@@ -49,6 +49,14 @@ jobs:
           environment-name: test
           condarc: |
             channel_priority: strict
+      - name: Cache test data
+        uses: actions/cache@v4
+        with:
+          path: tests/data
+          key: test-data-${{ hashFiles('scripts/fetch_test_data.py') }}
+      - name: Fetch test data
+        shell: bash -el {0}
+        run: python scripts/fetch_test_data.py
       - name: Run Rust tests
         shell: bash -el {0}
         run: cargo test --workspace

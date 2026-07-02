@@ -19,6 +19,9 @@ htmlcov/
 # Docs
 docs/_build/
 
+# Downloaded test datasets (fetched by scripts/fetch_test_data.py)
+tests/data/
+
 # Local planning and assistant files (not part of the library)
 plans/
 .claude/
