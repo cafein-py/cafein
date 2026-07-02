@@ -6,11 +6,13 @@
 
 mod model;
 mod read;
+mod timetable;
 
 pub use model::{
     Agency, Calendar, CalendarDate, Exception, Feed, FeedIndex, FeedInfo, Route, RouteIndex,
     RouteType, Stop, StopIndex, StopTime, Trip,
 };
+pub use timetable::build_timetable;
 
 /// Errors raised while reading or merging GTFS feeds.
 #[derive(Debug)]
@@ -21,6 +23,10 @@ pub enum Error {
     UnknownRoute { trip_id: String, route_id: String },
     /// A stop time references a stop that is missing from `stops.txt`.
     UnknownStop { trip_id: String, stop_id: String },
+    /// A stop time has neither an arrival nor a departure time.
+    MissingStopTime { trip_id: String },
+    /// The timetable could not be assembled.
+    Timetable(cafein_core::timetable::TimetableError),
 }
 
 impl std::fmt::Display for Error {
@@ -33,6 +39,13 @@ impl std::fmt::Display for Error {
             Error::UnknownStop { trip_id, stop_id } => {
                 write!(f, "trip '{trip_id}' references unknown stop '{stop_id}'")
             }
+            Error::MissingStopTime { trip_id } => {
+                write!(
+                    f,
+                    "trip '{trip_id}' has a stop time without arrival and departure"
+                )
+            }
+            Error::Timetable(error) => write!(f, "could not assemble timetable: {error}"),
         }
     }
 }
@@ -41,6 +54,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Gtfs(error) => Some(error),
+            Error::Timetable(error) => Some(error),
             _ => None,
         }
     }
@@ -49,5 +63,11 @@ impl std::error::Error for Error {
 impl From<gtfs_structures::Error> for Error {
     fn from(error: gtfs_structures::Error) -> Self {
         Error::Gtfs(error)
+    }
+}
+
+impl From<cafein_core::timetable::TimetableError> for Error {
+    fn from(error: cafein_core::timetable::TimetableError) -> Self {
+        Error::Timetable(error)
     }
 }
