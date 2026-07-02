@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cafein-core",
+    "crates/cafein-gtfs",
+    "crates/cafein-geom",
+    "crates/cafein-py",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/cafein-py/cafein"
+authors = ["Henrikki Tenkanen"]
+
+[workspace.dependencies]
+cafein-core = { path = "crates/cafein-core", version = "0.0.1" }
+
+[profile.release]
+lto = "thin"

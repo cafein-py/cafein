@@ -1,0 +1,8 @@
+[package]
+name = "cafein-core"
+description = "Transit data model and routing algorithms for cafein"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true

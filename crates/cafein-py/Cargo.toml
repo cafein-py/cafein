@@ -1,0 +1,16 @@
+[package]
+name = "cafein-py"
+description = "Python bindings for cafein"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "_cafein"
+crate-type = ["cdylib"]
+
+[dependencies]
+cafein-core.workspace = true
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }
