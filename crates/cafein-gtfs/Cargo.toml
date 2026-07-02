@@ -1,0 +1,11 @@
+[package]
+name = "cafein-gtfs"
+description = "GTFS ingest and timetable construction for cafein"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+cafein-core.workspace = true
