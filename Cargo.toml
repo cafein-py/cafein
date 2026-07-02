@@ -16,6 +16,13 @@ authors = ["Henrikki Tenkanen"]
 
 [workspace.dependencies]
 cafein-core = { path = "crates/cafein-core", version = "0.0.1" }
+chrono = { version = "0.4", default-features = false }
+gtfs-structures = { version = "0.48", default-features = false }
 
 [profile.release]
 lto = "thin"
+
+# Optimize dependencies even in dev/test builds; parsing the multi-million-row
+# test feeds is unusably slow with unoptimized csv/serde.
+[profile.dev.package."*"]
+opt-level = 2

@@ -9,3 +9,5 @@ authors.workspace = true
 
 [dependencies]
 cafein-core.workspace = true
+chrono.workspace = true
+gtfs-structures.workspace = true
