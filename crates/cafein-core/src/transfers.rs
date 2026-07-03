@@ -72,6 +72,11 @@ impl Transfers {
         })
     }
 
+    /// Number of transfer edges.
+    pub fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
     /// The transfers leaving a stop.
     pub fn from_stop(&self, stop: StopIdx) -> &[Transfer] {
         let start = self.offsets[stop.0 as usize] as usize;

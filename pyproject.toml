@@ -31,6 +31,14 @@ classifiers = [
     "Topic :: Scientific/Engineering :: GIS",
 ]
 dynamic = ["version"]
+dependencies = [
+    "geopandas>=0.14",
+    "numpy",
+    "pandas",
+    "pyrosm>=0.6.2",
+    "scipy>=1.8",
+    "shapely>=2.0",
+]
 
 [project.urls]
 Repository = "https://github.com/cafein-py/cafein"

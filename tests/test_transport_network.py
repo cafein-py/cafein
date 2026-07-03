@@ -82,6 +82,53 @@ def test_merged_feeds_require_qualified_stop_ids(helsinki_gtfs):
         assert transit["trip_id"] == f"{feed}:3001K_20220222_S1_2_0831"
 
 
+@pytest.fixture(scope="session")
+def network_with_footpaths(helsinki_gtfs, kantakaupunki_pbf):
+    with pytest.warns(UserWarning):
+        return TransportNetwork.from_gtfs(
+            [str(helsinki_gtfs)], osm_pbf=str(kantakaupunki_pbf)
+        )
+
+
+def test_an_osm_extract_installs_transfers(network_with_footpaths):
+    assert network_with_footpaths.transfer_count > 1_000_000
+
+
+def test_street_stops_are_reachable_only_over_footpaths(
+    network, network_with_footpaths
+):
+    # Kalasatama westbound metro platform to a Kamppi street stop: only
+    # metro trips serve the platform, so without footpaths the street stop
+    # is unreachable.
+    assert (
+        network.route_between_stops("1100602", "1040280", "2022-02-22", "08:30:00")
+        == []
+    )
+    # With footpaths: the 08:31 M2 reaches the Kamppi platform at 08:39
+    # (times straight from the GTFS tables) and the street stop is a
+    # 20-second walk away.
+    journeys = network_with_footpaths.route_between_stops(
+        "1100602", "1040280", "2022-02-22", "08:30:00"
+    )
+    first = journeys[0]
+    assert first["rides"] == 1
+    assert first["arrival"] == 8 * 3600 + 39 * 60 + 20
+
+    access, transit, transfer, egress = first["legs"]
+    assert access["type"] == "access"
+    assert transit["trip_id"] == "31M2_20220222_Ti_2_0817"
+    assert transit["route_short_name"] == "M2"
+    assert transit["board_stop"] == "1100602"
+    assert transit["departure"] == 8 * 3600 + 31 * 60
+    assert transit["alight_stop"] == "1040602"
+    assert transit["arrival"] == 8 * 3600 + 39 * 60
+    assert transfer["type"] == "transfer"
+    assert transfer["from_stop"] == "1040602"
+    assert transfer["to_stop"] == "1040280"
+    assert transfer["arrival"] - transfer["departure"] == 20
+    assert egress["type"] == "egress"
+
+
 def build_synthetic_gtfs(path):
     """A two-stop feed with one good trip, one backwards trip, and a stop
     whose raw id looks like a feed-qualified id."""
@@ -145,3 +192,48 @@ def test_qualified_ids_take_precedence_over_colon_raw_ids(tmp_path):
     assert journeys[0]["legs"][1]["board_stop"] == "0:S1"
     # The colon-named stop stays addressable through full qualification.
     assert merged.route_between_stops("0:0:S1", "0:S2", "2022-02-22", "07:30:00") == []
+
+
+def test_from_gtfs_accepts_a_single_bare_path(tmp_path):
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs(feed)
+    assert network.stop_count == 3
+
+
+def test_stops_are_exposed_with_coordinates(tmp_path):
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs([str(feed)])
+    assert network.stops == [
+        ("S1", 60.0, 24.0),
+        ("S2", 60.01, 24.01),
+        ("0:S1", 60.02, 24.02),
+    ]
+
+
+def test_set_transfers_routes_over_footpaths(tmp_path):
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs([str(feed)])
+    assert network.transfer_count == 0
+    network.set_transfers([("S2", "0:S1", 120), ("0:S1", "S2", 120)])
+    assert network.transfer_count == 2
+
+    # Ride to S2 (arrives 08:10), walk the 120-second footpath.
+    journeys = network.route_between_stops("S1", "0:S1", "2022-02-22", "07:30:00")
+    first = journeys[0]
+    assert first["arrival"] == 8 * 3600 + 10 * 60 + 120
+    types = [leg["type"] for leg in first["legs"]]
+    assert types == ["access", "transit", "transfer", "egress"]
+    transfer = first["legs"][2]
+    assert transfer["from_stop"] == "S2"
+    assert transfer["to_stop"] == "0:S1"
+
+
+def test_set_transfers_rejects_unknown_stops(tmp_path):
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs([str(feed)])
+    with pytest.raises(KeyError, match="no-such-stop"):
+        network.set_transfers([("no-such-stop", "S2", 60)])
