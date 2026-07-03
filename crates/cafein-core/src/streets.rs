@@ -36,6 +36,17 @@ pub struct StopLink {
     pub connector: f64,
 }
 
+/// A stop reached by the walking search.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WalkedStop {
+    pub stop: StopIdx,
+    /// Walking time in whole seconds, rounded up.
+    pub seconds: u32,
+    /// The exact walked street-path length in meters, connectors
+    /// included.
+    pub meters: f64,
+}
+
 /// A coordinate snapped onto the street network.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Snap {
@@ -378,14 +389,14 @@ impl StreetNetwork {
         best
     }
 
-    /// Every transit stop reachable on foot from a coordinate:
-    /// `(stop, seconds)` pairs sorted by stop index, or `None` when the
-    /// coordinate is farther than `max_snap_distance` meters from the
-    /// network or any parameter is out of range (the speed must be
-    /// positive and finite, the cutoffs non-negative and finite).
-    /// Walking is undirected, so the same search answers egress.
-    /// Seconds round up: understating a walking time could let routing
-    /// catch a departure the walk actually misses.
+    /// Every transit stop reachable on foot from a coordinate, sorted by
+    /// stop index, or `None` when the coordinate is farther than
+    /// `max_snap_distance` meters from the network or any parameter is
+    /// out of range (the speed must be positive and finite, the cutoffs
+    /// non-negative and finite). Walking is undirected, so the same
+    /// search answers egress. Seconds round up — understating a walking
+    /// time could let routing catch a departure the walk actually
+    /// misses — while meters stay the exact street-path length.
     pub fn access_stops(
         &self,
         latitude: f64,
@@ -393,7 +404,7 @@ impl StreetNetwork {
         walking_speed: f64,
         max_seconds: f64,
         max_snap_distance: f64,
-    ) -> Option<Vec<(StopIdx, u32)>> {
+    ) -> Option<Vec<WalkedStop>> {
         if !walking_speed.is_finite()
             || walking_speed <= 0.0
             || !max_seconds.is_finite()
@@ -412,7 +423,7 @@ impl StreetNetwork {
             ],
             cutoff,
         );
-        let mut fastest: HashMap<StopIdx, u32> = HashMap::new();
+        let mut nearest: HashMap<StopIdx, f64> = HashMap::new();
         for link in &self.links {
             let (link_from, link_to) = self.endpoints[link.edge as usize];
             let link_length = self.lengths[link.edge as usize];
@@ -429,16 +440,22 @@ impl StreetNetwork {
                 meters = meters.min(direct);
             }
             if meters <= cutoff + 1e-9 {
-                // A stop with several links keeps its fastest time.
-                let duration = seconds(meters / walking_speed);
-                fastest
+                // A stop with several links keeps its shortest path.
+                nearest
                     .entry(link.stop)
-                    .and_modify(|best| *best = (*best).min(duration))
-                    .or_insert(duration);
+                    .and_modify(|best| *best = best.min(meters))
+                    .or_insert(meters);
             }
         }
-        let mut reached: Vec<(StopIdx, u32)> = fastest.into_iter().collect();
-        reached.sort_unstable_by_key(|&(stop, _)| stop);
+        let mut reached: Vec<WalkedStop> = nearest
+            .into_iter()
+            .map(|(stop, meters)| WalkedStop {
+                stop,
+                seconds: seconds(meters / walking_speed),
+                meters,
+            })
+            .collect();
+        reached.sort_unstable_by_key(|walk| walk.stop);
         Some(reached)
     }
 
@@ -630,6 +647,11 @@ mod tests {
         vec![from, to]
     }
 
+    /// The `(stop, seconds)` view of a walking-search result.
+    fn timed(walks: &[WalkedStop]) -> Vec<(StopIdx, u32)> {
+        walks.iter().map(|walk| (walk.stop, walk.seconds)).collect()
+    }
+
     #[test]
     fn snaps_to_the_nearest_edge() {
         let network = network(
@@ -734,7 +756,9 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(100.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
-        assert_eq!(reached, vec![(StopIdx(0), 0), (StopIdx(1), 200)]);
+        assert_eq!(timed(&reached), vec![(StopIdx(0), 0), (StopIdx(1), 200)]);
+        assert!(reached[0].meters.abs() < 0.5);
+        assert!((reached[1].meters - 200.0).abs() < 0.5);
     }
 
     #[test]
@@ -750,7 +774,7 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(100.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
-        assert_eq!(reached, vec![(StopIdx(0), 400)]);
+        assert_eq!(timed(&reached), vec![(StopIdx(0), 400)]);
     }
 
     #[test]
@@ -768,7 +792,7 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(0.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
-        assert_eq!(reached, vec![(StopIdx(0), 400)]);
+        assert_eq!(timed(&reached), vec![(StopIdx(0), 400)]);
     }
 
     #[test]
@@ -789,7 +813,7 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(360.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 50.0).unwrap();
-        assert_eq!(reached, vec![(StopIdx(0), 300)]);
+        assert_eq!(timed(&reached), vec![(StopIdx(0), 300)]);
     }
 
     #[test]
@@ -803,7 +827,7 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(0.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 150.0, 100.0).unwrap();
-        assert_eq!(reached, vec![(StopIdx(0), 100)]);
+        assert_eq!(timed(&reached), vec![(StopIdx(0), 100)]);
     }
 
     #[test]
@@ -819,7 +843,7 @@ mod tests {
         let (lon, lat) = lonlat(100.0, 10.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
         assert_eq!(reached.len(), 1);
-        assert!((129..=131).contains(&reached[0].1));
+        assert!((129..=131).contains(&reached[0].seconds));
     }
 
     #[test]
@@ -833,8 +857,10 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(100.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
-        // 0.5 × 401 m at 1 m/s is 200.5 s and must not round down.
-        assert_eq!(reached, vec![(StopIdx(0), 201)]);
+        // 0.5 × 401 m at 1 m/s is 200.5 s and must not round down; the
+        // meters stay exact.
+        assert_eq!(timed(&reached), vec![(StopIdx(0), 201)]);
+        assert!((reached[0].meters - 200.5).abs() < 1e-9);
     }
 
     #[test]
@@ -848,7 +874,7 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(100.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
-        assert_eq!(reached, vec![(StopIdx(0), 100)]);
+        assert_eq!(timed(&reached), vec![(StopIdx(0), 100)]);
     }
 
     #[test]

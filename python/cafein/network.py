@@ -255,8 +255,9 @@ class TransportNetwork:
         the installed transfers; transit legs report their distance and
         its provenance when trip distances are installed.
         ``route_between_coordinates`` routes door-to-door from arbitrary
-        coordinates; leg geometries and emissions arrive with later
-        build steps.
+        coordinates, and ``annotate_emissions`` attaches emissions to
+        routed journeys. Legs carry times, stops, distances, and
+        provenance; per-leg geometries are not part of the output yet.
 
         Parameters
         ----------

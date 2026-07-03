@@ -11,7 +11,7 @@ use cafein_core::geometry::{DistanceProvenance, TripGeometry};
 use cafein_core::journey::{Journey, Leg};
 use cafein_core::raptor::Raptor;
 use cafein_core::router::{Request, TransitRouter};
-use cafein_core::streets::{StopLink, StreetNetwork};
+use cafein_core::streets::{StopLink, StreetNetwork, WalkedStop};
 use cafein_core::timetable::{StopIdx, TripIdx};
 use cafein_core::transfers::Transfers;
 use cafein_gtfs::{build_timetable, Feed, RouteType, TimetableBuild};
@@ -34,6 +34,29 @@ struct TransportNetwork {
 enum StopLookup {
     Unique(StopIdx),
     Ambiguous,
+}
+
+/// A coordinate query's exact walk lengths in meters, keyed by the stop
+/// each access or egress link enters the network through.
+struct WalkMaps {
+    access: HashMap<StopIdx, f64>,
+    egress: HashMap<StopIdx, f64>,
+}
+
+impl WalkMaps {
+    fn new(access: &[WalkedStop], egress: &[WalkedStop]) -> WalkMaps {
+        let meters =
+            |walks: &[WalkedStop]| walks.iter().map(|walk| (walk.stop, walk.meters)).collect();
+        WalkMaps {
+            access: meters(access),
+            egress: meters(egress),
+        }
+    }
+}
+
+/// The `(stop, seconds)` request offsets of a walking-search result.
+fn request_offsets(walks: &[WalkedStop]) -> Vec<(StopIdx, u32)> {
+    walks.iter().map(|walk| (walk.stop, walk.seconds)).collect()
 }
 
 #[pymethods]
@@ -290,8 +313,8 @@ impl TransportNetwork {
             "",
         )?;
         let result = PyDict::new(py);
-        for (stop, seconds) in reached {
-            result.set_item(self.public_stop_id(stop), seconds)?;
+        for walk in reached {
+            result.set_item(self.public_stop_id(walk.stop), walk.seconds)?;
         }
         Ok(result.unbind())
     }
@@ -353,8 +376,8 @@ impl TransportNetwork {
     /// the transfers installed with ``set_transfers``; transit legs
     /// report their distance and its provenance when trip distances are
     /// installed. ``route_between_coordinates`` routes door-to-door from
-    /// arbitrary coordinates; leg geometries and emissions join once the
-    /// geometry preprocessing produces them.
+    /// arbitrary coordinates. Legs carry times, stops, distances, and
+    /// provenance; per-leg geometries are not part of the output yet.
     ///
     /// Parameters
     /// ----------
@@ -481,14 +504,15 @@ impl TransportNetwork {
             max_snap_distance,
             "destination ",
         )?;
+        let walks = WalkMaps::new(&access, &egress);
         let request = Request {
             departure: parse_time(departure)?,
-            access,
-            egress,
+            access: request_offsets(&access),
+            egress: request_offsets(&egress),
             active_services: self.active_services(date)?,
             max_transfers,
         };
-        self.route_request(py, &request, window, Some(speed))
+        self.route_request(py, &request, window, Some(&walks))
     }
 
     /// Earliest arrival at every reachable stop from a coordinate.
@@ -549,7 +573,7 @@ impl TransportNetwork {
         let departure = parse_time(departure)?;
         let request = Request {
             departure,
-            access,
+            access: request_offsets(&access),
             egress: Vec::new(),
             active_services: self.active_services(date)?,
             max_transfers,
@@ -642,13 +666,13 @@ impl TransportNetwork {
     }
 
     /// Runs a request through the router and converts the journeys,
-    /// attaching walk-leg distances when the walking speed is known.
+    /// attaching walk-leg distances when the walk lengths are known.
     fn route_request(
         &self,
         py: Python<'_>,
         request: &Request,
         window: Option<u32>,
-        walk_speed: Option<f64>,
+        walks: Option<&WalkMaps>,
     ) -> PyResult<Py<PyList>> {
         let journeys = match window {
             None => Raptor.route(&self.build.timetable, &self.transfers, request),
@@ -658,7 +682,7 @@ impl TransportNetwork {
         };
         let result = PyList::empty(py);
         for journey in &journeys {
-            result.append(self.journey_to_dict(py, journey, walk_speed)?)?;
+            result.append(self.journey_to_dict(py, journey, walks)?)?;
         }
         Ok(result.unbind())
     }
@@ -701,7 +725,7 @@ impl TransportNetwork {
         &self,
         py: Python<'_>,
         journey: &Journey,
-        walk_speed: Option<f64>,
+        walks: Option<&WalkMaps>,
     ) -> PyResult<Py<PyDict>> {
         let timetable = &self.build.timetable;
         let dict = PyDict::new(py);
@@ -721,7 +745,10 @@ impl TransportNetwork {
                     entry.set_item("to_stop", self.public_stop_id(to_stop))?;
                     entry.set_item("departure", departure)?;
                     entry.set_item("arrival", arrival)?;
-                    entry.set_item("distance", walk_distance(walk_speed, departure, arrival))?;
+                    entry.set_item(
+                        "distance",
+                        walks.and_then(|walks| walks.access.get(&to_stop)).copied(),
+                    )?;
                     entry.set_item("distance_provenance", py.None())?;
                 }
                 Leg::Transit {
@@ -783,7 +810,12 @@ impl TransportNetwork {
                     entry.set_item("from_stop", self.public_stop_id(from_stop))?;
                     entry.set_item("departure", departure)?;
                     entry.set_item("arrival", arrival)?;
-                    entry.set_item("distance", walk_distance(walk_speed, departure, arrival))?;
+                    entry.set_item(
+                        "distance",
+                        walks
+                            .and_then(|walks| walks.egress.get(&from_stop))
+                            .copied(),
+                    )?;
                     entry.set_item("distance_provenance", py.None())?;
                 }
             }
@@ -819,9 +851,9 @@ fn validated_walking_speed(
     Ok(walking_speed_kmph / 3.6)
 }
 
-/// The stops walkable from a coordinate as `(stop, seconds)` links, or a
-/// `ValueError` when the coordinate is invalid or off the network;
-/// `side` prefixes the message (e.g. `"origin "`) to name the endpoint.
+/// The stops walkable from a coordinate, or a `ValueError` when the
+/// coordinate is invalid or off the network; `side` prefixes the message
+/// (e.g. `"origin "`) to name the endpoint.
 fn coordinate_links(
     streets: &StreetNetwork,
     coordinate: (f64, f64),
@@ -829,7 +861,7 @@ fn coordinate_links(
     max_walking_time: f64,
     max_snap_distance: f64,
     side: &str,
-) -> PyResult<Vec<(StopIdx, u32)>> {
+) -> PyResult<Vec<WalkedStop>> {
     let (lat, lon) = coordinate;
     if !lat.is_finite() || !lon.is_finite() {
         return Err(PyValueError::new_err(format!(
@@ -844,11 +876,6 @@ fn coordinate_links(
                  from the walking network"
             ))
         })
-}
-
-/// A walk leg's distance in meters when the walking speed is known.
-fn walk_distance(walk_speed: Option<f64>, departure: u32, arrival: u32) -> Option<f64> {
-    walk_speed.map(|speed| (arrival - departure) as f64 * speed)
 }
 
 /// Parses ``HH:MM:SS`` into seconds past the service day's start; hours may

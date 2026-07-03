@@ -270,11 +270,10 @@ def test_routes_door_to_door_between_coordinates(network_with_footpaths):
     access, transit, egress = first["legs"]
     assert access["type"] == "access"
     assert access["to_stop"] == "1100602"
-    # The default 3.6 km/h is 1 m/s, so walk meters equal walk seconds.
-    assert access["distance"] == pytest.approx(
-        access["arrival"] - access["departure"], abs=0.01
-    )
-    assert access["distance"] <= 15
+    # Walk distances are the exact street-path meters; the leg duration
+    # is the same walk rounded up to whole seconds at 1 m/s (3.6 km/h).
+    assert 0 <= access["distance"] <= 15
+    assert access["distance"] <= access["arrival"] - access["departure"]
     assert transit["trip_id"] == "31M2_20220222_Ti_2_0817"
     assert transit["departure"] == 8 * 3600 + 31 * 60
     assert egress["type"] == "egress"
@@ -371,7 +370,7 @@ def test_a_synthetic_network_routes_door_to_door(tmp_path):
     assert access["distance"] == 0.0
     assert transit["trip_id"] == "T_OK"
     assert egress["from_stop"] == "S2"
-    assert egress["distance"] == 200.0
+    assert egress["distance"] == pytest.approx(200.0)
 
     # Journeys ride at least one trip: a destination best reached by
     # walking alone yields no journeys.
