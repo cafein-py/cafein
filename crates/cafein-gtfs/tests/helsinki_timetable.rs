@@ -1,33 +1,35 @@
 //! Timetable construction from the Helsinki region GTFS feed shared with
 //! r5py (r5py.sampledata.helsinki v1.1.1).
 
-use std::path::PathBuf;
+mod common;
+
 use std::sync::OnceLock;
 
 use cafein_core::timetable::{PatternIdx, StopIdx, Timetable, TripIdx};
 use cafein_gtfs::{build_timetable, Feed};
 
-fn helsinki() -> &'static (Feed, Timetable) {
-    static DATA: OnceLock<(Feed, Timetable)> = OnceLock::new();
+fn helsinki() -> Option<&'static (Feed, Timetable)> {
+    static DATA: OnceLock<Option<(Feed, Timetable)>> = OnceLock::new();
     DATA.get_or_init(|| {
-        let path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/helsinki_gtfs.zip");
-        assert!(
-            path.exists(),
-            "test data missing at {}; run `python scripts/fetch_test_data.py`",
-            path.display()
-        );
+        let path = common::helsinki_gtfs_path()?;
         let feed = Feed::from_path(path).unwrap();
-        let timetable = build_timetable(&feed).unwrap();
-        (feed, timetable)
+        let build = build_timetable(&feed).unwrap();
+        // The HSL feed has no quarantinable trips.
+        assert!(build.quarantined.is_empty());
+        Some((feed, build.timetable))
     })
+    .as_ref()
 }
 
 #[test]
 fn extracts_patterns_from_the_full_feed() {
-    let (_, timetable) = helsinki();
+    let Some((_, timetable)) = helsinki() else {
+        return;
+    };
     assert_eq!(timetable.stop_count(), 8305);
-    assert_eq!(timetable.pattern_count(), 1011);
+    // 1 011 distinct (route, stop sequence) pairs, split into 1 395 FIFO
+    // patterns because HSL trips overtake within a stop sequence.
+    assert_eq!(timetable.pattern_count(), 1395);
     assert_eq!(timetable.trip_count(), 195_351);
     let total_stop_times: usize = (0..timetable.trip_count())
         .map(|trip| timetable.trip_stop_times(TripIdx(trip)).len())
@@ -36,20 +38,28 @@ fn extracts_patterns_from_the_full_feed() {
 }
 
 #[test]
-fn trips_within_a_pattern_depart_in_order() {
-    let (_, timetable) = helsinki();
+fn trips_within_a_pattern_never_overtake() {
+    let Some((_, timetable)) = helsinki() else {
+        return;
+    };
     for pattern in 0..timetable.pattern_count() {
-        let departures: Vec<u32> = timetable
-            .pattern_trips(PatternIdx(pattern))
-            .map(|trip| timetable.trip_stop_times(trip)[0].departure)
-            .collect();
-        assert!(departures.windows(2).all(|pair| pair[0] <= pair[1]));
+        let trips: Vec<TripIdx> = timetable.pattern_trips(PatternIdx(pattern)).collect();
+        for pair in trips.windows(2) {
+            let earlier = timetable.trip_stop_times(pair[0]);
+            let later = timetable.trip_stop_times(pair[1]);
+            assert!(earlier
+                .iter()
+                .zip(later)
+                .all(|(e, l)| { e.arrival <= l.arrival && e.departure <= l.departure }));
+        }
     }
 }
 
 #[test]
 fn night_bus_pattern_matches_the_feed() {
-    let (feed, timetable) = helsinki();
+    let Some((feed, timetable)) = helsinki() else {
+        return;
+    };
     let (trip_index, feed_trip) = feed
         .trips
         .iter()
@@ -89,7 +99,9 @@ fn night_bus_pattern_matches_the_feed() {
 
 #[test]
 fn stop_pattern_index_is_consistent() {
-    let (_, timetable) = helsinki();
+    let Some((_, timetable)) = helsinki() else {
+        return;
+    };
     let mut indexed_entries = 0usize;
     for stop in 0..timetable.stop_count() {
         for pattern_stop in timetable.patterns_at_stop(StopIdx(stop)) {

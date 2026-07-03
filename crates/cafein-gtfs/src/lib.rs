@@ -12,7 +12,7 @@ pub use model::{
     Agency, Calendar, CalendarDate, Exception, Feed, FeedIndex, FeedInfo, Route, RouteIndex,
     RouteType, Stop, StopIndex, StopTime, Trip,
 };
-pub use timetable::build_timetable;
+pub use timetable::{build_timetable, QuarantinedTrip, TimetableBuild};
 
 /// Errors raised while reading or merging GTFS feeds.
 #[derive(Debug)]

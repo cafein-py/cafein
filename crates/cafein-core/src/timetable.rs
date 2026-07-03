@@ -3,9 +3,11 @@
 //!
 //! A *pattern* is a unique ordered stop sequence served by one route (the
 //! RAPTOR "route" convention). Trips within a pattern are stored
-//! contiguously, sorted by departure time at the pattern's first stop, so
-//! boarding lookups can binary-search and range-RAPTOR can iterate
-//! departures in decreasing order.
+//! contiguously, sorted by departure time at the pattern's first stop, and
+//! no trip overtakes an earlier one at any stop — patterns violating this
+//! are split into FIFO chains at build time — so boarding lookups can
+//! binary-search and range-RAPTOR can iterate departures in decreasing
+//! order at every stop of the pattern.
 
 /// Index of a stop in a [`Timetable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -162,6 +164,9 @@ pub enum TimetableError {
         stop_times: usize,
         pattern_stops: usize,
     },
+    /// A trip's stop times go backwards: a departure before its arrival, or
+    /// an arrival before the previous stop's departure.
+    NonIncreasingStopTimes { source: u32, position: usize },
 }
 
 impl std::fmt::Display for TimetableError {
@@ -181,6 +186,10 @@ impl std::fmt::Display for TimetableError {
             } => write!(
                 f,
                 "trip (source {source}) has {stop_times} stop times but its pattern has {pattern_stops} stops"
+            ),
+            TimetableError::NonIncreasingStopTimes { source, position } => write!(
+                f,
+                "trip (source {source}) has stop times going backwards at position {position}"
             ),
         }
     }
@@ -226,6 +235,9 @@ impl TimetableBuilder {
 
     /// Adds a trip to a registered pattern with one stop time per pattern
     /// stop and a caller-defined source identifier.
+    ///
+    /// Stop times must move forwards: at every stop `arrival <= departure`,
+    /// and every arrival must be at or after the previous stop's departure.
     pub fn add_trip(
         &mut self,
         pattern: PatternIdx,
@@ -245,6 +257,14 @@ impl TimetableBuilder {
                 pattern_stops,
             });
         }
+        for (position, stop_time) in stop_times.iter().enumerate() {
+            let backwards_dwell = stop_time.departure < stop_time.arrival;
+            let backwards_hop =
+                position > 0 && stop_time.arrival < stop_times[position - 1].departure;
+            if backwards_dwell || backwards_hop {
+                return Err(TimetableError::NonIncreasingStopTimes { source, position });
+            }
+        }
         self.trips.push(BuilderTrip {
             pattern,
             source,
@@ -253,43 +273,94 @@ impl TimetableBuilder {
         Ok(())
     }
 
-    /// Sorts trips per pattern by first-stop departure and assembles the
-    /// timetable.
+    /// Sorts trips per registered pattern by first-stop departure, splits
+    /// each pattern into FIFO chains, and assembles the timetable.
+    ///
+    /// Within a final pattern no trip overtakes an earlier one at any stop.
+    /// Trips of a registered pattern that violate this are moved into
+    /// additional patterns sharing the same stops and route (greedy
+    /// first-fit in departure order), so the final pattern count can exceed
+    /// the number registered. Registered patterns without trips are dropped.
     pub fn finish(self) -> Timetable {
-        let pattern_count = self.pattern_routes.len();
+        let registered_count = self.pattern_routes.len();
         let mut trips = self.trips;
-        trips.sort_by_key(|trip| (trip.pattern, trip.stop_times[0].departure));
+        trips.sort_by(|left, right| {
+            left.pattern
+                .cmp(&right.pattern)
+                .then(
+                    left.stop_times[0]
+                        .departure
+                        .cmp(&right.stop_times[0].departure),
+                )
+                .then_with(|| compare_stop_times(&left.stop_times, &right.stop_times))
+        });
 
-        let mut pattern_trips_offsets = vec![0u32; pattern_count + 1];
-        for trip in &trips {
-            pattern_trips_offsets[trip.pattern.0 as usize + 1] += 1;
-        }
-        for pattern in 0..pattern_count {
-            pattern_trips_offsets[pattern + 1] += pattern_trips_offsets[pattern];
+        let mut pattern_stops_offsets = vec![0u32];
+        let mut pattern_stops: Vec<StopIdx> = Vec::new();
+        let mut pattern_routes: Vec<u32> = Vec::new();
+        let mut pattern_trips_offsets = vec![0u32];
+        let mut sorted_trips: Vec<BuilderTrip> = Vec::with_capacity(trips.len());
+
+        let mut trips = trips.into_iter().peekable();
+        for registered in 0..registered_count {
+            let mut registered_trips = Vec::new();
+            while trips
+                .peek()
+                .is_some_and(|trip| trip.pattern.0 as usize == registered)
+            {
+                registered_trips.push(trips.next().unwrap());
+            }
+
+            let mut chains: Vec<Vec<BuilderTrip>> = Vec::new();
+            'next_trip: for trip in registered_trips {
+                for chain in &mut chains {
+                    let last = chain.last().unwrap();
+                    if follows(&trip.stop_times, &last.stop_times) {
+                        chain.push(trip);
+                        continue 'next_trip;
+                    }
+                }
+                chains.push(vec![trip]);
+            }
+
+            let stops_start = self.pattern_stops_offsets[registered] as usize;
+            let stops_end = self.pattern_stops_offsets[registered + 1] as usize;
+            for chain in chains {
+                pattern_stops.extend_from_slice(&self.pattern_stops[stops_start..stops_end]);
+                pattern_stops_offsets.push(pattern_stops.len() as u32);
+                pattern_routes.push(self.pattern_routes[registered]);
+                pattern_trips_offsets
+                    .push(pattern_trips_offsets.last().unwrap() + chain.len() as u32);
+                sorted_trips.extend(chain);
+            }
         }
 
+        let pattern_count = pattern_routes.len();
         let mut pattern_times_offsets = vec![0u32; pattern_count];
         let mut total_times = 0u32;
         for pattern in 0..pattern_count {
             pattern_times_offsets[pattern] = total_times;
-            let stops =
-                self.pattern_stops_offsets[pattern + 1] - self.pattern_stops_offsets[pattern];
+            let stops = pattern_stops_offsets[pattern + 1] - pattern_stops_offsets[pattern];
             let pattern_trip_count =
                 pattern_trips_offsets[pattern + 1] - pattern_trips_offsets[pattern];
             total_times += stops * pattern_trip_count;
         }
 
         let mut stop_times = Vec::with_capacity(total_times as usize);
-        let mut trip_patterns = Vec::with_capacity(trips.len());
-        let mut trip_sources = Vec::with_capacity(trips.len());
-        for trip in &trips {
-            stop_times.extend_from_slice(&trip.stop_times);
-            trip_patterns.push(trip.pattern);
-            trip_sources.push(trip.source);
+        let mut trip_patterns = Vec::with_capacity(sorted_trips.len());
+        let mut trip_sources = Vec::with_capacity(sorted_trips.len());
+        for pattern in 0..pattern_count {
+            let start = pattern_trips_offsets[pattern];
+            let end = pattern_trips_offsets[pattern + 1];
+            for trip in &sorted_trips[start as usize..end as usize] {
+                stop_times.extend_from_slice(&trip.stop_times);
+                trip_patterns.push(PatternIdx(pattern as u32));
+                trip_sources.push(trip.source);
+            }
         }
 
         let mut stop_patterns_offsets = vec![0u32; self.stop_count as usize + 1];
-        for stop in &self.pattern_stops {
+        for stop in &pattern_stops {
             stop_patterns_offsets[stop.0 as usize + 1] += 1;
         }
         for stop in 0..self.stop_count as usize {
@@ -300,13 +371,13 @@ impl TimetableBuilder {
                 pattern: PatternIdx(0),
                 position: 0
             };
-            self.pattern_stops.len()
+            pattern_stops.len()
         ];
         let mut cursor = stop_patterns_offsets.clone();
         for pattern in 0..pattern_count {
-            let start = self.pattern_stops_offsets[pattern] as usize;
-            let end = self.pattern_stops_offsets[pattern + 1] as usize;
-            for (position, stop) in self.pattern_stops[start..end].iter().enumerate() {
+            let start = pattern_stops_offsets[pattern] as usize;
+            let end = pattern_stops_offsets[pattern + 1] as usize;
+            for (position, stop) in pattern_stops[start..end].iter().enumerate() {
                 let slot = cursor[stop.0 as usize] as usize;
                 stop_patterns[slot] = PatternStop {
                     pattern: PatternIdx(pattern as u32),
@@ -318,18 +389,37 @@ impl TimetableBuilder {
 
         Timetable {
             stop_count: self.stop_count,
-            pattern_stops_offsets: self.pattern_stops_offsets,
-            pattern_stops: self.pattern_stops,
+            pattern_stops_offsets,
+            pattern_stops,
             pattern_trips_offsets,
             pattern_times_offsets,
             stop_times,
             trip_patterns,
             trip_sources,
-            pattern_routes: self.pattern_routes,
+            pattern_routes,
             stop_patterns_offsets,
             stop_patterns,
         }
     }
+}
+
+/// Orders stop-time sequences lexicographically by `(arrival, departure)`.
+fn compare_stop_times(left: &[StopTime], right: &[StopTime]) -> std::cmp::Ordering {
+    for (a, b) in left.iter().zip(right) {
+        let ordering = (a.arrival, a.departure).cmp(&(b.arrival, b.departure));
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Whether `later` runs at or after `earlier` at every stop (no overtaking).
+fn follows(later: &[StopTime], earlier: &[StopTime]) -> bool {
+    later
+        .iter()
+        .zip(earlier)
+        .all(|(l, e)| l.arrival >= e.arrival && l.departure >= e.departure)
 }
 
 #[cfg(test)]
@@ -423,5 +513,63 @@ mod tests {
                 pattern_stops: 2
             })
         );
+    }
+
+    #[test]
+    fn rejects_backwards_stop_times() {
+        let mut builder = TimetableBuilder::new(2);
+        let pattern = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+        // Departure before arrival at the same stop.
+        assert_eq!(
+            builder.add_trip(pattern, vec![time(10, 5), time(20, 20)], 7),
+            Err(TimetableError::NonIncreasingStopTimes {
+                source: 7,
+                position: 0
+            })
+        );
+        // Arrival before the previous stop's departure.
+        assert_eq!(
+            builder.add_trip(pattern, vec![time(0, 30), time(20, 40)], 8),
+            Err(TimetableError::NonIncreasingStopTimes {
+                source: 8,
+                position: 1
+            })
+        );
+    }
+
+    #[test]
+    fn splits_overtaking_trips_into_fifo_patterns() {
+        let mut builder = TimetableBuilder::new(2);
+        let pattern = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 5).unwrap();
+        builder
+            .add_trip(pattern, vec![time(0, 0), time(100, 100)], 0)
+            .unwrap();
+        // Departs later than trip 0 but arrives earlier: overtakes it.
+        builder
+            .add_trip(pattern, vec![time(10, 10), time(50, 50)], 1)
+            .unwrap();
+        // Follows trip 0 at both stops.
+        builder
+            .add_trip(pattern, vec![time(20, 20), time(120, 120)], 2)
+            .unwrap();
+        let timetable = builder.finish();
+
+        assert_eq!(timetable.pattern_count(), 2);
+        let first: Vec<u32> = timetable
+            .pattern_trips(PatternIdx(0))
+            .map(|trip| timetable.trip_source(trip))
+            .collect();
+        let second: Vec<u32> = timetable
+            .pattern_trips(PatternIdx(1))
+            .map(|trip| timetable.trip_source(trip))
+            .collect();
+        assert_eq!(first, vec![0, 2]);
+        assert_eq!(second, vec![1]);
+        // The split patterns share stops and route.
+        assert_eq!(
+            timetable.pattern_stops(PatternIdx(0)),
+            timetable.pattern_stops(PatternIdx(1))
+        );
+        assert_eq!(timetable.pattern_route(PatternIdx(1)), 5);
     }
 }
