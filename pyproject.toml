@@ -40,6 +40,9 @@ dependencies = [
     "shapely>=2.0",
 ]
 
+[project.optional-dependencies]
+yaml = ["pyyaml"]
+
 [project.urls]
 Repository = "https://github.com/cafein-py/cafein"
 "Issue Tracker" = "https://github.com/cafein-py/cafein/issues"

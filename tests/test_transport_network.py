@@ -5,11 +5,6 @@ import pytest
 from cafein import TransportNetwork
 
 
-@pytest.fixture(scope="session")
-def network(helsinki_gtfs):
-    return TransportNetwork.from_gtfs([str(helsinki_gtfs)])
-
-
 def test_network_statistics(network):
     assert network.stop_count == 8305
     assert network.pattern_count == 1395
@@ -229,6 +224,15 @@ def test_from_gtfs_accepts_a_single_bare_path(tmp_path):
     with pytest.warns(UserWarning):
         network = TransportNetwork.from_gtfs(feed)
     assert network.stop_count == 3
+
+
+def test_routes_carry_the_single_agency_when_implicit(tmp_path):
+    # The synthetic feed's routes.txt has no agency_id column; its one
+    # agency still resolves for the agency-level emission-factor tier.
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs([str(feed)])
+    assert network.routes == [("R1", "A", 3)]
 
 
 def test_stops_are_exposed_with_coordinates(tmp_path):

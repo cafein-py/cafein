@@ -13,7 +13,7 @@ use cafein_core::raptor::Raptor;
 use cafein_core::router::{Request, TransitRouter};
 use cafein_core::timetable::{StopIdx, TripIdx};
 use cafein_core::transfers::Transfers;
-use cafein_gtfs::{build_timetable, Feed, TimetableBuild};
+use cafein_gtfs::{build_timetable, Feed, RouteType, TimetableBuild};
 
 /// A routable public-transport network built from GTFS data.
 #[pyclass]
@@ -190,6 +190,37 @@ impl TransportNetwork {
     #[getter]
     fn trip_ids(&self) -> Vec<String> {
         self.trips_by_public_id.keys().cloned().collect()
+    }
+
+    /// The network's routes as `(route_id, agency_id, route_type)`
+    /// tuples, with identifiers in their public form (feed-qualified
+    /// when several feeds are merged) and the GTFS route_type as its
+    /// numeric code. A route without an explicit agency in a
+    /// single-agency feed carries that feed's one agency.
+    #[getter]
+    fn routes(&self) -> Vec<(String, Option<String>, i32)> {
+        self.feed
+            .routes
+            .iter()
+            .map(|route| {
+                let agency_id = route.agency_id.clone().or_else(|| {
+                    let mut in_feed = self
+                        .feed
+                        .agencies
+                        .iter()
+                        .filter(|agency| agency.feed == route.feed);
+                    match (in_feed.next(), in_feed.next()) {
+                        (Some(only), None) => only.id.clone(),
+                        _ => None,
+                    }
+                });
+                (
+                    self.public_id(route.feed, &route.id),
+                    agency_id.map(|id| self.public_id(route.feed, &id)),
+                    route_type_code(&route.route_type),
+                )
+            })
+            .collect()
     }
 
     /// Number of trips per distance-provenance tier, empty before
@@ -432,6 +463,25 @@ fn parse_time(value: &str) -> PyResult<u32> {
 
 fn to_py_error(error: cafein_gtfs::Error) -> PyErr {
     PyValueError::new_err(error.to_string())
+}
+
+/// The numeric GTFS route_type of a parsed route type; named variants map
+/// to their standard codes, extended codes pass through.
+fn route_type_code(route_type: &RouteType) -> i32 {
+    match route_type {
+        RouteType::Tramway => 0,
+        RouteType::Subway => 1,
+        RouteType::Rail => 2,
+        RouteType::Bus => 3,
+        RouteType::Ferry => 4,
+        RouteType::CableCar => 5,
+        RouteType::Gondola => 6,
+        RouteType::Funicular => 7,
+        RouteType::Coach => 200,
+        RouteType::Air => 1100,
+        RouteType::Taxi => 1500,
+        RouteType::Other(code) => *code as i32,
+    }
 }
 
 fn provenance_name(tier: DistanceProvenance) -> &'static str {

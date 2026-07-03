@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Emissions: `cafein.emissions` computes per-leg and per-journey CO₂e
+  from the installed distances through a most-specific-wins factor
+  ladder (trip > route > agency + mode > mode > global default), with
+  shipped ITF life-cycle defaults, LCA component columns, user tables
+  from DataFrame/CSV/JSON/YAML (PyYAML via the optional `yaml` extra),
+  and `TransportNetwork.annotate_emissions`; networks expose `routes`.
+
 - Per-leg travel distances with provenance: `cafein.geometry.trip_distances`
   runs the distance fallback ladder over the feeds (validated
   `shape_dist_traveled` with unit correction; stops linear-referenced onto

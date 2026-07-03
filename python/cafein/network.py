@@ -117,6 +117,37 @@ class TransportNetwork:
         """The stops as ``(stop_id, latitude, longitude)`` tuples."""
         return self._core.stops
 
+    @property
+    def routes(self):
+        """The routes as ``(route_id, agency_id, route_type)`` tuples,
+        with the GTFS route_type as its numeric code."""
+        return self._core.routes
+
+    def annotate_emissions(self, journeys, factors=None, components=None):
+        """Attach per-leg and per-journey emissions to routed journeys.
+
+        Parameters
+        ----------
+        journeys : list of dict
+            Journeys from ``route_between_stops`` (with distances, the
+            default build).
+        factors : DataFrame or path (optional)
+            Extra emission-factor rows layered over the shipped
+            defaults; see ``cafein.emissions.load_factors``.
+        components : list of str (optional)
+            The life-cycle components to include (default: all four);
+            see ``cafein.emissions.annotate``.
+
+        Returns
+        -------
+        list of dict
+            The journeys, with ``emissions`` (grams CO₂e) on every leg
+            and journey; see ``cafein.emissions.annotate``.
+        """
+        from cafein import emissions
+
+        return emissions.annotate(journeys, self, factors, components)
+
     def set_transfers(self, footpaths):
         """Install precomputed stop-to-stop transfers.
 
