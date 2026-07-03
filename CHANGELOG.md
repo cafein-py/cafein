@@ -9,6 +9,11 @@
   transit stop reachable within a cutoff — the search door-to-door
   routing builds on.
 
+- Packaging: include the `LICENSE` file in the source distribution.
+  maturin records `License-File: LICENSE` in the metadata but omits the
+  file from the sdist for a workspace-member manifest, which PyPI
+  rejects on upload; the 0.1.0 sdist could not be published as a result.
+
 ## 0.1.0 — 2026-07-03
 
 The first release: public-transport routing from GTFS and OpenStreetMap
