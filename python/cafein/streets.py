@@ -228,7 +228,11 @@ def _snap_to_edges(stop_points, edges, max_snap_distance):
         max_distance=max_snap_distance,
         distance_col="snap_distance",
     )
+    # Several edges can tie as a stop's nearest; keep the closest match
+    # and break exact ties by edge id so the choice is deterministic.
+    matched = matched.sort_values(["snap_distance", "index_right"], kind="stable")
     matched = matched[~matched.index.duplicated()]
+    matched = matched.sort_index(kind="stable")
     if len(matched) < len(stop_points):
         warnings.warn(
             f"{len(stop_points) - len(matched)} stop(s) are farther than "

@@ -263,6 +263,15 @@ def test_the_street_payload_mirrors_the_walking_network():
     assert connectors[1] == pytest.approx(30.0, rel=0.01)
 
 
+def test_snap_ties_break_deterministically():
+    # Two edges with identical geometry tie exactly as a stop's nearest;
+    # the lower edge id wins, whatever order the spatial join returns.
+    nodes = {"A": (0, 0), "B": (400, 0)}
+    edges = [("A", "B", 400), ("A", "B", 800)]
+    *_, links = payload(nodes, edges, [stop("s1", 100, 0)])
+    assert [link[1] for link in links] == [0]
+
+
 def test_unsnapped_stops_get_no_street_links():
     with pytest.warns(UserWarning, match="farther than"):
         *_, links = payload(
