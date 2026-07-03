@@ -14,6 +14,7 @@ boundary fragments) stay in the graph; stops snapped onto different
 components simply get no footpath between them.
 """
 
+import math
 import warnings
 
 import geopandas as gpd
@@ -32,6 +33,15 @@ MAX_WALKING_TIME = 600.0
 
 MAX_SNAP_DISTANCE = 100.0
 """Default maximum distance from a stop to the walking network, in meters."""
+
+MAX_FOOTPATH_STOPS = 20_000
+"""Ceiling on snapped stops in the footpath build.
+
+The stop-to-stop search and its transitive closure materialize dense
+stop-by-stop matrices, so memory grows quadratically with the snapped
+stop count; the ceiling keeps the matrices within a few gigabytes.
+Larger stop sets are rejected rather than silently exhausting memory —
+build from smaller extracts instead."""
 
 _DIJKSTRA_CHUNK = 256
 
@@ -155,8 +165,12 @@ def _network_streets(
     max_snap_distance,
 ):
     """Footpaths and the street-network payload on a loaded network."""
-    if walking_speed_kmph <= 0:
-        raise ValueError("walking_speed_kmph must be positive")
+    if not (math.isfinite(walking_speed_kmph) and walking_speed_kmph > 0):
+        raise ValueError("walking_speed_kmph must be a positive, finite number")
+    if not (math.isfinite(max_walking_time) and max_walking_time >= 0):
+        raise ValueError("max_walking_time must be a non-negative, finite number")
+    if not (math.isfinite(max_snap_distance) and max_snap_distance >= 0):
+        raise ValueError("max_snap_distance must be a non-negative, finite number")
     speed = walking_speed_kmph / 3.6  # m/s
     nodes = nodes.reset_index(drop=True)
     edges = edges.reset_index(drop=True)
@@ -167,6 +181,12 @@ def _network_streets(
         snapped = pd.DataFrame(columns=["stop_id", "edge", "fraction", "snap_distance"])
     else:
         snapped = _snap_to_edges(stop_points, edges, max_snap_distance)
+    if len(snapped) > MAX_FOOTPATH_STOPS:
+        raise ValueError(
+            f"{len(snapped)} snapped stops exceed the dense footpath "
+            f"build's ceiling of {MAX_FOOTPATH_STOPS}; build from smaller "
+            "extracts"
+        )
     footpaths = []
     if not snapped.empty:
         graph, stop_vertices = _routing_graph(nodes, edges, snapped, speed)
@@ -323,8 +343,10 @@ def _routing_graph(nodes, edges, snapped, speed):
         ]
     )
 
-    # Walking is undirected, so orient each edge low→high and keep the
-    # cheapest of any parallel edges (duplicate COO entries would sum).
+    # Walking is undirected, so orient each edge low→high, keep the
+    # cheapest of any parallel edges (duplicate COO entries would sum),
+    # and store both directions explicitly so the graph is symmetric
+    # without relying on how one-sided entries are interpreted.
     unique = (
         pd.DataFrame(
             {
@@ -338,7 +360,14 @@ def _routing_graph(nodes, edges, snapped, speed):
     )
     size = len(nodes) + len(splits) + len(snapped)
     graph = sparse.coo_matrix(
-        (unique["weight"], (unique["a"], unique["b"])), shape=(size, size)
+        (
+            np.concatenate([unique["weight"], unique["weight"]]),
+            (
+                np.concatenate([unique["a"], unique["b"]]),
+                np.concatenate([unique["b"], unique["a"]]),
+            ),
+        ),
+        shape=(size, size),
     ).tocsr()
     return graph, stop_vertices
 

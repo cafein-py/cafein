@@ -172,6 +172,33 @@ def test_durations_round_up_conservatively():
     assert {(a, b): s for a, b, s in edges} == {("a", "b"): 11, ("b", "a"): 10}
 
 
+def test_out_of_range_build_options_are_rejected():
+    stops = [stop("s1", 100, 0), stop("s2", 300, 0)]
+    for options in [
+        {"walking_speed_kmph": float("nan")},
+        {"walking_speed_kmph": float("inf")},
+        {"walking_speed_kmph": 0.0},
+        {"max_walking_time": float("nan")},
+        {"max_walking_time": -1.0},
+        {"max_snap_distance": float("inf")},
+        {"max_snap_distance": -1.0},
+    ]:
+        with pytest.raises(ValueError, match="finite"):
+            footpaths(STRAIGHT_STREET, [("A", "B", 400)], stops, **options)
+
+
+def test_oversized_stop_sets_are_rejected(monkeypatch):
+    # The dense stop-by-stop matrices grow quadratically; builds beyond
+    # the ceiling fail fast instead of exhausting memory.
+    monkeypatch.setattr(streets, "MAX_FOOTPATH_STOPS", 1)
+    with pytest.raises(ValueError, match="snapped stops exceed"):
+        footpaths(
+            STRAIGHT_STREET,
+            [("A", "B", 400)],
+            [stop("s1", 100, 0), stop("s2", 300, 0)],
+        )
+
+
 def test_distant_stops_are_left_out():
     with pytest.warns(UserWarning, match="farther than"):
         result = footpaths(

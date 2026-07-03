@@ -224,6 +224,20 @@ def test_faster_walking_reaches_more_stops(network_with_footpaths):
     assert set(ran) > set(walked)
 
 
+def test_access_stops_reject_out_of_range_parameters(network_with_footpaths):
+    lat, lon = stop_coordinates(network_with_footpaths, "1040602")
+    with pytest.raises(ValueError, match="lat and lon"):
+        network_with_footpaths.access_stops(float("nan"), lon)
+    with pytest.raises(ValueError, match="walking_speed_kmph"):
+        network_with_footpaths.access_stops(lat, lon, walking_speed_kmph=float("inf"))
+    with pytest.raises(ValueError, match="walking_speed_kmph"):
+        network_with_footpaths.access_stops(lat, lon, walking_speed_kmph=0.0)
+    with pytest.raises(ValueError, match="max_walking_time"):
+        network_with_footpaths.access_stops(lat, lon, max_walking_time=float("nan"))
+    with pytest.raises(ValueError, match="max_snap_distance"):
+        network_with_footpaths.access_stops(lat, lon, max_snap_distance=-1.0)
+
+
 def test_access_stops_need_a_street_nearby(network_with_footpaths):
     # Open water south of the extract, far from every walkable way.
     with pytest.raises(ValueError, match="farther than"):

@@ -283,8 +283,23 @@ impl TransportNetwork {
                 "no street network installed; build the network with an OSM extract",
             ));
         };
-        if walking_speed_kmph <= 0.0 {
-            return Err(PyValueError::new_err("walking_speed_kmph must be positive"));
+        if !lat.is_finite() || !lon.is_finite() {
+            return Err(PyValueError::new_err("lat and lon must be finite"));
+        }
+        if !walking_speed_kmph.is_finite() || walking_speed_kmph <= 0.0 {
+            return Err(PyValueError::new_err(
+                "walking_speed_kmph must be a positive, finite number",
+            ));
+        }
+        if !max_walking_time.is_finite() || max_walking_time < 0.0 {
+            return Err(PyValueError::new_err(
+                "max_walking_time must be a non-negative, finite number",
+            ));
+        }
+        if !max_snap_distance.is_finite() || max_snap_distance < 0.0 {
+            return Err(PyValueError::new_err(
+                "max_snap_distance must be a non-negative, finite number",
+            ));
         }
         let reached = streets
             .access_stops(
