@@ -36,6 +36,8 @@ jobs:
   test:
     needs: lint
     runs-on: ${{ matrix.os }}
+    env:
+      CAFEIN_REQUIRE_TEST_DATA: "1"
     strategy:
       fail-fast: false
       matrix:
