@@ -1,8 +1,11 @@
 """TransportNetwork built from the Helsinki GTFS feed shared with r5py."""
 
+import numpy as np
 import pytest
 
 from cafein import TransportNetwork
+
+UNREACHABLE = np.uint32(0xFFFFFFFF)
 
 
 def test_network_statistics(network):
@@ -98,6 +101,40 @@ def test_travel_times_use_installed_transfers(network, network_with_footpaths):
     assert walked["1040280"] == 9 * 60 + 20
     # With footpaths the metro feeds the whole central network.
     assert len(walked) > 1_000
+
+
+def test_travel_time_matrix_matches_single_origin_runs(network):
+    origins = ["4810551", "1250551"]
+    matrix = network.travel_time_matrix(origins, "2022-02-22", "08:30:00")
+    assert matrix.shape == (2, network.stop_count)
+    assert matrix.dtype == np.uint32
+    stop_order = [stop for stop, _, _ in network.stops]
+    for row, origin in enumerate(origins):
+        times = network.travel_times_from_stop(origin, "2022-02-22", "08:30:00")
+        reachable = {
+            stop_order[column]: int(matrix[row, column])
+            for column in np.nonzero(matrix[row] != UNREACHABLE)[0]
+        }
+        assert reachable == times
+
+
+def test_travel_time_matrix_is_deterministic(network):
+    origins = [stop for stop, _, _ in network.stops[:64]]
+    first = network.travel_time_matrix(origins, "2022-02-22", "08:30:00")
+    second = network.travel_time_matrix(origins, "2022-02-22", "08:30:00")
+    assert np.array_equal(first, second)
+
+
+def test_travel_time_matrix_rejects_unknown_stops(network):
+    with pytest.raises(KeyError, match="no-such-stop"):
+        network.travel_time_matrix(
+            ["4810551", "no-such-stop"], "2022-02-22", "08:30:00"
+        )
+
+
+def test_travel_time_matrix_accepts_no_origins(network):
+    matrix = network.travel_time_matrix([], "2022-02-22", "08:30:00")
+    assert matrix.shape == (0, network.stop_count)
 
 
 def test_no_service_on_a_date_outside_the_feed_window(network):

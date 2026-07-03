@@ -8,4 +8,5 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+rayon.workspace = true
 rstar.workspace = true

@@ -15,6 +15,12 @@
   ``(from, to, seconds, meters)`` edges), completing per-leg distances
   across every leg type.
 
+- Parallel travel-time matrices: `TransportNetwork.travel_time_matrix`
+  fans the per-origin RAPTOR runs out over all cores (rayon) with
+  per-worker search-state reuse and the GIL released, returning a
+  NumPy ``(origins, stops)`` uint32 matrix; `scripts/benchmark_vs_r5py.py`
+  now measures matrices through it.
+
 - Query-time street access/egress: networks built with an OSM extract
   now carry the walking street network (a CSR graph with an R*-tree
   spatial index in the Rust core), and `TransportNetwork.access_stops(lat, lon)`

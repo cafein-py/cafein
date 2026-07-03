@@ -438,3 +438,36 @@ class TransportNetwork:
         return self._core.travel_times_from_stop(
             from_stop, date, departure, max_transfers
         )
+
+    def travel_time_matrix(self, from_stops, date, departure, max_transfers=4):
+        """Travel times from several stops to every stop, as a matrix.
+
+        One RAPTOR run serves each origin, computed in parallel across
+        the origins with per-worker state reuse; the result is
+        deterministic. This is the bulk primitive travel-time matrices
+        are assembled from — never per OD pair.
+
+        Parameters
+        ----------
+        from_stops : list of str
+            GTFS stop_ids of the origin stops;
+            ``<feed_index>:<stop_id>`` when an id occurs in several
+            merged feeds.
+        date : str
+            Service date as ``YYYY-MM-DD``.
+        departure : str
+            Departure time at every origin as ``HH:MM:SS``.
+        max_transfers : int (optional, default: 4)
+            Maximum number of transfers between rides.
+
+        Returns
+        -------
+        numpy.ndarray
+            A ``(len(from_stops), stop_count)`` uint32 array of travel
+            times in seconds; row order follows `from_stops`, column
+            order follows ``stops``. Unreachable pairs hold the maximum
+            uint32 value (4294967295).
+        """
+        return self._core.travel_time_matrix(
+            list(from_stops), date, departure, max_transfers
+        )

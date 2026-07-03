@@ -12,6 +12,8 @@
 //! its departure improves, and journeys dominated by a later departure are
 //! never emitted.
 
+use rayon::prelude::*;
+
 use crate::journey::{Journey, Leg};
 use crate::router::{Request, TransitRouter};
 use crate::timetable::{PatternIdx, StopIdx, Timetable, TripIdx};
@@ -66,12 +68,39 @@ impl Raptor {
     ) -> Vec<Option<u32>> {
         let mut search = Search::new(timetable, transfers, request);
         search.run(request.departure);
-        search
-            .best
-            .last()
-            .expect("search always has a round")
-            .iter()
-            .map(|&arrival| (arrival != UNREACHED).then_some(arrival))
+        search.arrivals()
+    }
+
+    /// Earliest arrival at every stop for each request — the matrix
+    /// computation, fanned out over the origins with rayon.
+    ///
+    /// Search state is pooled: a worker reuses its buffers across the
+    /// origins it processes instead of reallocating per query. Shared
+    /// inputs are immutable, and each result depends only on its own
+    /// request, so the output is deterministic regardless of how rayon
+    /// schedules the origins.
+    pub fn one_to_all_many(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        requests: &[Request],
+    ) -> Vec<Vec<Option<u32>>> {
+        requests
+            .par_iter()
+            .map_init(
+                || None,
+                |pooled: &mut Option<Search>, request| {
+                    let search = match pooled {
+                        Some(search) if search.rounds == request.max_transfers as usize + 1 => {
+                            search.reset(request);
+                            search
+                        }
+                        _ => pooled.insert(Search::new(timetable, transfers, request)),
+                    };
+                    search.run(request.departure);
+                    search.arrivals()
+                },
+            )
             .collect()
     }
 
@@ -184,6 +213,38 @@ impl<'a> Search<'a> {
             queue_position: vec![u16::MAX; timetable.pattern_count() as usize],
             queued_patterns: Vec::new(),
         }
+    }
+
+    /// Clears the per-query state for a new request, reusing the
+    /// allocated buffers. The request must keep the round count: callers
+    /// pooling a search across origins hold `max_transfers` fixed.
+    fn reset(&mut self, request: &'a Request) {
+        debug_assert_eq!(self.rounds, request.max_transfers as usize + 1);
+        self.request = request;
+        for tau in &mut self.tau {
+            tau.fill(UNREACHED);
+        }
+        for labels in &mut self.labels {
+            labels.fill(Label::Unreached);
+        }
+        for best in &mut self.best {
+            best.fill(UNREACHED);
+        }
+        self.marked.clear();
+        self.is_marked.fill(false);
+        // `queue_position` needs no reset: every pass restores it to
+        // u16::MAX as patterns are dequeued.
+    }
+
+    /// The earliest arrival at every stop over all processed departures,
+    /// with any number of rides; unreachable stops are `None`.
+    fn arrivals(&self) -> Vec<Option<u32>> {
+        self.best
+            .last()
+            .expect("search always has a round")
+            .iter()
+            .map(|&arrival| (arrival != UNREACHED).then_some(arrival))
+            .collect()
     }
 
     /// Runs one pass per departure — which must be strictly decreasing —
@@ -569,6 +630,27 @@ mod tests {
                 Raptor.route(&timetable, &transfers, &nearly_out_of_time),
                 Vec::new()
             );
+        }
+    }
+
+    #[test]
+    fn many_origins_match_single_runs() {
+        // The parallel fan-out must agree with per-request runs; enough
+        // duplicated requests make the workers reuse pooled state.
+        let (timetable, transfers) = network();
+        let origins = [StopIdx(0), StopIdx(1), StopIdx(2), StopIdx(4)];
+        let requests: Vec<Request> = (0..8)
+            .flat_map(|_| origins)
+            .map(|origin| {
+                let mut request = request(origin, StopIdx(3), 0);
+                request.egress = Vec::new();
+                request
+            })
+            .collect();
+        let rows = Raptor.one_to_all_many(&timetable, &transfers, &requests);
+        assert_eq!(rows.len(), requests.len());
+        for (request, row) in requests.iter().zip(&rows) {
+            assert_eq!(row, &Raptor.one_to_all(&timetable, &transfers, request));
         }
     }
 

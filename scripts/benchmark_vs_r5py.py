@@ -67,6 +67,8 @@ def peak_rss_mb():
 
 
 def run_cafein(stops):
+    import numpy as np
+
     from cafein import TransportNetwork
 
     started = time.perf_counter()
@@ -75,12 +77,11 @@ def run_cafein(stops):
     )
     build_seconds = time.perf_counter() - started
 
-    wanted = set(stops["stop_id"])
     started = time.perf_counter()
-    finite = 0
-    for stop_id in stops["stop_id"]:
-        row = network.travel_times_from_stop(stop_id, DATE, DEPARTURE)
-        finite += sum(1 for destination in wanted if destination in row)
+    matrix = network.travel_time_matrix(list(stops["stop_id"]), DATE, DEPARTURE)
+    column = {stop_id: at for at, (stop_id, _, _) in enumerate(network.stops)}
+    selected = matrix[:, [column[stop_id] for stop_id in stops["stop_id"]]]
+    finite = int((selected != np.uint32(0xFFFFFFFF)).sum())
     matrix_seconds = time.perf_counter() - started
     return build_seconds, matrix_seconds, finite
 
