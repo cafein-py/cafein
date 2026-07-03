@@ -13,4 +13,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 cafein-core.workspace = true
+cafein-gtfs.workspace = true
+chrono.workspace = true
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }

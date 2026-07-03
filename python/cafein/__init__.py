@@ -1,3 +1,3 @@
-from cafein._cafein import __version__
+from cafein._cafein import TransportNetwork, __version__
 
-__all__ = ["__version__"]
+__all__ = ["TransportNetwork", "__version__"]
