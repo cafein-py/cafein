@@ -76,9 +76,11 @@ def walking_footpaths(
 
     Returns
     -------
-    list of (str, str, int)
-        Transitively closed ``(from_stop, to_stop, seconds)`` walking
-        edges, suitable for ``TransportNetwork.set_transfers``.
+    list of (str, str, int, float)
+        Transitively closed ``(from_stop, to_stop, seconds, meters)``
+        walking edges — conservatively rounded seconds plus the exact
+        street-path length — suitable for
+        ``TransportNetwork.set_transfers``.
     """
     nodes, edges = _walking_network(osm_pbf)
     return _network_footpaths(
@@ -192,7 +194,7 @@ def _network_streets(
         graph, stop_vertices = _routing_graph(nodes, edges, snapped, speed)
         durations = _stop_durations(graph, stop_vertices, max_walking_time)
         closed = _transitive_closure(durations)
-        footpaths = _edge_list(snapped["stop_id"].to_numpy(), closed)
+        footpaths = _edge_list(snapped["stop_id"].to_numpy(), closed, speed)
     return footpaths, _street_payload(nodes, edges, snapped)
 
 
@@ -226,7 +228,11 @@ def _snap_to_edges(stop_points, edges, max_snap_distance):
         max_distance=max_snap_distance,
         distance_col="snap_distance",
     )
+    # Several edges can tie as a stop's nearest; keep the closest match
+    # and break exact ties by edge id so the choice is deterministic.
+    matched = matched.sort_values(["snap_distance", "index_right"], kind="stable")
     matched = matched[~matched.index.duplicated()]
+    matched = matched.sort_index(kind="stable")
     if len(matched) < len(stop_points):
         warnings.warn(
             f"{len(stop_points) - len(matched)} stop(s) are farther than "
@@ -408,15 +414,32 @@ def _transitive_closure(durations):
     return csgraph.dijkstra(graph, directed=False)
 
 
-def _edge_list(stop_ids, durations):
-    """The finite off-diagonal durations as `(from, to, seconds)` edges.
+def _edge_list(stop_ids, durations, speed):
+    """The finite off-diagonal durations as `(from, to, seconds, meters)`
+    edges.
 
     Durations are feasibility constraints, so they round up (with a small
     tolerance for floating-point noise): understating a walking time could
-    let routing catch a departure the walk actually misses.
+    let routing catch a departure the walk actually misses. The meters
+    stay exact: every walking cost is a street length over the uniform
+    speed, so the unrounded duration times the speed is the walked
+    street-path length.
     """
     finite = np.isfinite(durations)
     np.fill_diagonal(finite, False)
     i, j = np.nonzero(finite)
     seconds = np.ceil(durations[i, j] - 1e-6).astype(np.int64)
-    return list(zip(stop_ids[i].tolist(), stop_ids[j].tolist(), seconds.tolist()))
+    if len(seconds) and seconds.max() > 4_294_967_295:
+        raise ValueError(
+            "footpath durations exceed the routing core's 32-bit second "
+            "range; check the walking network and speed"
+        )
+    meters = durations[i, j] * speed
+    return list(
+        zip(
+            stop_ids[i].tolist(),
+            stop_ids[j].tolist(),
+            seconds.tolist(),
+            meters.tolist(),
+        )
+    )

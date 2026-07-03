@@ -60,7 +60,7 @@ def footpaths(nodes, edges, stops, **options):
         max_snap_distance=options.pop("max_snap_distance", 100.0),
     )
     assert not options
-    return {(a, b): seconds for a, b, seconds in edge_list}
+    return {(a, b): seconds for a, b, seconds, _ in edge_list}
 
 
 def payload(nodes, edges, stops, **options):
@@ -166,10 +166,19 @@ def test_transitive_closure_chains_footpaths_beyond_the_cutoff():
 def test_durations_round_up_conservatively():
     # Walking times are feasibility constraints: rounding down could let
     # routing catch a departure the walk actually misses. Only genuine
-    # floating-point noise is tolerated.
+    # floating-point noise is tolerated. Meters stay unrounded.
     durations = np.array([[0.0, 10.4], [9.9999999, 0.0]])
-    edges = streets._edge_list(np.array(["a", "b"], dtype=object), durations)
-    assert {(a, b): s for a, b, s in edges} == {("a", "b"): 11, ("b", "a"): 10}
+    edges = streets._edge_list(np.array(["a", "b"], dtype=object), durations, 1.25)
+    assert {(a, b): s for a, b, s, _ in edges} == {("a", "b"): 11, ("b", "a"): 10}
+    meters = {(a, b): m for a, b, _, m in edges}
+    assert meters[("a", "b")] == pytest.approx(13.0)
+    assert meters[("b", "a")] == pytest.approx(12.5, rel=1e-6)
+
+
+def test_durations_beyond_the_time_range_are_rejected():
+    durations = np.array([[0.0, 5e9], [5e9, 0.0]])
+    with pytest.raises(ValueError, match="32-bit second range"):
+        streets._edge_list(np.array(["a", "b"], dtype=object), durations, 1.0)
 
 
 def test_out_of_range_build_options_are_rejected():
@@ -254,6 +263,15 @@ def test_the_street_payload_mirrors_the_walking_network():
     assert connectors[1] == pytest.approx(30.0, rel=0.01)
 
 
+def test_snap_ties_break_deterministically():
+    # Two edges with identical geometry tie exactly as a stop's nearest;
+    # the lower edge id wins, whatever order the spatial join returns.
+    nodes = {"A": (0, 0), "B": (400, 0)}
+    edges = [("A", "B", 400), ("A", "B", 800)]
+    *_, links = payload(nodes, edges, [stop("s1", 100, 0)])
+    assert [link[1] for link in links] == [0]
+
+
 def test_unsnapped_stops_get_no_street_links():
     with pytest.warns(UserWarning, match="farther than"):
         *_, links = payload(
@@ -308,22 +326,25 @@ def test_helsinki_footpaths_cover_the_extract(helsinki_footpaths):
     # The extract covers central Helsinki only: roughly 1400 of the 8305
     # stops snap onto its walking network, and closure connects the dense
     # center almost completely.
-    origins = {from_stop for from_stop, _, _ in helsinki_footpaths}
+    origins = {from_stop for from_stop, _, _, _ in helsinki_footpaths}
     assert 1_330 <= len(origins) <= 1_440
     assert 1_100_000 <= len(helsinki_footpaths) <= 1_300_000
 
 
 def test_helsinki_footpaths_pin_known_pairs(helsinki_footpaths):
-    lookup = {(a, b): seconds for a, b, seconds in helsinki_footpaths}
+    lookup = {(a, b): seconds for a, b, seconds, _ in helsinki_footpaths}
     # Kamppi metro platforms sit next to each other; the westbound
     # platform is a short walk from the Kamppi street stops.
     assert lookup[("1040602", "1040601")] == 4
     assert lookup[("1040602", "1040280")] == 20
     assert lookup[("1000102", "1040280")] == 22
+    # Meters are the same walks unrounded, at the default 1 m/s.
+    meters = {(a, b): m for a, b, _, m in helsinki_footpaths}
+    assert 19 <= meters[("1040602", "1040280")] <= 20
 
 
 def test_helsinki_footpaths_are_symmetric(helsinki_footpaths):
-    lookup = {(a, b): seconds for a, b, seconds in helsinki_footpaths}
+    lookup = {(a, b): seconds for a, b, seconds, _ in helsinki_footpaths}
     assert all(lookup.get((b, a)) == seconds for (a, b), seconds in lookup.items())
 
 
@@ -335,7 +356,7 @@ def test_helsinki_street_network_covers_the_extract(helsinki_streets):
     assert offsets[0] == 0
     assert offsets[-1] == len(lons) == len(lats)
     # Every stop with footpaths snapped, so it also carries a street link.
-    origins = {from_stop for from_stop, _, _ in helsinki_streets[0]}
+    origins = {from_stop for from_stop, _, _, _ in helsinki_streets[0]}
     assert {link[0] for link in links} >= origins
     assert all(0 <= link[1] < len(edge_list) for link in links)
     assert all(0.0 <= link[2] <= 1.0 for link in links)
@@ -343,9 +364,9 @@ def test_helsinki_street_network_covers_the_extract(helsinki_streets):
 
 
 def test_helsinki_footpaths_are_transitively_closed(helsinki_footpaths):
-    lookup = {(a, b): seconds for a, b, seconds in helsinki_footpaths}
+    lookup = {(a, b): seconds for a, b, seconds, _ in helsinki_footpaths}
     by_origin = {}
-    for from_stop, to_stop, seconds in helsinki_footpaths:
+    for from_stop, to_stop, seconds, _ in helsinki_footpaths:
         by_origin.setdefault(from_stop, []).append((to_stop, seconds))
     generator = random.Random(0)
     for from_stop in generator.sample(sorted(by_origin), 100):

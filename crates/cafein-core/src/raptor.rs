@@ -216,7 +216,14 @@ impl<'a> Search<'a> {
         }
 
         for &(stop, duration) in &request.access {
-            let arrival = departure.saturating_add(duration);
+            // Skip access whose arrival cannot be represented below the
+            // UNREACHED sentinel; wrapping or saturating would corrupt it.
+            let Some(arrival) = departure
+                .checked_add(duration)
+                .filter(|&at| at != UNREACHED)
+            else {
+                continue;
+            };
             let index = stop.0 as usize;
             if arrival < self.tau[0][index] {
                 self.tau[0][index] = arrival;
@@ -320,7 +327,12 @@ impl<'a> Search<'a> {
                 .collect();
             for (stop, departure_at_stop) in transit_marked {
                 for transfer in self.transfers.from_stop(stop) {
-                    let arrival = departure_at_stop.saturating_add(transfer.duration);
+                    let Some(arrival) = departure_at_stop
+                        .checked_add(transfer.duration)
+                        .filter(|&at| at != UNREACHED)
+                    else {
+                        continue;
+                    };
                     let to = transfer.to.0 as usize;
                     if arrival < self.best[round][to] {
                         self.tau[round][to] = arrival;
@@ -355,7 +367,10 @@ impl<'a> Search<'a> {
                 if at_stop == UNREACHED {
                     continue;
                 }
-                let arrival = at_stop.saturating_add(duration);
+                let Some(arrival) = at_stop.checked_add(duration).filter(|&at| at != UNREACHED)
+                else {
+                    continue;
+                };
                 if best_egress.is_none_or(|(current, _, _)| arrival < current) {
                     best_egress = Some((arrival, stop, duration));
                 }
@@ -388,10 +403,11 @@ impl<'a> Search<'a> {
         let timetable = self.timetable;
         let mut legs = Vec::new();
         let departure_at_stop = self.tau[round][egress_stop.0 as usize];
+        // Cannot saturate: collect only emits in-range egress arrivals.
         legs.push(Leg::Egress {
             from_stop: egress_stop,
             departure: departure_at_stop,
-            arrival: departure_at_stop + egress_duration,
+            arrival: departure_at_stop.saturating_add(egress_duration),
         });
 
         let mut current_round = round;
@@ -447,7 +463,7 @@ impl<'a> Search<'a> {
 
         Journey {
             departure,
-            arrival: departure_at_stop + egress_duration,
+            arrival: departure_at_stop.saturating_add(egress_duration),
             legs,
         }
     }
@@ -526,7 +542,7 @@ mod tests {
             .add_trip(c, vec![time(400), time(1000)], 4, 0)
             .unwrap();
         let timetable = builder.finish();
-        let transfers = Transfers::from_edges(5, &[(StopIdx(2), StopIdx(4), 50)]).unwrap();
+        let transfers = Transfers::from_edges(5, &[(StopIdx(2), StopIdx(4), 50, 50.0)]).unwrap();
         (timetable, transfers)
     }
 
@@ -537,6 +553,22 @@ mod tests {
             egress: vec![(to, 0)],
             active_services: vec![true, false],
             max_transfers: 3,
+        }
+    }
+
+    #[test]
+    fn times_overflowing_the_representable_range_are_unreachable() {
+        // Access additions near the u32 limit must neither wrap nor
+        // collide with the UNREACHED sentinel; such paths simply stay
+        // unreachable instead of producing bogus arrivals.
+        let (timetable, transfers) = network();
+        for departure in [u32::MAX - 5, u32::MAX - 10] {
+            let mut nearly_out_of_time = request(StopIdx(0), StopIdx(3), departure);
+            nearly_out_of_time.access = vec![(StopIdx(0), 10)];
+            assert_eq!(
+                Raptor.route(&timetable, &transfers, &nearly_out_of_time),
+                Vec::new()
+            );
         }
     }
 
@@ -621,7 +653,10 @@ mod tests {
         let timetable = builder.finish();
         let transfers = Transfers::from_edges(
             4,
-            &[(StopIdx(1), StopIdx(2), 30), (StopIdx(2), StopIdx(3), 50)],
+            &[
+                (StopIdx(1), StopIdx(2), 30, 30.0),
+                (StopIdx(2), StopIdx(3), 50, 50.0),
+            ],
         )
         .unwrap();
         let journeys = Raptor.route(&timetable, &transfers, &request(StopIdx(0), StopIdx(3), 0));

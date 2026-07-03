@@ -19,6 +19,7 @@ cafein-core = { path = "crates/cafein-core", version = "0.1.0" }
 cafein-gtfs = { path = "crates/cafein-gtfs", version = "0.1.0" }
 chrono = { version = "0.4", default-features = false }
 gtfs-structures = { version = "0.48", default-features = false }
+rstar = "0.13"
 
 [profile.release]
 lto = "thin"

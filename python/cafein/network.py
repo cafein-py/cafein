@@ -12,6 +12,19 @@ def _gtfs_paths(paths):
     return [os.fspath(path) for path in paths]
 
 
+def _walk_options(walking_speed_kmph, max_walking_time, max_snap_distance):
+    """Street-query options with the shared defaults filled in."""
+    from cafein import streets
+
+    if walking_speed_kmph is None:
+        walking_speed_kmph = streets.WALKING_SPEED_KMPH
+    if max_walking_time is None:
+        max_walking_time = streets.MAX_WALKING_TIME
+    if max_snap_distance is None:
+        max_snap_distance = streets.MAX_SNAP_DISTANCE
+    return walking_speed_kmph, max_walking_time, max_snap_distance
+
+
 class TransportNetwork:
     """A routable public-transport network.
 
@@ -155,11 +168,11 @@ class TransportNetwork:
 
         Parameters
         ----------
-        footpaths : list of (str, str, int)
-            ``(from_stop, to_stop, seconds)`` walking edges. The list
-            must be transitively closed — routing relaxes a single
-            transfer hop per round; ``cafein.streets.walking_footpaths``
-            produces such lists.
+        footpaths : list of (str, str, int, float)
+            ``(from_stop, to_stop, seconds, meters)`` walking edges.
+            The list must be transitively closed — routing relaxes a
+            single transfer hop per round;
+            ``cafein.streets.walking_footpaths`` produces such lists.
         """
         self._core.set_transfers(footpaths)
 
@@ -209,20 +222,10 @@ class TransportNetwork:
             Walking time in seconds to each reachable stop, keyed by
             stop_id; stops beyond the cutoff are absent.
         """
-        from cafein import streets
-
-        if walking_speed_kmph is None:
-            walking_speed_kmph = streets.WALKING_SPEED_KMPH
-        if max_walking_time is None:
-            max_walking_time = streets.MAX_WALKING_TIME
-        if max_snap_distance is None:
-            max_snap_distance = streets.MAX_SNAP_DISTANCE
         return self._core.access_stops(
             lat,
             lon,
-            walking_speed_kmph,
-            max_walking_time,
-            max_snap_distance,
+            *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
         )
 
     def set_trip_distances(self, distances):
@@ -250,9 +253,11 @@ class TransportNetwork:
 
         Journeys ride trips and change vehicles at shared stops or over
         the installed transfers; transit legs report their distance and
-        its provenance when trip distances are installed. Door-to-door
-        access and egress from arbitrary coordinates, leg geometries,
-        and emissions arrive with later build steps.
+        its provenance when trip distances are installed.
+        ``route_between_coordinates`` routes door-to-door from arbitrary
+        coordinates, and ``annotate_emissions`` attaches emissions to
+        routed journeys. Legs carry times, stops, distances, and
+        provenance; per-leg geometries are not part of the output yet.
 
         Parameters
         ----------
@@ -288,6 +293,120 @@ class TransportNetwork:
         """
         return self._core.route_between_stops(
             from_stop, to_stop, date, departure, max_transfers, window
+        )
+
+    def route_between_coordinates(
+        self,
+        origin,
+        destination,
+        date,
+        departure,
+        max_transfers=4,
+        window=None,
+        *,
+        walking_speed_kmph=None,
+        max_walking_time=None,
+        max_snap_distance=None,
+    ):
+        """Route door-to-door between two coordinates.
+
+        Requires a network built with an OSM extract (``osm_pbf=``): the
+        street network provides walking access from the origin to nearby
+        stops and egress from stops to the destination. Journeys
+        otherwise behave as in ``route_between_stops``; access and
+        egress legs report their walking distance in meters. Journeys
+        ride at least one trip: a destination best reached by walking
+        alone yields no journeys.
+
+        Parameters
+        ----------
+        origin, destination : (float, float)
+            ``(lat, lon)`` coordinates, in EPSG:4326. A coordinate
+            farther than `max_snap_distance` from the walking network
+            raises ``ValueError``.
+        date : str
+            Service date as ``YYYY-MM-DD``.
+        departure : str
+            Departure time at the origin coordinate as ``HH:MM:SS``.
+        max_transfers : int (optional, default: 4)
+            Maximum number of transfers between rides.
+        window : int (optional)
+            Departure window in seconds, as in ``route_between_stops``.
+        walking_speed_kmph : float (optional, default: 3.6)
+            Walking speed in km/h of the access and egress searches.
+        max_walking_time : float (optional, default: 600)
+            Walking-time cutoff in seconds of each street search.
+        max_snap_distance : float (optional, default: 100)
+            Maximum straight-line distance in meters from each
+            coordinate to the walking network.
+
+        Returns
+        -------
+        list of dict
+            Journeys as in ``route_between_stops``; arrivals include
+            the egress walk.
+        """
+        return self._core.route_between_coordinates(
+            tuple(origin),
+            tuple(destination),
+            date,
+            departure,
+            max_transfers,
+            window,
+            *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
+        )
+
+    def travel_times_from_coordinate(
+        self,
+        origin,
+        date,
+        departure,
+        max_transfers=4,
+        *,
+        walking_speed_kmph=None,
+        max_walking_time=None,
+        max_snap_distance=None,
+    ):
+        """Earliest arrival at every reachable stop from a coordinate.
+
+        The counterpart of ``travel_times_from_stop`` for a coordinate
+        origin: walking access from the coordinate seeds one RAPTOR run
+        that serves all destinations. Requires a network built with an
+        OSM extract (``osm_pbf=``). Stops within the walking cutoff
+        appear with their walking time even without riding.
+
+        Parameters
+        ----------
+        origin : (float, float)
+            ``(lat, lon)`` coordinate, in EPSG:4326. A coordinate
+            farther than `max_snap_distance` from the walking network
+            raises ``ValueError``.
+        date : str
+            Service date as ``YYYY-MM-DD``.
+        departure : str
+            Departure time at the origin coordinate as ``HH:MM:SS``.
+        max_transfers : int (optional, default: 4)
+            Maximum number of transfers between rides.
+        walking_speed_kmph : float (optional, default: 3.6)
+            Walking speed in km/h of the access search.
+        max_walking_time : float (optional, default: 600)
+            Walking-time cutoff in seconds of the access search.
+        max_snap_distance : float (optional, default: 100)
+            Maximum straight-line distance in meters from the
+            coordinate to the walking network.
+
+        Returns
+        -------
+        dict
+            Travel time in seconds to every reachable stop, keyed by
+            stop_id; unreachable stops are absent.
+        """
+        return self._core.travel_times_from_coordinate(
+            tuple(origin),
+            date,
+            departure,
+            max_transfers,
+            *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
         )
 
     def travel_times_from_stop(self, from_stop, date, departure, max_transfers=4):

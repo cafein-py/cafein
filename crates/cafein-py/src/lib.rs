@@ -11,7 +11,7 @@ use cafein_core::geometry::{DistanceProvenance, TripGeometry};
 use cafein_core::journey::{Journey, Leg};
 use cafein_core::raptor::Raptor;
 use cafein_core::router::{Request, TransitRouter};
-use cafein_core::streets::{StopLink, StreetNetwork};
+use cafein_core::streets::{StopLink, StreetNetwork, WalkedStop};
 use cafein_core::timetable::{StopIdx, TripIdx};
 use cafein_core::transfers::Transfers;
 use cafein_gtfs::{build_timetable, Feed, RouteType, TimetableBuild};
@@ -34,6 +34,29 @@ struct TransportNetwork {
 enum StopLookup {
     Unique(StopIdx),
     Ambiguous,
+}
+
+/// A coordinate query's exact walk lengths in meters, keyed by the stop
+/// each access or egress link enters the network through.
+struct WalkMaps {
+    access: HashMap<StopIdx, f64>,
+    egress: HashMap<StopIdx, f64>,
+}
+
+impl WalkMaps {
+    fn new(access: &[WalkedStop], egress: &[WalkedStop]) -> WalkMaps {
+        let meters =
+            |walks: &[WalkedStop]| walks.iter().map(|walk| (walk.stop, walk.meters)).collect();
+        WalkMaps {
+            access: meters(access),
+            egress: meters(egress),
+        }
+    }
+}
+
+/// The `(stop, seconds)` request offsets of a walking-search result.
+fn request_offsets(walks: &[WalkedStop]) -> Vec<(StopIdx, u32)> {
+    walks.iter().map(|walk| (walk.stop, walk.seconds)).collect()
 }
 
 #[pymethods]
@@ -143,16 +166,27 @@ impl TransportNetwork {
     ///
     /// Parameters
     /// ----------
-    /// footpaths : list of (str, str, int)
-    ///     ``(from_stop, to_stop, seconds)`` walking edges, with stop
-    ///     identifiers as in ``route_between_stops``. The edge list must
-    ///     be transitively closed — routing relaxes a single transfer hop
+    /// footpaths : list of (str, str, int, float)
+    ///     ``(from_stop, to_stop, seconds, meters)`` walking edges, with
+    ///     stop identifiers as in ``route_between_stops`` and the walked
+    ///     street-path length in meters. The edge list must be
+    ///     transitively closed — routing relaxes a single transfer hop
     ///     per round; ``cafein.streets.walking_footpaths`` produces such
     ///     lists.
-    fn set_transfers(&mut self, footpaths: Vec<(String, String, u32)>) -> PyResult<()> {
+    fn set_transfers(&mut self, footpaths: Vec<(String, String, u32, f64)>) -> PyResult<()> {
         let mut edges = Vec::with_capacity(footpaths.len());
-        for (from, to, duration) in &footpaths {
-            edges.push((self.resolve_stop(from)?, self.resolve_stop(to)?, *duration));
+        for (index, (from, to, duration, meters)) in footpaths.iter().enumerate() {
+            if !meters.is_finite() || *meters < 0.0 {
+                return Err(PyValueError::new_err(format!(
+                    "footpath {index} has a negative or non-finite length"
+                )));
+            }
+            edges.push((
+                self.resolve_stop(from)?,
+                self.resolve_stop(to)?,
+                *duration,
+                *meters,
+            ));
         }
         self.transfers = Transfers::from_edges(self.build.timetable.stop_count(), &edges)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -278,46 +312,20 @@ impl TransportNetwork {
         max_walking_time: f64,
         max_snap_distance: f64,
     ) -> PyResult<Py<PyDict>> {
-        let Some(streets) = &self.streets else {
-            return Err(PyValueError::new_err(
-                "no street network installed; build the network with an OSM extract",
-            ));
-        };
-        if !lat.is_finite() || !lon.is_finite() {
-            return Err(PyValueError::new_err("lat and lon must be finite"));
-        }
-        if !walking_speed_kmph.is_finite() || walking_speed_kmph <= 0.0 {
-            return Err(PyValueError::new_err(
-                "walking_speed_kmph must be a positive, finite number",
-            ));
-        }
-        if !max_walking_time.is_finite() || max_walking_time < 0.0 {
-            return Err(PyValueError::new_err(
-                "max_walking_time must be a non-negative, finite number",
-            ));
-        }
-        if !max_snap_distance.is_finite() || max_snap_distance < 0.0 {
-            return Err(PyValueError::new_err(
-                "max_snap_distance must be a non-negative, finite number",
-            ));
-        }
-        let reached = streets
-            .access_stops(
-                lat,
-                lon,
-                walking_speed_kmph / 3.6,
-                max_walking_time,
-                max_snap_distance,
-            )
-            .ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "({lat}, {lon}) is farther than {max_snap_distance} m \
-                     from the walking network"
-                ))
-            })?;
+        let streets = self.installed_streets()?;
+        let speed =
+            validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
+        let reached = coordinate_links(
+            streets,
+            (lat, lon),
+            speed,
+            max_walking_time,
+            max_snap_distance,
+            "",
+        )?;
         let result = PyDict::new(py);
-        for (stop, seconds) in reached {
-            result.set_item(self.public_stop_id(stop), seconds)?;
+        for walk in reached {
+            result.set_item(self.public_stop_id(walk.stop), walk.seconds)?;
         }
         Ok(result.unbind())
     }
@@ -378,9 +386,9 @@ impl TransportNetwork {
     /// Journeys ride trips and change vehicles at shared stops or over
     /// the transfers installed with ``set_transfers``; transit legs
     /// report their distance and its provenance when trip distances are
-    /// installed. Door-to-door access/egress from arbitrary coordinates
-    /// joins once the query-time street search exists; leg geometries
-    /// and emissions join once the geometry preprocessing produces them.
+    /// installed. ``route_between_coordinates`` routes door-to-door from
+    /// arbitrary coordinates. Legs carry times, stops, distances, and
+    /// provenance; per-leg geometries are not part of the output yet.
     ///
     /// Parameters
     /// ----------
@@ -427,24 +435,169 @@ impl TransportNetwork {
     ) -> PyResult<Py<PyList>> {
         let origin = self.resolve_stop(from_stop)?;
         let destination = self.resolve_stop(to_stop)?;
-        let date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
-            .map_err(|error| PyValueError::new_err(format!("invalid date '{date}': {error}")))?;
         let request = Request {
             departure: parse_time(departure)?,
             access: vec![(origin, 0)],
             egress: vec![(destination, 0)],
-            active_services: self.build.services.active_on(date),
+            active_services: self.active_services(date)?,
             max_transfers,
         };
-        let journeys = match window {
-            None => Raptor.route(&self.build.timetable, &self.transfers, &request),
-            Some(window) => {
-                Raptor.route_range(&self.build.timetable, &self.transfers, &request, window)
-            }
+        self.route_request(py, &request, window, None)
+    }
+
+    /// Route door-to-door between two coordinates for a single departure.
+    ///
+    /// The street network installed with ``set_street_network`` provides
+    /// walking access from the origin to nearby stops and egress from
+    /// stops to the destination; journeys otherwise behave as in
+    /// ``route_between_stops``. Access and egress legs report their
+    /// walking distance in meters; a coordinate farther than
+    /// ``max_snap_distance`` from the walking network raises
+    /// ``ValueError``. Journeys ride at least one trip: a destination
+    /// best reached by walking alone yields no journeys.
+    ///
+    /// Parameters
+    /// ----------
+    /// origin, destination : (float, float)
+    ///     ``(lat, lon)`` coordinates, in EPSG:4326.
+    /// date : str
+    ///     Service date as ``YYYY-MM-DD``.
+    /// departure : str
+    ///     Departure time at the origin coordinate as ``HH:MM:SS``.
+    /// max_transfers : int (optional, default: 4)
+    ///     Maximum number of transfers between rides.
+    /// window : int (optional)
+    ///     Departure window in seconds, as in ``route_between_stops``.
+    /// walking_speed_kmph : float (optional, default: 3.6)
+    ///     Walking speed in km/h of the access and egress searches.
+    /// max_walking_time : float (optional, default: 600)
+    ///     Walking-time cutoff in seconds of each street search.
+    /// max_snap_distance : float (optional, default: 100)
+    ///     Maximum straight-line distance in meters from each coordinate
+    ///     to the walking network.
+    ///
+    /// Returns
+    /// -------
+    /// list of dict
+    ///     Journeys as in ``route_between_stops``; arrivals include the
+    ///     egress walk.
+    #[pyo3(signature = (origin, destination, date, departure, max_transfers = 4, window = None, walking_speed_kmph = 3.6, max_walking_time = 600.0, max_snap_distance = 100.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn route_between_coordinates(
+        &self,
+        py: Python<'_>,
+        origin: (f64, f64),
+        destination: (f64, f64),
+        date: &str,
+        departure: &str,
+        max_transfers: u8,
+        window: Option<u32>,
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+    ) -> PyResult<Py<PyList>> {
+        let streets = self.installed_streets()?;
+        let speed =
+            validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
+        let access = coordinate_links(
+            streets,
+            origin,
+            speed,
+            max_walking_time,
+            max_snap_distance,
+            "origin ",
+        )?;
+        let egress = coordinate_links(
+            streets,
+            destination,
+            speed,
+            max_walking_time,
+            max_snap_distance,
+            "destination ",
+        )?;
+        let walks = WalkMaps::new(&access, &egress);
+        let request = Request {
+            departure: parse_time(departure)?,
+            access: request_offsets(&access),
+            egress: request_offsets(&egress),
+            active_services: self.active_services(date)?,
+            max_transfers,
         };
-        let result = PyList::empty(py);
-        for journey in &journeys {
-            result.append(self.journey_to_dict(py, journey)?)?;
+        self.route_request(py, &request, window, Some(&walks))
+    }
+
+    /// Earliest arrival at every reachable stop from a coordinate.
+    ///
+    /// The counterpart of ``travel_times_from_stop`` for a coordinate
+    /// origin: walking access from the coordinate seeds the search, and
+    /// one RAPTOR run serves all destinations. Stops within the walking
+    /// cutoff appear with their walking time even without riding.
+    ///
+    /// Parameters
+    /// ----------
+    /// origin : (float, float)
+    ///     ``(lat, lon)`` coordinate, in EPSG:4326.
+    /// date : str
+    ///     Service date as ``YYYY-MM-DD``.
+    /// departure : str
+    ///     Departure time at the origin coordinate as ``HH:MM:SS``.
+    /// max_transfers : int (optional, default: 4)
+    ///     Maximum number of transfers between rides.
+    /// walking_speed_kmph : float (optional, default: 3.6)
+    ///     Walking speed in km/h of the access search.
+    /// max_walking_time : float (optional, default: 600)
+    ///     Walking-time cutoff in seconds of the access search.
+    /// max_snap_distance : float (optional, default: 100)
+    ///     Maximum straight-line distance in meters from the coordinate
+    ///     to the walking network; a coordinate farther away raises
+    ///     ``ValueError``.
+    ///
+    /// Returns
+    /// -------
+    /// dict
+    ///     Travel time in seconds to every reachable stop, keyed by
+    ///     stop_id; unreachable stops are absent.
+    #[pyo3(signature = (origin, date, departure, max_transfers = 4, walking_speed_kmph = 3.6, max_walking_time = 600.0, max_snap_distance = 100.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn travel_times_from_coordinate(
+        &self,
+        py: Python<'_>,
+        origin: (f64, f64),
+        date: &str,
+        departure: &str,
+        max_transfers: u8,
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+    ) -> PyResult<Py<PyDict>> {
+        let streets = self.installed_streets()?;
+        let speed =
+            validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
+        let access = coordinate_links(
+            streets,
+            origin,
+            speed,
+            max_walking_time,
+            max_snap_distance,
+            "origin ",
+        )?;
+        let departure = parse_time(departure)?;
+        let request = Request {
+            departure,
+            access: request_offsets(&access),
+            egress: Vec::new(),
+            active_services: self.active_services(date)?,
+            max_transfers,
+        };
+        let arrivals = Raptor.one_to_all(&self.build.timetable, &self.transfers, &request);
+        let result = PyDict::new(py);
+        for (index, arrival) in arrivals.iter().enumerate() {
+            if let Some(arrival) = arrival {
+                result.set_item(
+                    self.public_stop_id(StopIdx(index as u32)),
+                    arrival - departure,
+                )?;
+            }
         }
         Ok(result.unbind())
     }
@@ -483,14 +636,12 @@ impl TransportNetwork {
         max_transfers: u8,
     ) -> PyResult<Py<PyDict>> {
         let origin = self.resolve_stop(from_stop)?;
-        let date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
-            .map_err(|error| PyValueError::new_err(format!("invalid date '{date}': {error}")))?;
         let departure = parse_time(departure)?;
         let request = Request {
             departure,
             access: vec![(origin, 0)],
             egress: Vec::new(),
-            active_services: self.build.services.active_on(date),
+            active_services: self.active_services(date)?,
             max_transfers,
         };
         let arrivals = Raptor.one_to_all(&self.build.timetable, &self.transfers, &request);
@@ -508,6 +659,45 @@ impl TransportNetwork {
 }
 
 impl TransportNetwork {
+    /// The installed street network, or a `ValueError` explaining that
+    /// coordinate queries need one.
+    fn installed_streets(&self) -> PyResult<&StreetNetwork> {
+        self.streets.as_ref().ok_or_else(|| {
+            PyValueError::new_err(
+                "no street network installed; build the network with an OSM extract",
+            )
+        })
+    }
+
+    /// The service-activity flags of a `YYYY-MM-DD` date.
+    fn active_services(&self, date: &str) -> PyResult<Vec<bool>> {
+        let date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .map_err(|error| PyValueError::new_err(format!("invalid date '{date}': {error}")))?;
+        Ok(self.build.services.active_on(date))
+    }
+
+    /// Runs a request through the router and converts the journeys,
+    /// attaching walk-leg distances when the walk lengths are known.
+    fn route_request(
+        &self,
+        py: Python<'_>,
+        request: &Request,
+        window: Option<u32>,
+        walks: Option<&WalkMaps>,
+    ) -> PyResult<Py<PyList>> {
+        let journeys = match window {
+            None => Raptor.route(&self.build.timetable, &self.transfers, request),
+            Some(window) => {
+                Raptor.route_range(&self.build.timetable, &self.transfers, request, window)
+            }
+        };
+        let result = PyList::empty(py);
+        for journey in &journeys {
+            result.append(self.journey_to_dict(py, journey, walks)?)?;
+        }
+        Ok(result.unbind())
+    }
+
     /// The public form of a stop identifier: raw for a single feed,
     /// `<feed_index>:<id>` when several feeds are merged.
     fn public_stop_id(&self, stop: StopIdx) -> String {
@@ -542,7 +732,12 @@ impl TransportNetwork {
         }
     }
 
-    fn journey_to_dict(&self, py: Python<'_>, journey: &Journey) -> PyResult<Py<PyDict>> {
+    fn journey_to_dict(
+        &self,
+        py: Python<'_>,
+        journey: &Journey,
+        walks: Option<&WalkMaps>,
+    ) -> PyResult<Py<PyDict>> {
         let timetable = &self.build.timetable;
         let dict = PyDict::new(py);
         dict.set_item("departure", journey.departure)?;
@@ -561,7 +756,10 @@ impl TransportNetwork {
                     entry.set_item("to_stop", self.public_stop_id(to_stop))?;
                     entry.set_item("departure", departure)?;
                     entry.set_item("arrival", arrival)?;
-                    entry.set_item("distance", py.None())?;
+                    entry.set_item(
+                        "distance",
+                        walks.and_then(|walks| walks.access.get(&to_stop)).copied(),
+                    )?;
                     entry.set_item("distance_provenance", py.None())?;
                 }
                 Leg::Transit {
@@ -606,12 +804,20 @@ impl TransportNetwork {
                     departure,
                     arrival,
                 } => {
+                    // Transfers are deduplicated per stop pair, so the
+                    // one edge found is the one routing relaxed.
+                    let meters = self
+                        .transfers
+                        .from_stop(from_stop)
+                        .iter()
+                        .find(|transfer| transfer.to == to_stop)
+                        .map(|transfer| transfer.meters);
                     entry.set_item("type", "transfer")?;
                     entry.set_item("from_stop", self.public_stop_id(from_stop))?;
                     entry.set_item("to_stop", self.public_stop_id(to_stop))?;
                     entry.set_item("departure", departure)?;
                     entry.set_item("arrival", arrival)?;
-                    entry.set_item("distance", py.None())?;
+                    entry.set_item("distance", meters)?;
                     entry.set_item("distance_provenance", py.None())?;
                 }
                 Leg::Egress {
@@ -623,7 +829,12 @@ impl TransportNetwork {
                     entry.set_item("from_stop", self.public_stop_id(from_stop))?;
                     entry.set_item("departure", departure)?;
                     entry.set_item("arrival", arrival)?;
-                    entry.set_item("distance", py.None())?;
+                    entry.set_item(
+                        "distance",
+                        walks
+                            .and_then(|walks| walks.egress.get(&from_stop))
+                            .copied(),
+                    )?;
                     entry.set_item("distance_provenance", py.None())?;
                 }
             }
@@ -632,6 +843,58 @@ impl TransportNetwork {
         dict.set_item("legs", legs)?;
         Ok(dict.unbind())
     }
+}
+
+/// The walking speed in m/s of validated street-query parameters, or a
+/// `ValueError` naming the parameter that is out of range.
+fn validated_walking_speed(
+    walking_speed_kmph: f64,
+    max_walking_time: f64,
+    max_snap_distance: f64,
+) -> PyResult<f64> {
+    if !walking_speed_kmph.is_finite() || walking_speed_kmph <= 0.0 {
+        return Err(PyValueError::new_err(
+            "walking_speed_kmph must be a positive, finite number",
+        ));
+    }
+    if !max_walking_time.is_finite() || max_walking_time < 0.0 {
+        return Err(PyValueError::new_err(
+            "max_walking_time must be a non-negative, finite number",
+        ));
+    }
+    if !max_snap_distance.is_finite() || max_snap_distance < 0.0 {
+        return Err(PyValueError::new_err(
+            "max_snap_distance must be a non-negative, finite number",
+        ));
+    }
+    Ok(walking_speed_kmph / 3.6)
+}
+
+/// The stops walkable from a coordinate, or a `ValueError` when the
+/// coordinate is invalid or off the network; `side` prefixes the message
+/// (e.g. `"origin "`) to name the endpoint.
+fn coordinate_links(
+    streets: &StreetNetwork,
+    coordinate: (f64, f64),
+    walking_speed: f64,
+    max_walking_time: f64,
+    max_snap_distance: f64,
+    side: &str,
+) -> PyResult<Vec<WalkedStop>> {
+    let (lat, lon) = coordinate;
+    if !lat.is_finite() || !lon.is_finite() {
+        return Err(PyValueError::new_err(format!(
+            "{side}lat and lon must be finite"
+        )));
+    }
+    streets
+        .access_stops(lat, lon, walking_speed, max_walking_time, max_snap_distance)
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "{side}({lat}, {lon}) is farther than {max_snap_distance} m \
+                 from the walking network"
+            ))
+        })
 }
 
 /// Parses ``HH:MM:SS`` into seconds past the service day's start; hours may

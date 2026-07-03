@@ -3,9 +3,9 @@
 //! The Python-side build hands the walking graph over as flat arrays:
 //! vertices are implicit indices, edges carry their cost length in meters
 //! and their geometry. A query snaps a coordinate to its nearest edge
-//! through a uniform spatial grid — a virtual node at the snap point,
-//! with the split edge's cost pro-rated by the fraction each side covers —
-//! and runs a cutoff-bounded Dijkstra to collect every transit stop
+//! through an R*-tree over the edge segments — a virtual node at the snap
+//! point, with the split edge's cost pro-rated by the fraction each side
+//! covers — and runs a cutoff-bounded Dijkstra to collect every transit stop
 //! reachable on foot, entering stops through the same snap links the
 //! footpath precompute used. Walking is undirected, so one search serves
 //! access and egress alike.
@@ -18,10 +18,14 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 
+use rstar::primitives::{GeomWithData, Line};
+use rstar::RTree;
+
 use crate::timetable::StopIdx;
 
-/// Edge length of a spatial-grid cell, in meters.
-const CELL_METERS: f64 = 100.0;
+/// One polyline segment in the spatial index, tagged with the index of
+/// the edge it belongs to.
+type EdgeSegment = GeomWithData<Line<[f64; 2]>, u32>;
 
 /// How a stop enters the street graph: snapped onto an edge at a fraction
 /// of its cost length, over a straight connector to the snap point.
@@ -34,6 +38,17 @@ pub struct StopLink {
     pub fraction: f64,
     /// Straight-line distance from the stop to the snap point, in meters.
     pub connector: f64,
+}
+
+/// A stop reached by the walking search.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WalkedStop {
+    pub stop: StopIdx,
+    /// Walking time in whole seconds, rounded up.
+    pub seconds: u32,
+    /// The exact walked street-path length in meters, connectors
+    /// included.
+    pub meters: f64,
 }
 
 /// A coordinate snapped onto the street network.
@@ -132,11 +147,8 @@ pub struct StreetNetwork {
     ys: Vec<f64>,
     /// How each snapped stop enters the graph.
     links: Vec<StopLink>,
-    /// Edges indexed by the grid cells their geometry passes through.
-    grid: HashMap<(i32, i32), Vec<u32>>,
-    /// Occupied cell range as `(min_column, max_column, min_row,
-    /// max_row)`; `None` when the network has no edges.
-    cell_bounds: Option<(i32, i32, i32, i32)>,
+    /// Spatial index over the edge geometries, one entry per segment.
+    tree: RTree<EdgeSegment>,
     /// Projection origin as `(longitude, latitude)`.
     origin: (f64, f64),
     /// Meters per degree of `(longitude, latitude)` at the origin.
@@ -237,36 +249,21 @@ impl StreetNetwork {
             }
         }
 
-        let mut grid: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
-        let mut cell_bounds: Option<(i32, i32, i32, i32)> = None;
+        let mut segments = Vec::new();
         for index in 0..edges.len() {
             let start = coordinate_offsets[index] as usize;
             let end = coordinate_offsets[index + 1] as usize;
-            let mut cells = Vec::new();
             for segment in start..end - 1 {
-                let (min_x, max_x) = ordered(xs[segment], xs[segment + 1]);
-                let (min_y, max_y) = ordered(ys[segment], ys[segment + 1]);
-                for column in cell_of(min_x)..=cell_of(max_x) {
-                    for row in cell_of(min_y)..=cell_of(max_y) {
-                        cells.push((column, row));
-                    }
-                }
-            }
-            cells.sort_unstable();
-            cells.dedup();
-            for (column, row) in cells {
-                grid.entry((column, row)).or_default().push(index as u32);
-                cell_bounds = Some(match cell_bounds {
-                    None => (column, column, row, row),
-                    Some((min_column, max_column, min_row, max_row)) => (
-                        min_column.min(column),
-                        max_column.max(column),
-                        min_row.min(row),
-                        max_row.max(row),
+                segments.push(EdgeSegment::new(
+                    Line::new(
+                        [xs[segment], ys[segment]],
+                        [xs[segment + 1], ys[segment + 1]],
                     ),
-                });
+                    index as u32,
+                ));
             }
         }
+        let tree = RTree::bulk_load(segments);
 
         Ok(StreetNetwork {
             adjacency_offsets,
@@ -277,8 +274,7 @@ impl StreetNetwork {
             xs,
             ys,
             links,
-            grid,
-            cell_bounds,
+            tree,
             origin,
             scale,
         })
@@ -300,8 +296,8 @@ impl StreetNetwork {
     }
 
     /// Snaps a coordinate to its nearest edge within `max_snap_distance`
-    /// meters, searching grid cells in expanding rings. Non-finite
-    /// coordinates or a non-finite or negative allowance never snap.
+    /// meters through the segment R*-tree. Non-finite coordinates or a
+    /// non-finite or negative allowance never snap.
     pub fn snap(&self, latitude: f64, longitude: f64, max_snap_distance: f64) -> Option<Snap> {
         if !latitude.is_finite()
             || !longitude.is_finite()
@@ -312,80 +308,25 @@ impl StreetNetwork {
         }
         let x = (longitude - self.origin.0) * self.scale.0;
         let y = (latitude - self.origin.1) * self.scale.1;
-        self.nearest_edge(x, y, max_snap_distance)
-            .filter(|&(distance, _, _)| distance <= max_snap_distance)
-            .map(|(distance, edge, fraction)| Snap {
-                edge,
-                fraction,
-                connector: distance,
-            })
+        // The nearest segment's edge is the nearest edge; projecting onto
+        // the whole edge recovers the exact distance and the fraction.
+        let edge = self.tree.nearest_neighbor([x, y])?.data;
+        let (distance, fraction) = self.project_onto_edge(edge, x, y);
+        (distance <= max_snap_distance).then_some(Snap {
+            edge,
+            fraction,
+            connector: distance,
+        })
     }
 
-    /// The nearest edge to a projected position as
-    /// `(distance, edge, fraction)`, or `None` on an edgeless network.
-    ///
-    /// An allowance whose ring search would visit more cells than the
-    /// grid holds — it spans the whole grid, or the query lies far
-    /// outside it — degenerates to a scan of every edge, which bounds
-    /// the work whatever the caller allows.
-    fn nearest_edge(&self, x: f64, y: f64, max_snap_distance: f64) -> Option<(f64, u32, f64)> {
-        let (min_column, max_column, min_row, max_row) = self.cell_bounds?;
-        let center = (cell_of(x), cell_of(y));
-        let allowance = (max_snap_distance / CELL_METERS).ceil() + 1.0;
-        let extent = (center.0 as i64 - min_column as i64)
-            .max(max_column as i64 - center.0 as i64)
-            .max(center.1 as i64 - min_row as i64)
-            .max(max_row as i64 - center.1 as i64)
-            .max(0) as f64;
-        let mut best: Option<(f64, u32, f64)> = None;
-        if allowance >= extent || 4.0 * allowance * allowance >= self.grid.len() as f64 {
-            for edge in 0..self.endpoints.len() as u32 {
-                let (distance, fraction) = self.project_onto_edge(edge, x, y);
-                if best.is_none_or(|(nearest, _, _)| distance < nearest) {
-                    best = Some((distance, edge, fraction));
-                }
-            }
-            return best;
-        }
-        let mut seen = vec![false; self.endpoints.len()];
-        for radius in 0..=allowance as i32 {
-            // Cells on ring `radius` lie at least `radius - 1` cells away
-            // from the query, so a hit at or under that bound is final.
-            let reachable = (radius - 1) as f64 * CELL_METERS;
-            if reachable > max_snap_distance {
-                break;
-            }
-            if let Some((distance, _, _)) = best {
-                if distance <= reachable {
-                    break;
-                }
-            }
-            for cell in ring(center, radius) {
-                let Some(edges) = self.grid.get(&cell) else {
-                    continue;
-                };
-                for &edge in edges {
-                    if std::mem::replace(&mut seen[edge as usize], true) {
-                        continue;
-                    }
-                    let (distance, fraction) = self.project_onto_edge(edge, x, y);
-                    if best.is_none_or(|(nearest, _, _)| distance < nearest) {
-                        best = Some((distance, edge, fraction));
-                    }
-                }
-            }
-        }
-        best
-    }
-
-    /// Every transit stop reachable on foot from a coordinate:
-    /// `(stop, seconds)` pairs sorted by stop index, or `None` when the
-    /// coordinate is farther than `max_snap_distance` meters from the
-    /// network or any parameter is out of range (the speed must be
-    /// positive and finite, the cutoffs non-negative and finite).
-    /// Walking is undirected, so the same search answers egress.
-    /// Seconds round up: understating a walking time could let routing
-    /// catch a departure the walk actually misses.
+    /// Every transit stop reachable on foot from a coordinate, sorted by
+    /// stop index, or `None` when the coordinate is farther than
+    /// `max_snap_distance` meters from the network or any parameter is
+    /// out of range (the speed must be positive and finite, the cutoffs
+    /// non-negative and finite). Walking is undirected, so the same
+    /// search answers egress. Seconds round up — understating a walking
+    /// time could let routing catch a departure the walk actually
+    /// misses — while meters stay the exact street-path length.
     pub fn access_stops(
         &self,
         latitude: f64,
@@ -393,7 +334,7 @@ impl StreetNetwork {
         walking_speed: f64,
         max_seconds: f64,
         max_snap_distance: f64,
-    ) -> Option<Vec<(StopIdx, u32)>> {
+    ) -> Option<Vec<WalkedStop>> {
         if !walking_speed.is_finite()
             || walking_speed <= 0.0
             || !max_seconds.is_finite()
@@ -412,7 +353,7 @@ impl StreetNetwork {
             ],
             cutoff,
         );
-        let mut fastest: HashMap<StopIdx, u32> = HashMap::new();
+        let mut nearest: HashMap<StopIdx, f64> = HashMap::new();
         for link in &self.links {
             let (link_from, link_to) = self.endpoints[link.edge as usize];
             let link_length = self.lengths[link.edge as usize];
@@ -429,16 +370,22 @@ impl StreetNetwork {
                 meters = meters.min(direct);
             }
             if meters <= cutoff + 1e-9 {
-                // A stop with several links keeps its fastest time.
-                let duration = seconds(meters / walking_speed);
-                fastest
+                // A stop with several links keeps its shortest path.
+                nearest
                     .entry(link.stop)
-                    .and_modify(|best| *best = (*best).min(duration))
-                    .or_insert(duration);
+                    .and_modify(|best| *best = best.min(meters))
+                    .or_insert(meters);
             }
         }
-        let mut reached: Vec<(StopIdx, u32)> = fastest.into_iter().collect();
-        reached.sort_unstable_by_key(|&(stop, _)| stop);
+        let mut reached: Vec<WalkedStop> = nearest
+            .into_iter()
+            .map(|(stop, meters)| WalkedStop {
+                stop,
+                seconds: seconds(meters / walking_speed),
+                meters,
+            })
+            .collect();
+        reached.sort_unstable_by_key(|walk| walk.stop);
         Some(reached)
     }
 
@@ -537,37 +484,6 @@ fn seconds(duration: f64) -> u32 {
     (duration - 1e-6).ceil().max(0.0) as u32
 }
 
-/// The grid cell coordinate of a projected position.
-fn cell_of(position: f64) -> i32 {
-    (position / CELL_METERS).floor() as i32
-}
-
-fn ordered(a: f64, b: f64) -> (f64, f64) {
-    if a <= b {
-        (a, b)
-    } else {
-        (b, a)
-    }
-}
-
-/// The cells at Chebyshev distance `radius` around `center`.
-fn ring(center: (i32, i32), radius: i32) -> Vec<(i32, i32)> {
-    let (cx, cy) = center;
-    if radius == 0 {
-        return vec![(cx, cy)];
-    }
-    let mut cells = Vec::with_capacity(radius as usize * 8);
-    for dx in -radius..=radius {
-        cells.push((cx.saturating_add(dx), cy.saturating_sub(radius)));
-        cells.push((cx.saturating_add(dx), cy.saturating_add(radius)));
-    }
-    for dy in (1 - radius)..radius {
-        cells.push((cx.saturating_sub(radius), cy.saturating_add(dy)));
-        cells.push((cx.saturating_add(radius), cy.saturating_add(dy)));
-    }
-    cells
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,6 +546,11 @@ mod tests {
         vec![from, to]
     }
 
+    /// The `(stop, seconds)` view of a walking-search result.
+    fn timed(walks: &[WalkedStop]) -> Vec<(StopIdx, u32)> {
+        walks.iter().map(|walk| (walk.stop, walk.seconds)).collect()
+    }
+
     #[test]
     fn snaps_to_the_nearest_edge() {
         let network = network(
@@ -651,25 +572,18 @@ mod tests {
 
     #[test]
     fn respects_the_snap_distance() {
-        // The long second edge blows the grid up past the ring search's
-        // whole-grid fallback threshold, so the expanding rings really
-        // run; the nearest edge sits several rings from the query.
         let network = network(
-            4,
+            2,
             0,
-            &[
-                (0, 1, 400.0, straight((250.0, 0.0), (250.0, 400.0))),
-                (2, 3, 10_000.0, straight((250.0, 1500.0), (250.0, 11_500.0))),
-            ],
+            &[(0, 1, 400.0, straight((250.0, 0.0), (250.0, 400.0)))],
             vec![],
         )
         .unwrap();
         let (lon, lat) = lonlat(0.0, 0.0);
+        // The nearest edge is found whenever the allowance covers it.
         let snap = network.snap(lat, lon, 300.0).unwrap();
         assert_eq!(snap.edge, 0);
-        // The far edge shifts the mean-latitude scale a little, so the
-        // designed 250 m connector holds only to fractions of a meter.
-        assert!((snap.connector - 250.0).abs() < 0.5);
+        assert!((snap.connector - 250.0).abs() < 0.1);
         assert_eq!(network.snap(lat, lon, 200.0), None);
         assert_eq!(network.access_stops(lat, lon, 1.0, 600.0, 200.0), None);
     }
@@ -700,6 +614,25 @@ mod tests {
     }
 
     #[test]
+    fn indexes_long_diagonal_edges() {
+        // The index holds one entry per polyline segment, so even a
+        // 25 km diagonal is found exactly from a query at its middle.
+        let network = network(
+            2,
+            0,
+            &[(0, 1, 25_000.0, straight((0.0, 0.0), (20_000.0, 15_000.0)))],
+            vec![],
+        )
+        .unwrap();
+        // 50 m perpendicular to the segment's midpoint.
+        let (lon, lat) = lonlat(10_000.0 - 30.0, 7_500.0 + 40.0);
+        let snap = network.snap(lat, lon, 100.0).unwrap();
+        assert_eq!(snap.edge, 0);
+        assert!((snap.connector - 50.0).abs() < 0.5);
+        assert!((snap.fraction - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
     fn survives_huge_snap_allowances() {
         let network = network(
             2,
@@ -708,13 +641,13 @@ mod tests {
             vec![link(0, 0, 0.5, 0.0)],
         )
         .unwrap();
-        // A finite but absurd allowance degenerates to scanning every
-        // edge instead of walking grid rings; results stay correct.
+        // The allowance only filters the result, so a finite but absurd
+        // value costs nothing and stays correct.
         let (lon, lat) = lonlat(100.0, 0.0);
         let snap = network.snap(lat, lon, 1e12).unwrap();
         assert_eq!(snap.edge, 0);
         assert!(snap.connector < 0.01);
-        // The same fallback serves queries far outside the grid.
+        // Queries far outside the indexed extent behave the same.
         let (far_lon, far_lat) = lonlat(5_000_000.0, 0.0);
         let far = network.snap(far_lat, far_lon, 1e12).unwrap();
         assert_eq!(far.edge, 0);
@@ -734,7 +667,9 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(100.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
-        assert_eq!(reached, vec![(StopIdx(0), 0), (StopIdx(1), 200)]);
+        assert_eq!(timed(&reached), vec![(StopIdx(0), 0), (StopIdx(1), 200)]);
+        assert!(reached[0].meters.abs() < 0.5);
+        assert!((reached[1].meters - 200.0).abs() < 0.5);
     }
 
     #[test]
@@ -750,7 +685,7 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(100.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
-        assert_eq!(reached, vec![(StopIdx(0), 400)]);
+        assert_eq!(timed(&reached), vec![(StopIdx(0), 400)]);
     }
 
     #[test]
@@ -768,7 +703,7 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(0.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
-        assert_eq!(reached, vec![(StopIdx(0), 400)]);
+        assert_eq!(timed(&reached), vec![(StopIdx(0), 400)]);
     }
 
     #[test]
@@ -789,7 +724,7 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(360.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 50.0).unwrap();
-        assert_eq!(reached, vec![(StopIdx(0), 300)]);
+        assert_eq!(timed(&reached), vec![(StopIdx(0), 300)]);
     }
 
     #[test]
@@ -803,7 +738,7 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(0.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 150.0, 100.0).unwrap();
-        assert_eq!(reached, vec![(StopIdx(0), 100)]);
+        assert_eq!(timed(&reached), vec![(StopIdx(0), 100)]);
     }
 
     #[test]
@@ -819,7 +754,7 @@ mod tests {
         let (lon, lat) = lonlat(100.0, 10.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
         assert_eq!(reached.len(), 1);
-        assert!((129..=131).contains(&reached[0].1));
+        assert!((129..=131).contains(&reached[0].seconds));
     }
 
     #[test]
@@ -833,8 +768,10 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(100.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
-        // 0.5 × 401 m at 1 m/s is 200.5 s and must not round down.
-        assert_eq!(reached, vec![(StopIdx(0), 201)]);
+        // 0.5 × 401 m at 1 m/s is 200.5 s and must not round down; the
+        // meters stay exact.
+        assert_eq!(timed(&reached), vec![(StopIdx(0), 201)]);
+        assert!((reached[0].meters - 200.5).abs() < 1e-9);
     }
 
     #[test]
@@ -848,7 +785,7 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(100.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
-        assert_eq!(reached, vec![(StopIdx(0), 100)]);
+        assert_eq!(timed(&reached), vec![(StopIdx(0), 100)]);
     }
 
     #[test]
