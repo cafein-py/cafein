@@ -11,9 +11,9 @@ into each other.
     python scripts/benchmark_vs_r5py.py --stops 0     # every stop in the box
     python scripts/benchmark_vs_r5py.py --engine cafein   # one side only
 
-Requirements: cafein installed (with its compiled core); r5py and a Java
-runtime for the comparison side (`mamba install r5py` provides both).
-The test data comes from `python scripts/fetch_test_data.py`.
+Requirements: cafein installed (with its compiled core); r5py >= 1.0 and
+a Java runtime for the comparison side (`mamba install r5py` provides
+both). The test data comes from `python scripts/fetch_test_data.py`.
 
 The comparison is as close as the engines' semantics allow, and the
 differences are printed with the results: cafein computes stop-to-stop
@@ -100,7 +100,7 @@ def run_r5py(stops):
     )
     departure = datetime.datetime.fromisoformat(f"{DATE}T{DEPARTURE}")
     started = time.perf_counter()
-    computer = r5py.TravelTimeMatrixComputer(
+    matrix = r5py.TravelTimeMatrix(
         network,
         origins=points,
         destinations=points,
@@ -108,7 +108,6 @@ def run_r5py(stops):
         departure_time_window=datetime.timedelta(minutes=1),
         transport_modes=[r5py.TransportMode.TRANSIT, r5py.TransportMode.WALK],
     )
-    matrix = computer.compute_travel_times()
     matrix_seconds = time.perf_counter() - started
     return build_seconds, matrix_seconds, int(matrix["travel_time"].notna().sum())
 
@@ -172,7 +171,10 @@ def main():
         ]
         completed = subprocess.run(command, capture_output=True, text=True)
         if completed.returncode != 0:
-            print(f"{engine}: FAILED\n{completed.stderr.strip().splitlines()[-1]}")
+            detail = completed.stderr.strip().splitlines() or [
+                f"exit code {completed.returncode}"
+            ]
+            print(f"{engine}: FAILED\n{detail[-1]}")
             continue
         results.append(json.loads(completed.stdout.strip().splitlines()[-1]))
 
