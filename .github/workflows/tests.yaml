@@ -62,6 +62,12 @@ jobs:
       - name: Run Rust tests
         shell: bash -el {0}
         run: cargo test --workspace
+      # Dependencies install separately with default build isolation:
+      # pyrosm's cykhash ships no wheels and needs Cython to build, which
+      # --no-build-isolation would hide.
+      - name: Install Python dependencies
+        shell: bash -el {0}
+        run: pip install geopandas numpy pandas pyrosm scipy shapely
       - name: Install cafein
         shell: bash -el {0}
         run: pip install -e . --no-build-isolation

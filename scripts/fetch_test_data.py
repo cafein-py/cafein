@@ -23,6 +23,10 @@ DATASETS = {
         f"{BASE_URL}/helsinki_gtfs.zip",
         "8ecccde3e76441b47e90c7f311fc57a8d38df92e9ee592e8f440a9b7e3abf228",
     ),
+    "kantakaupunki.osm.pbf": (
+        f"{BASE_URL}/kantakaupunki.osm.pbf",
+        "94f1a86cb8defaca4b6eea64fba699fde957a848151642b2ad2599bd5ad1e858",
+    ),
 }
 
 DATA_DIRECTORY = pathlib.Path(__file__).parent.parent / "tests" / "data"

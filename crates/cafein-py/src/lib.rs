@@ -95,12 +95,57 @@ impl TransportNetwork {
         self.build.timetable.trip_count()
     }
 
+    /// Number of installed stop-to-stop transfers.
+    #[getter]
+    fn transfer_count(&self) -> usize {
+        self.transfers.edge_count()
+    }
+
+    /// The network's stops as `(stop_id, latitude, longitude)` tuples,
+    /// with identifiers in their public form (feed-qualified when several
+    /// feeds are merged) and coordinates `None` where the feed has none.
+    #[getter]
+    fn stops(&self) -> Vec<(String, Option<f64>, Option<f64>)> {
+        self.feed
+            .stops
+            .iter()
+            .enumerate()
+            .map(|(index, stop)| {
+                (
+                    self.public_stop_id(StopIdx(index as u32)),
+                    stop.latitude,
+                    stop.longitude,
+                )
+            })
+            .collect()
+    }
+
+    /// Install precomputed stop-to-stop transfers (footpaths).
+    ///
+    /// Parameters
+    /// ----------
+    /// footpaths : list of (str, str, int)
+    ///     ``(from_stop, to_stop, seconds)`` walking edges, with stop
+    ///     identifiers as in ``route_between_stops``. The edge list must
+    ///     be transitively closed — routing relaxes a single transfer hop
+    ///     per round; ``cafein.streets.walking_footpaths`` produces such
+    ///     lists.
+    fn set_transfers(&mut self, footpaths: Vec<(String, String, u32)>) -> PyResult<()> {
+        let mut edges = Vec::with_capacity(footpaths.len());
+        for (from, to, duration) in &footpaths {
+            edges.push((self.resolve_stop(from)?, self.resolve_stop(to)?, *duration));
+        }
+        self.transfers = Transfers::from_edges(self.build.timetable.stop_count(), &edges)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        Ok(())
+    }
+
     /// Route between two transit stops for a single departure.
     ///
-    /// Stop-to-stop routing on the transit network only: journeys ride
-    /// trips and change vehicles at shared stops. Street-network footpath
-    /// transfers and door-to-door access/egress join once the street
-    /// network build exists; per-leg distance, distance provenance,
+    /// Journeys ride trips and change vehicles at shared stops or over
+    /// the transfers installed with ``set_transfers``. Door-to-door
+    /// access/egress from arbitrary coordinates joins once the query-time
+    /// street search exists; per-leg distance, distance provenance,
     /// geometry, and emissions join once the geometry preprocessing
     /// produces them.
     ///
