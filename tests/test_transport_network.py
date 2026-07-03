@@ -249,6 +249,140 @@ def test_access_stops_need_a_street_network(network):
         network.access_stops(60.168, 24.931)
 
 
+def test_routes_door_to_door_between_coordinates(network_with_footpaths):
+    # Kalasatama westbound platform to the Kamppi street stop, queried by
+    # their own coordinates: the same 08:31 M2 ride the stop-to-stop
+    # oracle pins, but the egress walks straight from the Kamppi metro
+    # platform to the destination coordinate instead of transferring
+    # first, so the arrivals agree.
+    origin = stop_coordinates(network_with_footpaths, "1100602")
+    destination = stop_coordinates(network_with_footpaths, "1040280")
+    journeys = network_with_footpaths.route_between_coordinates(
+        origin, destination, "2022-02-22", "08:30:00"
+    )
+    stop_journeys = network_with_footpaths.route_between_stops(
+        "1100602", "1040280", "2022-02-22", "08:30:00"
+    )
+    first = journeys[0]
+    assert first["rides"] == 1
+    assert abs(first["arrival"] - stop_journeys[0]["arrival"]) <= 2
+
+    access, transit, egress = first["legs"]
+    assert access["type"] == "access"
+    assert access["to_stop"] == "1100602"
+    # The default 3.6 km/h is 1 m/s, so walk meters equal walk seconds.
+    assert access["distance"] == pytest.approx(
+        access["arrival"] - access["departure"], abs=0.01
+    )
+    assert access["distance"] <= 15
+    assert transit["trip_id"] == "31M2_20220222_Ti_2_0817"
+    assert transit["departure"] == 8 * 3600 + 31 * 60
+    assert egress["type"] == "egress"
+    assert egress["from_stop"] == "1040602"
+    assert 19 <= egress["distance"] <= 23
+
+
+def test_door_to_door_window_profiles_departures(network_with_footpaths):
+    origin = stop_coordinates(network_with_footpaths, "1100602")
+    destination = stop_coordinates(network_with_footpaths, "1040280")
+    profile = network_with_footpaths.route_between_coordinates(
+        origin, destination, "2022-02-22", "08:30:00", window=600
+    )
+    assert len(profile) >= 3
+    departures = [journey["departure"] for journey in profile]
+    assert departures == sorted(departures)
+    for journey in profile:
+        assert journey["departure"] >= 8 * 3600 + 30 * 60
+        assert journey["arrival"] > journey["departure"]
+        assert journey["rides"] >= 1
+
+
+def test_travel_times_from_coordinate_seed_walkable_stops(network_with_footpaths):
+    origin = stop_coordinates(network_with_footpaths, "1040602")
+    reached = network_with_footpaths.travel_times_from_coordinate(
+        origin, "2022-02-22", "08:30:00"
+    )
+    walkable = network_with_footpaths.access_stops(*origin)
+    # Every stop within walking distance appears, at most as far away as
+    # the pure walk; transit extends the reach far beyond it.
+    for stop, seconds in walkable.items():
+        assert reached[stop] <= seconds
+    assert reached["1040602"] <= 1
+    assert 19 <= reached["1040280"] <= 21
+    assert len(reached) > 10 * len(walkable)
+
+
+def test_door_to_door_needs_streets_and_valid_coordinates(
+    network, network_with_footpaths
+):
+    origin = stop_coordinates(network_with_footpaths, "1100602")
+    destination = stop_coordinates(network_with_footpaths, "1040280")
+    with pytest.raises(ValueError, match="no street network"):
+        network.route_between_coordinates(origin, destination, "2022-02-22", "08:30:00")
+    with pytest.raises(ValueError, match="no street network"):
+        network.travel_times_from_coordinate(origin, "2022-02-22", "08:30:00")
+    with pytest.raises(ValueError, match="origin .* is farther"):
+        network_with_footpaths.route_between_coordinates(
+            (60.14, 24.90), destination, "2022-02-22", "08:30:00"
+        )
+    with pytest.raises(ValueError, match="destination .* is farther"):
+        network_with_footpaths.route_between_coordinates(
+            origin, (60.14, 24.90), "2022-02-22", "08:30:00"
+        )
+    with pytest.raises(ValueError, match="walking_speed_kmph"):
+        network_with_footpaths.route_between_coordinates(
+            origin,
+            destination,
+            "2022-02-22",
+            "08:30:00",
+            walking_speed_kmph=float("nan"),
+        )
+    with pytest.raises(ValueError, match="origin lat and lon"):
+        network_with_footpaths.travel_times_from_coordinate(
+            (float("nan"), 24.9), "2022-02-22", "08:30:00"
+        )
+
+
+def test_a_synthetic_network_routes_door_to_door(tmp_path):
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs([str(feed)])
+    # One 2 km street edge; S1 sits on its start, S2 at 90 % of its cost
+    # length, so the walking cutoff (600 s at 1 m/s) keeps each endpoint
+    # within reach of exactly one stop and riding is the only way across.
+    network.set_street_network(
+        2,
+        [(0, 1, 2000.0)],
+        [0, 2],
+        [24.0, 24.035842],
+        [60.0, 60.0],
+        [("S1", 0, 0.0, 0.0), ("S2", 0, 0.9, 0.0)],
+    )
+    # From the edge start (S1's snap point) to the edge end: ride T_OK
+    # 08:00 -> 08:10, then walk the outer tenth of the edge's cost length
+    # (200 m at 1 m/s) — designed values, exact.
+    journeys = network.route_between_coordinates(
+        (60.0, 24.0), (60.0, 24.035842), "2022-02-22", "07:30:00"
+    )
+    first = journeys[0]
+    assert first["arrival"] == 8 * 3600 + 10 * 60 + 200
+    access, transit, egress = first["legs"]
+    assert access["to_stop"] == "S1"
+    assert access["distance"] == 0.0
+    assert transit["trip_id"] == "T_OK"
+    assert egress["from_stop"] == "S2"
+    assert egress["distance"] == 200.0
+
+    # Journeys ride at least one trip: a destination best reached by
+    # walking alone yields no journeys.
+    assert (
+        network.route_between_coordinates(
+            (60.0, 24.0), (60.0, 24.0009), "2022-02-22", "07:30:00"
+        )
+        == []
+    )
+
+
 def test_a_synthetic_street_network_answers_access_queries(tmp_path):
     feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
     with pytest.warns(UserWarning):
