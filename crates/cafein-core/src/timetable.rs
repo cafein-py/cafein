@@ -94,9 +94,13 @@ impl Timetable {
 
     /// The trips of a pattern, in departure-time order at its first stop.
     pub fn pattern_trips(&self, pattern: PatternIdx) -> impl Iterator<Item = TripIdx> {
-        let start = self.pattern_trips_offsets[pattern.0 as usize];
-        let end = self.pattern_trips_offsets[pattern.0 as usize + 1];
-        (start..end).map(TripIdx)
+        self.pattern_trip_range(pattern).map(TripIdx)
+    }
+
+    /// The contiguous trip-index range of a pattern.
+    pub fn pattern_trip_range(&self, pattern: PatternIdx) -> std::ops::Range<u32> {
+        self.pattern_trips_offsets[pattern.0 as usize]
+            ..self.pattern_trips_offsets[pattern.0 as usize + 1]
     }
 
     /// The pattern a trip belongs to.
