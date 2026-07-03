@@ -312,6 +312,63 @@ impl TransportNetwork {
         }
         Ok(result.unbind())
     }
+
+    /// Earliest arrival at every reachable stop for a single departure.
+    ///
+    /// One RAPTOR run serves all destinations, so travel-time matrices
+    /// are assembled origin by origin from this method — never per OD
+    /// pair.
+    ///
+    /// Parameters
+    /// ----------
+    /// from_stop : str
+    ///     GTFS stop_id of the origin stop; ``<feed_index>:<stop_id>``
+    ///     when the id occurs in several merged feeds.
+    /// date : str
+    ///     Service date as ``YYYY-MM-DD``.
+    /// departure : str
+    ///     Departure time at the origin as ``HH:MM:SS``.
+    /// max_transfers : int (optional, default: 4)
+    ///     Maximum number of transfers between rides.
+    ///
+    /// Returns
+    /// -------
+    /// dict
+    ///     Travel time in seconds to every reachable stop, keyed by
+    ///     public stop_id; the origin maps to 0 and unreachable stops
+    ///     are absent.
+    #[pyo3(signature = (from_stop, date, departure, max_transfers = 4))]
+    fn travel_times_from_stop(
+        &self,
+        py: Python<'_>,
+        from_stop: &str,
+        date: &str,
+        departure: &str,
+        max_transfers: u8,
+    ) -> PyResult<Py<PyDict>> {
+        let origin = self.resolve_stop(from_stop)?;
+        let date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .map_err(|error| PyValueError::new_err(format!("invalid date '{date}': {error}")))?;
+        let departure = parse_time(departure)?;
+        let request = Request {
+            departure,
+            access: vec![(origin, 0)],
+            egress: Vec::new(),
+            active_services: self.build.services.active_on(date),
+            max_transfers,
+        };
+        let arrivals = Raptor.one_to_all(&self.build.timetable, &self.transfers, &request);
+        let result = PyDict::new(py);
+        for (index, arrival) in arrivals.iter().enumerate() {
+            if let Some(arrival) = arrival {
+                result.set_item(
+                    self.public_stop_id(StopIdx(index as u32)),
+                    arrival - departure,
+                )?;
+            }
+        }
+        Ok(result.unbind())
+    }
 }
 
 impl TransportNetwork {
