@@ -184,6 +184,94 @@ def test_street_stops_are_reachable_only_over_footpaths(
     assert egress["type"] == "egress"
 
 
+def stop_coordinates(network, stop_id):
+    """A stop's (lat, lon) from the network's stop list."""
+    for stop, lat, lon in network.stops:
+        if stop == stop_id:
+            return lat, lon
+    raise KeyError(stop_id)
+
+
+def test_access_stops_match_the_footpath_pins(network_with_footpaths):
+    # Queried from a stop's own coordinates, the street search enters the
+    # graph through the same snap link as the footpath precompute, so the
+    # pinned Kamppi walking times reappear (the doubled connector and the
+    # snapping metric can shift a value across the one-second rounding).
+    lat, lon = stop_coordinates(network_with_footpaths, "1040602")
+    reached = network_with_footpaths.access_stops(lat, lon)
+    assert reached["1040602"] <= 1
+    assert 4 <= reached["1040601"] <= 5
+    assert 20 <= reached["1040280"] <= 21
+    lat, lon = stop_coordinates(network_with_footpaths, "1000102")
+    assert 22 <= network_with_footpaths.access_stops(lat, lon)["1040280"] <= 23
+
+
+def test_access_stops_respect_the_walking_cutoff(network_with_footpaths):
+    lat, lon = stop_coordinates(network_with_footpaths, "1040602")
+    walkable = network_with_footpaths.access_stops(lat, lon)
+    assert 30 <= len(walkable) <= 90
+    assert all(0 <= seconds <= 600 for seconds in walkable.values())
+    # A tighter cutoff filters the same walking times, never changes them.
+    nearby = network_with_footpaths.access_stops(lat, lon, max_walking_time=120.0)
+    assert set(nearby) < set(walkable)
+    assert all(walkable[stop] == seconds for stop, seconds in nearby.items())
+
+
+def test_faster_walking_reaches_more_stops(network_with_footpaths):
+    lat, lon = stop_coordinates(network_with_footpaths, "1040602")
+    walked = network_with_footpaths.access_stops(lat, lon)
+    ran = network_with_footpaths.access_stops(lat, lon, walking_speed_kmph=7.2)
+    assert set(ran) > set(walked)
+
+
+def test_access_stops_need_a_street_nearby(network_with_footpaths):
+    # Open water south of the extract, far from every walkable way.
+    with pytest.raises(ValueError, match="farther than"):
+        network_with_footpaths.access_stops(60.14, 24.90)
+
+
+def test_access_stops_need_a_street_network(network):
+    with pytest.raises(ValueError, match="no street network"):
+        network.access_stops(60.168, 24.931)
+
+
+def test_a_synthetic_street_network_answers_access_queries(tmp_path):
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs([str(feed)])
+    # One 400 m edge running east from S1's coordinates; S1 sits on its
+    # start, S2 halfway along. Walking at the default 3.6 km/h (1 m/s),
+    # the cost length — not the geometry — sets the times.
+    network.set_street_network(
+        2,
+        [(0, 1, 400.0)],
+        [0, 2],
+        [24.0, 24.0072],
+        [60.0, 60.0],
+        [("S1", 0, 0.0, 0.0), ("S2", 0, 0.5, 0.0)],
+    )
+    reached = network.access_stops(60.0, 24.0)
+    assert reached["S1"] == 0
+    assert reached["S2"] == 200
+
+
+def test_set_street_network_validates_its_payload(tmp_path):
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs([str(feed)])
+    with pytest.raises(ValueError, match="offsets"):
+        network.set_street_network(2, [(0, 1, 400.0)], [0], [], [], [])
+    with pytest.raises(KeyError, match="unknown stop_id"):
+        network.set_street_network(
+            2,
+            [(0, 1, 400.0)],
+            [0, 2],
+            [24.0, 24.0072],
+            [60.0, 60.0],
+            [("missing", 0, 0.5, 0.0)],
+        )
+
+
 def build_synthetic_gtfs(path):
     """A two-stop feed with one good trip, one backwards trip, and a stop
     whose raw id looks like a feed-qualified id."""

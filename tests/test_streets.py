@@ -63,6 +63,20 @@ def footpaths(nodes, edges, stops, **options):
     return {(a, b): seconds for a, b, seconds in edge_list}
 
 
+def payload(nodes, edges, stops, **options):
+    node_frame, edge_frame = street_network(nodes, edges)
+    _, street = streets._network_streets(
+        stops,
+        node_frame,
+        edge_frame,
+        walking_speed_kmph=options.pop("walking_speed_kmph", 3.6),
+        max_walking_time=options.pop("max_walking_time", 600.0),
+        max_snap_distance=options.pop("max_snap_distance", 100.0),
+    )
+    assert not options
+    return street
+
+
 def assert_footpaths(result, expected):
     """`expected` maps stop pairs to designed walking seconds."""
     assert set(result) == set(expected)
@@ -194,8 +208,54 @@ def test_disconnected_components_get_local_footpaths_only():
     assert ("i1", "m1") not in result
 
 
+def test_the_street_payload_mirrors_the_walking_network():
+    vertex_count, edge_list, offsets, lons, lats, links = payload(
+        STRAIGHT_STREET,
+        [("A", "B", 400)],
+        [stop("s1", 100, 0), stop("s2", 300, 30)],
+    )
+    assert vertex_count == 2
+    assert edge_list == [(0, 1, 400.0)]
+    assert offsets == [0, 2]
+    assert lons == pytest.approx([24.0, 24.0 + 400 * DEG_PER_M_LON])
+    assert lats == [60.0, 60.0]
+    assert [link[:2] for link in links] == [("s1", 0), ("s2", 0)]
+    fractions = [link[2] for link in links]
+    assert fractions == pytest.approx([0.25, 0.75], rel=1e-3)
+    connectors = [link[3] for link in links]
+    assert connectors[0] == pytest.approx(0.0, abs=0.1)
+    assert connectors[1] == pytest.approx(30.0, rel=0.01)
+
+
+def test_unsnapped_stops_get_no_street_links():
+    with pytest.warns(UserWarning, match="farther than"):
+        *_, links = payload(
+            STRAIGHT_STREET,
+            [("A", "B", 400)],
+            [stop("s1", 100, 0), stop("far", 200, 500)],
+        )
+    assert [link[0] for link in links] == ["s1"]
+
+
+def test_an_empty_network_yields_an_empty_payload():
+    empty_edges = gpd.GeoDataFrame(
+        {"u": [], "v": [], "length": []},
+        geometry=gpd.GeoSeries([], crs="EPSG:4326"),
+    )
+    footpath_list, street = streets._network_streets(
+        [stop("s1", 100, 0)],
+        pd.DataFrame({"id": []}),
+        empty_edges,
+        walking_speed_kmph=3.6,
+        max_walking_time=600.0,
+        max_snap_distance=100.0,
+    )
+    assert footpath_list == []
+    assert street == (0, [], [0], [], [], [])
+
+
 @pytest.fixture(scope="session")
-def helsinki_footpaths(helsinki_gtfs, kantakaupunki_pbf):
+def helsinki_streets(helsinki_gtfs, kantakaupunki_pbf):
     with (
         zipfile.ZipFile(helsinki_gtfs) as archive,
         archive.open("stops.txt") as stops_file,
@@ -209,7 +269,12 @@ def helsinki_footpaths(helsinki_gtfs, kantakaupunki_pbf):
         )
     )
     with pytest.warns(UserWarning):
-        return streets.walking_footpaths(str(kantakaupunki_pbf), triples)
+        return streets.walking_streets(str(kantakaupunki_pbf), triples)
+
+
+@pytest.fixture(scope="session")
+def helsinki_footpaths(helsinki_streets):
+    return helsinki_streets[0]
 
 
 def test_helsinki_footpaths_cover_the_extract(helsinki_footpaths):
@@ -233,6 +298,21 @@ def test_helsinki_footpaths_pin_known_pairs(helsinki_footpaths):
 def test_helsinki_footpaths_are_symmetric(helsinki_footpaths):
     lookup = {(a, b): seconds for a, b, seconds in helsinki_footpaths}
     assert all(lookup.get((b, a)) == seconds for (a, b), seconds in lookup.items())
+
+
+def test_helsinki_street_network_covers_the_extract(helsinki_streets):
+    vertex_count, edge_list, offsets, lons, lats, links = helsinki_streets[1]
+    assert vertex_count > 10_000
+    assert len(edge_list) > 10_000
+    assert len(offsets) == len(edge_list) + 1
+    assert offsets[0] == 0
+    assert offsets[-1] == len(lons) == len(lats)
+    # Every stop with footpaths snapped, so it also carries a street link.
+    origins = {from_stop for from_stop, _, _ in helsinki_streets[0]}
+    assert {link[0] for link in links} >= origins
+    assert all(0 <= link[1] < len(edge_list) for link in links)
+    assert all(0.0 <= link[2] <= 1.0 for link in links)
+    assert all(0.0 <= link[3] <= 100.0 for link in links)
 
 
 def test_helsinki_footpaths_are_transitively_closed(helsinki_footpaths):

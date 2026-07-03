@@ -7,5 +7,6 @@ pub mod geometry;
 pub mod journey;
 pub mod raptor;
 pub mod router;
+pub mod streets;
 pub mod timetable;
 pub mod transfers;

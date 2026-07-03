@@ -11,6 +11,7 @@ use cafein_core::geometry::{DistanceProvenance, TripGeometry};
 use cafein_core::journey::{Journey, Leg};
 use cafein_core::raptor::Raptor;
 use cafein_core::router::{Request, TransitRouter};
+use cafein_core::streets::{StopLink, StreetNetwork};
 use cafein_core::timetable::{StopIdx, TripIdx};
 use cafein_core::transfers::Transfers;
 use cafein_gtfs::{build_timetable, Feed, RouteType, TimetableBuild};
@@ -22,6 +23,7 @@ struct TransportNetwork {
     build: TimetableBuild,
     transfers: Transfers,
     geometry: Option<TripGeometry>,
+    streets: Option<StreetNetwork>,
     stops_by_id: HashMap<String, StopLookup>,
     stops_by_qualified_id: HashMap<String, StopIdx>,
     trips_by_public_id: HashMap<String, TripIdx>,
@@ -87,6 +89,7 @@ impl TransportNetwork {
             build,
             transfers,
             geometry: None,
+            streets: None,
             stops_by_id,
             stops_by_qualified_id,
             trips_by_public_id,
@@ -184,6 +187,124 @@ impl TransportNetwork {
                 .map_err(|error| PyValueError::new_err(error.to_string()))?,
         );
         Ok(())
+    }
+
+    /// Install the street network for query-time access/egress searches.
+    ///
+    /// Parameters
+    /// ----------
+    /// vertex_count : int
+    ///     Number of street vertices; edges reference vertices as
+    ///     indices below this count.
+    /// edges : list of (int, int, float)
+    ///     ``(from, to, meters)`` per walking edge (undirected), with
+    ///     the edge's cost length in meters.
+    /// coordinate_offsets : list of int
+    ///     Offsets into the coordinate arrays, one per edge plus a tail:
+    ///     edge ``i``'s geometry runs from its ``from`` vertex through
+    ///     coordinates ``coordinate_offsets[i]`` up to
+    ///     ``coordinate_offsets[i + 1]``.
+    /// longitudes, latitudes : list of float
+    ///     The flattened edge geometries, in EPSG:4326.
+    /// stop_links : list of (str, int, float, float)
+    ///     ``(stop_id, edge, fraction, connector_meters)`` snap records
+    ///     saying how each stop enters the street graph, with stop
+    ///     identifiers as in ``route_between_stops``.
+    ///     ``cafein.streets.walking_streets`` produces this payload.
+    fn set_street_network(
+        &mut self,
+        vertex_count: u32,
+        edges: Vec<(u32, u32, f64)>,
+        coordinate_offsets: Vec<u32>,
+        longitudes: Vec<f64>,
+        latitudes: Vec<f64>,
+        stop_links: Vec<(String, u32, f64, f64)>,
+    ) -> PyResult<()> {
+        let mut links = Vec::with_capacity(stop_links.len());
+        for (stop_id, edge, fraction, connector) in &stop_links {
+            links.push(StopLink {
+                stop: self.resolve_stop(stop_id)?,
+                edge: *edge,
+                fraction: *fraction,
+                connector: *connector,
+            });
+        }
+        self.streets = Some(
+            StreetNetwork::new(
+                vertex_count,
+                self.build.timetable.stop_count(),
+                &edges,
+                &coordinate_offsets,
+                &longitudes,
+                &latitudes,
+                links,
+            )
+            .map_err(|error| PyValueError::new_err(error.to_string()))?,
+        );
+        Ok(())
+    }
+
+    /// Walking times to every transit stop reachable from a coordinate.
+    ///
+    /// Requires an installed street network. Walking is undirected, so
+    /// the same search serves access from an origin and egress to a
+    /// destination.
+    ///
+    /// Parameters
+    /// ----------
+    /// lat, lon : float
+    ///     The coordinate, in EPSG:4326.
+    /// walking_speed_kmph : float (optional, default: 3.6)
+    ///     Walking speed in km/h, on the network and on the connectors.
+    /// max_walking_time : float (optional, default: 600)
+    ///     Walking-time cutoff in seconds.
+    /// max_snap_distance : float (optional, default: 100)
+    ///     Maximum straight-line distance in meters from the coordinate
+    ///     to the walking network; a coordinate farther away raises
+    ///     ``ValueError``.
+    ///
+    /// Returns
+    /// -------
+    /// dict
+    ///     Walking time in seconds to each reachable stop, keyed by
+    ///     stop_id; stops beyond the cutoff are absent.
+    #[pyo3(signature = (lat, lon, walking_speed_kmph = 3.6, max_walking_time = 600.0, max_snap_distance = 100.0))]
+    fn access_stops(
+        &self,
+        py: Python<'_>,
+        lat: f64,
+        lon: f64,
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+    ) -> PyResult<Py<PyDict>> {
+        let Some(streets) = &self.streets else {
+            return Err(PyValueError::new_err(
+                "no street network installed; build the network with an OSM extract",
+            ));
+        };
+        if walking_speed_kmph <= 0.0 {
+            return Err(PyValueError::new_err("walking_speed_kmph must be positive"));
+        }
+        let reached = streets
+            .access_stops(
+                lat,
+                lon,
+                walking_speed_kmph / 3.6,
+                max_walking_time,
+                max_snap_distance,
+            )
+            .ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "({lat}, {lon}) is farther than {max_snap_distance} m \
+                     from the walking network"
+                ))
+            })?;
+        let result = PyDict::new(py);
+        for (stop, seconds) in reached {
+            result.set_item(self.public_stop_id(stop), seconds)?;
+        }
+        Ok(result.unbind())
     }
 
     /// The public identifiers of the network's routable trips.
