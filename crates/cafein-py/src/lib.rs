@@ -7,10 +7,11 @@ use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+use cafein_core::geometry::{DistanceProvenance, TripGeometry};
 use cafein_core::journey::{Journey, Leg};
 use cafein_core::raptor::Raptor;
 use cafein_core::router::{Request, TransitRouter};
-use cafein_core::timetable::StopIdx;
+use cafein_core::timetable::{StopIdx, TripIdx};
 use cafein_core::transfers::Transfers;
 use cafein_gtfs::{build_timetable, Feed, TimetableBuild};
 
@@ -20,8 +21,10 @@ struct TransportNetwork {
     feed: Feed,
     build: TimetableBuild,
     transfers: Transfers,
+    geometry: Option<TripGeometry>,
     stops_by_id: HashMap<String, StopLookup>,
     stops_by_qualified_id: HashMap<String, StopIdx>,
+    trips_by_public_id: HashMap<String, TripIdx>,
 }
 
 /// Resolution of a raw GTFS stop_id, which merged feeds can duplicate.
@@ -68,12 +71,25 @@ impl TransportNetwork {
                 .and_modify(|entry| *entry = StopLookup::Ambiguous)
                 .or_insert(StopLookup::Unique(stop_index));
         }
+        let mut trips_by_public_id = HashMap::with_capacity(build.timetable.trip_count() as usize);
+        for index in 0..build.timetable.trip_count() {
+            let trip = TripIdx(index);
+            let source = &feed.trips[build.timetable.trip_source(trip) as usize];
+            let public = if feed.feed_count > 1 {
+                format!("{}:{}", source.feed, source.id)
+            } else {
+                source.id.clone()
+            };
+            trips_by_public_id.insert(public, trip);
+        }
         Ok(TransportNetwork {
             feed,
             build,
             transfers,
+            geometry: None,
             stops_by_id,
             stops_by_qualified_id,
+            trips_by_public_id,
         })
     }
 
@@ -140,14 +156,64 @@ impl TransportNetwork {
         Ok(())
     }
 
+    /// Install per-trip cumulative travel distances.
+    ///
+    /// Parameters
+    /// ----------
+    /// distances : list of (str, list of float, str)
+    ///     ``(trip_id, cumulative_meters, provenance)`` rows with one
+    ///     non-decreasing cumulative distance per stop of the trip, and
+    ///     the provenance tier as one of ``shape_dist``, ``shape_linref``,
+    ///     ``osm_relation``, ``map_matched``, ``crow_fly``. Trip
+    ///     identifiers follow the public convention (feed-qualified when
+    ///     several feeds are merged); rows for trips absent from the
+    ///     timetable — e.g. quarantined ones — are ignored. Every
+    ///     timetable trip must be covered.
+    ///     ``cafein.geometry.trip_distances`` produces such lists.
+    fn set_trip_distances(&mut self, distances: Vec<(String, Vec<f64>, String)>) -> PyResult<()> {
+        let mut entries = Vec::with_capacity(distances.len());
+        for (trip_id, cumulative, provenance) in &distances {
+            let Some(&trip) = self.trips_by_public_id.get(trip_id) else {
+                continue;
+            };
+            let cumulative: Vec<f32> = cumulative.iter().map(|&value| value as f32).collect();
+            entries.push((trip, cumulative, parse_provenance(provenance)?));
+        }
+        self.geometry = Some(
+            TripGeometry::from_trips(&self.build.timetable, entries)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?,
+        );
+        Ok(())
+    }
+
+    /// The public identifiers of the network's routable trips.
+    #[getter]
+    fn trip_ids(&self) -> Vec<String> {
+        self.trips_by_public_id.keys().cloned().collect()
+    }
+
+    /// Number of trips per distance-provenance tier, empty before
+    /// ``set_trip_distances``.
+    #[getter]
+    fn distance_provenance_counts(&self) -> HashMap<&'static str, u32> {
+        let mut counts = HashMap::new();
+        if let Some(geometry) = &self.geometry {
+            for index in 0..self.build.timetable.trip_count() {
+                let name = provenance_name(geometry.provenance(TripIdx(index)));
+                *counts.entry(name).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
     /// Route between two transit stops for a single departure.
     ///
     /// Journeys ride trips and change vehicles at shared stops or over
-    /// the transfers installed with ``set_transfers``. Door-to-door
-    /// access/egress from arbitrary coordinates joins once the query-time
-    /// street search exists; per-leg distance, distance provenance,
-    /// geometry, and emissions join once the geometry preprocessing
-    /// produces them.
+    /// the transfers installed with ``set_transfers``; transit legs
+    /// report their distance and its provenance when trip distances are
+    /// installed. Door-to-door access/egress from arbitrary coordinates
+    /// joins once the query-time street search exists; leg geometries
+    /// and emissions join once the geometry preprocessing produces them.
     ///
     /// Parameters
     /// ----------
@@ -271,14 +337,17 @@ impl TransportNetwork {
                     entry.set_item("to_stop", self.public_stop_id(to_stop))?;
                     entry.set_item("departure", departure)?;
                     entry.set_item("arrival", arrival)?;
+                    entry.set_item("distance", py.None())?;
+                    entry.set_item("distance_provenance", py.None())?;
                 }
                 Leg::Transit {
                     trip,
                     board_stop,
                     alight_stop,
+                    board_position,
+                    alight_position,
                     board_time,
                     alight_time,
-                    ..
                 } => {
                     let source_trip = &self.feed.trips[timetable.trip_source(trip) as usize];
                     let route = &self.feed.routes[source_trip.route as usize];
@@ -290,6 +359,22 @@ impl TransportNetwork {
                     entry.set_item("alight_stop", self.public_stop_id(alight_stop))?;
                     entry.set_item("departure", board_time)?;
                     entry.set_item("arrival", alight_time)?;
+                    match &self.geometry {
+                        Some(geometry) => {
+                            entry.set_item(
+                                "distance",
+                                geometry.leg_distance(trip, board_position, alight_position) as f64,
+                            )?;
+                            entry.set_item(
+                                "distance_provenance",
+                                provenance_name(geometry.provenance(trip)),
+                            )?;
+                        }
+                        None => {
+                            entry.set_item("distance", py.None())?;
+                            entry.set_item("distance_provenance", py.None())?;
+                        }
+                    }
                 }
                 Leg::Transfer {
                     from_stop,
@@ -302,6 +387,8 @@ impl TransportNetwork {
                     entry.set_item("to_stop", self.public_stop_id(to_stop))?;
                     entry.set_item("departure", departure)?;
                     entry.set_item("arrival", arrival)?;
+                    entry.set_item("distance", py.None())?;
+                    entry.set_item("distance_provenance", py.None())?;
                 }
                 Leg::Egress {
                     from_stop,
@@ -312,6 +399,8 @@ impl TransportNetwork {
                     entry.set_item("from_stop", self.public_stop_id(from_stop))?;
                     entry.set_item("departure", departure)?;
                     entry.set_item("arrival", arrival)?;
+                    entry.set_item("distance", py.None())?;
+                    entry.set_item("distance_provenance", py.None())?;
                 }
             }
             legs.append(entry)?;
@@ -343,6 +432,29 @@ fn parse_time(value: &str) -> PyResult<u32> {
 
 fn to_py_error(error: cafein_gtfs::Error) -> PyErr {
     PyValueError::new_err(error.to_string())
+}
+
+fn provenance_name(tier: DistanceProvenance) -> &'static str {
+    match tier {
+        DistanceProvenance::ShapeDist => "shape_dist",
+        DistanceProvenance::ShapeLinRef => "shape_linref",
+        DistanceProvenance::OsmRelation => "osm_relation",
+        DistanceProvenance::MapMatched => "map_matched",
+        DistanceProvenance::CrowFly => "crow_fly",
+    }
+}
+
+fn parse_provenance(value: &str) -> PyResult<DistanceProvenance> {
+    match value {
+        "shape_dist" => Ok(DistanceProvenance::ShapeDist),
+        "shape_linref" => Ok(DistanceProvenance::ShapeLinRef),
+        "osm_relation" => Ok(DistanceProvenance::OsmRelation),
+        "map_matched" => Ok(DistanceProvenance::MapMatched),
+        "crow_fly" => Ok(DistanceProvenance::CrowFly),
+        other => Err(PyValueError::new_err(format!(
+            "unknown distance provenance '{other}'"
+        ))),
+    }
 }
 
 #[pymodule]

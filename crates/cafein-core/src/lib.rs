@@ -3,6 +3,7 @@
 //! This crate holds the timetable data structures and the routing
 //! implementations. It compiles and tests without Python.
 
+pub mod geometry;
 pub mod journey;
 pub mod raptor;
 pub mod router;
