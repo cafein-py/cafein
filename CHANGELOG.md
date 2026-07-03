@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.1.0 — 2026-07-03
+
+The first release: public-transport routing from GTFS and OpenStreetMap
+data with per-leg distances, distance provenance, and carbon emissions —
+no JVM, no Rust toolchain required by users.
+
+- GTFS ingest and network model: zip or directory feeds, multi-feed
+  merging with feed-qualified identifiers, service-calendar resolution,
+  data-quality quarantine with warnings, and a CSR timetable with FIFO
+  pattern splitting (`cafein-gtfs`, `cafein-core`).
+- Routing: RAPTOR earliest-arrival journeys between stops with journey
+  reconstruction (`route_between_stops`), Pareto sets over arrival time
+  and number of rides.
 - One-to-all travel times: `travel_times_from_stop` returns the earliest
   arrival at every reachable stop from one RAPTOR run — the matrix
   primitive — and `scripts/benchmark_vs_r5py.py` benchmarks all-to-all
