@@ -47,7 +47,9 @@ class TransportNetwork:
             Path to an OpenStreetMap PBF extract covering the stops. Its
             walking network is turned into stop-to-stop footpaths (see
             ``cafein.streets.walking_footpaths``) that routing uses as
-            transfers; without it the network has no transfers.
+            transfers, and installed as the street network behind
+            coordinate-based access/egress searches (``access_stops``);
+            without it the network has neither.
         walking_speed_kmph : float (optional, default: 3.6)
             Walking speed in km/h of the footpath precompute.
         max_walking_time : float (optional, default: 600)
@@ -81,15 +83,15 @@ class TransportNetwork:
                 max_walking_time = streets.MAX_WALKING_TIME
             if max_snap_distance is None:
                 max_snap_distance = streets.MAX_SNAP_DISTANCE
-            core.set_transfers(
-                streets.walking_footpaths(
-                    osm_pbf,
-                    core.stops,
-                    walking_speed_kmph=walking_speed_kmph,
-                    max_walking_time=max_walking_time,
-                    max_snap_distance=max_snap_distance,
-                )
+            footpaths, street_network = streets.walking_streets(
+                osm_pbf,
+                core.stops,
+                walking_speed_kmph=walking_speed_kmph,
+                max_walking_time=max_walking_time,
+                max_snap_distance=max_snap_distance,
             )
+            core.set_transfers(footpaths)
+            core.set_street_network(*street_network)
         return cls(core)
 
     @property
@@ -160,6 +162,68 @@ class TransportNetwork:
             produces such lists.
         """
         self._core.set_transfers(footpaths)
+
+    def set_street_network(self, *street_network):
+        """Install the street network for coordinate access/egress.
+
+        Parameters
+        ----------
+        street_network : tuple
+            ``(vertex_count, edges, coordinate_offsets, longitudes,
+            latitudes, stop_links)``, as produced (alongside the
+            footpaths) by ``cafein.streets.walking_streets``.
+        """
+        self._core.set_street_network(*street_network)
+
+    def access_stops(
+        self,
+        lat,
+        lon,
+        *,
+        walking_speed_kmph=None,
+        max_walking_time=None,
+        max_snap_distance=None,
+    ):
+        """Walking times to every transit stop reachable from a coordinate.
+
+        Requires a network built with an OSM extract (``osm_pbf=``).
+        Walking is undirected, so the same search serves access from an
+        origin and egress to a destination.
+
+        Parameters
+        ----------
+        lat, lon : float
+            The coordinate, in EPSG:4326.
+        walking_speed_kmph : float (optional, default: 3.6)
+            Walking speed in km/h, on the network and on the connectors.
+        max_walking_time : float (optional, default: 600)
+            Walking-time cutoff in seconds.
+        max_snap_distance : float (optional, default: 100)
+            Maximum straight-line distance in meters from the coordinate
+            to the walking network; a coordinate farther away raises
+            ``ValueError``.
+
+        Returns
+        -------
+        dict
+            Walking time in seconds to each reachable stop, keyed by
+            stop_id; stops beyond the cutoff are absent.
+        """
+        from cafein import streets
+
+        if walking_speed_kmph is None:
+            walking_speed_kmph = streets.WALKING_SPEED_KMPH
+        if max_walking_time is None:
+            max_walking_time = streets.MAX_WALKING_TIME
+        if max_snap_distance is None:
+            max_snap_distance = streets.MAX_SNAP_DISTANCE
+        return self._core.access_stops(
+            lat,
+            lon,
+            walking_speed_kmph,
+            max_walking_time,
+            max_snap_distance,
+        )
 
     def set_trip_distances(self, distances):
         """Install per-trip cumulative travel distances.

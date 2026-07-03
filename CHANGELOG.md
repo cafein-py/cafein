@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Query-time street access/egress: networks built with an OSM extract
+  now carry the walking street network (a CSR graph with a spatial grid
+  index in the Rust core), and `TransportNetwork.access_stops(lat, lon)`
+  snaps a coordinate onto it and returns walking seconds to every
+  transit stop reachable within a cutoff — the search door-to-door
+  routing builds on.
+
 - Packaging: include the `LICENSE` file in the source distribution.
   maturin records `License-File: LICENSE` in the metadata but omits the
   file from the sdist for a workspace-member manifest, which PyPI

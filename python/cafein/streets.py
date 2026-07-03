@@ -1,16 +1,20 @@
-"""Stop-to-stop walking footpaths from an OpenStreetMap street network.
+"""Walking structures from an OpenStreetMap street network.
 
-The footpath build turns a PBF extract into the transfer edge list the
-routing core consumes: load the pyrosm walking network, snap every stop
-onto its nearest edge (splitting the edge at the snap point), run a
-cutoff-bounded one-to-many Dijkstra from every stop, and transitively
-close the resulting stop-to-stop times — routing relaxes a single transfer
-hop per round, so whenever two footpaths chain, the chained pair must be a
-footpath too. Disconnected walking-network components (islands, clipped
+The build turns a PBF extract into the two walking structures the routing
+core consumes. Stop-to-stop footpaths become the transfer edge list: snap
+every stop onto its nearest edge (splitting the edge at the snap point),
+run a cutoff-bounded one-to-many Dijkstra from every stop, and
+transitively close the resulting stop-to-stop times — routing relaxes a
+single transfer hop per round, so whenever two footpaths chain, the
+chained pair must be a footpath too. The street network itself is handed
+over as flat arrays (edges with their geometry, plus the stops' snap
+links) for the core's query-time access/egress searches from arbitrary
+coordinates. Disconnected walking-network components (islands, clipped
 boundary fragments) stay in the graph; stops snapped onto different
 components simply get no footpath between them.
 """
 
+import math
 import warnings
 
 import geopandas as gpd
@@ -29,6 +33,15 @@ MAX_WALKING_TIME = 600.0
 
 MAX_SNAP_DISTANCE = 100.0
 """Default maximum distance from a stop to the walking network, in meters."""
+
+MAX_FOOTPATH_STOPS = 20_000
+"""Ceiling on snapped stops in the footpath build.
+
+The stop-to-stop search and its transitive closure materialize dense
+stop-by-stop matrices, so memory grows quadratically with the snapped
+stop count; the ceiling keeps the matrices within a few gigabytes.
+Larger stop sets are rejected rather than silently exhausting memory —
+build from smaller extracts instead."""
 
 _DIJKSTRA_CHUNK = 256
 
@@ -78,6 +91,41 @@ def walking_footpaths(
     )
 
 
+def walking_streets(
+    osm_pbf,
+    stops,
+    *,
+    walking_speed_kmph=WALKING_SPEED_KMPH,
+    max_walking_time=MAX_WALKING_TIME,
+    max_snap_distance=MAX_SNAP_DISTANCE,
+):
+    """Both walking structures of an OSM extract, from one load.
+
+    Parameters are as in `walking_footpaths`.
+
+    Returns
+    -------
+    (footpaths, street_network)
+        ``footpaths`` as from `walking_footpaths`, and
+        ``street_network`` as the argument tuple of
+        ``TransportNetwork.set_street_network``: ``(vertex_count, edges,
+        coordinate_offsets, longitudes, latitudes, stop_links)``, with
+        edges as ``(from, to, meters)`` vertex-index triples, geometry
+        coordinates in EPSG:4326 flattened over the offsets, and stop
+        links as ``(stop_id, edge, fraction, connector_meters)`` snap
+        records.
+    """
+    nodes, edges = _walking_network(osm_pbf)
+    return _network_streets(
+        stops,
+        nodes,
+        edges,
+        walking_speed_kmph=walking_speed_kmph,
+        max_walking_time=max_walking_time,
+        max_snap_distance=max_snap_distance,
+    )
+
+
 def _walking_network(osm_pbf):
     """The walking network of a PBF extract, as pyrosm (nodes, edges)."""
     network = pyrosm.OSM(str(osm_pbf)).get_network(network_type="walking", nodes=True)
@@ -96,21 +144,56 @@ def _network_footpaths(
     max_snap_distance,
 ):
     """The footpath build on an already loaded street network."""
-    if walking_speed_kmph <= 0:
-        raise ValueError("walking_speed_kmph must be positive")
+    footpaths, _ = _network_streets(
+        stops,
+        nodes,
+        edges,
+        walking_speed_kmph=walking_speed_kmph,
+        max_walking_time=max_walking_time,
+        max_snap_distance=max_snap_distance,
+    )
+    return footpaths
+
+
+def _network_streets(
+    stops,
+    nodes,
+    edges,
+    *,
+    walking_speed_kmph,
+    max_walking_time,
+    max_snap_distance,
+):
+    """Footpaths and the street-network payload on a loaded network."""
+    if not (math.isfinite(walking_speed_kmph) and walking_speed_kmph > 0):
+        raise ValueError("walking_speed_kmph must be a positive, finite number")
+    if not (math.isfinite(max_walking_time) and max_walking_time >= 0):
+        raise ValueError("max_walking_time must be a non-negative, finite number")
+    if not (math.isfinite(max_snap_distance) and max_snap_distance >= 0):
+        raise ValueError("max_snap_distance must be a non-negative, finite number")
     speed = walking_speed_kmph / 3.6  # m/s
     nodes = nodes.reset_index(drop=True)
     edges = edges.reset_index(drop=True)
     stop_points = _stop_points(stops)
-    if stop_points.empty or edges.empty:
-        return []
-    snapped = _snap_to_edges(stop_points, edges, max_snap_distance)
-    if snapped.empty:
-        return []
-    graph, stop_vertices = _routing_graph(nodes, edges, snapped, speed)
-    durations = _stop_durations(graph, stop_vertices, max_walking_time)
-    closed = _transitive_closure(durations)
-    return _edge_list(snapped["stop_id"].to_numpy(), closed)
+    if edges.empty:
+        return [], (0, [], [0], [], [], [])
+    if stop_points.empty:
+        snapped = pd.DataFrame(columns=["stop_id", "edge", "fraction", "snap_distance"])
+    else:
+        snapped = _snap_to_edges(stop_points, edges, max_snap_distance)
+    if len(snapped) > MAX_FOOTPATH_STOPS:
+        raise ValueError(
+            f"{len(snapped)} snapped stops exceed the dense footpath "
+            f"build's ceiling of {MAX_FOOTPATH_STOPS}; build from smaller "
+            "extracts"
+        )
+    footpaths = []
+    if not snapped.empty:
+        graph, stop_vertices = _routing_graph(nodes, edges, snapped, speed)
+        durations = _stop_durations(graph, stop_vertices, max_walking_time)
+        closed = _transitive_closure(durations)
+        footpaths = _edge_list(snapped["stop_id"].to_numpy(), closed)
+    return footpaths, _street_payload(nodes, edges, snapped)
 
 
 def _stop_points(stops):
@@ -166,6 +249,43 @@ def _snap_to_edges(stop_points, edges, max_snap_distance):
     )
 
 
+def _vertex_endpoints(nodes, edges):
+    """Each edge's endpoints as vertex indices (node row positions)."""
+    node_index = pd.Series(np.arange(len(nodes)), index=nodes["id"].to_numpy())
+    u = node_index[edges["u"].to_numpy()].to_numpy()
+    v = node_index[edges["v"].to_numpy()].to_numpy()
+    return u, v
+
+
+def _street_payload(nodes, edges, snapped):
+    """The street network as the flat arrays the routing core consumes.
+
+    Returns the argument tuple of ``TransportNetwork.set_street_network``:
+    ``(vertex_count, edges, coordinate_offsets, longitudes, latitudes,
+    stop_links)``.
+    """
+    u, v = _vertex_endpoints(nodes, edges)
+    lengths = edges["length"].to_numpy(dtype=float)
+    geometry = edges.geometry.to_numpy()
+    offsets = np.concatenate([[0], np.cumsum(shapely.get_num_coordinates(geometry))])
+    coordinates = shapely.get_coordinates(geometry)
+    return (
+        len(nodes),
+        list(zip(u.tolist(), v.tolist(), lengths.tolist())),
+        offsets.tolist(),
+        coordinates[:, 0].tolist(),
+        coordinates[:, 1].tolist(),
+        list(
+            zip(
+                snapped["stop_id"].tolist(),
+                snapped["edge"].tolist(),
+                snapped["fraction"].tolist(),
+                snapped["snap_distance"].tolist(),
+            )
+        ),
+    )
+
+
 def _routing_graph(nodes, edges, snapped, speed):
     """The walking graph with snap points spliced in, plus stop vertices.
 
@@ -176,9 +296,7 @@ def _routing_graph(nodes, edges, snapped, speed):
     reuse the endpoint vertex. Returns the graph and the stop vertices in
     `snapped` row order.
     """
-    node_index = pd.Series(np.arange(len(nodes)), index=nodes["id"].to_numpy())
-    u = node_index[edges["u"].to_numpy()].to_numpy()
-    v = node_index[edges["v"].to_numpy()].to_numpy()
+    u, v = _vertex_endpoints(nodes, edges)
     seconds = edges["length"].to_numpy() / speed
 
     splits = (
@@ -225,8 +343,10 @@ def _routing_graph(nodes, edges, snapped, speed):
         ]
     )
 
-    # Walking is undirected, so orient each edge low→high and keep the
-    # cheapest of any parallel edges (duplicate COO entries would sum).
+    # Walking is undirected, so orient each edge low→high, keep the
+    # cheapest of any parallel edges (duplicate COO entries would sum),
+    # and store both directions explicitly so the graph is symmetric
+    # without relying on how one-sided entries are interpreted.
     unique = (
         pd.DataFrame(
             {
@@ -240,7 +360,14 @@ def _routing_graph(nodes, edges, snapped, speed):
     )
     size = len(nodes) + len(splits) + len(snapped)
     graph = sparse.coo_matrix(
-        (unique["weight"], (unique["a"], unique["b"])), shape=(size, size)
+        (
+            np.concatenate([unique["weight"], unique["weight"]]),
+            (
+                np.concatenate([unique["a"], unique["b"]]),
+                np.concatenate([unique["b"], unique["a"]]),
+            ),
+        ),
+        shape=(size, size),
     ).tocsr()
     return graph, stop_vertices
 
