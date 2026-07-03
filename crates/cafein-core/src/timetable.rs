@@ -62,6 +62,9 @@ pub struct Timetable {
     trip_patterns: Vec<PatternIdx>,
     /// Caller-defined identifier carried per trip (e.g. a feed trip index).
     trip_sources: Vec<u32>,
+    /// Caller-defined service identifier carried per trip, for filtering
+    /// trips by the services active on a query date.
+    trip_services: Vec<u32>,
     /// Caller-defined identifier carried per pattern (e.g. a feed route index).
     pattern_routes: Vec<u32>,
     /// CSR offsets into `stop_patterns`, one entry per stop plus a tail.
@@ -122,6 +125,11 @@ impl Timetable {
         self.trip_sources[trip.0 as usize]
     }
 
+    /// The caller-defined service identifier of a trip.
+    pub fn trip_service(&self, trip: TripIdx) -> u32 {
+        self.trip_services[trip.0 as usize]
+    }
+
     /// The caller-defined route identifier of a pattern.
     pub fn pattern_route(&self, pattern: PatternIdx) -> u32 {
         self.pattern_routes[pattern.0 as usize]
@@ -146,6 +154,7 @@ pub struct TimetableBuilder {
 struct BuilderTrip {
     pattern: PatternIdx,
     source: u32,
+    service: u32,
     stop_times: Vec<StopTime>,
 }
 
@@ -234,7 +243,8 @@ impl TimetableBuilder {
     }
 
     /// Adds a trip to a registered pattern with one stop time per pattern
-    /// stop and a caller-defined source identifier.
+    /// stop, a caller-defined source identifier, and a caller-defined
+    /// service identifier.
     ///
     /// Stop times must move forwards: at every stop `arrival <= departure`,
     /// and every arrival must be at or after the previous stop's departure.
@@ -243,6 +253,7 @@ impl TimetableBuilder {
         pattern: PatternIdx,
         stop_times: Vec<StopTime>,
         source: u32,
+        service: u32,
     ) -> Result<(), TimetableError> {
         let pattern_index = pattern.0 as usize;
         if pattern_index >= self.pattern_routes.len() {
@@ -268,6 +279,7 @@ impl TimetableBuilder {
         self.trips.push(BuilderTrip {
             pattern,
             source,
+            service,
             stop_times,
         });
         Ok(())
@@ -349,6 +361,7 @@ impl TimetableBuilder {
         let mut stop_times = Vec::with_capacity(total_times as usize);
         let mut trip_patterns = Vec::with_capacity(sorted_trips.len());
         let mut trip_sources = Vec::with_capacity(sorted_trips.len());
+        let mut trip_services = Vec::with_capacity(sorted_trips.len());
         for pattern in 0..pattern_count {
             let start = pattern_trips_offsets[pattern];
             let end = pattern_trips_offsets[pattern + 1];
@@ -356,6 +369,7 @@ impl TimetableBuilder {
                 stop_times.extend_from_slice(&trip.stop_times);
                 trip_patterns.push(PatternIdx(pattern as u32));
                 trip_sources.push(trip.source);
+                trip_services.push(trip.service);
             }
         }
 
@@ -396,6 +410,7 @@ impl TimetableBuilder {
             stop_times,
             trip_patterns,
             trip_sources,
+            trip_services,
             pattern_routes,
             stop_patterns_offsets,
             stop_patterns,
@@ -438,13 +453,18 @@ mod tests {
         let ba = builder.add_pattern(&[StopIdx(2), StopIdx(0)], 11).unwrap();
         // Added out of departure order on purpose.
         builder
-            .add_trip(ab, vec![time(600, 600), time(660, 665), time(720, 720)], 1)
+            .add_trip(
+                ab,
+                vec![time(600, 600), time(660, 665), time(720, 720)],
+                1,
+                21,
+            )
             .unwrap();
         builder
-            .add_trip(ab, vec![time(0, 0), time(60, 65), time(120, 120)], 0)
+            .add_trip(ab, vec![time(0, 0), time(60, 65), time(120, 120)], 0, 20)
             .unwrap();
         builder
-            .add_trip(ba, vec![time(30, 30), time(90, 90)], 2)
+            .add_trip(ba, vec![time(30, 30), time(90, 90)], 2, 22)
             .unwrap();
         builder.finish()
     }
@@ -467,6 +487,8 @@ mod tests {
         assert_eq!(timetable.trip_source(TripIdx(0)), 0);
         assert_eq!(timetable.trip_source(TripIdx(1)), 1);
         assert_eq!(timetable.trip_stop_times(TripIdx(1))[1], time(660, 665));
+        assert_eq!(timetable.trip_service(TripIdx(0)), 20);
+        assert_eq!(timetable.trip_service(TripIdx(1)), 21);
         assert_eq!(timetable.pattern_route(ab), 10);
     }
 
@@ -502,11 +524,11 @@ mod tests {
         );
         let pattern = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
         assert_eq!(
-            builder.add_trip(PatternIdx(9), vec![], 7),
+            builder.add_trip(PatternIdx(9), vec![], 7, 0),
             Err(TimetableError::UnknownPattern { pattern: 9 })
         );
         assert_eq!(
-            builder.add_trip(pattern, vec![time(0, 0)], 7),
+            builder.add_trip(pattern, vec![time(0, 0)], 7, 0),
             Err(TimetableError::StopTimeCountMismatch {
                 source: 7,
                 stop_times: 1,
@@ -521,7 +543,7 @@ mod tests {
         let pattern = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
         // Departure before arrival at the same stop.
         assert_eq!(
-            builder.add_trip(pattern, vec![time(10, 5), time(20, 20)], 7),
+            builder.add_trip(pattern, vec![time(10, 5), time(20, 20)], 7, 0),
             Err(TimetableError::NonIncreasingStopTimes {
                 source: 7,
                 position: 0
@@ -529,7 +551,7 @@ mod tests {
         );
         // Arrival before the previous stop's departure.
         assert_eq!(
-            builder.add_trip(pattern, vec![time(0, 30), time(20, 40)], 8),
+            builder.add_trip(pattern, vec![time(0, 30), time(20, 40)], 8, 0),
             Err(TimetableError::NonIncreasingStopTimes {
                 source: 8,
                 position: 1
@@ -542,15 +564,15 @@ mod tests {
         let mut builder = TimetableBuilder::new(2);
         let pattern = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 5).unwrap();
         builder
-            .add_trip(pattern, vec![time(0, 0), time(100, 100)], 0)
+            .add_trip(pattern, vec![time(0, 0), time(100, 100)], 0, 0)
             .unwrap();
         // Departs later than trip 0 but arrives earlier: overtakes it.
         builder
-            .add_trip(pattern, vec![time(10, 10), time(50, 50)], 1)
+            .add_trip(pattern, vec![time(10, 10), time(50, 50)], 1, 0)
             .unwrap();
         // Follows trip 0 at both stops.
         builder
-            .add_trip(pattern, vec![time(20, 20), time(120, 120)], 2)
+            .add_trip(pattern, vec![time(20, 20), time(120, 120)], 2, 0)
             .unwrap();
         let timetable = builder.finish();
 

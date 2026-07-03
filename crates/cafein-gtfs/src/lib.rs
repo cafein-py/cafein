@@ -5,13 +5,17 @@
 //! identifiers from different agencies cannot collide.
 
 mod model;
+mod qa;
 mod read;
+mod service;
 mod timetable;
 
 pub use model::{
     Agency, Calendar, CalendarDate, Exception, Feed, FeedIndex, FeedInfo, Route, RouteIndex,
     RouteType, Stop, StopIndex, StopTime, Trip,
 };
+pub use qa::{validate_feed, QaFinding};
+pub use service::{ServiceCalendar, ServiceIndex};
 pub use timetable::{build_timetable, QuarantinedTrip, TimetableBuild};
 
 /// Errors raised while reading or merging GTFS feeds.
