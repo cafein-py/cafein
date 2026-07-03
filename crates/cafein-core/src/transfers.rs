@@ -34,6 +34,10 @@ impl Transfers {
     }
 
     /// Builds the CSR structure from `(from, to, duration, meters)` edges.
+    ///
+    /// Duplicate `(from, to)` pairs keep one edge — the fastest, and the
+    /// shortest on equal durations — so the meters reported for a
+    /// relaxed transfer always belong to the edge routing used.
     pub fn from_edges(
         stop_count: u32,
         edges: &[(StopIdx, StopIdx, u32, f64)],
@@ -48,6 +52,14 @@ impl Transfers {
                 }
             }
         }
+        let mut edges = edges.to_vec();
+        edges.sort_by(|a, b| {
+            (a.0, a.1, a.2)
+                .cmp(&(b.0, b.1, b.2))
+                .then(a.3.total_cmp(&b.3))
+        });
+        edges.dedup_by_key(|&mut (from, to, _, _)| (from, to));
+        let edges = &edges[..];
         let mut offsets = vec![0u32; stop_count as usize + 1];
         for (from, _, _, _) in edges {
             offsets[from.0 as usize + 1] += 1;
@@ -124,6 +136,29 @@ mod tests {
         );
         assert_eq!(transfers.from_stop(StopIdx(1)), &[]);
         assert_eq!(transfers.from_stop(StopIdx(2)).len(), 1);
+    }
+
+    #[test]
+    fn keeps_one_edge_per_stop_pair() {
+        // The fastest duplicate wins; on equal durations, the shortest.
+        let transfers = Transfers::from_edges(
+            2,
+            &[
+                (StopIdx(0), StopIdx(1), 60, 59.0),
+                (StopIdx(0), StopIdx(1), 45, 44.0),
+                (StopIdx(0), StopIdx(1), 45, 43.5),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            transfers.from_stop(StopIdx(0)),
+            &[Transfer {
+                to: StopIdx(1),
+                duration: 45,
+                meters: 43.5,
+            }]
+        );
+        assert_eq!(transfers.edge_count(), 1);
     }
 
     #[test]

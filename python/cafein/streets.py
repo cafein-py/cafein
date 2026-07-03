@@ -425,6 +425,11 @@ def _edge_list(stop_ids, durations, speed):
     np.fill_diagonal(finite, False)
     i, j = np.nonzero(finite)
     seconds = np.ceil(durations[i, j] - 1e-6).astype(np.int64)
+    if len(seconds) and seconds.max() > 4_294_967_295:
+        raise ValueError(
+            "footpath durations exceed the routing core's 32-bit second "
+            "range; check the walking network and speed"
+        )
     meters = durations[i, j] * speed
     return list(
         zip(

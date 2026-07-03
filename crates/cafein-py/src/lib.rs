@@ -804,14 +804,13 @@ impl TransportNetwork {
                     departure,
                     arrival,
                 } => {
-                    // The relaxation takes the fastest transfer between a
-                    // stop pair, so its meters are the leg's distance.
+                    // Transfers are deduplicated per stop pair, so the
+                    // one edge found is the one routing relaxed.
                     let meters = self
                         .transfers
                         .from_stop(from_stop)
                         .iter()
-                        .filter(|transfer| transfer.to == to_stop)
-                        .min_by_key(|transfer| transfer.duration)
+                        .find(|transfer| transfer.to == to_stop)
                         .map(|transfer| transfer.meters);
                     entry.set_item("type", "transfer")?;
                     entry.set_item("from_stop", self.public_stop_id(from_stop))?;

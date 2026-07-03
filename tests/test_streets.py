@@ -175,6 +175,12 @@ def test_durations_round_up_conservatively():
     assert meters[("b", "a")] == pytest.approx(12.5, rel=1e-6)
 
 
+def test_durations_beyond_the_time_range_are_rejected():
+    durations = np.array([[0.0, 5e9], [5e9, 0.0]])
+    with pytest.raises(ValueError, match="32-bit second range"):
+        streets._edge_list(np.array(["a", "b"], dtype=object), durations, 1.0)
+
+
 def test_out_of_range_build_options_are_rejected():
     stops = [stop("s1", 100, 0), stop("s2", 300, 0)]
     for options in [
