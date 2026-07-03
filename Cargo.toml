@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/cafein-core",
     "crates/cafein-gtfs",
-    "crates/cafein-geom",
     "crates/cafein-py",
 ]
 
