@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- One-to-all travel times: `travel_times_from_stop` returns the earliest
+  arrival at every reachable stop from one RAPTOR run — the matrix
+  primitive — and `scripts/benchmark_vs_r5py.py` benchmarks all-to-all
+  stop-to-stop matrices against r5py (speed and peak memory).
+
 - Emissions: `cafein.emissions` computes per-leg and per-journey CO₂e
   from the installed distances through a most-specific-wins factor
   ladder (trip > route > agency + mode > mode > global default), with

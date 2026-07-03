@@ -53,6 +53,28 @@ impl TransitRouter for Raptor {
 }
 
 impl Raptor {
+    /// Earliest arrival at every stop for a single departure.
+    ///
+    /// One run serves all destinations — the matrix primitive: matrices
+    /// are computed origin by origin, never per OD pair. The request's
+    /// egress list is not consulted; unreachable stops are `None`.
+    pub fn one_to_all(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        request: &Request,
+    ) -> Vec<Option<u32>> {
+        let mut search = Search::new(timetable, transfers, request);
+        search.run(request.departure);
+        search
+            .best
+            .last()
+            .expect("search always has a round")
+            .iter()
+            .map(|&arrival| (arrival != UNREACHED).then_some(arrival))
+            .collect()
+    }
+
     /// Routes over a departure window: the Pareto set of journeys over
     /// (departure, arrival, rides) for departures within
     /// `[request.departure, request.departure + window)`.
@@ -730,6 +752,25 @@ mod tests {
         assert_eq!(journeys.len(), 1);
         assert_eq!(journeys[0].arrival, 250);
         assert_eq!(journeys[0].rides(), 2);
+    }
+
+    #[test]
+    fn one_to_all_reports_earliest_arrivals_everywhere() {
+        let (timetable, transfers) = network();
+        let arrivals =
+            Raptor.one_to_all(&timetable, &transfers, &request(StopIdx(0), StopIdx(0), 0));
+        // Origin at the departure time; ride A to 1 and 2; B onward to 3;
+        // the footpath reaches 4.
+        assert_eq!(arrivals[0], Some(0));
+        assert_eq!(arrivals[1], Some(200));
+        assert_eq!(arrivals[2], Some(300));
+        assert_eq!(arrivals[3], Some(400));
+        assert_eq!(arrivals[4], Some(350));
+        // Departing after the last useful trips, nothing is reachable
+        // beyond the origin itself.
+        let late = Raptor.one_to_all(&timetable, &transfers, &request(StopIdx(3), StopIdx(0), 0));
+        assert_eq!(late[3], Some(0));
+        assert_eq!(late[0], None);
     }
 
     #[test]

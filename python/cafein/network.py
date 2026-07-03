@@ -225,3 +225,33 @@ class TransportNetwork:
         return self._core.route_between_stops(
             from_stop, to_stop, date, departure, max_transfers, window
         )
+
+    def travel_times_from_stop(self, from_stop, date, departure, max_transfers=4):
+        """Earliest arrival at every reachable stop for a single departure.
+
+        One RAPTOR run serves all destinations, so travel-time matrices
+        are assembled origin by origin from this method — never per OD
+        pair.
+
+        Parameters
+        ----------
+        from_stop : str
+            GTFS stop_id of the origin stop; ``<feed_index>:<stop_id>``
+            when the id occurs in several merged feeds.
+        date : str
+            Service date as ``YYYY-MM-DD``.
+        departure : str
+            Departure time at the origin as ``HH:MM:SS``.
+        max_transfers : int (optional, default: 4)
+            Maximum number of transfers between rides.
+
+        Returns
+        -------
+        dict
+            Travel time in seconds to every reachable stop, keyed by
+            stop_id; the origin maps to 0 and unreachable stops are
+            absent.
+        """
+        return self._core.travel_times_from_stop(
+            from_stop, date, departure, max_transfers
+        )
