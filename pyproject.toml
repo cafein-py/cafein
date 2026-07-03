@@ -51,6 +51,10 @@ Repository = "https://github.com/cafein-py/cafein"
 manifest-path = "crates/cafein-py/Cargo.toml"
 python-source = "python"
 module-name = "cafein._cafein"
+# maturin records `License-File: LICENSE` in the metadata but omits the
+# file from the sdist when the manifest is a workspace member; include it
+# explicitly so the sdist validates on upload.
+include = [{ path = "LICENSE", format = "sdist" }]
 
 [tool.black]
 include = '(python/cafein|tests)/.*\.py$'
