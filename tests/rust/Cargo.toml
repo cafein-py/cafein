@@ -1,0 +1,30 @@
+[package]
+name = "cafein-integration-tests"
+description = "Integration tests for the cafein crates"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dev-dependencies]
+cafein-core.workspace = true
+cafein-gtfs.workspace = true
+chrono.workspace = true
+
+[[test]]
+name = "helsinki_feed"
+path = "helsinki_feed.rs"
+
+[[test]]
+name = "helsinki_timetable"
+path = "helsinki_timetable.rs"
+
+[[test]]
+name = "helsinki_services"
+path = "helsinki_services.rs"
+
+[[test]]
+name = "helsinki_routing"
+path = "helsinki_routing.rs"

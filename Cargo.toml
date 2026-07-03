@@ -4,6 +4,7 @@ members = [
     "crates/cafein-core",
     "crates/cafein-gtfs",
     "crates/cafein-py",
+    "tests/rust",
 ]
 
 [workspace.package]
@@ -15,6 +16,7 @@ authors = ["Henrikki Tenkanen"]
 
 [workspace.dependencies]
 cafein-core = { path = "crates/cafein-core", version = "0.0.1" }
+cafein-gtfs = { path = "crates/cafein-gtfs", version = "0.0.1" }
 chrono = { version = "0.4", default-features = false }
 gtfs-structures = { version = "0.48", default-features = false }
 

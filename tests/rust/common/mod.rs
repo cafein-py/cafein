@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 pub fn helsinki_gtfs_path() -> Option<PathBuf> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/helsinki_gtfs.zip");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../data/helsinki_gtfs.zip");
     if path.exists() {
         return Some(path);
     }
