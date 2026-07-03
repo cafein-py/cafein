@@ -166,16 +166,27 @@ impl TransportNetwork {
     ///
     /// Parameters
     /// ----------
-    /// footpaths : list of (str, str, int)
-    ///     ``(from_stop, to_stop, seconds)`` walking edges, with stop
-    ///     identifiers as in ``route_between_stops``. The edge list must
-    ///     be transitively closed — routing relaxes a single transfer hop
+    /// footpaths : list of (str, str, int, float)
+    ///     ``(from_stop, to_stop, seconds, meters)`` walking edges, with
+    ///     stop identifiers as in ``route_between_stops`` and the walked
+    ///     street-path length in meters. The edge list must be
+    ///     transitively closed — routing relaxes a single transfer hop
     ///     per round; ``cafein.streets.walking_footpaths`` produces such
     ///     lists.
-    fn set_transfers(&mut self, footpaths: Vec<(String, String, u32)>) -> PyResult<()> {
+    fn set_transfers(&mut self, footpaths: Vec<(String, String, u32, f64)>) -> PyResult<()> {
         let mut edges = Vec::with_capacity(footpaths.len());
-        for (from, to, duration) in &footpaths {
-            edges.push((self.resolve_stop(from)?, self.resolve_stop(to)?, *duration));
+        for (index, (from, to, duration, meters)) in footpaths.iter().enumerate() {
+            if !meters.is_finite() || *meters < 0.0 {
+                return Err(PyValueError::new_err(format!(
+                    "footpath {index} has a negative or non-finite length"
+                )));
+            }
+            edges.push((
+                self.resolve_stop(from)?,
+                self.resolve_stop(to)?,
+                *duration,
+                *meters,
+            ));
         }
         self.transfers = Transfers::from_edges(self.build.timetable.stop_count(), &edges)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -793,12 +804,21 @@ impl TransportNetwork {
                     departure,
                     arrival,
                 } => {
+                    // The relaxation takes the fastest transfer between a
+                    // stop pair, so its meters are the leg's distance.
+                    let meters = self
+                        .transfers
+                        .from_stop(from_stop)
+                        .iter()
+                        .filter(|transfer| transfer.to == to_stop)
+                        .min_by_key(|transfer| transfer.duration)
+                        .map(|transfer| transfer.meters);
                     entry.set_item("type", "transfer")?;
                     entry.set_item("from_stop", self.public_stop_id(from_stop))?;
                     entry.set_item("to_stop", self.public_stop_id(to_stop))?;
                     entry.set_item("departure", departure)?;
                     entry.set_item("arrival", arrival)?;
-                    entry.set_item("distance", py.None())?;
+                    entry.set_item("distance", meters)?;
                     entry.set_item("distance_provenance", py.None())?;
                 }
                 Leg::Egress {

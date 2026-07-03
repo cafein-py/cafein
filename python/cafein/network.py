@@ -168,11 +168,11 @@ class TransportNetwork:
 
         Parameters
         ----------
-        footpaths : list of (str, str, int)
-            ``(from_stop, to_stop, seconds)`` walking edges. The list
-            must be transitively closed — routing relaxes a single
-            transfer hop per round; ``cafein.streets.walking_footpaths``
-            produces such lists.
+        footpaths : list of (str, str, int, float)
+            ``(from_stop, to_stop, seconds, meters)`` walking edges.
+            The list must be transitively closed — routing relaxes a
+            single transfer hop per round;
+            ``cafein.streets.walking_footpaths`` produces such lists.
         """
         self._core.set_transfers(footpaths)
 

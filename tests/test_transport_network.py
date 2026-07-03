@@ -181,6 +181,8 @@ def test_street_stops_are_reachable_only_over_footpaths(
     assert transfer["from_stop"] == "1040602"
     assert transfer["to_stop"] == "1040280"
     assert transfer["arrival"] - transfer["departure"] == 20
+    # Transfer legs carry the footpath's exact meters (1 m/s walking).
+    assert 19 <= transfer["distance"] <= 20
     assert egress["type"] == "egress"
 
 
@@ -517,7 +519,7 @@ def test_set_transfers_routes_over_footpaths(tmp_path):
     with pytest.warns(UserWarning):
         network = TransportNetwork.from_gtfs([str(feed)])
     assert network.transfer_count == 0
-    network.set_transfers([("S2", "0:S1", 120), ("0:S1", "S2", 120)])
+    network.set_transfers([("S2", "0:S1", 120, 118.5), ("0:S1", "S2", 120, 118.5)])
     assert network.transfer_count == 2
 
     # Ride to S2 (arrives 08:10), walk the 120-second footpath.
@@ -529,6 +531,7 @@ def test_set_transfers_routes_over_footpaths(tmp_path):
     transfer = first["legs"][2]
     assert transfer["from_stop"] == "S2"
     assert transfer["to_stop"] == "0:S1"
+    assert transfer["distance"] == 118.5
 
 
 def test_set_transfers_rejects_unknown_stops(tmp_path):
@@ -536,7 +539,9 @@ def test_set_transfers_rejects_unknown_stops(tmp_path):
     with pytest.warns(UserWarning):
         network = TransportNetwork.from_gtfs([str(feed)])
     with pytest.raises(KeyError, match="no-such-stop"):
-        network.set_transfers([("no-such-stop", "S2", 60)])
+        network.set_transfers([("no-such-stop", "S2", 60, 60.0)])
+    with pytest.raises(ValueError, match="non-finite"):
+        network.set_transfers([("S1", "S2", 60, float("nan"))])
 
 
 def test_trip_distances_default_to_the_ladder(tmp_path):

@@ -3,11 +3,13 @@
 use crate::timetable::{StopIdx, TimetableError};
 
 /// A walkable connection to another stop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Transfer {
     pub to: StopIdx,
     /// Walking time in seconds.
     pub duration: u32,
+    /// Walked distance in meters.
+    pub meters: f64,
 }
 
 /// All stop-to-stop transfers of a network.
@@ -15,7 +17,7 @@ pub struct Transfer {
 /// The input edge list must already be transitively closed (the footpath
 /// precompute's responsibility): routing relaxes one transfer hop per
 /// round and does not chain transfers.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct Transfers {
     /// CSR offsets into `edges`, one entry per stop plus a tail.
     offsets: Vec<u32>,
@@ -31,12 +33,12 @@ impl Transfers {
         }
     }
 
-    /// Builds the CSR structure from `(from, to, duration)` edges.
+    /// Builds the CSR structure from `(from, to, duration, meters)` edges.
     pub fn from_edges(
         stop_count: u32,
-        edges: &[(StopIdx, StopIdx, u32)],
+        edges: &[(StopIdx, StopIdx, u32, f64)],
     ) -> Result<Transfers, TimetableError> {
-        for &(from, to, _) in edges {
+        for &(from, to, _, _) in edges {
             for stop in [from, to] {
                 if stop.0 >= stop_count {
                     return Err(TimetableError::StopOutOfRange {
@@ -47,7 +49,7 @@ impl Transfers {
             }
         }
         let mut offsets = vec![0u32; stop_count as usize + 1];
-        for (from, _, _) in edges {
+        for (from, _, _, _) in edges {
             offsets[from.0 as usize + 1] += 1;
         }
         for stop in 0..stop_count as usize {
@@ -56,14 +58,19 @@ impl Transfers {
         let mut sorted = vec![
             Transfer {
                 to: StopIdx(0),
-                duration: 0
+                duration: 0,
+                meters: 0.0,
             };
             edges.len()
         ];
         let mut cursor = offsets.clone();
-        for &(from, to, duration) in edges {
+        for &(from, to, duration, meters) in edges {
             let slot = cursor[from.0 as usize] as usize;
-            sorted[slot] = Transfer { to, duration };
+            sorted[slot] = Transfer {
+                to,
+                duration,
+                meters,
+            };
             cursor[from.0 as usize] += 1;
         }
         Ok(Transfers {
@@ -94,9 +101,9 @@ mod tests {
         let transfers = Transfers::from_edges(
             3,
             &[
-                (StopIdx(2), StopIdx(0), 30),
-                (StopIdx(0), StopIdx(1), 60),
-                (StopIdx(0), StopIdx(2), 90),
+                (StopIdx(2), StopIdx(0), 30, 30.0),
+                (StopIdx(0), StopIdx(1), 60, 58.5),
+                (StopIdx(0), StopIdx(2), 90, 90.0),
             ],
         )
         .unwrap();
@@ -105,11 +112,13 @@ mod tests {
             &[
                 Transfer {
                     to: StopIdx(1),
-                    duration: 60
+                    duration: 60,
+                    meters: 58.5,
                 },
                 Transfer {
                     to: StopIdx(2),
-                    duration: 90
+                    duration: 90,
+                    meters: 90.0,
                 },
             ]
         );
@@ -120,7 +129,7 @@ mod tests {
     #[test]
     fn rejects_out_of_range_stops() {
         assert_eq!(
-            Transfers::from_edges(1, &[(StopIdx(0), StopIdx(1), 30)]),
+            Transfers::from_edges(1, &[(StopIdx(0), StopIdx(1), 30, 30.0)]),
             Err(TimetableError::StopOutOfRange {
                 stop: 1,
                 stop_count: 1

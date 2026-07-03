@@ -526,7 +526,7 @@ mod tests {
             .add_trip(c, vec![time(400), time(1000)], 4, 0)
             .unwrap();
         let timetable = builder.finish();
-        let transfers = Transfers::from_edges(5, &[(StopIdx(2), StopIdx(4), 50)]).unwrap();
+        let transfers = Transfers::from_edges(5, &[(StopIdx(2), StopIdx(4), 50, 50.0)]).unwrap();
         (timetable, transfers)
     }
 
@@ -621,7 +621,10 @@ mod tests {
         let timetable = builder.finish();
         let transfers = Transfers::from_edges(
             4,
-            &[(StopIdx(1), StopIdx(2), 30), (StopIdx(2), StopIdx(3), 50)],
+            &[
+                (StopIdx(1), StopIdx(2), 30, 30.0),
+                (StopIdx(2), StopIdx(3), 50, 50.0),
+            ],
         )
         .unwrap();
         let journeys = Raptor.route(&timetable, &transfers, &request(StopIdx(0), StopIdx(3), 0));

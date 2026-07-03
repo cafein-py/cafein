@@ -5,14 +5,19 @@
 - Door-to-door routing: `TransportNetwork.route_between_coordinates`
   routes between arbitrary coordinates — street access/egress searches
   at both ends feed the transit router, for single departures and
-  departure windows alike, and access/egress legs report their walking
-  distance. `travel_times_from_coordinate` is the matrix primitive for
-  coordinate origins: walking access seeds one RAPTOR run that serves
-  all destinations.
+  departure windows alike, and access/egress legs report their exact
+  walked street-path distance. `travel_times_from_coordinate` is the
+  matrix primitive for coordinate origins: walking access seeds one
+  RAPTOR run that serves all destinations.
+
+- Transfer legs report their walking distance: footpaths now carry
+  their street-path meters (`walking_footpaths` emits
+  ``(from, to, seconds, meters)`` edges), completing per-leg distances
+  across every leg type.
 
 - Query-time street access/egress: networks built with an OSM extract
-  now carry the walking street network (a CSR graph with a spatial grid
-  index in the Rust core), and `TransportNetwork.access_stops(lat, lon)`
+  now carry the walking street network (a CSR graph with an R*-tree
+  spatial index in the Rust core), and `TransportNetwork.access_stops(lat, lon)`
   snaps a coordinate onto it and returns walking seconds to every
   transit stop reachable within a cutoff — the search door-to-door
   routing builds on.
