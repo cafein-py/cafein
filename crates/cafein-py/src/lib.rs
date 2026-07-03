@@ -164,14 +164,24 @@ impl TransportNetwork {
     ///     Departure time at the origin as ``HH:MM:SS``.
     /// max_transfers : int (optional, default: 4)
     ///     Maximum number of transfers between rides.
+    /// window : int (optional)
+    ///     Departure window in seconds. When given, departures within
+    ///     ``[departure, departure + window)`` are profiled: the result is
+    ///     the Pareto set of journeys over (departure, arrival, rides),
+    ///     each journey's departure being the latest time the origin can
+    ///     be left to catch it, sorted by departure and then rides. A
+    ///     journey that leaves within the window but waits for a ride
+    ///     beyond it carries the window's final second as its departure.
     ///
     /// Returns
     /// -------
     /// list of dict
-    ///     The Pareto set of journeys over (arrival time, number of rides),
-    ///     each with its legs. Times are seconds past the service day's
-    ///     start.
-    #[pyo3(signature = (from_stop, to_stop, date, departure, max_transfers = 4))]
+    ///     Without `window`, the Pareto set of journeys over (arrival
+    ///     time, number of rides) leaving at the departure time; with it,
+    ///     the departure-window profile. Each journey carries its legs;
+    ///     times are seconds past the service day's start.
+    #[pyo3(signature = (from_stop, to_stop, date, departure, max_transfers = 4, window = None))]
+    #[allow(clippy::too_many_arguments)]
     fn route_between_stops(
         &self,
         py: Python<'_>,
@@ -180,6 +190,7 @@ impl TransportNetwork {
         date: &str,
         departure: &str,
         max_transfers: u8,
+        window: Option<u32>,
     ) -> PyResult<Py<PyList>> {
         let origin = self.resolve_stop(from_stop)?;
         let destination = self.resolve_stop(to_stop)?;
@@ -192,7 +203,12 @@ impl TransportNetwork {
             active_services: self.build.services.active_on(date),
             max_transfers,
         };
-        let journeys = Raptor.route(&self.build.timetable, &self.transfers, &request);
+        let journeys = match window {
+            None => Raptor.route(&self.build.timetable, &self.transfers, &request),
+            Some(window) => {
+                Raptor.route_range(&self.build.timetable, &self.transfers, &request, window)
+            }
+        };
         let result = PyList::empty(py);
         for journey in &journeys {
             result.append(self.journey_to_dict(py, journey)?)?;
