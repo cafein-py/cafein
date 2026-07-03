@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Range queries (rRAPTOR): `route_between_stops` accepts a `window`
+  argument and profiles all departures within it — one RAPTOR pass per
+  candidate departure in decreasing order, reusing labels — returning the
+  Pareto set of journeys over (departure, arrival, rides).
+
 - Street-network build: `cafein.streets.walking_footpaths` precomputes
   transitively closed stop-to-stop walking transfers from an OpenStreetMap
   extract (pyrosm walking network, nearest-edge stop snapping with edge

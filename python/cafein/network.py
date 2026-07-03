@@ -115,8 +115,10 @@ class TransportNetwork:
         """
         self._core.set_transfers(footpaths)
 
-    def route_between_stops(self, from_stop, to_stop, date, departure, max_transfers=4):
-        """Route between two transit stops for a single departure.
+    def route_between_stops(
+        self, from_stop, to_stop, date, departure, max_transfers=4, window=None
+    ):
+        """Route between two transit stops.
 
         Journeys ride trips and change vehicles at shared stops or over
         the installed transfers. Door-to-door access and egress from
@@ -137,14 +139,24 @@ class TransportNetwork:
             Departure time at the origin as ``HH:MM:SS``.
         max_transfers : int (optional, default: 4)
             Maximum number of transfers between rides.
+        window : int (optional)
+            Departure window in seconds. When given, departures within
+            ``[departure, departure + window)`` are profiled: the result
+            is the Pareto set of journeys over (departure, arrival,
+            rides), each journey's departure being the latest time the
+            origin can be left to catch it, sorted by departure and then
+            rides. A journey that leaves within the window but waits for
+            a ride beyond it carries the window's final second as its
+            departure.
 
         Returns
         -------
         list of dict
-            The Pareto set of journeys over (arrival time, number of
-            rides), each with its legs. Times are seconds past the
-            service day's start.
+            Without `window`, the Pareto set of journeys over (arrival
+            time, number of rides) leaving at the departure time; with
+            it, the departure-window profile. Each journey carries its
+            legs; times are seconds past the service day's start.
         """
         return self._core.route_between_stops(
-            from_stop, to_stop, date, departure, max_transfers
+            from_stop, to_stop, date, departure, max_transfers, window
         )

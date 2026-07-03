@@ -1,16 +1,23 @@
-//! Plain RAPTOR: earliest-arrival routing for a single departure time.
+//! RAPTOR: earliest-arrival routing for a single departure time, and its
+//! range (rRAPTOR) extension for a departure window.
 //!
 //! Round-based: round `k` finds the earliest arrivals reachable with
 //! exactly `k` rides. Within a pattern, the earliest catchable trip at a
 //! stop position is found by binary search over departures, which is valid
 //! at every position because the timetable's patterns are FIFO chains.
+//!
+//! The range query runs one pass per candidate departure time, in
+//! decreasing order, on shared state: arrivals found for a later departure
+//! stay feasible for every earlier one, so each pass explores only what
+//! its departure improves, and journeys dominated by a later departure are
+//! never emitted.
 
 use crate::journey::{Journey, Leg};
 use crate::router::{Request, TransitRouter};
 use crate::timetable::{PatternIdx, StopIdx, Timetable, TripIdx};
 use crate::transfers::Transfers;
 
-/// The plain RAPTOR router.
+/// The RAPTOR router.
 pub struct Raptor;
 
 const UNREACHED: u32 = u32::MAX;
@@ -41,53 +48,188 @@ impl TransitRouter for Raptor {
         transfers: &Transfers,
         request: &Request,
     ) -> Vec<Journey> {
+        Search::new(timetable, transfers, request).profile(&[request.departure])
+    }
+}
+
+impl Raptor {
+    /// Routes over a departure window: the Pareto set of journeys over
+    /// (departure, arrival, rides) for departures within
+    /// `[request.departure, request.departure + window)`.
+    ///
+    /// Each journey's departure is the latest time the origin can be left
+    /// to catch it, capped at the window's final second — a journey that
+    /// leaves within the window but waits for a ride beyond it is
+    /// reported with that final second as its departure. So unlike
+    /// [`TransitRouter::route`] — which answers "leaving exactly at the
+    /// requested time" — the result enumerates the distinct departure
+    /// choices the window offers, sorted by departure and then by ride
+    /// count. A zero-length window has no departures.
+    pub fn route_range(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        request: &Request,
+        window: u32,
+    ) -> Vec<Journey> {
+        let departures = departure_candidates(timetable, request, window);
+        Search::new(timetable, transfers, request).profile(&departures)
+    }
+}
+
+/// The origin departure times within `[request.departure,
+/// request.departure + window)` at which some trip becomes catchable: one
+/// candidate per active-service trip departure at an access stop, shifted
+/// back by the stop's access duration. Descending, deduplicated.
+fn departure_candidates(timetable: &Timetable, request: &Request, window: u32) -> Vec<u32> {
+    // Widened so a window reaching past u32::MAX cannot clip candidates.
+    let end = request.departure as u64 + window as u64;
+    let mut candidates = Vec::new();
+    for &(stop, duration) in &request.access {
+        for pattern_stop in timetable.patterns_at_stop(stop) {
+            let position = pattern_stop.position as usize;
+            // Boarding at a pattern's last position is pointless.
+            if position + 1 == timetable.pattern_stops(pattern_stop.pattern).len() {
+                continue;
+            }
+            for trip in timetable.pattern_trips(pattern_stop.pattern) {
+                let service = timetable.trip_service(trip) as usize;
+                if !request
+                    .active_services
+                    .get(service)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let trip_departure = timetable.trip_stop_times(trip)[position].departure;
+                let Some(origin_departure) = trip_departure.checked_sub(duration) else {
+                    continue;
+                };
+                if origin_departure >= request.departure && (origin_departure as u64) < end {
+                    candidates.push(origin_departure);
+                }
+            }
+        }
+    }
+    // The window's final second is always a candidate: it covers journeys
+    // that leave within the window and wait for a ride beyond it.
+    if window > 0 {
+        candidates.push((end - 1).min(u32::MAX as u64) as u32);
+    }
+    candidates.sort_unstable_by(|left, right| right.cmp(left));
+    candidates.dedup();
+    candidates
+}
+
+/// RAPTOR state shared by the passes of one query.
+struct Search<'a> {
+    timetable: &'a Timetable,
+    transfers: &'a Transfers,
+    request: &'a Request,
+    rounds: usize,
+    /// Per-round arrival times; `tau[k][stop]` is the earliest arrival at
+    /// `stop` with exactly `k` rides, over all departures processed so far.
+    tau: Vec<Vec<u32>>,
+    labels: Vec<Vec<Label>>,
+    /// Prefix minimum of `tau`: `best[k][stop]` is the earliest arrival at
+    /// `stop` with at most `k` rides, over all departures processed so
+    /// far. Pruning at a round must not consult later rounds — a faster
+    /// but more-rides arrival from a later departure does not dominate
+    /// the fewer-ride option an earlier departure still offers.
+    best: Vec<Vec<u32>>,
+    marked: Vec<StopIdx>,
+    is_marked: Vec<bool>,
+    /// First marked position per pattern for the current round.
+    queue_position: Vec<u16>,
+    queued_patterns: Vec<PatternIdx>,
+}
+
+impl<'a> Search<'a> {
+    fn new(timetable: &'a Timetable, transfers: &'a Transfers, request: &'a Request) -> Self {
         let stop_count = timetable.stop_count() as usize;
         let rounds = request.max_transfers as usize + 1;
+        Search {
+            timetable,
+            transfers,
+            request,
+            rounds,
+            tau: vec![vec![UNREACHED; stop_count]; rounds + 1],
+            labels: vec![vec![Label::Unreached; stop_count]; rounds + 1],
+            best: vec![vec![UNREACHED; stop_count]; rounds + 1],
+            marked: Vec::new(),
+            is_marked: vec![false; stop_count],
+            queue_position: vec![u16::MAX; timetable.pattern_count() as usize],
+            queued_patterns: Vec::new(),
+        }
+    }
 
-        // Per-round arrival times and labels; `best` holds the minimum over
-        // all rounds so far for pruning.
-        let mut tau = vec![vec![UNREACHED; stop_count]; rounds + 1];
-        let mut labels = vec![vec![Label::Unreached; stop_count]; rounds + 1];
-        let mut best = vec![UNREACHED; stop_count];
-        let mut marked: Vec<StopIdx> = Vec::new();
-        let mut is_marked = vec![false; stop_count];
+    /// Runs one pass per departure — which must be strictly decreasing —
+    /// and returns the journeys no later departure dominates, sorted by
+    /// departure and then by ride count.
+    fn profile(mut self, departures: &[u32]) -> Vec<Journey> {
+        let mut journeys = Vec::new();
+        // The best arrival emitted with at most `round` rides so far; a
+        // pass may only emit strictly earlier arrivals, so journeys
+        // dominated by a later departure never surface.
+        let mut thresholds = vec![UNREACHED; self.rounds + 1];
+        for &departure in departures {
+            self.run(departure);
+            self.collect(departure, &mut thresholds, &mut journeys);
+        }
+        journeys.sort_by_key(|journey| (journey.departure, journey.rides()));
+        journeys
+    }
+
+    /// One RAPTOR pass from `departure`, improving the shared state.
+    fn run(&mut self, departure: u32) {
+        let timetable = self.timetable;
+        let request = self.request;
+
+        // Leftover marks from the previous pass describe stops whose
+        // labels are already final for later departures; they carry no
+        // work for this one.
+        for stop in std::mem::take(&mut self.marked) {
+            self.is_marked[stop.0 as usize] = false;
+        }
 
         for &(stop, duration) in &request.access {
-            let arrival = request.departure.saturating_add(duration);
-            if arrival < tau[0][stop.0 as usize] {
-                tau[0][stop.0 as usize] = arrival;
-                labels[0][stop.0 as usize] = Label::Access;
-                best[stop.0 as usize] = arrival;
-                if !is_marked[stop.0 as usize] {
-                    is_marked[stop.0 as usize] = true;
-                    marked.push(stop);
+            let arrival = departure.saturating_add(duration);
+            let index = stop.0 as usize;
+            if arrival < self.tau[0][index] {
+                self.tau[0][index] = arrival;
+                self.labels[0][index] = Label::Access;
+                for best in &mut self.best {
+                    best[index] = best[index].min(arrival);
+                }
+                if !self.is_marked[index] {
+                    self.is_marked[index] = true;
+                    self.marked.push(stop);
                 }
             }
         }
 
-        // First marked position per pattern for the current round.
-        let pattern_count = timetable.pattern_count() as usize;
-        let mut queue_position = vec![u16::MAX; pattern_count];
-        let mut queued_patterns: Vec<PatternIdx> = Vec::new();
-
-        for round in 1..=rounds {
-            queued_patterns.clear();
+        for round in 1..=self.rounds {
+            self.queued_patterns.clear();
+            let mut marked = std::mem::take(&mut self.marked);
             for stop in marked.drain(..) {
-                is_marked[stop.0 as usize] = false;
+                self.is_marked[stop.0 as usize] = false;
                 for pattern_stop in timetable.patterns_at_stop(stop) {
-                    let slot = &mut queue_position[pattern_stop.pattern.0 as usize];
+                    let slot = &mut self.queue_position[pattern_stop.pattern.0 as usize];
                     if *slot == u16::MAX {
-                        queued_patterns.push(pattern_stop.pattern);
+                        self.queued_patterns.push(pattern_stop.pattern);
                     }
                     if pattern_stop.position < *slot {
                         *slot = pattern_stop.position;
                     }
                 }
             }
+            self.marked = marked;
 
-            for &pattern in &queued_patterns {
-                let start_position = queue_position[pattern.0 as usize];
-                queue_position[pattern.0 as usize] = u16::MAX;
+            for index in 0..self.queued_patterns.len() {
+                let pattern = self.queued_patterns[index];
+                let start_position = self.queue_position[pattern.0 as usize];
+                self.queue_position[pattern.0 as usize] = u16::MAX;
                 let stops = timetable.pattern_stops(pattern);
                 let mut current: Option<(TripIdx, u16)> = None;
 
@@ -96,17 +238,19 @@ impl TransitRouter for Raptor {
 
                     if let Some((trip, board_position)) = current {
                         let arrival = timetable.trip_stop_times(trip)[position].arrival;
-                        if arrival < best[stop] {
-                            tau[round][stop] = arrival;
-                            best[stop] = arrival;
-                            labels[round][stop] = Label::Transit {
+                        if arrival < self.best[round][stop] {
+                            self.tau[round][stop] = arrival;
+                            for best in &mut self.best[round..] {
+                                best[stop] = best[stop].min(arrival);
+                            }
+                            self.labels[round][stop] = Label::Transit {
                                 trip,
                                 board_position,
                                 alight_position: position as u16,
                             };
-                            if !is_marked[stop] {
-                                is_marked[stop] = true;
-                                marked.push(stops[position]);
+                            if !self.is_marked[stop] {
+                                self.is_marked[stop] = true;
+                                self.marked.push(stops[position]);
                             }
                         }
                     }
@@ -117,7 +261,7 @@ impl TransitRouter for Raptor {
                     // boarding at a pattern's last position is pointless
                     // because there is no later stop to alight at, and other
                     // patterns serving this stop are queued separately.
-                    let reached = tau[round - 1][stop];
+                    let reached = self.tau[round - 1][stop];
                     if reached == UNREACHED || position + 1 == stops.len() {
                         continue;
                     }
@@ -143,34 +287,147 @@ impl TransitRouter for Raptor {
                 }
             }
 
-            // Relax one footpath hop from every stop improved by transit.
-            let transit_marked: Vec<StopIdx> = marked.clone();
-            for stop in transit_marked {
-                let departure = tau[round][stop.0 as usize];
-                for transfer in transfers.from_stop(stop) {
-                    let arrival = departure.saturating_add(transfer.duration);
+            // Relax one footpath hop from every stop improved by transit,
+            // leaving from the transit arrivals as they stand now — a
+            // transfer improving a marked stop must not chain into that
+            // stop's own outgoing transfers within the round.
+            let transit_marked: Vec<(StopIdx, u32)> = self
+                .marked
+                .iter()
+                .map(|&stop| (stop, self.tau[round][stop.0 as usize]))
+                .collect();
+            for (stop, departure_at_stop) in transit_marked {
+                for transfer in self.transfers.from_stop(stop) {
+                    let arrival = departure_at_stop.saturating_add(transfer.duration);
                     let to = transfer.to.0 as usize;
-                    if arrival < best[to] {
-                        tau[round][to] = arrival;
-                        best[to] = arrival;
-                        labels[round][to] = Label::Transfer {
+                    if arrival < self.best[round][to] {
+                        self.tau[round][to] = arrival;
+                        for best in &mut self.best[round..] {
+                            best[to] = best[to].min(arrival);
+                        }
+                        self.labels[round][to] = Label::Transfer {
                             from_stop: stop,
                             duration: transfer.duration,
                         };
-                        if !is_marked[to] {
-                            is_marked[to] = true;
-                            marked.push(transfer.to);
+                        if !self.is_marked[to] {
+                            self.is_marked[to] = true;
+                            self.marked.push(transfer.to);
                         }
                     }
                 }
             }
 
-            if marked.is_empty() {
+            if self.marked.is_empty() {
                 break;
             }
         }
+    }
 
-        collect_journeys(timetable, request, &tau, &labels, rounds)
+    /// Emits the pass's journeys: per round, the best egress arrival, if
+    /// it strictly beats everything already emitted with no more rides.
+    fn collect(&self, departure: u32, thresholds: &mut [u32], journeys: &mut Vec<Journey>) {
+        for round in 1..=self.rounds {
+            let mut best_egress: Option<(u32, StopIdx, u32)> = None;
+            for &(stop, duration) in &self.request.egress {
+                let at_stop = self.tau[round][stop.0 as usize];
+                if at_stop == UNREACHED {
+                    continue;
+                }
+                let arrival = at_stop.saturating_add(duration);
+                if best_egress.is_none_or(|(current, _, _)| arrival < current) {
+                    best_egress = Some((arrival, stop, duration));
+                }
+            }
+            let Some((arrival, egress_stop, egress_duration)) = best_egress else {
+                continue;
+            };
+            if arrival >= thresholds[round] {
+                continue;
+            }
+            for threshold in &mut thresholds[round..] {
+                *threshold = (*threshold).min(arrival);
+            }
+            journeys.push(self.reconstruct(departure, round, egress_stop, egress_duration));
+        }
+    }
+
+    /// Walks the labels backwards from the egress stop.
+    ///
+    /// Labels written by later-departure passes stay valid here: their
+    /// board times are at or after the (only ever improved) arrival of the
+    /// previous round, so the reconstructed chain is time-consistent.
+    fn reconstruct(
+        &self,
+        departure: u32,
+        round: usize,
+        egress_stop: StopIdx,
+        egress_duration: u32,
+    ) -> Journey {
+        let timetable = self.timetable;
+        let mut legs = Vec::new();
+        let departure_at_stop = self.tau[round][egress_stop.0 as usize];
+        legs.push(Leg::Egress {
+            from_stop: egress_stop,
+            departure: departure_at_stop,
+            arrival: departure_at_stop + egress_duration,
+        });
+
+        let mut current_round = round;
+        let mut stop = egress_stop;
+        loop {
+            match self.labels[current_round][stop.0 as usize] {
+                Label::Transit {
+                    trip,
+                    board_position,
+                    alight_position,
+                } => {
+                    let pattern = timetable.trip_pattern(trip);
+                    let pattern_stops = timetable.pattern_stops(pattern);
+                    let times = timetable.trip_stop_times(trip);
+                    let board_stop = pattern_stops[board_position as usize];
+                    legs.push(Leg::Transit {
+                        trip,
+                        board_stop,
+                        alight_stop: stop,
+                        board_position,
+                        alight_position,
+                        board_time: times[board_position as usize].departure,
+                        alight_time: times[alight_position as usize].arrival,
+                    });
+                    stop = board_stop;
+                    current_round -= 1;
+                }
+                Label::Transfer {
+                    from_stop,
+                    duration,
+                } => {
+                    let arrival = self.tau[current_round][stop.0 as usize];
+                    legs.push(Leg::Transfer {
+                        from_stop,
+                        to_stop: stop,
+                        departure: arrival - duration,
+                        arrival,
+                    });
+                    stop = from_stop;
+                }
+                Label::Access => {
+                    legs.push(Leg::Access {
+                        to_stop: stop,
+                        departure,
+                        arrival: self.tau[0][stop.0 as usize],
+                    });
+                    break;
+                }
+                Label::Unreached => unreachable!("journey reconstruction hit an unreached label"),
+            }
+        }
+        legs.reverse();
+
+        Journey {
+            departure,
+            arrival: departure_at_stop + egress_duration,
+            legs,
+        }
     }
 }
 
@@ -202,124 +459,6 @@ fn earliest_trip(
             .copied()
             .unwrap_or(false)
     })
-}
-
-/// Emits the Pareto set over (arrival, rides): one journey per round whose
-/// arrival strictly improves on all earlier rounds.
-fn collect_journeys(
-    timetable: &Timetable,
-    request: &Request,
-    tau: &[Vec<u32>],
-    labels: &[Vec<Label>],
-    rounds: usize,
-) -> Vec<Journey> {
-    let mut journeys = Vec::new();
-    let mut best_arrival = UNREACHED;
-    for round in 1..=rounds {
-        let mut best_egress: Option<(u32, StopIdx, u32)> = None;
-        for &(stop, duration) in &request.egress {
-            let at_stop = tau[round][stop.0 as usize];
-            if at_stop == UNREACHED {
-                continue;
-            }
-            let arrival = at_stop.saturating_add(duration);
-            if best_egress.is_none_or(|(current, _, _)| arrival < current) {
-                best_egress = Some((arrival, stop, duration));
-            }
-        }
-        let Some((arrival, egress_stop, egress_duration)) = best_egress else {
-            continue;
-        };
-        if arrival >= best_arrival {
-            continue;
-        }
-        best_arrival = arrival;
-        journeys.push(reconstruct(
-            timetable,
-            request,
-            tau,
-            labels,
-            round,
-            egress_stop,
-            egress_duration,
-        ));
-    }
-    journeys
-}
-
-fn reconstruct(
-    timetable: &Timetable,
-    request: &Request,
-    tau: &[Vec<u32>],
-    labels: &[Vec<Label>],
-    round: usize,
-    egress_stop: StopIdx,
-    egress_duration: u32,
-) -> Journey {
-    let mut legs = Vec::new();
-    let departure_at_stop = tau[round][egress_stop.0 as usize];
-    legs.push(Leg::Egress {
-        from_stop: egress_stop,
-        departure: departure_at_stop,
-        arrival: departure_at_stop + egress_duration,
-    });
-
-    let mut current_round = round;
-    let mut stop = egress_stop;
-    loop {
-        match labels[current_round][stop.0 as usize] {
-            Label::Transit {
-                trip,
-                board_position,
-                alight_position,
-            } => {
-                let pattern = timetable.trip_pattern(trip);
-                let pattern_stops = timetable.pattern_stops(pattern);
-                let times = timetable.trip_stop_times(trip);
-                let board_stop = pattern_stops[board_position as usize];
-                legs.push(Leg::Transit {
-                    trip,
-                    board_stop,
-                    alight_stop: stop,
-                    board_position,
-                    alight_position,
-                    board_time: times[board_position as usize].departure,
-                    alight_time: times[alight_position as usize].arrival,
-                });
-                stop = board_stop;
-                current_round -= 1;
-            }
-            Label::Transfer {
-                from_stop,
-                duration,
-            } => {
-                let arrival = tau[current_round][stop.0 as usize];
-                legs.push(Leg::Transfer {
-                    from_stop,
-                    to_stop: stop,
-                    departure: arrival - duration,
-                    arrival,
-                });
-                stop = from_stop;
-            }
-            Label::Access => {
-                legs.push(Leg::Access {
-                    to_stop: stop,
-                    departure: request.departure,
-                    arrival: tau[0][stop.0 as usize],
-                });
-                break;
-            }
-            Label::Unreached => unreachable!("journey reconstruction hit an unreached label"),
-        }
-    }
-    legs.reverse();
-
-    Journey {
-        departure: request.departure,
-        arrival: departure_at_stop + egress_duration,
-        legs,
-    }
 }
 
 #[cfg(test)]
@@ -441,6 +580,31 @@ mod tests {
                 arrival: 350,
             }
         ));
+    }
+
+    #[test]
+    fn transfers_relax_a_single_hop_from_transit_arrivals() {
+        // Footpaths 1→2 and 2→3 without a closing 1→3 edge: the walk out
+        // of stop 2 must leave from its transit arrival (500), not chain
+        // onto the walk that just improved stop 2 in the same round.
+        let mut builder = TimetableBuilder::new(4);
+        let to_a = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+        let to_b = builder.add_pattern(&[StopIdx(0), StopIdx(2)], 1).unwrap();
+        builder
+            .add_trip(to_a, vec![time(0), time(100)], 0, 0)
+            .unwrap();
+        builder
+            .add_trip(to_b, vec![time(0), time(500)], 1, 0)
+            .unwrap();
+        let timetable = builder.finish();
+        let transfers = Transfers::from_edges(
+            4,
+            &[(StopIdx(1), StopIdx(2), 30), (StopIdx(2), StopIdx(3), 50)],
+        )
+        .unwrap();
+        let journeys = Raptor.route(&timetable, &transfers, &request(StopIdx(0), StopIdx(3), 0));
+        assert_eq!(journeys.len(), 1);
+        assert_eq!(journeys[0].arrival, 550);
     }
 
     #[test]
@@ -575,5 +739,244 @@ mod tests {
         req.max_transfers = 0;
         let journeys = Raptor.route(&timetable, &transfers, &req);
         assert_eq!(journeys.len(), 0);
+    }
+
+    /// One pattern 0→1 with three rides: 100→300, 200→400, 300→500.
+    fn frequent_network() -> (Timetable, Transfers) {
+        let mut builder = TimetableBuilder::new(2);
+        let a = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+        for departure in [100, 200, 300] {
+            builder
+                .add_trip(a, vec![time(departure), time(departure + 200)], 0, 0)
+                .unwrap();
+        }
+        (builder.finish(), Transfers::empty(2))
+    }
+
+    #[test]
+    fn range_emits_one_journey_per_feasible_departure() {
+        let (timetable, transfers) = frequent_network();
+        let journeys = Raptor.route_range(
+            &timetable,
+            &transfers,
+            &request(StopIdx(0), StopIdx(1), 0),
+            250,
+        );
+        // Departures 100 and 200 fall in [0, 250); each ride is the
+        // latest-departure way to its arrival, so both survive. The
+        // window's final second waits for the 300 ride.
+        let profile: Vec<_> = journeys
+            .iter()
+            .map(|journey| (journey.departure, journey.arrival, journey.rides()))
+            .collect();
+        assert_eq!(profile, vec![(100, 300, 1), (200, 400, 1), (249, 500, 1)]);
+        // Each journey departs the origin at its stated departure time.
+        for journey in &journeys {
+            assert_eq!(
+                journey.legs[0],
+                Leg::Access {
+                    to_stop: StopIdx(0),
+                    departure: journey.departure,
+                    arrival: journey.departure,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn range_window_is_half_open() {
+        let (timetable, transfers) = frequent_network();
+        let journeys = Raptor.route_range(
+            &timetable,
+            &transfers,
+            &request(StopIdx(0), StopIdx(1), 100),
+            100,
+        );
+        // [100, 200) holds the 100 departure; the ride at 200 is only
+        // reached by waiting from the window's final second.
+        let profile: Vec<_> = journeys
+            .iter()
+            .map(|journey| (journey.departure, journey.arrival))
+            .collect();
+        assert_eq!(profile, vec![(100, 300), (199, 400)]);
+        // A zero-length window has no departures at all.
+        let none = Raptor.route_range(
+            &timetable,
+            &transfers,
+            &request(StopIdx(0), StopIdx(1), 100),
+            0,
+        );
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn range_waits_past_the_window_when_the_next_ride_is_later() {
+        let (timetable, transfers) = frequent_network();
+        // No ride departs within [0, 50), but leaving at its final second
+        // and waiting catches the ride at 100.
+        let journeys = Raptor.route_range(
+            &timetable,
+            &transfers,
+            &request(StopIdx(0), StopIdx(1), 0),
+            50,
+        );
+        let profile: Vec<_> = journeys
+            .iter()
+            .map(|journey| (journey.departure, journey.arrival, journey.rides()))
+            .collect();
+        assert_eq!(profile, vec![(49, 300, 1)]);
+    }
+
+    #[test]
+    fn range_keeps_fewer_ride_options_from_earlier_departures() {
+        // Departing at 200, a two-ride chain arrives at 320; departing at
+        // 100, the direct ride arrives at 400. Neither dominates the
+        // other — the direct journey needs fewer rides — so the faster
+        // later pass must not prune the earlier pass's direct label.
+        let mut builder = TimetableBuilder::new(3);
+        let direct = builder.add_pattern(&[StopIdx(0), StopIdx(2)], 0).unwrap();
+        let first = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 1).unwrap();
+        let second = builder.add_pattern(&[StopIdx(1), StopIdx(2)], 2).unwrap();
+        builder
+            .add_trip(direct, vec![time(100), time(400)], 0, 0)
+            .unwrap();
+        builder
+            .add_trip(first, vec![time(200), time(240)], 1, 0)
+            .unwrap();
+        builder
+            .add_trip(second, vec![time(250), time(320)], 2, 0)
+            .unwrap();
+        let timetable = builder.finish();
+        let transfers = Transfers::empty(3);
+        let journeys = Raptor.route_range(
+            &timetable,
+            &transfers,
+            &request(StopIdx(0), StopIdx(2), 0),
+            201,
+        );
+        let profile: Vec<_> = journeys
+            .iter()
+            .map(|journey| (journey.departure, journey.arrival, journey.rides()))
+            .collect();
+        assert_eq!(profile, vec![(100, 400, 1), (200, 320, 2)]);
+    }
+
+    #[test]
+    fn range_drops_journeys_dominated_by_later_departures() {
+        // A slow ride at 100 and an express at 150 that arrives earlier:
+        // departing at 100 offers nothing the 150 departure does not beat.
+        let mut builder = TimetableBuilder::new(2);
+        let local = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+        let express = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 1).unwrap();
+        builder
+            .add_trip(local, vec![time(100), time(400)], 0, 0)
+            .unwrap();
+        builder
+            .add_trip(express, vec![time(150), time(250)], 1, 0)
+            .unwrap();
+        let timetable = builder.finish();
+        let transfers = Transfers::empty(2);
+        let journeys = Raptor.route_range(
+            &timetable,
+            &transfers,
+            &request(StopIdx(0), StopIdx(1), 0),
+            200,
+        );
+        assert_eq!(journeys.len(), 1);
+        assert_eq!((journeys[0].departure, journeys[0].arrival), (150, 250));
+    }
+
+    #[test]
+    fn range_keeps_extra_rides_only_when_strictly_earlier() {
+        // Departing at 200, one direct ride arrives at 500. Departing at
+        // 100, a two-ride chain arrives at 300; the direct ride is also
+        // catchable then but no longer beats anything.
+        let mut builder = TimetableBuilder::new(3);
+        let direct = builder.add_pattern(&[StopIdx(0), StopIdx(2)], 0).unwrap();
+        let first = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 1).unwrap();
+        let second = builder.add_pattern(&[StopIdx(1), StopIdx(2)], 2).unwrap();
+        builder
+            .add_trip(direct, vec![time(200), time(500)], 0, 0)
+            .unwrap();
+        builder
+            .add_trip(first, vec![time(100), time(150)], 1, 0)
+            .unwrap();
+        builder
+            .add_trip(second, vec![time(160), time(300)], 2, 0)
+            .unwrap();
+        let timetable = builder.finish();
+        let transfers = Transfers::empty(3);
+        let journeys = Raptor.route_range(
+            &timetable,
+            &transfers,
+            &request(StopIdx(0), StopIdx(2), 0),
+            300,
+        );
+        let profile: Vec<_> = journeys
+            .iter()
+            .map(|journey| (journey.departure, journey.arrival, journey.rides()))
+            .collect();
+        assert_eq!(profile, vec![(100, 300, 2), (200, 500, 1)]);
+    }
+
+    #[test]
+    fn range_shifts_candidates_by_the_access_duration() {
+        let (timetable, transfers) = frequent_network();
+        let journeys = Raptor.route_range(
+            &timetable,
+            &transfers,
+            &Request {
+                departure: 0,
+                access: vec![(StopIdx(0), 50)],
+                egress: vec![(StopIdx(1), 0)],
+                active_services: vec![true],
+                max_transfers: 3,
+            },
+            200,
+        );
+        // Catching the rides at 100 and 200 means leaving at 50 and 150;
+        // the window's final second waits for the ride at 300.
+        let departures: Vec<_> = journeys.iter().map(|journey| journey.departure).collect();
+        assert_eq!(departures, vec![50, 150, 199]);
+        assert_eq!(
+            journeys[0].legs[0],
+            Leg::Access {
+                to_stop: StopIdx(0),
+                departure: 50,
+                arrival: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn range_skips_candidates_of_inactive_services() {
+        let (timetable, transfers) = network();
+        // B's service-1 trip departs stop 1 at 500 but never runs.
+        let journeys = Raptor.route_range(
+            &timetable,
+            &transfers,
+            &request(StopIdx(1), StopIdx(3), 0),
+            600,
+        );
+        let departures: Vec<_> = journeys.iter().map(|journey| journey.departure).collect();
+        assert_eq!(departures, vec![250]);
+    }
+
+    #[test]
+    fn range_walks_footpaths_per_departure() {
+        let (timetable, transfers) = network();
+        // Only A's first trip (dep 100) reaches stop 4 in time for C: ride
+        // to stop 2 (arr 300), walk 50 s, catch C at 400.
+        let journeys = Raptor.route_range(
+            &timetable,
+            &transfers,
+            &request(StopIdx(0), StopIdx(3), 0),
+            800,
+        );
+        let profile: Vec<_> = journeys
+            .iter()
+            .map(|journey| (journey.departure, journey.arrival, journey.rides()))
+            .collect();
+        assert_eq!(profile, vec![(100, 400, 2)]);
     }
 }

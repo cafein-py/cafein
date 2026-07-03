@@ -45,6 +45,22 @@ def test_routes_the_earliest_direct_k_train(network):
         assert later["arrival"] < earlier["arrival"]
 
 
+def test_a_departure_window_profiles_the_k_trains(network):
+    # Korso -> Käpylä over 08:30-09:00: the window holds two direct K
+    # trains (08:36->08:58 and 08:56->09:18, straight from the GTFS
+    # tables); each journey's departure is the latest feasible leave time,
+    # and the window's final second waits for the 09:16 train.
+    journeys = network.route_between_stops(
+        "4810551", "1250551", "2022-02-22", "08:30:00", window=1800
+    )
+    direct = [(j["departure"], j["arrival"]) for j in journeys if j["rides"] == 1]
+    assert direct == [
+        (8 * 3600 + 36 * 60, 8 * 3600 + 58 * 60),
+        (8 * 3600 + 56 * 60, 9 * 3600 + 18 * 60),
+        (9 * 3600 - 1, 9 * 3600 + 38 * 60),
+    ]
+
+
 def test_no_service_on_a_date_outside_the_feed_window(network):
     journeys = network.route_between_stops(
         "4810551", "1250551", "2022-06-01", "08:30:00"
