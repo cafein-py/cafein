@@ -7,13 +7,20 @@ use cafein_core::timetable::{
     PatternIdx, StopIdx, StopTime, Timetable, TimetableBuilder, TimetableError,
 };
 
+use crate::service::ServiceCalendar;
 use crate::{Error, Feed, RouteIndex};
 
-/// The outcome of building a timetable: the routing structure plus the
-/// trips that were quarantined for data-quality problems.
+/// The outcome of building a timetable: the routing structure, the service
+/// calendar resolving its trips' service identifiers, and the trips that
+/// were quarantined for data-quality problems.
 #[derive(Debug)]
 pub struct TimetableBuild {
     pub timetable: Timetable,
+    /// Resolves the service identifiers carried on timetable trips; combine
+    /// [`ServiceCalendar::active_on`] with
+    /// [`Timetable::trip_service`](cafein_core::timetable::Timetable::trip_service)
+    /// to restrict a query date to its running trips.
+    pub services: ServiceCalendar,
     /// Trips excluded from the timetable, with the reason each was dropped.
     pub quarantined: Vec<QuarantinedTrip>,
 }
@@ -42,6 +49,7 @@ pub struct QuarantinedTrip {
 /// (restricting a query to the trips active on its date) is layered on top
 /// separately and is not part of the timetable build.
 pub fn build_timetable(feed: &Feed) -> Result<TimetableBuild, Error> {
+    let services = ServiceCalendar::from_feed(feed);
     let mut builder = TimetableBuilder::new(feed.stops.len() as u32);
     let mut pattern_index: HashMap<(RouteIndex, Vec<StopIdx>), PatternIdx> = HashMap::new();
     let mut quarantined = Vec::new();
@@ -90,7 +98,10 @@ pub fn build_timetable(feed: &Feed) -> Result<TimetableBuild, Error> {
                 *entry.insert(pattern)
             }
         };
-        match builder.add_trip(pattern, stop_times, trip_index as u32) {
+        let service = services
+            .index(trip.feed, &trip.service_id)
+            .expect("trip services are interned by ServiceCalendar::from_feed");
+        match builder.add_trip(pattern, stop_times, trip_index as u32, service) {
             Ok(()) => {}
             Err(error @ TimetableError::NonIncreasingStopTimes { .. }) => {
                 quarantined.push(QuarantinedTrip {
@@ -103,6 +114,7 @@ pub fn build_timetable(feed: &Feed) -> Result<TimetableBuild, Error> {
     }
     Ok(TimetableBuild {
         timetable: builder.finish(),
+        services,
         quarantined,
     })
 }
