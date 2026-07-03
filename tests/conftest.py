@@ -30,3 +30,13 @@ def helsinki_gtfs():
 def kantakaupunki_pbf():
     """Path to the central-Helsinki OSM extract shared with r5py's sample data."""
     return _data_file("kantakaupunki.osm.pbf")
+
+
+@pytest.fixture(scope="session")
+def network(helsinki_gtfs):
+    """The Helsinki network with default preprocessing, shared across
+    modules because it takes seconds to build."""
+    pytest.importorskip("cafein._cafein")
+    from cafein import TransportNetwork
+
+    return TransportNetwork.from_gtfs([str(helsinki_gtfs)])
