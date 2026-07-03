@@ -205,10 +205,11 @@ def test_stops_are_exposed_with_coordinates(tmp_path):
     feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
     with pytest.warns(UserWarning):
         network = TransportNetwork.from_gtfs([str(feed)])
+    # Stops come back in the reader's order: sorted by id within a feed.
     assert network.stops == [
+        ("0:S1", 60.02, 24.02),
         ("S1", 60.0, 24.0),
         ("S2", 60.01, 24.01),
-        ("0:S1", 60.02, 24.02),
     ]
 
 
