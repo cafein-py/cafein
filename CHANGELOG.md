@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Per-leg travel distances with provenance: `cafein.geometry.trip_distances`
+  runs the distance fallback ladder over the feeds (validated
+  `shape_dist_traveled` with unit correction; stops linear-referenced onto
+  shape geometries; crow-fly with mode detour coefficients as the last
+  resort). `TransportNetwork.from_gtfs` installs the distances by default,
+  and transit legs report `distance` (meters) and `distance_provenance`.
+
 - Range queries (rRAPTOR): `route_between_stops` accepts a `window`
   argument and profiles all departures within it — one RAPTOR pass per
   candidate departure in decreasing order, reusing labels — returning the

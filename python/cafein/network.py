@@ -31,6 +31,7 @@ class TransportNetwork:
         walking_speed_kmph=None,
         max_walking_time=None,
         max_snap_distance=None,
+        trip_distances=True,
     ):
         """Build a network from GTFS archives and an optional OSM extract.
 
@@ -55,8 +56,22 @@ class TransportNetwork:
         max_snap_distance : float (optional, default: 100)
             Maximum distance in meters from a stop to the walking
             network; stops farther away get no footpaths.
+        trip_distances : bool (optional, default: True)
+            Compute per-trip travel distances through the fallback
+            ladder (``cafein.geometry.trip_distances``), so transit legs
+            report their distance and its provenance.
+
+        The build reads the input files more than once (timetable,
+        distance ladder, footpaths); they must not change underneath it.
         """
-        core = _TransportNetwork.from_gtfs(_gtfs_paths(paths))
+        paths = _gtfs_paths(paths)
+        core = _TransportNetwork.from_gtfs(paths)
+        if trip_distances:
+            from cafein import geometry
+
+            core.set_trip_distances(
+                geometry.trip_distances(paths, include=set(core.trip_ids))
+            )
         if osm_pbf is not None:
             from cafein import streets
 
@@ -115,15 +130,34 @@ class TransportNetwork:
         """
         self._core.set_transfers(footpaths)
 
+    def set_trip_distances(self, distances):
+        """Install per-trip cumulative travel distances.
+
+        Parameters
+        ----------
+        distances : list of (str, list of float, str)
+            ``(trip_id, cumulative_meters, provenance)`` rows with one
+            cumulative distance per stop of the trip;
+            ``cafein.geometry.trip_distances`` produces such lists.
+        """
+        self._core.set_trip_distances(distances)
+
+    @property
+    def distance_provenance_counts(self):
+        """Number of trips per distance-provenance tier (empty until
+        trip distances are installed)."""
+        return self._core.distance_provenance_counts
+
     def route_between_stops(
         self, from_stop, to_stop, date, departure, max_transfers=4, window=None
     ):
         """Route between two transit stops.
 
         Journeys ride trips and change vehicles at shared stops or over
-        the installed transfers. Door-to-door access and egress from
-        arbitrary coordinates, per-leg distance, geometry, and emissions
-        arrive with later build steps.
+        the installed transfers; transit legs report their distance and
+        its provenance when trip distances are installed. Door-to-door
+        access and egress from arbitrary coordinates, leg geometries,
+        and emissions arrive with later build steps.
 
         Parameters
         ----------

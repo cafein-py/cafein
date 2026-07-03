@@ -45,6 +45,20 @@ def test_routes_the_earliest_direct_k_train(network):
         assert later["arrival"] < earlier["arrival"]
 
 
+def test_transit_legs_carry_distance_and_provenance(network):
+    # The K train's Korso -> Käpylä distance is 16.786 km straight from
+    # the feed's shape_dist_traveled values (recorded in kilometers).
+    journeys = network.route_between_stops(
+        "4810551", "1250551", "2022-02-22", "08:30:00"
+    )
+    access, transit, egress = journeys[0]["legs"]
+    assert transit["distance"] == pytest.approx(16_786, abs=1)
+    assert transit["distance_provenance"] == "shape_dist"
+    assert access["distance"] is None
+    assert egress["distance"] is None
+    assert network.distance_provenance_counts == {"shape_dist": 195_351}
+
+
 def test_a_departure_window_profiles_the_k_trains(network):
     # Korso -> Käpylä over 08:30-09:00: the window holds two direct K
     # trains (08:36->08:58 and 08:56->09:18, straight from the GTFS
@@ -254,3 +268,84 @@ def test_set_transfers_rejects_unknown_stops(tmp_path):
         network = TransportNetwork.from_gtfs([str(feed)])
     with pytest.raises(KeyError, match="no-such-stop"):
         network.set_transfers([("no-such-stop", "S2", 60)])
+
+
+def test_trip_distances_default_to_the_ladder(tmp_path):
+    # The synthetic feed has no shapes: distances fall to crow-fly with
+    # the bus detour coefficient (S1->S2 is ~1243 m crow-fly).
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs([str(feed)])
+    journeys = network.route_between_stops("S1", "S2", "2022-02-22", "07:30:00")
+    transit = journeys[0]["legs"][1]
+    assert transit["distance"] == pytest.approx(1243 * 1.4, rel=0.01)
+    assert transit["distance_provenance"] == "crow_fly"
+
+
+def test_trip_distances_can_be_disabled(tmp_path):
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs([str(feed)], trip_distances=False)
+    assert network.distance_provenance_counts == {}
+    journeys = network.route_between_stops("S1", "S2", "2022-02-22", "07:30:00")
+    transit = journeys[0]["legs"][1]
+    assert transit["distance"] is None
+    assert transit["distance_provenance"] is None
+
+
+def test_quarantined_trips_cannot_abort_distance_preprocessing(tmp_path):
+    # A quarantined trip visiting a coordinate-less stop must not abort
+    # the default build: the ladder only runs over routable trips.
+    import zipfile
+
+    tables = {
+        "agency.txt": [
+            "agency_id,agency_name,agency_url,agency_timezone",
+            "A,Test Agency,http://example.com,Europe/Helsinki",
+        ],
+        "stops.txt": [
+            "stop_id,stop_name,stop_lat,stop_lon",
+            "S1,First,60.0,24.0",
+            "S2,Second,60.01,24.01",
+            "X,No coordinates,,",
+        ],
+        "routes.txt": ["route_id,route_short_name,route_type", "R1,1,3"],
+        "trips.txt": [
+            "route_id,service_id,trip_id",
+            "R1,SV,T_OK",
+            "R1,SV,T_BAD",
+        ],
+        "stop_times.txt": [
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+            "T_OK,08:00:00,08:00:00,S1,1",
+            "T_OK,08:10:00,08:10:00,S2,2",
+            "T_BAD,09:00:00,09:00:00,S1,1",
+            "T_BAD,08:30:00,08:30:00,X,2",
+        ],
+        "calendar.txt": [
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+            "sunday,start_date,end_date",
+            "SV,1,1,1,1,1,1,1,20220101,20221231",
+        ],
+    }
+    feed = tmp_path / "quarantine_gtfs.zip"
+    with zipfile.ZipFile(feed, "w") as archive:
+        for name, lines in tables.items():
+            archive.writestr(name, "\n".join(lines) + "\n")
+    with pytest.warns(UserWarning, match="quarantined 1 trip"):
+        network = TransportNetwork.from_gtfs([str(feed)])
+    assert network.distance_provenance_counts == {"crow_fly": 1}
+
+
+def test_set_trip_distances_validates_input(tmp_path):
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs([str(feed)], trip_distances=False)
+    # Unknown trips (e.g. quarantined ones) are ignored, but every
+    # timetable trip must end up covered.
+    with pytest.raises(ValueError, match="no distances"):
+        network.set_trip_distances([("no-such-trip", [0.0, 1.0], "crow_fly")])
+    with pytest.raises(ValueError, match="unknown distance provenance"):
+        network.set_trip_distances([("T_OK", [0.0, 1.0], "guesswork")])
+    network.set_trip_distances([("T_OK", [0.0, 1500.0], "map_matched")])
+    assert network.distance_provenance_counts == {"map_matched": 1}
