@@ -75,7 +75,11 @@ def test_travel_times_from_a_stop(network):
     assert times["4810551"] == 0
     # The K train reaches Käpylä at 08:58 (see the routing test above).
     assert times["1250551"] == 28 * 60
-    assert len(times) > 1000
+    # The sample feed carries only Helsinki-bound trips on this corridor,
+    # and without footpaths the rail platforms connect to nothing else:
+    # the origin plus the twelve downstream stops, verified independently
+    # with a time-respecting search over the raw GTFS tables.
+    assert len(times) == 13
     # Outside the feed window only the origin itself is reachable.
     assert network.travel_times_from_stop("4810551", "2022-06-01", "08:30:00") == {
         "4810551": 0
@@ -92,6 +96,8 @@ def test_travel_times_use_installed_transfers(network, network_with_footpaths):
         "1100602", "2022-02-22", "08:30:00"
     )
     assert walked["1040280"] == 9 * 60 + 20
+    # With footpaths the metro feeds the whole central network.
+    assert len(walked) > 1_000
 
 
 def test_no_service_on_a_date_outside_the_feed_window(network):
