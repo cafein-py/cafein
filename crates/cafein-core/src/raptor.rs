@@ -12,6 +12,8 @@
 //! its departure improves, and journeys dominated by a later departure are
 //! never emitted.
 
+use std::collections::HashMap;
+
 use rayon::prelude::*;
 
 use crate::geometry::{wkb_multi_line_string, LegGeometry, TripGeometry};
@@ -23,10 +25,12 @@ use crate::transfers::Transfers;
 /// The RAPTOR router.
 pub struct Raptor;
 
-/// Aggregated costs of the fastest journey to one destination stop.
+/// Aggregated costs of the fastest journey to one destination.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CostRow {
-    pub to: StopIdx,
+    /// The destination's index: a stop index for stop matrices, a
+    /// destination-point index for pointset matrices.
+    pub to: u32,
     /// Travel time in seconds from the requested departure.
     pub seconds: u32,
     /// Number of transit legs; 0 for a destination reached on foot.
@@ -134,7 +138,59 @@ impl Raptor {
                     search.run(request.departure);
                     destinations
                         .iter()
-                        .filter_map(|&stop| search.costs_to(stop, request.departure, inputs))
+                        .filter_map(|&stop| search.costs_to(stop, request.departure, inputs, None))
+                        .collect()
+                },
+            )
+            .collect()
+    }
+
+    /// The fastest journey's aggregated costs from each request to each
+    /// destination *point*, joined through the points' egress link
+    /// tables — the pointset cost matrix.
+    ///
+    /// `access_meters` gives each request's access-walk lengths keyed by
+    /// entry stop; `egress` gives each destination point's
+    /// `(stop, seconds, meters)` links. A point's travel time is the
+    /// minimum over its links of the arrival at the link's stop plus the
+    /// egress walk; its costs are the winning journey's, with the access
+    /// and egress walks added to `walk_meters`.
+    pub fn cost_matrix_to_points(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        access_meters: &[HashMap<StopIdx, f64>],
+        egress: &[Vec<(StopIdx, u32, f64)>],
+    ) -> Vec<Vec<CostRow>> {
+        assert_eq!(requests.len(), access_meters.len());
+        requests
+            .par_iter()
+            .zip(access_meters.par_iter())
+            .map_init(
+                || None,
+                |pooled: &mut Option<Search>, (request, access)| {
+                    let search = match pooled {
+                        Some(search) if search.rounds == request.max_transfers as usize + 1 => {
+                            search.reset(request);
+                            search
+                        }
+                        _ => pooled.insert(Search::new(timetable, transfers, request)),
+                    };
+                    search.run(request.departure);
+                    egress
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(point, links)| {
+                            search.costs_to_point(
+                                point as u32,
+                                links,
+                                request.departure,
+                                inputs,
+                                access,
+                            )
+                        })
                         .collect()
                 },
             )
@@ -317,10 +373,48 @@ impl<'a> Search<'a> {
             .collect()
     }
 
+    /// The fastest journey's aggregated costs to a destination point
+    /// over its egress links; `None` when no link's stop is reachable.
+    fn costs_to_point(
+        &self,
+        point: u32,
+        egress: &[(StopIdx, u32, f64)],
+        departure: u32,
+        inputs: &CostInputs<'_>,
+        access_meters: &HashMap<StopIdx, f64>,
+    ) -> Option<CostRow> {
+        let best = self.best.last().expect("search always has a round");
+        let mut chosen: Option<(u32, StopIdx, f64)> = None;
+        for &(stop, seconds, meters) in egress {
+            let at_stop = best[stop.0 as usize];
+            if at_stop == UNREACHED {
+                continue;
+            }
+            let Some(arrival) = at_stop.checked_add(seconds).filter(|&at| at != UNREACHED) else {
+                continue;
+            };
+            if chosen.is_none_or(|(current, _, _)| arrival < current) {
+                chosen = Some((arrival, stop, meters));
+            }
+        }
+        let (arrival, stop, egress_meters) = chosen?;
+        let mut row = self.costs_to(stop, departure, inputs, Some(access_meters))?;
+        row.to = point;
+        row.seconds = arrival - departure;
+        row.walk_meters += egress_meters;
+        Some(row)
+    }
+
     /// The fastest journey's aggregated costs to `stop`, walking the
     /// label chain of the round that achieves the earliest arrival;
     /// `None` when the stop is unreachable.
-    fn costs_to(&self, stop: StopIdx, departure: u32, inputs: &CostInputs<'_>) -> Option<CostRow> {
+    fn costs_to(
+        &self,
+        stop: StopIdx,
+        departure: u32,
+        inputs: &CostInputs<'_>,
+        access_meters: Option<&HashMap<StopIdx, f64>>,
+    ) -> Option<CostRow> {
         let mut best_round = 0;
         let mut best_arrival = UNREACHED;
         for round in 0..=self.rounds {
@@ -383,7 +477,12 @@ impl<'a> Search<'a> {
                         .unwrap_or(0.0);
                     at = from_stop;
                 }
-                Label::Access => break,
+                Label::Access => {
+                    if let Some(access) = access_meters {
+                        walk_meters += access.get(&at).copied().unwrap_or(0.0);
+                    }
+                    break;
+                }
                 Label::Unreached => unreachable!("cost reconstruction hit an unreached label"),
             }
         }
@@ -399,7 +498,7 @@ impl<'a> Search<'a> {
             _ => None,
         };
         Some(CostRow {
-            to: stop,
+            to: stop.0,
             seconds: best_arrival - departure,
             rides,
             transit_meters,
@@ -840,14 +939,14 @@ mod tests {
         // To stop 3: ride A 0→1 (500 m, 10 g/pkm), ride B 1→3 (800 m,
         // 20 g/pkm), arriving 400 with no walking.
         let to_3 = &rows[0][0];
-        assert_eq!((to_3.to, to_3.seconds, to_3.rides), (StopIdx(3), 400, 2));
+        assert_eq!((to_3.to, to_3.seconds, to_3.rides), (3, 400, 2));
         assert_eq!(to_3.transit_meters, 1300.0);
         assert_eq!(to_3.walk_meters, 0.0);
         assert!((to_3.emission_grams - 21.0).abs() < 1e-9);
         assert_eq!(to_3.geometry, None);
         // To stop 4: ride A 0→2 (1200 m), then the 50 m footpath.
         let to_4 = &rows[0][1];
-        assert_eq!((to_4.to, to_4.seconds, to_4.rides), (StopIdx(4), 350, 1));
+        assert_eq!((to_4.to, to_4.seconds, to_4.rides), (4, 350, 1));
         assert_eq!(to_4.transit_meters, 1200.0);
         assert_eq!(to_4.walk_meters, 50.0);
         assert!((to_4.emission_grams - 12.0).abs() < 1e-9);
@@ -866,6 +965,66 @@ mod tests {
         );
         assert!(rows[0][0].emission_grams.is_nan());
         assert!((rows[0][1].emission_grams - 12.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn point_rows_join_over_egress_links() {
+        let (timetable, transfers) = network();
+        let geometry = TripGeometry::from_trips(
+            &timetable,
+            vec![
+                (
+                    TripIdx(0),
+                    vec![0.0, 500.0, 1200.0],
+                    DistanceProvenance::CrowFly,
+                ),
+                (
+                    TripIdx(1),
+                    vec![0.0, 500.0, 1200.0],
+                    DistanceProvenance::CrowFly,
+                ),
+                (TripIdx(2), vec![0.0, 800.0], DistanceProvenance::CrowFly),
+                (TripIdx(3), vec![0.0, 800.0], DistanceProvenance::CrowFly),
+                (TripIdx(4), vec![0.0, 2000.0], DistanceProvenance::CrowFly),
+            ],
+        )
+        .unwrap();
+        let factors = [10.0, 10.0, 20.0, 20.0, 30.0];
+        let inputs = CostInputs {
+            geometry: &geometry,
+            factors: &factors,
+            leg_geometry: None,
+            with_geometry: false,
+        };
+        let mut request = request(StopIdx(0), StopIdx(3), 0);
+        request.egress = Vec::new();
+        let access: HashMap<StopIdx, f64> = [(StopIdx(0), 120.0)].into_iter().collect();
+        // Point 0 leaves from stop 3; point 1 prefers stop 4's shorter
+        // egress over stop 3's long one.
+        let egress = vec![
+            vec![(StopIdx(3), 30, 25.0)],
+            vec![(StopIdx(3), 1000, 900.0), (StopIdx(4), 10, 8.0)],
+        ];
+        let rows = Raptor.cost_matrix_to_points(
+            &timetable,
+            &transfers,
+            &inputs,
+            std::slice::from_ref(&request),
+            std::slice::from_ref(&access),
+            &egress,
+        );
+        let point_0 = &rows[0][0];
+        assert_eq!((point_0.to, point_0.seconds, point_0.rides), (0, 430, 2));
+        assert_eq!(point_0.transit_meters, 1300.0);
+        // Access 120 m plus egress 25 m; no transfer on this journey.
+        assert_eq!(point_0.walk_meters, 145.0);
+        assert!((point_0.emission_grams - 21.0).abs() < 1e-9);
+        let point_1 = &rows[0][1];
+        assert_eq!((point_1.to, point_1.seconds, point_1.rides), (1, 360, 1));
+        assert_eq!(point_1.transit_meters, 1200.0);
+        // Access 120 m, the 50 m footpath to stop 4, egress 8 m.
+        assert_eq!(point_1.walk_meters, 178.0);
+        assert!((point_1.emission_grams - 12.0).abs() < 1e-9);
     }
 
     #[test]

@@ -18,6 +18,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 
+use rayon::prelude::*;
 use rstar::primitives::{GeomWithData, Line};
 use rstar::RTree;
 
@@ -387,6 +388,32 @@ impl StreetNetwork {
             .collect();
         reached.sort_unstable_by_key(|walk| walk.stop);
         Some(reached)
+    }
+
+    /// Links many coordinates against the network in parallel: each
+    /// point's walkable stops, or `None` where a point does not snap.
+    /// One linking serves a whole matrix — per-origin work is then a
+    /// transit search plus a table join, never a street search per OD
+    /// pair.
+    pub fn link_many(
+        &self,
+        points: &[(f64, f64)],
+        walking_speed: f64,
+        max_seconds: f64,
+        max_snap_distance: f64,
+    ) -> Vec<Option<Vec<WalkedStop>>> {
+        points
+            .par_iter()
+            .map(|&(latitude, longitude)| {
+                self.access_stops(
+                    latitude,
+                    longitude,
+                    walking_speed,
+                    max_seconds,
+                    max_snap_distance,
+                )
+            })
+            .collect()
     }
 
     /// The distance and linear-referenced fraction of a coordinate's
