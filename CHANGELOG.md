@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Over-midnight service: a query early on a service day now also
+  considers the previous day's trips whose GTFS times run past
+  ``24:00:00`` — a ``25:30`` night-bus trip is reachable at ``01:30``
+  the next morning, its times shifted back a day. Previously only the
+  queried date's services were searched, so such trips were missed.
+
 - Travel-time matrices, long format: `cafein.TravelTimeMatrix(network,
   origins, ...)` returns one row per reachable OD pair (``from_id``,
   ``to_id``, ``travel_time`` in seconds) — the r5py-style face of

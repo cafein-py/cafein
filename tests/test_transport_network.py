@@ -768,3 +768,68 @@ def test_walk_legs_carry_street_paths(network_with_footpaths):
         "1100602", "1040280", "2022-02-22", "08:30:00", geometries=False
     )
     assert all(leg["geometry"] is None for leg in journeys[0]["legs"])
+
+
+def build_over_midnight_gtfs(path):
+    """A feed whose only trip runs past midnight on 2022-02-21."""
+    import zipfile
+
+    tables = {
+        "agency.txt": [
+            "agency_id,agency_name,agency_url,agency_timezone",
+            "A,Night,http://example.com,Europe/Helsinki",
+        ],
+        "stops.txt": [
+            "stop_id,stop_name,stop_lat,stop_lon",
+            "N1,First,60.0,24.0",
+            "N2,Second,60.02,24.02",
+        ],
+        "routes.txt": [
+            "route_id,route_short_name,route_type",
+            "RN,N,3",
+        ],
+        "trips.txt": [
+            "route_id,service_id,trip_id",
+            "RN,NIGHT,T_NIGHT",
+        ],
+        "stop_times.txt": [
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+            "T_NIGHT,25:00:00,25:00:00,N1,1",
+            "T_NIGHT,25:20:00,25:20:00,N2,2",
+        ],
+        "calendar.txt": [
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+            "sunday,start_date,end_date",
+            "NIGHT,1,0,0,0,0,0,0,20220221,20220221",
+        ],
+    }
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, lines in tables.items():
+            archive.writestr(name, "\n".join(lines) + "\n")
+    return path
+
+
+def test_previous_day_over_midnight_trip_is_reachable(tmp_path):
+    feed = build_over_midnight_gtfs(tmp_path / "night_gtfs.zip")
+    network = TransportNetwork.from_gtfs([str(feed)])
+
+    # The trip runs on Monday 2022-02-21 with a stored time of 25:00, i.e.
+    # 01:00 on the 22nd. A 00:30 query on the 22nd catches it as the
+    # previous day's over-midnight service.
+    journeys = network.route_between_stops("N1", "N2", "2022-02-22", "00:30:00")
+    assert journeys
+    access, transit, egress = journeys[0]["legs"]
+    assert transit["type"] == "transit"
+    assert transit["trip_id"] == "T_NIGHT"
+    assert transit["departure"] == 3600  # 01:00
+    assert transit["arrival"] == 4800  # 01:20
+    assert journeys[0]["arrival"] == 4800
+
+    # On its own service day the trip is only reachable by waiting out the
+    # day to its stored 25:00.
+    same_day = network.route_between_stops("N1", "N2", "2022-02-21", "00:30:00")
+    assert same_day
+    assert same_day[0]["arrival"] == 25 * 3600 + 20 * 60
+
+    # A day later there is no previous-day service to pull it in.
+    assert network.route_between_stops("N1", "N2", "2022-02-23", "00:30:00") == []

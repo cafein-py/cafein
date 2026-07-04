@@ -62,6 +62,10 @@ pub struct CostInputs<'a> {
 
 const UNREACHED: u32 = u32::MAX;
 
+/// Seconds in a service day: a previous-day trip's stored times are shifted
+/// back by this to place it on the queried day's clock.
+const DAY_SECONDS: u32 = 86_400;
+
 /// How a stop's arrival time in a round was achieved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Label {
@@ -69,10 +73,13 @@ enum Label {
     /// Reached directly from the origin.
     Access,
     /// Alighted from a trip boarded at `board_position` of its pattern.
+    /// `day_offset` is subtracted from the trip's stored times to place
+    /// them on the queried day (nonzero for a previous-day trip).
     Transit {
         trip: TripIdx,
         board_position: u16,
         alight_position: u16,
+        day_offset: u32,
     },
     /// Walked from another stop reached by transit in the same round.
     Transfer {
@@ -382,20 +389,32 @@ fn departure_candidates(timetable: &Timetable, request: &Request, window: u32) -
             }
             for trip in timetable.pattern_trips(pattern_stop.pattern) {
                 let service = timetable.trip_service(trip) as usize;
-                if !request
+                let stored = timetable.trip_stop_times(trip)[position].departure;
+                let active_today = request
                     .active_services
                     .get(service)
                     .copied()
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                let trip_departure = timetable.trip_stop_times(trip)[position].departure;
-                let Some(origin_departure) = trip_departure.checked_sub(duration) else {
-                    continue;
-                };
-                if origin_departure >= request.departure && (origin_departure as u64) < end {
-                    candidates.push(origin_departure);
+                    .unwrap_or(false);
+                let active_previous = request
+                    .active_services_previous
+                    .get(service)
+                    .copied()
+                    .unwrap_or(false);
+                // Today's trips depart at their stored time; the previous
+                // day's a day earlier.
+                let departures = [
+                    active_today.then_some(stored),
+                    active_previous
+                        .then(|| stored.checked_sub(DAY_SECONDS))
+                        .flatten(),
+                ];
+                for trip_departure in departures.into_iter().flatten() {
+                    let Some(origin_departure) = trip_departure.checked_sub(duration) else {
+                        continue;
+                    };
+                    if origin_departure >= request.departure && (origin_departure as u64) < end {
+                        candidates.push(origin_departure);
+                    }
                 }
             }
         }
@@ -625,6 +644,7 @@ impl<'a> Search<'a> {
                     trip,
                     board_position,
                     alight_position,
+                    day_offset: _,
                 } => {
                     rides += 1;
                     let meters = inputs
@@ -765,13 +785,15 @@ impl<'a> Search<'a> {
                 let start_position = self.queue_position[pattern.0 as usize];
                 self.queue_position[pattern.0 as usize] = u16::MAX;
                 let stops = timetable.pattern_stops(pattern);
-                let mut current: Option<(TripIdx, u16)> = None;
+                let mut current: Option<(TripIdx, u16, u32)> = None;
 
                 for position in start_position as usize..stops.len() {
                     let stop = stops[position].0 as usize;
 
-                    if let Some((trip, board_position)) = current {
-                        let arrival = timetable.trip_stop_times(trip)[position].arrival;
+                    if let Some((trip, board_position, day_offset)) = current {
+                        let arrival = timetable.trip_stop_times(trip)[position]
+                            .arrival
+                            .saturating_sub(day_offset);
                         if arrival < self.best[round][stop] {
                             self.tau[round][stop] = arrival;
                             for best in &mut self.best[round..] {
@@ -781,6 +803,7 @@ impl<'a> Search<'a> {
                                 trip,
                                 board_position,
                                 alight_position: position as u16,
+                                day_offset,
                             };
                             if !self.is_marked[stop] {
                                 self.is_marked[stop] = true;
@@ -800,21 +823,35 @@ impl<'a> Search<'a> {
                         continue;
                     }
                     let can_catch_earlier = match current {
-                        Some((trip, _)) => {
-                            reached <= timetable.trip_stop_times(trip)[position].departure
+                        Some((trip, _, day_offset)) => {
+                            reached
+                                <= timetable.trip_stop_times(trip)[position]
+                                    .departure
+                                    .saturating_sub(day_offset)
                         }
                         None => true,
                     };
                     if can_catch_earlier {
-                        if let Some(trip) =
+                        if let Some((trip, day_offset)) =
                             earliest_trip(timetable, request, pattern, position, reached)
                         {
+                            // Board the earlier-departing vehicle; across
+                            // service days trip index no longer orders
+                            // departures, so compare the shifted times.
+                            let departure = timetable.trip_stop_times(trip)[position]
+                                .departure
+                                .saturating_sub(day_offset);
                             let replaces = match current {
-                                Some((current_trip, _)) => trip.0 < current_trip.0,
+                                Some((current_trip, _, current_offset)) => {
+                                    departure
+                                        < timetable.trip_stop_times(current_trip)[position]
+                                            .departure
+                                            .saturating_sub(current_offset)
+                                }
                                 None => true,
                             };
                             if replaces {
-                                current = Some((trip, position as u16));
+                                current = Some((trip, position as u16, day_offset));
                             }
                         }
                     }
@@ -923,6 +960,7 @@ impl<'a> Search<'a> {
                     trip,
                     board_position,
                     alight_position,
+                    day_offset,
                 } => {
                     let pattern = timetable.trip_pattern(trip);
                     let pattern_stops = timetable.pattern_stops(pattern);
@@ -934,8 +972,12 @@ impl<'a> Search<'a> {
                         alight_stop: stop,
                         board_position,
                         alight_position,
-                        board_time: times[board_position as usize].departure,
-                        alight_time: times[alight_position as usize].arrival,
+                        board_time: times[board_position as usize]
+                            .departure
+                            .saturating_sub(day_offset),
+                        alight_time: times[alight_position as usize]
+                            .arrival
+                            .saturating_sub(day_offset),
                     });
                     stop = board_stop;
                     current_round -= 1;
@@ -974,12 +1016,64 @@ impl<'a> Search<'a> {
     }
 }
 
-/// The earliest trip of `pattern` catchable at `position` from time
-/// `reached`, skipping trips whose service is not active. Valid because
-/// departures at every position are sorted within a FIFO pattern.
+/// The earliest trip of `pattern` boardable at `position` no earlier than
+/// `reached`, and the day offset to subtract from its stored times. Today's
+/// services board at their stored times; the previous day's board a day
+/// earlier, so their over-midnight tail is reachable in the small hours.
+/// The two are compared on the queried day's clock and the earlier one wins.
 fn earliest_trip(
     timetable: &Timetable,
     request: &Request,
+    pattern: PatternIdx,
+    position: usize,
+    reached: u32,
+) -> Option<(TripIdx, u32)> {
+    let today = earliest_active_trip(
+        timetable,
+        &request.active_services,
+        pattern,
+        position,
+        reached,
+    )
+    .map(|trip| (trip, 0));
+    // A previous-day trip stored at time `t` runs at `t - DAY_SECONDS`, so
+    // it is boardable from `reached` when `t >= reached + DAY_SECONDS`.
+    let previous = reached
+        .checked_add(DAY_SECONDS)
+        .and_then(|threshold| {
+            earliest_active_trip(
+                timetable,
+                &request.active_services_previous,
+                pattern,
+                position,
+                threshold,
+            )
+        })
+        .map(|trip| (trip, DAY_SECONDS));
+    match (today, previous) {
+        (Some(today), Some(previous)) => {
+            let departure = |(trip, offset): (TripIdx, u32)| {
+                timetable.trip_stop_times(trip)[position]
+                    .departure
+                    .saturating_sub(offset)
+            };
+            Some(if departure(previous) < departure(today) {
+                previous
+            } else {
+                today
+            })
+        }
+        (today, None) => today,
+        (None, previous) => previous,
+    }
+}
+
+/// The earliest trip of `pattern` departing `position` at or after `reached`
+/// whose service is `active`. Valid because departures at every position are
+/// sorted within a FIFO pattern.
+fn earliest_active_trip(
+    timetable: &Timetable,
+    active: &[bool],
     pattern: PatternIdx,
     position: usize,
     reached: u32,
@@ -995,10 +1089,8 @@ fn earliest_trip(
         }
     }
     (low..range.end).map(TripIdx).find(|&trip| {
-        let service = timetable.trip_service(trip) as usize;
-        request
-            .active_services
-            .get(service)
+        active
+            .get(timetable.trip_service(trip) as usize)
             .copied()
             .unwrap_or(false)
     })
@@ -1058,6 +1150,7 @@ mod tests {
             access: vec![(from, 0)],
             egress: vec![(to, 0)],
             active_services: vec![true, false],
+            active_services_previous: Vec::new(),
             max_transfers: 3,
         }
     }
@@ -1450,6 +1543,7 @@ mod tests {
                 access: vec![(StopIdx(0), 0)],
                 egress: vec![(StopIdx(2), 0)],
                 active_services: vec![true],
+                active_services_previous: Vec::new(),
                 max_transfers: 3,
             },
         );
@@ -1471,6 +1565,7 @@ mod tests {
                 access: vec![(StopIdx(0), 90), (StopIdx(1), 10)],
                 egress: vec![(StopIdx(2), 500), (StopIdx(3), 20)],
                 active_services: vec![true, false],
+                active_services_previous: Vec::new(),
                 max_transfers: 3,
             },
         );
@@ -1513,6 +1608,7 @@ mod tests {
                 access: vec![(StopIdx(0), 0)],
                 egress: vec![(StopIdx(2), 0)],
                 active_services: vec![true],
+                active_services_previous: Vec::new(),
                 max_transfers: 3,
             },
         );
@@ -1738,6 +1834,7 @@ mod tests {
                 access: vec![(StopIdx(0), 50)],
                 egress: vec![(StopIdx(1), 0)],
                 active_services: vec![true],
+                active_services_previous: Vec::new(),
                 max_transfers: 3,
             },
             200,
@@ -1786,5 +1883,95 @@ mod tests {
             .map(|journey| (journey.departure, journey.arrival, journey.rides()))
             .collect();
         assert_eq!(profile, vec![(100, 400, 2)]);
+    }
+
+    /// A trip stored past midnight on the previous service day is boardable
+    /// early on the queried day, shifted back one day.
+    fn over_midnight_network() -> (Timetable, Transfers) {
+        let mut builder = TimetableBuilder::new(2);
+        let pattern = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+        // 25:00 → 25:10 the previous day is 01:00 → 01:10 on this one.
+        builder
+            .add_trip(pattern, vec![time(90_000), time(90_600)], 0, 0)
+            .unwrap();
+        (builder.finish(), Transfers::empty(2))
+    }
+
+    #[test]
+    fn boards_the_previous_days_over_midnight_trip() {
+        let (timetable, transfers) = over_midnight_network();
+        let base = Request {
+            departure: 0,
+            access: vec![(StopIdx(0), 0)],
+            egress: vec![(StopIdx(1), 0)],
+            active_services: vec![false],
+            active_services_previous: vec![false],
+            max_transfers: 1,
+        };
+
+        // Neither day runs the service: the night trip is unreachable.
+        assert!(Raptor.route(&timetable, &transfers, &base).is_empty());
+
+        // Today alone runs it at its stored 25:00 — reachable only by
+        // waiting out the whole day, arriving 25:10.
+        let today = Request {
+            active_services: vec![true],
+            ..base.clone()
+        };
+        let journeys = Raptor.route(&timetable, &transfers, &today);
+        assert_eq!(journeys.len(), 1);
+        assert_eq!(journeys[0].arrival, 90_600);
+
+        // Active the day before, the same trip runs at 01:00 → 01:10 here.
+        let previous = Request {
+            active_services_previous: vec![true],
+            ..base.clone()
+        };
+        let journeys = Raptor.route(&timetable, &transfers, &previous);
+        assert_eq!(journeys.len(), 1);
+        assert_eq!(journeys[0].arrival, 90_600 - 86_400);
+        let Leg::Transit {
+            board_time,
+            alight_time,
+            ..
+        } = journeys[0].legs[1]
+        else {
+            panic!("expected a transit leg, got {:?}", journeys[0].legs);
+        };
+        assert_eq!(
+            (board_time, alight_time),
+            (90_000 - 86_400, 90_600 - 86_400)
+        );
+
+        // Both days active: the earlier previous-day run wins.
+        let both = Request {
+            active_services: vec![true],
+            active_services_previous: vec![true],
+            ..base.clone()
+        };
+        let journeys = Raptor.route(&timetable, &transfers, &both);
+        assert_eq!(journeys.len(), 1);
+        assert_eq!(journeys[0].arrival, 90_600 - 86_400);
+    }
+
+    #[test]
+    fn range_profiles_previous_day_over_midnight_trips() {
+        let (timetable, transfers) = over_midnight_network();
+        let request = Request {
+            departure: 0,
+            access: vec![(StopIdx(0), 0)],
+            egress: vec![(StopIdx(1), 0)],
+            active_services: vec![false],
+            active_services_previous: vec![true],
+            max_transfers: 1,
+        };
+        // The window covers 00:00–02:00; the shifted 01:00 departure lands
+        // in it and profiles as leaving at 01:00, arriving 01:10.
+        let journeys = Raptor.route_range(&timetable, &transfers, &request, 2 * 3600);
+        let profile: Vec<_> = journeys
+            .iter()
+            .map(|journey| (journey.departure, journey.arrival, journey.rides()))
+            .collect();
+        assert_eq!(profile, vec![(3_600, 4_200, 1)]);
     }
 }
