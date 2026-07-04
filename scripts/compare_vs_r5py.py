@@ -6,19 +6,22 @@ For every shared scenario — a travel-time matrix and detailed itineraries —
 this runs both engines on the shared Helsinki sample data and records, per
 engine, the network build time, the compute time, and peak memory, then reports
 how closely the two agree on the results. Each engine runs in its own
-subprocess so peak-RSS figures do not bleed into each other (r5py loads a JVM;
-cafein does not). Results are printed as tables and, with ``--csv``, written to
-a file.
+subprocess; the parent samples that subprocess's whole process tree with psutil
+for peak memory (so a JVM child or worker threads are counted), enforces a
+per-engine timeout, and records a crash or out-of-memory kill as a status
+rather than failing the run. Results are printed as tables and, with ``--csv``,
+written to a file.
 
     python scripts/compare_vs_r5py.py                     # both engines, all scenarios
     python scripts/compare_vs_r5py.py --origins 40        # matrix sample size
     python scripts/compare_vs_r5py.py --engine cafein     # one engine only
     python scripts/compare_vs_r5py.py --scenario travel_time_matrix
-    python scripts/compare_vs_r5py.py --csv comparison.csv
+    python scripts/compare_vs_r5py.py --timeout 1200 --csv comparison.csv
 
-Requirements: cafein installed (with its compiled core); r5py >= 1.0 and a Java
-runtime for the comparison side (``mamba install r5py`` provides both). The test
-data comes from ``python scripts/fetch_test_data.py``.
+Requirements: cafein installed (with its compiled core); psutil (for peak
+memory; skipped if absent); r5py >= 1.0 and a Java runtime for the comparison
+side (``mamba install r5py psutil`` provides them). The test data comes from
+``python scripts/fetch_test_data.py``.
 
 The comparison is as close as the engines' semantics allow: both route
 door-to-door from the same points (the stops' own coordinates, so access legs
@@ -40,9 +43,9 @@ import time
 import zipfile
 
 try:
-    import resource
-except ImportError:  # resource is Unix-only; peak RSS is unavailable on Windows
-    resource = None
+    import psutil
+except ImportError:  # peak memory is skipped when psutil is unavailable
+    psutil = None
 
 DATA = pathlib.Path(__file__).parent.parent / "tests" / "data"
 GTFS = DATA / "helsinki_gtfs.zip"
@@ -64,15 +67,9 @@ ITINERARY_POINTS = 5
 ITINERARY_SNAP_METERS = 250.0
 # Travel times within this many minutes count as agreeing.
 TOLERANCE_MINUTES = 1.0
-
-RESULT_PREFIX = "RESULT_JSON:"
-
-
-def peak_rss_mb():
-    if resource is None:
-        return float("nan")
-    scale = 1024 * 1024 if sys.platform == "darwin" else 1024
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / scale
+# Per-engine wall-clock limit and how often the parent samples memory.
+DEFAULT_TIMEOUT_SECONDS = 1200
+SAMPLE_INTERVAL_SECONDS = 0.05
 
 
 def stop_points(count, seed, bbox=BBOX):
@@ -328,45 +325,109 @@ def run_worker(engine, origins, seed, outdir, scenarios):
             }
         except Exception as error:  # noqa: BLE001 - report any engine failure
             stats["scenarios"][name] = {"error": f"{type(error).__name__}: {error}"}
-    stats["peak_rss_mb"] = peak_rss_mb()
-    print(RESULT_PREFIX + json.dumps(stats))
+    (pathlib.Path(outdir) / f"{engine}_result.json").write_text(json.dumps(stats))
 
 
 # --- parent (orchestration, comparison, reporting) -------------------------
 
 
-def launch_worker(engine, origins, seed, outdir, scenarios):
-    process = subprocess.run(
-        [
-            sys.executable,
-            __file__,
-            "--worker",
-            engine,
-            "--origins",
-            str(origins),
-            "--seed",
-            str(seed),
-            "--outdir",
-            outdir,
-            "--scenario",
-            ",".join(scenarios),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if process.returncode != 0:
-        reason = (
-            process.stderr.strip().splitlines()[-1]
-            if process.stderr.strip()
-            else "failed"
-        )
-        print(f"  {engine}: unavailable ({reason})")
-        return None
-    for line in process.stdout.splitlines():
-        if line.startswith(RESULT_PREFIX):
-            return json.loads(line[len(RESULT_PREFIX) :])
-    print(f"  {engine}: produced no results")
-    return None
+def _kill_tree(process):
+    """Kill a subprocess and its descendants."""
+    if psutil is not None:
+        try:
+            for child in psutil.Process(process.pid).children(recursive=True):
+                try:
+                    child.kill()
+                except psutil.Error:
+                    pass
+        except psutil.Error:
+            pass
+    process.kill()
+
+
+def monitor_worker(command, timeout, stderr):
+    """Run a worker, sampling its process tree's peak RSS and enforcing a
+    timeout. Returns the status and peak memory in MB (``None`` without
+    psutil). A crash or out-of-memory kill surfaces as a non-ok status with
+    the memory reached before it died — inspired by the process-isolation in
+    RaczeQ's osm-python-readers-benchmark."""
+    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=stderr)
+    tree = None
+    if psutil is not None:
+        try:
+            tree = psutil.Process(process.pid)
+        except psutil.Error:
+            tree = None
+    peak = 0
+    started = time.time()
+    while process.poll() is None:
+        if timeout and time.time() - started > timeout:
+            _kill_tree(process)
+            process.wait()
+            return {"status": "timeout", "peak_mb": _mb(peak)}
+        if tree is not None:
+            try:
+                peak = max(
+                    peak,
+                    tree.memory_info().rss
+                    + sum(
+                        child.memory_info().rss
+                        for child in tree.children(recursive=True)
+                    ),
+                )
+            except psutil.Error:
+                pass
+        time.sleep(SAMPLE_INTERVAL_SECONDS)
+    status = "ok" if process.returncode == 0 else f"crash (exit {process.returncode})"
+    return {"status": status, "peak_mb": _mb(peak)}
+
+
+def _mb(peak_bytes):
+    return round(peak_bytes / 1e6, 1) if psutil is not None else None
+
+
+def _last_line(path):
+    text = pathlib.Path(path).read_text().strip() if pathlib.Path(path).exists() else ""
+    return text.splitlines()[-1] if text else "no error output"
+
+
+def launch_worker(engine, origins, seed, outdir, scenarios, timeout):
+    result_path = pathlib.Path(outdir) / f"{engine}_result.json"
+    stderr_path = pathlib.Path(outdir) / f"{engine}_stderr.log"
+    command = [
+        sys.executable,
+        __file__,
+        "--worker",
+        engine,
+        "--origins",
+        str(origins),
+        "--seed",
+        str(seed),
+        "--outdir",
+        outdir,
+        "--scenario",
+        ",".join(scenarios),
+    ]
+    with open(stderr_path, "w") as stderr:
+        monitored = monitor_worker(command, timeout, stderr)
+
+    record = {
+        "engine": engine,
+        "status": monitored["status"],
+        "peak_mb": monitored["peak_mb"],
+        "build_seconds": None,
+        "scenarios": {},
+    }
+    if monitored["status"] == "ok" and result_path.exists():
+        payload = json.loads(result_path.read_text())
+        record["build_seconds"] = payload.get("build_seconds")
+        record["scenarios"] = payload.get("scenarios", {})
+    elif monitored["status"] == "ok":
+        record["status"] = "no results"
+    if record["status"] != "ok":
+        record["reason"] = _last_line(stderr_path)
+        print(f"  {engine}: {record['status']} ({record['reason']})")
+    return record
 
 
 def compare_scenario(name, cafein_stats, r5py_stats):
@@ -413,32 +474,39 @@ def print_perf(per_engine, scenarios):
     )
     print(header)
     print("  " + "-" * (len(header) - 2))
-    for engine, stats in per_engine.items():
+    for engine, record in per_engine.items():
+        peak = "n/a" if record["peak_mb"] is None else f"{record['peak_mb']:.1f}"
+        build = (
+            f"{record['build_seconds']:.2f}"
+            if record["build_seconds"] is not None
+            else "-"
+        )
+        if record["status"] != "ok":
+            label = f"({record['status']})"
+            print(f"  {engine:<8} {label:<22} {'-':>8} {'-':>10} {peak:>9} {'-':>7}")
+            continue
         for name in scenarios:
-            scenario = stats["scenarios"].get(name)
+            scenario = record["scenarios"].get(name)
             if scenario is None:
                 continue
-            if "error" in scenario:
-                print(
-                    f"  {engine:<8} {name:<22} {stats['build_seconds']:>8.2f} "
-                    f"{'error':>10} {stats['peak_rss_mb']:>9.1f} {'-':>7}"
-                )
-                continue
-            print(
-                f"  {engine:<8} {name:<22} {stats['build_seconds']:>8.2f} "
-                f"{scenario['compute_seconds']:>10.2f} {stats['peak_rss_mb']:>9.1f} "
-                f"{scenario['n_results']:>7}"
+            compute = (
+                "error" if "error" in scenario else f"{scenario['compute_seconds']:.2f}"
             )
-    errors = [
-        (engine, name, scenario["error"])
-        for engine, stats in per_engine.items()
-        for name, scenario in stats["scenarios"].items()
-        if "error" in scenario
-    ]
+            rows = "-" if "error" in scenario else str(scenario["n_results"])
+            print(
+                f"  {engine:<8} {name:<22} {build:>8} {compute:>10} {peak:>9} {rows:>7}"
+            )
+    errors = []
+    for engine, record in per_engine.items():
+        if record["status"] != "ok":
+            errors.append((engine, record["status"], record.get("reason", "")))
+        for name, scenario in record["scenarios"].items():
+            if "error" in scenario:
+                errors.append((engine, name, scenario["error"]))
     if errors:
-        print("\nScenario errors")
-        for engine, name, message in errors:
-            print(f"  {engine} / {name}: {message}")
+        print("\nErrors")
+        for engine, what, message in errors:
+            print(f"  {engine} / {what}: {message}")
 
 
 def print_agreement(agreements):
@@ -471,9 +539,10 @@ def write_csv(path, per_engine, agreements, scenarios):
     fields = [
         "scenario",
         "engine",
+        "status",
         "build_seconds",
         "compute_seconds",
-        "peak_rss_mb",
+        "peak_mb",
         "n_results",
         "both_reachable",
         "only_cafein",
@@ -488,19 +557,31 @@ def write_csv(path, per_engine, agreements, scenarios):
     with open(path, "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
-        for engine, stats in per_engine.items():
-            for name in scenarios:
-                scenario = stats["scenarios"].get(name)
-                if scenario is None:
-                    continue
+        for engine, record in per_engine.items():
+            peak = "" if record["peak_mb"] is None else record["peak_mb"]
+            names = [name for name in scenarios if name in record["scenarios"]]
+            if not names:
+                writer.writerow(
+                    {
+                        "scenario": "",
+                        "engine": engine,
+                        "status": record["status"],
+                        "peak_mb": peak,
+                        "error": record.get("reason", ""),
+                    }
+                )
+                continue
+            for name in names:
+                scenario = record["scenarios"][name]
                 agreement = by_scenario.get(name, {})
                 writer.writerow(
                     {
                         "scenario": name,
                         "engine": engine,
-                        "build_seconds": round(stats["build_seconds"], 3),
+                        "status": "error" if "error" in scenario else "ok",
+                        "build_seconds": _round(record["build_seconds"]),
                         "compute_seconds": _round(scenario.get("compute_seconds")),
-                        "peak_rss_mb": round(stats["peak_rss_mb"], 1),
+                        "peak_mb": peak,
                         "n_results": scenario.get("n_results", ""),
                         "both_reachable": agreement.get("both_reachable", ""),
                         "only_cafein": agreement.get("only_cafein", ""),
@@ -531,6 +612,12 @@ def main():
     parser.add_argument("--origins", type=int, default=25, help="matrix sample size")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--scenario", default=",".join(SCENARIOS))
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help="per-engine wall-clock limit in seconds",
+    )
     parser.add_argument("--outdir", help=argparse.SUPPRESS)
     parser.add_argument("--csv", help="also write the results to this CSV path")
     args = parser.parse_args()
@@ -559,15 +646,12 @@ def main():
         f"(itineraries over {ITINERARY_POINTS}); results in {outdir}"
     )
 
-    per_engine = {}
-    for engine in engines:
-        stats = launch_worker(engine, args.origins, args.seed, outdir, scenarios)
-        if stats:
-            per_engine[engine] = stats
-
-    if not per_engine:
-        print("No engine produced results.")
-        return
+    per_engine = {
+        engine: launch_worker(
+            engine, args.origins, args.seed, outdir, scenarios, args.timeout
+        )
+        for engine in engines
+    }
 
     print_perf(per_engine, scenarios)
 
