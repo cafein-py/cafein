@@ -2,10 +2,11 @@
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import pytest
 import shapely
 
-from cafein import TravelCostMatrix, emissions
+from cafein import TravelCostMatrix, TravelTimeMatrix, emissions
 
 
 def point_frame(network, named_stops):
@@ -404,3 +405,137 @@ def test_arrow_tables_need_pyarrow(network, monkeypatch):
             date="2022-02-22",
             departure="08:30:00",
         )
+
+
+UNREACHABLE = np.iinfo(np.uint32).max
+
+
+def test_travel_time_matrix_unstacks_the_wide_matrix(network):
+    origins = ["4810551", "1250551"]
+    wide = network.travel_time_matrix(origins, "2022-02-22", "08:30:00")
+    stops = [stop for stop, _lat, _lon in network.stops]
+    matrix = TravelTimeMatrix(network, origins, date="2022-02-22", departure="08:30:00")
+    assert list(matrix.columns) == ["from_id", "to_id", "travel_time"]
+    # Every reachable wide cell is a row; unreachable cells are absent.
+    assert len(matrix) == int((wide != UNREACHABLE).sum())
+    long = {
+        (row.from_id, row.to_id): int(row.travel_time) for row in matrix.itertuples()
+    }
+    reference = {
+        (origin, stops[column]): int(wide[index, column])
+        for index, origin in enumerate(origins)
+        for column in range(wide.shape[1])
+        if wide[index, column] != UNREACHABLE
+    }
+    assert long == reference
+    # The Korso -> Käpylä pair keeps its 28-minute travel time.
+    korso = matrix[(matrix.from_id == "4810551") & (matrix.to_id == "1250551")]
+    assert int(korso.travel_time.iloc[0]) == 28 * 60
+    # Slices degrade to plain DataFrames.
+    assert type(matrix.iloc[:1]) is pd.DataFrame
+
+
+def test_travel_time_matrix_windowed_percentiles(network):
+    origins = ["4740551"]
+    percentiles = [10, 50, 90]
+    wide = network.travel_time_matrix(
+        origins,
+        "2022-02-22",
+        "08:00:00",
+        window=1800,
+        percentiles=percentiles,
+    )
+    stops = [stop for stop, _lat, _lon in network.stops]
+    matrix = TravelTimeMatrix(
+        network,
+        origins,
+        date="2022-02-22",
+        departure="08:00:00",
+        window=1800,
+        percentiles=percentiles,
+    )
+    assert list(matrix.columns) == [
+        "from_id",
+        "to_id",
+        "travel_time_p10",
+        "travel_time_p50",
+        "travel_time_p90",
+    ]
+    # Each row equals the corresponding wide percentile plane, cell for
+    # cell, with unreachable percentile cells read as NaN.
+    for row in matrix.itertuples():
+        column = stops.index(row.to_id)
+        for offset, percentile in enumerate((10, 50, 90)):
+            wide_value = wide[0, column, offset]
+            long_value = getattr(row, f"travel_time_p{percentile}")
+            if wide_value == UNREACHABLE:
+                assert np.isnan(long_value)
+            else:
+                assert long_value == wide_value
+    # Percentiles are ordered within a reachable row.
+    reachable = matrix.dropna()
+    assert (reachable.travel_time_p10 <= reachable.travel_time_p50).all()
+    assert (reachable.travel_time_p50 <= reachable.travel_time_p90).all()
+
+
+def test_travel_time_matrix_over_points(network_with_footpaths):
+    origins = point_frame(network_with_footpaths, [("A", "1100602")])
+    destinations = point_frame(
+        network_with_footpaths, [("B", "1040280"), ("C", "1250551")]
+    )
+    wide = network_with_footpaths.travel_time_matrix(
+        origins, "2022-02-22", "08:30:00", destinations=destinations
+    )
+    matrix = TravelTimeMatrix(
+        network_with_footpaths,
+        origins,
+        destinations,
+        date="2022-02-22",
+        departure="08:30:00",
+    )
+    long = {
+        (row.from_id, row.to_id): int(row.travel_time) for row in matrix.itertuples()
+    }
+    reference = {
+        ("A", destination): int(wide[0, column])
+        for column, destination in enumerate(["B", "C"])
+        if wide[0, column] != UNREACHABLE
+    }
+    assert long == reference
+    assert (matrix.from_id == "A").all()
+
+
+def test_travel_time_matrix_chunks_partition_origins(network):
+    origins = ["4810551", "1250551", "4740551"]
+    full = TravelTimeMatrix(network, origins, date="2022-02-22", departure="08:30:00")
+    parts = [
+        TravelTimeMatrix(
+            network, origins, date="2022-02-22", departure="08:30:00", chunk=(k, 3)
+        )
+        for k in range(3)
+    ]
+    stitched = pd.concat(parts, ignore_index=True)
+    assert len(stitched) == len(full)
+    assert set(map(tuple, stitched[["from_id", "to_id"]].to_numpy())) == set(
+        map(tuple, full[["from_id", "to_id"]].to_numpy())
+    )
+
+
+def test_travel_time_matrix_requires_date_and_departure(network):
+    with pytest.raises(TypeError, match="requires date and departure"):
+        TravelTimeMatrix(network, ["4810551"])
+
+
+def test_travel_time_matrix_defaults_to_all_stops(network):
+    stops = [stop for stop, _lat, _lon in network.stops]
+    # Omitted origins mean every stop; the first origin chunk keeps the
+    # all-stops resolution cheap to exercise.
+    matrix = TravelTimeMatrix(
+        network,
+        date="2022-02-22",
+        departure="08:30:00",
+        chunk=(0, network.stop_count),
+    )
+    assert set(matrix.from_id) == {stops[0]}
+    assert set(matrix.to_id) <= set(stops)
+    assert len(matrix) > 0

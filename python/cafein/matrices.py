@@ -119,6 +119,160 @@ class TravelCostMatrix(pd.DataFrame):
         super().__init__(pd.DataFrame(data))
 
 
+class TravelTimeMatrix(pd.DataFrame):
+    """Travel times per OD pair, long format — the lean r5py-style mode.
+
+    A pandas DataFrame with one row per reachable OD pair: ``from_id``,
+    ``to_id``, and ``travel_time`` in seconds. It is the long-format face
+    of ``TransportNetwork.travel_time_matrix``: one RAPTOR run serves
+    each origin, fanned out over all cores, and the reachable cells of
+    the resulting wide matrix are unstacked into rows. Unreachable pairs
+    are absent (never a sentinel), so the frame joins straight onto other
+    tables. Where travel times only are needed, this is lighter than
+    ``TravelCostMatrix``, which also aggregates transfers, distances, and
+    emissions.
+
+    With ``window``, every minute mark within ``[departure, departure +
+    window)`` is profiled and the ``travel_time`` column is replaced by
+    one ``travel_time_p<p>`` column per requested percentile (the median
+    by default, or ``confidence`` for the symmetric interval plus the
+    median), in seconds and floating-point so an unreachable percentile
+    reads as ``NaN``; a pair appears when at least one of its percentiles
+    is reachable.
+
+    Origins are either stop identifiers or a point GeoDataFrame with an
+    ``id`` column; destinations apply to point origins only — stop
+    origins always span every stop (the ``stops`` order). Points are
+    linked once against the street network (requires ``osm_pbf=`` at
+    build time); points off the walking network are reported with a
+    warning and stay unreachable. Slices and copies degrade to plain
+    DataFrames.
+
+    Parameters
+    ----------
+    network : TransportNetwork
+        The network to compute on.
+    origins : list of str, or GeoDataFrame (optional)
+        Origin stop_ids (every stop when omitted), or points with an
+        ``id`` column.
+    destinations : GeoDataFrame (optional)
+        Destination points; defaults to the origins. Only valid with
+        point origins — stop origins always span every stop.
+    date : str
+        Service date as ``YYYY-MM-DD``.
+    departure : str
+        Departure time at every origin as ``HH:MM:SS``.
+    max_transfers : int (optional, default: 4)
+        Maximum number of transfers between rides.
+    window : int (optional)
+        Departure window in seconds; enables percentile columns.
+    percentiles : list of float (optional)
+        Percentiles in ``[0, 100]`` over the window's departures;
+        requires `window`, defaults to ``[50]``.
+    confidence : float (optional)
+        A level in ``(0, 1)`` mapped to the symmetric percentile
+        interval plus the median; requires `window` and excludes
+        `percentiles`.
+    chunk : (int, int) (optional)
+        Compute only origin chunk ``k`` of ``n``: a deterministic
+        contiguous block of the resolved origins, so ``n`` batch jobs
+        cover all origins disjointly and their rows concatenate.
+    walking_speed_kmph, max_walking_time, max_snap_distance : float
+        The street-search options for point origins/destinations, as in
+        ``TransportNetwork.access_stops``; only valid with points.
+    """
+
+    @property
+    def _constructor(self):
+        return pd.DataFrame
+
+    def __init__(
+        self,
+        network,
+        origins=None,
+        destinations=None,
+        date=None,
+        departure=None,
+        *,
+        max_transfers=4,
+        window=None,
+        percentiles=None,
+        confidence=None,
+        chunk=None,
+        walking_speed_kmph=None,
+        max_walking_time=None,
+        max_snap_distance=None,
+    ):
+        data = _time_columns(
+            network,
+            origins,
+            date,
+            departure,
+            max_transfers,
+            destinations=destinations,
+            window=window,
+            percentiles=percentiles,
+            confidence=confidence,
+            chunk=chunk,
+            walking_speed_kmph=walking_speed_kmph,
+            max_walking_time=max_walking_time,
+            max_snap_distance=max_snap_distance,
+        )
+        super().__init__(pd.DataFrame(data))
+
+
+def _time_columns(
+    network,
+    origins,
+    date,
+    departure,
+    max_transfers,
+    *,
+    destinations,
+    window,
+    percentiles,
+    confidence,
+    chunk,
+    walking_speed_kmph,
+    max_walking_time,
+    max_snap_distance,
+):
+    """The reachable cells of the travel-time matrix, in long format."""
+    if date is None or departure is None:
+        raise TypeError("TravelTimeMatrix requires date and departure")
+    matrix, from_ids, to_ids, resolved = network._time_matrix_with_ids(
+        origins,
+        date,
+        departure,
+        max_transfers,
+        destinations=destinations,
+        window=window,
+        percentiles=percentiles,
+        confidence=confidence,
+        chunk=chunk,
+        walking_speed_kmph=walking_speed_kmph,
+        max_walking_time=max_walking_time,
+        max_snap_distance=max_snap_distance,
+    )
+    from_ids = np.asarray(from_ids, dtype=object)
+    to_ids = np.asarray(to_ids, dtype=object)
+    unreachable = np.iinfo(np.uint32).max
+    if resolved is None:
+        rows, columns = np.nonzero(matrix != unreachable)
+        return {
+            "from_id": from_ids[rows],
+            "to_id": to_ids[columns],
+            "travel_time": matrix[rows, columns],
+        }
+    rows, columns = np.nonzero((matrix != unreachable).any(axis=2))
+    values = matrix[rows, columns, :].astype(float)
+    values[values == unreachable] = np.nan
+    data = {"from_id": from_ids[rows], "to_id": to_ids[columns]}
+    for index, percentile in enumerate(resolved):
+        data[f"travel_time_p{percentile:g}"] = values[:, index]
+    return data
+
+
 def travel_cost_table(
     network,
     origins=None,
