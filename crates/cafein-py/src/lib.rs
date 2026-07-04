@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use chrono::NaiveDate;
+use numpy::{IntoPyArray, PyArray2, PyArrayMethods};
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -655,6 +656,75 @@ impl TransportNetwork {
             }
         }
         Ok(result.unbind())
+    }
+
+    /// Travel times from several stops to every stop, as a matrix.
+    ///
+    /// One RAPTOR run serves each origin, fanned out over the origins in
+    /// parallel with the GIL released; per-worker search state is pooled
+    /// across origins. The result is deterministic regardless of
+    /// scheduling.
+    ///
+    /// Parameters
+    /// ----------
+    /// from_stops : list of str
+    ///     GTFS stop_ids of the origin stops; ``<feed_index>:<stop_id>``
+    ///     when an id occurs in several merged feeds.
+    /// date : str
+    ///     Service date as ``YYYY-MM-DD``.
+    /// departure : str
+    ///     Departure time at every origin as ``HH:MM:SS``.
+    /// max_transfers : int (optional, default: 4)
+    ///     Maximum number of transfers between rides.
+    ///
+    /// Returns
+    /// -------
+    /// numpy.ndarray
+    ///     A ``(len(from_stops), stop_count)`` uint32 array of travel
+    ///     times in seconds; row order follows `from_stops`, column
+    ///     order follows ``stops``. Unreachable pairs hold the maximum
+    ///     uint32 value (4294967295).
+    #[pyo3(signature = (from_stops, date, departure, max_transfers = 4))]
+    fn travel_time_matrix<'py>(
+        &self,
+        py: Python<'py>,
+        from_stops: Vec<String>,
+        date: &str,
+        departure: &str,
+        max_transfers: u8,
+    ) -> PyResult<Bound<'py, PyArray2<u32>>> {
+        let origins: Vec<StopIdx> = from_stops
+            .iter()
+            .map(|stop| self.resolve_stop(stop))
+            .collect::<PyResult<_>>()?;
+        let departure = parse_time(departure)?;
+        let active_services = self.active_services(date)?;
+        let requests: Vec<Request> = origins
+            .into_iter()
+            .map(|origin| Request {
+                departure,
+                access: vec![(origin, 0)],
+                egress: Vec::new(),
+                active_services: active_services.clone(),
+                max_transfers,
+            })
+            .collect();
+        let stop_count = self.build.timetable.stop_count() as usize;
+        let flat: Vec<u32> = py.allow_threads(|| {
+            let rows = Raptor.one_to_all_many(&self.build.timetable, &self.transfers, &requests);
+            let mut flat = Vec::with_capacity(requests.len() * stop_count);
+            for row in rows {
+                flat.extend(row.into_iter().map(|arrival| match arrival {
+                    Some(arrival) => arrival - departure,
+                    None => u32::MAX,
+                }));
+            }
+            flat
+        });
+        let rows = requests.len();
+        flat.into_pyarray(py)
+            .reshape([rows, stop_count])
+            .map_err(|error| PyValueError::new_err(error.to_string()))
     }
 }
 
