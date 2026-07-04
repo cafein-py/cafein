@@ -85,3 +85,18 @@ def test_load_refuses_foreign_and_future_files(tmp_path):
 
     with pytest.raises(ValueError):
         TransportNetwork.load(tmp_path / "missing.cafein")
+
+
+def test_load_refuses_corrupted_payloads(tmp_path):
+    from test_transport_network import build_synthetic_gtfs
+
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs([str(feed)])
+    path = tmp_path / "small.cafein"
+    network.save(path)
+    blob = bytearray(path.read_bytes())
+    blob[-10] ^= 0xFF
+    path.write_bytes(bytes(blob))
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        TransportNetwork.load(path)

@@ -161,9 +161,11 @@ class TransportNetwork:
     def load(cls, path):
         """Load a network saved with `save`.
 
-        Artifacts written in another format version are refused with a
-        message naming the writing cafein version; rebuild from the
-        inputs (or re-save) with a matching version instead.
+        Artifacts written in another format version are refused with
+        a message naming the writing cafein version, and corrupted
+        payloads fail their checksum; rebuild from the inputs (or
+        re-save) with a matching version instead. Artifacts are
+        trusted input, like pickles: load only files you created.
 
         Parameters
         ----------

@@ -124,6 +124,34 @@ fn io_error(error: std::io::Error) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
 
+/// CRC-32 (IEEE) over the artifact payload.
+fn crc32(bytes: &[u8]) -> u32 {
+    const TABLE: [u32; 256] = {
+        let mut table = [0u32; 256];
+        let mut index = 0;
+        while index < 256 {
+            let mut value = index as u32;
+            let mut bit = 0;
+            while bit < 8 {
+                value = if value & 1 != 0 {
+                    0xEDB8_8320 ^ (value >> 1)
+                } else {
+                    value >> 1
+                };
+                bit += 1;
+            }
+            table[index] = value;
+            index += 1;
+        }
+        table
+    };
+    let mut crc = u32::MAX;
+    for &byte in bytes {
+        crc = TABLE[((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    !crc
+}
+
 /// Rejects an empty or out-of-range window/percentile specification.
 fn validate_window(window: u32, percentiles: &[f64]) -> PyResult<()> {
     if window == 0 {
@@ -227,8 +255,10 @@ impl TransportNetwork {
     /// service calendar, transfers, trip distances, leg geometries,
     /// and the street network — behind a versioned header, so batch
     /// jobs can ``load`` the same file read-only instead of rebuilding
-    /// from GTFS and OSM inputs. Build diagnostics (quarantine
-    /// reports) are not persisted; their warnings belong to the build.
+    /// from GTFS and OSM inputs. The payload carries a checksum, so
+    /// on-disk corruption is caught at load time. Build diagnostics
+    /// (quarantine reports) are not persisted; their warnings belong
+    /// to the build.
     fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
         use std::io::Write;
 
@@ -253,8 +283,15 @@ impl TransportNetwork {
                 .write_all(&(version.len() as u16).to_le_bytes())
                 .map_err(io_error)?;
             writer.write_all(version).map_err(io_error)?;
-            bincode::serialize_into(&mut writer, &artifact)
+            let payload = bincode::serialize(&artifact)
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            writer
+                .write_all(&(payload.len() as u64).to_le_bytes())
+                .map_err(io_error)?;
+            writer
+                .write_all(&crc32(&payload).to_le_bytes())
+                .map_err(io_error)?;
+            writer.write_all(&payload).map_err(io_error)?;
             writer.flush().map_err(io_error)
         })
     }
@@ -262,8 +299,10 @@ impl TransportNetwork {
     /// Load a network saved with ``save``.
     ///
     /// Artifacts written in another format version are refused with a
-    /// message naming the writing cafein version; rebuild from the
-    /// inputs (or re-save) with a matching version instead.
+    /// message naming the writing cafein version, and corrupted
+    /// payloads fail their checksum; rebuild from the inputs (or
+    /// re-save) with a matching version instead. Artifacts are trusted
+    /// input, like pickles: load only files you created.
     #[staticmethod]
     fn load(py: Python<'_>, path: &str) -> PyResult<TransportNetwork> {
         use std::io::Read;
@@ -294,8 +333,19 @@ impl TransportNetwork {
                     env!("CARGO_PKG_VERSION"),
                 )));
             }
-            bincode::deserialize_from(&mut reader)
-                .map_err(|error| PyValueError::new_err(error.to_string()))
+            let mut length = [0u8; 8];
+            reader.read_exact(&mut length).map_err(io_error)?;
+            let mut checksum = [0u8; 4];
+            reader.read_exact(&mut checksum).map_err(io_error)?;
+            let mut payload = vec![0u8; u64::from_le_bytes(length) as usize];
+            reader.read_exact(&mut payload).map_err(io_error)?;
+            if crc32(&payload) != u32::from_le_bytes(checksum) {
+                return Err(PyValueError::new_err(format!(
+                    "'{path}' is corrupted (checksum mismatch); rebuild the \
+                     network from its inputs and save it again"
+                )));
+            }
+            bincode::deserialize(&payload).map_err(|error| PyValueError::new_err(error.to_string()))
         })?;
         let build = TimetableBuild {
             timetable: artifact.timetable,
