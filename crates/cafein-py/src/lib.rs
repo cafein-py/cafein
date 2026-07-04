@@ -12,7 +12,7 @@ use cafein_core::geometry::{DistanceProvenance, LegGeometry, TripGeometry};
 use cafein_core::journey::{Journey, Leg};
 use cafein_core::raptor::{CostInputs, Raptor};
 use cafein_core::router::{Request, TransitRouter};
-use cafein_core::streets::{StopLink, StreetNetwork, StreetNetworkParts, WalkedStop};
+use cafein_core::streets::{Snap, StopLink, StreetNetwork, StreetNetworkParts, WalkedStop};
 use cafein_core::timetable::{StopIdx, Timetable, TripIdx};
 use cafein_core::transfers::Transfers;
 use cafein_gtfs::{build_timetable, Feed, RouteType, ServiceCalendar, TimetableBuild};
@@ -61,8 +61,16 @@ fn request_offsets(walks: &[WalkedStop]) -> Vec<(StopIdx, u32)> {
     walks.iter().map(|walk| (walk.stop, walk.seconds)).collect()
 }
 
+/// A coordinate query's endpoints, for drawing its walk legs.
+struct CoordinateEnds {
+    origin: (f64, f64),
+    origin_snap: Snap,
+    destination: (f64, f64),
+    destination_snap: Snap,
+}
+
 const ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINET";
-const ARTIFACT_FORMAT: u32 = 1;
+const ARTIFACT_FORMAT: u32 = 2;
 
 /// The saved network, borrowed for writing.
 #[derive(serde::Serialize)]
@@ -698,8 +706,8 @@ impl TransportNetwork {
     /// installed. ``route_between_coordinates`` routes door-to-door from
     /// arbitrary coordinates. Legs carry times, stops, distances, and
     /// provenance; transit legs add their geometry as a WKB LineString
-    /// when leg geometries are installed. Walk legs carry no geometry
-    /// yet.
+    /// when leg geometries are installed, and transfer legs their
+    /// walked street path when the street network is installed.
     ///
     /// Parameters
     /// ----------
@@ -754,7 +762,7 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             max_transfers,
         };
-        self.route_request(py, &request, window, None, geometries)
+        self.route_request(py, &request, window, None, None, geometries)
     }
 
     /// Route door-to-door between two coordinates for a single departure.
@@ -766,7 +774,10 @@ impl TransportNetwork {
     /// walking distance in meters; a coordinate farther than
     /// ``max_snap_distance`` from the walking network raises
     /// ``ValueError``. Journeys ride at least one trip: a destination
-    /// best reached by walking alone yields no journeys.
+    /// best reached by walking alone yields no journeys. With
+    /// ``geometries`` (the default), access and egress legs carry their
+    /// walked street path as WKB LineStrings alongside the transit
+    /// legs' geometry.
     ///
     /// Parameters
     /// ----------
@@ -829,6 +840,18 @@ impl TransportNetwork {
             "destination ",
         )?;
         let walks = WalkMaps::new(&access, &egress);
+        // The endpoints re-snap for geometry; the searches above prove
+        // both snaps exist.
+        let ends = CoordinateEnds {
+            origin,
+            origin_snap: streets
+                .snap(origin.0, origin.1, max_snap_distance)
+                .expect("origin linked above"),
+            destination,
+            destination_snap: streets
+                .snap(destination.0, destination.1, max_snap_distance)
+                .expect("destination linked above"),
+        };
         let request = Request {
             departure: parse_time(departure)?,
             access: request_offsets(&access),
@@ -836,7 +859,7 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             max_transfers,
         };
-        self.route_request(py, &request, window, Some(&walks), geometries)
+        self.route_request(py, &request, window, Some(&walks), Some(&ends), geometries)
     }
 
     /// Earliest arrival at every reachable stop from a coordinate.
@@ -1608,12 +1631,14 @@ impl TransportNetwork {
 
     /// Runs a request through the router and converts the journeys,
     /// attaching walk-leg distances when the walk lengths are known.
+    #[allow(clippy::too_many_arguments)]
     fn route_request(
         &self,
         py: Python<'_>,
         request: &Request,
         window: Option<u32>,
         walks: Option<&WalkMaps>,
+        ends: Option<&CoordinateEnds>,
         geometries: bool,
     ) -> PyResult<Py<PyList>> {
         let journeys = match window {
@@ -1624,9 +1649,31 @@ impl TransportNetwork {
         };
         let result = PyList::empty(py);
         for journey in &journeys {
-            result.append(self.journey_to_dict(py, journey, walks, geometries)?)?;
+            result.append(self.journey_to_dict(py, journey, walks, ends, geometries)?)?;
         }
         Ok(result.unbind())
+    }
+
+    /// A stop's coordinates and street snap, for drawing walk legs.
+    fn stop_walk_endpoint(&self, stop: StopIdx) -> Option<((f64, f64), Snap)> {
+        let streets = self.streets.as_ref()?;
+        let snap = streets.stop_snap(stop)?;
+        let feed_stop = &self.feed.stops[stop.0 as usize];
+        Some(((feed_stop.latitude?, feed_stop.longitude?), snap))
+    }
+
+    /// The walked street path between two snapped points, as WKB.
+    fn walk_wkb<'py>(
+        &self,
+        py: Python<'py>,
+        from_point: (f64, f64),
+        from_snap: &Snap,
+        to_point: (f64, f64),
+        to_snap: &Snap,
+    ) -> Option<Bound<'py, PyBytes>> {
+        let streets = self.streets.as_ref()?;
+        let (path, _) = streets.walk_path(from_point, from_snap, to_point, to_snap)?;
+        Some(wkb_line_string(py, &path))
     }
 
     /// The public form of a stop identifier: raw for a single feed,
@@ -1668,6 +1715,7 @@ impl TransportNetwork {
         py: Python<'_>,
         journey: &Journey,
         walks: Option<&WalkMaps>,
+        ends: Option<&CoordinateEnds>,
         geometries: bool,
     ) -> PyResult<Py<PyDict>> {
         let timetable = &self.build.timetable;
@@ -1693,7 +1741,11 @@ impl TransportNetwork {
                         walks.and_then(|walks| walks.access.get(&to_stop)).copied(),
                     )?;
                     entry.set_item("distance_provenance", py.None())?;
-                    entry.set_item("geometry", py.None())?;
+                    let geometry = ends.filter(|_| geometries).and_then(|ends| {
+                        let (point, snap) = self.stop_walk_endpoint(to_stop)?;
+                        self.walk_wkb(py, ends.origin, &ends.origin_snap, point, &snap)
+                    });
+                    entry.set_item("geometry", geometry)?;
                 }
                 Leg::Transit {
                     trip,
@@ -1767,7 +1819,14 @@ impl TransportNetwork {
                     entry.set_item("arrival", arrival)?;
                     entry.set_item("distance", meters)?;
                     entry.set_item("distance_provenance", py.None())?;
-                    entry.set_item("geometry", py.None())?;
+                    let geometry = geometries
+                        .then(|| {
+                            let (from_point, from_snap) = self.stop_walk_endpoint(from_stop)?;
+                            let (to_point, to_snap) = self.stop_walk_endpoint(to_stop)?;
+                            self.walk_wkb(py, from_point, &from_snap, to_point, &to_snap)
+                        })
+                        .flatten();
+                    entry.set_item("geometry", geometry)?;
                 }
                 Leg::Egress {
                     from_stop,
@@ -1785,7 +1844,11 @@ impl TransportNetwork {
                             .copied(),
                     )?;
                     entry.set_item("distance_provenance", py.None())?;
-                    entry.set_item("geometry", py.None())?;
+                    let geometry = ends.filter(|_| geometries).and_then(|ends| {
+                        let (point, snap) = self.stop_walk_endpoint(from_stop)?;
+                        self.walk_wkb(py, point, &snap, ends.destination, &ends.destination_snap)
+                    });
+                    entry.set_item("geometry", geometry)?;
                 }
             }
             legs.append(entry)?;

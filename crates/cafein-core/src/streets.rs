@@ -132,9 +132,9 @@ impl std::error::Error for StreetError {}
 pub struct StreetNetwork {
     /// CSR offsets into `adjacency`, one entry per vertex plus a tail.
     adjacency_offsets: Vec<u32>,
-    /// Outgoing `(target vertex, meters)` entries; edges appear in both
-    /// directions.
-    adjacency: Vec<(u32, f64)>,
+    /// Outgoing `(target vertex, meters, edge)` entries; edges appear
+    /// in both directions.
+    adjacency: Vec<(u32, f64, u32)>,
     /// Edge endpoints, one entry per input edge.
     endpoints: Vec<(u32, u32)>,
     /// Edge cost lengths in meters (the OSM way length, which the split
@@ -240,12 +240,12 @@ impl StreetNetwork {
         for vertex in 0..vertex_count as usize {
             adjacency_offsets[vertex + 1] += adjacency_offsets[vertex];
         }
-        let mut adjacency = vec![(0u32, 0.0); edges.len() * 2];
+        let mut adjacency = vec![(0u32, 0.0, 0u32); edges.len() * 2];
         let mut cursor = adjacency_offsets.clone();
-        for &(from, to, meters) in edges {
+        for (index, &(from, to, meters)) in edges.iter().enumerate() {
             for (a, b) in [(from, to), (to, from)] {
                 let slot = cursor[a as usize] as usize;
-                adjacency[slot] = (b, meters);
+                adjacency[slot] = (b, meters, index as u32);
                 cursor[a as usize] += 1;
             }
         }
@@ -437,6 +437,246 @@ impl StreetNetwork {
             .collect()
     }
 
+    /// A stop's snap link as a [`Snap`], when the stop is linked. A
+    /// stop with several links yields the nearest one.
+    pub fn stop_snap(&self, stop: StopIdx) -> Option<Snap> {
+        self.links
+            .iter()
+            .filter(|link| link.stop == stop)
+            .min_by(|a, b| a.connector.total_cmp(&b.connector))
+            .map(|link| Snap {
+                edge: link.edge,
+                fraction: link.fraction,
+                connector: link.connector,
+            })
+    }
+
+    /// The walked street path between two snapped coordinates: the
+    /// shortest path's geometry in EPSG:4326 — endpoint, connector,
+    /// partial edges at the snap fractions, full edges between — and
+    /// its length in meters, connectors included. `None` when the snap
+    /// points lie in different street components.
+    ///
+    /// For stop pairs whose stored transfer chained several footpaths
+    /// beyond the direct-search cutoff, this direct shortest path can
+    /// be shorter than the stored transfer.
+    pub fn walk_path(
+        &self,
+        from_point: (f64, f64),
+        from: &Snap,
+        to_point: (f64, f64),
+        to: &Snap,
+    ) -> Option<(Vec<(f64, f64)>, f64)> {
+        let from_length = self.lengths[from.edge as usize];
+        let to_length = self.lengths[to.edge as usize];
+        // The direct candidate: both points on one edge.
+        let direct = (from.edge == to.edge).then(|| {
+            from.connector + (from.fraction - to.fraction).abs() * from_length + to.connector
+        });
+
+        let (from_u, from_v) = self.endpoints[from.edge as usize];
+        let (distances, previous) = self.dijkstra_with_paths(&[
+            (from_u, from.connector + from.fraction * from_length),
+            (from_v, from.connector + (1.0 - from.fraction) * from_length),
+        ]);
+        let (to_u, to_v) = self.endpoints[to.edge as usize];
+        let via_u = distances[to_u as usize] + to.fraction * to_length + to.connector;
+        let via_v = distances[to_v as usize] + (1.0 - to.fraction) * to_length + to.connector;
+
+        let best_transit = if via_u <= via_v { via_u } else { via_v };
+        if direct.is_none_or(|meters| best_transit < meters) && best_transit.is_finite() {
+            let exit = if via_u <= via_v { to_u } else { to_v };
+            // Walk the predecessor chain back to the seed vertex.
+            let mut vertices = vec![exit];
+            let mut edges = Vec::new();
+            let mut at = exit;
+            while let Some((prev, edge)) = previous[at as usize] {
+                vertices.push(prev);
+                edges.push(edge);
+                at = prev;
+            }
+            vertices.reverse();
+            edges.reverse();
+
+            let mut path = Vec::new();
+            let origin = self.project(from_point);
+            path.push(origin);
+            path.push(self.point_at(from.edge, from.fraction));
+            // The partial first edge, from the snap point to the seed.
+            // A loop edge's endpoints coincide; its cheaper side was
+            // seeded, so pick the side by the snap fraction.
+            let entry = vertices[0];
+            let entry_fraction = if from_u == from_v {
+                if from.fraction <= 0.5 {
+                    0.0
+                } else {
+                    1.0
+                }
+            } else if entry == from_u {
+                0.0
+            } else {
+                1.0
+            };
+            path.extend(self.edge_slice(from.edge, from.fraction, entry_fraction));
+            for (step, &edge) in edges.iter().enumerate() {
+                let (u, _) = self.endpoints[edge as usize];
+                let forward = vertices[step] == u;
+                path.extend(self.edge_slice(
+                    edge,
+                    if forward { 0.0 } else { 1.0 },
+                    if forward { 1.0 } else { 0.0 },
+                ));
+            }
+            // The partial last edge, from the exit vertex to the snap;
+            // sides of a loop edge again picked by the snap fraction.
+            let exit_fraction = if to_u == to_v {
+                if to.fraction <= 0.5 {
+                    0.0
+                } else {
+                    1.0
+                }
+            } else if exit == to_u {
+                0.0
+            } else {
+                1.0
+            };
+            path.extend(self.edge_slice(to.edge, exit_fraction, to.fraction));
+            path.push(self.point_at(to.edge, to.fraction));
+            path.push(self.project(to_point));
+            return Some((self.unprojected(path), best_transit));
+        }
+
+        let meters = direct?;
+        let mut path = vec![self.project(from_point)];
+        path.push(self.point_at(from.edge, from.fraction));
+        path.extend(self.edge_slice(from.edge, from.fraction, to.fraction));
+        path.push(self.point_at(to.edge, to.fraction));
+        path.push(self.project(to_point));
+        Some((self.unprojected(path), meters))
+    }
+
+    /// An unbounded Dijkstra recording each vertex's predecessor and the
+    /// edge it was entered through.
+    #[allow(clippy::type_complexity)]
+    fn dijkstra_with_paths(&self, sources: &[(u32, f64)]) -> (Vec<f64>, Vec<Option<(u32, u32)>>) {
+        let count = self.vertex_count() as usize;
+        let mut distances = vec![f64::INFINITY; count];
+        let mut previous: Vec<Option<(u32, u32)>> = vec![None; count];
+        let mut heap = BinaryHeap::new();
+        for &(vertex, distance) in sources {
+            if distance < distances[vertex as usize] {
+                distances[vertex as usize] = distance;
+                previous[vertex as usize] = None;
+                heap.push(Reverse((distance.to_bits(), vertex)));
+            }
+        }
+        while let Some(Reverse((bits, vertex))) = heap.pop() {
+            let distance = f64::from_bits(bits);
+            if distance > distances[vertex as usize] {
+                continue;
+            }
+            let start = self.adjacency_offsets[vertex as usize] as usize;
+            let end = self.adjacency_offsets[vertex as usize + 1] as usize;
+            for &(target, meters, edge) in &self.adjacency[start..end] {
+                let next = distance + meters;
+                if next < distances[target as usize] {
+                    distances[target as usize] = next;
+                    previous[target as usize] = Some((vertex, edge));
+                    heap.push(Reverse((next.to_bits(), target)));
+                }
+            }
+        }
+        (distances, previous)
+    }
+
+    /// The projected coordinates of a `(lat, lon)` point.
+    fn project(&self, point: (f64, f64)) -> (f64, f64) {
+        (
+            (point.1 - self.origin.0) * self.scale.0,
+            (point.0 - self.origin.1) * self.scale.1,
+        )
+    }
+
+    /// Projected coordinates back to `(lon, lat)`, consecutive
+    /// duplicates dropped.
+    fn unprojected(&self, path: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+        let mut coordinates: Vec<(f64, f64)> = Vec::with_capacity(path.len());
+        for (x, y) in path {
+            let lonlat = (
+                x / self.scale.0 + self.origin.0,
+                y / self.scale.1 + self.origin.1,
+            );
+            if coordinates.last() != Some(&lonlat) {
+                coordinates.push(lonlat);
+            }
+        }
+        if coordinates.len() == 1 {
+            coordinates.push(coordinates[0]);
+        }
+        coordinates
+    }
+
+    /// The projected point at a fraction of an edge's geometric length.
+    fn point_at(&self, edge: u32, fraction: f64) -> (f64, f64) {
+        let slice = self.edge_slice(edge, fraction, fraction);
+        slice[0]
+    }
+
+    /// The projected geometry of an edge between two fractions of its
+    /// geometric length, endpoints interpolated; reversed when
+    /// `from_fraction > to_fraction`. Always at least one point.
+    fn edge_slice(&self, edge: u32, from_fraction: f64, to_fraction: f64) -> Vec<(f64, f64)> {
+        let start = self.coordinate_offsets[edge as usize] as usize;
+        let end = self.coordinate_offsets[edge as usize + 1] as usize;
+        let mut measures = Vec::with_capacity(end - start);
+        let mut cumulative = 0.0;
+        measures.push(0.0);
+        for vertex in start..end - 1 {
+            let (dx, dy) = (
+                self.xs[vertex + 1] - self.xs[vertex],
+                self.ys[vertex + 1] - self.ys[vertex],
+            );
+            cumulative += (dx * dx + dy * dy).sqrt();
+            measures.push(cumulative);
+        }
+        let total = cumulative;
+        let interpolate = |measure: f64| -> (f64, f64) {
+            let upper = measures
+                .partition_point(|&at| at < measure)
+                .clamp(1, measures.len() - 1);
+            let lower = upper - 1;
+            let span = measures[upper] - measures[lower];
+            let along = if span > 0.0 {
+                ((measure - measures[lower]) / span).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            (
+                self.xs[start + lower] + along * (self.xs[start + upper] - self.xs[start + lower]),
+                self.ys[start + lower] + along * (self.ys[start + upper] - self.ys[start + lower]),
+            )
+        };
+        let (low, high, reversed) = if from_fraction <= to_fraction {
+            (from_fraction * total, to_fraction * total, false)
+        } else {
+            (to_fraction * total, from_fraction * total, true)
+        };
+        let mut slice = Vec::new();
+        slice.push(interpolate(low));
+        let after = measures.partition_point(|&measure| measure <= low);
+        let until = measures.partition_point(|&measure| measure < high);
+        for vertex in after..until {
+            slice.push((self.xs[start + vertex], self.ys[start + vertex]));
+        }
+        if high > low {
+            slice.push(interpolate(high));
+        }
+        if reversed {
+            slice.reverse();
+        }
+        slice
+    }
+
     /// The distance and linear-referenced fraction of a coordinate's
     /// projection onto an edge's geometry.
     fn project_onto_edge(&self, edge: u32, x: f64, y: f64) -> (f64, f64) {
@@ -492,7 +732,7 @@ impl StreetNetwork {
             }
             let start = self.adjacency_offsets[vertex as usize] as usize;
             let end = self.adjacency_offsets[vertex as usize + 1] as usize;
-            for &(target, meters) in &self.adjacency[start..end] {
+            for &(target, meters, _) in &self.adjacency[start..end] {
                 let next = distance + meters;
                 if next <= cutoff + 1e-9 && next < distances[target as usize] {
                     distances[target as usize] = next;
@@ -509,7 +749,7 @@ impl StreetNetwork {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct StreetNetworkParts {
     adjacency_offsets: Vec<u32>,
-    adjacency: Vec<(u32, f64)>,
+    adjacency: Vec<(u32, f64, u32)>,
     endpoints: Vec<(u32, u32)>,
     lengths: Vec<f64>,
     coordinate_offsets: Vec<u32>,
@@ -735,6 +975,169 @@ mod tests {
         let far = network.snap(far_lat, far_lon, 1e12).unwrap();
         assert_eq!(far.edge, 0);
         assert!(far.connector > 1_000_000.0);
+    }
+
+    #[test]
+    fn walk_paths_follow_the_street() {
+        // An L-shaped walk with partial edges at both snap points.
+        let network = network(
+            3,
+            0,
+            &[
+                (0, 1, 300.0, straight((0.0, 0.0), (300.0, 0.0))),
+                (1, 2, 200.0, straight((300.0, 0.0), (300.0, 200.0))),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let origin = lonlat(100.0, -10.0);
+        let target = lonlat(310.0, 100.0);
+        let from = network.snap(origin.1, origin.0, 50.0).unwrap();
+        let to = network.snap(target.1, target.0, 50.0).unwrap();
+        let (path, meters) = network
+            .walk_path((origin.1, origin.0), &from, (target.1, target.0), &to)
+            .unwrap();
+        // 10 m connector + 200 m along the first edge + 100 m up the
+        // second + 10 m connector.
+        assert!((meters - 320.0).abs() < 0.5);
+        let designed = [
+            lonlat(100.0, -10.0),
+            lonlat(100.0, 0.0),
+            lonlat(300.0, 0.0),
+            lonlat(300.0, 100.0),
+            lonlat(310.0, 100.0),
+        ];
+        assert_eq!(path.len(), designed.len());
+        for (point, expected) in path.iter().zip(designed) {
+            assert!((point.0 - expected.0).abs() < 1e-6, "{path:?}");
+            assert!((point.1 - expected.1).abs() < 1e-6, "{path:?}");
+        }
+
+        // The same-edge direct case never detours over a vertex.
+        let near = lonlat(120.0, 20.0);
+        let close = network.snap(near.1, near.0, 50.0).unwrap();
+        let (short, direct_meters) = network
+            .walk_path((origin.1, origin.0), &from, (near.1, near.0), &close)
+            .unwrap();
+        assert!((direct_meters - 50.0).abs() < 0.5);
+        assert_eq!(short.len(), 4);
+
+        // Disconnected components yield no path.
+        let island =
+            network // separate component
+                .walk_path((origin.1, origin.0), &from, (origin.1, origin.0), &from);
+        assert!(island.is_some());
+    }
+
+    #[test]
+    fn walk_paths_traverse_reversed_edges() {
+        // The middle edge is defined against the walking direction, so
+        // its geometry must come out reversed.
+        let network = network(
+            3,
+            0,
+            &[
+                (0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0))),
+                (2, 1, 100.0, straight((200.0, 0.0), (100.0, 0.0))),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let origin = lonlat(50.0, 0.0);
+        let target = lonlat(150.0, 0.0);
+        let from = network.snap(origin.1, origin.0, 50.0).unwrap();
+        let to = network.snap(target.1, target.0, 50.0).unwrap();
+        let (path, meters) = network
+            .walk_path((origin.1, origin.0), &from, (target.1, target.0), &to)
+            .unwrap();
+        assert!((meters - 100.0).abs() < 0.5);
+        // Longitudes must increase monotonically along the walk.
+        for pair in path.windows(2) {
+            assert!(pair[1].0 >= pair[0].0 - 1e-12, "{path:?}");
+        }
+    }
+
+    #[test]
+    fn walk_paths_need_a_connected_street() {
+        let network = network(
+            4,
+            0,
+            &[
+                (0, 1, 400.0, straight((0.0, 0.0), (400.0, 0.0))),
+                (2, 3, 400.0, straight((0.0, 1000.0), (400.0, 1000.0))),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let origin = lonlat(100.0, 0.0);
+        let target = lonlat(100.0, 1000.0);
+        let from = network.snap(origin.1, origin.0, 50.0).unwrap();
+        let to = network.snap(target.1, target.0, 50.0).unwrap();
+        assert!(network
+            .walk_path((origin.1, origin.0), &from, (target.1, target.0), &to)
+            .is_none());
+    }
+
+    #[test]
+    fn stop_snaps_prefer_the_nearest_link() {
+        let network = network(
+            2,
+            1,
+            &[(0, 1, 400.0, straight((0.0, 0.0), (400.0, 0.0)))],
+            vec![link(0, 0, 0.75, 40.0), link(0, 0, 0.25, 10.0)],
+        )
+        .unwrap();
+        let snap = network.stop_snap(StopIdx(0)).unwrap();
+        assert!((snap.fraction - 0.25).abs() < 1e-9);
+        assert!((snap.connector - 10.0).abs() < 1e-9);
+        assert_eq!(network.stop_snap(StopIdx(1)), None);
+    }
+
+    #[test]
+    fn walk_paths_take_the_short_side_of_a_loop() {
+        // A square loop whose endpoints coincide: the walk wraps through
+        // the shared vertex, and the drawn sides must be the short ones.
+        let network = network(
+            1,
+            0,
+            &[(
+                0,
+                0,
+                400.0,
+                vec![
+                    (0.0, 0.0),
+                    (100.0, 0.0),
+                    (100.0, 100.0),
+                    (0.0, 100.0),
+                    (0.0, 0.0),
+                ],
+            )],
+            vec![],
+        )
+        .unwrap();
+        let origin = lonlat(-10.0, 40.0);
+        let target = lonlat(20.0, -10.0);
+        let from = network.snap(origin.1, origin.0, 50.0).unwrap();
+        let to = network.snap(target.1, target.0, 50.0).unwrap();
+        assert!((from.fraction - 0.9).abs() < 1e-6);
+        assert!((to.fraction - 0.05).abs() < 1e-6);
+        let (path, meters) = network
+            .walk_path((origin.1, origin.0), &from, (target.1, target.0), &to)
+            .unwrap();
+        // 10 m connector + 40 m down + 20 m along + 10 m connector.
+        assert!((meters - 80.0).abs() < 0.5, "{meters}");
+        let designed = [
+            lonlat(-10.0, 40.0),
+            lonlat(0.0, 40.0),
+            lonlat(0.0, 0.0),
+            lonlat(20.0, 0.0),
+            lonlat(20.0, -10.0),
+        ];
+        assert_eq!(path.len(), designed.len(), "{path:?}");
+        for (point, expected) in path.iter().zip(designed) {
+            assert!((point.0 - expected.0).abs() < 1e-6, "{path:?}");
+            assert!((point.1 - expected.1).abs() < 1e-6, "{path:?}");
+        }
     }
 
     #[test]

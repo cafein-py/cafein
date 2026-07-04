@@ -724,3 +724,47 @@ def test_set_trip_distances_validates_input(tmp_path):
         network.set_trip_distances([("T_OK", [0.0, 1.0], "guesswork")])
     network.set_trip_distances([("T_OK", [0.0, 1500.0], "map_matched")])
     assert network.distance_provenance_counts == {"map_matched": 1}
+
+
+def test_walk_legs_carry_street_paths(network_with_footpaths):
+    import geopandas as gpd
+    import shapely
+
+    def utm_length(line):
+        series = gpd.GeoSeries([line], crs="EPSG:4326")
+        return float(series.to_crs(series.estimate_utm_crs()).length.iloc[0])
+
+    origin = stop_coordinates(network_with_footpaths, "1100602")
+    destination = stop_coordinates(network_with_footpaths, "1040280")
+    journeys = network_with_footpaths.route_between_coordinates(
+        origin, destination, "2022-02-22", "08:30:00"
+    )
+    access, transit, egress = journeys[0]["legs"]
+    walk = shapely.from_wkb(access["geometry"])
+    assert walk.geom_type == "LineString"
+    assert utm_length(walk) == pytest.approx(access["distance"], rel=0.02, abs=0.5)
+    assert walk.coords[0] == pytest.approx((origin[1], origin[0]), abs=1e-6)
+    walk = shapely.from_wkb(egress["geometry"])
+    assert utm_length(walk) == pytest.approx(egress["distance"], rel=0.02, abs=0.5)
+    assert walk.coords[-1] == pytest.approx((destination[1], destination[0]), abs=1e-6)
+
+    # Transfer legs draw their street path on stop-to-stop journeys too.
+    journeys = network_with_footpaths.route_between_stops(
+        "1100602", "1040280", "2022-02-22", "08:30:00"
+    )
+    access, transit, transfer, egress = journeys[0]["legs"]
+    walk = shapely.from_wkb(transfer["geometry"])
+    assert utm_length(walk) == pytest.approx(transfer["distance"], rel=0.02, abs=0.5)
+    kamppi = stop_coordinates(network_with_footpaths, "1040602")
+    street_stop = stop_coordinates(network_with_footpaths, "1040280")
+    assert walk.coords[0] == pytest.approx((kamppi[1], kamppi[0]), abs=1e-6)
+    assert walk.coords[-1] == pytest.approx((street_stop[1], street_stop[0]), abs=1e-6)
+    # Zero-length stop access/egress legs stay without geometry.
+    assert access["geometry"] is None
+    assert egress["geometry"] is None
+
+    # geometries=False strips walk legs like transit legs.
+    journeys = network_with_footpaths.route_between_stops(
+        "1100602", "1040280", "2022-02-22", "08:30:00", geometries=False
+    )
+    assert all(leg["geometry"] is None for leg in journeys[0]["legs"])
