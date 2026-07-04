@@ -1,6 +1,12 @@
 """Public-transport routing with per-leg distance and emissions tracking."""
 
-__all__ = ["TransportNetwork", "TravelCostMatrix", "travel_cost_table", "__version__"]
+__all__ = [
+    "TransportNetwork",
+    "TravelCostMatrix",
+    "DetailedItineraries",
+    "travel_cost_table",
+    "__version__",
+]
 
 
 def __getattr__(name):
@@ -14,6 +20,10 @@ def __getattr__(name):
         from cafein.matrices import TravelCostMatrix
 
         return TravelCostMatrix
+    if name == "DetailedItineraries":
+        from cafein.itineraries import DetailedItineraries
+
+        return DetailedItineraries
     if name == "travel_cost_table":
         from cafein.matrices import travel_cost_table
 
