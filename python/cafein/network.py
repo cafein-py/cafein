@@ -352,8 +352,9 @@ class TransportNetwork:
         coordinates, and ``annotate_emissions`` attaches emissions to
         routed journeys. Legs carry times, stops, distances, and
         provenance; transit legs add their geometry as a WKB LineString
-        when leg geometries are installed (the default build). Walk
-        legs carry no geometry yet.
+        when leg geometries are installed (the default build), and
+        transfer legs their walked street path when the street network
+        is installed.
 
         Parameters
         ----------
@@ -411,9 +412,10 @@ class TransportNetwork:
         street network provides walking access from the origin to nearby
         stops and egress from stops to the destination. Journeys
         otherwise behave as in ``route_between_stops``; access and
-        egress legs report their walking distance in meters. Journeys
-        ride at least one trip: a destination best reached by walking
-        alone yields no journeys.
+        egress legs report their walking distance in meters and — with
+        `geometries`, the default — their walked street path as WKB
+        LineStrings. Journeys ride at least one trip: a destination
+        best reached by walking alone yields no journeys.
 
         Parameters
         ----------
