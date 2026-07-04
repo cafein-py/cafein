@@ -7,7 +7,7 @@
 use crate::timetable::{Timetable, TripIdx};
 
 /// How a trip's distances were estimated (the fallback-ladder tier).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DistanceProvenance {
     /// Valid `shape_dist_traveled` values taken directly from the feed.
     ShapeDist,
@@ -22,7 +22,7 @@ pub enum DistanceProvenance {
 }
 
 /// Cumulative distances in meters at every stop position of every trip.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TripGeometry {
     /// CSR offsets into `distances`, one entry per trip plus a tail.
     offsets: Vec<u32>,
@@ -221,7 +221,7 @@ impl std::error::Error for LegGeometryError {}
 /// positions in its polyline's measure. A transit leg's geometry is the
 /// polyline's slice between the board and alight positions, found by
 /// binary search and endpoint interpolation.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LegGeometry {
     /// CSR offsets into the coordinate arrays, one per polyline plus a
     /// tail.

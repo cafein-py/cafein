@@ -19,7 +19,7 @@ pub type RouteIndex = u32;
 /// the feed they came from; the pair `(feed, id)` is unique across the merge.
 /// Cross-references between tables are resolved to vector indices at read
 /// time, so lookups never go through string identifiers.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Feed {
     pub agencies: Vec<Agency>,
     pub stops: Vec<Stop>,
@@ -33,7 +33,7 @@ pub struct Feed {
 }
 
 /// A transit agency (`agency.txt`).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Agency {
     pub feed: FeedIndex,
     pub id: Option<String>,
@@ -42,7 +42,7 @@ pub struct Agency {
 }
 
 /// A stop or station (`stops.txt`).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Stop {
     pub feed: FeedIndex,
     pub id: String,
@@ -54,7 +54,7 @@ pub struct Stop {
 }
 
 /// A route (`routes.txt`).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Route {
     pub feed: FeedIndex,
     pub id: String,
@@ -66,7 +66,7 @@ pub struct Route {
 
 /// A trip (`trips.txt`) with its scheduled calls (`stop_times.txt`),
 /// ordered by `stop_sequence`.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Trip {
     pub feed: FeedIndex,
     pub id: String,
@@ -83,7 +83,7 @@ pub struct Trip {
 /// Times are seconds past the start of the service day. GTFS over-midnight
 /// times (`25:30:00`) stay above 86 400 seconds on their original service
 /// day instead of wrapping around.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct StopTime {
     pub stop: StopIndex,
     pub arrival: Option<u32>,
@@ -93,7 +93,7 @@ pub struct StopTime {
 }
 
 /// A weekly service pattern (`calendar.txt`).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Calendar {
     pub feed: FeedIndex,
     pub service_id: String,
@@ -104,7 +104,7 @@ pub struct Calendar {
 }
 
 /// A dated exception to a service pattern (`calendar_dates.txt`).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct CalendarDate {
     pub feed: FeedIndex,
     pub service_id: String,
@@ -113,7 +113,7 @@ pub struct CalendarDate {
 }
 
 /// Feed metadata (`feed_info.txt`).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct FeedInfo {
     pub feed: FeedIndex,
     pub publisher_name: String,

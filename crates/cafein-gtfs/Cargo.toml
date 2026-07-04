@@ -11,4 +11,5 @@ authors.workspace = true
 cafein-core.workspace = true
 chrono.workspace = true
 gtfs-structures.workspace = true
+serde.workspace = true
 

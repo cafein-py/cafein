@@ -141,6 +141,39 @@ class TransportNetwork:
             core.set_street_network(*street_network)
         return cls(core)
 
+    def save(self, path):
+        """Save the network as a reusable artifact.
+
+        The artifact carries everything queries need — the timetable,
+        service calendar, transfers, trip distances, leg geometries,
+        and the street network — so batch jobs can ``load`` the same
+        file read-only instead of rebuilding from GTFS and OSM inputs.
+        Build diagnostics (quarantine warnings) are not persisted.
+
+        Parameters
+        ----------
+        path : path
+            Destination file, conventionally ``*.cafein``.
+        """
+        self._core.save(os.fspath(path))
+
+    @classmethod
+    def load(cls, path):
+        """Load a network saved with `save`.
+
+        Artifacts written in another format version are refused with
+        a message naming the writing cafein version, and corrupted
+        payloads fail their checksum; rebuild from the inputs (or
+        re-save) with a matching version instead. Artifacts are
+        trusted input, like pickles: load only files you created.
+
+        Parameters
+        ----------
+        path : path
+            An artifact written by `save`.
+        """
+        return cls(_TransportNetwork.load(os.fspath(path)))
+
     @property
     def stop_count(self):
         """Number of stops in the network."""

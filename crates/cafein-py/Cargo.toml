@@ -12,8 +12,10 @@ name = "_cafein"
 crate-type = ["cdylib"]
 
 [dependencies]
+bincode.workspace = true
 cafein-core.workspace = true
 cafein-gtfs.workspace = true
 chrono.workspace = true
 numpy.workspace = true
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }
+serde.workspace = true

@@ -12,10 +12,10 @@ use cafein_core::geometry::{DistanceProvenance, LegGeometry, TripGeometry};
 use cafein_core::journey::{Journey, Leg};
 use cafein_core::raptor::{CostInputs, Raptor};
 use cafein_core::router::{Request, TransitRouter};
-use cafein_core::streets::{StopLink, StreetNetwork, WalkedStop};
-use cafein_core::timetable::{StopIdx, TripIdx};
+use cafein_core::streets::{StopLink, StreetNetwork, StreetNetworkParts, WalkedStop};
+use cafein_core::timetable::{StopIdx, Timetable, TripIdx};
 use cafein_core::transfers::Transfers;
-use cafein_gtfs::{build_timetable, Feed, RouteType, TimetableBuild};
+use cafein_gtfs::{build_timetable, Feed, RouteType, ServiceCalendar, TimetableBuild};
 
 /// A routable public-transport network built from GTFS data.
 #[pyclass]
@@ -59,6 +59,97 @@ impl WalkMaps {
 /// The `(stop, seconds)` request offsets of a walking-search result.
 fn request_offsets(walks: &[WalkedStop]) -> Vec<(StopIdx, u32)> {
     walks.iter().map(|walk| (walk.stop, walk.seconds)).collect()
+}
+
+const ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINET";
+const ARTIFACT_FORMAT: u32 = 1;
+
+/// The saved network, borrowed for writing.
+#[derive(serde::Serialize)]
+struct ArtifactRef<'a> {
+    feed: &'a Feed,
+    timetable: &'a Timetable,
+    services: &'a ServiceCalendar,
+    transfers: &'a Transfers,
+    geometry: &'a Option<TripGeometry>,
+    leg_geometry: &'a Option<LegGeometry>,
+    streets: Option<StreetNetworkParts>,
+}
+
+/// The saved network, owned after reading.
+#[derive(serde::Deserialize)]
+struct Artifact {
+    feed: Feed,
+    timetable: Timetable,
+    services: ServiceCalendar,
+    transfers: Transfers,
+    geometry: Option<TripGeometry>,
+    leg_geometry: Option<LegGeometry>,
+    streets: Option<StreetNetworkParts>,
+}
+
+/// The stop and trip lookup tables derived from a feed and timetable.
+type DerivedIndexes = (
+    HashMap<String, StopLookup>,
+    HashMap<String, StopIdx>,
+    HashMap<String, TripIdx>,
+);
+
+fn derived_indexes(feed: &Feed, timetable: &Timetable) -> DerivedIndexes {
+    let mut stops_by_id = HashMap::with_capacity(feed.stops.len());
+    let mut stops_by_qualified_id = HashMap::with_capacity(feed.stops.len());
+    for (index, stop) in feed.stops.iter().enumerate() {
+        let stop_index = StopIdx(index as u32);
+        stops_by_qualified_id.insert(format!("{}:{}", stop.feed, stop.id), stop_index);
+        stops_by_id
+            .entry(stop.id.clone())
+            .and_modify(|entry| *entry = StopLookup::Ambiguous)
+            .or_insert(StopLookup::Unique(stop_index));
+    }
+    let mut trips_by_public_id = HashMap::with_capacity(timetable.trip_count() as usize);
+    for index in 0..timetable.trip_count() {
+        let trip = TripIdx(index);
+        let source = &feed.trips[timetable.trip_source(trip) as usize];
+        let public = if feed.feed_count > 1 {
+            format!("{}:{}", source.feed, source.id)
+        } else {
+            source.id.clone()
+        };
+        trips_by_public_id.insert(public, trip);
+    }
+    (stops_by_id, stops_by_qualified_id, trips_by_public_id)
+}
+
+fn io_error(error: std::io::Error) -> PyErr {
+    PyValueError::new_err(error.to_string())
+}
+
+/// CRC-32 (IEEE) over the artifact payload.
+fn crc32(bytes: &[u8]) -> u32 {
+    const TABLE: [u32; 256] = {
+        let mut table = [0u32; 256];
+        let mut index = 0;
+        while index < 256 {
+            let mut value = index as u32;
+            let mut bit = 0;
+            while bit < 8 {
+                value = if value & 1 != 0 {
+                    0xEDB8_8320 ^ (value >> 1)
+                } else {
+                    value >> 1
+                };
+                bit += 1;
+            }
+            table[index] = value;
+            index += 1;
+        }
+        table
+    };
+    let mut crc = u32::MAX;
+    for &byte in bytes {
+        crc = TABLE[((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    !crc
 }
 
 /// Rejects an empty or out-of-range window/percentile specification.
@@ -143,27 +234,8 @@ impl TransportNetwork {
             )?;
         }
         let transfers = Transfers::empty(build.timetable.stop_count());
-        let mut stops_by_id = HashMap::with_capacity(feed.stops.len());
-        let mut stops_by_qualified_id = HashMap::with_capacity(feed.stops.len());
-        for (index, stop) in feed.stops.iter().enumerate() {
-            let stop_index = StopIdx(index as u32);
-            stops_by_qualified_id.insert(format!("{}:{}", stop.feed, stop.id), stop_index);
-            stops_by_id
-                .entry(stop.id.clone())
-                .and_modify(|entry| *entry = StopLookup::Ambiguous)
-                .or_insert(StopLookup::Unique(stop_index));
-        }
-        let mut trips_by_public_id = HashMap::with_capacity(build.timetable.trip_count() as usize);
-        for index in 0..build.timetable.trip_count() {
-            let trip = TripIdx(index);
-            let source = &feed.trips[build.timetable.trip_source(trip) as usize];
-            let public = if feed.feed_count > 1 {
-                format!("{}:{}", source.feed, source.id)
-            } else {
-                source.id.clone()
-            };
-            trips_by_public_id.insert(public, trip);
-        }
+        let (stops_by_id, stops_by_qualified_id, trips_by_public_id) =
+            derived_indexes(&feed, &build.timetable);
         Ok(TransportNetwork {
             feed,
             build,
@@ -171,6 +243,136 @@ impl TransportNetwork {
             geometry: None,
             leg_geometry: None,
             streets: None,
+            stops_by_id,
+            stops_by_qualified_id,
+            trips_by_public_id,
+        })
+    }
+
+    /// Save the network as a reusable artifact.
+    ///
+    /// The artifact carries everything queries need — the timetable,
+    /// service calendar, transfers, trip distances, leg geometries,
+    /// and the street network — behind a versioned header, so batch
+    /// jobs can ``load`` the same file read-only instead of rebuilding
+    /// from GTFS and OSM inputs. The payload carries a checksum, so
+    /// on-disk corruption is caught at load time. Build diagnostics
+    /// (quarantine reports) are not persisted; their warnings belong
+    /// to the build.
+    fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        use std::io::Write;
+
+        let artifact = ArtifactRef {
+            feed: &self.feed,
+            timetable: &self.build.timetable,
+            services: &self.build.services,
+            transfers: &self.transfers,
+            geometry: &self.geometry,
+            leg_geometry: &self.leg_geometry,
+            streets: self.streets.as_ref().map(StreetNetwork::to_parts),
+        };
+        py.allow_threads(|| {
+            let file = std::fs::File::create(path).map_err(io_error)?;
+            let mut writer = std::io::BufWriter::new(file);
+            writer.write_all(ARTIFACT_MAGIC).map_err(io_error)?;
+            writer
+                .write_all(&ARTIFACT_FORMAT.to_le_bytes())
+                .map_err(io_error)?;
+            let version = env!("CARGO_PKG_VERSION").as_bytes();
+            writer
+                .write_all(&(version.len() as u16).to_le_bytes())
+                .map_err(io_error)?;
+            writer.write_all(version).map_err(io_error)?;
+            let payload = bincode::serialize(&artifact)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            writer
+                .write_all(&(payload.len() as u64).to_le_bytes())
+                .map_err(io_error)?;
+            writer
+                .write_all(&crc32(&payload).to_le_bytes())
+                .map_err(io_error)?;
+            writer.write_all(&payload).map_err(io_error)?;
+            writer.flush().map_err(io_error)
+        })
+    }
+
+    /// Load a network saved with ``save``.
+    ///
+    /// Artifacts written in another format version are refused with a
+    /// message naming the writing cafein version, and corrupted
+    /// payloads fail their checksum; rebuild from the inputs (or
+    /// re-save) with a matching version instead. Artifacts are trusted
+    /// input, like pickles: load only files you created.
+    #[staticmethod]
+    fn load(py: Python<'_>, path: &str) -> PyResult<TransportNetwork> {
+        use std::io::Read;
+
+        let artifact: Artifact = py.allow_threads(|| {
+            let file = std::fs::File::open(path).map_err(io_error)?;
+            let total = file.metadata().map_err(io_error)?.len();
+            let mut reader = std::io::BufReader::new(file);
+            let mut magic = [0u8; 8];
+            reader.read_exact(&mut magic).map_err(io_error)?;
+            if &magic != ARTIFACT_MAGIC {
+                return Err(PyValueError::new_err(format!(
+                    "'{path}' is not a cafein network artifact"
+                )));
+            }
+            let mut format = [0u8; 4];
+            reader.read_exact(&mut format).map_err(io_error)?;
+            let format = u32::from_le_bytes(format);
+            let mut length = [0u8; 2];
+            reader.read_exact(&mut length).map_err(io_error)?;
+            let mut version = vec![0u8; u16::from_le_bytes(length) as usize];
+            reader.read_exact(&mut version).map_err(io_error)?;
+            let version = String::from_utf8_lossy(&version).into_owned();
+            if format != ARTIFACT_FORMAT {
+                return Err(PyValueError::new_err(format!(
+                    "'{path}' uses artifact format {format} (written by cafein \
+                     {version}), which this cafein ({}) cannot read; rebuild \
+                     the network from its inputs and save it again",
+                    env!("CARGO_PKG_VERSION"),
+                )));
+            }
+            let mut length = [0u8; 8];
+            reader.read_exact(&mut length).map_err(io_error)?;
+            let mut checksum = [0u8; 4];
+            reader.read_exact(&mut checksum).map_err(io_error)?;
+            // The declared length must equal what the file actually
+            // holds; checking before allocating keeps a corrupted
+            // length field from provoking a huge allocation.
+            let header = 8 + 4 + 2 + version.len() as u64 + 8 + 4;
+            let declared = u64::from_le_bytes(length);
+            if declared != total.saturating_sub(header) {
+                return Err(PyValueError::new_err(format!(
+                    "'{path}' is corrupted (payload length mismatch); \
+                     rebuild the network from its inputs and save it again"
+                )));
+            }
+            let mut payload = vec![0u8; declared as usize];
+            reader.read_exact(&mut payload).map_err(io_error)?;
+            if crc32(&payload) != u32::from_le_bytes(checksum) {
+                return Err(PyValueError::new_err(format!(
+                    "'{path}' is corrupted (checksum mismatch); rebuild the \
+                     network from its inputs and save it again"
+                )));
+            }
+            bincode::deserialize(&payload).map_err(|error| PyValueError::new_err(error.to_string()))
+        })?;
+        let build = TimetableBuild {
+            timetable: artifact.timetable,
+            services: artifact.services,
+            quarantined: Vec::new(),
+        };
+        let (stops_by_id, stops_by_qualified_id, trips_by_public_id) =
+            derived_indexes(&artifact.feed, &build.timetable);
+        Ok(TransportNetwork {
+            feed: artifact.feed,
+            build,
+            transfers: artifact.transfers,
+            geometry: artifact.geometry,
+            leg_geometry: artifact.leg_geometry,
+            streets: artifact.streets.map(StreetNetwork::from_parts),
             stops_by_id,
             stops_by_qualified_id,
             trips_by_public_id,

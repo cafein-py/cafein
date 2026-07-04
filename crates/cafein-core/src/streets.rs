@@ -30,7 +30,7 @@ type EdgeSegment = GeomWithData<Line<[f64; 2]>, u32>;
 
 /// How a stop enters the street graph: snapped onto an edge at a fraction
 /// of its cost length, over a straight connector to the snap point.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StopLink {
     pub stop: StopIdx,
     /// Index of the edge the stop snapped onto.
@@ -250,21 +250,7 @@ impl StreetNetwork {
             }
         }
 
-        let mut segments = Vec::new();
-        for index in 0..edges.len() {
-            let start = coordinate_offsets[index] as usize;
-            let end = coordinate_offsets[index + 1] as usize;
-            for segment in start..end - 1 {
-                segments.push(EdgeSegment::new(
-                    Line::new(
-                        [xs[segment], ys[segment]],
-                        [xs[segment + 1], ys[segment + 1]],
-                    ),
-                    index as u32,
-                ));
-            }
-        }
-        let tree = RTree::bulk_load(segments);
+        let tree = build_tree(coordinate_offsets, &xs, &ys);
 
         Ok(StreetNetwork {
             adjacency_offsets,
@@ -294,6 +280,41 @@ impl StreetNetwork {
     /// Number of stop links.
     pub fn link_count(&self) -> usize {
         self.links.len()
+    }
+
+    /// The network's serializable state — everything but the spatial
+    /// index, which `from_parts` rebuilds from the geometry.
+    pub fn to_parts(&self) -> StreetNetworkParts {
+        StreetNetworkParts {
+            adjacency_offsets: self.adjacency_offsets.clone(),
+            adjacency: self.adjacency.clone(),
+            endpoints: self.endpoints.clone(),
+            lengths: self.lengths.clone(),
+            coordinate_offsets: self.coordinate_offsets.clone(),
+            xs: self.xs.clone(),
+            ys: self.ys.clone(),
+            links: self.links.clone(),
+            origin: self.origin,
+            scale: self.scale,
+        }
+    }
+
+    /// Rebuilds a network from its serialized parts.
+    pub fn from_parts(parts: StreetNetworkParts) -> StreetNetwork {
+        let tree = build_tree(&parts.coordinate_offsets, &parts.xs, &parts.ys);
+        StreetNetwork {
+            adjacency_offsets: parts.adjacency_offsets,
+            adjacency: parts.adjacency,
+            endpoints: parts.endpoints,
+            lengths: parts.lengths,
+            coordinate_offsets: parts.coordinate_offsets,
+            xs: parts.xs,
+            ys: parts.ys,
+            links: parts.links,
+            tree,
+            origin: parts.origin,
+            scale: parts.scale,
+        }
     }
 
     /// Snaps a coordinate to its nearest edge within `max_snap_distance`
@@ -481,6 +502,41 @@ impl StreetNetwork {
         }
         distances
     }
+}
+
+/// A [`StreetNetwork`]'s serializable state; see
+/// [`StreetNetwork::to_parts`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct StreetNetworkParts {
+    adjacency_offsets: Vec<u32>,
+    adjacency: Vec<(u32, f64)>,
+    endpoints: Vec<(u32, u32)>,
+    lengths: Vec<f64>,
+    coordinate_offsets: Vec<u32>,
+    xs: Vec<f64>,
+    ys: Vec<f64>,
+    links: Vec<StopLink>,
+    origin: (f64, f64),
+    scale: (f64, f64),
+}
+
+/// The segment R*-tree over a polyline set.
+fn build_tree(coordinate_offsets: &[u32], xs: &[f64], ys: &[f64]) -> RTree<EdgeSegment> {
+    let mut segments = Vec::new();
+    for index in 0..coordinate_offsets.len().saturating_sub(1) {
+        let start = coordinate_offsets[index] as usize;
+        let end = coordinate_offsets[index + 1] as usize;
+        for segment in start..end - 1 {
+            segments.push(EdgeSegment::new(
+                Line::new(
+                    [xs[segment], ys[segment]],
+                    [xs[segment + 1], ys[segment + 1]],
+                ),
+                index as u32,
+            ));
+        }
+    }
+    RTree::bulk_load(segments)
 }
 
 /// The projection origin and meters-per-degree scale of a coordinate set.

@@ -3,7 +3,7 @@
 use crate::timetable::{StopIdx, TimetableError};
 
 /// A walkable connection to another stop.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Transfer {
     pub to: StopIdx,
     /// Walking time in seconds.
@@ -17,7 +17,7 @@ pub struct Transfer {
 /// The input edge list must already be transitively closed (the footpath
 /// precompute's responsibility): routing relaxes one transfer hop per
 /// round and does not chain transfers.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Transfers {
     /// CSR offsets into `edges`, one entry per stop plus a tail.
     offsets: Vec<u32>,
