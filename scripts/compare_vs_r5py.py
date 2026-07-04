@@ -33,12 +33,16 @@ import argparse
 import datetime
 import json
 import pathlib
-import resource
 import subprocess
 import sys
 import tempfile
 import time
 import zipfile
+
+try:
+    import resource
+except ImportError:  # resource is Unix-only; peak RSS is unavailable on Windows
+    resource = None
 
 DATA = pathlib.Path(__file__).parent.parent / "tests" / "data"
 GTFS = DATA / "helsinki_gtfs.zip"
@@ -65,6 +69,8 @@ RESULT_PREFIX = "RESULT_JSON:"
 
 
 def peak_rss_mb():
+    if resource is None:
+        return float("nan")
     scale = 1024 * 1024 if sys.platform == "darwin" else 1024
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / scale
 
