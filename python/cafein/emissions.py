@@ -234,6 +234,67 @@ def annotate(journeys, network, factors=None, components=None):
     return journeys
 
 
+def trip_factors(network, factors=None, components=None):
+    """Resolve one emission factor per routable trip through the ladder.
+
+    The per-trip form the bulk computations consume: the most specific
+    matching factor row for every trip of the network, in grams CO₂e per
+    passenger-kilometer.
+
+    Parameters
+    ----------
+    network : TransportNetwork
+        The network whose trips to resolve.
+    factors : DataFrame or path (optional)
+        Extra factor rows layered over the shipped defaults, as in
+        `annotate`.
+    components : list of str (optional)
+        The life-cycle components to include (default: all four).
+
+    Returns
+    -------
+    list of (str, float)
+        ``(trip_id, factor)`` pairs covering every routable trip;
+        ``float("nan")`` marks trips no factor row matches (a warning
+        names the affected route types, as in `annotate`).
+    """
+    if components is None:
+        components = COMPONENT_COLUMNS
+    else:
+        unknown = set(components) - set(COMPONENT_COLUMNS)
+        if unknown:
+            raise ValueError(f"unknown component(s): {', '.join(sorted(unknown))}")
+        components = [
+            column for column in COMPONENT_COLUMNS if column in set(components)
+        ]
+        if not components:
+            raise ValueError("components must name at least one component column")
+    table = default_factors()
+    if factors is not None:
+        table = pd.concat([table, load_factors(factors)], ignore_index=True)
+    resolver = _Resolver(table, components)
+    routes = {
+        route_id: (agency_id, route_type)
+        for route_id, agency_id, route_type in network.routes
+    }
+    unmatched = set()
+    results = []
+    for trip_id, route_id in network.trips:
+        agency_id, route_type = routes[route_id]
+        factor = resolver.resolve(trip_id, route_id, agency_id, route_type)
+        if factor is None:
+            unmatched.add(route_type)
+            factor = float("nan")
+        results.append((trip_id, factor))
+    if unmatched:
+        warnings.warn(
+            f"no emission factor matches route_type(s) {sorted(unmatched)}; "
+            "journeys riding the affected trips carry no emissions",
+            stacklevel=2,
+        )
+    return results
+
+
 def _read_factor_file(path):
     suffix = path.suffix.lower()
     if suffix == ".csv":

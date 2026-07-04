@@ -95,6 +95,24 @@ def test_crow_fly_legs_draw_the_stop_chain(tmp_path):
     assert list(line.coords) == [(24.0, 60.0), (24.01, 60.01)]
 
 
+def test_geometry_output_is_controllable(tmp_path):
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs([str(feed)])
+    journeys = network.route_between_stops(
+        "S1", "S2", "2022-02-22", "07:30:00", geometries=False
+    )
+    assert journeys[0]["legs"][1]["geometry"] is None
+    # Building without leg geometries keeps distances but no polylines.
+    with pytest.warns(UserWarning):
+        lean = TransportNetwork.from_gtfs([str(feed)], leg_geometries=False)
+    transit = lean.route_between_stops("S1", "S2", "2022-02-22", "07:30:00")[0]["legs"][
+        1
+    ]
+    assert transit["geometry"] is None
+    assert transit["distance"] is not None
+
+
 def test_set_leg_geometries_validates_its_payload(tmp_path):
     feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
     with pytest.warns(UserWarning):
@@ -226,14 +244,6 @@ def test_merged_feeds_require_qualified_stop_ids(helsinki_gtfs):
         assert transit["board_stop"] == f"{feed}:4810551"
         assert transit["alight_stop"] == f"{feed}:1250551"
         assert transit["trip_id"] == f"{feed}:3001K_20220222_S1_2_0831"
-
-
-@pytest.fixture(scope="session")
-def network_with_footpaths(helsinki_gtfs, kantakaupunki_pbf):
-    with pytest.warns(UserWarning):
-        return TransportNetwork.from_gtfs(
-            [str(helsinki_gtfs)], osm_pbf=str(kantakaupunki_pbf)
-        )
 
 
 def test_an_osm_extract_installs_transfers(network_with_footpaths):

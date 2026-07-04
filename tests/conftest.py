@@ -40,3 +40,15 @@ def network(helsinki_gtfs):
     from cafein import TransportNetwork
 
     return TransportNetwork.from_gtfs([str(helsinki_gtfs)])
+
+
+@pytest.fixture(scope="session")
+def network_with_footpaths(helsinki_gtfs, kantakaupunki_pbf):
+    """The Helsinki network with the OSM extract's walking structures."""
+    pytest.importorskip("cafein._cafein")
+    from cafein import TransportNetwork
+
+    with pytest.warns(UserWarning):
+        return TransportNetwork.from_gtfs(
+            [str(helsinki_gtfs)], osm_pbf=str(kantakaupunki_pbf)
+        )

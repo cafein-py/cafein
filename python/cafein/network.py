@@ -45,6 +45,7 @@ class TransportNetwork:
         max_walking_time=None,
         max_snap_distance=None,
         trip_distances=True,
+        leg_geometries=True,
     ):
         """Build a network from GTFS archives and an optional OSM extract.
 
@@ -72,10 +73,13 @@ class TransportNetwork:
             Maximum distance in meters from a stop to the walking
             network; stops farther away get no footpaths.
         trip_distances : bool (optional, default: True)
-            Compute per-trip travel distances and leg geometries through
-            the fallback ladder (``cafein.geometry.trip_distances``), so
-            transit legs report their distance, its provenance, and
-            their geometry.
+            Compute per-trip travel distances through the fallback
+            ladder (``cafein.geometry.trip_distances``), so transit legs
+            report their distance and its provenance.
+        leg_geometries : bool (optional, default: True)
+            Also store the trips' polylines, so transit legs report
+            their geometry; disable to save memory when geometries are
+            never needed. Ignored when `trip_distances` is off.
 
         The build reads the input files more than once (timetable,
         distance ladder, footpaths); they must not change underneath it.
@@ -85,11 +89,16 @@ class TransportNetwork:
         if trip_distances:
             from cafein import geometry
 
-            distances, leg_geometries = geometry.trip_distances(
-                paths, include=set(core.trip_ids), geometries=True
-            )
-            core.set_trip_distances(distances)
-            core.set_leg_geometries(*leg_geometries)
+            if leg_geometries:
+                distances, polylines = geometry.trip_distances(
+                    paths, include=set(core.trip_ids), geometries=True
+                )
+                core.set_trip_distances(distances)
+                core.set_leg_geometries(*polylines)
+            else:
+                core.set_trip_distances(
+                    geometry.trip_distances(paths, include=set(core.trip_ids))
+                )
         if osm_pbf is not None:
             from cafein import streets
 
@@ -140,6 +149,11 @@ class TransportNetwork:
         """The routes as ``(route_id, agency_id, route_type)`` tuples,
         with the GTFS route_type as its numeric code."""
         return self._core.routes
+
+    @property
+    def trips(self):
+        """The routable trips as ``(trip_id, route_id)`` tuples."""
+        return self._core.trips
 
     def annotate_emissions(self, journeys, factors=None, components=None):
         """Attach per-leg and per-journey emissions to routed journeys.
@@ -264,7 +278,15 @@ class TransportNetwork:
         return self._core.distance_provenance_counts
 
     def route_between_stops(
-        self, from_stop, to_stop, date, departure, max_transfers=4, window=None
+        self,
+        from_stop,
+        to_stop,
+        date,
+        departure,
+        max_transfers=4,
+        window=None,
+        *,
+        geometries=True,
     ):
         """Route between two transit stops.
 
@@ -311,7 +333,7 @@ class TransportNetwork:
             legs; times are seconds past the service day's start.
         """
         return self._core.route_between_stops(
-            from_stop, to_stop, date, departure, max_transfers, window
+            from_stop, to_stop, date, departure, max_transfers, window, geometries
         )
 
     def route_between_coordinates(
@@ -326,6 +348,7 @@ class TransportNetwork:
         walking_speed_kmph=None,
         max_walking_time=None,
         max_snap_distance=None,
+        geometries=True,
     ):
         """Route door-to-door between two coordinates.
 
@@ -373,6 +396,7 @@ class TransportNetwork:
             max_transfers,
             window,
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
+            geometries,
         )
 
     def travel_times_from_coordinate(

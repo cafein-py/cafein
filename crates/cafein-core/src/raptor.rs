@@ -14,6 +14,7 @@
 
 use rayon::prelude::*;
 
+use crate::geometry::{wkb_multi_line_string, LegGeometry, TripGeometry};
 use crate::journey::{Journey, Leg};
 use crate::router::{Request, TransitRouter};
 use crate::timetable::{PatternIdx, StopIdx, Timetable, TripIdx};
@@ -21,6 +22,39 @@ use crate::transfers::Transfers;
 
 /// The RAPTOR router.
 pub struct Raptor;
+
+/// Aggregated costs of the fastest journey to one destination stop.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CostRow {
+    pub to: StopIdx,
+    /// Travel time in seconds from the requested departure.
+    pub seconds: u32,
+    /// Number of transit legs; 0 for a destination reached on foot.
+    pub rides: u32,
+    /// Distance ridden on transit, in meters.
+    pub transit_meters: f64,
+    /// Distance walked on transfers and access links, in meters.
+    pub walk_meters: f64,
+    /// Grams CO₂e over the ridden legs; NaN when a ridden trip has no
+    /// emission factor.
+    pub emission_grams: f64,
+    /// The ridden legs' geometry as a WKB MultiLineString, when asked
+    /// for and leg geometries are installed.
+    pub geometry: Option<Vec<u8>>,
+}
+
+/// Everything the cost reconstruction reads besides the search state.
+pub struct CostInputs<'a> {
+    /// Per-trip cumulative distances (drives meters and emissions).
+    pub geometry: &'a TripGeometry,
+    /// Grams CO₂e per passenger-kilometer per trip, indexed by trip;
+    /// NaN marks a trip without a resolved factor.
+    pub factors: &'a [f64],
+    /// Leg polylines; required to emit geometries.
+    pub leg_geometry: Option<&'a LegGeometry>,
+    /// Emit each row's WKB MultiLineString.
+    pub with_geometry: bool,
+}
 
 const UNREACHED: u32 = u32::MAX;
 
@@ -69,6 +103,42 @@ impl Raptor {
         let mut search = Search::new(timetable, transfers, request);
         search.run(request.departure);
         search.arrivals()
+    }
+
+    /// The fastest journey's aggregated costs from each request to each
+    /// destination — the cost-matrix computation, fanned out over the
+    /// origins with rayon like [`Raptor::one_to_all_many`].
+    ///
+    /// Rows come back per origin, reachable destinations only, in
+    /// destination order. Deterministic regardless of scheduling.
+    pub fn cost_matrix(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        destinations: &[StopIdx],
+    ) -> Vec<Vec<CostRow>> {
+        requests
+            .par_iter()
+            .map_init(
+                || None,
+                |pooled: &mut Option<Search>, request| {
+                    let search = match pooled {
+                        Some(search) if search.rounds == request.max_transfers as usize + 1 => {
+                            search.reset(request);
+                            search
+                        }
+                        _ => pooled.insert(Search::new(timetable, transfers, request)),
+                    };
+                    search.run(request.departure);
+                    destinations
+                        .iter()
+                        .filter_map(|&stop| search.costs_to(stop, request.departure, inputs))
+                        .collect()
+                },
+            )
+            .collect()
     }
 
     /// Earliest arrival at every stop for each request — the matrix
@@ -245,6 +315,98 @@ impl<'a> Search<'a> {
             .iter()
             .map(|&arrival| (arrival != UNREACHED).then_some(arrival))
             .collect()
+    }
+
+    /// The fastest journey's aggregated costs to `stop`, walking the
+    /// label chain of the round that achieves the earliest arrival;
+    /// `None` when the stop is unreachable.
+    fn costs_to(&self, stop: StopIdx, departure: u32, inputs: &CostInputs<'_>) -> Option<CostRow> {
+        let mut best_round = 0;
+        let mut best_arrival = UNREACHED;
+        for round in 0..=self.rounds {
+            let arrival = self.tau[round][stop.0 as usize];
+            if arrival < best_arrival {
+                best_arrival = arrival;
+                best_round = round;
+            }
+        }
+        if best_arrival == UNREACHED {
+            return None;
+        }
+        let timetable = self.timetable;
+        let mut round = best_round;
+        let mut at = stop;
+        let mut rides = 0u32;
+        let mut transit_meters = 0.0;
+        let mut walk_meters = 0.0;
+        let mut grams = 0.0;
+        let mut resolved = true;
+        let mut legs: Vec<(TripIdx, u16, u16)> = Vec::new();
+        loop {
+            match self.labels[round][at.0 as usize] {
+                Label::Transit {
+                    trip,
+                    board_position,
+                    alight_position,
+                } => {
+                    rides += 1;
+                    let meters = inputs
+                        .geometry
+                        .leg_distance(trip, board_position, alight_position)
+                        as f64;
+                    transit_meters += meters;
+                    let factor = inputs.factors[trip.0 as usize];
+                    if factor.is_finite() {
+                        grams += meters / 1000.0 * factor;
+                    } else {
+                        resolved = false;
+                    }
+                    if inputs.with_geometry {
+                        legs.push((trip, board_position, alight_position));
+                    }
+                    at = timetable.pattern_stops(timetable.trip_pattern(trip))
+                        [board_position as usize];
+                    round -= 1;
+                }
+                Label::Transfer {
+                    from_stop,
+                    duration: _,
+                } => {
+                    // Transfers are deduplicated per stop pair: the one
+                    // edge found is the one routing relaxed.
+                    walk_meters += self
+                        .transfers
+                        .from_stop(from_stop)
+                        .iter()
+                        .find(|transfer| transfer.to == at)
+                        .map(|transfer| transfer.meters)
+                        .unwrap_or(0.0);
+                    at = from_stop;
+                }
+                Label::Access => break,
+                Label::Unreached => unreachable!("cost reconstruction hit an unreached label"),
+            }
+        }
+        let geometry = match (inputs.with_geometry, inputs.leg_geometry) {
+            (true, Some(shapes)) => {
+                let parts: Vec<Vec<(f64, f64)>> = legs
+                    .iter()
+                    .rev()
+                    .map(|&(trip, board, alight)| shapes.leg_coordinates(trip, board, alight))
+                    .collect();
+                Some(wkb_multi_line_string(&parts))
+            }
+            _ => None,
+        };
+        Some(CostRow {
+            to: stop,
+            seconds: best_arrival - departure,
+            rides,
+            transit_meters,
+            walk_meters,
+            emission_grams: if resolved { grams } else { f64::NAN },
+            geometry,
+        })
     }
 
     /// Runs one pass per departure — which must be strictly decreasing —
@@ -563,6 +725,7 @@ fn earliest_trip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::DistanceProvenance;
     use crate::timetable::{StopTime, TimetableBuilder};
 
     fn time(at: u32) -> StopTime {
@@ -631,6 +794,78 @@ mod tests {
                 Vec::new()
             );
         }
+    }
+
+    #[test]
+    fn cost_rows_aggregate_the_fastest_journey() {
+        // Distances per trip: pattern A trips 1200 m over three stops,
+        // B trips 800 m, C 2000 m; factors 10/10/20/20/30 g/pkm.
+        let (timetable, transfers) = network();
+        let geometry = TripGeometry::from_trips(
+            &timetable,
+            vec![
+                (
+                    TripIdx(0),
+                    vec![0.0, 500.0, 1200.0],
+                    DistanceProvenance::CrowFly,
+                ),
+                (
+                    TripIdx(1),
+                    vec![0.0, 500.0, 1200.0],
+                    DistanceProvenance::CrowFly,
+                ),
+                (TripIdx(2), vec![0.0, 800.0], DistanceProvenance::CrowFly),
+                (TripIdx(3), vec![0.0, 800.0], DistanceProvenance::CrowFly),
+                (TripIdx(4), vec![0.0, 2000.0], DistanceProvenance::CrowFly),
+            ],
+        )
+        .unwrap();
+        let factors = [10.0, 10.0, 20.0, 20.0, 30.0];
+        let inputs = CostInputs {
+            geometry: &geometry,
+            factors: &factors,
+            leg_geometry: None,
+            with_geometry: false,
+        };
+        let mut request = request(StopIdx(0), StopIdx(3), 0);
+        request.egress = Vec::new();
+        let rows = Raptor.cost_matrix(
+            &timetable,
+            &transfers,
+            &inputs,
+            std::slice::from_ref(&request),
+            &[StopIdx(3), StopIdx(4)],
+        );
+        assert_eq!(rows.len(), 1);
+        // To stop 3: ride A 0→1 (500 m, 10 g/pkm), ride B 1→3 (800 m,
+        // 20 g/pkm), arriving 400 with no walking.
+        let to_3 = &rows[0][0];
+        assert_eq!((to_3.to, to_3.seconds, to_3.rides), (StopIdx(3), 400, 2));
+        assert_eq!(to_3.transit_meters, 1300.0);
+        assert_eq!(to_3.walk_meters, 0.0);
+        assert!((to_3.emission_grams - 21.0).abs() < 1e-9);
+        assert_eq!(to_3.geometry, None);
+        // To stop 4: ride A 0→2 (1200 m), then the 50 m footpath.
+        let to_4 = &rows[0][1];
+        assert_eq!((to_4.to, to_4.seconds, to_4.rides), (StopIdx(4), 350, 1));
+        assert_eq!(to_4.transit_meters, 1200.0);
+        assert_eq!(to_4.walk_meters, 50.0);
+        assert!((to_4.emission_grams - 12.0).abs() < 1e-9);
+        // An unresolved factor (NaN) poisons only the affected row.
+        let partial = [10.0, 10.0, f64::NAN, f64::NAN, 30.0];
+        let inputs = CostInputs {
+            factors: &partial,
+            ..inputs
+        };
+        let rows = Raptor.cost_matrix(
+            &timetable,
+            &transfers,
+            &inputs,
+            std::slice::from_ref(&request),
+            &[StopIdx(3), StopIdx(4)],
+        );
+        assert!(rows[0][0].emission_grams.is_nan());
+        assert!((rows[0][1].emission_grams - 12.0).abs() < 1e-9);
     }
 
     #[test]
