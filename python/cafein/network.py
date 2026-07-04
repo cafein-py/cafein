@@ -12,6 +12,28 @@ def _gtfs_paths(paths):
     return [os.fspath(path) for path in paths]
 
 
+def _window_percentiles(window, percentiles, confidence):
+    """The percentile list a window/percentiles/confidence spec asks
+    for; ``None`` without a window."""
+    if window is None:
+        if percentiles is not None or confidence is not None:
+            raise ValueError("percentiles and confidence require a window")
+        return None
+    if percentiles is not None and confidence is not None:
+        raise ValueError("pass either percentiles or confidence, not both")
+    if confidence is not None:
+        if not 0 < confidence < 1:
+            raise ValueError("confidence must be within (0, 1)")
+        # Rounded so the derived bounds equal their explicit decimal
+        # forms; raw float arithmetic (e.g. (1 - 0.9) / 2 * 100 =
+        # 4.999999999999999) could otherwise flip a half-up rank tie.
+        half = round((1 - confidence) / 2 * 100, 9)
+        return [half, 50.0, round(100 - half, 9)]
+    if percentiles is None:
+        return [50.0]
+    return [float(percentile) for percentile in percentiles]
+
+
 def _walk_options(walking_speed_kmph, max_walking_time, max_snap_distance):
     """Street-query options with the shared defaults filled in."""
     from cafein import streets
@@ -490,6 +512,9 @@ class TransportNetwork:
         max_transfers=4,
         *,
         destinations=None,
+        window=None,
+        percentiles=None,
+        confidence=None,
         walking_speed_kmph=None,
         max_walking_time=None,
         max_snap_distance=None,
@@ -500,6 +525,17 @@ class TransportNetwork:
         the origins with per-worker state reuse; the result is
         deterministic. This is the bulk primitive travel-time matrices
         are assembled from — never per OD pair.
+
+        With `window`, every minute mark within ``[departure,
+        departure + window)`` is evaluated through one descending range
+        scan per origin, and the output holds nearest-rank percentiles
+        of the travel-time distribution across the window — exact
+        values, since the samples are the full minute-level departure
+        population. `percentiles` selects them (default: the median);
+        `confidence` instead maps a level to the symmetric interval
+        plus the median (e.g. ``0.8`` → the 10th, 50th, and 90th
+        percentiles), quantifying travel-time variability due to
+        departure time within the window.
 
         Parameters
         ----------
@@ -520,6 +556,15 @@ class TransportNetwork:
         destinations : GeoDataFrame (optional)
             Destination points; defaults to the origins. Only valid
             with point origins — stop origins always span every stop.
+        window : int (optional)
+            Departure window in seconds; enables percentile output.
+        percentiles : list of float (optional)
+            Percentiles in ``[0, 100]`` over the window's departures;
+            requires `window`, defaults to ``[50]``.
+        confidence : float (optional)
+            A level in ``(0, 1)`` mapped to the symmetric percentile
+            interval plus the median; requires `window` and excludes
+            `percentiles`.
         walking_speed_kmph, max_walking_time, max_snap_distance : float
             The street-search options for points, as in
             ``access_stops``; only valid with point origins.
@@ -529,26 +574,44 @@ class TransportNetwork:
         numpy.ndarray
             A uint32 array of travel times in seconds — origins by all
             stops (column order follows ``stops``) for stop origins,
-            origins by destination points for point origins.
+            origins by destination points for point origins; with
+            `window`, one plane per percentile as a third axis, in the
+            requested order (lower, median, upper for `confidence`).
             Unreachable pairs hold the maximum uint32 value
             (4294967295).
         """
         from cafein.matrices import _is_point_frame, _point_list, _warn_unsnapped
 
+        percentiles = _window_percentiles(window, percentiles, confidence)
         if _is_point_frame(from_stops):
             from_ids, origin_points = _point_list(from_stops, "origins")
             if destinations is None:
                 to_ids, destination_points = from_ids, origin_points
             else:
                 to_ids, destination_points = _point_list(destinations, "destinations")
-            table = self._core.travel_time_matrix_from_points(
-                origin_points,
-                destination_points,
-                date,
-                departure,
-                max_transfers,
-                *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
+            walk = _walk_options(
+                walking_speed_kmph, max_walking_time, max_snap_distance
             )
+            if percentiles is None:
+                table = self._core.travel_time_matrix_from_points(
+                    origin_points,
+                    destination_points,
+                    date,
+                    departure,
+                    max_transfers,
+                    *walk,
+                )
+            else:
+                table = self._core.travel_time_percentiles_from_points(
+                    origin_points,
+                    destination_points,
+                    date,
+                    departure,
+                    window,
+                    percentiles,
+                    max_transfers,
+                    *walk,
+                )
             _warn_unsnapped(table, from_ids, to_ids)
             return table["matrix"]
         if not (
@@ -558,6 +621,10 @@ class TransportNetwork:
             and max_snap_distance is None
         ):
             raise ValueError("destinations and walking options apply to point origins")
-        return self._core.travel_time_matrix(
-            list(from_stops), date, departure, max_transfers
+        if percentiles is None:
+            return self._core.travel_time_matrix(
+                list(from_stops), date, departure, max_transfers
+            )
+        return self._core.travel_time_percentiles(
+            list(from_stops), date, departure, window, percentiles, max_transfers
         )
