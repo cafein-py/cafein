@@ -760,6 +760,7 @@ impl TransportNetwork {
             access: vec![(origin, 0)],
             egress: vec![(destination, 0)],
             active_services: self.active_services(date)?,
+            active_services_previous: self.active_services_previous(date)?,
             max_transfers,
         };
         self.route_request(py, &request, window, None, None, geometries)
@@ -857,6 +858,7 @@ impl TransportNetwork {
             access: request_offsets(&access),
             egress: request_offsets(&egress),
             active_services: self.active_services(date)?,
+            active_services_previous: self.active_services_previous(date)?,
             max_transfers,
         };
         self.route_request(py, &request, window, Some(&walks), Some(&ends), geometries)
@@ -923,6 +925,7 @@ impl TransportNetwork {
             access: request_offsets(&access),
             egress: Vec::new(),
             active_services: self.active_services(date)?,
+            active_services_previous: self.active_services_previous(date)?,
             max_transfers,
         };
         let arrivals = Raptor.one_to_all(&self.build.timetable, &self.transfers, &request);
@@ -978,6 +981,7 @@ impl TransportNetwork {
             access: vec![(origin, 0)],
             egress: Vec::new(),
             active_services: self.active_services(date)?,
+            active_services_previous: self.active_services_previous(date)?,
             max_transfers,
         };
         let arrivals = Raptor.one_to_all(&self.build.timetable, &self.transfers, &request);
@@ -1034,6 +1038,7 @@ impl TransportNetwork {
             .collect::<PyResult<_>>()?;
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
         let requests: Vec<Request> = origins
             .into_iter()
             .map(|origin| Request {
@@ -1041,6 +1046,7 @@ impl TransportNetwork {
                 access: vec![(origin, 0)],
                 egress: Vec::new(),
                 active_services: active_services.clone(),
+                active_services_previous: active_services_previous.clone(),
                 max_transfers,
             })
             .collect();
@@ -1110,6 +1116,7 @@ impl TransportNetwork {
             .collect::<PyResult<_>>()?;
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
         let requests: Vec<Request> = origins
             .into_iter()
             .map(|origin| Request {
@@ -1117,6 +1124,7 @@ impl TransportNetwork {
                 access: vec![(origin, 0)],
                 egress: Vec::new(),
                 active_services: active_services.clone(),
+                active_services_previous: active_services_previous.clone(),
                 max_transfers,
             })
             .collect();
@@ -1173,6 +1181,7 @@ impl TransportNetwork {
         validate_points(&destinations)?;
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
         let destination_count = destinations.len();
         let (flat, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
             let origin_links =
@@ -1188,6 +1197,7 @@ impl TransportNetwork {
                     access: request_offsets(links.as_deref().unwrap_or(&[])),
                     egress: Vec::new(),
                     active_services: active_services.clone(),
+                    active_services_previous: active_services_previous.clone(),
                     max_transfers,
                 })
                 .collect();
@@ -1297,6 +1307,7 @@ impl TransportNetwork {
         }
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
         let requests: Vec<Request> = origins
             .into_iter()
             .map(|origin| Request {
@@ -1304,6 +1315,7 @@ impl TransportNetwork {
                 access: vec![(origin, 0)],
                 egress: Vec::new(),
                 active_services: active_services.clone(),
+                active_services_previous: active_services_previous.clone(),
                 max_transfers,
             })
             .collect();
@@ -1414,6 +1426,7 @@ impl TransportNetwork {
         validate_points(&destinations)?;
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
         let stop_count = self.build.timetable.stop_count() as usize;
         let destination_count = destinations.len();
         let (flat, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
@@ -1430,6 +1443,7 @@ impl TransportNetwork {
                     access: request_offsets(links.as_deref().unwrap_or(&[])),
                     egress: Vec::new(),
                     active_services: active_services.clone(),
+                    active_services_previous: active_services_previous.clone(),
                     max_transfers,
                 })
                 .collect();
@@ -1525,6 +1539,7 @@ impl TransportNetwork {
         }
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
         let inputs = CostInputs {
             geometry,
             factors: &per_trip,
@@ -1547,6 +1562,7 @@ impl TransportNetwork {
                     access: request_offsets(links),
                     egress: Vec::new(),
                     active_services: active_services.clone(),
+                    active_services_previous: active_services_previous.clone(),
                     max_transfers,
                 });
                 access_meters.push(
@@ -1627,6 +1643,17 @@ impl TransportNetwork {
         let date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
             .map_err(|error| PyValueError::new_err(format!("invalid date '{date}': {error}")))?;
         Ok(self.build.services.active_on(date))
+    }
+
+    /// The services running the day before `date`, whose over-midnight
+    /// trips reach into it.
+    fn active_services_previous(&self, date: &str) -> PyResult<Vec<bool>> {
+        let date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .map_err(|error| PyValueError::new_err(format!("invalid date '{date}': {error}")))?;
+        let previous = date
+            .pred_opt()
+            .ok_or_else(|| PyValueError::new_err(format!("date '{date}' has no previous day")))?;
+        Ok(self.build.services.active_on(previous))
     }
 
     /// Runs a request through the router and converts the journeys,

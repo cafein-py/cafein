@@ -54,6 +54,9 @@ fn finds_the_earliest_direct_k_train() {
         access: vec![(korso, 0)],
         egress: vec![(kapyla, 0)],
         active_services: build.services.active_on(date),
+        active_services_previous: build
+            .services
+            .active_on(date.pred_opt().expect("date has a previous day")),
         max_transfers: 4,
     };
     let transfers = Transfers::empty(build.timetable.stop_count());
@@ -103,6 +106,9 @@ fn profiles_a_departure_window() {
         access: vec![(korso, 0)],
         egress: vec![(kapyla, 0)],
         active_services: build.services.active_on(date),
+        active_services_previous: build
+            .services
+            .active_on(date.pred_opt().expect("date has a previous day")),
         max_transfers: 4,
     };
     let transfers = Transfers::empty(build.timetable.stop_count());
@@ -162,6 +168,9 @@ fn journeys_are_time_consistent() {
         access: vec![(korso, 120)],
         egress: vec![(kapyla, 180)],
         active_services: build.services.active_on(date),
+        active_services_previous: build
+            .services
+            .active_on(date.pred_opt().expect("date has a previous day")),
         max_transfers: 4,
     };
     let transfers = Transfers::empty(build.timetable.stop_count());
