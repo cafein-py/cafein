@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.2.0 — 2026-07-04
+
+Door-to-door routing and the bulk matrix machinery: journeys and
+matrices from arbitrary coordinates, aggregated travel costs with
+emissions per OD pair, per-leg geometries, and travel-time percentiles
+over departure windows — computed in parallel over all cores.
+
 - Departure-window percentiles: `travel_time_matrix` accepts
   ``window=`` with ``percentiles=`` (or the ``confidence=``
   convenience, mapping a level to the symmetric interval plus the

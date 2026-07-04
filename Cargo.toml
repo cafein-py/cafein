@@ -8,15 +8,15 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/cafein-py/cafein"
 authors = ["Henrikki Tenkanen"]
 
 [workspace.dependencies]
-cafein-core = { path = "crates/cafein-core", version = "0.1.0" }
-cafein-gtfs = { path = "crates/cafein-gtfs", version = "0.1.0" }
+cafein-core = { path = "crates/cafein-core", version = "0.2.0" }
+cafein-gtfs = { path = "crates/cafein-gtfs", version = "0.2.0" }
 chrono = { version = "0.4", default-features = false }
 gtfs-structures = { version = "0.48", default-features = false }
 numpy = "0.23"
