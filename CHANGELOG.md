@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Departure-window percentiles: `travel_time_matrix` accepts
+  ``window=`` with ``percentiles=`` (or the ``confidence=``
+  convenience, mapping a level to the symmetric interval plus the
+  median) for stop and point matrices alike — every minute mark in the
+  window is evaluated through one descending range scan per origin, so
+  the output holds exact nearest-rank percentiles of the travel-time
+  distribution across the window; the r5py benchmark now compares
+  medians over the same one-minute window on both engines.
+
 - Pointset matrices: `TravelCostMatrix` and
   `TransportNetwork.travel_time_matrix` accept point GeoDataFrames
   (an ``id`` column plus point geometry) as origins and destinations.

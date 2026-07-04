@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use chrono::NaiveDate;
-use numpy::{IntoPyArray, PyArray2, PyArrayMethods};
+use numpy::{IntoPyArray, PyArray2, PyArray3, PyArrayMethods};
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
@@ -59,6 +59,24 @@ impl WalkMaps {
 /// The `(stop, seconds)` request offsets of a walking-search result.
 fn request_offsets(walks: &[WalkedStop]) -> Vec<(StopIdx, u32)> {
     walks.iter().map(|walk| (walk.stop, walk.seconds)).collect()
+}
+
+/// Rejects an empty or out-of-range window/percentile specification.
+fn validate_window(window: u32, percentiles: &[f64]) -> PyResult<()> {
+    if window == 0 {
+        return Err(PyValueError::new_err("window must be at least 1 second"));
+    }
+    if percentiles.is_empty() {
+        return Err(PyValueError::new_err("percentiles must not be empty"));
+    }
+    for &percentile in percentiles {
+        if !percentile.is_finite() || !(0.0..=100.0).contains(&percentile) {
+            return Err(PyValueError::new_err(
+                "percentiles must be finite and within [0, 100]",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Rejects non-finite point coordinates with the offending index.
@@ -817,6 +835,160 @@ impl TransportNetwork {
         flat.into_pyarray(py)
             .reshape([rows, stop_count])
             .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
+    /// Travel-time percentiles over a departure window, as a matrix.
+    ///
+    /// Every minute mark within ``[departure, departure + window)`` is
+    /// evaluated through one descending range scan per origin, in
+    /// parallel with the GIL released; the returned values are exact
+    /// nearest-rank percentiles of the travel-time distribution across
+    /// the window's minute marks.
+    ///
+    /// Parameters
+    /// ----------
+    /// from_stops : list of str
+    ///     GTFS stop_ids of the origin stops.
+    /// date : str
+    ///     Service date as ``YYYY-MM-DD``.
+    /// departure : str
+    ///     Window start at every origin as ``HH:MM:SS``.
+    /// window : int
+    ///     Window length in seconds, at least 1.
+    /// percentiles : list of float
+    ///     Percentiles in ``[0, 100]``, e.g. ``[10, 50, 90]``.
+    /// max_transfers : int (optional, default: 4)
+    ///     Maximum number of transfers between rides.
+    ///
+    /// Returns
+    /// -------
+    /// numpy.ndarray
+    ///     A ``(len(from_stops), stop_count, len(percentiles))`` uint32
+    ///     array of travel times in seconds; unreachable percentiles
+    ///     hold the maximum uint32 value (4294967295).
+    #[pyo3(signature = (from_stops, date, departure, window, percentiles, max_transfers = 4))]
+    #[allow(clippy::too_many_arguments)]
+    fn travel_time_percentiles<'py>(
+        &self,
+        py: Python<'py>,
+        from_stops: Vec<String>,
+        date: &str,
+        departure: &str,
+        window: u32,
+        percentiles: Vec<f64>,
+        max_transfers: u8,
+    ) -> PyResult<Bound<'py, PyArray3<u32>>> {
+        validate_window(window, &percentiles)?;
+        let origins: Vec<StopIdx> = from_stops
+            .iter()
+            .map(|stop| self.resolve_stop(stop))
+            .collect::<PyResult<_>>()?;
+        let departure = parse_time(departure)?;
+        let active_services = self.active_services(date)?;
+        let requests: Vec<Request> = origins
+            .into_iter()
+            .map(|origin| Request {
+                departure,
+                access: vec![(origin, 0)],
+                egress: Vec::new(),
+                active_services: active_services.clone(),
+                max_transfers,
+            })
+            .collect();
+        let stop_count = self.build.timetable.stop_count() as usize;
+        let flat: Vec<u32> = py.allow_threads(|| {
+            Raptor
+                .percentile_matrix(
+                    &self.build.timetable,
+                    &self.transfers,
+                    &requests,
+                    window,
+                    &percentiles,
+                )
+                .concat()
+        });
+        let rows = requests.len();
+        flat.into_pyarray(py)
+            .reshape([rows, stop_count, percentiles.len()])
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
+    /// Travel-time percentiles over a departure window between
+    /// coordinate points — ``travel_time_percentiles`` over linked
+    /// points, with each mark's arrival at a destination joined through
+    /// its egress links as in ``travel_time_matrix_from_points``.
+    ///
+    /// Returns
+    /// -------
+    /// dict
+    ///     ``matrix``: a ``(len(origins), len(destinations),
+    ///     len(percentiles))`` uint32 array; ``unsnapped_from`` /
+    ///     ``unsnapped_to``: indices of points off the walking network.
+    #[pyo3(signature = (origins, destinations, date, departure, window, percentiles, max_transfers = 4, walking_speed_kmph = 3.6, max_walking_time = 600.0, max_snap_distance = 100.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn travel_time_percentiles_from_points(
+        &self,
+        py: Python<'_>,
+        origins: Vec<(f64, f64)>,
+        destinations: Vec<(f64, f64)>,
+        date: &str,
+        departure: &str,
+        window: u32,
+        percentiles: Vec<f64>,
+        max_transfers: u8,
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+    ) -> PyResult<Py<PyDict>> {
+        let streets = self.installed_streets()?;
+        validate_window(window, &percentiles)?;
+        let speed =
+            validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
+        validate_points(&origins)?;
+        validate_points(&destinations)?;
+        let departure = parse_time(departure)?;
+        let active_services = self.active_services(date)?;
+        let destination_count = destinations.len();
+        let (flat, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
+            let origin_links =
+                streets.link_many(&origins, speed, max_walking_time, max_snap_distance);
+            let destination_links =
+                streets.link_many(&destinations, speed, max_walking_time, max_snap_distance);
+            let unsnapped_from = unsnapped(&origin_links);
+            let unsnapped_to = unsnapped(&destination_links);
+            let requests: Vec<Request> = origin_links
+                .iter()
+                .map(|links| Request {
+                    departure,
+                    access: request_offsets(links.as_deref().unwrap_or(&[])),
+                    egress: Vec::new(),
+                    active_services: active_services.clone(),
+                    max_transfers,
+                })
+                .collect();
+            let egress = egress_tables(&destination_links);
+            let flat = Raptor
+                .percentile_matrix_to_points(
+                    &self.build.timetable,
+                    &self.transfers,
+                    &requests,
+                    &egress,
+                    window,
+                    &percentiles,
+                )
+                .concat();
+            (flat, unsnapped_from, unsnapped_to)
+        });
+        let result = PyDict::new(py);
+        result.set_item(
+            "matrix",
+            flat.into_pyarray(py)
+                .reshape([origins.len(), destination_count, percentiles.len()])
+                .map_err(|error| PyValueError::new_err(error.to_string()))?,
+        )?;
+        result.set_item("unsnapped_from", unsnapped_from.into_pyarray(py))?;
+        result.set_item("unsnapped_to", unsnapped_to.into_pyarray(py))?;
+        Ok(result.unbind())
     }
 
     /// The fastest journey's aggregated costs per OD pair, long format.

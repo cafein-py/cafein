@@ -230,6 +230,117 @@ impl Raptor {
             .collect()
     }
 
+    /// Travel-time percentiles over a departure window, per origin —
+    /// the windowed matrix primitive, fanned out over origins with rayon.
+    ///
+    /// Every minute mark within `[departure, departure + window)` is
+    /// evaluated: one descending rRAPTOR scan per origin on shared
+    /// state yields, at each mark, the earliest arrival when leaving at
+    /// or after it. The samples are therefore the full minute-level
+    /// departure population, and the returned values are exact
+    /// nearest-rank percentiles of the travel-time distribution across
+    /// the window. Walking-only reachability (the access list) is
+    /// departure-independent and overlays every sample.
+    ///
+    /// Returns, per request, `stop_count × percentiles.len()` travel
+    /// times flat by stop; `u32::MAX` marks an unreachable percentile.
+    pub fn percentile_matrix(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        requests: &[Request],
+        window: u32,
+        percentiles: &[f64],
+    ) -> Vec<Vec<u32>> {
+        let stop_count = timetable.stop_count() as usize;
+        requests
+            .par_iter()
+            .map_init(
+                || None,
+                |pooled: &mut Option<Search>, request| {
+                    let arrivals = window_samples(pooled, timetable, transfers, request, window);
+                    let access_floor = access_floor(stop_count, request);
+                    let mut out = Vec::with_capacity(stop_count * percentiles.len());
+                    let mut samples = vec![0u32; arrivals.len()];
+                    for stop in 0..stop_count {
+                        for (sample, (mark, marked)) in samples.iter_mut().zip(&arrivals) {
+                            *sample = travel_time(marked[stop], *mark, access_floor[stop]);
+                        }
+                        samples.sort_unstable();
+                        for &percentile in percentiles {
+                            out.push(nearest_rank(&samples, percentile));
+                        }
+                    }
+                    out
+                },
+            )
+            .collect()
+    }
+
+    /// Travel-time percentiles over a departure window to destination
+    /// points, joined through the points' egress link tables — the
+    /// windowed pointset matrix. Semantics follow
+    /// [`Raptor::percentile_matrix`], with each mark's arrival at a
+    /// point being the minimum over its links of the arrival at the
+    /// link's stop plus the egress walk.
+    ///
+    /// Returns, per request, `egress.len() × percentiles.len()` travel
+    /// times flat by point; `u32::MAX` marks an unreachable percentile.
+    pub fn percentile_matrix_to_points(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        requests: &[Request],
+        egress: &[Vec<(StopIdx, u32, f64)>],
+        window: u32,
+        percentiles: &[f64],
+    ) -> Vec<Vec<u32>> {
+        let stop_count = timetable.stop_count() as usize;
+        requests
+            .par_iter()
+            .map_init(
+                || None,
+                |pooled: &mut Option<Search>, request| {
+                    let arrivals = window_samples(pooled, timetable, transfers, request, window);
+                    let access_floor = access_floor(stop_count, request);
+                    let mut out = Vec::with_capacity(egress.len() * percentiles.len());
+                    let mut samples = vec![0u32; arrivals.len()];
+                    for links in egress {
+                        // The walking-only floor through any link is
+                        // departure-independent, like the access floor.
+                        let mut walk_floor = UNREACHED;
+                        for &(stop, seconds, _) in links {
+                            let floor = access_floor[stop.0 as usize];
+                            if floor != UNREACHED {
+                                walk_floor = walk_floor.min(floor.saturating_add(seconds));
+                            }
+                        }
+                        for (sample, (mark, marked)) in samples.iter_mut().zip(&arrivals) {
+                            let mut at_point = UNREACHED;
+                            for &(stop, seconds, _) in links {
+                                let at_stop = marked[stop.0 as usize];
+                                if at_stop == UNREACHED {
+                                    continue;
+                                }
+                                if let Some(arrival) =
+                                    at_stop.checked_add(seconds).filter(|&at| at != UNREACHED)
+                                {
+                                    at_point = at_point.min(arrival);
+                                }
+                            }
+                            *sample = travel_time(at_point, *mark, walk_floor);
+                        }
+                        samples.sort_unstable();
+                        for &percentile in percentiles {
+                            out.push(nearest_rank(&samples, percentile));
+                        }
+                    }
+                    out
+                },
+            )
+            .collect()
+    }
+
     /// Routes over a departure window: the Pareto set of journeys over
     /// (departure, arrival, rides) for departures within
     /// `[request.departure, request.departure + window)`.
@@ -297,6 +408,78 @@ fn departure_candidates(timetable: &Timetable, request: &Request, window: u32) -
     candidates.sort_unstable_by(|left, right| right.cmp(left));
     candidates.dedup();
     candidates
+}
+
+/// One descending rRAPTOR scan over a request's departure window: for
+/// every minute mark within `[departure, departure + window)`,
+/// ascending, the per-stop earliest arrivals when leaving at or after
+/// that mark. The pooled search is rebuilt when the round count changes.
+fn window_samples<'a>(
+    pooled: &mut Option<Search<'a>>,
+    timetable: &'a Timetable,
+    transfers: &'a Transfers,
+    request: &'a Request,
+    window: u32,
+) -> Vec<(u32, Vec<u32>)> {
+    let search = match pooled {
+        Some(search) if search.rounds == request.max_transfers as usize + 1 => {
+            search.reset(request);
+            search
+        }
+        _ => pooled.insert(Search::new(timetable, transfers, request)),
+    };
+    let candidates = departure_candidates(timetable, request, window);
+    let mut next_candidate = 0;
+    let sample_count = (window as u64).div_ceil(60).max(1) as u32;
+    let mut samples = Vec::with_capacity(sample_count as usize);
+    for step in (0..sample_count).rev() {
+        let Some(mark) = request.departure.checked_add(step * 60) else {
+            continue;
+        };
+        while next_candidate < candidates.len() && candidates[next_candidate] >= mark {
+            search.run(candidates[next_candidate]);
+            next_candidate += 1;
+        }
+        samples.push((
+            mark,
+            search
+                .best
+                .last()
+                .expect("search always has a round")
+                .clone(),
+        ));
+    }
+    samples.reverse();
+    samples
+}
+
+/// Walking-only travel times from the request's access list, by stop.
+fn access_floor(stop_count: usize, request: &Request) -> Vec<u32> {
+    let mut floor = vec![UNREACHED; stop_count];
+    for &(stop, duration) in &request.access {
+        let slot = &mut floor[stop.0 as usize];
+        *slot = (*slot).min(duration);
+    }
+    floor
+}
+
+/// One travel-time sample: the transit arrival over the mark, floored
+/// by the departure-independent walking-only time.
+fn travel_time(arrival: u32, mark: u32, walk_floor: u32) -> u32 {
+    let transit = if arrival == UNREACHED {
+        UNREACHED
+    } else {
+        arrival - mark
+    };
+    transit.min(walk_floor)
+}
+
+/// The nearest-rank percentile of ascending samples; ranks exactly
+/// between two samples round up (the upper median), keeping the
+/// convention reproducible across languages.
+fn nearest_rank(sorted: &[u32], percentile: f64) -> u32 {
+    let position = (percentile / 100.0) * (sorted.len() - 1) as f64;
+    sorted[((position + 0.5).floor() as usize).min(sorted.len() - 1)]
 }
 
 /// RAPTOR state shared by the passes of one query.
@@ -892,6 +1075,79 @@ mod tests {
                 Raptor.route(&timetable, &transfers, &nearly_out_of_time),
                 Vec::new()
             );
+        }
+    }
+
+    #[test]
+    fn window_percentiles_match_per_minute_runs() {
+        // The windowed scan's samples must equal fresh single-departure
+        // runs at every minute mark; percentiles follow nearest-rank.
+        let (timetable, transfers) = network();
+        let window = 600;
+        let percentiles = [0.0, 50.0, 100.0];
+        let mut request = request(StopIdx(0), StopIdx(3), 0);
+        request.egress = Vec::new();
+        let rows = Raptor.percentile_matrix(
+            &timetable,
+            &transfers,
+            std::slice::from_ref(&request),
+            window,
+            &percentiles,
+        );
+        let stop_count = timetable.stop_count() as usize;
+        for stop in 0..stop_count {
+            let mut samples: Vec<u32> = (0..window / 60)
+                .map(|step| {
+                    let mark = step * 60;
+                    let mut fresh = request.clone();
+                    fresh.departure = mark;
+                    match Raptor.one_to_all(&timetable, &transfers, &fresh)[stop] {
+                        Some(arrival) => arrival - mark,
+                        None => UNREACHED,
+                    }
+                })
+                .collect();
+            samples.sort_unstable();
+            for (at, &percentile) in percentiles.iter().enumerate() {
+                assert_eq!(
+                    rows[0][stop * percentiles.len() + at],
+                    nearest_rank(&samples, percentile),
+                    "stop {stop} percentile {percentile}"
+                );
+            }
+        }
+        // The pointset variant joins the same samples over egress links.
+        let egress = vec![vec![(StopIdx(3), 30, 25.0), (StopIdx(4), 10, 8.0)]];
+        let point_rows = Raptor.percentile_matrix_to_points(
+            &timetable,
+            &transfers,
+            std::slice::from_ref(&request),
+            &egress,
+            window,
+            &percentiles,
+        );
+        let mut samples: Vec<u32> = (0..window / 60)
+            .map(|step| {
+                let mark = step * 60;
+                let mut fresh = request.clone();
+                fresh.departure = mark;
+                let arrivals = Raptor.one_to_all(&timetable, &transfers, &fresh);
+                let mut best = UNREACHED;
+                for &(stop, seconds, _) in &egress[0] {
+                    if let Some(at) = arrivals[stop.0 as usize] {
+                        best = best.min(at + seconds);
+                    }
+                }
+                if best == UNREACHED {
+                    UNREACHED
+                } else {
+                    best - mark
+                }
+            })
+            .collect();
+        samples.sort_unstable();
+        for (at, &percentile) in percentiles.iter().enumerate() {
+            assert_eq!(point_rows[0][at], nearest_rank(&samples, percentile));
         }
     }
 

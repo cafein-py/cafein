@@ -198,3 +198,101 @@ def test_stop_matrices_reject_point_options(network):
         network.travel_time_matrix(
             ["4810551"], "2022-02-22", "08:30:00", max_walking_time=300.0
         )
+
+
+def nearest_rank(sorted_samples, percentile):
+    """The core's half-up nearest-rank convention."""
+    position = percentile / 100 * (len(sorted_samples) - 1)
+    return sorted_samples[int(position + 0.5)]
+
+
+def test_window_percentiles_match_per_minute_runs(network):
+    window = 1800
+    percentiles = [0.0, 50.0, 100.0]
+    matrix = network.travel_time_matrix(
+        ["4810551"],
+        "2022-02-22",
+        "08:30:00",
+        window=window,
+        percentiles=percentiles,
+    )
+    assert matrix.shape == (1, network.stop_count, 3)
+    stop_order = [stop for stop, _, _ in network.stops]
+    per_minute = []
+    for step in range(window // 60):
+        mark = 8 * 3600 + 30 * 60 + 60 * step
+        clock = f"{mark // 3600:02d}:{mark % 3600 // 60:02d}:00"
+        per_minute.append(
+            network.travel_times_from_stop("4810551", "2022-02-22", clock)
+        )
+    unreachable = int(np.uint32(0xFFFFFFFF))
+    for column, stop in enumerate(stop_order):
+        samples = sorted(times.get(stop, unreachable) for times in per_minute)
+        for plane, percentile in enumerate(percentiles):
+            assert matrix[0, column, plane] == nearest_rank(samples, percentile), (
+                stop,
+                percentile,
+            )
+
+
+def test_confidence_maps_to_the_symmetric_interval(network):
+    left = network.travel_time_matrix(
+        ["4810551"], "2022-02-22", "08:30:00", window=1800, confidence=0.8
+    )
+    right = network.travel_time_matrix(
+        ["4810551"],
+        "2022-02-22",
+        "08:30:00",
+        window=1800,
+        percentiles=[10, 50, 90],
+    )
+    assert np.array_equal(left, right)
+    korso = [stop for stop, _, _ in network.stops].index("1250551")
+    lower, median, upper = left[0, korso]
+    assert lower <= median <= upper
+    assert lower < int(np.uint32(0xFFFFFFFF))
+
+
+def test_point_window_percentiles_keep_walks_constant(network_with_footpaths):
+    # A destination best reached on foot does not depend on the
+    # departure time: every percentile equals the walk.
+    origins = point_frame(network_with_footpaths, [("kamppi_metro", "1040602")])
+    destinations = point_frame(network_with_footpaths, [("kamppi_street", "1040280")])
+    matrix = network_with_footpaths.travel_time_matrix(
+        origins,
+        "2022-02-22",
+        "08:30:00",
+        destinations=destinations,
+        window=1800,
+        percentiles=[0, 50, 100],
+    )
+    assert matrix.shape == (1, 1, 3)
+    assert 19 <= matrix[0, 0, 0] == matrix[0, 0, 1] == matrix[0, 0, 2] <= 21
+
+
+def test_window_specifications_are_validated(network):
+    with pytest.raises(ValueError, match="require a window"):
+        network.travel_time_matrix(
+            ["4810551"], "2022-02-22", "08:30:00", percentiles=[50]
+        )
+    with pytest.raises(ValueError, match="not both"):
+        network.travel_time_matrix(
+            ["4810551"],
+            "2022-02-22",
+            "08:30:00",
+            window=600,
+            percentiles=[50],
+            confidence=0.8,
+        )
+    with pytest.raises(ValueError, match="within"):
+        network.travel_time_matrix(
+            ["4810551"], "2022-02-22", "08:30:00", window=600, confidence=1.5
+        )
+    with pytest.raises(ValueError, match="within"):
+        network.travel_time_matrix(
+            ["4810551"],
+            "2022-02-22",
+            "08:30:00",
+            window=600,
+            percentiles=[120],
+        )

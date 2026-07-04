@@ -17,10 +17,10 @@ both). The test data comes from `python scripts/fetch_test_data.py`.
 
 The comparison is as close as the engines' semantics allow, and the
 differences are printed with the results: cafein computes stop-to-stop
-earliest arrivals for one exact departure; r5py computes door-to-door
+medians over a one-minute departure window; r5py computes door-to-door
 times for point coordinates (here: the stop locations, so access legs are
-near-zero) as the median over a departure window, which is set to one
-minute — a single R5 departure sample. Both networks take their walking
+near-zero) as the median over the same one-minute window — a single
+departure sample on both sides. Both networks take their walking
 transfers from the same OSM extract. Stops are restricted to the
 extract's coverage so both engines can route them.
 """
@@ -78,9 +78,11 @@ def run_cafein(stops):
     build_seconds = time.perf_counter() - started
 
     started = time.perf_counter()
-    matrix = network.travel_time_matrix(list(stops["stop_id"]), DATE, DEPARTURE)
+    matrix = network.travel_time_matrix(
+        list(stops["stop_id"]), DATE, DEPARTURE, window=60
+    )
     column = {stop_id: at for at, (stop_id, _, _) in enumerate(network.stops)}
-    selected = matrix[:, [column[stop_id] for stop_id in stops["stop_id"]]]
+    selected = matrix[:, [column[stop_id] for stop_id in stops["stop_id"]], 0]
     finite = int((selected != np.uint32(0xFFFFFFFF)).sum())
     matrix_seconds = time.perf_counter() - started
     return build_seconds, matrix_seconds, finite
