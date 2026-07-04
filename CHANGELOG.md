@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Geographic street index: the walking street network is stored in
+  geographic coordinates and distances use a local ``cos(latitude)``
+  evaluated at the point's own latitude, replacing the single
+  equirectangular projection scaled at the network's mean latitude. Snap
+  connector distances and walk-path geometry now stay accurate over
+  country-scale latitude ranges (a single global scale was off by the
+  ``cos(latitude)`` ratio — tens of percent across a country). Segments
+  are densified to a maximum length at build time so the local-scale
+  model is exact. The network artifact format is now version 3;
+  version-2 artifacts are refused with the rebuild message.
+
 - Over-midnight service: a query early on a service day now also
   considers the previous day's trips whose GTFS times run past
   ``24:00:00`` — a ``25:30`` night-bus trip is reachable at ``01:30``
