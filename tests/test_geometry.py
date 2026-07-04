@@ -90,6 +90,57 @@ def single(rows):
     return cumulative, tier
 
 
+def test_geometries_carry_the_stop_chain_without_a_shape(tmp_path):
+    feed = gtfs_zip(tmp_path / "feed.zip")
+    rows, (polylines, trips) = geometry.trip_distances(feed, geometries=True)
+    assert len(rows) == 1
+    assert len(polylines) == 1
+    lons, lats, measures = polylines[0]
+    assert lons == [24.0, 24.01, 24.02]
+    assert lats == [60.0, 60.0, 60.0]
+    assert measures[0] == 0.0
+    assert measures[-1] == pytest.approx(CROW_TOTAL, rel=0.01)
+    trip_id, polyline, positions = trips[0]
+    assert (trip_id, polyline) == ("T1", 0)
+    # Chain positions are the chain's own measures: stops sit on vertices.
+    assert positions == measures
+
+
+def test_geometries_use_the_shape_when_stops_lie_on_it(tmp_path):
+    feed = gtfs_zip(tmp_path / "feed.zip", shape_points=DENSE_SHAPE)
+    rows, (polylines, trips) = geometry.trip_distances(feed, geometries=True)
+    lons, lats, measures = polylines[0]
+    assert len(lons) == len(DENSE_SHAPE)
+    assert lons[0] == 24.0 and lons[-1] == pytest.approx(24.02)
+    assert measures == sorted(measures)
+    trip_id, polyline, positions = trips[0]
+    assert polyline == 0
+    # The stops locate at the chain's crow-fly spacing along the shape.
+    assert positions[0] == pytest.approx(0.0, abs=1.0)
+    assert positions[1] == pytest.approx(measures[-1] / 2, rel=0.01)
+    assert positions[2] == pytest.approx(measures[-1], rel=0.01)
+
+
+def test_geometries_dedup_polylines_across_trips(tmp_path):
+    # Two trips of one shape and stop sequence share one polyline.
+    feed = gtfs_zip(tmp_path / "feed.zip", shape_points=DENSE_SHAPE)
+    with zipfile.ZipFile(feed, "a") as archive:
+        with archive.open("trips.txt") as member:
+            lines = member.read().decode().splitlines()
+        with archive.open("stop_times.txt") as member:
+            stop_times = member.read().decode().splitlines()
+        archive.writestr("trips.txt", "\n".join(lines + ["R1,SV,T2,S1"]) + "\n")
+        second = [line.replace("T1,", "T2,") for line in stop_times[1:]]
+        archive.writestr("stop_times.txt", "\n".join(stop_times + second) + "\n")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        rows, (polylines, trips) = geometry.trip_distances(feed, geometries=True)
+    assert len(rows) == 2
+    assert len(polylines) == 1
+    assert {trip_id for trip_id, _, _ in trips} == {"T1", "T2"}
+    assert {polyline for _, polyline, _ in trips} == {0}
+
+
 def test_valid_shape_dist_in_meters_is_used_directly(tmp_path):
     feed = gtfs_zip(tmp_path / "feed.zip", shape_dist=[0, 700, 1400])
     cumulative, tier = single(geometry.trip_distances(feed))
