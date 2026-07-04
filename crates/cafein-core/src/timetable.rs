@@ -10,21 +10,27 @@
 //! order at every stop of the pattern.
 
 /// Index of a stop in a [`Timetable`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct StopIdx(pub u32);
 
 /// Index of a stop-sequence pattern in a [`Timetable`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct PatternIdx(pub u32);
 
 /// Index of a trip in a [`Timetable`].
 ///
 /// Trips are numbered contiguously per pattern, in departure-time order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct TripIdx(pub u32);
 
 /// A pattern serving a stop, and the position of that stop in the pattern.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PatternStop {
     pub pattern: PatternIdx,
     pub position: u16,
@@ -32,7 +38,7 @@ pub struct PatternStop {
 
 /// Scheduled arrival and departure at one position of a trip, in seconds
 /// past the start of the service day (over-midnight times exceed 86 400).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StopTime {
     pub arrival: u32,
     pub departure: u32,
@@ -43,7 +49,7 @@ pub struct StopTime {
 /// Built through [`TimetableBuilder`]; all cross-references are vector
 /// indices, and all per-pattern data lives in flat arrays addressed through
 /// offset tables (CSR).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Timetable {
     stop_count: u32,
     /// CSR offsets into `pattern_stops`, one entry per pattern plus a tail.

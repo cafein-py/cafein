@@ -2,7 +2,13 @@
 
 ## Unreleased
 
-Nothing yet.
+- Network artifacts: `TransportNetwork.save(path)` writes the built
+  network — timetable, service calendar, transfers, trip distances,
+  leg geometries, and the street network — as one versioned file, and
+  `TransportNetwork.load(path)` restores it, refusing artifacts written
+  in another format version with a clear rebuild message. The
+  build-once/compute-many workflow: batch jobs load the same artifact
+  read-only instead of rebuilding from GTFS and OSM inputs.
 
 ## 0.2.0 — 2026-07-04
 

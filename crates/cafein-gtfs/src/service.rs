@@ -11,7 +11,7 @@ use crate::model::{Exception, Feed, FeedIndex};
 /// trips as their service identifier.
 pub type ServiceIndex = u32;
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct WeeklyPattern {
     /// Monday through Sunday.
     weekdays: [bool; 7],
@@ -26,7 +26,7 @@ struct WeeklyPattern {
 /// Every service referenced anywhere in the feed — by a calendar entry, an
 /// exception, or a trip — gets an index; a service referenced only by trips
 /// has no calendar data and never runs.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ServiceCalendar {
     index_by_id: HashMap<(FeedIndex, String), ServiceIndex>,
     weekly: Vec<Option<WeeklyPattern>>,
