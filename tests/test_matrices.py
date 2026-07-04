@@ -296,3 +296,19 @@ def test_window_specifications_are_validated(network):
             window=600,
             percentiles=[120],
         )
+
+
+def test_confidence_bounds_equal_their_decimal_percentiles(network):
+    # 31 samples put the 5th percentile's half-up rank exactly on a tie:
+    # (1 - 0.9) / 2 * 100 must reach the core as 5, not 4.999999999999999.
+    left = network.travel_time_matrix(
+        ["4810551"], "2022-02-22", "08:30:00", window=1860, confidence=0.9
+    )
+    right = network.travel_time_matrix(
+        ["4810551"],
+        "2022-02-22",
+        "08:30:00",
+        window=1860,
+        percentiles=[5, 50, 95],
+    )
+    assert np.array_equal(left, right)

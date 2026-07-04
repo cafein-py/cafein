@@ -24,8 +24,11 @@ def _window_percentiles(window, percentiles, confidence):
     if confidence is not None:
         if not 0 < confidence < 1:
             raise ValueError("confidence must be within (0, 1)")
-        half = (1 - confidence) / 2 * 100
-        return [half, 50.0, 100 - half]
+        # Rounded so the derived bounds equal their explicit decimal
+        # forms; raw float arithmetic (e.g. (1 - 0.9) / 2 * 100 =
+        # 4.999999999999999) could otherwise flip a half-up rank tie.
+        half = round((1 - confidence) / 2 * 100, 9)
+        return [half, 50.0, round(100 - half, 9)]
     if percentiles is None:
         return [50.0]
     return [float(percentile) for percentile in percentiles]

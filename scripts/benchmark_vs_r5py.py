@@ -195,9 +195,9 @@ def main():
         for row in results:
             print("  ".join(str(row[key]).ljust(widths[key]) for key in keys))
     print(
-        "\nnotes: cafein computes stop-to-stop earliest arrivals for the "
-        "exact departure;\nr5py computes door-to-door medians over a "
-        "1-minute window from the stop coordinates,\nincluding "
+        "\nnotes: cafein computes stop-to-stop medians over a 1-minute "
+        "window;\nr5py computes door-to-door medians over the same "
+        "1-minute window from the stop\ncoordinates, including "
         "access/egress snapping. Both use the OSM extract for walking "
         "transfers.\nfinite_share differs accordingly."
     )
