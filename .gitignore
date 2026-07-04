@@ -25,6 +25,7 @@ tests/data/
 # Local planning and assistant files (not part of the library)
 plans/
 .claude/
+CLAUDE.md
 
 # Editors and OS
 .idea/
