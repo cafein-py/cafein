@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Per-leg transit geometries: transit legs carry their travelled path
+  as a WKB LineString (``geometry``) — the GTFS shape sliced between
+  the board and alight stops when the stops verifiably lie along it,
+  the straight stop chain otherwise. The geometry payload comes from
+  the same preprocessing pass as the distances
+  (`cafein.geometry.trip_distances(..., geometries=True)`), with
+  polylines deduplicated across trips. Walk legs carry no geometry yet.
+
 - Door-to-door routing: `TransportNetwork.route_between_coordinates`
   routes between arbitrary coordinates — street access/egress searches
   at both ends feed the transit router, for single departures and

@@ -72,9 +72,10 @@ class TransportNetwork:
             Maximum distance in meters from a stop to the walking
             network; stops farther away get no footpaths.
         trip_distances : bool (optional, default: True)
-            Compute per-trip travel distances through the fallback
-            ladder (``cafein.geometry.trip_distances``), so transit legs
-            report their distance and its provenance.
+            Compute per-trip travel distances and leg geometries through
+            the fallback ladder (``cafein.geometry.trip_distances``), so
+            transit legs report their distance, its provenance, and
+            their geometry.
 
         The build reads the input files more than once (timetable,
         distance ladder, footpaths); they must not change underneath it.
@@ -84,9 +85,11 @@ class TransportNetwork:
         if trip_distances:
             from cafein import geometry
 
-            core.set_trip_distances(
-                geometry.trip_distances(paths, include=set(core.trip_ids))
+            distances, leg_geometries = geometry.trip_distances(
+                paths, include=set(core.trip_ids), geometries=True
             )
+            core.set_trip_distances(distances)
+            core.set_leg_geometries(*leg_geometries)
         if osm_pbf is not None:
             from cafein import streets
 
@@ -176,6 +179,20 @@ class TransportNetwork:
         """
         self._core.set_transfers(footpaths)
 
+    def set_leg_geometries(self, *leg_geometries):
+        """Install per-trip leg geometries.
+
+        Parameters
+        ----------
+        leg_geometries : tuple
+            ``(polylines, trips)`` — deduplicated ``(longitudes,
+            latitudes, measures)`` polylines and ``(trip_id, polyline,
+            stop_positions)`` rows locating each stop of a trip along
+            its polyline — as produced (alongside the distances) by
+            ``cafein.geometry.trip_distances(..., geometries=True)``.
+        """
+        self._core.set_leg_geometries(*leg_geometries)
+
     def set_street_network(self, *street_network):
         """Install the street network for coordinate access/egress.
 
@@ -257,7 +274,9 @@ class TransportNetwork:
         ``route_between_coordinates`` routes door-to-door from arbitrary
         coordinates, and ``annotate_emissions`` attaches emissions to
         routed journeys. Legs carry times, stops, distances, and
-        provenance; per-leg geometries are not part of the output yet.
+        provenance; transit legs add their geometry as a WKB LineString
+        when leg geometries are installed (the default build). Walk
+        legs carry no geometry yet.
 
         Parameters
         ----------

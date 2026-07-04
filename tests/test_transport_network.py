@@ -57,6 +57,60 @@ def test_transit_legs_carry_distance_and_provenance(network):
     assert network.distance_provenance_counts == {"shape_dist": 195_351}
 
 
+def test_transit_legs_carry_wkb_geometry(network):
+    # The K train's leg geometry is the HSL shape sliced between Korso
+    # and Käpylä: a dense LineString whose projected length agrees with
+    # the shape_dist distance and whose ends sit on the stops.
+    import geopandas as gpd
+    import shapely
+
+    journeys = network.route_between_stops(
+        "4810551", "1250551", "2022-02-22", "08:30:00"
+    )
+    access, transit, egress = journeys[0]["legs"]
+    line = shapely.from_wkb(transit["geometry"])
+    assert line.geom_type == "LineString"
+    assert shapely.get_num_coordinates(line) > 10
+    series = gpd.GeoSeries([line], crs="EPSG:4326")
+    length = float(series.to_crs(series.estimate_utm_crs()).length.iloc[0])
+    assert length == pytest.approx(transit["distance"], rel=0.01)
+    coordinates = {stop: (lon, lat) for stop, lat, lon in network.stops}
+    assert line.coords[0] == pytest.approx(coordinates["4810551"], abs=1e-3)
+    assert line.coords[-1] == pytest.approx(coordinates["1250551"], abs=1e-3)
+    # Walk legs carry no geometry yet.
+    assert access["geometry"] is None
+    assert egress["geometry"] is None
+
+
+def test_crow_fly_legs_draw_the_stop_chain(tmp_path):
+    import shapely
+
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs([str(feed)])
+    journeys = network.route_between_stops("S1", "S2", "2022-02-22", "07:30:00")
+    transit = journeys[0]["legs"][1]
+    line = shapely.from_wkb(transit["geometry"])
+    # No shape in the feed: the geometry is the straight stop chain.
+    assert list(line.coords) == [(24.0, 60.0), (24.01, 60.01)]
+
+
+def test_set_leg_geometries_validates_its_payload(tmp_path):
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs([str(feed)], trip_distances=False)
+    with pytest.raises(ValueError, match="malformed"):
+        network.set_leg_geometries(
+            [([24.0], [60.0], [0.0])],
+            [("T_OK", 0, [0.0, 100.0])],
+        )
+    with pytest.raises(ValueError, match="no positions"):
+        network.set_leg_geometries(
+            [([24.0, 24.01], [60.0, 60.01], [0.0, 100.0])],
+            [],
+        )
+
+
 def test_a_departure_window_profiles_the_k_trains(network):
     # Korso -> Käpylä over 08:30-09:00: the window holds two direct K
     # trains (08:36->08:58 and 08:56->09:18, straight from the GTFS

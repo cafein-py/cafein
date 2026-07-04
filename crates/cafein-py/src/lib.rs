@@ -6,9 +6,9 @@ use chrono::NaiveDate;
 use numpy::{IntoPyArray, PyArray2, PyArrayMethods};
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList};
 
-use cafein_core::geometry::{DistanceProvenance, TripGeometry};
+use cafein_core::geometry::{DistanceProvenance, LegGeometry, TripGeometry};
 use cafein_core::journey::{Journey, Leg};
 use cafein_core::raptor::Raptor;
 use cafein_core::router::{Request, TransitRouter};
@@ -24,6 +24,7 @@ struct TransportNetwork {
     build: TimetableBuild,
     transfers: Transfers,
     geometry: Option<TripGeometry>,
+    leg_geometry: Option<LegGeometry>,
     streets: Option<StreetNetwork>,
     stops_by_id: HashMap<String, StopLookup>,
     stops_by_qualified_id: HashMap<String, StopIdx>,
@@ -113,6 +114,7 @@ impl TransportNetwork {
             build,
             transfers,
             geometry: None,
+            leg_geometry: None,
             streets: None,
             stops_by_id,
             stops_by_qualified_id,
@@ -219,6 +221,41 @@ impl TransportNetwork {
         }
         self.geometry = Some(
             TripGeometry::from_trips(&self.build.timetable, entries)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?,
+        );
+        Ok(())
+    }
+
+    /// Install per-trip leg geometries.
+    ///
+    /// Parameters
+    /// ----------
+    /// polylines : list of (list of float, list of float, list of float)
+    ///     Deduplicated ``(longitudes, latitudes, measures)`` polylines:
+    ///     coordinates in EPSG:4326 with a non-decreasing measure at
+    ///     every vertex (e.g. cumulative meters).
+    /// trips : list of (str, int, list of float)
+    ///     ``(trip_id, polyline, stop_positions)`` rows locating each
+    ///     stop of the trip along its polyline, in the polyline's
+    ///     measure. Trip identifiers follow the public convention; rows
+    ///     for trips absent from the timetable — e.g. quarantined ones —
+    ///     are ignored. Every timetable trip must be covered.
+    ///     ``cafein.geometry.trip_distances(..., geometries=True)``
+    ///     produces this payload.
+    fn set_leg_geometries(
+        &mut self,
+        polylines: Vec<(Vec<f64>, Vec<f64>, Vec<f64>)>,
+        trips: Vec<(String, u32, Vec<f64>)>,
+    ) -> PyResult<()> {
+        let mut entries = Vec::with_capacity(trips.len());
+        for (trip_id, polyline, positions) in trips {
+            let Some(&trip) = self.trips_by_public_id.get(&trip_id) else {
+                continue;
+            };
+            entries.push((trip, polyline, positions));
+        }
+        self.leg_geometry = Some(
+            LegGeometry::new(&self.build.timetable, &polylines, entries)
                 .map_err(|error| PyValueError::new_err(error.to_string()))?,
         );
         Ok(())
@@ -389,7 +426,9 @@ impl TransportNetwork {
     /// report their distance and its provenance when trip distances are
     /// installed. ``route_between_coordinates`` routes door-to-door from
     /// arbitrary coordinates. Legs carry times, stops, distances, and
-    /// provenance; per-leg geometries are not part of the output yet.
+    /// provenance; transit legs add their geometry as a WKB LineString
+    /// when leg geometries are installed. Walk legs carry no geometry
+    /// yet.
     ///
     /// Parameters
     /// ----------
@@ -831,6 +870,7 @@ impl TransportNetwork {
                         walks.and_then(|walks| walks.access.get(&to_stop)).copied(),
                     )?;
                     entry.set_item("distance_provenance", py.None())?;
+                    entry.set_item("geometry", py.None())?;
                 }
                 Leg::Transit {
                     trip,
@@ -867,6 +907,13 @@ impl TransportNetwork {
                             entry.set_item("distance_provenance", py.None())?;
                         }
                     }
+                    let geometry = self.leg_geometry.as_ref().map(|geometry| {
+                        wkb_line_string(
+                            py,
+                            &geometry.leg_coordinates(trip, board_position, alight_position),
+                        )
+                    });
+                    entry.set_item("geometry", geometry)?;
                 }
                 Leg::Transfer {
                     from_stop,
@@ -889,6 +936,7 @@ impl TransportNetwork {
                     entry.set_item("arrival", arrival)?;
                     entry.set_item("distance", meters)?;
                     entry.set_item("distance_provenance", py.None())?;
+                    entry.set_item("geometry", py.None())?;
                 }
                 Leg::Egress {
                     from_stop,
@@ -906,6 +954,7 @@ impl TransportNetwork {
                             .copied(),
                     )?;
                     entry.set_item("distance_provenance", py.None())?;
+                    entry.set_item("geometry", py.None())?;
                 }
             }
             legs.append(entry)?;
@@ -965,6 +1014,19 @@ fn coordinate_links(
                  from the walking network"
             ))
         })
+}
+
+/// Encodes coordinates as a little-endian WKB LineString (XY).
+fn wkb_line_string<'py>(py: Python<'py>, coordinates: &[(f64, f64)]) -> Bound<'py, PyBytes> {
+    let mut wkb = Vec::with_capacity(9 + coordinates.len() * 16);
+    wkb.push(1u8);
+    wkb.extend_from_slice(&2u32.to_le_bytes());
+    wkb.extend_from_slice(&(coordinates.len() as u32).to_le_bytes());
+    for &(x, y) in coordinates {
+        wkb.extend_from_slice(&x.to_le_bytes());
+        wkb.extend_from_slice(&y.to_le_bytes());
+    }
+    PyBytes::new(py, &wkb)
 }
 
 /// Parses ``HH:MM:SS`` into seconds past the service day's start; hours may
