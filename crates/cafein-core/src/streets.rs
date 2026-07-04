@@ -19,6 +19,12 @@
 //! computed in a frame local to the relevant short segment. The R*-tree
 //! stores segments in lon/lat and is used only for envelope queries — never
 //! metric nearest-neighbour, whose degree-Euclidean distance would be wrong.
+//!
+//! Coordinates are assumed to be a contiguous extract within a continuous
+//! longitude range — the regional OSM extracts cafein consumes never cross the
+//! antimeridian. Distance measurement still uses the shortest signed longitude
+//! delta defensively, but the snap envelope is a single longitude interval, so
+//! snapping is not supported across ±180°.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -358,7 +364,12 @@ impl StreetNetwork {
     fn foot_on_segment(&self, latitude: f64, longitude: f64, edge: u32, start: u32) -> (f64, f64) {
         let (a, b) = (start as usize, start as usize + 1);
         let (mpd_lon, mpd_lat) = meters_per_degree(latitude);
-        let to_xy = |lon: f64, lat: f64| ((lon - longitude) * mpd_lon, (lat - latitude) * mpd_lat);
+        let to_xy = |lon: f64, lat: f64| {
+            (
+                longitude_delta(longitude, lon) * mpd_lon,
+                (lat - latitude) * mpd_lat,
+            )
+        };
         let (ax, ay) = to_xy(self.lons[a], self.lats[a]);
         let (bx, by) = to_xy(self.lons[b], self.lats[b]);
         let (dx, dy) = (bx - ax, by - ay);
@@ -799,11 +810,24 @@ fn snap_envelope(latitude: f64, longitude: f64, max_snap_distance: f64) -> AABB<
     )
 }
 
+/// Shortest signed longitude difference in degrees, wrapped to `[-180, 180]`
+/// so a pair straddling the antimeridian measures the short way.
+fn longitude_delta(from: f64, to: f64) -> f64 {
+    let delta = (to - from) % 360.0;
+    if delta > 180.0 {
+        delta - 360.0
+    } else if delta < -180.0 {
+        delta + 360.0
+    } else {
+        delta
+    }
+}
+
 /// The true geometric length between two lon/lat points, in metres, using a
 /// local `cos(latitude)` at their midpoint (exact for a short segment).
 fn segment_length(lon_a: f64, lat_a: f64, lon_b: f64, lat_b: f64) -> f64 {
     let (mpd_lon, mpd_lat) = meters_per_degree((lat_a + lat_b) / 2.0);
-    let dx = (lon_b - lon_a) * mpd_lon;
+    let dx = longitude_delta(lon_a, lon_b) * mpd_lon;
     let dy = (lat_b - lat_a) * mpd_lat;
     (dx * dx + dy * dy).sqrt()
 }
@@ -832,7 +856,19 @@ fn densify(
         for point in start..end - 1 {
             let (lon_a, lat_a) = (longitudes[point], latitudes[point]);
             let (lon_b, lat_b) = (longitudes[point + 1], latitudes[point + 1]);
-            let pieces = (segment_length(lon_a, lat_a, lon_b, lat_b) / MAX_SEGMENT_METERS)
+            // Bound each sub-piece by the largest metres-per-degree over the
+            // segment's latitude band, so none exceeds MAX_SEGMENT_METERS even
+            // when the segment spans a wide latitude range. Longitude
+            // metres-per-degree peaks toward the equator, latitude toward the
+            // poles.
+            let mut max_mpd_lon = meters_per_degree(lat_a).0.max(meters_per_degree(lat_b).0);
+            if (lat_a <= 0.0) != (lat_b <= 0.0) {
+                max_mpd_lon = max_mpd_lon.max(meters_per_degree(0.0).0);
+            }
+            let max_mpd_lat = meters_per_degree(lat_a).1.max(meters_per_degree(lat_b).1);
+            let dx = longitude_delta(lon_a, lon_b).abs() * max_mpd_lon;
+            let dy = (lat_b - lat_a).abs() * max_mpd_lat;
+            let pieces = ((dx * dx + dy * dy).sqrt() / MAX_SEGMENT_METERS)
                 .ceil()
                 .max(1.0) as usize;
             for k in 1..=pieces {
@@ -1090,6 +1126,38 @@ mod tests {
         // Midpoint of the edge is 2500 m along.
         let (_, lat) = network.point_at(0, 0.5);
         assert!((segment_length(25.0, 60.0, 25.0, lat) - 2_500.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn wraps_longitude_across_the_antimeridian() {
+        assert!((longitude_delta(179.99, -179.99) - 0.02).abs() < 1e-9);
+        assert!((longitude_delta(-179.99, 179.99) + 0.02).abs() < 1e-9);
+        assert!((longitude_delta(10.0, 20.0) - 10.0).abs() < 1e-9);
+        // A short segment straddling ±180° measures short, not near-global.
+        assert!(segment_length(179.99, 0.0, -179.99, 0.0) < 3_000.0);
+    }
+
+    #[test]
+    fn densifies_wide_latitude_segments() {
+        // Equator to 70°N with some longitude: every sub-piece stays short
+        // even though metres-per-degree changes markedly along the segment.
+        let network = StreetNetwork::new(
+            2,
+            0,
+            &[(0u32, 1u32, 1000.0)],
+            &[0u32, 2],
+            &[25.0, 25.5],
+            &[0.0, 70.0],
+            vec![],
+        )
+        .unwrap();
+        for (lons, lats) in network.lons.windows(2).zip(network.lats.windows(2)) {
+            let seg = segment_length(lons[0], lats[0], lons[1], lats[1]);
+            assert!(
+                seg <= MAX_SEGMENT_METERS + 1e-6,
+                "sub-piece {seg} m too long"
+            );
+        }
     }
 
     #[test]
