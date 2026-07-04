@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Detailed itineraries: `cafein.DetailedItineraries(network, origins,
+  destinations, date, departure)` returns every Pareto-optimal journey
+  between each origin and each destination as a GeoDataFrame with one
+  row per leg — leg type, times, boarding and alighting stops, distance
+  and provenance, emissions, and geometry — from stop or point
+  (door-to-door) inputs. Group by ``["from_id", "to_id", "option"]`` to
+  recover whole journeys.
+
+- Walk legs carry their geometry: the access and egress legs of
+  door-to-door journeys and the transfer legs of any journey (with the
+  street network installed) report the walked street path as a WKB
+  LineString. The network artifact format is now version 2; version-1
+  artifacts are refused with the rebuild message.
+
 - Batch outputs: matrices accept ``chunk=(k, n)`` to compute a
   deterministic contiguous origin block, so batch jobs cover all
   origins disjointly, and `cafein.travel_cost_table` returns the
