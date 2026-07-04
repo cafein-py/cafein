@@ -10,23 +10,39 @@
 //! footpath precompute used. Walking is undirected, so one search serves
 //! access and egress alike.
 //!
-//! Geometry lives in a single local equirectangular plane scaled at the
-//! network's mean latitude, which is accurate over the city- and
-//! regional-scale extracts one street tile covers; country-scale
-//! coverage splits into tiles, each with its own projection.
+//! Geometry is stored in geographic coordinates (longitude/latitude); there
+//! is no global projection. Distances use a local `cos(latitude)` evaluated
+//! at the point's own latitude, so they stay accurate over country-scale
+//! latitude ranges (following R5/OpenTripPlanner). Segments are densified to
+//! a maximum length at build time, so the local-scale model is exact: the
+//! snap foot, the connector distance, and the geometry lengths are all
+//! computed in a frame local to the relevant short segment. The R*-tree
+//! stores segments in lon/lat and is used only for envelope queries — never
+//! metric nearest-neighbour, whose degree-Euclidean distance would be wrong.
+//!
+//! Coordinates are assumed to be a contiguous extract within a continuous
+//! longitude range — the regional OSM extracts cafein consumes never cross the
+//! antimeridian. Distance measurement still uses the shortest signed longitude
+//! delta defensively, but the snap envelope is a single longitude interval, so
+//! snapping is not supported across ±180°.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 
 use rayon::prelude::*;
 use rstar::primitives::{GeomWithData, Line};
-use rstar::RTree;
+use rstar::{RTree, AABB};
 
 use crate::timetable::StopIdx;
 
-/// One polyline segment in the spatial index, tagged with the index of
-/// the edge it belongs to.
-type EdgeSegment = GeomWithData<Line<[f64; 2]>, u32>;
+/// Longest stored segment, in meters. Segments are densified below this so a
+/// single centre-latitude scale represents each one to well under a
+/// millimetre even at high latitude.
+const MAX_SEGMENT_METERS: f64 = 100.0;
+
+/// One polyline segment in the spatial index (lon/lat), tagged with
+/// `(edge index, index of the segment's first coordinate)`.
+type EdgeSegment = GeomWithData<Line<[f64; 2]>, (u32, u32)>;
 
 /// How a stop enters the street graph: snapped onto an edge at a fraction
 /// of its cost length, over a straight connector to the snap point.
@@ -140,20 +156,22 @@ pub struct StreetNetwork {
     /// Edge cost lengths in meters (the OSM way length, which the split
     /// pro-rating distributes; it may differ from the geometric length).
     lengths: Vec<f64>,
-    /// Offsets into the projected coordinate arrays, one per edge plus a
-    /// tail.
+    /// Offsets into the coordinate arrays, one per edge plus a tail. The
+    /// geometry is densified so every segment is at most
+    /// `MAX_SEGMENT_METERS`.
     coordinate_offsets: Vec<u32>,
-    /// Edge geometries projected to local equirectangular meters.
-    xs: Vec<f64>,
-    ys: Vec<f64>,
+    /// Edge geometries in geographic coordinates (longitude, latitude).
+    lons: Vec<f64>,
+    lats: Vec<f64>,
+    /// Per-coordinate cumulative true distance from the edge's first point,
+    /// in meters; parallel to `lons`/`lats`. The last point of each edge
+    /// holds the edge's total geometric length.
+    cumulative: Vec<f64>,
     /// How each snapped stop enters the graph.
     links: Vec<StopLink>,
-    /// Spatial index over the edge geometries, one entry per segment.
+    /// Spatial index over the edge segments in lon/lat, for envelope
+    /// queries only.
     tree: RTree<EdgeSegment>,
-    /// Projection origin as `(longitude, latitude)`.
-    origin: (f64, f64),
-    /// Meters per degree of `(longitude, latitude)` at the origin.
-    scale: (f64, f64),
 }
 
 impl StreetNetwork {
@@ -222,15 +240,8 @@ impl StreetNetwork {
             }
         }
 
-        let (origin, scale) = projection(longitudes, latitudes);
-        let xs: Vec<f64> = longitudes
-            .iter()
-            .map(|lon| (lon - origin.0) * scale.0)
-            .collect();
-        let ys: Vec<f64> = latitudes
-            .iter()
-            .map(|lat| (lat - origin.1) * scale.1)
-            .collect();
+        let (dense_offsets, lons, lats, cumulative) =
+            densify(coordinate_offsets, longitudes, latitudes);
 
         let mut adjacency_offsets = vec![0u32; vertex_count as usize + 1];
         for &(from, to, _) in edges {
@@ -250,20 +261,19 @@ impl StreetNetwork {
             }
         }
 
-        let tree = build_tree(coordinate_offsets, &xs, &ys);
+        let tree = build_tree(&dense_offsets, &lons, &lats);
 
         Ok(StreetNetwork {
             adjacency_offsets,
             adjacency,
             endpoints: edges.iter().map(|&(from, to, _)| (from, to)).collect(),
             lengths: edges.iter().map(|&(_, _, meters)| meters).collect(),
-            coordinate_offsets: coordinate_offsets.to_vec(),
-            xs,
-            ys,
+            coordinate_offsets: dense_offsets,
+            lons,
+            lats,
+            cumulative,
             links,
             tree,
-            origin,
-            scale,
         })
     }
 
@@ -291,29 +301,27 @@ impl StreetNetwork {
             endpoints: self.endpoints.clone(),
             lengths: self.lengths.clone(),
             coordinate_offsets: self.coordinate_offsets.clone(),
-            xs: self.xs.clone(),
-            ys: self.ys.clone(),
+            lons: self.lons.clone(),
+            lats: self.lats.clone(),
+            cumulative: self.cumulative.clone(),
             links: self.links.clone(),
-            origin: self.origin,
-            scale: self.scale,
         }
     }
 
     /// Rebuilds a network from its serialized parts.
     pub fn from_parts(parts: StreetNetworkParts) -> StreetNetwork {
-        let tree = build_tree(&parts.coordinate_offsets, &parts.xs, &parts.ys);
+        let tree = build_tree(&parts.coordinate_offsets, &parts.lons, &parts.lats);
         StreetNetwork {
             adjacency_offsets: parts.adjacency_offsets,
             adjacency: parts.adjacency,
             endpoints: parts.endpoints,
             lengths: parts.lengths,
             coordinate_offsets: parts.coordinate_offsets,
-            xs: parts.xs,
-            ys: parts.ys,
+            lons: parts.lons,
+            lats: parts.lats,
+            cumulative: parts.cumulative,
             links: parts.links,
             tree,
-            origin: parts.origin,
-            scale: parts.scale,
         }
     }
 
@@ -328,17 +336,59 @@ impl StreetNetwork {
         {
             return None;
         }
-        let x = (longitude - self.origin.0) * self.scale.0;
-        let y = (latitude - self.origin.1) * self.scale.1;
-        // The nearest segment's edge is the nearest edge; projecting onto
-        // the whole edge recovers the exact distance and the fraction.
-        let edge = self.tree.nearest_neighbor([x, y])?.data;
-        let (distance, fraction) = self.project_onto_edge(edge, x, y);
-        (distance <= max_snap_distance).then_some(Snap {
-            edge,
-            fraction,
-            connector: distance,
-        })
+        // Every segment within `max_snap_distance` is inside this lon/lat
+        // envelope; the tree is queried by envelope intersection, never by a
+        // degree-Euclidean nearest, and each candidate is re-measured exactly.
+        let envelope = snap_envelope(latitude, longitude, max_snap_distance);
+        let mut best: Option<Snap> = None;
+        for segment in self.tree.locate_in_envelope_intersecting(envelope) {
+            let (edge, start) = segment.data;
+            let (connector, fraction) = self.foot_on_segment(latitude, longitude, edge, start);
+            if connector <= max_snap_distance
+                && best.is_none_or(|current| connector < current.connector)
+            {
+                best = Some(Snap {
+                    edge,
+                    fraction,
+                    connector,
+                });
+            }
+        }
+        best
+    }
+
+    /// The exact connector distance and true-length fraction of a query's
+    /// foot on one segment (its first coordinate is `start`), measured in an
+    /// equirectangular frame local to the query — exact because segments are
+    /// short (densified below `MAX_SEGMENT_METERS`).
+    fn foot_on_segment(&self, latitude: f64, longitude: f64, edge: u32, start: u32) -> (f64, f64) {
+        let (a, b) = (start as usize, start as usize + 1);
+        let (mpd_lon, mpd_lat) = meters_per_degree(latitude);
+        let to_xy = |lon: f64, lat: f64| {
+            (
+                longitude_delta(longitude, lon) * mpd_lon,
+                (lat - latitude) * mpd_lat,
+            )
+        };
+        let (ax, ay) = to_xy(self.lons[a], self.lats[a]);
+        let (bx, by) = to_xy(self.lons[b], self.lats[b]);
+        let (dx, dy) = (bx - ax, by - ay);
+        let squared = dx * dx + dy * dy;
+        // The query sits at the frame origin, so the foot parameter is
+        // ((Q - A)·(B - A)) / |B - A|² with Q = 0.
+        let t = if squared > 0.0 {
+            ((-ax * dx - ay * dy) / squared).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (px, py) = (ax + t * dx, ay + t * dy);
+        let connector = (px * px + py * py).sqrt();
+
+        let end = self.coordinate_offsets[edge as usize + 1] as usize;
+        let along = self.cumulative[a] + t * (self.cumulative[b] - self.cumulative[a]);
+        let total = self.cumulative[end - 1];
+        let fraction = if total > 0.0 { along / total } else { 0.0 };
+        (connector, fraction)
     }
 
     /// Every transit stop reachable on foot from a coordinate, sorted by
@@ -499,8 +549,7 @@ impl StreetNetwork {
             edges.reverse();
 
             let mut path = Vec::new();
-            let origin = self.project(from_point);
-            path.push(origin);
+            path.push((from_point.1, from_point.0));
             path.push(self.point_at(from.edge, from.fraction));
             // The partial first edge, from the snap point to the seed.
             // A loop edge's endpoints coincide; its cheaper side was
@@ -542,17 +591,17 @@ impl StreetNetwork {
             };
             path.extend(self.edge_slice(to.edge, exit_fraction, to.fraction));
             path.push(self.point_at(to.edge, to.fraction));
-            path.push(self.project(to_point));
-            return Some((self.unprojected(path), best_transit));
+            path.push((to_point.1, to_point.0));
+            return Some((dedup_consecutive(path), best_transit));
         }
 
         let meters = direct?;
-        let mut path = vec![self.project(from_point)];
+        let mut path = vec![(from_point.1, from_point.0)];
         path.push(self.point_at(from.edge, from.fraction));
         path.extend(self.edge_slice(from.edge, from.fraction, to.fraction));
         path.push(self.point_at(to.edge, to.fraction));
-        path.push(self.project(to_point));
-        Some((self.unprojected(path), meters))
+        path.push((to_point.1, to_point.0));
+        Some((dedup_consecutive(path), meters))
     }
 
     /// An unbounded Dijkstra recording each vertex's predecessor and the
@@ -589,87 +638,38 @@ impl StreetNetwork {
         (distances, previous)
     }
 
-    /// The projected coordinates of a `(lat, lon)` point.
-    fn project(&self, point: (f64, f64)) -> (f64, f64) {
-        (
-            (point.1 - self.origin.0) * self.scale.0,
-            (point.0 - self.origin.1) * self.scale.1,
-        )
-    }
-
-    /// Projected coordinates back to `(lon, lat)`, consecutive
-    /// duplicates dropped.
-    fn unprojected(&self, path: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
-        let mut coordinates: Vec<(f64, f64)> = Vec::with_capacity(path.len());
-        for (x, y) in path {
-            let lonlat = (
-                x / self.scale.0 + self.origin.0,
-                y / self.scale.1 + self.origin.1,
-            );
-            if coordinates.last() != Some(&lonlat) {
-                coordinates.push(lonlat);
-            }
-        }
-        if coordinates.len() == 1 {
-            coordinates.push(coordinates[0]);
-        }
-        coordinates
-    }
-
-    /// The projected point at a fraction of an edge's geometric length.
+    /// The `(lon, lat)` point at a fraction of an edge's true length.
     fn point_at(&self, edge: u32, fraction: f64) -> (f64, f64) {
-        let slice = self.edge_slice(edge, fraction, fraction);
-        slice[0]
+        let start = self.coordinate_offsets[edge as usize] as usize;
+        let end = self.coordinate_offsets[edge as usize + 1] as usize;
+        let total = self.cumulative[end - 1];
+        self.interpolate(start, end, fraction.clamp(0.0, 1.0) * total)
     }
 
-    /// The projected geometry of an edge between two fractions of its
-    /// geometric length, endpoints interpolated; reversed when
-    /// `from_fraction > to_fraction`. Always at least one point.
+    /// The `(lon, lat)` geometry of an edge between two fractions of its true
+    /// length, endpoints interpolated; reversed when `from_fraction >
+    /// to_fraction`. Always at least one point.
     fn edge_slice(&self, edge: u32, from_fraction: f64, to_fraction: f64) -> Vec<(f64, f64)> {
         let start = self.coordinate_offsets[edge as usize] as usize;
         let end = self.coordinate_offsets[edge as usize + 1] as usize;
-        let mut measures = Vec::with_capacity(end - start);
-        let mut cumulative = 0.0;
-        measures.push(0.0);
-        for vertex in start..end - 1 {
-            let (dx, dy) = (
-                self.xs[vertex + 1] - self.xs[vertex],
-                self.ys[vertex + 1] - self.ys[vertex],
-            );
-            cumulative += (dx * dx + dy * dy).sqrt();
-            measures.push(cumulative);
-        }
-        let total = cumulative;
-        let interpolate = |measure: f64| -> (f64, f64) {
-            let upper = measures
-                .partition_point(|&at| at < measure)
-                .clamp(1, measures.len() - 1);
-            let lower = upper - 1;
-            let span = measures[upper] - measures[lower];
-            let along = if span > 0.0 {
-                ((measure - measures[lower]) / span).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            (
-                self.xs[start + lower] + along * (self.xs[start + upper] - self.xs[start + lower]),
-                self.ys[start + lower] + along * (self.ys[start + upper] - self.ys[start + lower]),
-            )
-        };
+        let total = self.cumulative[end - 1];
         let (low, high, reversed) = if from_fraction <= to_fraction {
-            (from_fraction * total, to_fraction * total, false)
+            (from_fraction, to_fraction, false)
         } else {
-            (to_fraction * total, from_fraction * total, true)
+            (to_fraction, from_fraction, true)
         };
+        let low = low.clamp(0.0, 1.0) * total;
+        let high = high.clamp(0.0, 1.0) * total;
         let mut slice = Vec::new();
-        slice.push(interpolate(low));
-        let after = measures.partition_point(|&measure| measure <= low);
-        let until = measures.partition_point(|&measure| measure < high);
-        for vertex in after..until {
-            slice.push((self.xs[start + vertex], self.ys[start + vertex]));
+        slice.push(self.interpolate(start, end, low));
+        for point in start..end {
+            let along = self.cumulative[point];
+            if along > low && along < high {
+                slice.push((self.lons[point], self.lats[point]));
+            }
         }
         if high > low {
-            slice.push(interpolate(high));
+            slice.push(self.interpolate(start, end, high));
         }
         if reversed {
             slice.reverse();
@@ -677,39 +677,32 @@ impl StreetNetwork {
         slice
     }
 
-    /// The distance and linear-referenced fraction of a coordinate's
-    /// projection onto an edge's geometry.
-    fn project_onto_edge(&self, edge: u32, x: f64, y: f64) -> (f64, f64) {
-        let start = self.coordinate_offsets[edge as usize] as usize;
-        let end = self.coordinate_offsets[edge as usize + 1] as usize;
-        let mut nearest = f64::INFINITY;
-        let mut nearest_along = 0.0;
-        let mut cumulative = 0.0;
-        for segment in start..end - 1 {
-            let (ax, ay) = (self.xs[segment], self.ys[segment]);
-            let (bx, by) = (self.xs[segment + 1], self.ys[segment + 1]);
-            let (dx, dy) = (bx - ax, by - ay);
-            let squared = dx * dx + dy * dy;
-            let along = if squared > 0.0 {
-                (((x - ax) * dx + (y - ay) * dy) / squared).clamp(0.0, 1.0)
+    /// The `(lon, lat)` point at along-edge distance `target` (metres from the
+    /// edge's first coordinate), interpolated within the containing segment.
+    fn interpolate(&self, start: usize, end: usize, target: f64) -> (f64, f64) {
+        let total = self.cumulative[end - 1];
+        let target = target.clamp(0.0, total);
+        // Largest coordinate index whose cumulative distance is at most the
+        // target; the containing segment is `[lo, lo + 1]`.
+        let (mut lo, mut hi) = (start, end - 1);
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if self.cumulative[mid] <= target {
+                lo = mid;
             } else {
-                0.0
-            };
-            let (px, py) = (ax + along * dx, ay + along * dy);
-            let distance = ((x - px) * (x - px) + (y - py) * (y - py)).sqrt();
-            let segment_length = squared.sqrt();
-            if distance < nearest {
-                nearest = distance;
-                nearest_along = cumulative + along * segment_length;
+                hi = mid;
             }
-            cumulative += segment_length;
         }
-        let fraction = if cumulative > 0.0 {
-            nearest_along / cumulative
+        let span = self.cumulative[lo + 1] - self.cumulative[lo];
+        let t = if span > 0.0 {
+            (target - self.cumulative[lo]) / span
         } else {
             0.0
         };
-        (nearest, fraction)
+        (
+            self.lons[lo] + t * (self.lons[lo + 1] - self.lons[lo]),
+            self.lats[lo] + t * (self.lats[lo + 1] - self.lats[lo]),
+        )
     }
 
     /// Shortest distances in meters from the source frontier to every
@@ -753,43 +746,145 @@ pub struct StreetNetworkParts {
     endpoints: Vec<(u32, u32)>,
     lengths: Vec<f64>,
     coordinate_offsets: Vec<u32>,
-    xs: Vec<f64>,
-    ys: Vec<f64>,
+    lons: Vec<f64>,
+    lats: Vec<f64>,
+    cumulative: Vec<f64>,
     links: Vec<StopLink>,
-    origin: (f64, f64),
-    scale: (f64, f64),
 }
 
-/// The segment R*-tree over a polyline set.
-fn build_tree(coordinate_offsets: &[u32], xs: &[f64], ys: &[f64]) -> RTree<EdgeSegment> {
+/// The segment R*-tree over a lon/lat polyline set. Each entry is tagged with
+/// `(edge index, its first coordinate's index)`.
+fn build_tree(coordinate_offsets: &[u32], lons: &[f64], lats: &[f64]) -> RTree<EdgeSegment> {
     let mut segments = Vec::new();
-    for index in 0..coordinate_offsets.len().saturating_sub(1) {
-        let start = coordinate_offsets[index] as usize;
-        let end = coordinate_offsets[index + 1] as usize;
+    for edge in 0..coordinate_offsets.len().saturating_sub(1) {
+        let start = coordinate_offsets[edge] as usize;
+        let end = coordinate_offsets[edge + 1] as usize;
         for segment in start..end - 1 {
             segments.push(EdgeSegment::new(
                 Line::new(
-                    [xs[segment], ys[segment]],
-                    [xs[segment + 1], ys[segment + 1]],
+                    [lons[segment], lats[segment]],
+                    [lons[segment + 1], lats[segment + 1]],
                 ),
-                index as u32,
+                (edge as u32, segment as u32),
             ));
         }
     }
     RTree::bulk_load(segments)
 }
 
-/// The projection origin and meters-per-degree scale of a coordinate set.
-fn projection(longitudes: &[f64], latitudes: &[f64]) -> ((f64, f64), (f64, f64)) {
-    if longitudes.is_empty() {
-        return ((0.0, 0.0), meters_per_degree(0.0));
+/// Drops consecutive duplicate points, keeping at least two.
+fn dedup_consecutive(path: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    let mut coordinates: Vec<(f64, f64)> = Vec::with_capacity(path.len());
+    for point in path {
+        if coordinates.last() != Some(&point) {
+            coordinates.push(point);
+        }
     }
-    let count = longitudes.len() as f64;
-    let origin = (
-        longitudes.iter().sum::<f64>() / count,
-        latitudes.iter().sum::<f64>() / count,
-    );
-    (origin, meters_per_degree(origin.1))
+    if coordinates.len() == 1 {
+        coordinates.push(coordinates[0]);
+    }
+    coordinates
+}
+
+/// The lon/lat envelope containing every segment within `max_snap_distance` of
+/// a query, sized at the query's own latitude. The latitude half-width uses a
+/// global minimum metres-per-degree-latitude; the longitude half-width uses
+/// the minimum metres-per-degree-longitude over the reachable latitude band,
+/// so no truly-nearby segment is clipped at any latitude or snap distance.
+fn snap_envelope(latitude: f64, longitude: f64, max_snap_distance: f64) -> AABB<[f64; 2]> {
+    // Metres per degree of latitude bottoms out at the equator.
+    const MIN_MPD_LAT: f64 = 110_574.0;
+    let margin = 1.0 + 1e-6;
+    let delta_lat = max_snap_distance / MIN_MPD_LAT * margin;
+    let lo_lat = (latitude - delta_lat).clamp(-90.0, 90.0);
+    let hi_lat = (latitude + delta_lat).clamp(-90.0, 90.0);
+    let min_mpd_lon = meters_per_degree(lo_lat).0.min(meters_per_degree(hi_lat).0);
+    let delta_lon = if min_mpd_lon > 1e-9 {
+        (max_snap_distance / min_mpd_lon * margin).min(180.0)
+    } else {
+        180.0
+    };
+    AABB::from_corners(
+        [longitude - delta_lon, latitude - delta_lat],
+        [longitude + delta_lon, latitude + delta_lat],
+    )
+}
+
+/// Shortest signed longitude difference in degrees, wrapped to `[-180, 180]`
+/// so a pair straddling the antimeridian measures the short way.
+fn longitude_delta(from: f64, to: f64) -> f64 {
+    let delta = (to - from) % 360.0;
+    if delta > 180.0 {
+        delta - 360.0
+    } else if delta < -180.0 {
+        delta + 360.0
+    } else {
+        delta
+    }
+}
+
+/// The true geometric length between two lon/lat points, in metres, using a
+/// local `cos(latitude)` at their midpoint (exact for a short segment).
+fn segment_length(lon_a: f64, lat_a: f64, lon_b: f64, lat_b: f64) -> f64 {
+    let (mpd_lon, mpd_lat) = meters_per_degree((lat_a + lat_b) / 2.0);
+    let dx = longitude_delta(lon_a, lon_b) * mpd_lon;
+    let dy = (lat_b - lat_a) * mpd_lat;
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// Splits every segment longer than `MAX_SEGMENT_METERS` into equal colinear
+/// pieces, returning the densified coordinate offsets, geographic coordinates,
+/// and per-coordinate cumulative distance from each edge's first point.
+fn densify(
+    coordinate_offsets: &[u32],
+    longitudes: &[f64],
+    latitudes: &[f64],
+) -> (Vec<u32>, Vec<f64>, Vec<f64>, Vec<f64>) {
+    let edge_count = coordinate_offsets.len().saturating_sub(1);
+    let mut offsets = Vec::with_capacity(coordinate_offsets.len());
+    let mut lons = Vec::new();
+    let mut lats = Vec::new();
+    let mut cumulative = Vec::new();
+    offsets.push(0);
+    for edge in 0..edge_count {
+        let start = coordinate_offsets[edge] as usize;
+        let end = coordinate_offsets[edge + 1] as usize;
+        lons.push(longitudes[start]);
+        lats.push(latitudes[start]);
+        cumulative.push(0.0);
+        let mut running = 0.0;
+        for point in start..end - 1 {
+            let (lon_a, lat_a) = (longitudes[point], latitudes[point]);
+            let (lon_b, lat_b) = (longitudes[point + 1], latitudes[point + 1]);
+            // Bound each sub-piece by the largest metres-per-degree over the
+            // segment's latitude band, so none exceeds MAX_SEGMENT_METERS even
+            // when the segment spans a wide latitude range. Longitude
+            // metres-per-degree peaks toward the equator, latitude toward the
+            // poles.
+            let mut max_mpd_lon = meters_per_degree(lat_a).0.max(meters_per_degree(lat_b).0);
+            if (lat_a <= 0.0) != (lat_b <= 0.0) {
+                max_mpd_lon = max_mpd_lon.max(meters_per_degree(0.0).0);
+            }
+            let max_mpd_lat = meters_per_degree(lat_a).1.max(meters_per_degree(lat_b).1);
+            let dx = longitude_delta(lon_a, lon_b).abs() * max_mpd_lon;
+            let dy = (lat_b - lat_a).abs() * max_mpd_lat;
+            let pieces = ((dx * dx + dy * dy).sqrt() / MAX_SEGMENT_METERS)
+                .ceil()
+                .max(1.0) as usize;
+            for k in 1..=pieces {
+                let t = k as f64 / pieces as f64;
+                let lon = lon_a + t * (lon_b - lon_a);
+                let lat = lat_a + t * (lat_b - lat_a);
+                let (prev_lon, prev_lat) = (*lons.last().unwrap(), *lats.last().unwrap());
+                running += segment_length(prev_lon, prev_lat, lon, lat);
+                lons.push(lon);
+                lats.push(lat);
+                cumulative.push(running);
+            }
+        }
+        offsets.push(lons.len() as u32);
+    }
+    (offsets, lons, lats, cumulative)
 }
 
 /// Local meters per degree of (longitude, latitude) on the WGS84 spheroid.
@@ -978,6 +1073,94 @@ mod tests {
     }
 
     #[test]
+    fn snaps_accurately_across_a_wide_latitude_range() {
+        // Two short edges, one at 60°N and one at 70°N. Each snap must
+        // measure its connector with the local scale at its own latitude —
+        // a single network-mean projection would be ~24% wrong at 70°N.
+        let mpd_lon_60 = meters_per_degree(60.0).0;
+        let mpd_lon_70 = meters_per_degree(70.0).0;
+        let longitudes = [25.0, 25.0, 25.0, 25.0];
+        let latitudes = [60.0, 60.01, 70.0, 70.01];
+        let offsets = [0u32, 2, 4];
+        let edges = [(0u32, 1u32, 1000.0), (2u32, 3u32, 1000.0)];
+        let network =
+            StreetNetwork::new(4, 0, &edges, &offsets, &longitudes, &latitudes, vec![]).unwrap();
+
+        // 30 m due east of each edge's midpoint snaps at a ~30 m connector,
+        // even though 30 m is a different Δlon at each latitude.
+        let north = network
+            .snap(70.005, 25.0 + 30.0 / mpd_lon_70, 100.0)
+            .unwrap();
+        assert_eq!(north.edge, 1);
+        assert!((north.connector - 30.0).abs() < 0.1, "{}", north.connector);
+        assert!((north.fraction - 0.5).abs() < 0.01);
+
+        let south = network
+            .snap(60.005, 25.0 + 30.0 / mpd_lon_60, 100.0)
+            .unwrap();
+        assert_eq!(south.edge, 0);
+        assert!((south.connector - 30.0).abs() < 0.1, "{}", south.connector);
+    }
+
+    #[test]
+    fn densifies_long_segments() {
+        // A single 5 km edge is split so every stored segment is short.
+        let mpd_lat = meters_per_degree(60.0).1;
+        let span = 5_000.0 / mpd_lat;
+        let network = StreetNetwork::new(
+            2,
+            0,
+            &[(0u32, 1u32, 5_000.0)],
+            &[0u32, 2],
+            &[25.0, 25.0],
+            &[60.0, 60.0 + span],
+            vec![],
+        )
+        .unwrap();
+        let count = network.coordinate_offsets[1] as usize;
+        assert!(count >= 51, "expected >=51 densified points, got {count}");
+        for pair in network.lats.windows(2) {
+            let seg = segment_length(25.0, pair[0], 25.0, pair[1]);
+            assert!(seg <= MAX_SEGMENT_METERS + 1e-6, "segment {seg} m too long");
+        }
+        // Midpoint of the edge is 2500 m along.
+        let (_, lat) = network.point_at(0, 0.5);
+        assert!((segment_length(25.0, 60.0, 25.0, lat) - 2_500.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn wraps_longitude_across_the_antimeridian() {
+        assert!((longitude_delta(179.99, -179.99) - 0.02).abs() < 1e-9);
+        assert!((longitude_delta(-179.99, 179.99) + 0.02).abs() < 1e-9);
+        assert!((longitude_delta(10.0, 20.0) - 10.0).abs() < 1e-9);
+        // A short segment straddling ±180° measures short, not near-global.
+        assert!(segment_length(179.99, 0.0, -179.99, 0.0) < 3_000.0);
+    }
+
+    #[test]
+    fn densifies_wide_latitude_segments() {
+        // Equator to 70°N with some longitude: every sub-piece stays short
+        // even though metres-per-degree changes markedly along the segment.
+        let network = StreetNetwork::new(
+            2,
+            0,
+            &[(0u32, 1u32, 1000.0)],
+            &[0u32, 2],
+            &[25.0, 25.5],
+            &[0.0, 70.0],
+            vec![],
+        )
+        .unwrap();
+        for (lons, lats) in network.lons.windows(2).zip(network.lats.windows(2)) {
+            let seg = segment_length(lons[0], lats[0], lons[1], lats[1]);
+            assert!(
+                seg <= MAX_SEGMENT_METERS + 1e-6,
+                "sub-piece {seg} m too long"
+            );
+        }
+    }
+
+    #[test]
     fn walk_paths_follow_the_street() {
         // An L-shaped walk with partial edges at both snap points.
         let network = network(
@@ -1007,11 +1190,25 @@ mod tests {
             lonlat(300.0, 100.0),
             lonlat(310.0, 100.0),
         ];
-        assert_eq!(path.len(), designed.len());
-        for (point, expected) in path.iter().zip(designed) {
-            assert!((point.0 - expected.0).abs() < 1e-6, "{path:?}");
-            assert!((point.1 - expected.1).abs() < 1e-6, "{path:?}");
+        // Densification inserts colinear vertices along the straight edges,
+        // so the path passes through the designed corners in order with extra
+        // points between them; endpoints match exactly.
+        assert_eq!(path.first().copied(), Some(designed[0]), "{path:?}");
+        assert_eq!(
+            path.last().copied(),
+            Some(designed[designed.len() - 1]),
+            "{path:?}"
+        );
+        let mut corner = 0;
+        for &point in &path {
+            if corner < designed.len()
+                && (point.0 - designed[corner].0).abs() < 1e-6
+                && (point.1 - designed[corner].1).abs() < 1e-6
+            {
+                corner += 1;
+            }
         }
+        assert_eq!(corner, designed.len(), "path {path:?} skips a corner");
 
         // The same-edge direct case never detours over a vertex.
         let near = lonlat(120.0, 20.0);

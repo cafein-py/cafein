@@ -70,7 +70,7 @@ struct CoordinateEnds {
 }
 
 const ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINET";
-const ARTIFACT_FORMAT: u32 = 2;
+const ARTIFACT_FORMAT: u32 = 3;
 
 /// The saved network, borrowed for writing.
 #[derive(serde::Serialize)]
