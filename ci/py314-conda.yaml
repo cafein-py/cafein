@@ -3,6 +3,9 @@ channels:
   - conda-forge
 dependencies:
   - python=3.14
+  # Pin the GIL build: pyarrow pulls in the free-threaded 3.14 variant
+  # on some platforms, and pyo3's abi3 build cannot target it.
+  - python_abi=3.14=*_cp314
   - pip
   - rust
   - maturin
