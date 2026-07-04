@@ -100,3 +100,17 @@ def test_load_refuses_corrupted_payloads(tmp_path):
     path.write_bytes(bytes(blob))
     with pytest.raises(ValueError, match="checksum mismatch"):
         TransportNetwork.load(path)
+
+
+def test_load_refuses_truncated_payloads(tmp_path):
+    from test_transport_network import build_synthetic_gtfs
+
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs([str(feed)])
+    path = tmp_path / "small.cafein"
+    network.save(path)
+    blob = path.read_bytes()
+    path.write_bytes(blob[: len(blob) // 2])
+    with pytest.raises(ValueError, match="length mismatch"):
+        TransportNetwork.load(path)

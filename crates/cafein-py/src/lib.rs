@@ -309,6 +309,7 @@ impl TransportNetwork {
 
         let artifact: Artifact = py.allow_threads(|| {
             let file = std::fs::File::open(path).map_err(io_error)?;
+            let total = file.metadata().map_err(io_error)?.len();
             let mut reader = std::io::BufReader::new(file);
             let mut magic = [0u8; 8];
             reader.read_exact(&mut magic).map_err(io_error)?;
@@ -337,7 +338,18 @@ impl TransportNetwork {
             reader.read_exact(&mut length).map_err(io_error)?;
             let mut checksum = [0u8; 4];
             reader.read_exact(&mut checksum).map_err(io_error)?;
-            let mut payload = vec![0u8; u64::from_le_bytes(length) as usize];
+            // The declared length must equal what the file actually
+            // holds; checking before allocating keeps a corrupted
+            // length field from provoking a huge allocation.
+            let header = 8 + 4 + 2 + version.len() as u64 + 8 + 4;
+            let declared = u64::from_le_bytes(length);
+            if declared != total.saturating_sub(header) {
+                return Err(PyValueError::new_err(format!(
+                    "'{path}' is corrupted (payload length mismatch); \
+                     rebuild the network from its inputs and save it again"
+                )));
+            }
+            let mut payload = vec![0u8; declared as usize];
             reader.read_exact(&mut payload).map_err(io_error)?;
             if crc32(&payload) != u32::from_le_bytes(checksum) {
                 return Err(PyValueError::new_err(format!(
