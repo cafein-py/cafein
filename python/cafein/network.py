@@ -548,6 +548,7 @@ class TransportNetwork:
         window=None,
         percentiles=None,
         confidence=None,
+        chunk=None,
         walking_speed_kmph=None,
         max_walking_time=None,
         max_snap_distance=None,
@@ -598,6 +599,10 @@ class TransportNetwork:
             A level in ``(0, 1)`` mapped to the symmetric percentile
             interval plus the median; requires `window` and excludes
             `percentiles`.
+        chunk : (int, int) (optional)
+            Compute only origin chunk ``k`` of ``n``: a deterministic
+            contiguous block of the resolved origins, so ``n`` batch
+            jobs cover all origins disjointly; rows follow the chunk.
         walking_speed_kmph, max_walking_time, max_snap_distance : float
             The street-search options for points, as in
             ``access_stops``; only valid with point origins.
@@ -613,7 +618,12 @@ class TransportNetwork:
             Unreachable pairs hold the maximum uint32 value
             (4294967295).
         """
-        from cafein.matrices import _is_point_frame, _point_list, _warn_unsnapped
+        from cafein.matrices import (
+            _chunk_slice,
+            _is_point_frame,
+            _point_list,
+            _warn_unsnapped,
+        )
 
         percentiles = _window_percentiles(window, percentiles, confidence)
         if _is_point_frame(from_stops):
@@ -622,6 +632,9 @@ class TransportNetwork:
                 to_ids, destination_points = from_ids, origin_points
             else:
                 to_ids, destination_points = _point_list(destinations, "destinations")
+            rows = _chunk_slice(len(from_ids), chunk)
+            from_ids = from_ids[rows]
+            origin_points = origin_points[rows]
             walk = _walk_options(
                 walking_speed_kmph, max_walking_time, max_snap_distance
             )
@@ -654,10 +667,12 @@ class TransportNetwork:
             and max_snap_distance is None
         ):
             raise ValueError("destinations and walking options apply to point origins")
+        from_stops = list(from_stops)
+        from_stops = from_stops[_chunk_slice(len(from_stops), chunk)]
         if percentiles is None:
             return self._core.travel_time_matrix(
-                list(from_stops), date, departure, max_transfers
+                from_stops, date, departure, max_transfers
             )
         return self._core.travel_time_percentiles(
-            list(from_stops), date, departure, window, percentiles, max_transfers
+            from_stops, date, departure, window, percentiles, max_transfers
         )

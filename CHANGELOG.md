@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Batch outputs: matrices accept ``chunk=(k, n)`` to compute a
+  deterministic contiguous origin block, so batch jobs cover all
+  origins disjointly, and `cafein.travel_cost_table` returns the
+  travel-cost matrix as a pyarrow Table (dictionary-encoded ids,
+  zero-copy numeric columns, WKB geometry) ready to write as one
+  Parquet shard per chunk; pyarrow ships as the optional ``arrow``
+  extra.
+
 - Network artifacts: `TransportNetwork.save(path)` writes the built
   network — timetable, service calendar, transfers, trip distances,
   leg geometries, and the street network — as one versioned file, and

@@ -8,4 +8,5 @@ dependencies:
   - maturin
   - pytest
   - pytest-cov
+  - pyarrow
   - pyyaml
