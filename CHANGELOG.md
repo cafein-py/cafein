@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- `cafein.TravelCostMatrix`: the fastest journey's aggregated costs per
+  OD pair as a long-format DataFrame — travel time, transfers, transit
+  and walking distance, and CO₂e emissions (LCA components selectable),
+  with `geometries=True` adding the ridden legs as shapely
+  MultiLineStrings. Per-origin RAPTOR runs fan out over all cores with
+  the GIL released; emission factors resolve per trip in Python
+  (`cafein.emissions.trip_factors`) and aggregate in the core.
+
+- Geometry output is controllable: `from_gtfs(leg_geometries=False)`
+  skips storing polylines while keeping distances, and the routing
+  calls accept `geometries=False` to omit leg geometry.
+
 - Per-leg transit geometries: transit legs carry their travelled path
   as a WKB LineString (``geometry``) — the GTFS shape sliced between
   the board and alight stops when the stops verifiably lie along it,

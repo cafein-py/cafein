@@ -10,7 +10,7 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 
 use cafein_core::geometry::{DistanceProvenance, LegGeometry, TripGeometry};
 use cafein_core::journey::{Journey, Leg};
-use cafein_core::raptor::Raptor;
+use cafein_core::raptor::{CostInputs, Raptor};
 use cafein_core::router::{Request, TransitRouter};
 use cafein_core::streets::{StopLink, StreetNetwork, WalkedStop};
 use cafein_core::timetable::{StopIdx, TripIdx};
@@ -374,6 +374,20 @@ impl TransportNetwork {
         self.trips_by_public_id.keys().cloned().collect()
     }
 
+    /// The network's routable trips as `(trip_id, route_id)` tuples,
+    /// with identifiers in their public form.
+    #[getter]
+    fn trips(&self) -> Vec<(String, String)> {
+        self.trips_by_public_id
+            .iter()
+            .map(|(public, &trip)| {
+                let source = &self.feed.trips[self.build.timetable.trip_source(trip) as usize];
+                let route = &self.feed.routes[source.route as usize];
+                (public.clone(), self.public_id(route.feed, &route.id))
+            })
+            .collect()
+    }
+
     /// The network's routes as `(route_id, agency_id, route_type)`
     /// tuples, with identifiers in their public form (feed-qualified
     /// when several feeds are merged) and the GTFS route_type as its
@@ -461,7 +475,7 @@ impl TransportNetwork {
     ///     time, number of rides) leaving at the departure time; with it,
     ///     the departure-window profile. Each journey carries its legs;
     ///     times are seconds past the service day's start.
-    #[pyo3(signature = (from_stop, to_stop, date, departure, max_transfers = 4, window = None))]
+    #[pyo3(signature = (from_stop, to_stop, date, departure, max_transfers = 4, window = None, geometries = true))]
     #[allow(clippy::too_many_arguments)]
     fn route_between_stops(
         &self,
@@ -472,6 +486,7 @@ impl TransportNetwork {
         departure: &str,
         max_transfers: u8,
         window: Option<u32>,
+        geometries: bool,
     ) -> PyResult<Py<PyList>> {
         let origin = self.resolve_stop(from_stop)?;
         let destination = self.resolve_stop(to_stop)?;
@@ -482,7 +497,7 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             max_transfers,
         };
-        self.route_request(py, &request, window, None)
+        self.route_request(py, &request, window, None, geometries)
     }
 
     /// Route door-to-door between two coordinates for a single departure.
@@ -521,7 +536,7 @@ impl TransportNetwork {
     /// list of dict
     ///     Journeys as in ``route_between_stops``; arrivals include the
     ///     egress walk.
-    #[pyo3(signature = (origin, destination, date, departure, max_transfers = 4, window = None, walking_speed_kmph = 3.6, max_walking_time = 600.0, max_snap_distance = 100.0))]
+    #[pyo3(signature = (origin, destination, date, departure, max_transfers = 4, window = None, walking_speed_kmph = 3.6, max_walking_time = 600.0, max_snap_distance = 100.0, geometries = true))]
     #[allow(clippy::too_many_arguments)]
     fn route_between_coordinates(
         &self,
@@ -535,6 +550,7 @@ impl TransportNetwork {
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
+        geometries: bool,
     ) -> PyResult<Py<PyList>> {
         let streets = self.installed_streets()?;
         let speed =
@@ -563,7 +579,7 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             max_transfers,
         };
-        self.route_request(py, &request, window, Some(&walks))
+        self.route_request(py, &request, window, Some(&walks), geometries)
     }
 
     /// Earliest arrival at every reachable stop from a coordinate.
@@ -765,6 +781,153 @@ impl TransportNetwork {
             .reshape([rows, stop_count])
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }
+
+    /// The fastest journey's aggregated costs per OD pair, long format.
+    ///
+    /// One RAPTOR run serves each origin, fanned out in parallel with
+    /// the GIL released as in ``travel_time_matrix``; each reachable
+    /// pair's costs come from walking the winning label chain. Requires
+    /// installed trip distances.
+    ///
+    /// Parameters
+    /// ----------
+    /// from_stops : list of str
+    ///     GTFS stop_ids of the origin stops.
+    /// date : str
+    ///     Service date as ``YYYY-MM-DD``.
+    /// departure : str
+    ///     Departure time at every origin as ``HH:MM:SS``.
+    /// factors : list of (str, float)
+    ///     Grams CO₂e per passenger-kilometer per trip, resolved by
+    ///     ``cafein.emissions.trip_factors``; NaN marks a trip without
+    ///     a factor, poisoning the emissions of journeys that ride it.
+    ///     Rows for unknown trips are ignored.
+    /// max_transfers : int (optional, default: 4)
+    ///     Maximum number of transfers between rides.
+    /// to_stops : list of str (optional)
+    ///     Destination stops; every stop when omitted.
+    /// geometries : bool (optional, default: False)
+    ///     Attach each pair's ridden legs as a WKB MultiLineString;
+    ///     requires installed leg geometries.
+    ///
+    /// Returns
+    /// -------
+    /// dict
+    ///     Equal-length arrays for the reachable pairs: ``from`` (row
+    ///     into `from_stops`), ``to`` (index into ``stops``),
+    ///     ``travel_time`` (seconds), ``rides``, ``transit_distance``
+    ///     and ``walk_distance`` (meters), ``emissions`` (grams CO₂e,
+    ///     NaN when unresolved), and with `geometries` a ``geometry``
+    ///     list of WKB bytes.
+    #[pyo3(signature = (from_stops, date, departure, factors, max_transfers = 4, to_stops = None, geometries = false))]
+    #[allow(clippy::too_many_arguments)]
+    fn travel_cost_matrix(
+        &self,
+        py: Python<'_>,
+        from_stops: Vec<String>,
+        date: &str,
+        departure: &str,
+        factors: Vec<(String, f64)>,
+        max_transfers: u8,
+        to_stops: Option<Vec<String>>,
+        geometries: bool,
+    ) -> PyResult<Py<PyDict>> {
+        let Some(geometry) = &self.geometry else {
+            return Err(PyValueError::new_err(
+                "no trip distances installed; build the network with trip distances enabled",
+            ));
+        };
+        if geometries && self.leg_geometry.is_none() {
+            return Err(PyValueError::new_err(
+                "no leg geometries installed; build the network with leg geometries enabled",
+            ));
+        }
+        let origins: Vec<StopIdx> = from_stops
+            .iter()
+            .map(|stop| self.resolve_stop(stop))
+            .collect::<PyResult<_>>()?;
+        let destinations: Vec<StopIdx> = match to_stops {
+            Some(stops) => stops
+                .iter()
+                .map(|stop| self.resolve_stop(stop))
+                .collect::<PyResult<_>>()?,
+            None => (0..self.build.timetable.stop_count())
+                .map(StopIdx)
+                .collect(),
+        };
+        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
+        for (trip_id, factor) in &factors {
+            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
+                per_trip[trip.0 as usize] = *factor;
+            }
+        }
+        let departure = parse_time(departure)?;
+        let active_services = self.active_services(date)?;
+        let requests: Vec<Request> = origins
+            .into_iter()
+            .map(|origin| Request {
+                departure,
+                access: vec![(origin, 0)],
+                egress: Vec::new(),
+                active_services: active_services.clone(),
+                max_transfers,
+            })
+            .collect();
+        let inputs = CostInputs {
+            geometry,
+            factors: &per_trip,
+            leg_geometry: self.leg_geometry.as_ref(),
+            with_geometry: geometries,
+        };
+        let rows = py.allow_threads(|| {
+            Raptor.cost_matrix(
+                &self.build.timetable,
+                &self.transfers,
+                &inputs,
+                &requests,
+                &destinations,
+            )
+        });
+
+        let total: usize = rows.iter().map(Vec::len).sum();
+        let mut from = Vec::with_capacity(total);
+        let mut to = Vec::with_capacity(total);
+        let mut travel_time = Vec::with_capacity(total);
+        let mut rides = Vec::with_capacity(total);
+        let mut transit_distance = Vec::with_capacity(total);
+        let mut walk_distance = Vec::with_capacity(total);
+        let mut emissions = Vec::with_capacity(total);
+        let wkbs = PyList::empty(py);
+        for (origin, origin_rows) in rows.into_iter().enumerate() {
+            for row in origin_rows {
+                from.push(origin as u32);
+                to.push(row.to.0);
+                travel_time.push(row.seconds);
+                rides.push(row.rides);
+                transit_distance.push(row.transit_meters);
+                walk_distance.push(row.walk_meters);
+                emissions.push(row.emission_grams);
+                if geometries {
+                    match row.geometry {
+                        Some(wkb) => wkbs.append(PyBytes::new(py, &wkb))?,
+                        None => wkbs.append(py.None())?,
+                    }
+                }
+            }
+        }
+        let result = PyDict::new(py);
+        result.set_item("from", from.into_pyarray(py))?;
+        result.set_item("to", to.into_pyarray(py))?;
+        result.set_item("travel_time", travel_time.into_pyarray(py))?;
+        result.set_item("rides", rides.into_pyarray(py))?;
+        result.set_item("transit_distance", transit_distance.into_pyarray(py))?;
+        result.set_item("walk_distance", walk_distance.into_pyarray(py))?;
+        result.set_item("emissions", emissions.into_pyarray(py))?;
+        if geometries {
+            result.set_item("geometry", wkbs)?;
+        }
+        Ok(result.unbind())
+    }
 }
 
 impl TransportNetwork {
@@ -793,6 +956,7 @@ impl TransportNetwork {
         request: &Request,
         window: Option<u32>,
         walks: Option<&WalkMaps>,
+        geometries: bool,
     ) -> PyResult<Py<PyList>> {
         let journeys = match window {
             None => Raptor.route(&self.build.timetable, &self.transfers, request),
@@ -802,7 +966,7 @@ impl TransportNetwork {
         };
         let result = PyList::empty(py);
         for journey in &journeys {
-            result.append(self.journey_to_dict(py, journey, walks)?)?;
+            result.append(self.journey_to_dict(py, journey, walks, geometries)?)?;
         }
         Ok(result.unbind())
     }
@@ -846,6 +1010,7 @@ impl TransportNetwork {
         py: Python<'_>,
         journey: &Journey,
         walks: Option<&WalkMaps>,
+        geometries: bool,
     ) -> PyResult<Py<PyDict>> {
         let timetable = &self.build.timetable;
         let dict = PyDict::new(py);
@@ -907,12 +1072,20 @@ impl TransportNetwork {
                             entry.set_item("distance_provenance", py.None())?;
                         }
                     }
-                    let geometry = self.leg_geometry.as_ref().map(|geometry| {
-                        wkb_line_string(
-                            py,
-                            &geometry.leg_coordinates(trip, board_position, alight_position),
-                        )
-                    });
+                    let geometry =
+                        self.leg_geometry
+                            .as_ref()
+                            .filter(|_| geometries)
+                            .map(|geometry| {
+                                wkb_line_string(
+                                    py,
+                                    &geometry.leg_coordinates(
+                                        trip,
+                                        board_position,
+                                        alight_position,
+                                    ),
+                                )
+                            });
                     entry.set_item("geometry", geometry)?;
                 }
                 Leg::Transfer {
@@ -1018,15 +1191,7 @@ fn coordinate_links(
 
 /// Encodes coordinates as a little-endian WKB LineString (XY).
 fn wkb_line_string<'py>(py: Python<'py>, coordinates: &[(f64, f64)]) -> Bound<'py, PyBytes> {
-    let mut wkb = Vec::with_capacity(9 + coordinates.len() * 16);
-    wkb.push(1u8);
-    wkb.extend_from_slice(&2u32.to_le_bytes());
-    wkb.extend_from_slice(&(coordinates.len() as u32).to_le_bytes());
-    for &(x, y) in coordinates {
-        wkb.extend_from_slice(&x.to_le_bytes());
-        wkb.extend_from_slice(&y.to_le_bytes());
-    }
-    PyBytes::new(py, &wkb)
+    PyBytes::new(py, &cafein_core::geometry::wkb_line_string(coordinates))
 }
 
 /// Parses ``HH:MM:SS`` into seconds past the service day's start; hours may

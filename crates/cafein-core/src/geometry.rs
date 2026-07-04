@@ -381,6 +381,32 @@ impl LegGeometry {
     }
 }
 
+/// Encodes coordinates as a little-endian WKB LineString (XY).
+pub fn wkb_line_string(coordinates: &[(f64, f64)]) -> Vec<u8> {
+    let mut wkb = Vec::with_capacity(9 + coordinates.len() * 16);
+    wkb.push(1u8);
+    wkb.extend_from_slice(&2u32.to_le_bytes());
+    wkb.extend_from_slice(&(coordinates.len() as u32).to_le_bytes());
+    for &(x, y) in coordinates {
+        wkb.extend_from_slice(&x.to_le_bytes());
+        wkb.extend_from_slice(&y.to_le_bytes());
+    }
+    wkb
+}
+
+/// Encodes line parts as a little-endian WKB MultiLineString (XY).
+pub fn wkb_multi_line_string(parts: &[Vec<(f64, f64)>]) -> Vec<u8> {
+    let coordinates: usize = parts.iter().map(Vec::len).sum();
+    let mut wkb = Vec::with_capacity(9 + parts.len() * 9 + coordinates * 16);
+    wkb.push(1u8);
+    wkb.extend_from_slice(&5u32.to_le_bytes());
+    wkb.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+    for part in parts {
+        wkb.extend_from_slice(&wkb_line_string(part));
+    }
+    wkb
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
