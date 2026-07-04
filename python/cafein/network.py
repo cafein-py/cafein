@@ -620,6 +620,44 @@ class TransportNetwork:
             Unreachable pairs hold the maximum uint32 value
             (4294967295).
         """
+        matrix, _from_ids, _to_ids, _percentiles = self._time_matrix_with_ids(
+            from_stops,
+            date,
+            departure,
+            max_transfers,
+            destinations=destinations,
+            window=window,
+            percentiles=percentiles,
+            confidence=confidence,
+            chunk=chunk,
+            walking_speed_kmph=walking_speed_kmph,
+            max_walking_time=max_walking_time,
+            max_snap_distance=max_snap_distance,
+        )
+        return matrix
+
+    def _time_matrix_with_ids(
+        self,
+        from_stops,
+        date,
+        departure,
+        max_transfers,
+        *,
+        destinations,
+        window,
+        percentiles,
+        confidence,
+        chunk,
+        walking_speed_kmph,
+        max_walking_time,
+        max_snap_distance,
+    ):
+        """The travel-time matrix with its origin and destination id
+        axes and the resolved percentile list (``None`` without a
+        window). Backs both ``travel_time_matrix`` and the
+        ``TravelTimeMatrix`` long-format wrapper, so the two share one
+        origin/destination resolution.
+        """
         from cafein.matrices import (
             _chunk_slice,
             _is_point_frame,
@@ -661,7 +699,7 @@ class TransportNetwork:
                     *walk,
                 )
             _warn_unsnapped(table, from_ids, to_ids)
-            return table["matrix"]
+            return table["matrix"], from_ids, to_ids, percentiles
         if not (
             destinations is None
             and walking_speed_kmph is None
@@ -669,12 +707,15 @@ class TransportNetwork:
             and max_snap_distance is None
         ):
             raise ValueError("destinations and walking options apply to point origins")
-        from_stops = list(from_stops)
+        to_ids = [stop for stop, _latitude, _longitude in self._core.stops]
+        from_stops = list(to_ids) if from_stops is None else list(from_stops)
         from_stops = from_stops[_chunk_slice(len(from_stops), chunk)]
         if percentiles is None:
-            return self._core.travel_time_matrix(
+            matrix = self._core.travel_time_matrix(
                 from_stops, date, departure, max_transfers
             )
-        return self._core.travel_time_percentiles(
-            from_stops, date, departure, window, percentiles, max_transfers
-        )
+        else:
+            matrix = self._core.travel_time_percentiles(
+                from_stops, date, departure, window, percentiles, max_transfers
+            )
+        return matrix, from_stops, to_ids, percentiles

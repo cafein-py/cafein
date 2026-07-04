@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Travel-time matrices, long format: `cafein.TravelTimeMatrix(network,
+  origins, ...)` returns one row per reachable OD pair (``from_id``,
+  ``to_id``, ``travel_time`` in seconds) — the r5py-style face of
+  `TransportNetwork.travel_time_matrix`, unreachable pairs absent. With
+  ``window=`` it carries one ``travel_time_p<p>`` column per requested
+  percentile (or ``confidence=``), unreachable percentiles as ``NaN``.
+  Stop or point origins, ``chunk=`` for batch shards.
+
 - Detailed itineraries: `cafein.DetailedItineraries(network, origins,
   destinations, date, departure)` returns every Pareto-optimal journey
   between each origin and each destination as a GeoDataFrame with one
