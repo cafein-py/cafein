@@ -58,6 +58,10 @@ class TravelCostMatrix(pd.DataFrame):
     geometries : bool (optional, default: False)
         Attach each pair's ridden legs as geometry. Off by default:
         per-pair geometries over large matrices are enormous.
+    chunk : (int, int) (optional)
+        Compute only origin chunk ``k`` of ``n``: a deterministic
+        contiguous block of the resolved origins, so ``n`` batch jobs
+        cover all origins disjointly and their shards concatenate.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         The street-search options for point origins/destinations, as in
         ``TransportNetwork.access_stops``; only valid with points.
@@ -79,53 +83,26 @@ class TravelCostMatrix(pd.DataFrame):
         factors=None,
         components=None,
         geometries=False,
+        chunk=None,
         walking_speed_kmph=None,
         max_walking_time=None,
         max_snap_distance=None,
     ):
-        from cafein import emissions
-        from cafein.network import _walk_options
-
-        if date is None or departure is None:
-            raise TypeError("TravelCostMatrix requires date and departure")
-        trip_factors = emissions.trip_factors(network, factors, components)
-        if _is_point_frame(origins) or _is_point_frame(destinations):
-            from_ids, origin_points = _point_list(origins, "origins")
-            if destinations is None:
-                to_ids, destination_points = from_ids, origin_points
-            else:
-                to_ids, destination_points = _point_list(destinations, "destinations")
-            table = network._core.travel_cost_matrix_from_points(
-                origin_points,
-                destination_points,
-                date,
-                departure,
-                trip_factors,
-                max_transfers,
-                *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
-                geometries,
-            )
-            _warn_unsnapped(table, from_ids, to_ids)
-        else:
-            if not (
-                walking_speed_kmph is None
-                and max_walking_time is None
-                and max_snap_distance is None
-            ):
-                raise ValueError("walking options apply to point origins/destinations")
-            stop_ids = [stop for stop, _, _ in network.stops]
-            from_ids = list(stop_ids) if origins is None else [str(o) for o in origins]
-            to_stops = None if destinations is None else [str(d) for d in destinations]
-            table = network._core.travel_cost_matrix(
-                from_ids,
-                date,
-                departure,
-                trip_factors,
-                max_transfers,
-                to_stops,
-                geometries,
-            )
-            to_ids = stop_ids
+        table, from_ids, to_ids = _cost_columns(
+            network,
+            origins,
+            destinations,
+            date,
+            departure,
+            max_transfers=max_transfers,
+            factors=factors,
+            components=components,
+            geometries=geometries,
+            chunk=chunk,
+            walking_speed_kmph=walking_speed_kmph,
+            max_walking_time=max_walking_time,
+            max_snap_distance=max_snap_distance,
+        )
         data = {
             "from_id": np.array(from_ids, dtype=object)[table["from"]],
             "to_id": np.array(to_ids, dtype=object)[table["to"]],
@@ -140,6 +117,163 @@ class TravelCostMatrix(pd.DataFrame):
                 np.array(table["geometry"], dtype=object)
             )
         super().__init__(pd.DataFrame(data))
+
+
+def travel_cost_table(
+    network,
+    origins=None,
+    destinations=None,
+    date=None,
+    departure=None,
+    *,
+    max_transfers=4,
+    factors=None,
+    components=None,
+    geometries=False,
+    chunk=None,
+    walking_speed_kmph=None,
+    max_walking_time=None,
+    max_snap_distance=None,
+):
+    """The travel-cost matrix as a pyarrow Table — the shard-writing form.
+
+    Semantics and parameters follow `TravelCostMatrix`; the output is an
+    Arrow table with ``from_id`` and ``to_id`` dictionary-encoded over
+    the origin and destination identifiers, the numeric columns wrapping
+    the computed arrays zero-copy, and — with ``geometries=True`` — the
+    ridden legs as WKB in a binary ``geometry`` column. The batch
+    workflow writes one shard per origin chunk::
+
+        network = TransportNetwork.load("network.cafein")
+        table = travel_cost_table(network, ..., chunk=(k, n))
+        pyarrow.parquet.write_table(table, f"shard-{k:04d}.parquet")
+
+    Shards concatenate trivially. Requires pyarrow (install
+    ``cafein[arrow]``).
+    """
+    try:
+        import pyarrow
+    except ImportError as error:
+        raise ImportError(
+            "Arrow tables need the optional pyarrow dependency; install "
+            "cafein[arrow] or pyarrow"
+        ) from error
+    table, from_ids, to_ids = _cost_columns(
+        network,
+        origins,
+        destinations,
+        date,
+        departure,
+        max_transfers=max_transfers,
+        factors=factors,
+        components=components,
+        geometries=geometries,
+        chunk=chunk,
+        walking_speed_kmph=walking_speed_kmph,
+        max_walking_time=max_walking_time,
+        max_snap_distance=max_snap_distance,
+    )
+    columns = {
+        "from_id": pyarrow.DictionaryArray.from_arrays(
+            pyarrow.array(table["from"]),
+            pyarrow.array(from_ids, type=pyarrow.string()),
+        ),
+        "to_id": pyarrow.DictionaryArray.from_arrays(
+            pyarrow.array(table["to"]),
+            pyarrow.array(to_ids, type=pyarrow.string()),
+        ),
+        "travel_time": pyarrow.array(table["travel_time"]),
+        "transfers": pyarrow.array(np.maximum(table["rides"], 1) - 1),
+        "transit_distance": pyarrow.array(table["transit_distance"]),
+        "walk_distance": pyarrow.array(table["walk_distance"]),
+        "emissions": pyarrow.array(table["emissions"]),
+    }
+    if geometries:
+        columns["geometry"] = pyarrow.array(
+            list(table["geometry"]), type=pyarrow.binary()
+        )
+    return pyarrow.table(columns)
+
+
+def _cost_columns(
+    network,
+    origins,
+    destinations,
+    date,
+    departure,
+    *,
+    max_transfers,
+    factors,
+    components,
+    geometries,
+    chunk,
+    walking_speed_kmph,
+    max_walking_time,
+    max_snap_distance,
+):
+    """The core's cost arrays plus the origin and destination ids."""
+    from cafein import emissions
+    from cafein.network import _walk_options
+
+    if date is None or departure is None:
+        raise TypeError("TravelCostMatrix requires date and departure")
+    trip_factors = emissions.trip_factors(network, factors, components)
+    if _is_point_frame(origins) or _is_point_frame(destinations):
+        from_ids, origin_points = _point_list(origins, "origins")
+        if destinations is None:
+            to_ids, destination_points = from_ids, origin_points
+        else:
+            to_ids, destination_points = _point_list(destinations, "destinations")
+        rows = _chunk_slice(len(from_ids), chunk)
+        from_ids = from_ids[rows]
+        origin_points = origin_points[rows]
+        table = network._core.travel_cost_matrix_from_points(
+            origin_points,
+            destination_points,
+            date,
+            departure,
+            trip_factors,
+            max_transfers,
+            *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
+            geometries,
+        )
+        _warn_unsnapped(table, from_ids, to_ids)
+    else:
+        if not (
+            walking_speed_kmph is None
+            and max_walking_time is None
+            and max_snap_distance is None
+        ):
+            raise ValueError("walking options apply to point origins/destinations")
+        stop_ids = [stop for stop, _, _ in network.stops]
+        from_ids = list(stop_ids) if origins is None else [str(o) for o in origins]
+        from_ids = from_ids[_chunk_slice(len(from_ids), chunk)]
+        to_stops = None if destinations is None else [str(d) for d in destinations]
+        table = network._core.travel_cost_matrix(
+            from_ids,
+            date,
+            departure,
+            trip_factors,
+            max_transfers,
+            to_stops,
+            geometries,
+        )
+        to_ids = stop_ids
+    return table, from_ids, to_ids
+
+
+def _chunk_slice(count, chunk):
+    """The deterministic contiguous origin block ``chunk = (k, n)``
+    selects: chunk ``k`` of ``n`` equal blocks (the last possibly
+    shorter), covering all origins disjointly across ``k = 0..n-1``."""
+    if chunk is None:
+        return slice(None)
+    index, total = chunk
+    index, total = int(index), int(total)
+    if total < 1 or not 0 <= index < total:
+        raise ValueError("chunk must be (k, n) with 0 <= k < n")
+    size = -(-count // total)
+    return slice(index * size, min((index + 1) * size, count))
 
 
 def _is_point_frame(value):

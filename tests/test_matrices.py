@@ -312,3 +312,95 @@ def test_confidence_bounds_equal_their_decimal_percentiles(network):
         percentiles=[5, 50, 95],
     )
     assert np.array_equal(left, right)
+
+
+def test_chunks_partition_the_matrix(network):
+    import pandas as pd
+
+    origins = [stop for stop, _, _ in network.stops[:10]]
+    full = cost_matrix(
+        network, origins=origins, destinations=["1250551"], departure="08:30:00"
+    )
+    parts = [
+        cost_matrix(
+            network,
+            origins=origins,
+            destinations=["1250551"],
+            departure="08:30:00",
+            chunk=(part, 3),
+        )
+        for part in range(3)
+    ]
+    assert pd.concat(parts, ignore_index=True).equals(pd.DataFrame(full))
+
+    matrix = network.travel_time_matrix(origins, "2022-02-22", "08:30:00")
+    rows = [
+        network.travel_time_matrix(origins, "2022-02-22", "08:30:00", chunk=(part, 3))
+        for part in range(3)
+    ]
+    assert np.array_equal(np.vstack(rows), matrix)
+
+
+def test_chunk_specifications_are_validated(network):
+    for chunk in [(3, 3), (-1, 3), (0, 0)]:
+        with pytest.raises(ValueError, match="chunk"):
+            network.travel_time_matrix(
+                ["4810551"], "2022-02-22", "08:30:00", chunk=chunk
+            )
+
+
+def test_arrow_table_matches_the_dataframe(network, tmp_path):
+    pyarrow = pytest.importorskip("pyarrow")
+    import pyarrow.parquet
+    from cafein import travel_cost_table
+
+    with pytest.warns(UserWarning, match="route_type"):
+        table = travel_cost_table(
+            network,
+            origins=["4810551"],
+            destinations=["1250551"],
+            date="2022-02-22",
+            departure="08:30:00",
+            geometries=True,
+        )
+    frame = cost_matrix(
+        network,
+        origins=["4810551"],
+        destinations=["1250551"],
+        departure="08:30:00",
+        geometries=True,
+    )
+    assert pyarrow.types.is_dictionary(table.schema.field("from_id").type)
+    assert table.column("from_id").to_pylist() == list(frame.from_id)
+    assert table.column("to_id").to_pylist() == list(frame.to_id)
+    assert table.column("travel_time").to_pylist() == list(frame.travel_time)
+    assert table.column("transfers").to_pylist() == list(frame.transfers)
+    assert table.column("emissions").to_pylist() == pytest.approx(list(frame.emissions))
+    decoded = shapely.from_wkb(table.column("geometry").to_pylist()[0])
+    assert decoded.equals(frame.geometry.iloc[0])
+    # The documented shard workflow: write one chunk, read it back.
+    shard = tmp_path / "shard-0000.parquet"
+    pyarrow.parquet.write_table(table, shard)
+    assert pyarrow.parquet.read_table(shard).num_rows == len(frame)
+
+
+def test_arrow_tables_need_pyarrow(network, monkeypatch):
+    import builtins
+
+    from cafein import travel_cost_table
+
+    real_import = builtins.__import__
+
+    def no_pyarrow(name, *args, **kwargs):
+        if name == "pyarrow":
+            raise ImportError("pyarrow is not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_pyarrow)
+    with pytest.raises(ImportError, match="cafein\\[arrow\\]"):
+        travel_cost_table(
+            network,
+            origins=["4810551"],
+            date="2022-02-22",
+            departure="08:30:00",
+        )
