@@ -307,16 +307,21 @@ def run_worker(engine, origins, seed, outdir, scenarios):
         origins_input, destinations_input = (
             (points, points) if name == "travel_time_matrix" else (corner, corner)
         )
-        compute_started = time.perf_counter()
-        result = runner(network, origins_input, destinations_input)
-        compute_seconds = time.perf_counter() - compute_started
-        path = pathlib.Path(outdir) / f"{engine}_{name}.csv"
-        result.to_csv(path, index=False)
-        stats["scenarios"][name] = {
-            "compute_seconds": compute_seconds,
-            "n_results": int(len(result)),
-            "path": str(path),
-        }
+        # A scenario that raises (e.g. an r5py API mismatch) must not sink the
+        # other scenarios: record the error and carry on.
+        try:
+            compute_started = time.perf_counter()
+            result = runner(network, origins_input, destinations_input)
+            compute_seconds = time.perf_counter() - compute_started
+            path = pathlib.Path(outdir) / f"{engine}_{name}.csv"
+            result.to_csv(path, index=False)
+            stats["scenarios"][name] = {
+                "compute_seconds": compute_seconds,
+                "n_results": int(len(result)),
+                "path": str(path),
+            }
+        except Exception as error:  # noqa: BLE001 - report any engine failure
+            stats["scenarios"][name] = {"error": f"{type(error).__name__}: {error}"}
     stats["peak_rss_mb"] = peak_rss_mb()
     print(RESULT_PREFIX + json.dumps(stats))
 
@@ -404,14 +409,30 @@ def print_perf(per_engine, scenarios):
     print("  " + "-" * (len(header) - 2))
     for engine, stats in per_engine.items():
         for name in scenarios:
-            if name not in stats["scenarios"]:
+            scenario = stats["scenarios"].get(name)
+            if scenario is None:
                 continue
-            scenario = stats["scenarios"][name]
+            if "error" in scenario:
+                print(
+                    f"  {engine:<8} {name:<22} {stats['build_seconds']:>8.2f} "
+                    f"{'error':>10} {stats['peak_rss_mb']:>9.1f} {'-':>7}"
+                )
+                continue
             print(
                 f"  {engine:<8} {name:<22} {stats['build_seconds']:>8.2f} "
                 f"{scenario['compute_seconds']:>10.2f} {stats['peak_rss_mb']:>9.1f} "
                 f"{scenario['n_results']:>7}"
             )
+    errors = [
+        (engine, name, scenario["error"])
+        for engine, stats in per_engine.items()
+        for name, scenario in stats["scenarios"].items()
+        if "error" in scenario
+    ]
+    if errors:
+        print("\nScenario errors")
+        for engine, name, message in errors:
+            print(f"  {engine} / {name}: {message}")
 
 
 def print_agreement(agreements):
@@ -455,24 +476,26 @@ def write_csv(path, per_engine, agreements, scenarios):
         "median_abs_diff_min",
         "p95_abs_diff_min",
         "max_abs_diff_min",
+        "transit_legs_match_share",
+        "error",
     ]
     with open(path, "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for engine, stats in per_engine.items():
             for name in scenarios:
-                if name not in stats["scenarios"]:
+                scenario = stats["scenarios"].get(name)
+                if scenario is None:
                     continue
-                scenario = stats["scenarios"][name]
                 agreement = by_scenario.get(name, {})
                 writer.writerow(
                     {
                         "scenario": name,
                         "engine": engine,
                         "build_seconds": round(stats["build_seconds"], 3),
-                        "compute_seconds": round(scenario["compute_seconds"], 3),
+                        "compute_seconds": _round(scenario.get("compute_seconds")),
                         "peak_rss_mb": round(stats["peak_rss_mb"], 1),
-                        "n_results": scenario["n_results"],
+                        "n_results": scenario.get("n_results", ""),
                         "both_reachable": agreement.get("both_reachable", ""),
                         "only_cafein": agreement.get("only_cafein", ""),
                         "only_r5py": agreement.get("only_r5py", ""),
@@ -482,6 +505,10 @@ def write_csv(path, per_engine, agreements, scenarios):
                         ),
                         "p95_abs_diff_min": _round(agreement.get("p95_abs_diff_min")),
                         "max_abs_diff_min": _round(agreement.get("max_abs_diff_min")),
+                        "transit_legs_match_share": _round(
+                            agreement.get("transit_legs_match_share")
+                        ),
+                        "error": scenario.get("error", ""),
                     }
                 )
     print(f"\nWrote {path}")
@@ -502,9 +529,14 @@ def main():
     parser.add_argument("--csv", help="also write the results to this CSV path")
     args = parser.parse_args()
 
-    scenarios = [name for name in args.scenario.split(",") if name in SCENARIOS]
-    if not scenarios:
-        parser.error(f"no known scenarios in '{args.scenario}'")
+    requested = [name for name in args.scenario.split(",") if name]
+    unknown = [name for name in requested if name not in SCENARIOS]
+    if unknown:
+        parser.error(
+            f"unknown scenario(s): {', '.join(unknown)}; "
+            f"choose from {', '.join(SCENARIOS)}"
+        )
+    scenarios = requested or list(SCENARIOS)
 
     if args.worker:
         run_worker(args.worker, args.origins, args.seed, args.outdir, scenarios)
@@ -535,11 +567,25 @@ def main():
 
     agreements = []
     if "cafein" in per_engine and "r5py" in per_engine:
+        comparable = [
+            name
+            for name in scenarios
+            if "path" in per_engine["cafein"]["scenarios"].get(name, {})
+            and "path" in per_engine["r5py"]["scenarios"].get(name, {})
+        ]
         agreements = [
             compare_scenario(name, per_engine["cafein"], per_engine["r5py"])
-            for name in scenarios
+            for name in comparable
         ]
-        print_agreement(agreements)
+        if agreements:
+            print_agreement(agreements)
+        skipped = [name for name in scenarios if name not in comparable]
+        if skipped:
+            print(
+                "\n(no agreement for "
+                + ", ".join(skipped)
+                + " — a scenario errored or produced no results on one side)"
+            )
     else:
         print("\n(agreement needs both engines — install r5py and a Java runtime)")
 
