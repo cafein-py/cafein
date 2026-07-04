@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Pointset matrices: `TravelCostMatrix` and
+  `TransportNetwork.travel_time_matrix` accept point GeoDataFrames
+  (an ``id`` column plus point geometry) as origins and destinations.
+  Points are linked once against the street network — per-origin work
+  is a transit search plus a table join, never a street search per OD
+  pair — access and egress walks count toward ``walk_distance``,
+  walk-only pairs appear with zero transit and emissions, and points
+  off the walking network are reported with a warning.
+
 - `cafein.TravelCostMatrix`: the fastest journey's aggregated costs per
   OD pair as a long-format DataFrame — travel time, transfers, transit
   and walking distance, and CO₂e emissions (LCA components selectable),

@@ -482,8 +482,19 @@ class TransportNetwork:
             from_stop, date, departure, max_transfers
         )
 
-    def travel_time_matrix(self, from_stops, date, departure, max_transfers=4):
-        """Travel times from several stops to every stop, as a matrix.
+    def travel_time_matrix(
+        self,
+        from_stops,
+        date,
+        departure,
+        max_transfers=4,
+        *,
+        destinations=None,
+        walking_speed_kmph=None,
+        max_walking_time=None,
+        max_snap_distance=None,
+    ):
+        """Travel times as a matrix, from stops or from points.
 
         One RAPTOR run serves each origin, computed in parallel across
         the origins with per-worker state reuse; the result is
@@ -492,25 +503,61 @@ class TransportNetwork:
 
         Parameters
         ----------
-        from_stops : list of str
-            GTFS stop_ids of the origin stops;
-            ``<feed_index>:<stop_id>`` when an id occurs in several
-            merged feeds.
+        from_stops : list of str, or GeoDataFrame
+            GTFS stop_ids of the origin stops
+            (``<feed_index>:<stop_id>`` when an id occurs in several
+            merged feeds), or a point GeoDataFrame with an ``id``
+            column. Points are linked once against the street network
+            (requires ``osm_pbf=`` at build time); points off the
+            walking network are reported with a warning and stay
+            unreachable.
         date : str
             Service date as ``YYYY-MM-DD``.
         departure : str
             Departure time at every origin as ``HH:MM:SS``.
         max_transfers : int (optional, default: 4)
             Maximum number of transfers between rides.
+        destinations : GeoDataFrame (optional)
+            Destination points; defaults to the origins. Only valid
+            with point origins — stop origins always span every stop.
+        walking_speed_kmph, max_walking_time, max_snap_distance : float
+            The street-search options for points, as in
+            ``access_stops``; only valid with point origins.
 
         Returns
         -------
         numpy.ndarray
-            A ``(len(from_stops), stop_count)`` uint32 array of travel
-            times in seconds; row order follows `from_stops`, column
-            order follows ``stops``. Unreachable pairs hold the maximum
-            uint32 value (4294967295).
+            A uint32 array of travel times in seconds — origins by all
+            stops (column order follows ``stops``) for stop origins,
+            origins by destination points for point origins.
+            Unreachable pairs hold the maximum uint32 value
+            (4294967295).
         """
+        from cafein.matrices import _is_point_frame, _point_list, _warn_unsnapped
+
+        if _is_point_frame(from_stops):
+            from_ids, origin_points = _point_list(from_stops, "origins")
+            if destinations is None:
+                to_ids, destination_points = from_ids, origin_points
+            else:
+                to_ids, destination_points = _point_list(destinations, "destinations")
+            table = self._core.travel_time_matrix_from_points(
+                origin_points,
+                destination_points,
+                date,
+                departure,
+                max_transfers,
+                *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
+            )
+            _warn_unsnapped(table, from_ids, to_ids)
+            return table["matrix"]
+        if not (
+            destinations is None
+            and walking_speed_kmph is None
+            and max_walking_time is None
+            and max_snap_distance is None
+        ):
+            raise ValueError("destinations and walking options apply to point origins")
         return self._core.travel_time_matrix(
             list(from_stops), date, departure, max_transfers
         )
