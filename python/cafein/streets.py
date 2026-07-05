@@ -9,9 +9,10 @@ single transfer hop per round, so whenever two footpaths chain, the
 chained pair must be a footpath too. The street network itself is handed
 over as flat arrays (edges with their geometry, plus the stops' snap
 links) for the core's query-time access/egress searches from arbitrary
-coordinates. Disconnected walking-network components (islands, clipped
-boundary fragments) stay in the graph; stops snapped onto different
-components simply get no footpath between them.
+coordinates. Tiny disconnected components (mapping artifacts, clipped
+boundary stubs) are pruned so a snap cannot get trapped on one; larger
+disconnected components (genuine islands) stay, and stops snapped onto
+different components simply get no footpath between them.
 """
 
 import math
@@ -38,11 +39,21 @@ Distinct from the footpath cutoff: it matches r5py's two-hour walking
 cap for door-to-door access and egress, while precomputed transfers keep
 the shorter ``MAX_WALKING_TIME`` cutoff."""
 
-MAX_SNAP_DISTANCE = 300.0
+MAX_SNAP_DISTANCE = 1600.0
 """Default maximum distance from a stop to the walking network, in meters.
 
-Matches R5's street-link radius, so a stop up to this far from the
-walking network still attaches to it."""
+Matches R5's ``LINK_RADIUS_METERS``, the radius within which it links
+stops and query points to the street layer (its 300 m constant is only
+an initial fast-path search radius), so a stop up to this far from the
+walking network still attaches to it over a straight connector."""
+
+MIN_ISLAND_VERTICES = 40
+"""Smallest disconnected walking-network component kept, in vertices.
+
+Matches R5's ``MIN_SUBGRAPH_SIZE``. Smaller components are mapping
+artifacts or stubs clipped at the extract boundary — snapping into one
+traps the walk on a handful of edges — while genuinely walkable islands
+are far larger."""
 
 MAX_FOOTPATH_STOPS = 20_000
 """Ceiling on snapped stops in the footpath build.
@@ -80,7 +91,7 @@ def walking_footpaths(
     max_walking_time : float (optional, default: 1200)
         Walking-time cutoff of the direct footpath search, in seconds.
         Transitive closure may produce chained footpaths that exceed it.
-    max_snap_distance : float (optional, default: 300)
+    max_snap_distance : float (optional, default: 1600)
         Maximum straight-line distance in meters from a stop to its
         nearest walking-network edge.
 
@@ -178,7 +189,25 @@ def _walking_network(osm_pbf):
     )
     if network is None:
         raise ValueError(f"no walkable ways in '{osm_pbf}'")
-    return network
+    nodes, edges = _prune_islands(*network)
+    if edges.empty:
+        raise ValueError(f"no walkable ways in '{osm_pbf}'")
+    return nodes, edges
+
+
+def _prune_islands(nodes, edges):
+    """The network without its sub-`MIN_ISLAND_VERTICES` components.
+
+    A nearest-edge snap cannot tell a real street from a disconnected
+    stub, so stubs must not exist to be snapped onto.
+    """
+    u, v = _vertex_endpoints(nodes, edges)
+    graph = sparse.coo_matrix((np.ones(len(u)), (u, v)), shape=(len(nodes), len(nodes)))
+    _, labels = csgraph.connected_components(graph, directed=False)
+    sizes = np.bincount(labels)
+    edges = edges[sizes[labels[u]] >= MIN_ISLAND_VERTICES].reset_index(drop=True)
+    nodes = nodes[sizes[labels] >= MIN_ISLAND_VERTICES].reset_index(drop=True)
+    return nodes, edges
 
 
 def _network_footpaths(

@@ -91,7 +91,7 @@ class TransportNetwork:
         max_walking_time : float (optional, default: 1200)
             Walking-time cutoff of the direct footpath search, in
             seconds; chained footpaths may exceed it.
-        max_snap_distance : float (optional, default: 300)
+        max_snap_distance : float (optional, default: 1600)
             Maximum distance in meters from a stop to the walking
             network; stops farther away get no footpaths.
         trip_distances : bool (optional, default: True)
@@ -331,7 +331,7 @@ class TransportNetwork:
             Walking speed in km/h, on the network and on the connectors.
         max_walking_time : float (optional, default: 7200)
             Walking-time cutoff in seconds.
-        max_snap_distance : float (optional, default: 300)
+        max_snap_distance : float (optional, default: 1600)
             Maximum straight-line distance in meters from the coordinate
             to the walking network; a coordinate farther away raises
             ``ValueError``.
@@ -469,7 +469,7 @@ class TransportNetwork:
             Walking speed in km/h of the access and egress searches.
         max_walking_time : float (optional, default: 7200)
             Walking-time cutoff in seconds of each street search.
-        max_snap_distance : float (optional, default: 300)
+        max_snap_distance : float (optional, default: 1600)
             Maximum straight-line distance in meters from each
             coordinate to the walking network.
 
@@ -525,7 +525,7 @@ class TransportNetwork:
             Walking speed in km/h of the access search.
         max_walking_time : float (optional, default: 7200)
             Walking-time cutoff in seconds of the access search.
-        max_snap_distance : float (optional, default: 300)
+        max_snap_distance : float (optional, default: 1600)
             Maximum straight-line distance in meters from the
             coordinate to the walking network.
 

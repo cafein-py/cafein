@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Tiny disconnected walking-network components (fewer than 40 vertices,
+  R5's ``MIN_SUBGRAPH_SIZE``) are pruned when the network is extracted:
+  they are mapping artifacts or stubs clipped at the extract boundary,
+  and a nearest-edge snap could get trapped on one; genuinely walkable
+  islands are far larger and stay. On the Helsinki test extract the
+  walking graph tightens to 3 components with 99.9 % of vertices in the
+  largest. The default snap radius rises from 300 m to 1600 m — R5's
+  actual ``LINK_RADIUS_METERS`` (its 300 m constant is only an initial
+  fast-path search radius) — so stops and query points link like r5py's.
+
 - The walking network keeps shared-use paths: street extraction now takes
   the full OSM way network and applies cafein's own walkability rule — a
   way is walkable unless it is a motor-only or unbuilt road, is mapped as
@@ -60,9 +70,9 @@
 
 - Default street-search parameters now match r5py's, so door-to-door and
   point-matrix results line up with r5py out of the box. The stop/coordinate
-  snap radius is 300 m (R5's street-link radius, was 100 m), so a stop up to
-  300 m from the walking network attaches to it instead of being silently
-  unroutable. The query-time access/egress walking cutoff is 7200 s (two
+  snap radius is 1600 m (R5's ``LINK_RADIUS_METERS``, was 100 m), so a stop
+  up to 1.6 km from the walking network attaches to it over a straight
+  connector instead of being silently unroutable. The query-time access/egress walking cutoff is 7200 s (two
   hours, r5py's ``max_time_walking``) and is now separate from the
   footpath/transfer cutoff, whose default rises from 600 s to 1200 s (a
   20-minute transfer walk). The default maximum transfers is 7 (r5py's eight
