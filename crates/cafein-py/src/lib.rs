@@ -8,9 +8,9 @@ use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
-use cafein_core::geometry::{DistanceProvenance, LegGeometry, TripGeometry};
+use cafein_core::geometry::{wkb_multi_line_string, DistanceProvenance, LegGeometry, TripGeometry};
 use cafein_core::journey::{Journey, Leg};
-use cafein_core::raptor::{CostInputs, Raptor};
+use cafein_core::raptor::{CostInputs, CostRow, Raptor};
 use cafein_core::router::{Request, TransitRouter};
 use cafein_core::streets::{
     Backing, MappedStreets, Snap, StopLink, StoredLink, StreetNetwork, StreetNetworkParts,
@@ -1363,7 +1363,7 @@ impl TransportNetwork {
     ///     Walking speed in km/h, on the network and on the connectors.
     /// max_walking_time : float (optional, default: 7200)
     ///     Walking-time cutoff in seconds.
-    /// max_snap_distance : float (optional, default: 300)
+    /// max_snap_distance : float (optional, default: 1600)
     ///     Maximum straight-line distance in meters from the coordinate
     ///     to the walking network; a coordinate farther away raises
     ///     ``ValueError``.
@@ -1373,7 +1373,7 @@ impl TransportNetwork {
     /// dict
     ///     Walking time in seconds to each reachable stop, keyed by
     ///     stop_id; stops beyond the cutoff are absent.
-    #[pyo3(signature = (lat, lon, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 300.0))]
+    #[pyo3(signature = (lat, lon, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
     fn access_stops(
         &self,
         py: Python<'_>,
@@ -1542,11 +1542,13 @@ impl TransportNetwork {
     /// ``route_between_stops``. Access and egress legs report their
     /// walking distance in meters; a coordinate farther than
     /// ``max_snap_distance`` from the walking network raises
-    /// ``ValueError``. Journeys ride at least one trip: a destination
-    /// best reached by walking alone yields no journeys. With
-    /// ``geometries`` (the default), access and egress legs carry their
-    /// walked street path as WKB LineStrings alongside the transit
-    /// legs' geometry.
+    /// ``ValueError``. Walking all the way is a journey too: within
+    /// ``max_walking_time`` the result leads with a walking-only
+    /// journey (one ``walk`` leg, zero rides), and a journey is dropped
+    /// when walking, leaving at that journey's own departure, would
+    /// arrive no later. With ``geometries`` (the default), walk legs
+    /// carry their walked street path as WKB LineStrings alongside the
+    /// transit legs' geometry.
     ///
     /// Parameters
     /// ----------
@@ -1564,7 +1566,7 @@ impl TransportNetwork {
     ///     Walking speed in km/h of the access and egress searches.
     /// max_walking_time : float (optional, default: 7200)
     ///     Walking-time cutoff in seconds of each street search.
-    /// max_snap_distance : float (optional, default: 300)
+    /// max_snap_distance : float (optional, default: 1600)
     ///     Maximum straight-line distance in meters from each coordinate
     ///     to the walking network.
     ///
@@ -1573,7 +1575,7 @@ impl TransportNetwork {
     /// list of dict
     ///     Journeys as in ``route_between_stops``; arrivals include the
     ///     egress walk.
-    #[pyo3(signature = (origin, destination, date, departure, max_transfers = 7, window = None, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 300.0, geometries = true))]
+    #[pyo3(signature = (origin, destination, date, departure, max_transfers = 7, window = None, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true))]
     #[allow(clippy::too_many_arguments)]
     fn route_between_coordinates(
         &self,
@@ -1629,7 +1631,60 @@ impl TransportNetwork {
             active_services_previous: self.active_services_previous(date)?,
             max_transfers,
         };
-        self.route_request(py, &request, window, Some(&walks), Some(&ends), geometries)
+        // The walking-only alternative: door to door over the streets,
+        // no vehicle, available at every departure. It dominates a
+        // journey when walking out at that journey's own departure
+        // would arrive no later (walking rides nothing), and is
+        // dominated only by a faster journey that also rides nothing.
+        // A destination at the origin's exact coordinate is a zero
+        // walk — snap arithmetic would charge the connector twice.
+        let direct = if origin == destination {
+            Some((0, 0.0))
+        } else {
+            streets
+                .walk_to_snaps(
+                    &ends.origin_snap,
+                    &[Some(ends.destination_snap)],
+                    speed,
+                    max_walking_time,
+                )
+                .swap_remove(0)
+        };
+        let journeys = match window {
+            None => Raptor.route(&self.build.timetable, &self.transfers, &request),
+            Some(window) => {
+                Raptor.route_range(&self.build.timetable, &self.transfers, &request, window)
+            }
+        };
+        let kept: Vec<&Journey> = journeys
+            .iter()
+            .filter(|journey| match direct {
+                Some((walk_seconds, _)) => journey.arrival - journey.departure < walk_seconds,
+                None => true,
+            })
+            .collect();
+        let result = PyList::empty(py);
+        if let Some(walk) = direct.filter(|_| !kept.iter().any(|journey| journey.rides() == 0)) {
+            // Journeys sort by (departure, rides); the walk leaves at the
+            // requested departure with zero rides, so it leads the list.
+            result.append(self.walk_journey_dict(
+                py,
+                request.departure,
+                walk,
+                &ends,
+                geometries,
+            )?)?;
+        }
+        for journey in kept {
+            result.append(self.journey_to_dict(
+                py,
+                journey,
+                Some(&walks),
+                Some(&ends),
+                geometries,
+            )?)?;
+        }
+        Ok(result.unbind())
     }
 
     /// Earliest arrival at every reachable stop from a coordinate.
@@ -1653,7 +1708,7 @@ impl TransportNetwork {
     ///     Walking speed in km/h of the access search.
     /// max_walking_time : float (optional, default: 7200)
     ///     Walking-time cutoff in seconds of the access search.
-    /// max_snap_distance : float (optional, default: 300)
+    /// max_snap_distance : float (optional, default: 1600)
     ///     Maximum straight-line distance in meters from the coordinate
     ///     to the walking network; a coordinate farther away raises
     ///     ``ValueError``.
@@ -1663,7 +1718,7 @@ impl TransportNetwork {
     /// dict
     ///     Travel time in seconds to every reachable stop, keyed by
     ///     stop_id; unreachable stops are absent.
-    #[pyo3(signature = (origin, date, departure, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 300.0))]
+    #[pyo3(signature = (origin, date, departure, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
     #[allow(clippy::too_many_arguments)]
     fn travel_times_from_coordinate(
         &self,
@@ -1925,7 +1980,7 @@ impl TransportNetwork {
     ///     ``matrix``: a ``(len(origins), len(destinations),
     ///     len(percentiles))`` uint32 array; ``unsnapped_from`` /
     ///     ``unsnapped_to``: indices of points off the walking network.
-    #[pyo3(signature = (origins, destinations, date, departure, window, percentiles, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 300.0))]
+    #[pyo3(signature = (origins, destinations, date, departure, window, percentiles, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
     #[allow(clippy::too_many_arguments)]
     fn travel_time_percentiles_from_points(
         &self,
@@ -1970,7 +2025,7 @@ impl TransportNetwork {
                 })
                 .collect();
             let egress = egress_tables(&destination_links);
-            let flat = Raptor
+            let mut flat = Raptor
                 .percentile_matrix_to_points(
                     &self.build.timetable,
                     &self.transfers,
@@ -1980,6 +2035,26 @@ impl TransportNetwork {
                     &percentiles,
                 )
                 .concat();
+            // A direct walk is departure-independent, so it caps every
+            // percentile of a cell's distribution alike.
+            let walk = streets.walk_matrix(
+                &origins,
+                &destinations,
+                speed,
+                max_walking_time,
+                max_snap_distance,
+            );
+            let planes = percentiles.len();
+            for (origin, row) in walk.iter().enumerate() {
+                for (point, cell) in row.iter().enumerate() {
+                    if let Some((walk_seconds, _)) = cell {
+                        let base = (origin * destination_count + point) * planes;
+                        for value in &mut flat[base..base + planes] {
+                            *value = (*value).min(*walk_seconds);
+                        }
+                    }
+                }
+            }
             (flat, unsnapped_from, unsnapped_to)
         });
         let result = PyDict::new(py);
@@ -2173,7 +2248,7 @@ impl TransportNetwork {
     ///     unreachable; ``unsnapped_from`` / ``unsnapped_to``: indices
     ///     of points farther than `max_snap_distance` from the walking
     ///     network (their rows/columns are unreachable).
-    #[pyo3(signature = (origins, destinations, date, departure, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 300.0))]
+    #[pyo3(signature = (origins, destinations, date, departure, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
     #[allow(clippy::too_many_arguments)]
     fn travel_time_matrix_from_points(
         &self,
@@ -2238,6 +2313,23 @@ impl TransportNetwork {
                     }
                 }
             }
+            // Walking directly can beat transit; each cell keeps the
+            // faster of the two (one street search per origin).
+            let walk = streets.walk_matrix(
+                &origins,
+                &destinations,
+                speed,
+                max_walking_time,
+                max_snap_distance,
+            );
+            for (origin, row) in walk.iter().enumerate() {
+                for (point, cell) in row.iter().enumerate() {
+                    if let Some((walk_seconds, _)) = cell {
+                        let at = origin * destination_count + point;
+                        flat[at] = flat[at].min(*walk_seconds);
+                    }
+                }
+            }
             (flat, unsnapped_from, unsnapped_to)
         });
         let result = PyDict::new(py);
@@ -2268,7 +2360,7 @@ impl TransportNetwork {
     ///     origin and destination point lists — plus
     ///     ``unsnapped_from`` / ``unsnapped_to`` with the indices of
     ///     points off the walking network.
-    #[pyo3(signature = (origins, destinations, date, departure, factors, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 300.0, geometries = false))]
+    #[pyo3(signature = (origins, destinations, date, departure, factors, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false))]
     #[allow(clippy::too_many_arguments)]
     fn travel_cost_matrix_from_points(
         &self,
@@ -2341,7 +2433,7 @@ impl TransportNetwork {
                 );
             }
             let egress = egress_tables(&destination_links);
-            let rows = Raptor.cost_matrix_to_points(
+            let mut rows = Raptor.cost_matrix_to_points(
                 &self.build.timetable,
                 &self.transfers,
                 &inputs,
@@ -2349,6 +2441,74 @@ impl TransportNetwork {
                 &access_meters,
                 &egress,
             );
+            // Walking directly can beat transit: such cells become
+            // walking-only rows — zero rides, zero emissions, the walk
+            // as the distance. The time fill is one street search per
+            // origin; with geometries, each *winning* walk cell
+            // additionally reconstructs its street path, mirroring the
+            // per-row WKB assembly transit rows already pay.
+            let walk = streets.walk_matrix(
+                &origins,
+                &destinations,
+                speed,
+                max_walking_time,
+                max_snap_distance,
+            );
+            let walk_geometry = |origin: usize, point: usize| -> Option<Vec<u8>> {
+                if !geometries {
+                    return None;
+                }
+                let from_point = origins[origin];
+                let to_point = destinations[point];
+                if from_point == to_point {
+                    // A zero walk degenerates at its own coordinate.
+                    let at = (from_point.1, from_point.0);
+                    return Some(wkb_multi_line_string(&[vec![at, at]]));
+                }
+                let from = streets.snap(from_point.0, from_point.1, max_snap_distance)?;
+                let to = streets.snap(to_point.0, to_point.1, max_snap_distance)?;
+                let (path, _) = streets.walk_path(from_point, &from, to_point, &to)?;
+                Some(wkb_multi_line_string(&[path]))
+            };
+            for (origin, origin_rows) in rows.iter_mut().enumerate() {
+                let walk_row = &walk[origin];
+                let mut reached = vec![false; destinations.len()];
+                for row in origin_rows.iter_mut() {
+                    reached[row.to as usize] = true;
+                    if let Some((walk_seconds, meters)) = walk_row[row.to as usize] {
+                        // Ties resolve toward fewer rides, as the
+                        // matrix contract promises: an equal-time walk
+                        // beats a ridden row.
+                        if walk_seconds < row.seconds
+                            || (walk_seconds == row.seconds && row.rides > 0)
+                        {
+                            row.seconds = walk_seconds;
+                            row.rides = 0;
+                            row.transit_meters = 0.0;
+                            row.walk_meters = meters;
+                            row.emission_grams = 0.0;
+                            row.geometry = walk_geometry(origin, row.to as usize);
+                        }
+                    }
+                }
+                for (point, cell) in walk_row.iter().enumerate() {
+                    if reached[point] {
+                        continue;
+                    }
+                    if let Some((walk_seconds, meters)) = cell {
+                        origin_rows.push(CostRow {
+                            to: point as u32,
+                            seconds: *walk_seconds,
+                            rides: 0,
+                            transit_meters: 0.0,
+                            walk_meters: *meters,
+                            emission_grams: 0.0,
+                            geometry: walk_geometry(origin, point),
+                        });
+                    }
+                }
+                origin_rows.sort_unstable_by_key(|row| row.to);
+            }
             (rows, unsnapped_from, unsnapped_to)
         });
 
@@ -2447,6 +2607,52 @@ impl TransportNetwork {
             result.append(self.journey_to_dict(py, journey, walks, ends, geometries)?)?;
         }
         Ok(result.unbind())
+    }
+
+    /// A walking-only journey between the query coordinates, as a dict
+    /// shaped like ``journey_to_dict``'s: one ``walk`` leg carrying the
+    /// exact street distance and, when asked, the walked path.
+    fn walk_journey_dict(
+        &self,
+        py: Python<'_>,
+        departure: u32,
+        (walk_seconds, meters): (u32, f64),
+        ends: &CoordinateEnds,
+        geometries: bool,
+    ) -> PyResult<Py<PyDict>> {
+        let arrival = departure.saturating_add(walk_seconds);
+        let dict = PyDict::new(py);
+        dict.set_item("departure", departure)?;
+        dict.set_item("arrival", arrival)?;
+        dict.set_item("rides", 0)?;
+        let entry = PyDict::new(py);
+        entry.set_item("type", "walk")?;
+        entry.set_item("departure", departure)?;
+        entry.set_item("arrival", arrival)?;
+        entry.set_item("distance", meters)?;
+        entry.set_item("distance_provenance", py.None())?;
+        let geometry = geometries
+            .then(|| {
+                if ends.origin == ends.destination {
+                    // A zero walk degenerates at its own coordinate.
+                    let at = (ends.origin.1, ends.origin.0);
+                    Some(wkb_line_string(py, &[at, at]))
+                } else {
+                    self.walk_wkb(
+                        py,
+                        ends.origin,
+                        &ends.origin_snap,
+                        ends.destination,
+                        &ends.destination_snap,
+                    )
+                }
+            })
+            .flatten();
+        entry.set_item("geometry", geometry)?;
+        let legs = PyList::empty(py);
+        legs.append(entry)?;
+        dict.set_item("legs", legs)?;
+        Ok(dict.unbind())
     }
 
     /// A stop's coordinates and street snap, for drawing walk legs.

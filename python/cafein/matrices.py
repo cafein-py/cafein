@@ -22,10 +22,13 @@ class TravelCostMatrix(pd.DataFrame):
     Origins and destinations are either stop identifiers or point
     GeoDataFrames with an ``id`` column. Points are linked once against
     the street network (requires ``osm_pbf=`` at build time): a point's
-    travel time is its fastest walk–ride–walk chain, the access and
-    egress walks count toward ``walk_distance``, and points off the
-    walking network are reported with a warning and yield no rows. From
-    stop origins, ``walk_distance`` covers transfers only.
+    travel time is its fastest walk–ride–walk chain or the direct street
+    walk (within ``max_walking_time``), whichever is faster — a
+    walking-only pair reports zero ``transfers``, zero emissions, and
+    the walk as ``walk_distance``. The access and egress walks count
+    toward ``walk_distance``, and points off the walking network are
+    reported with a warning and yield no rows. From stop origins,
+    ``walk_distance`` covers transfers only.
 
     One RAPTOR run serves each origin, fanned out over all cores; each
     pair's costs come from its fastest journey (ties resolved toward

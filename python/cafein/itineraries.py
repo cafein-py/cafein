@@ -34,8 +34,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
     between each origin and each destination: ``from_id`` and ``to_id``
     (the OD pair), ``option`` (the journey alternative, numbered per OD
     pair), ``segment`` (the leg's position in that journey), and the leg
-    itself — ``leg_type`` (``access``, ``transit``, ``transfer``, or
-    ``egress``), ``departure`` and ``arrival`` and ``travel_time`` in
+    itself — ``leg_type`` (``access``, ``transit``, ``transfer``,
+    ``egress``, or ``walk`` for a walking-only door-to-door journey),
+    ``departure`` and ``arrival`` and ``travel_time`` in
     seconds, ``from_stop`` and ``to_stop`` (the boarding and alighting
     stops; ``None`` at the walked ends of a door-to-door journey),
     ``trip_id``/``route_id``/``route_short_name`` on transit legs,
@@ -237,6 +238,9 @@ def _leg_record(from_id, to_id, option, segment, leg):
         from_stop, to_stop = None, leg["to_stop"]
     elif leg_type == "egress":
         from_stop, to_stop = leg["from_stop"], None
+    elif leg_type == "walk":
+        # A door-to-door walking journey never touches a stop.
+        from_stop, to_stop = None, None
     else:
         from_stop, to_stop = leg["from_stop"], leg["to_stop"]
     wkb = leg.get("geometry")

@@ -162,6 +162,63 @@ def test_point_matrices_walk_ride_and_walk(network_with_footpaths):
         assert times[origin, destination] == row.travel_time
 
 
+def test_point_matrices_take_the_direct_walk(tmp_path):
+    from cafein import TransportNetwork
+    from test_transport_network import build_synthetic_gtfs
+
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs([str(feed)])
+    # One 2 km street edge with stops at its start and at 90 % of its
+    # cost length. The query points sit at 25 % and 30 %: walking the
+    # 100 m between them directly beats any walk through a stop (the
+    # nearest is 500 m back) — the cell must hold the direct walk.
+    network.set_street_network(
+        2,
+        [(0, 1, 2000.0)],
+        [0, 2],
+        [24.0, 24.035842],
+        [60.0, 60.0],
+        [("S1", 0, 0.0, 0.0), ("S2", 0, 0.9, 0.0)],
+    )
+    origins = gpd.GeoDataFrame(
+        {"id": ["a"]},
+        geometry=gpd.points_from_xy([24.0089605], [60.0]),
+        crs="EPSG:4326",
+    )
+    destinations = gpd.GeoDataFrame(
+        {"id": ["b"]},
+        geometry=gpd.points_from_xy([24.0107526], [60.0]),
+        crs="EPSG:4326",
+    )
+    times = network.travel_time_matrix(
+        origins, "2022-02-22", "07:30:00", destinations=destinations
+    )
+    assert times[0, 0] in (100, 101)
+    # A walk is departure-independent: every percentile plane holds it.
+    windowed = network.travel_time_matrix(
+        origins,
+        "2022-02-22",
+        "07:30:00",
+        destinations=destinations,
+        window=600,
+        confidence=0.8,
+    )
+    assert set(windowed[0, 0, :].tolist()) == {times[0, 0]}
+    # The cost matrix reports the same walking-only pair: no rides, no
+    # transit distance, no emissions, the walk as the distance.
+    matrix = TravelCostMatrix(
+        network, origins, destinations, "2022-02-22", "07:30:00", geometries=True
+    )
+    row = matrix.iloc[0]
+    assert row["travel_time"] == times[0, 0]
+    assert row["transfers"] == 0
+    assert row["transit_distance"] == 0.0
+    assert row["walk_distance"] == pytest.approx(100.0, abs=0.5)
+    assert row["emissions"] == 0.0
+    assert row["geometry"].geom_type == "MultiLineString"
+
+
 def test_point_matrices_report_unsnapped_points(network_with_footpaths):
     # Open water south of the extract: the point cannot snap.
     sea = gpd.GeoDataFrame(

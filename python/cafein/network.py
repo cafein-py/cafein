@@ -448,8 +448,11 @@ class TransportNetwork:
         otherwise behave as in ``route_between_stops``; access and
         egress legs report their walking distance in meters and — with
         `geometries`, the default — their walked street path as WKB
-        LineStrings. Journeys ride at least one trip: a destination
-        best reached by walking alone yields no journeys.
+        LineStrings. Walking all the way is a journey too: within
+        `max_walking_time` the result leads with a walking-only journey
+        — a single ``walk`` leg, zero rides — and a journey is dropped
+        when walking out at that journey's own departure would arrive
+        no later than it does.
 
         Parameters
         ----------
@@ -616,7 +619,9 @@ class TransportNetwork:
             column. Points are linked once against the street network
             (requires ``osm_pbf=`` at build time); points off the
             walking network are reported with a warning and stay
-            unreachable.
+            unreachable. Point cells hold the faster of transit and
+            walking directly (within ``max_walking_time``), so a pair
+            best covered on foot reports its walking time.
         date : str
             Service date as ``YYYY-MM-DD``.
         departure : str

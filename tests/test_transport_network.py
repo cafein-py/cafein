@@ -366,7 +366,14 @@ def test_routes_door_to_door_between_coordinates(network_with_footpaths):
     stop_journeys = network_with_footpaths.route_between_stops(
         "1100602", "1040280", "2022-02-22", "08:30:00"
     )
-    first = journeys[0]
+    # Walking all the way leads the frontier (zero rides) but is far
+    # slower than the ride; the M2 journey follows.
+    walk_only, first = journeys[0], journeys[1]
+    assert walk_only["rides"] == 0
+    (walk_leg,) = walk_only["legs"]
+    assert walk_leg["type"] == "walk"
+    assert 3_000 <= walk_leg["distance"] <= 6_000
+    assert walk_only["arrival"] - walk_only["departure"] >= walk_leg["distance"]
     assert first["rides"] == 1
     assert abs(first["arrival"] - stop_journeys[0]["arrival"]) <= 2
 
@@ -390,10 +397,15 @@ def test_door_to_door_window_profiles_departures(network_with_footpaths):
     profile = network_with_footpaths.route_between_coordinates(
         origin, destination, "2022-02-22", "08:30:00", window=600
     )
-    assert len(profile) >= 3
+    # The departure-independent walk leads the profile; every ride
+    # follows in departure order.
+    walk_only, rides = profile[0], profile[1:]
+    assert walk_only["rides"] == 0
+    assert walk_only["legs"][0]["type"] == "walk"
+    assert len(rides) >= 3
     departures = [journey["departure"] for journey in profile]
     assert departures == sorted(departures)
-    for journey in profile:
+    for journey in rides:
         assert journey["departure"] >= 8 * 3600 + 30 * 60
         assert journey["arrival"] > journey["departure"]
         assert journey["rides"] >= 1
@@ -479,11 +491,33 @@ def test_a_synthetic_network_routes_door_to_door(tmp_path):
     assert egress["from_stop"] == "S2"
     assert egress["distance"] == pytest.approx(200.0)
 
-    # Journeys ride at least one trip: a destination best reached by
-    # walking alone yields no journeys.
+    # A destination best reached on foot yields a walking-only journey:
+    # ~50 m along the edge (0.0009° of its 0.035842° cost length).
+    (walk_only,) = network.route_between_coordinates(
+        (60.0, 24.0), (60.0, 24.0009), "2022-02-22", "07:30:00"
+    )
+    assert walk_only["rides"] == 0
+    (walk_leg,) = walk_only["legs"]
+    assert walk_leg["type"] == "walk"
+    assert walk_leg["distance"] == pytest.approx(50.2, abs=1.0)
+    assert walk_only["arrival"] - walk_only["departure"] in (50, 51)
+
+    # A destination at the origin's own coordinate is a zero walk.
+    (still,) = network.route_between_coordinates(
+        (60.0, 24.0), (60.0, 24.0), "2022-02-22", "07:30:00"
+    )
+    assert still["rides"] == 0
+    assert still["arrival"] == still["departure"]
+    assert still["legs"][0]["distance"] == 0.0
+
+    # Beyond the walking cutoff there is neither a ride nor a walk.
     assert (
         network.route_between_coordinates(
-            (60.0, 24.0), (60.0, 24.0009), "2022-02-22", "07:30:00"
+            (60.0, 24.0),
+            (60.0, 24.0009),
+            "2022-02-22",
+            "07:30:00",
+            max_walking_time=20.0,
         )
         == []
     )
@@ -743,7 +777,16 @@ def test_walk_legs_carry_street_paths(network_with_footpaths):
     journeys = network_with_footpaths.route_between_coordinates(
         origin, destination, "2022-02-22", "08:30:00"
     )
-    access, transit, egress = journeys[0]["legs"]
+    # The walking-only journey draws its whole street path.
+    (walk_leg,) = journeys[0]["legs"]
+    direct = shapely.from_wkb(walk_leg["geometry"])
+    assert direct.geom_type == "LineString"
+    assert utm_length(direct) == pytest.approx(walk_leg["distance"], rel=0.02, abs=0.5)
+    assert direct.coords[0] == pytest.approx((origin[1], origin[0]), abs=1e-6)
+    assert direct.coords[-1] == pytest.approx(
+        (destination[1], destination[0]), abs=1e-6
+    )
+    access, transit, egress = journeys[1]["legs"]
     walk = shapely.from_wkb(access["geometry"])
     assert walk.geom_type == "LineString"
     assert utm_length(walk) == pytest.approx(access["distance"], rel=0.02, abs=0.5)
