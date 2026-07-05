@@ -328,7 +328,7 @@ def test_helsinki_footpaths_cover_the_extract(helsinki_footpaths):
     # center almost completely.
     origins = {from_stop for from_stop, _, _, _ in helsinki_footpaths}
     assert 1_330 <= len(origins) <= 1_440
-    assert 1_100_000 <= len(helsinki_footpaths) <= 1_300_000
+    assert 1_450_000 <= len(helsinki_footpaths) <= 1_600_000
 
 
 def test_helsinki_footpaths_pin_known_pairs(helsinki_footpaths):

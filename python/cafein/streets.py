@@ -28,7 +28,7 @@ from scipy.sparse import csgraph
 WALKING_SPEED_KMPH = 3.6
 """Default walking speed, matching r5py's."""
 
-MAX_WALKING_TIME = 600.0
+MAX_WALKING_TIME = 1200.0
 """Default cutoff of the direct footpath (transfer) search, in seconds."""
 
 MAX_ACCESS_EGRESS_TIME = 7200.0
@@ -77,7 +77,7 @@ def walking_footpaths(
         footpaths.
     walking_speed_kmph : float (optional, default: 3.6)
         Walking speed in km/h, on the network and on the stop connectors.
-    max_walking_time : float (optional, default: 600)
+    max_walking_time : float (optional, default: 1200)
         Walking-time cutoff of the direct footpath search, in seconds.
         Transitive closure may produce chained footpaths that exceed it.
     max_snap_distance : float (optional, default: 300)

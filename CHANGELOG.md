@@ -7,8 +7,9 @@
   snap radius is 300 m (R5's street-link radius, was 100 m), so a stop up to
   300 m from the walking network attaches to it instead of being silently
   unroutable. The query-time access/egress walking cutoff is 7200 s (two
-  hours, r5py's ``max_time_walking``) and is now separate from the 600 s
-  footpath/transfer cutoff. The default maximum transfers is 7 (r5py's eight
+  hours, r5py's ``max_time_walking``) and is now separate from the
+  footpath/transfer cutoff, whose default rises from 600 s to 1200 s (a
+  20-minute transfer walk). The default maximum transfers is 7 (r5py's eight
   public-transport rides, was 4). Pass explicit ``max_snap_distance``,
   ``max_walking_time``, or ``max_transfers`` to override.
 

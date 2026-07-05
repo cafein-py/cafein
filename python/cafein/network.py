@@ -88,7 +88,7 @@ class TransportNetwork:
             without it the network has neither.
         walking_speed_kmph : float (optional, default: 3.6)
             Walking speed in km/h of the footpath precompute.
-        max_walking_time : float (optional, default: 600)
+        max_walking_time : float (optional, default: 1200)
             Walking-time cutoff of the direct footpath search, in
             seconds; chained footpaths may exceed it.
         max_snap_distance : float (optional, default: 300)
