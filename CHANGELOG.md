@@ -13,6 +13,16 @@
   public-transport rides, was 4). Pass explicit ``max_snap_distance``,
   ``max_walking_time``, or ``max_transfers`` to override.
 
+- Street searches scale with the walk, not the network: the walking
+  access/egress and walk-path searches keep sparse per-query state
+  (reached vertices only, reused per thread) instead of allocating
+  network-sized arrays per call, look candidate stop links up from a
+  vertex index instead of scanning every link, and the walk-path search
+  stops once its target edge is settled instead of exploring the whole
+  street component. Results are unchanged; per-query time and memory no
+  longer grow with the street network's size — groundwork for
+  country-scale networks.
+
 - Geographic street index: the walking street network is stored in
   geographic coordinates and distances use a local ``cos(latitude)``
   evaluated at the point's own latitude, replacing the single
