@@ -143,6 +143,40 @@ impl std::fmt::Display for StreetError {
 
 impl std::error::Error for StreetError {}
 
+/// Reusable per-thread Dijkstra state. The maps are keyed by vertex and
+/// cleared (capacity kept) between searches, so a query's memory scales
+/// with the vertices it reaches, never with the network's vertex count.
+#[derive(Default)]
+struct SearchState {
+    /// Best known distance in meters, present only for reached vertices.
+    distances: HashMap<u32, f64>,
+    /// Predecessor `(vertex, edge)` per reached vertex; seeds are absent.
+    previous: HashMap<u32, (u32, u32)>,
+    /// Pending `(distance bits, vertex)` entries. Non-negative floats
+    /// order like their IEEE bit patterns.
+    heap: BinaryHeap<Reverse<(u64, u32)>>,
+}
+
+impl SearchState {
+    fn clear(&mut self) {
+        self.distances.clear();
+        self.previous.clear();
+        self.heap.clear();
+    }
+
+    fn distance(&self, vertex: u32) -> f64 {
+        self.distances
+            .get(&vertex)
+            .copied()
+            .unwrap_or(f64::INFINITY)
+    }
+}
+
+thread_local! {
+    static SEARCH_STATE: std::cell::RefCell<SearchState> =
+        std::cell::RefCell::new(SearchState::default());
+}
+
 /// The walking street graph with its spatial index and stop links.
 #[derive(Debug)]
 pub struct StreetNetwork {
@@ -169,6 +203,10 @@ pub struct StreetNetwork {
     cumulative: Vec<f64>,
     /// How each snapped stop enters the graph.
     links: Vec<StopLink>,
+    /// `(vertex, link index)` pairs sorted by vertex — every link listed
+    /// under both endpoints of its edge — so a search finds the links
+    /// near its reached vertices without scanning all links.
+    vertex_links: Vec<(u32, u32)>,
     /// Spatial index over the edge segments in lon/lat, for envelope
     /// queries only.
     tree: RTree<EdgeSegment>,
@@ -262,17 +300,20 @@ impl StreetNetwork {
         }
 
         let tree = build_tree(&dense_offsets, &lons, &lats);
+        let endpoints: Vec<(u32, u32)> = edges.iter().map(|&(from, to, _)| (from, to)).collect();
+        let vertex_links = build_vertex_links(&links, &endpoints);
 
         Ok(StreetNetwork {
             adjacency_offsets,
             adjacency,
-            endpoints: edges.iter().map(|&(from, to, _)| (from, to)).collect(),
+            endpoints,
             lengths: edges.iter().map(|&(_, _, meters)| meters).collect(),
             coordinate_offsets: dense_offsets,
             lons,
             lats,
             cumulative,
             links,
+            vertex_links,
             tree,
         })
     }
@@ -311,6 +352,7 @@ impl StreetNetwork {
     /// Rebuilds a network from its serialized parts.
     pub fn from_parts(parts: StreetNetworkParts) -> StreetNetwork {
         let tree = build_tree(&parts.coordinate_offsets, &parts.lons, &parts.lats);
+        let vertex_links = build_vertex_links(&parts.links, &parts.endpoints);
         StreetNetwork {
             adjacency_offsets: parts.adjacency_offsets,
             adjacency: parts.adjacency,
@@ -321,6 +363,7 @@ impl StreetNetwork {
             lats: parts.lats,
             cumulative: parts.cumulative,
             links: parts.links,
+            vertex_links,
             tree,
         }
     }
@@ -418,47 +461,75 @@ impl StreetNetwork {
         let cutoff = max_seconds * walking_speed;
         let (from, to) = self.endpoints[snap.edge as usize];
         let length = self.lengths[snap.edge as usize];
-        let distances = self.bounded_dijkstra(
-            &[
-                (from, snap.connector + snap.fraction * length),
-                (to, snap.connector + (1.0 - snap.fraction) * length),
-            ],
-            cutoff,
-        );
-        let mut nearest: HashMap<StopIdx, f64> = HashMap::new();
-        for link in &self.links {
-            let (link_from, link_to) = self.endpoints[link.edge as usize];
-            let link_length = self.lengths[link.edge as usize];
-            let mut meters = f64::min(
-                distances[link_from as usize] + link.fraction * link_length,
-                distances[link_to as usize] + (1.0 - link.fraction) * link_length,
-            ) + link.connector;
-            if link.edge == snap.edge {
-                // Both points sit on one edge: walking between the snap
-                // points never has to reach an endpoint.
-                let direct = snap.connector
-                    + (link.fraction - snap.fraction).abs() * length
-                    + link.connector;
-                meters = meters.min(direct);
+        SEARCH_STATE.with(|cell| {
+            let state = &mut cell.borrow_mut();
+            self.bounded_dijkstra(
+                &[
+                    (from, snap.connector + snap.fraction * length),
+                    (to, snap.connector + (1.0 - snap.fraction) * length),
+                ],
+                cutoff,
+                state,
+            );
+            // The candidate links near the search: those at reached
+            // vertices, plus those on the snapped edge itself, whose
+            // direct on-edge path can be walkable even when neither
+            // endpoint is within the cutoff. Sorted so processing order
+            // is independent of hash-map iteration order.
+            let mut candidates: Vec<u32> = Vec::new();
+            for vertex in [from, to] {
+                candidates.extend(self.links_at(vertex));
             }
-            if meters <= cutoff + 1e-9 {
-                // A stop with several links keeps its shortest path.
-                nearest
-                    .entry(link.stop)
-                    .and_modify(|best| *best = best.min(meters))
-                    .or_insert(meters);
+            for &vertex in state.distances.keys() {
+                candidates.extend(self.links_at(vertex));
             }
-        }
-        let mut reached: Vec<WalkedStop> = nearest
-            .into_iter()
-            .map(|(stop, meters)| WalkedStop {
-                stop,
-                seconds: seconds(meters / walking_speed),
-                meters,
-            })
-            .collect();
-        reached.sort_unstable_by_key(|walk| walk.stop);
-        Some(reached)
+            candidates.sort_unstable();
+            candidates.dedup();
+            let mut nearest: HashMap<StopIdx, f64> = HashMap::new();
+            for index in candidates {
+                let link = &self.links[index as usize];
+                let (link_from, link_to) = self.endpoints[link.edge as usize];
+                let link_length = self.lengths[link.edge as usize];
+                let mut meters = f64::min(
+                    state.distance(link_from) + link.fraction * link_length,
+                    state.distance(link_to) + (1.0 - link.fraction) * link_length,
+                ) + link.connector;
+                if link.edge == snap.edge {
+                    // Both points sit on one edge: walking between the snap
+                    // points never has to reach an endpoint.
+                    let direct = snap.connector
+                        + (link.fraction - snap.fraction).abs() * length
+                        + link.connector;
+                    meters = meters.min(direct);
+                }
+                if meters <= cutoff + 1e-9 {
+                    // A stop with several links keeps its shortest path.
+                    nearest
+                        .entry(link.stop)
+                        .and_modify(|best| *best = best.min(meters))
+                        .or_insert(meters);
+                }
+            }
+            let mut reached: Vec<WalkedStop> = nearest
+                .into_iter()
+                .map(|(stop, meters)| WalkedStop {
+                    stop,
+                    seconds: seconds(meters / walking_speed),
+                    meters,
+                })
+                .collect();
+            reached.sort_unstable_by_key(|walk| walk.stop);
+            Some(reached)
+        })
+    }
+
+    /// The indices of the links whose edge touches a vertex.
+    fn links_at(&self, vertex: u32) -> impl Iterator<Item = u32> + '_ {
+        let start = self.vertex_links.partition_point(|&(v, _)| v < vertex);
+        self.vertex_links[start..]
+            .iter()
+            .take_while(move |&&(v, _)| v == vertex)
+            .map(|&(_, link)| link)
     }
 
     /// Links many coordinates against the network in parallel: each
@@ -525,29 +596,40 @@ impl StreetNetwork {
         });
 
         let (from_u, from_v) = self.endpoints[from.edge as usize];
-        let (distances, previous) = self.dijkstra_with_paths(&[
-            (from_u, from.connector + from.fraction * from_length),
-            (from_v, from.connector + (1.0 - from.fraction) * from_length),
-        ]);
         let (to_u, to_v) = self.endpoints[to.edge as usize];
-        let via_u = distances[to_u as usize] + to.fraction * to_length + to.connector;
-        let via_v = distances[to_v as usize] + (1.0 - to.fraction) * to_length + to.connector;
-
-        let best_transit = if via_u <= via_v { via_u } else { via_v };
-        if direct.is_none_or(|meters| best_transit < meters) && best_transit.is_finite() {
+        let transit = SEARCH_STATE.with(|cell| {
+            let state = &mut cell.borrow_mut();
+            self.dijkstra_with_paths(
+                &[
+                    (from_u, from.connector + from.fraction * from_length),
+                    (from_v, from.connector + (1.0 - from.fraction) * from_length),
+                ],
+                (to_u, to_v),
+                state,
+            );
+            let via_u = state.distance(to_u) + to.fraction * to_length + to.connector;
+            let via_v = state.distance(to_v) + (1.0 - to.fraction) * to_length + to.connector;
+            let best_transit = if via_u <= via_v { via_u } else { via_v };
+            if !best_transit.is_finite() {
+                return None;
+            }
             let exit = if via_u <= via_v { to_u } else { to_v };
             // Walk the predecessor chain back to the seed vertex.
             let mut vertices = vec![exit];
             let mut edges = Vec::new();
             let mut at = exit;
-            while let Some((prev, edge)) = previous[at as usize] {
+            while let Some(&(prev, edge)) = state.previous.get(&at) {
                 vertices.push(prev);
                 edges.push(edge);
                 at = prev;
             }
             vertices.reverse();
             edges.reverse();
-
+            Some((vertices, edges, exit, best_transit))
+        });
+        if let Some((vertices, edges, exit, best_transit)) =
+            transit.filter(|&(_, _, _, meters)| direct.is_none_or(|direct| meters < direct))
+        {
             let mut path = Vec::new();
             path.push((from_point.1, from_point.0));
             path.push(self.point_at(from.edge, from.fraction));
@@ -604,38 +686,50 @@ impl StreetNetwork {
         Some((dedup_consecutive(path), meters))
     }
 
-    /// An unbounded Dijkstra recording each vertex's predecessor and the
-    /// edge it was entered through.
-    #[allow(clippy::type_complexity)]
-    fn dijkstra_with_paths(&self, sources: &[(u32, f64)]) -> (Vec<f64>, Vec<Option<(u32, u32)>>) {
-        let count = self.vertex_count() as usize;
-        let mut distances = vec![f64::INFINITY; count];
-        let mut previous: Vec<Option<(u32, u32)>> = vec![None; count];
-        let mut heap = BinaryHeap::new();
+    /// A Dijkstra from the seed vertices into the search state, recording
+    /// each reached vertex's predecessor and the edge it was entered
+    /// through. Stops once both target vertices are settled — a settled
+    /// distance and the predecessor chain behind it are final — so the
+    /// work grows with the search ball around the seeds, never with the
+    /// network.
+    fn dijkstra_with_paths(
+        &self,
+        sources: &[(u32, f64)],
+        targets: (u32, u32),
+        state: &mut SearchState,
+    ) {
+        state.clear();
         for &(vertex, distance) in sources {
-            if distance < distances[vertex as usize] {
-                distances[vertex as usize] = distance;
-                previous[vertex as usize] = None;
-                heap.push(Reverse((distance.to_bits(), vertex)));
+            if distance < state.distance(vertex) {
+                state.distances.insert(vertex, distance);
+                state.previous.remove(&vertex);
+                state.heap.push(Reverse((distance.to_bits(), vertex)));
             }
         }
-        while let Some(Reverse((bits, vertex))) = heap.pop() {
+        let (target_a, target_b) = targets;
+        let mut settled_a = false;
+        let mut settled_b = false;
+        while let Some(Reverse((bits, vertex))) = state.heap.pop() {
             let distance = f64::from_bits(bits);
-            if distance > distances[vertex as usize] {
+            if distance > state.distance(vertex) {
                 continue;
+            }
+            settled_a |= vertex == target_a;
+            settled_b |= vertex == target_b;
+            if settled_a && settled_b {
+                break;
             }
             let start = self.adjacency_offsets[vertex as usize] as usize;
             let end = self.adjacency_offsets[vertex as usize + 1] as usize;
             for &(target, meters, edge) in &self.adjacency[start..end] {
                 let next = distance + meters;
-                if next < distances[target as usize] {
-                    distances[target as usize] = next;
-                    previous[target as usize] = Some((vertex, edge));
-                    heap.push(Reverse((next.to_bits(), target)));
+                if next < state.distance(target) {
+                    state.distances.insert(target, next);
+                    state.previous.insert(target, (vertex, edge));
+                    state.heap.push(Reverse((next.to_bits(), target)));
                 }
             }
         }
-        (distances, previous)
     }
 
     /// The `(lon, lat)` point at a fraction of an edge's true length.
@@ -705,35 +799,31 @@ impl StreetNetwork {
         )
     }
 
-    /// Shortest distances in meters from the source frontier to every
-    /// vertex within `cutoff` (`inf` beyond).
-    fn bounded_dijkstra(&self, sources: &[(u32, f64)], cutoff: f64) -> Vec<f64> {
-        let mut distances = vec![f64::INFINITY; self.vertex_count() as usize];
-        // Non-negative floats order like their IEEE bit patterns, which
-        // makes them usable as binary-heap keys.
-        let mut heap = BinaryHeap::new();
+    /// Shortest distances in meters from the source frontier into the
+    /// search state; only vertices within `cutoff` are reached.
+    fn bounded_dijkstra(&self, sources: &[(u32, f64)], cutoff: f64, state: &mut SearchState) {
+        state.clear();
         for &(vertex, distance) in sources {
-            if distance <= cutoff + 1e-9 && distance < distances[vertex as usize] {
-                distances[vertex as usize] = distance;
-                heap.push(Reverse((distance.to_bits(), vertex)));
+            if distance <= cutoff + 1e-9 && distance < state.distance(vertex) {
+                state.distances.insert(vertex, distance);
+                state.heap.push(Reverse((distance.to_bits(), vertex)));
             }
         }
-        while let Some(Reverse((bits, vertex))) = heap.pop() {
+        while let Some(Reverse((bits, vertex))) = state.heap.pop() {
             let distance = f64::from_bits(bits);
-            if distance > distances[vertex as usize] {
+            if distance > state.distance(vertex) {
                 continue;
             }
             let start = self.adjacency_offsets[vertex as usize] as usize;
             let end = self.adjacency_offsets[vertex as usize + 1] as usize;
             for &(target, meters, _) in &self.adjacency[start..end] {
                 let next = distance + meters;
-                if next <= cutoff + 1e-9 && next < distances[target as usize] {
-                    distances[target as usize] = next;
-                    heap.push(Reverse((next.to_bits(), target)));
+                if next <= cutoff + 1e-9 && next < state.distance(target) {
+                    state.distances.insert(target, next);
+                    state.heap.push(Reverse((next.to_bits(), target)));
                 }
             }
         }
-        distances
     }
 }
 
@@ -750,6 +840,22 @@ pub struct StreetNetworkParts {
     lats: Vec<f64>,
     cumulative: Vec<f64>,
     links: Vec<StopLink>,
+}
+
+/// The `(vertex, link index)` pairs behind [`StreetNetwork::links_at`],
+/// sorted by vertex: each link listed under both endpoints of its edge,
+/// once when they coincide.
+fn build_vertex_links(links: &[StopLink], endpoints: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut vertex_links = Vec::with_capacity(links.len() * 2);
+    for (index, link) in links.iter().enumerate() {
+        let (from, to) = endpoints[link.edge as usize];
+        vertex_links.push((from, index as u32));
+        if to != from {
+            vertex_links.push((to, index as u32));
+        }
+    }
+    vertex_links.sort_unstable();
+    vertex_links
 }
 
 /// The segment R*-tree over a lon/lat polyline set. Each entry is tagged with
@@ -1353,6 +1459,24 @@ mod tests {
         assert_eq!(timed(&reached), vec![(StopIdx(0), 0), (StopIdx(1), 200)]);
         assert!(reached[0].meters.abs() < 0.5);
         assert!((reached[1].meters - 200.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn walks_a_shared_edge_whose_endpoints_exceed_the_cutoff() {
+        // Snap point and stop sit mid-edge on a 2 km edge: both endpoint
+        // seeds cost 900/1100 m, beyond the 200 m cutoff, yet the direct
+        // on-edge walk (200 m) is within it and must still be found.
+        let network = network(
+            2,
+            1,
+            &[(0, 1, 2000.0, straight((0.0, 0.0), (2000.0, 0.0)))],
+            vec![link(0, 0, 0.55, 0.0)],
+        )
+        .unwrap();
+        let (lon, lat) = lonlat(900.0, 0.0);
+        let reached = network.access_stops(lat, lon, 1.0, 200.0, 100.0).unwrap();
+        assert_eq!(timed(&reached), vec![(StopIdx(0), 200)]);
+        assert!((reached[0].meters - 200.0).abs() < 0.5);
     }
 
     #[test]
