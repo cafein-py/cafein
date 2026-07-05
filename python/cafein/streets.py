@@ -138,9 +138,44 @@ def walking_streets(
     )
 
 
+_UNWALKABLE_FILTER = {
+    "area": ["yes"],
+    "highway": [
+        "abandoned",
+        "construction",
+        "motor",
+        "motorway",
+        "motorway_link",
+        "proposed",
+        "raceway",
+    ],
+    "foot": ["no"],
+    "service": ["private"],
+}
+"""Ways pedestrians never walk on: motor-only or unbuilt roads, ways
+mapped as areas, and ways that explicitly exclude pedestrians."""
+
+
 def _walking_network(osm_pbf):
-    """The walking network of a PBF extract, as pyrosm (nodes, edges)."""
-    network = pyrosm.OSM(str(osm_pbf)).get_network(network_type="walking", nodes=True)
+    """The walkable street network of a PBF extract, as (nodes, edges).
+
+    Extracted with cafein's own walkability rule rather than pyrosm's
+    ``walking`` network type, which drops every ``highway=cycleway`` —
+    severing the shared foot-and-cycle paths that carry much of the
+    pedestrian traffic in Nordic cities — and every transit platform,
+    fragmenting the graph. The exclusion filter here is pyrosm's walking
+    filter without those two types, so shared-use paths and platforms
+    stay in (R5 applies the same permissive rule).
+    """
+    # The out-of-core engine streams the PBF instead of loading it into
+    # memory, so country-scale extracts parse within bounded RAM.
+    osm = pyrosm.OSM(str(osm_pbf), engine="out_of_core", workers="auto")
+    network = osm.get_network(
+        network_type="walking",
+        custom_filter=_UNWALKABLE_FILTER,
+        filter_type="exclude",
+        nodes=True,
+    )
     if network is None:
         raise ValueError(f"no walkable ways in '{osm_pbf}'")
     return network
