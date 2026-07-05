@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.3.0 — 2026-07-05
+
+Street routing grows up: the network artifact is memory-mappable — many
+processes share one copy of the street data, loaded lazily — the walking
+network keeps the shared-use paths Nordic cities walk on and links stops
+and points the way R5 does, and walking all the way is a first-class
+journey wherever feet beat transit. Version-3 artifacts must be rebuilt.
+
 - Walking all the way is a journey: door-to-door queries and point
   matrices now consider walking directly from origin to destination over
   the street network, capped by ``max_walking_time``.
