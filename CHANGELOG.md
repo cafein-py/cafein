@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- ``TransportNetwork.load(path, mmap=True)`` memory-maps the artifact and
+  uses the street arrays in place instead of copying them: the operating
+  system pages street data in as queries touch it and shares those pages
+  between every process mapping the same artifact, so per-process memory
+  scales with the region a job walks, not with the network. The mapped
+  load is lazy — it reads no street bytes at all — and falls back to the
+  in-memory load where mapping is unavailable (``mmap="require"`` raises
+  instead). ``verify`` toggles the street checksum (default on for
+  in-memory loads, off for mapped ones, where it would page the whole
+  section in); a mapped artifact must not be modified in place — replace
+  it by atomic rename, and keep it out of cloud-synced folders. ``save``
+  itself honours the contract: it stages the artifact beside the
+  destination and atomically renames it into place. The ``mapped``
+  property reports which backing a network uses.
+
 - Network artifact format 4: the container is sectioned — a small
   decoded META block (timetable, calendar, transfers, geometries, stop
   links, and a descriptor table) plus a STREETS section holding every

@@ -149,6 +149,9 @@ class TransportNetwork:
         and the street network — so batch jobs can ``load`` the same
         file read-only instead of rebuilding from GTFS and OSM inputs.
         Build diagnostics (quarantine warnings) are not persisted.
+        The file is staged beside the destination and atomically
+        renamed into place, so saving over an existing artifact never
+        rewrites it under live memory-mapped readers.
 
         Parameters
         ----------
@@ -158,7 +161,7 @@ class TransportNetwork:
         self._core.save(os.fspath(path))
 
     @classmethod
-    def load(cls, path):
+    def load(cls, path, *, mmap=False, verify=None):
         """Load a network saved with `save`.
 
         Artifacts written in another format version are refused with
@@ -167,12 +170,43 @@ class TransportNetwork:
         re-save) with a matching version instead. Artifacts are
         trusted input, like pickles: load only files you created.
 
+        With ``mmap=True`` the street arrays are used directly from a
+        read-only memory map of the file instead of being copied into
+        memory: the operating system pages street data in as queries
+        touch it and shares those pages between every process mapping
+        the same artifact, so per-process memory scales with the region
+        a job actually walks, not with the network. A mapped artifact
+        must stay unchanged while any process maps it — replace it by
+        writing a new file and renaming it over the old one, never by
+        editing in place, and keep it out of cloud-synced folders
+        (OneDrive and its kin rewrite files in place).
+
         Parameters
         ----------
         path : path
             An artifact written by `save`.
+        mmap : bool or "require"
+            ``False`` (default) loads everything into memory. ``True``
+            maps the file, falling back to the in-memory load where
+            mapping is unavailable; ``"require"`` raises instead of
+            falling back.
+        verify : bool, optional
+            Whether to checksum the street data. Defaults to ``True``
+            for in-memory loads (the bytes are read anyway) and
+            ``False`` for mapped loads, where the check would page the
+            whole street section in and defeat the lazy load.
         """
-        return cls(_TransportNetwork.load(os.fspath(path)))
+        modes = {False: "off", True: "auto", "require": "require"}
+        if mmap not in modes:
+            raise ValueError(f"mmap must be False, True, or 'require', not {mmap!r}")
+        return cls(
+            _TransportNetwork.load(os.fspath(path), mmap=modes[mmap], verify=verify)
+        )
+
+    @property
+    def mapped(self):
+        """Whether the street arrays are memory-mapped from the artifact."""
+        return self._core.mapped
 
     @property
     def stop_count(self):

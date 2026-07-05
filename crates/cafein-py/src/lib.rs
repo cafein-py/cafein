@@ -13,7 +13,8 @@ use cafein_core::journey::{Journey, Leg};
 use cafein_core::raptor::{CostInputs, Raptor};
 use cafein_core::router::{Request, TransitRouter};
 use cafein_core::streets::{
-    Snap, StopLink, StoredLink, StreetNetwork, StreetNetworkParts, WalkedStop,
+    Backing, MappedStreets, Snap, StopLink, StoredLink, StreetNetwork, StreetNetworkParts,
+    WalkedStop,
 };
 use cafein_core::timetable::{StopIdx, Timetable, TripIdx};
 use cafein_core::transfers::Transfers;
@@ -31,6 +32,9 @@ struct TransportNetwork {
     stops_by_id: HashMap<String, StopLookup>,
     stops_by_qualified_id: HashMap<String, StopIdx>,
     trips_by_public_id: HashMap<String, TripIdx>,
+    /// STREETS-section bytes the load explicitly read — 0 for a lazy
+    /// mapped load; the laziness tests assert on it.
+    streets_bytes_read: u64,
 }
 
 /// Resolution of a raw GTFS stop_id, which merged feeds can duplicate.
@@ -186,6 +190,38 @@ const STREET_ARRAY_ORDER: [(StreetArray, ArrayKind); 13] = [
     (StreetArray::IndexPayload, ArrayKind::U32),
     (StreetArray::IndexLevelStarts, ArrayKind::U32),
 ];
+
+/// A read-only memory map of an artifact file, kept alive by the street
+/// network whose arrays point into it. The mapped file must stay
+/// unchanged for the mapping's lifetime (see [`Backing`]): replace
+/// artifacts by atomic rename, never by editing in place — and keep them
+/// out of cloud-synced folders, whose daemons rewrite files in place.
+struct MappedArtifact(memmap2::Mmap);
+
+impl Backing for MappedArtifact {
+    fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// How `load` should back the street arrays.
+#[derive(PartialEq, Clone, Copy)]
+enum MmapMode {
+    Off,
+    Auto,
+    Require,
+}
+
+/// The section directory of a parsed container: everything `load` needs
+/// to locate the sections, checksums still unchecked.
+struct ContainerLayout {
+    meta_offset: u64,
+    meta_length: u64,
+    meta_crc: u32,
+    streets_offset: u64,
+    streets_length: u64,
+    streets_crc: u32,
+}
 
 /// The stop and trip lookup tables derived from a feed and timetable.
 type DerivedIndexes = (
@@ -346,14 +382,39 @@ fn encode_streets(parts: &StreetNetworkParts) -> (Vec<ArrayDescriptor>, Vec<u8>)
     (descriptors, bytes)
 }
 
-/// Validates a street descriptor table against the expected array order
-/// and the section extent, and decodes the arrays into owned parts.
-fn decode_streets(
+/// The level-start table a packed index with `leaves` leaves must carry —
+/// mirrors the builder in cafein-core.
+fn expected_level_starts(leaves: usize) -> Vec<u32> {
+    let mut levels = vec![0u32];
+    let mut total = leaves;
+    let mut level_size = leaves;
+    while level_size > 1 {
+        levels.push(total as u32);
+        level_size = level_size.div_ceil(16);
+        total += level_size;
+    }
+    match leaves {
+        0 => vec![0, 0],
+        1 => vec![0, 1],
+        _ => {
+            levels.push(total as u32);
+            levels
+        }
+    }
+}
+
+/// Validates a street layer from the decoded META alone: descriptor
+/// order, sequential aligned layout inside the section, counts mutually
+/// consistent (so no query indexes out of an array), and well-formed
+/// link records. Runs on every load path without touching a single
+/// STREETS byte — which is what keeps a mapped load lazy. Returns the
+/// level-start table the index must carry.
+fn validate_street_shape(
     path: &str,
-    meta: StreetsMeta,
-    section: &[u8],
+    meta: &StreetsMeta,
+    section_length: u64,
     stop_count: u32,
-) -> PyResult<StreetNetworkParts> {
+) -> PyResult<Vec<u32>> {
     if meta.descriptors.len() != STREET_ARRAY_ORDER.len() {
         return Err(corrupted(path, "street descriptor table shape"));
     }
@@ -370,7 +431,7 @@ fn decode_streets(
             .count
             .checked_mul(kind.size())
             .and_then(|length| descriptor.offset.checked_add(length));
-        let Some(end) = extent.filter(|&end| end <= section.len() as u64) else {
+        let Some(end) = extent.filter(|&end| end <= section_length) else {
             return Err(corrupted(path, "street array bounds"));
         };
         if descriptor.offset != expected_offset {
@@ -379,9 +440,57 @@ fn decode_streets(
         last_end = end;
         expected_offset = end.div_ceil(ARRAY_ALIGNMENT) * ARRAY_ALIGNMENT;
     }
-    if last_end != section.len() as u64 {
+    if last_end != section_length {
         return Err(corrupted(path, "street array bounds"));
     }
+    let count = |i: usize| meta.descriptors[i].count;
+    let vertices = u64::from(meta.vertex_count);
+    let edges = count(5);
+    let coordinates = count(7);
+    let leaves = count(11) / 2;
+    let expected_levels = expected_level_starts(leaves as usize);
+    let consistent = count(0) == vertices + 1
+        && count(1) == count(2)
+        && count(1) == count(3)
+        && Some(count(1)) == edges.checked_mul(2)
+        && count(4) == count(1)
+        && count(6) == edges + 1
+        && count(8) == coordinates
+        && count(9) == coordinates
+        && count(11) % 2 == 0
+        // The leaves must be exactly one per consecutive coordinate
+        // pair, or snapping would silently skip streets …
+        && Some(leaves) == coordinates.checked_sub(edges)
+        // … in a tree shaped exactly as its builder shapes it.
+        && count(12) == expected_levels.len() as u64
+        && Some(count(10)) == u64::from(*expected_levels.last().unwrap()).checked_mul(4);
+    if !consistent {
+        return Err(corrupted(path, "street array consistency"));
+    }
+    for link in &meta.links {
+        if u64::from(link.edge) >= edges
+            || link.stop.0 >= stop_count
+            || !(0.0..=1.0).contains(&link.fraction)
+            || !link.connector.is_finite()
+            || link.connector < 0.0
+            || u64::from(link.from) >= vertices
+            || u64::from(link.to) >= vertices
+        {
+            return Err(corrupted(path, "street link records"));
+        }
+    }
+    Ok(expected_levels)
+}
+
+/// Decodes the street arrays into owned parts and cross-checks their
+/// contents — the value tier a mapped load defers to `verify` and to
+/// first use. The shape tier ([`validate_street_shape`]) has run.
+fn decode_streets(
+    path: &str,
+    meta: StreetsMeta,
+    section: &[u8],
+    expected_levels: Vec<u32>,
+) -> PyResult<StreetNetworkParts> {
     fn read<T>(
         section: &[u8],
         descriptor: &ArrayDescriptor,
@@ -433,39 +542,17 @@ fn decode_streets(
         links: meta.links,
     };
 
-    // Cross-checks over the decoded shapes: counts must be mutually
-    // consistent so no query indexes out of an array (Rust's bounds
-    // checks would panic rather than corrupt, but a clear load error
-    // beats a panic).
+    // Interior values: offsets monotonic with at least two coordinates
+    // per edge and their tails matching the array lengths, ids in range,
+    // costs and along-distances well-formed, and the packed index laid
+    // out exactly as its builder lays it out, so a corrupted artifact
+    // fails loading instead of panicking mid-query.
     let vertices = parts.vertex_count as usize;
     let edges = parts.lengths.len();
     let coordinates = parts.lons.len();
-    let index_nodes = parts.index_boxes.len() / 4;
-    let consistent = parts.adjacency_offsets.len() == vertices + 1
-        && parts.adjacency_offsets.last().copied() == u32::try_from(parts.adj_targets.len()).ok()
-        && parts.adj_targets.len() == parts.adj_meters.len()
-        && parts.adj_targets.len() == parts.adj_edges.len()
-        && parts.adj_targets.len() == edges * 2
-        && parts.endpoints.len() == edges * 2
-        && parts.coordinate_offsets.len() == edges + 1
-        && parts.coordinate_offsets.last().copied() == u32::try_from(coordinates).ok()
-        && parts.lats.len() == coordinates
-        && parts.cumulative.len() == coordinates
-        && parts.index_boxes.len().is_multiple_of(4)
-        && parts.index_payload.len().is_multiple_of(2)
-        && parts.index_level_starts.len() >= 2
-        && parts.index_level_starts.last().copied() == u32::try_from(index_nodes).ok()
-        && parts.index_level_starts[0] == 0
-        && parts.index_level_starts[1] as usize == parts.index_payload.len() / 2;
-    if !consistent {
-        return Err(corrupted(path, "street array consistency"));
-    }
-    // Interior values: offsets monotonic with at least two coordinates
-    // per edge, ids in range, costs and along-distances well-formed, and
-    // the packed index shaped exactly as its builder shapes it, so a
-    // corrupted artifact fails loading instead of panicking mid-query.
     if parts.adjacency_offsets.first() != Some(&0)
         || !parts.adjacency_offsets.windows(2).all(|w| w[0] <= w[1])
+        || parts.adjacency_offsets.last().copied() != u32::try_from(parts.adj_targets.len()).ok()
     {
         return Err(corrupted(path, "street adjacency offsets"));
     }
@@ -474,6 +561,7 @@ fn decode_streets(
             .coordinate_offsets
             .windows(2)
             .all(|w| w[1].checked_sub(w[0]).is_some_and(|span| span >= 2))
+        || parts.coordinate_offsets.last().copied() != u32::try_from(coordinates).ok()
     {
         return Err(corrupted(path, "street coordinate offsets"));
     }
@@ -520,32 +608,12 @@ fn decode_streets(
     {
         return Err(corrupted(path, "street costs"));
     }
-    let leaves = parts.index_payload.len() / 2;
-    let mut expected_levels = vec![0u32];
-    let mut total = leaves;
-    let mut level_size = leaves;
-    while level_size > 1 {
-        expected_levels.push(total as u32);
-        level_size = level_size.div_ceil(16);
-        total += level_size;
-    }
-    let expected_levels = match leaves {
-        0 => vec![0, 0],
-        1 => vec![0, 1],
-        _ => {
-            expected_levels.push(total as u32);
-            expected_levels
-        }
-    };
     if parts.index_level_starts != expected_levels {
         return Err(corrupted(path, "street index shape"));
     }
     // The leaves must be exactly the segment set — every consecutive
     // coordinate pair once, none missing or repeated — or snapping would
     // silently skip streets.
-    if leaves != coordinates - edges {
-        return Err(corrupted(path, "street index coverage"));
-    }
     let mut seen = vec![false; coordinates];
     for payload in parts.index_payload.chunks_exact(2) {
         let (edge, segment) = (payload[0] as usize, payload[1] as usize);
@@ -558,20 +626,250 @@ fn decode_streets(
         }
     }
     for link in &parts.links {
-        if link.edge as usize >= edges
-            || link.stop.0 >= stop_count
-            || !(0.0..=1.0).contains(&link.fraction)
-            || !link.connector.is_finite()
-            || link.connector < 0.0
-            // The denormalised endpoints must restate the edge's own,
-            // since the vertex→link index is rebuilt from them.
-            || link.from != parts.endpoints[2 * link.edge as usize]
+        // The denormalised endpoints must restate the edge's own, since
+        // the vertex→link index is rebuilt from them.
+        if link.from != parts.endpoints[2 * link.edge as usize]
             || link.to != parts.endpoints[2 * link.edge as usize + 1]
         {
             return Err(corrupted(path, "street link records"));
         }
     }
     Ok(parts)
+}
+
+/// Parses and bounds-checks a container's header and section directory.
+/// Checksums are the caller's job — the two load paths verify different
+/// sections.
+fn parse_container(path: &str, bytes: &[u8]) -> PyResult<ContainerLayout> {
+    let total = bytes.len() as u64;
+    let take = |offset: usize, length: usize| -> PyResult<&[u8]> {
+        offset
+            .checked_add(length)
+            .and_then(|end| bytes.get(offset..end))
+            .ok_or_else(|| corrupted(path, "truncated header"))
+    };
+    if take(0, 8)? != ARTIFACT_MAGIC {
+        return Err(PyValueError::new_err(format!(
+            "'{path}' is not a cafein network artifact"
+        )));
+    }
+    let format = u32::from_le_bytes(take(8, 4)?.try_into().unwrap());
+    let version_length = u16::from_le_bytes(take(12, 2)?.try_into().unwrap()) as usize;
+    let version = String::from_utf8_lossy(take(14, version_length)?).into_owned();
+    if format != ARTIFACT_FORMAT {
+        return Err(PyValueError::new_err(format!(
+            "'{path}' uses artifact format {format} (written by cafein \
+             {version}), which this cafein ({}) cannot read; rebuild \
+             the network from its inputs and save it again",
+            env!("CARGO_PKG_VERSION"),
+        )));
+    }
+    let mut cursor = 14 + version_length;
+    let section_count = u32::from_le_bytes(take(cursor, 4)?.try_into().unwrap());
+    cursor += 4;
+    if section_count != 2 {
+        return Err(corrupted(path, "section directory shape"));
+    }
+    let mut sections = Vec::new();
+    for _ in 0..2 {
+        let tag = u16::from_le_bytes(take(cursor, 2)?.try_into().unwrap());
+        let offset = u64::from_le_bytes(take(cursor + 2, 8)?.try_into().unwrap());
+        let length = u64::from_le_bytes(take(cursor + 10, 8)?.try_into().unwrap());
+        let checksum = u32::from_le_bytes(take(cursor + 18, 4)?.try_into().unwrap());
+        cursor += 22;
+        sections.push((tag, offset, length, checksum));
+    }
+    let directory_end = cursor as u64;
+    match sections.as_slice() {
+        &[(SECTION_META, meta_offset, meta_length, meta_crc), (SECTION_STREETS, streets_offset, streets_length, streets_crc)] =>
+        {
+            let meta_end = meta_offset.checked_add(meta_length);
+            let streets_end = streets_offset.checked_add(streets_length);
+            if meta_offset < directory_end
+                || meta_end.is_none_or(|end| end > streets_offset)
+                || streets_end.is_none_or(|end| end > total)
+            {
+                return Err(corrupted(path, "section bounds"));
+            }
+            // The writer starts a non-empty STREETS section on the
+            // alignment boundary; loads enforce the invariant so a
+            // mapped load can rely on it.
+            if streets_length > 0 && !streets_offset.is_multiple_of(STREETS_ALIGNMENT) {
+                return Err(corrupted(path, "street section alignment"));
+            }
+            Ok(ContainerLayout {
+                meta_offset,
+                meta_length,
+                meta_crc,
+                streets_offset,
+                streets_length,
+                streets_crc,
+            })
+        }
+        _ => Err(corrupted(path, "section directory shape")),
+    }
+}
+
+/// A parsed artifact: the decoded META, the adopted street network, and
+/// how many STREETS-section bytes the load explicitly read.
+type LoadedArtifact = (Artifact, Option<StreetNetwork>, u64);
+
+/// Loads an artifact into owned memory — the default path. `verify`
+/// (default on: the bytes are read anyway) toggles the STREETS checksum;
+/// META is always checked before anything is decoded.
+fn load_owned(path: &str, verify: Option<bool>) -> PyResult<LoadedArtifact> {
+    let bytes = std::fs::read(path).map_err(io_error)?;
+    let layout = parse_container(path, &bytes)?;
+    let meta =
+        &bytes[layout.meta_offset as usize..(layout.meta_offset + layout.meta_length) as usize];
+    let section = &bytes
+        [layout.streets_offset as usize..(layout.streets_offset + layout.streets_length) as usize];
+    if crc32(meta) != layout.meta_crc {
+        return Err(corrupted(path, "checksum mismatch"));
+    }
+    if verify.unwrap_or(true) && crc32(section) != layout.streets_crc {
+        return Err(corrupted(path, "checksum mismatch"));
+    }
+    let mut artifact: Artifact =
+        bincode::deserialize(meta).map_err(|error| PyValueError::new_err(error.to_string()))?;
+    if artifact.streets.is_some() && section.is_empty() {
+        return Err(corrupted(path, "missing street section"));
+    }
+    let stop_count = artifact.timetable.stop_count();
+    let streets = match artifact.streets.take() {
+        Some(streets_meta) => {
+            let expected_levels =
+                validate_street_shape(path, &streets_meta, layout.streets_length, stop_count)?;
+            Some(StreetNetwork::from_parts(decode_streets(
+                path,
+                streets_meta,
+                section,
+                expected_levels,
+            )?))
+        }
+        None => None,
+    };
+    Ok((artifact, streets, layout.streets_length))
+}
+
+/// Loads an artifact with the street arrays as views into a memory map.
+/// `Ok(Err(reason))` means mapping is environmentally unavailable and the
+/// caller decides between fallback and error; artifact problems are hard
+/// errors on every path.
+fn load_mapped(path: &str, verify: Option<bool>) -> PyResult<Result<LoadedArtifact, String>> {
+    // Mapped arrays reinterpret the stored little-endian bytes in place.
+    if cfg!(target_endian = "big") {
+        return Ok(Err("mapped street arrays need a little-endian host".into()));
+    }
+    if std::env::var_os("CAFEIN_DISABLE_MMAP")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+    {
+        return Ok(Err("disabled by CAFEIN_DISABLE_MMAP".into()));
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => return Ok(Err(error.to_string())),
+    };
+    // SAFETY: artifacts are immutable by contract while mapped (see
+    // `MappedArtifact`); the map is read-only on our side.
+    let map = match unsafe { memmap2::Mmap::map(&file) } {
+        Ok(map) => map,
+        Err(error) => return Ok(Err(error.to_string())),
+    };
+    let backing = std::sync::Arc::new(MappedArtifact(map));
+    let bytes = backing.bytes();
+    let layout = parse_container(path, bytes)?;
+    let meta =
+        &bytes[layout.meta_offset as usize..(layout.meta_offset + layout.meta_length) as usize];
+    if crc32(meta) != layout.meta_crc {
+        return Err(corrupted(path, "checksum mismatch"));
+    }
+    // The STREETS checksum would page the whole section in and defeat
+    // the lazy load, so it is opt-in here; without it the street content
+    // is trusted the way any store trusts its own files — the shape
+    // validation and slice bounds checks turn corruption into an error
+    // or a wrong result, never into unsoundness.
+    let mut streets_read = 0u64;
+    if verify == Some(true) {
+        let section = &bytes[layout.streets_offset as usize
+            ..(layout.streets_offset + layout.streets_length) as usize];
+        if crc32(section) != layout.streets_crc {
+            return Err(corrupted(path, "checksum mismatch"));
+        }
+        streets_read = layout.streets_length;
+    }
+    let mut artifact: Artifact =
+        bincode::deserialize(meta).map_err(|error| PyValueError::new_err(error.to_string()))?;
+    if artifact.streets.is_some() && layout.streets_length == 0 {
+        return Err(corrupted(path, "missing street section"));
+    }
+    let stop_count = artifact.timetable.stop_count();
+    let streets = match artifact.streets.take() {
+        Some(streets_meta) => {
+            validate_street_shape(path, &streets_meta, layout.streets_length, stop_count)?;
+            let ranges: Vec<(u64, u64)> = streets_meta
+                .descriptors
+                .iter()
+                .map(|descriptor| (layout.streets_offset + descriptor.offset, descriptor.count))
+                .collect();
+            let spec = MappedStreets {
+                backing,
+                vertex_count: streets_meta.vertex_count,
+                links: streets_meta.links,
+                adjacency_offsets: ranges[0],
+                adj_targets: ranges[1],
+                adj_meters: ranges[2],
+                adj_edges: ranges[3],
+                endpoints: ranges[4],
+                lengths: ranges[5],
+                coordinate_offsets: ranges[6],
+                lons: ranges[7],
+                lats: ranges[8],
+                cumulative: ranges[9],
+                index_boxes: ranges[10],
+                index_payload: ranges[11],
+            };
+            Some(
+                StreetNetwork::from_mapped(spec)
+                    .map_err(|_| corrupted(path, "street array bounds"))?,
+            )
+        }
+        None => None,
+    };
+    Ok(Ok((artifact, streets, streets_read)))
+}
+
+/// Assembles a network from a loaded artifact, rebuilding the derived
+/// lookup tables.
+fn assemble((artifact, streets, streets_bytes_read): LoadedArtifact) -> TransportNetwork {
+    let Artifact {
+        feed,
+        timetable,
+        services,
+        transfers,
+        geometry,
+        leg_geometry,
+        streets: _,
+    } = artifact;
+    let build = TimetableBuild {
+        timetable,
+        services,
+        quarantined: Vec::new(),
+    };
+    let (stops_by_id, stops_by_qualified_id, trips_by_public_id) =
+        derived_indexes(&feed, &build.timetable);
+    TransportNetwork {
+        feed,
+        build,
+        transfers,
+        geometry,
+        leg_geometry,
+        streets,
+        stops_by_id,
+        stops_by_qualified_id,
+        trips_by_public_id,
+        streets_bytes_read,
+    }
 }
 
 /// Rejects an empty or out-of-range window/percentile specification.
@@ -668,6 +966,7 @@ impl TransportNetwork {
             stops_by_id,
             stops_by_qualified_id,
             trips_by_public_id,
+            streets_bytes_read: 0,
         })
     }
 
@@ -680,7 +979,9 @@ impl TransportNetwork {
     /// from GTFS and OSM inputs. The payload carries a checksum, so
     /// on-disk corruption is caught at load time. Build diagnostics
     /// (quarantine reports) are not persisted; their warnings belong
-    /// to the build.
+    /// to the build. The file is staged beside the destination and
+    /// atomically renamed into place, so saving over an artifact never
+    /// rewrites it under live mapped readers.
     fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
         use std::io::Write;
 
@@ -728,37 +1029,67 @@ impl TransportNetwork {
                 meta_end.div_ceil(STREETS_ALIGNMENT) * STREETS_ALIGNMENT
             };
 
-            let file = std::fs::File::create(path).map_err(io_error)?;
-            let mut writer = std::io::BufWriter::new(file);
-            writer.write_all(ARTIFACT_MAGIC).map_err(io_error)?;
-            writer
-                .write_all(&ARTIFACT_FORMAT.to_le_bytes())
-                .map_err(io_error)?;
-            writer
-                .write_all(&(version.len() as u16).to_le_bytes())
-                .map_err(io_error)?;
-            writer.write_all(version).map_err(io_error)?;
-            writer.write_all(&2u32.to_le_bytes()).map_err(io_error)?;
-            for (tag, offset, bytes) in [
-                (SECTION_META, meta_offset, &meta),
-                (SECTION_STREETS, streets_offset, &streets_bytes),
-            ] {
-                writer.write_all(&tag.to_le_bytes()).map_err(io_error)?;
-                writer.write_all(&offset.to_le_bytes()).map_err(io_error)?;
+            // Stage into a sibling temp file and atomically rename over
+            // the destination: an artifact must never be rewritten in
+            // place under live mapped readers, whose mappings keep the
+            // replaced inode valid. The name is unique per process and
+            // save, and creation is exclusive, so concurrent saves never
+            // share a staging path and a stale file or symlink at it
+            // fails the save instead of being written through.
+            static SAVE_SEQUENCE: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let sequence = SAVE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let temporary = format!("{path}.tmp-{}-{sequence}", std::process::id());
+            let write = || -> PyResult<()> {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)
+                    .map_err(io_error)?;
+                let mut writer = std::io::BufWriter::new(file);
+                writer.write_all(ARTIFACT_MAGIC).map_err(io_error)?;
                 writer
-                    .write_all(&(bytes.len() as u64).to_le_bytes())
+                    .write_all(&ARTIFACT_FORMAT.to_le_bytes())
                     .map_err(io_error)?;
                 writer
-                    .write_all(&crc32(bytes).to_le_bytes())
+                    .write_all(&(version.len() as u16).to_le_bytes())
                     .map_err(io_error)?;
-            }
-            writer.write_all(&meta).map_err(io_error)?;
-            let padding = streets_offset - meta_offset - meta.len() as u64;
-            writer
-                .write_all(&vec![0u8; padding as usize])
-                .map_err(io_error)?;
-            writer.write_all(&streets_bytes).map_err(io_error)?;
-            writer.flush().map_err(io_error)
+                writer.write_all(version).map_err(io_error)?;
+                writer.write_all(&2u32.to_le_bytes()).map_err(io_error)?;
+                for (tag, offset, bytes) in [
+                    (SECTION_META, meta_offset, &meta),
+                    (SECTION_STREETS, streets_offset, &streets_bytes),
+                ] {
+                    writer.write_all(&tag.to_le_bytes()).map_err(io_error)?;
+                    writer.write_all(&offset.to_le_bytes()).map_err(io_error)?;
+                    writer
+                        .write_all(&(bytes.len() as u64).to_le_bytes())
+                        .map_err(io_error)?;
+                    writer
+                        .write_all(&crc32(bytes).to_le_bytes())
+                        .map_err(io_error)?;
+                }
+                writer.write_all(&meta).map_err(io_error)?;
+                let padding = streets_offset - meta_offset - meta.len() as u64;
+                writer
+                    .write_all(&vec![0u8; padding as usize])
+                    .map_err(io_error)?;
+                writer.write_all(&streets_bytes).map_err(io_error)?;
+                writer.flush().map_err(io_error)?;
+                writer.get_ref().sync_all().map_err(io_error)?;
+                // Replacing keeps the destination's permissions, as the
+                // old truncate-in-place write did.
+                if let Ok(metadata) = std::fs::metadata(path) {
+                    writer
+                        .get_ref()
+                        .set_permissions(metadata.permissions())
+                        .map_err(io_error)?;
+                }
+                std::fs::rename(&temporary, path).map_err(io_error)
+            };
+            write().inspect_err(|_| {
+                let _ = std::fs::remove_file(&temporary);
+            })
         })
     }
 
@@ -769,121 +1100,59 @@ impl TransportNetwork {
     /// payloads fail their checksum; rebuild from the inputs (or
     /// re-save) with a matching version instead. Artifacts are trusted
     /// input, like pickles: load only files you created.
+    ///
+    /// ``mmap='auto'`` maps the file and uses the street arrays in
+    /// place, falling back to the owned load where mapping is
+    /// unavailable; ``'require'`` errors instead of falling back.
+    /// ``verify`` toggles the STREETS checksum: default on for owned
+    /// loads (the bytes are read anyway), off for mapped loads (the
+    /// check would page the whole section in).
     #[staticmethod]
-    fn load(py: Python<'_>, path: &str) -> PyResult<TransportNetwork> {
-        let (artifact, streets) = py.allow_threads(|| {
-            let bytes = std::fs::read(path).map_err(io_error)?;
-            let total = bytes.len() as u64;
-            let take = |offset: usize, length: usize| -> PyResult<&[u8]> {
-                offset
-                    .checked_add(length)
-                    .and_then(|end| bytes.get(offset..end))
-                    .ok_or_else(|| corrupted(path, "truncated header"))
-            };
-            if take(0, 8)? != ARTIFACT_MAGIC {
+    #[pyo3(signature = (path, mmap = "off", verify = None))]
+    fn load(
+        py: Python<'_>,
+        path: &str,
+        mmap: &str,
+        verify: Option<bool>,
+    ) -> PyResult<TransportNetwork> {
+        let mode = match mmap {
+            "off" => MmapMode::Off,
+            "auto" => MmapMode::Auto,
+            "require" => MmapMode::Require,
+            other => {
                 return Err(PyValueError::new_err(format!(
-                    "'{path}' is not a cafein network artifact"
-                )));
+                    "mmap must be 'off', 'auto', or 'require', not '{other}'"
+                )))
             }
-            let format = u32::from_le_bytes(take(8, 4)?.try_into().unwrap());
-            let version_length = u16::from_le_bytes(take(12, 2)?.try_into().unwrap()) as usize;
-            let version = String::from_utf8_lossy(take(14, version_length)?).into_owned();
-            if format != ARTIFACT_FORMAT {
-                return Err(PyValueError::new_err(format!(
-                    "'{path}' uses artifact format {format} (written by cafein \
-                     {version}), which this cafein ({}) cannot read; rebuild \
-                     the network from its inputs and save it again",
-                    env!("CARGO_PKG_VERSION"),
-                )));
-            }
-            // Section directory: bounds first, then the CRC of every
-            // section this load consumes, before anything is decoded.
-            let mut cursor = 14 + version_length;
-            let section_count = u32::from_le_bytes(take(cursor, 4)?.try_into().unwrap());
-            cursor += 4;
-            if section_count != 2 {
-                return Err(corrupted(path, "section directory shape"));
-            }
-            let mut sections = Vec::new();
-            for _ in 0..2 {
-                let tag = u16::from_le_bytes(take(cursor, 2)?.try_into().unwrap());
-                let offset = u64::from_le_bytes(take(cursor + 2, 8)?.try_into().unwrap());
-                let length = u64::from_le_bytes(take(cursor + 10, 8)?.try_into().unwrap());
-                let checksum = u32::from_le_bytes(take(cursor + 18, 4)?.try_into().unwrap());
-                cursor += 22;
-                sections.push((tag, offset, length, checksum));
-            }
-            let directory_end = cursor as u64;
-            let (meta, streets_section) = match sections.as_slice() {
-                &[(SECTION_META, meta_offset, meta_length, meta_crc), (SECTION_STREETS, streets_offset, streets_length, streets_crc)] =>
-                {
-                    let meta_end = meta_offset.checked_add(meta_length);
-                    let streets_end = streets_offset.checked_add(streets_length);
-                    if meta_offset < directory_end
-                        || meta_end.is_none_or(|end| end > streets_offset)
-                        || streets_end.is_none_or(|end| end > total)
-                    {
-                        return Err(corrupted(path, "section bounds"));
-                    }
-                    // The writer starts a non-empty STREETS section on the
-                    // alignment boundary; loads enforce the invariant so a
-                    // mapped load can rely on it.
-                    if streets_length > 0 && !streets_offset.is_multiple_of(STREETS_ALIGNMENT) {
-                        return Err(corrupted(path, "street section alignment"));
-                    }
-                    let meta = &bytes[meta_offset as usize..(meta_offset + meta_length) as usize];
-                    let streets = &bytes
-                        [streets_offset as usize..(streets_offset + streets_length) as usize];
-                    if crc32(meta) != meta_crc || crc32(streets) != streets_crc {
-                        return Err(corrupted(path, "checksum mismatch"));
-                    }
-                    (meta, streets)
+        };
+        if mode != MmapMode::Off {
+            match py.allow_threads(|| load_mapped(path, verify))? {
+                Ok(loaded) => return Ok(assemble(loaded)),
+                Err(reason) if mode == MmapMode::Require => {
+                    return Err(PyValueError::new_err(format!(
+                        "'{path}' cannot be memory-mapped ({reason}) and \
+                         mmap='require' forbids the owned fallback"
+                    )))
                 }
-                _ => return Err(corrupted(path, "section directory shape")),
-            };
-            let artifact: Artifact = bincode::deserialize(meta)
-                .map_err(|error| PyValueError::new_err(error.to_string()))?;
-            if artifact.streets.is_some() && streets_section.is_empty() {
-                return Err(corrupted(path, "missing street section"));
+                Err(_) => {}
             }
-            Ok((artifact, streets_section.to_vec()))
-        })?;
-        let Artifact {
-            feed,
-            timetable,
-            services,
-            transfers,
-            geometry,
-            leg_geometry,
-            streets: streets_meta,
-        } = artifact;
-        let street_network = match streets_meta {
-            Some(meta) => Some(StreetNetwork::from_parts(decode_streets(
-                path,
-                meta,
-                &streets,
-                timetable.stop_count(),
-            )?)),
-            None => None,
-        };
-        let build = TimetableBuild {
-            timetable,
-            services,
-            quarantined: Vec::new(),
-        };
-        let (stops_by_id, stops_by_qualified_id, trips_by_public_id) =
-            derived_indexes(&feed, &build.timetable);
-        Ok(TransportNetwork {
-            feed,
-            build,
-            transfers,
-            geometry,
-            leg_geometry,
-            streets: street_network,
-            stops_by_id,
-            stops_by_qualified_id,
-            trips_by_public_id,
-        })
+        }
+        let loaded = py.allow_threads(|| load_owned(path, verify))?;
+        Ok(assemble(loaded))
+    }
+
+    /// Whether the street arrays are memory-mapped views of the loaded
+    /// artifact.
+    #[getter]
+    fn mapped(&self) -> bool {
+        self.streets.as_ref().is_some_and(StreetNetwork::is_mapped)
+    }
+
+    /// STREETS-section bytes the load explicitly read — 0 for a lazy
+    /// mapped load. Internal; the laziness tests assert on it.
+    #[getter]
+    fn _streets_bytes_read(&self) -> u64 {
+        self.streets_bytes_read
     }
 
     /// Number of stops in the network.

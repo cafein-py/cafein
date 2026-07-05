@@ -96,35 +96,40 @@ struct PackedIndex {
     level_starts: Vec<u32>,
 }
 
-impl PackedIndex {
-    /// Collects the payloads of every leaf whose box intersects the
-    /// envelope, sorted by payload so callers see a traversal-free order.
-    fn query_into(&self, envelope: &Envelope, matches: &mut Vec<(u32, u32)>) {
-        matches.clear();
-        if self.payload.is_empty() {
-            return;
-        }
-        let levels = self.level_starts.len() - 1;
-        // (global node index, level), starting at the root.
-        let mut stack = vec![(self.boxes.len() - 1, levels - 1)];
-        while let Some((node, level)) = stack.pop() {
-            if !envelopes_intersect(&self.boxes[node], envelope) {
-                continue;
-            }
-            if level == 0 {
-                matches.push((self.payload[2 * node], self.payload[2 * node + 1]));
-                continue;
-            }
-            // A node's children sit in the level below, in its own run.
-            let position = node - self.level_starts[level] as usize;
-            let start = self.level_starts[level - 1] as usize + position * INDEX_NODE_SIZE;
-            let end = (start + INDEX_NODE_SIZE).min(self.level_starts[level] as usize);
-            for child in start..end {
-                stack.push((child, level - 1));
-            }
-        }
-        matches.sort_unstable();
+/// Collects the payloads of every leaf whose box intersects the envelope,
+/// sorted by payload so callers see a traversal-free order. The arrays
+/// are a [`PackedIndex`]'s, whichever backing they live in.
+fn query_packed_index(
+    boxes: &[Envelope],
+    payload: &[u32],
+    level_starts: &[u32],
+    envelope: &Envelope,
+    matches: &mut Vec<(u32, u32)>,
+) {
+    matches.clear();
+    if payload.is_empty() {
+        return;
     }
+    let levels = level_starts.len() - 1;
+    // (global node index, level), starting at the root.
+    let mut stack = vec![(boxes.len() - 1, levels - 1)];
+    while let Some((node, level)) = stack.pop() {
+        if !envelopes_intersect(&boxes[node], envelope) {
+            continue;
+        }
+        if level == 0 {
+            matches.push((payload[2 * node], payload[2 * node + 1]));
+            continue;
+        }
+        // A node's children sit in the level below, in its own run.
+        let position = node - level_starts[level] as usize;
+        let start = level_starts[level - 1] as usize + position * INDEX_NODE_SIZE;
+        let end = (start + INDEX_NODE_SIZE).min(level_starts[level] as usize);
+        for child in start..end {
+            stack.push((child, level - 1));
+        }
+    }
+    matches.sort_unstable();
 }
 
 /// Builds the packed index over a densified fixed-point polyline set.
@@ -167,19 +172,12 @@ fn build_index(coordinate_offsets: &[u32], lons: &[i32], lats: &[i32]) -> Packed
     items.sort_unstable_by_key(|&(key, payload, _)| (key, payload));
 
     let count = items.len();
-    let mut level_starts = vec![0u32];
-    let mut total = count;
-    let mut level_size = count;
-    while level_size > 1 {
-        level_starts.push(total as u32);
-        level_size = level_size.div_ceil(INDEX_NODE_SIZE);
-        total += level_size;
-    }
+    let level_starts = level_starts_for(count);
     if count == 0 {
         return PackedIndex {
             boxes: Vec::new(),
             payload: Vec::new(),
-            level_starts: vec![0, 0],
+            level_starts,
         };
     }
     if count == 1 {
@@ -188,11 +186,11 @@ fn build_index(coordinate_offsets: &[u32], lons: &[i32], lats: &[i32]) -> Packed
         return PackedIndex {
             boxes: vec![envelope],
             payload: vec![edge, segment],
-            level_starts: vec![0, 1],
+            level_starts,
         };
     }
-    level_starts.push(total as u32);
 
+    let total = *level_starts.last().unwrap() as usize;
     let mut boxes = Vec::with_capacity(total);
     let mut payload = Vec::with_capacity(count * 2);
     for (_, (edge, segment), envelope) in items {
@@ -220,6 +218,30 @@ fn build_index(coordinate_offsets: &[u32], lons: &[i32], lats: &[i32]) -> Packed
         boxes,
         payload,
         level_starts,
+    }
+}
+
+/// The level-start offsets of a packed index with `count` leaves: each
+/// level's start in the node array (leaves at 0), plus a tail holding the
+/// total node count. A pure function of the leaf count, so an adopted
+/// index never needs them stored.
+fn level_starts_for(count: usize) -> Vec<u32> {
+    let mut level_starts = vec![0u32];
+    let mut total = count;
+    let mut level_size = count;
+    while level_size > 1 {
+        level_starts.push(total as u32);
+        level_size = level_size.div_ceil(INDEX_NODE_SIZE);
+        total += level_size;
+    }
+    match count {
+        0 => vec![0, 0],
+        // A single leaf is its own root: one leaf-only level.
+        1 => vec![0, 1],
+        _ => {
+            level_starts.push(total as u32);
+            level_starts
+        }
     }
 }
 
@@ -343,6 +365,9 @@ pub enum StreetError {
     /// A stop link's fraction is outside [0, 1] or its connector is
     /// negative or not finite.
     InvalidLink { link: usize },
+    /// A mapped array range is out of bounds, misaligned, or shaped
+    /// inconsistently with the index payload.
+    InvalidMapping,
 }
 
 impl std::fmt::Display for StreetError {
@@ -380,6 +405,9 @@ impl std::fmt::Display for StreetError {
                     f,
                     "stop link {link} has a fraction outside [0, 1] or an invalid connector"
                 )
+            }
+            StreetError::InvalidMapping => {
+                write!(f, "a mapped street array is out of bounds or misaligned")
             }
         }
     }
@@ -421,42 +449,183 @@ thread_local! {
         std::cell::RefCell::new(SearchState::default());
 }
 
-/// The walking street graph with its spatial index and stop links.
+/// An immutable byte store backing mapped street arrays — a read-only
+/// memory map of a saved artifact, on the Python side.
+///
+/// The bytes must never change while any [`StreetNetwork`] holds the
+/// store: the network reinterprets them as typed slices, so a mutation
+/// would be undefined behaviour, not just a wrong result. Producers
+/// replace artifacts by writing a new file and atomically renaming it
+/// over the old one — never by editing or truncating in place.
+pub trait Backing: Send + Sync + 'static {
+    fn bytes(&self) -> &[u8];
+}
+
+impl Backing for Vec<u8> {
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+/// A typed view of a byte range inside a [`Backing`] store, resolved and
+/// validated (bounds and alignment) once at adoption.
+#[derive(Debug, Clone, Copy)]
+struct MappedSlice<T> {
+    ptr: *const T,
+    len: usize,
+}
+
+// The slices point into an immutable `Backing` owned by the same
+// `MappedArrays`, so they are as sendable as the store itself.
+unsafe impl<T: Send + Sync> Send for MappedSlice<T> {}
+unsafe impl<T: Send + Sync> Sync for MappedSlice<T> {}
+
+impl<T> MappedSlice<T> {
+    /// Resolves `count` elements at `offset` bytes into `bytes`,
+    /// refusing out-of-bounds or misaligned ranges.
+    fn new(bytes: &[u8], offset: u64, count: u64) -> Option<MappedSlice<T>> {
+        let length = count.checked_mul(std::mem::size_of::<T>() as u64)?;
+        let end = offset.checked_add(length)?;
+        if end > bytes.len() as u64 {
+            return None;
+        }
+        let ptr = bytes[offset as usize..].as_ptr();
+        if !(ptr as usize).is_multiple_of(std::mem::align_of::<T>()) {
+            return None;
+        }
+        Some(MappedSlice {
+            ptr: ptr.cast(),
+            len: count as usize,
+        })
+    }
+
+    fn get(&self) -> &[T] {
+        // SAFETY: `new` validated bounds and alignment against the
+        // backing store, which outlives the slice and never mutates
+        // (the `Backing` contract).
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+/// The persisted street arrays as owned vectors — the build and default
+/// load path.
 #[derive(Debug)]
-pub struct StreetNetwork {
-    /// CSR offsets into the adjacency columns, one entry per vertex plus
-    /// a tail.
+struct OwnedArrays {
     adjacency_offsets: Vec<u32>,
-    /// Outgoing adjacency as parallel columns — target vertex, cost
-    /// meters, edge — with every edge appearing in both directions.
     adj_targets: Vec<u32>,
     adj_meters: Vec<f64>,
     adj_edges: Vec<u32>,
-    /// Edge endpoints, two entries (`from`, `to`) per edge.
     endpoints: Vec<u32>,
-    /// Edge cost lengths in meters (the OSM way length, which the split
-    /// pro-rating distributes; it may differ from the geometric length).
     lengths: Vec<f64>,
-    /// Offsets into the coordinate arrays, one per edge plus a tail. The
-    /// geometry is densified so every segment is at most
-    /// `MAX_SEGMENT_METERS`.
     coordinate_offsets: Vec<u32>,
-    /// Edge geometries in fixed-point geographic coordinates
-    /// (degrees × 10⁷ — see `COORDINATE_SCALE`).
     lons: Vec<i32>,
     lats: Vec<i32>,
-    /// Per-coordinate cumulative true distance from the edge's first point,
-    /// in meters; parallel to `lons`/`lats`. The last point of each edge
-    /// holds the edge's total geometric length.
     cumulative: Vec<f32>,
+    index_boxes: Vec<Envelope>,
+    index_payload: Vec<u32>,
+}
+
+/// The persisted street arrays as typed views into a mapped artifact.
+struct MappedArrays {
+    /// Keeps the mapping alive; every slice below points into it.
+    _backing: std::sync::Arc<dyn Backing>,
+    adjacency_offsets: MappedSlice<u32>,
+    adj_targets: MappedSlice<u32>,
+    adj_meters: MappedSlice<f64>,
+    adj_edges: MappedSlice<u32>,
+    endpoints: MappedSlice<u32>,
+    lengths: MappedSlice<f64>,
+    coordinate_offsets: MappedSlice<u32>,
+    lons: MappedSlice<i32>,
+    lats: MappedSlice<i32>,
+    cumulative: MappedSlice<f32>,
+    index_boxes: MappedSlice<Envelope>,
+    index_payload: MappedSlice<u32>,
+}
+
+impl std::fmt::Debug for MappedArrays {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedArrays")
+            .field("lons", &self.lons.len)
+            .field("endpoints", &self.endpoints.len)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The street arrays behind either backing. Query code reads through the
+/// slice accessors and never touches a concrete field.
+#[derive(Debug)]
+enum Arrays {
+    Owned(OwnedArrays),
+    Mapped(MappedArrays),
+}
+
+macro_rules! array_accessor {
+    ($name:ident, $type:ty) => {
+        fn $name(&self) -> &[$type] {
+            match self {
+                Arrays::Owned(arrays) => &arrays.$name,
+                Arrays::Mapped(arrays) => arrays.$name.get(),
+            }
+        }
+    };
+}
+
+impl Arrays {
+    array_accessor!(adjacency_offsets, u32);
+    array_accessor!(adj_targets, u32);
+    array_accessor!(adj_meters, f64);
+    array_accessor!(adj_edges, u32);
+    array_accessor!(endpoints, u32);
+    array_accessor!(lengths, f64);
+    array_accessor!(coordinate_offsets, u32);
+    array_accessor!(lons, i32);
+    array_accessor!(lats, i32);
+    array_accessor!(cumulative, f32);
+    array_accessor!(index_boxes, Envelope);
+    array_accessor!(index_payload, u32);
+}
+
+/// Where each street array lives inside a mapped artifact: byte offsets
+/// into the backing store plus element counts, as the artifact's
+/// descriptor table records them. The index level starts are not mapped —
+/// they are a pure function of the leaf count and are recomputed.
+pub struct MappedStreets {
+    pub backing: std::sync::Arc<dyn Backing>,
+    pub vertex_count: u32,
+    pub links: Vec<StoredLink>,
+    /// `(byte offset, element count)` per array; offsets are absolute
+    /// within the backing bytes.
+    pub adjacency_offsets: (u64, u64),
+    pub adj_targets: (u64, u64),
+    pub adj_meters: (u64, u64),
+    pub adj_edges: (u64, u64),
+    pub endpoints: (u64, u64),
+    pub lengths: (u64, u64),
+    pub coordinate_offsets: (u64, u64),
+    pub lons: (u64, u64),
+    pub lats: (u64, u64),
+    pub cumulative: (u64, u64),
+    pub index_boxes: (u64, u64),
+    pub index_payload: (u64, u64),
+}
+
+/// The walking street graph with its spatial index and stop links.
+///
+/// The large persisted arrays live behind [`Arrays`] — owned vectors or
+/// typed views into a mapped artifact; queries are identical over both.
+#[derive(Debug)]
+pub struct StreetNetwork {
+    arrays: Arrays,
+    /// Start of each level in the index boxes (leaves at 0), plus a
+    /// tail; derived from the leaf count, tiny, and always owned.
+    level_starts: Vec<u32>,
     /// How each snapped stop enters the graph, endpoints denormalised.
     links: Vec<StoredLink>,
     /// `(vertex, link index)` pairs sorted by vertex — every link listed
     /// under both endpoints of its edge — so a search finds the links
     /// near its reached vertices without scanning all links.
     vertex_links: Vec<(u32, u32)>,
-    /// Spatial index over the edge segments, for envelope queries only.
-    index: PackedIndex,
 }
 
 impl StreetNetwork {
@@ -658,30 +827,34 @@ impl StreetNetwork {
         let vertex_links = build_vertex_links(&links);
 
         Ok(StreetNetwork {
-            adjacency_offsets,
-            adj_targets,
-            adj_meters,
-            adj_edges,
-            endpoints,
-            lengths: edges.iter().map(|&(_, _, meters)| meters).collect(),
-            coordinate_offsets: dense_offsets,
-            lons,
-            lats,
-            cumulative,
+            arrays: Arrays::Owned(OwnedArrays {
+                adjacency_offsets,
+                adj_targets,
+                adj_meters,
+                adj_edges,
+                endpoints,
+                lengths: edges.iter().map(|&(_, _, meters)| meters).collect(),
+                coordinate_offsets: dense_offsets,
+                lons,
+                lats,
+                cumulative,
+                index_boxes: index.boxes,
+                index_payload: index.payload,
+            }),
+            level_starts: index.level_starts,
             links,
             vertex_links,
-            index,
         })
     }
 
     /// Number of street vertices.
     pub fn vertex_count(&self) -> u32 {
-        self.adjacency_offsets.len() as u32 - 1
+        self.arrays.adjacency_offsets().len() as u32 - 1
     }
 
     /// Number of street edges.
     pub fn edge_count(&self) -> u32 {
-        (self.endpoints.len() / 2) as u32
+        (self.arrays.endpoints().len() / 2) as u32
     }
 
     /// Number of stop links.
@@ -689,46 +862,55 @@ impl StreetNetwork {
         self.links.len()
     }
 
+    /// Whether the arrays are views into a mapped artifact.
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.arrays, Arrays::Mapped(_))
+    }
+
     /// An edge's `(from, to)` endpoint vertices.
     fn edge_endpoints(&self, edge: u32) -> (u32, u32) {
+        let endpoints = self.arrays.endpoints();
         (
-            self.endpoints[2 * edge as usize],
-            self.endpoints[2 * edge as usize + 1],
+            endpoints[2 * edge as usize],
+            endpoints[2 * edge as usize + 1],
         )
     }
 
     /// A stored coordinate as float degrees.
     fn coordinate(&self, position: usize) -> (f64, f64) {
-        (degrees(self.lons[position]), degrees(self.lats[position]))
+        (
+            degrees(self.arrays.lons()[position]),
+            degrees(self.arrays.lats()[position]),
+        )
     }
 
     /// A stored cumulative along-distance as f64 meters.
     fn along(&self, position: usize) -> f64 {
-        f64::from(self.cumulative[position])
+        f64::from(self.arrays.cumulative()[position])
     }
 
     /// The network's serializable state.
     pub fn to_parts(&self) -> StreetNetworkParts {
         StreetNetworkParts {
             vertex_count: self.vertex_count(),
-            adjacency_offsets: self.adjacency_offsets.clone(),
-            adj_targets: self.adj_targets.clone(),
-            adj_meters: self.adj_meters.clone(),
-            adj_edges: self.adj_edges.clone(),
-            endpoints: self.endpoints.clone(),
-            lengths: self.lengths.clone(),
-            coordinate_offsets: self.coordinate_offsets.clone(),
-            lons: self.lons.clone(),
-            lats: self.lats.clone(),
-            cumulative: self.cumulative.clone(),
+            adjacency_offsets: self.arrays.adjacency_offsets().to_vec(),
+            adj_targets: self.arrays.adj_targets().to_vec(),
+            adj_meters: self.arrays.adj_meters().to_vec(),
+            adj_edges: self.arrays.adj_edges().to_vec(),
+            endpoints: self.arrays.endpoints().to_vec(),
+            lengths: self.arrays.lengths().to_vec(),
+            coordinate_offsets: self.arrays.coordinate_offsets().to_vec(),
+            lons: self.arrays.lons().to_vec(),
+            lats: self.arrays.lats().to_vec(),
+            cumulative: self.arrays.cumulative().to_vec(),
             index_boxes: self
-                .index
-                .boxes
+                .arrays
+                .index_boxes()
                 .iter()
                 .flat_map(|envelope| *envelope)
                 .collect(),
-            index_payload: self.index.payload.clone(),
-            index_level_starts: self.index.level_starts.clone(),
+            index_payload: self.arrays.index_payload().to_vec(),
+            index_level_starts: self.level_starts.clone(),
             links: self.links.clone(),
         }
     }
@@ -739,30 +921,75 @@ impl StreetNetwork {
     /// denormalised endpoints.
     pub fn from_parts(parts: StreetNetworkParts) -> StreetNetwork {
         let vertex_links = build_vertex_links(&parts.links);
-        let index = PackedIndex {
-            boxes: parts
-                .index_boxes
-                .chunks_exact(4)
-                .map(|chunk| [chunk[0], chunk[1], chunk[2], chunk[3]])
-                .collect(),
-            payload: parts.index_payload,
-            level_starts: parts.index_level_starts,
-        };
         StreetNetwork {
-            adjacency_offsets: parts.adjacency_offsets,
-            adj_targets: parts.adj_targets,
-            adj_meters: parts.adj_meters,
-            adj_edges: parts.adj_edges,
-            endpoints: parts.endpoints,
-            lengths: parts.lengths,
-            coordinate_offsets: parts.coordinate_offsets,
-            lons: parts.lons,
-            lats: parts.lats,
-            cumulative: parts.cumulative,
+            arrays: Arrays::Owned(OwnedArrays {
+                adjacency_offsets: parts.adjacency_offsets,
+                adj_targets: parts.adj_targets,
+                adj_meters: parts.adj_meters,
+                adj_edges: parts.adj_edges,
+                endpoints: parts.endpoints,
+                lengths: parts.lengths,
+                coordinate_offsets: parts.coordinate_offsets,
+                lons: parts.lons,
+                lats: parts.lats,
+                cumulative: parts.cumulative,
+                index_boxes: parts
+                    .index_boxes
+                    .chunks_exact(4)
+                    .map(|chunk| [chunk[0], chunk[1], chunk[2], chunk[3]])
+                    .collect(),
+                index_payload: parts.index_payload,
+            }),
+            level_starts: parts.index_level_starts,
             links: parts.links,
             vertex_links,
-            index,
         }
+    }
+
+    /// Adopts a network whose arrays stay typed views into a mapped
+    /// artifact — no street-sized bytes are read or copied. The caller
+    /// (the artifact loader) has validated the layout against the
+    /// descriptor table; the bounds and alignment checks here are the
+    /// soundness net for constructing the slices, and content stays as
+    /// trusted as the mapping (see [`Backing`]).
+    pub fn from_mapped(spec: MappedStreets) -> Result<StreetNetwork, StreetError> {
+        let bytes = spec.backing.bytes();
+        fn slice<T>(
+            bytes: &[u8],
+            (offset, count): (u64, u64),
+        ) -> Result<MappedSlice<T>, StreetError> {
+            MappedSlice::new(bytes, offset, count).ok_or(StreetError::InvalidMapping)
+        }
+        // Envelopes are stored as flat i32 quadruples.
+        if !spec.index_boxes.1.is_multiple_of(4) {
+            return Err(StreetError::InvalidMapping);
+        }
+        let arrays = MappedArrays {
+            adjacency_offsets: slice(bytes, spec.adjacency_offsets)?,
+            adj_targets: slice(bytes, spec.adj_targets)?,
+            adj_meters: slice(bytes, spec.adj_meters)?,
+            adj_edges: slice(bytes, spec.adj_edges)?,
+            endpoints: slice(bytes, spec.endpoints)?,
+            lengths: slice(bytes, spec.lengths)?,
+            coordinate_offsets: slice(bytes, spec.coordinate_offsets)?,
+            lons: slice(bytes, spec.lons)?,
+            lats: slice(bytes, spec.lats)?,
+            cumulative: slice(bytes, spec.cumulative)?,
+            index_boxes: slice(bytes, (spec.index_boxes.0, spec.index_boxes.1 / 4))?,
+            index_payload: slice(bytes, spec.index_payload)?,
+            _backing: spec.backing,
+        };
+        let level_starts = level_starts_for(arrays.index_payload.len / 2);
+        if *level_starts.last().unwrap() as usize != arrays.index_boxes.len {
+            return Err(StreetError::InvalidMapping);
+        }
+        let vertex_links = build_vertex_links(&spec.links);
+        Ok(StreetNetwork {
+            arrays: Arrays::Mapped(arrays),
+            level_starts,
+            links: spec.links,
+            vertex_links,
+        })
     }
 
     /// Snaps a coordinate to its nearest edge within `max_snap_distance`
@@ -783,7 +1010,7 @@ impl StreetNetwork {
         // winner is a function of the built network, not of index internals.
         let envelope = snap_envelope(latitude, longitude, max_snap_distance);
         let mut candidates = Vec::new();
-        self.index.query_into(&envelope, &mut candidates);
+        self.query_index_into(&envelope, &mut candidates);
         let mut best: Option<Snap> = None;
         for (edge, start) in candidates {
             let (connector, fraction) = self.foot_on_segment(latitude, longitude, edge, start);
@@ -802,6 +1029,18 @@ impl StreetNetwork {
             }
         }
         best
+    }
+
+    /// Collects the payloads of every packed-index leaf whose box
+    /// intersects the envelope, through the array accessors.
+    fn query_index_into(&self, envelope: &Envelope, matches: &mut Vec<(u32, u32)>) {
+        query_packed_index(
+            self.arrays.index_boxes(),
+            self.arrays.index_payload(),
+            &self.level_starts,
+            envelope,
+            matches,
+        );
     }
 
     /// The exact connector distance and true-length fraction of a query's
@@ -833,7 +1072,7 @@ impl StreetNetwork {
         let (px, py) = (ax + t * dx, ay + t * dy);
         let connector = (px * px + py * py).sqrt();
 
-        let end = self.coordinate_offsets[edge as usize + 1] as usize;
+        let end = self.arrays.coordinate_offsets()[edge as usize + 1] as usize;
         let along = self.along(a) + t * (self.along(b) - self.along(a));
         let total = self.along(end - 1);
         let fraction = if total > 0.0 { along / total } else { 0.0 };
@@ -866,7 +1105,7 @@ impl StreetNetwork {
         let snap = self.snap(latitude, longitude, max_snap_distance)?;
         let cutoff = max_seconds * walking_speed;
         let (from, to) = self.edge_endpoints(snap.edge);
-        let length = self.lengths[snap.edge as usize];
+        let length = self.arrays.lengths()[snap.edge as usize];
         SEARCH_STATE.with(|cell| {
             let state = &mut cell.borrow_mut();
             self.bounded_dijkstra(
@@ -895,7 +1134,7 @@ impl StreetNetwork {
             for index in candidates {
                 let link = &self.links[index as usize];
                 let (link_from, link_to) = (link.from, link.to);
-                let link_length = self.lengths[link.edge as usize];
+                let link_length = self.arrays.lengths()[link.edge as usize];
                 let mut meters = f64::min(
                     state.distance(link_from) + link.fraction * link_length,
                     state.distance(link_to) + (1.0 - link.fraction) * link_length,
@@ -994,8 +1233,8 @@ impl StreetNetwork {
         to_point: (f64, f64),
         to: &Snap,
     ) -> Option<(Vec<(f64, f64)>, f64)> {
-        let from_length = self.lengths[from.edge as usize];
-        let to_length = self.lengths[to.edge as usize];
+        let from_length = self.arrays.lengths()[from.edge as usize];
+        let to_length = self.arrays.lengths()[to.edge as usize];
         // The direct candidate: both points on one edge.
         let direct = (from.edge == to.edge).then(|| {
             from.connector + (from.fraction - to.fraction).abs() * from_length + to.connector
@@ -1105,6 +1344,10 @@ impl StreetNetwork {
         state: &mut SearchState,
     ) {
         state.clear();
+        let adjacency_offsets = self.arrays.adjacency_offsets();
+        let adj_targets = self.arrays.adj_targets();
+        let adj_meters = self.arrays.adj_meters();
+        let adj_edges = self.arrays.adj_edges();
         for &(vertex, distance) in sources {
             if distance < state.distance(vertex) {
                 state.distances.insert(vertex, distance);
@@ -1125,16 +1368,14 @@ impl StreetNetwork {
             if settled_a && settled_b {
                 break;
             }
-            let start = self.adjacency_offsets[vertex as usize] as usize;
-            let end = self.adjacency_offsets[vertex as usize + 1] as usize;
+            let start = adjacency_offsets[vertex as usize] as usize;
+            let end = adjacency_offsets[vertex as usize + 1] as usize;
             for slot in start..end {
-                let target = self.adj_targets[slot];
-                let next = distance + self.adj_meters[slot];
+                let target = adj_targets[slot];
+                let next = distance + adj_meters[slot];
                 if next < state.distance(target) {
                     state.distances.insert(target, next);
-                    state
-                        .previous
-                        .insert(target, (vertex, self.adj_edges[slot]));
+                    state.previous.insert(target, (vertex, adj_edges[slot]));
                     state.heap.push(Reverse((next.to_bits(), target)));
                 }
             }
@@ -1143,8 +1384,8 @@ impl StreetNetwork {
 
     /// The `(lon, lat)` point at a fraction of an edge's true length.
     fn point_at(&self, edge: u32, fraction: f64) -> (f64, f64) {
-        let start = self.coordinate_offsets[edge as usize] as usize;
-        let end = self.coordinate_offsets[edge as usize + 1] as usize;
+        let start = self.arrays.coordinate_offsets()[edge as usize] as usize;
+        let end = self.arrays.coordinate_offsets()[edge as usize + 1] as usize;
         let total = self.along(end - 1);
         self.interpolate(start, end, fraction.clamp(0.0, 1.0) * total)
     }
@@ -1153,8 +1394,8 @@ impl StreetNetwork {
     /// length, endpoints interpolated; reversed when `from_fraction >
     /// to_fraction`. Always at least one point.
     fn edge_slice(&self, edge: u32, from_fraction: f64, to_fraction: f64) -> Vec<(f64, f64)> {
-        let start = self.coordinate_offsets[edge as usize] as usize;
-        let end = self.coordinate_offsets[edge as usize + 1] as usize;
+        let start = self.arrays.coordinate_offsets()[edge as usize] as usize;
+        let end = self.arrays.coordinate_offsets()[edge as usize + 1] as usize;
         let total = self.along(end - 1);
         let (low, high, reversed) = if from_fraction <= to_fraction {
             (from_fraction, to_fraction, false)
@@ -1214,6 +1455,9 @@ impl StreetNetwork {
     /// search state; only vertices within `cutoff` are reached.
     fn bounded_dijkstra(&self, sources: &[(u32, f64)], cutoff: f64, state: &mut SearchState) {
         state.clear();
+        let adjacency_offsets = self.arrays.adjacency_offsets();
+        let adj_targets = self.arrays.adj_targets();
+        let adj_meters = self.arrays.adj_meters();
         for &(vertex, distance) in sources {
             if distance <= cutoff + 1e-9 && distance < state.distance(vertex) {
                 state.distances.insert(vertex, distance);
@@ -1225,11 +1469,11 @@ impl StreetNetwork {
             if distance > state.distance(vertex) {
                 continue;
             }
-            let start = self.adjacency_offsets[vertex as usize] as usize;
-            let end = self.adjacency_offsets[vertex as usize + 1] as usize;
+            let start = adjacency_offsets[vertex as usize] as usize;
+            let end = adjacency_offsets[vertex as usize + 1] as usize;
             for slot in start..end {
-                let target = self.adj_targets[slot];
-                let next = distance + self.adj_meters[slot];
+                let target = adj_targets[slot];
+                let next = distance + adj_meters[slot];
                 if next <= cutoff + 1e-9 && next < state.distance(target) {
                     state.distances.insert(target, next);
                     state.heap.push(Reverse((next.to_bits(), target)));
@@ -1243,7 +1487,7 @@ impl StreetNetwork {
 /// arrays a container stores raw, plus the small link records and scalars
 /// it stores decoded. The spatial index rides along as plain arrays;
 /// nothing is rebuilt on adoption except the L-sized vertex→link index.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct StreetNetworkParts {
     pub vertex_count: u32,
     pub adjacency_offsets: Vec<u32>,
@@ -1668,9 +1912,9 @@ mod tests {
             vec![],
         )
         .unwrap();
-        let count = network.coordinate_offsets[1] as usize;
+        let count = network.arrays.coordinate_offsets()[1] as usize;
         assert!(count >= 51, "expected >=51 densified points, got {count}");
-        for pair in network.lats.windows(2) {
+        for pair in network.arrays.lats().windows(2) {
             let seg = segment_length(25.0, degrees(pair[0]), 25.0, degrees(pair[1]));
             assert!(seg <= MAX_SEGMENT_METERS + 1e-6, "segment {seg} m too long");
         }
@@ -1702,7 +1946,12 @@ mod tests {
             vec![],
         )
         .unwrap();
-        for (lons, lats) in network.lons.windows(2).zip(network.lats.windows(2)) {
+        for (lons, lats) in network
+            .arrays
+            .lons()
+            .windows(2)
+            .zip(network.arrays.lats().windows(2))
+        {
             let seg = segment_length(
                 degrees(lons[0]),
                 degrees(lats[0]),
@@ -2196,7 +2445,13 @@ mod tests {
                 quantize(lon + dlon),
                 quantize(lat + dlat),
             ];
-            index.query_into(&envelope, &mut matches);
+            query_packed_index(
+                &index.boxes,
+                &index.payload,
+                &index.level_starts,
+                &envelope,
+                &mut matches,
+            );
             let mut expected: Vec<(u32, u32)> = scan
                 .iter()
                 .filter(|(_, envelope_b)| envelopes_intersect(&envelope, envelope_b))
@@ -2293,5 +2548,129 @@ mod tests {
         assert!((snap.connector - 5.0).abs() < 0.05);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
         assert_walks(&reached, &[(0, 30)]);
+    }
+
+    /// Lays a network's parts out as a mapped artifact would: each array's
+    /// native-endian bytes at the next 8-byte boundary of one buffer.
+    fn mapped_from(owned: &StreetNetwork) -> StreetNetwork {
+        fn push<T: Copy>(bytes: &mut Vec<u8>, values: &[T]) -> (u64, u64) {
+            while !bytes.len().is_multiple_of(8) {
+                bytes.push(0);
+            }
+            let offset = bytes.len() as u64;
+            // SAFETY: the arrays are plain-old-data numeric types.
+            let raw = unsafe {
+                std::slice::from_raw_parts(
+                    values.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(values),
+                )
+            };
+            bytes.extend_from_slice(raw);
+            (offset, values.len() as u64)
+        }
+        let parts = owned.to_parts();
+        let mut bytes = Vec::new();
+        let adjacency_offsets = push(&mut bytes, &parts.adjacency_offsets);
+        let adj_targets = push(&mut bytes, &parts.adj_targets);
+        let adj_meters = push(&mut bytes, &parts.adj_meters);
+        let adj_edges = push(&mut bytes, &parts.adj_edges);
+        let endpoints = push(&mut bytes, &parts.endpoints);
+        let lengths = push(&mut bytes, &parts.lengths);
+        let coordinate_offsets = push(&mut bytes, &parts.coordinate_offsets);
+        let lons = push(&mut bytes, &parts.lons);
+        let lats = push(&mut bytes, &parts.lats);
+        let cumulative = push(&mut bytes, &parts.cumulative);
+        let index_boxes = push(&mut bytes, &parts.index_boxes);
+        let index_payload = push(&mut bytes, &parts.index_payload);
+        StreetNetwork::from_mapped(MappedStreets {
+            backing: std::sync::Arc::new(bytes),
+            vertex_count: parts.vertex_count,
+            links: parts.links,
+            adjacency_offsets,
+            adj_targets,
+            adj_meters,
+            adj_edges,
+            endpoints,
+            lengths,
+            coordinate_offsets,
+            lons,
+            lats,
+            cumulative,
+            index_boxes,
+            index_payload,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn mapped_networks_match_owned() {
+        let owned = network(
+            4,
+            2,
+            &[
+                (0, 1, 400.0, straight((0.0, 0.0), (400.0, 0.0))),
+                (1, 2, 300.0, straight((400.0, 0.0), (400.0, 300.0))),
+                (2, 3, 200.0, straight((400.0, 300.0), (600.0, 300.0))),
+            ],
+            vec![link(0, 1, 0.5, 10.0), link(1, 2, 1.0, 0.0)],
+        )
+        .unwrap();
+        let mapped = mapped_from(&owned);
+        assert!(mapped.is_mapped() && !owned.is_mapped());
+        // The mapped view serializes back to the identical parts …
+        assert_eq!(mapped.to_parts(), owned.to_parts());
+        // … and answers queries identically.
+        for &(x, y) in &[(50.0, 5.0), (400.0, 150.0), (590.0, 290.0)] {
+            let (lon, lat) = lonlat(x, y);
+            assert_eq!(mapped.snap(lat, lon, 100.0), owned.snap(lat, lon, 100.0));
+            assert_eq!(
+                mapped.access_stops(lat, lon, 1.0, 1200.0, 100.0),
+                owned.access_stops(lat, lon, 1.0, 1200.0, 100.0)
+            );
+        }
+        let from = owned.snap(lonlat(50.0, 5.0).1, lonlat(50.0, 5.0).0, 100.0);
+        let to = owned.snap(lonlat(590.0, 290.0).1, lonlat(590.0, 290.0).0, 100.0);
+        let (from, to) = (from.unwrap(), to.unwrap());
+        let from_point = (lonlat(50.0, 5.0).1, lonlat(50.0, 5.0).0);
+        let to_point = (lonlat(590.0, 290.0).1, lonlat(590.0, 290.0).0);
+        assert_eq!(
+            mapped.walk_path(from_point, &from, to_point, &to),
+            owned.walk_path(from_point, &from, to_point, &to)
+        );
+    }
+
+    #[test]
+    fn mapped_adoption_refuses_misaligned_or_truncated_ranges() {
+        let owned = network(
+            2,
+            1,
+            &[(0, 1, 50.0, straight((0.0, 0.0), (50.0, 0.0)))],
+            vec![link(0, 0, 1.0, 0.0)],
+        )
+        .unwrap();
+        let parts = owned.to_parts();
+        let backing: std::sync::Arc<dyn Backing> = std::sync::Arc::new(vec![0u8; 64]);
+        let spec = |lengths: (u64, u64)| MappedStreets {
+            backing: backing.clone(),
+            vertex_count: parts.vertex_count,
+            links: parts.links.clone(),
+            adjacency_offsets: (0, 3),
+            adj_targets: (16, 2),
+            adj_meters: (24, 2),
+            adj_edges: (40, 2),
+            endpoints: (48, 2),
+            lengths,
+            coordinate_offsets: (0, 2),
+            lons: (0, 2),
+            lats: (0, 2),
+            cumulative: (0, 2),
+            index_boxes: (0, 4),
+            index_payload: (0, 2),
+        };
+        // An f64 array at a 4-byte offset is misaligned; one past the
+        // buffer is out of bounds.
+        assert!(StreetNetwork::from_mapped(spec((4, 1))).is_err());
+        assert!(StreetNetwork::from_mapped(spec((56, 2))).is_err());
+        assert!(StreetNetwork::from_mapped(spec((56, 1))).is_ok());
     }
 }

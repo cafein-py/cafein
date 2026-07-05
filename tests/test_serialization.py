@@ -1,5 +1,8 @@
 """Saving and loading network artifacts."""
 
+import multiprocessing
+import os
+
 import numpy as np
 import pytest
 
@@ -7,11 +10,39 @@ from cafein import TransportNetwork
 
 
 @pytest.fixture(scope="module")
-def reloaded(network_with_footpaths, tmp_path_factory):
-    """The street-enabled Helsinki network, round-tripped through disk."""
+def artifact_path(network_with_footpaths, tmp_path_factory):
+    """The street-enabled Helsinki network saved to disk once."""
     path = tmp_path_factory.mktemp("artifact") / "helsinki.cafein"
     network_with_footpaths.save(path)
-    return TransportNetwork.load(path)
+    return path
+
+
+@pytest.fixture(scope="module")
+def reloaded(artifact_path):
+    """The street-enabled Helsinki network, round-tripped through disk."""
+    return TransportNetwork.load(artifact_path)
+
+
+@pytest.fixture(scope="module")
+def mmap_available(artifact_path):
+    """Whether this environment can memory-map artifacts."""
+    return TransportNetwork.load(artifact_path, mmap=True).mapped
+
+
+def _streets_section(path):
+    """The (offset, length) of an artifact's STREETS section."""
+    with open(path, "rb") as artifact:
+        header = artifact.read(4096)
+    assert header[:8] == b"CAFEINET"
+    cursor = 14 + int.from_bytes(header[12:14], "little") + 4
+    sections = {}
+    for _ in range(2):
+        tag = int.from_bytes(header[cursor : cursor + 2], "little")
+        offset = int.from_bytes(header[cursor + 2 : cursor + 10], "little")
+        length = int.from_bytes(header[cursor + 10 : cursor + 18], "little")
+        sections[tag] = (offset, length)
+        cursor += 22
+    return sections[2]
 
 
 def test_round_trip_preserves_the_network(network_with_footpaths, reloaded):
@@ -68,6 +99,8 @@ def test_loaded_networks_save_again(reloaded, tmp_path):
     twice = TransportNetwork.load(path)
     assert twice.stop_count == reloaded.stop_count
     assert twice.transfer_count == reloaded.transfer_count
+    # The staged temp file was renamed into place, not left behind.
+    assert [entry.name for entry in tmp_path.iterdir()] == ["again.cafein"]
 
 
 def test_load_refuses_foreign_and_future_files(tmp_path):
@@ -113,7 +146,9 @@ def test_load_refuses_corrupted_payloads(tmp_path):
         TransportNetwork.load(path)
 
 
-def test_load_refuses_corrupted_street_sections(network_with_footpaths, tmp_path):
+def test_load_refuses_corrupted_street_sections(
+    network_with_footpaths, mmap_available, tmp_path
+):
     # The last byte of a street-enabled artifact sits in the raw STREETS
     # section; flipping it must fail that section's checksum.
     path = tmp_path / "streets.cafein"
@@ -123,6 +158,13 @@ def test_load_refuses_corrupted_street_sections(network_with_footpaths, tmp_path
     path.write_bytes(bytes(blob))
     with pytest.raises(ValueError, match="checksum mismatch"):
         TransportNetwork.load(path)
+    # A mapped load checksums the streets only when asked: verify=True
+    # detects the corruption, the lazy default trusts the content.
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        TransportNetwork.load(path, mmap=True, verify=True)
+    if mmap_available:
+        lazy = TransportNetwork.load(path, mmap=True)
+        assert lazy.stop_count == network_with_footpaths.stop_count
 
 
 def test_load_refuses_truncated_payloads(tmp_path):
@@ -137,3 +179,127 @@ def test_load_refuses_truncated_payloads(tmp_path):
     path.write_bytes(blob[: len(blob) // 2])
     with pytest.raises(ValueError, match="section bounds"):
         TransportNetwork.load(path)
+
+
+def test_mapped_loads_match_owned(
+    network_with_footpaths, artifact_path, mmap_available
+):
+    if not mmap_available:
+        pytest.skip("memory mapping unavailable in this environment")
+    mapped = TransportNetwork.load(artifact_path, mmap=True)
+    assert mapped.mapped and not network_with_footpaths.mapped
+    coordinates = {stop: (lat, lon) for stop, lat, lon in mapped.stops}
+    origin = coordinates["1100602"]
+    destination = coordinates["1040280"]
+    assert mapped.route_between_coordinates(
+        origin, destination, "2022-02-22", "08:30:00"
+    ) == network_with_footpaths.route_between_coordinates(
+        origin, destination, "2022-02-22", "08:30:00"
+    )
+    assert mapped.access_stops(*origin) == network_with_footpaths.access_stops(*origin)
+    origins = ["4810551", "1100602"]
+    assert np.array_equal(
+        mapped.travel_time_matrix(origins, "2022-02-22", "08:30:00"),
+        network_with_footpaths.travel_time_matrix(origins, "2022-02-22", "08:30:00"),
+    )
+
+
+def test_mapped_loads_fall_back_when_mapping_is_unavailable(artifact_path, monkeypatch):
+    monkeypatch.setenv("CAFEIN_DISABLE_MMAP", "1")
+    fallback = TransportNetwork.load(artifact_path, mmap=True)
+    assert not fallback.mapped
+    assert fallback.access_stops(60.169, 24.941)
+    with pytest.raises(ValueError, match="CAFEIN_DISABLE_MMAP"):
+        TransportNetwork.load(artifact_path, mmap="require")
+    with pytest.raises(ValueError, match="mmap must be"):
+        TransportNetwork.load(artifact_path, mmap="sometimes")
+
+
+def test_mapped_loads_read_no_street_bytes(artifact_path, mmap_available):
+    if not mmap_available:
+        pytest.skip("memory mapping unavailable in this environment")
+    length = _streets_section(artifact_path)[1]
+    assert length > 0
+    mapped = TransportNetwork.load(artifact_path, mmap=True)
+    assert mapped._core._streets_bytes_read == 0
+    owned = TransportNetwork.load(artifact_path)
+    assert owned._core._streets_bytes_read == length
+    verified = TransportNetwork.load(artifact_path, mmap=True, verify=True)
+    assert verified._core._streets_bytes_read == length
+
+
+def test_mapped_street_pages_stay_cold_after_load(artifact_path, mmap_available):
+    # The strong laziness observable: evict the artifact from the page
+    # cache, load it mapped, and require the STREETS pages still cold —
+    # any loader scan of the section would page it back in wholesale.
+    if not mmap_available or not hasattr(os, "posix_fadvise"):
+        pytest.skip("needs memory mapping and posix_fadvise")
+    import ctypes
+    import mmap as mmap_module
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    if not hasattr(libc, "mincore"):
+        pytest.skip("needs mincore")
+    offset, length = _streets_section(artifact_path)
+    page = mmap_module.PAGESIZE
+
+    def resident_street_bytes():
+        # A private copy-on-write mapping: never written, so mincore sees
+        # the shared page-cache pages, while the buffer stays writable
+        # (ctypes.from_buffer refuses the read-only mapping's buffer).
+        with open(artifact_path, "rb") as artifact:
+            view = mmap_module.mmap(
+                artifact.fileno(),
+                0,
+                prot=mmap_module.PROT_READ | mmap_module.PROT_WRITE,
+                flags=mmap_module.MAP_PRIVATE,
+            )
+        try:
+            buffer = ctypes.c_char.from_buffer(view)
+            pages = (view.size() + page - 1) // page
+            flags = (ctypes.c_ubyte * pages)()
+            failed = libc.mincore(
+                ctypes.c_void_p(ctypes.addressof(buffer)),
+                ctypes.c_size_t(view.size()),
+                flags,
+            )
+            del buffer
+            if failed:
+                pytest.skip("mincore is unavailable")
+            first = offset // page
+            last = (offset + length + page - 1) // page
+            return sum(flag & 1 for flag in flags[first:last]) * page
+        finally:
+            view.close()
+
+    with open(artifact_path, "rb") as artifact:
+        os.fsync(artifact.fileno())
+        os.posix_fadvise(artifact.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    if resident_street_bytes() > 16 * page:
+        pytest.skip("the page cache did not evict the artifact")
+    network = TransportNetwork.load(artifact_path, mmap=True)
+    assert network.mapped
+    # Kernel readahead around META may pull a sliver of STREETS in; a
+    # scan would page in the whole section.
+    assert resident_street_bytes() < max(length // 20, 4 * 1024 * 1024)
+
+
+def _mapped_walks(args):
+    path, lat, lon = args
+    network = TransportNetwork.load(path, mmap="require")
+    assert network.mapped
+    return network.access_stops(lat, lon)
+
+
+def test_mapped_artifacts_serve_concurrent_processes(
+    network_with_footpaths, artifact_path, mmap_available
+):
+    if not mmap_available:
+        pytest.skip("memory mapping unavailable in this environment")
+    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+    lat, lon = coordinates["1100602"]
+    context = multiprocessing.get_context("spawn")
+    with context.Pool(2) as pool:
+        results = pool.map(_mapped_walks, [(str(artifact_path), lat, lon)] * 2)
+    expected = network_with_footpaths.access_stops(lat, lon)
+    assert results == [expected, expected]
