@@ -5,7 +5,9 @@
 For every shared scenario — a travel-time matrix and detailed itineraries —
 this runs both engines on the shared Helsinki sample data and records, per
 engine, the network build time, the compute time, and peak memory, then reports
-how closely the two agree on the results. Each engine runs in its own
+how closely the two agree on the results. r5py caches built networks, so its
+cache is cleared before it builds and its build time is measured cold, like
+cafein's. Each engine runs in its own
 subprocess; the parent samples that subprocess's whole process tree with psutil
 for peak memory (so a JVM child or worker threads are counted), enforces a
 per-engine timeout, and records a crash or out-of-memory kill as a status
@@ -35,6 +37,7 @@ if your r5py version differs.
 import argparse
 import datetime
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -64,7 +67,6 @@ WALKING_SPEED_KMPH = 3.6
 # Detailed itineraries are one search per OD pair, so they run over a small
 # central corner of the stop sample.
 ITINERARY_POINTS = 5
-ITINERARY_SNAP_METERS = 250.0
 # Travel times within this many minutes count as agreeing.
 TOLERANCE_MINUTES = 1.0
 # Per-engine wall-clock limit and how often the parent samples memory.
@@ -140,7 +142,6 @@ def cafein_detailed_itineraries(network, origins, destinations):
         destinations=destinations,
         date=DATE,
         departure=DEPARTURE,
-        max_snap_distance=ITINERARY_SNAP_METERS,
     )
     frame = pd.DataFrame(itineraries.drop(columns="geometry"))
     if frame.empty:
@@ -389,6 +390,31 @@ def _mb(peak_bytes):
 def _last_line(path):
     text = pathlib.Path(path).read_text().strip() if pathlib.Path(path).exists() else ""
     return text.splitlines()[-1] if text else "no error output"
+
+
+def clear_r5py_network_cache():
+    """Delete r5py's cached transport networks so its build is measured cold.
+
+    r5py caches a built network under its cache dir keyed by input; left in
+    place, the "build" is a deserialize, not a from-OSM+GTFS build, and its
+    time is not comparable to cafein's. The R5 jar in the same dir is kept.
+    """
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME")
+    cache = (
+        pathlib.Path(base) / "r5py" if base else pathlib.Path.home() / ".cache" / "r5py"
+    )
+    if not cache.is_dir():
+        return
+    removed = 0
+    for pattern in ("*.transport_network", "*.mapdb", "*.mapdb.p", "*.warnings"):
+        for path in cache.glob(pattern):
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            removed += 1
+    if removed:
+        print(f"cleared {removed} cached r5py network file(s) for a cold build")
 
 
 def launch_worker(engine, origins, seed, outdir, scenarios, timeout):
@@ -646,12 +672,13 @@ def main():
         f"(itineraries over {ITINERARY_POINTS}); results in {outdir}"
     )
 
-    per_engine = {
-        engine: launch_worker(
+    per_engine = {}
+    for engine in engines:
+        if engine == "r5py":
+            clear_r5py_network_cache()
+        per_engine[engine] = launch_worker(
             engine, args.origins, args.seed, outdir, scenarios, args.timeout
         )
-        for engine in engines
-    }
 
     print_perf(per_engine, scenarios)
 

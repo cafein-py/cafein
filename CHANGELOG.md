@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Default street-search parameters now match r5py's, so door-to-door and
+  point-matrix results line up with r5py out of the box. The stop/coordinate
+  snap radius is 300 m (R5's street-link radius, was 100 m), so a stop up to
+  300 m from the walking network attaches to it instead of being silently
+  unroutable. The query-time access/egress walking cutoff is 7200 s (two
+  hours, r5py's ``max_time_walking``) and is now separate from the 600 s
+  footpath/transfer cutoff. The default maximum transfers is 7 (r5py's eight
+  public-transport rides, was 4). Pass explicit ``max_snap_distance``,
+  ``max_walking_time``, or ``max_transfers`` to override.
+
 - Geographic street index: the walking street network is stored in
   geographic coordinates and distances use a local ``cos(latitude)``
   evaluated at the point's own latitude, replacing the single

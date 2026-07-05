@@ -73,7 +73,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         Service date as ``YYYY-MM-DD``.
     departure : str
         Departure time at every origin as ``HH:MM:SS``.
-    max_transfers : int (optional, default: 4)
+    max_transfers : int (optional, default: 7)
         Maximum number of transfers between rides.
     factors : DataFrame or path (optional)
         Extra emission-factor rows layered over the shipped defaults;
@@ -102,7 +102,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         date=None,
         departure=None,
         *,
-        max_transfers=4,
+        max_transfers=7,
         factors=None,
         components=None,
         geometries=True,
