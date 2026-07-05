@@ -44,11 +44,34 @@ use crate::timetable::StopIdx;
 /// millimetre even at high latitude.
 const MAX_SEGMENT_METERS: f64 = 100.0;
 
+/// Headroom the densifier leaves under `MAX_SEGMENT_METERS`, so re-quantizing
+/// the inserted points (≤ ~0.8 cm each) never pushes a segment over the
+/// maximum.
+const QUANTIZATION_GUARD_METERS: f64 = 0.05;
+
+/// Fixed-point coordinate scale: degrees × 10⁷ stored as `i32`
+/// (≈ 1.1 cm of latitude per step; ±180° fits comfortably).
+const COORDINATE_SCALE: f64 = 1e7;
+
 /// Children per packed-index node.
 const INDEX_NODE_SIZE: usize = 16;
 
-/// A lon/lat bounding box: `[min_lon, min_lat, max_lon, max_lat]`.
-type Envelope = [f64; 4];
+/// A fixed-point degree value from a float one, rounding to the nearest
+/// grid step (ties to even).
+fn quantize(degrees: f64) -> i32 {
+    (degrees * COORDINATE_SCALE)
+        .round_ties_even()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+/// The float degree value of a fixed-point one.
+fn degrees(fixed: i32) -> f64 {
+    f64::from(fixed) / COORDINATE_SCALE
+}
+
+/// A lon/lat bounding box in fixed-point coordinates:
+/// `[min_lon, min_lat, max_lon, max_lat]`.
+type Envelope = [i32; 4];
 
 fn envelopes_intersect(a: &Envelope, b: &Envelope) -> bool {
     a[0] <= b[2] && b[0] <= a[2] && a[1] <= b[3] && b[1] <= a[3]
@@ -58,15 +81,17 @@ fn envelopes_intersect(a: &Envelope, b: &Envelope) -> bool {
 /// boxes sorted by the Hilbert position of their segment's midpoint, parent
 /// levels packed bottom-up over runs of `INDEX_NODE_SIZE` children — flat
 /// arrays with an implicit tree layout, built once and never mutated.
-/// Queried by envelope intersection only.
+/// Queried by envelope intersection only. Boxes are exact in the
+/// fixed-point grid (the coordinates are grid points), so only query
+/// envelopes need outward rounding.
 #[derive(Debug)]
 struct PackedIndex {
     /// Node boxes: the leaves first (Hilbert order), then each parent
     /// level, the root last.
     boxes: Vec<Envelope>,
-    /// Per-leaf `(edge index, index of the segment's first coordinate)`,
-    /// parallel to the leaf boxes.
-    payload: Vec<(u32, u32)>,
+    /// Two entries per leaf — `edge index, index of the segment's first
+    /// coordinate` — parallel to the leaf boxes.
+    payload: Vec<u32>,
     /// Start of each level in `boxes` (leaves at 0), plus a tail.
     level_starts: Vec<u32>,
 }
@@ -87,7 +112,7 @@ impl PackedIndex {
                 continue;
             }
             if level == 0 {
-                matches.push(self.payload[node]);
+                matches.push((self.payload[2 * node], self.payload[2 * node + 1]));
                 continue;
             }
             // A node's children sit in the level below, in its own run.
@@ -102,8 +127,8 @@ impl PackedIndex {
     }
 }
 
-/// Builds the packed index over a densified polyline set.
-fn build_index(coordinate_offsets: &[u32], lons: &[f64], lats: &[f64]) -> PackedIndex {
+/// Builds the packed index over a densified fixed-point polyline set.
+fn build_index(coordinate_offsets: &[u32], lons: &[i32], lats: &[i32]) -> PackedIndex {
     // One item per consecutive coordinate pair, keyed by the Hilbert
     // position of its midpoint on a grid over the extract; ties broken by
     // the payload so the order is a pure function of the geometry.
@@ -116,8 +141,16 @@ fn build_index(coordinate_offsets: &[u32], lons: &[f64], lats: &[f64]) -> Packed
             let (lon_a, lat_a) = (lons[segment], lats[segment]);
             let (lon_b, lat_b) = (lons[segment + 1], lats[segment + 1]);
             let key = hilbert(
-                grid_position((lon_a + lon_b) / 2.0, bounds[0], bounds[2]),
-                grid_position((lat_a + lat_b) / 2.0, bounds[1], bounds[3]),
+                grid_position(
+                    ((i64::from(lon_a) + i64::from(lon_b)) / 2) as i32,
+                    bounds[0],
+                    bounds[2],
+                ),
+                grid_position(
+                    ((i64::from(lat_a) + i64::from(lat_b)) / 2) as i32,
+                    bounds[1],
+                    bounds[3],
+                ),
             );
             items.push((
                 key,
@@ -151,20 +184,21 @@ fn build_index(coordinate_offsets: &[u32], lons: &[f64], lats: &[f64]) -> Packed
     }
     if count == 1 {
         // A single leaf is its own root: one leaf-only level.
-        let (_, tag, envelope) = items[0];
+        let (_, (edge, segment), envelope) = items[0];
         return PackedIndex {
             boxes: vec![envelope],
-            payload: vec![tag],
+            payload: vec![edge, segment],
             level_starts: vec![0, 1],
         };
     }
     level_starts.push(total as u32);
 
     let mut boxes = Vec::with_capacity(total);
-    let mut payload = Vec::with_capacity(count);
-    for (_, tag, envelope) in items {
+    let mut payload = Vec::with_capacity(count * 2);
+    for (_, (edge, segment), envelope) in items {
         boxes.push(envelope);
-        payload.push(tag);
+        payload.push(edge);
+        payload.push(segment);
     }
     for level in 1..level_starts.len() - 1 {
         let (start, end) = (
@@ -189,14 +223,10 @@ fn build_index(coordinate_offsets: &[u32], lons: &[f64], lats: &[f64]) -> Packed
     }
 }
 
-/// The `[min_lon, min_lat, max_lon, max_lat]` bounds of a coordinate set.
-fn coordinate_bounds(lons: &[f64], lats: &[f64]) -> Envelope {
-    let mut bounds = [
-        f64::INFINITY,
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-        f64::NEG_INFINITY,
-    ];
+/// The `[min_lon, min_lat, max_lon, max_lat]` bounds of a fixed-point
+/// coordinate set.
+fn coordinate_bounds(lons: &[i32], lats: &[i32]) -> Envelope {
+    let mut bounds = [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
     for (&lon, &lat) in lons.iter().zip(lats) {
         bounds[0] = bounds[0].min(lon);
         bounds[1] = bounds[1].min(lat);
@@ -207,11 +237,13 @@ fn coordinate_bounds(lons: &[f64], lats: &[f64]) -> Envelope {
 }
 
 /// A coordinate's cell on a 2¹⁶-wide grid over `[min, max]`.
-fn grid_position(value: f64, min: f64, max: f64) -> u16 {
+fn grid_position(value: i32, min: i32, max: i32) -> u16 {
     if max <= min {
         return 0;
     }
-    (((value - min) / (max - min)) * f64::from(u16::MAX)).clamp(0.0, f64::from(u16::MAX)) as u16
+    let fraction =
+        (i64::from(value) - i64::from(min)) as f64 / (i64::from(max) - i64::from(min)) as f64;
+    (fraction * f64::from(u16::MAX)).clamp(0.0, f64::from(u16::MAX)) as u16
 }
 
 /// A cell's position along the order-16 Hilbert curve (the classic
@@ -250,6 +282,23 @@ pub struct StopLink {
     pub fraction: f64,
     /// Straight-line distance from the stop to the snap point, in meters.
     pub connector: f64,
+}
+
+/// A stop link as the network stores it: the input [`StopLink`] with its
+/// edge's endpoint vertices denormalised in, so a load can rebuild the
+/// vertex→link index from the links alone, without the street arrays.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StoredLink {
+    pub stop: StopIdx,
+    /// Index of the edge the stop snapped onto (internal numbering).
+    pub edge: u32,
+    /// Snap position as a fraction of the edge, 0 at its `from` vertex.
+    pub fraction: f64,
+    /// Straight-line distance from the stop to the snap point, in meters.
+    pub connector: f64,
+    /// The edge's endpoint vertices.
+    pub from: u32,
+    pub to: u32,
 }
 
 /// A stop reached by the walking search.
@@ -375,13 +424,16 @@ thread_local! {
 /// The walking street graph with its spatial index and stop links.
 #[derive(Debug)]
 pub struct StreetNetwork {
-    /// CSR offsets into `adjacency`, one entry per vertex plus a tail.
+    /// CSR offsets into the adjacency columns, one entry per vertex plus
+    /// a tail.
     adjacency_offsets: Vec<u32>,
-    /// Outgoing `(target vertex, meters, edge)` entries; edges appear
-    /// in both directions.
-    adjacency: Vec<(u32, f64, u32)>,
-    /// Edge endpoints, one entry per input edge.
-    endpoints: Vec<(u32, u32)>,
+    /// Outgoing adjacency as parallel columns — target vertex, cost
+    /// meters, edge — with every edge appearing in both directions.
+    adj_targets: Vec<u32>,
+    adj_meters: Vec<f64>,
+    adj_edges: Vec<u32>,
+    /// Edge endpoints, two entries (`from`, `to`) per edge.
+    endpoints: Vec<u32>,
     /// Edge cost lengths in meters (the OSM way length, which the split
     /// pro-rating distributes; it may differ from the geometric length).
     lengths: Vec<f64>,
@@ -389,21 +441,21 @@ pub struct StreetNetwork {
     /// geometry is densified so every segment is at most
     /// `MAX_SEGMENT_METERS`.
     coordinate_offsets: Vec<u32>,
-    /// Edge geometries in geographic coordinates (longitude, latitude).
-    lons: Vec<f64>,
-    lats: Vec<f64>,
+    /// Edge geometries in fixed-point geographic coordinates
+    /// (degrees × 10⁷ — see `COORDINATE_SCALE`).
+    lons: Vec<i32>,
+    lats: Vec<i32>,
     /// Per-coordinate cumulative true distance from the edge's first point,
     /// in meters; parallel to `lons`/`lats`. The last point of each edge
     /// holds the edge's total geometric length.
-    cumulative: Vec<f64>,
-    /// How each snapped stop enters the graph.
-    links: Vec<StopLink>,
+    cumulative: Vec<f32>,
+    /// How each snapped stop enters the graph, endpoints denormalised.
+    links: Vec<StoredLink>,
     /// `(vertex, link index)` pairs sorted by vertex — every link listed
     /// under both endpoints of its edge — so a search finds the links
     /// near its reached vertices without scanning all links.
     vertex_links: Vec<(u32, u32)>,
-    /// Spatial index over the edge segments in lon/lat, for envelope
-    /// queries only.
+    /// Spatial index over the edge segments, for envelope queries only.
     index: PackedIndex,
 }
 
@@ -473,6 +525,13 @@ impl StreetNetwork {
             }
         }
 
+        // Quantize the geometry onto the fixed-point grid up front, so
+        // every derived structure — permutation keys, densified points,
+        // cumulative lengths, index boxes — is a pure function of the
+        // stored coordinates.
+        let fixed_lons: Vec<i32> = longitudes.iter().map(|&lon| quantize(lon)).collect();
+        let fixed_lats: Vec<i32> = latitudes.iter().map(|&lat| quantize(lat)).collect();
+
         // Hilbert-order the edges by their first coordinate and renumber
         // vertices by first appearance in that order, so spatially-nearby
         // streets are nearby in every edge- and vertex-indexed array. The
@@ -483,9 +542,9 @@ impl StreetNetwork {
         // the input position, so the layout is the same whatever order the
         // edges arrive in (edges identical in every field are
         // interchangeable, and their links follow them either way).
-        let bounds = coordinate_bounds(longitudes, latitudes);
+        let bounds = coordinate_bounds(&fixed_lons, &fixed_lats);
         let mut order: Vec<u32> = (0..edges.len() as u32).collect();
-        type EdgeKey = (u64, u64, u64, u64, u64, u64, u32, u32);
+        type EdgeKey = (u64, i32, i32, i32, i32, u64, u32, u32);
         let keys: Vec<EdgeKey> = (0..edges.len())
             .map(|edge| {
                 let first = coordinate_offsets[edge] as usize;
@@ -493,31 +552,31 @@ impl StreetNetwork {
                 let (from, to, meters) = edges[edge];
                 (
                     hilbert(
-                        grid_position(longitudes[first], bounds[0], bounds[2]),
-                        grid_position(latitudes[first], bounds[1], bounds[3]),
+                        grid_position(fixed_lons[first], bounds[0], bounds[2]),
+                        grid_position(fixed_lats[first], bounds[1], bounds[3]),
                     ),
-                    longitudes[first].to_bits(),
-                    latitudes[first].to_bits(),
-                    longitudes[last].to_bits(),
-                    latitudes[last].to_bits(),
+                    fixed_lons[first],
+                    fixed_lats[first],
+                    fixed_lons[last],
+                    fixed_lats[last],
                     meters.to_bits(),
                     from,
                     to,
                 )
             })
             .collect();
-        let geometry_bits = |edge: u32| {
+        let geometry_points = |edge: u32| {
             let start = coordinate_offsets[edge as usize] as usize;
             let end = coordinate_offsets[edge as usize + 1] as usize;
-            longitudes[start..end]
+            fixed_lons[start..end]
                 .iter()
-                .zip(&latitudes[start..end])
-                .map(|(&lon, &lat)| (lon.to_bits(), lat.to_bits()))
+                .zip(&fixed_lats[start..end])
+                .map(|(&lon, &lat)| (lon, lat))
         };
         order.sort_unstable_by(|&a, &b| {
             keys[a as usize]
                 .cmp(&keys[b as usize])
-                .then_with(|| geometry_bits(a).cmp(geometry_bits(b)))
+                .then_with(|| geometry_points(a).cmp(geometry_points(b)))
         });
 
         let mut edge_map = vec![0u32; edges.len()];
@@ -525,8 +584,8 @@ impl StreetNetwork {
         let mut next_vertex = 0u32;
         let mut permuted_edges = Vec::with_capacity(edges.len());
         let mut permuted_offsets = Vec::with_capacity(edges.len() + 1);
-        let mut permuted_lons = Vec::with_capacity(longitudes.len());
-        let mut permuted_lats = Vec::with_capacity(latitudes.len());
+        let mut permuted_lons = Vec::with_capacity(fixed_lons.len());
+        let mut permuted_lats = Vec::with_capacity(fixed_lats.len());
         permuted_offsets.push(0u32);
         for (new_edge, &old_edge) in order.iter().enumerate() {
             edge_map[old_edge as usize] = new_edge as u32;
@@ -541,8 +600,8 @@ impl StreetNetwork {
             permuted_edges.push((renumber(from), renumber(to), meters));
             let start = coordinate_offsets[old_edge as usize] as usize;
             let end = coordinate_offsets[old_edge as usize + 1] as usize;
-            permuted_lons.extend_from_slice(&longitudes[start..end]);
-            permuted_lats.extend_from_slice(&latitudes[start..end]);
+            permuted_lons.extend_from_slice(&fixed_lons[start..end]);
+            permuted_lats.extend_from_slice(&fixed_lats[start..end]);
             permuted_offsets.push(permuted_lons.len() as u32);
         }
         // Vertices no edge touches keep ids after the connected ones.
@@ -552,14 +611,22 @@ impl StreetNetwork {
                 next_vertex += 1;
             }
         }
-        let links: Vec<StopLink> = links
+        let edges = permuted_edges;
+        let links: Vec<StoredLink> = links
             .into_iter()
-            .map(|link| StopLink {
-                edge: edge_map[link.edge as usize],
-                ..link
+            .map(|link| {
+                let edge = edge_map[link.edge as usize];
+                let (from, to, _) = edges[edge as usize];
+                StoredLink {
+                    stop: link.stop,
+                    edge,
+                    fraction: link.fraction,
+                    connector: link.connector,
+                    from,
+                    to,
+                }
             })
             .collect();
-        let edges = permuted_edges;
 
         let (dense_offsets, lons, lats, cumulative) =
             densify(&permuted_offsets, &permuted_lons, &permuted_lats);
@@ -572,23 +639,29 @@ impl StreetNetwork {
         for vertex in 0..vertex_count as usize {
             adjacency_offsets[vertex + 1] += adjacency_offsets[vertex];
         }
-        let mut adjacency = vec![(0u32, 0.0, 0u32); edges.len() * 2];
+        let mut adj_targets = vec![0u32; edges.len() * 2];
+        let mut adj_meters = vec![0f64; edges.len() * 2];
+        let mut adj_edges = vec![0u32; edges.len() * 2];
         let mut cursor = adjacency_offsets.clone();
         for (index, &(from, to, meters)) in edges.iter().enumerate() {
             for (a, b) in [(from, to), (to, from)] {
                 let slot = cursor[a as usize] as usize;
-                adjacency[slot] = (b, meters, index as u32);
+                adj_targets[slot] = b;
+                adj_meters[slot] = meters;
+                adj_edges[slot] = index as u32;
                 cursor[a as usize] += 1;
             }
         }
 
         let index = build_index(&dense_offsets, &lons, &lats);
-        let endpoints: Vec<(u32, u32)> = edges.iter().map(|&(from, to, _)| (from, to)).collect();
-        let vertex_links = build_vertex_links(&links, &endpoints);
+        let endpoints: Vec<u32> = edges.iter().flat_map(|&(from, to, _)| [from, to]).collect();
+        let vertex_links = build_vertex_links(&links);
 
         Ok(StreetNetwork {
             adjacency_offsets,
-            adjacency,
+            adj_targets,
+            adj_meters,
+            adj_edges,
             endpoints,
             lengths: edges.iter().map(|&(_, _, meters)| meters).collect(),
             coordinate_offsets: dense_offsets,
@@ -608,7 +681,7 @@ impl StreetNetwork {
 
     /// Number of street edges.
     pub fn edge_count(&self) -> u32 {
-        self.endpoints.len() as u32
+        (self.endpoints.len() / 2) as u32
     }
 
     /// Number of stop links.
@@ -616,31 +689,70 @@ impl StreetNetwork {
         self.links.len()
     }
 
-    /// The network's serializable state — everything but the spatial
-    /// index, which `from_parts` rebuilds from the geometry.
+    /// An edge's `(from, to)` endpoint vertices.
+    fn edge_endpoints(&self, edge: u32) -> (u32, u32) {
+        (
+            self.endpoints[2 * edge as usize],
+            self.endpoints[2 * edge as usize + 1],
+        )
+    }
+
+    /// A stored coordinate as float degrees.
+    fn coordinate(&self, position: usize) -> (f64, f64) {
+        (degrees(self.lons[position]), degrees(self.lats[position]))
+    }
+
+    /// A stored cumulative along-distance as f64 meters.
+    fn along(&self, position: usize) -> f64 {
+        f64::from(self.cumulative[position])
+    }
+
+    /// The network's serializable state.
     pub fn to_parts(&self) -> StreetNetworkParts {
         StreetNetworkParts {
+            vertex_count: self.vertex_count(),
             adjacency_offsets: self.adjacency_offsets.clone(),
-            adjacency: self.adjacency.clone(),
+            adj_targets: self.adj_targets.clone(),
+            adj_meters: self.adj_meters.clone(),
+            adj_edges: self.adj_edges.clone(),
             endpoints: self.endpoints.clone(),
             lengths: self.lengths.clone(),
             coordinate_offsets: self.coordinate_offsets.clone(),
             lons: self.lons.clone(),
             lats: self.lats.clone(),
             cumulative: self.cumulative.clone(),
+            index_boxes: self
+                .index
+                .boxes
+                .iter()
+                .flat_map(|envelope| *envelope)
+                .collect(),
+            index_payload: self.index.payload.clone(),
+            index_level_starts: self.index.level_starts.clone(),
             links: self.links.clone(),
         }
     }
 
-    /// Rebuilds a network from its serialized parts. The stored edge order
-    /// is adopted as-is — new saves carry the Hilbert layout; older
-    /// artifacts keep their original order, correct either way.
+    /// Adopts a network from its serialized parts — nothing street-sized
+    /// is rebuilt (the spatial index arrives as arrays); the one derived
+    /// rebuild is the L-sized vertex→link index, from the links'
+    /// denormalised endpoints.
     pub fn from_parts(parts: StreetNetworkParts) -> StreetNetwork {
-        let index = build_index(&parts.coordinate_offsets, &parts.lons, &parts.lats);
-        let vertex_links = build_vertex_links(&parts.links, &parts.endpoints);
+        let vertex_links = build_vertex_links(&parts.links);
+        let index = PackedIndex {
+            boxes: parts
+                .index_boxes
+                .chunks_exact(4)
+                .map(|chunk| [chunk[0], chunk[1], chunk[2], chunk[3]])
+                .collect(),
+            payload: parts.index_payload,
+            level_starts: parts.index_level_starts,
+        };
         StreetNetwork {
             adjacency_offsets: parts.adjacency_offsets,
-            adjacency: parts.adjacency,
+            adj_targets: parts.adj_targets,
+            adj_meters: parts.adj_meters,
+            adj_edges: parts.adj_edges,
             endpoints: parts.endpoints,
             lengths: parts.lengths,
             coordinate_offsets: parts.coordinate_offsets,
@@ -705,8 +817,10 @@ impl StreetNetwork {
                 (lat - latitude) * mpd_lat,
             )
         };
-        let (ax, ay) = to_xy(self.lons[a], self.lats[a]);
-        let (bx, by) = to_xy(self.lons[b], self.lats[b]);
+        let (lon_a, lat_a) = self.coordinate(a);
+        let (lon_b, lat_b) = self.coordinate(b);
+        let (ax, ay) = to_xy(lon_a, lat_a);
+        let (bx, by) = to_xy(lon_b, lat_b);
         let (dx, dy) = (bx - ax, by - ay);
         let squared = dx * dx + dy * dy;
         // The query sits at the frame origin, so the foot parameter is
@@ -720,8 +834,8 @@ impl StreetNetwork {
         let connector = (px * px + py * py).sqrt();
 
         let end = self.coordinate_offsets[edge as usize + 1] as usize;
-        let along = self.cumulative[a] + t * (self.cumulative[b] - self.cumulative[a]);
-        let total = self.cumulative[end - 1];
+        let along = self.along(a) + t * (self.along(b) - self.along(a));
+        let total = self.along(end - 1);
         let fraction = if total > 0.0 { along / total } else { 0.0 };
         (connector, fraction)
     }
@@ -751,7 +865,7 @@ impl StreetNetwork {
         }
         let snap = self.snap(latitude, longitude, max_snap_distance)?;
         let cutoff = max_seconds * walking_speed;
-        let (from, to) = self.endpoints[snap.edge as usize];
+        let (from, to) = self.edge_endpoints(snap.edge);
         let length = self.lengths[snap.edge as usize];
         SEARCH_STATE.with(|cell| {
             let state = &mut cell.borrow_mut();
@@ -780,7 +894,7 @@ impl StreetNetwork {
             let mut nearest: HashMap<StopIdx, f64> = HashMap::new();
             for index in candidates {
                 let link = &self.links[index as usize];
-                let (link_from, link_to) = self.endpoints[link.edge as usize];
+                let (link_from, link_to) = (link.from, link.to);
                 let link_length = self.lengths[link.edge as usize];
                 let mut meters = f64::min(
                     state.distance(link_from) + link.fraction * link_length,
@@ -887,8 +1001,8 @@ impl StreetNetwork {
             from.connector + (from.fraction - to.fraction).abs() * from_length + to.connector
         });
 
-        let (from_u, from_v) = self.endpoints[from.edge as usize];
-        let (to_u, to_v) = self.endpoints[to.edge as usize];
+        let (from_u, from_v) = self.edge_endpoints(from.edge);
+        let (to_u, to_v) = self.edge_endpoints(to.edge);
         let transit = SEARCH_STATE.with(|cell| {
             let state = &mut cell.borrow_mut();
             self.dijkstra_with_paths(
@@ -942,7 +1056,7 @@ impl StreetNetwork {
             };
             path.extend(self.edge_slice(from.edge, from.fraction, entry_fraction));
             for (step, &edge) in edges.iter().enumerate() {
-                let (u, _) = self.endpoints[edge as usize];
+                let (u, _) = self.edge_endpoints(edge);
                 let forward = vertices[step] == u;
                 path.extend(self.edge_slice(
                     edge,
@@ -1013,11 +1127,14 @@ impl StreetNetwork {
             }
             let start = self.adjacency_offsets[vertex as usize] as usize;
             let end = self.adjacency_offsets[vertex as usize + 1] as usize;
-            for &(target, meters, edge) in &self.adjacency[start..end] {
-                let next = distance + meters;
+            for slot in start..end {
+                let target = self.adj_targets[slot];
+                let next = distance + self.adj_meters[slot];
                 if next < state.distance(target) {
                     state.distances.insert(target, next);
-                    state.previous.insert(target, (vertex, edge));
+                    state
+                        .previous
+                        .insert(target, (vertex, self.adj_edges[slot]));
                     state.heap.push(Reverse((next.to_bits(), target)));
                 }
             }
@@ -1028,7 +1145,7 @@ impl StreetNetwork {
     fn point_at(&self, edge: u32, fraction: f64) -> (f64, f64) {
         let start = self.coordinate_offsets[edge as usize] as usize;
         let end = self.coordinate_offsets[edge as usize + 1] as usize;
-        let total = self.cumulative[end - 1];
+        let total = self.along(end - 1);
         self.interpolate(start, end, fraction.clamp(0.0, 1.0) * total)
     }
 
@@ -1038,7 +1155,7 @@ impl StreetNetwork {
     fn edge_slice(&self, edge: u32, from_fraction: f64, to_fraction: f64) -> Vec<(f64, f64)> {
         let start = self.coordinate_offsets[edge as usize] as usize;
         let end = self.coordinate_offsets[edge as usize + 1] as usize;
-        let total = self.cumulative[end - 1];
+        let total = self.along(end - 1);
         let (low, high, reversed) = if from_fraction <= to_fraction {
             (from_fraction, to_fraction, false)
         } else {
@@ -1049,9 +1166,9 @@ impl StreetNetwork {
         let mut slice = Vec::new();
         slice.push(self.interpolate(start, end, low));
         for point in start..end {
-            let along = self.cumulative[point];
+            let along = self.along(point);
             if along > low && along < high {
-                slice.push((self.lons[point], self.lats[point]));
+                slice.push(self.coordinate(point));
             }
         }
         if high > low {
@@ -1066,28 +1183,30 @@ impl StreetNetwork {
     /// The `(lon, lat)` point at along-edge distance `target` (metres from the
     /// edge's first coordinate), interpolated within the containing segment.
     fn interpolate(&self, start: usize, end: usize, target: f64) -> (f64, f64) {
-        let total = self.cumulative[end - 1];
+        let total = self.along(end - 1);
         let target = target.clamp(0.0, total);
         // Largest coordinate index whose cumulative distance is at most the
         // target; the containing segment is `[lo, lo + 1]`.
         let (mut lo, mut hi) = (start, end - 1);
         while lo + 1 < hi {
             let mid = (lo + hi) / 2;
-            if self.cumulative[mid] <= target {
+            if self.along(mid) <= target {
                 lo = mid;
             } else {
                 hi = mid;
             }
         }
-        let span = self.cumulative[lo + 1] - self.cumulative[lo];
+        let span = self.along(lo + 1) - self.along(lo);
         let t = if span > 0.0 {
-            (target - self.cumulative[lo]) / span
+            (target - self.along(lo)) / span
         } else {
             0.0
         };
+        let (lon_lo, lat_lo) = self.coordinate(lo);
+        let (lon_hi, lat_hi) = self.coordinate(lo + 1);
         (
-            self.lons[lo] + t * (self.lons[lo + 1] - self.lons[lo]),
-            self.lats[lo] + t * (self.lats[lo + 1] - self.lats[lo]),
+            lon_lo + t * (lon_hi - lon_lo),
+            lat_lo + t * (lat_hi - lat_lo),
         )
     }
 
@@ -1108,8 +1227,9 @@ impl StreetNetwork {
             }
             let start = self.adjacency_offsets[vertex as usize] as usize;
             let end = self.adjacency_offsets[vertex as usize + 1] as usize;
-            for &(target, meters, _) in &self.adjacency[start..end] {
-                let next = distance + meters;
+            for slot in start..end {
+                let target = self.adj_targets[slot];
+                let next = distance + self.adj_meters[slot];
                 if next <= cutoff + 1e-9 && next < state.distance(target) {
                     state.distances.insert(target, next);
                     state.heap.push(Reverse((next.to_bits(), target)));
@@ -1119,31 +1239,43 @@ impl StreetNetwork {
     }
 }
 
-/// A [`StreetNetwork`]'s serializable state; see
-/// [`StreetNetwork::to_parts`].
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+/// A [`StreetNetwork`]'s state split for serialization: the flat POD
+/// arrays a container stores raw, plus the small link records and scalars
+/// it stores decoded. The spatial index rides along as plain arrays;
+/// nothing is rebuilt on adoption except the L-sized vertex→link index.
+#[derive(Debug)]
 pub struct StreetNetworkParts {
-    adjacency_offsets: Vec<u32>,
-    adjacency: Vec<(u32, f64, u32)>,
-    endpoints: Vec<(u32, u32)>,
-    lengths: Vec<f64>,
-    coordinate_offsets: Vec<u32>,
-    lons: Vec<f64>,
-    lats: Vec<f64>,
-    cumulative: Vec<f64>,
-    links: Vec<StopLink>,
+    pub vertex_count: u32,
+    pub adjacency_offsets: Vec<u32>,
+    pub adj_targets: Vec<u32>,
+    pub adj_meters: Vec<f64>,
+    pub adj_edges: Vec<u32>,
+    /// Two entries (`from`, `to`) per edge.
+    pub endpoints: Vec<u32>,
+    pub lengths: Vec<f64>,
+    pub coordinate_offsets: Vec<u32>,
+    /// Fixed-point degrees × 10⁷.
+    pub lons: Vec<i32>,
+    pub lats: Vec<i32>,
+    pub cumulative: Vec<f32>,
+    /// Flattened index boxes, four entries per node.
+    pub index_boxes: Vec<i32>,
+    /// Flattened leaf payloads, two entries per leaf.
+    pub index_payload: Vec<u32>,
+    pub index_level_starts: Vec<u32>,
+    pub links: Vec<StoredLink>,
 }
 
 /// The `(vertex, link index)` pairs behind [`StreetNetwork::links_at`],
 /// sorted by vertex: each link listed under both endpoints of its edge,
-/// once when they coincide.
-fn build_vertex_links(links: &[StopLink], endpoints: &[(u32, u32)]) -> Vec<(u32, u32)> {
+/// once when they coincide. The endpoints come from the links themselves,
+/// so this rebuilds without touching any street-sized array.
+fn build_vertex_links(links: &[StoredLink]) -> Vec<(u32, u32)> {
     let mut vertex_links = Vec::with_capacity(links.len() * 2);
     for (index, link) in links.iter().enumerate() {
-        let (from, to) = endpoints[link.edge as usize];
-        vertex_links.push((from, index as u32));
-        if to != from {
-            vertex_links.push((to, index as u32));
+        vertex_links.push((link.from, index as u32));
+        if link.to != link.from {
+            vertex_links.push((link.to, index as u32));
         }
     }
     vertex_links.sort_unstable();
@@ -1182,11 +1314,18 @@ fn snap_envelope(latitude: f64, longitude: f64, max_snap_distance: f64) -> Envel
     } else {
         180.0
     };
+    // Rounded outward onto the fixed-point grid, so the envelope stays a
+    // superset of the true one.
+    let outward = |degrees: f64, up: bool| -> i32 {
+        let scaled = degrees * COORDINATE_SCALE;
+        let rounded = if up { scaled.ceil() } else { scaled.floor() };
+        rounded.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+    };
     [
-        longitude - delta_lon,
-        latitude - delta_lat,
-        longitude + delta_lon,
-        latitude + delta_lat,
+        outward(longitude - delta_lon, false),
+        outward(latitude - delta_lat, false),
+        outward(longitude + delta_lon, true),
+        outward(latitude + delta_lat, true),
     ]
 }
 
@@ -1217,25 +1356,31 @@ fn segment_length(lon_a: f64, lat_a: f64, lon_b: f64, lat_b: f64) -> f64 {
 /// and per-coordinate cumulative distance from each edge's first point.
 fn densify(
     coordinate_offsets: &[u32],
-    longitudes: &[f64],
-    latitudes: &[f64],
-) -> (Vec<u32>, Vec<f64>, Vec<f64>, Vec<f64>) {
+    longitudes: &[i32],
+    latitudes: &[i32],
+) -> (Vec<u32>, Vec<i32>, Vec<i32>, Vec<f32>) {
     let edge_count = coordinate_offsets.len().saturating_sub(1);
     let mut offsets = Vec::with_capacity(coordinate_offsets.len());
     let mut lons = Vec::new();
     let mut lats = Vec::new();
     let mut cumulative = Vec::new();
+    // Inserted points re-quantize onto the grid (≤ ~0.8 cm each), so the
+    // split targets a hair under the maximum and no sub-segment exceeds it.
+    let target = MAX_SEGMENT_METERS - QUANTIZATION_GUARD_METERS;
     offsets.push(0);
     for edge in 0..edge_count {
         let start = coordinate_offsets[edge] as usize;
         let end = coordinate_offsets[edge + 1] as usize;
         lons.push(longitudes[start]);
         lats.push(latitudes[start]);
-        cumulative.push(0.0);
-        let mut running = 0.0;
+        cumulative.push(0.0f32);
+        let mut running = 0.0f64;
         for point in start..end - 1 {
-            let (lon_a, lat_a) = (longitudes[point], latitudes[point]);
-            let (lon_b, lat_b) = (longitudes[point + 1], latitudes[point + 1]);
+            let (lon_a, lat_a) = (degrees(longitudes[point]), degrees(latitudes[point]));
+            let (lon_b, lat_b) = (
+                degrees(longitudes[point + 1]),
+                degrees(latitudes[point + 1]),
+            );
             // Bound each sub-piece by the largest metres-per-degree over the
             // segment's latitude band, so none exceeds MAX_SEGMENT_METERS even
             // when the segment spans a wide latitude range. Longitude
@@ -1248,18 +1393,29 @@ fn densify(
             let max_mpd_lat = meters_per_degree(lat_a).1.max(meters_per_degree(lat_b).1);
             let dx = longitude_delta(lon_a, lon_b).abs() * max_mpd_lon;
             let dy = (lat_b - lat_a).abs() * max_mpd_lat;
-            let pieces = ((dx * dx + dy * dy).sqrt() / MAX_SEGMENT_METERS)
-                .ceil()
-                .max(1.0) as usize;
+            let pieces = ((dx * dx + dy * dy).sqrt() / target).ceil().max(1.0) as usize;
             for k in 1..=pieces {
                 let t = k as f64 / pieces as f64;
-                let lon = lon_a + t * (lon_b - lon_a);
-                let lat = lat_a + t * (lat_b - lat_a);
+                let lon = if k == pieces {
+                    longitudes[point + 1]
+                } else {
+                    quantize(lon_a + t * (lon_b - lon_a))
+                };
+                let lat = if k == pieces {
+                    latitudes[point + 1]
+                } else {
+                    quantize(lat_a + t * (lat_b - lat_a))
+                };
                 let (prev_lon, prev_lat) = (*lons.last().unwrap(), *lats.last().unwrap());
-                running += segment_length(prev_lon, prev_lat, lon, lat);
+                running += segment_length(
+                    degrees(prev_lon),
+                    degrees(prev_lat),
+                    degrees(lon),
+                    degrees(lat),
+                );
                 lons.push(lon);
                 lats.push(lat);
-                cumulative.push(running);
+                cumulative.push(running as f32);
             }
         }
         offsets.push(lons.len() as u32);
@@ -1349,6 +1505,21 @@ mod tests {
         walks.iter().map(|walk| (walk.stop, walk.seconds)).collect()
     }
 
+    /// Asserts designed walking times, allowing the one extra second that
+    /// conservative rounding may add when coordinate quantization (≤ ~2 cm
+    /// per segment) nudges a designed-exact distance past a whole second.
+    fn assert_walks(walks: &[WalkedStop], designed: &[(u32, u32)]) {
+        assert_eq!(walks.len(), designed.len(), "stops differ: {walks:?}");
+        for (walk, &(stop, seconds)) in walks.iter().zip(designed) {
+            assert_eq!(walk.stop, StopIdx(stop), "stops differ: {walks:?}");
+            assert!(
+                walk.seconds >= seconds && walk.seconds <= seconds + 1,
+                "stop {stop}: {} s, designed {seconds} s",
+                walk.seconds
+            );
+        }
+    }
+
     #[test]
     fn snaps_to_the_nearest_edge() {
         let network = network(
@@ -1364,7 +1535,7 @@ mod tests {
         let (lon, lat) = lonlat(100.0, 10.0);
         let snap = network.snap(lat, lon, 100.0).unwrap();
         assert_eq!(snap.edge, 0);
-        assert!((snap.fraction - 0.25).abs() < 1e-6);
+        assert!((snap.fraction - 0.25).abs() < 1e-4);
         assert!((snap.connector - 10.0).abs() < 0.05);
     }
 
@@ -1500,7 +1671,7 @@ mod tests {
         let count = network.coordinate_offsets[1] as usize;
         assert!(count >= 51, "expected >=51 densified points, got {count}");
         for pair in network.lats.windows(2) {
-            let seg = segment_length(25.0, pair[0], 25.0, pair[1]);
+            let seg = segment_length(25.0, degrees(pair[0]), 25.0, degrees(pair[1]));
             assert!(seg <= MAX_SEGMENT_METERS + 1e-6, "segment {seg} m too long");
         }
         // Midpoint of the edge is 2500 m along.
@@ -1532,7 +1703,12 @@ mod tests {
         )
         .unwrap();
         for (lons, lats) in network.lons.windows(2).zip(network.lats.windows(2)) {
-            let seg = segment_length(lons[0], lats[0], lons[1], lats[1]);
+            let seg = segment_length(
+                degrees(lons[0]),
+                degrees(lats[0]),
+                degrees(lons[1]),
+                degrees(lats[1]),
+            );
             assert!(
                 seg <= MAX_SEGMENT_METERS + 1e-6,
                 "sub-piece {seg} m too long"
@@ -1730,7 +1906,7 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(100.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
-        assert_eq!(timed(&reached), vec![(StopIdx(0), 0), (StopIdx(1), 200)]);
+        assert_walks(&reached, &[(0, 0), (1, 200)]);
         assert!(reached[0].meters.abs() < 0.5);
         assert!((reached[1].meters - 200.0).abs() < 0.5);
     }
@@ -1766,7 +1942,7 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(100.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
-        assert_eq!(timed(&reached), vec![(StopIdx(0), 400)]);
+        assert_walks(&reached, &[(0, 400)]);
     }
 
     #[test]
@@ -1784,7 +1960,7 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(0.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
-        assert_eq!(timed(&reached), vec![(StopIdx(0), 400)]);
+        assert_walks(&reached, &[(0, 400)]);
     }
 
     #[test]
@@ -1805,7 +1981,7 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(360.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 50.0).unwrap();
-        assert_eq!(timed(&reached), vec![(StopIdx(0), 300)]);
+        assert_walks(&reached, &[(0, 300)]);
     }
 
     #[test]
@@ -1819,7 +1995,7 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(0.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 150.0, 100.0).unwrap();
-        assert_eq!(timed(&reached), vec![(StopIdx(0), 100)]);
+        assert_walks(&reached, &[(0, 100)]);
     }
 
     #[test]
@@ -1850,9 +2026,9 @@ mod tests {
         let (lon, lat) = lonlat(100.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
         // 0.5 × 401 m at 1 m/s is 200.5 s and must not round down; the
-        // meters stay exact.
-        assert_eq!(timed(&reached), vec![(StopIdx(0), 201)]);
-        assert!((reached[0].meters - 200.5).abs() < 1e-9);
+        // meters shift only within the coordinate-quantization bound.
+        assert_walks(&reached, &[(0, 201)]);
+        assert!((reached[0].meters - 200.5).abs() < 0.05);
     }
 
     #[test]
@@ -1866,7 +2042,7 @@ mod tests {
         .unwrap();
         let (lon, lat) = lonlat(100.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
-        assert_eq!(timed(&reached), vec![(StopIdx(0), 100)]);
+        assert_walks(&reached, &[(0, 100)]);
     }
 
     #[test]
@@ -1984,13 +2160,13 @@ mod tests {
             (state >> 33) as f64 / (1u64 << 31) as f64
         };
         let mut offsets = vec![0u32];
-        let mut lons = Vec::new();
-        let mut lats = Vec::new();
+        let mut lons: Vec<i32> = Vec::new();
+        let mut lats: Vec<i32> = Vec::new();
         for _ in 0..120 {
             let points = 2 + (random() * 4.0) as usize;
             for _ in 0..points {
-                lons.push(24.0 + random() * 0.5);
-                lats.push(60.0 + random() * 0.5);
+                lons.push(quantize(24.0 + random() * 0.5));
+                lats.push(quantize(60.0 + random() * 0.5));
             }
             offsets.push(lons.len() as u32);
         }
@@ -2014,7 +2190,12 @@ mod tests {
         for _ in 0..200 {
             let (lon, lat) = (24.0 + random() * 0.5, 60.0 + random() * 0.5);
             let (dlon, dlat) = (random() * 0.05, random() * 0.05);
-            let envelope = [lon - dlon, lat - dlat, lon + dlon, lat + dlat];
+            let envelope = [
+                quantize(lon - dlon),
+                quantize(lat - dlat),
+                quantize(lon + dlon),
+                quantize(lat + dlat),
+            ];
             index.query_into(&envelope, &mut matches);
             let mut expected: Vec<(u32, u32)> = scan
                 .iter()
@@ -2108,9 +2289,9 @@ mod tests {
         let (lon, lat) = lonlat(25.0, 5.0);
         let snap = network.snap(lat, lon, 100.0).unwrap();
         assert_eq!(snap.edge, 0);
-        assert!((snap.fraction - 0.5).abs() < 1e-6);
+        assert!((snap.fraction - 0.5).abs() < 1e-4);
         assert!((snap.connector - 5.0).abs() < 0.05);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
-        assert_eq!(timed(&reached), vec![(StopIdx(0), 30)]);
+        assert_walks(&reached, &[(0, 30)]);
     }
 }
