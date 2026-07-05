@@ -2,7 +2,19 @@
 
 ## Unreleased
 
-Nothing yet.
+- Time × emissions Pareto frontiers: ``cafein.journey_frontier(network,
+  origin, destination, date, departure, window)`` routes a departure
+  window between two stops or door-to-door coordinates, attaches
+  emissions to every candidate journey, and returns them as a DataFrame
+  with a ``frontier`` flag — the journeys no candidate beats on both
+  travel time and emissions. ``cafein.least_emissions(frontier,
+  within=...)`` picks the cleanest journey, optionally within a
+  travel-time budget. The candidates are the range-RAPTOR Pareto set
+  over (departure, arrival, rides): slower-but-simpler journeys and the
+  walking-only journey (door-to-door) are on offer, while a journey both
+  slower and more-transferring than every time-optimal alternative is
+  not — the documented contract of this frontier. Journeys whose ridden
+  trips lack an emission factor carry NaN and never join the frontier.
 
 ## 0.3.0 — 2026-07-05
 
