@@ -228,26 +228,50 @@ def test_mapped_loads_read_no_street_bytes(artifact_path, mmap_available):
     assert verified._core._streets_bytes_read == length
 
 
-def test_mapped_street_pages_stay_cold_after_load(artifact_path, mmap_available):
+def test_mapped_street_pages_stay_cold_after_load(
+    kantakaupunki_pbf, mmap_available, tmp_path
+):
     # The strong laziness observable: evict the artifact from the page
-    # cache, load it mapped, and require the STREETS pages still cold —
-    # any loader scan of the section would page it back in wholesale.
+    # cache, load it mapped, and require the STREETS pages mostly cold —
+    # a loader scan of the section would page it back in wholesale.
+    #
+    # Kernel readahead is the confounder: any fault near the file head
+    # speculatively reads one device window ahead, and a window is
+    # bounded only by `read_ahead_kb` and the end of the file. The
+    # artifact therefore pairs a tiny synthetic feed with the real
+    # street network — META is kilobytes, so the loader faults almost
+    # nothing and no readahead stream ramps up — and the test skips on
+    # devices whose single window could cover the street section anyway
+    # (some CI machines configure tens-of-MB readahead, which pulled the
+    # whole section in and is indistinguishable from a scan).
     if not mmap_available or not hasattr(os, "posix_fadvise"):
         pytest.skip("needs memory mapping and posix_fadvise")
     import ctypes
     import mmap as mmap_module
 
+    from cafein import streets
+    from test_transport_network import build_synthetic_gtfs
+
     libc = ctypes.CDLL(None, use_errno=True)
     if not hasattr(libc, "mincore"):
         pytest.skip("needs mincore")
-    offset, length = _streets_section(artifact_path)
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs([str(feed)])
+        # The synthetic stops lie outside the extract, so they get no
+        # links — irrelevant here; the street arrays carry the extract.
+        _, payload = streets.walking_streets(str(kantakaupunki_pbf), network.stops)
+    network.set_street_network(*payload)
+    path = tmp_path / "streets-heavy.cafein"
+    network.save(path)
+    offset, length = _streets_section(path)
     page = mmap_module.PAGESIZE
 
     def resident_street_bytes():
         # A private copy-on-write mapping: never written, so mincore sees
         # the shared page-cache pages, while the buffer stays writable
         # (ctypes.from_buffer refuses the read-only mapping's buffer).
-        with open(artifact_path, "rb") as artifact:
+        with open(path, "rb") as artifact:
             view = mmap_module.mmap(
                 artifact.fileno(),
                 0,
@@ -272,16 +296,30 @@ def test_mapped_street_pages_stay_cold_after_load(artifact_path, mmap_available)
         finally:
             view.close()
 
-    with open(artifact_path, "rb") as artifact:
+    with open(path, "rb") as artifact:
         os.fsync(artifact.fileno())
         os.posix_fadvise(artifact.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
     if resident_street_bytes() > 16 * page:
         pytest.skip("the page cache did not evict the artifact")
-    network = TransportNetwork.load(artifact_path, mmap=True)
+    # A residency assertion is only meaningful when a single speculative
+    # readahead window cannot cover a substantial part of the section.
+    device = os.stat(path).st_dev
+    bdi = f"/sys/dev/block/{os.major(device)}:{os.minor(device)}/bdi/read_ahead_kb"
+    try:
+        with open(bdi) as sysfs:
+            read_ahead = int(sysfs.read()) * 1024
+    except (OSError, ValueError):
+        pytest.skip("the device's readahead window is unknown")
+    if read_ahead >= length // 4:
+        pytest.skip(f"device readahead ({read_ahead} B) can cover the section")
+    network = TransportNetwork.load(path, mmap=True)
     assert network.mapped
-    # Kernel readahead around META may pull a sliver of STREETS in; a
-    # scan would page in the whole section.
-    assert resident_street_bytes() < max(length // 20, 4 * 1024 * 1024)
+    # The loader faults only the tiny META, so at most one readahead
+    # window (< a quarter of the section, per the guard above) can spill
+    # into STREETS; a scan pages in essentially all of it.
+    assert length > 8 * 1024 * 1024
+    resident = resident_street_bytes()
+    assert resident < length // 2, f"resident {resident} B, readahead {read_ahead} B"
 
 
 def _mapped_walks(args):
