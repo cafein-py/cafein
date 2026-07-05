@@ -5,7 +5,8 @@
 Computes an all-to-all stop-to-stop travel time matrix on both engines
 and reports build time, matrix time, throughput, and peak memory. Each
 engine runs in its own subprocess so the peak-RSS numbers do not bleed
-into each other.
+into each other. r5py's cached networks are cleared before it builds, so its
+build time is measured cold rather than as a warm cache load.
 
     python scripts/benchmark_vs_r5py.py               # sampled stops
     python scripts/benchmark_vs_r5py.py --stops 0     # every stop in the box
@@ -28,6 +29,7 @@ extract's coverage so both engines can route them.
 import argparse
 import datetime
 import json
+import os
 import pathlib
 import resource
 import subprocess
@@ -116,6 +118,8 @@ def run_r5py(stops):
 
 
 def run_engine(engine, stops):
+    if engine == "r5py":
+        clear_r5py_network_cache()
     build_seconds, matrix_seconds, finite = (
         run_cafein(stops) if engine == "cafein" else run_r5py(stops)
     )
@@ -133,6 +137,31 @@ def run_engine(engine, stops):
             }
         )
     )
+
+
+def clear_r5py_network_cache():
+    """Delete r5py's cached transport networks so its build is measured cold.
+
+    r5py caches a built network under its cache dir keyed by input; left in
+    place, the "build" is a deserialize, not a from-OSM+GTFS build, and its
+    time is not comparable to cafein's. The R5 jar in the same dir is kept.
+    """
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME")
+    cache = (
+        pathlib.Path(base) / "r5py" if base else pathlib.Path.home() / ".cache" / "r5py"
+    )
+    if not cache.is_dir():
+        return
+    removed = 0
+    for pattern in ("*.transport_network", "*.mapdb", "*.mapdb.p", "*.warnings"):
+        for path in cache.glob(pattern):
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            removed += 1
+    if removed:
+        print(f"cleared {removed} cached r5py network file(s) for a cold build")
 
 
 def main():

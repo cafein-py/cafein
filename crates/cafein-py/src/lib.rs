@@ -593,9 +593,9 @@ impl TransportNetwork {
     ///     The coordinate, in EPSG:4326.
     /// walking_speed_kmph : float (optional, default: 3.6)
     ///     Walking speed in km/h, on the network and on the connectors.
-    /// max_walking_time : float (optional, default: 600)
+    /// max_walking_time : float (optional, default: 7200)
     ///     Walking-time cutoff in seconds.
-    /// max_snap_distance : float (optional, default: 100)
+    /// max_snap_distance : float (optional, default: 300)
     ///     Maximum straight-line distance in meters from the coordinate
     ///     to the walking network; a coordinate farther away raises
     ///     ``ValueError``.
@@ -605,7 +605,7 @@ impl TransportNetwork {
     /// dict
     ///     Walking time in seconds to each reachable stop, keyed by
     ///     stop_id; stops beyond the cutoff are absent.
-    #[pyo3(signature = (lat, lon, walking_speed_kmph = 3.6, max_walking_time = 600.0, max_snap_distance = 100.0))]
+    #[pyo3(signature = (lat, lon, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 300.0))]
     fn access_stops(
         &self,
         py: Python<'_>,
@@ -722,7 +722,7 @@ impl TransportNetwork {
     ///     Service date as ``YYYY-MM-DD``.
     /// departure : str
     ///     Departure time at the origin as ``HH:MM:SS``.
-    /// max_transfers : int (optional, default: 4)
+    /// max_transfers : int (optional, default: 7)
     ///     Maximum number of transfers between rides.
     /// window : int (optional)
     ///     Departure window in seconds. When given, departures within
@@ -740,7 +740,7 @@ impl TransportNetwork {
     ///     time, number of rides) leaving at the departure time; with it,
     ///     the departure-window profile. Each journey carries its legs;
     ///     times are seconds past the service day's start.
-    #[pyo3(signature = (from_stop, to_stop, date, departure, max_transfers = 4, window = None, geometries = true))]
+    #[pyo3(signature = (from_stop, to_stop, date, departure, max_transfers = 7, window = None, geometries = true))]
     #[allow(clippy::too_many_arguments)]
     fn route_between_stops(
         &self,
@@ -788,15 +788,15 @@ impl TransportNetwork {
     ///     Service date as ``YYYY-MM-DD``.
     /// departure : str
     ///     Departure time at the origin coordinate as ``HH:MM:SS``.
-    /// max_transfers : int (optional, default: 4)
+    /// max_transfers : int (optional, default: 7)
     ///     Maximum number of transfers between rides.
     /// window : int (optional)
     ///     Departure window in seconds, as in ``route_between_stops``.
     /// walking_speed_kmph : float (optional, default: 3.6)
     ///     Walking speed in km/h of the access and egress searches.
-    /// max_walking_time : float (optional, default: 600)
+    /// max_walking_time : float (optional, default: 7200)
     ///     Walking-time cutoff in seconds of each street search.
-    /// max_snap_distance : float (optional, default: 100)
+    /// max_snap_distance : float (optional, default: 300)
     ///     Maximum straight-line distance in meters from each coordinate
     ///     to the walking network.
     ///
@@ -805,7 +805,7 @@ impl TransportNetwork {
     /// list of dict
     ///     Journeys as in ``route_between_stops``; arrivals include the
     ///     egress walk.
-    #[pyo3(signature = (origin, destination, date, departure, max_transfers = 4, window = None, walking_speed_kmph = 3.6, max_walking_time = 600.0, max_snap_distance = 100.0, geometries = true))]
+    #[pyo3(signature = (origin, destination, date, departure, max_transfers = 7, window = None, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 300.0, geometries = true))]
     #[allow(clippy::too_many_arguments)]
     fn route_between_coordinates(
         &self,
@@ -879,13 +879,13 @@ impl TransportNetwork {
     ///     Service date as ``YYYY-MM-DD``.
     /// departure : str
     ///     Departure time at the origin coordinate as ``HH:MM:SS``.
-    /// max_transfers : int (optional, default: 4)
+    /// max_transfers : int (optional, default: 7)
     ///     Maximum number of transfers between rides.
     /// walking_speed_kmph : float (optional, default: 3.6)
     ///     Walking speed in km/h of the access search.
-    /// max_walking_time : float (optional, default: 600)
+    /// max_walking_time : float (optional, default: 7200)
     ///     Walking-time cutoff in seconds of the access search.
-    /// max_snap_distance : float (optional, default: 100)
+    /// max_snap_distance : float (optional, default: 300)
     ///     Maximum straight-line distance in meters from the coordinate
     ///     to the walking network; a coordinate farther away raises
     ///     ``ValueError``.
@@ -895,7 +895,7 @@ impl TransportNetwork {
     /// dict
     ///     Travel time in seconds to every reachable stop, keyed by
     ///     stop_id; unreachable stops are absent.
-    #[pyo3(signature = (origin, date, departure, max_transfers = 4, walking_speed_kmph = 3.6, max_walking_time = 600.0, max_snap_distance = 100.0))]
+    #[pyo3(signature = (origin, date, departure, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 300.0))]
     #[allow(clippy::too_many_arguments)]
     fn travel_times_from_coordinate(
         &self,
@@ -956,7 +956,7 @@ impl TransportNetwork {
     ///     Service date as ``YYYY-MM-DD``.
     /// departure : str
     ///     Departure time at the origin as ``HH:MM:SS``.
-    /// max_transfers : int (optional, default: 4)
+    /// max_transfers : int (optional, default: 7)
     ///     Maximum number of transfers between rides.
     ///
     /// Returns
@@ -965,7 +965,7 @@ impl TransportNetwork {
     ///     Travel time in seconds to every reachable stop, keyed by
     ///     public stop_id; the origin maps to 0 and unreachable stops
     ///     are absent.
-    #[pyo3(signature = (from_stop, date, departure, max_transfers = 4))]
+    #[pyo3(signature = (from_stop, date, departure, max_transfers = 7))]
     fn travel_times_from_stop(
         &self,
         py: Python<'_>,
@@ -1013,7 +1013,7 @@ impl TransportNetwork {
     ///     Service date as ``YYYY-MM-DD``.
     /// departure : str
     ///     Departure time at every origin as ``HH:MM:SS``.
-    /// max_transfers : int (optional, default: 4)
+    /// max_transfers : int (optional, default: 7)
     ///     Maximum number of transfers between rides.
     ///
     /// Returns
@@ -1023,7 +1023,7 @@ impl TransportNetwork {
     ///     times in seconds; row order follows `from_stops`, column
     ///     order follows ``stops``. Unreachable pairs hold the maximum
     ///     uint32 value (4294967295).
-    #[pyo3(signature = (from_stops, date, departure, max_transfers = 4))]
+    #[pyo3(signature = (from_stops, date, departure, max_transfers = 7))]
     fn travel_time_matrix<'py>(
         &self,
         py: Python<'py>,
@@ -1088,7 +1088,7 @@ impl TransportNetwork {
     ///     Window length in seconds, at least 1.
     /// percentiles : list of float
     ///     Percentiles in ``[0, 100]``, e.g. ``[10, 50, 90]``.
-    /// max_transfers : int (optional, default: 4)
+    /// max_transfers : int (optional, default: 7)
     ///     Maximum number of transfers between rides.
     ///
     /// Returns
@@ -1097,7 +1097,7 @@ impl TransportNetwork {
     ///     A ``(len(from_stops), stop_count, len(percentiles))`` uint32
     ///     array of travel times in seconds; unreachable percentiles
     ///     hold the maximum uint32 value (4294967295).
-    #[pyo3(signature = (from_stops, date, departure, window, percentiles, max_transfers = 4))]
+    #[pyo3(signature = (from_stops, date, departure, window, percentiles, max_transfers = 7))]
     #[allow(clippy::too_many_arguments)]
     fn travel_time_percentiles<'py>(
         &self,
@@ -1157,7 +1157,7 @@ impl TransportNetwork {
     ///     ``matrix``: a ``(len(origins), len(destinations),
     ///     len(percentiles))`` uint32 array; ``unsnapped_from`` /
     ///     ``unsnapped_to``: indices of points off the walking network.
-    #[pyo3(signature = (origins, destinations, date, departure, window, percentiles, max_transfers = 4, walking_speed_kmph = 3.6, max_walking_time = 600.0, max_snap_distance = 100.0))]
+    #[pyo3(signature = (origins, destinations, date, departure, window, percentiles, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 300.0))]
     #[allow(clippy::too_many_arguments)]
     fn travel_time_percentiles_from_points(
         &self,
@@ -1246,7 +1246,7 @@ impl TransportNetwork {
     ///     ``cafein.emissions.trip_factors``; NaN marks a trip without
     ///     a factor, poisoning the emissions of journeys that ride it.
     ///     Rows for unknown trips are ignored.
-    /// max_transfers : int (optional, default: 4)
+    /// max_transfers : int (optional, default: 7)
     ///     Maximum number of transfers between rides.
     /// to_stops : list of str (optional)
     ///     Destination stops; every stop when omitted.
@@ -1263,7 +1263,7 @@ impl TransportNetwork {
     ///     and ``walk_distance`` (meters), ``emissions`` (grams CO₂e,
     ///     NaN when unresolved), and with `geometries` a ``geometry``
     ///     list of WKB bytes.
-    #[pyo3(signature = (from_stops, date, departure, factors, max_transfers = 4, to_stops = None, geometries = false))]
+    #[pyo3(signature = (from_stops, date, departure, factors, max_transfers = 7, to_stops = None, geometries = false))]
     #[allow(clippy::too_many_arguments)]
     fn travel_cost_matrix(
         &self,
@@ -1392,7 +1392,7 @@ impl TransportNetwork {
     ///     Service date as ``YYYY-MM-DD``.
     /// departure : str
     ///     Departure time at every origin as ``HH:MM:SS``.
-    /// max_transfers : int (optional, default: 4)
+    /// max_transfers : int (optional, default: 7)
     ///     Maximum number of transfers between rides.
     /// walking_speed_kmph, max_walking_time, max_snap_distance :
     ///     The street-search options, as in ``access_stops``.
@@ -1405,7 +1405,7 @@ impl TransportNetwork {
     ///     unreachable; ``unsnapped_from`` / ``unsnapped_to``: indices
     ///     of points farther than `max_snap_distance` from the walking
     ///     network (their rows/columns are unreachable).
-    #[pyo3(signature = (origins, destinations, date, departure, max_transfers = 4, walking_speed_kmph = 3.6, max_walking_time = 600.0, max_snap_distance = 100.0))]
+    #[pyo3(signature = (origins, destinations, date, departure, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 300.0))]
     #[allow(clippy::too_many_arguments)]
     fn travel_time_matrix_from_points(
         &self,
@@ -1500,7 +1500,7 @@ impl TransportNetwork {
     ///     origin and destination point lists — plus
     ///     ``unsnapped_from`` / ``unsnapped_to`` with the indices of
     ///     points off the walking network.
-    #[pyo3(signature = (origins, destinations, date, departure, factors, max_transfers = 4, walking_speed_kmph = 3.6, max_walking_time = 600.0, max_snap_distance = 100.0, geometries = false))]
+    #[pyo3(signature = (origins, destinations, date, departure, factors, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 300.0, geometries = false))]
     #[allow(clippy::too_many_arguments)]
     fn travel_cost_matrix_from_points(
         &self,

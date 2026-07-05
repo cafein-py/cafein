@@ -41,7 +41,7 @@ def _walk_options(walking_speed_kmph, max_walking_time, max_snap_distance):
     if walking_speed_kmph is None:
         walking_speed_kmph = streets.WALKING_SPEED_KMPH
     if max_walking_time is None:
-        max_walking_time = streets.MAX_WALKING_TIME
+        max_walking_time = streets.MAX_ACCESS_EGRESS_TIME
     if max_snap_distance is None:
         max_snap_distance = streets.MAX_SNAP_DISTANCE
     return walking_speed_kmph, max_walking_time, max_snap_distance
@@ -88,10 +88,10 @@ class TransportNetwork:
             without it the network has neither.
         walking_speed_kmph : float (optional, default: 3.6)
             Walking speed in km/h of the footpath precompute.
-        max_walking_time : float (optional, default: 600)
+        max_walking_time : float (optional, default: 1200)
             Walking-time cutoff of the direct footpath search, in
             seconds; chained footpaths may exceed it.
-        max_snap_distance : float (optional, default: 100)
+        max_snap_distance : float (optional, default: 300)
             Maximum distance in meters from a stop to the walking
             network; stops farther away get no footpaths.
         trip_distances : bool (optional, default: True)
@@ -295,9 +295,9 @@ class TransportNetwork:
             The coordinate, in EPSG:4326.
         walking_speed_kmph : float (optional, default: 3.6)
             Walking speed in km/h, on the network and on the connectors.
-        max_walking_time : float (optional, default: 600)
+        max_walking_time : float (optional, default: 7200)
             Walking-time cutoff in seconds.
-        max_snap_distance : float (optional, default: 100)
+        max_snap_distance : float (optional, default: 300)
             Maximum straight-line distance in meters from the coordinate
             to the walking network; a coordinate farther away raises
             ``ValueError``.
@@ -338,7 +338,7 @@ class TransportNetwork:
         to_stop,
         date,
         departure,
-        max_transfers=4,
+        max_transfers=7,
         window=None,
         *,
         geometries=True,
@@ -368,7 +368,7 @@ class TransportNetwork:
             Service date as ``YYYY-MM-DD``.
         departure : str
             Departure time at the origin as ``HH:MM:SS``.
-        max_transfers : int (optional, default: 4)
+        max_transfers : int (optional, default: 7)
             Maximum number of transfers between rides.
         window : int (optional)
             Departure window in seconds. When given, departures within
@@ -398,7 +398,7 @@ class TransportNetwork:
         destination,
         date,
         departure,
-        max_transfers=4,
+        max_transfers=7,
         window=None,
         *,
         walking_speed_kmph=None,
@@ -427,15 +427,15 @@ class TransportNetwork:
             Service date as ``YYYY-MM-DD``.
         departure : str
             Departure time at the origin coordinate as ``HH:MM:SS``.
-        max_transfers : int (optional, default: 4)
+        max_transfers : int (optional, default: 7)
             Maximum number of transfers between rides.
         window : int (optional)
             Departure window in seconds, as in ``route_between_stops``.
         walking_speed_kmph : float (optional, default: 3.6)
             Walking speed in km/h of the access and egress searches.
-        max_walking_time : float (optional, default: 600)
+        max_walking_time : float (optional, default: 7200)
             Walking-time cutoff in seconds of each street search.
-        max_snap_distance : float (optional, default: 100)
+        max_snap_distance : float (optional, default: 300)
             Maximum straight-line distance in meters from each
             coordinate to the walking network.
 
@@ -461,7 +461,7 @@ class TransportNetwork:
         origin,
         date,
         departure,
-        max_transfers=4,
+        max_transfers=7,
         *,
         walking_speed_kmph=None,
         max_walking_time=None,
@@ -485,13 +485,13 @@ class TransportNetwork:
             Service date as ``YYYY-MM-DD``.
         departure : str
             Departure time at the origin coordinate as ``HH:MM:SS``.
-        max_transfers : int (optional, default: 4)
+        max_transfers : int (optional, default: 7)
             Maximum number of transfers between rides.
         walking_speed_kmph : float (optional, default: 3.6)
             Walking speed in km/h of the access search.
-        max_walking_time : float (optional, default: 600)
+        max_walking_time : float (optional, default: 7200)
             Walking-time cutoff in seconds of the access search.
-        max_snap_distance : float (optional, default: 100)
+        max_snap_distance : float (optional, default: 300)
             Maximum straight-line distance in meters from the
             coordinate to the walking network.
 
@@ -509,7 +509,7 @@ class TransportNetwork:
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
         )
 
-    def travel_times_from_stop(self, from_stop, date, departure, max_transfers=4):
+    def travel_times_from_stop(self, from_stop, date, departure, max_transfers=7):
         """Earliest arrival at every reachable stop for a single departure.
 
         One RAPTOR run serves all destinations, so travel-time matrices
@@ -525,7 +525,7 @@ class TransportNetwork:
             Service date as ``YYYY-MM-DD``.
         departure : str
             Departure time at the origin as ``HH:MM:SS``.
-        max_transfers : int (optional, default: 4)
+        max_transfers : int (optional, default: 7)
             Maximum number of transfers between rides.
 
         Returns
@@ -544,7 +544,7 @@ class TransportNetwork:
         from_stops,
         date,
         departure,
-        max_transfers=4,
+        max_transfers=7,
         *,
         destinations=None,
         window=None,
@@ -587,7 +587,7 @@ class TransportNetwork:
             Service date as ``YYYY-MM-DD``.
         departure : str
             Departure time at every origin as ``HH:MM:SS``.
-        max_transfers : int (optional, default: 4)
+        max_transfers : int (optional, default: 7)
             Maximum number of transfers between rides.
         destinations : GeoDataFrame (optional)
             Destination points; defaults to the origins. Only valid

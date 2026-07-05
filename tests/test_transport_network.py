@@ -311,7 +311,7 @@ def test_access_stops_match_the_footpath_pins(network_with_footpaths):
 
 def test_access_stops_respect_the_walking_cutoff(network_with_footpaths):
     lat, lon = stop_coordinates(network_with_footpaths, "1040602")
-    walkable = network_with_footpaths.access_stops(lat, lon)
+    walkable = network_with_footpaths.access_stops(lat, lon, max_walking_time=600.0)
     assert 30 <= len(walkable) <= 90
     assert all(0 <= seconds <= 600 for seconds in walkable.values())
     # A tighter cutoff filters the same walking times, never changes them.
@@ -402,9 +402,9 @@ def test_door_to_door_window_profiles_departures(network_with_footpaths):
 def test_travel_times_from_coordinate_seed_walkable_stops(network_with_footpaths):
     origin = stop_coordinates(network_with_footpaths, "1040602")
     reached = network_with_footpaths.travel_times_from_coordinate(
-        origin, "2022-02-22", "08:30:00"
+        origin, "2022-02-22", "08:30:00", max_walking_time=600.0
     )
-    walkable = network_with_footpaths.access_stops(*origin)
+    walkable = network_with_footpaths.access_stops(*origin, max_walking_time=600.0)
     # Every stop within walking distance appears, at most as far away as
     # the pure walk; transit extends the reach far beyond it.
     for stop, seconds in walkable.items():
@@ -464,7 +464,11 @@ def test_a_synthetic_network_routes_door_to_door(tmp_path):
     # 08:00 -> 08:10, then walk the outer tenth of the edge's cost length
     # (200 m at 1 m/s) — designed values, exact.
     journeys = network.route_between_coordinates(
-        (60.0, 24.0), (60.0, 24.035842), "2022-02-22", "07:30:00"
+        (60.0, 24.0),
+        (60.0, 24.035842),
+        "2022-02-22",
+        "07:30:00",
+        max_walking_time=600.0,
     )
     first = journeys[0]
     assert first["arrival"] == 8 * 3600 + 10 * 60 + 200

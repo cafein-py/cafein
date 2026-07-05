@@ -328,7 +328,7 @@ def test_helsinki_footpaths_cover_the_extract(helsinki_footpaths):
     # center almost completely.
     origins = {from_stop for from_stop, _, _, _ in helsinki_footpaths}
     assert 1_330 <= len(origins) <= 1_440
-    assert 1_100_000 <= len(helsinki_footpaths) <= 1_300_000
+    assert 1_450_000 <= len(helsinki_footpaths) <= 1_600_000
 
 
 def test_helsinki_footpaths_pin_known_pairs(helsinki_footpaths):
@@ -360,7 +360,7 @@ def test_helsinki_street_network_covers_the_extract(helsinki_streets):
     assert {link[0] for link in links} >= origins
     assert all(0 <= link[1] < len(edge_list) for link in links)
     assert all(0.0 <= link[2] <= 1.0 for link in links)
-    assert all(0.0 <= link[3] <= 100.0 for link in links)
+    assert all(0.0 <= link[3] <= 300.0 for link in links)
 
 
 def test_helsinki_footpaths_are_transitively_closed(helsinki_footpaths):

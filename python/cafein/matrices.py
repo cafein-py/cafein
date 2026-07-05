@@ -47,7 +47,7 @@ class TravelCostMatrix(pd.DataFrame):
         Service date as ``YYYY-MM-DD``.
     departure : str
         Departure time at every origin as ``HH:MM:SS``.
-    max_transfers : int (optional, default: 4)
+    max_transfers : int (optional, default: 7)
         Maximum number of transfers between rides.
     factors : DataFrame or path (optional)
         Extra emission-factor rows layered over the shipped defaults;
@@ -79,7 +79,7 @@ class TravelCostMatrix(pd.DataFrame):
         date=None,
         departure=None,
         *,
-        max_transfers=4,
+        max_transfers=7,
         factors=None,
         components=None,
         geometries=False,
@@ -162,7 +162,7 @@ class TravelTimeMatrix(pd.DataFrame):
         Service date as ``YYYY-MM-DD``.
     departure : str
         Departure time at every origin as ``HH:MM:SS``.
-    max_transfers : int (optional, default: 4)
+    max_transfers : int (optional, default: 7)
         Maximum number of transfers between rides.
     window : int (optional)
         Departure window in seconds; enables percentile columns.
@@ -194,7 +194,7 @@ class TravelTimeMatrix(pd.DataFrame):
         date=None,
         departure=None,
         *,
-        max_transfers=4,
+        max_transfers=7,
         window=None,
         percentiles=None,
         confidence=None,
@@ -280,7 +280,7 @@ def travel_cost_table(
     date=None,
     departure=None,
     *,
-    max_transfers=4,
+    max_transfers=7,
     factors=None,
     components=None,
     geometries=False,

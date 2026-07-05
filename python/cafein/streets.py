@@ -28,11 +28,21 @@ from scipy.sparse import csgraph
 WALKING_SPEED_KMPH = 3.6
 """Default walking speed, matching r5py's."""
 
-MAX_WALKING_TIME = 600.0
-"""Default cutoff of the direct footpath search, in seconds."""
+MAX_WALKING_TIME = 1200.0
+"""Default cutoff of the direct footpath (transfer) search, in seconds."""
 
-MAX_SNAP_DISTANCE = 100.0
-"""Default maximum distance from a stop to the walking network, in meters."""
+MAX_ACCESS_EGRESS_TIME = 7200.0
+"""Default cutoff of the query-time access/egress walk, in seconds.
+
+Distinct from the footpath cutoff: it matches r5py's two-hour walking
+cap for door-to-door access and egress, while precomputed transfers keep
+the shorter ``MAX_WALKING_TIME`` cutoff."""
+
+MAX_SNAP_DISTANCE = 300.0
+"""Default maximum distance from a stop to the walking network, in meters.
+
+Matches R5's street-link radius, so a stop up to this far from the
+walking network still attaches to it."""
 
 MAX_FOOTPATH_STOPS = 20_000
 """Ceiling on snapped stops in the footpath build.
@@ -67,10 +77,10 @@ def walking_footpaths(
         footpaths.
     walking_speed_kmph : float (optional, default: 3.6)
         Walking speed in km/h, on the network and on the stop connectors.
-    max_walking_time : float (optional, default: 600)
+    max_walking_time : float (optional, default: 1200)
         Walking-time cutoff of the direct footpath search, in seconds.
         Transitive closure may produce chained footpaths that exceed it.
-    max_snap_distance : float (optional, default: 100)
+    max_snap_distance : float (optional, default: 300)
         Maximum straight-line distance in meters from a stop to its
         nearest walking-network edge.
 
