@@ -166,7 +166,7 @@ def test_point_matrices_report_unsnapped_points(network_with_footpaths):
     # Open water south of the extract: the point cannot snap.
     sea = gpd.GeoDataFrame(
         {"id": ["sea"]},
-        geometry=gpd.points_from_xy([24.90], [60.14]),
+        geometry=gpd.points_from_xy([24.90], [60.10]),
         crs="EPSG:4326",
     )
     destinations = point_frame(network_with_footpaths, [("kamppi", "1040280")])

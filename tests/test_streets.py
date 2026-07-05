@@ -323,12 +323,13 @@ def helsinki_footpaths(helsinki_streets):
 
 
 def test_helsinki_footpaths_cover_the_extract(helsinki_footpaths):
-    # The extract covers central Helsinki only: roughly 1500 of the 8305
+    # The extract covers central Helsinki only: roughly 1750 of the 8305
     # stops snap onto its walking network (shared-use paths and platforms
-    # included), and closure connects the dense center almost completely.
+    # included, links out to R5's 1.6 km radius), and closure connects
+    # the dense center almost completely.
     origins = {from_stop for from_stop, _, _, _ in helsinki_footpaths}
-    assert 1_460 <= len(origins) <= 1_580
-    assert 2_150_000 <= len(helsinki_footpaths) <= 2_400_000
+    assert 1_690 <= len(origins) <= 1_830
+    assert 2_700_000 <= len(helsinki_footpaths) <= 3_000_000
 
 
 def test_helsinki_footpaths_pin_known_pairs(helsinki_footpaths):
@@ -366,7 +367,7 @@ def test_helsinki_street_network_covers_the_extract(helsinki_streets):
     assert {link[0] for link in links} >= origins
     assert all(0 <= link[1] < len(edge_list) for link in links)
     assert all(0.0 <= link[2] <= 1.0 for link in links)
-    assert all(0.0 <= link[3] <= 300.0 for link in links)
+    assert all(0.0 <= link[3] <= streets.MAX_SNAP_DISTANCE for link in links)
 
 
 def test_helsinki_footpaths_are_transitively_closed(helsinki_footpaths):

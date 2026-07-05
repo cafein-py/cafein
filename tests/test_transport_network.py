@@ -344,7 +344,7 @@ def test_access_stops_reject_out_of_range_parameters(network_with_footpaths):
 def test_access_stops_need_a_street_nearby(network_with_footpaths):
     # Open water south of the extract, far from every walkable way.
     with pytest.raises(ValueError, match="farther than"):
-        network_with_footpaths.access_stops(60.14, 24.90)
+        network_with_footpaths.access_stops(60.10, 24.90)
 
 
 def test_access_stops_need_a_street_network(network):
@@ -425,11 +425,11 @@ def test_door_to_door_needs_streets_and_valid_coordinates(
         network.travel_times_from_coordinate(origin, "2022-02-22", "08:30:00")
     with pytest.raises(ValueError, match="origin .* is farther"):
         network_with_footpaths.route_between_coordinates(
-            (60.14, 24.90), destination, "2022-02-22", "08:30:00"
+            (60.10, 24.90), destination, "2022-02-22", "08:30:00"
         )
     with pytest.raises(ValueError, match="destination .* is farther"):
         network_with_footpaths.route_between_coordinates(
-            origin, (60.14, 24.90), "2022-02-22", "08:30:00"
+            origin, (60.10, 24.90), "2022-02-22", "08:30:00"
         )
     with pytest.raises(ValueError, match="walking_speed_kmph"):
         network_with_footpaths.route_between_coordinates(
