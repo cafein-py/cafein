@@ -3,12 +3,17 @@
 //! The Python-side build hands the walking graph over as flat arrays:
 //! vertices are implicit indices, edges carry their cost length in meters
 //! and their geometry. A query snaps a coordinate to its nearest edge
-//! through an R*-tree over the edge segments — a virtual node at the snap
-//! point, with the split edge's cost pro-rated by the fraction each side
-//! covers — and runs a cutoff-bounded Dijkstra to collect every transit stop
-//! reachable on foot, entering stops through the same snap links the
+//! through a packed static index over the edge segments — a virtual node at
+//! the snap point, with the split edge's cost pro-rated by the fraction each
+//! side covers — and runs a cutoff-bounded Dijkstra to collect every transit
+//! stop reachable on foot, entering stops through the same snap links the
 //! footpath precompute used. Walking is undirected, so one search serves
 //! access and egress alike.
+//!
+//! Edges and vertices are renumbered along a Hilbert curve at build time, so
+//! spatially-nearby streets are nearby in every edge-indexed array — the ids
+//! are internal, and only exactly-equal snap or cost ties can resolve
+//! differently than under the input order.
 //!
 //! Geometry is stored in geographic coordinates (longitude/latitude); there
 //! is no global projection. Distances use a local `cos(latitude)` evaluated
@@ -16,9 +21,10 @@
 //! latitude ranges (following R5/OpenTripPlanner). Segments are densified to
 //! a maximum length at build time, so the local-scale model is exact: the
 //! snap foot, the connector distance, and the geometry lengths are all
-//! computed in a frame local to the relevant short segment. The R*-tree
-//! stores segments in lon/lat and is used only for envelope queries — never
-//! metric nearest-neighbour, whose degree-Euclidean distance would be wrong.
+//! computed in a frame local to the relevant short segment. The packed index
+//! stores segment boxes in lon/lat and is used only for envelope queries —
+//! never metric nearest-neighbour, whose degree-Euclidean distance would be
+//! wrong.
 //!
 //! Coordinates are assumed to be a contiguous extract within a continuous
 //! longitude range — the regional OSM extracts cafein consumes never cross the
@@ -30,8 +36,6 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 
 use rayon::prelude::*;
-use rstar::primitives::{GeomWithData, Line};
-use rstar::{RTree, AABB};
 
 use crate::timetable::StopIdx;
 
@@ -40,9 +44,200 @@ use crate::timetable::StopIdx;
 /// millimetre even at high latitude.
 const MAX_SEGMENT_METERS: f64 = 100.0;
 
-/// One polyline segment in the spatial index (lon/lat), tagged with
-/// `(edge index, index of the segment's first coordinate)`.
-type EdgeSegment = GeomWithData<Line<[f64; 2]>, (u32, u32)>;
+/// Children per packed-index node.
+const INDEX_NODE_SIZE: usize = 16;
+
+/// A lon/lat bounding box: `[min_lon, min_lat, max_lon, max_lat]`.
+type Envelope = [f64; 4];
+
+fn envelopes_intersect(a: &Envelope, b: &Envelope) -> bool {
+    a[0] <= b[2] && b[0] <= a[2] && a[1] <= b[3] && b[1] <= a[3]
+}
+
+/// A packed static spatial index over the densified edge segments: leaf
+/// boxes sorted by the Hilbert position of their segment's midpoint, parent
+/// levels packed bottom-up over runs of `INDEX_NODE_SIZE` children — flat
+/// arrays with an implicit tree layout, built once and never mutated.
+/// Queried by envelope intersection only.
+#[derive(Debug)]
+struct PackedIndex {
+    /// Node boxes: the leaves first (Hilbert order), then each parent
+    /// level, the root last.
+    boxes: Vec<Envelope>,
+    /// Per-leaf `(edge index, index of the segment's first coordinate)`,
+    /// parallel to the leaf boxes.
+    payload: Vec<(u32, u32)>,
+    /// Start of each level in `boxes` (leaves at 0), plus a tail.
+    level_starts: Vec<u32>,
+}
+
+impl PackedIndex {
+    /// Collects the payloads of every leaf whose box intersects the
+    /// envelope, sorted by payload so callers see a traversal-free order.
+    fn query_into(&self, envelope: &Envelope, matches: &mut Vec<(u32, u32)>) {
+        matches.clear();
+        if self.payload.is_empty() {
+            return;
+        }
+        let levels = self.level_starts.len() - 1;
+        // (global node index, level), starting at the root.
+        let mut stack = vec![(self.boxes.len() - 1, levels - 1)];
+        while let Some((node, level)) = stack.pop() {
+            if !envelopes_intersect(&self.boxes[node], envelope) {
+                continue;
+            }
+            if level == 0 {
+                matches.push(self.payload[node]);
+                continue;
+            }
+            // A node's children sit in the level below, in its own run.
+            let position = node - self.level_starts[level] as usize;
+            let start = self.level_starts[level - 1] as usize + position * INDEX_NODE_SIZE;
+            let end = (start + INDEX_NODE_SIZE).min(self.level_starts[level] as usize);
+            for child in start..end {
+                stack.push((child, level - 1));
+            }
+        }
+        matches.sort_unstable();
+    }
+}
+
+/// Builds the packed index over a densified polyline set.
+fn build_index(coordinate_offsets: &[u32], lons: &[f64], lats: &[f64]) -> PackedIndex {
+    // One item per consecutive coordinate pair, keyed by the Hilbert
+    // position of its midpoint on a grid over the extract; ties broken by
+    // the payload so the order is a pure function of the geometry.
+    let bounds = coordinate_bounds(lons, lats);
+    let mut items: Vec<(u64, (u32, u32), Envelope)> = Vec::new();
+    for edge in 0..coordinate_offsets.len().saturating_sub(1) {
+        let start = coordinate_offsets[edge] as usize;
+        let end = coordinate_offsets[edge + 1] as usize;
+        for segment in start..end - 1 {
+            let (lon_a, lat_a) = (lons[segment], lats[segment]);
+            let (lon_b, lat_b) = (lons[segment + 1], lats[segment + 1]);
+            let key = hilbert(
+                grid_position((lon_a + lon_b) / 2.0, bounds[0], bounds[2]),
+                grid_position((lat_a + lat_b) / 2.0, bounds[1], bounds[3]),
+            );
+            items.push((
+                key,
+                (edge as u32, segment as u32),
+                [
+                    lon_a.min(lon_b),
+                    lat_a.min(lat_b),
+                    lon_a.max(lon_b),
+                    lat_a.max(lat_b),
+                ],
+            ));
+        }
+    }
+    items.sort_unstable_by_key(|&(key, payload, _)| (key, payload));
+
+    let count = items.len();
+    let mut level_starts = vec![0u32];
+    let mut total = count;
+    let mut level_size = count;
+    while level_size > 1 {
+        level_starts.push(total as u32);
+        level_size = level_size.div_ceil(INDEX_NODE_SIZE);
+        total += level_size;
+    }
+    if count == 0 {
+        return PackedIndex {
+            boxes: Vec::new(),
+            payload: Vec::new(),
+            level_starts: vec![0, 0],
+        };
+    }
+    if count == 1 {
+        // A single leaf is its own root: one leaf-only level.
+        let (_, tag, envelope) = items[0];
+        return PackedIndex {
+            boxes: vec![envelope],
+            payload: vec![tag],
+            level_starts: vec![0, 1],
+        };
+    }
+    level_starts.push(total as u32);
+
+    let mut boxes = Vec::with_capacity(total);
+    let mut payload = Vec::with_capacity(count);
+    for (_, tag, envelope) in items {
+        boxes.push(envelope);
+        payload.push(tag);
+    }
+    for level in 1..level_starts.len() - 1 {
+        let (start, end) = (
+            level_starts[level - 1] as usize,
+            level_starts[level] as usize,
+        );
+        for run in (start..end).step_by(INDEX_NODE_SIZE) {
+            let mut merged = boxes[run];
+            for child in &boxes[run + 1..(run + INDEX_NODE_SIZE).min(end)] {
+                merged[0] = merged[0].min(child[0]);
+                merged[1] = merged[1].min(child[1]);
+                merged[2] = merged[2].max(child[2]);
+                merged[3] = merged[3].max(child[3]);
+            }
+            boxes.push(merged);
+        }
+    }
+    PackedIndex {
+        boxes,
+        payload,
+        level_starts,
+    }
+}
+
+/// The `[min_lon, min_lat, max_lon, max_lat]` bounds of a coordinate set.
+fn coordinate_bounds(lons: &[f64], lats: &[f64]) -> Envelope {
+    let mut bounds = [
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    for (&lon, &lat) in lons.iter().zip(lats) {
+        bounds[0] = bounds[0].min(lon);
+        bounds[1] = bounds[1].min(lat);
+        bounds[2] = bounds[2].max(lon);
+        bounds[3] = bounds[3].max(lat);
+    }
+    bounds
+}
+
+/// A coordinate's cell on a 2¹⁶-wide grid over `[min, max]`.
+fn grid_position(value: f64, min: f64, max: f64) -> u16 {
+    if max <= min {
+        return 0;
+    }
+    (((value - min) / (max - min)) * f64::from(u16::MAX)).clamp(0.0, f64::from(u16::MAX)) as u16
+}
+
+/// A cell's position along the order-16 Hilbert curve (the classic
+/// rotate-and-accumulate walk), giving spatially-nearby cells nearby
+/// positions.
+fn hilbert(x: u16, y: u16) -> u64 {
+    const N: u64 = 1 << 16;
+    let (mut x, mut y) = (u64::from(x), u64::from(y));
+    let mut d: u64 = 0;
+    let mut s: u64 = N / 2;
+    while s > 0 {
+        let rx = u64::from(x & s > 0);
+        let ry = u64::from(y & s > 0);
+        d += s * s * ((3 * rx) ^ ry);
+        // Rotate the quadrant so the curve connects.
+        if ry == 0 {
+            if rx == 1 {
+                x = N - 1 - x;
+                y = N - 1 - y;
+            }
+            std::mem::swap(&mut x, &mut y);
+        }
+        s /= 2;
+    }
+    d
+}
 
 /// How a stop enters the street graph: snapped onto an edge at a fraction
 /// of its cost length, over a straight connector to the snap point.
@@ -209,7 +404,7 @@ pub struct StreetNetwork {
     vertex_links: Vec<(u32, u32)>,
     /// Spatial index over the edge segments in lon/lat, for envelope
     /// queries only.
-    tree: RTree<EdgeSegment>,
+    index: PackedIndex,
 }
 
 impl StreetNetwork {
@@ -278,11 +473,99 @@ impl StreetNetwork {
             }
         }
 
+        // Hilbert-order the edges by their first coordinate and renumber
+        // vertices by first appearance in that order, so spatially-nearby
+        // streets are nearby in every edge- and vertex-indexed array. The
+        // ids are internal; costs and results are unchanged (only
+        // exactly-equal ties could resolve differently than under the
+        // input order). Hilbert-cell ties break by the edges' own data —
+        // endpoints, length, vertices, then the full geometry — never by
+        // the input position, so the layout is the same whatever order the
+        // edges arrive in (edges identical in every field are
+        // interchangeable, and their links follow them either way).
+        let bounds = coordinate_bounds(longitudes, latitudes);
+        let mut order: Vec<u32> = (0..edges.len() as u32).collect();
+        type EdgeKey = (u64, u64, u64, u64, u64, u64, u32, u32);
+        let keys: Vec<EdgeKey> = (0..edges.len())
+            .map(|edge| {
+                let first = coordinate_offsets[edge] as usize;
+                let last = coordinate_offsets[edge + 1] as usize - 1;
+                let (from, to, meters) = edges[edge];
+                (
+                    hilbert(
+                        grid_position(longitudes[first], bounds[0], bounds[2]),
+                        grid_position(latitudes[first], bounds[1], bounds[3]),
+                    ),
+                    longitudes[first].to_bits(),
+                    latitudes[first].to_bits(),
+                    longitudes[last].to_bits(),
+                    latitudes[last].to_bits(),
+                    meters.to_bits(),
+                    from,
+                    to,
+                )
+            })
+            .collect();
+        let geometry_bits = |edge: u32| {
+            let start = coordinate_offsets[edge as usize] as usize;
+            let end = coordinate_offsets[edge as usize + 1] as usize;
+            longitudes[start..end]
+                .iter()
+                .zip(&latitudes[start..end])
+                .map(|(&lon, &lat)| (lon.to_bits(), lat.to_bits()))
+        };
+        order.sort_unstable_by(|&a, &b| {
+            keys[a as usize]
+                .cmp(&keys[b as usize])
+                .then_with(|| geometry_bits(a).cmp(geometry_bits(b)))
+        });
+
+        let mut edge_map = vec![0u32; edges.len()];
+        let mut vertex_map = vec![u32::MAX; vertex_count as usize];
+        let mut next_vertex = 0u32;
+        let mut permuted_edges = Vec::with_capacity(edges.len());
+        let mut permuted_offsets = Vec::with_capacity(edges.len() + 1);
+        let mut permuted_lons = Vec::with_capacity(longitudes.len());
+        let mut permuted_lats = Vec::with_capacity(latitudes.len());
+        permuted_offsets.push(0u32);
+        for (new_edge, &old_edge) in order.iter().enumerate() {
+            edge_map[old_edge as usize] = new_edge as u32;
+            let (from, to, meters) = edges[old_edge as usize];
+            let mut renumber = |vertex: u32| {
+                if vertex_map[vertex as usize] == u32::MAX {
+                    vertex_map[vertex as usize] = next_vertex;
+                    next_vertex += 1;
+                }
+                vertex_map[vertex as usize]
+            };
+            permuted_edges.push((renumber(from), renumber(to), meters));
+            let start = coordinate_offsets[old_edge as usize] as usize;
+            let end = coordinate_offsets[old_edge as usize + 1] as usize;
+            permuted_lons.extend_from_slice(&longitudes[start..end]);
+            permuted_lats.extend_from_slice(&latitudes[start..end]);
+            permuted_offsets.push(permuted_lons.len() as u32);
+        }
+        // Vertices no edge touches keep ids after the connected ones.
+        for slot in vertex_map.iter_mut() {
+            if *slot == u32::MAX {
+                *slot = next_vertex;
+                next_vertex += 1;
+            }
+        }
+        let links: Vec<StopLink> = links
+            .into_iter()
+            .map(|link| StopLink {
+                edge: edge_map[link.edge as usize],
+                ..link
+            })
+            .collect();
+        let edges = permuted_edges;
+
         let (dense_offsets, lons, lats, cumulative) =
-            densify(coordinate_offsets, longitudes, latitudes);
+            densify(&permuted_offsets, &permuted_lons, &permuted_lats);
 
         let mut adjacency_offsets = vec![0u32; vertex_count as usize + 1];
-        for &(from, to, _) in edges {
+        for &(from, to, _) in &edges {
             adjacency_offsets[from as usize + 1] += 1;
             adjacency_offsets[to as usize + 1] += 1;
         }
@@ -299,7 +582,7 @@ impl StreetNetwork {
             }
         }
 
-        let tree = build_tree(&dense_offsets, &lons, &lats);
+        let index = build_index(&dense_offsets, &lons, &lats);
         let endpoints: Vec<(u32, u32)> = edges.iter().map(|&(from, to, _)| (from, to)).collect();
         let vertex_links = build_vertex_links(&links, &endpoints);
 
@@ -314,7 +597,7 @@ impl StreetNetwork {
             cumulative,
             links,
             vertex_links,
-            tree,
+            index,
         })
     }
 
@@ -349,9 +632,11 @@ impl StreetNetwork {
         }
     }
 
-    /// Rebuilds a network from its serialized parts.
+    /// Rebuilds a network from its serialized parts. The stored edge order
+    /// is adopted as-is — new saves carry the Hilbert layout; older
+    /// artifacts keep their original order, correct either way.
     pub fn from_parts(parts: StreetNetworkParts) -> StreetNetwork {
-        let tree = build_tree(&parts.coordinate_offsets, &parts.lons, &parts.lats);
+        let index = build_index(&parts.coordinate_offsets, &parts.lons, &parts.lats);
         let vertex_links = build_vertex_links(&parts.links, &parts.endpoints);
         StreetNetwork {
             adjacency_offsets: parts.adjacency_offsets,
@@ -364,12 +649,12 @@ impl StreetNetwork {
             cumulative: parts.cumulative,
             links: parts.links,
             vertex_links,
-            tree,
+            index,
         }
     }
 
     /// Snaps a coordinate to its nearest edge within `max_snap_distance`
-    /// meters through the segment R*-tree. Non-finite coordinates or a
+    /// meters through the packed segment index. Non-finite coordinates or a
     /// non-finite or negative allowance never snap.
     pub fn snap(&self, latitude: f64, longitude: f64, max_snap_distance: f64) -> Option<Snap> {
         if !latitude.is_finite()
@@ -380,15 +665,22 @@ impl StreetNetwork {
             return None;
         }
         // Every segment within `max_snap_distance` is inside this lon/lat
-        // envelope; the tree is queried by envelope intersection, never by a
-        // degree-Euclidean nearest, and each candidate is re-measured exactly.
+        // envelope; the index is queried by envelope intersection, never by
+        // a degree-Euclidean nearest, and each candidate is re-measured
+        // exactly. Exact connector ties break by (edge, fraction), so the
+        // winner is a function of the built network, not of index internals.
         let envelope = snap_envelope(latitude, longitude, max_snap_distance);
+        let mut candidates = Vec::new();
+        self.index.query_into(&envelope, &mut candidates);
         let mut best: Option<Snap> = None;
-        for segment in self.tree.locate_in_envelope_intersecting(envelope) {
-            let (edge, start) = segment.data;
+        for (edge, start) in candidates {
             let (connector, fraction) = self.foot_on_segment(latitude, longitude, edge, start);
             if connector <= max_snap_distance
-                && best.is_none_or(|current| connector < current.connector)
+                && best.is_none_or(|current| {
+                    connector < current.connector
+                        || (connector == current.connector
+                            && (edge, fraction) < (current.edge, current.fraction))
+                })
             {
                 best = Some(Snap {
                     edge,
@@ -858,26 +1150,6 @@ fn build_vertex_links(links: &[StopLink], endpoints: &[(u32, u32)]) -> Vec<(u32,
     vertex_links
 }
 
-/// The segment R*-tree over a lon/lat polyline set. Each entry is tagged with
-/// `(edge index, its first coordinate's index)`.
-fn build_tree(coordinate_offsets: &[u32], lons: &[f64], lats: &[f64]) -> RTree<EdgeSegment> {
-    let mut segments = Vec::new();
-    for edge in 0..coordinate_offsets.len().saturating_sub(1) {
-        let start = coordinate_offsets[edge] as usize;
-        let end = coordinate_offsets[edge + 1] as usize;
-        for segment in start..end - 1 {
-            segments.push(EdgeSegment::new(
-                Line::new(
-                    [lons[segment], lats[segment]],
-                    [lons[segment + 1], lats[segment + 1]],
-                ),
-                (edge as u32, segment as u32),
-            ));
-        }
-    }
-    RTree::bulk_load(segments)
-}
-
 /// Drops consecutive duplicate points, keeping at least two.
 fn dedup_consecutive(path: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
     let mut coordinates: Vec<(f64, f64)> = Vec::with_capacity(path.len());
@@ -897,7 +1169,7 @@ fn dedup_consecutive(path: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
 /// global minimum metres-per-degree-latitude; the longitude half-width uses
 /// the minimum metres-per-degree-longitude over the reachable latitude band,
 /// so no truly-nearby segment is clipped at any latitude or snap distance.
-fn snap_envelope(latitude: f64, longitude: f64, max_snap_distance: f64) -> AABB<[f64; 2]> {
+fn snap_envelope(latitude: f64, longitude: f64, max_snap_distance: f64) -> Envelope {
     // Metres per degree of latitude bottoms out at the equator.
     const MIN_MPD_LAT: f64 = 110_574.0;
     let margin = 1.0 + 1e-6;
@@ -910,10 +1182,12 @@ fn snap_envelope(latitude: f64, longitude: f64, max_snap_distance: f64) -> AABB<
     } else {
         180.0
     };
-    AABB::from_corners(
-        [longitude - delta_lon, latitude - delta_lat],
-        [longitude + delta_lon, latitude + delta_lat],
-    )
+    [
+        longitude - delta_lon,
+        latitude - delta_lat,
+        longitude + delta_lon,
+        latitude + delta_lat,
+    ]
 }
 
 /// Shortest signed longitude difference in degrees, wrapped to `[-180, 180]`
@@ -1660,5 +1934,183 @@ mod tests {
             network(2, 1, &[edge(400.0)], vec![link(0, 0, 0.5, -1.0)]).unwrap_err(),
             StreetError::InvalidLink { link: 0 }
         );
+    }
+
+    /// The inverse Hilbert walk (reference d2xy), for the bijection test.
+    fn hilbert_inverse(d: u64) -> (u16, u16) {
+        const N: u64 = 1 << 16;
+        let (mut x, mut y) = (0u64, 0u64);
+        let mut t = d;
+        let mut s: u64 = 1;
+        while s < N {
+            let rx = 1 & (t / 2);
+            let ry = 1 & (t ^ rx);
+            if ry == 0 {
+                if rx == 1 {
+                    x = s - 1 - x;
+                    y = s - 1 - y;
+                }
+                std::mem::swap(&mut x, &mut y);
+            }
+            x += s * rx;
+            y += s * ry;
+            t /= 4;
+            s *= 2;
+        }
+        (x as u16, y as u16)
+    }
+
+    #[test]
+    fn hilbert_positions_are_a_bijection() {
+        // Round-tripping through the independent inverse walk catches any
+        // rotation or accumulation mistake in the forward encoding.
+        for x in (0..=u16::MAX).step_by(4099) {
+            for y in (0..=u16::MAX).step_by(5273) {
+                assert_eq!(hilbert_inverse(hilbert(x, y)), (x, y));
+            }
+        }
+        assert_eq!(hilbert(0, 0), 0);
+    }
+
+    #[test]
+    fn packed_index_matches_a_linear_scan() {
+        // Pseudo-random polylines (fixed LCG seed); every envelope query
+        // must return exactly the segments whose boxes intersect it.
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut random = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as f64 / (1u64 << 31) as f64
+        };
+        let mut offsets = vec![0u32];
+        let mut lons = Vec::new();
+        let mut lats = Vec::new();
+        for _ in 0..120 {
+            let points = 2 + (random() * 4.0) as usize;
+            for _ in 0..points {
+                lons.push(24.0 + random() * 0.5);
+                lats.push(60.0 + random() * 0.5);
+            }
+            offsets.push(lons.len() as u32);
+        }
+        let index = build_index(&offsets, &lons, &lats);
+
+        let mut scan = Vec::new();
+        for edge in 0..offsets.len() - 1 {
+            for segment in offsets[edge] as usize..offsets[edge + 1] as usize - 1 {
+                scan.push((
+                    (edge as u32, segment as u32),
+                    [
+                        lons[segment].min(lons[segment + 1]),
+                        lats[segment].min(lats[segment + 1]),
+                        lons[segment].max(lons[segment + 1]),
+                        lats[segment].max(lats[segment + 1]),
+                    ],
+                ));
+            }
+        }
+        let mut matches = Vec::new();
+        for _ in 0..200 {
+            let (lon, lat) = (24.0 + random() * 0.5, 60.0 + random() * 0.5);
+            let (dlon, dlat) = (random() * 0.05, random() * 0.05);
+            let envelope = [lon - dlon, lat - dlat, lon + dlon, lat + dlat];
+            index.query_into(&envelope, &mut matches);
+            let mut expected: Vec<(u32, u32)> = scan
+                .iter()
+                .filter(|(_, envelope_b)| envelopes_intersect(&envelope, envelope_b))
+                .map(|&(tag, _)| tag)
+                .collect();
+            expected.sort_unstable();
+            assert_eq!(matches, expected);
+        }
+    }
+
+    #[test]
+    fn input_edge_order_does_not_change_results() {
+        // Two far-apart clusters interleaved in the input: the Hilbert
+        // layout normalises both input orders to the same internal one, so
+        // every query result — internal ids included — must coincide.
+        let edges: Vec<TestEdge> = vec![
+            (0, 1, 400.0, straight((0.0, 0.0), (400.0, 0.0))),
+            (2, 3, 400.0, straight((5000.0, 5000.0), (5400.0, 5000.0))),
+            (1, 4, 400.0, straight((400.0, 0.0), (800.0, 0.0))),
+            (3, 5, 400.0, straight((5400.0, 5000.0), (5800.0, 5000.0))),
+        ];
+        let links = vec![link(0, 0, 0.5, 0.0), link(1, 3, 0.5, 0.0)];
+        let forward = network(6, 2, &edges, links.clone()).unwrap();
+
+        let shuffled_edges: Vec<TestEdge> = vec![
+            edges[3].clone(),
+            edges[1].clone(),
+            edges[2].clone(),
+            edges[0].clone(),
+        ];
+        // Links follow their edges to the shuffled positions.
+        let shuffled_links = vec![link(0, 3, 0.5, 0.0), link(1, 0, 0.5, 0.0)];
+        let shuffled = network(6, 2, &shuffled_edges, shuffled_links).unwrap();
+
+        for &(x, y) in &[(200.0, 10.0), (5600.0, 4990.0), (700.0, -20.0)] {
+            let (lon, lat) = lonlat(x, y);
+            assert_eq!(
+                forward.snap(lat, lon, 100.0),
+                shuffled.snap(lat, lon, 100.0)
+            );
+            assert_eq!(
+                forward.access_stops(lat, lon, 1.0, 1200.0, 100.0),
+                shuffled.access_stops(lat, lon, 1.0, 1200.0, 100.0)
+            );
+        }
+    }
+
+    #[test]
+    fn edges_sharing_a_hilbert_cell_keep_an_input_free_order() {
+        // Three edges fan out from one point — identical first coordinate,
+        // identical Hilbert key — so the layout's tie-break must come from
+        // the edges' own data, never their input position.
+        let edges: Vec<TestEdge> = vec![
+            (0, 1, 400.0, straight((0.0, 0.0), (400.0, 0.0))),
+            (0, 2, 400.0, straight((0.0, 0.0), (0.0, 400.0))),
+            (0, 3, 400.0, straight((0.0, 0.0), (-400.0, 0.0))),
+        ];
+        let links = vec![link(0, 0, 1.0, 0.0), link(1, 1, 1.0, 0.0)];
+        let forward = network(4, 2, &edges, links).unwrap();
+
+        let shuffled_edges: Vec<TestEdge> =
+            vec![edges[2].clone(), edges[0].clone(), edges[1].clone()];
+        let shuffled_links = vec![link(0, 1, 1.0, 0.0), link(1, 2, 1.0, 0.0)];
+        let shuffled = network(4, 2, &shuffled_edges, shuffled_links).unwrap();
+
+        for &(x, y) in &[(390.0, 5.0), (-5.0, 390.0), (10.0, 10.0)] {
+            let (lon, lat) = lonlat(x, y);
+            assert_eq!(
+                forward.snap(lat, lon, 100.0),
+                shuffled.snap(lat, lon, 100.0)
+            );
+            assert_eq!(
+                forward.access_stops(lat, lon, 1.0, 1200.0, 100.0),
+                shuffled.access_stops(lat, lon, 1.0, 1200.0, 100.0)
+            );
+        }
+    }
+
+    #[test]
+    fn snaps_on_a_single_segment_network() {
+        // One 50 m edge densifies to a single segment: the packed index's
+        // one leaf is its own root and must still be found.
+        let network = network(
+            2,
+            1,
+            &[(0, 1, 50.0, straight((0.0, 0.0), (50.0, 0.0)))],
+            vec![link(0, 0, 1.0, 0.0)],
+        )
+        .unwrap();
+        let (lon, lat) = lonlat(25.0, 5.0);
+        let snap = network.snap(lat, lon, 100.0).unwrap();
+        assert_eq!(snap.edge, 0);
+        assert!((snap.fraction - 0.5).abs() < 1e-6);
+        assert!((snap.connector - 5.0).abs() < 0.05);
+        let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
+        assert_eq!(timed(&reached), vec![(StopIdx(0), 30)]);
     }
 }
