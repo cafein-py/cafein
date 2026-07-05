@@ -872,6 +872,54 @@ fn assemble((artifact, streets, streets_bytes_read): LoadedArtifact) -> Transpor
     }
 }
 
+/// Flattens per-origin cost rows into the columnar dict the Python
+/// matrices consume: equal-length arrays for the surviving pairs, plus
+/// a WKB list when geometries ride along.
+fn cost_rows_dict(
+    py: Python<'_>,
+    rows: Vec<Vec<CostRow>>,
+    geometries: bool,
+) -> PyResult<Py<PyDict>> {
+    let total: usize = rows.iter().map(Vec::len).sum();
+    let mut from = Vec::with_capacity(total);
+    let mut to = Vec::with_capacity(total);
+    let mut travel_time = Vec::with_capacity(total);
+    let mut rides = Vec::with_capacity(total);
+    let mut transit_distance = Vec::with_capacity(total);
+    let mut walk_distance = Vec::with_capacity(total);
+    let mut emissions = Vec::with_capacity(total);
+    let wkbs = PyList::empty(py);
+    for (origin, origin_rows) in rows.into_iter().enumerate() {
+        for row in origin_rows {
+            from.push(origin as u32);
+            to.push(row.to);
+            travel_time.push(row.seconds);
+            rides.push(row.rides);
+            transit_distance.push(row.transit_meters);
+            walk_distance.push(row.walk_meters);
+            emissions.push(row.emission_grams);
+            if geometries {
+                match row.geometry {
+                    Some(wkb) => wkbs.append(PyBytes::new(py, &wkb))?,
+                    None => wkbs.append(py.None())?,
+                }
+            }
+        }
+    }
+    let result = PyDict::new(py);
+    result.set_item("from", from.into_pyarray(py))?;
+    result.set_item("to", to.into_pyarray(py))?;
+    result.set_item("travel_time", travel_time.into_pyarray(py))?;
+    result.set_item("rides", rides.into_pyarray(py))?;
+    result.set_item("transit_distance", transit_distance.into_pyarray(py))?;
+    result.set_item("walk_distance", walk_distance.into_pyarray(py))?;
+    result.set_item("emissions", emissions.into_pyarray(py))?;
+    if geometries {
+        result.set_item("geometry", wkbs)?;
+    }
+    Ok(result.unbind())
+}
+
 /// Rejects an empty or out-of-range window/percentile specification.
 fn validate_window(window: u32, percentiles: &[f64]) -> PyResult<()> {
     if window == 0 {
@@ -2177,45 +2225,7 @@ impl TransportNetwork {
                 &destinations,
             )
         });
-
-        let total: usize = rows.iter().map(Vec::len).sum();
-        let mut from = Vec::with_capacity(total);
-        let mut to = Vec::with_capacity(total);
-        let mut travel_time = Vec::with_capacity(total);
-        let mut rides = Vec::with_capacity(total);
-        let mut transit_distance = Vec::with_capacity(total);
-        let mut walk_distance = Vec::with_capacity(total);
-        let mut emissions = Vec::with_capacity(total);
-        let wkbs = PyList::empty(py);
-        for (origin, origin_rows) in rows.into_iter().enumerate() {
-            for row in origin_rows {
-                from.push(origin as u32);
-                to.push(row.to);
-                travel_time.push(row.seconds);
-                rides.push(row.rides);
-                transit_distance.push(row.transit_meters);
-                walk_distance.push(row.walk_meters);
-                emissions.push(row.emission_grams);
-                if geometries {
-                    match row.geometry {
-                        Some(wkb) => wkbs.append(PyBytes::new(py, &wkb))?,
-                        None => wkbs.append(py.None())?,
-                    }
-                }
-            }
-        }
-        let result = PyDict::new(py);
-        result.set_item("from", from.into_pyarray(py))?;
-        result.set_item("to", to.into_pyarray(py))?;
-        result.set_item("travel_time", travel_time.into_pyarray(py))?;
-        result.set_item("rides", rides.into_pyarray(py))?;
-        result.set_item("transit_distance", transit_distance.into_pyarray(py))?;
-        result.set_item("walk_distance", walk_distance.into_pyarray(py))?;
-        result.set_item("emissions", emissions.into_pyarray(py))?;
-        if geometries {
-            result.set_item("geometry", wkbs)?;
-        }
-        Ok(result.unbind())
+        cost_rows_dict(py, rows, geometries)
     }
 
     /// Travel times between coordinate points, as a matrix.
@@ -2511,47 +2521,280 @@ impl TransportNetwork {
             }
             (rows, unsnapped_from, unsnapped_to)
         });
+        let result = cost_rows_dict(py, rows, geometries)?;
+        result
+            .bind(py)
+            .set_item("unsnapped_from", unsnapped_from.into_pyarray(py))?;
+        result
+            .bind(py)
+            .set_item("unsnapped_to", unsnapped_to.into_pyarray(py))?;
+        Ok(result)
+    }
 
-        let total: usize = rows.iter().map(Vec::len).sum();
-        let mut from = Vec::with_capacity(total);
-        let mut to = Vec::with_capacity(total);
-        let mut travel_time = Vec::with_capacity(total);
-        let mut rides = Vec::with_capacity(total);
-        let mut transit_distance = Vec::with_capacity(total);
-        let mut walk_distance = Vec::with_capacity(total);
-        let mut emissions = Vec::with_capacity(total);
-        let wkbs = PyList::empty(py);
-        for (origin, origin_rows) in rows.into_iter().enumerate() {
-            for row in origin_rows {
-                from.push(origin as u32);
-                to.push(row.to);
-                travel_time.push(row.seconds);
-                rides.push(row.rides);
-                transit_distance.push(row.transit_meters);
-                walk_distance.push(row.walk_meters);
-                emissions.push(row.emission_grams);
-                if geometries {
-                    match row.geometry {
-                        Some(wkb) => wkbs.append(PyBytes::new(py, &wkb))?,
-                        None => wkbs.append(py.None())?,
-                    }
-                }
+    /// The cleanest journey's aggregated costs per OD pair within a
+    /// travel-time budget, long format — the emissions counterpart of
+    /// ``travel_cost_matrix`` over a departure window.
+    ///
+    /// The candidates per pair are the departure window's
+    /// (departure, arrival, rides)-Pareto set — the same set
+    /// ``journey_frontier`` sees — and a cell reports its
+    /// lowest-emission member within `budget` (no budget: within the
+    /// window's reach), ties resolved toward the shorter travel time.
+    /// Pairs with no qualifying resolved-emissions candidate are absent.
+    #[pyo3(signature = (from_stops, date, departure, window, factors, budget = None, max_transfers = 7, to_stops = None, geometries = false))]
+    #[allow(clippy::too_many_arguments)]
+    fn least_emission_matrix(
+        &self,
+        py: Python<'_>,
+        from_stops: Vec<String>,
+        date: &str,
+        departure: &str,
+        window: u32,
+        factors: Vec<(String, f64)>,
+        budget: Option<u32>,
+        max_transfers: u8,
+        to_stops: Option<Vec<String>>,
+        geometries: bool,
+    ) -> PyResult<Py<PyDict>> {
+        let Some(geometry) = &self.geometry else {
+            return Err(PyValueError::new_err(
+                "no trip distances installed; build the network with trip distances enabled",
+            ));
+        };
+        if geometries && self.leg_geometry.is_none() {
+            return Err(PyValueError::new_err(
+                "no leg geometries installed; build the network with leg geometries enabled",
+            ));
+        }
+        if window == 0 {
+            return Err(PyValueError::new_err(
+                "window must be a positive number of seconds",
+            ));
+        }
+        let origins: Vec<StopIdx> = from_stops
+            .iter()
+            .map(|stop| self.resolve_stop(stop))
+            .collect::<PyResult<_>>()?;
+        let destinations: Vec<StopIdx> = match to_stops {
+            Some(stops) => stops
+                .iter()
+                .map(|stop| self.resolve_stop(stop))
+                .collect::<PyResult<_>>()?,
+            None => (0..self.build.timetable.stop_count())
+                .map(StopIdx)
+                .collect(),
+        };
+        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
+        for (trip_id, factor) in &factors {
+            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
+                per_trip[trip.0 as usize] = *factor;
             }
         }
-        let result = PyDict::new(py);
-        result.set_item("from", from.into_pyarray(py))?;
-        result.set_item("to", to.into_pyarray(py))?;
-        result.set_item("travel_time", travel_time.into_pyarray(py))?;
-        result.set_item("rides", rides.into_pyarray(py))?;
-        result.set_item("transit_distance", transit_distance.into_pyarray(py))?;
-        result.set_item("walk_distance", walk_distance.into_pyarray(py))?;
-        result.set_item("emissions", emissions.into_pyarray(py))?;
-        if geometries {
-            result.set_item("geometry", wkbs)?;
+        let departure = parse_time(departure)?;
+        let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
+        let requests: Vec<Request> = origins
+            .into_iter()
+            .map(|origin| Request {
+                departure,
+                access: vec![(origin, 0)],
+                egress: Vec::new(),
+                active_services: active_services.clone(),
+                active_services_previous: active_services_previous.clone(),
+                max_transfers,
+            })
+            .collect();
+        let inputs = CostInputs {
+            geometry,
+            factors: &per_trip,
+            leg_geometry: self.leg_geometry.as_ref(),
+            with_geometry: geometries,
+        };
+        let rows = py.allow_threads(|| {
+            Raptor.least_emission_matrix(
+                &self.build.timetable,
+                &self.transfers,
+                &inputs,
+                &requests,
+                &destinations,
+                window,
+                budget,
+            )
+        });
+        cost_rows_dict(py, rows, geometries)
+    }
+
+    /// ``least_emission_matrix`` between coordinate points, linked
+    /// through the street network like ``travel_cost_matrix_from_points``
+    /// — including the walking-only alternative, whose zero emissions
+    /// win any cell they qualify for within the budget.
+    #[pyo3(signature = (origins, destinations, date, departure, window, factors, budget = None, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false))]
+    #[allow(clippy::too_many_arguments)]
+    fn least_emission_matrix_from_points(
+        &self,
+        py: Python<'_>,
+        origins: Vec<(f64, f64)>,
+        destinations: Vec<(f64, f64)>,
+        date: &str,
+        departure: &str,
+        window: u32,
+        factors: Vec<(String, f64)>,
+        budget: Option<u32>,
+        max_transfers: u8,
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+        geometries: bool,
+    ) -> PyResult<Py<PyDict>> {
+        let streets = self.installed_streets()?;
+        let Some(geometry) = &self.geometry else {
+            return Err(PyValueError::new_err(
+                "no trip distances installed; build the network with trip distances enabled",
+            ));
+        };
+        if geometries && self.leg_geometry.is_none() {
+            return Err(PyValueError::new_err(
+                "no leg geometries installed; build the network with leg geometries enabled",
+            ));
         }
-        result.set_item("unsnapped_from", unsnapped_from.into_pyarray(py))?;
-        result.set_item("unsnapped_to", unsnapped_to.into_pyarray(py))?;
-        Ok(result.unbind())
+        if window == 0 {
+            return Err(PyValueError::new_err(
+                "window must be a positive number of seconds",
+            ));
+        }
+        let speed =
+            validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
+        validate_points(&origins)?;
+        validate_points(&destinations)?;
+        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
+        for (trip_id, factor) in &factors {
+            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
+                per_trip[trip.0 as usize] = *factor;
+            }
+        }
+        let departure = parse_time(departure)?;
+        let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
+        let inputs = CostInputs {
+            geometry,
+            factors: &per_trip,
+            leg_geometry: self.leg_geometry.as_ref(),
+            with_geometry: geometries,
+        };
+        let (rows, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
+            let origin_links =
+                streets.link_many(&origins, speed, max_walking_time, max_snap_distance);
+            let destination_links =
+                streets.link_many(&destinations, speed, max_walking_time, max_snap_distance);
+            let unsnapped_from = unsnapped(&origin_links);
+            let unsnapped_to = unsnapped(&destination_links);
+            let mut requests = Vec::with_capacity(origin_links.len());
+            let mut access_meters = Vec::with_capacity(origin_links.len());
+            for links in &origin_links {
+                let links = links.as_deref().unwrap_or(&[]);
+                requests.push(Request {
+                    departure,
+                    access: request_offsets(links),
+                    egress: Vec::new(),
+                    active_services: active_services.clone(),
+                    active_services_previous: active_services_previous.clone(),
+                    max_transfers,
+                });
+                access_meters.push(
+                    links
+                        .iter()
+                        .map(|walk| (walk.stop, walk.meters))
+                        .collect::<HashMap<_, _>>(),
+                );
+            }
+            let egress = egress_tables(&destination_links);
+            let mut rows = Raptor.least_emission_matrix_to_points(
+                &self.build.timetable,
+                &self.transfers,
+                &inputs,
+                &requests,
+                &access_meters,
+                &egress,
+                window,
+                budget,
+            );
+            // The walking-only alternative: zero grams, so within the
+            // budget it wins any cell (equal-gram cells resolve toward
+            // the shorter travel time, as everywhere).
+            let walk = streets.walk_matrix(
+                &origins,
+                &destinations,
+                speed,
+                max_walking_time,
+                max_snap_distance,
+            );
+            let walk_geometry = |origin: usize, point: usize| -> Option<Vec<u8>> {
+                if !geometries {
+                    return None;
+                }
+                let from_point = origins[origin];
+                let to_point = destinations[point];
+                if from_point == to_point {
+                    let at = (from_point.1, from_point.0);
+                    return Some(wkb_multi_line_string(&[vec![at, at]]));
+                }
+                let from = streets.snap(from_point.0, from_point.1, max_snap_distance)?;
+                let to = streets.snap(to_point.0, to_point.1, max_snap_distance)?;
+                let (path, _) = streets.walk_path(from_point, &from, to_point, &to)?;
+                Some(wkb_multi_line_string(&[path]))
+            };
+            for (origin, origin_rows) in rows.iter_mut().enumerate() {
+                let walk_row = &walk[origin];
+                let mut reached = vec![false; destinations.len()];
+                for row in origin_rows.iter_mut() {
+                    reached[row.to as usize] = true;
+                    if let Some((walk_seconds, meters)) = walk_row[row.to as usize] {
+                        if budget.is_some_and(|budget| walk_seconds > budget) {
+                            continue;
+                        }
+                        if row.emission_grams > 0.0
+                            || (row.emission_grams == 0.0 && walk_seconds < row.seconds)
+                        {
+                            row.seconds = walk_seconds;
+                            row.rides = 0;
+                            row.transit_meters = 0.0;
+                            row.walk_meters = meters;
+                            row.emission_grams = 0.0;
+                            row.geometry = walk_geometry(origin, row.to as usize);
+                        }
+                    }
+                }
+                for (point, cell) in walk_row.iter().enumerate() {
+                    if reached[point] {
+                        continue;
+                    }
+                    if let Some((walk_seconds, meters)) = cell {
+                        if budget.is_some_and(|budget| *walk_seconds > budget) {
+                            continue;
+                        }
+                        origin_rows.push(CostRow {
+                            to: point as u32,
+                            seconds: *walk_seconds,
+                            rides: 0,
+                            transit_meters: 0.0,
+                            walk_meters: *meters,
+                            emission_grams: 0.0,
+                            geometry: walk_geometry(origin, point),
+                        });
+                    }
+                }
+                origin_rows.sort_unstable_by_key(|row| row.to);
+            }
+            (rows, unsnapped_from, unsnapped_to)
+        });
+        let result = cost_rows_dict(py, rows, geometries)?;
+        result
+            .bind(py)
+            .set_item("unsnapped_from", unsnapped_from.into_pyarray(py))?;
+        result
+            .bind(py)
+            .set_item("unsnapped_to", unsnapped_to.into_pyarray(py))?;
+        Ok(result)
     }
 }
 

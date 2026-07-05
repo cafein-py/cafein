@@ -162,6 +162,153 @@ def test_point_matrices_walk_ride_and_walk(network_with_footpaths):
         assert times[origin, destination] == row.travel_time
 
 
+def test_least_emission_cells_match_the_frontier(tmp_path):
+    from cafein import TransportNetwork, journey_frontier, least_emissions
+    from test_frontier import build_two_line_gtfs
+
+    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
+    network = TransportNetwork.from_gtfs([str(feed)])
+    frontier = journey_frontier(
+        network, "A", "B", "2022-02-22", "08:00:00", window=1800
+    )
+
+    def cell(within=None):
+        matrix = TravelCostMatrix(
+            network,
+            ["A"],
+            ["B"],
+            "2022-02-22",
+            "08:00:00",
+            optimize="emissions",
+            window=1800,
+            within=within,
+        )
+        rows = matrix[matrix.to_id == "B"]
+        return rows.iloc[0] if len(rows) else None
+
+    # The matrix cell is the frontier's least-emission pick, cell for
+    # cell: the slow-clean tram unbudgeted, the fast-dirty bus chain
+    # within 15 minutes, nothing within a minute.
+    cleanest, oracle = cell(), least_emissions(frontier)
+    assert cleanest["emissions"] == pytest.approx(oracle["emissions"])
+    assert cleanest["travel_time"] == oracle["travel_time"] == 1800
+    assert cleanest["transfers"] == 0
+    budgeted, oracle = cell(within=900), least_emissions(frontier, within=900)
+    assert budgeted["emissions"] == pytest.approx(oracle["emissions"])
+    assert budgeted["travel_time"] == oracle["travel_time"] == 900
+    assert budgeted["transfers"] == 1
+    assert cell(within=60) is None
+
+
+def test_point_emission_cells_prefer_walking(network_with_footpaths):
+    origins = point_frame(network_with_footpaths, [("metro", "1040602")])
+    destinations = point_frame(network_with_footpaths, [("street", "1040280")])
+    matrix = cost_matrix(
+        network_with_footpaths,
+        origins=origins,
+        destinations=destinations,
+        departure="08:30:00",
+        optimize="emissions",
+        window=600,
+    )
+    row = matrix.iloc[0]
+    assert row.emissions == 0.0
+    assert row.transfers == 0
+    assert row.transit_distance == 0.0
+    assert 19 <= row.travel_time <= 21
+    assert 19 <= row.walk_distance <= 21
+
+
+def test_point_emission_cells_match_the_frontier(network_with_footpaths):
+    from cafein import journey_frontier, least_emissions
+
+    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+    frontier = journey_frontier(
+        network_with_footpaths,
+        coordinates["1100602"],
+        coordinates["1040280"],
+        "2022-02-22",
+        "08:30:00",
+        window=600,
+    )
+    # A budget below the walking time forces a ride, so the cell must
+    # equal the frontier's budgeted least-emission journey exactly.
+    oracle = least_emissions(frontier, within=900)
+    assert oracle["rides"] >= 1
+    matrix = cost_matrix(
+        network_with_footpaths,
+        origins=point_frame(network_with_footpaths, [("a", "1100602")]),
+        destinations=point_frame(network_with_footpaths, [("b", "1040280")]),
+        departure="08:30:00",
+        optimize="emissions",
+        window=600,
+        within=900,
+    )
+    row = matrix.iloc[0]
+    assert row.emissions == pytest.approx(oracle["emissions"])
+    assert row.travel_time == oracle["travel_time"]
+    assert row.transfers == oracle["rides"] - 1
+
+
+def test_emission_matrices_validate_their_options(network):
+    with pytest.raises(ValueError, match="requires a departure window"):
+        TravelCostMatrix(
+            network,
+            ["4810551"],
+            date="2022-02-22",
+            departure="08:30:00",
+            optimize="emissions",
+        )
+    with pytest.raises(ValueError, match="optimize='emissions'"):
+        TravelCostMatrix(
+            network,
+            ["4810551"],
+            date="2022-02-22",
+            departure="08:30:00",
+            within=600,
+        )
+    with pytest.raises(ValueError, match="optimize must be"):
+        TravelCostMatrix(
+            network,
+            ["4810551"],
+            date="2022-02-22",
+            departure="08:30:00",
+            optimize="fastest",
+        )
+
+
+def test_emission_cells_never_exceed_the_fastest_journeys_emissions(network):
+    fastest = cost_matrix(
+        network,
+        origins=["4810551"],
+        destinations=["1250551"],
+        departure="08:30:00",
+    )
+    cleanest = cost_matrix(
+        network,
+        origins=["4810551"],
+        destinations=["1250551"],
+        departure="08:30:00",
+        optimize="emissions",
+        window=600,
+    )
+    assert len(fastest) == 1 and len(cleanest) == 1
+    assert cleanest.iloc[0].emissions <= fastest.iloc[0].emissions
+    # The zero-ride floor: the origin reaches itself at zero cost in the
+    # emission mode too.
+    self_cell = cost_matrix(
+        network,
+        origins=["4810551"],
+        destinations=["4810551"],
+        departure="08:30:00",
+        optimize="emissions",
+        window=600,
+    ).iloc[0]
+    assert self_cell.travel_time == 0
+    assert self_cell.emissions == 0.0
+    assert self_cell.transfers == 0
+
+
 def test_point_matrices_take_the_direct_walk(tmp_path):
     from cafein import TransportNetwork
     from test_transport_network import build_synthetic_gtfs

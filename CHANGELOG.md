@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Least-emission matrices: ``TravelCostMatrix(...,
+  optimize="emissions", window=..., within=...)`` reports, per OD pair,
+  the lowest-emission journey of a departure window instead of the
+  fastest — optionally within the ``within`` travel-time budget (the
+  cleanest way to work, shop, or school that still gets you there in
+  time). Candidates per pair are the window's (departure, arrival,
+  rides)-Pareto set — the same ride candidates ``journey_frontier``
+  sees — plus a zero-ride, zero-emission floor (the origin itself for
+  stop pairs; the walking-only alternative for point pairs), with ties
+  resolving toward the shorter travel time;
+  pairs with no qualifying journey of resolved emissions are absent.
+  Works for stop and point matrices alike, with the same chunking and
+  parallel origin fan-out.
+
 - Time × emissions Pareto frontiers: ``cafein.journey_frontier(network,
   origin, destination, date, departure, window)`` routes a departure
   window between two stops or door-to-door coordinates, attaches
