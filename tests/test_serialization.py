@@ -235,16 +235,15 @@ def test_mapped_street_pages_stay_cold_after_load(
     # cache, load it mapped, and require the STREETS pages mostly cold —
     # a loader scan of the section would page it back in wholesale.
     #
-    # The artifact pairs a tiny synthetic feed with the real street
-    # network, so META is kilobytes and STREETS is essentially the whole
-    # file. That matters: decoding a large META faults a long sequential
-    # stream through the mapping, and the kernel's readahead — whose
-    # window ramps up over such a stream and is capped only by the end
-    # of the file — can then speculatively pull a small trailing street
-    # section in wholesale, indistinguishably from a scan (observed on
-    # Linux CI with the Helsinki artifact's ~290 MB META). With no META
-    # stream to ramp on, readahead is bounded by a single device window,
-    # far below the half-section budget.
+    # Kernel readahead is the confounder: any fault near the file head
+    # speculatively reads one device window ahead, and a window is
+    # bounded only by `read_ahead_kb` and the end of the file. The
+    # artifact therefore pairs a tiny synthetic feed with the real
+    # street network — META is kilobytes, so the loader faults almost
+    # nothing and no readahead stream ramps up — and the test skips on
+    # devices whose single window could cover the street section anyway
+    # (some CI machines configure tens-of-MB readahead, which pulled the
+    # whole section in and is indistinguishable from a scan).
     if not mmap_available or not hasattr(os, "posix_fadvise"):
         pytest.skip("needs memory mapping and posix_fadvise")
     import ctypes
@@ -302,12 +301,25 @@ def test_mapped_street_pages_stay_cold_after_load(
         os.posix_fadvise(artifact.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
     if resident_street_bytes() > 16 * page:
         pytest.skip("the page cache did not evict the artifact")
+    # A residency assertion is only meaningful when a single speculative
+    # readahead window cannot cover a substantial part of the section.
+    device = os.stat(path).st_dev
+    bdi = f"/sys/dev/block/{os.major(device)}:{os.minor(device)}/bdi/read_ahead_kb"
+    try:
+        with open(bdi) as sysfs:
+            read_ahead = int(sysfs.read()) * 1024
+    except (OSError, ValueError):
+        pytest.skip("the device's readahead window is unknown")
+    if read_ahead >= length // 4:
+        pytest.skip(f"device readahead ({read_ahead} B) can cover the section")
     network = TransportNetwork.load(path, mmap=True)
     assert network.mapped
-    # With the short META stream, readahead cannot plausibly cover half
-    # the dominant street section; a scan pages in essentially all of it.
+    # The loader faults only the tiny META, so at most one readahead
+    # window (< a quarter of the section, per the guard above) can spill
+    # into STREETS; a scan pages in essentially all of it.
     assert length > 8 * 1024 * 1024
-    assert resident_street_bytes() < length // 2
+    resident = resident_street_bytes()
+    assert resident < length // 2, f"resident {resident} B, readahead {read_ahead} B"
 
 
 def _mapped_walks(args):
