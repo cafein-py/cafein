@@ -88,11 +88,20 @@ def test_door_to_door_itinerary_walks_the_streets(network_with_footpaths):
     itineraries = DetailedItineraries(
         network_with_footpaths, origins, destinations, "2022-02-22", "08:30:00"
     )
+    # Option 0 is the walking-only alternative: one walk leg, no stops.
     option0 = itineraries[itineraries["option"] == 0]
-    assert list(option0["leg_type"]) == ["access", "transit", "egress"]
+    assert list(option0["leg_type"]) == ["walk"]
+    walk = option0.iloc[0]
+    assert walk["geometry"].geom_type == "LineString"
+    assert walk["from_stop"] is None or walk["from_stop"] != walk["from_stop"]
+    assert walk["trip_id"] is None or walk["trip_id"] != walk["trip_id"]
+    assert walk["emissions"] == 0.0
 
-    access = option0[option0["leg_type"] == "access"].iloc[0]
-    egress = option0[option0["leg_type"] == "egress"].iloc[0]
+    option1 = itineraries[itineraries["option"] == 1]
+    assert list(option1["leg_type"]) == ["access", "transit", "egress"]
+
+    access = option1[option1["leg_type"] == "access"].iloc[0]
+    egress = option1[option1["leg_type"] == "egress"].iloc[0]
     assert access["geometry"].geom_type == "LineString"
     origin_lat, origin_lon = coordinates["1100602"]
     assert access["geometry"].coords[0] == pytest.approx(

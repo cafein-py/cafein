@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Walking all the way is a journey: door-to-door queries and point
+  matrices now consider walking directly from origin to destination over
+  the street network, capped by ``max_walking_time``.
+  ``route_between_coordinates`` (and point ``DetailedItineraries``)
+  returns a walking-only journey — a single ``walk`` leg with the exact
+  street distance and path, zero rides, zero emissions — leading the
+  Pareto set, and drops journeys that would arrive no earlier; point
+  travel-time matrices hold the faster of transit and walking in every
+  cell (and in every percentile of a departure window, since a walk is
+  departure-independent); point cost matrices report walking-only pairs
+  with zero transfers, zero transit distance, and zero emissions (an
+  equal-time walk wins the tie, resolving toward fewer rides). The
+  direct-walk time fill costs one street search per origin, never one
+  per OD pair; with ``geometries=True`` each winning walk cell
+  additionally reconstructs its street path, as transit rows already
+  assemble their geometry per row.
+
 - Tiny disconnected walking-network components (fewer than 40 vertices,
   R5's ``MIN_SUBGRAPH_SIZE``) are pruned when the network is extracted:
   they are mapping artifacts or stubs clipped at the extract boundary,

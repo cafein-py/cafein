@@ -1168,6 +1168,103 @@ impl StreetNetwork {
         })
     }
 
+    /// Walking times and exact street distances from one snapped point
+    /// to many, or `None` where a target is unsnapped or beyond the
+    /// cutoff — one bounded search serving a whole matrix row, so a
+    /// direct-walk fill costs one street search per origin, never one
+    /// per OD pair. Distances include both connectors; seconds round up
+    /// like every walk.
+    pub fn walk_to_snaps(
+        &self,
+        from: &Snap,
+        targets: &[Option<Snap>],
+        walking_speed: f64,
+        max_seconds: f64,
+    ) -> Vec<Option<(u32, f64)>> {
+        if !walking_speed.is_finite()
+            || walking_speed <= 0.0
+            || !max_seconds.is_finite()
+            || max_seconds < 0.0
+        {
+            return vec![None; targets.len()];
+        }
+        let cutoff = max_seconds * walking_speed;
+        let (from_u, from_v) = self.edge_endpoints(from.edge);
+        let from_length = self.arrays.lengths()[from.edge as usize];
+        SEARCH_STATE.with(|cell| {
+            let state = &mut cell.borrow_mut();
+            self.bounded_dijkstra(
+                &[
+                    (from_u, from.connector + from.fraction * from_length),
+                    (from_v, from.connector + (1.0 - from.fraction) * from_length),
+                ],
+                cutoff,
+                state,
+            );
+            targets
+                .iter()
+                .map(|target| {
+                    let target = target.as_ref()?;
+                    let length = self.arrays.lengths()[target.edge as usize];
+                    let (u, v) = self.edge_endpoints(target.edge);
+                    let mut meters = f64::min(
+                        state.distance(u) + target.fraction * length,
+                        state.distance(v) + (1.0 - target.fraction) * length,
+                    ) + target.connector;
+                    if target.edge == from.edge {
+                        // Both points sit on one edge: walking between
+                        // them never has to reach an endpoint.
+                        let direct = from.connector
+                            + (target.fraction - from.fraction).abs() * from_length
+                            + target.connector;
+                        meters = meters.min(direct);
+                    }
+                    (meters <= cutoff + 1e-9).then(|| (seconds(meters / walking_speed), meters))
+                })
+                .collect()
+        })
+    }
+
+    /// Direct walking times and distances between coordinate sets, in
+    /// parallel over the origins: per origin, per destination,
+    /// `(seconds, meters)` or `None` where either point does not snap
+    /// or the walk exceeds the cutoff. A destination at the origin's
+    /// exact coordinate is a zero walk — snap-level arithmetic would
+    /// charge the connector out to the street and back.
+    pub fn walk_matrix(
+        &self,
+        origins: &[(f64, f64)],
+        destinations: &[(f64, f64)],
+        walking_speed: f64,
+        max_seconds: f64,
+        max_snap_distance: f64,
+    ) -> Vec<Vec<Option<(u32, f64)>>> {
+        let targets: Vec<Option<Snap>> = destinations
+            .iter()
+            .map(|&(lat, lon)| self.snap(lat, lon, max_snap_distance))
+            .collect();
+        origins
+            .par_iter()
+            .map(
+                |&origin| match self.snap(origin.0, origin.1, max_snap_distance) {
+                    Some(from) => {
+                        let mut row =
+                            self.walk_to_snaps(&from, &targets, walking_speed, max_seconds);
+                        for ((cell, target), &destination) in
+                            row.iter_mut().zip(&targets).zip(destinations)
+                        {
+                            if target.is_some() && destination == origin {
+                                *cell = Some((0, 0.0));
+                            }
+                        }
+                        row
+                    }
+                    None => vec![None; destinations.len()],
+                },
+            )
+            .collect()
+    }
+
     /// The indices of the links whose edge touches a vertex.
     fn links_at(&self, vertex: u32) -> impl Iterator<Item = u32> + '_ {
         let start = self.vertex_links.partition_point(|&(v, _)| v < vertex);
@@ -2548,6 +2645,58 @@ mod tests {
         assert!((snap.connector - 5.0).abs() < 0.05);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
         assert_walks(&reached, &[(0, 30)]);
+    }
+
+    #[test]
+    fn walks_to_many_snapped_points() {
+        // An L of two edges; targets on both edges and off-network.
+        let network = network(
+            3,
+            0,
+            &[
+                (0, 1, 300.0, straight((0.0, 0.0), (300.0, 0.0))),
+                (1, 2, 200.0, straight((300.0, 0.0), (300.0, 200.0))),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let snap_at = |x: f64, y: f64| {
+            let (lon, lat) = lonlat(x, y);
+            network.snap(lat, lon, 100.0)
+        };
+        let from = snap_at(50.0, 10.0).unwrap();
+        let targets = vec![
+            snap_at(250.0, 0.0),   // same edge: direct along it
+            snap_at(300.0, 150.0), // around the corner
+            None,                  // unsnapped point
+        ];
+        let walks = network.walk_to_snaps(&from, &targets, 1.0, 1200.0);
+        // Same edge: 10 m connector + 200 m along; corner: 10 + 250 + 150.
+        let (seconds_a, meters_a) = walks[0].unwrap();
+        assert!((meters_a - 210.0).abs() < 0.1, "{meters_a}");
+        assert!((210..=211).contains(&seconds_a));
+        let (seconds_b, meters_b) = walks[1].unwrap();
+        assert!((meters_b - 410.0).abs() < 0.1, "{meters_b}");
+        assert!((410..=411).contains(&seconds_b));
+        assert!(walks[2].is_none());
+        // A tight cutoff drops the farther target only.
+        let close = network.walk_to_snaps(&from, &targets, 1.0, 300.0);
+        assert!(close[0].is_some() && close[1].is_none());
+        // The matrix driver agrees with the single-origin search.
+        let (from_lon, from_lat) = lonlat(50.0, 10.0);
+        let (to_lon, to_lat) = lonlat(300.0, 150.0);
+        let matrix = network.walk_matrix(
+            &[(from_lat, from_lon)],
+            &[(to_lat, to_lon), (89.0, 0.0), (from_lat, from_lon)],
+            1.0,
+            1200.0,
+            100.0,
+        );
+        assert_eq!(matrix[0][0], walks[1]);
+        assert!(matrix[0][1].is_none());
+        // The origin's own coordinate is a zero walk, not a trip out to
+        // the street and back over the connector.
+        assert_eq!(matrix[0][2], Some((0, 0.0)));
     }
 
     /// Lays a network's parts out as a mapped artifact would: each array's
