@@ -33,6 +33,12 @@ def kantakaupunki_pbf():
 
 
 @pytest.fixture(scope="session")
+def fares_poa():
+    """Path to r5r's saved Porto Alegre fare structure."""
+    return _data_file("fares_poa.zip")
+
+
+@pytest.fixture(scope="session")
 def network(helsinki_gtfs):
     """The Helsinki network with default preprocessing, shared across
     modules because it takes seconds to build."""
