@@ -32,7 +32,7 @@ def test_round_trip_preserves_routing(network_with_footpaths, reloaded):
     )
     after = reloaded.route_between_stops("1100602", "1040280", "2022-02-22", "08:30:00")
     assert after == before
-    # Door-to-door from coordinates exercises the rebuilt street index.
+    # Door-to-door from coordinates exercises the persisted street index.
     coordinates = {stop: (lat, lon) for stop, lat, lon in reloaded.stops}
     origin = coordinates["1100602"]
     destination = coordinates["1040280"]
@@ -87,6 +87,17 @@ def test_load_refuses_foreign_and_future_files(tmp_path):
         TransportNetwork.load(tmp_path / "missing.cafein")
 
 
+def test_load_refuses_previous_format_versions(tmp_path):
+    # A version-3 header (the pre-sectioned format) must name the format
+    # and the writing version in its rebuild message.
+    old = tmp_path / "v3.cafein"
+    old.write_bytes(
+        b"CAFEINET" + (3).to_bytes(4, "little") + (5).to_bytes(2, "little") + b"0.2.0"
+    )
+    with pytest.raises(ValueError, match=r"format 3 \(written by cafein 0\.2\.0\)"):
+        TransportNetwork.load(old)
+
+
 def test_load_refuses_corrupted_payloads(tmp_path):
     from test_transport_network import build_synthetic_gtfs
 
@@ -102,6 +113,18 @@ def test_load_refuses_corrupted_payloads(tmp_path):
         TransportNetwork.load(path)
 
 
+def test_load_refuses_corrupted_street_sections(network_with_footpaths, tmp_path):
+    # The last byte of a street-enabled artifact sits in the raw STREETS
+    # section; flipping it must fail that section's checksum.
+    path = tmp_path / "streets.cafein"
+    network_with_footpaths.save(path)
+    blob = bytearray(path.read_bytes())
+    blob[-1] ^= 0xFF
+    path.write_bytes(bytes(blob))
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        TransportNetwork.load(path)
+
+
 def test_load_refuses_truncated_payloads(tmp_path):
     from test_transport_network import build_synthetic_gtfs
 
@@ -112,5 +135,5 @@ def test_load_refuses_truncated_payloads(tmp_path):
     network.save(path)
     blob = path.read_bytes()
     path.write_bytes(blob[: len(blob) // 2])
-    with pytest.raises(ValueError, match="length mismatch"):
+    with pytest.raises(ValueError, match="section bounds"):
         TransportNetwork.load(path)

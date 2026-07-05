@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Network artifact format 4: the container is sectioned — a small
+  decoded META block (timetable, calendar, transfers, geometries, stop
+  links, and a descriptor table) plus a STREETS section holding every
+  street-sized array as raw little-endian values at aligned offsets, the
+  section itself starting on a 64 KiB boundary. Street coordinates are
+  stored fixed-point (degrees × 10⁷ as 32-bit integers, ~1 cm steps;
+  cumulative lengths as 32-bit floats), roughly halving the street
+  geometry's memory and file size — routing costs stay 64-bit and exact,
+  and derived walking distances move at most centimetres. The packed
+  spatial index is persisted, so loading adopts arrays instead of
+  rebuilding anything street-sized. This is the load format
+  memory-mapped loading will map directly. Version-3 artifacts are
+  refused with the rebuild message.
+
 - The street spatial index is a packed static index over Hilbert-sorted
   edge segments (flat arrays, an implicit tree — the OSRM/Flatbush
   layout), replacing the rstar R\*-tree, and edges and vertices are
