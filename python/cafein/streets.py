@@ -138,12 +138,46 @@ def walking_streets(
     )
 
 
+_UNWALKABLE_HIGHWAYS = [
+    "abandoned",
+    "construction",
+    "motor",
+    "motorway",
+    "motorway_link",
+    "proposed",
+    "raceway",
+]
+"""Way types pedestrians never walk on: motor-only or unbuilt roads."""
+
+
 def _walking_network(osm_pbf):
-    """The walking network of a PBF extract, as pyrosm (nodes, edges)."""
-    network = pyrosm.OSM(str(osm_pbf)).get_network(network_type="walking", nodes=True)
+    """The walkable street network of a PBF extract, as (nodes, edges).
+
+    Extracted from the full way network with cafein's own walkability
+    rule rather than pyrosm's ``walking`` network type, which drops
+    every ``highway=cycleway`` — severing the shared foot-and-cycle
+    paths that carry much of the pedestrian traffic in Nordic cities —
+    and every transit platform, fragmenting the graph. Here a way is
+    walkable unless it is a motor-only or unbuilt road, is mapped as an
+    area, or explicitly excludes pedestrians (R5 applies the same
+    permissive rule).
+    """
+    network = pyrosm.OSM(str(osm_pbf)).get_network(network_type="all", nodes=True)
     if network is None:
         raise ValueError(f"no walkable ways in '{osm_pbf}'")
-    return network
+    nodes, edges = network
+    walkable = (
+        ~edges["highway"].isin(_UNWALKABLE_HIGHWAYS)
+        & (edges["area"] != "yes")
+        & (edges["foot"] != "no")
+        & (edges["service"] != "private")
+    )
+    edges = edges[walkable].reset_index(drop=True)
+    if edges.empty:
+        raise ValueError(f"no walkable ways in '{osm_pbf}'")
+    used = np.unique(np.concatenate([edges["u"].to_numpy(), edges["v"].to_numpy()]))
+    nodes = nodes[nodes["id"].isin(used)].reset_index(drop=True)
+    return nodes, edges
 
 
 def _network_footpaths(

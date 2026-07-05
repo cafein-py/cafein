@@ -323,12 +323,12 @@ def helsinki_footpaths(helsinki_streets):
 
 
 def test_helsinki_footpaths_cover_the_extract(helsinki_footpaths):
-    # The extract covers central Helsinki only: roughly 1400 of the 8305
-    # stops snap onto its walking network, and closure connects the dense
-    # center almost completely.
+    # The extract covers central Helsinki only: roughly 1500 of the 8305
+    # stops snap onto its walking network (shared-use paths and platforms
+    # included), and closure connects the dense center almost completely.
     origins = {from_stop for from_stop, _, _, _ in helsinki_footpaths}
-    assert 1_330 <= len(origins) <= 1_440
-    assert 1_450_000 <= len(helsinki_footpaths) <= 1_600_000
+    assert 1_460 <= len(origins) <= 1_580
+    assert 2_150_000 <= len(helsinki_footpaths) <= 2_400_000
 
 
 def test_helsinki_footpaths_pin_known_pairs(helsinki_footpaths):
@@ -338,9 +338,15 @@ def test_helsinki_footpaths_pin_known_pairs(helsinki_footpaths):
     assert lookup[("1040602", "1040601")] == 4
     assert lookup[("1040602", "1040280")] == 20
     assert lookup[("1000102", "1040280")] == 22
+    # These stops' snap edges were disconnected fragments under pyrosm's
+    # walking network type (no footpaths at all); the shared-use
+    # cycleways the walkability rule keeps connect them.
+    assert lookup[("1130102", "1130101")] == 80
+    assert lookup[("1341105", "1341123")] == 69
     # Meters are the same walks unrounded, at the default 1 m/s.
     meters = {(a, b): m for a, b, _, m in helsinki_footpaths}
     assert 19 <= meters[("1040602", "1040280")] <= 20
+    assert 79 <= meters[("1130102", "1130101")] <= 80
 
 
 def test_helsinki_footpaths_are_symmetric(helsinki_footpaths):

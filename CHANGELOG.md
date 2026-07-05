@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- The walking network keeps shared-use paths: street extraction now takes
+  the full OSM way network and applies cafein's own walkability rule — a
+  way is walkable unless it is a motor-only or unbuilt road, is mapped as
+  an area, or explicitly excludes pedestrians (``foot=no``,
+  ``service=private``). pyrosm's ``walking`` network type, used
+  previously, drops every ``highway=cycleway`` and ``highway=platform``,
+  which severs the combined foot-and-cycle paths common in Nordic cities
+  and fragments the walking graph; coordinates snapped into such
+  fragments could walk almost nowhere. On the Helsinki test extract the
+  walking graph goes from 2,142 connected components (84 % of vertices
+  in the largest) to 543 (98.8 %), more stops gain footpaths, and
+  coordinates that previously snapped into fragments now reach the whole
+  network. Walking times can shorten wherever a shared-use path is the
+  true shortest route.
+
 - ``TransportNetwork.load(path, mmap=True)`` memory-maps the artifact and
   uses the street arrays in place instead of copying them: the operating
   system pages street data in as queries touch it and shares those pages
