@@ -32,7 +32,9 @@ class TravelCostMatrix(pd.DataFrame):
 
     One RAPTOR run serves each origin, fanned out over all cores; each
     pair's costs come from its fastest journey (ties resolved toward
-    fewer rides). Unreachable pairs are absent. Requires a network built
+    fewer rides) — or, with ``optimize="emissions"``, from the cleanest
+    journey of a departure window, optionally within a travel-time
+    budget. Unreachable pairs are absent. Requires a network built
     with trip distances (the default), and with leg geometries for
     ``geometries=True``. Slices and copies degrade to plain DataFrames.
 
@@ -52,6 +54,24 @@ class TravelCostMatrix(pd.DataFrame):
         Departure time at every origin as ``HH:MM:SS``.
     max_transfers : int (optional, default: 7)
         Maximum number of transfers between rides.
+    optimize : str (optional, default: "time")
+        What each cell's journey minimises. ``"time"`` (the default)
+        reports the fastest journey. ``"emissions"`` reports the
+        lowest-emission journey among the departure window's
+        (departure, arrival, rides)-Pareto candidates — the same ride
+        candidates ``journey_frontier`` sees — optionally within the
+        ``within`` travel-time budget. A zero-ride, zero-emission floor
+        joins the candidates: for stop pairs the origin itself, for
+        point pairs the walking-only alternative, which wins any cell
+        it qualifies for. Pairs with no qualifying resolved-emissions
+        candidate are absent.
+    window : int (optional)
+        Departure window in seconds; required with
+        ``optimize="emissions"``.
+    within : int (optional)
+        Travel-time budget in seconds for ``optimize="emissions"``:
+        only journeys at most this long qualify. Unbudgeted, the
+        cleanest reachable journey wins.
     factors : DataFrame or path (optional)
         Extra emission-factor rows layered over the shipped defaults;
         see ``cafein.emissions.load_factors``.
@@ -83,6 +103,9 @@ class TravelCostMatrix(pd.DataFrame):
         departure=None,
         *,
         max_transfers=7,
+        optimize="time",
+        window=None,
+        within=None,
         factors=None,
         components=None,
         geometries=False,
@@ -98,6 +121,9 @@ class TravelCostMatrix(pd.DataFrame):
             date,
             departure,
             max_transfers=max_transfers,
+            optimize=optimize,
+            window=window,
+            within=within,
             factors=factors,
             components=components,
             geometries=geometries,
@@ -284,6 +310,9 @@ def travel_cost_table(
     departure=None,
     *,
     max_transfers=7,
+    optimize="time",
+    window=None,
+    within=None,
     factors=None,
     components=None,
     geometries=False,
@@ -294,7 +323,8 @@ def travel_cost_table(
 ):
     """The travel-cost matrix as a pyarrow Table — the shard-writing form.
 
-    Semantics and parameters follow `TravelCostMatrix`; the output is an
+    Semantics and parameters follow `TravelCostMatrix` — including
+    ``optimize="emissions"`` with its ``window``/``within``; the output is an
     Arrow table with ``from_id`` and ``to_id`` dictionary-encoded over
     the origin and destination identifiers, the numeric columns wrapping
     the computed arrays zero-copy, and — with ``geometries=True`` — the
@@ -322,6 +352,9 @@ def travel_cost_table(
         date,
         departure,
         max_transfers=max_transfers,
+        optimize=optimize,
+        window=window,
+        within=within,
         factors=factors,
         components=components,
         geometries=geometries,
@@ -367,6 +400,9 @@ def _cost_columns(
     walking_speed_kmph,
     max_walking_time,
     max_snap_distance,
+    optimize="time",
+    window=None,
+    within=None,
 ):
     """The core's cost arrays plus the origin and destination ids."""
     from cafein import emissions
@@ -374,6 +410,12 @@ def _cost_columns(
 
     if date is None or departure is None:
         raise TypeError("TravelCostMatrix requires date and departure")
+    if optimize not in ("time", "emissions"):
+        raise ValueError(f"optimize must be 'time' or 'emissions', not {optimize!r}")
+    if optimize == "emissions" and window is None:
+        raise ValueError("optimize='emissions' requires a departure window")
+    if optimize == "time" and not (window is None and within is None):
+        raise ValueError("window and within require optimize='emissions'")
     trip_factors = emissions.trip_factors(network, factors, components)
     if _is_point_frame(origins) or _is_point_frame(destinations):
         from_ids, origin_points = _point_list(origins, "origins")
@@ -384,16 +426,31 @@ def _cost_columns(
         rows = _chunk_slice(len(from_ids), chunk)
         from_ids = from_ids[rows]
         origin_points = origin_points[rows]
-        table = network._core.travel_cost_matrix_from_points(
-            origin_points,
-            destination_points,
-            date,
-            departure,
-            trip_factors,
-            max_transfers,
-            *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
-            geometries,
-        )
+        walk = _walk_options(walking_speed_kmph, max_walking_time, max_snap_distance)
+        if optimize == "emissions":
+            table = network._core.least_emission_matrix_from_points(
+                origin_points,
+                destination_points,
+                date,
+                departure,
+                window,
+                trip_factors,
+                within,
+                max_transfers,
+                *walk,
+                geometries,
+            )
+        else:
+            table = network._core.travel_cost_matrix_from_points(
+                origin_points,
+                destination_points,
+                date,
+                departure,
+                trip_factors,
+                max_transfers,
+                *walk,
+                geometries,
+            )
         _warn_unsnapped(table, from_ids, to_ids)
     else:
         if not (
@@ -406,15 +463,28 @@ def _cost_columns(
         from_ids = list(stop_ids) if origins is None else [str(o) for o in origins]
         from_ids = from_ids[_chunk_slice(len(from_ids), chunk)]
         to_stops = None if destinations is None else [str(d) for d in destinations]
-        table = network._core.travel_cost_matrix(
-            from_ids,
-            date,
-            departure,
-            trip_factors,
-            max_transfers,
-            to_stops,
-            geometries,
-        )
+        if optimize == "emissions":
+            table = network._core.least_emission_matrix(
+                from_ids,
+                date,
+                departure,
+                window,
+                trip_factors,
+                within,
+                max_transfers,
+                to_stops,
+                geometries,
+            )
+        else:
+            table = network._core.travel_cost_matrix(
+                from_ids,
+                date,
+                departure,
+                trip_factors,
+                max_transfers,
+                to_stops,
+                geometries,
+            )
         to_ids = stop_ids
     return table, from_ids, to_ids
 

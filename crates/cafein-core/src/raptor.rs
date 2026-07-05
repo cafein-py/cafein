@@ -62,6 +62,26 @@ pub struct CostInputs<'a> {
 
 const UNREACHED: u32 = u32::MAX;
 
+/// Keeps the cleaner of an existing candidate and a challenger: fewer
+/// grams win, equal grams resolve toward the shorter travel time. NaN
+/// grams (an unresolved emission factor) never qualify.
+fn fold_cleaner(current: &mut Option<CostRow>, challenger: CostRow) {
+    if challenger.emission_grams.is_nan() {
+        return;
+    }
+    let better = match current {
+        None => true,
+        Some(row) => {
+            challenger.emission_grams < row.emission_grams
+                || (challenger.emission_grams == row.emission_grams
+                    && challenger.seconds < row.seconds)
+        }
+    };
+    if better {
+        *current = Some(challenger);
+    }
+}
+
 /// Seconds in a service day: a previous-day trip's stored times are shifted
 /// back by this to place it on the queried day's clock.
 const DAY_SECONDS: u32 = 86_400;
@@ -232,6 +252,109 @@ impl Raptor {
                     };
                     search.run(request.departure);
                     search.arrivals()
+                },
+            )
+            .collect()
+    }
+
+    /// The cleanest journey's aggregated costs within a travel-time
+    /// budget, per destination, over a departure window — the emissions
+    /// counterpart of [`Raptor::cost_matrix`]. One descending range
+    /// scan per origin; each pass's improved per-round arrivals are
+    /// reconstructed and folded, so the candidates are the profile's
+    /// (departure, arrival, rides)-Pareto set and a cell holds its
+    /// lowest-emission member within the budget (no budget: within the
+    /// window's reach). Destinations with no qualifying resolved-
+    /// emissions candidate are absent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn least_emission_matrix(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        destinations: &[StopIdx],
+        window: u32,
+        budget: Option<u32>,
+    ) -> Vec<Vec<CostRow>> {
+        requests
+            .par_iter()
+            .map_init(
+                || None,
+                |pooled: &mut Option<Search>, request| {
+                    let search = match pooled {
+                        Some(search) if search.rounds == request.max_transfers as usize + 1 => {
+                            search.reset(request);
+                            search
+                        }
+                        _ => pooled.insert(Search::new(timetable, transfers, request)),
+                    };
+                    let departures = departure_candidates(timetable, request, window);
+                    let mut thresholds = vec![UNREACHED; destinations.len() * (search.rounds + 1)];
+                    let mut cleanest: Vec<Option<CostRow>> = vec![None; destinations.len()];
+                    for &departure in &departures {
+                        search.run(departure);
+                        search.fold_cleanest(
+                            departure,
+                            destinations,
+                            budget,
+                            inputs,
+                            None,
+                            &mut thresholds,
+                            &mut cleanest,
+                        );
+                    }
+                    cleanest.into_iter().flatten().collect()
+                },
+            )
+            .collect()
+    }
+
+    /// [`Raptor::least_emission_matrix`] over destination points, joined
+    /// through the points' egress link tables like
+    /// [`Raptor::cost_matrix_to_points`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn least_emission_matrix_to_points(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        access_meters: &[HashMap<StopIdx, f64>],
+        egress: &[Vec<(StopIdx, u32, f64)>],
+        window: u32,
+        budget: Option<u32>,
+    ) -> Vec<Vec<CostRow>> {
+        assert_eq!(requests.len(), access_meters.len());
+        requests
+            .par_iter()
+            .zip(access_meters.par_iter())
+            .map_init(
+                || None,
+                |pooled: &mut Option<Search>, (request, access)| {
+                    let search = match pooled {
+                        Some(search) if search.rounds == request.max_transfers as usize + 1 => {
+                            search.reset(request);
+                            search
+                        }
+                        _ => pooled.insert(Search::new(timetable, transfers, request)),
+                    };
+                    let departures = departure_candidates(timetable, request, window);
+                    let mut thresholds = vec![UNREACHED; egress.len() * (search.rounds + 1)];
+                    let mut cleanest: Vec<Option<CostRow>> = vec![None; egress.len()];
+                    for &departure in &departures {
+                        search.run(departure);
+                        search.fold_cleanest_points(
+                            departure,
+                            egress,
+                            budget,
+                            inputs,
+                            access,
+                            &mut thresholds,
+                            &mut cleanest,
+                        );
+                    }
+                    cleanest.into_iter().flatten().collect()
                 },
             )
             .collect()
@@ -629,6 +752,22 @@ impl<'a> Search<'a> {
         if best_arrival == UNREACHED {
             return None;
         }
+        let mut row = self.walk_costs(stop, best_round, inputs, access_meters);
+        row.seconds = best_arrival - departure;
+        Some(row)
+    }
+
+    /// The aggregated costs of the journey behind `tau[round][stop]`,
+    /// walking its label chain. The caller has checked the label is
+    /// reached; `seconds` is left at zero for the caller to fill (the
+    /// travel time depends on which departure the caller charges).
+    fn walk_costs(
+        &self,
+        stop: StopIdx,
+        best_round: usize,
+        inputs: &CostInputs<'_>,
+        access_meters: Option<&HashMap<StopIdx, f64>>,
+    ) -> CostRow {
         let timetable = self.timetable;
         let mut round = best_round;
         let mut at = stop;
@@ -700,15 +839,125 @@ impl<'a> Search<'a> {
             }
             _ => None,
         };
-        Some(CostRow {
+        CostRow {
             to: stop.0,
-            seconds: best_arrival - departure,
+            seconds: 0,
             rides,
             transit_meters,
             walk_meters,
             emission_grams: if resolved { grams } else { f64::NAN },
             geometry,
-        })
+        }
+    }
+
+    /// Folds a pass's improved arrivals into each destination's cleanest
+    /// candidate: the lowest-emission journey within the travel-time
+    /// budget seen so far, ties resolved toward the shorter travel time.
+    ///
+    /// `thresholds` carries the best arrival per (destination, round)
+    /// across the descending departures; an arrival that does not
+    /// improve its threshold left `tau` unchanged, so it has no label
+    /// chain to reconstruct — the candidates are exactly the profile's
+    /// (departure, arrival, rides)-Pareto set, the same set
+    /// `journey_frontier` sees. Unresolved emissions (NaN) never
+    /// qualify.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_cleanest(
+        &self,
+        departure: u32,
+        destinations: &[StopIdx],
+        budget: Option<u32>,
+        inputs: &CostInputs<'_>,
+        access_meters: Option<&HashMap<StopIdx, f64>>,
+        thresholds: &mut [u32],
+        cleanest: &mut [Option<CostRow>],
+    ) {
+        for (slot, &stop) in destinations.iter().enumerate() {
+            let thresholds = &mut thresholds[slot * (self.rounds + 1)..][..self.rounds + 1];
+            // At-most-k-ride thresholds — `collect`'s admission rule —
+            // so the ride candidates match the profile's. Round 0 joins
+            // as the zero-ride floor: the access-seeded stops (for a
+            // stop matrix, the origin itself at 0 s and 0 g — footpaths
+            // only relax after a ride, as in the time-optimising
+            // matrix); for points the caller's direct-walk overlay
+            // plays that part instead.
+            for round in 0..=self.rounds {
+                let arrival = self.tau[round][stop.0 as usize];
+                if arrival >= thresholds[round] {
+                    continue;
+                }
+                for threshold in &mut thresholds[round..] {
+                    *threshold = (*threshold).min(arrival);
+                }
+                let seconds = arrival - departure;
+                if budget.is_some_and(|budget| seconds > budget) {
+                    continue;
+                }
+                let mut row = self.walk_costs(stop, round, inputs, access_meters);
+                row.seconds = seconds;
+                fold_cleaner(&mut cleanest[slot], row);
+            }
+        }
+    }
+
+    /// [`Search::fold_cleanest`] joined through each destination point's
+    /// egress links: a point's per-round arrival is the minimum over its
+    /// links of the stop arrival plus the egress walk.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_cleanest_points(
+        &self,
+        departure: u32,
+        egress: &[Vec<(StopIdx, u32, f64)>],
+        budget: Option<u32>,
+        inputs: &CostInputs<'_>,
+        access_meters: &HashMap<StopIdx, f64>,
+        thresholds: &mut [u32],
+        cleanest: &mut [Option<CostRow>],
+    ) {
+        for (point, links) in egress.iter().enumerate() {
+            let thresholds = &mut thresholds[point * (self.rounds + 1)..][..self.rounds + 1];
+            // Rounds from 1, at-most-k-ride thresholds over the joined
+            // point arrival — exactly `collect`'s admission rule (the
+            // per-stop pruning inside `tau` does not survive the link
+            // join, so the suffix update is what enforces dominance by
+            // fewer-ride journeys here). The walking-only alternative
+            // arrives via the caller's direct-walk overlay, as it does
+            // for `journey_frontier`.
+            for round in 1..=self.rounds {
+                let mut chosen: Option<(u32, StopIdx, f64)> = None;
+                for &(stop, seconds, meters) in links {
+                    let at_stop = self.tau[round][stop.0 as usize];
+                    if at_stop == UNREACHED {
+                        continue;
+                    }
+                    let Some(arrival) = at_stop.checked_add(seconds).filter(|&at| at != UNREACHED)
+                    else {
+                        continue;
+                    };
+                    if chosen.is_none_or(|(current, _, _)| arrival < current) {
+                        chosen = Some((arrival, stop, meters));
+                    }
+                }
+                let Some((arrival, stop, egress_meters)) = chosen else {
+                    continue;
+                };
+                if arrival >= thresholds[round] {
+                    continue;
+                }
+                for threshold in &mut thresholds[round..] {
+                    *threshold = (*threshold).min(arrival);
+                }
+                let seconds = arrival - departure;
+                if budget.is_some_and(|budget| seconds > budget) {
+                    continue;
+                }
+                let mut row = self.walk_costs(stop, round, inputs, Some(access_meters));
+                row.to = point as u32;
+                row.seconds = seconds;
+                row.walk_meters += egress_meters;
+                fold_cleaner(&mut cleanest[point], row);
+            }
+        }
     }
 
     /// Runs one pass per departure — which must be strictly decreasing —
