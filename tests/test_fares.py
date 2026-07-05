@@ -195,9 +195,7 @@ def test_zone_structure_tolerates_missing_fare_columns(tmp_path):
         archive.writestr("fare_rules.txt", "fare_id,contains_id\nZ,A\n")
         archive.writestr("stops.txt", "stop_id,stop_name,zone_id\nS1,One,A\n")
     open_ended = fares.zone_fare_structure(minimal)
-    long_trip = journey(
-        ride("any", 0, "S1", "S1"), ride("any", 50_000, "S1", "S1")
-    )
+    long_trip = journey(ride("any", 0, "S1", "S1"), ride("any", 50_000, "S1", "S1"))
     assert open_ended.price(long_trip) == pytest.approx(2.0)
     # A feed without fare files says so.
     bare = tmp_path / "bare.zip"
