@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- The street spatial index is a packed static index over Hilbert-sorted
+  edge segments (flat arrays, an implicit tree — the OSRM/Flatbush
+  layout), replacing the rstar R\*-tree, and edges and vertices are
+  renumbered along the Hilbert curve at build time so spatially-nearby
+  streets sit nearby in every array. Snapping results are unchanged
+  (candidates are still re-measured exactly; exact connector ties now
+  break deterministically by edge and fraction instead of index
+  internals); the ``rstar`` dependency is dropped. This is groundwork
+  for memory-mapping the street network: the index is plain arrays a
+  future container can persist directly, and the Hilbert layout keeps
+  a local query's reads in a compact range.
+
 - Default street-search parameters now match r5py's, so door-to-door and
   point-matrix results line up with r5py out of the box. The stop/coordinate
   snap radius is 300 m (R5's street-link radius, was 100 m), so a stop up to

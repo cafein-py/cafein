@@ -9,5 +9,4 @@ authors.workspace = true
 
 [dependencies]
 rayon.workspace = true
-rstar.workspace = true
 serde.workspace = true
