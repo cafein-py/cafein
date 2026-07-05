@@ -41,6 +41,7 @@ def journey_frontier(
     max_transfers=7,
     factors=None,
     components=None,
+    fares=None,
     walking_speed_kmph=None,
     max_walking_time=None,
     max_snap_distance=None,
@@ -52,6 +53,10 @@ def journey_frontier(
     journey, and marks the Pareto frontier: the journeys no other
     candidate beats on both travel time and emissions. Requires a
     network built with trip distances (the default).
+
+    With a fare structure (`fares`), every candidate is also priced and
+    the frame gains a ``fare`` column — monetary cost as an annotation
+    alongside the frontier, not (yet) a criterion of it.
 
     Parameters
     ----------
@@ -73,6 +78,10 @@ def journey_frontier(
     factors, components : optional
         Emission-factor rows layered over the shipped defaults and the
         LCA components to include, as in ``emissions.annotate``.
+    fares : FareStructure or ZoneFareStructure (optional)
+        A fare model (see ``cafein.fares``); prices every candidate and
+        adds the ``fare`` column (grams stay the frontier's second
+        criterion). NaN marks journeys the model cannot price.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         The street-search options for coordinate queries, as in
         ``route_between_coordinates``; only valid with coordinates.
@@ -125,6 +134,10 @@ def journey_frontier(
             geometries=geometries,
         )
     emissions.annotate(journeys, network, factors, components)
+    if fares is not None:
+        from cafein.fares import annotate_fares
+
+        annotate_fares(journeys, fares)
     records = [
         {
             "departure": journey["departure"],
@@ -134,16 +147,24 @@ def journey_frontier(
             "emissions": (
                 math.nan if journey["emissions"] is None else journey["emissions"]
             ),
+            **({"fare": journey["fare"]} if fares is not None else {}),
             "journey": journey,
         }
         for journey in journeys
     ]
-    frame = pd.DataFrame(records, columns=[c for c in _COLUMNS if c != "frontier"])
+    columns = [c for c in _COLUMNS if c != "frontier"]
+    if fares is not None:
+        columns.insert(columns.index("journey"), "fare")
+    frame = pd.DataFrame(records, columns=columns)
     frame["frontier"] = _frontier_mask(
         frame["travel_time"].tolist(), frame["emissions"].tolist()
     )
+    ordered = [c for c in _COLUMNS if c != "journey"]
+    if fares is not None:
+        ordered.append("fare")
+    ordered.append("journey")
     return (
-        frame[_COLUMNS].sort_values(["travel_time", "emissions"]).reset_index(drop=True)
+        frame[ordered].sort_values(["travel_time", "emissions"]).reset_index(drop=True)
     )
 
 

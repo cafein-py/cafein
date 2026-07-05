@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- Monetary costs: the new ``cafein.fares`` module prices journeys after
+  routing, from their leg sequence and timing. Two fare models ship: a
+  **rule-based structure mirroring r5r's** — global
+  ``max_discounted_transfers``/``transfer_time_allowance``/``fare_cap``
+  plus the editable ``fares_per_type``/``fares_per_transfer``/
+  ``fares_per_route`` DataFrames, seeded from a network with
+  ``setup_fare_structure(network, base_fare)``, priced exactly as r5r's
+  rule-based calculator, and read/written in r5r's zip format
+  (``load_fare_structure``/``save_fare_structure``) so the two tools
+  share fare definitions (on merged multi-feed networks, re-key the
+  loaded ``fares_per_route`` to cafein's feed-qualified route ids, as
+  the comparison script demonstrates) — and a **zone-based structure
+  from GTFS fare
+  files** (``zone_fare_structure``): ``fare_attributes``/``fare_rules``
+  ``contains_id`` zone sets, as Helsinki Region Transport ships, where
+  a journey pays the cheapest chain of zone tickets covering the zones
+  it touches within their transfer windows. ``annotate_fares(journeys,
+  structure)`` attaches ``fare`` to routed journeys, and
+  ``journey_frontier(..., fares=structure)`` adds the ``fare`` column
+  to the frontier frame (an annotation alongside the time × emissions
+  frontier; fares as a criterion come later). Route- or
+  origin/destination-keyed fare rules are not modelled. The Porto
+  Alegre fare structure and sample feeds r5r bundles are pinned into
+  the test data, and a manual comparison script
+  (``scripts/compare_fares_vs_r5r.py``) runs r5r's fare-aware Pareto
+  frontier on them and checks that every cafein fare is a level of the
+  shared structure.
+
 - Least-emission matrices: ``TravelCostMatrix(...,
   optimize="emissions", window=..., within=...)`` reports, per OD pair,
   the lowest-emission journey of a departure window instead of the

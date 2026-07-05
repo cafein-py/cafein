@@ -3,8 +3,10 @@
 """Download the shared test datasets into tests/data/.
 
 The datasets are the r5py sample data for the Helsinki region
-(https://github.com/r5py/r5py.sampledata.helsinki), pinned by release tag and
-SHA-256 so that cafein and r5py test against byte-identical input files.
+(https://github.com/r5py/r5py.sampledata.helsinki) and r5r's Porto
+Alegre fare structure (https://github.com/ipeaGIT/r5r), pinned by
+release tag or commit and SHA-256 so that cafein and r5py/r5r test
+against byte-identical input files.
 """
 
 import hashlib
@@ -18,6 +20,8 @@ DOWNLOAD_ATTEMPTS = 3
 
 BASE_URL = "https://github.com/r5py/r5py.sampledata.helsinki/raw/v1.1.1/data"
 
+R5R_URL = "https://github.com/ipeaGIT/r5r/raw/eae1aacfc94987bcc06d55e04e43c3d879280d13"
+
 DATASETS = {
     "helsinki_gtfs.zip": (
         f"{BASE_URL}/helsinki_gtfs.zip",
@@ -26,6 +30,22 @@ DATASETS = {
     "kantakaupunki.osm.pbf": (
         f"{BASE_URL}/kantakaupunki.osm.pbf",
         "94f1a86cb8defaca4b6eea64fba699fde957a848151642b2ad2599bd5ad1e858",
+    ),
+    "fares_poa.zip": (
+        f"{R5R_URL}/r-package/inst/extdata/poa/fares/fares_poa.zip",
+        "84cbb9ab01f4f1406aa6c281cd70101b5ad98180a450ad90f304fbdd8a5cc2a0",
+    ),
+    "poa_eptc.zip": (
+        f"{R5R_URL}/r-package/inst/extdata/poa/poa_eptc.zip",
+        "90f9e66980efc998d4bf69f13b760b93bb85bf41f884eb6818629cd261a547ba",
+    ),
+    "poa_trensurb.zip": (
+        f"{R5R_URL}/r-package/inst/extdata/poa/poa_trensurb.zip",
+        "1c0162e0b7c76604c79037e9e9879f94325989b3775cec854e93fe9473fd99f1",
+    ),
+    "poa_osm.pbf": (
+        f"{R5R_URL}/r-package/inst/extdata/poa/poa_osm.pbf",
+        "d0d692b2b13c3ccabb494856966ea40068fbb3b6d5534b70b9234c74f465787d",
     ),
 }
 
