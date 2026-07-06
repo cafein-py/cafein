@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- GTFS ingest robustness: blank interior stop times — legal at
+  non-timepoint stops — are now filled by linear interpolation between
+  the surrounding timed stops when the timetable is built, as
+  timepoint-only feeds expect of their consumers (a warning reports how
+  many trips were repaired; trips missing a first or last time are
+  still quarantined). An invalid cosmetic ``route_color``/
+  ``route_text_color`` value no longer rejects a whole feed: the reader
+  retries on an in-memory copy with the colour columns dropped, never
+  touching the input. r5r's Porto Alegre sample feeds now load
+  unmodified, and ``scripts/compare_fares_vs_r5r.py`` no longer
+  sanitizes feed copies.
+
 - Fares as a criterion: with a fare structure
   (``journey_frontier(..., fares=structure)``), the fare now joins the
   frontier as a third criterion — a slower or dirtier journey stays on

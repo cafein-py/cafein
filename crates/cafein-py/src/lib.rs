@@ -856,6 +856,7 @@ fn assemble((artifact, streets, streets_bytes_read): LoadedArtifact) -> Transpor
         timetable,
         services,
         quarantined: Vec::new(),
+        interpolated: Vec::new(),
     };
     let (stops_by_id, stops_by_qualified_id, trips_by_public_id) =
         derived_indexes(&feed, &build.timetable);
@@ -1085,6 +1086,17 @@ impl TransportNetwork {
             let message = format!(
                 "quarantined {} trip(s) with data-quality problems; routing excludes them",
                 build.quarantined.len()
+            );
+            let warnings = py.import("warnings")?;
+            warnings.call_method1(
+                "warn",
+                (message, py.get_type::<pyo3::exceptions::PyUserWarning>(), 2),
+            )?;
+        }
+        if !build.interpolated.is_empty() {
+            let message = format!(
+                "interpolated blank stop times on {} trip(s)",
+                build.interpolated.len()
             );
             let warnings = py.import("warnings")?;
             warnings.call_method1(

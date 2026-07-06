@@ -1,6 +1,7 @@
 //! Reading GTFS archives or directories into a [`Feed`].
 
 use std::collections::HashMap;
+use std::io::{Cursor, Read as _, Write as _};
 use std::path::Path;
 
 use gtfs_structures::{DirectionType, Gtfs, GtfsReader};
@@ -26,14 +27,111 @@ impl Feed {
     pub fn from_paths<P: AsRef<Path>>(paths: &[P]) -> Result<Feed, Error> {
         let mut feed = Feed::default();
         for (feed_index, path) in paths.iter().enumerate() {
-            let gtfs = GtfsReader::default()
-                .read_shapes(false)
-                .read_from_path(path)?;
+            let gtfs = read_gtfs(path.as_ref())?;
             append_gtfs(&mut feed, feed_index as FeedIndex, gtfs)?;
         }
         feed.feed_count = paths.len() as FeedIndex;
         Ok(feed)
     }
+}
+
+/// Reads one feed, tolerating malformed cosmetic colour values.
+///
+/// Colours are irrelevant to routing, but the strict parser rejects a
+/// whole feed over an invalid `route_color`/`route_text_color`. When
+/// routes.txt is the file that failed, retry on an in-memory copy of
+/// the feed with the colour columns dropped; the input itself is never
+/// modified. Any other failure — including a failure to assemble the
+/// copy — surfaces the original error.
+fn read_gtfs(path: &Path) -> Result<Gtfs, Error> {
+    match GtfsReader::default()
+        .read_shapes(false)
+        .read_from_path(path)
+    {
+        Err(error) if failed_on_routes(&error) => {
+            let Ok(sanitized) = archive_without_colours(path) else {
+                return Err(error.into());
+            };
+            GtfsReader::default()
+                .read_shapes(false)
+                .raw()
+                .read_from_reader(Cursor::new(sanitized))
+                .and_then(Gtfs::try_from)
+                .map_err(Into::into)
+        }
+        result => result.map_err(Into::into),
+    }
+}
+
+fn failed_on_routes(error: &gtfs_structures::Error) -> bool {
+    matches!(
+        error,
+        gtfs_structures::Error::CSVError { file_name, .. } if file_name.ends_with("routes.txt")
+    )
+}
+
+type SanitizeError = Box<dyn std::error::Error + Send + Sync>;
+
+/// An in-memory zip copy of the feed with the colour columns dropped
+/// from routes.txt.
+fn archive_without_colours(path: &Path) -> Result<Vec<u8>, SanitizeError> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default();
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let mut bytes = std::fs::read(entry.path())?;
+            if name == "routes.txt" {
+                bytes = without_colour_columns(&bytes)?;
+            }
+            writer.start_file(name, options)?;
+            writer.write_all(&bytes)?;
+        }
+    } else {
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+        for index in 0..archive.len() {
+            let entry = archive.by_index_raw(index)?;
+            if entry.is_file() && entry.name().ends_with("routes.txt") {
+                let name = entry.name().to_string();
+                drop(entry);
+                let mut bytes = Vec::new();
+                archive.by_index(index)?.read_to_end(&mut bytes)?;
+                writer.start_file(name, options)?;
+                writer.write_all(&without_colour_columns(&bytes)?)?;
+            } else {
+                writer.raw_copy_file(entry)?;
+            }
+        }
+    }
+    Ok(writer.finish()?.into_inner())
+}
+
+/// routes.txt with the `route_color`/`route_text_color` columns removed.
+///
+/// Record lengths are enforced strictly: a ragged row fails the rewrite
+/// (and thereby the retry), so the colour fallback cannot mask a real
+/// shape problem in routes.txt.
+fn without_colour_columns(bytes: &[u8]) -> Result<Vec<u8>, SanitizeError> {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let mut reader = csv::Reader::from_reader(bytes);
+    let headers = reader.headers()?.clone();
+    let kept: Vec<usize> = headers
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| !matches!(name.trim(), "route_color" | "route_text_color"))
+        .map(|(index, _)| index)
+        .collect();
+    let mut writer = csv::Writer::from_writer(Vec::new());
+    writer.write_record(kept.iter().map(|&index| &headers[index]))?;
+    for record in reader.records() {
+        let record = record?;
+        writer.write_record(kept.iter().map(|&index| &record[index]))?;
+    }
+    Ok(writer.into_inner()?)
 }
 
 fn append_gtfs(feed: &mut Feed, feed_index: FeedIndex, gtfs: Gtfs) -> Result<(), Error> {
@@ -163,4 +261,98 @@ fn append_gtfs(feed: &mut Feed, feed_index: FeedIndex, gtfs: Gtfs) -> Result<(),
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-trip feed whose routes.txt carries the given extra header
+    /// columns and row values, as zip bytes.
+    fn minimal_feed_zip(extra_columns: &str, extra_values: &str) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        let files = [
+            (
+                "agency.txt",
+                "agency_id,agency_name,agency_url,agency_timezone\n\
+                 A,Agency,http://example.com,Europe/Helsinki\n"
+                    .to_string(),
+            ),
+            (
+                "stops.txt",
+                "stop_id,stop_name,stop_lat,stop_lon\nS1,One,60.0,24.0\nS2,Two,60.01,24.01\n"
+                    .to_string(),
+            ),
+            (
+                "routes.txt",
+                format!(
+                    "route_id,route_short_name,route_type{extra_columns}\nR1,1,3{extra_values}\n"
+                ),
+            ),
+            (
+                "trips.txt",
+                "route_id,service_id,trip_id\nR1,SV,T1\n".to_string(),
+            ),
+            (
+                "stop_times.txt",
+                "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+                 T1,08:00:00,08:00:00,S1,1\nT1,08:10:00,08:10:00,S2,2\n"
+                    .to_string(),
+            ),
+            (
+                "calendar.txt",
+                "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,\
+                 start_date,end_date\nSV,1,1,1,1,1,1,1,20220101,20221231\n"
+                    .to_string(),
+            ),
+        ];
+        for (name, content) in files {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(content.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn read_zip_bytes(tag: &str, bytes: &[u8]) -> Result<Feed, Error> {
+        let path =
+            std::env::temp_dir().join(format!("cafein-read-test-{}-{tag}.zip", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let feed = Feed::from_path(&path);
+        std::fs::remove_file(&path).ok();
+        feed
+    }
+
+    #[test]
+    fn tolerates_invalid_route_colours() {
+        // route_text_color "0" is not RRGGBB; the strict read fails and
+        // the colour-less retry recovers the feed intact.
+        let feed = read_zip_bytes(
+            "colours",
+            &minimal_feed_zip(",route_color,route_text_color", ",FFFFFF,0"),
+        )
+        .unwrap();
+        assert_eq!(feed.routes.len(), 1);
+        assert_eq!(feed.routes[0].id, "R1");
+        assert_eq!(feed.trips.len(), 1);
+        assert_eq!(feed.trips[0].stop_times.len(), 2);
+    }
+
+    #[test]
+    fn keeps_routes_errors_that_are_not_colours() {
+        // A malformed route_type fails the colour-less retry too: the
+        // fallback never masks real routes.txt problems.
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("routes.txt", options).unwrap();
+        writer
+            .write_all(b"route_id,route_short_name,route_type\nR1,1,not-a-number\n")
+            .unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        assert!(read_zip_bytes("route-type", &bytes).is_err());
+        // A ragged row (extra field) fails the sanitizer, so a shape
+        // error is never repaired into a loadable feed either.
+        let ragged = minimal_feed_zip(",route_text_color", ",0,i-am-an-extra-field");
+        assert!(read_zip_bytes("ragged", &ragged).is_err());
+    }
 }
