@@ -1,32 +1,36 @@
-//! The TBTR trip-to-trip transfer set over the Helsinki region GTFS
-//! feed shared with r5py (r5py.sampledata.helsinki v1.1.1).
+//! The TBTR day views and trip-to-trip transfer sets over the Helsinki
+//! region GTFS feed shared with r5py (r5py.sampledata.helsinki v1.1.1).
 
 mod common;
 
 use std::sync::OnceLock;
 
-use cafein_core::tbtr::{TransferSet, TransferSetBuild};
-use cafein_core::timetable::{Timetable, TripIdx};
+use cafein_core::tbtr::{DayView, TransferSet, TransferSetBuild, ViewTrip};
+use cafein_core::timetable::Timetable;
 use cafein_core::transfers::Transfers;
-use cafein_gtfs::{build_timetable, Feed};
+use cafein_gtfs::{build_timetable, Feed, ServiceCalendar};
+use chrono::NaiveDate;
 
-fn helsinki() -> Option<&'static (Timetable, TransferSetBuild)> {
-    static DATA: OnceLock<Option<(Timetable, TransferSetBuild)>> = OnceLock::new();
+fn helsinki() -> Option<&'static (Timetable, ServiceCalendar, TransferSetBuild)> {
+    static DATA: OnceLock<Option<(Timetable, ServiceCalendar, TransferSetBuild)>> = OnceLock::new();
     DATA.get_or_init(|| {
         let path = common::helsinki_gtfs_path()?;
         let feed = Feed::from_path(path).unwrap();
-        let timetable = build_timetable(&feed).unwrap().timetable;
+        let build = build_timetable(&feed).unwrap();
         // Same-stop transfers only: footpaths come from OSM streets,
         // which the Rust integration layer does not build.
-        let build = TransferSet::build(&timetable, &Transfers::empty(timetable.stop_count()));
-        Some((timetable, build))
+        let transfers = TransferSet::build(
+            &build.timetable,
+            &Transfers::empty(build.timetable.stop_count()),
+        );
+        Some((build.timetable, build.services, transfers))
     })
     .as_ref()
 }
 
 #[test]
 fn reduction_keeps_a_fraction_of_the_feasible_transfers() {
-    let Some((_, build)) = helsinki() else {
+    let Some((_, _, build)) = helsinki() else {
         return;
     };
     assert!(!build.transfers.is_empty());
@@ -39,33 +43,57 @@ fn reduction_keeps_a_fraction_of_the_feasible_transfers() {
 }
 
 #[test]
-fn kept_transfers_are_feasible_and_earliest() {
-    let Some((timetable, build)) = helsinki() else {
+fn a_date_view_shrinks_the_universe_and_the_set() {
+    let Some((timetable, services, universal)) = helsinki() else {
         return;
     };
+    let date = NaiveDate::from_ymd_opt(2022, 2, 22).unwrap();
+    let view = DayView::for_date(
+        timetable,
+        &services.active_on(date),
+        &services.active_on(date.pred_opt().unwrap()),
+    );
+    assert!(view.trip_count() < timetable.trip_count());
+    assert!(view.trip_count() > 0);
+    let build = TransferSet::for_view(&view, timetable, &Transfers::empty(timetable.stop_count()));
+    assert!(!build.transfers.is_empty());
+    assert!(build.transfers.len() < universal.transfers.len());
+    // Pinned for the fixture: the Tuesday universe holds 24 280 of the
+    // 195 351 trips (the feed spans weeks of service days).
+    assert_eq!(view.trip_count(), 24_280);
+    assert_eq!(build.transfers.len(), 576_932);
+}
+
+#[test]
+fn kept_transfers_are_feasible_and_earliest() {
+    let Some((timetable, _, build)) = helsinki() else {
+        return;
+    };
+    let view = DayView::universal(timetable);
     let set = &build.transfers;
     // Every kept transfer boards a catchable trip that still has track
-    // ahead, and no earlier trip of the same pattern position was
-    // catchable — sampled across the trip space.
-    for trip in (0..timetable.trip_count()).step_by(997).map(TripIdx) {
-        let stops = timetable.pattern_stops(timetable.trip_pattern(trip));
-        let times = timetable.trip_stop_times(trip);
+    // ahead, and no earlier trip of the same line position was
+    // catchable — sampled across the trip space. In the universal view
+    // virtual trips coincide with timetable trips.
+    for trip in (0..view.trip_count()).step_by(997).map(ViewTrip) {
+        let stops = timetable.pattern_stops(view.line_pattern(view.line_of(trip)));
+        let times = view.stored_times(timetable, trip);
         for alight in 1..stops.len() {
             for transfer in set.from_trip_position(trip, alight as u16) {
-                let boarded_pattern = timetable.trip_pattern(transfer.trip);
-                let boarded_stops = timetable.pattern_stops(boarded_pattern);
+                let line = view.line_of(transfer.trip);
+                let boarded_stops = timetable.pattern_stops(view.line_pattern(line));
                 let position = transfer.position as usize;
                 assert!(position + 1 < boarded_stops.len());
                 assert_eq!(boarded_stops[position], stops[alight]);
-                let departure = timetable.trip_stop_times(transfer.trip)[position].departure;
+                let departure = view.stored_times(timetable, transfer.trip)[position].departure;
                 assert!(departure >= times[alight].arrival);
-                // Earliest boardable of its pattern position: the
-                // previous trip of the pattern departs too early.
-                let range = timetable.pattern_trip_range(boarded_pattern);
+                // Earliest boardable of its line position: the
+                // previous trip of the line departs too early.
+                let range = view.line_trips(line);
                 if transfer.trip.0 > range.start {
-                    let previous = TripIdx(transfer.trip.0 - 1);
+                    let previous = ViewTrip(transfer.trip.0 - 1);
                     assert!(
-                        timetable.trip_stop_times(previous)[position].departure
+                        view.stored_times(timetable, previous)[position].departure
                             < times[alight].arrival
                     );
                 }
