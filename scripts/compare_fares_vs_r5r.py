@@ -26,7 +26,6 @@ JDK 21+ if rJava needs it. The test data comes from
 """
 
 import argparse
-import math
 import os
 import pathlib
 import shutil
@@ -87,59 +86,6 @@ def stop_sample(count, seed):
     return stops, list(zip(origins["stop_id"], destinations["stop_id"]))
 
 
-def sanitized_feeds(staging):
-    """Copies of the feeds cafein's stricter ingest accepts.
-
-    Two poa quirks are smoothed over: the EPTC feed carries an invalid
-    ``route_text_color`` (``0``), which the strict GTFS parser rejects —
-    colours are irrelevant to routing and fares — and its stop times are
-    interpolated (blank at non-timepoints), which cafein does not yet
-    interpolate itself the way R5 does, so the copies interpolate them
-    linearly between timepoints. Boarding times at timepoints are
-    unchanged; in-between times shift by at most the interpolation
-    error, which fares are insensitive to at transfer-window scale.
-    """
-    import io
-
-    import pandas as pd
-
-    def parse(value):
-        if not isinstance(value, str) or not value.strip():
-            return math.nan
-        hours, minutes, seconds = value.split(":")
-        return int(hours) * 3600 + int(minutes) * 60 + int(seconds)
-
-    def render(seconds):
-        seconds = int(round(seconds))
-        return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
-
-    copies = []
-    for feed in FEEDS:
-        copy = staging / feed.name
-        with zipfile.ZipFile(feed) as source, zipfile.ZipFile(copy, "w") as out:
-            for name in source.namelist():
-                data = source.read(name)
-                if name == "routes.txt":
-                    frame = pd.read_csv(io.BytesIO(data), dtype=str)
-                    frame = frame.drop(
-                        columns=["route_color", "route_text_color"], errors="ignore"
-                    )
-                    data = frame.to_csv(index=False).encode()
-                if name == "stop_times.txt":
-                    frame = pd.read_csv(io.BytesIO(data), dtype=str)
-                    for column in ("arrival_time", "departure_time"):
-                        frame[column] = frame[column].map(parse)
-                        frame[column] = (
-                            frame.groupby("trip_id")[column]
-                            .transform(lambda times: times.interpolate())
-                            .map(render)
-                        )
-                    data = frame.to_csv(index=False).encode()
-                out.writestr(name, data)
-        copies.append(copy)
-    return copies
-
-
 def requalified(structure, network):
     """The fare structure re-keyed to the network's public route ids.
 
@@ -178,11 +124,12 @@ def cafein_candidates(stops, pairs, fare_levels):
     coordinates = {
         row.stop_id: (row.stop_lat, row.stop_lon) for row in stops.itertuples()
     }
-    staging = pathlib.Path(tempfile.mkdtemp(prefix="cafein-fares-"))
     with warnings.catch_warnings():
+        # The ingest interpolates the EPTC feed's blank stop times and
+        # tolerates its invalid route_text_color, warning about both.
         warnings.simplefilter("ignore")
         network = TransportNetwork.from_gtfs(
-            [str(feed) for feed in sanitized_feeds(staging)], osm_pbf=str(PBF)
+            [str(feed) for feed in FEEDS], osm_pbf=str(PBF)
         )
         structure = requalified(fares.load_fare_structure(FARES), network)
         results = {}

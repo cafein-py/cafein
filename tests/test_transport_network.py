@@ -613,6 +613,64 @@ def test_quarantined_trips_raise_a_warning(tmp_path):
     assert journeys[0]["arrival"] == 8 * 3600 + 10 * 60
 
 
+def build_timepoint_gtfs(path):
+    """A three-stop feed in the shape issue #45 describes: stop times
+    blank at the non-timepoint middle stop, and an invalid (non-hex)
+    ``route_text_color`` that a strict parser rejects."""
+    import zipfile
+
+    tables = {
+        "agency.txt": [
+            "agency_id,agency_name,agency_url,agency_timezone",
+            "A,Test Agency,http://example.com,Europe/Helsinki",
+        ],
+        "stops.txt": [
+            "stop_id,stop_name,stop_lat,stop_lon",
+            "S1,First,60.0,24.0",
+            "S2,Middle,60.01,24.01",
+            "S3,Last,60.02,24.02",
+        ],
+        "routes.txt": [
+            "route_id,route_short_name,route_type,route_text_color",
+            "R1,1,3,0",
+        ],
+        "trips.txt": [
+            "route_id,service_id,trip_id",
+            "R1,SV,T1",
+        ],
+        "stop_times.txt": [
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+            "T1,08:00:00,08:00:00,S1,1",
+            "T1,,,S2,2",
+            "T1,08:10:00,08:10:00,S3,3",
+        ],
+        "calendar.txt": [
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+            "sunday,start_date,end_date",
+            "SV,1,1,1,1,1,1,1,20220101,20221231",
+        ],
+    }
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, lines in tables.items():
+            archive.writestr(name, "\n".join(lines) + "\n")
+    return path
+
+
+def test_timepoint_feeds_are_repaired_at_ingest(tmp_path):
+    # Issue #45: blank interior stop times interpolate (with a warning)
+    # and an invalid cosmetic route colour no longer rejects the feed.
+    feed = build_timepoint_gtfs(tmp_path / "timepoint_gtfs.zip")
+    with pytest.warns(UserWarning, match="interpolated blank stop times on 1 trip"):
+        network = TransportNetwork.from_gtfs([str(feed)])
+    assert [route_id for route_id, _, _ in network.routes] == ["R1"]
+    # Boarding at the interpolated middle stop works, halfway between
+    # the timepoints.
+    journeys = network.route_between_stops("S2", "S3", "2022-02-22", "08:00:00")
+    transit = [leg for leg in journeys[0]["legs"] if leg["type"] == "transit"]
+    assert transit[0]["departure"] == 8 * 3600 + 5 * 60
+    assert journeys[0]["arrival"] == 8 * 3600 + 10 * 60
+
+
 def test_qualified_ids_take_precedence_over_colon_raw_ids(tmp_path):
     feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
     with pytest.warns(UserWarning):
