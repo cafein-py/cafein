@@ -447,6 +447,34 @@ impl<'a> TbtrEngine<'a> {
         egress: &[(StopIdx, u32)],
         max_transfers: u8,
     ) -> Vec<Journey> {
+        self.profile(&[departure], access, egress, max_transfers)
+    }
+
+    /// The range counterpart of [`Raptor::route_range`]: the journeys
+    /// of the request's departure window no later departure dominates,
+    /// enumerated over the same candidate departures.
+    pub fn route_range(&self, request: &Request, window: u32) -> Vec<Journey> {
+        let departures = crate::raptor::departure_candidates(self.timetable, request, window);
+        self.profile(
+            &departures,
+            &request.access,
+            &request.egress,
+            request.max_transfers,
+        )
+    }
+
+    /// One rTBTR pass per departure — which must be strictly
+    /// decreasing — on shared state: the reached horizons persist, so
+    /// each pass explores only what its departure improves, and the
+    /// per-round thresholds suppress journeys dominated by a later
+    /// departure. Journeys come back sorted by (departure, rides).
+    pub fn profile(
+        &self,
+        departures: &[u32],
+        access: &[(StopIdx, u32)],
+        egress: &[(StopIdx, u32)],
+        max_transfers: u8,
+    ) -> Vec<Journey> {
         // Per-line ways to reach the destination: alight positions with
         // their walks, direct or over one incoming footpath — the same
         // one-hop closure RAPTOR reaches with its post-round transfer
@@ -486,21 +514,209 @@ impl<'a> TbtrEngine<'a> {
         }
 
         let rounds = max_transfers as usize + 1;
-        // Nothing reached yet: a trip's horizon is its pattern length.
-        let mut reached: Vec<u16> = (0..self.view.trip_count())
-            .map(|trip| {
-                let line = self.view.line_of(ViewTrip(trip));
-                self.timetable
-                    .pattern_stops(self.view.line_pattern(line))
-                    .len() as u16
-            })
-            .collect();
+        let mut reached = self.horizons(rounds);
         let mut arena: Vec<Segment> = Vec::new();
         let mut queues: Vec<Vec<(u32, u16)>> = vec![Vec::new(); rounds];
         let mut journeys = Vec::new();
-        let mut best = UNREACHED;
+        // The best arrival emitted with at most `round` rides so far,
+        // across the (descending) departures: a pass may only emit
+        // strictly earlier arrivals, so journeys dominated by a later
+        // departure never surface.
+        let mut thresholds = vec![UNREACHED; rounds];
 
-        // Seed round 0 from the access stops.
+        for &departure in departures {
+            self.seed(
+                departure,
+                access,
+                &mut reached,
+                rounds,
+                &mut arena,
+                &mut queues[0],
+            );
+            for round in 0..rounds {
+                if queues[round].is_empty() {
+                    break;
+                }
+                let mut round_best: Option<(u32, u32, u16, &Target)> = None;
+                let segments = std::mem::take(&mut queues[round]);
+                for &(segment, end) in &segments {
+                    let trip = arena[segment as usize].trip;
+                    let board = arena[segment as usize].board;
+                    let line = self.view.line_of(trip);
+                    let offset = self.view.line_day_offset(line);
+                    let times = self.view.stored_times(self.timetable, trip);
+                    // Alights run past the old horizon inclusively: the
+                    // segment that set it boarded there and never
+                    // alighted at its own boarding position.
+                    let last = (end as usize + 1).min(times.len());
+                    // Destination joins.
+                    if let Some(line_targets) = targets.get(&line) {
+                        for target in line_targets {
+                            if target.position <= board || target.position as usize >= last {
+                                continue;
+                            }
+                            let arrival = (times[target.position as usize].arrival - offset)
+                                .saturating_add(target.total);
+                            let current = round_best.map_or(thresholds[round], |(at, _, _, _)| {
+                                at.min(thresholds[round])
+                            });
+                            if arrival < current {
+                                round_best = Some((arrival, segment, target.position, target));
+                            }
+                        }
+                    }
+                    // Transfers into the next round. A continuation can
+                    // still be emitted at any later round; the weakest
+                    // bar it must clear is the next round's threshold
+                    // (they are non-increasing), tightened by what this
+                    // round is about to emit.
+                    if round + 1 < rounds {
+                        let live = round_best.map_or(thresholds[round + 1], |(at, _, _, _)| {
+                            at.min(thresholds[round + 1])
+                        });
+                        for alight in board + 1..last as u16 {
+                            if times[alight as usize].arrival - offset >= live {
+                                break;
+                            }
+                            for transfer in self.set.from_trip_position(trip, alight) {
+                                enqueue(
+                                    &self.view,
+                                    &mut reached,
+                                    rounds,
+                                    round + 1,
+                                    &mut arena,
+                                    &mut queues[round + 1],
+                                    Segment {
+                                        trip: transfer.trip,
+                                        board: transfer.position,
+                                        origin: SegmentOrigin::Transfer {
+                                            parent: segment,
+                                            alight,
+                                        },
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                if let Some((arrival, segment, alight, target)) = round_best {
+                    if arrival < thresholds[round] {
+                        for threshold in &mut thresholds[round..] {
+                            *threshold = (*threshold).min(arrival);
+                        }
+                        journeys.push(self.assemble(departure, &arena, segment, alight, target));
+                    }
+                }
+            }
+        }
+        journeys.sort_by_key(|journey| (journey.departure, journey.rides()));
+        journeys
+    }
+
+    /// The earliest arrival at every stop for one departure, with any
+    /// number of rides up to the transfer cap — the TBTR counterpart of
+    /// [`Raptor::one_to_all`]: access-seeded stops at their walk time,
+    /// everything else over rides and one-hop footpaths; unreachable
+    /// stops are `None`.
+    pub fn one_to_all(
+        &self,
+        departure: u32,
+        access: &[(StopIdx, u32)],
+        max_transfers: u8,
+    ) -> Vec<Option<u32>> {
+        let rounds = max_transfers as usize + 1;
+        let mut best = vec![UNREACHED; self.timetable.stop_count() as usize];
+        for &(stop, seconds) in access {
+            let at = departure.saturating_add(seconds);
+            best[stop.0 as usize] = best[stop.0 as usize].min(at);
+        }
+        let mut reached = self.horizons(rounds);
+        let mut arena: Vec<Segment> = Vec::new();
+        let mut queues: Vec<Vec<(u32, u16)>> = vec![Vec::new(); rounds];
+        self.seed(
+            departure,
+            access,
+            &mut reached,
+            rounds,
+            &mut arena,
+            &mut queues[0],
+        );
+        for round in 0..rounds {
+            if queues[round].is_empty() {
+                break;
+            }
+            let segments = std::mem::take(&mut queues[round]);
+            for &(segment, end) in &segments {
+                let trip = arena[segment as usize].trip;
+                let board = arena[segment as usize].board;
+                let line = self.view.line_of(trip);
+                let offset = self.view.line_day_offset(line);
+                let stops = self.timetable.pattern_stops(self.view.line_pattern(line));
+                let times = self.view.stored_times(self.timetable, trip);
+                let last = (end as usize + 1).min(times.len()) as u16;
+                for alight in board + 1..last {
+                    let arrival = times[alight as usize].arrival - offset;
+                    let stop = stops[alight as usize];
+                    best[stop.0 as usize] = best[stop.0 as usize].min(arrival);
+                    for footpath in self.footpaths.from_stop(stop) {
+                        let walked = arrival.saturating_add(footpath.duration);
+                        let slot = &mut best[footpath.to.0 as usize];
+                        *slot = (*slot).min(walked);
+                    }
+                    if round + 1 < rounds {
+                        for transfer in self.set.from_trip_position(trip, alight) {
+                            enqueue(
+                                &self.view,
+                                &mut reached,
+                                rounds,
+                                round + 1,
+                                &mut arena,
+                                &mut queues[round + 1],
+                                Segment {
+                                    trip: transfer.trip,
+                                    board: transfer.position,
+                                    origin: SegmentOrigin::Transfer {
+                                        parent: segment,
+                                        alight,
+                                    },
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        best.into_iter()
+            .map(|arrival| (arrival != UNREACHED).then_some(arrival))
+            .collect()
+    }
+
+    /// Fresh per-(trip, round) reached horizons: a trip's is its
+    /// pattern length.
+    fn horizons(&self, rounds: usize) -> Vec<u16> {
+        let mut horizons = Vec::with_capacity(self.view.trip_count() as usize * rounds);
+        for trip in 0..self.view.trip_count() {
+            let line = self.view.line_of(ViewTrip(trip));
+            let length = self
+                .timetable
+                .pattern_stops(self.view.line_pattern(line))
+                .len() as u16;
+            horizons.extend(std::iter::repeat_n(length, rounds));
+        }
+        horizons
+    }
+
+    /// Seeds round 0 from the access stops for one departure.
+    #[allow(clippy::too_many_arguments)]
+    fn seed(
+        &self,
+        departure: u32,
+        access: &[(StopIdx, u32)],
+        reached: &mut [u16],
+        rounds: usize,
+        arena: &mut Vec<Segment>,
+        queue: &mut Vec<(u32, u16)>,
+    ) {
         for &(stop, seconds) in access {
             let ready = departure.saturating_add(seconds);
             for served in self.timetable.patterns_at_stop(stop) {
@@ -521,9 +737,11 @@ impl<'a> TbtrEngine<'a> {
                     };
                     enqueue(
                         &self.view,
-                        &mut reached,
-                        &mut arena,
-                        &mut queues[0],
+                        reached,
+                        rounds,
+                        0,
+                        arena,
+                        queue,
                         Segment {
                             trip: boarded,
                             board: served.position,
@@ -533,67 +751,6 @@ impl<'a> TbtrEngine<'a> {
                 }
             }
         }
-
-        for round in 0..rounds {
-            if queues[round].is_empty() {
-                break;
-            }
-            let mut round_best: Option<(u32, u32, u16, &Target)> = None;
-            let segments = std::mem::take(&mut queues[round]);
-            for &(segment, end) in &segments {
-                let trip = arena[segment as usize].trip;
-                let board = arena[segment as usize].board;
-                let line = self.view.line_of(trip);
-                let offset = self.view.line_day_offset(line);
-                let times = self.view.stored_times(self.timetable, trip);
-                // Destination joins.
-                if let Some(line_targets) = targets.get(&line) {
-                    for target in line_targets {
-                        if target.position <= board || target.position >= end {
-                            continue;
-                        }
-                        let arrival = (times[target.position as usize].arrival - offset)
-                            .saturating_add(target.total);
-                        let current = round_best.map_or(best, |(at, _, _, _)| at.min(best));
-                        if arrival < current {
-                            round_best = Some((arrival, segment, target.position, target));
-                        }
-                    }
-                }
-                // Transfers into the next round.
-                if round + 1 < rounds {
-                    let live = round_best.map_or(best, |(at, _, _, _)| at.min(best));
-                    for alight in board + 1..end {
-                        if times[alight as usize].arrival - offset >= live {
-                            break;
-                        }
-                        for transfer in self.set.from_trip_position(trip, alight) {
-                            enqueue(
-                                &self.view,
-                                &mut reached,
-                                &mut arena,
-                                &mut queues[round + 1],
-                                Segment {
-                                    trip: transfer.trip,
-                                    board: transfer.position,
-                                    origin: SegmentOrigin::Transfer {
-                                        parent: segment,
-                                        alight,
-                                    },
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-            if let Some((arrival, segment, alight, target)) = round_best {
-                if arrival < best {
-                    best = arrival;
-                    journeys.push(self.assemble(departure, &arena, segment, alight, target));
-                }
-            }
-        }
-        journeys
     }
 
     /// Walks a winning segment chain back into the journey contract.
@@ -713,27 +870,36 @@ impl<'a> TbtrEngine<'a> {
 }
 
 /// Queues a segment when it boards earlier than anything seen on its
-/// trip, and marks the trip and its later line siblings reached: under
-/// FIFO, boarding a later sibling at the same or a later position can
-/// never beat this one.
+/// trip with this many rides or fewer, and marks the trip and its
+/// later line siblings reached from this round on: under FIFO,
+/// boarding a later sibling at the same or a later position with the
+/// same or more rides can never beat this one. The horizons are per
+/// (trip, round) — profile passes at earlier departures may re-board a
+/// trip already used by a later departure when they do so with fewer
+/// rides, and a single per-trip horizon would wrongly suppress them.
 fn enqueue(
     view: &DayView,
     reached: &mut [u16],
+    rounds: usize,
+    round: usize,
     arena: &mut Vec<Segment>,
     queue: &mut Vec<(u32, u16)>,
     segment: Segment,
 ) {
     let trip = segment.trip;
     let board = segment.board;
-    if board >= reached[trip.0 as usize] {
+    let slot = trip.0 as usize * rounds + round;
+    if board >= reached[slot] {
         return;
     }
-    queue.push((arena.len() as u32, reached[trip.0 as usize]));
+    queue.push((arena.len() as u32, reached[slot]));
     arena.push(segment);
     let line_end = view.line_trips(view.line_of(trip)).end;
     for later in trip.0..line_end {
-        let slot = &mut reached[later as usize];
-        *slot = (*slot).min(board);
+        let base = later as usize * rounds;
+        for horizon in &mut reached[base + round..base + rounds] {
+            *horizon = (*horizon).min(board);
+        }
     }
 }
 
@@ -1201,6 +1367,72 @@ mod tests {
         let tbtr = Tbtr.route(&timetable, &footpaths, &request);
         assert_eq!(pareto(&tbtr), pareto(&raptor));
         assert_eq!(tbtr[0].arrival, 11_000);
+    }
+
+    #[test]
+    fn range_profiles_match_raptor() {
+        use crate::raptor::Raptor;
+
+        // The crossing plus a later A trip and a later B trip: the
+        // window offers two distinct departures with different
+        // connections, and the descending passes must suppress
+        // journeys dominated by the later departure.
+        let mut builder = TimetableBuilder::new(4);
+        let a = builder
+            .add_pattern(&[StopIdx(0), StopIdx(1), StopIdx(2)], 0)
+            .unwrap();
+        let b = builder.add_pattern(&[StopIdx(1), StopIdx(3)], 1).unwrap();
+        builder
+            .add_trip(a, vec![time(0), time(100), time(300)], 0, 0)
+            .unwrap();
+        builder
+            .add_trip(a, vec![time(150), time(250), time(450)], 1, 0)
+            .unwrap();
+        builder
+            .add_trip(b, vec![time(120), time(500)], 2, 0)
+            .unwrap();
+        builder
+            .add_trip(b, vec![time(300), time(650)], 3, 0)
+            .unwrap();
+        let timetable = builder.finish();
+        let footpaths = Transfers::empty(4);
+        let request = request(1, StopIdx(0), StopIdx(3), 0);
+        let raptor = Raptor.route_range(&timetable, &footpaths, &request, 400);
+        let engine = TbtrEngine::for_date(
+            &timetable,
+            &footpaths,
+            &request.active_services,
+            &request.active_services_previous,
+        );
+        let tbtr = engine.route_range(&request, 400);
+        let triples = |journeys: &[Journey]| -> Vec<(u32, u32, usize)> {
+            journeys
+                .iter()
+                .map(|journey| (journey.departure, journey.arrival, journey.rides()))
+                .collect()
+        };
+        assert_eq!(triples(&tbtr), triples(&raptor));
+        assert!(tbtr.len() >= 2);
+    }
+
+    #[test]
+    fn one_to_all_matches_raptor() {
+        use crate::raptor::Raptor;
+
+        let timetable = crossing();
+        let footpaths = Transfers::from_edges(4, &[(StopIdx(2), StopIdx(3), 45, 40.0)]).unwrap();
+        let request = request(3, StopIdx(0), StopIdx(3), 0);
+        let raptor = Raptor.one_to_all(&timetable, &footpaths, &request);
+        let engine = TbtrEngine::for_date(
+            &timetable,
+            &footpaths,
+            &request.active_services,
+            &request.active_services_previous,
+        );
+        let tbtr = engine.one_to_all(request.departure, &request.access, request.max_transfers);
+        assert_eq!(tbtr, raptor);
+        // The footpath tail is reachable: stop 3 over stop 2's walk.
+        assert!(tbtr[3].is_some());
     }
 
     #[test]
