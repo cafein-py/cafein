@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- The exact time × emissions Pareto set:
+  ``cafein.exhaustive_frontier(network, origin, destination, date,
+  departure)`` enumerates the mathematically complete frontier for one
+  departure between two stops — every boardable trip considered,
+  microgram-quantized gram labels, the same journey rules as the
+  routers. It is a brute-force oracle for verifying frontiers and
+  inspecting true Pareto sets at sampled-pair scale, orders of
+  magnitude slower than ``journey_frontier`` — whose documented
+  interim contract it also measures: on the Helsinki fixture the
+  time-Pareto candidate set does miss cleaner-but-slower journeys with
+  more rides (pinned in the tests), the gap a true multicriteria
+  search will close.
+
 - Trip-Based Transit Routing (TBTR): the compute core gains Witt's
   TBTR as a second routing engine — a precomputed, reduced
   trip-to-trip transfer set over a query date's trip universe

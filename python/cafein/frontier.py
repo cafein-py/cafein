@@ -173,6 +173,67 @@ def journey_frontier(
     )
 
 
+def exhaustive_frontier(
+    network,
+    origin,
+    destination,
+    date,
+    departure,
+    *,
+    max_transfers=7,
+    factors=None,
+    components=None,
+):
+    """The exact time × emissions Pareto set between two stops.
+
+    A brute-force oracle: every boardable trip is considered, with
+    gram labels quantized to a microgram (float noise must not split a
+    true point), so the result is the mathematically
+    complete frontier for the departure — at a cost orders of magnitude
+    above ``journey_frontier``. Use it to verify frontiers or inspect
+    true Pareto sets for sampled pairs, never in bulk. Journeys riding
+    a trip without a resolved emission factor can never sit on an
+    emissions frontier and are excluded outright.
+
+    Unlike ``journey_frontier`` this answers a single departure (no
+    window) between stop ids (no coordinates), and returns points, not
+    journeys.
+
+    Parameters
+    ----------
+    network : TransportNetwork
+        The network to route on; requires trip distances (the default).
+    origin, destination : str
+        Stop ids.
+    date : str
+        Service date as ``YYYY-MM-DD``.
+    departure : str
+        Departure time as ``HH:MM:SS``.
+    max_transfers : int (optional, default: 7)
+        Maximum number of transfers between rides.
+    factors, components : optional
+        Emission-factor rows layered over the shipped defaults and the
+        LCA components to include, as in ``emissions.annotate``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per true frontier point, sorted by arrival:
+        ``arrival`` and ``travel_time`` (seconds), ``rides`` (the
+        fewest transit legs achieving the point), and ``emissions``
+        (grams CO₂e).
+    """
+    trip_factors = emissions.trip_factors(network, factors, components)
+    points = network._core.pareto_oracle(
+        origin, destination, date, departure, trip_factors, max_transfers
+    )
+    hours, minutes, seconds = departure.split(":")
+    start = int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+    frame = pd.DataFrame(points, columns=["arrival", "emissions", "rides"])
+    frame["travel_time"] = frame["arrival"] - start
+    return frame[["arrival", "travel_time", "rides", "emissions"]]
+
+
 def least_emissions(frontier, within=None):
     """The lowest-emission journey of a frontier, as its row.
 
