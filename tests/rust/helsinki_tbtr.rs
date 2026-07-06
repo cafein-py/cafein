@@ -1,12 +1,15 @@
-//! The TBTR day views and trip-to-trip transfer sets over the Helsinki
-//! region GTFS feed shared with r5py (r5py.sampledata.helsinki v1.1.1).
+//! The TBTR day views, trip-to-trip transfer sets, and query engine
+//! over the Helsinki region GTFS feed shared with r5py
+//! (r5py.sampledata.helsinki v1.1.1).
 
 mod common;
 
 use std::sync::OnceLock;
 
-use cafein_core::tbtr::{DayView, TransferSet, TransferSetBuild, ViewTrip};
-use cafein_core::timetable::Timetable;
+use cafein_core::raptor::Raptor;
+use cafein_core::router::{Request, TransitRouter};
+use cafein_core::tbtr::{DayView, TbtrEngine, TransferSet, TransferSetBuild, ViewTrip};
+use cafein_core::timetable::{StopIdx, Timetable};
 use cafein_core::transfers::Transfers;
 use cafein_gtfs::{build_timetable, Feed, ServiceCalendar};
 use chrono::NaiveDate;
@@ -62,6 +65,56 @@ fn a_date_view_shrinks_the_universe_and_the_set() {
     // 195 351 trips (the feed spans weeks of service days).
     assert_eq!(view.trip_count(), 24_280);
     assert_eq!(build.transfers.len(), 576_932);
+}
+
+#[test]
+fn queries_match_raptor_across_sampled_pairs() {
+    let Some((timetable, services, _)) = helsinki() else {
+        return;
+    };
+    let date = NaiveDate::from_ymd_opt(2022, 2, 22).unwrap();
+    let active = services.active_on(date);
+    let active_previous = services.active_on(date.pred_opt().unwrap());
+    let footpaths = Transfers::empty(timetable.stop_count());
+    let engine = TbtrEngine::for_date(timetable, &footpaths, &active, &active_previous);
+    let pareto = |journeys: &[cafein_core::journey::Journey]| -> Vec<(u32, usize)> {
+        journeys
+            .iter()
+            .map(|journey| (journey.arrival, journey.rides()))
+            .collect()
+    };
+    // Deterministic strides across the stop space, morning and evening
+    // departures: the (arrival, rides) Pareto sets must agree pair for
+    // pair with RAPTOR's.
+    let mut compared = 0;
+    for origin in (0..timetable.stop_count()).step_by(611).map(StopIdx) {
+        for destination in (37..timetable.stop_count()).step_by(1259).map(StopIdx) {
+            for departure in [8 * 3600 + 30 * 60, 17 * 3600] {
+                let request = Request {
+                    departure,
+                    access: vec![(origin, 0)],
+                    egress: vec![(destination, 0)],
+                    active_services: active.clone(),
+                    active_services_previous: active_previous.clone(),
+                    max_transfers: 4,
+                };
+                let raptor = Raptor.route(timetable, &footpaths, &request);
+                let tbtr = engine.query(
+                    departure,
+                    &request.access,
+                    &request.egress,
+                    request.max_transfers,
+                );
+                assert_eq!(
+                    pareto(&tbtr),
+                    pareto(&raptor),
+                    "pareto sets diverge for {origin:?}->{destination:?} at {departure}"
+                );
+                compared += 1;
+            }
+        }
+    }
+    assert!(compared >= 150);
 }
 
 #[test]
