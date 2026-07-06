@@ -8,6 +8,8 @@ import shapely
 
 from cafein import TravelCostMatrix, TravelTimeMatrix, emissions
 
+UNREACHABLE_POINT = np.uint32(0xFFFFFFFF)
+
 
 def point_frame(network, named_stops):
     """Points at known stops' coordinates, under fresh ids."""
@@ -26,6 +28,35 @@ def cost_matrix(network, **kwargs):
     # of the resolution contract and irrelevant to most assertions.
     with pytest.warns(UserWarning, match="route_type"):
         return TravelCostMatrix(network, date="2022-02-22", **kwargs)
+
+
+def scattered_points(network, count, seed):
+    """Deterministic building-like locations: central stops offset by
+    30–300 m in pseudo-random directions — arbitrary points on the
+    street network rather than stop coordinates."""
+    import math
+
+    south, north, west, east = 60.155, 60.185, 24.91, 24.96
+    central = [
+        (stop, lat, lon)
+        for stop, lat, lon in network.stops
+        if lat is not None and south <= lat <= north and west <= lon <= east
+    ]
+    identifiers, latitudes, longitudes = [], [], []
+    for index in range(count):
+        _, lat, lon = central[(seed + index * 97) % len(central)]
+        angle = (seed + index) * 2.399963  # the golden angle
+        radius = 30 + (seed * 13 + index * 53) % 270
+        identifiers.append(f"point-{seed}-{index}")
+        latitudes.append(lat + radius * math.cos(angle) / 111_320)
+        longitudes.append(
+            lon + radius * math.sin(angle) / (111_320 * math.cos(math.radians(lat)))
+        )
+    return gpd.GeoDataFrame(
+        {"id": identifiers},
+        geometry=gpd.points_from_xy(longitudes, latitudes),
+        crs="EPSG:4326",
+    )
 
 
 def test_cost_rows_pin_the_k_train(network):
@@ -160,6 +191,55 @@ def test_point_matrices_walk_ride_and_walk(network_with_footpaths):
         origin = list(origins["id"]).index(row.from_id)
         destination = list(destinations["id"]).index(row.to_id)
         assert times[origin, destination] == row.travel_time
+
+
+def test_point_matrices_from_arbitrary_locations(network_with_footpaths):
+    # The typical accessibility workload: travel times from a set of
+    # "buildings" to a set of "libraries", none of them at a stop.
+    network = network_with_footpaths
+    buildings = scattered_points(network, 24, seed=7)
+    libraries = scattered_points(network, 6, seed=101)
+    times = network.travel_time_matrix(
+        buildings, "2022-02-22", "08:30:00", destinations=libraries
+    )
+    assert times.shape == (24, 6)
+    # Central locations snap onto the walking network, and within the
+    # inner city everything connects by walk-ride-walk or on foot.
+    assert (times != UNREACHABLE_POINT).all()
+    # The long-format cost matrix agrees cell for cell.
+    matrix = cost_matrix(
+        network, origins=buildings, destinations=libraries, departure="08:30:00"
+    )
+    assert len(matrix) == 24 * 6
+    building_order = list(buildings["id"])
+    library_order = list(libraries["id"])
+    for row in matrix.itertuples():
+        at = building_order.index(row.from_id), library_order.index(row.to_id)
+        assert times[at] == row.travel_time
+    # Sampled cells equal the per-pair door-to-door routing: the matrix
+    # is the bulk face of route_between_coordinates.
+    departure = 8 * 3600 + 30 * 60
+    for i in range(0, 24, 7):
+        for j in range(0, 6, 2):
+            origin = (buildings.geometry.y.iloc[i], buildings.geometry.x.iloc[i])
+            destination = (libraries.geometry.y.iloc[j], libraries.geometry.x.iloc[j])
+            journeys = network.route_between_coordinates(
+                origin, destination, "2022-02-22", "08:30:00"
+            )
+            assert journeys
+            fastest = min(journey["arrival"] for journey in journeys)
+            assert fastest - departure == times[i, j]
+    # A building off the street network warns and yields no rows.
+    nowhere = gpd.GeoDataFrame(
+        {"id": ["sea"]},
+        geometry=gpd.points_from_xy([24.90], [60.10]),
+        crs="EPSG:4326",
+    )
+    with pytest.warns(UserWarning, match="off the walking network"):
+        stranded = TravelCostMatrix(
+            network, nowhere, libraries, "2022-02-22", "08:30:00"
+        )
+    assert stranded.empty
 
 
 def test_least_emission_cells_match_the_frontier(tmp_path):
