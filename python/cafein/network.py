@@ -588,6 +588,7 @@ class TransportNetwork:
         percentiles=None,
         confidence=None,
         chunk=None,
+        router="raptor",
         walking_speed_kmph=None,
         max_walking_time=None,
         max_snap_distance=None,
@@ -644,6 +645,15 @@ class TransportNetwork:
             Compute only origin chunk ``k`` of ``n``: a deterministic
             contiguous block of the resolved origins, so ``n`` batch
             jobs cover all origins disjointly; rows follow the chunk.
+        router : str (optional, default: "raptor")
+            The routing engine for single-departure stop matrices:
+            ``"raptor"``, or ``"tbtr"`` to precompute a TBTR day engine
+            (Trip-Based Transit Routing: Witt's trip-transfer set) for
+            the date and fan the origins out over it. The results are
+            identical. Windowed and point matrices run on RAPTOR only,
+            and networks with installed footpaths are rejected — the
+            transitively closed footpath set is too dense for the TBTR
+            precompute as yet.
         walking_speed_kmph, max_walking_time, max_snap_distance : float
             The street-search options for points, as in
             ``access_stops``; only valid with point origins.
@@ -669,6 +679,7 @@ class TransportNetwork:
             percentiles=percentiles,
             confidence=confidence,
             chunk=chunk,
+            router=router,
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
@@ -690,6 +701,7 @@ class TransportNetwork:
         walking_speed_kmph,
         max_walking_time,
         max_snap_distance,
+        router="raptor",
     ):
         """The travel-time matrix with its origin and destination id
         axes and the resolved percentile list (``None`` without a
@@ -704,6 +716,13 @@ class TransportNetwork:
             _warn_unsnapped,
         )
 
+        if router not in ("raptor", "tbtr"):
+            raise ValueError(f"router must be 'raptor' or 'tbtr', not {router!r}")
+        if router == "tbtr" and (window is not None or _is_point_frame(from_stops)):
+            raise ValueError(
+                "router='tbtr' backs single-departure stop matrices only; "
+                "windowed and point matrices run on RAPTOR"
+            )
         percentiles = _window_percentiles(window, percentiles, confidence)
         if _is_point_frame(from_stops):
             from_ids, origin_points = _point_list(from_stops, "origins")
@@ -751,7 +770,7 @@ class TransportNetwork:
         from_stops = from_stops[_chunk_slice(len(from_stops), chunk)]
         if percentiles is None:
             matrix = self._core.travel_time_matrix(
-                from_stops, date, departure, max_transfers
+                from_stops, date, departure, max_transfers, router
             )
         else:
             matrix = self._core.travel_time_percentiles(

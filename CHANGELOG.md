@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Trip-Based Transit Routing (TBTR): the compute core gains Witt's
+  TBTR as a second routing engine — a precomputed, reduced
+  trip-to-trip transfer set over a query date's trip universe
+  (previous-day over-midnight trips included as shifted lines) and a
+  segment-scanning query engine whose (arrival, rides) results are
+  exactly RAPTOR's, verified pair for pair on the Helsinki fixture
+  across earliest-arrival queries, departure-window profiles, and
+  one-to-all sweeps. Single-departure stop matrices can select it:
+  ``travel_time_matrix(..., router="tbtr")`` and
+  ``TravelTimeMatrix(..., router=)`` precompute a TBTR day engine and
+  fan the origins out over it. RAPTOR remains the default engine
+  everywhere, and networks with installed footpaths are rejected by
+  ``router="tbtr"`` for now: the transitively closed footpath set is
+  quadratic in dense areas, beyond what the TBTR precompute digests.
+
 - GTFS ingest robustness: blank interior stop times — legal at
   non-timepoint stops — are now filled by linear interpolation between
   the surrounding timed stops when the timetable is built, as

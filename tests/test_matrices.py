@@ -790,6 +790,15 @@ def test_travel_time_matrix_unstacks_the_wide_matrix(network):
     assert type(matrix.iloc[:1]) is pd.DataFrame
 
 
+def test_travel_time_matrix_accepts_the_tbtr_router(network):
+    origins = ["4810551", "1040602", "1250551"]
+    raptor = TravelTimeMatrix(network, origins, date="2022-02-22", departure="08:30:00")
+    tbtr = TravelTimeMatrix(
+        network, origins, date="2022-02-22", departure="08:30:00", router="tbtr"
+    )
+    assert raptor.equals(tbtr)
+
+
 def test_travel_time_matrix_windowed_percentiles(network):
     origins = ["4740551"]
     percentiles = [10, 50, 90]
