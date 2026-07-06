@@ -32,10 +32,11 @@ class TravelCostMatrix(pd.DataFrame):
 
     One RAPTOR run serves each origin, fanned out over all cores; each
     pair's costs come from its fastest journey (ties resolved toward
-    fewer rides) — or, with ``optimize="emissions"``, from the cleanest
-    journey of a departure window, optionally within a travel-time
-    budget. Unreachable pairs are absent. Requires a network built
-    with trip distances (the default), and with leg geometries for
+    fewer rides) — or, with ``optimize="emissions"`` or
+    ``optimize="fare"``, from the cleanest or cheapest journey of a
+    departure window, optionally within a travel-time budget.
+    Unreachable pairs are absent. Requires a network built with trip
+    distances (the default), and with leg geometries for
     ``geometries=True``. Slices and copies degrade to plain DataFrames.
 
     Parameters
@@ -56,28 +57,35 @@ class TravelCostMatrix(pd.DataFrame):
         Maximum number of transfers between rides.
     optimize : str (optional, default: "time")
         What each cell's journey minimises. ``"time"`` (the default)
-        reports the fastest journey. ``"emissions"`` reports the
-        lowest-emission journey among the departure window's
-        (departure, arrival, rides)-Pareto candidates — the same ride
-        candidates ``journey_frontier`` sees — optionally within the
-        ``within`` travel-time budget. A zero-ride, zero-emission floor
-        joins the candidates: for stop pairs the origin itself, for
-        point pairs the walking-only alternative, which wins any cell
-        it qualifies for. Pairs with no qualifying resolved-emissions
+        reports the fastest journey. ``"emissions"`` and ``"fare"``
+        report the lowest-emission or cheapest journey among the
+        departure window's (departure, arrival, rides)-Pareto
+        candidates — the same ride candidates ``journey_frontier``
+        sees — optionally within the ``within`` travel-time budget. A
+        zero-ride floor (zero emissions, zero fare) joins the
+        candidates: for stop pairs the origin itself, for point pairs
+        the walking-only alternative, which wins any cell it qualifies
+        for. Each objective qualifies candidates by its own key: NaN
+        emissions drop a candidate under ``"emissions"``, an
+        unpriceable fare under ``"fare"`` — pairs with no qualifying
         candidate are absent.
     window : int (optional)
         Departure window in seconds; required with
-        ``optimize="emissions"``.
+        ``optimize="emissions"`` and ``optimize="fare"``.
     within : int (optional)
-        Travel-time budget in seconds for ``optimize="emissions"``:
+        Travel-time budget in seconds for the windowed optimize modes:
         only journeys at most this long qualify. Unbudgeted, the
-        cleanest reachable journey wins.
+        cleanest (cheapest) reachable journey wins.
     factors : DataFrame or path (optional)
         Extra emission-factor rows layered over the shipped defaults;
         see ``cafein.emissions.load_factors``.
     components : list of str (optional)
         The life-cycle components to include (default: all four); see
         ``cafein.emissions.annotate``.
+    fares : FareStructure or ZoneFareStructure (optional)
+        A fare model (see ``cafein.fares``); adds a ``fare`` column
+        with each cell's journey priced (NaN where the model cannot
+        price it), and is required for ``optimize="fare"``.
     geometries : bool (optional, default: False)
         Attach each pair's ridden legs as geometry. Off by default:
         per-pair geometries over large matrices are enormous.
@@ -108,6 +116,7 @@ class TravelCostMatrix(pd.DataFrame):
         within=None,
         factors=None,
         components=None,
+        fares=None,
         geometries=False,
         chunk=None,
         walking_speed_kmph=None,
@@ -126,6 +135,7 @@ class TravelCostMatrix(pd.DataFrame):
             within=within,
             factors=factors,
             components=components,
+            fares=fares,
             geometries=geometries,
             chunk=chunk,
             walking_speed_kmph=walking_speed_kmph,
@@ -141,6 +151,8 @@ class TravelCostMatrix(pd.DataFrame):
             "walk_distance": table["walk_distance"],
             "emissions": table["emissions"],
         }
+        if fares is not None:
+            data["fare"] = table["fare"]
         if geometries:
             data["geometry"] = shapely.from_wkb(
                 np.array(table["geometry"], dtype=object)
@@ -315,6 +327,7 @@ def travel_cost_table(
     within=None,
     factors=None,
     components=None,
+    fares=None,
     geometries=False,
     chunk=None,
     walking_speed_kmph=None,
@@ -323,8 +336,9 @@ def travel_cost_table(
 ):
     """The travel-cost matrix as a pyarrow Table — the shard-writing form.
 
-    Semantics and parameters follow `TravelCostMatrix` — including
-    ``optimize="emissions"`` with its ``window``/``within``; the output is an
+    Semantics and parameters follow `TravelCostMatrix` — including the
+    windowed optimize modes with their ``window``/``within`` and the
+    ``fares`` pricing; the output is an
     Arrow table with ``from_id`` and ``to_id`` dictionary-encoded over
     the origin and destination identifiers, the numeric columns wrapping
     the computed arrays zero-copy, and — with ``geometries=True`` — the
@@ -357,6 +371,7 @@ def travel_cost_table(
         within=within,
         factors=factors,
         components=components,
+        fares=fares,
         geometries=geometries,
         chunk=chunk,
         walking_speed_kmph=walking_speed_kmph,
@@ -378,6 +393,8 @@ def travel_cost_table(
         "walk_distance": pyarrow.array(table["walk_distance"]),
         "emissions": pyarrow.array(table["emissions"]),
     }
+    if fares is not None:
+        columns["fare"] = pyarrow.array(table["fare"])
     if geometries:
         columns["geometry"] = pyarrow.array(
             list(table["geometry"]), type=pyarrow.binary()
@@ -403,6 +420,7 @@ def _cost_columns(
     optimize="time",
     window=None,
     within=None,
+    fares=None,
 ):
     """The core's cost arrays plus the origin and destination ids."""
     from cafein import emissions
@@ -410,12 +428,17 @@ def _cost_columns(
 
     if date is None or departure is None:
         raise TypeError("TravelCostMatrix requires date and departure")
-    if optimize not in ("time", "emissions"):
-        raise ValueError(f"optimize must be 'time' or 'emissions', not {optimize!r}")
-    if optimize == "emissions" and window is None:
-        raise ValueError("optimize='emissions' requires a departure window")
+    if optimize not in ("time", "emissions", "fare"):
+        raise ValueError(
+            f"optimize must be 'time', 'emissions', or 'fare', not {optimize!r}"
+        )
+    if optimize != "time" and window is None:
+        raise ValueError(f"optimize={optimize!r} requires a departure window")
     if optimize == "time" and not (window is None and within is None):
-        raise ValueError("window and within require optimize='emissions'")
+        raise ValueError("window and within require optimize='emissions' or 'fare'")
+    if optimize == "fare" and fares is None:
+        raise ValueError("optimize='fare' requires a fare structure (fares=)")
+    fare_tables = None if fares is None else fares._flat_tables(network)
     trip_factors = emissions.trip_factors(network, factors, components)
     if _is_point_frame(origins) or _is_point_frame(destinations):
         from_ids, origin_points = _point_list(origins, "origins")
@@ -427,14 +450,16 @@ def _cost_columns(
         from_ids = from_ids[rows]
         origin_points = origin_points[rows]
         walk = _walk_options(walking_speed_kmph, max_walking_time, max_snap_distance)
-        if optimize == "emissions":
-            table = network._core.least_emission_matrix_from_points(
+        if optimize != "time":
+            table = network._core.least_cost_matrix_from_points(
                 origin_points,
                 destination_points,
                 date,
                 departure,
                 window,
                 trip_factors,
+                optimize,
+                fare_tables,
                 within,
                 max_transfers,
                 *walk,
@@ -450,6 +475,7 @@ def _cost_columns(
                 max_transfers,
                 *walk,
                 geometries,
+                fare_tables,
             )
         _warn_unsnapped(table, from_ids, to_ids)
     else:
@@ -463,13 +489,15 @@ def _cost_columns(
         from_ids = list(stop_ids) if origins is None else [str(o) for o in origins]
         from_ids = from_ids[_chunk_slice(len(from_ids), chunk)]
         to_stops = None if destinations is None else [str(d) for d in destinations]
-        if optimize == "emissions":
-            table = network._core.least_emission_matrix(
+        if optimize != "time":
+            table = network._core.least_cost_matrix(
                 from_ids,
                 date,
                 departure,
                 window,
                 trip_factors,
+                optimize,
+                fare_tables,
                 within,
                 max_transfers,
                 to_stops,
@@ -484,6 +512,7 @@ def _cost_columns(
                 max_transfers,
                 to_stops,
                 geometries,
+                fare_tables,
             )
         to_ids = stop_ids
     return table, from_ids, to_ids

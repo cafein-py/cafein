@@ -8,9 +8,10 @@ use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
+use cafein_core::fares::{FareTables, RuleFares, ZoneFares, ZoneProduct, NO_FARE};
 use cafein_core::geometry::{wkb_multi_line_string, DistanceProvenance, LegGeometry, TripGeometry};
 use cafein_core::journey::{Journey, Leg};
-use cafein_core::raptor::{CostInputs, CostRow, Raptor};
+use cafein_core::raptor::{CostInputs, CostRow, Objective, Raptor};
 use cafein_core::router::{Request, TransitRouter};
 use cafein_core::streets::{
     Backing, MappedStreets, Snap, StopLink, StoredLink, StreetNetwork, StreetNetworkParts,
@@ -872,6 +873,93 @@ fn assemble((artifact, streets, streets_bytes_read): LoadedArtifact) -> Transpor
     }
 }
 
+/// Parses the flat fare tables `cafein.fares` produces, validating the
+/// arrays against the network's route and stop counts.
+fn fare_tables(
+    spec: &Bound<'_, PyDict>,
+    route_count: usize,
+    stop_count: usize,
+) -> PyResult<FareTables> {
+    fn item<'py, T: FromPyObject<'py>>(spec: &Bound<'py, PyDict>, key: &str) -> PyResult<T> {
+        spec.get_item(key)?
+            .ok_or_else(|| PyValueError::new_err(format!("fare tables are missing {key:?}")))?
+            .extract()
+    }
+    if spec.contains("stop_zone")? {
+        let stop_zone: Vec<u32> = item(spec, "stop_zone")?;
+        if stop_zone.len() != stop_count {
+            return Err(PyValueError::new_err(
+                "the fare tables' stop_zone must cover every stop",
+            ));
+        }
+        if stop_zone.iter().any(|&zone| zone != NO_FARE && zone >= 128) {
+            return Err(PyValueError::new_err(
+                "fare zone indexes must stay below 128",
+            ));
+        }
+        let products: Vec<(f64, u128, f64, u32)> = item(spec, "products")?;
+        let products = products
+            .into_iter()
+            .map(|(price, zones, duration, transfers)| ZoneProduct {
+                price,
+                zones,
+                duration,
+                transfers,
+            })
+            .collect();
+        Ok(FareTables::Zone(ZoneFares {
+            stop_zone,
+            products,
+        }))
+    } else {
+        let tables = RuleFares {
+            route_type: item(spec, "route_type")?,
+            route_fare: item(spec, "route_fare")?,
+            unlimited_transfers: item(spec, "unlimited_transfers")?,
+            allow_same_route: item(spec, "allow_same_route")?,
+            pair_fare: item(spec, "pair_fare")?,
+            max_discounted_transfers: item(spec, "max_discounted_transfers")?,
+            transfer_allowance: item(spec, "transfer_allowance")?,
+            fare_cap: item(spec, "fare_cap")?,
+        };
+        let count = tables.unlimited_transfers.len();
+        if tables.route_type.len() != route_count || tables.route_fare.len() != route_count {
+            return Err(PyValueError::new_err(
+                "the fare tables' route arrays must cover every route",
+            ));
+        }
+        if tables.allow_same_route.len() != count || tables.pair_fare.len() != count * count {
+            return Err(PyValueError::new_err(
+                "the fare tables' type arrays disagree on the type count",
+            ));
+        }
+        if tables
+            .route_type
+            .iter()
+            .any(|&kind| kind != NO_FARE && kind as usize >= count)
+        {
+            return Err(PyValueError::new_err(
+                "the fare tables' route types must index the type arrays",
+            ));
+        }
+        Ok(FareTables::RuleBased(tables))
+    }
+}
+
+/// Parses the objective a windowed candidate fold minimises.
+fn parse_objective(objective: &str, fares: Option<&FareTables>) -> PyResult<Objective> {
+    match objective {
+        "emissions" => Ok(Objective::Emissions),
+        "fare" if fares.is_none() => Err(PyValueError::new_err(
+            "the 'fare' objective requires fare tables",
+        )),
+        "fare" => Ok(Objective::Fare),
+        other => Err(PyValueError::new_err(format!(
+            "objective must be 'emissions' or 'fare', not {other:?}"
+        ))),
+    }
+}
+
 /// Flattens per-origin cost rows into the columnar dict the Python
 /// matrices consume: equal-length arrays for the surviving pairs, plus
 /// a WKB list when geometries ride along.
@@ -888,6 +976,7 @@ fn cost_rows_dict(
     let mut transit_distance = Vec::with_capacity(total);
     let mut walk_distance = Vec::with_capacity(total);
     let mut emissions = Vec::with_capacity(total);
+    let mut fare = Vec::with_capacity(total);
     let wkbs = PyList::empty(py);
     for (origin, origin_rows) in rows.into_iter().enumerate() {
         for row in origin_rows {
@@ -898,6 +987,7 @@ fn cost_rows_dict(
             transit_distance.push(row.transit_meters);
             walk_distance.push(row.walk_meters);
             emissions.push(row.emission_grams);
+            fare.push(row.fare);
             if geometries {
                 match row.geometry {
                     Some(wkb) => wkbs.append(PyBytes::new(py, &wkb))?,
@@ -914,6 +1004,7 @@ fn cost_rows_dict(
     result.set_item("transit_distance", transit_distance.into_pyarray(py))?;
     result.set_item("walk_distance", walk_distance.into_pyarray(py))?;
     result.set_item("emissions", emissions.into_pyarray(py))?;
+    result.set_item("fare", fare.into_pyarray(py))?;
     if geometries {
         result.set_item("geometry", wkbs)?;
     }
@@ -2144,6 +2235,9 @@ impl TransportNetwork {
     /// geometries : bool (optional, default: False)
     ///     Attach each pair's ridden legs as a WKB MultiLineString;
     ///     requires installed leg geometries.
+    /// fares : dict (optional)
+    ///     Flat fare tables from ``cafein.fares``; prices each pair's
+    ///     journey into the ``fare`` array.
     ///
     /// Returns
     /// -------
@@ -2152,9 +2246,10 @@ impl TransportNetwork {
     ///     into `from_stops`), ``to`` (index into ``stops``),
     ///     ``travel_time`` (seconds), ``rides``, ``transit_distance``
     ///     and ``walk_distance`` (meters), ``emissions`` (grams CO₂e,
-    ///     NaN when unresolved), and with `geometries` a ``geometry``
-    ///     list of WKB bytes.
-    #[pyo3(signature = (from_stops, date, departure, factors, max_transfers = 7, to_stops = None, geometries = false))]
+    ///     NaN when unresolved), ``fare`` (NaN without `fares` or when
+    ///     unpriceable), and with `geometries` a ``geometry`` list of
+    ///     WKB bytes.
+    #[pyo3(signature = (from_stops, date, departure, factors, max_transfers = 7, to_stops = None, geometries = false, fares = None))]
     #[allow(clippy::too_many_arguments)]
     fn travel_cost_matrix(
         &self,
@@ -2166,6 +2261,7 @@ impl TransportNetwork {
         max_transfers: u8,
         to_stops: Option<Vec<String>>,
         geometries: bool,
+        fares: Option<Bound<'_, PyDict>>,
     ) -> PyResult<Py<PyDict>> {
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
@@ -2177,6 +2273,15 @@ impl TransportNetwork {
                 "no leg geometries installed; build the network with leg geometries enabled",
             ));
         }
+        let tables = fares
+            .map(|spec| {
+                fare_tables(
+                    &spec,
+                    self.feed.routes.len(),
+                    self.build.timetable.stop_count() as usize,
+                )
+            })
+            .transpose()?;
         let origins: Vec<StopIdx> = from_stops
             .iter()
             .map(|stop| self.resolve_stop(stop))
@@ -2215,6 +2320,7 @@ impl TransportNetwork {
             factors: &per_trip,
             leg_geometry: self.leg_geometry.as_ref(),
             with_geometry: geometries,
+            fares: tables.as_ref(),
         };
         let rows = py.allow_threads(|| {
             Raptor.cost_matrix(
@@ -2370,7 +2476,7 @@ impl TransportNetwork {
     ///     origin and destination point lists — plus
     ///     ``unsnapped_from`` / ``unsnapped_to`` with the indices of
     ///     points off the walking network.
-    #[pyo3(signature = (origins, destinations, date, departure, factors, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false))]
+    #[pyo3(signature = (origins, destinations, date, departure, factors, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, fares = None))]
     #[allow(clippy::too_many_arguments)]
     fn travel_cost_matrix_from_points(
         &self,
@@ -2385,6 +2491,7 @@ impl TransportNetwork {
         max_walking_time: f64,
         max_snap_distance: f64,
         geometries: bool,
+        fares: Option<Bound<'_, PyDict>>,
     ) -> PyResult<Py<PyDict>> {
         let streets = self.installed_streets()?;
         let Some(geometry) = &self.geometry else {
@@ -2397,6 +2504,18 @@ impl TransportNetwork {
                 "no leg geometries installed; build the network with leg geometries enabled",
             ));
         }
+        let tables = fares
+            .map(|spec| {
+                fare_tables(
+                    &spec,
+                    self.feed.routes.len(),
+                    self.build.timetable.stop_count() as usize,
+                )
+            })
+            .transpose()?;
+        // Walking rides nothing: with tables it is free, without them
+        // fares are not computed at all.
+        let walk_fare = if tables.is_some() { 0.0 } else { f64::NAN };
         let speed =
             validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
         validate_points(&origins)?;
@@ -2415,6 +2534,7 @@ impl TransportNetwork {
             factors: &per_trip,
             leg_geometry: self.leg_geometry.as_ref(),
             with_geometry: geometries,
+            fares: tables.as_ref(),
         };
         let (rows, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
             let origin_links =
@@ -2497,6 +2617,7 @@ impl TransportNetwork {
                             row.transit_meters = 0.0;
                             row.walk_meters = meters;
                             row.emission_grams = 0.0;
+                            row.fare = walk_fare;
                             row.geometry = walk_geometry(origin, row.to as usize);
                         }
                     }
@@ -2513,6 +2634,7 @@ impl TransportNetwork {
                             transit_meters: 0.0,
                             walk_meters: *meters,
                             emission_grams: 0.0,
+                            fare: walk_fare,
                             geometry: walk_geometry(origin, point),
                         });
                     }
@@ -2531,19 +2653,21 @@ impl TransportNetwork {
         Ok(result)
     }
 
-    /// The cleanest journey's aggregated costs per OD pair within a
-    /// travel-time budget, long format — the emissions counterpart of
-    /// ``travel_cost_matrix`` over a departure window.
+    /// The objective-best journey's aggregated costs per OD pair
+    /// within a travel-time budget, long format — the emissions/fare
+    /// counterpart of ``travel_cost_matrix`` over a departure window.
     ///
     /// The candidates per pair are the departure window's
     /// (departure, arrival, rides)-Pareto set — the same set
     /// ``journey_frontier`` sees — and a cell reports its
-    /// lowest-emission member within `budget` (no budget: within the
+    /// lowest-objective member within `budget` (no budget: within the
     /// window's reach), ties resolved toward the shorter travel time.
-    /// Pairs with no qualifying resolved-emissions candidate are absent.
-    #[pyo3(signature = (from_stops, date, departure, window, factors, budget = None, max_transfers = 7, to_stops = None, geometries = false))]
+    /// Pairs with no qualifying candidate (a resolved emission, a
+    /// priceable fare) are absent. The ``"fare"`` objective requires
+    /// the flat fare tables ``cafein.fares`` produces.
+    #[pyo3(signature = (from_stops, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, to_stops = None, geometries = false))]
     #[allow(clippy::too_many_arguments)]
-    fn least_emission_matrix(
+    fn least_cost_matrix(
         &self,
         py: Python<'_>,
         from_stops: Vec<String>,
@@ -2551,6 +2675,8 @@ impl TransportNetwork {
         departure: &str,
         window: u32,
         factors: Vec<(String, f64)>,
+        objective: &str,
+        fares: Option<Bound<'_, PyDict>>,
         budget: Option<u32>,
         max_transfers: u8,
         to_stops: Option<Vec<String>>,
@@ -2571,6 +2697,16 @@ impl TransportNetwork {
                 "window must be a positive number of seconds",
             ));
         }
+        let tables = fares
+            .map(|spec| {
+                fare_tables(
+                    &spec,
+                    self.feed.routes.len(),
+                    self.build.timetable.stop_count() as usize,
+                )
+            })
+            .transpose()?;
+        let objective = parse_objective(objective, tables.as_ref())?;
         let origins: Vec<StopIdx> = from_stops
             .iter()
             .map(|stop| self.resolve_stop(stop))
@@ -2609,9 +2745,10 @@ impl TransportNetwork {
             factors: &per_trip,
             leg_geometry: self.leg_geometry.as_ref(),
             with_geometry: geometries,
+            fares: tables.as_ref(),
         };
         let rows = py.allow_threads(|| {
-            Raptor.least_emission_matrix(
+            Raptor.least_cost_matrix(
                 &self.build.timetable,
                 &self.transfers,
                 &inputs,
@@ -2619,18 +2756,19 @@ impl TransportNetwork {
                 &destinations,
                 window,
                 budget,
+                objective,
             )
         });
         cost_rows_dict(py, rows, geometries)
     }
 
-    /// ``least_emission_matrix`` between coordinate points, linked
-    /// through the street network like ``travel_cost_matrix_from_points``
-    /// — including the walking-only alternative, whose zero emissions
-    /// win any cell they qualify for within the budget.
-    #[pyo3(signature = (origins, destinations, date, departure, window, factors, budget = None, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false))]
+    /// ``least_cost_matrix`` between coordinate points, linked through
+    /// the street network like ``travel_cost_matrix_from_points`` —
+    /// including the walking-only alternative, whose zero emissions
+    /// (and zero fare) win any cell they qualify for within the budget.
+    #[pyo3(signature = (origins, destinations, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false))]
     #[allow(clippy::too_many_arguments)]
-    fn least_emission_matrix_from_points(
+    fn least_cost_matrix_from_points(
         &self,
         py: Python<'_>,
         origins: Vec<(f64, f64)>,
@@ -2639,6 +2777,8 @@ impl TransportNetwork {
         departure: &str,
         window: u32,
         factors: Vec<(String, f64)>,
+        objective: &str,
+        fares: Option<Bound<'_, PyDict>>,
         budget: Option<u32>,
         max_transfers: u8,
         walking_speed_kmph: f64,
@@ -2662,6 +2802,17 @@ impl TransportNetwork {
                 "window must be a positive number of seconds",
             ));
         }
+        let tables = fares
+            .map(|spec| {
+                fare_tables(
+                    &spec,
+                    self.feed.routes.len(),
+                    self.build.timetable.stop_count() as usize,
+                )
+            })
+            .transpose()?;
+        let objective = parse_objective(objective, tables.as_ref())?;
+        let walk_fare = if tables.is_some() { 0.0 } else { f64::NAN };
         let speed =
             validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
         validate_points(&origins)?;
@@ -2680,6 +2831,7 @@ impl TransportNetwork {
             factors: &per_trip,
             leg_geometry: self.leg_geometry.as_ref(),
             with_geometry: geometries,
+            fares: tables.as_ref(),
         };
         let (rows, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
             let origin_links =
@@ -2708,7 +2860,7 @@ impl TransportNetwork {
                 );
             }
             let egress = egress_tables(&destination_links);
-            let mut rows = Raptor.least_emission_matrix_to_points(
+            let mut rows = Raptor.least_cost_matrix_to_points(
                 &self.build.timetable,
                 &self.transfers,
                 &inputs,
@@ -2717,10 +2869,15 @@ impl TransportNetwork {
                 &egress,
                 window,
                 budget,
+                objective,
             );
-            // The walking-only alternative: zero grams, so within the
-            // budget it wins any cell (equal-gram cells resolve toward
-            // the shorter travel time, as everywhere).
+            // The walking-only alternative: zero grams and zero fare,
+            // so within the budget it wins any cell (equal-key cells
+            // resolve toward the shorter travel time, as everywhere).
+            let key = |row: &CostRow| match objective {
+                Objective::Emissions => row.emission_grams,
+                Objective::Fare => row.fare,
+            };
             let walk = streets.walk_matrix(
                 &origins,
                 &destinations,
@@ -2752,14 +2909,13 @@ impl TransportNetwork {
                         if budget.is_some_and(|budget| walk_seconds > budget) {
                             continue;
                         }
-                        if row.emission_grams > 0.0
-                            || (row.emission_grams == 0.0 && walk_seconds < row.seconds)
-                        {
+                        if key(row) > 0.0 || (key(row) == 0.0 && walk_seconds < row.seconds) {
                             row.seconds = walk_seconds;
                             row.rides = 0;
                             row.transit_meters = 0.0;
                             row.walk_meters = meters;
                             row.emission_grams = 0.0;
+                            row.fare = walk_fare;
                             row.geometry = walk_geometry(origin, row.to as usize);
                         }
                     }
@@ -2779,6 +2935,7 @@ impl TransportNetwork {
                             transit_meters: 0.0,
                             walk_meters: *meters,
                             emission_grams: 0.0,
+                            fare: walk_fare,
                             geometry: walk_geometry(origin, point),
                         });
                     }
