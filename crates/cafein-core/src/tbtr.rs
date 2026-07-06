@@ -691,6 +691,22 @@ impl<'a> TbtrEngine<'a> {
             .collect()
     }
 
+    /// [`TbtrEngine::one_to_all`] fanned out over origins with rayon —
+    /// the matrix primitive on the TBTR engine. The engine is shared
+    /// read-only and each origin runs independently, so the output is
+    /// deterministic regardless of scheduling.
+    pub fn one_to_all_many(
+        &self,
+        departure: u32,
+        accesses: &[Vec<(StopIdx, u32)>],
+        max_transfers: u8,
+    ) -> Vec<Vec<Option<u32>>> {
+        accesses
+            .par_iter()
+            .map(|access| self.one_to_all(departure, access, max_transfers))
+            .collect()
+    }
+
     /// Fresh per-(trip, round) reached horizons: a trip's is its
     /// pattern length.
     fn horizons(&self, rounds: usize) -> Vec<u16> {

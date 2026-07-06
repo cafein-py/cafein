@@ -17,6 +17,7 @@ use cafein_core::streets::{
     Backing, MappedStreets, Snap, StopLink, StoredLink, StreetNetwork, StreetNetworkParts,
     WalkedStop,
 };
+use cafein_core::tbtr::TbtrEngine;
 use cafein_core::timetable::{StopIdx, Timetable, TripIdx};
 use cafein_core::transfers::Transfers;
 use cafein_gtfs::{build_timetable, Feed, RouteType, ServiceCalendar, TimetableBuild};
@@ -1989,6 +1990,14 @@ impl TransportNetwork {
     ///     Departure time at every origin as ``HH:MM:SS``.
     /// max_transfers : int (optional, default: 7)
     ///     Maximum number of transfers between rides.
+    /// router : str (optional, default: "raptor")
+    ///     The routing engine: ``"raptor"``, or ``"tbtr"`` to build a
+    ///     TBTR day engine (view + reduced trip-transfer set) for the
+    ///     date and fan the origins out over it. The results are
+    ///     identical; TBTR trades a per-date precompute for faster
+    ///     scans. Networks with installed footpaths are rejected: the
+    ///     transitively closed footpath set is quadratic in dense
+    ///     areas and the precompute cannot digest it yet.
     ///
     /// Returns
     /// -------
@@ -1997,7 +2006,7 @@ impl TransportNetwork {
     ///     times in seconds; row order follows `from_stops`, column
     ///     order follows ``stops``. Unreachable pairs hold the maximum
     ///     uint32 value (4294967295).
-    #[pyo3(signature = (from_stops, date, departure, max_transfers = 7))]
+    #[pyo3(signature = (from_stops, date, departure, max_transfers = 7, router = "raptor"))]
     fn travel_time_matrix<'py>(
         &self,
         py: Python<'py>,
@@ -2005,7 +2014,23 @@ impl TransportNetwork {
         date: &str,
         departure: &str,
         max_transfers: u8,
+        router: &str,
     ) -> PyResult<Bound<'py, PyArray2<u32>>> {
+        if !matches!(router, "raptor" | "tbtr") {
+            return Err(PyValueError::new_err(format!(
+                "router must be 'raptor' or 'tbtr', not {router:?}"
+            )));
+        }
+        if router == "tbtr" && self.transfers.edge_count() > 0 {
+            // The transitively closed footpath set is quadratic in
+            // dense areas; TBTR's transfer-set precompute enumerates
+            // boarding candidates per footpath neighbour and cannot
+            // digest that density yet.
+            return Err(PyValueError::new_err(
+                "router='tbtr' does not support networks with installed \
+                 footpaths yet; use the default router",
+            ));
+        }
         let origins: Vec<StopIdx> = from_stops
             .iter()
             .map(|stop| self.resolve_stop(stop))
@@ -2013,21 +2038,34 @@ impl TransportNetwork {
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
-        let requests: Vec<Request> = origins
-            .into_iter()
-            .map(|origin| Request {
-                departure,
-                access: vec![(origin, 0)],
-                egress: Vec::new(),
-                active_services: active_services.clone(),
-                active_services_previous: active_services_previous.clone(),
-                max_transfers,
-            })
-            .collect();
         let stop_count = self.build.timetable.stop_count() as usize;
+        let count = origins.len();
         let flat: Vec<u32> = py.allow_threads(|| {
-            let rows = Raptor.one_to_all_many(&self.build.timetable, &self.transfers, &requests);
-            let mut flat = Vec::with_capacity(requests.len() * stop_count);
+            let rows = if router == "tbtr" {
+                let engine = TbtrEngine::for_date(
+                    &self.build.timetable,
+                    &self.transfers,
+                    &active_services,
+                    &active_services_previous,
+                );
+                let accesses: Vec<Vec<(StopIdx, u32)>> =
+                    origins.iter().map(|&origin| vec![(origin, 0)]).collect();
+                engine.one_to_all_many(departure, &accesses, max_transfers)
+            } else {
+                let requests: Vec<Request> = origins
+                    .into_iter()
+                    .map(|origin| Request {
+                        departure,
+                        access: vec![(origin, 0)],
+                        egress: Vec::new(),
+                        active_services: active_services.clone(),
+                        active_services_previous: active_services_previous.clone(),
+                        max_transfers,
+                    })
+                    .collect();
+                Raptor.one_to_all_many(&self.build.timetable, &self.transfers, &requests)
+            };
+            let mut flat = Vec::with_capacity(count * stop_count);
             for row in rows {
                 flat.extend(row.into_iter().map(|arrival| match arrival {
                     Some(arrival) => arrival - departure,
@@ -2036,9 +2074,8 @@ impl TransportNetwork {
             }
             flat
         });
-        let rows = requests.len();
         flat.into_pyarray(py)
-            .reshape([rows, stop_count])
+            .reshape([count, stop_count])
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }
 

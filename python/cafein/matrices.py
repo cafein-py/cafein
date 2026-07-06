@@ -218,6 +218,13 @@ class TravelTimeMatrix(pd.DataFrame):
         Compute only origin chunk ``k`` of ``n``: a deterministic
         contiguous block of the resolved origins, so ``n`` batch jobs
         cover all origins disjointly and their rows concatenate.
+    router : str (optional, default: "raptor")
+        The routing engine for single-departure stop matrices:
+        ``"raptor"``, or ``"tbtr"`` to precompute a TBTR day engine for
+        the date and fan the origins out over it; the results are
+        identical. Windowed and point matrices run on RAPTOR only, and
+        networks with installed footpaths are rejected — the closed
+        footpath set is too dense for the TBTR precompute as yet.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         The street-search options for point origins/destinations, as in
         ``TransportNetwork.access_stops``; only valid with points.
@@ -240,6 +247,7 @@ class TravelTimeMatrix(pd.DataFrame):
         percentiles=None,
         confidence=None,
         chunk=None,
+        router="raptor",
         walking_speed_kmph=None,
         max_walking_time=None,
         max_snap_distance=None,
@@ -255,6 +263,7 @@ class TravelTimeMatrix(pd.DataFrame):
             percentiles=percentiles,
             confidence=confidence,
             chunk=chunk,
+            router=router,
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
@@ -277,6 +286,7 @@ def _time_columns(
     walking_speed_kmph,
     max_walking_time,
     max_snap_distance,
+    router="raptor",
 ):
     """The reachable cells of the travel-time matrix, in long format."""
     if date is None or departure is None:
@@ -291,6 +301,7 @@ def _time_columns(
         percentiles=percentiles,
         confidence=confidence,
         chunk=chunk,
+        router=router,
         walking_speed_kmph=walking_speed_kmph,
         max_walking_time=max_walking_time,
         max_snap_distance=max_snap_distance,
