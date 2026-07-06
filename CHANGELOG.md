@@ -12,10 +12,11 @@
   one-to-all sweeps. Single-departure stop matrices can select it:
   ``travel_time_matrix(..., router="tbtr")`` and
   ``TravelTimeMatrix(..., router=)`` precompute a TBTR day engine and
-  fan the origins out over it. RAPTOR remains the default engine
-  everywhere, and networks with installed footpaths are rejected by
-  ``router="tbtr"`` for now: the transitively closed footpath set is
-  quadratic in dense areas, beyond what the TBTR precompute digests.
+  fan the origins out over it. The precomputed set covers same-stop
+  transfers; installed footpaths relax at query time, RAPTOR-style, so
+  the transitively closed footpath set — quadratic in dense areas —
+  never enters the precompute. RAPTOR remains the default engine
+  everywhere.
 
 - GTFS ingest robustness: blank interior stop times — legal at
   non-timepoint stops — are now filled by linear interpolation between

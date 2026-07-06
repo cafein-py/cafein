@@ -222,9 +222,7 @@ class TravelTimeMatrix(pd.DataFrame):
         The routing engine for single-departure stop matrices:
         ``"raptor"``, or ``"tbtr"`` to precompute a TBTR day engine for
         the date and fan the origins out over it; the results are
-        identical. Windowed and point matrices run on RAPTOR only, and
-        networks with installed footpaths are rejected — the closed
-        footpath set is too dense for the TBTR precompute as yet.
+        identical. Windowed and point matrices run on RAPTOR only.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         The street-search options for point origins/destinations, as in
         ``TransportNetwork.access_stops``; only valid with points.

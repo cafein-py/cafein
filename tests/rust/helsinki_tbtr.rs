@@ -184,6 +184,136 @@ fn range_profiles_and_one_to_all_match_raptor() {
 }
 
 #[test]
+fn footpath_queries_match_raptor() {
+    let Some((timetable, services, _)) = helsinki() else {
+        return;
+    };
+    let date = NaiveDate::from_ymd_opt(2022, 2, 22).unwrap();
+    let active = services.active_on(date);
+    let active_previous = services.active_on(date.pred_opt().unwrap());
+    // A synthetic footpath set over a patch of stops, transitively
+    // closed: cafein's transfer contract (see cafein.streets) is a
+    // closed set — single-hop routers are incomplete on non-closed
+    // sets, RAPTOR included — so the oracle must honour it. Chains of
+    // varying strides plus a dense clique, closed by Floyd–Warshall,
+    // exercise the query-time relaxation without OSM data.
+    let count = timetable.stop_count();
+    const PATCH_START: u32 = 3_300;
+    const PATCH: usize = 300;
+    let mut walk = vec![[u32::MAX; PATCH]; PATCH];
+    let mut connect = |a: usize, b: usize, seconds: u32| {
+        walk[a][b] = walk[a][b].min(seconds);
+        walk[b][a] = walk[b][a].min(seconds);
+    };
+    for local in 0..PATCH as u32 {
+        for (stride, base) in [(1u32, 90u32), (7, 240), (131, 420)] {
+            let to = local + stride;
+            if (to as usize) < PATCH {
+                connect(local as usize, to as usize, base + (local * 37) % 180);
+            }
+        }
+    }
+    for a in 40..110usize {
+        for b in 40..110usize {
+            if a != b {
+                connect(a, b, 60 + (a + b) as u32 % 240);
+            }
+        }
+    }
+    for via in 0..PATCH {
+        for from in 0..PATCH {
+            if walk[from][via] == u32::MAX {
+                continue;
+            }
+            for to in 0..PATCH {
+                if walk[via][to] != u32::MAX {
+                    let chained = walk[from][via] + walk[via][to];
+                    if chained < walk[from][to] {
+                        walk[from][to] = chained;
+                    }
+                }
+            }
+        }
+    }
+    let mut edges = Vec::new();
+    for (from, row) in walk.iter().enumerate() {
+        for (to, &seconds) in row.iter().enumerate() {
+            if from != to && seconds != u32::MAX {
+                edges.push((
+                    StopIdx(PATCH_START + from as u32),
+                    StopIdx(PATCH_START + to as u32),
+                    seconds,
+                    seconds as f64,
+                ));
+            }
+        }
+    }
+    let footpaths = Transfers::from_edges(count, &edges).unwrap();
+    let engine = TbtrEngine::for_date(timetable, &footpaths, &active, &active_previous);
+    let pareto = |journeys: &[cafein_core::journey::Journey]| -> Vec<(u32, usize)> {
+        journeys
+            .iter()
+            .map(|journey| (journey.arrival, journey.rides()))
+            .collect()
+    };
+    for origin in (5..count).step_by(1471).map(StopIdx) {
+        for destination in (900..count).step_by(2903).map(StopIdx) {
+            let request = Request {
+                departure: 8 * 3600 + 30 * 60,
+                access: vec![(origin, 0)],
+                egress: vec![(destination, 0)],
+                active_services: active.clone(),
+                active_services_previous: active_previous.clone(),
+                max_transfers: 4,
+            };
+            let raptor = Raptor.route(timetable, &footpaths, &request);
+            let tbtr = engine.query(
+                request.departure,
+                &request.access,
+                &request.egress,
+                request.max_transfers,
+            );
+            assert_eq!(
+                pareto(&tbtr),
+                pareto(&raptor),
+                "footpath pareto sets diverge for {origin:?}->{destination:?}"
+            );
+            let window_raptor = Raptor.route_range(timetable, &footpaths, &request, 1200);
+            let window_tbtr = engine.route_range(&request, 1200);
+            assert_eq!(
+                pareto(&window_tbtr),
+                pareto(&window_raptor),
+                "footpath window profiles diverge for {origin:?}->{destination:?}"
+            );
+        }
+    }
+    // One-to-all with footpaths, full arrays.
+    for origin in (777..count).step_by(3251).map(StopIdx) {
+        let request = Request {
+            departure: 8 * 3600 + 30 * 60,
+            access: vec![(origin, 0)],
+            egress: Vec::new(),
+            active_services: active.clone(),
+            active_services_previous: active_previous.clone(),
+            max_transfers: 4,
+        };
+        let raptor = Raptor.one_to_all(timetable, &footpaths, &request);
+        let tbtr = engine.one_to_all(request.departure, &request.access, request.max_transfers);
+        let mismatches: Vec<_> = tbtr
+            .iter()
+            .zip(raptor.iter())
+            .enumerate()
+            .filter(|(_, (ours, theirs))| ours != theirs)
+            .take(5)
+            .collect();
+        assert!(
+            mismatches.is_empty(),
+            "footpath one-to-all diverges from {origin:?}: {mismatches:?}"
+        );
+    }
+}
+
+#[test]
 fn kept_transfers_are_feasible_and_earliest() {
     let Some((timetable, _, build)) = helsinki() else {
         return;

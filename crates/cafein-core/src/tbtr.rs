@@ -394,6 +394,15 @@ struct Target {
 
 impl<'a> TbtrEngine<'a> {
     /// Builds the engine for one service date.
+    ///
+    /// The precomputed transfer set covers same-stop transfers only:
+    /// the transitively closed footpath set is quadratic in dense
+    /// areas, far beyond what generation and reduction can enumerate.
+    /// Footpaths join at query time instead — per-stop arrival labels
+    /// relax them RAPTOR-style, and boardings are searched from the
+    /// stops a walk improved — so the two engines see exactly the same
+    /// journeys while the timetable side keeps TBTR's precomputed
+    /// pruning.
     pub fn for_date(
         timetable: &'a Timetable,
         footpaths: &'a Transfers,
@@ -401,7 +410,8 @@ impl<'a> TbtrEngine<'a> {
         active_services_previous: &[bool],
     ) -> TbtrEngine<'a> {
         let view = DayView::for_date(timetable, active_services, active_services_previous);
-        let set = TransferSet::for_view(&view, timetable, footpaths).transfers;
+        let same_stop = Transfers::empty(timetable.stop_count());
+        let set = TransferSet::for_view(&view, timetable, &same_stop).transfers;
         // Reverse the footpath adjacency once per engine.
         let stop_count = timetable.stop_count() as usize;
         let mut counts = vec![0u32; stop_count + 1];
@@ -523,8 +533,33 @@ impl<'a> TbtrEngine<'a> {
         // strictly earlier arrivals, so journeys dominated by a later
         // departure never surface.
         let mut thresholds = vec![UNREACHED; rounds];
+        // Per-(round, stop) arrival labels back the query-time footpath
+        // relaxation; like the reached horizons they persist across the
+        // descending departures, and like the horizons they need the
+        // round dimension — an earlier departure may reach a stop later
+        // in time yet with fewer rides, and boarding from it then is
+        // not dominated.
+        let stop_count = self.timetable.stop_count() as usize;
+        let mut labels = vec![UNREACHED; stop_count * rounds];
+        let improve = move |labels: &mut Vec<u32>, stop: StopIdx, time: u32, round: usize| {
+            let base = stop.0 as usize * rounds;
+            let gate = time < labels[base + round];
+            for slot in &mut labels[base + round..base + rounds] {
+                if time < *slot {
+                    *slot = time;
+                }
+            }
+            gate
+        };
+        let mut walked: HashMap<u32, (u32, u32, u16)> = HashMap::new();
 
         for &departure in departures {
+            // Access stops carry their labels from the start: a ride
+            // looping back to one never improves it, so — matching
+            // RAPTOR — nothing relaxes onward from such an arrival.
+            for &(stop, seconds) in access {
+                improve(&mut labels, stop, departure.saturating_add(seconds), 0);
+            }
             self.seed(
                 departure,
                 access,
@@ -539,20 +574,28 @@ impl<'a> TbtrEngine<'a> {
                 }
                 let mut round_best: Option<(u32, u32, u16, &Target)> = None;
                 let segments = std::mem::take(&mut queues[round]);
+                walked.clear();
                 for &(segment, end) in &segments {
                     let trip = arena[segment as usize].trip;
                     let board = arena[segment as usize].board;
                     let line = self.view.line_of(trip);
                     let offset = self.view.line_day_offset(line);
+                    let stops = self.timetable.pattern_stops(self.view.line_pattern(line));
                     let times = self.view.stored_times(self.timetable, trip);
                     // Alights run past the old horizon inclusively: the
                     // segment that set it boarded there and never
                     // alighted at its own boarding position.
                     let last = (end as usize + 1).min(times.len());
-                    // Destination joins.
+                    // Direct destination joins: alighting at an
+                    // egress stop itself. Never better than an earlier
+                    // round's join at the same stop, so no label gate
+                    // is needed — the thresholds filter duplicates.
                     if let Some(line_targets) = targets.get(&line) {
                         for target in line_targets {
-                            if target.position <= board || target.position as usize >= last {
+                            if target.via.is_some()
+                                || target.position <= board
+                                || target.position as usize >= last
+                            {
                                 continue;
                             }
                             let arrival = (times[target.position as usize].arrival - offset)
@@ -565,19 +608,55 @@ impl<'a> TbtrEngine<'a> {
                             }
                         }
                     }
-                    // Transfers into the next round. A continuation can
-                    // still be emitted at any later round; the weakest
-                    // bar it must clear is the next round's threshold
-                    // (they are non-increasing), tightened by what this
-                    // round is about to emit.
-                    if round + 1 < rounds {
-                        let live = round_best.map_or(thresholds[round + 1], |(at, _, _, _)| {
+                    let expand = round + 1 < rounds;
+                    let expansion_bar = if expand {
+                        round_best.map_or(thresholds[round + 1], |(at, _, _, _)| {
                             at.min(thresholds[round + 1])
-                        });
-                        for alight in board + 1..last as u16 {
-                            if times[alight as usize].arrival - offset >= live {
-                                break;
+                        })
+                    } else {
+                        0
+                    };
+                    for alight in board + 1..last as u16 {
+                        let arrival = times[alight as usize].arrival - offset;
+                        let stop = stops[alight as usize];
+                        // Everything walking onward from this arrival —
+                        // via-joins to the destination, footpath
+                        // boardings — is gated on the arrival improving
+                        // the stop's label, exactly like RAPTOR's
+                        // marked-stop transfer relaxation. An arrival a
+                        // ride looping back cannot beat never improves.
+                        let improved = improve(&mut labels, stop, arrival, round);
+                        if improved {
+                            if let Some(line_targets) = targets.get(&line) {
+                                for target in line_targets {
+                                    if target.via.is_none() || target.position != alight {
+                                        continue;
+                                    }
+                                    let joined = arrival.saturating_add(target.total);
+                                    let current = round_best
+                                        .map_or(thresholds[round], |(at, _, _, _)| {
+                                            at.min(thresholds[round])
+                                        });
+                                    if joined < current {
+                                        round_best = Some((joined, segment, alight, target));
+                                    }
+                                }
                             }
+                            if expand {
+                                for footpath in self.footpaths.from_stop(stop) {
+                                    let walked_at = arrival.saturating_add(footpath.duration);
+                                    if improve(&mut labels, footpath.to, walked_at, round) {
+                                        walked.insert(footpath.to.0, (walked_at, segment, alight));
+                                    }
+                                }
+                            }
+                        }
+                        // Transfers into the next round. A continuation
+                        // can still be emitted at any later round; the
+                        // weakest bar it must clear is the next round's
+                        // threshold (they are non-increasing), tightened
+                        // by what this round is about to emit.
+                        if expand && arrival < expansion_bar {
                             for transfer in self.set.from_trip_position(trip, alight) {
                                 enqueue(
                                     &self.view,
@@ -599,6 +678,21 @@ impl<'a> TbtrEngine<'a> {
                         }
                     }
                 }
+                if round + 1 < rounds {
+                    for (&stop, &(ready, parent, alight)) in &walked {
+                        self.board_walked(
+                            StopIdx(stop),
+                            ready,
+                            parent,
+                            alight,
+                            &mut reached,
+                            rounds,
+                            round + 1,
+                            &mut arena,
+                            &mut queues[round + 1],
+                        );
+                    }
+                }
                 if let Some((arrival, segment, alight, target)) = round_best {
                     if arrival < thresholds[round] {
                         for threshold in &mut thresholds[round..] {
@@ -611,6 +705,51 @@ impl<'a> TbtrEngine<'a> {
         }
         journeys.sort_by_key(|journey| (journey.departure, journey.rides()));
         journeys
+    }
+
+    /// Boards every line catchable at `stop` from `ready` — the
+    /// query-time counterpart of the precomputed same-stop transfers,
+    /// used for the stops a footpath improved.
+    #[allow(clippy::too_many_arguments)]
+    fn board_walked(
+        &self,
+        stop: StopIdx,
+        ready: u32,
+        parent: u32,
+        alight: u16,
+        reached: &mut [u16],
+        rounds: usize,
+        round: usize,
+        arena: &mut Vec<Segment>,
+        queue: &mut Vec<(u32, u16)>,
+    ) {
+        for served in self.timetable.patterns_at_stop(stop) {
+            for line in self
+                .view
+                .lines_of_pattern(served.pattern)
+                .into_iter()
+                .flatten()
+            {
+                let Some(boarded) =
+                    earliest_boardable(&self.view, self.timetable, line, served.position, ready)
+                else {
+                    continue;
+                };
+                enqueue(
+                    &self.view,
+                    reached,
+                    rounds,
+                    round,
+                    arena,
+                    queue,
+                    Segment {
+                        trip: boarded,
+                        board: served.position,
+                        origin: SegmentOrigin::Transfer { parent, alight },
+                    },
+                );
+            }
+        }
     }
 
     /// The earliest arrival at every stop for one departure, with any
@@ -633,6 +772,7 @@ impl<'a> TbtrEngine<'a> {
         let mut reached = self.horizons(rounds);
         let mut arena: Vec<Segment> = Vec::new();
         let mut queues: Vec<Vec<(u32, u16)>> = vec![Vec::new(); rounds];
+        let mut walked: HashMap<u32, (u32, u32, u16)> = HashMap::new();
         self.seed(
             departure,
             access,
@@ -646,6 +786,7 @@ impl<'a> TbtrEngine<'a> {
                 break;
             }
             let segments = std::mem::take(&mut queues[round]);
+            walked.clear();
             for &(segment, end) in &segments {
                 let trip = arena[segment as usize].trip;
                 let board = arena[segment as usize].board;
@@ -657,11 +798,20 @@ impl<'a> TbtrEngine<'a> {
                 for alight in board + 1..last {
                     let arrival = times[alight as usize].arrival - offset;
                     let stop = stops[alight as usize];
-                    best[stop.0 as usize] = best[stop.0 as usize].min(arrival);
-                    for footpath in self.footpaths.from_stop(stop) {
-                        let walked = arrival.saturating_add(footpath.duration);
-                        let slot = &mut best[footpath.to.0 as usize];
-                        *slot = (*slot).min(walked);
+                    // Walks relax only from arrivals that improve the
+                    // stop — RAPTOR's marked-stop semantics; a ride
+                    // looping back to a better-known stop goes nowhere.
+                    let improved = arrival < best[stop.0 as usize];
+                    if improved {
+                        best[stop.0 as usize] = arrival;
+                        for footpath in self.footpaths.from_stop(stop) {
+                            let walked_at = arrival.saturating_add(footpath.duration);
+                            let slot = &mut best[footpath.to.0 as usize];
+                            if walked_at < *slot {
+                                *slot = walked_at;
+                                walked.insert(footpath.to.0, (walked_at, segment, alight));
+                            }
+                        }
                     }
                     if round + 1 < rounds {
                         for transfer in self.set.from_trip_position(trip, alight) {
@@ -683,6 +833,21 @@ impl<'a> TbtrEngine<'a> {
                             );
                         }
                     }
+                }
+            }
+            if round + 1 < rounds {
+                for (&stop, &(ready, parent, alight)) in &walked {
+                    self.board_walked(
+                        StopIdx(stop),
+                        ready,
+                        parent,
+                        alight,
+                        &mut reached,
+                        rounds,
+                        round + 1,
+                        &mut arena,
+                        &mut queues[round + 1],
+                    );
                 }
             }
         }

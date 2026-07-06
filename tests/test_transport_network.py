@@ -197,14 +197,21 @@ def test_travel_time_matrix_is_deterministic(network):
     assert np.array_equal(first, second)
 
 
-def test_tbtr_router_matches_raptor(network):
+def test_tbtr_router_matches_raptor(network, network_with_footpaths):
     stops = [stop for stop, _, _ in network.stops][:120]
     raptor = network.travel_time_matrix(stops, "2022-02-22", "08:30:00")
     tbtr = network.travel_time_matrix(stops, "2022-02-22", "08:30:00", router="tbtr")
     assert np.array_equal(raptor, tbtr)
+    # With footpaths installed, the walks relax at query time; the
+    # matrices must still agree cell for cell.
+    raptor = network_with_footpaths.travel_time_matrix(stops, "2022-02-22", "08:30:00")
+    tbtr = network_with_footpaths.travel_time_matrix(
+        stops, "2022-02-22", "08:30:00", router="tbtr"
+    )
+    assert np.array_equal(raptor, tbtr)
 
 
-def test_router_option_is_validated(network, network_with_footpaths):
+def test_router_option_is_validated(network):
     with pytest.raises(ValueError, match="router must be"):
         network.travel_time_matrix(
             ["4810551"], "2022-02-22", "08:30:00", router="fastest"
@@ -212,14 +219,6 @@ def test_router_option_is_validated(network, network_with_footpaths):
     with pytest.raises(ValueError, match="single-departure"):
         network.travel_time_matrix(
             ["4810551"], "2022-02-22", "08:30:00", window=600, router="tbtr"
-        )
-    # The transitively closed footpath set is quadratic in dense areas
-    # and TBTR's precompute cannot digest that density yet: networks
-    # with installed footpaths are rejected up front rather than left
-    # to grind for hours.
-    with pytest.raises(ValueError, match="installed footpaths"):
-        network_with_footpaths.travel_time_matrix(
-            ["4810551"], "2022-02-22", "08:30:00", router="tbtr"
         )
 
 
