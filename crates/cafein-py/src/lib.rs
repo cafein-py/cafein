@@ -8,6 +8,7 @@ use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
+use cafein_core::exhaustive;
 use cafein_core::fares::{FareTables, RuleFares, ZoneFares, ZoneProduct, NO_FARE};
 use cafein_core::geometry::{wkb_multi_line_string, DistanceProvenance, LegGeometry, TripGeometry};
 use cafein_core::journey::{Journey, Leg};
@@ -17,7 +18,7 @@ use cafein_core::streets::{
     Backing, MappedStreets, Snap, StopLink, StoredLink, StreetNetwork, StreetNetworkParts,
     WalkedStop,
 };
-use cafein_core::tbtr::TbtrEngine;
+use cafein_core::tbtr::{DayView, TbtrEngine};
 use cafein_core::timetable::{StopIdx, Timetable, TripIdx};
 use cafein_core::transfers::Transfers;
 use cafein_gtfs::{build_timetable, Feed, RouteType, ServiceCalendar, TimetableBuild};
@@ -2066,6 +2067,74 @@ impl TransportNetwork {
         flat.into_pyarray(py)
             .reshape([count, stop_count])
             .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
+    /// The exact time × emissions Pareto set between two stops — the
+    /// exhaustive oracle behind the frontier machinery.
+    ///
+    /// Considers every boardable trip, with gram labels quantized to a
+    /// microgram; orders of magnitude slower than the routers: meant for
+    /// verifying frontiers and inspecting true Pareto sets at
+    /// sampled-pair scale, never for bulk computation. Trips without a
+    /// resolved emission factor are skipped — they can never sit on an
+    /// emissions frontier. Requires installed trip distances.
+    ///
+    /// Returns
+    /// -------
+    /// list of (int, float, int)
+    ///     ``(arrival, grams, rides)`` per frontier point, sorted by
+    ///     arrival; ``rides`` is the fewest transit legs achieving the
+    ///     point.
+    #[pyo3(signature = (origin, destination, date, departure, factors, max_transfers = 7))]
+    #[allow(clippy::too_many_arguments)]
+    fn pareto_oracle(
+        &self,
+        py: Python<'_>,
+        origin: &str,
+        destination: &str,
+        date: &str,
+        departure: &str,
+        factors: Vec<(String, f64)>,
+        max_transfers: u8,
+    ) -> PyResult<Vec<(u32, f64, u32)>> {
+        let Some(geometry) = &self.geometry else {
+            return Err(PyValueError::new_err(
+                "no trip distances installed; build the network with trip distances enabled",
+            ));
+        };
+        let origin = self.resolve_stop(origin)?;
+        let destination = self.resolve_stop(destination)?;
+        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
+        for (trip_id, factor) in &factors {
+            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
+                per_trip[trip.0 as usize] = *factor;
+            }
+        }
+        let departure = parse_time(departure)?;
+        let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
+        let points = py.allow_threads(|| {
+            let view = DayView::for_date(
+                &self.build.timetable,
+                &active_services,
+                &active_services_previous,
+            );
+            exhaustive::pareto_oracle(
+                &view,
+                &self.build.timetable,
+                &self.transfers,
+                geometry,
+                &per_trip,
+                departure,
+                &[(origin, 0)],
+                &[(destination, 0)],
+                max_transfers,
+            )
+        });
+        Ok(points
+            .into_iter()
+            .map(|point| (point.arrival, point.grams, point.rides))
+            .collect())
     }
 
     /// Travel-time percentiles over a departure window, as a matrix.

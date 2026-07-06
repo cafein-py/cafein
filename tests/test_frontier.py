@@ -320,6 +320,71 @@ def test_least_fare_survives_unresolved_emissions(network, helsinki_gtfs):
     assert least_fare(frame, within=1) is None
 
 
+def test_exhaustive_frontier_agrees_with_hand_checkable_candidates(tmp_path):
+    from cafein import TransportNetwork, exhaustive_frontier
+
+    # On the two-line feed the interim candidates at a single departure
+    # ARE the true frontier: the fast-dirty bus chain and the
+    # slow-clean tram. The oracle must reproduce them exactly.
+    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
+    network = TransportNetwork.from_gtfs([str(feed)])
+    true_set = exhaustive_frontier(
+        network, "A", "B", "2022-02-22", "08:00:00", max_transfers=4
+    )
+    interim = journey_frontier(network, "A", "B", "2022-02-22", "08:00:00", window=1)
+    assert len(true_set) == 2
+    assert true_set["arrival"].tolist() == interim["arrival"].tolist()
+    assert true_set["rides"].tolist() == interim["rides"].tolist()
+    assert true_set["emissions"].tolist() == pytest.approx(
+        interim["emissions"].tolist()
+    )
+
+
+def test_exhaustive_frontier_finds_points_the_interim_misses(network):
+    from cafein import exhaustive_frontier
+
+    # The K-train pin: Korso → Käpylä has a single true Pareto point,
+    # the direct train.
+    direct = exhaustive_frontier(
+        network, "4810551", "1250551", "2022-02-22", "08:30:00", max_transfers=4
+    )
+    assert len(direct) == 1
+    assert direct.iloc[0]["arrival"] == 32_280
+    assert direct.iloc[0]["rides"] == 1
+    assert direct.iloc[0]["emissions"] == pytest.approx(419.65, abs=0.1)
+
+    # The documented blind spot, measured: this pair has a
+    # cleaner-but-slower journey with more rides that the interim
+    # (time-Pareto) candidate set cannot see.
+    origin, destination = "1370104", "4960238"
+    true_set = exhaustive_frontier(
+        network, origin, destination, "2022-02-22", "08:30:00", max_transfers=4
+    )
+    interim = journey_frontier(
+        network, origin, destination, "2022-02-22", "08:30:00", window=1
+    )
+    resolved = interim[interim["emissions"].notna()]
+    # Soundness: every interim candidate is dominated-or-equalled by a
+    # true frontier point (the oracle covers everything reachable).
+    for row in resolved.itertuples():
+        assert any(
+            point.arrival <= row.arrival and point.emissions <= row.emissions + 1e-6
+            for point in true_set.itertuples()
+        )
+    # Incompleteness of the interim: a true point no interim candidate
+    # dominates or equals.
+    missing = [
+        point
+        for point in true_set.itertuples()
+        if not any(
+            row.arrival <= point.arrival and row.emissions <= point.emissions + 1e-6
+            for row in resolved.itertuples()
+        )
+    ]
+    assert len(missing) == 1
+    assert missing[0].emissions < resolved["emissions"].min()
+
+
 def test_unmatched_factors_poison_but_do_not_block(network):
     # The Suomenlinna ferry has no shipped factor: its journeys carry
     # NaN emissions and never join the frontier.
