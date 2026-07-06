@@ -71,6 +71,54 @@ def build_two_line_gtfs(path):
     return path
 
 
+def two_line_fares(tram_priced=True):
+    """Buses at 4.00, trams at 6.00, and a bus–bus pair total of 10.00
+    within a 10-minute allowance — dearer than two full fares, so the
+    fast chain (7-minute transfer) pays 10.00 while the slow chain's
+    15-minute wait breaks the window and pays 8.00."""
+    import pandas as pd
+
+    from cafein.fares import FareStructure
+
+    routes = [("BUS_IN", "BUS", 4.0), ("BUS_OUT", "BUS", 4.0)]
+    if tram_priced:
+        routes.append(("TRAM", "TRAM", 6.0))
+    return FareStructure(
+        max_discounted_transfers=1,
+        transfer_time_allowance=10.0,
+        fares_per_type=pd.DataFrame(
+            [
+                {
+                    "type": kind,
+                    "unlimited_transfers": False,
+                    "allow_same_route_transfer": False,
+                    "use_route_fare": False,
+                    "fare": fare,
+                }
+                for kind, fare in [("BUS", 4.0), ("TRAM", 6.0)]
+            ]
+        ),
+        fares_per_transfer=pd.DataFrame(
+            [{"first_leg": "BUS", "second_leg": "BUS", "fare": 10.0}]
+        ),
+        fares_per_route=pd.DataFrame(
+            [
+                {
+                    "agency_id": "",
+                    "agency_name": "",
+                    "route_id": route,
+                    "route_short_name": "",
+                    "route_long_name": "",
+                    "mode": kind,
+                    "route_fare": fare,
+                    "fare_type": kind,
+                }
+                for route, kind, fare in routes
+            ]
+        ),
+    )
+
+
 @pytest.fixture()
 def two_line_frontier(tmp_path):
     from cafein import TransportNetwork
@@ -131,6 +179,61 @@ def test_dominated_candidates_leave_the_frontier(two_line_frontier):
         assert g1 == g2 if t1 == t2 else g1 > g2
 
 
+def test_fares_join_the_frontier(tmp_path):
+    from cafein import TransportNetwork, least_fare
+
+    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
+    network = TransportNetwork.from_gtfs([str(feed)])
+    frame = journey_frontier(
+        network,
+        "A",
+        "B",
+        "2022-02-22",
+        "08:00:00",
+        window=1800,
+        fares=two_line_fares(),
+    )
+    by_time = {row["travel_time"]: row for _, row in frame.iterrows()}
+    assert by_time[900]["fare"] == pytest.approx(10.0)
+    assert by_time[1380]["fare"] == pytest.approx(8.0)
+    assert by_time[1800]["fare"] == pytest.approx(6.0)
+    # Cheapness returns the 08:15 bus chain to the frontier: dominated
+    # on (time, emissions) — see the base test — but strictly cheaper
+    # than the fast chain, whose short transfer pays the pair total.
+    assert set(frame.loc[frame["frontier"], "travel_time"]) == {900, 1380, 1800}
+    # The budget view over money: cheapest overall is the tram, the
+    # bus chains under tightening time budgets, nothing within a minute.
+    assert least_fare(frame)["fare"] == pytest.approx(6.0)
+    assert least_fare(frame, within=1380)["fare"] == pytest.approx(8.0)
+    assert least_fare(frame, within=900)["fare"] == pytest.approx(10.0)
+    assert least_fare(frame, within=60) is None
+    unpriced = journey_frontier(
+        network, "A", "B", "2022-02-22", "08:00:00", window=1800
+    )
+    with pytest.raises(ValueError, match="carries no fares"):
+        least_fare(unpriced)
+
+
+def test_unpriceable_candidates_leave_the_frontier(tmp_path):
+    from cafein import TransportNetwork
+
+    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
+    network = TransportNetwork.from_gtfs([str(feed)])
+    frame = journey_frontier(
+        network,
+        "A",
+        "B",
+        "2022-02-22",
+        "08:00:00",
+        window=1800,
+        fares=two_line_fares(tram_priced=False),
+    )
+    trams = frame[frame["rides"] == 1]
+    assert trams["fare"].isna().all()
+    assert not trams["frontier"].any()
+    assert set(frame.loc[frame["frontier"], "travel_time"]) == {900, 1380}
+
+
 def test_door_to_door_frontier_anchors_on_walking(network_with_footpaths):
     coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
     frame = journey_frontier(
@@ -189,6 +292,32 @@ def test_frontier_rejects_mixed_endpoints(network_with_footpaths):
             window=600,
             max_snap_distance=100.0,
         )
+
+
+def test_least_fare_survives_unresolved_emissions(network, helsinki_gtfs):
+    from cafein import least_fare
+    from cafein.fares import zone_fare_structure
+
+    hsl = zone_fare_structure(helsinki_gtfs)
+    # Every journey to Suomenlinna rides the factorless ferry: nothing
+    # reaches the frontier and least_emissions has nothing to pick, yet
+    # the journeys still price and the cheapest one is returned.
+    with pytest.warns(UserWarning, match="route_type"):
+        frame = journey_frontier(
+            network,
+            "1080701",
+            "1520703",
+            "2022-02-22",
+            "10:00:00",
+            window=3600,
+            fares=hsl,
+        )
+    assert frame["emissions"].isna().all()
+    assert not frame["frontier"].any()
+    assert least_emissions(frame) is None
+    cheapest = least_fare(frame)
+    assert cheapest["fare"] == pytest.approx(2.8)
+    assert least_fare(frame, within=1) is None
 
 
 def test_unmatched_factors_poison_but_do_not_block(network):

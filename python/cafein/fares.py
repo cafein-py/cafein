@@ -33,6 +33,9 @@ import zipfile
 
 import pandas as pd
 
+#: The compiled core's sentinel for "no fare row" / "no zone".
+_NO_FARE = 0xFFFFFFFF
+
 _MODES = {
     0: "TRAM",
     1: "SUBWAY",
@@ -194,6 +197,59 @@ class FareStructure:
 
         return priced
 
+    def _flat_tables(self, network):
+        """The flat arrays the compiled matrix computers price with.
+
+        Route and type identities become positions: ``route_type`` and
+        ``route_fare`` follow ``network.routes`` order with the full
+        fare (route or type fare) resolved ahead, and ``pair_fare`` is
+        the dense type × type total-price matrix (NaN: no integration).
+        """
+        types = {
+            str(row["type"]): (index, row)
+            for index, (_, row) in enumerate(self.fares_per_type.iterrows())
+        }
+        count = len(self.fares_per_type)
+        pair_fare = [math.nan] * (count * count)
+        for _, row in self.fares_per_transfer.iterrows():
+            first = types.get(str(row["first_leg"]))
+            second = types.get(str(row["second_leg"]))
+            if first is None or second is None:
+                continue
+            pair_fare[first[0] * count + second[0]] = float(row["fare"])
+        routes = {}
+        for _, row in self.fares_per_route.iterrows():
+            kind = types.get(str(row["fare_type"]))
+            if kind is None:
+                continue
+            index, spec = kind
+            full = (
+                float(row["route_fare"])
+                if bool(spec["use_route_fare"])
+                else float(spec["fare"])
+            )
+            routes[str(row["route_id"])] = (index, full)
+        route_type, route_fare = [], []
+        for route_id, _, _ in network.routes:
+            index, full = routes.get(str(route_id), (_NO_FARE, math.nan))
+            route_type.append(index)
+            route_fare.append(full)
+        return {
+            "route_type": route_type,
+            "route_fare": route_fare,
+            "unlimited_transfers": [
+                bool(value) for value in self.fares_per_type["unlimited_transfers"]
+            ],
+            "allow_same_route": [
+                bool(value)
+                for value in self.fares_per_type["allow_same_route_transfer"]
+            ],
+            "pair_fare": pair_fare,
+            "max_discounted_transfers": self.max_discounted_transfers,
+            "transfer_allowance": self.transfer_time_allowance * 60.0,
+            "fare_cap": self.fare_cap,
+        }
+
 
 class ZoneFareStructure:
     """Zone-set fares from GTFS ``fare_attributes``/``fare_rules``.
@@ -290,6 +346,45 @@ class ZoneFareStructure:
             return cost(0)
 
         return priced
+
+    def _flat_tables(self, network):
+        """The flat arrays the compiled matrix computers price with.
+
+        Zones become bit positions: ``stop_zone`` maps each stop (in
+        ``network.stops`` order) to its zone index, and each product is
+        ``(price, zone bitmask, window seconds, boardings after the
+        first)`` with sentinels for "no zone" and "unlimited".
+        """
+        zones = sorted(
+            {zone for covered in self.fare_zones.values() for zone in covered}
+            | set(self.stop_zones.values())
+        )
+        if len(zones) > 128:
+            raise ValueError("matrix fare pricing supports at most 128 zones")
+        index = {zone: position for position, zone in enumerate(zones)}
+        stop_zone = [
+            index.get(self.stop_zones.get(str(stop_id)), _NO_FARE)
+            for stop_id, _, _ in network.stops
+        ]
+        products = []
+        for _, row in self.fares.iterrows():
+            covered = self.fare_zones.get(str(row["fare_id"]))
+            if covered is None:
+                continue
+            mask = 0
+            for zone in covered:
+                mask |= 1 << index[zone]
+            duration = row.get("transfer_duration")
+            transfers = row.get("transfers")
+            products.append(
+                (
+                    float(row["price"]),
+                    mask,
+                    math.inf if pd.isna(duration) else float(duration),
+                    _NO_FARE if pd.isna(transfers) else int(transfers),
+                )
+            )
+        return {"stop_zone": stop_zone, "products": products}
 
 
 def setup_fare_structure(network, base_fare, by="MODE"):

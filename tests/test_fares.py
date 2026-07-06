@@ -205,6 +205,23 @@ def test_zone_structure_tolerates_missing_fare_columns(tmp_path):
         fares.zone_fare_structure(bare)
 
 
+def test_flat_tables_align_with_the_network(network, hsl):
+    seeded = fares.setup_fare_structure(network, base_fare=3.0)
+    flat = seeded._flat_tables(network)
+    assert len(flat["route_type"]) == len(network.routes) == len(flat["route_fare"])
+    count = len(flat["unlimited_transfers"])
+    assert len(flat["allow_same_route"]) == count
+    assert len(flat["pair_fare"]) == count * count
+    assert all(kind < count for kind in flat["route_type"])
+    assert flat["transfer_allowance"] == seeded.transfer_time_allowance * 60.0
+    zones = hsl._flat_tables(network)
+    assert len(zones["stop_zone"]) == len(network.stops)
+    assert len(zones["products"]) == len(hsl.fares)
+    # The ABCD product covers all four zone bits.
+    named = dict(zip(hsl.fares["fare_id"], zones["products"]))
+    assert bin(named["ABCD"][1]).count("1") == 4
+
+
 def test_frontier_carries_fares(network, hsl):
     from cafein import journey_frontier, least_emissions
 
@@ -220,7 +237,7 @@ def test_frontier_carries_fares(network, hsl):
     assert "fare" in frame.columns
     assert len(frame)
     # Every candidate crosses C to A: the ABC ticket prices them all,
-    # and the fare annotation leaves the frontier untouched.
+    # so the equal fares leave the frontier membership unchanged.
     assert frame["fare"].tolist() == pytest.approx([4.1] * len(frame))
     assert frame["frontier"].any()
     assert least_emissions(frame) is not None

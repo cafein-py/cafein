@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Fares as a criterion: with a fare structure
+  (``journey_frontier(..., fares=structure)``), the fare now joins the
+  frontier as a third criterion — a slower or dirtier journey stays on
+  the frontier when it is strictly cheaper — and ``least_fare(frontier,
+  within=...)`` picks the cheapest journey within a travel-time budget.
+  At matrix scale, ``TravelCostMatrix``/``travel_cost_table`` accept
+  ``fares=`` and gain a ``fare`` column pricing each cell's reported
+  journey, and ``optimize="fare"`` (with ``window=``/``within=``)
+  reports the cheapest journey of the departure window per pair, over
+  the same candidate set as the least-emission mode with the same
+  zero-ride (zero-fare) floor. Matrix rows carry no leg sequences, so
+  both fare models are priced inside the compute core at
+  candidate-reconstruction time — routing itself remains fare-free,
+  like the emissions firewall.
+
 - Monetary costs: the new ``cafein.fares`` module prices journeys after
   routing, from their leg sequence and timing. Two fare models ship: a
   **rule-based structure mirroring r5r's** — global
@@ -21,8 +36,8 @@
   it touches within their transfer windows. ``annotate_fares(journeys,
   structure)`` attaches ``fare`` to routed journeys, and
   ``journey_frontier(..., fares=structure)`` adds the ``fare`` column
-  to the frontier frame (an annotation alongside the time × emissions
-  frontier; fares as a criterion come later). Route- or
+  to the frontier frame (and, per the entry above, makes it a
+  criterion). Route- or
   origin/destination-keyed fare rules are not modelled. The Porto
   Alegre fare structure and sample feeds r5r bundles are pinned into
   the test data, and a manual comparison script

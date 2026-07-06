@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 use rayon::prelude::*;
 
+use crate::fares::{FareLeg, FareTables};
 use crate::geometry::{wkb_multi_line_string, LegGeometry, TripGeometry};
 use crate::journey::{Journey, Leg};
 use crate::router::{Request, TransitRouter};
@@ -42,6 +43,9 @@ pub struct CostRow {
     /// Grams CO₂e over the ridden legs; NaN when a ridden trip has no
     /// emission factor.
     pub emission_grams: f64,
+    /// The journey's fare under the fare tables; NaN when the journey
+    /// cannot be priced, or when no tables were given.
+    pub fare: f64,
     /// The ridden legs' geometry as a WKB MultiLineString, when asked
     /// for and leg geometries are installed.
     pub geometry: Option<Vec<u8>>,
@@ -58,23 +62,44 @@ pub struct CostInputs<'a> {
     pub leg_geometry: Option<&'a LegGeometry>,
     /// Emit each row's WKB MultiLineString.
     pub with_geometry: bool,
+    /// Fare tables to price each row's journey with; `None` leaves
+    /// fares NaN.
+    pub fares: Option<&'a FareTables>,
 }
 
 const UNREACHED: u32 = u32::MAX;
 
-/// Keeps the cleaner of an existing candidate and a challenger: fewer
-/// grams win, equal grams resolve toward the shorter travel time. NaN
-/// grams (an unresolved emission factor) never qualify.
-fn fold_cleaner(current: &mut Option<CostRow>, challenger: CostRow) {
-    if challenger.emission_grams.is_nan() {
+/// What the windowed candidate fold minimises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Objective {
+    /// Grams CO₂e; unresolved (NaN) emissions never qualify.
+    Emissions,
+    /// The journey fare; unpriceable (NaN) journeys never qualify.
+    Fare,
+}
+
+impl Objective {
+    fn key(self, row: &CostRow) -> f64 {
+        match self {
+            Objective::Emissions => row.emission_grams,
+            Objective::Fare => row.fare,
+        }
+    }
+}
+
+/// Keeps the better of an existing candidate and a challenger on the
+/// objective: a lower key wins, equal keys resolve toward the shorter
+/// travel time. NaN keys never qualify.
+fn fold_better(current: &mut Option<CostRow>, challenger: CostRow, objective: Objective) {
+    let key = objective.key(&challenger);
+    if key.is_nan() {
         return;
     }
     let better = match current {
         None => true,
         Some(row) => {
-            challenger.emission_grams < row.emission_grams
-                || (challenger.emission_grams == row.emission_grams
-                    && challenger.seconds < row.seconds)
+            key < objective.key(row)
+                || (key == objective.key(row) && challenger.seconds < row.seconds)
         }
     };
     if better {
@@ -257,17 +282,18 @@ impl Raptor {
             .collect()
     }
 
-    /// The cleanest journey's aggregated costs within a travel-time
-    /// budget, per destination, over a departure window — the emissions
-    /// counterpart of [`Raptor::cost_matrix`]. One descending range
-    /// scan per origin; each pass's improved per-round arrivals are
-    /// reconstructed and folded, so the candidates are the profile's
-    /// (departure, arrival, rides)-Pareto set and a cell holds its
-    /// lowest-emission member within the budget (no budget: within the
-    /// window's reach). Destinations with no qualifying resolved-
-    /// emissions candidate are absent.
+    /// The objective-best journey's aggregated costs within a
+    /// travel-time budget, per destination, over a departure window —
+    /// the emissions/fare counterpart of [`Raptor::cost_matrix`]. One
+    /// descending range scan per origin; each pass's improved
+    /// per-round arrivals are reconstructed and folded, so the
+    /// candidates are the profile's (departure, arrival, rides)-Pareto
+    /// set and a cell holds its lowest-objective member within the
+    /// budget (no budget: within the window's reach). Destinations
+    /// with no qualifying candidate (a resolved emission, a priceable
+    /// fare) are absent.
     #[allow(clippy::too_many_arguments)]
-    pub fn least_emission_matrix(
+    pub fn least_cost_matrix(
         &self,
         timetable: &Timetable,
         transfers: &Transfers,
@@ -276,6 +302,7 @@ impl Raptor {
         destinations: &[StopIdx],
         window: u32,
         budget: Option<u32>,
+        objective: Objective,
     ) -> Vec<Vec<CostRow>> {
         requests
             .par_iter()
@@ -291,30 +318,31 @@ impl Raptor {
                     };
                     let departures = departure_candidates(timetable, request, window);
                     let mut thresholds = vec![UNREACHED; destinations.len() * (search.rounds + 1)];
-                    let mut cleanest: Vec<Option<CostRow>> = vec![None; destinations.len()];
+                    let mut best: Vec<Option<CostRow>> = vec![None; destinations.len()];
                     for &departure in &departures {
                         search.run(departure);
-                        search.fold_cleanest(
+                        search.fold_best(
                             departure,
                             destinations,
                             budget,
                             inputs,
                             None,
+                            objective,
                             &mut thresholds,
-                            &mut cleanest,
+                            &mut best,
                         );
                     }
-                    cleanest.into_iter().flatten().collect()
+                    best.into_iter().flatten().collect()
                 },
             )
             .collect()
     }
 
-    /// [`Raptor::least_emission_matrix`] over destination points, joined
+    /// [`Raptor::least_cost_matrix`] over destination points, joined
     /// through the points' egress link tables like
     /// [`Raptor::cost_matrix_to_points`].
     #[allow(clippy::too_many_arguments)]
-    pub fn least_emission_matrix_to_points(
+    pub fn least_cost_matrix_to_points(
         &self,
         timetable: &Timetable,
         transfers: &Transfers,
@@ -324,6 +352,7 @@ impl Raptor {
         egress: &[Vec<(StopIdx, u32, f64)>],
         window: u32,
         budget: Option<u32>,
+        objective: Objective,
     ) -> Vec<Vec<CostRow>> {
         assert_eq!(requests.len(), access_meters.len());
         requests
@@ -341,20 +370,21 @@ impl Raptor {
                     };
                     let departures = departure_candidates(timetable, request, window);
                     let mut thresholds = vec![UNREACHED; egress.len() * (search.rounds + 1)];
-                    let mut cleanest: Vec<Option<CostRow>> = vec![None; egress.len()];
+                    let mut best: Vec<Option<CostRow>> = vec![None; egress.len()];
                     for &departure in &departures {
                         search.run(departure);
-                        search.fold_cleanest_points(
+                        search.fold_best_points(
                             departure,
                             egress,
                             budget,
                             inputs,
                             access,
+                            objective,
                             &mut thresholds,
-                            &mut cleanest,
+                            &mut best,
                         );
                     }
-                    cleanest.into_iter().flatten().collect()
+                    best.into_iter().flatten().collect()
                 },
             )
             .collect()
@@ -777,13 +807,14 @@ impl<'a> Search<'a> {
         let mut grams = 0.0;
         let mut resolved = true;
         let mut legs: Vec<(TripIdx, u16, u16)> = Vec::new();
+        let mut fare_legs: Vec<FareLeg> = Vec::new();
         loop {
             match self.labels[round][at.0 as usize] {
                 Label::Transit {
                     trip,
                     board_position,
                     alight_position,
-                    day_offset: _,
+                    day_offset,
                 } => {
                     rides += 1;
                     let meters = inputs
@@ -800,8 +831,19 @@ impl<'a> Search<'a> {
                     if inputs.with_geometry {
                         legs.push((trip, board_position, alight_position));
                     }
-                    at = timetable.pattern_stops(timetable.trip_pattern(trip))
-                        [board_position as usize];
+                    let pattern = timetable.trip_pattern(trip);
+                    let board_stop = timetable.pattern_stops(pattern)[board_position as usize];
+                    if inputs.fares.is_some() {
+                        fare_legs.push(FareLeg {
+                            route: timetable.pattern_route(pattern),
+                            board_stop: board_stop.0,
+                            alight_stop: at.0,
+                            board_time: timetable.trip_stop_times(trip)[board_position as usize]
+                                .departure
+                                .saturating_sub(day_offset),
+                        });
+                    }
+                    at = board_stop;
                     round -= 1;
                 }
                 Label::Transfer {
@@ -839,6 +881,15 @@ impl<'a> Search<'a> {
             }
             _ => None,
         };
+        let fare = match inputs.fares {
+            Some(tables) => {
+                // The chain walks back to front; pricing needs rides in
+                // order.
+                fare_legs.reverse();
+                tables.price(&fare_legs)
+            }
+            None => f64::NAN,
+        };
         CostRow {
             to: stop.0,
             seconds: 0,
@@ -846,31 +897,34 @@ impl<'a> Search<'a> {
             transit_meters,
             walk_meters,
             emission_grams: if resolved { grams } else { f64::NAN },
+            fare,
             geometry,
         }
     }
 
-    /// Folds a pass's improved arrivals into each destination's cleanest
-    /// candidate: the lowest-emission journey within the travel-time
-    /// budget seen so far, ties resolved toward the shorter travel time.
+    /// Folds a pass's improved arrivals into each destination's best
+    /// candidate on the objective: the lowest-key journey within the
+    /// travel-time budget seen so far, ties resolved toward the
+    /// shorter travel time.
     ///
     /// `thresholds` carries the best arrival per (destination, round)
     /// across the descending departures; an arrival that does not
     /// improve its threshold left `tau` unchanged, so it has no label
     /// chain to reconstruct — the candidates are exactly the profile's
     /// (departure, arrival, rides)-Pareto set, the same set
-    /// `journey_frontier` sees. Unresolved emissions (NaN) never
-    /// qualify.
+    /// `journey_frontier` sees. NaN keys (an unresolved emission
+    /// factor, an unpriceable journey) never qualify.
     #[allow(clippy::too_many_arguments)]
-    fn fold_cleanest(
+    fn fold_best(
         &self,
         departure: u32,
         destinations: &[StopIdx],
         budget: Option<u32>,
         inputs: &CostInputs<'_>,
         access_meters: Option<&HashMap<StopIdx, f64>>,
+        objective: Objective,
         thresholds: &mut [u32],
-        cleanest: &mut [Option<CostRow>],
+        best: &mut [Option<CostRow>],
     ) {
         for (slot, &stop) in destinations.iter().enumerate() {
             let thresholds = &mut thresholds[slot * (self.rounds + 1)..][..self.rounds + 1];
@@ -895,24 +949,25 @@ impl<'a> Search<'a> {
                 }
                 let mut row = self.walk_costs(stop, round, inputs, access_meters);
                 row.seconds = seconds;
-                fold_cleaner(&mut cleanest[slot], row);
+                fold_better(&mut best[slot], row, objective);
             }
         }
     }
 
-    /// [`Search::fold_cleanest`] joined through each destination point's
+    /// [`Search::fold_best`] joined through each destination point's
     /// egress links: a point's per-round arrival is the minimum over its
     /// links of the stop arrival plus the egress walk.
     #[allow(clippy::too_many_arguments)]
-    fn fold_cleanest_points(
+    fn fold_best_points(
         &self,
         departure: u32,
         egress: &[Vec<(StopIdx, u32, f64)>],
         budget: Option<u32>,
         inputs: &CostInputs<'_>,
         access_meters: &HashMap<StopIdx, f64>,
+        objective: Objective,
         thresholds: &mut [u32],
-        cleanest: &mut [Option<CostRow>],
+        best: &mut [Option<CostRow>],
     ) {
         for (point, links) in egress.iter().enumerate() {
             let thresholds = &mut thresholds[point * (self.rounds + 1)..][..self.rounds + 1];
@@ -955,7 +1010,7 @@ impl<'a> Search<'a> {
                 row.to = point as u32;
                 row.seconds = seconds;
                 row.walk_meters += egress_meters;
-                fold_cleaner(&mut cleanest[point], row);
+                fold_better(&mut best[point], row, objective);
             }
         }
     }
@@ -1523,6 +1578,7 @@ mod tests {
             factors: &factors,
             leg_geometry: None,
             with_geometry: false,
+            fares: None,
         };
         let mut request = request(StopIdx(0), StopIdx(3), 0);
         request.egress = Vec::new();
@@ -1593,6 +1649,7 @@ mod tests {
             factors: &factors,
             leg_geometry: None,
             with_geometry: false,
+            fares: None,
         };
         let mut request = request(StopIdx(0), StopIdx(3), 0);
         request.egress = Vec::new();
@@ -1623,6 +1680,104 @@ mod tests {
         // Access 120 m, the 50 m footpath to stop 4, egress 8 m.
         assert_eq!(point_1.walk_meters, 178.0);
         assert!((point_1.emission_grams - 12.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_rows_carry_fares() {
+        use crate::fares::{RuleFares, ZoneFares, ZoneProduct, NO_FARE};
+
+        let (timetable, transfers) = network();
+        let geometry = TripGeometry::from_trips(
+            &timetable,
+            vec![
+                (
+                    TripIdx(0),
+                    vec![0.0, 500.0, 1200.0],
+                    DistanceProvenance::CrowFly,
+                ),
+                (
+                    TripIdx(1),
+                    vec![0.0, 500.0, 1200.0],
+                    DistanceProvenance::CrowFly,
+                ),
+                (TripIdx(2), vec![0.0, 800.0], DistanceProvenance::CrowFly),
+                (TripIdx(3), vec![0.0, 800.0], DistanceProvenance::CrowFly),
+                (TripIdx(4), vec![0.0, 2000.0], DistanceProvenance::CrowFly),
+            ],
+        )
+        .unwrap();
+        let factors = [10.0, 10.0, 20.0, 20.0, 30.0];
+        let rules = |allowance: f64| {
+            FareTables::RuleBased(RuleFares {
+                route_type: vec![0, 0, 0],
+                route_fare: vec![2.0, 3.0, 4.0],
+                unlimited_transfers: vec![false],
+                allow_same_route: vec![false],
+                pair_fare: vec![4.5],
+                max_discounted_transfers: 1,
+                transfer_allowance: allowance,
+                fare_cap: f64::INFINITY,
+            })
+        };
+        let mut request = request(StopIdx(0), StopIdx(3), 0);
+        request.egress = Vec::new();
+        let priced = |tables: &FareTables| {
+            let inputs = CostInputs {
+                geometry: &geometry,
+                factors: &factors,
+                leg_geometry: None,
+                with_geometry: false,
+                fares: Some(tables),
+            };
+            Raptor.cost_matrix(
+                &timetable,
+                &transfers,
+                &inputs,
+                std::slice::from_ref(&request),
+                &[StopIdx(0), StopIdx(3)],
+            )
+        };
+        // 0→3 boards route 0 at 100 and route 1 at 250: within a 200 s
+        // allowance the pair total applies; a 100 s allowance splits it
+        // into two full fares. The origin itself rides nothing.
+        let rows = priced(&rules(200.0));
+        assert_eq!(rows[0][0].fare, 0.0);
+        assert!((rows[0][1].fare - 4.5).abs() < 1e-9);
+        let rows = priced(&rules(100.0));
+        assert!((rows[0][1].fare - 5.0).abs() < 1e-9);
+        // Zone pricing reads the boarding and alighting stops' zones.
+        let zones = FareTables::Zone(ZoneFares {
+            stop_zone: vec![0, 0, 1, 1, NO_FARE],
+            products: vec![ZoneProduct {
+                price: 2.8,
+                zones: 0b11,
+                duration: f64::INFINITY,
+                transfers: NO_FARE,
+            }],
+        });
+        let rows = priced(&zones);
+        assert!((rows[0][1].fare - 2.8).abs() < 1e-9);
+        // The windowed fold keeps priceable candidates only and carries
+        // the same fares.
+        let inputs = CostInputs {
+            geometry: &geometry,
+            factors: &factors,
+            leg_geometry: None,
+            with_geometry: false,
+            fares: Some(&rules(200.0)),
+        };
+        let rows = Raptor.least_cost_matrix(
+            &timetable,
+            &transfers,
+            &inputs,
+            std::slice::from_ref(&request),
+            &[StopIdx(0), StopIdx(3)],
+            600,
+            None,
+            Objective::Fare,
+        );
+        assert_eq!(rows[0][0].fare, 0.0);
+        assert!((rows[0][1].fare - 4.5).abs() < 1e-9);
     }
 
     #[test]

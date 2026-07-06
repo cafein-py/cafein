@@ -1,10 +1,10 @@
 """Time × emissions Pareto frontiers over departure-window journeys.
 
 The frontier answers "what is the lowest-CO₂ way there, and what does it
-cost in time?" from the range-RAPTOR candidate set: the journeys optimal
-in (departure, arrival, rides) over a departure window, annotated with
-emissions post hoc, reduced to the rows no candidate beats on both
-travel time and emissions.
+cost in time — and money?" from the range-RAPTOR candidate set: the
+journeys optimal in (departure, arrival, rides) over a departure window,
+annotated with emissions (and fares) post hoc, reduced to the rows no
+candidate beats on every annotated criterion.
 
 The contract follows from the candidate set: a journey that is slower
 *and* rides more vehicles than every time-optimal alternative never
@@ -47,16 +47,18 @@ def journey_frontier(
     max_snap_distance=None,
     geometries=False,
 ):
-    """The travel time × emissions trade-off between two places.
+    """The travel time × emissions (× fare) trade-off between two places.
 
     Routes the departure window, attaches emissions to every candidate
     journey, and marks the Pareto frontier: the journeys no other
-    candidate beats on both travel time and emissions. Requires a
-    network built with trip distances (the default).
+    candidate beats on every criterion — travel time and emissions,
+    plus fare when a fare structure is given. Requires a network built
+    with trip distances (the default).
 
-    With a fare structure (`fares`), every candidate is also priced and
-    the frame gains a ``fare`` column — monetary cost as an annotation
-    alongside the frontier, not (yet) a criterion of it.
+    With a fare structure (`fares`), every candidate is also priced,
+    the frame gains a ``fare`` column, and the fare joins the frontier
+    as a third criterion: a slower or dirtier journey stays on the
+    frontier when it is strictly cheaper.
 
     Parameters
     ----------
@@ -79,9 +81,10 @@ def journey_frontier(
         Emission-factor rows layered over the shipped defaults and the
         LCA components to include, as in ``emissions.annotate``.
     fares : FareStructure or ZoneFareStructure (optional)
-        A fare model (see ``cafein.fares``); prices every candidate and
-        adds the ``fare`` column (grams stay the frontier's second
-        criterion). NaN marks journeys the model cannot price.
+        A fare model (see ``cafein.fares``); prices every candidate,
+        adds the ``fare`` column, and makes the fare the frontier's
+        third criterion. NaN marks journeys the model cannot price —
+        like NaN emissions, they never join the frontier.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         The street-search options for coordinate queries, as in
         ``route_between_coordinates``; only valid with coordinates.
@@ -95,9 +98,9 @@ def journey_frontier(
         ``departure`` and ``arrival`` (seconds past the service day's
         start), ``travel_time`` (seconds), ``rides``, ``emissions``
         (grams CO₂e; NaN when a ridden trip has no matching factor),
-        ``frontier`` (whether the row is Pareto-optimal — NaN-emission
-        rows never are), and ``journey``, the annotated journey dict as
-        returned by the routing calls.
+        ``frontier`` (whether the row is Pareto-optimal — rows with NaN
+        on any criterion never are), and ``journey``, the annotated
+        journey dict as returned by the routing calls.
     """
     stops = isinstance(origin, str), isinstance(destination, str)
     if stops[0] != stops[1]:
@@ -157,7 +160,9 @@ def journey_frontier(
         columns.insert(columns.index("journey"), "fare")
     frame = pd.DataFrame(records, columns=columns)
     frame["frontier"] = _frontier_mask(
-        frame["travel_time"].tolist(), frame["emissions"].tolist()
+        frame["travel_time"].tolist(),
+        frame["emissions"].tolist(),
+        frame["fare"].tolist() if fares is not None else None,
     )
     ordered = [c for c in _COLUMNS if c != "journey"]
     if fares is not None:
@@ -171,23 +176,28 @@ def journey_frontier(
 def least_emissions(frontier, within=None):
     """The lowest-emission journey of a frontier, as its row.
 
+    Selects among the candidates with resolved emissions — NaN never
+    qualifies — so the budgeted view is a filter, not a second search;
+    the pick sits on the frontier whenever its other criteria resolve
+    too. This is the same rule the matrix computers' emissions
+    objective applies per cell.
+
     Parameters
     ----------
     frontier : pandas.DataFrame
         A ``journey_frontier`` result.
     within : float (optional)
         A travel-time budget in seconds; only journeys at most this long
-        qualify. The lowest-emission journey within a budget is always a
-        frontier row, so the budgeted view is a filter, not a search.
+        qualify.
 
     Returns
     -------
     pandas.Series or None
-        The qualifying frontier row with the lowest emissions (ties
-        resolved toward the shorter travel time), or ``None`` when no
-        journey qualifies.
+        The qualifying row with the lowest emissions (ties resolved
+        toward the shorter travel time), or ``None`` when no journey
+        qualifies.
     """
-    rows = frontier[frontier["frontier"]]
+    rows = frontier[frontier["emissions"].notna()]
     if within is not None:
         rows = rows[rows["travel_time"] <= within]
     if rows.empty:
@@ -195,24 +205,64 @@ def least_emissions(frontier, within=None):
     return rows.sort_values(["emissions", "travel_time"]).iloc[0]
 
 
-def _frontier_mask(times, grams):
-    """Which (time, grams) points no other point dominates.
+def least_fare(frontier, within=None):
+    """The cheapest journey of a frontier, as its row.
 
-    A point is dominated when another is at least as good on both axes
-    and strictly better on one; NaN grams never join the frontier and
-    never dominate.
+    Selects among the priced candidates — an unpriceable (NaN) fare
+    never qualifies, but unresolved emissions do not disqualify a
+    journey from being the cheapest — so the pick sits on the frontier
+    whenever its emissions also resolve. This is the same rule the
+    matrix computers' fare objective applies per cell.
+
+    Parameters
+    ----------
+    frontier : pandas.DataFrame
+        A ``journey_frontier`` result priced with ``fares=``.
+    within : float (optional)
+        A travel-time budget in seconds; only journeys at most this
+        long qualify.
+
+    Returns
+    -------
+    pandas.Series or None
+        The qualifying row with the lowest fare (ties resolved toward
+        the shorter travel time, then the lower emissions), or ``None``
+        when no journey qualifies.
     """
+    if "fare" not in frontier.columns:
+        raise ValueError(
+            "the frontier carries no fares; pass fares= to journey_frontier"
+        )
+    rows = frontier[frontier["fare"].notna()]
+    if within is not None:
+        rows = rows[rows["travel_time"] <= within]
+    if rows.empty:
+        return None
+    return rows.sort_values(["fare", "travel_time", "emissions"]).iloc[0]
+
+
+def _frontier_mask(times, grams, fares=None):
+    """Which candidate points no other point dominates.
+
+    A point is dominated when another is at least as good on every axis
+    and strictly better on one; a NaN on any axis keeps a point off the
+    frontier and out of the domination tests.
+    """
+    points = (
+        list(zip(times, grams)) if fares is None else list(zip(times, grams, fares))
+    )
+    valid = [not any(math.isnan(value) for value in point) for point in points]
     mask = []
-    for i, (time_i, grams_i) in enumerate(zip(times, grams)):
-        if math.isnan(grams_i):
+    for i, point in enumerate(points):
+        if not valid[i]:
             mask.append(False)
             continue
         dominated = any(
-            time_j <= time_i
-            and grams_j <= grams_i
-            and (time_j < time_i or grams_j < grams_i)
-            for j, (time_j, grams_j) in enumerate(zip(times, grams))
-            if j != i and not math.isnan(grams_j)
+            valid[j]
+            and all(other_axis <= axis for other_axis, axis in zip(other, point))
+            and any(other_axis < axis for other_axis, axis in zip(other, point))
+            for j, other in enumerate(points)
+            if j != i
         )
         mask.append(not dominated)
     return mask

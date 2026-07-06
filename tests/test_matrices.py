@@ -250,6 +250,157 @@ def test_point_emission_cells_match_the_frontier(network_with_footpaths):
     assert row.transfers == oracle["rides"] - 1
 
 
+def test_least_fare_cells_match_the_frontier(tmp_path):
+    from cafein import TransportNetwork, journey_frontier, least_fare
+    from test_frontier import build_two_line_gtfs, two_line_fares
+
+    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
+    network = TransportNetwork.from_gtfs([str(feed)])
+    fares = two_line_fares()
+    frontier = journey_frontier(
+        network, "A", "B", "2022-02-22", "08:00:00", window=1800, fares=fares
+    )
+
+    def cell(within=None):
+        matrix = TravelCostMatrix(
+            network,
+            ["A"],
+            ["B"],
+            "2022-02-22",
+            "08:00:00",
+            optimize="fare",
+            window=1800,
+            within=within,
+            fares=fares,
+        )
+        rows = matrix[matrix.to_id == "B"]
+        return rows.iloc[0] if len(rows) else None
+
+    # The matrix cell is the frontier's cheapest pick, budget for
+    # budget: the tram unbudgeted, then the out-of-allowance bus chain,
+    # then the fast chain at the pair total, nothing within a minute.
+    for within in (None, 1380, 900):
+        row, oracle = cell(within), least_fare(frontier, within=within)
+        assert row["fare"] == pytest.approx(oracle["fare"])
+        assert row["travel_time"] == oracle["travel_time"]
+    assert cell(within=60) is None
+
+
+def test_fare_columns_price_the_reported_journeys(network, helsinki_gtfs):
+    from cafein import fares as fare_module
+
+    hsl = fare_module.zone_fare_structure(helsinki_gtfs)
+    matrix = cost_matrix(
+        network,
+        origins=["4810551"],
+        destinations=["1250551"],
+        departure="08:30:00",
+        fares=hsl,
+    )
+    row = matrix.iloc[0]
+    # Korso (C) → Käpylä (A) prices at the ABC ticket, and the matrix
+    # price equals the routed journey's python-side price.
+    assert row.fare == pytest.approx(4.1)
+    journeys = network.route_between_stops(
+        "4810551", "1250551", "2022-02-22", "08:30:00"
+    )
+    fare_module.annotate_fares(journeys, hsl)
+    fastest = min(journeys, key=lambda journey: journey["arrival"])
+    assert row.fare == pytest.approx(fastest["fare"])
+    # A seeded rule-based structure prices per boarding: the base fare,
+    # one discounted transfer at the pair total (= base), then full
+    # fares — so a cell's fare follows its transfer count exactly.
+    seeded = fare_module.setup_fare_structure(network, base_fare=3.0)
+    bulk = cost_matrix(
+        network,
+        origins=["4810551", "1040602", "1250551"],
+        departure="08:30:00",
+        fares=seeded,
+    )
+    expected = np.where(
+        bulk["travel_time"] == 0, 0.0, np.maximum(bulk["transfers"], 1) * 3.0
+    )
+    assert bulk["fare"].to_numpy() == pytest.approx(expected)
+
+
+def test_fare_cells_survive_unresolved_emissions(network, helsinki_gtfs):
+    from cafein import fares as fare_module
+
+    hsl = fare_module.zone_fare_structure(helsinki_gtfs)
+    # Each objective qualifies by its own key: the factorless ferry to
+    # Suomenlinna prices at the zone ticket under the fare objective,
+    # while the emissions objective has no qualifying candidate.
+    cheapest = cost_matrix(
+        network,
+        origins=["1080701"],
+        destinations=["1520703"],
+        departure="10:00:00",
+        optimize="fare",
+        window=3600,
+        fares=hsl,
+    )
+    assert cheapest.iloc[0].fare == pytest.approx(2.8)
+    assert np.isnan(cheapest.iloc[0].emissions)
+    cleanest = cost_matrix(
+        network,
+        origins=["1080701"],
+        destinations=["1520703"],
+        departure="10:00:00",
+        optimize="emissions",
+        window=3600,
+        fares=hsl,
+    )
+    assert cleanest.empty
+
+
+def test_point_fare_cells_prefer_walking(network_with_footpaths, helsinki_gtfs):
+    from cafein import fares as fare_module
+
+    hsl = fare_module.zone_fare_structure(helsinki_gtfs)
+    matrix = cost_matrix(
+        network_with_footpaths,
+        origins=point_frame(network_with_footpaths, [("metro", "1040602")]),
+        destinations=point_frame(network_with_footpaths, [("street", "1040280")]),
+        departure="08:30:00",
+        optimize="fare",
+        window=600,
+        fares=hsl,
+    )
+    row = matrix.iloc[0]
+    assert row.fare == 0.0
+    assert row.transfers == 0
+    assert row.transit_distance == 0.0
+    assert 19 <= row.travel_time <= 21
+
+
+def test_fare_matrices_validate_their_options(network, helsinki_gtfs):
+    from cafein import fares as fare_module
+
+    with pytest.raises(ValueError, match="requires a fare structure"):
+        TravelCostMatrix(
+            network,
+            ["4810551"],
+            date="2022-02-22",
+            departure="08:30:00",
+            optimize="fare",
+            window=600,
+        )
+    with pytest.raises(ValueError, match="requires a departure window"):
+        TravelCostMatrix(
+            network,
+            ["4810551"],
+            date="2022-02-22",
+            departure="08:30:00",
+            optimize="fare",
+            fares=fare_module.zone_fare_structure(helsinki_gtfs),
+        )
+    # Without a fare structure no fare column appears.
+    plain = cost_matrix(
+        network, origins=["4810551"], destinations=["1250551"], departure="08:30:00"
+    )
+    assert "fare" not in plain.columns
+
+
 def test_emission_matrices_validate_their_options(network):
     with pytest.raises(ValueError, match="requires a departure window"):
         TravelCostMatrix(
