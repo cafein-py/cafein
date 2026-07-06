@@ -118,6 +118,72 @@ fn queries_match_raptor_across_sampled_pairs() {
 }
 
 #[test]
+fn range_profiles_and_one_to_all_match_raptor() {
+    let Some((timetable, services, _)) = helsinki() else {
+        return;
+    };
+    let date = NaiveDate::from_ymd_opt(2022, 2, 22).unwrap();
+    let active = services.active_on(date);
+    let active_previous = services.active_on(date.pred_opt().unwrap());
+    let footpaths = Transfers::empty(timetable.stop_count());
+    let engine = TbtrEngine::for_date(timetable, &footpaths, &active, &active_previous);
+    let triples = |journeys: &[cafein_core::journey::Journey]| -> Vec<(u32, u32, usize)> {
+        journeys
+            .iter()
+            .map(|journey| (journey.departure, journey.arrival, journey.rides()))
+            .collect()
+    };
+    let mut window_pairs = 0;
+    for origin in (13..timetable.stop_count()).step_by(1103).map(StopIdx) {
+        for destination in (271..timetable.stop_count()).step_by(2417).map(StopIdx) {
+            for departure in [8 * 3600 + 30 * 60, 16 * 3600 + 30 * 60] {
+                let request = Request {
+                    departure,
+                    access: vec![(origin, 0)],
+                    egress: vec![(destination, 0)],
+                    active_services: active.clone(),
+                    active_services_previous: active_previous.clone(),
+                    max_transfers: 4,
+                };
+                let raptor = Raptor.route_range(timetable, &footpaths, &request, 1800);
+                let tbtr = engine.route_range(&request, 1800);
+                assert_eq!(
+                    triples(&tbtr),
+                    triples(&raptor),
+                    "window profiles diverge for {origin:?}->{destination:?} at {departure}"
+                );
+                window_pairs += 1;
+            }
+        }
+    }
+    assert!(window_pairs >= 40);
+    // One-to-all: full per-stop arrival arrays, origin by origin.
+    for origin in (401..timetable.stop_count()).step_by(1667).map(StopIdx) {
+        let request = Request {
+            departure: 8 * 3600 + 30 * 60,
+            access: vec![(origin, 0)],
+            egress: Vec::new(),
+            active_services: active.clone(),
+            active_services_previous: active_previous.clone(),
+            max_transfers: 4,
+        };
+        let raptor = Raptor.one_to_all(timetable, &footpaths, &request);
+        let tbtr = engine.one_to_all(request.departure, &request.access, request.max_transfers);
+        let mismatches: Vec<_> = tbtr
+            .iter()
+            .zip(raptor.iter())
+            .enumerate()
+            .filter(|(_, (ours, theirs))| ours != theirs)
+            .take(5)
+            .collect();
+        assert!(
+            mismatches.is_empty(),
+            "one-to-all diverges from {origin:?} at (stop, (tbtr, raptor)): {mismatches:?}"
+        );
+    }
+}
+
+#[test]
 fn kept_transfers_are_feasible_and_earliest() {
     let Some((timetable, _, build)) = helsinki() else {
         return;

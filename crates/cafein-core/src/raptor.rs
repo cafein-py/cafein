@@ -528,8 +528,13 @@ impl Raptor {
 /// The origin departure times within `[request.departure,
 /// request.departure + window)` at which some trip becomes catchable: one
 /// candidate per active-service trip departure at an access stop, shifted
-/// back by the stop's access duration. Descending, deduplicated.
-fn departure_candidates(timetable: &Timetable, request: &Request, window: u32) -> Vec<u32> {
+/// back by the stop's access duration. Descending, deduplicated. Shared
+/// with the TBTR range router so both enumerate identical windows.
+pub(crate) fn departure_candidates(
+    timetable: &Timetable,
+    request: &Request,
+    window: u32,
+) -> Vec<u32> {
     // Widened so a window reaching past u32::MAX cannot clip candidates.
     let end = request.departure as u64 + window as u64;
     let mut candidates = Vec::new();
