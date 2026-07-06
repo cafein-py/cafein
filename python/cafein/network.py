@@ -650,10 +650,7 @@ class TransportNetwork:
             ``"raptor"``, or ``"tbtr"`` to precompute a TBTR day engine
             (Trip-Based Transit Routing: Witt's trip-transfer set) for
             the date and fan the origins out over it. The results are
-            identical. Windowed and point matrices run on RAPTOR only,
-            and networks with installed footpaths are rejected — the
-            transitively closed footpath set is too dense for the TBTR
-            precompute as yet.
+            identical. Windowed and point matrices run on RAPTOR only.
         walking_speed_kmph, max_walking_time, max_snap_distance : float
             The street-search options for points, as in
             ``access_stops``; only valid with point origins.

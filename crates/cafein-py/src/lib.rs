@@ -1995,9 +1995,8 @@ impl TransportNetwork {
     ///     TBTR day engine (view + reduced trip-transfer set) for the
     ///     date and fan the origins out over it. The results are
     ///     identical; TBTR trades a per-date precompute for faster
-    ///     scans. Networks with installed footpaths are rejected: the
-    ///     transitively closed footpath set is quadratic in dense
-    ///     areas and the precompute cannot digest it yet.
+    ///     scans. The precomputed set covers same-stop transfers;
+    ///     installed footpaths relax at query time, RAPTOR-style.
     ///
     /// Returns
     /// -------
@@ -2020,16 +2019,6 @@ impl TransportNetwork {
             return Err(PyValueError::new_err(format!(
                 "router must be 'raptor' or 'tbtr', not {router:?}"
             )));
-        }
-        if router == "tbtr" && self.transfers.edge_count() > 0 {
-            // The transitively closed footpath set is quadratic in
-            // dense areas; TBTR's transfer-set precompute enumerates
-            // boarding candidates per footpath neighbour and cannot
-            // digest that density yet.
-            return Err(PyValueError::new_err(
-                "router='tbtr' does not support networks with installed \
-                 footpaths yet; use the default router",
-            ));
         }
         let origins: Vec<StopIdx> = from_stops
             .iter()
