@@ -21,13 +21,16 @@
 //! Pareto point. On lines with uniform factors — the common case — this
 //! collapses to the classic earliest-trip rule.
 
+use rayon::prelude::*;
+
 use crate::exhaustive::quantized;
-use crate::geometry::TripGeometry;
+use crate::fares::FareLeg;
+use crate::geometry::{wkb_multi_line_string, TripGeometry};
 use crate::journey::{Journey, Leg};
-use crate::raptor::departure_candidates;
+use crate::raptor::{departure_candidates, CostInputs, CostRow};
 use crate::router::Request;
 use crate::tbtr::{earliest_boardable, DayView, ViewTrip};
-use crate::timetable::{StopIdx, Timetable};
+use crate::timetable::{StopIdx, Timetable, TripIdx};
 use crate::transfers::Transfers;
 
 /// How a label reached its stop; parents index the label arena.
@@ -51,6 +54,9 @@ struct Label {
     arrival: u32,
     grams: f64,
     stop: StopIdx,
+    /// The profile pass that grew this label's chain: label chains
+    /// never cross passes, so travel time is `arrival - departure`.
+    departure: u32,
     origin: Origin,
 }
 
@@ -152,6 +158,44 @@ struct Rider {
     grams: f64,
     factor: f64,
     parent: u32,
+    departure: u32,
+}
+
+/// Per-destination fold state for the emissions matrix: the cleanest
+/// (then fastest) label seen per destination, folded at label creation
+/// so cross-pass bag evictions cannot lose a budget-qualifying
+/// candidate. Mirrors the interim fold's rules: lower grams win, ties
+/// resolve toward the shorter travel time, a travel-time budget
+/// disqualifies outright.
+struct MatrixFold<'a> {
+    /// Per stop: destination slot + 1, or 0 when not a destination.
+    slots: &'a [u32],
+    budget: Option<u32>,
+    /// Per slot: (grams, seconds, label).
+    best: &'a mut [Option<(f64, u32, u32)>],
+}
+
+impl MatrixFold<'_> {
+    fn fold(&mut self, label: &Label, index: u32) {
+        let slot = self.slots[label.stop.0 as usize];
+        if slot == 0 {
+            return;
+        }
+        let seconds = label.arrival - label.departure;
+        if self.budget.is_some_and(|budget| seconds > budget) {
+            return;
+        }
+        let best = &mut self.best[slot as usize - 1];
+        let better = match best {
+            None => true,
+            Some((grams, at, _)) => {
+                label.grams < *grams || (label.grams == *grams && seconds < *at)
+            }
+        };
+        if better {
+            *best = Some((label.grams, seconds, index));
+        }
+    }
 }
 
 struct Search<'a> {
@@ -219,6 +263,68 @@ pub fn route_range(
     )
 }
 
+/// The least-emissions cost matrix over McRAPTOR's candidate set: per
+/// origin–destination cell, the cleanest journey (ties toward the
+/// shorter travel time) among the (departure, arrival, emissions
+/// bucket) Pareto candidates of the departure window — the same
+/// widened set `journey_frontier`'s pareto candidates draw from, so a
+/// cell can be strictly cleaner than the interim objective's, which
+/// only sees time-optimal journeys. Candidates fold per pass at label
+/// creation, so a `budget` (travel-time cap in seconds) is applied
+/// against each label's own departure. Requests fan out over origins
+/// with rayon; the access seeds are the zero-ride floor of the
+/// origin's own cell.
+#[allow(clippy::too_many_arguments)]
+pub fn least_emissions_matrix(
+    view: &DayView,
+    timetable: &Timetable,
+    footpaths: &Transfers,
+    inputs: &CostInputs<'_>,
+    requests: &[Request],
+    destinations: &[StopIdx],
+    window: u32,
+    budget: Option<u32>,
+    bucket: f64,
+) -> Vec<Vec<CostRow>> {
+    assert!(
+        bucket.is_finite() && bucket > 0.0,
+        "the emissions bucket must be positive"
+    );
+    let mut slots = vec![0u32; timetable.stop_count() as usize];
+    for (index, stop) in destinations.iter().enumerate() {
+        slots[stop.0 as usize] = index as u32 + 1;
+    }
+    requests
+        .par_iter()
+        .map(|request| {
+            let mut search = Search::start(
+                view,
+                timetable,
+                footpaths,
+                inputs.geometry,
+                inputs.factors,
+                bucket,
+            );
+            let departures = departure_candidates(timetable, request, window);
+            let mut best: Vec<Option<(f64, u32, u32)>> = vec![None; destinations.len()];
+            for &departure in &departures {
+                let mut fold = Some(MatrixFold {
+                    slots: &slots,
+                    budget,
+                    best: &mut best,
+                });
+                search.pass(request, departure, &mut fold);
+            }
+            best.into_iter()
+                .enumerate()
+                .filter_map(|(slot, winner)| {
+                    winner.map(|winner| search.cost_row(inputs, winner, destinations[slot].0))
+                })
+                .collect()
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn profile(
     view: &DayView,
@@ -234,21 +340,9 @@ fn profile(
         bucket.is_finite() && bucket > 0.0,
         "the emissions bucket must be positive"
     );
-    let mut search = Search {
-        view,
-        timetable,
-        footpaths,
-        geometry,
-        factors,
-        bucket,
-        arena: Vec::new(),
-        bags: vec![Bag::default(); timetable.stop_count() as usize],
-        destination: DestinationBag::default(),
-        queue: vec![Vec::new(); view.line_count() as usize],
-        touched: Vec::new(),
-    };
+    let mut search = Search::start(view, timetable, footpaths, geometry, factors, bucket);
     for &departure in departures {
-        search.pass(request, departure);
+        search.pass(request, departure, &mut None);
     }
     let mut journeys: Vec<Journey> = search
         .destination
@@ -260,7 +354,30 @@ fn profile(
     journeys
 }
 
-impl Search<'_> {
+impl<'a> Search<'a> {
+    fn start(
+        view: &'a DayView,
+        timetable: &'a Timetable,
+        footpaths: &'a Transfers,
+        geometry: &'a TripGeometry,
+        factors: &'a [f64],
+        bucket: f64,
+    ) -> Search<'a> {
+        Search {
+            view,
+            timetable,
+            footpaths,
+            geometry,
+            factors,
+            bucket,
+            arena: Vec::new(),
+            bags: vec![Bag::default(); timetable.stop_count() as usize],
+            destination: DestinationBag::default(),
+            queue: vec![Vec::new(); view.line_count() as usize],
+            touched: Vec::new(),
+        }
+    }
+
     fn key(&self, grams: f64) -> i64 {
         (grams / self.bucket).floor() as i64
     }
@@ -268,8 +385,10 @@ impl Search<'_> {
     /// One profile pass: seed the access labels at `departure`, then
     /// ride/walk/join for each round. Bags persist across passes —
     /// labels of later departures suppress what they dominate, exactly
-    /// the range-RAPTOR reuse.
-    fn pass(&mut self, request: &Request, departure: u32) {
+    /// the range-RAPTOR reuse. A matrix fold, when given, sees every
+    /// label the pass creates (the access seeds are the zero-ride
+    /// floor of the origin's own cell).
+    fn pass(&mut self, request: &Request, departure: u32, fold: &mut Option<MatrixFold<'_>>) {
         let mut fresh: Vec<u32> = Vec::new();
         for &(stop, seconds) in &request.access {
             let arrival = departure.saturating_add(seconds);
@@ -280,8 +399,12 @@ impl Search<'_> {
                     arrival,
                     grams: 0.0,
                     stop,
+                    departure,
                     origin: Origin::Access,
                 });
+                if let Some(fold) = fold {
+                    fold.fold(&self.arena[label as usize], label);
+                }
                 fresh.push(label);
             }
         }
@@ -328,6 +451,7 @@ impl Search<'_> {
                             arrival,
                             grams: from.grams,
                             stop: footpath.to,
+                            departure: from.departure,
                             origin: Origin::Walk {
                                 parent: label,
                                 duration: footpath.duration,
@@ -339,6 +463,9 @@ impl Search<'_> {
             }
             for &label in &next {
                 let reached = self.arena[label as usize];
+                if let Some(fold) = fold {
+                    fold.fold(&reached, label);
+                }
                 for &(stop, seconds) in &request.egress {
                     if stop == reached.stop {
                         let arrival = reached.arrival.saturating_add(seconds);
@@ -389,6 +516,7 @@ impl Search<'_> {
                         arrival,
                         grams,
                         stop: stops[position],
+                        departure: rider.departure,
                         origin: Origin::Ride {
                             parent: rider.parent,
                             trip: rider.trip,
@@ -439,12 +567,98 @@ impl Search<'_> {
                         grams: boarding.grams,
                         factor,
                         parent: label,
+                        departure: boarding.departure,
                     });
                 }
             }
         }
         entries.clear();
         self.queue[line as usize] = entries;
+    }
+
+    /// Walks a winning label's chain into a cost row, mirroring the
+    /// interim reconstruction: transit and transfer meters summed leg
+    /// by leg, geometry legs reversed into ride order, fare legs
+    /// priced in order. Emissions come from the label itself — the
+    /// same cumulative-distance sums, already microgram-quantized.
+    fn cost_row(&self, inputs: &CostInputs<'_>, winner: (f64, u32, u32), to: u32) -> CostRow {
+        let (grams, seconds, mut at) = winner;
+        let mut rides = 0u32;
+        let mut transit_meters = 0.0;
+        let mut walk_meters = 0.0;
+        let mut legs: Vec<(TripIdx, u16, u16)> = Vec::new();
+        let mut fare_legs: Vec<FareLeg> = Vec::new();
+        loop {
+            let label = &self.arena[at as usize];
+            match label.origin {
+                Origin::Access => break,
+                Origin::Ride {
+                    parent,
+                    trip,
+                    board,
+                    alight,
+                } => {
+                    rides += 1;
+                    let backing = self.view.backing(trip);
+                    transit_meters += inputs.geometry.leg_distance(backing, board, alight) as f64;
+                    if inputs.with_geometry {
+                        legs.push((backing, board, alight));
+                    }
+                    if inputs.fares.is_some() {
+                        let pattern = self.timetable.trip_pattern(backing);
+                        let stops = self.timetable.pattern_stops(pattern);
+                        fare_legs.push(FareLeg {
+                            route: self.timetable.pattern_route(pattern),
+                            board_stop: stops[board as usize].0,
+                            alight_stop: stops[alight as usize].0,
+                            board_time: self.timetable.trip_stop_times(backing)[board as usize]
+                                .departure
+                                .saturating_sub(self.view.day_offset(trip)),
+                        });
+                    }
+                    at = parent;
+                }
+                Origin::Walk { parent, .. } => {
+                    let from = &self.arena[parent as usize];
+                    walk_meters += self
+                        .footpaths
+                        .from_stop(from.stop)
+                        .iter()
+                        .find(|transfer| transfer.to == label.stop)
+                        .map(|transfer| transfer.meters)
+                        .unwrap_or(0.0);
+                    at = parent;
+                }
+            }
+        }
+        let geometry = match (inputs.with_geometry, inputs.leg_geometry) {
+            (true, Some(shapes)) => {
+                let parts: Vec<Vec<(f64, f64)>> = legs
+                    .iter()
+                    .rev()
+                    .map(|&(trip, board, alight)| shapes.leg_coordinates(trip, board, alight))
+                    .collect();
+                Some(wkb_multi_line_string(&parts))
+            }
+            _ => None,
+        };
+        let fare = match inputs.fares {
+            Some(tables) => {
+                fare_legs.reverse();
+                tables.price(&fare_legs)
+            }
+            None => f64::NAN,
+        };
+        CostRow {
+            to,
+            seconds,
+            rides,
+            transit_meters,
+            walk_meters,
+            emission_grams: grams,
+            fare,
+            geometry,
+        }
     }
 
     /// Walks a destination entry's label chain back into the journey
@@ -854,6 +1068,177 @@ mod tests {
             1e-6,
         );
         assert!(journeys.is_empty());
+    }
+
+    #[test]
+    fn the_emissions_matrix_sees_past_the_time_candidates() {
+        use crate::raptor::{Objective, Raptor};
+
+        let (timetable, geometry, factors) = frontier_fixture();
+        let view = DayView::universal(&timetable);
+        let footpaths = Transfers::empty(4);
+        let inputs = CostInputs {
+            geometry: &geometry,
+            factors: &factors,
+            leg_geometry: None,
+            with_geometry: false,
+            fares: None,
+        };
+        let requests = vec![Request {
+            departure: 0,
+            access: vec![(StopIdx(0), 0)],
+            egress: Vec::new(),
+            active_services: vec![true],
+            active_services_previous: vec![false],
+            max_transfers: 3,
+        }];
+        let destinations = [StopIdx(0), StopIdx(3)];
+        let rows = least_emissions_matrix(
+            &view,
+            &timetable,
+            &footpaths,
+            &inputs,
+            &requests,
+            &destinations,
+            600,
+            None,
+            1e-6,
+        );
+        // The cleanest journey is the slow clean line — invisible to
+        // the interim objective, whose per-round RAPTOR arrivals only
+        // ever hold the faster dirty alternatives.
+        let cell = rows[0].iter().find(|row| row.to == 3).unwrap();
+        assert_eq!((cell.seconds, cell.rides), (800, 1));
+        assert!((cell.emission_grams - 10.0).abs() < 1e-9);
+        assert_eq!(cell.transit_meters, 1000.0);
+        let interim = Raptor.least_cost_matrix(
+            &timetable,
+            &footpaths,
+            &inputs,
+            &requests,
+            &destinations,
+            600,
+            None,
+            Objective::Emissions,
+        );
+        let interim_cell = interim[0].iter().find(|row| row.to == 3).unwrap();
+        assert!((interim_cell.emission_grams - 100.0).abs() < 1e-9);
+        assert!(cell.emission_grams < interim_cell.emission_grams);
+        // The origin's own cell is the zero-ride floor.
+        let floor = rows[0].iter().find(|row| row.to == 0).unwrap();
+        assert_eq!((floor.seconds, floor.rides), (0, 0));
+        assert_eq!(floor.emission_grams, 0.0);
+    }
+
+    #[test]
+    fn a_budget_caps_the_matrix_travel_time() {
+        let (timetable, geometry, factors) = frontier_fixture();
+        let view = DayView::universal(&timetable);
+        let footpaths = Transfers::empty(4);
+        let inputs = CostInputs {
+            geometry: &geometry,
+            factors: &factors,
+            leg_geometry: None,
+            with_geometry: false,
+            fares: None,
+        };
+        let requests = vec![Request {
+            departure: 0,
+            access: vec![(StopIdx(0), 0)],
+            egress: Vec::new(),
+            active_services: vec![true],
+            active_services_previous: vec![false],
+            max_transfers: 3,
+        }];
+        let cell = |budget: Option<u32>| {
+            let rows = least_emissions_matrix(
+                &view,
+                &timetable,
+                &footpaths,
+                &inputs,
+                &requests,
+                &[StopIdx(3)],
+                600,
+                budget,
+                1e-6,
+            );
+            rows[0].iter().find(|row| row.to == 3).cloned()
+        };
+        // Tightening budgets walk the frontier: the clean line, the
+        // transfer combination, the dirty direct, then nothing.
+        let unbudgeted = cell(None).unwrap();
+        assert_eq!((unbudgeted.seconds, unbudgeted.rides), (800, 1));
+        let combo = cell(Some(600)).unwrap();
+        assert_eq!((combo.seconds, combo.rides), (600, 2));
+        assert!((combo.emission_grams - 55.0).abs() < 1e-9);
+        let dirty = cell(Some(400)).unwrap();
+        assert_eq!((dirty.seconds, dirty.rides), (400, 1));
+        assert!((dirty.emission_grams - 100.0).abs() < 1e-9);
+        assert!(cell(Some(100)).is_none());
+    }
+
+    #[test]
+    fn matrix_rows_carry_their_transfer_walks() {
+        let mut builder = TimetableBuilder::new(4);
+        let first = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+        let second = builder.add_pattern(&[StopIdx(2), StopIdx(3)], 1).unwrap();
+        builder
+            .add_trip(first, vec![time(0), time(100)], 0, 0)
+            .unwrap();
+        builder
+            .add_trip(second, vec![time(200), time(300)], 1, 0)
+            .unwrap();
+        let timetable = builder.finish();
+        let geometry = TripGeometry::from_trips(
+            &timetable,
+            vec![
+                (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+                (TripIdx(1), vec![0.0, 2000.0], DistanceProvenance::CrowFly),
+            ],
+        )
+        .unwrap();
+        let factors = [10.0, 20.0];
+        let footpaths = Transfers::from_edges(
+            4,
+            &[
+                (StopIdx(1), StopIdx(2), 50, 50.0),
+                (StopIdx(2), StopIdx(1), 50, 50.0),
+            ],
+        )
+        .unwrap();
+        let view = DayView::universal(&timetable);
+        let inputs = CostInputs {
+            geometry: &geometry,
+            factors: &factors,
+            leg_geometry: None,
+            with_geometry: false,
+            fares: None,
+        };
+        let requests = vec![Request {
+            departure: 0,
+            access: vec![(StopIdx(0), 0)],
+            egress: Vec::new(),
+            active_services: vec![true],
+            active_services_previous: vec![false],
+            max_transfers: 3,
+        }];
+        let rows = least_emissions_matrix(
+            &view,
+            &timetable,
+            &footpaths,
+            &inputs,
+            &requests,
+            &[StopIdx(3)],
+            100,
+            None,
+            1e-6,
+        );
+        let cell = rows[0].iter().find(|row| row.to == 3).unwrap();
+        assert_eq!((cell.seconds, cell.rides), (300, 2));
+        assert_eq!(cell.transit_meters, 3000.0);
+        assert_eq!(cell.walk_meters, 50.0);
+        assert!((cell.emission_grams - 50.0).abs() < 1e-9);
+        assert!(cell.fare.is_nan());
     }
 
     #[test]

@@ -3025,7 +3025,13 @@ impl TransportNetwork {
     /// Pairs with no qualifying candidate (a resolved emission, a
     /// priceable fare) are absent. The ``"fare"`` objective requires
     /// the flat fare tables ``cafein.fares`` produces.
-    #[pyo3(signature = (from_stops, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, to_stops = None, geometries = false))]
+    ///
+    /// With ``candidates="pareto"`` (``"emissions"`` objective only)
+    /// the candidates per pair are McRAPTOR's (departure, arrival,
+    /// emissions bucket) Pareto set instead, which also holds the
+    /// cleaner-but-slower journeys the time-optimal set misses; cells
+    /// can therefore report strictly lower emissions.
+    #[pyo3(signature = (from_stops, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, to_stops = None, candidates = "time", bucket = 25.0, geometries = false))]
     #[allow(clippy::too_many_arguments)]
     fn least_cost_matrix(
         &self,
@@ -3040,6 +3046,8 @@ impl TransportNetwork {
         budget: Option<u32>,
         max_transfers: u8,
         to_stops: Option<Vec<String>>,
+        candidates: &str,
+        bucket: f64,
         geometries: bool,
     ) -> PyResult<Py<PyDict>> {
         let Some(geometry) = &self.geometry else {
@@ -3066,6 +3074,23 @@ impl TransportNetwork {
                 )
             })
             .transpose()?;
+        if candidates != "time" && candidates != "pareto" {
+            return Err(PyValueError::new_err(
+                "candidates must be 'time' or 'pareto'",
+            ));
+        }
+        if candidates == "pareto" {
+            if objective != "emissions" {
+                return Err(PyValueError::new_err(
+                    "pareto candidates support the 'emissions' objective only",
+                ));
+            }
+            if !bucket.is_finite() || bucket <= 0.0 {
+                return Err(PyValueError::new_err(
+                    "bucket must be a positive number of grams",
+                ));
+            }
+        }
         let objective = parse_objective(objective, tables.as_ref())?;
         let origins: Vec<StopIdx> = from_stops
             .iter()
@@ -3108,16 +3133,35 @@ impl TransportNetwork {
             fares: tables.as_ref(),
         };
         let rows = py.allow_threads(|| {
-            Raptor.least_cost_matrix(
-                &self.build.timetable,
-                &self.transfers,
-                &inputs,
-                &requests,
-                &destinations,
-                window,
-                budget,
-                objective,
-            )
+            if candidates == "pareto" {
+                let view = DayView::for_date(
+                    &self.build.timetable,
+                    &active_services,
+                    &active_services_previous,
+                );
+                mcraptor::least_emissions_matrix(
+                    &view,
+                    &self.build.timetable,
+                    &self.transfers,
+                    &inputs,
+                    &requests,
+                    &destinations,
+                    window,
+                    budget,
+                    bucket,
+                )
+            } else {
+                Raptor.least_cost_matrix(
+                    &self.build.timetable,
+                    &self.transfers,
+                    &inputs,
+                    &requests,
+                    &destinations,
+                    window,
+                    budget,
+                    objective,
+                )
+            }
         });
         cost_rows_dict(py, rows, geometries)
     }

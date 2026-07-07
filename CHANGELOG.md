@@ -19,6 +19,11 @@
   Coordinate queries route door-to-door like the time candidates:
   walking access and egress, the zero-emission walking-only journey
   anchoring the clean end, and the same walk-domination rule.
+  ``TravelCostMatrix(optimize="emissions", candidates="pareto")``
+  draws each cell's candidates from the same widened set (stop
+  origins and destinations), so a cell can report strictly lower
+  emissions than the time-candidate objective, whose per-round
+  arrivals never hold a cleaner-but-slower journey.
 
 - The exact time × emissions Pareto set:
   ``cafein.exhaustive_frontier(network, origin, destination, date,

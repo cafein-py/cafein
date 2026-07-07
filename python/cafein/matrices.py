@@ -76,6 +76,18 @@ class TravelCostMatrix(pd.DataFrame):
         Travel-time budget in seconds for the windowed optimize modes:
         only journeys at most this long qualify. Unbudgeted, the
         cleanest (cheapest) reachable journey wins.
+    candidates : str (optional, default: "time")
+        The candidate journey set of the windowed optimize modes.
+        ``"pareto"`` (with ``optimize="emissions"``, stop origins and
+        destinations) draws each cell's candidates from McRAPTOR's
+        (departure, arrival, emissions) Pareto set, which also holds
+        the cleaner-but-slower journeys the time-optimal set misses —
+        cells can report strictly lower emissions, at more compute per
+        origin.
+    bucket : float (optional, default: 25.0)
+        The emissions bucket width in grams CO₂e of the pareto search,
+        as in ``journey_frontier``. Only used with
+        ``candidates="pareto"``.
     factors : DataFrame or path (optional)
         Extra emission-factor rows layered over the shipped defaults;
         see ``cafein.emissions.load_factors``.
@@ -117,6 +129,8 @@ class TravelCostMatrix(pd.DataFrame):
         factors=None,
         components=None,
         fares=None,
+        candidates="time",
+        bucket=25.0,
         geometries=False,
         chunk=None,
         walking_speed_kmph=None,
@@ -136,6 +150,8 @@ class TravelCostMatrix(pd.DataFrame):
             factors=factors,
             components=components,
             fares=fares,
+            candidates=candidates,
+            bucket=bucket,
             geometries=geometries,
             chunk=chunk,
             walking_speed_kmph=walking_speed_kmph,
@@ -347,7 +363,8 @@ def travel_cost_table(
 
     Semantics and parameters follow `TravelCostMatrix` — including the
     windowed optimize modes with their ``window``/``within`` and the
-    ``fares`` pricing; the output is an
+    ``fares`` pricing, though always over the time candidates
+    (no ``candidates``/``bucket``); the output is an
     Arrow table with ``from_id`` and ``to_id`` dictionary-encoded over
     the origin and destination identifiers, the numeric columns wrapping
     the computed arrays zero-copy, and — with ``geometries=True`` — the
@@ -430,6 +447,8 @@ def _cost_columns(
     window=None,
     within=None,
     fares=None,
+    candidates="time",
+    bucket=25.0,
 ):
     """The core's cost arrays plus the origin and destination ids."""
     from cafein import emissions
@@ -447,6 +466,13 @@ def _cost_columns(
         raise ValueError("window and within require optimize='emissions' or 'fare'")
     if optimize == "fare" and fares is None:
         raise ValueError("optimize='fare' requires a fare structure (fares=)")
+    if candidates not in ("time", "pareto"):
+        raise ValueError("candidates must be 'time' or 'pareto'")
+    if candidates == "pareto":
+        if optimize != "emissions":
+            raise ValueError("candidates='pareto' requires optimize='emissions'")
+        if _is_point_frame(origins) or _is_point_frame(destinations):
+            raise ValueError("pareto candidates require stop origins and destinations")
     fare_tables = None if fares is None else fares._flat_tables(network)
     trip_factors = emissions.trip_factors(network, factors, components)
     if _is_point_frame(origins) or _is_point_frame(destinations):
@@ -510,6 +536,8 @@ def _cost_columns(
                 within,
                 max_transfers,
                 to_stops,
+                candidates,
+                bucket,
                 geometries,
             )
         else:
