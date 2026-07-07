@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use chrono::NaiveDate;
-use numpy::{IntoPyArray, PyArray2, PyArray3, PyArrayMethods};
+use numpy::{IntoPyArray, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1};
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
@@ -1377,6 +1377,65 @@ impl TransportNetwork {
                 *duration,
                 *meters,
             ));
+        }
+        self.transfers = Transfers::from_edges(self.build.timetable.stop_count(), &edges)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Install precomputed stop-to-stop transfers from flat arrays.
+    ///
+    /// The array form of ``set_transfers``: `stop_ids` names each
+    /// snapped stop once, `from_index`/`to_index` are positions into
+    /// it, and the per-edge payloads cross as numpy arrays — no
+    /// per-edge Python objects. The edge set must be transitively
+    /// closed, as in ``set_transfers``;
+    /// ``cafein.streets.walking_footpaths`` produces this shape.
+    fn set_transfer_arrays(
+        &mut self,
+        stop_ids: Vec<String>,
+        from_index: PyReadonlyArray1<'_, u32>,
+        to_index: PyReadonlyArray1<'_, u32>,
+        seconds: PyReadonlyArray1<'_, u32>,
+        meters: PyReadonlyArray1<'_, f64>,
+    ) -> PyResult<()> {
+        let resolved: Vec<StopIdx> = stop_ids
+            .iter()
+            .map(|stop| self.resolve_stop(stop))
+            .collect::<PyResult<_>>()?;
+        let from_index = from_index.as_slice()?;
+        let to_index = to_index.as_slice()?;
+        let seconds = seconds.as_slice()?;
+        let meters = meters.as_slice()?;
+        if from_index.len() != to_index.len()
+            || from_index.len() != seconds.len()
+            || from_index.len() != meters.len()
+        {
+            return Err(PyValueError::new_err(
+                "footpath arrays must all have the same length",
+            ));
+        }
+        let stop_at = |index: usize, position: u32| {
+            resolved.get(position as usize).copied().ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "footpath {index} references a position outside stop_ids"
+                ))
+            })
+        };
+        let mut edges = Vec::with_capacity(from_index.len());
+        for (index, (((&from, &to), &duration), &length)) in from_index
+            .iter()
+            .zip(to_index)
+            .zip(seconds)
+            .zip(meters)
+            .enumerate()
+        {
+            if !length.is_finite() || length < 0.0 {
+                return Err(PyValueError::new_err(format!(
+                    "footpath {index} has a negative or non-finite length"
+                )));
+            }
+            edges.push((stop_at(index, from)?, stop_at(index, to)?, duration, length));
         }
         self.transfers = Transfers::from_edges(self.build.timetable.stop_count(), &edges)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;

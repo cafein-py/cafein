@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Footpath transfers cross into the routing core as flat arrays:
+  ``cafein.streets.walking_footpaths`` (and ``walking_streets``) now
+  return a ``Footpaths`` container — stop ids named once, the closed
+  edge set as numpy index/seconds/meters arrays — instead of a list
+  with one Python tuple per edge, and ``set_transfers`` accepts it
+  alongside the legacy tuple list, which remains supported for
+  hand-built edge sets. Iterating a ``Footpaths`` yields the legacy
+  tuples.
+
 - McRAPTOR — the true multicriteria search:
   ``journey_frontier(..., candidates="pareto")`` draws its candidate
   journeys from a multicriteria RAPTOR over (departure, arrival,

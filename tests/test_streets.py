@@ -170,6 +170,22 @@ def test_durations_round_up_conservatively():
     durations = np.array([[0.0, 10.4], [9.9999999, 0.0]])
     edges = streets._edge_list(np.array(["a", "b"], dtype=object), durations, 1.25)
     assert {(a, b): s for a, b, s, _ in edges} == {("a", "b"): 11, ("b", "a"): 10}
+
+
+def test_footpaths_are_flat_arrays():
+    # The edge list crosses into the core as arrays: stop ids named
+    # once, uint32 indexes and seconds, float64 meters — and the
+    # legacy tuple view is the same edges.
+    durations = np.array([[0.0, 10.4], [9.9999999, 0.0]])
+    edges = streets._edge_list(np.array(["a", "b"], dtype=object), durations, 1.25)
+    assert isinstance(edges, streets.Footpaths)
+    assert len(edges) == 2
+    assert edges.stop_ids == ["a", "b"]
+    assert edges.from_index.dtype == np.uint32
+    assert edges.to_index.dtype == np.uint32
+    assert edges.seconds.dtype == np.uint32
+    assert edges.meters.dtype == np.float64
+    assert list(edges) == [("a", "b", 11, 13.0), ("b", "a", 10, pytest.approx(12.5))]
     meters = {(a, b): m for a, b, _, m in edges}
     assert meters[("a", "b")] == pytest.approx(13.0)
     assert meters[("b", "a")] == pytest.approx(12.5, rel=1e-6)
@@ -295,7 +311,7 @@ def test_an_empty_network_yields_an_empty_payload():
         max_walking_time=600.0,
         max_snap_distance=100.0,
     )
-    assert footpath_list == []
+    assert list(footpath_list) == []
     assert street == (0, [], [0], [], [], [])
 
 
