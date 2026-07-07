@@ -50,6 +50,7 @@ def journey_frontier(
     fares=None,
     candidates="time",
     bucket=25.0,
+    router="raptor",
     walking_speed_kmph=None,
     max_walking_time=None,
     max_snap_distance=None,
@@ -112,6 +113,12 @@ def journey_frontier(
         journeys within one bucket of each other count as equal on
         emissions while searching, bounding its cost. Only used with
         ``candidates="pareto"``.
+    router : str (optional, default: "raptor")
+        The pareto search engine: McRAPTOR (``"raptor"``) answers
+        immediately; McTBTR (``"tbtr"``, stop ids only) precomputes the
+        date's multicriteria transfer set first — slower for a single
+        pair, built for batch reuse — and returns the same journeys.
+        Only used with ``candidates="pareto"``.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         The street-search options for coordinate queries, as in
         ``route_between_coordinates``; only valid with coordinates.
@@ -131,6 +138,10 @@ def journey_frontier(
     """
     if candidates not in ("time", "pareto"):
         raise ValueError("candidates must be 'time' or 'pareto'")
+    if router not in ("raptor", "tbtr"):
+        raise ValueError("router must be 'raptor' or 'tbtr'")
+    if router == "tbtr" and candidates != "pareto":
+        raise ValueError("router='tbtr' requires candidates='pareto'")
     stops = isinstance(origin, str), isinstance(destination, str)
     if stops[0] != stops[1]:
         raise ValueError(
@@ -154,6 +165,7 @@ def journey_frontier(
                 window,
                 max_transfers,
                 bucket,
+                router,
                 geometries,
             )
         else:
@@ -169,6 +181,8 @@ def journey_frontier(
     elif candidates == "pareto":
         from cafein.network import _walk_options
 
+        if router == "tbtr":
+            raise ValueError("router='tbtr' requires stop ids, not coordinates")
         trip_factors = emissions.trip_factors(network, factors, components)
         journeys = network._core.mc_route_between_coordinates(
             tuple(origin),

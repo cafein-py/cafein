@@ -13,6 +13,7 @@ use cafein_core::fares::{FareTables, RuleFares, ZoneFares, ZoneProduct, NO_FARE}
 use cafein_core::geometry::{wkb_multi_line_string, DistanceProvenance, LegGeometry, TripGeometry};
 use cafein_core::journey::{Journey, Leg};
 use cafein_core::mcraptor;
+use cafein_core::mctbtr::McTbtrEngine;
 use cafein_core::raptor::{CostInputs, CostRow, Objective, Raptor};
 use cafein_core::router::{Request, TransitRouter};
 use cafein_core::streets::{
@@ -2199,7 +2200,7 @@ impl TransportNetwork {
 
     /// Multicriteria journeys between two stops: the Pareto set over
     /// (arrival, emissions bucket) — with a window, over (departure,
-    /// arrival, emissions bucket) — found by McRAPTOR.
+    /// arrival, emissions bucket).
     ///
     /// Emissions enter the search as per-trip factors over precomputed
     /// cumulative distances; labels within `bucket` grams of each other
@@ -2208,11 +2209,16 @@ impl TransportNetwork {
     /// resolved factor are skipped — journeys riding them can never sit
     /// on an emissions frontier. Requires installed trip distances.
     ///
+    /// ``router`` picks the engine: McRAPTOR (``"raptor"``, the
+    /// default) answers immediately; McTBTR (``"tbtr"``) precomputes
+    /// the day's multicriteria transfer set first — slower for one
+    /// pair, built for batch reuse — and returns the same journeys.
+    ///
     /// Returns
     /// -------
     /// list of dict
     ///     Journeys shaped as in ``route_between_stops``.
-    #[pyo3(signature = (from_stop, to_stop, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, geometries = true))]
+    #[pyo3(signature = (from_stop, to_stop, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, router = "raptor", geometries = true))]
     #[allow(clippy::too_many_arguments)]
     fn mc_route_between_stops(
         &self,
@@ -2225,12 +2231,16 @@ impl TransportNetwork {
         window: Option<u32>,
         max_transfers: u8,
         bucket: f64,
+        router: &str,
         geometries: bool,
     ) -> PyResult<Py<PyList>> {
         if !bucket.is_finite() || bucket <= 0.0 {
             return Err(PyValueError::new_err(
                 "bucket must be a positive number of grams",
             ));
+        }
+        if router != "raptor" && router != "tbtr" {
+            return Err(PyValueError::new_err("router must be 'raptor' or 'tbtr'"));
         }
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
@@ -2254,6 +2264,20 @@ impl TransportNetwork {
             max_transfers,
         };
         let journeys = py.allow_threads(|| {
+            if router == "tbtr" {
+                let engine = McTbtrEngine::for_date(
+                    &self.build.timetable,
+                    &self.transfers,
+                    geometry,
+                    &per_trip,
+                    &request.active_services,
+                    &request.active_services_previous,
+                );
+                return match window {
+                    None => engine.route(&request, bucket),
+                    Some(window) => engine.route_range(&request, window, bucket),
+                };
+            }
             let view = DayView::for_date(
                 &self.build.timetable,
                 &request.active_services,

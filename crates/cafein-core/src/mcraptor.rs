@@ -70,9 +70,10 @@ struct Entry {
 }
 
 /// A per-stop label bag under bucketed dominance, cumulative across
-/// rounds and profile passes.
+/// rounds and profile passes. Shared with the trip-based engine, whose
+/// stop bags follow the same contract.
 #[derive(Debug, Clone, Default)]
-struct Bag {
+pub(crate) struct Bag {
     entries: Vec<Entry>,
 }
 
@@ -82,7 +83,7 @@ impl Bag {
     /// on both axes but strictly dirtier in exact grams is refined
     /// (replaced), keeping the bucket's representative as clean as the
     /// search has seen.
-    fn insert(&mut self, arrival: u32, grams: f64, key: i64) -> bool {
+    pub(crate) fn insert(&mut self, arrival: u32, grams: f64, key: i64) -> bool {
         for entry in &self.entries {
             if entry.arrival <= arrival
                 && entry.key <= key
