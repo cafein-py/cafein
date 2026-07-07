@@ -681,4 +681,40 @@ mod tests {
         let shortcuts = compute_shortcuts(&view, &timetable, &transfers, 0, NEVER - 1);
         assert!(shortcuts.is_empty(), "{shortcuts:?}");
     }
+
+    #[test]
+    fn the_shortcut_survives_a_final_transfer() {
+        // The candidate journey reaches its destination only after a
+        // final walk (3→4) past the second trip. The intermediate 1→2
+        // transfer is still the single shortcut; the final walk is never
+        // itself an intermediate transfer (nothing boards at 4).
+        let mut builder = TimetableBuilder::new(5);
+        let a = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+        let b = builder.add_pattern(&[StopIdx(2), StopIdx(3)], 1).unwrap();
+        builder.add_trip(a, vec![time(0), time(100)], 0, 0).unwrap();
+        builder
+            .add_trip(b, vec![time(200), time(300)], 1, 0)
+            .unwrap();
+        let timetable = builder.finish();
+        let view = DayView::universal(&timetable);
+        let transfers = Transfers::from_edges(
+            5,
+            &[
+                (StopIdx(1), StopIdx(2), 50, 50.0),
+                (StopIdx(2), StopIdx(1), 50, 50.0),
+                (StopIdx(3), StopIdx(4), 30, 30.0),
+                (StopIdx(4), StopIdx(3), 30, 30.0),
+            ],
+        )
+        .unwrap();
+        let shortcuts = compute_shortcuts(&view, &timetable, &transfers, 0, NEVER - 1);
+        assert_eq!(
+            shortcuts,
+            vec![Shortcut {
+                origin: StopIdx(1),
+                destination: StopIdx(2),
+                seconds: 50,
+            }]
+        );
+    }
 }
