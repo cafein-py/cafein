@@ -17,7 +17,10 @@
   and on the Helsinki network with footpaths. Select it with
   ``journey_frontier(candidates="pareto", router="tbtr")`` (stop ids;
   the engine precomputes the date's transfer set first, so it is
-  built for batch reuse rather than single pairs).
+  built for batch reuse rather than single pairs) — and at matrix
+  scale with ``TravelCostMatrix(optimize="emissions",
+  candidates="pareto", router="tbtr")``, where one engine build
+  serves every origin.
 
 - Footpath transfers cross into the routing core as flat arrays:
   ``cafein.streets.walking_footpaths`` (and ``walking_streets``) now

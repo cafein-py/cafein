@@ -34,15 +34,16 @@
 use rayon::prelude::*;
 
 use crate::exhaustive::quantized;
-use crate::geometry::TripGeometry;
+use crate::fares::FareLeg;
+use crate::geometry::{wkb_multi_line_string, TripGeometry};
 use crate::journey::{Journey, Leg};
 use crate::mcraptor::Bag;
-use crate::raptor::departure_candidates;
+use crate::raptor::{departure_candidates, CostInputs, CostRow};
 use crate::router::Request;
 use crate::tbtr::{
     earliest_boardable, u_turn, DayView, TransferSet, TransferSetBuild, TripTransfer, ViewTrip,
 };
-use crate::timetable::{StopIdx, Timetable};
+use crate::timetable::{StopIdx, Timetable, TripIdx};
 use crate::transfers::Transfers;
 
 /// Builds the multicriteria transfer set of a day view, fanned out
@@ -337,6 +338,69 @@ struct Arrived {
     walk: Option<(StopIdx, u32)>,
 }
 
+/// The sentinel leaf of a zero-ride (access floor) matrix winner.
+const ACCESS_LEAF: u32 = u32::MAX;
+
+/// One matrix winner: the cleanest (then fastest) point folded for a
+/// destination, with the chain to rebuild its cost row.
+#[derive(Debug, Clone, Copy)]
+struct Winner {
+    grams: f64,
+    seconds: u32,
+    leaf: u32,
+    alight: u16,
+    /// The point was reached over a final footpath hop.
+    walked: bool,
+}
+
+/// Per-destination fold state for the emissions matrix, mirroring the
+/// McRAPTOR matrix fold: candidates fold per pass at creation (an
+/// end-of-search bag readout would lose budget-qualifying candidates
+/// to cross-pass evictions), lower grams win, ties resolve toward the
+/// shorter travel time, a travel-time budget disqualifies outright.
+struct MatrixSink<'a> {
+    /// Per stop: destination slot + 1, or 0 when not a destination.
+    slots: &'a [u32],
+    budget: Option<u32>,
+    best: &'a mut [Option<Winner>],
+}
+
+impl MatrixSink<'_> {
+    fn fold(
+        &mut self,
+        stop: StopIdx,
+        seconds: u32,
+        grams: f64,
+        leaf: u32,
+        alight: u16,
+        walked: bool,
+    ) {
+        let slot = self.slots[stop.0 as usize];
+        if slot == 0 {
+            return;
+        }
+        if self.budget.is_some_and(|budget| seconds > budget) {
+            return;
+        }
+        let best = &mut self.best[slot as usize - 1];
+        let better = match best {
+            None => true,
+            Some(winner) => {
+                grams < winner.grams || (grams == winner.grams && seconds < winner.seconds)
+            }
+        };
+        if better {
+            *best = Some(Winner {
+                grams,
+                seconds,
+                leaf,
+                alight,
+                walked,
+            });
+        }
+    }
+}
+
 /// The multicriteria trip-based engine for one query date: the day
 /// view, the dominance-aware transfer set, and per-trip factors.
 /// Queries return the same journeys McRAPTOR's would — verified
@@ -378,17 +442,41 @@ impl<'a> McTbtrEngine<'a> {
     /// The Pareto set over (arrival, emissions bucket) for a single
     /// departure, as full journeys.
     pub fn route(&self, request: &Request, bucket: f64) -> Vec<Journey> {
-        self.profile(request, &[request.departure], bucket)
+        self.profile(request, &[request.departure], bucket, &mut None)
     }
 
     /// The departure-window profile over (departure, arrival,
     /// emissions bucket).
     pub fn route_range(&self, request: &Request, window: u32, bucket: f64) -> Vec<Journey> {
         let departures = departure_candidates(self.timetable, request, window);
-        self.profile(request, &departures, bucket)
+        self.profile(request, &departures, bucket, &mut None)
     }
 
-    fn profile(&self, request: &Request, departures: &[u32], bucket: f64) -> Vec<Journey> {
+    fn profile(
+        &self,
+        request: &Request,
+        departures: &[u32],
+        bucket: f64,
+        fold: &mut Option<MatrixSink<'_>>,
+    ) -> Vec<Journey> {
+        let (arena, destination) = self.passes(request, departures, bucket, fold);
+        let mut journeys: Vec<Journey> = destination
+            .iter()
+            .map(|arrived| self.assemble(arrived, &arena))
+            .collect();
+        journeys.sort_by_key(|journey| (journey.departure, journey.arrival, journey.rides()));
+        journeys
+    }
+
+    /// The pass loop shared by the journey profile and the matrix:
+    /// returns the segment arena and the destination frontier.
+    fn passes(
+        &self,
+        request: &Request,
+        departures: &[u32],
+        bucket: f64,
+        fold: &mut Option<MatrixSink<'_>>,
+    ) -> (Vec<Segment>, Vec<Arrived>) {
         assert!(
             bucket.is_finite() && bucket > 0.0,
             "the emissions bucket must be positive"
@@ -408,6 +496,17 @@ impl<'a> McTbtrEngine<'a> {
                 let admitted = stop_bags[stop.0 as usize].insert(ready, 0.0, key(0.0));
                 if !admitted {
                     continue;
+                }
+                if let Some(sink) = fold {
+                    // The zero-ride floor of the origin's own cell.
+                    sink.fold(
+                        stop,
+                        ready.saturating_sub(departure),
+                        0.0,
+                        ACCESS_LEAF,
+                        0,
+                        false,
+                    );
                 }
                 self.board(
                     stop,
@@ -436,16 +535,12 @@ impl<'a> McTbtrEngine<'a> {
                         &mut stop_bags,
                         &mut destination,
                         &mut queue,
+                        fold,
                     );
                 }
             }
         }
-        let mut journeys: Vec<Journey> = destination
-            .iter()
-            .map(|arrived| self.assemble(arrived, &arena))
-            .collect();
-        journeys.sort_by_key(|journey| (journey.departure, journey.arrival, journey.rides()));
-        journeys
+        (arena, destination)
     }
 
     /// Boards the earliest catchable trip of every line serving `stop`,
@@ -528,6 +623,7 @@ impl<'a> McTbtrEngine<'a> {
         stop_bags: &mut [Bag],
         destination: &mut Vec<Arrived>,
         queue: &mut [Vec<u32>],
+        fold: &mut Option<MatrixSink<'_>>,
     ) {
         let segment = arena[index as usize];
         let trip = segment.trip;
@@ -562,10 +658,30 @@ impl<'a> McTbtrEngine<'a> {
             // Query-time footpaths, gated on stop-bag improvement (the
             // T4b semantics); improving walks board and join.
             if stop_bags[stop.0 as usize].insert(arrival, grams, key(grams)) {
+                if let Some(sink) = fold {
+                    sink.fold(
+                        stop,
+                        arrival - segment.departure,
+                        grams,
+                        index,
+                        alight as u16,
+                        false,
+                    );
+                }
                 for footpath in self.footpaths.from_stop(stop) {
                     let reached = arrival.saturating_add(footpath.duration);
                     if !stop_bags[footpath.to.0 as usize].insert(reached, grams, key(grams)) {
                         continue;
+                    }
+                    if let Some(sink) = fold {
+                        sink.fold(
+                            footpath.to,
+                            reached - segment.departure,
+                            grams,
+                            index,
+                            alight as u16,
+                            true,
+                        );
                     }
                     for &(egress, seconds) in &request.egress {
                         if egress == footpath.to {
@@ -691,6 +807,161 @@ impl<'a> McTbtrEngine<'a> {
             alight,
             walk,
         });
+    }
+
+    /// The least-emissions cost matrix over this engine's candidate
+    /// set: per origin–destination cell, the cleanest journey (ties
+    /// toward the shorter travel time) among the (departure, arrival,
+    /// emissions bucket) Pareto candidates of the departure window,
+    /// optionally within a travel-time `budget`. The McTBTR
+    /// counterpart of the McRAPTOR matrix: one engine build serves
+    /// every origin, fanned out with rayon.
+    pub fn least_emissions_matrix(
+        &self,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        destinations: &[StopIdx],
+        window: u32,
+        budget: Option<u32>,
+        bucket: f64,
+    ) -> Vec<Vec<CostRow>> {
+        let mut slots = vec![0u32; self.timetable.stop_count() as usize];
+        for (index, stop) in destinations.iter().enumerate() {
+            slots[stop.0 as usize] = index as u32 + 1;
+        }
+        requests
+            .par_iter()
+            .map(|request| {
+                let departures = departure_candidates(self.timetable, request, window);
+                let mut best: Vec<Option<Winner>> = vec![None; destinations.len()];
+                let mut fold = Some(MatrixSink {
+                    slots: &slots,
+                    budget,
+                    best: &mut best,
+                });
+                let (arena_out, _) = self.passes(request, &departures, bucket, &mut fold);
+                best.into_iter()
+                    .enumerate()
+                    .filter_map(|(slot, winner)| {
+                        winner.map(|winner| {
+                            self.cost_row(inputs, &winner, &arena_out, destinations[slot])
+                        })
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Walks a matrix winner's chain into a cost row, mirroring the
+    /// McRAPTOR matrix reconstruction; the sentinel leaf is the
+    /// origin's zero-ride floor.
+    fn cost_row(
+        &self,
+        inputs: &CostInputs<'_>,
+        winner: &Winner,
+        arena: &[Segment],
+        to: StopIdx,
+    ) -> CostRow {
+        let mut rides = 0u32;
+        let mut transit_meters = 0.0;
+        let mut walk_meters = 0.0;
+        let mut legs: Vec<(TripIdx, u16, u16)> = Vec::new();
+        let mut fare_legs: Vec<FareLeg> = Vec::new();
+        if winner.leaf != ACCESS_LEAF {
+            let mut segment = &arena[winner.leaf as usize];
+            let mut alight = winner.alight;
+            if winner.walked {
+                let stops = self
+                    .timetable
+                    .pattern_stops(self.view.line_pattern(self.view.line_of(segment.trip)));
+                walk_meters += self
+                    .footpaths
+                    .from_stop(stops[alight as usize])
+                    .iter()
+                    .find(|footpath| footpath.to == to)
+                    .map(|footpath| footpath.meters)
+                    .unwrap_or(0.0);
+            }
+            loop {
+                let trip = segment.trip;
+                let backing = self.view.backing(trip);
+                rides += 1;
+                transit_meters +=
+                    inputs.geometry.leg_distance(backing, segment.board, alight) as f64;
+                if inputs.with_geometry {
+                    legs.push((backing, segment.board, alight));
+                }
+                if inputs.fares.is_some() {
+                    let pattern = self.timetable.trip_pattern(backing);
+                    let stops = self.timetable.pattern_stops(pattern);
+                    fare_legs.push(FareLeg {
+                        route: self.timetable.pattern_route(pattern),
+                        board_stop: stops[segment.board as usize].0,
+                        alight_stop: stops[alight as usize].0,
+                        board_time: self.timetable.trip_stop_times(backing)[segment.board as usize]
+                            .departure
+                            .saturating_sub(self.view.day_offset(trip)),
+                    });
+                }
+                let board_stop = self
+                    .timetable
+                    .pattern_stops(self.view.line_pattern(self.view.line_of(trip)))
+                    [segment.board as usize];
+                match segment.origin {
+                    SegOrigin::Access { .. } => break,
+                    SegOrigin::Transfer { parent, alight: at }
+                    | SegOrigin::Walked {
+                        parent, alight: at, ..
+                    } => {
+                        let parent_segment = &arena[parent as usize];
+                        let parent_stops = self.timetable.pattern_stops(
+                            self.view
+                                .line_pattern(self.view.line_of(parent_segment.trip)),
+                        );
+                        let parent_stop = parent_stops[at as usize];
+                        if parent_stop != board_stop {
+                            walk_meters += self
+                                .footpaths
+                                .from_stop(parent_stop)
+                                .iter()
+                                .find(|footpath| footpath.to == board_stop)
+                                .map(|footpath| footpath.meters)
+                                .unwrap_or(0.0);
+                        }
+                        alight = at;
+                        segment = parent_segment;
+                    }
+                }
+            }
+        }
+        let geometry = match (inputs.with_geometry, inputs.leg_geometry) {
+            (true, Some(shapes)) => {
+                let parts: Vec<Vec<(f64, f64)>> = legs
+                    .iter()
+                    .rev()
+                    .map(|&(trip, board, alight)| shapes.leg_coordinates(trip, board, alight))
+                    .collect();
+                Some(wkb_multi_line_string(&parts))
+            }
+            _ => None,
+        };
+        let fare = match inputs.fares {
+            Some(tables) => {
+                fare_legs.reverse();
+                tables.price(&fare_legs)
+            }
+            None => f64::NAN,
+        };
+        CostRow {
+            to: to.0,
+            seconds: winner.seconds,
+            rides,
+            transit_meters,
+            walk_meters,
+            emission_grams: winner.grams,
+            fare,
+            geometry,
+        }
     }
 
     /// Walks a winning segment chain back into the journey contract.
@@ -1211,6 +1482,82 @@ mod tests {
             3,
         );
         assert_eq!(frontier, vec![(200, 80.0, 1)]);
+    }
+
+    #[test]
+    fn the_matrix_matches_the_mcraptor_matrix() {
+        // Cell for cell against the McRAPTOR matrix on the forked
+        // fixture, across budgets — including the zero-ride floor of
+        // the origin's own cell and the empty cell a tight budget
+        // leaves.
+        let (timetable, geometry) = forked();
+        let factors = [50.0, 100.0, 10.0];
+        let footpaths = Transfers::empty(4);
+        let view = DayView::universal(&timetable);
+        let inputs = CostInputs {
+            geometry: &geometry,
+            factors: &factors,
+            leg_geometry: None,
+            with_geometry: false,
+            fares: None,
+        };
+        let requests = vec![Request {
+            departure: 0,
+            access: vec![(StopIdx(0), 0)],
+            egress: Vec::new(),
+            active_services: vec![true],
+            active_services_previous: vec![false],
+            max_transfers: 3,
+        }];
+        let destinations = [StopIdx(0), StopIdx(3)];
+        let engine = McTbtrEngine::for_date(
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &requests[0].active_services,
+            &requests[0].active_services_previous,
+        );
+        for budget in [None, Some(600), Some(400), Some(50)] {
+            let tbtr =
+                engine.least_emissions_matrix(&inputs, &requests, &destinations, 600, budget, 1e-6);
+            let raptor = mcraptor::least_emissions_matrix(
+                &view,
+                &timetable,
+                &footpaths,
+                &inputs,
+                &requests,
+                &destinations,
+                600,
+                budget,
+                1e-6,
+            );
+            let cells = |rows: &Vec<Vec<CostRow>>| -> Vec<(u32, u32, u32, f64, f64, f64)> {
+                let mut list: Vec<_> = rows[0]
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.to,
+                            row.seconds,
+                            row.rides,
+                            row.transit_meters,
+                            row.walk_meters,
+                            row.emission_grams,
+                        )
+                    })
+                    .collect();
+                list.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                list
+            };
+            assert_eq!(cells(&tbtr), cells(&raptor), "budget {budget:?}");
+        }
+        // The unbudgeted cell is the slow clean line, not the fast
+        // dirty one.
+        let rows =
+            engine.least_emissions_matrix(&inputs, &requests, &destinations, 600, None, 1e-6);
+        let cell = rows[0].iter().find(|row| row.to == 3).unwrap();
+        assert_eq!((cell.seconds, cell.rides), (600, 2));
+        assert!((cell.emission_grams - 35.0).abs() < 1e-9);
     }
 
     #[test]

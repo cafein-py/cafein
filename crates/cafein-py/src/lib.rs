@@ -3114,7 +3114,7 @@ impl TransportNetwork {
     /// emissions bucket) Pareto set instead, which also holds the
     /// cleaner-but-slower journeys the time-optimal set misses; cells
     /// can therefore report strictly lower emissions.
-    #[pyo3(signature = (from_stops, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, to_stops = None, candidates = "time", bucket = 25.0, geometries = false))]
+    #[pyo3(signature = (from_stops, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, to_stops = None, candidates = "time", bucket = 25.0, router = "raptor", geometries = false))]
     #[allow(clippy::too_many_arguments)]
     fn least_cost_matrix(
         &self,
@@ -3131,8 +3131,17 @@ impl TransportNetwork {
         to_stops: Option<Vec<String>>,
         candidates: &str,
         bucket: f64,
+        router: &str,
         geometries: bool,
     ) -> PyResult<Py<PyDict>> {
+        if router != "raptor" && router != "tbtr" {
+            return Err(PyValueError::new_err("router must be 'raptor' or 'tbtr'"));
+        }
+        if router == "tbtr" && candidates != "pareto" {
+            return Err(PyValueError::new_err(
+                "router='tbtr' requires candidates='pareto'",
+            ));
+        }
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
                 "no trip distances installed; build the network with trip distances enabled",
@@ -3216,6 +3225,24 @@ impl TransportNetwork {
             fares: tables.as_ref(),
         };
         let rows = py.allow_threads(|| {
+            if candidates == "pareto" && router == "tbtr" {
+                let engine = McTbtrEngine::for_date(
+                    &self.build.timetable,
+                    &self.transfers,
+                    geometry,
+                    &per_trip,
+                    &active_services,
+                    &active_services_previous,
+                );
+                return engine.least_emissions_matrix(
+                    &inputs,
+                    &requests,
+                    &destinations,
+                    window,
+                    budget,
+                    bucket,
+                );
+            }
             if candidates == "pareto" {
                 let view = DayView::for_date(
                     &self.build.timetable,
