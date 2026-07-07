@@ -97,13 +97,24 @@ fn stations(transfers: &Transfers, stop_count: u32) -> Vec<StopIdx> {
         }
         root
     }
+    // Collect directed zero-duration edges, then union a pair only when the
+    // reverse also exists: a station is stops *mutually* reachable at 0 s.
+    // A one-way zero transfer must not merge — the members would not share a
+    // representative that can board all of their trips, and the skipped
+    // stop's departures would be missed. Unmerged stops just run their own
+    // search, which never yields fewer shortcuts.
+    let mut zero: HashSet<(u32, u32)> = HashSet::new();
     for from in 0..stop_count {
         for edge in transfers.from_stop(StopIdx(from)) {
-            if edge.duration != 0 {
-                continue;
+            if edge.duration == 0 {
+                zero.insert((from, edge.to.0));
             }
+        }
+    }
+    for &(from, to) in &zero {
+        if from < to && zero.contains(&(to, from)) {
             let a = find(&mut representative, from);
-            let b = find(&mut representative, edge.to.0);
+            let b = find(&mut representative, to);
             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
             representative[hi as usize] = StopIdx(lo);
         }
@@ -218,6 +229,14 @@ fn collect_departures(
             Some(route) => result.last_mut().unwrap().routes.push(route),
         }
     }
+    // The trailing bucket holds any route segments with no source-station
+    // marker below them and is dropped — as in the reference. Those are
+    // departures with no trip boardable within the source station, which
+    // generate no shortcut candidates (a candidate's first trip must be
+    // boarded in the source station; a first trip reached by an initial
+    // walk is a witness, considered inside the searches of the departures
+    // that do have a station boarding). So dropping them loses no
+    // shortcut.
     result.pop();
     for departure in &mut result {
         departure.routes.sort_unstable();
@@ -319,9 +338,9 @@ impl<'a> Search<'a> {
     fn run_departure(&mut self, departure: &Departure) {
         self.clear_labels();
         self.relax_initial(departure.time);
-        self.scan_routes(1);
+        self.scan_initial_routes(departure);
         self.intermediate_dijkstra();
-        self.scan_routes(2);
+        self.scan_routes();
         self.final_dijkstra();
     }
 
@@ -347,7 +366,9 @@ impl<'a> Search<'a> {
     }
 
     /// Round-0 walk: seed every stop reachable from the source at
-    /// `departure + walk`, valid for all three rounds; they board trip 1.
+    /// `departure + walk`, valid as a witness in all three rounds. The
+    /// initial trips are boarded from `departure.routes`, not from these
+    /// seeds, so no stop is queued for a route scan here.
     fn relax_initial(&mut self, departure: u32) {
         for stop in 0..self.stop_count as usize {
             if self.direct[stop] == NEVER {
@@ -357,23 +378,58 @@ impl<'a> Search<'a> {
             self.zero[stop] = arrival;
             self.one[stop] = arrival;
             self.two[stop] = arrival;
-            self.updated_by_transfer.push(StopIdx(stop as u32));
         }
     }
 
-    /// Scan the routes serving the transfer-updated stops, boarding the
-    /// earliest catchable trip and riding onward. `round` is 1 or 2.
-    fn scan_routes(&mut self, round: u8) {
+    /// Round 1: board only the first-trip segments this departure catches
+    /// (`departure.routes`), as in the reference. Scanning every
+    /// walk-reachable route instead would board later departures' first
+    /// trips here too, inflating the search and emitting superfluous
+    /// candidates.
+    fn scan_initial_routes(&mut self, departure: &Departure) {
         let (view, timetable, station, source_rep) =
             (self.view, self.timetable, self.station, self.source_rep);
+        self.updated_by_route.clear();
+        for &(line, position) in &departure.routes {
+            let pattern = view.line_pattern(line);
+            let stops = timetable.pattern_stops(pattern);
+            let board = stops[position as usize];
+            let ready = self.zero[board.0 as usize];
+            if ready == NEVER {
+                continue;
+            }
+            let Some(trip) = earliest_boardable(view, timetable, line, position, ready) else {
+                continue;
+            };
+            let offset = view.line_day_offset(line);
+            let times = view.stored_times(timetable, trip);
+            for pos in position as usize + 1..stops.len() {
+                let stop = stops[pos];
+                let arrival = times[pos].arrival.saturating_sub(offset);
+                if arrival < self.one[stop.0 as usize] {
+                    self.one[stop.0 as usize] = arrival;
+                    // Candidate iff the trip was boarded within the source
+                    // station; its alight is the shortcut origin.
+                    self.one_parent[stop.0 as usize] =
+                        (station[board.0 as usize] == source_rep).then_some(stop);
+                    if arrival < self.two[stop.0 as usize] {
+                        self.two[stop.0 as usize] = arrival;
+                    }
+                    self.updated_by_route.push(stop);
+                }
+            }
+        }
+        dedup_stops(&mut self.updated_by_route);
+    }
+
+    /// Round 2: board the routes serving the intermediate-transfer-updated
+    /// stops, riding onward and recording shortcut destinations.
+    fn scan_routes(&mut self) {
+        let (view, timetable) = (self.view, self.timetable);
         let boarding = std::mem::take(&mut self.updated_by_transfer);
         self.updated_by_route.clear();
         for board in boarding {
-            let ready = if round == 1 {
-                self.zero[board.0 as usize]
-            } else {
-                self.one[board.0 as usize]
-            };
+            let ready = self.one[board.0 as usize];
             if ready == NEVER {
                 continue;
             }
@@ -393,20 +449,7 @@ impl<'a> Search<'a> {
                     for position in served.position as usize + 1..stops.len() {
                         let stop = stops[position];
                         let arrival = times[position].arrival.saturating_sub(offset);
-                        if round == 1 {
-                            if arrival < self.one[stop.0 as usize] {
-                                self.one[stop.0 as usize] = arrival;
-                                // Candidate iff the trip was boarded within
-                                // the source station; its alight is the
-                                // shortcut origin.
-                                self.one_parent[stop.0 as usize] =
-                                    (station[board.0 as usize] == source_rep).then_some(stop);
-                                if arrival < self.two[stop.0 as usize] {
-                                    self.two[stop.0 as usize] = arrival;
-                                }
-                                self.updated_by_route.push(stop);
-                            }
-                        } else if arrival < self.two[stop.0 as usize] {
+                        if arrival < self.two[stop.0 as usize] {
                             self.two[stop.0 as usize] = arrival;
                             self.two_route_parent[stop.0 as usize] =
                                 self.candidate_destination(board);
@@ -450,6 +493,13 @@ impl<'a> Search<'a> {
             for edge in transfers.from_stop(StopIdx(stop)) {
                 let next = time.saturating_add(edge.duration);
                 let to = edge.to.0 as usize;
+                // Strict improvement suffices: labels are fresh each
+                // departure, so the reference's equal-arrival branch —
+                // which only fires for a label carried over from a
+                // *previous* departure (a stale timestamp) — never
+                // applies here. Within one departure, a witness tie means
+                // an equally-good non-candidate path already reaches `to`,
+                // so treating `to` as non-candidate loses no shortcut.
                 if next < self.one[to] {
                     self.one[to] = next;
                     self.one_parent[to] = self.one_parent[stop as usize];
@@ -488,9 +538,15 @@ impl<'a> Search<'a> {
             for edge in transfers.from_stop(StopIdx(stop)) {
                 let next = time.saturating_add(edge.duration);
                 let to = edge.to.0 as usize;
+                // Strict improvement, as in the reference (`arrivalByEdge2`
+                // fires only on a strictly earlier arrival): a witness that
+                // reaches `to` strictly earlier dominates `to`'s candidate,
+                // so drop it. An equal-time witness keeps the shortcut —
+                // the reference does the same, so a Pareto point is never
+                // dropped, at the cost of an occasional superfluous
+                // shortcut on an exact tie.
                 if next < self.two[to] {
                     self.two[to] = next;
-                    // A witness reached `to` no later: its candidate dies.
                     if let Some(route_parent) = self.two_route_parent[to].take() {
                         if let Some(set) = self.dest_candidates.get_mut(&route_parent) {
                             set.remove(&edge.to);
