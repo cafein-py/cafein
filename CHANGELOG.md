@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- McTBTR groundwork — the multicriteria transfer set: the compute core
+  gains a dominance-aware variant of the TBTR transfer precompute for
+  the (arrival, emissions) criteria. Witt's reduction is unsound under
+  a second criterion, so generation boards later-but-cleaner trips
+  besides the earliest catchable one and the reduction keeps a
+  transfer whenever it lands an (arrival, grams) point nothing else
+  dominates — a provable superset of the time-optimal set. The
+  multicriteria trip-based query engine builds on it in a later
+  release; nothing user-facing changes yet.
+
 - Footpath transfers cross into the routing core as flat arrays:
   ``cafein.streets.walking_footpaths`` (and ``walking_streets``) now
   return a ``Footpaths`` container — stop ids named once, the closed
