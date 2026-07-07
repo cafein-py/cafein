@@ -317,6 +317,44 @@ def test_pareto_candidates_lower_the_emission_cells(network):
     assert cell(candidates="pareto")["emissions"] < interim["emissions"]
 
 
+def test_the_tbtr_pareto_matrix_matches_mcraptor(network):
+    from cafein import TravelCostMatrix
+
+    # The measured gap pair, cell for cell between the two engines at
+    # a vanishing bucket.
+    origin, destination = "1370104", "4960238"
+    cells = [
+        TravelCostMatrix(
+            network,
+            [origin],
+            [destination],
+            "2022-02-22",
+            "08:30:00",
+            optimize="emissions",
+            window=1,
+            max_transfers=4,
+            candidates="pareto",
+            bucket=1e-6,
+            router=router,
+        ).iloc[0]
+        for router in ("raptor", "tbtr")
+    ]
+    for column in ["travel_time", "transfers", "transit_distance", "walk_distance"]:
+        assert cells[0][column] == cells[1][column]
+    assert cells[0]["emissions"] == pytest.approx(cells[1]["emissions"], abs=1e-6)
+    with pytest.raises(ValueError, match="candidates='pareto'"):
+        TravelCostMatrix(
+            network,
+            [origin],
+            [destination],
+            "2022-02-22",
+            "08:30:00",
+            optimize="emissions",
+            window=1,
+            router="tbtr",
+        )
+
+
 def test_pareto_matrices_validate_their_options(network):
     from cafein import TravelCostMatrix
 
