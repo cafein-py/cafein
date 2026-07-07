@@ -103,9 +103,10 @@ def journey_frontier(
         The candidate journey set: ``"time"`` for the range-RAPTOR
         time-optimal journeys, ``"pareto"`` for the McRAPTOR journeys
         Pareto-optimal in (departure, arrival, emissions). Pareto
-        candidates require stop ids and a network with trip distances;
-        journeys riding a trip without a resolved emission factor never
-        enter them.
+        candidates require a network with trip distances; journeys
+        riding a trip without a resolved emission factor never enter
+        them. Coordinate queries route door-to-door either way and
+        include the walking-only journey.
     bucket : float (optional, default: 25.0)
         The emissions bucket width in grams CO₂e of the pareto search:
         journeys within one bucket of each other count as equal on
@@ -135,8 +136,6 @@ def journey_frontier(
         raise ValueError(
             "origin and destination must both be stop ids or both be coordinates"
         )
-    if candidates == "pareto" and not stops[0]:
-        raise ValueError("pareto candidates require stop ids, not coordinates")
     if stops[0]:
         if not (
             walking_speed_kmph is None
@@ -167,6 +166,22 @@ def journey_frontier(
                 window,
                 geometries=geometries,
             )
+    elif candidates == "pareto":
+        from cafein.network import _walk_options
+
+        trip_factors = emissions.trip_factors(network, factors, components)
+        journeys = network._core.mc_route_between_coordinates(
+            tuple(origin),
+            tuple(destination),
+            date,
+            departure,
+            trip_factors,
+            window,
+            max_transfers,
+            bucket,
+            *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
+            geometries,
+        )
     else:
         journeys = network.route_between_coordinates(
             tuple(origin),

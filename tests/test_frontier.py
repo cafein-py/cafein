@@ -556,6 +556,51 @@ def test_pareto_candidates_match_the_oracle_over_footpaths(network_with_footpath
         )
 
 
+def test_pareto_candidates_route_door_to_door(network_with_footpaths):
+    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+    origin, destination = coordinates["1100602"], coordinates["1040280"]
+    frame = journey_frontier(
+        network_with_footpaths,
+        origin,
+        destination,
+        "2022-02-22",
+        "08:30:00",
+        window=600,
+        candidates="pareto",
+        bucket=1e-6,
+    )
+    # The walking-only journey anchors the clean end, exactly as in the
+    # time-candidate door-to-door frontier.
+    walk = frame[frame["rides"] == 0]
+    assert len(walk) == 1
+    assert walk.iloc[0]["emissions"] == 0.0
+    assert bool(walk.iloc[0]["frontier"])
+    assert walk.iloc[0]["journey"]["legs"][0]["type"] == "walk"
+    # Whatever rides beats walking — the walk-domination rule.
+    transit = frame[frame["rides"] >= 1]
+    assert len(transit) > 0
+    assert (transit["travel_time"] < walk.iloc[0]["travel_time"]).all()
+    # Soundness against the time-optimal door-to-door profile: every
+    # resolved interim candidate is dominated or equalled by a pareto
+    # candidate, and both engines agree on the fastest arrival.
+    interim = journey_frontier(
+        network_with_footpaths,
+        origin,
+        destination,
+        "2022-02-22",
+        "08:30:00",
+        window=600,
+    )
+    for row in interim[interim["emissions"].notna()].itertuples():
+        assert any(
+            candidate.departure >= row.departure
+            and candidate.arrival <= row.arrival
+            and candidate.emissions <= row.emissions + 1e-6
+            for candidate in frame.itertuples()
+        )
+    assert transit["arrival"].min() == interim[interim["rides"] >= 1]["arrival"].min()
+
+
 def test_pareto_candidate_options_are_validated(tmp_path):
     from cafein import TransportNetwork
 
@@ -570,16 +615,6 @@ def test_pareto_candidate_options_are_validated(tmp_path):
             "08:00:00",
             window=1,
             candidates="fastest",
-        )
-    with pytest.raises(ValueError, match="stop ids"):
-        journey_frontier(
-            network,
-            (60.0, 24.0),
-            (60.0, 24.05),
-            "2022-02-22",
-            "08:00:00",
-            window=1,
-            candidates="pareto",
         )
     with pytest.raises(ValueError, match="bucket"):
         journey_frontier(
