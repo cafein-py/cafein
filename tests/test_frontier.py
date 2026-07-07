@@ -601,6 +601,70 @@ def test_pareto_candidates_route_door_to_door(network_with_footpaths):
     assert transit["arrival"].min() == interim[interim["rides"] >= 1]["arrival"].min()
 
 
+def test_the_tbtr_pareto_router_matches_mcraptor(network_with_footpaths):
+    from cafein import exhaustive_frontier
+
+    # The full McTBTR stack — factor-aware transfer set plus segment
+    # scanning with query-time footpaths — against McRAPTOR and the
+    # oracle on the real closed Helsinki footpath network.
+    origin, destination = "1100602", "1040280"
+    true_set = exhaustive_frontier(
+        network_with_footpaths,
+        origin,
+        destination,
+        "2022-02-22",
+        "08:30:00",
+        max_transfers=3,
+    )
+    frames = [
+        journey_frontier(
+            network_with_footpaths,
+            origin,
+            destination,
+            "2022-02-22",
+            "08:30:00",
+            window=1,
+            max_transfers=3,
+            candidates="pareto",
+            bucket=1e-6,
+            router=router,
+        )
+        for router in ("raptor", "tbtr")
+    ]
+    for frame in frames:
+        on = frame[frame["frontier"]]
+        assert on["arrival"].tolist() == true_set["arrival"].tolist()
+        assert on["rides"].tolist() == true_set["rides"].tolist()
+        assert on["emissions"].tolist() == pytest.approx(
+            true_set["emissions"].tolist(), abs=1e-3
+        )
+    # And over a window, journey for journey. The vanishing bucket
+    # makes both searches exact — at coarser buckets each engine may
+    # legitimately keep a different same-bucket representative.
+    profiles = [
+        journey_frontier(
+            network_with_footpaths,
+            origin,
+            destination,
+            "2022-02-22",
+            "08:30:00",
+            window=600,
+            max_transfers=3,
+            candidates="pareto",
+            bucket=1e-6,
+            router=router,
+        )
+        for router in ("raptor", "tbtr")
+    ]
+    columns = ["departure", "arrival", "rides", "emissions", "frontier"]
+    ordered = [
+        frame.sort_values(["departure", "arrival"]).reset_index(drop=True)
+        for frame in profiles
+    ]
+    for column in columns:
+        assert ordered[0][column].tolist() == pytest.approx(ordered[1][column].tolist())
+
+
 def test_pareto_candidate_options_are_validated(tmp_path):
     from cafein import TransportNetwork
 
@@ -626,6 +690,21 @@ def test_pareto_candidate_options_are_validated(tmp_path):
             window=1,
             candidates="pareto",
             bucket=0.0,
+        )
+    with pytest.raises(ValueError, match="router"):
+        journey_frontier(
+            network,
+            "A",
+            "B",
+            "2022-02-22",
+            "08:00:00",
+            window=1,
+            candidates="pareto",
+            router="dijkstra",
+        )
+    with pytest.raises(ValueError, match="candidates='pareto'"):
+        journey_frontier(
+            network, "A", "B", "2022-02-22", "08:00:00", window=1, router="tbtr"
         )
 
 

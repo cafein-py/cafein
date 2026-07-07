@@ -9,8 +9,15 @@
   besides the earliest catchable one and the reduction keeps a
   transfer whenever it lands an (arrival, grams) point nothing else
   dominates — a provable superset of the time-optimal set. The
-  multicriteria trip-based query engine builds on it in a later
-  release; nothing user-facing changes yet.
+  McTBTR query engine scans segments over that set with per-(trip,
+  round) (board position, κ) Pareto bags, query-time footpath
+  relaxation (the same hybrid as the time engine), and
+  departure-window passes, returning the same journeys as McRAPTOR —
+  verified against it and the exhaustive oracle on synthetic fixtures
+  and on the Helsinki network with footpaths. Select it with
+  ``journey_frontier(candidates="pareto", router="tbtr")`` (stop ids;
+  the engine precomputes the date's transfer set first, so it is
+  built for batch reuse rather than single pairs).
 
 - Footpath transfers cross into the routing core as flat arrays:
   ``cafein.streets.walking_footpaths`` (and ``walking_streets``) now
