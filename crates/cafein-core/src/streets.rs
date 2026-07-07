@@ -1103,27 +1103,50 @@ impl StreetNetwork {
             return None;
         }
         let snap = self.snap(latitude, longitude, max_snap_distance)?;
+        Some(self.reachable_from_snaps(&[snap], walking_speed, max_seconds))
+    }
+
+    /// Every transit stop reachable on foot from one or more snapped
+    /// points, sorted by stop index. The bounded road search plus the
+    /// link join shared by [`access_stops`](Self::access_stops) (a
+    /// coordinate's single snap) and
+    /// [`stop_transfers`](Self::stop_transfers) (all of a source stop's
+    /// links). The search is seeded from every source snap's split-edge
+    /// endpoints, and the walk to a candidate is the minimum over all
+    /// source snaps — so a source that snaps to several edges reaches
+    /// through whichever link is nearest, just as a destination stop is
+    /// reached through its nearest link. The caller has already
+    /// validated the speed and cutoff. Uses the thread-local search
+    /// state, so parallel callers reuse it per worker thread. Seconds
+    /// round up (understating a walk could catch a missed departure);
+    /// meters stay the exact street-path length.
+    fn reachable_from_snaps(
+        &self,
+        snaps: &[Snap],
+        walking_speed: f64,
+        max_seconds: f64,
+    ) -> Vec<WalkedStop> {
         let cutoff = max_seconds * walking_speed;
-        let (from, to) = self.edge_endpoints(snap.edge);
-        let length = self.arrays.lengths()[snap.edge as usize];
         SEARCH_STATE.with(|cell| {
             let state = &mut cell.borrow_mut();
-            self.bounded_dijkstra(
-                &[
-                    (from, snap.connector + snap.fraction * length),
-                    (to, snap.connector + (1.0 - snap.fraction) * length),
-                ],
-                cutoff,
-                state,
-            );
+            let mut seeds: Vec<(u32, f64)> = Vec::with_capacity(snaps.len() * 2);
+            for snap in snaps {
+                let (from, to) = self.edge_endpoints(snap.edge);
+                let length = self.arrays.lengths()[snap.edge as usize];
+                seeds.push((from, snap.connector + snap.fraction * length));
+                seeds.push((to, snap.connector + (1.0 - snap.fraction) * length));
+            }
+            self.bounded_dijkstra(&seeds, cutoff, state);
             // The candidate links near the search: those at reached
-            // vertices, plus those on the snapped edge itself, whose
-            // direct on-edge path can be walkable even when neither
-            // endpoint is within the cutoff. Sorted so processing order
-            // is independent of hash-map iteration order.
+            // vertices, plus those on any source edge, whose direct
+            // on-edge path can be walkable even when neither endpoint is
+            // within the cutoff. Sorted so processing order is
+            // independent of hash-map iteration order.
             let mut candidates: Vec<u32> = Vec::new();
-            for vertex in [from, to] {
-                candidates.extend(self.links_at(vertex));
+            for snap in snaps {
+                let (from, to) = self.edge_endpoints(snap.edge);
+                candidates.extend(self.links_at(from));
+                candidates.extend(self.links_at(to));
             }
             for &vertex in state.distances.keys() {
                 candidates.extend(self.links_at(vertex));
@@ -1139,13 +1162,16 @@ impl StreetNetwork {
                     state.distance(link_from) + link.fraction * link_length,
                     state.distance(link_to) + (1.0 - link.fraction) * link_length,
                 ) + link.connector;
-                if link.edge == snap.edge {
-                    // Both points sit on one edge: walking between the snap
-                    // points never has to reach an endpoint.
-                    let direct = snap.connector
-                        + (link.fraction - snap.fraction).abs() * length
-                        + link.connector;
-                    meters = meters.min(direct);
+                // A source snap on this link's edge can walk it directly,
+                // never reaching an endpoint; keep the shortest over all.
+                for snap in snaps {
+                    if snap.edge == link.edge {
+                        let length = self.arrays.lengths()[snap.edge as usize];
+                        let direct = snap.connector
+                            + (link.fraction - snap.fraction).abs() * length
+                            + link.connector;
+                        meters = meters.min(direct);
+                    }
                 }
                 if meters <= cutoff + 1e-9 {
                     // A stop with several links keeps its shortest path.
@@ -1164,8 +1190,72 @@ impl StreetNetwork {
                 })
                 .collect();
             reached.sort_unstable_by_key(|walk| walk.stop);
-            Some(reached)
+            reached
         })
+    }
+
+    /// The walking transfers between every pair of linked stops within
+    /// `max_seconds` on foot — the road-network shortest walk, computed
+    /// natively and in parallel over source stops. Emitted as
+    /// `(from, to, seconds, meters)` edges, self-transfers dropped.
+    ///
+    /// Each edge is one complete direct road walk (never a chain through
+    /// an intermediate stop): the shortest path between two coordinates
+    /// runs over streets, not stops, so a bounded search from each source
+    /// stop's links already yields the true walk to every stop in range.
+    /// A stop that snaps to several edges is searched from all of them,
+    /// matching how `access_stops` reaches a stop through any of its
+    /// links, so the result stays symmetric. Unlike the footpath closure
+    /// this can replace, the set is *not* padded with beyond-cutoff pairs
+    /// reachable only by chaining shorter hops — those represent walks
+    /// past the cutoff and are excluded by policy; single-hop relaxation
+    /// stays complete for every walk within it. Seconds round up and
+    /// meters are exact, matching `access_stops`.
+    ///
+    /// This is a **road-search substrate**, not the ULTRA shortcut set:
+    /// it enumerates every within-cutoff walk with no timetable awareness
+    /// or witness pruning, so it is the dense (unrestricted) transfer
+    /// graph ULTRA's shortcut enumeration consumes and reduces — and the
+    /// oracle its minimal output is checked against — not the minimal
+    /// shortcut output itself (see plans/ultra-plan.md).
+    pub fn stop_transfers(
+        &self,
+        walking_speed: f64,
+        max_seconds: f64,
+    ) -> Vec<(StopIdx, StopIdx, u32, f64)> {
+        if !walking_speed.is_finite()
+            || walking_speed <= 0.0
+            || !max_seconds.is_finite()
+            || max_seconds < 0.0
+        {
+            return Vec::new();
+        }
+        // Group each source stop's links so the search leaves from all of
+        // them — a stop can snap to several edges — mirroring how
+        // access_stops reaches a stop through any of its links.
+        let mut by_stop: HashMap<StopIdx, Vec<Snap>> = HashMap::new();
+        for link in &self.links {
+            by_stop.entry(link.stop).or_default().push(Snap {
+                edge: link.edge,
+                fraction: link.fraction,
+                connector: link.connector,
+            });
+        }
+        let mut sources: Vec<(StopIdx, Vec<Snap>)> = by_stop.into_iter().collect();
+        sources.sort_unstable_by_key(|(stop, _)| *stop);
+        let mut edges: Vec<(StopIdx, StopIdx, u32, f64)> = sources
+            .into_par_iter()
+            .flat_map_iter(|(stop, snaps)| {
+                self.reachable_from_snaps(&snaps, walking_speed, max_seconds)
+                    .into_iter()
+                    .filter(move |walk| walk.stop != stop)
+                    .map(move |walk| (stop, walk.stop, walk.seconds, walk.meters))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        // Deterministic order regardless of worker scheduling.
+        edges.sort_unstable_by_key(|&(from, to, _, _)| (from, to));
+        edges
     }
 
     /// Walking times and exact street distances from one snapped point
@@ -2307,6 +2397,140 @@ mod tests {
         let (lon, lat) = lonlat(0.0, 0.0);
         let reached = network.access_stops(lat, lon, 1.0, 600.0, 100.0).unwrap();
         assert_walks(&reached, &[(0, 400)]);
+    }
+
+    /// The `(from, to, seconds)` view of a transfer set, dropping the
+    /// exact meters (checked separately where they matter).
+    fn transfer_times(edges: &[(StopIdx, StopIdx, u32, f64)]) -> Vec<(u32, u32, u32)> {
+        edges
+            .iter()
+            .map(|&(from, to, seconds, _)| (from.0, to.0, seconds))
+            .collect()
+    }
+
+    #[test]
+    fn stop_transfers_are_direct_walks_within_the_cutoff() {
+        // Three stops along one 1000 m edge at 100/400/900 m. Pairwise
+        // walks are 300, 500, 800 m; at a 600 m cutoff only the 300 m and
+        // 500 m pairs survive — the 800 m pair is past the cutoff and is
+        // never padded back in by chaining through the middle stop.
+        let network = network(
+            2,
+            3,
+            &[(0, 1, 1000.0, straight((0.0, 0.0), (1000.0, 0.0)))],
+            vec![
+                link(0, 0, 0.1, 0.0),
+                link(1, 0, 0.4, 0.0),
+                link(2, 0, 0.9, 0.0),
+            ],
+        )
+        .unwrap();
+        let edges = network.stop_transfers(1.0, 600.0);
+        assert_eq!(
+            transfer_times(&edges),
+            vec![(0, 1, 300), (1, 0, 300), (1, 2, 500), (2, 1, 500)],
+            "{edges:?}"
+        );
+        for &(_, _, seconds, meters) in &edges {
+            assert!(
+                (meters - f64::from(seconds)).abs() < 1.0,
+                "meters {meters} vs seconds {seconds}"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_transfers_are_symmetric() {
+        // Walking is undirected, so every A→B edge has a B→A twin with the
+        // same walk. An L of two edges with three stops exercises walks
+        // that run through a vertex.
+        let network = network(
+            3,
+            3,
+            &[
+                (0, 1, 300.0, straight((0.0, 0.0), (300.0, 0.0))),
+                (1, 2, 400.0, straight((300.0, 0.0), (300.0, 400.0))),
+            ],
+            vec![
+                link(0, 0, 0.2, 0.0),
+                link(1, 0, 0.9, 0.0),
+                link(2, 1, 0.5, 0.0),
+            ],
+        )
+        .unwrap();
+        let edges = network.stop_transfers(1.0, 900.0);
+        for &(from, to, seconds, meters) in &edges {
+            let twin = edges
+                .iter()
+                .find(|&&(a, b, _, _)| a == to && b == from)
+                .unwrap_or_else(|| panic!("no twin for {from:?}->{to:?} in {edges:?}"));
+            assert_eq!(twin.2, seconds, "asymmetric seconds {edges:?}");
+            assert!(
+                (twin.3 - meters).abs() < 1e-9,
+                "asymmetric meters {edges:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_transfers_search_from_all_source_links() {
+        // Source stop 0 snaps to both of two disconnected edges; stop 1
+        // sits only on the first, stop 2 only on the second. Searching
+        // from a single (nearest) link would reach one of them; searching
+        // from all links reaches both, symmetrically.
+        let network = network(
+            4,
+            3,
+            &[
+                (0, 1, 400.0, straight((0.0, 0.0), (400.0, 0.0))),
+                (2, 3, 400.0, straight((0.0, 1000.0), (400.0, 1000.0))),
+            ],
+            vec![
+                link(0, 0, 0.5, 0.0),
+                link(0, 1, 0.5, 0.0),
+                link(1, 0, 0.2, 0.0),
+                link(2, 1, 0.8, 0.0),
+            ],
+        )
+        .unwrap();
+        let edges = network.stop_transfers(1.0, 600.0);
+        assert_eq!(
+            transfer_times(&edges),
+            vec![(0, 1, 120), (0, 2, 120), (1, 0, 120), (2, 0, 120)],
+            "{edges:?}"
+        );
+    }
+
+    #[test]
+    fn stop_transfers_skip_disconnected_stops() {
+        // Two separate street components, one stop on each: neither can
+        // walk to the other, so the transfer set is empty.
+        let network = network(
+            4,
+            2,
+            &[
+                (0, 1, 400.0, straight((0.0, 0.0), (400.0, 0.0))),
+                (2, 3, 400.0, straight((0.0, 1000.0), (400.0, 1000.0))),
+            ],
+            vec![link(0, 0, 0.5, 0.0), link(1, 1, 0.5, 0.0)],
+        )
+        .unwrap();
+        assert!(network.stop_transfers(1.0, 3600.0).is_empty());
+    }
+
+    #[test]
+    fn stop_transfers_reject_invalid_parameters() {
+        let network = network(
+            2,
+            2,
+            &[(0, 1, 400.0, straight((0.0, 0.0), (400.0, 0.0)))],
+            vec![link(0, 0, 0.25, 0.0), link(1, 0, 0.75, 0.0)],
+        )
+        .unwrap();
+        assert!(network.stop_transfers(0.0, 600.0).is_empty());
+        assert!(network.stop_transfers(f64::NAN, 600.0).is_empty());
+        assert!(network.stop_transfers(1.0, -1.0).is_empty());
+        assert!(network.stop_transfers(1.0, f64::INFINITY).is_empty());
     }
 
     #[test]
