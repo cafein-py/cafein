@@ -493,7 +493,10 @@ impl<'a> McTbtrEngine<'a> {
             // Seed: board from every access stop.
             for &(stop, seconds) in &request.access {
                 let ready = departure.saturating_add(seconds);
-                let admitted = stop_bags[stop.0 as usize].insert(ready, 0.0, key(0.0));
+                // rides = 0: the trip-based engine ranks rounds in its
+                // trip bags, so its stop bags dominate on (arrival, key)
+                // only — see mcraptor::Bag::insert.
+                let admitted = stop_bags[stop.0 as usize].insert(ready, 0.0, key(0.0), 0);
                 if !admitted {
                     continue;
                 }
@@ -657,7 +660,7 @@ impl<'a> McTbtrEngine<'a> {
             }
             // Query-time footpaths, gated on stop-bag improvement (the
             // T4b semantics); improving walks board and join.
-            if stop_bags[stop.0 as usize].insert(arrival, grams, key(grams)) {
+            if stop_bags[stop.0 as usize].insert(arrival, grams, key(grams), 0) {
                 if let Some(sink) = fold {
                     sink.fold(
                         stop,
@@ -670,7 +673,7 @@ impl<'a> McTbtrEngine<'a> {
                 }
                 for footpath in self.footpaths.from_stop(stop) {
                     let reached = arrival.saturating_add(footpath.duration);
-                    if !stop_bags[footpath.to.0 as usize].insert(reached, grams, key(grams)) {
+                    if !stop_bags[footpath.to.0 as usize].insert(reached, grams, key(grams), 0) {
                         continue;
                     }
                     if let Some(sink) = fold {

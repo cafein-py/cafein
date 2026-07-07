@@ -61,12 +61,14 @@ struct Label {
 }
 
 /// One bag entry; `key` is the grams bucket, `grams` the exact
-/// (microgram-quantized) value behind it.
+/// (microgram-quantized) value behind it, `rides` the transit legs the
+/// label used to reach the stop.
 #[derive(Debug, Clone, Copy)]
 struct Entry {
     arrival: u32,
     key: i64,
     grams: f64,
+    rides: u8,
 }
 
 /// A per-stop label bag under bucketed dominance, cumulative across
@@ -78,26 +80,41 @@ pub(crate) struct Bag {
 }
 
 impl Bag {
-    /// Inserts unless an entry arriving no later sits in the same or a
-    /// cleaner bucket; evicts what the newcomer covers. An entry equal
-    /// on both axes but strictly dirtier in exact grams is refined
-    /// (replaced), keeping the bucket's representative as clean as the
-    /// search has seen.
-    pub(crate) fn insert(&mut self, arrival: u32, grams: f64, key: i64) -> bool {
+    /// Inserts unless an entry arriving no later, in the same or a
+    /// cleaner bucket, AND on no more rides already dominates it; evicts
+    /// what the newcomer covers. The `rides` axis is what makes the
+    /// cumulative-across-passes bag sound under the second criterion: a
+    /// later-departure label may only suppress an earlier-departure one
+    /// when it also used no more transit legs, so it keeps at least the
+    /// onward-transfer budget to reproduce every continuation. Dropping
+    /// it lets a later-but-more-transferred journey wrongly evict a
+    /// cleaner earlier one that still had transfers to spend. An entry
+    /// equal on arrival, bucket and rides but strictly dirtier in exact
+    /// grams is refined (replaced), keeping the bucket's representative
+    /// as clean as the search has seen. The trip-based engine passes
+    /// `rides = 0` throughout (its rounds are ranked in the trip bags,
+    /// not here), so its dominance stays exactly `(arrival, key)`.
+    pub(crate) fn insert(&mut self, arrival: u32, grams: f64, key: i64, rides: u8) -> bool {
         for entry in &self.entries {
             if entry.arrival <= arrival
                 && entry.key <= key
-                && !(entry.arrival == arrival && entry.key == key && grams < entry.grams)
+                && entry.rides <= rides
+                && !(entry.arrival == arrival
+                    && entry.key == key
+                    && entry.rides == rides
+                    && grams < entry.grams)
             {
                 return false;
             }
         }
-        self.entries
-            .retain(|entry| !(arrival <= entry.arrival && key <= entry.key));
+        self.entries.retain(|entry| {
+            !(arrival <= entry.arrival && key <= entry.key && rides <= entry.rides)
+        });
         self.entries.push(Entry {
             arrival,
             key,
             grams,
+            rides,
         });
         true
     }
@@ -385,17 +402,19 @@ impl<'a> Search<'a> {
 
     /// One profile pass: seed the access labels at `departure`, then
     /// ride/walk/join for each round. Bags persist across passes —
-    /// labels of later departures suppress what they dominate, exactly
-    /// the range-RAPTOR reuse. A matrix fold, when given, sees every
-    /// label the pass creates (the access seeds are the zero-ride
-    /// floor of the origin's own cell).
+    /// labels of later departures suppress what they dominate on
+    /// (arrival, bucket, rides), the range-RAPTOR reuse made sound under
+    /// the emissions criterion by ranking the rides used (see
+    /// `Bag::insert`). A matrix fold, when given, sees every label the
+    /// pass creates (the access seeds are the zero-ride floor of the
+    /// origin's own cell).
     fn pass(&mut self, request: &Request, departure: u32, fold: &mut Option<MatrixFold<'_>>) {
         let mut fresh: Vec<u32> = Vec::new();
         for &(stop, seconds) in &request.access {
             let arrival = departure.saturating_add(seconds);
             let label = self.arena.len() as u32;
             let key = self.key(0.0);
-            if self.bags[stop.0 as usize].insert(arrival, 0.0, key) {
+            if self.bags[stop.0 as usize].insert(arrival, 0.0, key, 0) {
                 self.arena.push(Label {
                     arrival,
                     grams: 0.0,
@@ -409,10 +428,11 @@ impl<'a> Search<'a> {
                 fresh.push(label);
             }
         }
-        for _round in 1..=request.max_transfers as u32 + 1 {
+        for round in 1..=request.max_transfers as u32 + 1 {
             if fresh.is_empty() {
                 break;
             }
+            let rides = round as u8;
             for &label in &fresh {
                 let stop = self.arena[label as usize].stop;
                 for served in self.timetable.patterns_at_stop(stop) {
@@ -436,7 +456,7 @@ impl<'a> Search<'a> {
             let mut rode: Vec<u32> = Vec::new();
             let touched = std::mem::take(&mut self.touched);
             for &line in &touched {
-                self.scan_line(line, &mut rode);
+                self.scan_line(line, rides, &mut rode);
             }
             // One footpath hop from the improving ride labels; the
             // closed transfer contract makes chains redundant.
@@ -447,7 +467,7 @@ impl<'a> Search<'a> {
                 for footpath in self.footpaths.from_stop(from.stop) {
                     let arrival = from.arrival.saturating_add(footpath.duration);
                     let walked = self.arena.len() as u32;
-                    if self.bags[footpath.to.0 as usize].insert(arrival, from.grams, key) {
+                    if self.bags[footpath.to.0 as usize].insert(arrival, from.grams, key, rides) {
                         self.arena.push(Label {
                             arrival,
                             grams: from.grams,
@@ -489,7 +509,7 @@ impl<'a> Search<'a> {
     /// the earliest boardable trip, later trips join while their factor
     /// strictly improves; same-trip riders reduce to the lowest
     /// `kappa`.
-    fn scan_line(&mut self, line: u32, rode: &mut Vec<u32>) {
+    fn scan_line(&mut self, line: u32, rides: u8, rode: &mut Vec<u32>) {
         let mut entries = std::mem::take(&mut self.queue[line as usize]);
         entries.sort_unstable_by_key(|&(position, _)| position);
         let pattern = self.view.line_pattern(line);
@@ -512,7 +532,7 @@ impl<'a> Search<'a> {
                 let grams = quantized(rider.grams + meters / 1000.0 * rider.factor);
                 let label = self.arena.len() as u32;
                 let key = self.key(grams);
-                if self.bags[stops[position].0 as usize].insert(arrival, grams, key) {
+                if self.bags[stops[position].0 as usize].insert(arrival, grams, key, rides) {
                     self.arena.push(Label {
                         arrival,
                         grams,
