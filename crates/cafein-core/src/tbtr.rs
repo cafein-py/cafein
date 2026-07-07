@@ -277,8 +277,14 @@ impl TransferSet {
                 },
             )
             .collect();
+        TransferSet::assemble(per_trip)
+    }
+
+    /// Lays per-trip kept transfers out as the CSR set; shared with the
+    /// multicriteria builder.
+    pub(crate) fn assemble(per_trip: Vec<(Vec<Vec<TripTransfer>>, usize)>) -> TransferSetBuild {
         let generated = per_trip.iter().map(|(_, count)| count).sum();
-        let mut trip_base = Vec::with_capacity(view.trip_count() as usize + 1);
+        let mut trip_base = Vec::with_capacity(per_trip.len() + 1);
         let mut offsets = Vec::new();
         let mut transfers = Vec::new();
         let mut base = 0u32;
@@ -1186,7 +1192,7 @@ pub(crate) fn earliest_boardable(
 /// segment `trip` arrived on, when it was already catchable one stop
 /// earlier — the classic redundant U-turn.
 #[allow(clippy::too_many_arguments)]
-fn u_turn(
+pub(crate) fn u_turn(
     view: &DayView,
     timetable: &Timetable,
     stops: &[StopIdx],
