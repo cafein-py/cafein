@@ -477,12 +477,26 @@ impl<'a> Search<'a> {
     /// The intermediate transfer: Dijkstra over the transfer graph from
     /// the one-trip arrivals, propagating the shortcut origin. Settled
     /// stops board trip 2.
+    ///
+    /// Bounded by a **witness limit of zero** (Baum et al. 2023, §3.3): the
+    /// search stops once no candidate label remains in the queue. Every
+    /// candidate still settles before the stop, so no shortcut is missed —
+    /// only the domination a later witness would provide is skipped, which
+    /// at worst leaves an occasional superfluous shortcut (as the reference
+    /// accepts). Without the bound the search drains the whole reachable
+    /// transfer graph on every departure, which is intractable at scale.
     fn intermediate_dijkstra(&mut self) {
         let transfers = self.transfers;
         let seeds = std::mem::take(&mut self.updated_by_route);
         let mut heap: BinaryHeap<Reverse<(u32, u32)>> = BinaryHeap::new();
+        // Count of candidate labels (a propagated shortcut origin) pending
+        // in the queue; a reached-but-unsettled stop is pending.
+        let mut candidates_in_queue: usize = 0;
         for stop in &seeds {
             heap.push(Reverse((self.one[stop.0 as usize], stop.0)));
+            if self.one_parent[stop.0 as usize].is_some() {
+                candidates_in_queue += 1;
+            }
         }
         self.updated_by_transfer.clear();
         while let Some(Reverse((time, stop))) = heap.pop() {
@@ -490,6 +504,9 @@ impl<'a> Search<'a> {
                 continue;
             }
             self.updated_by_transfer.push(StopIdx(stop));
+            if self.one_parent[stop as usize].is_some() {
+                candidates_in_queue -= 1;
+            }
             for edge in transfers.from_stop(StopIdx(stop)) {
                 let next = time.saturating_add(edge.duration);
                 let to = edge.to.0 as usize;
@@ -501,6 +518,14 @@ impl<'a> Search<'a> {
                 // an equally-good non-candidate path already reaches `to`,
                 // so treating `to` as non-candidate loses no shortcut.
                 if next < self.one[to] {
+                    // `to`'s pending label changes; keep the counter exact.
+                    let was_candidate = self.one[to] != NEVER && self.one_parent[to].is_some();
+                    let now_candidate = self.one_parent[stop as usize].is_some();
+                    match (was_candidate, now_candidate) {
+                        (false, true) => candidates_in_queue += 1,
+                        (true, false) => candidates_in_queue -= 1,
+                        _ => {}
+                    }
                     self.one[to] = next;
                     self.one_parent[to] = self.one_parent[stop as usize];
                     if next < self.two[to] {
@@ -508,6 +533,9 @@ impl<'a> Search<'a> {
                     }
                     heap.push(Reverse((next, edge.to.0)));
                 }
+            }
+            if candidates_in_queue == 0 {
+                break;
             }
         }
     }
