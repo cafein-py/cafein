@@ -137,7 +137,13 @@ class TransportNetwork:
                 max_walking_time=max_walking_time,
                 max_snap_distance=max_snap_distance,
             )
-            core.set_transfers(footpaths)
+            core.set_transfer_arrays(
+                footpaths.stop_ids,
+                footpaths.from_index,
+                footpaths.to_index,
+                footpaths.seconds,
+                footpaths.meters,
+            )
             core.set_street_network(*street_network)
         return cls(core)
 
@@ -274,13 +280,25 @@ class TransportNetwork:
 
         Parameters
         ----------
-        footpaths : list of (str, str, int, float)
-            ``(from_stop, to_stop, seconds, meters)`` walking edges.
-            The list must be transitively closed — routing relaxes a
-            single transfer hop per round;
-            ``cafein.streets.walking_footpaths`` produces such lists.
+        footpaths : Footpaths, or list of (str, str, int, float)
+            ``cafein.streets.walking_footpaths``'s array form — whose
+            edges cross into the core whole, without per-edge Python
+            objects — or ``(from_stop, to_stop, seconds, meters)``
+            walking edges. Either way the edge set must be transitively
+            closed: routing relaxes a single transfer hop per round.
         """
-        self._core.set_transfers(footpaths)
+        from cafein.streets import Footpaths
+
+        if isinstance(footpaths, Footpaths):
+            self._core.set_transfer_arrays(
+                footpaths.stop_ids,
+                footpaths.from_index,
+                footpaths.to_index,
+                footpaths.seconds,
+                footpaths.meters,
+            )
+        else:
+            self._core.set_transfers(footpaths)
 
     def set_leg_geometries(self, *leg_geometries):
         """Install per-trip leg geometries.

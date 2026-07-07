@@ -766,6 +766,65 @@ def test_set_transfers_rejects_unknown_stops(tmp_path):
         network.set_transfers([("S1", "S2", 60, float("nan"))])
 
 
+def test_transfer_arrays_match_the_tuple_form(tmp_path):
+    from cafein.streets import Footpaths
+
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    edges = [("S2", "0:S1", 120, 118.5), ("0:S1", "S2", 120, 118.5)]
+    networks = []
+    for footpaths in (
+        edges,
+        Footpaths(["S2", "0:S1"], [0, 1], [1, 0], [120, 120], [118.5, 118.5]),
+    ):
+        with pytest.warns(UserWarning):
+            network = TransportNetwork.from_gtfs([str(feed)])
+        network.set_transfers(footpaths)
+        networks.append(network)
+    tuples, arrays = networks
+    assert tuples.transfer_count == arrays.transfer_count == 2
+    # Both installs route identically, footpath legs included.
+    key = ("S1", "0:S1", "2022-02-22", "07:30:00")
+    assert tuples.route_between_stops(*key) == arrays.route_between_stops(*key)
+
+
+def test_transfer_arrays_are_validated(tmp_path):
+    from cafein.streets import Footpaths
+
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs([str(feed)])
+    with pytest.raises(KeyError, match="no-such-stop"):
+        network.set_transfers(Footpaths(["no-such-stop", "S2"], [0], [1], [60], [60.0]))
+    with pytest.raises(ValueError, match="non-finite"):
+        network.set_transfers(Footpaths(["S1", "S2"], [0], [1], [60], [float("nan")]))
+    with pytest.raises(ValueError, match="outside stop_ids"):
+        network._core.set_transfer_arrays(
+            ["S1", "S2"],
+            np.array([5], dtype=np.uint32),
+            np.array([1], dtype=np.uint32),
+            np.array([60], dtype=np.uint32),
+            np.array([60.0]),
+        )
+    with pytest.raises(ValueError, match="same length"):
+        network._core.set_transfer_arrays(
+            ["S1", "S2"],
+            np.array([0], dtype=np.uint32),
+            np.array([1, 0], dtype=np.uint32),
+            np.array([60], dtype=np.uint32),
+            np.array([60.0]),
+        )
+    # Values that would silently wrap into valid uint32 edges are
+    # rejected before any narrowing cast.
+    with pytest.raises(ValueError, match="unsigned 32-bit"):
+        Footpaths(["S1", "S2"], np.array([-1]), [1], [60], [60.0])
+    with pytest.raises(ValueError, match="unsigned 32-bit"):
+        Footpaths(["S1", "S2"], [0], [1], np.array([2**32], dtype=np.uint64), [60.0])
+    with pytest.raises(ValueError, match="integer"):
+        Footpaths(["S1", "S2"], np.array([0.5]), [1], [60], [60.0])
+    with pytest.raises(ValueError, match="one-dimensional"):
+        Footpaths(["S1", "S2"], np.array([[0]]), [1], [60], [60.0])
+
+
 def test_trip_distances_default_to_the_ladder(tmp_path):
     # The synthetic feed has no shapes: distances fall to crow-fly with
     # the bus detour coefficient (S1->S2 is ~1243 m crow-fly).

@@ -67,6 +67,58 @@ build from smaller extracts instead."""
 _DIJKSTRA_CHUNK = 256
 
 
+class Footpaths:
+    """Transitively closed stop-to-stop walking transfers, as flat arrays.
+
+    ``stop_ids`` names each snapped stop once; ``from_index`` and
+    ``to_index`` are positions into it, one edge per element alongside
+    its ``seconds`` and ``meters``. The arrays cross into the routing
+    core whole — no per-edge Python objects — and iterating yields the
+    ``(from_stop, to_stop, seconds, meters)`` tuples of the legacy
+    edge-list form.
+    """
+
+    __slots__ = ("stop_ids", "from_index", "to_index", "seconds", "meters")
+
+    def __init__(self, stop_ids, from_index, to_index, seconds, meters):
+        self.stop_ids = list(stop_ids)
+        self.from_index = _uint32_array(from_index, "from_index")
+        self.to_index = _uint32_array(to_index, "to_index")
+        self.seconds = _uint32_array(seconds, "seconds")
+        meters = np.asarray(meters, dtype=np.float64)
+        if meters.ndim != 1:
+            raise ValueError("meters must be one-dimensional")
+        self.meters = np.ascontiguousarray(meters)
+
+    def __len__(self):
+        return len(self.seconds)
+
+    def __iter__(self):
+        ids = np.asarray(self.stop_ids, dtype=object)
+        return zip(
+            ids[self.from_index].tolist(),
+            ids[self.to_index].tolist(),
+            self.seconds.tolist(),
+            self.meters.tolist(),
+        )
+
+
+def _uint32_array(values, name):
+    """`values` as a contiguous uint32 array, validated before the cast:
+    numpy would silently wrap negative or oversized values into valid
+    edge indexes or durations."""
+    array = np.asarray(values)
+    if array.ndim != 1:
+        raise ValueError(f"{name} must be one-dimensional")
+    if array.size == 0:
+        return np.zeros(0, dtype=np.uint32)
+    if not np.issubdtype(array.dtype, np.integer):
+        raise ValueError(f"{name} must be an integer array")
+    if int(array.min()) < 0 or int(array.max()) > 4_294_967_295:
+        raise ValueError(f"{name} values must fit an unsigned 32-bit integer")
+    return np.ascontiguousarray(array, dtype=np.uint32)
+
+
 def walking_footpaths(
     osm_pbf,
     stops,
@@ -97,11 +149,12 @@ def walking_footpaths(
 
     Returns
     -------
-    list of (str, str, int, float)
-        Transitively closed ``(from_stop, to_stop, seconds, meters)``
-        walking edges — conservatively rounded seconds plus the exact
-        street-path length — suitable for
-        ``TransportNetwork.set_transfers``.
+    Footpaths
+        The transitively closed walking edges as flat arrays —
+        conservatively rounded seconds plus the exact street-path
+        length — suitable for ``TransportNetwork.set_transfers``;
+        iterating yields the legacy ``(from_stop, to_stop, seconds,
+        meters)`` tuples.
     """
     nodes, edges = _walking_network(osm_pbf)
     return _network_footpaths(
@@ -252,7 +305,7 @@ def _network_streets(
     edges = edges.reset_index(drop=True)
     stop_points = _stop_points(stops)
     if edges.empty:
-        return [], (0, [], [0], [], [], [])
+        return Footpaths([], [], [], [], []), (0, [], [0], [], [], [])
     if stop_points.empty:
         snapped = pd.DataFrame(columns=["stop_id", "edge", "fraction", "snap_distance"])
     else:
@@ -263,7 +316,7 @@ def _network_streets(
             f"build's ceiling of {MAX_FOOTPATH_STOPS}; build from smaller "
             "extracts"
         )
-    footpaths = []
+    footpaths = Footpaths([], [], [], [], [])
     if not snapped.empty:
         graph, stop_vertices = _routing_graph(nodes, edges, snapped, speed)
         durations = _stop_durations(graph, stop_vertices, max_walking_time)
@@ -489,8 +542,7 @@ def _transitive_closure(durations):
 
 
 def _edge_list(stop_ids, durations, speed):
-    """The finite off-diagonal durations as `(from, to, seconds, meters)`
-    edges.
+    """The finite off-diagonal durations as `Footpaths` arrays.
 
     Durations are feasibility constraints, so they round up (with a small
     tolerance for floating-point noise): understating a walking time could
@@ -509,11 +561,4 @@ def _edge_list(stop_ids, durations, speed):
             "range; check the walking network and speed"
         )
     meters = durations[i, j] * speed
-    return list(
-        zip(
-            stop_ids[i].tolist(),
-            stop_ids[j].tolist(),
-            seconds.tolist(),
-            meters.tolist(),
-        )
-    )
+    return Footpaths(stop_ids.tolist(), i, j, seconds, meters)
