@@ -1151,7 +1151,7 @@ fn generate(
 /// The earliest trip of `line` boardable at `position` no earlier than
 /// `ready` on the query day's clock; `None` when none departs in time
 /// or the position is the pattern's last (nothing left to ride).
-fn earliest_boardable(
+pub(crate) fn earliest_boardable(
     view: &DayView,
     timetable: &Timetable,
     line: u32,

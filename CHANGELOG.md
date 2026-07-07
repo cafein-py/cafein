@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- McRAPTOR — the true multicriteria search:
+  ``journey_frontier(..., candidates="pareto")`` draws its candidate
+  journeys from a multicriteria RAPTOR over (departure, arrival,
+  emissions) instead of the time-optimal profile, and so also finds
+  the cleaner-but-slower journeys the time candidates provably miss
+  (the gap ``exhaustive_frontier`` measured). Emissions compare at a
+  configurable bucket width during the search — ``bucket=25.0`` grams
+  by default — bounding label-bag sizes while keeping arrivals exact;
+  a vanishing bucket reproduces the exhaustive oracle's frontier,
+  verified against it on synthetic fixtures and on the Helsinki
+  network with and without footpaths. Journeys riding a trip without
+  a resolved emission factor never enter the candidates. Boarding
+  looks past the earliest catchable trip when a later trip's factor
+  strictly improves, so waiting for a cleaner vehicle is searched too.
+
 - The exact time × emissions Pareto set:
   ``cafein.exhaustive_frontier(network, origin, destination, date,
   departure)`` enumerates the mathematically complete frontier for one

@@ -385,6 +385,215 @@ def test_exhaustive_frontier_finds_points_the_interim_misses(network):
     assert missing[0].emissions < resolved["emissions"].min()
 
 
+def test_pareto_candidates_match_the_oracle_on_the_two_line_feed(tmp_path):
+    from cafein import TransportNetwork, exhaustive_frontier
+
+    # With a vanishing bucket the McRAPTOR candidate set is the true
+    # frontier the oracle enumerates.
+    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
+    network = TransportNetwork.from_gtfs([str(feed)])
+    true_set = exhaustive_frontier(
+        network, "A", "B", "2022-02-22", "08:00:00", max_transfers=4
+    )
+    frame = journey_frontier(
+        network,
+        "A",
+        "B",
+        "2022-02-22",
+        "08:00:00",
+        window=1,
+        max_transfers=4,
+        candidates="pareto",
+        bucket=1e-6,
+    )
+    assert frame["frontier"].all()
+    assert frame["arrival"].tolist() == true_set["arrival"].tolist()
+    assert frame["rides"].tolist() == true_set["rides"].tolist()
+    assert frame["emissions"].tolist() == pytest.approx(true_set["emissions"].tolist())
+
+
+def test_pareto_window_candidates_cover_the_time_candidates(tmp_path):
+    from cafein import TransportNetwork
+
+    # On the two-line feed the time-optimal window candidates are all
+    # Pareto-optimal in (departure, arrival, emissions) too, and no
+    # further journey is: the two profiles must coincide row for row.
+    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
+    network = TransportNetwork.from_gtfs([str(feed)])
+    interim = journey_frontier(network, "A", "B", "2022-02-22", "08:00:00", window=1800)
+    pareto = journey_frontier(
+        network,
+        "A",
+        "B",
+        "2022-02-22",
+        "08:00:00",
+        window=1800,
+        candidates="pareto",
+        bucket=1e-6,
+    )
+    columns = ["departure", "arrival", "rides", "emissions", "frontier"]
+    ordered = [
+        frame.sort_values(["departure", "arrival"]) for frame in (interim, pareto)
+    ]
+    for column in columns:
+        assert ordered[0][column].tolist() == pytest.approx(ordered[1][column].tolist())
+
+
+def test_pareto_candidates_close_the_interim_gap(network):
+    from cafein import exhaustive_frontier
+
+    # The measured blind spot of the time candidates (see the oracle
+    # test above): McRAPTOR must hold the cleaner-but-slower journey the
+    # interim set cannot see.
+    origin, destination = "1370104", "4960238"
+    true_set = exhaustive_frontier(
+        network, origin, destination, "2022-02-22", "08:30:00", max_transfers=4
+    )
+    exact = journey_frontier(
+        network,
+        origin,
+        destination,
+        "2022-02-22",
+        "08:30:00",
+        window=1,
+        max_transfers=4,
+        candidates="pareto",
+        bucket=1e-6,
+    )
+    on = exact[exact["frontier"]]
+    assert on["arrival"].tolist() == true_set["arrival"].tolist()
+    assert on["rides"].tolist() == true_set["rides"].tolist()
+    assert on["emissions"].tolist() == pytest.approx(
+        true_set["emissions"].tolist(), abs=1e-3
+    )
+    # At the default 25 g bucket the gap stays closed: a candidate
+    # cleaner than everything the interim set holds, and the cleanest
+    # candidate within the documented bucket band of the true optimum.
+    frame = journey_frontier(
+        network,
+        origin,
+        destination,
+        "2022-02-22",
+        "08:30:00",
+        window=1,
+        max_transfers=4,
+        candidates="pareto",
+    )
+    interim = journey_frontier(
+        network,
+        origin,
+        destination,
+        "2022-02-22",
+        "08:30:00",
+        window=1,
+        max_transfers=4,
+    )
+    resolved = interim[interim["emissions"].notna()]
+    assert frame["emissions"].min() < resolved["emissions"].min()
+    assert frame["emissions"].min() <= true_set["emissions"].min() + 25.0
+
+
+def test_pareto_candidates_match_the_oracle_over_footpaths(network_with_footpaths):
+    from cafein import exhaustive_frontier
+
+    # The strongest cross-engine check: on the network carrying the
+    # real (transitively closed) footpath set, a vanishing bucket must
+    # reproduce the oracle's frontier — 20 points for this pair.
+    origin, destination = "1100602", "1040280"
+    true_set = exhaustive_frontier(
+        network_with_footpaths,
+        origin,
+        destination,
+        "2022-02-22",
+        "08:30:00",
+        max_transfers=3,
+    )
+    exact = journey_frontier(
+        network_with_footpaths,
+        origin,
+        destination,
+        "2022-02-22",
+        "08:30:00",
+        window=1,
+        max_transfers=3,
+        candidates="pareto",
+        bucket=1e-6,
+    )
+    on = exact[exact["frontier"]]
+    assert len(true_set) == 20
+    assert on["arrival"].tolist() == true_set["arrival"].tolist()
+    assert on["rides"].tolist() == true_set["rides"].tolist()
+    assert on["emissions"].tolist() == pytest.approx(
+        true_set["emissions"].tolist(), abs=1e-3
+    )
+    # And over a departure window, the widened set stays sound against
+    # the time-optimal profile: every resolved interim candidate is
+    # dominated or equalled by a pareto candidate.
+    interim = journey_frontier(
+        network_with_footpaths,
+        origin,
+        destination,
+        "2022-02-22",
+        "08:30:00",
+        window=600,
+    )
+    pareto = journey_frontier(
+        network_with_footpaths,
+        origin,
+        destination,
+        "2022-02-22",
+        "08:30:00",
+        window=600,
+        candidates="pareto",
+        bucket=1e-6,
+    )
+    for row in interim[interim["emissions"].notna()].itertuples():
+        assert any(
+            candidate.departure >= row.departure
+            and candidate.arrival <= row.arrival
+            and candidate.emissions <= row.emissions + 1e-6
+            for candidate in pareto.itertuples()
+        )
+
+
+def test_pareto_candidate_options_are_validated(tmp_path):
+    from cafein import TransportNetwork
+
+    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
+    network = TransportNetwork.from_gtfs([str(feed)])
+    with pytest.raises(ValueError, match="candidates"):
+        journey_frontier(
+            network,
+            "A",
+            "B",
+            "2022-02-22",
+            "08:00:00",
+            window=1,
+            candidates="fastest",
+        )
+    with pytest.raises(ValueError, match="stop ids"):
+        journey_frontier(
+            network,
+            (60.0, 24.0),
+            (60.0, 24.05),
+            "2022-02-22",
+            "08:00:00",
+            window=1,
+            candidates="pareto",
+        )
+    with pytest.raises(ValueError, match="bucket"):
+        journey_frontier(
+            network,
+            "A",
+            "B",
+            "2022-02-22",
+            "08:00:00",
+            window=1,
+            candidates="pareto",
+            bucket=0.0,
+        )
+
+
 def test_unmatched_factors_poison_but_do_not_block(network):
     # The Suomenlinna ferry has no shipped factor: its journeys carry
     # NaN emissions and never join the frontier.
