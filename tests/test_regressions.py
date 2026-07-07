@@ -53,3 +53,43 @@ def test_mcraptor_window_profile_keeps_cleaner_earlier_journeys(network_with_foo
 
     assert transit["emissions"].min() == pytest.approx(cleanest, abs=1e-3)
     assert len(transit) > 1
+
+
+def test_mctbtr_window_profile_keeps_cleaner_earlier_journeys(network_with_footpaths):
+    """The McTBTR profile has the same cross-pass hazard as McRAPTOR, in
+    the stop bags that gate its query-time footpath relaxation.
+
+    Those bags dominate on (arrival, emissions bucket) and persist across
+    the descending profile passes; before the fix they ignored the rides
+    used to reach a stop, so a later-departure arrival on more rides could
+    suppress a cleaner fewer-rides arrival, and the walk that would reach
+    a cleaner onward leg was never relaxed. On this pair McTBTR kept a
+    journey a few grams dirtier than the oracle's cleanest; ranking the
+    rides in the stop bags restores completeness.
+    """
+    origin, destination = "1010108", "3170218"
+    oracle = exhaustive_frontier(
+        network_with_footpaths,
+        origin,
+        destination,
+        "2022-02-22",
+        "08:30:00",
+        max_transfers=4,
+    )
+    cleanest = oracle["emissions"].min()
+
+    frontier = journey_frontier(
+        network_with_footpaths,
+        origin,
+        destination,
+        "2022-02-22",
+        "08:30:00",
+        window=900,
+        max_transfers=4,
+        candidates="pareto",
+        bucket=1e-6,
+        router="tbtr",
+    )
+    transit = frontier[frontier["frontier"] & (frontier["rides"] >= 1)]
+
+    assert transit["emissions"].min() == pytest.approx(cleanest, abs=1e-3)

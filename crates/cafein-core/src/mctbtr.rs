@@ -659,8 +659,12 @@ impl<'a> McTbtrEngine<'a> {
                 }
             }
             // Query-time footpaths, gated on stop-bag improvement (the
-            // T4b semantics); improving walks board and join.
-            if stop_bags[stop.0 as usize].insert(arrival, grams, key(grams), 0) {
+            // T4b semantics); improving walks board and join. Rank the
+            // rides used (this segment's round) so a later-departure
+            // pass that reached the stop on more rides cannot suppress a
+            // cleaner fewer-rides arrival across the profile — the same
+            // cross-pass soundness the McRAPTOR bag needs.
+            if stop_bags[stop.0 as usize].insert(arrival, grams, key(grams), round as u8) {
                 if let Some(sink) = fold {
                     sink.fold(
                         stop,
@@ -673,7 +677,12 @@ impl<'a> McTbtrEngine<'a> {
                 }
                 for footpath in self.footpaths.from_stop(stop) {
                     let reached = arrival.saturating_add(footpath.duration);
-                    if !stop_bags[footpath.to.0 as usize].insert(reached, grams, key(grams), 0) {
+                    if !stop_bags[footpath.to.0 as usize].insert(
+                        reached,
+                        grams,
+                        key(grams),
+                        round as u8,
+                    ) {
                         continue;
                     }
                     if let Some(sink) = fold {
