@@ -280,6 +280,85 @@ def test_least_emission_cells_match_the_frontier(tmp_path):
     assert cell(within=60) is None
 
 
+def test_pareto_candidates_lower_the_emission_cells(network):
+    from cafein import TravelCostMatrix, exhaustive_frontier
+
+    # The measured blind spot (see test_frontier): the interim
+    # emissions cell picks among time-optimal journeys only; the pareto
+    # candidates hold the strictly cleaner slower one.
+    origin, destination = "1370104", "4960238"
+
+    def cell(**kwargs):
+        matrix = TravelCostMatrix(
+            network,
+            [origin],
+            [destination],
+            "2022-02-22",
+            "08:30:00",
+            optimize="emissions",
+            window=1,
+            max_transfers=4,
+            **kwargs,
+        )
+        rows = matrix[matrix.to_id == destination]
+        return rows.iloc[0] if len(rows) else None
+
+    interim, pareto = cell(), cell(candidates="pareto", bucket=1e-6)
+    assert pareto["emissions"] < interim["emissions"]
+    # The pareto cell is the true optimum the oracle pins, at that
+    # point's own travel time.
+    true_set = exhaustive_frontier(
+        network, origin, destination, "2022-02-22", "08:30:00", max_transfers=4
+    )
+    point = true_set.loc[true_set["emissions"].idxmin()]
+    assert pareto["emissions"] == pytest.approx(point["emissions"], abs=1e-3)
+    assert pareto["travel_time"] == point["travel_time"]
+    # The default bucket keeps the gap closed.
+    assert cell(candidates="pareto")["emissions"] < interim["emissions"]
+
+
+def test_pareto_matrices_validate_their_options(network):
+    from cafein import TravelCostMatrix
+
+    shared = dict(date="2022-02-22", departure="08:30:00")
+    with pytest.raises(ValueError, match="candidates"):
+        TravelCostMatrix(
+            network,
+            ["1370104"],
+            ["4960238"],
+            **shared,
+            optimize="emissions",
+            window=1,
+            candidates="fastest",
+        )
+    with pytest.raises(ValueError, match="optimize='emissions'"):
+        TravelCostMatrix(
+            network, ["1370104"], ["4960238"], **shared, candidates="pareto"
+        )
+    with pytest.raises(ValueError, match="bucket"):
+        TravelCostMatrix(
+            network,
+            ["1370104"],
+            ["4960238"],
+            **shared,
+            optimize="emissions",
+            window=1,
+            candidates="pareto",
+            bucket=0.0,
+        )
+    points = scattered_points(network, 2, seed=7)
+    with pytest.raises(ValueError, match="stop origins"):
+        TravelCostMatrix(
+            network,
+            points,
+            points,
+            **shared,
+            optimize="emissions",
+            window=1,
+            candidates="pareto",
+        )
+
+
 def test_point_emission_cells_prefer_walking(network_with_footpaths):
     origins = point_frame(network_with_footpaths, [("metro", "1040602")])
     destinations = point_frame(network_with_footpaths, [("street", "1040280")])
