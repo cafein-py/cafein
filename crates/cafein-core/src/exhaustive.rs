@@ -40,7 +40,7 @@ struct Bag {
     labels: Vec<(u32, f64)>,
 }
 
-fn quantized(grams: f64) -> f64 {
+pub(crate) fn quantized(grams: f64) -> f64 {
     (grams * 1e6).round() / 1e6
 }
 

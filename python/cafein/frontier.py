@@ -1,16 +1,22 @@
 """Time × emissions Pareto frontiers over departure-window journeys.
 
 The frontier answers "what is the lowest-CO₂ way there, and what does it
-cost in time — and money?" from the range-RAPTOR candidate set: the
-journeys optimal in (departure, arrival, rides) over a departure window,
-annotated with emissions (and fares) post hoc, reduced to the rows no
-candidate beats on every annotated criterion.
+cost in time — and money?" from a candidate journey set annotated with
+emissions (and fares) post hoc, reduced to the rows no candidate beats
+on every annotated criterion. Two candidate sets are available:
 
-The contract follows from the candidate set: a journey that is slower
-*and* rides more vehicles than every time-optimal alternative never
-enters the candidates, even if it would be cleaner; slower-but-simpler
-journeys (fewer rides) do, and door-to-door queries include the
-walking-only journey, whose zero emissions anchor the clean end.
+- ``candidates="time"``: the range-RAPTOR set — journeys optimal in
+  (departure, arrival, rides). A journey that is slower *and* rides
+  more vehicles than every time-optimal alternative never enters this
+  set, even if it would be cleaner; slower-but-simpler journeys (fewer
+  rides) do, and door-to-door queries include the walking-only journey,
+  whose zero emissions anchor the clean end.
+- ``candidates="pareto"``: the McRAPTOR set — journeys Pareto-optimal
+  in (departure, arrival, emissions), with emissions compared at a
+  configurable bucket width during the search. This is the set that
+  also holds the cleaner-but-slower-with-more-rides journeys the time
+  candidates provably miss; ``exhaustive_frontier`` is its exact,
+  brute-force reference.
 """
 
 import math
@@ -42,6 +48,8 @@ def journey_frontier(
     factors=None,
     components=None,
     fares=None,
+    candidates="time",
+    bucket=25.0,
     walking_speed_kmph=None,
     max_walking_time=None,
     max_snap_distance=None,
@@ -54,6 +62,12 @@ def journey_frontier(
     candidate beats on every criterion — travel time and emissions,
     plus fare when a fare structure is given. Requires a network built
     with trip distances (the default).
+
+    With ``candidates="pareto"`` the candidate set comes from McRAPTOR,
+    which searches over (departure, arrival, emissions) directly and so
+    also finds the cleaner-but-slower journeys the time-optimal set
+    misses; emissions are compared at ``bucket`` grams during the
+    search and re-annotated exactly afterwards.
 
     With a fare structure (`fares`), every candidate is also priced,
     the frame gains a ``fare`` column, and the fare joins the frontier
@@ -85,6 +99,18 @@ def journey_frontier(
         adds the ``fare`` column, and makes the fare the frontier's
         third criterion. NaN marks journeys the model cannot price —
         like NaN emissions, they never join the frontier.
+    candidates : str (optional, default: "time")
+        The candidate journey set: ``"time"`` for the range-RAPTOR
+        time-optimal journeys, ``"pareto"`` for the McRAPTOR journeys
+        Pareto-optimal in (departure, arrival, emissions). Pareto
+        candidates require stop ids and a network with trip distances;
+        journeys riding a trip without a resolved emission factor never
+        enter them.
+    bucket : float (optional, default: 25.0)
+        The emissions bucket width in grams CO₂e of the pareto search:
+        journeys within one bucket of each other count as equal on
+        emissions while searching, bounding its cost. Only used with
+        ``candidates="pareto"``.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         The street-search options for coordinate queries, as in
         ``route_between_coordinates``; only valid with coordinates.
@@ -102,11 +128,15 @@ def journey_frontier(
         on any criterion never are), and ``journey``, the annotated
         journey dict as returned by the routing calls.
     """
+    if candidates not in ("time", "pareto"):
+        raise ValueError("candidates must be 'time' or 'pareto'")
     stops = isinstance(origin, str), isinstance(destination, str)
     if stops[0] != stops[1]:
         raise ValueError(
             "origin and destination must both be stop ids or both be coordinates"
         )
+    if candidates == "pareto" and not stops[0]:
+        raise ValueError("pareto candidates require stop ids, not coordinates")
     if stops[0]:
         if not (
             walking_speed_kmph is None
@@ -114,15 +144,29 @@ def journey_frontier(
             and max_snap_distance is None
         ):
             raise ValueError("street-search options apply to coordinate queries only")
-        journeys = network.route_between_stops(
-            origin,
-            destination,
-            date,
-            departure,
-            max_transfers,
-            window,
-            geometries=geometries,
-        )
+        if candidates == "pareto":
+            trip_factors = emissions.trip_factors(network, factors, components)
+            journeys = network._core.mc_route_between_stops(
+                origin,
+                destination,
+                date,
+                departure,
+                trip_factors,
+                window,
+                max_transfers,
+                bucket,
+                geometries,
+            )
+        else:
+            journeys = network.route_between_stops(
+                origin,
+                destination,
+                date,
+                departure,
+                max_transfers,
+                window,
+                geometries=geometries,
+            )
     else:
         journeys = network.route_between_coordinates(
             tuple(origin),

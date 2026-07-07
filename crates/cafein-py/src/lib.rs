@@ -12,6 +12,7 @@ use cafein_core::exhaustive;
 use cafein_core::fares::{FareTables, RuleFares, ZoneFares, ZoneProduct, NO_FARE};
 use cafein_core::geometry::{wkb_multi_line_string, DistanceProvenance, LegGeometry, TripGeometry};
 use cafein_core::journey::{Journey, Leg};
+use cafein_core::mcraptor;
 use cafein_core::raptor::{CostInputs, CostRow, Objective, Raptor};
 use cafein_core::router::{Request, TransitRouter};
 use cafein_core::streets::{
@@ -2135,6 +2136,97 @@ impl TransportNetwork {
             .into_iter()
             .map(|point| (point.arrival, point.grams, point.rides))
             .collect())
+    }
+
+    /// Multicriteria journeys between two stops: the Pareto set over
+    /// (arrival, emissions bucket) — with a window, over (departure,
+    /// arrival, emissions bucket) — found by McRAPTOR.
+    ///
+    /// Emissions enter the search as per-trip factors over precomputed
+    /// cumulative distances; labels within `bucket` grams of each other
+    /// count as equal, so the returned set is exact on arrivals and
+    /// within a bucket-sized band on emissions. Trips without a
+    /// resolved factor are skipped — journeys riding them can never sit
+    /// on an emissions frontier. Requires installed trip distances.
+    ///
+    /// Returns
+    /// -------
+    /// list of dict
+    ///     Journeys shaped as in ``route_between_stops``.
+    #[pyo3(signature = (from_stop, to_stop, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, geometries = true))]
+    #[allow(clippy::too_many_arguments)]
+    fn mc_route_between_stops(
+        &self,
+        py: Python<'_>,
+        from_stop: &str,
+        to_stop: &str,
+        date: &str,
+        departure: &str,
+        factors: Vec<(String, f64)>,
+        window: Option<u32>,
+        max_transfers: u8,
+        bucket: f64,
+        geometries: bool,
+    ) -> PyResult<Py<PyList>> {
+        if !bucket.is_finite() || bucket <= 0.0 {
+            return Err(PyValueError::new_err(
+                "bucket must be a positive number of grams",
+            ));
+        }
+        let Some(geometry) = &self.geometry else {
+            return Err(PyValueError::new_err(
+                "no trip distances installed; build the network with trip distances enabled",
+            ));
+        };
+        let origin = self.resolve_stop(from_stop)?;
+        let destination = self.resolve_stop(to_stop)?;
+        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
+        for (trip_id, factor) in &factors {
+            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
+                per_trip[trip.0 as usize] = *factor;
+            }
+        }
+        let request = Request {
+            departure: parse_time(departure)?,
+            access: vec![(origin, 0)],
+            egress: vec![(destination, 0)],
+            active_services: self.active_services(date)?,
+            active_services_previous: self.active_services_previous(date)?,
+            max_transfers,
+        };
+        let journeys = py.allow_threads(|| {
+            let view = DayView::for_date(
+                &self.build.timetable,
+                &request.active_services,
+                &request.active_services_previous,
+            );
+            match window {
+                None => mcraptor::route(
+                    &view,
+                    &self.build.timetable,
+                    &self.transfers,
+                    geometry,
+                    &per_trip,
+                    &request,
+                    bucket,
+                ),
+                Some(window) => mcraptor::route_range(
+                    &view,
+                    &self.build.timetable,
+                    &self.transfers,
+                    geometry,
+                    &per_trip,
+                    &request,
+                    window,
+                    bucket,
+                ),
+            }
+        });
+        let result = PyList::empty(py);
+        for journey in &journeys {
+            result.append(self.journey_to_dict(py, journey, None, None, geometries)?)?;
+        }
+        Ok(result.unbind())
     }
 
     /// Travel-time percentiles over a departure window, as a matrix.
