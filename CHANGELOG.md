@@ -16,6 +16,9 @@
   a resolved emission factor never enter the candidates. Boarding
   looks past the earliest catchable trip when a later trip's factor
   strictly improves, so waiting for a cleaner vehicle is searched too.
+  Coordinate queries route door-to-door like the time candidates:
+  walking access and egress, the zero-emission walking-only journey
+  anchoring the clean end, and the same walk-domination rule.
 
 - The exact time × emissions Pareto set:
   ``cafein.exhaustive_frontier(network, origin, destination, date,

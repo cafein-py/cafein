@@ -2229,6 +2229,167 @@ impl TransportNetwork {
         Ok(result.unbind())
     }
 
+    /// Multicriteria door-to-door journeys between two coordinates —
+    /// the McRAPTOR counterpart of ``route_between_coordinates``.
+    ///
+    /// Walking access, egress, the walking-only journey, and the
+    /// walk-domination rule behave exactly as in
+    /// ``route_between_coordinates``; the candidate set is the Pareto
+    /// set over (departure, arrival, emissions bucket) as in
+    /// ``mc_route_between_stops``. The zero-emission walking-only
+    /// journey anchors the clean end: it dominates every journey that
+    /// rides yet arrives no earlier than walking out at that journey's
+    /// own departure would.
+    ///
+    /// Returns
+    /// -------
+    /// list of dict
+    ///     Journeys shaped as in ``route_between_coordinates``.
+    #[pyo3(signature = (origin, destination, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true))]
+    #[allow(clippy::too_many_arguments)]
+    fn mc_route_between_coordinates(
+        &self,
+        py: Python<'_>,
+        origin: (f64, f64),
+        destination: (f64, f64),
+        date: &str,
+        departure: &str,
+        factors: Vec<(String, f64)>,
+        window: Option<u32>,
+        max_transfers: u8,
+        bucket: f64,
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+        geometries: bool,
+    ) -> PyResult<Py<PyList>> {
+        if !bucket.is_finite() || bucket <= 0.0 {
+            return Err(PyValueError::new_err(
+                "bucket must be a positive number of grams",
+            ));
+        }
+        let Some(geometry) = &self.geometry else {
+            return Err(PyValueError::new_err(
+                "no trip distances installed; build the network with trip distances enabled",
+            ));
+        };
+        let streets = self.installed_streets()?;
+        let speed =
+            validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
+        let access = coordinate_links(
+            streets,
+            origin,
+            speed,
+            max_walking_time,
+            max_snap_distance,
+            "origin ",
+        )?;
+        let egress = coordinate_links(
+            streets,
+            destination,
+            speed,
+            max_walking_time,
+            max_snap_distance,
+            "destination ",
+        )?;
+        let walks = WalkMaps::new(&access, &egress);
+        let ends = CoordinateEnds {
+            origin,
+            origin_snap: streets
+                .snap(origin.0, origin.1, max_snap_distance)
+                .expect("origin linked above"),
+            destination,
+            destination_snap: streets
+                .snap(destination.0, destination.1, max_snap_distance)
+                .expect("destination linked above"),
+        };
+        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
+        for (trip_id, factor) in &factors {
+            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
+                per_trip[trip.0 as usize] = *factor;
+            }
+        }
+        let request = Request {
+            departure: parse_time(departure)?,
+            access: request_offsets(&access),
+            egress: request_offsets(&egress),
+            active_services: self.active_services(date)?,
+            active_services_previous: self.active_services_previous(date)?,
+            max_transfers,
+        };
+        // The walking-only alternative, exactly as in
+        // route_between_coordinates: zero emissions, available at
+        // every departure, dominating whatever rides without arriving
+        // earlier.
+        let direct = if origin == destination {
+            Some((0, 0.0))
+        } else {
+            streets
+                .walk_to_snaps(
+                    &ends.origin_snap,
+                    &[Some(ends.destination_snap)],
+                    speed,
+                    max_walking_time,
+                )
+                .swap_remove(0)
+        };
+        let journeys = py.allow_threads(|| {
+            let view = DayView::for_date(
+                &self.build.timetable,
+                &request.active_services,
+                &request.active_services_previous,
+            );
+            match window {
+                None => mcraptor::route(
+                    &view,
+                    &self.build.timetable,
+                    &self.transfers,
+                    geometry,
+                    &per_trip,
+                    &request,
+                    bucket,
+                ),
+                Some(window) => mcraptor::route_range(
+                    &view,
+                    &self.build.timetable,
+                    &self.transfers,
+                    geometry,
+                    &per_trip,
+                    &request,
+                    window,
+                    bucket,
+                ),
+            }
+        });
+        let kept: Vec<&Journey> = journeys
+            .iter()
+            .filter(|journey| match direct {
+                Some((walk_seconds, _)) => journey.arrival - journey.departure < walk_seconds,
+                None => true,
+            })
+            .collect();
+        let result = PyList::empty(py);
+        if let Some(walk) = direct {
+            result.append(self.walk_journey_dict(
+                py,
+                request.departure,
+                walk,
+                &ends,
+                geometries,
+            )?)?;
+        }
+        for journey in kept {
+            result.append(self.journey_to_dict(
+                py,
+                journey,
+                Some(&walks),
+                Some(&ends),
+                geometries,
+            )?)?;
+        }
+        Ok(result.unbind())
+    }
+
     /// Travel-time percentiles over a departure window, as a matrix.
     ///
     /// Every minute mark within ``[departure, departure + window)`` is
