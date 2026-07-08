@@ -36,8 +36,16 @@
   initial, intermediate, and final walking, matching
   ``route_between_coordinates`` — with ``walking_speed_kmph``/
   ``max_walking_time``/``max_snap_distance`` bounding that walking; without
-  the set it keeps today's board-at-origin closure routing. Requires a network
-  built with an OSM extract.
+  the set it keeps today's board-at-origin closure routing. The one-to-all time
+  queries — ``travel_times_from_stop``, ``travel_times_from_coordinate``, and
+  the ``"raptor"`` ``travel_time_matrix`` — likewise reach every stop
+  **door-to-door** under a whole-day set: a new
+  ``StreetNetwork::final_transfers`` search folds one unrestricted final walk
+  into the arrivals (a stop origin is treated as its coordinate and gains the
+  same three walking arguments). The matrix partitions its origins per row —
+  snappable origins route door-to-door, an off-network origin falls back to the
+  closure — preserving input order. Without a whole-day set they keep the
+  closure, tau-direct search. Requires a network built with an OSM extract.
 
 - McTBTR groundwork — the multicriteria transfer set: the compute core
   gains a dominance-aware variant of the TBTR transfer precompute for

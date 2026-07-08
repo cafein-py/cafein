@@ -141,11 +141,15 @@ def test_point_destination_routing(central_gtfs, kantakaupunki_pbf):
     stop_before = net.travel_times_from_stop(endpoints[0], QUERY_DATE, QUERY_TIME)
     assert any(pareto for pareto in closure.values())
 
-    # A partial-window set is stored but not relaxed by routing.
+    # A partial-window set is stored but not relaxed by routing — door-to-door
+    # and the one-to-all stop query alike keep the closure.
     net.compute_ultra_shortcuts(
         max_transfer_time=600.0, min_departure=29700, max_departure=31500
     )
     assert _door_to_door(net, coords, endpoints, QUERY_TIME) == closure
+    assert (
+        net.travel_times_from_stop(endpoints[0], QUERY_DATE, QUERY_TIME) == stop_before
+    )
 
     # A whole-day set is: superset, at least one gained journey, and transfer
     # legs report a distance looked up in the ULTRA set (which carries metres).
@@ -158,10 +162,6 @@ def test_point_destination_routing(central_gtfs, kantakaupunki_pbf):
         if ultra[pair] != before:
             improved += 1
     assert improved >= 1
-
-    assert (
-        net.travel_times_from_stop(endpoints[0], QUERY_DATE, QUERY_TIME) == stop_before
-    )
 
     saw_transfer = False
     for origin, destination in closure:
@@ -375,6 +375,106 @@ def test_route_between_stops_door_to_door_under_ultra(central_gtfs, kantakaupunk
             max_walking_time=ACCESS,
         )
     )
+
+
+def test_travel_times_from_stop_door_to_door_under_ultra(
+    central_gtfs, kantakaupunki_pbf
+):
+    # Under a whole-day ULTRA set, travel_times_from_stop routes door-to-door
+    # from the origin stop's coordinate: it equals travel_times_from_coordinate
+    # there (unrestricted initial/intermediate/final walking), reaches a
+    # superset of the closure's stops, and reaches strictly more. Without the
+    # set it keeps the closure board-at-origin path and ignores the walking
+    # arguments.
+    with pytest.warns(UserWarning):
+        net = TransportNetwork.from_gtfs(
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=60
+        )
+    coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
+    origin = next(iter(coords))
+
+    closure = net.travel_times_from_stop(origin, QUERY_DATE, QUERY_TIME)
+    # The walking arguments are ignored without a whole-day set.
+    assert (
+        net.travel_times_from_stop(
+            origin, QUERY_DATE, QUERY_TIME, max_walking_time=ACCESS
+        )
+        == closure
+    )
+
+    net.compute_ultra_shortcuts(max_transfer_time=600.0)  # whole day
+
+    ultra = net.travel_times_from_stop(
+        origin, QUERY_DATE, QUERY_TIME, max_walking_time=ACCESS
+    )
+    # Door-to-door: identical to routing from the origin stop's coordinate.
+    assert ultra == net.travel_times_from_coordinate(
+        coords[origin], QUERY_DATE, QUERY_TIME, max_walking_time=ACCESS
+    )
+    # Reachability superset of the closure, and strictly more stops reached
+    # (the origin itself now costs its stop-to-platform connector walk, so this
+    # is a reachability superset, not a strict per-stop time superset).
+    assert set(closure) <= set(ultra)
+    assert len(ultra) > len(closure)
+
+
+def test_travel_time_matrix_mixed_origins_under_ultra(
+    central_gtfs, kantakaupunki_pbf, tmp_path
+):
+    # A stop-origin travel_time_matrix under a whole-day set partitions its
+    # origins: snappable origins route door-to-door, an off-network origin
+    # falls back to the closure board-at-origin search, and rows follow input
+    # order. Each row equals the matching per-origin travel_times_from_stop,
+    # which gates identically.
+    import zipfile
+
+    import numpy as np
+    import pandas as pd
+
+    with zipfile.ZipFile(central_gtfs) as archive:
+        tables = {
+            name[:-4]: pd.read_csv(archive.open(name), dtype=str)
+            for name in archive.namelist()
+            if name.endswith(".txt")
+        }
+    offnet = tables["stops"]["stop_id"].iloc[0]
+    tables["stops"].loc[
+        tables["stops"]["stop_id"] == offnet, ["stop_lat", "stop_lon"]
+    ] = [
+        "0.0",
+        "0.0",
+    ]  # off the walking network — forces the closure fallback
+    feed = tmp_path / "offnet.zip"
+    with zipfile.ZipFile(feed, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, frame in tables.items():
+            archive.writestr(name + ".txt", frame.to_csv(index=False))
+
+    with pytest.warns(UserWarning):
+        net = TransportNetwork.from_gtfs(
+            [str(feed)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=60
+        )
+    net.compute_ultra_shortcuts(max_transfer_time=600.0)  # whole day
+    stops = [s for s, _, _ in net.stops]
+    usable = [s for s, lat, _ in net.stops if lat is not None and abs(lat) > 1][:3]
+    origins = [offnet, *usable]  # mixed, fallback origin first
+
+    matrix = net.travel_time_matrix(
+        origins, QUERY_DATE, QUERY_TIME, max_walking_time=ACCESS
+    )
+    unreached = np.iinfo(np.uint32).max
+    for i, origin in enumerate(origins):
+        row = {
+            stops[j]: int(matrix[i, j])
+            for j in range(len(stops))
+            if matrix[i, j] != unreached
+        }
+        assert row == net.travel_times_from_stop(
+            origin, QUERY_DATE, QUERY_TIME, max_walking_time=ACCESS
+        )
+    # The off-network origin fell back to closure board-at-origin (maps to 0);
+    # a usable origin routes door-to-door (its own cell costs the connector).
+    assert matrix[0, stops.index(offnet)] == 0
+    assert matrix[1, stops.index(usable[0])] > 0
 
 
 def test_compute_is_deterministic(helsinki_gtfs, kantakaupunki_pbf, ultra_network):
