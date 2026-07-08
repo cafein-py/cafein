@@ -2157,13 +2157,14 @@ impl TransportNetwork {
             max_transfers,
         };
         // Under a whole-day ULTRA set the intermediate transfers use the
-        // shortcuts and a final full-graph walk reaches every stop; otherwise
-        // this is the closure, tau-direct search (`time_transfers` is the
-        // closure then, and the fold is skipped).
+        // shortcuts and a bounded final walk (`<= max_walking_time`) reaches
+        // the remaining stops; otherwise this is the closure, tau-direct search
+        // (`time_transfers` is the closure then, and the fold is skipped).
         let mut arrivals =
             Raptor.one_to_all(&self.build.timetable, self.time_transfers(), &request);
         if self.ultra_active() {
-            self.fold_final_transfers(&mut arrivals, streets, departure, speed, max_walking_time);
+            let egress = self.final_egress(streets, speed, max_walking_time, max_snap_distance);
+            self.fold_final_transfers(&mut arrivals, &egress);
         }
         self.arrivals_dict(py, &arrivals, departure)
     }
@@ -2219,8 +2220,9 @@ impl TransportNetwork {
         let departure = parse_time(departure)?;
         // With a whole-day ULTRA set, treat the origin stop as its coordinate
         // and reach every stop door-to-door (coordinate access, ULTRA
-        // intermediate transfers, one unrestricted final walk); otherwise board
-        // at the origin stop and relax the closure (today's behaviour).
+        // intermediate transfers, one final walk bounded by max_walking_time);
+        // otherwise board at the origin stop and relax the closure (today's
+        // behaviour).
         if self.ultra_active() {
             if let (Some(streets), Some(coordinate)) =
                 (self.streets.as_ref(), self.stop_coordinate(origin))
@@ -2252,13 +2254,9 @@ impl TransportNetwork {
                     };
                     let mut arrivals =
                         Raptor.one_to_all(&self.build.timetable, self.time_transfers(), &request);
-                    self.fold_final_transfers(
-                        &mut arrivals,
-                        streets,
-                        departure,
-                        speed,
-                        max_walking_time,
-                    );
+                    let egress =
+                        self.final_egress(streets, speed, max_walking_time, max_snap_distance);
+                    self.fold_final_transfers(&mut arrivals, &egress);
                     return self.arrivals_dict(py, &arrivals, departure);
                 }
             }
@@ -3785,7 +3783,7 @@ impl TransportNetwork {
     /// the door-to-door RAPTOR time queries all relax it — `route_between_stops`
     /// (via the coordinate path), and the one-to-all `travel_times_from_stop` /
     /// `travel_times_from_coordinate` / `travel_time_matrix`, which pair it with
-    /// a `final_transfers` full-graph walk for the final leg (see
+    /// a bounded per-destination `final_egress` walk for the final leg (see
     /// `ultra_active`). The emissions/fare engines keep the closure: ULTRA is
     /// not emissions-complete. A partial-window set is not relaxed by routing —
     /// a journey's
@@ -3814,31 +3812,83 @@ impl TransportNetwork {
         Some((stop.latitude?, stop.longitude?))
     }
 
-    /// Folds one unrestricted final walk (`StreetNetwork::final_transfers`)
-    /// into a one-to-all arrival array: every stop reachable by a final walk
-    /// from a transit-reached stop takes the earlier of its RAPTOR arrival and
-    /// the walked arrival. Used by the one-to-all time queries under a
-    /// whole-day ULTRA set.
+    /// The per-destination final-walk egress for the one-to-all time queries:
+    /// a bounded (`max_walking_time`) `link_many` from every stop's coordinate,
+    /// giving `egress[t]` the stops within a final walk of `t` and their walk
+    /// seconds. The same bounded construction the coordinate query and the cost
+    /// matrix use — walking is undirected, so a search from `t` yields the
+    /// `s -> t` egress. Built once per query and reused across a matrix's
+    /// origins. `None` means the stop has no coordinate (it cannot be located,
+    /// so it keeps its bare transit arrival); `Some(list)` treats the stop's
+    /// coordinate as the destination — an empty list is a located-but-unreachable
+    /// coordinate (its connector exceeds the cap), which gets no arrival, exactly
+    /// as `route_between_coordinates` would refuse it.
+    fn final_egress(
+        &self,
+        streets: &StreetNetwork,
+        speed: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+    ) -> Vec<Option<Vec<(StopIdx, u32)>>> {
+        let stop_count = self.build.timetable.stop_count() as usize;
+        let mut coordinates: Vec<(f64, f64)> = Vec::with_capacity(stop_count);
+        let mut slots: Vec<Option<usize>> = Vec::with_capacity(stop_count);
+        for index in 0..stop_count {
+            match self.stop_coordinate(StopIdx(index as u32)) {
+                Some(coordinate) => {
+                    slots.push(Some(coordinates.len()));
+                    coordinates.push(coordinate);
+                }
+                None => slots.push(None),
+            }
+        }
+        let links = streets.link_many(&coordinates, speed, max_walking_time, max_snap_distance);
+        (0..stop_count)
+            .map(|index| {
+                slots[index].map(|slot| {
+                    let mut sources = Vec::new();
+                    if let Some(reached) = &links[slot] {
+                        sources.extend(reached.iter().map(|walk| (walk.stop, walk.seconds)));
+                    }
+                    sources
+                })
+            })
+            .collect()
+    }
+
+    /// Folds one **bounded** final walk into a one-to-all arrival array,
+    /// location-based: each *located* target stop's arrival becomes the earliest
+    /// `arrival[source] + walk(source -> target)` over the sources in
+    /// `egress[target]` (within `max_walking_time`). The egress is
+    /// `link_many(target.coordinate)`, which includes the target itself via its
+    /// connector, so a transit-reached target keeps its own arrival plus that
+    /// connector — the arrival *at the stop's coordinate*, matching
+    /// `route_between_coordinates`. `egress[target] == None` (no coordinate)
+    /// keeps the bare RAPTOR arrival; `Some(empty)` (coordinate unreachable
+    /// within `max_walking_time`) yields no arrival, as the coordinate query
+    /// would. A single hop over a snapshot of the RAPTOR arrivals, so a final
+    /// walk never chains. Used by the one-to-all time queries under a whole-day
+    /// ULTRA set.
     fn fold_final_transfers(
         &self,
         arrivals: &mut [Option<u32>],
-        streets: &StreetNetwork,
-        departure: u32,
-        speed: f64,
-        walk_cutoff_seconds: f64,
+        egress: &[Option<Vec<(StopIdx, u32)>>],
     ) {
-        let reached: Vec<(StopIdx, u32)> = arrivals
-            .iter()
-            .enumerate()
-            .filter_map(|(index, arrival)| arrival.map(|at| (StopIdx(index as u32), at)))
-            .collect();
-        for (stop, arrival) in
-            streets.final_transfers(&reached, departure, speed, walk_cutoff_seconds)
-        {
-            let slot = &mut arrivals[stop.0 as usize];
-            if slot.is_none_or(|current| arrival < current) {
-                *slot = Some(arrival);
+        let reached: Vec<Option<u32>> = arrivals.to_vec();
+        for (target, entry) in egress.iter().enumerate() {
+            let Some(sources) = entry else {
+                continue; // no coordinate: keep the bare transit arrival
+            };
+            let mut best = None;
+            for &(source, walk) in sources {
+                let Some(at) = reached[source.0 as usize] else {
+                    continue;
+                };
+                if let Some(candidate) = at.checked_add(walk).filter(|&at| at != u32::MAX) {
+                    best = Some(best.map_or(candidate, |current: u32| current.min(candidate)));
+                }
             }
+            arrivals[target] = best;
         }
     }
 
@@ -3865,7 +3915,7 @@ impl TransportNetwork {
     /// The RAPTOR one-to-all rows for a stop-origin travel-time matrix under a
     /// whole-day ULTRA set. Origins whose stop coordinate snaps route
     /// door-to-door — coordinate access, `time_transfers()` intermediate
-    /// transfers, and one `final_transfers` walk folded into the row, all in
+    /// transfers, and one bounded `final_egress` walk folded into the row, all in
     /// parallel over origins; origins that cannot snap fall back to the closure
     /// board-at-origin search. Rows come back in the input origin order. Runs
     /// with the GIL released, so it uses the erasing `access_stops` (no
@@ -3927,8 +3977,11 @@ impl TransportNetwork {
                 .collect();
             let mut usable_rows =
                 Raptor.one_to_all_many(&self.build.timetable, self.time_transfers(), &requests);
+            // The bounded final-walk egress is origin-independent — build it
+            // once and fold it into every usable origin's arrivals.
+            let egress = self.final_egress(streets, speed, max_walking_time, max_snap_distance);
             usable_rows.par_iter_mut().for_each(|row| {
-                self.fold_final_transfers(row, streets, departure, speed, max_walking_time);
+                self.fold_final_transfers(row, &egress);
             });
             for (row, &(index, _)) in usable_rows.into_iter().zip(&usable) {
                 rows[index] = row;

@@ -477,6 +477,62 @@ def test_travel_time_matrix_mixed_origins_under_ultra(
     assert matrix[1, stops.index(usable[0])] > 0
 
 
+def test_final_walk_respects_max_walking_time(central_gtfs, kantakaupunki_pbf):
+    # Regression: the one-to-all final walk must not exceed max_walking_time.
+    # Location-based, travel_times_from_coordinate reports arrival at each stop's
+    # coordinate, so under a given cap it must agree with the trusted
+    # route_between_coordinates within a connector: exactly for transit journeys,
+    # a few seconds above it for a direct walk to an adjacent stop (reached via
+    # the stop's snap, never faster than the coordinate query). To actually
+    # expose the bug the test must check a destination where a forbidden
+    # > max_walking_time walk WOULD arrive sooner — the bug took that walk and
+    # read hundreds-to-thousands of seconds too FAST. A loose-cap route arriving
+    # sooner than the capped route flags such a "cap-biting" destination.
+    with pytest.warns(UserWarning):
+        net = TransportNetwork.from_gtfs(
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=60
+        )
+    net.compute_ultra_shortcuts(max_transfer_time=600.0)  # whole day
+    coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
+    origin = next(iter(coords))
+    tight = net.travel_times_from_coordinate(
+        coords[origin], QUERY_DATE, QUERY_TIME, max_walking_time=ACCESS
+    )
+
+    def earliest(destination, cap):
+        return min(
+            journey["arrival"] - journey["departure"]
+            for journey in net.route_between_coordinates(
+                coords[origin],
+                coords[destination],
+                QUERY_DATE,
+                QUERY_TIME,
+                max_walking_time=cap,
+            )
+        )
+
+    checked = 0
+    cap_biting = 0
+    for dd in list(coords)[:40]:
+        if dd == origin or dd not in tight:
+            continue
+        try:
+            capped = earliest(dd, ACCESS)
+            loose = earliest(dd, 3000.0)  # allows the long walk the cap forbids
+        except ValueError:  # dd's coordinate off the walking network
+            continue
+        # The one-to-all (capped) arrival agrees with the capped coordinate query
+        # within a connector — never the forbidden faster walk the loose cap
+        # allows, which the bug took (tight ~= loose, far below capped).
+        assert abs(tight[dd] - capped) < 60
+        if loose < capped - 60:  # a forbidden walk would arrive sooner
+            cap_biting += 1
+        checked += 1
+    assert checked >= 1
+    # The suite is meaningless unless it exercised the bug's condition.
+    assert cap_biting >= 1
+
+
 def test_compute_is_deterministic(helsinki_gtfs, kantakaupunki_pbf, ultra_network):
     with pytest.warns(UserWarning):
         again = TransportNetwork.from_gtfs(
