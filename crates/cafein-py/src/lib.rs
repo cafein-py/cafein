@@ -33,10 +33,15 @@ struct TransportNetwork {
     build: TimetableBuild,
     transfers: Transfers,
     /// The ULTRA shortcut set, when computed (`compute_ultra_shortcuts`):
-    /// intermediate transfers as `(origin, destination, seconds)`, derived
-    /// from the installed street network. In-memory only in this stage —
-    /// not persisted and not yet relaxed by routing.
-    ultra_shortcuts: Option<Vec<Shortcut>>,
+    /// the intermediate transfers as a `Transfers`, derived from the
+    /// installed street network. The time engines relax it in place of the
+    /// closure `transfers` when it is present; the emissions/fare engines
+    /// always use the closure. In-memory only in this stage (not persisted).
+    ultra_transfers: Option<Transfers>,
+    /// The source-departure window the ULTRA set was computed for, in
+    /// seconds since midnight. A time query outside it falls back to the
+    /// closure, so a partial-window set never silently drops transfers.
+    ultra_window: Option<(u32, u32)>,
     geometry: Option<TripGeometry>,
     leg_geometry: Option<LegGeometry>,
     streets: Option<StreetNetwork>,
@@ -874,7 +879,8 @@ fn assemble((artifact, streets, streets_bytes_read): LoadedArtifact) -> Transpor
         feed,
         build,
         transfers,
-        ultra_shortcuts: None,
+        ultra_transfers: None,
+        ultra_window: None,
         geometry,
         leg_geometry,
         streets,
@@ -1122,7 +1128,8 @@ impl TransportNetwork {
             feed,
             build,
             transfers,
-            ultra_shortcuts: None,
+            ultra_transfers: None,
+            ultra_window: None,
             geometry: None,
             leg_geometry: None,
             streets: None,
@@ -1345,23 +1352,28 @@ impl TransportNetwork {
     /// Number of ULTRA shortcuts, or `None` when none are computed.
     #[getter]
     fn ultra_shortcut_count(&self) -> Option<usize> {
-        self.ultra_shortcuts.as_ref().map(|set| set.len())
+        self.ultra_transfers.as_ref().map(|set| set.edge_count())
     }
 
     /// The computed ULTRA shortcuts as `(origin_stop_id, destination_stop_id,
-    /// seconds)` triples, or `None` when none are computed. Sorted, so two
-    /// runs over the same network return byte-identical lists.
-    fn ultra_shortcuts(&self) -> Option<Vec<(String, String, u32)>> {
-        self.ultra_shortcuts.as_ref().map(|set| {
-            set.iter()
-                .map(|shortcut| {
-                    (
-                        self.public_stop_id(shortcut.origin),
-                        self.public_stop_id(shortcut.destination),
-                        shortcut.seconds,
-                    )
-                })
-                .collect()
+    /// seconds, meters)` tuples, or `None` when none are computed. Sorted by
+    /// origin then destination, so two runs over the same network return
+    /// byte-identical lists.
+    fn ultra_shortcuts(&self) -> Option<Vec<(String, String, u32, f64)>> {
+        self.ultra_transfers.as_ref().map(|set| {
+            let mut shortcuts = Vec::with_capacity(set.edge_count());
+            for from in 0..self.build.timetable.stop_count() {
+                let origin = self.public_stop_id(StopIdx(from));
+                for edge in set.from_stop(StopIdx(from)) {
+                    shortcuts.push((
+                        origin.clone(),
+                        self.public_stop_id(edge.to),
+                        edge.duration,
+                        edge.meters,
+                    ));
+                }
+            }
+            shortcuts
         })
     }
 
@@ -1372,13 +1384,21 @@ impl TransportNetwork {
     /// network must be built with an OSM extract), keeping the minimal
     /// set of intermediate transfers a Pareto-optimal two-trip journey
     /// needs. The result is held in memory (`ultra_shortcut_count`,
-    /// `ultra_shortcuts`) — this stage neither persists it nor relaxes it
-    /// in routing. Returns the number of shortcuts. `walking_speed_kmph`
-    /// sets the walking pace and `max_transfer_time` bounds an
-    /// intermediate walk, in seconds. `min_departure`/`max_departure`
-    /// bound the source-departure times the shortcuts serve, in seconds
-    /// since midnight (the whole service day by default); a narrower
-    /// window costs proportionally less.
+    /// `ultra_shortcuts`). Computed **for the whole service day** (the
+    /// default window), it is relaxed by the point-destination time queries
+    /// (door-to-door coordinate routing and the point-set matrices) in place
+    /// of the closure transfers, giving them unrestricted walking;
+    /// stop-destination time queries and the emissions/fare engines keep the
+    /// closure. A partial-window set (a narrower `min_departure`/
+    /// `max_departure`) is stored and inspectable but not relaxed by routing
+    /// — a journey's source departure can fall outside a bounded window. The
+    /// set is not persisted in this stage.
+    /// Returns the number of shortcuts. `walking_speed_kmph` sets the
+    /// walking pace and `max_transfer_time` bounds an intermediate walk,
+    /// in seconds. `min_departure`/`max_departure` bound the
+    /// source-departure times the shortcuts serve, in seconds since
+    /// midnight (the whole service day by default); a narrower window
+    /// costs proportionally less.
     #[pyo3(signature = (
         walking_speed_kmph = 3.6,
         max_transfer_time = 1800.0,
@@ -1412,23 +1432,33 @@ impl TransportNetwork {
         let stop_count = self.build.timetable.stop_count();
         let timetable = &self.build.timetable;
         let streets = self.installed_streets()?;
-        let shortcuts = py
+        let set = py
             .allow_threads(|| {
                 let dense = streets.stop_transfers(speed, max_transfer_time);
                 let graph =
                     Transfers::from_edges(stop_count, &dense).map_err(|error| error.to_string())?;
                 let view = DayView::universal(timetable);
-                Ok::<Vec<Shortcut>, String>(compute_shortcuts(
-                    &view,
-                    timetable,
-                    &graph,
-                    min_departure,
-                    max_departure,
-                ))
+                let shortcuts: Vec<Shortcut> =
+                    compute_shortcuts(&view, timetable, &graph, min_departure, max_departure);
+                // The shortcuts carry the walked distance, so they build a
+                // routing-ready transfer set directly.
+                let edges: Vec<(StopIdx, StopIdx, u32, f64)> = shortcuts
+                    .iter()
+                    .map(|shortcut| {
+                        (
+                            shortcut.origin,
+                            shortcut.destination,
+                            shortcut.seconds,
+                            shortcut.meters,
+                        )
+                    })
+                    .collect();
+                Transfers::from_edges(stop_count, &edges).map_err(|error| error.to_string())
             })
             .map_err(PyValueError::new_err)?;
-        let count = shortcuts.len();
-        self.ultra_shortcuts = Some(shortcuts);
+        let count = set.edge_count();
+        self.ultra_transfers = Some(set);
+        self.ultra_window = Some((min_departure, max_departure));
         Ok(count)
     }
 
@@ -1660,7 +1690,8 @@ impl TransportNetwork {
         );
         // ULTRA shortcuts are derived from the street network; a new one
         // invalidates them.
-        self.ultra_shortcuts = None;
+        self.ultra_transfers = None;
+        self.ultra_window = None;
         Ok(())
     }
 
@@ -1965,11 +1996,12 @@ impl TransportNetwork {
                 )
                 .swap_remove(0)
         };
+        // One choice for both routing and the leg-distance lookup, so an
+        // ULTRA-routed leg is measured in the ULTRA set.
+        let transfers = self.time_transfers();
         let journeys = match window {
-            None => Raptor.route(&self.build.timetable, &self.transfers, &request),
-            Some(window) => {
-                Raptor.route_range(&self.build.timetable, &self.transfers, &request, window)
-            }
+            None => Raptor.route(&self.build.timetable, transfers, &request),
+            Some(window) => Raptor.route_range(&self.build.timetable, transfers, &request, window),
         };
         let kept: Vec<&Journey> = journeys
             .iter()
@@ -1997,6 +2029,7 @@ impl TransportNetwork {
                 Some(&walks),
                 Some(&ends),
                 geometries,
+                transfers,
             )?)?;
         }
         Ok(result.unbind())
@@ -2408,7 +2441,14 @@ impl TransportNetwork {
         });
         let result = PyList::empty(py);
         for journey in &journeys {
-            result.append(self.journey_to_dict(py, journey, None, None, geometries)?)?;
+            result.append(self.journey_to_dict(
+                py,
+                journey,
+                None,
+                None,
+                geometries,
+                &self.transfers,
+            )?)?;
         }
         Ok(result.unbind())
     }
@@ -2569,6 +2609,7 @@ impl TransportNetwork {
                 Some(&walks),
                 Some(&ends),
                 geometries,
+                &self.transfers,
             )?)?;
         }
         Ok(result.unbind())
@@ -2711,7 +2752,7 @@ impl TransportNetwork {
             let mut flat = Raptor
                 .percentile_matrix_to_points(
                     &self.build.timetable,
-                    &self.transfers,
+                    self.time_transfers(),
                     &requests,
                     &egress,
                     window,
@@ -2951,7 +2992,8 @@ impl TransportNetwork {
                 })
                 .collect();
             let egress = egress_tables(&destination_links);
-            let rows = Raptor.one_to_all_many(&self.build.timetable, &self.transfers, &requests);
+            let rows =
+                Raptor.one_to_all_many(&self.build.timetable, self.time_transfers(), &requests);
             let mut flat = vec![u32::MAX; requests.len() * destination_count];
             for (origin, arrivals) in rows.iter().enumerate() {
                 debug_assert_eq!(arrivals.len(), stop_count);
@@ -3109,7 +3151,7 @@ impl TransportNetwork {
             let egress = egress_tables(&destination_links);
             let mut rows = Raptor.cost_matrix_to_points(
                 &self.build.timetable,
-                &self.transfers,
+                self.time_transfers(),
                 &inputs,
                 &requests,
                 &access_meters,
@@ -3571,6 +3613,25 @@ impl TransportNetwork {
 }
 
 impl TransportNetwork {
+    /// The intermediate-transfer set for the **point-destination** time
+    /// queries: the ULTRA shortcuts only when computed **for the whole
+    /// service day**, else the closure footpaths. Used by door-to-door
+    /// coordinate routing and the point-set matrices, where the street
+    /// access/egress search supplies the initial and final walks, so the
+    /// transfer set carries only intermediate transfers. Stop-destination
+    /// queries (whose final walk *is* a transfer) and the emissions/fare
+    /// engines keep the closure: ULTRA holds neither final transfers nor the
+    /// emissions/fare ones. A partial-window set is not relaxed by routing —
+    /// a journey's source-station departure (after access walking and waiting
+    /// for a first trip) can fall outside a bounded window, which would
+    /// silently drop its transfers — so only a whole-day set is used.
+    fn time_transfers(&self) -> &Transfers {
+        match (self.ultra_transfers.as_ref(), self.ultra_window) {
+            (Some(ultra), Some((0, hi))) if hi >= u32::MAX - 1 => ultra,
+            _ => &self.transfers,
+        }
+    }
+
     /// The installed street network, or a `ValueError` explaining that
     /// coordinate queries need one.
     fn installed_streets(&self) -> PyResult<&StreetNetwork> {
@@ -3619,7 +3680,14 @@ impl TransportNetwork {
         };
         let result = PyList::empty(py);
         for journey in &journeys {
-            result.append(self.journey_to_dict(py, journey, walks, ends, geometries)?)?;
+            result.append(self.journey_to_dict(
+                py,
+                journey,
+                walks,
+                ends,
+                geometries,
+                &self.transfers,
+            )?)?;
         }
         Ok(result.unbind())
     }
@@ -3733,6 +3801,7 @@ impl TransportNetwork {
         walks: Option<&WalkMaps>,
         ends: Option<&CoordinateEnds>,
         geometries: bool,
+        transfers: &Transfers,
     ) -> PyResult<Py<PyDict>> {
         let timetable = &self.build.timetable;
         let dict = PyDict::new(py);
@@ -3820,10 +3889,13 @@ impl TransportNetwork {
                     departure,
                     arrival,
                 } => {
-                    // Transfers are deduplicated per stop pair, so the
-                    // one edge found is the one routing relaxed.
-                    let meters = self
-                        .transfers
+                    // Look up the walked distance in the same transfer set
+                    // routing relaxed (the ULTRA set for point-destination
+                    // time routes, else the closure), so an ULTRA-only
+                    // shortcut leg still reports its metres. Transfers are
+                    // deduplicated per stop pair, so the one edge found is
+                    // the one routing relaxed.
+                    let meters = transfers
                         .from_stop(from_stop)
                         .iter()
                         .find(|transfer| transfer.to == to_stop)

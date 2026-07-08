@@ -242,8 +242,9 @@ class TransportNetwork:
     @property
     def ultra_shortcuts(self):
         """The ULTRA shortcuts as ``(origin_stop_id, destination_stop_id,
-        seconds)`` tuples, or ``None`` if none are computed. Sorted, so the
-        list is identical across runs over the same network."""
+        seconds, meters)`` tuples, or ``None`` if none are computed. Sorted
+        by origin then destination, so the list is identical across runs
+        over the same network."""
         return self._core.ultra_shortcuts()
 
     @property
@@ -327,8 +328,21 @@ class TransportNetwork:
         transfers a Pareto-optimal two-trip journey needs (see the ULTRA
         preprocessing of Baum et al.). The network must be built with an
         OSM extract. The result is held in memory (``ultra_shortcut_count``,
-        ``ultra_shortcuts``); this stage neither persists it (it is dropped
-        by ``save``) nor relaxes it in routing.
+        ``ultra_shortcuts``). Computed **for the whole service day** (the
+        default window), it is relaxed by the **point-destination time**
+        queries in place of the closure footpaths, giving them unrestricted
+        walking: door-to-door coordinate routing
+        (``route_between_coordinates``) and the point-set matrices
+        (``TravelTimeMatrix``/``TravelCostMatrix`` from point origins and
+        destinations, ``DetailedItineraries``). There the access/egress
+        street search supplies the initial and final walks, so the transfer
+        set carries only the intermediate transfers ULTRA is complete for.
+        **Stop-to-stop** time queries (whose final walk is itself a
+        transfer) and all **emissions/fare** queries keep the closure. A
+        partial-window set (a narrower ``min_departure``/``max_departure``)
+        is stored and inspectable but not relaxed by routing, since a
+        journey's source departure can fall outside a bounded window. The
+        set is not persisted (it is dropped by ``save``).
 
         A whole-day build over a metropolitan network is a heavy,
         run-once operation (minutes, parallel over cores); ``save`` it and
