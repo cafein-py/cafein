@@ -29,8 +29,9 @@
   shortcut set and its compute window are persisted by ``save`` and restored
   by ``load`` (artifact format 5; artifacts written by older versions are
   refused), so the heavy run-once preprocessing is reusable and a loaded
-  partial-window set stays unused. Requires a network built with an OSM
-  extract.
+  partial-window set stays unused. ``from_gtfs(ultra=True)`` computes the
+  whole-day set at build time (off by default; requires an OSM extract and
+  uses ``walking_speed_kmph``). Requires a network built with an OSM extract.
 
 - McTBTR groundwork — the multicriteria transfer set: the compute core
   gains a dominance-aware variant of the TBTR transfer precompute for

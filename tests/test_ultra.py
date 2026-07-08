@@ -294,6 +294,34 @@ def test_save_load_without_an_ultra_set(network, tmp_path):
     assert loaded.ultra_shortcuts is None
 
 
+def test_from_gtfs_ultra_default_off(network_with_footpaths):
+    # The flag is opt-in: a plain OSM build computes no shortcuts.
+    assert network_with_footpaths.ultra_shortcut_count is None
+
+
+def test_from_gtfs_ultra_requires_an_osm_extract(helsinki_gtfs):
+    # ultra=True has no meaning without a street network to walk.
+    with pytest.raises(ValueError, match="OSM extract"):
+        TransportNetwork.from_gtfs([str(helsinki_gtfs)], ultra=True)
+
+
+def test_from_gtfs_ultra_computes_the_whole_day_set(central_gtfs, kantakaupunki_pbf):
+    # ultra=True computes the whole-day set at build time, identically to
+    # building without the flag and calling compute_ultra_shortcuts().
+    with pytest.warns(UserWarning):
+        built = TransportNetwork.from_gtfs(
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), ultra=True
+        )
+    with pytest.warns(UserWarning):
+        manual = TransportNetwork.from_gtfs(
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf)
+        )
+    assert manual.ultra_shortcut_count is None
+    manual.compute_ultra_shortcuts()
+    assert built.ultra_shortcut_count and built.ultra_shortcut_count > 0
+    assert built.ultra_shortcuts == manual.ultra_shortcuts
+
+
 def test_compute_is_deterministic(helsinki_gtfs, kantakaupunki_pbf, ultra_network):
     with pytest.warns(UserWarning):
         again = TransportNetwork.from_gtfs(
