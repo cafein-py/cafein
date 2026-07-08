@@ -58,13 +58,17 @@ pub fn compute_shortcuts(
     all
 }
 
-/// One intermediate-transfer shortcut: walk `seconds` from `origin` (a
-/// trip's alight stop) to `destination` (the next trip's board stop).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One intermediate-transfer shortcut: walk `seconds`/`meters` from
+/// `origin` (a trip's alight stop) to `destination` (the next trip's board
+/// stop). `meters` is the walked distance along the transfer graph (a
+/// stop-chain, so a slight overestimate of the direct road walk until the
+/// road-graph search stage).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Shortcut {
     pub origin: StopIdx,
     pub destination: StopIdx,
     pub seconds: u32,
+    pub meters: f64,
 }
 
 /// One source-departure and the first-trip boardings catchable when
@@ -271,6 +275,10 @@ struct Search<'a> {
     /// For a one-trip label: the shortcut origin (the trip's alight stop)
     /// when the journey is a candidate, else `None` (a witness/walk).
     one_parent: Vec<Option<StopIdx>>,
+    /// Walked metres of the intermediate transfer reaching a one-trip label,
+    /// measured from its shortcut origin (0 at the intermediate-Dijkstra
+    /// seeds); the walked distance of an emitted shortcut.
+    one_meters: Vec<f64>,
     /// For a two-trip label reached by route: the shortcut destination
     /// (the trip's board stop) when it is a candidate, else `None`.
     two_route_parent: Vec<Option<StopIdx>>,
@@ -304,6 +312,7 @@ impl<'a> Search<'a> {
             one: vec![NEVER; n],
             two: vec![NEVER; n],
             one_parent: vec![None; n],
+            one_meters: vec![0.0; n],
             two_route_parent: vec![None; n],
             updated_by_route: Vec::new(),
             updated_by_transfer: Vec::new(),
@@ -494,6 +503,7 @@ impl<'a> Search<'a> {
         let mut candidates_in_queue: usize = 0;
         for stop in &seeds {
             heap.push(Reverse((self.one[stop.0 as usize], stop.0)));
+            self.one_meters[stop.0 as usize] = 0.0;
             if self.one_parent[stop.0 as usize].is_some() {
                 candidates_in_queue += 1;
             }
@@ -527,6 +537,7 @@ impl<'a> Search<'a> {
                         _ => {}
                     }
                     self.one[to] = next;
+                    self.one_meters[to] = self.one_meters[stop as usize] + edge.meters;
                     self.one_parent[to] = self.one_parent[stop as usize];
                     if next < self.two[to] {
                         self.two[to] = next;
@@ -592,11 +603,13 @@ impl<'a> Search<'a> {
                 let origin = self.one_parent[route_parent.0 as usize]
                     .expect("a candidate destination has a shortcut origin");
                 let seconds = self.one[route_parent.0 as usize] - self.one[origin.0 as usize];
+                let meters = self.one_meters[route_parent.0 as usize];
                 if self.emitted.insert((origin.0, route_parent.0)) {
                     self.shortcuts.push(Shortcut {
                         origin,
                         destination: route_parent,
                         seconds,
+                        meters,
                     });
                 }
                 if let Some(set) = self.dest_candidates.remove(&route_parent) {
@@ -734,6 +747,7 @@ mod tests {
                 origin: StopIdx(1),
                 destination: StopIdx(2),
                 seconds: 50,
+                meters: 50.0,
             }]
         );
     }
@@ -798,6 +812,42 @@ mod tests {
                 origin: StopIdx(1),
                 destination: StopIdx(2),
                 seconds: 50,
+                meters: 50.0,
+            }]
+        );
+    }
+
+    #[test]
+    fn the_shortcut_metres_sum_a_multi_hop_walk() {
+        // The intermediate transfer chains 1→2 (30 s / 30 m) and 2→3
+        // (20 s / 20 m); the shortcut carries the summed distance, 50 m.
+        let mut builder = TimetableBuilder::new(5);
+        let a = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+        let b = builder.add_pattern(&[StopIdx(3), StopIdx(4)], 1).unwrap();
+        builder.add_trip(a, vec![time(0), time(100)], 0, 0).unwrap();
+        builder
+            .add_trip(b, vec![time(200), time(300)], 1, 0)
+            .unwrap();
+        let timetable = builder.finish();
+        let view = DayView::universal(&timetable);
+        let transfers = Transfers::from_edges(
+            5,
+            &[
+                (StopIdx(1), StopIdx(2), 30, 30.0),
+                (StopIdx(2), StopIdx(1), 30, 30.0),
+                (StopIdx(2), StopIdx(3), 20, 20.0),
+                (StopIdx(3), StopIdx(2), 20, 20.0),
+            ],
+        )
+        .unwrap();
+        let shortcuts = compute_shortcuts(&view, &timetable, &transfers, 0, NEVER - 1);
+        assert_eq!(
+            shortcuts,
+            vec![Shortcut {
+                origin: StopIdx(1),
+                destination: StopIdx(3),
+                seconds: 50,
+                meters: 50.0,
             }]
         );
     }
