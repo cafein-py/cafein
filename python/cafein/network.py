@@ -68,6 +68,7 @@ class TransportNetwork:
         max_snap_distance=None,
         trip_distances=True,
         leg_geometries=True,
+        ultra=False,
     ):
         """Build a network from GTFS archives and an optional OSM extract.
 
@@ -102,11 +103,20 @@ class TransportNetwork:
             Also store the trips' polylines, so transit legs report
             their geometry; disable to save memory when geometries are
             never needed. Ignored when `trip_distances` is off.
+        ultra : bool (optional, default: False)
+            Also compute the whole-day ULTRA intermediate-transfer
+            shortcuts (see ``compute_ultra_shortcuts``), giving the
+            point-destination time queries unrestricted intermediate
+            walking. Requires ``osm_pbf`` and uses ``walking_speed_kmph``.
+            It is a heavy, run-once operation (minutes over a metropolitan
+            network); ``save`` the result and reuse it. Off by default.
 
         The build reads the input files more than once (timetable,
         distance ladder, footpaths); they must not change underneath it.
         """
         paths = _gtfs_paths(paths)
+        if ultra and osm_pbf is None:
+            raise ValueError("ultra=True requires an OSM extract; pass osm_pbf=")
         core = _TransportNetwork.from_gtfs(paths)
         if trip_distances:
             from cafein import geometry
@@ -145,6 +155,8 @@ class TransportNetwork:
                 footpaths.meters,
             )
             core.set_street_network(*street_network)
+            if ultra:
+                core.compute_ultra_shortcuts(walking_speed_kmph)
         return cls(core)
 
     def save(self, path):
