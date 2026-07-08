@@ -48,6 +48,16 @@
   snappable origins route door-to-door, an off-network origin falls back to the
   closure — preserving input order. Without a whole-day set they keep the
   closure, tau-direct search. Requires a network built with an OSM extract.
+  The time-optimal stop cost matrix — ``TravelCostMatrix`` /
+  ``travel_cost_matrix`` with ``optimize="time"`` over stop origins and
+  destinations — routes door-to-door the same way under a whole-day set: it is
+  the point cost matrix over the stops' coordinates (same location-based egress),
+  so its ``travel_time`` equals the ``travel_time_matrix`` cell while it also
+  annotates distance, emissions, and fare, and it gains the same three walking
+  arguments. Snappable origins route door-to-door and off-network origins fall
+  back to the closure, per row. The emissions/fare stop matrices
+  (``optimize="emissions"``/``"fare"``) keep the closure until McULTRA and still
+  reject the walking arguments.
 
 - McTBTR groundwork — the multicriteria transfer set: the compute core
   gains a dominance-aware variant of the TBTR transfer precompute for

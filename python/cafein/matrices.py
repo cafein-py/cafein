@@ -526,17 +526,19 @@ def _cost_columns(
             )
         _warn_unsnapped(table, from_ids, to_ids)
     else:
-        if not (
-            walking_speed_kmph is None
-            and max_walking_time is None
-            and max_snap_distance is None
-        ):
-            raise ValueError("walking options apply to point origins/destinations")
         stop_ids = [stop for stop, _, _ in network.stops]
         from_ids = list(stop_ids) if origins is None else [str(o) for o in origins]
         from_ids = from_ids[_chunk_slice(len(from_ids), chunk)]
         to_stops = None if destinations is None else [str(d) for d in destinations]
         if optimize != "time":
+            # The emissions/fare (McRAPTOR) stop matrix keeps the closure until
+            # McULTRA, so it takes no walking options.
+            if not (
+                walking_speed_kmph is None
+                and max_walking_time is None
+                and max_snap_distance is None
+            ):
+                raise ValueError("walking options apply to point origins/destinations")
             table = network._core.least_cost_matrix(
                 from_ids,
                 date,
@@ -554,6 +556,8 @@ def _cost_columns(
                 geometries,
             )
         else:
+            # The walking options bound the door-to-door cost matrix under a
+            # whole-day ULTRA set; they are ignored on the closure path.
             table = network._core.travel_cost_matrix(
                 from_ids,
                 date,
@@ -561,6 +565,7 @@ def _cost_columns(
                 trip_factors,
                 max_transfers,
                 to_stops,
+                *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
                 geometries,
                 fare_tables,
             )
