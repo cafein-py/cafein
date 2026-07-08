@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- ULTRA shortcut computation, first integration step —
+- ULTRA unrestricted walking for point-destination time routing —
   ``TransportNetwork.compute_ultra_shortcuts`` enumerates the ULTRA
   intermediate-transfer shortcuts (Baum et al.) over the unrestricted
   stop-to-stop walking graph of the installed street network: the
@@ -12,10 +12,22 @@
   cutoff, and ``min_departure``/``max_departure`` bound the
   source-departure window (the whole service day by default; a whole-day
   metropolitan build is a heavy run-once operation). The result is held
-  in memory as ``(origin, destination, seconds)`` triples, exposed as
-  ``ultra_shortcut_count`` and ``ultra_shortcuts``; this step neither
-  persists it nor relaxes it in routing. Requires a network built with
-  an OSM extract.
+  in memory as ``(origin, destination, seconds, meters)`` tuples, exposed
+  as ``ultra_shortcut_count`` and ``ultra_shortcuts``. Computed for the
+  **whole service day** (the default window), it is relaxed by the
+  **point-destination** time queries in place of the closure footpaths,
+  giving them unrestricted intermediate walking: door-to-door coordinate
+  routing (``route_between_coordinates``) and the point-set matrices
+  (``TravelTimeMatrix``/``TravelCostMatrix`` from point origins and
+  destinations, ``DetailedItineraries``), where the access/egress street
+  search supplies the initial and final walks. Stop-to-stop time queries
+  and all emissions/fare queries keep the closure — ULTRA shortcuts are
+  complete only for the intermediate transfers of the (arrival, transfers)
+  criteria. A partial-window set (a narrower ``min_departure``/
+  ``max_departure``) is stored and inspectable but not relaxed by routing,
+  since a journey's source departure can fall outside a bounded window. The
+  set is not persisted (it is dropped by ``save``). Requires a network
+  built with an OSM extract.
 
 - McTBTR groundwork — the multicriteria transfer set: the compute core
   gains a dominance-aware variant of the TBTR transfer precompute for
