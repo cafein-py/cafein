@@ -1194,6 +1194,137 @@ impl StreetNetwork {
         })
     }
 
+    /// Earliest arrival at every stop reachable by a single **final walk**
+    /// from the transit-reached stops — the last, unrestricted leg of a
+    /// journey. `reached` pairs each reached stop with its arrival time
+    /// (seconds on the query's clock); `origin_time` is the query departure
+    /// the arrivals share. Returns `(stop, arrival)` for every stop a final
+    /// walk reaches, its arrival the earliest `arrival_r + walk(r -> stop)`
+    /// over the reached stops `r`.
+    ///
+    /// The final walk is **unrestricted**: `walk_cutoff_seconds` bounds the
+    /// search for tractability, not each walk. A single fused multi-source
+    /// search cannot both cap every walk *and* return the min-arrival target
+    /// (that needs a multi-criteria search), so every reached stop is granted
+    /// a final-walk allowance of at least `walk_cutoff_seconds`, and a stop
+    /// arriving earlier may contribute a longer walk (its arrival slack). This
+    /// is faithful to ULTRA's unrestricted walking. Each reached stop is
+    /// seeded from all of its links, offset by the arrival's
+    /// walking-equivalent distance, so the multi-source search returns the
+    /// min-*arrival* target rather than the nearest source. Symmetric,
+    /// deterministic, and independent of thread count.
+    pub fn final_transfers(
+        &self,
+        reached: &[(StopIdx, u32)],
+        origin_time: u32,
+        walking_speed: f64,
+        walk_cutoff_seconds: f64,
+    ) -> Vec<(StopIdx, u32)> {
+        if reached.is_empty()
+            || !walking_speed.is_finite()
+            || walking_speed <= 0.0
+            || !walk_cutoff_seconds.is_finite()
+            || walk_cutoff_seconds < 0.0
+        {
+            return Vec::new();
+        }
+        // Each reached stop's arrival becomes a meters offset on the shared
+        // frontier: a stop reached `Δ` seconds later starts `Δ * speed`
+        // metres "further", so the summed frontier is the arrival time.
+        let offsets: HashMap<StopIdx, f64> = reached
+            .iter()
+            .map(|&(stop, arrival)| {
+                (
+                    stop,
+                    arrival.saturating_sub(origin_time) as f64 * walking_speed,
+                )
+            })
+            .collect();
+        let mut sources: Vec<(Snap, f64)> = Vec::new();
+        for link in &self.links {
+            if let Some(&offset) = offsets.get(&link.stop) {
+                sources.push((
+                    Snap {
+                        edge: link.edge,
+                        fraction: link.fraction,
+                        connector: link.connector,
+                    },
+                    offset,
+                ));
+            }
+        }
+        if sources.is_empty() {
+            return Vec::new();
+        }
+        let max_offset = offsets.values().copied().fold(0.0_f64, f64::max);
+        let cutoff = max_offset + walk_cutoff_seconds * walking_speed;
+        SEARCH_STATE.with(|cell| {
+            let state = &mut cell.borrow_mut();
+            let mut seeds: Vec<(u32, f64)> = Vec::with_capacity(sources.len() * 2);
+            for (snap, offset) in &sources {
+                let (from, to) = self.edge_endpoints(snap.edge);
+                let length = self.arrays.lengths()[snap.edge as usize];
+                seeds.push((from, offset + snap.connector + snap.fraction * length));
+                seeds.push((to, offset + snap.connector + (1.0 - snap.fraction) * length));
+            }
+            self.bounded_dijkstra(&seeds, cutoff, state);
+            let mut candidates: Vec<u32> = Vec::new();
+            for (snap, _) in &sources {
+                let (from, to) = self.edge_endpoints(snap.edge);
+                candidates.extend(self.links_at(from));
+                candidates.extend(self.links_at(to));
+            }
+            for &vertex in state.distances.keys() {
+                candidates.extend(self.links_at(vertex));
+            }
+            candidates.sort_unstable();
+            candidates.dedup();
+            // Source snaps grouped by edge, so a target stop on the same edge
+            // as a reached stop takes the shorter direct on-edge walk.
+            let mut on_edge: HashMap<u32, Vec<(f64, f64, f64)>> = HashMap::new();
+            for (snap, offset) in &sources {
+                on_edge.entry(snap.edge).or_default().push((
+                    *offset,
+                    snap.fraction,
+                    snap.connector,
+                ));
+            }
+            // Seed each reached stop at its own arrival (a zero-length final
+            // walk), so a reached stop keeps its arrival rather than an
+            // out-and-back over its connector; a candidate link only lowers it.
+            let mut earliest: HashMap<StopIdx, f64> = offsets;
+            for index in candidates {
+                let link = &self.links[index as usize];
+                let link_length = self.arrays.lengths()[link.edge as usize];
+                let mut meters = f64::min(
+                    state.distance(link.from) + link.fraction * link_length,
+                    state.distance(link.to) + (1.0 - link.fraction) * link_length,
+                ) + link.connector;
+                if let Some(list) = on_edge.get(&link.edge) {
+                    for &(offset, src_fraction, src_connector) in list {
+                        let direct = offset
+                            + src_connector
+                            + (link.fraction - src_fraction).abs() * link_length
+                            + link.connector;
+                        meters = meters.min(direct);
+                    }
+                }
+                if meters <= cutoff + 1e-9 {
+                    earliest
+                        .entry(link.stop)
+                        .and_modify(|best| *best = best.min(meters))
+                        .or_insert(meters);
+                }
+            }
+            let mut arrivals: Vec<(StopIdx, u32)> = earliest
+                .into_iter()
+                .map(|(stop, meters)| (stop, origin_time + seconds(meters / walking_speed)))
+                .collect();
+            arrivals.sort_unstable_by_key(|&(stop, _)| stop);
+            arrivals
+        })
+    }
+
     /// The walking transfers between every pair of linked stops within
     /// `max_seconds` on foot — the road-network shortest walk, computed
     /// natively and in parallel over source stops. Emitted as
@@ -2531,6 +2662,95 @@ mod tests {
         assert!(network.stop_transfers(f64::NAN, 600.0).is_empty());
         assert!(network.stop_transfers(1.0, -1.0).is_empty());
         assert!(network.stop_transfers(1.0, f64::INFINITY).is_empty());
+    }
+
+    #[test]
+    fn final_transfers_take_the_earliest_arrival_over_reached_stops() {
+        // Three stops on one 400 m edge: stop 0 at 0 m, stop 1 at 200 m,
+        // stop 2 at 400 m; walking speed 1 m/s so metres are seconds. A final
+        // walk to stop 1 is the min over reached stops of arrival + walk: from
+        // stop 2 (arrival 90 + 200 m) beats stop 0 (arrival 100 + 200 m), so
+        // the arrival offset must make the later-but-closer source win. Each
+        // reached stop keeps its own arrival (a zero-length walk).
+        let network = network(
+            2,
+            3,
+            &[(0, 1, 400.0, straight((0.0, 0.0), (400.0, 0.0)))],
+            vec![
+                link(0, 0, 0.0, 0.0),
+                link(1, 0, 0.5, 0.0),
+                link(2, 0, 1.0, 0.0),
+            ],
+        )
+        .unwrap();
+        let out = network.final_transfers(&[(StopIdx(0), 100), (StopIdx(2), 90)], 0, 1.0, 1000.0);
+        assert_eq!(
+            out,
+            vec![(StopIdx(0), 100), (StopIdx(1), 290), (StopIdx(2), 90)]
+        );
+    }
+
+    #[test]
+    fn final_transfers_reject_empty_and_invalid_parameters() {
+        let network = network(
+            2,
+            2,
+            &[(0, 1, 400.0, straight((0.0, 0.0), (400.0, 0.0)))],
+            vec![link(0, 0, 0.25, 0.0), link(1, 0, 0.75, 0.0)],
+        )
+        .unwrap();
+        assert!(network.final_transfers(&[], 0, 1.0, 600.0).is_empty());
+        assert!(network
+            .final_transfers(&[(StopIdx(0), 100)], 0, 0.0, 600.0)
+            .is_empty());
+        assert!(network
+            .final_transfers(&[(StopIdx(0), 100)], 0, 1.0, -1.0)
+            .is_empty());
+    }
+
+    #[test]
+    fn final_transfers_walk_through_vertices() {
+        // L-shaped graph: v0 --300 m-- v1 --100 m-- v2, a stop at each vertex
+        // (stop 0 at v0, stop 2 at the corner v1, stop 1 at v2). With stop 0
+        // reached at t=0 and stop 1 at t=50, the earliest arrival at the corner
+        // (stop 2) is stop 1's 100 m walk over edge 1 (50 + 100 = 150), not
+        // stop 0's 300 m walk over edge 0 (0 + 300 = 300) — a min-arrival path
+        // that traverses a vertex, and the later-but-closer source wins.
+        let network = network(
+            3,
+            3,
+            &[
+                (0, 1, 300.0, straight((0.0, 0.0), (300.0, 0.0))),
+                (1, 2, 100.0, straight((300.0, 0.0), (300.0, 100.0))),
+            ],
+            vec![
+                link(0, 0, 0.0, 0.0),
+                link(1, 1, 1.0, 0.0),
+                link(2, 0, 1.0, 0.0),
+            ],
+        )
+        .unwrap();
+        let out = network.final_transfers(&[(StopIdx(0), 0), (StopIdx(1), 50)], 0, 1.0, 1000.0);
+        assert_eq!(
+            out,
+            vec![(StopIdx(0), 0), (StopIdx(1), 50), (StopIdx(2), 150)]
+        );
+    }
+
+    #[test]
+    fn final_transfers_keep_a_reached_stop_at_its_own_arrival() {
+        // A reached stop sits mid-edge behind a 20 m connector. Its own final
+        // walk is zero-length, so it keeps its arrival (100 s) rather than an
+        // out-and-back over the connector (which would report 140 s).
+        let network = network(
+            2,
+            1,
+            &[(0, 1, 400.0, straight((0.0, 0.0), (400.0, 0.0)))],
+            vec![link(0, 0, 0.5, 20.0)],
+        )
+        .unwrap();
+        let out = network.final_transfers(&[(StopIdx(0), 100)], 0, 1.0, 600.0);
+        assert_eq!(out, vec![(StopIdx(0), 100)]);
     }
 
     #[test]

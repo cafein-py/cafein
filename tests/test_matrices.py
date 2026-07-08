@@ -740,6 +740,11 @@ def test_point_matrices_report_unsnapped_points(network_with_footpaths):
 
 
 def test_stop_matrices_reject_point_options(network):
+    # The cost matrix still rejects the walking options for stop origins (its
+    # door-to-door support is a later stage); `destinations` stays point-only
+    # for the travel-time matrix too. The travel-time matrix now *accepts* the
+    # walking options for stop origins — they bound its door-to-door routing
+    # under a whole-day ULTRA set and are ignored otherwise.
     with pytest.raises(ValueError, match="point origins"):
         cost_matrix(
             network,
@@ -749,8 +754,15 @@ def test_stop_matrices_reject_point_options(network):
         )
     with pytest.raises(ValueError, match="point origins"):
         network.travel_time_matrix(
-            ["4810551"], "2022-02-22", "08:30:00", max_walking_time=300.0
+            ["4810551"],
+            "2022-02-22",
+            "08:30:00",
+            destinations=point_frame(network, [("d", "4810551")]),
         )
+    matrix = network.travel_time_matrix(
+        ["4810551"], "2022-02-22", "08:30:00", max_walking_time=300.0
+    )
+    assert matrix.shape == (1, network.stop_count)
 
 
 def nearest_rank(sorted_samples, percentile):

@@ -2156,17 +2156,16 @@ impl TransportNetwork {
             active_services_previous: self.active_services_previous(date)?,
             max_transfers,
         };
-        let arrivals = Raptor.one_to_all(&self.build.timetable, &self.transfers, &request);
-        let result = PyDict::new(py);
-        for (index, arrival) in arrivals.iter().enumerate() {
-            if let Some(arrival) = arrival {
-                result.set_item(
-                    self.public_stop_id(StopIdx(index as u32)),
-                    arrival - departure,
-                )?;
-            }
+        // Under a whole-day ULTRA set the intermediate transfers use the
+        // shortcuts and a final full-graph walk reaches every stop; otherwise
+        // this is the closure, tau-direct search (`time_transfers` is the
+        // closure then, and the fold is skipped).
+        let mut arrivals =
+            Raptor.one_to_all(&self.build.timetable, self.time_transfers(), &request);
+        if self.ultra_active() {
+            self.fold_final_transfers(&mut arrivals, streets, departure, speed, max_walking_time);
         }
-        Ok(result.unbind())
+        self.arrivals_dict(py, &arrivals, departure)
     }
 
     /// Earliest arrival at every reachable stop for a single departure.
@@ -2186,14 +2185,25 @@ impl TransportNetwork {
     ///     Departure time at the origin as ``HH:MM:SS``.
     /// max_transfers : int (optional, default: 7)
     ///     Maximum number of transfers between rides.
+    /// walking_speed_kmph, max_walking_time, max_snap_distance : float
+    ///     Bound the door-to-door walking under a whole-day ULTRA set
+    ///     (defaults 3.6 km/h, 7200 s, 1600 m); ignored otherwise.
+    ///
+    /// With a whole-day ULTRA set (``compute_ultra_shortcuts``) the origin
+    /// stop is treated as its coordinate and every stop is reached
+    /// door-to-door — unrestricted initial, intermediate, and final walking;
+    /// without it the search boards at the origin stop over the closure.
     ///
     /// Returns
     /// -------
     /// dict
     ///     Travel time in seconds to every reachable stop, keyed by
-    ///     public stop_id; the origin maps to 0 and unreachable stops
-    ///     are absent.
-    #[pyo3(signature = (from_stop, date, departure, max_transfers = 7))]
+    ///     public stop_id; unreachable stops are absent. On the closure path
+    ///     the origin maps to 0; under a whole-day ULTRA set it is the
+    ///     door-to-door time from the origin stop's coordinate and may cost
+    ///     the short walk to the platform.
+    #[pyo3(signature = (from_stop, date, departure, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    #[allow(clippy::too_many_arguments)]
     fn travel_times_from_stop(
         &self,
         py: Python<'_>,
@@ -2201,9 +2211,58 @@ impl TransportNetwork {
         date: &str,
         departure: &str,
         max_transfers: u8,
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
     ) -> PyResult<Py<PyDict>> {
         let origin = self.resolve_stop(from_stop)?;
         let departure = parse_time(departure)?;
+        // With a whole-day ULTRA set, treat the origin stop as its coordinate
+        // and reach every stop door-to-door (coordinate access, ULTRA
+        // intermediate transfers, one unrestricted final walk); otherwise board
+        // at the origin stop and relax the closure (today's behaviour).
+        if self.ultra_active() {
+            if let (Some(streets), Some(coordinate)) =
+                (self.streets.as_ref(), self.stop_coordinate(origin))
+            {
+                if streets
+                    .snap(coordinate.0, coordinate.1, max_snap_distance)
+                    .is_some()
+                {
+                    let speed = validated_walking_speed(
+                        walking_speed_kmph,
+                        max_walking_time,
+                        max_snap_distance,
+                    )?;
+                    let access = coordinate_links(
+                        streets,
+                        coordinate,
+                        speed,
+                        max_walking_time,
+                        max_snap_distance,
+                        "origin ",
+                    )?;
+                    let request = Request {
+                        departure,
+                        access: request_offsets(&access),
+                        egress: Vec::new(),
+                        active_services: self.active_services(date)?,
+                        active_services_previous: self.active_services_previous(date)?,
+                        max_transfers,
+                    };
+                    let mut arrivals =
+                        Raptor.one_to_all(&self.build.timetable, self.time_transfers(), &request);
+                    self.fold_final_transfers(
+                        &mut arrivals,
+                        streets,
+                        departure,
+                        speed,
+                        max_walking_time,
+                    );
+                    return self.arrivals_dict(py, &arrivals, departure);
+                }
+            }
+        }
         let request = Request {
             departure,
             access: vec![(origin, 0)],
@@ -2213,16 +2272,7 @@ impl TransportNetwork {
             max_transfers,
         };
         let arrivals = Raptor.one_to_all(&self.build.timetable, &self.transfers, &request);
-        let result = PyDict::new(py);
-        for (index, arrival) in arrivals.iter().enumerate() {
-            if let Some(arrival) = arrival {
-                result.set_item(
-                    self.public_stop_id(StopIdx(index as u32)),
-                    arrival - departure,
-                )?;
-            }
-        }
-        Ok(result.unbind())
+        self.arrivals_dict(py, &arrivals, departure)
     }
 
     /// Travel times from several stops to every stop, as a matrix.
@@ -2250,6 +2300,17 @@ impl TransportNetwork {
     ///     identical; TBTR trades a per-date precompute for faster
     ///     scans. The precomputed set covers same-stop transfers;
     ///     installed footpaths relax at query time, RAPTOR-style.
+    /// walking_speed_kmph, max_walking_time, max_snap_distance : float
+    ///     Bound the door-to-door walking of the ``"raptor"`` router under a
+    ///     whole-day ULTRA set (defaults 3.6 km/h, 7200 s, 1600 m); ignored
+    ///     otherwise.
+    ///
+    /// With a whole-day ULTRA set the ``"raptor"`` router reaches every stop
+    /// door-to-door from each origin (the origin treated as its coordinate,
+    /// unrestricted initial/intermediate/final walking); a stop that has no
+    /// coordinate or is off the walking network keeps the closure
+    /// board-at-origin search for its row. The ``"tbtr"`` router keeps the
+    /// closure.
     ///
     /// Returns
     /// -------
@@ -2258,7 +2319,8 @@ impl TransportNetwork {
     ///     times in seconds; row order follows `from_stops`, column
     ///     order follows ``stops``. Unreachable pairs hold the maximum
     ///     uint32 value (4294967295).
-    #[pyo3(signature = (from_stops, date, departure, max_transfers = 7, router = "raptor"))]
+    #[pyo3(signature = (from_stops, date, departure, max_transfers = 7, router = "raptor", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    #[allow(clippy::too_many_arguments)]
     fn travel_time_matrix<'py>(
         &self,
         py: Python<'py>,
@@ -2267,6 +2329,9 @@ impl TransportNetwork {
         departure: &str,
         max_transfers: u8,
         router: &str,
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
     ) -> PyResult<Bound<'py, PyArray2<u32>>> {
         if !matches!(router, "raptor" | "tbtr") {
             return Err(PyValueError::new_err(format!(
@@ -2282,8 +2347,33 @@ impl TransportNetwork {
         let active_services_previous = self.active_services_previous(date)?;
         let stop_count = self.build.timetable.stop_count() as usize;
         let count = origins.len();
+        // The RAPTOR router routes door-to-door under a whole-day ULTRA set,
+        // but only for origins that snap; validate the walking speed up front
+        // (error creation needs the GIL that `allow_threads` releases) and only
+        // when at least one origin is usable — a matrix whose origins all fall
+        // back ignores the walking options, as `travel_times_from_stop` does.
+        let ultra_usable = router == "raptor"
+            && self.ultra_active()
+            && self.streets.as_ref().is_some_and(|streets| {
+                origins.iter().any(|&origin| {
+                    self.stop_coordinate(origin).is_some_and(|coordinate| {
+                        streets
+                            .snap(coordinate.0, coordinate.1, max_snap_distance)
+                            .is_some()
+                    })
+                })
+            });
+        let ultra_speed = if ultra_usable {
+            Some(validated_walking_speed(
+                walking_speed_kmph,
+                max_walking_time,
+                max_snap_distance,
+            )?)
+        } else {
+            None
+        };
         let flat: Vec<u32> = py.allow_threads(|| {
-            let rows = if router == "tbtr" {
+            let rows: Vec<Vec<Option<u32>>> = if router == "tbtr" {
                 let engine = TbtrEngine::for_date(
                     &self.build.timetable,
                     &self.transfers,
@@ -2293,10 +2383,26 @@ impl TransportNetwork {
                 let accesses: Vec<Vec<(StopIdx, u32)>> =
                     origins.iter().map(|&origin| vec![(origin, 0)]).collect();
                 engine.one_to_all_many(departure, &accesses, max_transfers)
+            } else if let Some(speed) = ultra_speed {
+                let streets = self
+                    .streets
+                    .as_ref()
+                    .expect("ultra_speed is set only when a street network is installed");
+                self.ultra_matrix_rows(
+                    streets,
+                    &origins,
+                    departure,
+                    &active_services,
+                    &active_services_previous,
+                    max_transfers,
+                    speed,
+                    max_walking_time,
+                    max_snap_distance,
+                )
             } else {
                 let requests: Vec<Request> = origins
-                    .into_iter()
-                    .map(|origin| Request {
+                    .iter()
+                    .map(|&origin| Request {
                         departure,
                         access: vec![(origin, 0)],
                         egress: Vec::new(),
@@ -3675,12 +3781,14 @@ impl TransportNetwork {
     /// service day**, else the closure footpaths. Used by door-to-door
     /// coordinate routing and the point-set matrices, where the street
     /// access/egress search supplies the initial and final walks, so the
-    /// transfer set carries only intermediate transfers. `route_between_stops`
-    /// routes through that same door-to-door path under a whole-day set (see
-    /// `ultra_active`). The one-to-all stop-destination queries (whose final
-    /// walk *is* a transfer) and the emissions/fare engines keep the closure:
-    /// ULTRA holds neither final transfers nor the emissions/fare ones. A
-    /// partial-window set is not relaxed by routing — a journey's
+    /// transfer set carries only intermediate transfers. Under a whole-day set
+    /// the door-to-door RAPTOR time queries all relax it — `route_between_stops`
+    /// (via the coordinate path), and the one-to-all `travel_times_from_stop` /
+    /// `travel_times_from_coordinate` / `travel_time_matrix`, which pair it with
+    /// a `final_transfers` full-graph walk for the final leg (see
+    /// `ultra_active`). The emissions/fare engines keep the closure: ULTRA is
+    /// not emissions-complete. A partial-window set is not relaxed by routing —
+    /// a journey's
     /// source-station departure (after access walking and waiting for a first
     /// trip) can fall outside a bounded window, which would silently drop its
     /// transfers — so only a whole-day set is used.
@@ -3704,6 +3812,140 @@ impl TransportNetwork {
     fn stop_coordinate(&self, stop: StopIdx) -> Option<(f64, f64)> {
         let stop = &self.feed.stops[stop.0 as usize];
         Some((stop.latitude?, stop.longitude?))
+    }
+
+    /// Folds one unrestricted final walk (`StreetNetwork::final_transfers`)
+    /// into a one-to-all arrival array: every stop reachable by a final walk
+    /// from a transit-reached stop takes the earlier of its RAPTOR arrival and
+    /// the walked arrival. Used by the one-to-all time queries under a
+    /// whole-day ULTRA set.
+    fn fold_final_transfers(
+        &self,
+        arrivals: &mut [Option<u32>],
+        streets: &StreetNetwork,
+        departure: u32,
+        speed: f64,
+        walk_cutoff_seconds: f64,
+    ) {
+        let reached: Vec<(StopIdx, u32)> = arrivals
+            .iter()
+            .enumerate()
+            .filter_map(|(index, arrival)| arrival.map(|at| (StopIdx(index as u32), at)))
+            .collect();
+        for (stop, arrival) in
+            streets.final_transfers(&reached, departure, speed, walk_cutoff_seconds)
+        {
+            let slot = &mut arrivals[stop.0 as usize];
+            if slot.is_none_or(|current| arrival < current) {
+                *slot = Some(arrival);
+            }
+        }
+    }
+
+    /// A one-to-all arrival array as a `{public_stop_id: travel_time}` dict,
+    /// travel time measured from `departure`; unreachable stops are absent.
+    fn arrivals_dict(
+        &self,
+        py: Python<'_>,
+        arrivals: &[Option<u32>],
+        departure: u32,
+    ) -> PyResult<Py<PyDict>> {
+        let result = PyDict::new(py);
+        for (index, arrival) in arrivals.iter().enumerate() {
+            if let Some(arrival) = arrival {
+                result.set_item(
+                    self.public_stop_id(StopIdx(index as u32)),
+                    arrival - departure,
+                )?;
+            }
+        }
+        Ok(result.unbind())
+    }
+
+    /// The RAPTOR one-to-all rows for a stop-origin travel-time matrix under a
+    /// whole-day ULTRA set. Origins whose stop coordinate snaps route
+    /// door-to-door — coordinate access, `time_transfers()` intermediate
+    /// transfers, and one `final_transfers` walk folded into the row, all in
+    /// parallel over origins; origins that cannot snap fall back to the closure
+    /// board-at-origin search. Rows come back in the input origin order. Runs
+    /// with the GIL released, so it uses the erasing `access_stops` (no
+    /// `ValueError` construction) rather than `coordinate_links`.
+    #[allow(clippy::too_many_arguments)]
+    fn ultra_matrix_rows(
+        &self,
+        streets: &StreetNetwork,
+        origins: &[StopIdx],
+        departure: u32,
+        active_services: &[bool],
+        active_services_previous: &[bool],
+        max_transfers: u8,
+        speed: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+    ) -> Vec<Vec<Option<u32>>> {
+        use rayon::prelude::*;
+        // Partition into door-to-door usable (snappable coordinate) and closure
+        // fallback, keeping each origin's input index for the merge.
+        let mut usable: Vec<(usize, (f64, f64))> = Vec::new();
+        let mut fallback: Vec<(usize, StopIdx)> = Vec::new();
+        for (index, &origin) in origins.iter().enumerate() {
+            match self.stop_coordinate(origin) {
+                Some(coordinate)
+                    if streets
+                        .snap(coordinate.0, coordinate.1, max_snap_distance)
+                        .is_some() =>
+                {
+                    usable.push((index, coordinate));
+                }
+                _ => fallback.push((index, origin)),
+            }
+        }
+        let request = |access: Vec<(StopIdx, u32)>| Request {
+            departure,
+            access,
+            egress: Vec::new(),
+            active_services: active_services.to_vec(),
+            active_services_previous: active_services_previous.to_vec(),
+            max_transfers,
+        };
+        let mut rows: Vec<Vec<Option<u32>>> = vec![Vec::new(); origins.len()];
+        if !usable.is_empty() {
+            let requests: Vec<Request> = usable
+                .iter()
+                .map(|&(_, coordinate)| {
+                    let access = streets
+                        .access_stops(
+                            coordinate.0,
+                            coordinate.1,
+                            speed,
+                            max_walking_time,
+                            max_snap_distance,
+                        )
+                        .unwrap_or_default();
+                    request(request_offsets(&access))
+                })
+                .collect();
+            let mut usable_rows =
+                Raptor.one_to_all_many(&self.build.timetable, self.time_transfers(), &requests);
+            usable_rows.par_iter_mut().for_each(|row| {
+                self.fold_final_transfers(row, streets, departure, speed, max_walking_time);
+            });
+            for (row, &(index, _)) in usable_rows.into_iter().zip(&usable) {
+                rows[index] = row;
+            }
+        }
+        if !fallback.is_empty() {
+            let requests: Vec<Request> = fallback
+                .iter()
+                .map(|&(_, origin)| request(vec![(origin, 0)]))
+                .collect();
+            let fallback_rows =
+                Raptor.one_to_all_many(&self.build.timetable, &self.transfers, &requests);
+            for (row, &(index, _)) in fallback_rows.into_iter().zip(&fallback) {
+                rows[index] = row;
+            }
+        }
+        rows
     }
 
     /// The installed street network, or a `ValueError` explaining that

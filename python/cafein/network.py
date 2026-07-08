@@ -344,16 +344,15 @@ class TransportNetwork:
         ``ultra_shortcuts``). Computed **for the whole service day** (the
         default window), it is relaxed by the **door-to-door time** queries
         in place of the closure footpaths, giving them unrestricted walking:
-        door-to-door coordinate routing (``route_between_coordinates``), stop
-        routing (``route_between_stops``, which routes between the stops'
-        coordinates), and the point-set matrices
+        the routing queries (``route_between_coordinates``,
+        ``route_between_stops`` — which routes between the stops' coordinates),
+        the one-to-all queries (``travel_times_from_stop``,
+        ``travel_times_from_coordinate``, and the ``"raptor"``
+        ``travel_time_matrix``, which treat a stop origin as its coordinate and
+        add one ``final_transfers`` walk), and the point-set matrices
         (``TravelTimeMatrix``/``TravelCostMatrix`` from point origins and
-        destinations, ``DetailedItineraries``). There the access/egress
-        street search supplies the initial and final walks, so the transfer
-        set carries only the intermediate transfers ULTRA is complete for.
-        The **one-to-all** stop-destination time queries (whose final walk is
-        itself a transfer) and all **emissions/fare** queries keep the
-        closure. A
+        destinations, ``DetailedItineraries``). The **emissions/fare** queries
+        keep the closure — ULTRA is not emissions-complete. A
         partial-window set (a narrower ``min_departure``/``max_departure``)
         is stored and inspectable but not relaxed by routing, since a
         journey's source departure can fall outside a bounded window. The
@@ -687,12 +686,29 @@ class TransportNetwork:
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
         )
 
-    def travel_times_from_stop(self, from_stop, date, departure, max_transfers=7):
+    def travel_times_from_stop(
+        self,
+        from_stop,
+        date,
+        departure,
+        max_transfers=7,
+        *,
+        walking_speed_kmph=None,
+        max_walking_time=None,
+        max_snap_distance=None,
+    ):
         """Earliest arrival at every reachable stop for a single departure.
 
         One RAPTOR run serves all destinations, so travel-time matrices
         are assembled origin by origin from this method — never per OD
         pair.
+
+        With a whole-day ULTRA set (``compute_ultra_shortcuts``) the origin
+        stop is treated as its coordinate and every stop is reached
+        door-to-door — unrestricted initial, intermediate, and final walking,
+        bounded by the three walking arguments; without such a set the search
+        boards at the origin stop over the closure and those arguments are
+        ignored.
 
         Parameters
         ----------
@@ -705,16 +721,31 @@ class TransportNetwork:
             Departure time at the origin as ``HH:MM:SS``.
         max_transfers : int (optional, default: 7)
             Maximum number of transfers between rides.
+        walking_speed_kmph : float (optional, default: 3.6)
+            Walking speed in km/h of the door-to-door searches (whole-day
+            ULTRA only; ignored otherwise).
+        max_walking_time : float (optional, default: 7200)
+            Walking-time cutoff in seconds of the initial and final walks
+            (whole-day ULTRA only; ignored otherwise).
+        max_snap_distance : float (optional, default: 1600)
+            Maximum straight-line distance in meters from the origin stop to
+            the walking network (whole-day ULTRA only; ignored otherwise).
 
         Returns
         -------
         dict
             Travel time in seconds to every reachable stop, keyed by
-            stop_id; the origin maps to 0 and unreachable stops are
-            absent.
+            stop_id; unreachable stops are absent. On the closure path the
+            origin maps to 0; under a whole-day ULTRA set it is the
+            door-to-door time from the origin stop's coordinate, so the origin
+            may cost its short walk to the platform.
         """
         return self._core.travel_times_from_stop(
-            from_stop, date, departure, max_transfers
+            from_stop,
+            date,
+            departure,
+            max_transfers,
+            *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
         )
 
     def travel_time_matrix(
@@ -793,8 +824,10 @@ class TransportNetwork:
             the date and fan the origins out over it. The results are
             identical. Windowed and point matrices run on RAPTOR only.
         walking_speed_kmph, max_walking_time, max_snap_distance : float
-            The street-search options for points, as in
-            ``access_stops``; only valid with point origins.
+            The street-search options, as in ``access_stops``. They apply to
+            point origins, and to stop origins of the ``"raptor"`` matrix under
+            a whole-day ULTRA set (which routes them door-to-door); they are
+            ignored for stop origins otherwise.
 
         Returns
         -------
@@ -896,19 +929,21 @@ class TransportNetwork:
                 )
             _warn_unsnapped(table, from_ids, to_ids)
             return table["matrix"], from_ids, to_ids, percentiles
-        if not (
-            destinations is None
-            and walking_speed_kmph is None
-            and max_walking_time is None
-            and max_snap_distance is None
-        ):
-            raise ValueError("destinations and walking options apply to point origins")
+        if destinations is not None:
+            raise ValueError("destinations apply to point origins")
         to_ids = [stop for stop, _latitude, _longitude in self._core.stops]
         from_stops = list(to_ids) if from_stops is None else list(from_stops)
         from_stops = from_stops[_chunk_slice(len(from_stops), chunk)]
         if percentiles is None:
+            # The walking options bound the door-to-door raptor matrix under a
+            # whole-day ULTRA set; they are ignored on the closure path.
             matrix = self._core.travel_time_matrix(
-                from_stops, date, departure, max_transfers, router
+                from_stops,
+                date,
+                departure,
+                max_transfers,
+                router,
+                *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
             )
         else:
             matrix = self._core.travel_time_percentiles(
