@@ -477,6 +477,174 @@ def test_travel_time_matrix_mixed_origins_under_ultra(
     assert matrix[1, stops.index(usable[0])] > 0
 
 
+def test_travel_cost_matrix_agrees_with_time_matrix_under_ultra(
+    central_gtfs, kantakaupunki_pbf, tmp_path
+):
+    # A stop travel_cost_matrix under a whole-day set is location-based, exactly
+    # like travel_time_matrix: its travel_time column equals the time-matrix cell
+    # for every reachable OD pair (mixed usable + off-network origins, input
+    # order). An off-network origin falls back to the closure board-at-origin
+    # cost matrix; without a whole-day set the matrix is the closure and the
+    # walking options are ignored.
+    import warnings
+    import zipfile
+
+    import numpy as np
+    import pandas as pd
+
+    from cafein import TravelCostMatrix
+
+    with zipfile.ZipFile(central_gtfs) as archive:
+        tables = {
+            name[:-4]: pd.read_csv(archive.open(name), dtype=str)
+            for name in archive.namelist()
+            if name.endswith(".txt")
+        }
+    offnet = tables["stops"]["stop_id"].iloc[0]
+    tables["stops"].loc[
+        tables["stops"]["stop_id"] == offnet, ["stop_lat", "stop_lon"]
+    ] = [
+        "0.0",
+        "0.0",
+    ]  # off the walking network — forces the closure fallback
+    feed = tmp_path / "offnet_cost.zip"
+    with zipfile.ZipFile(feed, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, frame in tables.items():
+            archive.writestr(name + ".txt", frame.to_csv(index=False))
+
+    with pytest.warns(UserWarning):
+        net = TransportNetwork.from_gtfs(
+            [str(feed)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=60
+        )
+    stops = [s for s, _, _ in net.stops]
+    usable = [s for s, lat, _ in net.stops if lat is not None and abs(lat) > 1][:3]
+    origins = [offnet, *usable]  # mixed, fallback origin first
+
+    def cost_times(**walk):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # emissions-factor gaps aren't the subject
+            frame = TravelCostMatrix(
+                net, origins, stops, QUERY_DATE, QUERY_TIME, **walk
+            )
+        return {
+            (row["from_id"], row["to_id"]): int(row["travel_time"])
+            for _, row in frame.iterrows()
+        }
+
+    # Without a whole-day set the walking options are ignored — the closure.
+    closure = cost_times()
+    assert cost_times(max_walking_time=ACCESS) == closure
+
+    net.compute_ultra_shortcuts(max_transfer_time=600.0)  # whole day
+    ultra = cost_times(max_walking_time=ACCESS)
+
+    # Time agreement: each cost-matrix travel_time equals the time-matrix cell,
+    # the same location-based door-to-door routing.
+    matrix = net.travel_time_matrix(
+        origins, QUERY_DATE, QUERY_TIME, max_walking_time=ACCESS
+    )
+    unreached = np.iinfo(np.uint32).max
+    time_cells = {
+        (origins[i], stops[j]): int(matrix[i, j])
+        for i in range(len(origins))
+        for j in range(len(stops))
+        if matrix[i, j] != unreached
+    }
+    assert ultra == time_cells
+
+    # The off-network origin fell back to the closure — its rows are unchanged by
+    # computing ULTRA (board-at-origin, walking ignored).
+    assert {c: v for c, v in ultra.items() if c[0] == offnet} == {
+        c: v for c, v in closure.items() if c[0] == offnet
+    }
+    # Unrestricted walking reaches OD pairs the closure's short footpaths miss.
+    assert set(ultra) - set(closure)
+    # Location-based ultra is not a strict superset of the closure: from a usable
+    # origin, a destination whose coordinate is unreachable within
+    # max_walking_time (here the off-network stop) is dropped, as
+    # route_between_coordinates would drop it, though the closure reaches it.
+    assert (usable[0], offnet) in closure
+    assert (usable[0], offnet) not in ultra
+
+
+def test_travel_cost_matrix_transit_columns_match_the_point_matrix(
+    central_gtfs, kantakaupunki_pbf
+):
+    # Location-based, a transit OD cell of the stop cost matrix is the same
+    # door-to-door journey as the point cost matrix over the stops' coordinates,
+    # so every column — time, transfers, transit/walk distance, emissions —
+    # agrees, confirming the CostRow (the ridden legs' emissions and transit
+    # distance plus the walks) is correct through the stop path. (Pure-walk cells
+    # differ: the point matrix walks straight between coordinates, the stop
+    # matrices route via the stops — the same connector detour the time
+    # agreement test documents — so they are compared on transit cells only.)
+    import warnings
+
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    from cafein import TravelCostMatrix
+
+    with pytest.warns(UserWarning):
+        net = TransportNetwork.from_gtfs(
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=60
+        )
+    net.compute_ultra_shortcuts(max_transfer_time=600.0)  # whole day
+    coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
+    endpoints = list(coords)[:12]
+    points = gpd.GeoDataFrame(
+        {"id": endpoints},
+        geometry=[Point(coords[s][1], coords[s][0]) for s in endpoints],
+        crs="EPSG:4326",
+    )
+    cols = [
+        "travel_time",
+        "transfers",
+        "transit_distance",
+        "walk_distance",
+        "emissions",
+    ]
+
+    def transit_cells(frame):
+        # Keyed by OD, keeping only ridden cells (transit distance > 0).
+        return {
+            (str(row["from_id"]), str(row["to_id"])): tuple(
+                round(float(row[c]), 3) for c in cols
+            )
+            for _, row in frame.iterrows()
+            if row["transit_distance"] > 0
+        }
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # emissions-factor gaps aren't the subject
+        stop_matrix = transit_cells(
+            TravelCostMatrix(
+                net,
+                endpoints,
+                endpoints,
+                QUERY_DATE,
+                QUERY_TIME,
+                max_walking_time=ACCESS,
+            )
+        )
+        point_matrix = transit_cells(
+            TravelCostMatrix(
+                net,
+                points,
+                points,
+                date=QUERY_DATE,
+                departure=QUERY_TIME,
+                max_walking_time=ACCESS,
+            )
+        )
+    assert stop_matrix and stop_matrix == point_matrix
+    # A ridden door-to-door cell carries emissions and an access/egress walk.
+    assert any(
+        cell[cols.index("emissions")] > 0 and cell[cols.index("walk_distance")] > 0
+        for cell in stop_matrix.values()
+    )
+
+
 def test_final_walk_respects_max_walking_time(central_gtfs, kantakaupunki_pbf):
     # Regression: the one-to-all final walk must not exceed max_walking_time.
     # Location-based, travel_times_from_coordinate reports arrival at each stop's

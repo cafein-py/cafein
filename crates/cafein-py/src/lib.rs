@@ -2995,7 +2995,7 @@ impl TransportNetwork {
     ///     NaN when unresolved), ``fare`` (NaN without `fares` or when
     ///     unpriceable), and with `geometries` a ``geometry`` list of
     ///     WKB bytes.
-    #[pyo3(signature = (from_stops, date, departure, factors, max_transfers = 7, to_stops = None, geometries = false, fares = None))]
+    #[pyo3(signature = (from_stops, date, departure, factors, max_transfers = 7, to_stops = None, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, fares = None))]
     #[allow(clippy::too_many_arguments)]
     fn travel_cost_matrix(
         &self,
@@ -3006,6 +3006,9 @@ impl TransportNetwork {
         factors: Vec<(String, f64)>,
         max_transfers: u8,
         to_stops: Option<Vec<String>>,
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
         geometries: bool,
         fares: Option<Bound<'_, PyDict>>,
     ) -> PyResult<Py<PyDict>> {
@@ -3050,17 +3053,6 @@ impl TransportNetwork {
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
-        let requests: Vec<Request> = origins
-            .into_iter()
-            .map(|origin| Request {
-                departure,
-                access: vec![(origin, 0)],
-                egress: Vec::new(),
-                active_services: active_services.clone(),
-                active_services_previous: active_services_previous.clone(),
-                max_transfers,
-            })
-            .collect();
         let inputs = CostInputs {
             geometry,
             factors: &per_trip,
@@ -3068,14 +3060,67 @@ impl TransportNetwork {
             with_geometry: geometries,
             fares: tables.as_ref(),
         };
+        // Under a whole-day set, snappable origins route door-to-door (the stop
+        // cost matrix as a point cost matrix over the stops' coordinates);
+        // validate the walking speed only when at least one origin is usable.
+        let ultra_usable = self.ultra_active()
+            && self.streets.as_ref().is_some_and(|streets| {
+                origins.iter().any(|&origin| {
+                    self.stop_coordinate(origin).is_some_and(|coordinate| {
+                        streets
+                            .snap(coordinate.0, coordinate.1, max_snap_distance)
+                            .is_some()
+                    })
+                })
+            });
+        let ultra_speed = if ultra_usable {
+            Some(validated_walking_speed(
+                walking_speed_kmph,
+                max_walking_time,
+                max_snap_distance,
+            )?)
+        } else {
+            None
+        };
         let rows = py.allow_threads(|| {
-            Raptor.cost_matrix(
-                &self.build.timetable,
-                &self.transfers,
-                &inputs,
-                &requests,
-                &destinations,
-            )
+            if let Some(speed) = ultra_speed {
+                let streets = self
+                    .streets
+                    .as_ref()
+                    .expect("ultra_usable implies a street network");
+                self.ultra_cost_matrix_rows(
+                    streets,
+                    &origins,
+                    &destinations,
+                    departure,
+                    &active_services,
+                    &active_services_previous,
+                    max_transfers,
+                    &inputs,
+                    speed,
+                    max_walking_time,
+                    max_snap_distance,
+                )
+            } else {
+                let requests: Vec<Request> = origins
+                    .iter()
+                    .map(|&origin| Request {
+                        departure,
+                        access: vec![(origin, 0)],
+                        egress: Vec::new(),
+                        active_services: active_services.clone(),
+                        active_services_previous: active_services_previous.clone(),
+                        max_transfers,
+                    })
+                    .collect();
+                Raptor.cost_matrix(
+                    &self.build.timetable,
+                    &self.transfers,
+                    &inputs,
+                    &requests,
+                    &destinations,
+                )
+            }
         });
         cost_rows_dict(py, rows, geometries)
     }
@@ -3996,6 +4041,155 @@ impl TransportNetwork {
                 Raptor.one_to_all_many(&self.build.timetable, &self.transfers, &requests);
             for (row, &(index, _)) in fallback_rows.into_iter().zip(&fallback) {
                 rows[index] = row;
+            }
+        }
+        rows
+    }
+
+    /// The `CostRow` rows for a stop-origin travel-cost matrix under a
+    /// whole-day ULTRA set. Usable (snappable) origins route door-to-door: the
+    /// stop cost matrix is the point cost matrix over the stops' coordinates,
+    /// so `cost_matrix_to_points` runs with coordinate access and a
+    /// location-based per-destination egress — the final walks `link_many` finds
+    /// to `d`'s coordinate (which include `d` itself via its connector), the
+    /// same egress the point cost matrix uses; `costs_to_point` rebuilds each
+    /// final-walk row from its source stop's row with the walk added. A
+    /// destination with no coordinate keeps its transit arrival via a
+    /// `(d, 0, 0)` seed instead (it cannot be located), matching the one-to-all
+    /// time queries. Off-network origins fall back to the closure `cost_matrix`.
+    /// Rows come back in input origin order, keyed by global destination stop
+    /// index (the point-matrix rows are remapped from destination-list index).
+    #[allow(clippy::too_many_arguments)]
+    fn ultra_cost_matrix_rows(
+        &self,
+        streets: &StreetNetwork,
+        origins: &[StopIdx],
+        destinations: &[StopIdx],
+        departure: u32,
+        active_services: &[bool],
+        active_services_previous: &[bool],
+        max_transfers: u8,
+        inputs: &CostInputs<'_>,
+        speed: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+    ) -> Vec<Vec<CostRow>> {
+        let mut usable: Vec<(usize, (f64, f64))> = Vec::new();
+        let mut fallback: Vec<(usize, StopIdx)> = Vec::new();
+        for (index, &origin) in origins.iter().enumerate() {
+            match self.stop_coordinate(origin) {
+                Some(coordinate)
+                    if streets
+                        .snap(coordinate.0, coordinate.1, max_snap_distance)
+                        .is_some() =>
+                {
+                    usable.push((index, coordinate));
+                }
+                _ => fallback.push((index, origin)),
+            }
+        }
+        let mut rows: Vec<Vec<CostRow>> = vec![Vec::new(); origins.len()];
+        if !usable.is_empty() {
+            // Per-destination egress, location-based (the destination stop as
+            // its coordinate): the final walks link_many finds to that
+            // coordinate — undirected walking, so this is the s -> d egress, the
+            // same construction the point cost matrix uses.
+            let mut link_inputs: Vec<(f64, f64)> = Vec::new();
+            let mut link_index: Vec<Option<usize>> = Vec::with_capacity(destinations.len());
+            for &destination in destinations {
+                match self.stop_coordinate(destination) {
+                    Some(coordinate) => {
+                        link_index.push(Some(link_inputs.len()));
+                        link_inputs.push(coordinate);
+                    }
+                    None => link_index.push(None),
+                }
+            }
+            let destination_links =
+                streets.link_many(&link_inputs, speed, max_walking_time, max_snap_distance);
+            let egress: Vec<Vec<(StopIdx, u32, f64)>> = destinations
+                .iter()
+                .enumerate()
+                .map(|(index, &destination)| match link_index[index] {
+                    // Located: the walks link_many finds to the stop's coordinate
+                    // (which includes the stop itself via its connector), exactly
+                    // the point cost matrix's egress — no separate (d, 0, 0)
+                    // transit seed. Empty (coordinate off the network) leaves the
+                    // destination unreachable, as the coordinate query would.
+                    Some(slot) => destination_links[slot]
+                        .as_ref()
+                        .map(|reached| {
+                            reached
+                                .iter()
+                                .map(|walk| (walk.stop, walk.seconds, walk.meters))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    // No coordinate: the stop cannot be located, so keep its
+                    // transit arrival via a zero-length final walk at the stop.
+                    None => vec![(destination, 0u32, 0.0f64)],
+                })
+                .collect();
+            let coordinates: Vec<(f64, f64)> = usable.iter().map(|&(_, c)| c).collect();
+            let origin_links =
+                streets.link_many(&coordinates, speed, max_walking_time, max_snap_distance);
+            let mut requests = Vec::with_capacity(usable.len());
+            let mut access_meters = Vec::with_capacity(usable.len());
+            for links in &origin_links {
+                let links = links.as_deref().unwrap_or(&[]);
+                requests.push(Request {
+                    departure,
+                    access: request_offsets(links),
+                    egress: Vec::new(),
+                    active_services: active_services.to_vec(),
+                    active_services_previous: active_services_previous.to_vec(),
+                    max_transfers,
+                });
+                access_meters.push(
+                    links
+                        .iter()
+                        .map(|walk| (walk.stop, walk.meters))
+                        .collect::<HashMap<_, _>>(),
+                );
+            }
+            let mut usable_rows = Raptor.cost_matrix_to_points(
+                &self.build.timetable,
+                self.time_transfers(),
+                inputs,
+                &requests,
+                &access_meters,
+                &egress,
+            );
+            for origin_rows in usable_rows.iter_mut() {
+                for row in origin_rows.iter_mut() {
+                    row.to = destinations[row.to as usize].0;
+                }
+            }
+            for (origin_rows, &(index, _)) in usable_rows.into_iter().zip(&usable) {
+                rows[index] = origin_rows;
+            }
+        }
+        if !fallback.is_empty() {
+            let requests: Vec<Request> = fallback
+                .iter()
+                .map(|&(_, origin)| Request {
+                    departure,
+                    access: vec![(origin, 0)],
+                    egress: Vec::new(),
+                    active_services: active_services.to_vec(),
+                    active_services_previous: active_services_previous.to_vec(),
+                    max_transfers,
+                })
+                .collect();
+            let fallback_rows = Raptor.cost_matrix(
+                &self.build.timetable,
+                &self.transfers,
+                inputs,
+                &requests,
+                destinations,
+            );
+            for (origin_rows, &(index, _)) in fallback_rows.into_iter().zip(&fallback) {
+                rows[index] = origin_rows;
             }
         }
         rows
