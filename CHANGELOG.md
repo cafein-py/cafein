@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- ULTRA shortcut computation, first integration step —
+  ``TransportNetwork.compute_ultra_shortcuts`` enumerates the ULTRA
+  intermediate-transfer shortcuts (Baum et al.) over the unrestricted
+  stop-to-stop walking graph of the installed street network: the
+  minimal set of alight-to-board walks a Pareto-optimal two-trip
+  journey needs, computed in parallel over station representatives.
+  ``walking_speed_kmph``/``max_transfer_time`` set the pace and walk
+  cutoff, and ``min_departure``/``max_departure`` bound the
+  source-departure window (the whole service day by default; a whole-day
+  metropolitan build is a heavy run-once operation). The result is held
+  in memory as ``(origin, destination, seconds)`` triples, exposed as
+  ``ultra_shortcut_count`` and ``ultra_shortcuts``; this step neither
+  persists it nor relaxes it in routing. Requires a network built with
+  an OSM extract.
+
 - McTBTR groundwork — the multicriteria transfer set: the compute core
   gains a dominance-aware variant of the TBTR transfer precompute for
   the (arrival, emissions) criteria. Witt's reduction is unsound under

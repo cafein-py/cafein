@@ -23,6 +23,7 @@ use cafein_core::streets::{
 use cafein_core::tbtr::{DayView, TbtrEngine};
 use cafein_core::timetable::{StopIdx, Timetable, TripIdx};
 use cafein_core::transfers::Transfers;
+use cafein_core::ultra::{compute_shortcuts, Shortcut};
 use cafein_gtfs::{build_timetable, Feed, RouteType, ServiceCalendar, TimetableBuild};
 
 /// A routable public-transport network built from GTFS data.
@@ -31,6 +32,11 @@ struct TransportNetwork {
     feed: Feed,
     build: TimetableBuild,
     transfers: Transfers,
+    /// The ULTRA shortcut set, when computed (`compute_ultra_shortcuts`):
+    /// intermediate transfers as `(origin, destination, seconds)`, derived
+    /// from the installed street network. In-memory only in this stage —
+    /// not persisted and not yet relaxed by routing.
+    ultra_shortcuts: Option<Vec<Shortcut>>,
     geometry: Option<TripGeometry>,
     leg_geometry: Option<LegGeometry>,
     streets: Option<StreetNetwork>,
@@ -868,6 +874,7 @@ fn assemble((artifact, streets, streets_bytes_read): LoadedArtifact) -> Transpor
         feed,
         build,
         transfers,
+        ultra_shortcuts: None,
         geometry,
         leg_geometry,
         streets,
@@ -1115,6 +1122,7 @@ impl TransportNetwork {
             feed,
             build,
             transfers,
+            ultra_shortcuts: None,
             geometry: None,
             leg_geometry: None,
             streets: None,
@@ -1332,6 +1340,96 @@ impl TransportNetwork {
     #[getter]
     fn transfer_count(&self) -> usize {
         self.transfers.edge_count()
+    }
+
+    /// Number of ULTRA shortcuts, or `None` when none are computed.
+    #[getter]
+    fn ultra_shortcut_count(&self) -> Option<usize> {
+        self.ultra_shortcuts.as_ref().map(|set| set.len())
+    }
+
+    /// The computed ULTRA shortcuts as `(origin_stop_id, destination_stop_id,
+    /// seconds)` triples, or `None` when none are computed. Sorted, so two
+    /// runs over the same network return byte-identical lists.
+    fn ultra_shortcuts(&self) -> Option<Vec<(String, String, u32)>> {
+        self.ultra_shortcuts.as_ref().map(|set| {
+            set.iter()
+                .map(|shortcut| {
+                    (
+                        self.public_stop_id(shortcut.origin),
+                        self.public_stop_id(shortcut.destination),
+                        shortcut.seconds,
+                    )
+                })
+                .collect()
+        })
+    }
+
+    /// Compute the ULTRA intermediate-transfer shortcuts and store them.
+    ///
+    /// Runs the shortcut search over the unrestricted stop-to-stop
+    /// walking graph derived from the installed street network (so the
+    /// network must be built with an OSM extract), keeping the minimal
+    /// set of intermediate transfers a Pareto-optimal two-trip journey
+    /// needs. The result is held in memory (`ultra_shortcut_count`,
+    /// `ultra_shortcuts`) — this stage neither persists it nor relaxes it
+    /// in routing. Returns the number of shortcuts. `walking_speed_kmph`
+    /// sets the walking pace and `max_transfer_time` bounds an
+    /// intermediate walk, in seconds. `min_departure`/`max_departure`
+    /// bound the source-departure times the shortcuts serve, in seconds
+    /// since midnight (the whole service day by default); a narrower
+    /// window costs proportionally less.
+    #[pyo3(signature = (
+        walking_speed_kmph = 3.6,
+        max_transfer_time = 1800.0,
+        min_departure = 0,
+        max_departure = u32::MAX - 1,
+    ))]
+    fn compute_ultra_shortcuts(
+        &mut self,
+        py: Python<'_>,
+        walking_speed_kmph: f64,
+        max_transfer_time: f64,
+        min_departure: u32,
+        max_departure: u32,
+    ) -> PyResult<usize> {
+        if !walking_speed_kmph.is_finite() || walking_speed_kmph <= 0.0 {
+            return Err(PyValueError::new_err(
+                "walking_speed_kmph must be a positive, finite number",
+            ));
+        }
+        if !max_transfer_time.is_finite() || max_transfer_time < 0.0 {
+            return Err(PyValueError::new_err(
+                "max_transfer_time must be a non-negative, finite number",
+            ));
+        }
+        if min_departure > max_departure {
+            return Err(PyValueError::new_err(
+                "min_departure must not exceed max_departure",
+            ));
+        }
+        let speed = walking_speed_kmph / 3.6;
+        let stop_count = self.build.timetable.stop_count();
+        let timetable = &self.build.timetable;
+        let streets = self.installed_streets()?;
+        let shortcuts = py
+            .allow_threads(|| {
+                let dense = streets.stop_transfers(speed, max_transfer_time);
+                let graph =
+                    Transfers::from_edges(stop_count, &dense).map_err(|error| error.to_string())?;
+                let view = DayView::universal(timetable);
+                Ok::<Vec<Shortcut>, String>(compute_shortcuts(
+                    &view,
+                    timetable,
+                    &graph,
+                    min_departure,
+                    max_departure,
+                ))
+            })
+            .map_err(PyValueError::new_err)?;
+        let count = shortcuts.len();
+        self.ultra_shortcuts = Some(shortcuts);
+        Ok(count)
     }
 
     /// The network's stops as `(stop_id, latitude, longitude)` tuples,
@@ -1560,6 +1658,9 @@ impl TransportNetwork {
             )
             .map_err(|error| PyValueError::new_err(error.to_string()))?,
         );
+        // ULTRA shortcuts are derived from the street network; a new one
+        // invalidates them.
+        self.ultra_shortcuts = None;
         Ok(())
     }
 

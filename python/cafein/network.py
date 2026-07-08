@@ -235,6 +235,18 @@ class TransportNetwork:
         return self._core.transfer_count
 
     @property
+    def ultra_shortcut_count(self):
+        """Number of ULTRA shortcuts, or ``None`` if none are computed."""
+        return self._core.ultra_shortcut_count
+
+    @property
+    def ultra_shortcuts(self):
+        """The ULTRA shortcuts as ``(origin_stop_id, destination_stop_id,
+        seconds)`` tuples, or ``None`` if none are computed. Sorted, so the
+        list is identical across runs over the same network."""
+        return self._core.ultra_shortcuts()
+
+    @property
     def stops(self):
         """The stops as ``(stop_id, latitude, longitude)`` tuples."""
         return self._core.stops
@@ -299,6 +311,59 @@ class TransportNetwork:
             )
         else:
             self._core.set_transfers(footpaths)
+
+    def compute_ultra_shortcuts(
+        self,
+        *,
+        walking_speed_kmph=None,
+        max_transfer_time=1800.0,
+        min_departure=0,
+        max_departure=None,
+    ):
+        """Compute the ULTRA intermediate-transfer shortcuts and store them.
+
+        Enumerates, over the unrestricted stop-to-stop walking graph of
+        the installed street network, the minimal set of intermediate
+        transfers a Pareto-optimal two-trip journey needs (see the ULTRA
+        preprocessing of Baum et al.). The network must be built with an
+        OSM extract. The result is held in memory (``ultra_shortcut_count``,
+        ``ultra_shortcuts``); this stage neither persists it (it is dropped
+        by ``save``) nor relaxes it in routing.
+
+        A whole-day build over a metropolitan network is a heavy,
+        run-once operation (minutes, parallel over cores); ``save`` it and
+        reuse. Narrowing ``min_departure``/``max_departure`` bounds the
+        source-departure set and costs proportionally less.
+
+        Parameters
+        ----------
+        walking_speed_kmph : float (optional, default: 3.6)
+            Walking speed in km/h of the shortcut search.
+        max_transfer_time : float (optional, default: 1800)
+            Cutoff of an intermediate walk, in seconds.
+        min_departure : int (optional, default: 0)
+            Earliest source-departure time to serve, in seconds since
+            midnight.
+        max_departure : int (optional)
+            Latest source-departure time to serve, in seconds since
+            midnight; the whole service day by default.
+
+        Returns
+        -------
+        int
+            The number of shortcuts computed.
+        """
+        from cafein import streets
+
+        if walking_speed_kmph is None:
+            walking_speed_kmph = streets.WALKING_SPEED_KMPH
+        if max_departure is None:
+            return self._core.compute_ultra_shortcuts(
+                walking_speed_kmph, max_transfer_time, min_departure
+            )
+        return self._core.compute_ultra_shortcuts(
+            walking_speed_kmph, max_transfer_time, min_departure, max_departure
+        )
 
     def set_leg_geometries(self, *leg_geometries):
         """Install per-trip leg geometries.
