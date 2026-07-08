@@ -241,6 +241,59 @@ def test_point_matrix_supersets_and_emissions_ignore(central_gtfs, kantakaupunki
     assert frontier() == frontier_before
 
 
+def test_save_load_round_trips_the_ultra_set(central_gtfs, kantakaupunki_pbf, tmp_path):
+    # The shortcut set and its compute window survive save/load: a whole-day
+    # set stays routed by point-destination queries, and a partial-window set
+    # is restored but stays unused (its scope is not mistaken for whole-day).
+    with pytest.warns(UserWarning):
+        net = TransportNetwork.from_gtfs(
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=60
+        )
+    coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
+    endpoints = list(coords)[:15]
+    closure = _door_to_door(net, coords, endpoints, QUERY_TIME)
+
+    # A whole-day set: shortcuts and routing behaviour reproduce after a
+    # round-trip, and the routed result genuinely differs from the closure so
+    # the equality below is not trivially satisfied.
+    net.compute_ultra_shortcuts(max_transfer_time=600.0)
+    shortcuts = net.ultra_shortcuts
+    routed = _door_to_door(net, coords, endpoints, QUERY_TIME)
+    assert routed != closure
+    stop_before = net.travel_times_from_stop(endpoints[0], QUERY_DATE, QUERY_TIME)
+    whole = tmp_path / "whole.cafein"
+    net.save(whole)
+    loaded = TransportNetwork.load(whole)
+    assert loaded.ultra_shortcuts == shortcuts
+    assert _door_to_door(loaded, coords, endpoints, QUERY_TIME) == routed
+    assert (
+        loaded.travel_times_from_stop(endpoints[0], QUERY_DATE, QUERY_TIME)
+        == stop_before
+    )
+
+    # A partial-window set: restored and inspectable, but routing keeps the
+    # closure — the persisted window is a partial one, not whole-day.
+    net.compute_ultra_shortcuts(
+        max_transfer_time=600.0, min_departure=29700, max_departure=31500
+    )
+    partial_shortcuts = net.ultra_shortcuts
+    partial = tmp_path / "partial.cafein"
+    net.save(partial)
+    loaded_partial = TransportNetwork.load(partial)
+    assert loaded_partial.ultra_shortcut_count == len(partial_shortcuts)
+    assert loaded_partial.ultra_shortcuts == partial_shortcuts
+    assert _door_to_door(loaded_partial, coords, endpoints, QUERY_TIME) == closure
+
+
+def test_save_load_without_an_ultra_set(network, tmp_path):
+    # A network that never computed shortcuts round-trips to no set.
+    path = tmp_path / "no_ultra.cafein"
+    network.save(path)
+    loaded = TransportNetwork.load(path)
+    assert loaded.ultra_shortcut_count is None
+    assert loaded.ultra_shortcuts is None
+
+
 def test_compute_is_deterministic(helsinki_gtfs, kantakaupunki_pbf, ultra_network):
     with pytest.warns(UserWarning):
         again = TransportNetwork.from_gtfs(

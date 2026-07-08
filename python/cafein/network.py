@@ -152,7 +152,8 @@ class TransportNetwork:
 
         The artifact carries everything queries need — the timetable,
         service calendar, transfers, trip distances, leg geometries,
-        and the street network — so batch jobs can ``load`` the same
+        the street network, and the ULTRA shortcut set with its compute
+        window (when computed) — so batch jobs can ``load`` the same
         file read-only instead of rebuilding from GTFS and OSM inputs.
         Build diagnostics (quarantine warnings) are not persisted.
         The file is staged beside the destination and atomically
@@ -342,7 +343,8 @@ class TransportNetwork:
         partial-window set (a narrower ``min_departure``/``max_departure``)
         is stored and inspectable but not relaxed by routing, since a
         journey's source departure can fall outside a bounded window. The
-        set is not persisted (it is dropped by ``save``).
+        set and its compute window are persisted by ``save`` and restored
+        by ``load``, so a loaded partial-window set stays unused.
 
         A whole-day build over a metropolitan network is a heavy,
         run-once operation (minutes, parallel over cores); ``save`` it and

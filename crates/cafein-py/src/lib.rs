@@ -36,7 +36,8 @@ struct TransportNetwork {
     /// the intermediate transfers as a `Transfers`, derived from the
     /// installed street network. The time engines relax it in place of the
     /// closure `transfers` when it is present; the emissions/fare engines
-    /// always use the closure. In-memory only in this stage (not persisted).
+    /// always use the closure. Persisted with the artifact and restored on
+    /// load, scoped by `ultra_window`.
     ultra_transfers: Option<Transfers>,
     /// The source-departure window the ULTRA set was computed for, in
     /// seconds since midnight. A time query outside it falls back to the
@@ -92,7 +93,7 @@ struct CoordinateEnds {
 }
 
 const ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINET";
-const ARTIFACT_FORMAT: u32 = 4;
+const ARTIFACT_FORMAT: u32 = 5;
 /// Section tags in the container directory.
 const SECTION_META: u16 = 1;
 const SECTION_STREETS: u16 = 2;
@@ -116,6 +117,12 @@ struct ArtifactRef<'a> {
     geometry: &'a Option<TripGeometry>,
     leg_geometry: &'a Option<LegGeometry>,
     streets: Option<StreetsMeta>,
+    /// The ULTRA shortcut set and the source-departure window it was
+    /// computed for, when present; restored so the heavy run-once
+    /// preprocessing need not be repeated, and so a partial-window set
+    /// is never mistaken for a whole-day one.
+    ultra_transfers: &'a Option<Transfers>,
+    ultra_window: Option<(u32, u32)>,
 }
 
 /// The decoded part of the saved network, owned after reading.
@@ -128,6 +135,8 @@ struct Artifact {
     geometry: Option<TripGeometry>,
     leg_geometry: Option<LegGeometry>,
     streets: Option<StreetsMeta>,
+    ultra_transfers: Option<Transfers>,
+    ultra_window: Option<(u32, u32)>,
 }
 
 /// The street layer's decoded state: link records (endpoints
@@ -866,6 +875,8 @@ fn assemble((artifact, streets, streets_bytes_read): LoadedArtifact) -> Transpor
         geometry,
         leg_geometry,
         streets: _,
+        ultra_transfers,
+        ultra_window,
     } = artifact;
     let build = TimetableBuild {
         timetable,
@@ -879,8 +890,8 @@ fn assemble((artifact, streets, streets_bytes_read): LoadedArtifact) -> Transpor
         feed,
         build,
         transfers,
-        ultra_transfers: None,
-        ultra_window: None,
+        ultra_transfers,
+        ultra_window,
         geometry,
         leg_geometry,
         streets,
@@ -1179,6 +1190,8 @@ impl TransportNetwork {
                 geometry: &self.geometry,
                 leg_geometry: &self.leg_geometry,
                 streets: streets_meta,
+                ultra_transfers: &self.ultra_transfers,
+                ultra_window: self.ultra_window,
             };
             let meta = bincode::serialize(&artifact)
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -1392,7 +1405,8 @@ impl TransportNetwork {
     /// closure. A partial-window set (a narrower `min_departure`/
     /// `max_departure`) is stored and inspectable but not relaxed by routing
     /// — a journey's source departure can fall outside a bounded window. The
-    /// set is not persisted in this stage.
+    /// set and its compute window are persisted by `save` and restored by
+    /// `load`, so the heavy run-once preprocessing is reusable.
     /// Returns the number of shortcuts. `walking_speed_kmph` sets the
     /// walking pace and `max_transfer_time` bounds an intermediate walk,
     /// in seconds. `min_departure`/`max_departure` bound the
