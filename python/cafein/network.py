@@ -342,16 +342,18 @@ class TransportNetwork:
         preprocessing of Baum et al.). The network must be built with an
         OSM extract. The result is held in memory (``ultra_shortcut_count``,
         ``ultra_shortcuts``). Computed **for the whole service day** (the
-        default window), it is relaxed by the **point-destination time**
-        queries in place of the closure footpaths, giving them unrestricted
-        walking: door-to-door coordinate routing
-        (``route_between_coordinates``) and the point-set matrices
+        default window), it is relaxed by the **door-to-door time** queries
+        in place of the closure footpaths, giving them unrestricted walking:
+        door-to-door coordinate routing (``route_between_coordinates``), stop
+        routing (``route_between_stops``, which routes between the stops'
+        coordinates), and the point-set matrices
         (``TravelTimeMatrix``/``TravelCostMatrix`` from point origins and
         destinations, ``DetailedItineraries``). There the access/egress
         street search supplies the initial and final walks, so the transfer
         set carries only the intermediate transfers ULTRA is complete for.
-        **Stop-to-stop** time queries (whose final walk is itself a
-        transfer) and all **emissions/fare** queries keep the closure. A
+        The **one-to-all** stop-destination time queries (whose final walk is
+        itself a transfer) and all **emissions/fare** queries keep the
+        closure. A
         partial-window set (a narrower ``min_departure``/``max_departure``)
         is stored and inspectable but not relaxed by routing, since a
         journey's source departure can fall outside a bounded window. The
@@ -486,6 +488,9 @@ class TransportNetwork:
         max_transfers=7,
         window=None,
         *,
+        walking_speed_kmph=None,
+        max_walking_time=None,
+        max_snap_distance=None,
         geometries=True,
     ):
         """Route between two transit stops.
@@ -500,6 +505,15 @@ class TransportNetwork:
         when leg geometries are installed (the default build), and
         transfer legs their walked street path when the street network
         is installed.
+
+        With a whole-day ULTRA set (``compute_ultra_shortcuts``), the two
+        stops are routed **door-to-door between their coordinates** — the
+        same unrestricted initial/intermediate/final walking as
+        ``route_between_coordinates`` — and ``walking_speed_kmph``,
+        ``max_walking_time``, and ``max_snap_distance`` bound that walking.
+        Without such a set (or when a stop has no coordinate or is off the
+        walking network) the query boards at the origin stop and relaxes
+        the closure transfers, and those three arguments are ignored.
 
         Parameters
         ----------
@@ -524,6 +538,15 @@ class TransportNetwork:
             rides. A journey that leaves within the window but waits for
             a ride beyond it carries the window's final second as its
             departure.
+        walking_speed_kmph : float (optional, default: 3.6)
+            Walking speed in km/h of the door-to-door searches (whole-day
+            ULTRA only; ignored otherwise).
+        max_walking_time : float (optional, default: 7200)
+            Walking-time cutoff in seconds of each street search (whole-day
+            ULTRA only; ignored otherwise).
+        max_snap_distance : float (optional, default: 1600)
+            Maximum straight-line distance in meters from a stop to the
+            walking network (whole-day ULTRA only; ignored otherwise).
 
         Returns
         -------
@@ -534,7 +557,14 @@ class TransportNetwork:
             legs; times are seconds past the service day's start.
         """
         return self._core.route_between_stops(
-            from_stop, to_stop, date, departure, max_transfers, window, geometries
+            from_stop,
+            to_stop,
+            date,
+            departure,
+            max_transfers,
+            window,
+            *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
+            geometries,
         )
 
     def route_between_coordinates(

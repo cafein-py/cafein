@@ -322,6 +322,61 @@ def test_from_gtfs_ultra_computes_the_whole_day_set(central_gtfs, kantakaupunki_
     assert built.ultra_shortcuts == manual.ultra_shortcuts
 
 
+def test_route_between_stops_door_to_door_under_ultra(central_gtfs, kantakaupunki_pbf):
+    # Under a whole-day ULTRA set, route_between_stops routes door-to-door
+    # between the stops' coordinates (unrestricted initial/intermediate/final
+    # walking) — equal to route_between_coordinates on those coordinates — and
+    # finds journeys the closure board-at-origin path misses. Without the set
+    # it keeps the closure and ignores the walking arguments.
+    with pytest.warns(UserWarning):
+        net = TransportNetwork.from_gtfs(
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=60
+        )
+    coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
+    endpoints = list(coords)[:15]
+
+    def stops_pareto(o, d, **kw):
+        return _pareto(net.route_between_stops(o, d, QUERY_DATE, QUERY_TIME, **kw))
+
+    a, b = endpoints[0], endpoints[1]
+    assert stops_pareto(a, b, max_walking_time=ACCESS) == stops_pareto(a, b)
+    closure = {
+        (o, d): stops_pareto(o, d) for o in endpoints for d in endpoints if o != d
+    }
+
+    net.compute_ultra_shortcuts(max_transfer_time=600.0)  # whole day
+
+    improved = 0
+    for (o, d), before in closure.items():
+        via_stops = stops_pareto(o, d, max_walking_time=ACCESS)
+        via_coords = _pareto(
+            net.route_between_coordinates(
+                coords[o], coords[d], QUERY_DATE, QUERY_TIME, max_walking_time=ACCESS
+            )
+        )
+        assert via_stops == via_coords
+        if via_stops != before:
+            improved += 1
+    assert improved >= 1
+
+    # The windowed (range) query is door-to-door too.
+    ranged = _pareto(
+        net.route_between_stops(
+            a, b, QUERY_DATE, QUERY_TIME, window=1800, max_walking_time=ACCESS
+        )
+    )
+    assert ranged == _pareto(
+        net.route_between_coordinates(
+            coords[a],
+            coords[b],
+            QUERY_DATE,
+            QUERY_TIME,
+            window=1800,
+            max_walking_time=ACCESS,
+        )
+    )
+
+
 def test_compute_is_deterministic(helsinki_gtfs, kantakaupunki_pbf, ultra_network):
     with pytest.warns(UserWarning):
         again = TransportNetwork.from_gtfs(

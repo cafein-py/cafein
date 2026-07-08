@@ -31,7 +31,13 @@
   refused), so the heavy run-once preprocessing is reusable and a loaded
   partial-window set stays unused. ``from_gtfs(ultra=True)`` computes the
   whole-day set at build time (off by default; requires an OSM extract and
-  uses ``walking_speed_kmph``). Requires a network built with an OSM extract.
+  uses ``walking_speed_kmph``). Under a whole-day set, ``route_between_stops``
+  routes **door-to-door** between the two stops' coordinates — unrestricted
+  initial, intermediate, and final walking, matching
+  ``route_between_coordinates`` — with ``walking_speed_kmph``/
+  ``max_walking_time``/``max_snap_distance`` bounding that walking; without
+  the set it keeps today's board-at-origin closure routing. Requires a network
+  built with an OSM extract.
 
 - McTBTR groundwork — the multicriteria transfer set: the compute core
   gains a dominance-aware variant of the TBTR transfer precompute for

@@ -1398,11 +1398,12 @@ impl TransportNetwork {
     /// set of intermediate transfers a Pareto-optimal two-trip journey
     /// needs. The result is held in memory (`ultra_shortcut_count`,
     /// `ultra_shortcuts`). Computed **for the whole service day** (the
-    /// default window), it is relaxed by the point-destination time queries
-    /// (door-to-door coordinate routing and the point-set matrices) in place
-    /// of the closure transfers, giving them unrestricted walking;
-    /// stop-destination time queries and the emissions/fare engines keep the
-    /// closure. A partial-window set (a narrower `min_departure`/
+    /// default window), it is relaxed by the door-to-door time queries
+    /// (`route_between_coordinates`, `route_between_stops`, and the point-set
+    /// matrices) in place of the closure transfers, giving them unrestricted
+    /// walking; the one-to-all stop-destination time queries and the
+    /// emissions/fare engines keep the closure. A partial-window set (a
+    /// narrower `min_departure`/
     /// `max_departure`) is stored and inspectable but not relaxed by routing
     /// — a journey's source departure can fall outside a bounded window. The
     /// set and its compute window are persisted by `save` and restored by
@@ -1837,6 +1838,15 @@ impl TransportNetwork {
     /// when leg geometries are installed, and transfer legs their
     /// walked street path when the street network is installed.
     ///
+    /// With a whole-day ULTRA set (``compute_ultra_shortcuts``), the two
+    /// stops are routed **door-to-door between their coordinates** — the
+    /// same unrestricted initial/intermediate/final walking as
+    /// ``route_between_coordinates`` — and ``walking_speed_kmph``,
+    /// ``max_walking_time``, and ``max_snap_distance`` bound that walking.
+    /// Without such a set (or when a stop has no coordinate or is off the
+    /// walking network) the query boards at the origin stop and relaxes the
+    /// closure transfers, and those three arguments are ignored.
+    ///
     /// Parameters
     /// ----------
     /// from_stop : str
@@ -1868,7 +1878,7 @@ impl TransportNetwork {
     ///     time, number of rides) leaving at the departure time; with it,
     ///     the departure-window profile. Each journey carries its legs;
     ///     times are seconds past the service day's start.
-    #[pyo3(signature = (from_stop, to_stop, date, departure, max_transfers = 7, window = None, geometries = true))]
+    #[pyo3(signature = (from_stop, to_stop, date, departure, max_transfers = 7, window = None, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true))]
     #[allow(clippy::too_many_arguments)]
     fn route_between_stops(
         &self,
@@ -1879,10 +1889,43 @@ impl TransportNetwork {
         departure: &str,
         max_transfers: u8,
         window: Option<u32>,
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
         geometries: bool,
     ) -> PyResult<Py<PyList>> {
         let origin = self.resolve_stop(from_stop)?;
         let destination = self.resolve_stop(to_stop)?;
+        // With a whole-day ULTRA set, route door-to-door between the stops'
+        // coordinates for unrestricted walking; otherwise board at the origin
+        // stop and relax the closure (today's behaviour).
+        if self.ultra_active() {
+            if let (Some(streets), Some(from_xy), Some(to_xy)) = (
+                self.streets.as_ref(),
+                self.stop_coordinate(origin),
+                self.stop_coordinate(destination),
+            ) {
+                if streets
+                    .snap(from_xy.0, from_xy.1, max_snap_distance)
+                    .is_some()
+                    && streets.snap(to_xy.0, to_xy.1, max_snap_distance).is_some()
+                {
+                    return self.route_between_coordinates(
+                        py,
+                        from_xy,
+                        to_xy,
+                        date,
+                        departure,
+                        max_transfers,
+                        window,
+                        walking_speed_kmph,
+                        max_walking_time,
+                        max_snap_distance,
+                        geometries,
+                    );
+                }
+            }
+        }
         let request = Request {
             departure: parse_time(departure)?,
             access: vec![(origin, 0)],
@@ -3632,18 +3675,35 @@ impl TransportNetwork {
     /// service day**, else the closure footpaths. Used by door-to-door
     /// coordinate routing and the point-set matrices, where the street
     /// access/egress search supplies the initial and final walks, so the
-    /// transfer set carries only intermediate transfers. Stop-destination
-    /// queries (whose final walk *is* a transfer) and the emissions/fare
-    /// engines keep the closure: ULTRA holds neither final transfers nor the
-    /// emissions/fare ones. A partial-window set is not relaxed by routing —
-    /// a journey's source-station departure (after access walking and waiting
-    /// for a first trip) can fall outside a bounded window, which would
-    /// silently drop its transfers — so only a whole-day set is used.
+    /// transfer set carries only intermediate transfers. `route_between_stops`
+    /// routes through that same door-to-door path under a whole-day set (see
+    /// `ultra_active`). The one-to-all stop-destination queries (whose final
+    /// walk *is* a transfer) and the emissions/fare engines keep the closure:
+    /// ULTRA holds neither final transfers nor the emissions/fare ones. A
+    /// partial-window set is not relaxed by routing — a journey's
+    /// source-station departure (after access walking and waiting for a first
+    /// trip) can fall outside a bounded window, which would silently drop its
+    /// transfers — so only a whole-day set is used.
     fn time_transfers(&self) -> &Transfers {
         match (self.ultra_transfers.as_ref(), self.ultra_window) {
             (Some(ultra), Some((0, hi))) if hi >= u32::MAX - 1 => ultra,
             _ => &self.transfers,
         }
+    }
+
+    /// Whether a whole-day ULTRA set is installed, i.e. `time_transfers`
+    /// returns it — the gate for door-to-door stop routing.
+    fn ultra_active(&self) -> bool {
+        matches!(
+            (self.ultra_transfers.as_ref(), self.ultra_window),
+            (Some(_), Some((0, hi))) if hi >= u32::MAX - 1
+        )
+    }
+
+    /// A stop's `(latitude, longitude)`, or `None` when the feed omits it.
+    fn stop_coordinate(&self, stop: StopIdx) -> Option<(f64, f64)> {
+        let stop = &self.feed.stops[stop.0 as usize];
+        Some((stop.latitude?, stop.longitude?))
     }
 
     /// The installed street network, or a `ValueError` explaining that
