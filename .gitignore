@@ -22,6 +22,9 @@ docs/_build/
 # Downloaded test datasets (fetched by scripts/fetch_test_data.py)
 tests/data/
 
+# pyrosm parse cache (written when tests read an OSM extract)
+cache/
+
 # Local planning and assistant files (not part of the library)
 plans/
 .claude/

@@ -26,8 +26,11 @@
   criteria. A partial-window set (a narrower ``min_departure``/
   ``max_departure``) is stored and inspectable but not relaxed by routing,
   since a journey's source departure can fall outside a bounded window. The
-  set is not persisted (it is dropped by ``save``). Requires a network
-  built with an OSM extract.
+  shortcut set and its compute window are persisted by ``save`` and restored
+  by ``load`` (artifact format 5; artifacts written by older versions are
+  refused), so the heavy run-once preprocessing is reusable and a loaded
+  partial-window set stays unused. Requires a network built with an OSM
+  extract.
 
 - McTBTR groundwork — the multicriteria transfer set: the compute core
   gains a dominance-aware variant of the TBTR transfer precompute for
