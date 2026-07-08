@@ -2992,11 +2992,8 @@ impl TransportNetwork {
                 })
                 .collect();
             let egress = egress_tables(&destination_links);
-            let rows = Raptor.one_to_all_many(
-                &self.build.timetable,
-                self.time_transfers(),
-                &requests,
-            );
+            let rows =
+                Raptor.one_to_all_many(&self.build.timetable, self.time_transfers(), &requests);
             let mut flat = vec![u32::MAX; requests.len() * destination_count];
             for (origin, arrivals) in rows.iter().enumerate() {
                 debug_assert_eq!(arrivals.len(), stop_count);
