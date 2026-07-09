@@ -103,6 +103,42 @@ def test_loaded_networks_save_again(reloaded, tmp_path):
     assert [entry.name for entry in tmp_path.iterdir()] == ["again.cafein"]
 
 
+def test_round_trip_preserves_the_walking_hierarchy(
+    artifact_path, mmap_available, tmp_path
+):
+    # An installed contraction hierarchy: the run-once contraction persists and
+    # its buckets rebuild on load, so a loaded network's walking searches match a
+    # freshly contracted one — not the bounded-Dijkstra fallback of a network
+    # that lost its hierarchy.
+    accelerated = TransportNetwork.load(artifact_path)
+    accelerated._core.install_walking_hierarchy()
+    assert accelerated._core.has_walking_hierarchy
+
+    path = tmp_path / "hierarchy.cafein"
+    accelerated.save(path)
+    restored = TransportNetwork.load(path)
+    assert restored._core.has_walking_hierarchy
+
+    coordinates = {stop: (lat, lon) for stop, lat, lon in restored.stops}
+    origin = coordinates["1100602"]
+    destination = coordinates["1040280"]
+    assert restored.access_stops(*origin) == accelerated.access_stops(*origin)
+    assert restored.route_between_coordinates(
+        origin, destination, "2022-02-22", "08:30:00"
+    ) == accelerated.route_between_coordinates(
+        origin, destination, "2022-02-22", "08:30:00"
+    )
+
+    # A lazy mapped load restores the hierarchy from META and rebuilds its
+    # buckets without paging the STREETS section — validating a hierarchy
+    # artifact must not defeat the lazy load.
+    if mmap_available:
+        lazy = TransportNetwork.load(path, mmap=True)
+        assert lazy._core.has_walking_hierarchy
+        assert lazy._core._streets_bytes_read == 0
+        assert lazy.access_stops(*origin) == accelerated.access_stops(*origin)
+
+
 def test_load_refuses_foreign_and_future_files(tmp_path):
     junk = tmp_path / "junk.cafein"
     junk.write_bytes(b"definitely not a network artifact")

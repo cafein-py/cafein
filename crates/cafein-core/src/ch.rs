@@ -26,14 +26,23 @@ pub const ORIGINAL: u32 = u32::MAX;
 /// A contraction hierarchy: per-vertex `rank` (contraction order — lower is
 /// contracted earlier / less important) and an upward CSR of edges to
 /// higher-rank neighbours. `up_middle[e]` is [`ORIGINAL`] for an original edge,
-/// else the middle vertex a shortcut bridges (for unpacking).
-#[derive(Debug)]
+/// else the middle vertex a shortcut bridges (for unpacking). Serializable so
+/// the run-once contraction persists in an artifact; the buckets are rebuilt on
+/// load.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ContractionHierarchy {
     rank: Vec<u32>,
     up_offsets: Vec<u32>,
     up_targets: Vec<u32>,
     up_meters: Vec<f64>,
     up_middle: Vec<u32>,
+    /// A fingerprint of the CSR (`offsets`/`targets`/`metres`) the hierarchy was
+    /// contracted from, so a persisted hierarchy binds to its exact graph: a
+    /// loaded artifact whose street CSR does not reproduce this is refused
+    /// rather than trusted for wrong distances (see [`graph_fingerprint`]).
+    ///
+    /// [`graph_fingerprint`]: ContractionHierarchy::graph_fingerprint
+    graph_fingerprint: u64,
 }
 
 /// Precomputed one-to-many buckets over a fixed set of target vertices (built by
@@ -193,6 +202,7 @@ impl ContractionHierarchy {
             up_targets,
             up_meters,
             up_middle,
+            graph_fingerprint: csr_fingerprint(offsets, targets, meters),
         }
     }
 
@@ -201,10 +211,72 @@ impl ContractionHierarchy {
         self.rank.len() as u32
     }
 
+    /// A fingerprint of the CSR the hierarchy was contracted from. On load, the
+    /// accompanying street graph's [`csr_fingerprint`] must equal this, binding
+    /// the persisted hierarchy to its exact graph — an artifact carrying a
+    /// hierarchy for a different graph of the same size is refused, not trusted.
+    pub fn graph_fingerprint(&self) -> u64 {
+        self.graph_fingerprint
+    }
+
     /// The number of shortcut edges in the upward CSR (contraction added). A
     /// witness-suppressed contraction adds none; a forced middle adds some.
     pub fn shortcut_count(&self) -> usize {
         self.up_middle.iter().filter(|&&m| m != ORIGINAL).count()
+    }
+
+    /// Whether the arrays form a well-formed hierarchy — not merely in-range, but
+    /// a valid one: the upward CSR is shaped right, `rank` is a permutation of
+    /// `0..vertex_count`, every CSR edge points to a strictly higher-rank target,
+    /// every shortcut middle is in range, and every metre is finite and
+    /// non-negative. A persisted hierarchy is checked against this — and its
+    /// [`vertex_count`](Self::vertex_count) and [`graph_fingerprint`] against the
+    /// street graph it accompanies — before its buckets are rebuilt, so a
+    /// corrupted or crafted artifact is refused rather than answering queries from
+    /// an invalid hierarchy.
+    ///
+    /// [`graph_fingerprint`]: ContractionHierarchy::graph_fingerprint
+    pub fn is_consistent(&self) -> bool {
+        let vertex_count = self.rank.len();
+        if self.up_offsets.len() != vertex_count + 1 || self.up_offsets.first() != Some(&0) {
+            return false;
+        }
+        let edge_count = self.up_targets.len();
+        if self.up_meters.len() != edge_count
+            || self.up_middle.len() != edge_count
+            || *self.up_offsets.last().unwrap() as usize != edge_count
+            || self.up_offsets.windows(2).any(|pair| pair[0] > pair[1])
+        {
+            return false;
+        }
+        let count = vertex_count as u32;
+        // `rank` is a permutation of `0..vertex_count` (in range, no duplicates).
+        let mut seen = vec![false; vertex_count];
+        for &rank in &self.rank {
+            match seen.get_mut(rank as usize) {
+                Some(slot) if !*slot => *slot = true,
+                _ => return false,
+            }
+        }
+        // Shortcut middles are in range; metres are finite and non-negative.
+        if self
+            .up_middle
+            .iter()
+            .any(|&middle| middle != ORIGINAL && middle >= count)
+            || self
+                .up_meters
+                .iter()
+                .any(|&meter| !meter.is_finite() || meter < 0.0)
+        {
+            return false;
+        }
+        // Every upward edge points to a strictly higher-rank target.
+        (0..vertex_count).all(|vertex| {
+            let edges = self.up_offsets[vertex] as usize..self.up_offsets[vertex + 1] as usize;
+            self.up_targets[edges]
+                .iter()
+                .all(|&target| target < count && self.rank[target as usize] > self.rank[vertex])
+        })
     }
 
     /// The shortest-walk distance in metres between `source` and `target`, or
@@ -536,6 +608,27 @@ fn has_witness(
     false
 }
 
+/// A deterministic, order- and length-sensitive fingerprint of a walking-graph
+/// CSR (`offsets`/`targets`/`metres`, metres by their bit pattern). Binds a
+/// persisted [`ContractionHierarchy`] to the exact graph it was built from; it
+/// is an integrity check against a mismatched graph, not a cryptographic digest.
+pub fn csr_fingerprint(offsets: &[u32], targets: &[u32], meters: &[f64]) -> u64 {
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = 0xcbf29ce484222325u64;
+    for &offset in offsets {
+        hash = (hash ^ offset as u64).wrapping_mul(PRIME);
+    }
+    for &target in targets {
+        hash = (hash ^ target as u64).wrapping_mul(PRIME);
+    }
+    for &meter in meters {
+        hash = (hash ^ meter.to_bits()).wrapping_mul(PRIME);
+    }
+    hash = (hash ^ offsets.len() as u64).wrapping_mul(PRIME);
+    hash = (hash ^ targets.len() as u64).wrapping_mul(PRIME);
+    (hash ^ meters.len() as u64).wrapping_mul(PRIME)
+}
+
 /// A vertex's importance: edge difference (shortcuts needed minus live degree)
 /// plus the number of already-contracted neighbours (spreads contraction out).
 /// Lower contracts first.
@@ -859,6 +952,53 @@ mod tests {
         let ch = ContractionHierarchy::build(3, &offsets, &targets, &meters);
         assert_eq!(ch.shortcut_count(), 0, "witnesses suppress every shortcut");
         assert_matches(3, &edges);
+    }
+
+    #[test]
+    fn consistency_guard_flags_a_tampered_hierarchy() {
+        let edges = grid_edges(4);
+        let (offsets, targets, meters) = csr(16, &edges);
+        let ch = ContractionHierarchy::build(16, &offsets, &targets, &meters);
+        assert_eq!(ch.vertex_count(), 16);
+        assert!(
+            ch.is_consistent(),
+            "a freshly built hierarchy is consistent"
+        );
+
+        // An out-of-range target — as a corrupted artifact could carry — is caught.
+        let mut out_of_range = ContractionHierarchy::build(16, &offsets, &targets, &meters);
+        assert!(!out_of_range.up_targets.is_empty());
+        out_of_range.up_targets[0] = 999;
+        assert!(!out_of_range.is_consistent());
+
+        // A truncated upward-CSR offset array is caught.
+        let mut truncated = ContractionHierarchy::build(16, &offsets, &targets, &meters);
+        truncated.up_offsets.pop();
+        assert!(!truncated.is_consistent());
+
+        // A rank that is no longer a permutation (a duplicate) is caught.
+        let mut duplicate_rank = ContractionHierarchy::build(16, &offsets, &targets, &meters);
+        duplicate_rank.rank[0] = duplicate_rank.rank[1];
+        assert!(!duplicate_rank.is_consistent());
+
+        // A non-finite metre is caught.
+        let mut bad_meter = ContractionHierarchy::build(16, &offsets, &targets, &meters);
+        assert!(!bad_meter.up_meters.is_empty());
+        bad_meter.up_meters[0] = f64::NAN;
+        assert!(!bad_meter.is_consistent());
+
+        // The fingerprint reproduces from the same CSR and binds to this graph:
+        // a different graph of the same vertex count fingerprints differently.
+        assert_eq!(
+            ch.graph_fingerprint(),
+            csr_fingerprint(&offsets, &targets, &meters)
+        );
+        let (other_offsets, other_targets, other_meters) =
+            csr(16, &[(0, 1, 1.0), (1, 2, 1.0), (3, 4, 2.0)]);
+        assert_ne!(
+            ch.graph_fingerprint(),
+            csr_fingerprint(&other_offsets, &other_targets, &other_meters)
+        );
     }
 
     #[test]
