@@ -139,6 +139,29 @@ def test_round_trip_preserves_the_walking_hierarchy(
         assert lazy.access_stops(*origin) == accelerated.access_stops(*origin)
 
 
+def test_round_trip_preserves_the_mcultra_set(artifact_path, tmp_path):
+    # The McULTRA emissions-shortcut set persists with its window and factor
+    # fingerprint (a bounded window here; the persistence is identical for any
+    # window, and all three ride the same META record).
+    from cafein import emissions
+
+    net = TransportNetwork.load(artifact_path)
+    assert net._core.mcultra_shortcut_count is None
+    factors = emissions.trip_factors(net)
+    count = net._core.compute_mcultra_shortcuts(3.6, 300.0, factors, 28800, 29100)
+    assert count > 0
+    assert net._core.mcultra_shortcut_count == count
+
+    path = tmp_path / "mcultra.cafein"
+    net.save(path)
+    restored = TransportNetwork.load(path)
+    assert restored._core.mcultra_shortcut_count == count
+    # The window and factor fingerprint round-trip too (they gate activation).
+    assert restored._core.mcultra_window == net._core.mcultra_window == (28800, 29100)
+    assert restored._core._mcultra_factor == net._core._mcultra_factor
+    assert restored._core._mcultra_factor is not None
+
+
 def test_load_refuses_foreign_and_future_files(tmp_path):
     junk = tmp_path / "junk.cafein"
     junk.write_bytes(b"definitely not a network artifact")
