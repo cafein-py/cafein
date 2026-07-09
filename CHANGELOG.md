@@ -2,62 +2,69 @@
 
 ## Unreleased
 
-- ULTRA unrestricted walking for point-destination time routing —
-  ``TransportNetwork.compute_ultra_shortcuts`` enumerates the ULTRA
-  intermediate-transfer shortcuts (Baum et al.) over the unrestricted
-  stop-to-stop walking graph of the installed street network: the
-  minimal set of alight-to-board walks a Pareto-optimal two-trip
-  journey needs, computed in parallel over station representatives.
-  ``walking_speed_kmph``/``max_transfer_time`` set the pace and walk
-  cutoff, and ``min_departure``/``max_departure`` bound the
-  source-departure window (the whole service day by default; a whole-day
-  metropolitan build is a heavy run-once operation). The result is held
-  in memory as ``(origin, destination, seconds, meters)`` tuples, exposed
-  as ``ultra_shortcut_count`` and ``ultra_shortcuts``. Computed for the
-  **whole service day** (the default window), it is relaxed by the
-  **point-destination** time queries in place of the closure footpaths,
-  giving them unrestricted intermediate walking: door-to-door coordinate
-  routing (``route_between_coordinates``) and the point-set matrices
+- ULTRA shortcut set — ``TransportNetwork.compute_ultra_shortcuts``
+  enumerates the ULTRA intermediate-transfer shortcuts (Baum et al.) over the
+  unrestricted stop-to-stop walking graph of the installed street network: the
+  minimal set of alight-to-board walks a Pareto-optimal two-trip journey needs,
+  computed in parallel over station representatives.
+  ``walking_speed_kmph``/``max_transfer_time`` set the pace and walk cutoff,
+  and ``min_departure``/``max_departure`` bound the source-departure window
+  (the whole service day by default; a whole-day metropolitan build is a heavy
+  run-once operation). The set is held in memory as
+  ``(origin, destination, seconds, meters)`` tuples, exposed as
+  ``ultra_shortcut_count`` and ``ultra_shortcuts``.
+
+- ULTRA point-destination time routing — a **whole-day** set (the default
+  window) is relaxed by the **point-destination** time queries in place of the
+  closure footpaths, giving them unrestricted intermediate walking:
+  ``route_between_coordinates`` and the point-set matrices
   (``TravelTimeMatrix``/``TravelCostMatrix`` from point origins and
-  destinations, ``DetailedItineraries``), where the access/egress street
-  search supplies the initial and final walks. Stop-to-stop time queries
-  and all emissions/fare queries keep the closure — ULTRA shortcuts are
-  complete only for the intermediate transfers of the (arrival, transfers)
-  criteria. A partial-window set (a narrower ``min_departure``/
-  ``max_departure``) is stored and inspectable but not relaxed by routing,
-  since a journey's source departure can fall outside a bounded window. The
-  shortcut set and its compute window are persisted by ``save`` and restored
-  by ``load`` (artifact format 7; artifacts written by older versions are
-  refused), so the heavy run-once preprocessing is reusable and a loaded
-  partial-window set stays unused. ``from_gtfs(ultra=True)`` computes the
-  whole-day set at build time (off by default; requires an OSM extract and
-  uses ``walking_speed_kmph``). Under a whole-day set, ``route_between_stops``
-  routes **door-to-door** between the two stops' coordinates — unrestricted
-  initial, intermediate, and final walking, matching
-  ``route_between_coordinates`` — with ``walking_speed_kmph``/
-  ``max_walking_time``/``max_snap_distance`` bounding that walking; without
-  the set it keeps today's board-at-origin closure routing. The one-to-all time
-  queries — ``travel_times_from_stop``, ``travel_times_from_coordinate``, and
-  the ``"raptor"`` ``travel_time_matrix`` — likewise reach every stop
-  **door-to-door** under a whole-day set: a per-destination egress
-  (``StreetNetwork::link_many`` on each stop's coordinate, capped at
-  ``max_walking_time``) folds one **bounded** final walk into the arrivals,
-  treating each origin and destination stop as its coordinate and gaining the
-  same three walking arguments — so they agree with ``route_between_coordinates``
-  (arrival at the stop's coordinate). The matrix partitions its origins per row —
-  snappable origins route door-to-door, an off-network origin falls back to the
-  closure — preserving input order. Without a whole-day set they keep the
-  closure, tau-direct search. Requires a network built with an OSM extract.
-  The time-optimal stop cost matrix — ``TravelCostMatrix`` /
+  destinations, ``DetailedItineraries``), where the access/egress street search
+  supplies the initial and final walks. ULTRA shortcuts are complete only for
+  the intermediate transfers of the (arrival, transfers) criteria, so
+  stop-to-stop time queries and all emissions/fare queries keep the closure. A
+  partial-window set (a narrower ``min_departure``/``max_departure``) is stored
+  and inspectable but not relaxed by routing, since a journey's source departure
+  can fall outside a bounded window.
+
+- ULTRA persistence and build-time compute — the shortcut set and its compute
+  window are persisted by ``save`` and restored by ``load`` (artifact format 7;
+  artifacts written by older versions are refused), so the run-once
+  preprocessing is reusable and a loaded partial-window set stays unused.
+  ``from_gtfs(ultra=True)`` computes the whole-day set at build time (off by
+  default; requires an OSM extract and uses ``walking_speed_kmph``).
+
+- ULTRA door-to-door stop routing — under a whole-day set,
+  ``route_between_stops`` routes **door-to-door** between the two stops'
+  coordinates (unrestricted initial, intermediate, and final walking, matching
+  ``route_between_coordinates``), with
+  ``walking_speed_kmph``/``max_walking_time``/``max_snap_distance`` bounding
+  that walking; without the set it keeps today's board-at-origin closure
+  routing.
+
+- ULTRA door-to-door one-to-all time queries —
+  ``travel_times_from_stop``, ``travel_times_from_coordinate``, and the
+  ``"raptor"`` ``travel_time_matrix`` reach every stop **door-to-door** under a
+  whole-day set: a per-destination egress (``StreetNetwork::link_many`` on each
+  stop's coordinate, capped at ``max_walking_time``) folds one **bounded** final
+  walk into the arrivals, treating each origin and destination stop as its
+  coordinate and gaining the same three walking arguments — so they agree with
+  ``route_between_coordinates`` (arrival at the stop's coordinate). The matrix
+  partitions its origins per row (snappable origins route door-to-door, an
+  off-network origin falls back to the closure), preserving input order. Without
+  a whole-day set they keep the closure, tau-direct search. Requires a network
+  built with an OSM extract.
+
+- ULTRA door-to-door time-optimal stop cost matrix — ``TravelCostMatrix`` /
   ``travel_cost_matrix`` with ``optimize="time"`` over stop origins and
-  destinations — routes door-to-door the same way under a whole-day set: it is
-  the point cost matrix over the stops' coordinates (same location-based egress),
-  so its ``travel_time`` equals the ``travel_time_matrix`` cell while it also
-  annotates distance, emissions, and fare, and it gains the same three walking
-  arguments. Snappable origins route door-to-door and off-network origins fall
-  back to the closure, per row. The emissions/fare stop matrices
-  (``optimize="emissions"``/``"fare"``) keep the closure until McULTRA and still
-  reject the walking arguments.
+  destinations routes door-to-door under a whole-day set: it is the point cost
+  matrix over the stops' coordinates (same location-based egress), so its
+  ``travel_time`` equals the ``travel_time_matrix`` cell while it also annotates
+  distance, emissions, and fare, and it gains the same three walking arguments.
+  Snappable origins route door-to-door and off-network origins fall back to the
+  closure, per row. The emissions/fare stop matrices
+  (``optimize="emissions"``/``"fare"``) keep the closure and still reject the
+  walking arguments.
 
 - McTBTR groundwork — the multicriteria transfer set: the compute core
   gains a dominance-aware variant of the TBTR transfer precompute for
