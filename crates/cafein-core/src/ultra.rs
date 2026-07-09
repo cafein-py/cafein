@@ -27,7 +27,7 @@ use crate::timetable::{StopIdx, Timetable};
 use crate::transfers::Transfers;
 
 /// A stop is never reached at this time.
-const NEVER: u32 = u32::MAX;
+pub(crate) const NEVER: u32 = u32::MAX;
 
 /// The ULTRA shortcut set of a network: the minimal intermediate
 /// transfers over the transfer graph, computed in parallel over source
@@ -75,17 +75,17 @@ pub struct Shortcut {
 /// leaving the source at that time. Mirrors the reference's
 /// `ConsolidatedDepartureLabel`.
 #[derive(Debug, Clone)]
-struct Departure {
-    time: u32,
+pub(crate) struct Departure {
+    pub(crate) time: u32,
     /// The `(line, position)` route segments first-boardable at `time`.
-    routes: Vec<(u32, u16)>,
+    pub(crate) routes: Vec<(u32, u16)>,
 }
 
 /// The representative stop of every stop's station, a station being the
 /// stops mutually reachable over zero-time transfers (coincident stops).
 /// The representative is the least stop id in the component. Only the
 /// representative of a station runs the shortcut search.
-fn stations(transfers: &Transfers, stop_count: u32) -> Vec<StopIdx> {
+pub(crate) fn stations(transfers: &Transfers, stop_count: u32) -> Vec<StopIdx> {
     let mut representative: Vec<StopIdx> = (0..stop_count).map(StopIdx).collect();
     // Union-find over zero-duration transfer edges.
     fn find(rep: &mut [StopIdx], stop: u32) -> u32 {
@@ -133,7 +133,7 @@ fn stations(transfers: &Transfers, stop_count: u32) -> Vec<StopIdx> {
 
 /// Dijkstra over the transfer graph from `source`, returning the walking
 /// time to every stop (`NEVER` when unreachable). `source` itself is 0.
-fn walk_from(transfers: &Transfers, source: StopIdx, stop_count: u32) -> Vec<u32> {
+pub(crate) fn walk_from(transfers: &Transfers, source: StopIdx, stop_count: u32) -> Vec<u32> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
     let mut distance = vec![NEVER; stop_count as usize];
@@ -160,7 +160,7 @@ fn walk_from(transfers: &Transfers, source: StopIdx, stop_count: u32) -> Vec<u32
 /// leaving the source lets a first trip be boarded, given the walk to its
 /// boarding stop. Faithful to the reference's `collectDepartures`:
 /// `direct` supplies the round-0 walk, `station` the source-station test.
-fn collect_departures(
+pub(crate) fn collect_departures(
     view: &DayView,
     timetable: &Timetable,
     direct: &[u32],
@@ -623,7 +623,7 @@ impl<'a> Search<'a> {
 }
 
 /// Sorts and removes duplicate stops in place.
-fn dedup_stops(stops: &mut Vec<StopIdx>) {
+pub(crate) fn dedup_stops(stops: &mut Vec<StopIdx>) {
     stops.sort_unstable();
     stops.dedup();
 }
