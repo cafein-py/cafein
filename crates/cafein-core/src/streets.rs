@@ -1979,6 +1979,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ch_buckets_match_bounded_dijkstra_on_link_vertices() {
+        // A bucket-CH over the stops' link-endpoint vertices reproduces
+        // `bounded_dijkstra`'s distances to those vertices from a snapped source
+        // (the CH-2 integration point). The stop link-join on top of these vertex
+        // distances is validated when CH is wired into `access_stops` (CH-3), so
+        // this checks the bucket meeting on a real StreetNetwork CSR.
+        let net = network(
+            4,
+            3,
+            &[
+                (0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0))),
+                (1, 2, 100.0, straight((100.0, 0.0), (200.0, 0.0))),
+                (2, 3, 100.0, straight((200.0, 0.0), (300.0, 0.0))),
+                (0, 3, 350.0, straight((0.0, 0.0), (300.0, 0.0))),
+            ],
+            vec![
+                link(0, 0, 0.5, 0.0),
+                link(1, 1, 0.5, 0.0),
+                link(2, 2, 0.5, 0.0),
+            ],
+        )
+        .unwrap();
+        let ch = crate::ch::ContractionHierarchy::build(
+            net.vertex_count(),
+            net.arrays.adjacency_offsets(),
+            net.arrays.adj_targets(),
+            net.arrays.adj_meters(),
+        );
+        let mut targets: Vec<u32> = net
+            .links
+            .iter()
+            .flat_map(|link| [link.from, link.to])
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        let cutoff = 1000.0;
+        let buckets = ch.buckets(&targets, cutoff);
+        let mut state = SearchState {
+            distances: HashMap::new(),
+            previous: HashMap::new(),
+            heap: BinaryHeap::new(),
+        };
+        // Seed like a snap would: an interior vertex, with a couple of offsets.
+        for seeds in [vec![(0u32, 0.0)], vec![(1u32, 10.0), (2u32, 0.0)]] {
+            net.bounded_dijkstra(&seeds, cutoff, &mut state);
+            let got: HashMap<u32, f64> = ch
+                .one_to_many(&buckets, &seeds, cutoff)
+                .into_iter()
+                .collect();
+            for &target in &targets {
+                let expected = state.distance(target);
+                if expected <= cutoff + 1e-9 {
+                    assert!(
+                        got.get(&target)
+                            .is_some_and(|&d| (d - expected).abs() < 1e-6),
+                        "o2m[{target}] = {:?} vs bounded_dijkstra {expected} (seeds {seeds:?})",
+                        got.get(&target)
+                    );
+                }
+            }
+        }
+    }
+
     /// The `(stop, seconds)` view of a walking-search result.
     fn timed(walks: &[WalkedStop]) -> Vec<(StopIdx, u32)> {
         walks.iter().map(|walk| (walk.stop, walk.seconds)).collect()
