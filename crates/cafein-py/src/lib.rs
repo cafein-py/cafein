@@ -45,6 +45,16 @@ struct TransportNetwork {
     /// seconds since midnight. A time query outside it falls back to the
     /// closure, so a partial-window set never silently drops transfers.
     ultra_window: Option<(u32, u32)>,
+    /// The McULTRA (emissions-aware) shortcut set, when computed
+    /// (`compute_mcultra_shortcuts`): the coordinate emissions engines relax it
+    /// in place of the closure when a whole-day set is present and the query's
+    /// factor vector matches the one it was built for (`mcultra_factor`). Not
+    /// yet persisted.
+    mcultra_transfers: Option<Transfers>,
+    mcultra_window: Option<(u32, u32)>,
+    /// A fingerprint of the per-trip emission-factor vector the McULTRA set was
+    /// built with; a query using different factors falls back to the closure.
+    mcultra_factor: Option<u64>,
     geometry: Option<TripGeometry>,
     leg_geometry: Option<LegGeometry>,
     streets: Option<StreetNetwork>,
@@ -940,6 +950,10 @@ fn assemble((artifact, streets, streets_bytes_read): LoadedArtifact) -> Transpor
         transfers,
         ultra_transfers,
         ultra_window,
+        // McULTRA is not yet persisted; it is recomputed after load if wanted.
+        mcultra_transfers: None,
+        mcultra_window: None,
+        mcultra_factor: None,
         geometry,
         leg_geometry,
         streets,
@@ -1143,6 +1157,18 @@ fn egress_tables(links: &[Option<Vec<WalkedStop>>]) -> Vec<Vec<(StopIdx, u32, f6
         .collect()
 }
 
+/// A deterministic, NaN-safe fingerprint of a per-trip emission-factor vector,
+/// binding a McULTRA set to the factor configuration it was built with (a query
+/// with different factors falls back to the closure). Not a cryptographic digest.
+fn factor_fingerprint(per_trip: &[f64]) -> u64 {
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = 0xcbf29ce484222325u64;
+    for &factor in per_trip {
+        hash = (hash ^ factor.to_bits()).wrapping_mul(PRIME);
+    }
+    (hash ^ per_trip.len() as u64).wrapping_mul(PRIME)
+}
+
 #[pymethods]
 impl TransportNetwork {
     /// Build a network from one or several GTFS zip archives.
@@ -1189,6 +1215,9 @@ impl TransportNetwork {
             transfers,
             ultra_transfers: None,
             ultra_window: None,
+            mcultra_transfers: None,
+            mcultra_window: None,
+            mcultra_factor: None,
             geometry: None,
             leg_geometry: None,
             streets: None,
@@ -1417,6 +1446,28 @@ impl TransportNetwork {
         self.ultra_transfers.as_ref().map(|set| set.edge_count())
     }
 
+    /// Number of McULTRA shortcuts, or `None` when none are computed.
+    #[getter]
+    fn mcultra_shortcut_count(&self) -> Option<usize> {
+        self.mcultra_transfers.as_ref().map(|set| set.edge_count())
+    }
+
+    /// Whether an emissions query with these `factors` would relax the installed
+    /// McULTRA set (a whole-day set whose factor fingerprint matches) rather than
+    /// the closure. Exposes the `emissions_transfers` gate for inspection/tests.
+    fn mcultra_active_for(&self, factors: Vec<(String, f64)>) -> bool {
+        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
+        for (trip_id, factor) in &factors {
+            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
+                per_trip[trip.0 as usize] = *factor;
+            }
+        }
+        !std::ptr::eq(
+            self.emissions_transfers(factor_fingerprint(&per_trip)),
+            &self.transfers,
+        )
+    }
+
     /// The computed ULTRA shortcuts as `(origin_stop_id, destination_stop_id,
     /// seconds, meters)` tuples, or `None` when none are computed. Sorted by
     /// origin then destination, so two runs over the same network return
@@ -1526,14 +1577,15 @@ impl TransportNetwork {
         Ok(count)
     }
 
-    /// Computes the McULTRA (emissions-aware) shortcut set and returns its edge
-    /// count — the Stage 1 measurement entry point. It does **not** install the
-    /// set (relaxing it into the emissions engines is a later stage). `factors`
+    /// Computes and **installs** the McULTRA (emissions-aware) shortcut set,
+    /// returning its edge count. The coordinate emissions engine relaxes it in
+    /// place of the closure when a whole-day set is installed and the query's
+    /// factors match the ones it was built with (`emissions_transfers`). `factors`
     /// is the `trip_factors` table; trips without a finite factor are skipped.
     /// Requires installed streets and trip distances.
     #[pyo3(signature = (walking_speed_kmph, max_transfer_time, factors, min_departure, max_departure))]
     fn compute_mcultra_shortcuts(
-        &self,
+        &mut self,
         py: Python<'_>,
         walking_speed_kmph: f64,
         max_transfer_time: f64,
@@ -1571,7 +1623,7 @@ impl TransportNetwork {
         let stop_count = self.build.timetable.stop_count();
         let timetable = &self.build.timetable;
         let streets = self.installed_streets()?;
-        let count = py
+        let set = py
             .allow_threads(|| {
                 let dense = streets.stop_transfers(speed, max_transfer_time);
                 let graph =
@@ -1586,9 +1638,20 @@ impl TransportNetwork {
                     min_departure,
                     max_departure,
                 );
-                Ok::<usize, String>(shortcuts.len())
+                // The shortcuts carry the walked distance, so they build a
+                // routing-ready transfer set directly (as the ULTRA path does).
+                let edges: Vec<(StopIdx, StopIdx, u32, f64)> = shortcuts
+                    .iter()
+                    .map(|s| (s.origin, s.destination, s.seconds, s.meters))
+                    .collect();
+                Transfers::from_edges(stop_count, &edges).map_err(|error| error.to_string())
             })
             .map_err(PyValueError::new_err)?;
+        let count = set.edge_count();
+        let fingerprint = factor_fingerprint(&per_trip);
+        self.mcultra_transfers = Some(set);
+        self.mcultra_window = Some((min_departure, max_departure));
+        self.mcultra_factor = Some(fingerprint);
         Ok(count)
     }
 
@@ -1728,6 +1791,11 @@ impl TransportNetwork {
             TripGeometry::from_trips(&self.build.timetable, entries)
                 .map_err(|error| PyValueError::new_err(error.to_string()))?,
         );
+        // The McULTRA search used the trip geometry to decide emissions-relevant
+        // transfers; new distances invalidate the set (ULTRA is distance-free).
+        self.mcultra_transfers = None;
+        self.mcultra_window = None;
+        self.mcultra_factor = None;
         Ok(())
     }
 
@@ -1818,10 +1886,13 @@ impl TransportNetwork {
             )
             .map_err(|error| PyValueError::new_err(error.to_string()))?,
         );
-        // ULTRA shortcuts are derived from the street network; a new one
-        // invalidates them.
+        // ULTRA and McULTRA shortcuts are derived from the street network; a new
+        // one invalidates them.
         self.ultra_transfers = None;
         self.ultra_window = None;
+        self.mcultra_transfers = None;
+        self.mcultra_window = None;
+        self.mcultra_factor = None;
         Ok(())
     }
 
@@ -2856,6 +2927,10 @@ impl TransportNetwork {
                 )
                 .swap_remove(0)
         };
+        // Door-to-door emissions: relax the McULTRA set for the intermediate
+        // transfers when one is installed for this factor configuration; the
+        // access/egress and direct walk above stay unchanged.
+        let intermediate = self.emissions_transfers(factor_fingerprint(&per_trip));
         let journeys = py.allow_threads(|| {
             let view = DayView::for_date(
                 &self.build.timetable,
@@ -2866,7 +2941,7 @@ impl TransportNetwork {
                 None => mcraptor::route(
                     &view,
                     &self.build.timetable,
-                    &self.transfers,
+                    intermediate,
                     geometry,
                     &per_trip,
                     &request,
@@ -2875,7 +2950,7 @@ impl TransportNetwork {
                 Some(window) => mcraptor::route_range(
                     &view,
                     &self.build.timetable,
-                    &self.transfers,
+                    intermediate,
                     geometry,
                     &per_trip,
                     &request,
@@ -2908,7 +2983,9 @@ impl TransportNetwork {
                 Some(&walks),
                 Some(&ends),
                 geometries,
-                &self.transfers,
+                // The same set the route relaxed, so transfer legs report the
+                // McULTRA walk distance rather than the closure's.
+                intermediate,
             )?)?;
         }
         Ok(result.unbind())
@@ -3861,6 +3938,11 @@ impl TransportNetwork {
                 );
             }
             let egress = egress_tables(&destination_links);
+            // Single-criterion (time-Pareto candidates, then lowest-objective):
+            // it keeps the closure. McULTRA is an emissions-Pareto set, not
+            // time-complete, so relaxing it here could drop time-relevant
+            // transfers; the emissions-complete coordinate path is the McRAPTOR
+            // one (`mc_route_between_coordinates`, `candidates="pareto"`).
             let mut rows = Raptor.least_cost_matrix_to_points(
                 &self.build.timetable,
                 &self.transfers,
@@ -3987,6 +4069,22 @@ impl TransportNetwork {
             (self.ultra_transfers.as_ref(), self.ultra_window),
             (Some(_), Some((0, hi))) if hi >= u32::MAX - 1
         )
+    }
+
+    /// The transfer set the coordinate emissions engines relax for a query using
+    /// factors with fingerprint `factor`: the whole-day McULTRA set when one is
+    /// installed for that exact factor configuration, else the closure. A
+    /// partial-window or factor-mismatched set is never silently used (§Factor
+    /// contract).
+    fn emissions_transfers(&self, factor: u64) -> &Transfers {
+        match (
+            self.mcultra_transfers.as_ref(),
+            self.mcultra_window,
+            self.mcultra_factor,
+        ) {
+            (Some(set), Some((0, hi)), Some(built)) if hi >= u32::MAX - 1 && built == factor => set,
+            _ => &self.transfers,
+        }
     }
 
     /// A stop's `(latitude, longitude)`, or `None` when the feed omits it.
