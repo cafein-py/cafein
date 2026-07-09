@@ -27,7 +27,7 @@
   ``max_departure``) is stored and inspectable but not relaxed by routing,
   since a journey's source departure can fall outside a bounded window. The
   shortcut set and its compute window are persisted by ``save`` and restored
-  by ``load`` (artifact format 5; artifacts written by older versions are
+  by ``load`` (artifact format 6; artifacts written by older versions are
   refused), so the heavy run-once preprocessing is reusable and a loaded
   partial-window set stays unused. ``from_gtfs(ultra=True)`` computes the
   whole-day set at build time (off by default; requires an OSM extract and

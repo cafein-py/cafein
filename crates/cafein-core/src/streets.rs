@@ -629,8 +629,8 @@ pub struct StreetNetwork {
     /// An optional contraction hierarchy accelerating the bounded one-to-many
     /// walking searches (`access_stops`/`stop_transfers`/…). Built on demand by
     /// [`install_hierarchy`](Self::install_hierarchy); when absent the searches
-    /// use `bounded_dijkstra`. Derived from the graph, so not persisted (rebuilt
-    /// on demand after `load`).
+    /// use `bounded_dijkstra`. The contraction persists with the artifact; its
+    /// buckets are derived state, rebuilt on load.
     hierarchy: Option<ChIndex>,
 }
 
@@ -894,8 +894,8 @@ impl StreetNetwork {
     /// so the bounded walking searches (`access_stops`/`stop_transfers`/…) run as
     /// hierarchy queries instead of graph sweeps. Heavy (the contraction is
     /// run-once); opt-in, so the default build path is unchanged. Idempotent —
-    /// rebuilding replaces the index. Derived from the graph, so it is not
-    /// persisted; call again after `load` to re-enable acceleration.
+    /// rebuilding replaces the index. The contraction persists with the artifact,
+    /// so acceleration survives `save`/`load` without a second contraction.
     pub fn install_hierarchy(&mut self) {
         let hierarchy = crate::ch::ContractionHierarchy::build(
             self.vertex_count(),
@@ -903,6 +903,16 @@ impl StreetNetwork {
             self.arrays.adj_targets(),
             self.arrays.adj_meters(),
         );
+        self.install_hierarchy_from(hierarchy);
+    }
+
+    /// Installs a prebuilt contraction hierarchy, deriving its one-to-many
+    /// buckets from the stops' link-endpoint vertices. Used to restore a
+    /// persisted hierarchy on `load`: the run-once contraction is deserialised
+    /// and only the buckets — derived state — are rebuilt, exactly as
+    /// [`install_hierarchy`](Self::install_hierarchy) builds them for a fresh
+    /// contraction, so a loaded network matches a freshly built one.
+    pub fn install_hierarchy_from(&mut self, hierarchy: crate::ch::ContractionHierarchy) {
         let mut endpoints: Vec<u32> = self
             .links
             .iter()
@@ -912,6 +922,23 @@ impl StreetNetwork {
         endpoints.dedup();
         let buckets = hierarchy.buckets(&endpoints, f64::INFINITY);
         self.hierarchy = Some(ChIndex { hierarchy, buckets });
+    }
+
+    /// The installed contraction hierarchy, if any — the run-once contraction
+    /// result. Persisted with the artifact; the buckets are rebuilt on load.
+    pub fn hierarchy(&self) -> Option<&crate::ch::ContractionHierarchy> {
+        self.hierarchy.as_ref().map(|index| &index.hierarchy)
+    }
+
+    /// A fingerprint of this network's walking-graph CSR, matching what a
+    /// hierarchy built over it records: a persisted hierarchy binds to this so a
+    /// loaded artifact with a mismatched graph is refused.
+    pub fn graph_fingerprint(&self) -> u64 {
+        crate::ch::csr_fingerprint(
+            self.arrays.adjacency_offsets(),
+            self.arrays.adj_targets(),
+            self.arrays.adj_meters(),
+        )
     }
 
     /// An edge's `(from, to)` endpoint vertices.

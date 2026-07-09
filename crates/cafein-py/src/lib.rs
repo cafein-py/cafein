@@ -8,6 +8,7 @@ use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
+use cafein_core::ch::ContractionHierarchy;
 use cafein_core::exhaustive;
 use cafein_core::fares::{FareTables, RuleFares, ZoneFares, ZoneProduct, NO_FARE};
 use cafein_core::geometry::{wkb_multi_line_string, DistanceProvenance, LegGeometry, TripGeometry};
@@ -93,7 +94,7 @@ struct CoordinateEnds {
 }
 
 const ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINET";
-const ARTIFACT_FORMAT: u32 = 5;
+const ARTIFACT_FORMAT: u32 = 6;
 /// Section tags in the container directory.
 const SECTION_META: u16 = 1;
 const SECTION_STREETS: u16 = 2;
@@ -123,6 +124,10 @@ struct ArtifactRef<'a> {
     /// is never mistaken for a whole-day one.
     ultra_transfers: &'a Option<Transfers>,
     ultra_window: Option<(u32, u32)>,
+    /// The walking contraction hierarchy, when installed; restored so the
+    /// run-once contraction need not be repeated. Its one-to-many buckets are
+    /// derived state, rebuilt on load rather than persisted.
+    walking_hierarchy: Option<&'a ContractionHierarchy>,
 }
 
 /// The decoded part of the saved network, owned after reading.
@@ -137,6 +142,7 @@ struct Artifact {
     streets: Option<StreetsMeta>,
     ultra_transfers: Option<Transfers>,
     ultra_window: Option<(u32, u32)>,
+    walking_hierarchy: Option<ContractionHierarchy>,
 }
 
 /// The street layer's decoded state: link records (endpoints
@@ -739,6 +745,35 @@ fn parse_container(path: &str, bytes: &[u8]) -> PyResult<ContainerLayout> {
 /// how many STREETS-section bytes the load explicitly read.
 type LoadedArtifact = (Artifact, Option<StreetNetwork>, u64);
 
+/// Validates a persisted walking hierarchy against the street graph it rides
+/// with, before its buckets are rebuilt on load: it must accompany a street
+/// network, cover exactly that graph's vertices, and be internally consistent.
+/// When the street CSR is already materialised (`csr_read` — every owned load,
+/// and a mapped load with `verify`), it must also carry a fingerprint
+/// reproducing that CSR, binding the hierarchy to its exact graph. A lazy mapped
+/// load skips only that fingerprint step, since recomputing it would page the
+/// STREETS section the lazy path deliberately leaves unread — the same trust the
+/// lazy path already extends to the street arrays themselves; the shape check
+/// (which reads only META) still runs, so a rebuild never indexes out of bounds.
+fn validate_walking_hierarchy(
+    path: &str,
+    artifact: &Artifact,
+    streets: &Option<StreetNetwork>,
+    csr_read: bool,
+) -> PyResult<()> {
+    if let Some(hierarchy) = &artifact.walking_hierarchy {
+        let matches = streets.as_ref().is_some_and(|network| {
+            hierarchy.vertex_count() == network.vertex_count()
+                && hierarchy.is_consistent()
+                && (!csr_read || hierarchy.graph_fingerprint() == network.graph_fingerprint())
+        });
+        if !matches {
+            return Err(corrupted(path, "walking hierarchy shape"));
+        }
+    }
+    Ok(())
+}
+
 /// Loads an artifact into owned memory — the default path. `verify`
 /// (default on: the bytes are read anyway) toggles the STREETS checksum;
 /// META is always checked before anything is decoded.
@@ -774,6 +809,7 @@ fn load_owned(path: &str, verify: Option<bool>) -> PyResult<LoadedArtifact> {
         }
         None => None,
     };
+    validate_walking_hierarchy(path, &artifact, &streets, true)?;
     Ok((artifact, streets, layout.streets_length))
 }
 
@@ -861,6 +897,9 @@ fn load_mapped(path: &str, verify: Option<bool>) -> PyResult<Result<LoadedArtifa
         }
         None => None,
     };
+    // Only the `verify` path has paged (and CRC-checked) the STREETS section, so
+    // only there is recomputing the CSR fingerprint free of extra reads.
+    validate_walking_hierarchy(path, &artifact, &streets, verify == Some(true))?;
     Ok(Ok((artifact, streets, streets_read)))
 }
 
@@ -877,7 +916,15 @@ fn assemble((artifact, streets, streets_bytes_read): LoadedArtifact) -> Transpor
         streets: _,
         ultra_transfers,
         ultra_window,
+        walking_hierarchy,
     } = artifact;
+    // The contraction persisted; its buckets are derived state, rebuilt here on
+    // the loading thread exactly as `install_hierarchy` builds them for a fresh
+    // contraction, so a loaded network matches a freshly built one.
+    let mut streets = streets;
+    if let (Some(network), Some(hierarchy)) = (streets.as_mut(), walking_hierarchy) {
+        network.install_hierarchy_from(hierarchy);
+    }
     let build = TimetableBuild {
         timetable,
         services,
@@ -1192,6 +1239,7 @@ impl TransportNetwork {
                 streets: streets_meta,
                 ultra_transfers: &self.ultra_transfers,
                 ultra_window: self.ultra_window,
+                walking_hierarchy: self.streets.as_ref().and_then(StreetNetwork::hierarchy),
             };
             let meta = bincode::serialize(&artifact)
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -1714,8 +1762,8 @@ impl TransportNetwork {
     /// the bounded one-to-many searches (`access_stops`, `travel_times_*`, the
     /// stop matrices' access/egress) run as hierarchy queries instead of graph
     /// sweeps, at identical results. Heavy, run-once preprocessing; opt-in.
-    /// Requires an installed street network. Not persisted, so call again after
-    /// `load`.
+    /// Requires an installed street network. Persisted by `save` and restored by
+    /// `load` (the buckets are rebuilt on load), so it need not be run again.
     fn install_walking_hierarchy(&mut self, py: Python<'_>) -> PyResult<()> {
         let streets = self
             .streets
