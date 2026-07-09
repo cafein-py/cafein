@@ -1,17 +1,22 @@
 //! Contraction hierarchy over the undirected walking graph — the acceleration
 //! substrate for the `O(stops)` access/egress/stop-transfer searches (see
-//! `plans/core-ch-plan.md`). This is CH-1: preprocessing (importance ordering +
-//! contraction with a core-only witness search), a bidirectional point-to-point
-//! query, and shortcut unpacking, validated against a plain Dijkstra. There is
-//! no `StreetNetwork` integration yet.
+//! `plans/core-ch-plan.md`). Preprocessing (importance ordering + contraction
+//! with a core-only witness search) and a bidirectional point-to-point query
+//! with shortcut unpacking (CH-1), plus the **bucket one-to-many** —
+//! precomputed per-target [`Buckets`] and a source-side [`one_to_many`] query —
+//! for the access/egress workload (CH-2). Validated against a plain Dijkstra;
+//! there is no `StreetNetwork` integration yet.
+//!
+//! [`one_to_many`]: ContractionHierarchy::one_to_many
 //!
 //! The graph is symmetric (walking), so the hierarchy stores a single **upward
 //! CSR** — per vertex, the edges to its higher-rank neighbours (originals and
 //! shortcuts). Both the forward search (from `s`) and the backward search (from
 //! `t`) relax this same upward adjacency, each climbing toward higher ranks.
 
+use rayon::prelude::*;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 
 /// Sentinel for an original edge in `up_middle` (i.e. not a shortcut).
 pub const ORIGINAL: u32 = u32::MAX;
@@ -26,6 +31,19 @@ pub struct ContractionHierarchy {
     up_targets: Vec<u32>,
     up_meters: Vec<f64>,
     up_middle: Vec<u32>,
+}
+
+/// Precomputed one-to-many buckets over a fixed set of target vertices (built by
+/// [`ContractionHierarchy::buckets`]). `entries[v]` lists `(target, distance)`
+/// for every target whose bounded upward search settled vertex `v` — the
+/// backward half of a bucket-CH query, shared across all sources.
+pub struct Buckets {
+    entries: Vec<Vec<(u32, f64)>>,
+    /// The cutoff the buckets were built for. A query cutoff must not exceed it
+    /// (see [`ContractionHierarchy::one_to_many`]): the bucket side already
+    /// pruned meeting vertices past this bound, so a larger query would silently
+    /// omit reachable targets.
+    cutoff: f64,
 }
 
 /// A vertex's live adjacency during contraction: neighbour → (metres, middle),
@@ -258,6 +276,101 @@ impl ContractionHierarchy {
             }
         }
         distances
+    }
+
+    /// A **bounded** upward search from `seeds` (each `(vertex, initial
+    /// distance)`): the settled `(vertex, distance)` pairs with
+    /// `distance <= cutoff`, climbing the upward CSR. The sparse, seed-and-cutoff
+    /// form of [`settle`](Self::settle) that builds and queries buckets.
+    fn up_search(&self, seeds: &[(u32, f64)], cutoff: f64) -> Vec<(u32, f64)> {
+        let mut distances: HashMap<u32, f64> = HashMap::new();
+        let mut heap: BinaryHeap<Reverse<(u64, u32)>> = BinaryHeap::new();
+        for &(vertex, distance) in seeds {
+            if distance <= cutoff + 1e-9
+                && distance < *distances.get(&vertex).unwrap_or(&f64::INFINITY)
+            {
+                distances.insert(vertex, distance);
+                heap.push(Reverse((distance.to_bits(), vertex)));
+            }
+        }
+        while let Some(Reverse((bits, vertex))) = heap.pop() {
+            let distance = f64::from_bits(bits);
+            if distance > *distances.get(&vertex).unwrap_or(&f64::INFINITY) {
+                continue;
+            }
+            let start = self.up_offsets[vertex as usize] as usize;
+            let end = self.up_offsets[vertex as usize + 1] as usize;
+            for slot in start..end {
+                let target = self.up_targets[slot];
+                let next = distance + self.up_meters[slot];
+                if next <= cutoff + 1e-9 && next < *distances.get(&target).unwrap_or(&f64::INFINITY)
+                {
+                    distances.insert(target, next);
+                    heap.push(Reverse((next.to_bits(), target)));
+                }
+            }
+        }
+        distances.into_iter().collect()
+    }
+
+    /// Builds one-to-many **buckets** for a fixed set of `targets` (vertex ids),
+    /// each bounded by `cutoff`. The per-target upward searches are independent
+    /// and run in parallel; the results scatter into `entries[v]` =
+    /// `(target, distance(target, v))`. Built once and reused across sources by
+    /// [`one_to_many`](Self::one_to_many).
+    pub fn buckets(&self, targets: &[u32], cutoff: f64) -> Buckets {
+        let per_target: Vec<(u32, Vec<(u32, f64)>)> = targets
+            .par_iter()
+            .map(|&target| (target, self.up_search(&[(target, 0.0)], cutoff)))
+            .collect();
+        let mut entries: Vec<Vec<(u32, f64)>> = vec![Vec::new(); self.rank.len()];
+        for (target, settled) in per_target {
+            for (vertex, distance) in settled {
+                entries[vertex as usize].push((target, distance));
+            }
+        }
+        Buckets { entries, cutoff }
+    }
+
+    /// One-to-many shortest distances from `seeds` (a snapped source) to every
+    /// bucketed target within `cutoff`. For each vertex the source's bounded
+    /// upward search settles, the buckets give the targets reachable through it,
+    /// and each target keeps
+    /// `min(distance(source, vertex) + distance(target, vertex))` — the bucket-CH
+    /// meeting. Bounding both halves by `cutoff` never drops a within-cutoff
+    /// target, since the meeting vertex's distance from each side is a prefix of
+    /// the (`<= cutoff`) total. Returns `(target, distance)` pairs.
+    ///
+    /// # Panics
+    ///
+    /// The `cutoff` must not exceed the buckets' build cutoff. A larger query
+    /// cutoff is a contract violation: the bucket side already pruned meeting
+    /// vertices past its build cutoff, so reachable targets would be silently
+    /// omitted. Build the buckets for at least the largest query cutoff.
+    pub fn one_to_many(
+        &self,
+        buckets: &Buckets,
+        seeds: &[(u32, f64)],
+        cutoff: f64,
+    ) -> Vec<(u32, f64)> {
+        assert!(
+            cutoff <= buckets.cutoff + 1e-9,
+            "one_to_many cutoff {cutoff} exceeds the bucket build cutoff {}; \
+             rebuild the buckets for at least this cutoff",
+            buckets.cutoff
+        );
+        let mut best: HashMap<u32, f64> = HashMap::new();
+        for (vertex, source_distance) in self.up_search(seeds, cutoff) {
+            for &(target, target_distance) in &buckets.entries[vertex as usize] {
+                let candidate = source_distance + target_distance;
+                if candidate <= cutoff + 1e-9 {
+                    best.entry(target)
+                        .and_modify(|current| *current = current.min(candidate))
+                        .or_insert(candidate);
+                }
+            }
+        }
+        best.into_iter().collect()
     }
 
     /// The upward-tree vertex path `origin..=peak` following predecessors of the
@@ -530,6 +643,168 @@ mod tests {
         }
     }
 
+    /// A plain multi-seed bounded Dijkstra on the original CSR — the reference
+    /// the bucket-CH one-to-many must match.
+    fn reference_seeds(
+        vertex_count: u32,
+        offsets: &[u32],
+        targets: &[u32],
+        meters: &[f64],
+        seeds: &[(u32, f64)],
+    ) -> Vec<f64> {
+        let mut distances = vec![f64::INFINITY; vertex_count as usize];
+        let mut heap: BinaryHeap<Reverse<(u64, u32)>> = BinaryHeap::new();
+        for &(vertex, distance) in seeds {
+            if distance < distances[vertex as usize] {
+                distances[vertex as usize] = distance;
+                heap.push(Reverse((distance.to_bits(), vertex)));
+            }
+        }
+        while let Some(Reverse((bits, vertex))) = heap.pop() {
+            let distance = f64::from_bits(bits);
+            if distance > distances[vertex as usize] {
+                continue;
+            }
+            let start = offsets[vertex as usize] as usize;
+            let end = offsets[vertex as usize + 1] as usize;
+            for slot in start..end {
+                let target = targets[slot];
+                let next = distance + meters[slot];
+                if next < distances[target as usize] {
+                    distances[target as usize] = next;
+                    heap.push(Reverse((next.to_bits(), target)));
+                }
+            }
+        }
+        distances
+    }
+
+    fn assert_one_to_many(
+        vertex_count: u32,
+        edges: &[(u32, u32, f64)],
+        seeds: &[(u32, f64)],
+        cutoff: f64,
+    ) {
+        let (offsets, targets_csr, meters) = csr(vertex_count, edges);
+        let ch = ContractionHierarchy::build(vertex_count, &offsets, &targets_csr, &meters);
+        let targets: Vec<u32> = (0..vertex_count).collect();
+        let buckets = ch.buckets(&targets, cutoff);
+        let reference = reference_seeds(vertex_count, &offsets, &targets_csr, &meters, seeds);
+        let got: HashMap<u32, f64> = ch
+            .one_to_many(&buckets, seeds, cutoff)
+            .into_iter()
+            .collect();
+        for target in 0..vertex_count {
+            let expected = reference[target as usize];
+            if expected.is_finite() && expected <= cutoff + 1e-9 {
+                let distance = got.get(&target).copied();
+                assert!(
+                    distance.is_some_and(|distance| (distance - expected).abs() < 1e-6),
+                    "one_to_many({seeds:?})[{target}] = {distance:?}, expected {expected}"
+                );
+            } else {
+                assert!(
+                    got.get(&target)
+                        .is_none_or(|&distance| distance > cutoff + 1e-9),
+                    "one_to_many({seeds:?})[{target}] = {:?}, expected none (>{cutoff})",
+                    got.get(&target)
+                );
+            }
+        }
+    }
+
+    fn grid_edges(side: u32) -> Vec<(u32, u32, f64)> {
+        let mut edges = Vec::new();
+        for r in 0..side {
+            for c in 0..side {
+                let v = r * side + c;
+                if c + 1 < side {
+                    edges.push((v, v + 1, 1.0));
+                }
+                if r + 1 < side {
+                    edges.push((v, v + side, 1.0));
+                }
+            }
+        }
+        edges
+    }
+
+    fn random_edges(n: u32) -> Vec<(u32, u32, f64)> {
+        let mut edges: Vec<(u32, u32, f64)> = Vec::new();
+        for v in 0..n - 1 {
+            let w = 1.0 + ((v as f64 * 7.0 + 3.0) % 9.0);
+            edges.push((v, v + 1, w));
+        }
+        let mut state = 12345u64;
+        for _ in 0..80 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let a = (state >> 33) as u32 % n;
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let b = (state >> 33) as u32 % n;
+            if a != b {
+                let w = 1.0 + ((state >> 40) % 20) as f64;
+                edges.push((a, b, w));
+            }
+        }
+        edges
+    }
+
+    #[test]
+    fn bucket_one_to_many_matches_dijkstra() {
+        let edges = grid_edges(4);
+        assert_one_to_many(16, &edges, &[(0, 0.0)], f64::INFINITY); // unbounded
+        assert_one_to_many(16, &edges, &[(0, 0.0)], 3.0); // bounded prunes far cells
+        assert_one_to_many(16, &edges, &[(0, 2.0), (5, 0.0)], 4.0); // multi-seed with offsets
+    }
+
+    #[test]
+    fn bucket_one_to_many_on_a_random_graph() {
+        let edges = random_edges(40);
+        assert_one_to_many(40, &edges, &[(0, 0.0)], 15.0);
+        assert_one_to_many(40, &edges, &[(7, 1.0), (20, 0.0)], 12.0);
+    }
+
+    #[test]
+    fn bucket_one_to_many_allows_a_smaller_query_cutoff() {
+        // Buckets built for a generous cutoff answer any query bounded by it.
+        let edges = grid_edges(4);
+        let (offsets, targets_csr, meters) = csr(16, &edges);
+        let ch = ContractionHierarchy::build(16, &offsets, &targets_csr, &meters);
+        let targets: Vec<u32> = (0..16).collect();
+        let buckets = ch.buckets(&targets, 100.0);
+        let reference = reference_seeds(16, &offsets, &targets_csr, &meters, &[(0, 0.0)]);
+        let got: HashMap<u32, f64> = ch
+            .one_to_many(&buckets, &[(0, 0.0)], 3.0)
+            .into_iter()
+            .collect();
+        for target in 0..16u32 {
+            let expected = reference[target as usize];
+            if expected <= 3.0 + 1e-9 {
+                assert!(got
+                    .get(&target)
+                    .is_some_and(|&d| (d - expected).abs() < 1e-6));
+            } else {
+                assert!(got.get(&target).is_none_or(|&d| d > 3.0 + 1e-9));
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the bucket build cutoff")]
+    fn bucket_one_to_many_rejects_a_larger_query_cutoff() {
+        // Querying past the build cutoff would silently omit reachable targets,
+        // so it is a hard contract violation rather than a wrong answer.
+        let edges = grid_edges(4);
+        let (offsets, targets_csr, meters) = csr(16, &edges);
+        let ch = ContractionHierarchy::build(16, &offsets, &targets_csr, &meters);
+        let buckets = ch.buckets(&(0..16).collect::<Vec<_>>(), 3.0);
+        ch.one_to_many(&buckets, &[(0, 0.0)], 10.0);
+    }
+
     #[test]
     fn contraction_forces_and_unpacks_a_shortcut() {
         // A path 0-1-2 whose middle (1) needs the shortcut 0-2 (no witness).
@@ -572,21 +847,7 @@ mod tests {
 
     #[test]
     fn grid_matches_dijkstra() {
-        // A 4x4 grid with unit edges.
-        let side = 4u32;
-        let mut edges = Vec::new();
-        for r in 0..side {
-            for c in 0..side {
-                let v = r * side + c;
-                if c + 1 < side {
-                    edges.push((v, v + 1, 1.0));
-                }
-                if r + 1 < side {
-                    edges.push((v, v + side, 1.0));
-                }
-            }
-        }
-        assert_matches(side * side, &edges);
+        assert_matches(16, &grid_edges(4));
     }
 
     #[test]
@@ -597,53 +858,17 @@ mod tests {
 
     #[test]
     fn weighted_random_graph_matches() {
-        // A deterministic pseudo-random connected weighted graph.
-        let n = 40u32;
-        let mut edges: Vec<(u32, u32, f64)> = Vec::new();
-        // A spanning path guarantees connectivity.
-        for v in 0..n - 1 {
-            let w = 1.0 + ((v as f64 * 7.0 + 3.0) % 9.0);
-            edges.push((v, v + 1, w));
-        }
-        // Deterministic extra chords.
-        let mut state = 12345u64;
-        for _ in 0..80 {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let a = (state >> 33) as u32 % n;
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let b = (state >> 33) as u32 % n;
-            if a != b {
-                let w = 1.0 + ((state >> 40) % 20) as f64;
-                edges.push((a, b, w));
-            }
-        }
-        assert_matches(n, &edges);
+        assert_matches(40, &random_edges(40));
     }
 
     #[test]
     fn unpacked_path_length_equals_distance() {
-        let side = 4u32;
-        let mut edges = Vec::new();
-        for r in 0..side {
-            for c in 0..side {
-                let v = r * side + c;
-                if c + 1 < side {
-                    edges.push((v, v + 1, 1.0));
-                }
-                if r + 1 < side {
-                    edges.push((v, v + side, 1.0));
-                }
-            }
-        }
-        let (offsets, targets, meters) = csr(side * side, &edges);
-        let ch = ContractionHierarchy::build(side * side, &offsets, &targets, &meters);
-        let path = ch.path(0, side * side - 1).expect("reachable");
+        let edges = grid_edges(4);
+        let (offsets, targets, meters) = csr(16, &edges);
+        let ch = ContractionHierarchy::build(16, &offsets, &targets, &meters);
+        let path = ch.path(0, 15).expect("reachable");
         assert_eq!(path.first(), Some(&0));
-        assert_eq!(path.last(), Some(&(side * side - 1)));
+        assert_eq!(path.last(), Some(&15));
         // The path is over original edges; its length equals the CH distance.
         let mut length = 0.0;
         for window in path.windows(2) {
@@ -657,6 +882,6 @@ mod tests {
             }
             length += edge.expect("consecutive path vertices are adjacent");
         }
-        assert!((length - ch.distance(0, side * side - 1).unwrap()).abs() < 1e-6);
+        assert!((length - ch.distance(0, 15).unwrap()).abs() < 1e-6);
     }
 }
