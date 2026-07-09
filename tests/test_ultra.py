@@ -738,3 +738,73 @@ def test_count_is_none_before_computation(network):
 def test_compute_without_a_street_network_errors(network):
     with pytest.raises(ValueError, match="street network"):
         network.compute_ultra_shortcuts()
+
+
+def test_mcultra_wires_into_the_door_to_door_emissions_frontier(
+    central_gtfs, kantakaupunki_pbf
+):
+    # Stage 2 wiring: with a whole-day McULTRA set installed for the query's
+    # factor configuration, the coordinate McRAPTOR emissions engine
+    # (mc_route_between_coordinates, used by journey_frontier candidates="pareto")
+    # relaxes it instead of the closure — and still produces a valid frontier.
+    pytest.importorskip("cafein._cafein")
+    from cafein import emissions
+    from cafein.frontier import journey_frontier
+
+    with pytest.warns(UserWarning):
+        net = TransportNetwork.from_gtfs(
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=300
+        )
+    coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
+    ids = list(coords)[:20]
+
+    def frontier(o, d, components=None):
+        frame = journey_frontier(
+            net,
+            coords[o],
+            coords[d],
+            QUERY_DATE,
+            QUERY_TIME,
+            1800,
+            candidates="pareto",
+            components=components,
+        )
+        return sorted(
+            frame[["travel_time", "emissions", "rides"]]
+            .round(3)
+            .itertuples(index=False, name=None)
+        )
+
+    def dominated(journey, options):
+        tt, grams, _ = journey
+        return any(a <= tt + 1e-6 and g <= grams + 1e-6 for a, g, _ in options)
+
+    pair = next(((o, d) for o in ids for d in ids if o != d and frontier(o, d)), None)
+    assert pair is not None, "no routable coordinate emissions pair in the crop"
+    before = frontier(*pair)
+    # A closure result for a *different* factor configuration (vehicle-only),
+    # captured before McULTRA is installed.
+    closure_vehicle = frontier(*pair, components=["vehicle"])
+
+    assert net._core.mcultra_shortcut_count is None
+    default = emissions.trip_factors(net)  # all LCA components
+    vehicle = emissions.trip_factors(net, components=["vehicle"])
+    count = net._core.compute_mcultra_shortcuts(3.6, 300.0, default, 0, 4_294_967_294)
+    assert count > 0
+    assert net._core.mcultra_shortcut_count == count
+
+    # The factor-contract gate: the query the set was built for relaxes McULTRA;
+    # a query with a different factor vector falls back to the closure.
+    assert net._core.mcultra_active_for(default)
+    assert not net._core.mcultra_active_for(vehicle)
+
+    # The wired path still routes and never returns a journey the closure beats
+    # on both time and grams.
+    after = frontier(*pair)
+    assert after
+    for journey in before:
+        assert dominated(journey, after), (journey, after)
+
+    # And behaviourally, the vehicle-only query falls back to the closure result
+    # captured before installation.
+    assert frontier(*pair, components=["vehicle"]) == closure_vehicle
