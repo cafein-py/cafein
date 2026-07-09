@@ -4,8 +4,10 @@
 //! with a core-only witness search) and a bidirectional point-to-point query
 //! with shortcut unpacking (CH-1), plus the **bucket one-to-many** —
 //! precomputed per-target [`Buckets`] and a source-side [`one_to_many`] query —
-//! for the access/egress workload (CH-2). Validated against a plain Dijkstra;
-//! there is no `StreetNetwork` integration yet.
+//! for the access/egress workload (CH-2). Installed on a
+//! [`StreetNetwork`](crate::streets) via `install_hierarchy` (CH-3), where the
+//! stop-destination walking searches run it instead of a graph sweep. Validated
+//! against a plain Dijkstra.
 //!
 //! [`one_to_many`]: ContractionHierarchy::one_to_many
 //!
@@ -25,6 +27,7 @@ pub const ORIGINAL: u32 = u32::MAX;
 /// contracted earlier / less important) and an upward CSR of edges to
 /// higher-rank neighbours. `up_middle[e]` is [`ORIGINAL`] for an original edge,
 /// else the middle vertex a shortcut bridges (for unpacking).
+#[derive(Debug)]
 pub struct ContractionHierarchy {
     rank: Vec<u32>,
     up_offsets: Vec<u32>,
@@ -37,6 +40,7 @@ pub struct ContractionHierarchy {
 /// [`ContractionHierarchy::buckets`]). `entries[v]` lists `(target, distance)`
 /// for every target whose bounded upward search settled vertex `v` — the
 /// backward half of a bucket-CH query, shared across all sources.
+#[derive(Debug)]
 pub struct Buckets {
     entries: Vec<Vec<(u32, f64)>>,
     /// The cutoff the buckets were built for. A query cutoff must not exceed it
@@ -141,13 +145,12 @@ impl ContractionHierarchy {
             for neighbour in &adjacency[vertex as usize] {
                 if !contracted[neighbour.vertex as usize] {
                     contracted_neighbours[neighbour.vertex as usize] += 1;
-                    let updated = importance(
-                        neighbour.vertex,
-                        &adjacency,
-                        &contracted,
-                        &contracted_neighbours,
-                    );
-                    queue.push(Reverse((updated, neighbour.vertex)));
+                    // Importance is recomputed **lazily** when the neighbour is
+                    // popped, not eagerly here: an eager recompute runs a witness
+                    // search per neighbour per contraction (~O(E) batches), the
+                    // dominant preprocessing cost. A stale-high queue key only
+                    // delays a vertex — the pop-time recompute reinserts it — so
+                    // the hierarchy stays correct, just built far faster.
                 }
             }
         }
@@ -478,9 +481,17 @@ fn shortcuts_for(vertex: u32, adjacency: &Adjacency, contracted: &[bool]) -> Vec
     shortcuts
 }
 
+/// Caps the witness search at this many settled vertices. Past it, the search
+/// gives up and a (possibly superfluous) shortcut is added — a longer local
+/// search finds a few more witnesses but is much slower, and a superfluous
+/// shortcut never corrupts distances (its weight is never below the true path,
+/// which the query still finds), so this only trades a slightly denser hierarchy
+/// for a far faster contraction.
+const WITNESS_SETTLE_LIMIT: usize = 200;
+
 /// Whether a path `source..target` no longer than `limit` exists over the
 /// current uncontracted core with `excluded` (the vertex being contracted) and
-/// all already-contracted vertices removed. A bounded Dijkstra.
+/// all already-contracted vertices removed — a bounded, settle-limited Dijkstra.
 fn has_witness(
     source: u32,
     target: u32,
@@ -493,6 +504,7 @@ fn has_witness(
     let mut heap: BinaryHeap<Reverse<(u64, u32)>> = BinaryHeap::new();
     distances.insert(source, 0.0);
     heap.push(Reverse((0.0f64.to_bits(), source)));
+    let mut settled = 0usize;
     while let Some(Reverse((bits, vertex))) = heap.pop() {
         let distance = f64::from_bits(bits);
         if distance > limit + 1e-9 {
@@ -503,6 +515,10 @@ fn has_witness(
         }
         if vertex == target {
             return distance <= limit + 1e-9;
+        }
+        settled += 1;
+        if settled >= WITNESS_SETTLE_LIMIT {
+            return false; // give up — add a shortcut rather than search further
         }
         for neighbour in &adjacency[vertex as usize] {
             let next_vertex = neighbour.vertex;

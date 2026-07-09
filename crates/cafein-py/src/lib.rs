@@ -1710,6 +1710,29 @@ impl TransportNetwork {
         Ok(())
     }
 
+    /// Builds and installs a contraction hierarchy over the walking graph, so
+    /// the bounded one-to-many searches (`access_stops`, `travel_times_*`, the
+    /// stop matrices' access/egress) run as hierarchy queries instead of graph
+    /// sweeps, at identical results. Heavy, run-once preprocessing; opt-in.
+    /// Requires an installed street network. Not persisted, so call again after
+    /// `load`.
+    fn install_walking_hierarchy(&mut self, py: Python<'_>) -> PyResult<()> {
+        let streets = self
+            .streets
+            .as_mut()
+            .ok_or_else(|| PyValueError::new_err("no street network is installed"))?;
+        py.allow_threads(|| streets.install_hierarchy());
+        Ok(())
+    }
+
+    /// Whether a walking contraction hierarchy is installed.
+    #[getter]
+    fn has_walking_hierarchy(&self) -> bool {
+        self.streets
+            .as_ref()
+            .is_some_and(StreetNetwork::has_hierarchy)
+    }
+
     /// Walking times to every transit stop reachable from a coordinate.
     ///
     /// Requires an installed street network. Walking is undirected, so

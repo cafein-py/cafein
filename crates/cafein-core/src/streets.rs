@@ -626,6 +626,22 @@ pub struct StreetNetwork {
     /// under both endpoints of its edge — so a search finds the links
     /// near its reached vertices without scanning all links.
     vertex_links: Vec<(u32, u32)>,
+    /// An optional contraction hierarchy accelerating the bounded one-to-many
+    /// walking searches (`access_stops`/`stop_transfers`/…). Built on demand by
+    /// [`install_hierarchy`](Self::install_hierarchy); when absent the searches
+    /// use `bounded_dijkstra`. Derived from the graph, so not persisted (rebuilt
+    /// on demand after `load`).
+    hierarchy: Option<ChIndex>,
+}
+
+/// A contraction hierarchy plus the one-to-many buckets over the stops'
+/// link-endpoint vertices — the acceleration index for `reachable_from_snaps`.
+#[derive(Debug)]
+struct ChIndex {
+    hierarchy: crate::ch::ContractionHierarchy,
+    /// Built **unbounded** (over the link-endpoint vertices), so a query at any
+    /// finite cutoff is within the buckets' build cutoff.
+    buckets: crate::ch::Buckets,
 }
 
 impl StreetNetwork {
@@ -844,6 +860,7 @@ impl StreetNetwork {
             level_starts: index.level_starts,
             links,
             vertex_links,
+            hierarchy: None,
         })
     }
 
@@ -865,6 +882,36 @@ impl StreetNetwork {
     /// Whether the arrays are views into a mapped artifact.
     pub fn is_mapped(&self) -> bool {
         matches!(self.arrays, Arrays::Mapped(_))
+    }
+
+    /// Whether a contraction-hierarchy index is installed.
+    pub fn has_hierarchy(&self) -> bool {
+        self.hierarchy.is_some()
+    }
+
+    /// Builds and installs a contraction hierarchy over the walking graph, plus
+    /// **unbounded** one-to-many buckets over the stops' link-endpoint vertices,
+    /// so the bounded walking searches (`access_stops`/`stop_transfers`/…) run as
+    /// hierarchy queries instead of graph sweeps. Heavy (the contraction is
+    /// run-once); opt-in, so the default build path is unchanged. Idempotent —
+    /// rebuilding replaces the index. Derived from the graph, so it is not
+    /// persisted; call again after `load` to re-enable acceleration.
+    pub fn install_hierarchy(&mut self) {
+        let hierarchy = crate::ch::ContractionHierarchy::build(
+            self.vertex_count(),
+            self.arrays.adjacency_offsets(),
+            self.arrays.adj_targets(),
+            self.arrays.adj_meters(),
+        );
+        let mut endpoints: Vec<u32> = self
+            .links
+            .iter()
+            .flat_map(|link| [link.from, link.to])
+            .collect();
+        endpoints.sort_unstable();
+        endpoints.dedup();
+        let buckets = hierarchy.buckets(&endpoints, f64::INFINITY);
+        self.hierarchy = Some(ChIndex { hierarchy, buckets });
     }
 
     /// An edge's `(from, to)` endpoint vertices.
@@ -943,6 +990,7 @@ impl StreetNetwork {
             level_starts: parts.index_level_starts,
             links: parts.links,
             vertex_links,
+            hierarchy: None,
         }
     }
 
@@ -989,6 +1037,7 @@ impl StreetNetwork {
             level_starts,
             links: spec.links,
             vertex_links,
+            hierarchy: None,
         })
     }
 
@@ -1116,8 +1165,9 @@ impl StreetNetwork {
     /// source snaps — so a source that snaps to several edges reaches
     /// through whichever link is nearest, just as a destination stop is
     /// reached through its nearest link. The caller has already
-    /// validated the speed and cutoff. Uses the thread-local search
-    /// state, so parallel callers reuse it per worker thread. Seconds
+    /// validated the speed and cutoff. The per-vertex distances come from the
+    /// installed contraction hierarchy when present, else a `bounded_dijkstra`
+    /// over the thread-local search state (reused per worker thread). Seconds
     /// round up (understating a walk could catch a missed departure);
     /// meters stay the exact street-path length.
     fn reachable_from_snaps(
@@ -1127,71 +1177,101 @@ impl StreetNetwork {
         max_seconds: f64,
     ) -> Vec<WalkedStop> {
         let cutoff = max_seconds * walking_speed;
-        SEARCH_STATE.with(|cell| {
-            let state = &mut cell.borrow_mut();
-            let mut seeds: Vec<(u32, f64)> = Vec::with_capacity(snaps.len() * 2);
+        let mut seeds: Vec<(u32, f64)> = Vec::with_capacity(snaps.len() * 2);
+        for snap in snaps {
+            let (from, to) = self.edge_endpoints(snap.edge);
+            let length = self.arrays.lengths()[snap.edge as usize];
+            seeds.push((from, snap.connector + snap.fraction * length));
+            seeds.push((to, snap.connector + (1.0 - snap.fraction) * length));
+        }
+        // The reached per-vertex distances, from the contraction hierarchy when
+        // installed, else a bounded Dijkstra over the graph. Both feed the same
+        // link join, so the `WalkedStop`s are identical.
+        match &self.hierarchy {
+            Some(index) => {
+                let distances: HashMap<u32, f64> = index
+                    .hierarchy
+                    .one_to_many(&index.buckets, &seeds, cutoff)
+                    .into_iter()
+                    .collect();
+                self.link_join(snaps, cutoff, walking_speed, &distances)
+            }
+            None => SEARCH_STATE.with(|cell| {
+                let state = &mut cell.borrow_mut();
+                self.bounded_dijkstra(&seeds, cutoff, state);
+                self.link_join(snaps, cutoff, walking_speed, &state.distances)
+            }),
+        }
+    }
+
+    /// Joins per-vertex reached `distances` to the stops through their links —
+    /// each stop's walk is the minimum over its links of the reached
+    /// edge-endpoint distance plus the on-edge offset and connector, and the
+    /// direct on-edge walk from a source snap sharing the link's edge. Shared by
+    /// the `bounded_dijkstra` and contraction-hierarchy paths of
+    /// [`reachable_from_snaps`](Self::reachable_from_snaps), so both return the
+    /// same `WalkedStop`s. Seconds round up; meters stay exact.
+    fn link_join(
+        &self,
+        snaps: &[Snap],
+        cutoff: f64,
+        walking_speed: f64,
+        distances: &HashMap<u32, f64>,
+    ) -> Vec<WalkedStop> {
+        let distance = |vertex: u32| distances.get(&vertex).copied().unwrap_or(f64::INFINITY);
+        // Candidate links: those at reached vertices, plus those on any source
+        // edge (whose direct on-edge path can be walkable even when neither
+        // endpoint is within the cutoff). Sorted so processing order is
+        // independent of hash-map iteration order.
+        let mut candidates: Vec<u32> = Vec::new();
+        for snap in snaps {
+            let (from, to) = self.edge_endpoints(snap.edge);
+            candidates.extend(self.links_at(from));
+            candidates.extend(self.links_at(to));
+        }
+        for &vertex in distances.keys() {
+            candidates.extend(self.links_at(vertex));
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        let mut nearest: HashMap<StopIdx, f64> = HashMap::new();
+        for index in candidates {
+            let link = &self.links[index as usize];
+            let (link_from, link_to) = (link.from, link.to);
+            let link_length = self.arrays.lengths()[link.edge as usize];
+            let mut meters = f64::min(
+                distance(link_from) + link.fraction * link_length,
+                distance(link_to) + (1.0 - link.fraction) * link_length,
+            ) + link.connector;
+            // A source snap on this link's edge can walk it directly, never
+            // reaching an endpoint; keep the shortest over all.
             for snap in snaps {
-                let (from, to) = self.edge_endpoints(snap.edge);
-                let length = self.arrays.lengths()[snap.edge as usize];
-                seeds.push((from, snap.connector + snap.fraction * length));
-                seeds.push((to, snap.connector + (1.0 - snap.fraction) * length));
-            }
-            self.bounded_dijkstra(&seeds, cutoff, state);
-            // The candidate links near the search: those at reached
-            // vertices, plus those on any source edge, whose direct
-            // on-edge path can be walkable even when neither endpoint is
-            // within the cutoff. Sorted so processing order is
-            // independent of hash-map iteration order.
-            let mut candidates: Vec<u32> = Vec::new();
-            for snap in snaps {
-                let (from, to) = self.edge_endpoints(snap.edge);
-                candidates.extend(self.links_at(from));
-                candidates.extend(self.links_at(to));
-            }
-            for &vertex in state.distances.keys() {
-                candidates.extend(self.links_at(vertex));
-            }
-            candidates.sort_unstable();
-            candidates.dedup();
-            let mut nearest: HashMap<StopIdx, f64> = HashMap::new();
-            for index in candidates {
-                let link = &self.links[index as usize];
-                let (link_from, link_to) = (link.from, link.to);
-                let link_length = self.arrays.lengths()[link.edge as usize];
-                let mut meters = f64::min(
-                    state.distance(link_from) + link.fraction * link_length,
-                    state.distance(link_to) + (1.0 - link.fraction) * link_length,
-                ) + link.connector;
-                // A source snap on this link's edge can walk it directly,
-                // never reaching an endpoint; keep the shortest over all.
-                for snap in snaps {
-                    if snap.edge == link.edge {
-                        let length = self.arrays.lengths()[snap.edge as usize];
-                        let direct = snap.connector
-                            + (link.fraction - snap.fraction).abs() * length
-                            + link.connector;
-                        meters = meters.min(direct);
-                    }
-                }
-                if meters <= cutoff + 1e-9 {
-                    // A stop with several links keeps its shortest path.
-                    nearest
-                        .entry(link.stop)
-                        .and_modify(|best| *best = best.min(meters))
-                        .or_insert(meters);
+                if snap.edge == link.edge {
+                    let length = self.arrays.lengths()[snap.edge as usize];
+                    let direct = snap.connector
+                        + (link.fraction - snap.fraction).abs() * length
+                        + link.connector;
+                    meters = meters.min(direct);
                 }
             }
-            let mut reached: Vec<WalkedStop> = nearest
-                .into_iter()
-                .map(|(stop, meters)| WalkedStop {
-                    stop,
-                    seconds: seconds(meters / walking_speed),
-                    meters,
-                })
-                .collect();
-            reached.sort_unstable_by_key(|walk| walk.stop);
-            reached
-        })
+            if meters <= cutoff + 1e-9 {
+                // A stop with several links keeps its shortest path.
+                nearest
+                    .entry(link.stop)
+                    .and_modify(|best| *best = best.min(meters))
+                    .or_insert(meters);
+            }
+        }
+        let mut reached: Vec<WalkedStop> = nearest
+            .into_iter()
+            .map(|(stop, meters)| WalkedStop {
+                stop,
+                seconds: seconds(meters / walking_speed),
+                meters,
+            })
+            .collect();
+        reached.sort_unstable_by_key(|walk| walk.stop);
+        reached
     }
 
     /// The walking transfers between every pair of linked stops within
@@ -2040,6 +2120,65 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn installing_a_hierarchy_keeps_the_walking_results() {
+        // `access_stops` and `stop_transfers` return the same stops and walks
+        // whether they search the graph (`bounded_dijkstra`) or the installed
+        // contraction hierarchy. Distances match within `1e-6` (the hierarchy
+        // sums shortcuts in a different order); the stop set and rounded seconds
+        // are identical.
+        let mut net = network(
+            4,
+            3,
+            &[
+                (0, 1, 137.0, straight((0.0, 0.0), (137.0, 0.0))),
+                (1, 2, 149.0, straight((137.0, 0.0), (286.0, 0.0))),
+                (2, 3, 151.0, straight((286.0, 0.0), (437.0, 0.0))),
+                (0, 3, 500.0, straight((0.0, 0.0), (437.0, 0.0))),
+            ],
+            vec![
+                link(0, 0, 0.3, 1.0),
+                link(1, 1, 0.5, 2.0),
+                link(2, 2, 0.7, 1.5),
+            ],
+        )
+        .unwrap();
+        let coord = lonlat(70.0, 0.0); // (lon, lat) near vertex 0's edge
+        let base_access = net
+            .access_stops(coord.1, coord.0, 1.0, 600.0, 100.0)
+            .unwrap();
+        let base_transfers = net.stop_transfers(1.0, 600.0);
+
+        net.install_hierarchy();
+        assert!(net.has_hierarchy());
+        let ch_access = net
+            .access_stops(coord.1, coord.0, 1.0, 600.0, 100.0)
+            .unwrap();
+        let ch_transfers = net.stop_transfers(1.0, 600.0);
+
+        assert_eq!(timed(&ch_access), timed(&base_access));
+        for (a, b) in ch_access.iter().zip(&base_access) {
+            assert!((a.meters - b.meters).abs() < 1e-6, "{a:?} vs {b:?}");
+        }
+        let key =
+            |edges: &[(StopIdx, StopIdx, u32, f64)]| -> HashMap<(StopIdx, StopIdx), (u32, f64)> {
+                edges.iter().map(|&(f, t, s, m)| ((f, t), (s, m))).collect()
+            };
+        let (base_map, ch_map) = (key(&base_transfers), key(&ch_transfers));
+        assert_eq!(
+            base_map.keys().collect::<std::collections::BTreeSet<_>>(),
+            ch_map.keys().collect::<std::collections::BTreeSet<_>>()
+        );
+        for (pair, &(seconds, meters)) in &base_map {
+            let &(ch_seconds, ch_meters) = &ch_map[pair];
+            assert_eq!(ch_seconds, seconds, "transfer {pair:?} seconds");
+            assert!(
+                (ch_meters - meters).abs() < 1e-6,
+                "transfer {pair:?} meters"
+            );
         }
     }
 
