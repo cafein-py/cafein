@@ -282,16 +282,6 @@ def test_frontier_rejects_mixed_endpoints(network_with_footpaths):
             "08:30:00",
             window=600,
         )
-    with pytest.raises(ValueError, match="coordinate queries"):
-        journey_frontier(
-            network_with_footpaths,
-            "1100602",
-            "1040280",
-            "2022-02-22",
-            "08:30:00",
-            window=600,
-            max_snap_distance=100.0,
-        )
 
 
 def test_least_fare_survives_unresolved_emissions(network, helsinki_gtfs):

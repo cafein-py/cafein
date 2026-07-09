@@ -120,8 +120,10 @@ def journey_frontier(
         pair, built for batch reuse — and returns the same journeys.
         Only used with ``candidates="pareto"``.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
-        The street-search options for coordinate queries, as in
-        ``route_between_coordinates``; only valid with coordinates.
+        Street-search options for the walking access/egress, as in
+        ``route_between_coordinates``. For stop origins/destinations they
+        apply only when a whole-day shortcut set routes them door-to-door
+        (ULTRA for ``candidates="time"``, McULTRA for ``"pareto"``).
     geometries : bool (optional, default: False)
         Attach leg geometries to the returned journeys.
 
@@ -148,12 +150,8 @@ def journey_frontier(
             "origin and destination must both be stop ids or both be coordinates"
         )
     if stops[0]:
-        if not (
-            walking_speed_kmph is None
-            and max_walking_time is None
-            and max_snap_distance is None
-        ):
-            raise ValueError("street-search options apply to coordinate queries only")
+        from cafein.network import _walk_options
+
         if candidates == "pareto":
             trip_factors = emissions.trip_factors(network, factors, components)
             journeys = network._core.mc_route_between_stops(
@@ -166,6 +164,7 @@ def journey_frontier(
                 max_transfers,
                 bucket,
                 router,
+                *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
                 geometries,
             )
         else:
@@ -176,6 +175,9 @@ def journey_frontier(
                 departure,
                 max_transfers,
                 window,
+                walking_speed_kmph=walking_speed_kmph,
+                max_walking_time=max_walking_time,
+                max_snap_distance=max_snap_distance,
                 geometries=geometries,
             )
     elif candidates == "pareto":
