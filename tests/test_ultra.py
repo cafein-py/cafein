@@ -808,3 +808,76 @@ def test_mcultra_wires_into_the_door_to_door_emissions_frontier(
     # And behaviourally, the vehicle-only query falls back to the closure result
     # captured before installation.
     assert frontier(*pair, components=["vehicle"]) == closure_vehicle
+
+
+def test_mcultra_routes_stop_pareto_queries_door_to_door(
+    central_gtfs, kantakaupunki_pbf
+):
+    # Stage 4a: under a whole-day McULTRA set matching the query's factors, a
+    # stop-based pareto query routes door-to-door between the two stops'
+    # coordinates — mc_route_between_stops delegates to
+    # mc_route_between_coordinates, pairing the set's unrestricted intermediate
+    # walking with a full street-graph access/egress (the McRAPTOR analogue of
+    # ULTRA route_between_stops). A factor-mismatched query keeps today's
+    # board-at-origin closure routing.
+    pytest.importorskip("cafein._cafein")
+    from cafein import emissions
+    from cafein.frontier import journey_frontier
+
+    with pytest.warns(UserWarning):
+        net = TransportNetwork.from_gtfs(
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=300
+        )
+    coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
+    ids = list(coords)[:25]
+    walk = dict(
+        walking_speed_kmph=3.6, max_walking_time=300.0, max_snap_distance=1600.0
+    )
+
+    def frontier(origin, destination, components=None):
+        frame = journey_frontier(
+            net,
+            origin,
+            destination,
+            QUERY_DATE,
+            QUERY_TIME,
+            1800,
+            candidates="pareto",
+            components=components,
+            **walk,
+        )
+        return sorted(
+            frame[["travel_time", "emissions", "rides"]]
+            .round(3)
+            .itertuples(index=False, name=None)
+        )
+
+    # A stop pair whose door-to-door coordinate query yields a frontier.
+    pair = next(
+        ((o, d) for o in ids for d in ids if o != d and frontier(coords[o], coords[d])),
+        None,
+    )
+    assert pair is not None, "no routable coordinate emissions pair in the crop"
+    origin, destination = pair
+    # The vehicle-only stop result before installation is board-at-origin closure
+    # routing (no coordinate egress); capture it for the fallback check.
+    vehicle_stop_before = frontier(origin, destination, components=["vehicle"])
+
+    default = emissions.trip_factors(net)  # all LCA components
+    vehicle = emissions.trip_factors(net, components=["vehicle"])
+    count = net._core.compute_mcultra_shortcuts(3.6, 300.0, default, 0, 4_294_967_294)
+    assert count > 0
+
+    # The factor-contract gate: only the query the set was built for activates it.
+    assert net._core.mcultra_active_for(default)
+    assert not net._core.mcultra_active_for(vehicle)
+
+    # Under the matching set, the stop query routes door-to-door: its frontier
+    # equals the coordinate query over the same two stops' coordinates.
+    assert frontier(origin, destination) == frontier(
+        coords[origin], coords[destination]
+    )
+
+    # A factor-mismatched (vehicle-only) query does not delegate — it keeps the
+    # board-at-origin closure routing it had before the set was installed.
+    assert frontier(origin, destination, components=["vehicle"]) == vehicle_stop_before

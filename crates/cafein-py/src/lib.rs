@@ -2750,7 +2750,7 @@ impl TransportNetwork {
     /// -------
     /// list of dict
     ///     Journeys shaped as in ``route_between_stops``.
-    #[pyo3(signature = (from_stop, to_stop, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, router = "raptor", geometries = true))]
+    #[pyo3(signature = (from_stop, to_stop, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, router = "raptor", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true))]
     #[allow(clippy::too_many_arguments)]
     fn mc_route_between_stops(
         &self,
@@ -2764,6 +2764,9 @@ impl TransportNetwork {
         max_transfers: u8,
         bucket: f64,
         router: &str,
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
         geometries: bool,
     ) -> PyResult<Py<PyList>> {
         if !bucket.is_finite() || bucket <= 0.0 {
@@ -2785,6 +2788,47 @@ impl TransportNetwork {
         for (trip_id, factor) in &factors {
             if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
                 per_trip[trip.0 as usize] = *factor;
+            }
+        }
+        // Under a McULTRA set matching this query's factors, route door-to-door
+        // between the two stops' coordinates, so the set's unrestricted
+        // intermediate walking is paired with a full street-graph initial and
+        // final walk — the McRAPTOR analogue of ULTRA `route_between_stops`. The
+        // set covers only the intermediate transfers, so it needs those endpoint
+        // searches; TBTR and a factor mismatch keep today's board-at-origin
+        // closure routing.
+        if router == "raptor"
+            && !std::ptr::eq(
+                self.emissions_transfers(factor_fingerprint(&per_trip)),
+                &self.transfers,
+            )
+        {
+            if let (Some(streets), Some(from_xy), Some(to_xy)) = (
+                self.streets.as_ref(),
+                self.stop_coordinate(origin),
+                self.stop_coordinate(destination),
+            ) {
+                if streets
+                    .snap(from_xy.0, from_xy.1, max_snap_distance)
+                    .is_some()
+                    && streets.snap(to_xy.0, to_xy.1, max_snap_distance).is_some()
+                {
+                    return self.mc_route_between_coordinates(
+                        py,
+                        from_xy,
+                        to_xy,
+                        date,
+                        departure,
+                        factors,
+                        window,
+                        max_transfers,
+                        bucket,
+                        walking_speed_kmph,
+                        max_walking_time,
+                        max_snap_distance,
+                        geometries,
+                    );
+                }
             }
         }
         let request = Request {
