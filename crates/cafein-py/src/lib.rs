@@ -15,6 +15,7 @@ use cafein_core::geometry::{wkb_multi_line_string, DistanceProvenance, LegGeomet
 use cafein_core::journey::{Journey, Leg};
 use cafein_core::mcraptor;
 use cafein_core::mctbtr::McTbtrEngine;
+use cafein_core::mcultra::compute_mcultra_shortcuts;
 use cafein_core::raptor::{CostInputs, CostRow, Objective, Raptor};
 use cafein_core::router::{Request, TransitRouter};
 use cafein_core::streets::{
@@ -1522,6 +1523,72 @@ impl TransportNetwork {
         let count = set.edge_count();
         self.ultra_transfers = Some(set);
         self.ultra_window = Some((min_departure, max_departure));
+        Ok(count)
+    }
+
+    /// Computes the McULTRA (emissions-aware) shortcut set and returns its edge
+    /// count — the Stage 1 measurement entry point. It does **not** install the
+    /// set (relaxing it into the emissions engines is a later stage). `factors`
+    /// is the `trip_factors` table; trips without a finite factor are skipped.
+    /// Requires installed streets and trip distances.
+    #[pyo3(signature = (walking_speed_kmph, max_transfer_time, factors, min_departure, max_departure))]
+    fn compute_mcultra_shortcuts(
+        &self,
+        py: Python<'_>,
+        walking_speed_kmph: f64,
+        max_transfer_time: f64,
+        factors: Vec<(String, f64)>,
+        min_departure: u32,
+        max_departure: u32,
+    ) -> PyResult<usize> {
+        if !walking_speed_kmph.is_finite() || walking_speed_kmph <= 0.0 {
+            return Err(PyValueError::new_err(
+                "walking_speed_kmph must be a positive, finite number",
+            ));
+        }
+        if !max_transfer_time.is_finite() || max_transfer_time < 0.0 {
+            return Err(PyValueError::new_err(
+                "max_transfer_time must be a non-negative, finite number",
+            ));
+        }
+        if min_departure > max_departure {
+            return Err(PyValueError::new_err(
+                "min_departure must not exceed max_departure",
+            ));
+        }
+        let Some(geometry) = &self.geometry else {
+            return Err(PyValueError::new_err(
+                "no trip distances installed; build the network with trip distances enabled",
+            ));
+        };
+        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
+        for (trip_id, factor) in &factors {
+            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
+                per_trip[trip.0 as usize] = *factor;
+            }
+        }
+        let speed = walking_speed_kmph / 3.6;
+        let stop_count = self.build.timetable.stop_count();
+        let timetable = &self.build.timetable;
+        let streets = self.installed_streets()?;
+        let count = py
+            .allow_threads(|| {
+                let dense = streets.stop_transfers(speed, max_transfer_time);
+                let graph =
+                    Transfers::from_edges(stop_count, &dense).map_err(|error| error.to_string())?;
+                let view = DayView::universal(timetable);
+                let shortcuts = compute_mcultra_shortcuts(
+                    &view,
+                    timetable,
+                    &graph,
+                    geometry,
+                    &per_trip,
+                    min_departure,
+                    max_departure,
+                );
+                Ok::<usize, String>(shortcuts.len())
+            })
+            .map_err(PyValueError::new_err)?;
         Ok(count)
     }
 

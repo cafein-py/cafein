@@ -10,6 +10,7 @@ pub mod geometry;
 pub mod journey;
 pub mod mcraptor;
 pub mod mctbtr;
+pub mod mcultra;
 pub mod raptor;
 pub mod router;
 pub mod streets;
