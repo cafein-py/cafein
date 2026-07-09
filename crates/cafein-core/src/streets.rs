@@ -1931,6 +1931,54 @@ mod tests {
         vec![from, to]
     }
 
+    #[test]
+    fn ch_matches_bounded_dijkstra_on_a_street_network() {
+        // A contraction hierarchy built from a StreetNetwork's CSR reproduces
+        // its `bounded_dijkstra` shortest walks (the CH-1 integration point,
+        // both in the same Hilbert-renumbered vertex space). A path 0-1-2-3
+        // (300 m) plus a longer direct 0-3 (350 m) forces interior shortcuts the
+        // query must unpack back to 300 m.
+        let net = network(
+            4,
+            0,
+            &[
+                (0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0))),
+                (1, 2, 100.0, straight((100.0, 0.0), (200.0, 0.0))),
+                (2, 3, 100.0, straight((200.0, 0.0), (300.0, 0.0))),
+                (0, 3, 350.0, straight((0.0, 0.0), (300.0, 0.0))),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let ch = crate::ch::ContractionHierarchy::build(
+            net.vertex_count(),
+            net.arrays.adjacency_offsets(),
+            net.arrays.adj_targets(),
+            net.arrays.adj_meters(),
+        );
+        let mut state = SearchState {
+            distances: HashMap::new(),
+            previous: HashMap::new(),
+            heap: BinaryHeap::new(),
+        };
+        for source in 0..net.vertex_count() {
+            net.bounded_dijkstra(&[(source, 0.0)], f64::INFINITY, &mut state);
+            for target in 0..net.vertex_count() {
+                let expected = state.distance(target);
+                match ch.distance(source, target) {
+                    Some(distance) => assert!(
+                        (distance - expected).abs() < 1e-6,
+                        "ch d({source},{target})={distance} vs bounded_dijkstra {expected}"
+                    ),
+                    None => assert!(
+                        !expected.is_finite(),
+                        "ch says {source}->{target} unreachable, bounded_dijkstra {expected}"
+                    ),
+                }
+            }
+        }
+    }
+
     /// The `(stop, seconds)` view of a walking-search result.
     fn timed(walks: &[WalkedStop]) -> Vec<(StopIdx, u32)> {
         walks.iter().map(|walk| (walk.stop, walk.seconds)).collect()
