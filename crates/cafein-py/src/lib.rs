@@ -48,8 +48,9 @@ struct TransportNetwork {
     /// The McULTRA (emissions-aware) shortcut set, when computed
     /// (`compute_mcultra_shortcuts`): the coordinate emissions engines relax it
     /// in place of the closure when a whole-day set is present and the query's
-    /// factor vector matches the one it was built for (`mcultra_factor`). Not
-    /// yet persisted.
+    /// factor vector matches the one it was built for (`mcultra_factor`).
+    /// Persisted with the artifact and restored on load, with its window and
+    /// factor fingerprint.
     mcultra_transfers: Option<Transfers>,
     mcultra_window: Option<(u32, u32)>,
     /// A fingerprint of the per-trip emission-factor vector the McULTRA set was
@@ -105,7 +106,7 @@ struct CoordinateEnds {
 }
 
 const ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINET";
-const ARTIFACT_FORMAT: u32 = 6;
+const ARTIFACT_FORMAT: u32 = 7;
 /// Section tags in the container directory.
 const SECTION_META: u16 = 1;
 const SECTION_STREETS: u16 = 2;
@@ -135,6 +136,12 @@ struct ArtifactRef<'a> {
     /// is never mistaken for a whole-day one.
     ultra_transfers: &'a Option<Transfers>,
     ultra_window: Option<(u32, u32)>,
+    /// The McULTRA (emissions-aware) shortcut set with its window and the
+    /// factor-vector fingerprint it was built for; restored so the heavy
+    /// run-once preprocessing need not be repeated and the factor contract holds.
+    mcultra_transfers: &'a Option<Transfers>,
+    mcultra_window: Option<(u32, u32)>,
+    mcultra_factor: Option<u64>,
     /// The walking contraction hierarchy, when installed; restored so the
     /// run-once contraction need not be repeated. Its one-to-many buckets are
     /// derived state, rebuilt on load rather than persisted.
@@ -153,6 +160,9 @@ struct Artifact {
     streets: Option<StreetsMeta>,
     ultra_transfers: Option<Transfers>,
     ultra_window: Option<(u32, u32)>,
+    mcultra_transfers: Option<Transfers>,
+    mcultra_window: Option<(u32, u32)>,
+    mcultra_factor: Option<u64>,
     walking_hierarchy: Option<ContractionHierarchy>,
 }
 
@@ -927,6 +937,9 @@ fn assemble((artifact, streets, streets_bytes_read): LoadedArtifact) -> Transpor
         streets: _,
         ultra_transfers,
         ultra_window,
+        mcultra_transfers,
+        mcultra_window,
+        mcultra_factor,
         walking_hierarchy,
     } = artifact;
     // The contraction persisted; its buckets are derived state, rebuilt here on
@@ -950,10 +963,9 @@ fn assemble((artifact, streets, streets_bytes_read): LoadedArtifact) -> Transpor
         transfers,
         ultra_transfers,
         ultra_window,
-        // McULTRA is not yet persisted; it is recomputed after load if wanted.
-        mcultra_transfers: None,
-        mcultra_window: None,
-        mcultra_factor: None,
+        mcultra_transfers,
+        mcultra_window,
+        mcultra_factor,
         geometry,
         leg_geometry,
         streets,
@@ -1269,6 +1281,9 @@ impl TransportNetwork {
                 streets: streets_meta,
                 ultra_transfers: &self.ultra_transfers,
                 ultra_window: self.ultra_window,
+                mcultra_transfers: &self.mcultra_transfers,
+                mcultra_window: self.mcultra_window,
+                mcultra_factor: self.mcultra_factor,
                 walking_hierarchy: self.streets.as_ref().and_then(StreetNetwork::hierarchy),
             };
             let meta = bincode::serialize(&artifact)
@@ -1450,6 +1465,19 @@ impl TransportNetwork {
     #[getter]
     fn mcultra_shortcut_count(&self) -> Option<usize> {
         self.mcultra_transfers.as_ref().map(|set| set.edge_count())
+    }
+
+    /// The source-departure window the McULTRA set was computed for, or `None`.
+    #[getter]
+    fn mcultra_window(&self) -> Option<(u32, u32)> {
+        self.mcultra_window
+    }
+
+    /// The McULTRA set's stored factor-vector fingerprint, or `None`. For
+    /// inspection/tests (the fingerprint binds the set to its factor config).
+    #[getter]
+    fn _mcultra_factor(&self) -> Option<u64> {
+        self.mcultra_factor
     }
 
     /// Whether an emissions query with these `factors` would relax the installed
