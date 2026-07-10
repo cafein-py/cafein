@@ -133,6 +133,18 @@
   ``journey_frontier`` and ``TravelCostMatrix``; the default
   ``candidates="time"`` keeps the (arrival, rides) alternatives.
 
+- Relaxed suboptimal alternatives — ``journey_frontier(candidates=
+  "relaxed", slack_seconds=…)`` widens the McRAPTOR search by a time
+  slack: a journey is kept even when a cleaner or simpler one dominates
+  it, as long as that dominator is not more than ``slack_seconds``
+  earlier, surfacing the near-frontier journeys strict Pareto drops.
+  ``slack_seconds=0`` reproduces ``candidates="pareto"`` exactly.
+  ``max_options`` caps the suboptimal alternatives kept — the strict
+  frontier is always returned, so a cap never hides an optimal journey.
+  The relaxation lives in the McRAPTOR label dominance, so it also
+  recovers non-dominated journeys the bucketed strict search skips;
+  ``router="raptor"`` only.
+
 - The exact time × emissions Pareto set:
   ``cafein.exhaustive_frontier(network, origin, destination, date,
   departure)`` enumerates the mathematically complete frontier for one

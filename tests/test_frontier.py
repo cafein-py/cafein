@@ -698,6 +698,159 @@ def test_pareto_candidate_options_are_validated(tmp_path):
         )
 
 
+def _frontier_tuples(frame):
+    return sorted(
+        (
+            int(row.departure),
+            int(row.arrival),
+            int(row.rides),
+            round(float(row.emissions), 3),
+        )
+        for row in frame.itertuples()
+    )
+
+
+def test_relaxed_candidates_reduce_to_pareto_at_zero_slack(network):
+    # slack_seconds=0 reproduces the strict pareto candidate set exactly.
+    origin, destination = "1370104", "4960238"
+    common = dict(window=600, max_transfers=4)
+    pareto = journey_frontier(
+        network,
+        origin,
+        destination,
+        "2022-02-22",
+        "08:30:00",
+        candidates="pareto",
+        **common,
+    )
+    relaxed = journey_frontier(
+        network,
+        origin,
+        destination,
+        "2022-02-22",
+        "08:30:00",
+        candidates="relaxed",
+        slack_seconds=0,
+        **common,
+    )
+    assert _frontier_tuples(relaxed) == _frontier_tuples(pareto)
+
+
+def test_relaxed_candidates_widen_the_pareto_set(network):
+    # A positive slack keeps journeys arriving within the band that strict
+    # per-stop pruning drops, so the relaxed set is a strict superset of the
+    # pareto set.
+    origin, destination = "1370104", "4960238"
+    common = dict(window=600, max_transfers=4)
+    pareto = set(
+        _frontier_tuples(
+            journey_frontier(
+                network,
+                origin,
+                destination,
+                "2022-02-22",
+                "08:30:00",
+                candidates="pareto",
+                **common,
+            )
+        )
+    )
+    relaxed = set(
+        _frontier_tuples(
+            journey_frontier(
+                network,
+                origin,
+                destination,
+                "2022-02-22",
+                "08:30:00",
+                candidates="relaxed",
+                slack_seconds=900,
+                **common,
+            )
+        )
+    )
+    assert pareto <= relaxed
+    assert len(relaxed) > len(pareto)
+
+
+def test_relaxed_max_options_keeps_the_frontier(network):
+    # A wide slack surfaces genuinely suboptimal journeys; max_options caps
+    # them but never drops a frontier journey. A cap of one returns just the
+    # frontier subset, and capping at the full size returns everything.
+    origin, destination = "1370104", "4960238"
+
+    def relaxed(**kw):
+        return journey_frontier(
+            network,
+            origin,
+            destination,
+            "2022-02-22",
+            "08:30:00",
+            window=600,
+            max_transfers=4,
+            candidates="relaxed",
+            slack_seconds=3600,
+            **kw,
+        )
+
+    widened = _frontier_tuples(relaxed())
+    frontier = _frontier_tuples(relaxed(max_options=1))
+    assert set(frontier) <= set(widened)
+    assert len(frontier) < len(widened)
+    assert _frontier_tuples(relaxed(max_options=len(widened))) == widened
+
+
+def test_relaxed_candidate_options_are_validated(tmp_path):
+    from cafein import TransportNetwork
+
+    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
+    network = TransportNetwork.from_gtfs([str(feed)])
+    with pytest.raises(ValueError, match="candidates='pareto'"):
+        journey_frontier(
+            network,
+            "A",
+            "B",
+            "2022-02-22",
+            "08:00:00",
+            window=1,
+            candidates="relaxed",
+            router="tbtr",
+        )
+    with pytest.raises(ValueError, match="slack"):
+        journey_frontier(
+            network,
+            "A",
+            "B",
+            "2022-02-22",
+            "08:00:00",
+            window=1,
+            candidates="relaxed",
+            slack_seconds=-5,
+        )
+    with pytest.raises(ValueError, match="max_options"):
+        journey_frontier(
+            network,
+            "A",
+            "B",
+            "2022-02-22",
+            "08:00:00",
+            window=1,
+            candidates="relaxed",
+            max_options=0,
+        )
+    with pytest.raises(ValueError, match="max_options"):
+        journey_frontier(
+            network,
+            "A",
+            "B",
+            "2022-02-22",
+            "08:00:00",
+            window=1,
+            candidates="relaxed",
+            max_options=2.5,
+        )
+
+
 def test_unmatched_factors_poison_but_do_not_block(network):
     # The Suomenlinna ferry has no shipped factor: its journeys carry
     # NaN emissions and never join the frontier.
