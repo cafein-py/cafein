@@ -1017,6 +1017,34 @@ def test_travel_time_matrix_accepts_the_tbtr_router(network):
     assert raptor.equals(tbtr)
 
 
+def test_tbtr_transfer_cache_reuse_matches_ad_hoc(helsinki_gtfs):
+    # compute_tbtr_transfers precomputes the transfer set once; a router="tbtr"
+    # time matrix on that date reuses it (build once, query many) and returns
+    # the same cells as the ad-hoc build. A fresh network keeps the mutation off
+    # the shared fixture.
+    from cafein import TransportNetwork
+
+    network = TransportNetwork.from_gtfs([str(helsinki_gtfs)])
+    origins = ["4810551", "1040602", "1250551"]
+    common = dict(date="2022-02-22", departure="08:30:00")
+    ad_hoc = TravelTimeMatrix(network, origins, router="tbtr", **common)
+
+    assert not network.has_tbtr_transfers
+    network.compute_tbtr_transfers("2022-02-22")
+    assert network.has_tbtr_transfers
+    cached = TravelTimeMatrix(network, origins, router="tbtr", **common)
+    assert cached.equals(ad_hoc)
+
+    # A query on a different date ignores the cache (ad-hoc build), still correct.
+    other = TravelTimeMatrix(
+        network, origins, date="2022-02-23", departure="08:30:00", router="tbtr"
+    )
+    other_raptor = TravelTimeMatrix(
+        network, origins, date="2022-02-23", departure="08:30:00"
+    )
+    assert other.equals(other_raptor)
+
+
 def test_travel_time_matrix_windowed_percentiles(network):
     origins = ["4740551"]
     percentiles = [10, 50, 90]

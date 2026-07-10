@@ -231,7 +231,7 @@ pub struct TripTransfer {
 
 /// The reduced trip-to-trip transfer set, in CSR layout keyed by
 /// (virtual trip, alight position).
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TransferSet {
     /// Base slot of each virtual trip's positions plus a tail: alight
     /// position `i` of trip `t` is slot `trip_base[t] + i`.
@@ -418,6 +418,31 @@ impl<'a> TbtrEngine<'a> {
         let view = DayView::for_date(timetable, active_services, active_services_previous);
         let same_stop = Transfers::empty(timetable.stop_count());
         let set = TransferSet::for_view(&view, timetable, &same_stop).transfers;
+        Self::build_engine(timetable, footpaths, view, set)
+    }
+
+    /// The engine over a **prebuilt** transfer set — the reused path when the
+    /// caller cached the date's set (via [`TransferSet::for_view`]), skipping
+    /// the expensive precompute. The set must have been built for these
+    /// `active_services`; only the cheap per-engine state (the day view and the
+    /// reversed footpath adjacency) is rebuilt.
+    pub fn from_set(
+        timetable: &'a Timetable,
+        footpaths: &'a Transfers,
+        active_services: &[bool],
+        active_services_previous: &[bool],
+        set: TransferSet,
+    ) -> TbtrEngine<'a> {
+        let view = DayView::for_date(timetable, active_services, active_services_previous);
+        Self::build_engine(timetable, footpaths, view, set)
+    }
+
+    fn build_engine(
+        timetable: &'a Timetable,
+        footpaths: &'a Transfers,
+        view: DayView,
+        set: TransferSet,
+    ) -> TbtrEngine<'a> {
         // Reverse the footpath adjacency once per engine.
         let stop_count = timetable.stop_count() as usize;
         let mut counts = vec![0u32; stop_count + 1];
@@ -446,6 +471,18 @@ impl<'a> TbtrEngine<'a> {
             incoming_offsets: counts,
             incoming,
         }
+    }
+
+    /// Builds only the transfer set for a date — the cacheable precompute that
+    /// [`from_set`](Self::from_set) later reuses.
+    pub fn transfers_for_date(
+        timetable: &Timetable,
+        active_services: &[bool],
+        active_services_previous: &[bool],
+    ) -> TransferSet {
+        let view = DayView::for_date(timetable, active_services, active_services_previous);
+        let same_stop = Transfers::empty(timetable.stop_count());
+        TransferSet::for_view(&view, timetable, &same_stop).transfers
     }
 
     fn incoming(&self, stop: StopIdx) -> &[(StopIdx, u32)] {

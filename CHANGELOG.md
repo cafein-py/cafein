@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Cached TBTR transfer set —
+  ``TransportNetwork.compute_tbtr_transfers(date)`` precomputes and stores the
+  trip-based transfer set for a date, so repeated single-departure stop
+  ``travel_time_matrix(router="tbtr")`` calls on that date reuse it (one clone
+  per call) instead of rebuilding the dominance-aware set every call — the
+  "build once, query many" workload TBTR is built for. A query on another date
+  rebuilds ad hoc; ``has_tbtr_transfers`` reports whether a set is cached. Held
+  in memory only. ``TbtrEngine::from_set`` builds the engine over a prebuilt
+  ``TransferSet``, which now derives ``Clone``.
+
 - ULTRA shortcut set — ``TransportNetwork.compute_ultra_shortcuts``
   enumerates the ULTRA intermediate-transfer shortcuts (Baum et al.) over the
   unrestricted stop-to-stop walking graph of the installed street network: the
