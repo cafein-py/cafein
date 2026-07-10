@@ -881,3 +881,142 @@ def test_mcultra_routes_stop_pareto_queries_door_to_door(
     # A factor-mismatched (vehicle-only) query does not delegate — it keeps the
     # board-at-origin closure routing it had before the set was installed.
     assert frontier(origin, destination, components=["vehicle"]) == vehicle_stop_before
+
+
+def test_mcultra_routes_the_emissions_matrix_door_to_door(
+    central_gtfs, kantakaupunki_pbf
+):
+    # Stage 4b: under a whole-day McULTRA set matching the query's factors, the
+    # emissions cost matrix (least_cost_matrix candidates="pareto") routes
+    # door-to-door — a location-based initial walk per origin, the shortcut set
+    # for the intermediate transfers, and a street final walk folded per
+    # destination. A cell's cleanest journey then matches the single-pair
+    # door-to-door route (Stage 4a); a factor-mismatched query keeps the
+    # board-at-origin closure routing.
+    import math
+
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelCostMatrix, emissions
+    from cafein.frontier import journey_frontier
+
+    with pytest.warns(UserWarning):
+        net = TransportNetwork.from_gtfs(
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=300
+        )
+    coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
+    ids = list(coords)[:25]
+    walk = dict(
+        walking_speed_kmph=3.6, max_walking_time=300.0, max_snap_distance=1600.0
+    )
+
+    def frontier(origin, destination, components=None):
+        return journey_frontier(
+            net,
+            origin,
+            destination,
+            QUERY_DATE,
+            QUERY_TIME,
+            1800,
+            candidates="pareto",
+            components=components,
+            bucket=1e-6,
+            **walk,
+        )
+
+    def cleanest(frame):
+        if not len(frame):
+            return None
+        value = frame["emissions"].min()
+        return None if math.isnan(value) else value
+
+    def matrix_cell(origin, destination, components=None):
+        matrix = TravelCostMatrix(
+            net,
+            [origin],
+            [destination],
+            QUERY_DATE,
+            QUERY_TIME,
+            optimize="emissions",
+            candidates="pareto",
+            window=1800,
+            bucket=1e-6,
+            components=components,
+            **walk,
+        )
+        rows = matrix[matrix.to_id == destination]
+        return rows.iloc[0] if len(rows) else None
+
+    default = emissions.trip_factors(net)  # all LCA components
+    vehicle = emissions.trip_factors(net, components=["vehicle"])
+    count = net._core.compute_mcultra_shortcuts(3.6, 300.0, default, 0, 4_294_967_294)
+    assert count > 0
+    assert net._core.mcultra_active_for(default)
+    assert not net._core.mcultra_active_for(vehicle)
+
+    # A pair whose door-to-door frontier needs transit — every journey rides, so
+    # no direct walk dominates — with positive emissions, so the transit-only
+    # matrix has a cell to cross-check against the single-pair route.
+    pair = None
+    for origin in ids:
+        for destination in ids:
+            if origin == destination:
+                continue
+            frame = frontier(origin, destination)
+            emis = cleanest(frame)
+            if len(frame) and (frame["rides"] > 0).all() and emis and emis > 0:
+                pair = (origin, destination)
+                break
+        if pair is not None:
+            break
+    assert pair is not None, "no transit-only door-to-door pair in the crop"
+    origin, destination = pair
+
+    # The cell's cleanest emissions equal the single-pair door-to-door route's
+    # cleanest — the same transit routing, folded matrix-wide. (Emissions are
+    # connector-independent, so a snapping difference in the reported walk time
+    # cannot perturb this.)
+    cell = matrix_cell(origin, destination)
+    assert cell is not None
+    assert cell["emissions"] == pytest.approx(
+        cleanest(frontier(origin, destination)), abs=1e-3
+    )
+
+    # A factor-mismatched (vehicle-only) query falls back to the closure, so the
+    # matrix cell matches the vehicle-only single-pair route, which also does.
+    vehicle_cell = matrix_cell(origin, destination, components=["vehicle"])
+    vehicle_clean = cleanest(frontier(origin, destination, components=["vehicle"]))
+    assert (vehicle_cell is None) == (vehicle_clean is None)
+    if vehicle_clean is not None:
+        assert vehicle_cell["emissions"] == pytest.approx(vehicle_clean, abs=1e-3)
+
+    # A directly walkable pair yields a walking-only cell — zero rides and, under
+    # today's zero walking factor, zero emissions — matching the single-pair
+    # route's explicit direct walk.
+    walk_pair = None
+    for o in ids:
+        for d in ids:
+            if o == d:
+                continue
+            frame = frontier(o, d)
+            if len(frame) and (frame["rides"] == 0).any():
+                walk_pair = (o, d)
+                break
+        if walk_pair is not None:
+            break
+    assert walk_pair is not None, "no directly walkable pair in the crop"
+    walk_cell = matrix_cell(*walk_pair)
+    assert walk_cell is not None
+    # The walking-only journey wins the cell: zero transfers and the single-pair
+    # route's cleanest emissions (zero under today's walking factor).
+    assert walk_cell["transfers"] == 0
+    assert walk_cell["emissions"] == pytest.approx(
+        cleanest(frontier(*walk_pair)), abs=1e-6
+    )
+
+    # The diagonal is a true zero: origin == destination costs nothing (the
+    # explicit direct-walk overlay special-cases identical coordinates to zero,
+    # rather than charging the origin's stop connector).
+    diagonal = matrix_cell(origin, origin)
+    assert diagonal is not None
+    assert diagonal["travel_time"] == 0
+    assert diagonal["emissions"] == pytest.approx(0.0, abs=1e-6)

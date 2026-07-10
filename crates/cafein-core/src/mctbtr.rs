@@ -1530,6 +1530,7 @@ mod tests {
             &requests[0].active_services,
             &requests[0].active_services_previous,
         );
+        let no_egress = vec![Vec::new(); timetable.stop_count() as usize];
         for budget in [None, Some(600), Some(400), Some(50)] {
             let tbtr =
                 engine.least_emissions_matrix(&inputs, &requests, &destinations, 600, budget, 1e-6);
@@ -1540,6 +1541,9 @@ mod tests {
                 &inputs,
                 &requests,
                 &destinations,
+                &no_egress,
+                &vec![Vec::new(); requests.len()],
+                false,
                 600,
                 budget,
                 1e-6,

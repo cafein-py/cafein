@@ -1181,6 +1181,48 @@ fn factor_fingerprint(per_trip: &[f64]) -> u64 {
     (hash ^ per_trip.len() as u64).wrapping_mul(PRIME)
 }
 
+/// Overlays an origin's explicit direct street walks onto its emissions cost
+/// cells: a walking-only journey — zero rides, its walked metres, zero emissions
+/// under today's walking factor — wins a destination cell whenever nothing
+/// transit-side is cleaner. `walks` is `(destination slot, walk seconds, walk
+/// metres)` with the diagonal (origin coordinate == destination coordinate)
+/// already zeroed by the caller; a walk beyond the travel-time `budget` is
+/// dropped. `priced` prices the walk at zero fare when a fare model is present.
+fn merge_direct_walk_cells(
+    row: &mut Vec<CostRow>,
+    walks: &[(u32, u32, f64)],
+    destinations: &[StopIdx],
+    budget: Option<u32>,
+    priced: bool,
+) {
+    for &(slot, seconds, meters) in walks {
+        if budget.is_some_and(|cap| seconds > cap) {
+            continue;
+        }
+        let to = destinations[slot as usize].0;
+        let cell = CostRow {
+            to,
+            seconds,
+            rides: 0,
+            transit_meters: 0.0,
+            walk_meters: meters,
+            emission_grams: 0.0,
+            fare: if priced { 0.0 } else { f64::NAN },
+            geometry: None,
+        };
+        match row.iter_mut().find(|existing| existing.to == to) {
+            Some(existing) => {
+                if 0.0 < existing.emission_grams
+                    || (existing.emission_grams == 0.0 && seconds < existing.seconds)
+                {
+                    *existing = cell;
+                }
+            }
+            None => row.push(cell),
+        }
+    }
+}
+
 #[pymethods]
 impl TransportNetwork {
     /// Build a network from one or several GTFS zip archives.
@@ -3750,7 +3792,7 @@ impl TransportNetwork {
     /// emissions bucket) Pareto set instead, which also holds the
     /// cleaner-but-slower journeys the time-optimal set misses; cells
     /// can therefore report strictly lower emissions.
-    #[pyo3(signature = (from_stops, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, to_stops = None, candidates = "time", bucket = 25.0, router = "raptor", geometries = false))]
+    #[pyo3(signature = (from_stops, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, to_stops = None, candidates = "time", bucket = 25.0, router = "raptor", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false))]
     #[allow(clippy::too_many_arguments)]
     fn least_cost_matrix(
         &self,
@@ -3768,6 +3810,9 @@ impl TransportNetwork {
         candidates: &str,
         bucket: f64,
         router: &str,
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
         geometries: bool,
     ) -> PyResult<Py<PyDict>> {
         if router != "raptor" && router != "tbtr" {
@@ -3842,11 +3887,86 @@ impl TransportNetwork {
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
-        let requests: Vec<Request> = origins
+        // Under a McULTRA set matching this query's factors, the pareto/raptor
+        // matrix routes door-to-door: a location-based initial walk per origin,
+        // the shortcut set for the intermediate transfers, and a street final
+        // walk folded per destination. Without a matching set (or a street
+        // network) it keeps the closure and board-at-origin access; TBTR and the
+        // time objective always keep the closure.
+        let stop_count = self.build.timetable.stop_count() as usize;
+        let fingerprint = factor_fingerprint(&per_trip);
+        let matrix_mcultra = candidates == "pareto"
+            && router == "raptor"
+            && !std::ptr::eq(self.emissions_transfers(fingerprint), &self.transfers)
+            && self.streets.is_some();
+        // Origins that do not take a location-based initial walk (no coordinate,
+        // no snap, or no stop reachable within the cap) are marked `!located`;
+        // routed over the intermediate-only set they would lose the closure's
+        // initial footpaths, so they fall back to closure board-at-origin routing
+        // below (mirroring the ULTRA matrices' per-row partition).
+        let (access, snappable, egress_map, direct_walks) = if matrix_mcultra {
+            let streets = self.streets.as_ref().unwrap();
+            let speed =
+                validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
+            let (access, located) = self.matrix_location_access(
+                streets,
+                &origins,
+                speed,
+                max_walking_time,
+                max_snap_distance,
+            );
+            let egress_map = self.matrix_street_egress(
+                streets,
+                &destinations,
+                speed,
+                max_walking_time,
+                max_snap_distance,
+            );
+            let direct_walks = self.matrix_direct_walks(
+                streets,
+                &origins,
+                &destinations,
+                speed,
+                max_walking_time,
+                max_snap_distance,
+            );
+            (access, located, egress_map, direct_walks)
+        } else {
+            (
+                origins
+                    .iter()
+                    .map(|&origin| vec![(origin, 0u32, 0.0)])
+                    .collect(),
+                Vec::new(),
+                vec![Vec::new(); stop_count],
+                Vec::new(),
+            )
+        };
+        let matrix_transfers = if matrix_mcultra {
+            self.emissions_transfers(fingerprint)
+        } else {
+            &self.transfers
+        };
+        // Split the located access into routing offsets (stop, seconds) and the
+        // walk metres reported per boarded stop.
+        let access_meters: Vec<Vec<(StopIdx, f64)>> = access
+            .iter()
+            .map(|offsets| {
+                offsets
+                    .iter()
+                    .map(|&(stop, _, meters)| (stop, meters))
+                    .collect()
+            })
+            .collect();
+        let priced = tables.is_some();
+        let requests: Vec<Request> = access
             .into_iter()
-            .map(|origin| Request {
+            .map(|offsets| Request {
                 departure,
-                access: vec![(origin, 0)],
+                access: offsets
+                    .into_iter()
+                    .map(|(stop, seconds, _)| (stop, seconds))
+                    .collect(),
                 egress: Vec::new(),
                 active_services: active_services.clone(),
                 active_services_previous: active_services_previous.clone(),
@@ -3885,17 +4005,84 @@ impl TransportNetwork {
                     &active_services,
                     &active_services_previous,
                 );
-                mcraptor::least_emissions_matrix(
+                let mut rows = mcraptor::least_emissions_matrix(
                     &view,
                     &self.build.timetable,
-                    &self.transfers,
+                    matrix_transfers,
                     &inputs,
                     &requests,
                     &destinations,
+                    &egress_map,
+                    &access_meters,
+                    matrix_mcultra,
                     window,
                     budget,
                     bucket,
-                )
+                );
+                if matrix_mcultra && snappable.iter().any(|&located| !located) {
+                    // Re-route the unsnappable origins over the closure (board at
+                    // the origin, no street walks) and keep the door-to-door rows
+                    // only for snappable origins, in input order.
+                    let closure_requests: Vec<Request> = origins
+                        .iter()
+                        .map(|&origin| Request {
+                            departure,
+                            access: vec![(origin, 0)],
+                            egress: Vec::new(),
+                            active_services: active_services.clone(),
+                            active_services_previous: active_services_previous.clone(),
+                            max_transfers,
+                        })
+                        .collect();
+                    let closure_egress = vec![Vec::new(); stop_count];
+                    let closure_access_meters = vec![Vec::new(); origins.len()];
+                    let closure = mcraptor::least_emissions_matrix(
+                        &view,
+                        &self.build.timetable,
+                        &self.transfers,
+                        &inputs,
+                        &closure_requests,
+                        &destinations,
+                        &closure_egress,
+                        &closure_access_meters,
+                        false,
+                        window,
+                        budget,
+                        bucket,
+                    );
+                    rows = rows
+                        .into_iter()
+                        .zip(closure)
+                        .zip(&snappable)
+                        .map(
+                            |((door, closure_row), &located)| {
+                                if located {
+                                    door
+                                } else {
+                                    closure_row
+                                }
+                            },
+                        )
+                        .collect();
+                }
+                // Overlay the explicit direct street walks onto each located
+                // origin's door-to-door cells (the diagonal is a true zero walk).
+                if matrix_mcultra {
+                    for (origin_rows, (walks, &located)) in
+                        rows.iter_mut().zip(direct_walks.iter().zip(&snappable))
+                    {
+                        if located {
+                            merge_direct_walk_cells(
+                                origin_rows,
+                                walks,
+                                &destinations,
+                                budget,
+                                priced,
+                            );
+                        }
+                    }
+                }
+                rows
             } else {
                 Raptor.least_cost_matrix(
                     &self.build.timetable,
@@ -4205,6 +4392,170 @@ impl TransportNetwork {
                     }
                     sources
                 })
+            })
+            .collect()
+    }
+
+    /// The street egress for the emissions cost matrix, keyed by source stop:
+    /// `map[s]` lists `(destination slot, walk seconds, walk meters)` for every
+    /// matrix destination reachable by a final walk off stop `s` — the reverse
+    /// of `final_egress`, carrying metres for the reported walk distance. A
+    /// destination without a coordinate (or unreachable within
+    /// `max_walking_time`) contributes no sources, so it is reached only by
+    /// alighting there directly.
+    fn matrix_street_egress(
+        &self,
+        streets: &StreetNetwork,
+        destinations: &[StopIdx],
+        speed: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+    ) -> Vec<Vec<(u32, u32, f64)>> {
+        let stop_count = self.build.timetable.stop_count() as usize;
+        let mut coordinates: Vec<(f64, f64)> = Vec::with_capacity(destinations.len());
+        let mut slot_of: Vec<u32> = Vec::with_capacity(destinations.len());
+        for (slot, &destination) in destinations.iter().enumerate() {
+            if let Some(coordinate) = self.stop_coordinate(destination) {
+                slot_of.push(slot as u32);
+                coordinates.push(coordinate);
+            }
+        }
+        let links = streets.link_many(&coordinates, speed, max_walking_time, max_snap_distance);
+        let mut map = vec![Vec::new(); stop_count];
+        for (index, reached) in links.iter().enumerate() {
+            if let Some(reached) = reached {
+                let slot = slot_of[index];
+                for walk in reached {
+                    map[walk.stop.0 as usize].push((slot, walk.seconds, walk.meters));
+                }
+            }
+        }
+        // A destination with no coordinate cannot be a door-to-door coordinate,
+        // so it is reachable only by a direct alight — give it a bare zero-walk
+        // self-entry. A located destination is left to its `link_many` connector:
+        // if its coordinate does not snap or lies beyond the cap it carries no
+        // entry and is simply unreachable, exactly as the single-pair coordinate
+        // route would refuse it (rather than crediting it as a free alight).
+        for (slot, &destination) in destinations.iter().enumerate() {
+            if self.stop_coordinate(destination).is_none() {
+                map[destination.0 as usize].push((slot as u32, 0, 0.0));
+            }
+        }
+        map
+    }
+
+    /// The location-based access for the emissions cost matrix, one entry per
+    /// origin: the stops within an initial walk of the origin's coordinate — its
+    /// own connector included — as `(stop, walk seconds, walk meters)`, plus a
+    /// `located` flag. A coordinate that **snaps** is `located` (`true`) even
+    /// when no stop is reachable within the cap — its access is then empty (no
+    /// transit boarding), but it stays on the door-to-door path so its
+    /// direct-walk overlay still applies. Only a missing coordinate or a failed
+    /// snap gives the board-at-origin fallback `[(origin, 0, 0)]` with `false`,
+    /// routing that origin over the closure rather than the intermediate-only
+    /// set. The initial-walk analogue of `matrix_street_egress`; the metres are
+    /// threaded into the reported walk distance.
+    #[allow(clippy::type_complexity)]
+    fn matrix_location_access(
+        &self,
+        streets: &StreetNetwork,
+        origins: &[StopIdx],
+        speed: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+    ) -> (Vec<Vec<(StopIdx, u32, f64)>>, Vec<bool>) {
+        let mut coordinates: Vec<(f64, f64)> = Vec::with_capacity(origins.len());
+        let mut coordinate_of: Vec<Option<usize>> = Vec::with_capacity(origins.len());
+        for &origin in origins {
+            match self.stop_coordinate(origin) {
+                Some(coordinate) => {
+                    coordinate_of.push(Some(coordinates.len()));
+                    coordinates.push(coordinate);
+                }
+                None => coordinate_of.push(None),
+            }
+        }
+        let links = streets.link_many(&coordinates, speed, max_walking_time, max_snap_distance);
+        origins
+            .iter()
+            .zip(coordinate_of)
+            .map(
+                |(&origin, slot)| match slot.and_then(|slot| links[slot].as_ref()) {
+                    // Snapped — located even when no stop is reachable within the
+                    // cap: it still takes the direct-walk overlay, an empty access
+                    // just means no transit boarding. Only a missing coordinate or
+                    // a failed snap falls back to closure board-at-origin routing.
+                    Some(reached) => (
+                        reached
+                            .iter()
+                            .map(|walk| (walk.stop, walk.seconds, walk.meters))
+                            .collect(),
+                        true,
+                    ),
+                    None => (vec![(origin, 0, 0.0)], false),
+                },
+            )
+            .unzip()
+    }
+
+    /// The explicit coordinate-to-coordinate direct street walks for the
+    /// emissions cost matrix, per origin: `(destination slot, walk seconds, walk
+    /// metres)` for every destination the origin's coordinate reaches on foot
+    /// within the cap. Built from `walk_matrix`, which snaps both coordinates,
+    /// zeroes the same-coordinate diagonal, and returns nothing for a coordinate
+    /// that does not snap — so a cell matches the single-pair route's direct
+    /// walk rather than inferring one from stop connectors. A stop with no
+    /// coordinate contributes and receives no walk.
+    fn matrix_direct_walks(
+        &self,
+        streets: &StreetNetwork,
+        origins: &[StopIdx],
+        destinations: &[StopIdx],
+        speed: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+    ) -> Vec<Vec<(u32, u32, f64)>> {
+        let mut origin_coords: Vec<(f64, f64)> = Vec::new();
+        let mut origin_row: Vec<Option<usize>> = Vec::with_capacity(origins.len());
+        for &origin in origins {
+            match self.stop_coordinate(origin) {
+                Some(coordinate) => {
+                    origin_row.push(Some(origin_coords.len()));
+                    origin_coords.push(coordinate);
+                }
+                None => origin_row.push(None),
+            }
+        }
+        let mut dest_coords: Vec<(f64, f64)> = Vec::new();
+        let mut dest_col: Vec<Option<usize>> = Vec::with_capacity(destinations.len());
+        for &destination in destinations {
+            match self.stop_coordinate(destination) {
+                Some(coordinate) => {
+                    dest_col.push(Some(dest_coords.len()));
+                    dest_coords.push(coordinate);
+                }
+                None => dest_col.push(None),
+            }
+        }
+        let walk = streets.walk_matrix(
+            &origin_coords,
+            &dest_coords,
+            speed,
+            max_walking_time,
+            max_snap_distance,
+        );
+        origin_row
+            .iter()
+            .map(|&row| match row {
+                None => Vec::new(),
+                Some(row) => dest_col
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, &col)| {
+                        let (seconds, meters) = walk[row][col?]?;
+                        Some((slot as u32, seconds, meters))
+                    })
+                    .collect(),
             })
             .collect()
     }

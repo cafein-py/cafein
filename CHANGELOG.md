@@ -62,9 +62,13 @@
   ``travel_time`` equals the ``travel_time_matrix`` cell while it also annotates
   distance, emissions, and fare, and it gains the same three walking arguments.
   Snappable origins route door-to-door and off-network origins fall back to the
-  closure, per row. The emissions/fare stop matrices
-  (``optimize="emissions"``/``"fare"``) keep the closure and still reject the
-  walking arguments.
+  closure, per row. The fare stop matrix keeps the closure; the emissions stop
+  matrix (``optimize="emissions"``, ``candidates="pareto"``) routes door-to-door
+  the same way under a whole-day **McULTRA** set — location-based access, the
+  shortcut set's intermediate walking, a street final walk folded per
+  destination, and the direct walk winning any cell it is cleanest on, one
+  cleanest journey per cell — with unsnappable origins falling back to the
+  closure. Both stop matrices now accept the walking arguments.
 
 - McTBTR groundwork — the multicriteria transfer set: the compute core
   gains a dominance-aware variant of the TBTR transfer precompute for
