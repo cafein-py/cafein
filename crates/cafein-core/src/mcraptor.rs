@@ -95,20 +95,44 @@ impl Bag {
     /// `rides = 0` throughout (its rounds are ranked in the trip bags,
     /// not here), so its dominance stays exactly `(arrival, key)`.
     pub(crate) fn insert(&mut self, arrival: u32, grams: f64, key: i64, rides: u8) -> bool {
+        self.insert_slack(arrival, grams, key, rides, 0)
+    }
+
+    /// `insert` under a time slack: an entry rejects the newcomer only
+    /// when it is at least `slack` seconds earlier (and no dirtier / no
+    /// more rides), so a journey dominated by a nearer one survives as a
+    /// suboptimal alternative. Same-class (`arrival`, `key`, `rides`)
+    /// duplicates still reduce to the cleanest representative, and eviction
+    /// likewise needs the full `slack` margin. `slack = 0` is exactly
+    /// strict `insert`; the trip-based and exhaustive engines only call the
+    /// strict form, so they keep unchanged dominance.
+    pub(crate) fn insert_slack(
+        &mut self,
+        arrival: u32,
+        grams: f64,
+        key: i64,
+        rides: u8,
+        slack: u32,
+    ) -> bool {
         for entry in &self.entries {
-            if entry.arrival <= arrival
-                && entry.key <= key
-                && entry.rides <= rides
-                && !(entry.arrival == arrival
-                    && entry.key == key
-                    && entry.rides == rides
-                    && grams < entry.grams)
-            {
-                return false;
+            if entry.key <= key && entry.rides <= rides {
+                if entry.arrival == arrival && entry.key == key && entry.rides == rides {
+                    if grams >= entry.grams {
+                        return false;
+                    }
+                } else if entry.arrival.saturating_add(slack) <= arrival {
+                    return false;
+                }
             }
         }
         self.entries.retain(|entry| {
-            !(arrival <= entry.arrival && key <= entry.key && rides <= entry.rides)
+            !((key <= entry.key
+                && rides <= entry.rides
+                && arrival.saturating_add(slack) <= entry.arrival)
+                || (entry.arrival == arrival
+                    && entry.key == key
+                    && entry.rides == rides
+                    && grams < entry.grams))
         });
         self.entries.push(Entry {
             arrival,
@@ -140,23 +164,34 @@ struct DestinationBag {
 }
 
 impl DestinationBag {
-    fn insert(&mut self, candidate: Arrived) -> bool {
+    /// Inserts under the same time slack as the stop bags: a frontier entry
+    /// rejects the candidate only when it is at least `slack` seconds
+    /// earlier and no dirtier, so suboptimal arrivals within the band are
+    /// retained. `slack = 0` is the strict (departure↓, arrival, bucket)
+    /// Pareto frontier.
+    fn insert(&mut self, candidate: Arrived, slack: u32) -> bool {
         for entry in &self.entries {
-            if entry.departure >= candidate.departure
-                && entry.arrival <= candidate.arrival
-                && entry.key <= candidate.key
-                && !(entry.departure == candidate.departure
+            if entry.departure >= candidate.departure && entry.key <= candidate.key {
+                if entry.departure == candidate.departure
                     && entry.arrival == candidate.arrival
                     && entry.key == candidate.key
-                    && candidate.grams < entry.grams)
-            {
-                return false;
+                {
+                    if candidate.grams >= entry.grams {
+                        return false;
+                    }
+                } else if entry.arrival.saturating_add(slack) <= candidate.arrival {
+                    return false;
+                }
             }
         }
         self.entries.retain(|entry| {
-            !(candidate.departure >= entry.departure
-                && candidate.arrival <= entry.arrival
-                && candidate.key <= entry.key)
+            !((candidate.departure >= entry.departure
+                && candidate.key <= entry.key
+                && candidate.arrival.saturating_add(slack) <= entry.arrival)
+                || (entry.departure == candidate.departure
+                    && entry.arrival == candidate.arrival
+                    && entry.key == candidate.key
+                    && candidate.grams < entry.grams))
         });
         self.entries.push(candidate);
         true
@@ -274,6 +309,8 @@ struct Search<'a> {
     geometry: &'a TripGeometry,
     factors: &'a [f64],
     bucket: f64,
+    /// The time-slack band, in seconds; 0 is the strict frontier.
+    slack: u32,
     arena: Vec<Label>,
     bags: Vec<Bag>,
     destination: DestinationBag,
@@ -283,7 +320,10 @@ struct Search<'a> {
 }
 
 /// The multicriteria journeys for a single departure: the Pareto set
-/// over (arrival, emissions bucket), as full journeys.
+/// over (arrival, emissions bucket), as full journeys. A positive `slack`
+/// (seconds) widens the set to the suboptimal journeys arriving within the
+/// band; `max_options`, when set, caps the returned count.
+#[allow(clippy::too_many_arguments)]
 pub fn route(
     view: &DayView,
     timetable: &Timetable,
@@ -292,6 +332,8 @@ pub fn route(
     factors: &[f64],
     request: &Request,
     bucket: f64,
+    slack: u32,
+    max_options: Option<usize>,
 ) -> Vec<Journey> {
     profile(
         view,
@@ -302,6 +344,8 @@ pub fn route(
         request,
         &[request.departure],
         bucket,
+        slack,
+        max_options,
     )
 }
 
@@ -318,6 +362,8 @@ pub fn route_range(
     request: &Request,
     window: u32,
     bucket: f64,
+    slack: u32,
+    max_options: Option<usize>,
 ) -> Vec<Journey> {
     let departures = departure_candidates(timetable, request, window);
     profile(
@@ -329,6 +375,8 @@ pub fn route_range(
         request,
         &departures,
         bucket,
+        slack,
+        max_options,
     )
 }
 
@@ -391,6 +439,7 @@ pub fn least_emissions_matrix(
                 inputs.geometry,
                 inputs.factors,
                 bucket,
+                0,
             );
             let departures = departure_candidates(timetable, request, window);
             let mut best: Vec<Option<(f64, u32, u32, f64)>> = vec![None; destinations.len()];
@@ -426,23 +475,85 @@ fn profile(
     request: &Request,
     departures: &[u32],
     bucket: f64,
+    slack: u32,
+    max_options: Option<usize>,
 ) -> Vec<Journey> {
     assert!(
         bucket.is_finite() && bucket > 0.0,
         "the emissions bucket must be positive"
     );
-    let mut search = Search::start(view, timetable, footpaths, geometry, factors, bucket);
+    let mut search = Search::start(view, timetable, footpaths, geometry, factors, bucket, slack);
     for &departure in departures {
         search.pass(request, departure, &mut None);
     }
-    let mut journeys: Vec<Journey> = search
-        .destination
-        .entries
-        .iter()
+    let kept = cap_entries(&search.destination.entries, max_options);
+    let mut journeys: Vec<Journey> = kept
+        .into_iter()
         .map(|arrived| search.assemble(arrived))
         .collect();
     journeys.sort_by_key(|journey| (journey.departure, journey.arrival, journey.rides()));
     journeys
+}
+
+/// Strict (departure↓, arrival, emissions bucket) domination between two
+/// destination entries — the relation that ranks suboptimal arrivals under
+/// `max_options`.
+fn strictly_dominates(a: &Arrived, b: &Arrived) -> bool {
+    a.departure >= b.departure
+        && a.arrival <= b.arrival
+        && a.key <= b.key
+        && (a.departure > b.departure || a.arrival < b.arrival || a.key < b.key)
+}
+
+/// The destination entries to assemble. Without a cap (or when the set
+/// already fits) every entry is kept; otherwise the strict frontier — the
+/// entries no other entry strictly dominates — is kept in full and the
+/// suboptimal arrivals of smallest time-gap above it fill the remainder up
+/// to `max_options`, ties toward the cleaner emissions. A suboptimal entry's
+/// gap is the seconds by which its nearest strict-frontier dominator arrives
+/// earlier. The cap never drops a frontier (optimal) journey, so the result
+/// can exceed `max_options` when the frontier itself is larger.
+fn cap_entries(entries: &[Arrived], max_options: Option<usize>) -> Vec<&Arrived> {
+    let cap = match max_options {
+        Some(cap) if entries.len() > cap => cap,
+        _ => return entries.iter().collect(),
+    };
+    let on_frontier: Vec<bool> = entries
+        .iter()
+        .map(|entry| !entries.iter().any(|other| strictly_dominates(other, entry)))
+        .collect();
+    let mut ranked: Vec<(&Arrived, bool, u32)> = entries
+        .iter()
+        .zip(&on_frontier)
+        .map(|(entry, &frontier)| {
+            let gap = if frontier {
+                0
+            } else {
+                entries
+                    .iter()
+                    .zip(&on_frontier)
+                    .filter(|(other, &f)| f && strictly_dominates(other, entry))
+                    .map(|(other, _)| entry.arrival.saturating_sub(other.arrival))
+                    .min()
+                    .unwrap_or(u32::MAX)
+            };
+            (entry, frontier, gap)
+        })
+        .collect();
+    // Frontier entries first (always kept), then suboptimals by time-gap.
+    ranked.sort_by(|(a, fa, ga), (b, fb, gb)| {
+        fb.cmp(fa)
+            .then(ga.cmp(gb))
+            .then(a.key.cmp(&b.key))
+            .then(a.grams.total_cmp(&b.grams))
+    });
+    let frontier = on_frontier.iter().filter(|&&f| f).count();
+    let keep = cap.max(frontier);
+    ranked
+        .into_iter()
+        .take(keep)
+        .map(|(entry, _, _)| entry)
+        .collect()
 }
 
 impl<'a> Search<'a> {
@@ -453,6 +564,7 @@ impl<'a> Search<'a> {
         geometry: &'a TripGeometry,
         factors: &'a [f64],
         bucket: f64,
+        slack: u32,
     ) -> Search<'a> {
         Search {
             view,
@@ -461,6 +573,7 @@ impl<'a> Search<'a> {
             geometry,
             factors,
             bucket,
+            slack,
             arena: Vec::new(),
             bags: vec![Bag::default(); timetable.stop_count() as usize],
             destination: DestinationBag::default(),
@@ -487,7 +600,7 @@ impl<'a> Search<'a> {
             let arrival = departure.saturating_add(seconds);
             let label = self.arena.len() as u32;
             let key = self.key(0.0);
-            if self.bags[stop.0 as usize].insert(arrival, 0.0, key, 0) {
+            if self.bags[stop.0 as usize].insert_slack(arrival, 0.0, key, 0, self.slack) {
                 self.arena.push(Label {
                     arrival,
                     grams: 0.0,
@@ -540,7 +653,9 @@ impl<'a> Search<'a> {
                 for footpath in self.footpaths.from_stop(from.stop) {
                     let arrival = from.arrival.saturating_add(footpath.duration);
                     let walked = self.arena.len() as u32;
-                    if self.bags[footpath.to.0 as usize].insert(arrival, from.grams, key, rides) {
+                    if self.bags[footpath.to.0 as usize]
+                        .insert_slack(arrival, from.grams, key, rides, self.slack)
+                    {
                         self.arena.push(Label {
                             arrival,
                             grams: from.grams,
@@ -563,13 +678,16 @@ impl<'a> Search<'a> {
                 for &(stop, seconds) in &request.egress {
                     if stop == reached.stop {
                         let arrival = reached.arrival.saturating_add(seconds);
-                        self.destination.insert(Arrived {
-                            departure,
-                            arrival,
-                            key: self.key(reached.grams),
-                            grams: reached.grams,
-                            label,
-                        });
+                        self.destination.insert(
+                            Arrived {
+                                departure,
+                                arrival,
+                                key: self.key(reached.grams),
+                                grams: reached.grams,
+                                label,
+                            },
+                            self.slack,
+                        );
                     }
                 }
             }
@@ -605,7 +723,9 @@ impl<'a> Search<'a> {
                 let grams = quantized(rider.grams + meters / 1000.0 * rider.factor);
                 let label = self.arena.len() as u32;
                 let key = self.key(grams);
-                if self.bags[stops[position].0 as usize].insert(arrival, grams, key, rides) {
+                if self.bags[stops[position].0 as usize]
+                    .insert_slack(arrival, grams, key, rides, self.slack)
+                {
                     self.arena.push(Label {
                         arrival,
                         grams,
@@ -635,13 +755,43 @@ impl<'a> Search<'a> {
                     continue;
                 };
                 let mut cleanest = f64::INFINITY;
+                // The latest boarded trip whose factor set `cleanest` — the
+                // nearest no-dirtier earlier departure a within-slack trip is
+                // measured against (only tracked when relaxing).
+                let mut last_clean_departure = if self.slack > 0 {
+                    self.view.stored_times(self.timetable, first)[position].departure - offset
+                } else {
+                    0
+                };
                 for rank in first.0..self.view.line_trips(line).end {
                     let trip = ViewTrip(rank);
                     let factor = self.factors[self.view.backing(trip).0 as usize];
-                    if !factor.is_finite() || factor >= cleanest {
+                    if !factor.is_finite() {
                         continue;
                     }
-                    cleanest = factor;
+                    if factor < cleanest {
+                        cleanest = factor;
+                        if self.slack > 0 {
+                            last_clean_departure =
+                                self.view.stored_times(self.timetable, trip)[position].departure
+                                    - offset;
+                        }
+                    } else if self.slack == 0 {
+                        continue;
+                    } else {
+                        // Under a slack, board a later same-line trip that is
+                        // not strictly cleaner when it departs within the band of
+                        // the nearest no-dirtier boarded trip — the "next
+                        // departure" alternative strict Pareto drops. The stop
+                        // bags prune the ones that fall more than `slack` behind
+                        // at their alights.
+                        let departure = self.view.stored_times(self.timetable, trip)[position]
+                            .departure
+                            - offset;
+                        if departure.saturating_sub(last_clean_departure) > self.slack {
+                            continue;
+                        }
+                    }
                     let travelled =
                         self.geometry
                             .leg_distance(self.view.backing(trip), 0, position as u16)
@@ -948,7 +1098,7 @@ mod tests {
         let footpaths = Transfers::empty(4);
         let request = request(StopIdx(0), StopIdx(3), 3);
         let journeys = route(
-            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6,
+            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 0, None,
         );
         let points = pareto_oracle(
             &view,
@@ -971,6 +1121,196 @@ mod tests {
         );
     }
 
+    /// Two frontier journeys — a fast dirty line and a slower cleaner one
+    /// — plus a middle line that strict Pareto drops as dominated but a
+    /// time slack keeps as a suboptimal alternative.
+    fn relaxed_fixture() -> (Timetable, TripGeometry, [f64; 3]) {
+        let mut builder = TimetableBuilder::new(2);
+        let fast = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+        let clean = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 1).unwrap();
+        let middle = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 2).unwrap();
+        builder
+            .add_trip(fast, vec![time(100), time(500)], 0, 0)
+            .unwrap();
+        builder
+            .add_trip(clean, vec![time(100), time(700)], 1, 0)
+            .unwrap();
+        builder
+            .add_trip(middle, vec![time(100), time(600)], 2, 0)
+            .unwrap();
+        let timetable = builder.finish();
+        let geometry = TripGeometry::from_trips(
+            &timetable,
+            vec![
+                (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+                (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+                (TripIdx(2), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            ],
+        )
+        .unwrap();
+        (timetable, geometry, [100.0, 60.0, 100.0])
+    }
+
+    #[test]
+    fn zero_slack_matches_the_strict_frontier() {
+        let (timetable, geometry, factors) = relaxed_fixture();
+        let view = DayView::universal(&timetable);
+        let footpaths = Transfers::empty(2);
+        let request = request(StopIdx(0), StopIdx(1), 3);
+        let strict = route(
+            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 0, None,
+        );
+        // Only the fast dirty line and the slow clean one; the middle line
+        // is strictly dominated and dropped.
+        assert_eq!(
+            triples(&strict, &geometry, &factors),
+            vec![(500, 100.0, 1), (700, 60.0, 1)]
+        );
+    }
+
+    #[test]
+    fn a_time_slack_keeps_the_suboptimal_middle_line() {
+        let (timetable, geometry, factors) = relaxed_fixture();
+        let view = DayView::universal(&timetable);
+        let footpaths = Transfers::empty(2);
+        let request = request(StopIdx(0), StopIdx(1), 3);
+        // 200 s exceeds the 100 s the fast line beats the middle line by,
+        // so the middle line (600, dominated by 500) is retained.
+        let relaxed = route(
+            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 200, None,
+        );
+        assert_eq!(
+            triples(&relaxed, &geometry, &factors),
+            vec![(500, 100.0, 1), (600, 100.0, 1), (700, 60.0, 1)]
+        );
+    }
+
+    #[test]
+    fn max_options_keeps_the_frontier_over_the_suboptimal() {
+        let (timetable, geometry, factors) = relaxed_fixture();
+        let view = DayView::universal(&timetable);
+        let footpaths = Transfers::empty(2);
+        let request = request(StopIdx(0), StopIdx(1), 3);
+        // The relaxed set is three journeys; a cap of two keeps the strict
+        // frontier and drops the suboptimal middle line.
+        let capped = route(
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            1e-6,
+            200,
+            Some(2),
+        );
+        assert_eq!(
+            triples(&capped, &geometry, &factors),
+            vec![(500, 100.0, 1), (700, 60.0, 1)]
+        );
+    }
+
+    /// One line, two trips one headway apart at the same factor: the later
+    /// trip is strictly dominated and never boarded by the strict line scan.
+    fn same_line_fixture() -> (Timetable, TripGeometry, [f64; 2]) {
+        let mut builder = TimetableBuilder::new(2);
+        let line = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+        builder
+            .add_trip(line, vec![time(100), time(500)], 0, 0)
+            .unwrap();
+        builder
+            .add_trip(line, vec![time(200), time(600)], 1, 0)
+            .unwrap();
+        let timetable = builder.finish();
+        let geometry = TripGeometry::from_trips(
+            &timetable,
+            vec![
+                (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+                (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            ],
+        )
+        .unwrap();
+        (timetable, geometry, [100.0, 100.0])
+    }
+
+    #[test]
+    fn a_time_slack_boards_the_next_same_line_trip() {
+        let (timetable, geometry, factors) = same_line_fixture();
+        let view = DayView::universal(&timetable);
+        let footpaths = Transfers::empty(2);
+        let request = request(StopIdx(0), StopIdx(1), 3);
+        // Strict Pareto boards only the earliest trip; the later same-factor
+        // trip arrives later at no lower emissions, so it is dropped.
+        let strict = route(
+            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 0, None,
+        );
+        assert_eq!(triples(&strict, &geometry, &factors), vec![(500, 100.0, 1)]);
+        // A 200 s slack boards the next departure too — the "one trip later"
+        // alternative the strict line scan never surfaces.
+        let relaxed = route(
+            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 200, None,
+        );
+        assert_eq!(
+            triples(&relaxed, &geometry, &factors),
+            vec![(500, 100.0, 1), (600, 100.0, 1)]
+        );
+    }
+
+    /// One line, three trips: a dirty first, a much-later clean one, and a
+    /// middle-factor trip just after the clean one. The middle trip is within
+    /// slack of the clean frontier trip but far beyond the first departure —
+    /// only measuring against the nearest no-dirtier boarded trip admits it.
+    fn later_frontier_fixture() -> (Timetable, TripGeometry, [f64; 3]) {
+        let mut builder = TimetableBuilder::new(2);
+        let line = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+        builder
+            .add_trip(line, vec![time(100), time(500)], 0, 0)
+            .unwrap();
+        builder
+            .add_trip(line, vec![time(900), time(1300)], 1, 0)
+            .unwrap();
+        builder
+            .add_trip(line, vec![time(1000), time(1400)], 2, 0)
+            .unwrap();
+        let timetable = builder.finish();
+        let geometry = TripGeometry::from_trips(
+            &timetable,
+            vec![
+                (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+                (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+                (TripIdx(2), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            ],
+        )
+        .unwrap();
+        (timetable, geometry, [100.0, 10.0, 50.0])
+    }
+
+    #[test]
+    fn a_time_slack_boards_the_next_trip_after_a_later_frontier() {
+        let (timetable, geometry, factors) = later_frontier_fixture();
+        let view = DayView::universal(&timetable);
+        let footpaths = Transfers::empty(2);
+        let request = request(StopIdx(0), StopIdx(1), 3);
+        // Strict Pareto keeps the two frontier trips only.
+        let strict = route(
+            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 0, None,
+        );
+        assert_eq!(
+            triples(&strict, &geometry, &factors),
+            vec![(500, 100.0, 1), (1300, 10.0, 1)]
+        );
+        // A 200 s slack admits the middle-factor trip 100 s after the clean
+        // frontier trip — far beyond the first departure, so measuring only
+        // against the first would wrongly drop it.
+        let relaxed = route(
+            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 200, None,
+        );
+        assert_eq!(
+            triples(&relaxed, &geometry, &factors),
+            vec![(500, 100.0, 1), (1300, 10.0, 1), (1400, 50.0, 1)]
+        );
+    }
+
     #[test]
     fn a_wide_bucket_collapses_to_the_fastest_journey() {
         let (timetable, geometry, factors) = frontier_fixture();
@@ -978,7 +1318,7 @@ mod tests {
         let footpaths = Transfers::empty(4);
         let request = request(StopIdx(0), StopIdx(3), 3);
         let journeys = route(
-            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e9,
+            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e9, 0, None,
         );
         assert_eq!(
             triples(&journeys, &geometry, &factors),
@@ -1026,7 +1366,7 @@ mod tests {
         let view = DayView::universal(&timetable);
         let request = request(StopIdx(0), StopIdx(2), 3);
         let journeys = route(
-            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6,
+            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 0, None,
         );
         assert_eq!(
             triples(&journeys, &geometry, &factors),
@@ -1061,7 +1401,7 @@ mod tests {
         let footpaths = Transfers::empty(2);
         let request = request(StopIdx(0), StopIdx(1), 1);
         let journeys = route(
-            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6,
+            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 0, None,
         );
         let points = pareto_oracle(
             &view,
@@ -1118,7 +1458,7 @@ mod tests {
         let view = DayView::universal(&timetable);
         let request = request(StopIdx(0), StopIdx(3), 3);
         let journeys = route(
-            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6,
+            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 0, None,
         );
         let points = pareto_oracle(
             &view,
@@ -1175,6 +1515,8 @@ mod tests {
             &[f64::NAN],
             &request,
             1e-6,
+            0,
+            None,
         );
         assert!(journeys.is_empty());
     }
@@ -1393,7 +1735,7 @@ mod tests {
             max_transfers: 1,
         };
         let journeys = route_range(
-            &view, &timetable, &footpaths, &geometry, &factors, &request, 200, 1e-6,
+            &view, &timetable, &footpaths, &geometry, &factors, &request, 200, 1e-6, 0, None,
         );
         let profile: Vec<(u32, u32)> = journeys
             .iter()

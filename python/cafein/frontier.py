@@ -51,6 +51,8 @@ def journey_frontier(
     candidates="time",
     bucket=25.0,
     router="raptor",
+    slack_seconds=300.0,
+    max_options=None,
     walking_speed_kmph=None,
     max_walking_time=None,
     max_snap_distance=None,
@@ -68,7 +70,9 @@ def journey_frontier(
     which searches over (departure, arrival, emissions) directly and so
     also finds the cleaner-but-slower journeys the time-optimal set
     misses; emissions are compared at ``bucket`` grams during the
-    search and re-annotated exactly afterwards.
+    search and re-annotated exactly afterwards. ``candidates="relaxed"``
+    widens that set by ``slack_seconds`` to also keep the suboptimal
+    journeys arriving within the band (capped by ``max_options``).
 
     With a fare structure (`fares`), every candidate is also priced,
     the frame gains a ``fare`` column, and the fare joins the frontier
@@ -103,22 +107,39 @@ def journey_frontier(
     candidates : str (optional, default: "time")
         The candidate journey set: ``"time"`` for the range-RAPTOR
         time-optimal journeys, ``"pareto"`` for the McRAPTOR journeys
-        Pareto-optimal in (departure, arrival, emissions). Pareto
-        candidates require a network with trip distances; journeys
-        riding a trip without a resolved emission factor never enter
-        them. Coordinate queries route door-to-door either way and
-        include the walking-only journey.
+        Pareto-optimal in (departure, arrival, emissions), or
+        ``"relaxed"`` for the ``"pareto"`` set widened by
+        ``slack_seconds`` to the suboptimal journeys arriving within the
+        band — the "a bit slower but a real alternative" options that
+        strict Pareto drops. Both multicriteria sets require a network
+        with trip distances; journeys riding a trip without a resolved
+        emission factor never enter them. Coordinate queries route
+        door-to-door either way and include the walking-only journey.
     bucket : float (optional, default: 25.0)
         The emissions bucket width in grams CO₂e of the pareto search:
         journeys within one bucket of each other count as equal on
         emissions while searching, bounding its cost. Only used with
-        ``candidates="pareto"``.
+        ``candidates="pareto"`` or ``"relaxed"``.
     router : str (optional, default: "raptor")
         The pareto search engine: McRAPTOR (``"raptor"``) answers
         immediately; McTBTR (``"tbtr"``, stop ids only) precomputes the
         date's multicriteria transfer set first — slower for a single
         pair, built for batch reuse — and returns the same journeys.
-        Only used with ``candidates="pareto"``.
+        Only used with ``candidates="pareto"``; ``"relaxed"`` requires
+        ``"raptor"``.
+    slack_seconds : float (optional, default: 300.0)
+        The time-slack band in seconds for ``candidates="relaxed"``: a
+        journey is kept even when a cleaner or simpler one dominates it,
+        as long as that dominator is not more than ``slack_seconds``
+        earlier. ``0`` reproduces the strict ``"pareto"`` frontier. Only
+        used with ``candidates="relaxed"``.
+    max_options : int (optional, default: None)
+        A cap on the suboptimal alternatives kept. The strict frontier is
+        always returned in full; the suboptimal journeys nearest to it
+        (smallest time-gap) fill the rest up to ``max_options``, so the
+        result can exceed ``max_options`` when the frontier itself is
+        larger. ``None`` returns every journey within the slack. Only
+        used with ``candidates="relaxed"``.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         Street-search options for the walking access/egress, as in
         ``route_between_coordinates``. For stop origins/destinations they
@@ -138,12 +159,28 @@ def journey_frontier(
         on any criterion never are), and ``journey``, the annotated
         journey dict as returned by the routing calls.
     """
-    if candidates not in ("time", "pareto"):
-        raise ValueError("candidates must be 'time' or 'pareto'")
+    if candidates not in ("time", "pareto", "relaxed"):
+        raise ValueError("candidates must be 'time', 'pareto', or 'relaxed'")
     if router not in ("raptor", "tbtr"):
         raise ValueError("router must be 'raptor' or 'tbtr'")
     if router == "tbtr" and candidates != "pareto":
         raise ValueError("router='tbtr' requires candidates='pareto'")
+    if candidates == "relaxed":
+        if not (
+            isinstance(slack_seconds, (int, float))
+            and math.isfinite(slack_seconds)
+            and slack_seconds >= 0
+        ):
+            raise ValueError("slack_seconds must be a non-negative number of seconds")
+        if max_options is not None and (
+            not isinstance(max_options, int)
+            or isinstance(max_options, bool)
+            or max_options < 1
+        ):
+            raise ValueError("max_options must be a positive integer or None")
+    slack = float(slack_seconds) if candidates == "relaxed" else 0.0
+    options = max_options if candidates == "relaxed" else None
+    multicriteria = candidates in ("pareto", "relaxed")
     stops = isinstance(origin, str), isinstance(destination, str)
     if stops[0] != stops[1]:
         raise ValueError(
@@ -152,7 +189,7 @@ def journey_frontier(
     if stops[0]:
         from cafein.network import _walk_options
 
-        if candidates == "pareto":
+        if multicriteria:
             trip_factors = emissions.trip_factors(network, factors, components)
             journeys = network._core.mc_route_between_stops(
                 origin,
@@ -166,6 +203,8 @@ def journey_frontier(
                 router,
                 *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
                 geometries,
+                slack,
+                options,
             )
         else:
             journeys = network.route_between_stops(
@@ -180,7 +219,7 @@ def journey_frontier(
                 max_snap_distance=max_snap_distance,
                 geometries=geometries,
             )
-    elif candidates == "pareto":
+    elif multicriteria:
         from cafein.network import _walk_options
 
         if router == "tbtr":
@@ -197,6 +236,8 @@ def journey_frontier(
             bucket,
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
             geometries,
+            slack,
+            options,
         )
     else:
         journeys = network.route_between_coordinates(

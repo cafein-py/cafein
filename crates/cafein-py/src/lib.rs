@@ -2792,7 +2792,7 @@ impl TransportNetwork {
     /// -------
     /// list of dict
     ///     Journeys shaped as in ``route_between_stops``.
-    #[pyo3(signature = (from_stop, to_stop, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, router = "raptor", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true))]
+    #[pyo3(signature = (from_stop, to_stop, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, router = "raptor", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None))]
     #[allow(clippy::too_many_arguments)]
     fn mc_route_between_stops(
         &self,
@@ -2810,6 +2810,8 @@ impl TransportNetwork {
         max_walking_time: f64,
         max_snap_distance: f64,
         geometries: bool,
+        slack: f64,
+        max_options: Option<usize>,
     ) -> PyResult<Py<PyList>> {
         if !bucket.is_finite() || bucket <= 0.0 {
             return Err(PyValueError::new_err(
@@ -2818,6 +2820,21 @@ impl TransportNetwork {
         }
         if router != "raptor" && router != "tbtr" {
             return Err(PyValueError::new_err("router must be 'raptor' or 'tbtr'"));
+        }
+        if !slack.is_finite() || slack < 0.0 {
+            return Err(PyValueError::new_err(
+                "slack must be a non-negative number of seconds",
+            ));
+        }
+        if matches!(max_options, Some(0)) {
+            return Err(PyValueError::new_err(
+                "max_options must be a positive integer",
+            ));
+        }
+        if slack > 0.0 && router == "tbtr" {
+            return Err(PyValueError::new_err(
+                "relaxed candidates (slack > 0) require router='raptor'",
+            ));
         }
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
@@ -2869,6 +2886,8 @@ impl TransportNetwork {
                         max_walking_time,
                         max_snap_distance,
                         geometries,
+                        slack,
+                        max_options,
                     );
                 }
             }
@@ -2901,6 +2920,7 @@ impl TransportNetwork {
                 &request.active_services,
                 &request.active_services_previous,
             );
+            let slack = slack.round() as u32;
             match window {
                 None => mcraptor::route(
                     &view,
@@ -2910,6 +2930,8 @@ impl TransportNetwork {
                     &per_trip,
                     &request,
                     bucket,
+                    slack,
+                    max_options,
                 ),
                 Some(window) => mcraptor::route_range(
                     &view,
@@ -2920,6 +2942,8 @@ impl TransportNetwork {
                     &request,
                     window,
                     bucket,
+                    slack,
+                    max_options,
                 ),
             }
         });
@@ -2953,7 +2977,7 @@ impl TransportNetwork {
     /// -------
     /// list of dict
     ///     Journeys shaped as in ``route_between_coordinates``.
-    #[pyo3(signature = (origin, destination, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true))]
+    #[pyo3(signature = (origin, destination, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None))]
     #[allow(clippy::too_many_arguments)]
     fn mc_route_between_coordinates(
         &self,
@@ -2970,10 +2994,22 @@ impl TransportNetwork {
         max_walking_time: f64,
         max_snap_distance: f64,
         geometries: bool,
+        slack: f64,
+        max_options: Option<usize>,
     ) -> PyResult<Py<PyList>> {
         if !bucket.is_finite() || bucket <= 0.0 {
             return Err(PyValueError::new_err(
                 "bucket must be a positive number of grams",
+            ));
+        }
+        if !slack.is_finite() || slack < 0.0 {
+            return Err(PyValueError::new_err(
+                "slack must be a non-negative number of seconds",
+            ));
+        }
+        if matches!(max_options, Some(0)) {
+            return Err(PyValueError::new_err(
+                "max_options must be a positive integer",
             ));
         }
         let Some(geometry) = &self.geometry else {
@@ -3045,6 +3081,7 @@ impl TransportNetwork {
         // transfers when one is installed for this factor configuration; the
         // access/egress and direct walk above stay unchanged.
         let intermediate = self.emissions_transfers(factor_fingerprint(&per_trip));
+        let slack = slack.round() as u32;
         let journeys = py.allow_threads(|| {
             let view = DayView::for_date(
                 &self.build.timetable,
@@ -3060,6 +3097,8 @@ impl TransportNetwork {
                     &per_trip,
                     &request,
                     bucket,
+                    slack,
+                    max_options,
                 ),
                 Some(window) => mcraptor::route_range(
                     &view,
@@ -3070,6 +3109,8 @@ impl TransportNetwork {
                     &request,
                     window,
                     bucket,
+                    slack,
+                    max_options,
                 ),
             }
         });
