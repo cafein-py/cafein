@@ -145,6 +145,13 @@
   recovers non-dominated journeys the bucketed strict search skips;
   ``router="raptor"`` only.
 
+- Relaxed alternatives in ``DetailedItineraries`` —
+  ``DetailedItineraries(candidates="relaxed", slack_seconds=…)`` draws
+  each OD pair's ``option`` set from the same slack-widened McRAPTOR
+  search, so a query returns the suboptimal journeys within the band
+  alongside the frontier, capped by ``max_options``.
+  ``candidates="relaxed"`` requires ``router="raptor"``.
+
 - Route-diverse alternatives —
   ``journey_frontier(candidates="diverse", max_options=N)`` returns up to
   ``N`` distinct-corridor alternatives by iterative route penalization:
