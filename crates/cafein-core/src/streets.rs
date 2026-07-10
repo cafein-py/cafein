@@ -447,6 +447,10 @@ impl SearchState {
 thread_local! {
     static SEARCH_STATE: std::cell::RefCell<SearchState> =
         std::cell::RefCell::new(SearchState::default());
+    /// Per-thread scratch for the contraction-hierarchy one-to-many query,
+    /// reused across a matrix's per-origin searches like `SEARCH_STATE`.
+    static CH_SCRATCH: std::cell::RefCell<crate::ch::ChScratch> =
+        std::cell::RefCell::new(crate::ch::ChScratch::default());
 }
 
 /// An immutable byte store backing mapped street arrays — a read-only
@@ -1215,14 +1219,13 @@ impl StreetNetwork {
         // installed, else a bounded Dijkstra over the graph. Both feed the same
         // link join, so the `WalkedStop`s are identical.
         match &self.hierarchy {
-            Some(index) => {
-                let distances: HashMap<u32, f64> = index
+            Some(index) => CH_SCRATCH.with(|cell| {
+                let scratch = &mut cell.borrow_mut();
+                index
                     .hierarchy
-                    .one_to_many(&index.buckets, &seeds, cutoff)
-                    .into_iter()
-                    .collect();
-                self.link_join(snaps, cutoff, walking_speed, &distances)
-            }
+                    .one_to_many(&index.buckets, &seeds, cutoff, scratch);
+                self.link_join(snaps, cutoff, walking_speed, scratch.best())
+            }),
             None => SEARCH_STATE.with(|cell| {
                 let state = &mut cell.borrow_mut();
                 self.bounded_dijkstra(&seeds, cutoff, state);
@@ -2132,10 +2135,9 @@ mod tests {
         // Seed like a snap would: an interior vertex, with a couple of offsets.
         for seeds in [vec![(0u32, 0.0)], vec![(1u32, 10.0), (2u32, 0.0)]] {
             net.bounded_dijkstra(&seeds, cutoff, &mut state);
-            let got: HashMap<u32, f64> = ch
-                .one_to_many(&buckets, &seeds, cutoff)
-                .into_iter()
-                .collect();
+            let mut scratch = crate::ch::ChScratch::default();
+            ch.one_to_many(&buckets, &seeds, cutoff, &mut scratch);
+            let got = scratch.best();
             for &target in &targets {
                 let expected = state.distance(target);
                 if expected <= cutoff + 1e-9 {

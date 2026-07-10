@@ -59,6 +59,29 @@ pub struct Buckets {
     cutoff: f64,
 }
 
+/// Reusable per-thread scratch for the bucket one-to-many query, mirroring the
+/// street search's `SearchState`: the maps are keyed by vertex and cleared
+/// (capacity kept) between queries, so a matrix's per-origin search reuses one
+/// worker allocation rather than a fresh `HashMap`/heap per call.
+#[derive(Default)]
+pub struct ChScratch {
+    /// The source-side bounded upward search's settled distances.
+    distances: HashMap<u32, f64>,
+    /// Pending `(distance bits, vertex)` for that search.
+    heap: BinaryHeap<Reverse<(u64, u32)>>,
+    /// The one-to-many result: `target vertex -> distance` within the cutoff.
+    best: HashMap<u32, f64>,
+}
+
+impl ChScratch {
+    /// The one-to-many result left by the last
+    /// [`one_to_many`](ContractionHierarchy::one_to_many) into this scratch:
+    /// `target vertex -> distance`.
+    pub fn best(&self) -> &HashMap<u32, f64> {
+        &self.best
+    }
+}
+
 /// A vertex's live adjacency during contraction: neighbour → (metres, middle),
 /// where `middle` is [`ORIGINAL`] for an original edge, else the shortcut's
 /// middle vertex. Parallel edges collapse to the shortest (ties keep the
@@ -354,12 +377,16 @@ impl ContractionHierarchy {
     }
 
     /// A **bounded** upward search from `seeds` (each `(vertex, initial
-    /// distance)`): the settled `(vertex, distance)` pairs with
-    /// `distance <= cutoff`, climbing the upward CSR. The sparse, seed-and-cutoff
-    /// form of [`settle`](Self::settle) that builds and queries buckets.
-    fn up_search(&self, seeds: &[(u32, f64)], cutoff: f64) -> Vec<(u32, f64)> {
-        let mut distances: HashMap<u32, f64> = HashMap::new();
-        let mut heap: BinaryHeap<Reverse<(u64, u32)>> = BinaryHeap::new();
+    /// distance)`), climbing the upward CSR: the settled `vertex -> distance`
+    /// pairs with `distance <= cutoff` are left in `scratch.distances`. The
+    /// sparse, seed-and-cutoff, pooled form of [`settle`](Self::settle) that
+    /// builds and queries buckets; `scratch` is cleared first and reused between
+    /// calls.
+    fn up_search(&self, seeds: &[(u32, f64)], cutoff: f64, scratch: &mut ChScratch) {
+        let distances = &mut scratch.distances;
+        let heap = &mut scratch.heap;
+        distances.clear();
+        heap.clear();
         for &(vertex, distance) in seeds {
             if distance <= cutoff + 1e-9
                 && distance < *distances.get(&vertex).unwrap_or(&f64::INFINITY)
@@ -385,18 +412,23 @@ impl ContractionHierarchy {
                 }
             }
         }
-        distances.into_iter().collect()
     }
 
     /// Builds one-to-many **buckets** for a fixed set of `targets` (vertex ids),
     /// each bounded by `cutoff`. The per-target upward searches are independent
-    /// and run in parallel; the results scatter into `entries[v]` =
-    /// `(target, distance(target, v))`. Built once and reused across sources by
-    /// [`one_to_many`](Self::one_to_many).
+    /// and run in parallel over a per-worker [`ChScratch`]; the results scatter
+    /// into `entries[v]` = `(target, distance(target, v))`. Built once and reused
+    /// across sources by [`one_to_many`](Self::one_to_many).
     pub fn buckets(&self, targets: &[u32], cutoff: f64) -> Buckets {
         let per_target: Vec<(u32, Vec<(u32, f64)>)> = targets
             .par_iter()
-            .map(|&target| (target, self.up_search(&[(target, 0.0)], cutoff)))
+            .map_init(ChScratch::default, |scratch, &target| {
+                self.up_search(&[(target, 0.0)], cutoff, scratch);
+                (
+                    target,
+                    scratch.distances.iter().map(|(&v, &d)| (v, d)).collect(),
+                )
+            })
             .collect();
         let mut entries: Vec<Vec<(u32, f64)>> = vec![Vec::new(); self.rank.len()];
         for (target, settled) in per_target {
@@ -408,13 +440,14 @@ impl ContractionHierarchy {
     }
 
     /// One-to-many shortest distances from `seeds` (a snapped source) to every
-    /// bucketed target within `cutoff`. For each vertex the source's bounded
-    /// upward search settles, the buckets give the targets reachable through it,
-    /// and each target keeps
-    /// `min(distance(source, vertex) + distance(target, vertex))` — the bucket-CH
-    /// meeting. Bounding both halves by `cutoff` never drops a within-cutoff
-    /// target, since the meeting vertex's distance from each side is a prefix of
-    /// the (`<= cutoff`) total. Returns `(target, distance)` pairs.
+    /// bucketed target within `cutoff`, left in `scratch.best`
+    /// ([`ChScratch::best`]). For each vertex the source's bounded upward search
+    /// settles, the buckets give the targets reachable through it, and each
+    /// target keeps `min(distance(source, vertex) + distance(target, vertex))` —
+    /// the bucket-CH meeting. Bounding both halves by `cutoff` never drops a
+    /// within-cutoff target, since the meeting vertex's distance from each side is
+    /// a prefix of the (`<= cutoff`) total. `scratch` is cleared first and reused
+    /// between calls.
     ///
     /// # Panics
     ///
@@ -427,15 +460,20 @@ impl ContractionHierarchy {
         buckets: &Buckets,
         seeds: &[(u32, f64)],
         cutoff: f64,
-    ) -> Vec<(u32, f64)> {
+        scratch: &mut ChScratch,
+    ) {
         assert!(
             cutoff <= buckets.cutoff + 1e-9,
             "one_to_many cutoff {cutoff} exceeds the bucket build cutoff {}; \
              rebuild the buckets for at least this cutoff",
             buckets.cutoff
         );
-        let mut best: HashMap<u32, f64> = HashMap::new();
-        for (vertex, source_distance) in self.up_search(seeds, cutoff) {
+        self.up_search(seeds, cutoff, scratch);
+        let ChScratch {
+            distances, best, ..
+        } = scratch;
+        best.clear();
+        for (&vertex, &source_distance) in distances.iter() {
             for &(target, target_distance) in &buckets.entries[vertex as usize] {
                 let candidate = source_distance + target_distance;
                 if candidate <= cutoff + 1e-9 {
@@ -445,7 +483,6 @@ impl ContractionHierarchy {
                 }
             }
         }
-        best.into_iter().collect()
     }
 
     /// The upward-tree vertex path `origin..=peak` following predecessors of the
@@ -799,10 +836,9 @@ mod tests {
         let targets: Vec<u32> = (0..vertex_count).collect();
         let buckets = ch.buckets(&targets, cutoff);
         let reference = reference_seeds(vertex_count, &offsets, &targets_csr, &meters, seeds);
-        let got: HashMap<u32, f64> = ch
-            .one_to_many(&buckets, seeds, cutoff)
-            .into_iter()
-            .collect();
+        let mut scratch = ChScratch::default();
+        ch.one_to_many(&buckets, seeds, cutoff, &mut scratch);
+        let got = scratch.best();
         for target in 0..vertex_count {
             let expected = reference[target as usize];
             if expected.is_finite() && expected <= cutoff + 1e-9 {
@@ -886,10 +922,9 @@ mod tests {
         let targets: Vec<u32> = (0..16).collect();
         let buckets = ch.buckets(&targets, 100.0);
         let reference = reference_seeds(16, &offsets, &targets_csr, &meters, &[(0, 0.0)]);
-        let got: HashMap<u32, f64> = ch
-            .one_to_many(&buckets, &[(0, 0.0)], 3.0)
-            .into_iter()
-            .collect();
+        let mut scratch = ChScratch::default();
+        ch.one_to_many(&buckets, &[(0, 0.0)], 3.0, &mut scratch);
+        let got = scratch.best();
         for target in 0..16u32 {
             let expected = reference[target as usize];
             if expected <= 3.0 + 1e-9 {
@@ -911,7 +946,7 @@ mod tests {
         let (offsets, targets_csr, meters) = csr(16, &edges);
         let ch = ContractionHierarchy::build(16, &offsets, &targets_csr, &meters);
         let buckets = ch.buckets(&(0..16).collect::<Vec<_>>(), 3.0);
-        ch.one_to_many(&buckets, &[(0, 0.0)], 10.0);
+        ch.one_to_many(&buckets, &[(0, 0.0)], 10.0, &mut ChScratch::default());
     }
 
     #[test]
