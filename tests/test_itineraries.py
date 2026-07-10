@@ -213,3 +213,90 @@ def test_pareto_and_router_options_are_validated(network):
             candidates="pareto",
             router="tbtr",
         )
+
+
+def _option_summaries(itineraries):
+    return sorted(
+        (int(group["arrival"].max()), int((group["leg_type"] == "transit").sum()))
+        for _, group in itineraries.groupby("option")
+    )
+
+
+def test_relaxed_itineraries_reduce_to_pareto_at_zero_slack(network):
+    # slack_seconds=0 gives back the strict pareto options exactly.
+    origin, destination = "1370104", "4960238"
+    common = dict(max_transfers=4, bucket=1e-6)
+    pareto = DetailedItineraries(
+        network,
+        [origin],
+        [destination],
+        "2022-02-22",
+        "08:30:00",
+        candidates="pareto",
+        **common,
+    )
+    relaxed = DetailedItineraries(
+        network,
+        [origin],
+        [destination],
+        "2022-02-22",
+        "08:30:00",
+        candidates="relaxed",
+        slack_seconds=0,
+        **common,
+    )
+    assert _option_summaries(relaxed) == _option_summaries(pareto)
+
+
+def test_relaxed_itineraries_widen_the_pareto_options(network):
+    # A wide slack adds suboptimal alternatives per OD; max_options caps them
+    # while keeping the frontier.
+    origin, destination = "1370104", "4960238"
+
+    def options(**kw):
+        return DetailedItineraries(
+            network,
+            [origin],
+            [destination],
+            "2022-02-22",
+            "08:30:00",
+            max_transfers=4,
+            **kw,
+        )["option"].nunique()
+
+    pareto = options(candidates="pareto")
+    widened = options(candidates="relaxed", slack_seconds=3600)
+    assert widened > pareto
+    capped = options(candidates="relaxed", slack_seconds=3600, max_options=pareto)
+    assert capped == pareto
+
+
+def test_relaxed_itinerary_options_are_validated(network):
+    stops = (["4810551"], ["1250551"])
+    with pytest.raises(ValueError, match="requires candidates='pareto'"):
+        DetailedItineraries(
+            network,
+            *stops,
+            "2022-02-22",
+            "08:30:00",
+            candidates="relaxed",
+            router="tbtr",
+        )
+    with pytest.raises(ValueError, match="slack"):
+        DetailedItineraries(
+            network,
+            *stops,
+            "2022-02-22",
+            "08:30:00",
+            candidates="relaxed",
+            slack_seconds=-5,
+        )
+    with pytest.raises(ValueError, match="max_options"):
+        DetailedItineraries(
+            network,
+            *stops,
+            "2022-02-22",
+            "08:30:00",
+            candidates="relaxed",
+            max_options=0,
+        )

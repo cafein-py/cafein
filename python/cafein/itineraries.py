@@ -1,5 +1,7 @@
 """Detailed door-to-door itineraries as a GeoDataFrame."""
 
+import math
+
 import geopandas as gpd
 import pandas as pd
 import shapely
@@ -32,8 +34,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
 
     A GeoDataFrame with one row per leg of every alternative journey
     between each origin and each destination — the time-optimal
-    (arrival, rides) set by default, or the (arrival, emissions) set
-    with ``candidates="pareto"``: ``from_id`` and ``to_id``
+    (arrival, rides) set by default, the (arrival, emissions) set with
+    ``candidates="pareto"``, or that set widened to nearby suboptimal
+    journeys with ``candidates="relaxed"``: ``from_id`` and ``to_id``
     (the OD pair), ``option`` (the journey alternative, numbered per OD
     pair), ``segment`` (the leg's position in that journey), and the leg
     itself — ``leg_type`` (``access``, ``transit``, ``transfer``,
@@ -84,12 +87,14 @@ class DetailedItineraries(gpd.GeoDataFrame):
     components : list of str (optional)
         The life-cycle components to include (default: all four); see
         ``cafein.emissions.annotate``.
-    candidates : {"time", "pareto"} (optional, default: "time")
+    candidates : {"time", "pareto", "relaxed"} (optional, default: "time")
         Which alternatives to return per OD pair. ``"time"`` draws the
         time-optimal (arrival, rides) journeys of the RAPTOR engine;
         ``"pareto"`` draws the (arrival, emissions) journeys of the
         McRAPTOR engine — the cleaner-but-slower alternatives the
-        time-optimal set misses — at the single given departure.
+        time-optimal set misses — at the single given departure;
+        ``"relaxed"`` widens the ``"pareto"`` set by ``slack_seconds`` to
+        the suboptimal journeys arriving within the band.
     bucket : float (optional, default: 25.0)
         The emissions bucket width in grams CO₂e for the ``"pareto"``
         search's arrival tie-break; smaller keeps finer emission
@@ -98,7 +103,18 @@ class DetailedItineraries(gpd.GeoDataFrame):
         The engine backing ``candidates="pareto"`` between stops:
         multicriteria RAPTOR, or trip-based (``"tbtr"``). ``"tbtr"``
         requires ``candidates="pareto"`` with stop-id origins and
-        destinations.
+        destinations; ``"relaxed"`` requires ``"raptor"``.
+    slack_seconds : float (optional, default: 300.0)
+        The time-slack band in seconds for ``candidates="relaxed"``: a
+        journey is kept even when a cleaner or simpler one dominates it,
+        as long as that dominator is not more than ``slack_seconds``
+        earlier. ``0`` reproduces ``candidates="pareto"``. Only used with
+        ``candidates="relaxed"``.
+    max_options : int (optional, default: None)
+        A cap on the suboptimal alternatives kept per OD pair. The strict
+        frontier is always returned; the suboptimal journeys nearest to it
+        fill the rest up to ``max_options``. ``None`` returns every
+        journey within the slack. Only used with ``candidates="relaxed"``.
     geometries : bool (optional, default: True)
         Attach each leg's geometry. Turn off to skip the geometry work
         when only the leg records are needed.
@@ -126,6 +142,8 @@ class DetailedItineraries(gpd.GeoDataFrame):
         candidates="time",
         bucket=25.0,
         router="raptor",
+        slack_seconds=300.0,
+        max_options=None,
         geometries=True,
         walking_speed_kmph=None,
         max_walking_time=None,
@@ -148,6 +166,8 @@ class DetailedItineraries(gpd.GeoDataFrame):
             candidates=candidates,
             bucket=bucket,
             router=router,
+            slack_seconds=slack_seconds,
+            max_options=max_options,
             geometries=geometries,
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
@@ -169,6 +189,8 @@ def _itineraries_frame(
     candidates,
     bucket,
     router,
+    slack_seconds,
+    max_options,
     geometries,
     walking_speed_kmph,
     max_walking_time,
@@ -186,18 +208,32 @@ def _itineraries_frame(
     walk = (walking_speed_kmph, max_walking_time, max_snap_distance)
     if kind == "stops" and any(option is not None for option in walk):
         raise ValueError("walking options apply to point origins and destinations")
-    if candidates not in ("time", "pareto"):
-        raise ValueError("candidates must be 'time' or 'pareto'")
+    if candidates not in ("time", "pareto", "relaxed"):
+        raise ValueError("candidates must be 'time', 'pareto', or 'relaxed'")
     if router not in ("raptor", "tbtr"):
         raise ValueError("router must be 'raptor' or 'tbtr'")
     if router == "tbtr" and (candidates != "pareto" or kind != "stops"):
         raise ValueError("router='tbtr' requires candidates='pareto' with stop ids")
-    # The emissions-Pareto (McRAPTOR) candidates need the per-trip factor vector;
+    if candidates == "relaxed":
+        if not (
+            isinstance(slack_seconds, (int, float))
+            and math.isfinite(slack_seconds)
+            and slack_seconds >= 0
+        ):
+            raise ValueError("slack_seconds must be a non-negative number of seconds")
+        if max_options is not None and (
+            not isinstance(max_options, int)
+            or isinstance(max_options, bool)
+            or max_options < 1
+        ):
+            raise ValueError("max_options must be a positive integer or None")
+    multicriteria = candidates in ("pareto", "relaxed")
+    slack = float(slack_seconds) if candidates == "relaxed" else 0.0
+    options = max_options if candidates == "relaxed" else None
+    # The multicriteria (McRAPTOR) candidates need the per-trip factor vector;
     # the time candidates get their emissions from the post-hoc annotation only.
     trip_factors = (
-        emissions.trip_factors(network, factors, components)
-        if candidates == "pareto"
-        else None
+        emissions.trip_factors(network, factors, components) if multicriteria else None
     )
 
     records = []
@@ -216,6 +252,8 @@ def _itineraries_frame(
                 candidates,
                 router,
                 bucket,
+                slack,
+                options,
                 trip_factors,
             )
             if not journeys:
@@ -257,12 +295,14 @@ def _route(
     candidates,
     router,
     bucket,
+    slack,
+    options,
     trip_factors,
 ):
     """The Pareto-optimal journeys of one OD pair — the time-optimal
     (arrival, rides) set, or the (arrival, emissions) McRAPTOR set with
-    ``candidates="pareto"``."""
-    if candidates == "pareto":
+    ``candidates="pareto"`` / ``"relaxed"``."""
+    if candidates in ("pareto", "relaxed"):
         return _route_pareto(
             network,
             kind,
@@ -275,6 +315,8 @@ def _route(
             walk,
             router,
             bucket,
+            slack,
+            options,
             trip_factors,
         )
     if kind == "points":
@@ -307,10 +349,13 @@ def _route_pareto(
     walk,
     router,
     bucket,
+    slack,
+    options,
     trip_factors,
 ):
     """The (arrival, emissions) McRAPTOR journeys of one OD pair — the
-    cleaner-but-slower alternatives the time-optimal set misses. Single
+    cleaner-but-slower alternatives the time-optimal set misses, widened by
+    ``slack`` seconds to the suboptimal ones within the band. Single
     departure (``window=None``)."""
     from cafein.network import _walk_options
 
@@ -326,6 +371,8 @@ def _route_pareto(
             bucket,
             *_walk_options(*walk),
             geometries,
+            slack,
+            options,
         )
     return network._core.mc_route_between_stops(
         origin_key,
@@ -339,6 +386,8 @@ def _route_pareto(
         router,
         *_walk_options(*walk),
         geometries,
+        slack,
+        options,
     )
 
 
