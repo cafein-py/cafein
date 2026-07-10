@@ -261,6 +261,12 @@ class TransportNetwork:
         return self._core.ultra_shortcuts()
 
     @property
+    def has_tbtr_transfers(self):
+        """Whether a cached time-only TBTR transfer set is present
+        (see ``compute_tbtr_transfers``)."""
+        return self._core.has_tbtr_transfers
+
+    @property
     def stops(self):
         """The stops as ``(stop_id, latitude, longitude)`` tuples."""
         return self._core.stops
@@ -393,6 +399,24 @@ class TransportNetwork:
         return self._core.compute_ultra_shortcuts(
             walking_speed_kmph, max_transfer_time, min_departure, max_departure
         )
+
+    def compute_tbtr_transfers(self, date):
+        """Precompute and cache the trip-based (TBTR) transfer set for `date`.
+
+        The dominance-aware transfer set is TBTR's amortised asset: caching it
+        lets repeated single-departure stop ``travel_time_matrix(router="tbtr")``
+        calls on the same date reuse it instead of rebuilding it every call —
+        the "build once, query many" workload the trip-based engine is built
+        for. A query on a different date rebuilds ad hoc. The cache is held in
+        memory only (not persisted) and re-keyed when computed for a new date;
+        ``has_tbtr_transfers`` reports whether one is present.
+
+        Parameters
+        ----------
+        date : str
+            Service date as ``YYYY-MM-DD``.
+        """
+        return self._core.compute_tbtr_transfers(date)
 
     def set_leg_geometries(self, *leg_geometries):
         """Install per-trip leg geometries.

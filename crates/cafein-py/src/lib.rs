@@ -56,6 +56,12 @@ struct TransportNetwork {
     /// A fingerprint of the per-trip emission-factor vector the McULTRA set was
     /// built with; a query using different factors falls back to the closure.
     mcultra_factor: Option<u64>,
+    /// The cached time-only TBTR transfer set, when computed
+    /// (`compute_tbtr_transfers`), keyed by the date string it was built for.
+    /// A `router="tbtr"` single-departure stop time matrix on the same date
+    /// reuses it (build once, query many); other queries rebuild ad-hoc. Held
+    /// in memory only (not yet persisted).
+    tbtr_time_transfers: Option<(String, cafein_core::tbtr::TransferSet)>,
     geometry: Option<TripGeometry>,
     leg_geometry: Option<LegGeometry>,
     streets: Option<StreetNetwork>,
@@ -966,6 +972,7 @@ fn assemble((artifact, streets, streets_bytes_read): LoadedArtifact) -> Transpor
         mcultra_transfers,
         mcultra_window,
         mcultra_factor,
+        tbtr_time_transfers: None,
         geometry,
         leg_geometry,
         streets,
@@ -1272,6 +1279,7 @@ impl TransportNetwork {
             mcultra_transfers: None,
             mcultra_window: None,
             mcultra_factor: None,
+            tbtr_time_transfers: None,
             geometry: None,
             leg_geometry: None,
             streets: None,
@@ -1558,6 +1566,32 @@ impl TransportNetwork {
             }
             shortcuts
         })
+    }
+
+    /// Precompute and cache the trip-based (TBTR) transfer set for `date`.
+    ///
+    /// The dominance-aware transfer set is TBTR's amortised asset — "build
+    /// once, query many". Caching it lets repeated single-departure stop
+    /// `travel_time_matrix(router="tbtr")` calls on the same date reuse it
+    /// instead of rebuilding it every call, which is where the trip-based engine
+    /// pays off: large batches of queries on one network and date. A query on a
+    /// different date rebuilds ad hoc. Held in memory only (not persisted);
+    /// recomputing for a new date replaces the cached set.
+    fn compute_tbtr_transfers(&mut self, py: Python<'_>, date: &str) -> PyResult<()> {
+        let active = self.active_services(date)?;
+        let previous = self.active_services_previous(date)?;
+        let timetable = &self.build.timetable;
+        let set =
+            py.allow_threads(|| TbtrEngine::transfers_for_date(timetable, &active, &previous));
+        self.tbtr_time_transfers = Some((date.to_string(), set));
+        Ok(())
+    }
+
+    /// Whether a cached time-only TBTR transfer set is present
+    /// (`compute_tbtr_transfers`).
+    #[getter]
+    fn has_tbtr_transfers(&self) -> bool {
+        self.tbtr_time_transfers.is_some()
     }
 
     /// Compute the ULTRA intermediate-transfer shortcuts and store them.
@@ -2651,12 +2685,29 @@ impl TransportNetwork {
         };
         let flat: Vec<u32> = py.allow_threads(|| {
             let rows: Vec<Vec<Option<u32>>> = if router == "tbtr" {
-                let engine = TbtrEngine::for_date(
-                    &self.build.timetable,
-                    &self.transfers,
-                    &active_services,
-                    &active_services_previous,
-                );
+                // Reuse the cached transfer set when it was precomputed for this
+                // date (`compute_tbtr_transfers`); one clone per matrix call, vs
+                // rebuilding the dominance-aware set. Otherwise build ad hoc.
+                let cached = self
+                    .tbtr_time_transfers
+                    .as_ref()
+                    .filter(|(cached_date, _)| cached_date.as_str() == date)
+                    .map(|(_, set)| set.clone());
+                let engine = match cached {
+                    Some(set) => TbtrEngine::from_set(
+                        &self.build.timetable,
+                        &self.transfers,
+                        &active_services,
+                        &active_services_previous,
+                        set,
+                    ),
+                    None => TbtrEngine::for_date(
+                        &self.build.timetable,
+                        &self.transfers,
+                        &active_services,
+                        &active_services_previous,
+                    ),
+                };
                 let accesses: Vec<Vec<(StopIdx, u32)>> =
                     origins.iter().map(|&origin| vec![(origin, 0)]).collect();
                 engine.one_to_all_many(departure, &accesses, max_transfers)
