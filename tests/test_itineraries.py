@@ -158,3 +158,58 @@ def test_inputs_must_match_and_be_valid(network):
         )
     with pytest.raises(ValueError, match="required for detailed itineraries"):
         DetailedItineraries(network, None, ["1250551"], "2022-02-22", "08:30:00")
+
+
+def test_pareto_candidates_add_the_cleaner_slower_journey(network):
+    # The measured blind spot (see test_frontier/test_matrices): the time-optimal
+    # candidates miss the cleaner-but-slower journey the (arrival, emissions)
+    # McRAPTOR candidates find. DetailedItineraries surfaces it per OD with
+    # candidates="pareto".
+    origin, destination = "1370104", "4960238"
+
+    def cleanest(itineraries):
+        best = None
+        for _, group in itineraries.groupby("option"):
+            grams = group.loc[group["leg_type"] == "transit", "emissions"].sum()
+            best = grams if best is None else min(best, grams)
+        return best
+
+    time_it = DetailedItineraries(
+        network, [origin], [destination], "2022-02-22", "08:30:00", max_transfers=4
+    )
+    pareto_it = DetailedItineraries(
+        network,
+        [origin],
+        [destination],
+        "2022-02-22",
+        "08:30:00",
+        max_transfers=4,
+        candidates="pareto",
+        bucket=1e-6,
+    )
+    assert isinstance(pareto_it, gpd.GeoDataFrame)
+    assert (pareto_it["option"] >= 0).all()
+    assert cleanest(pareto_it) < cleanest(time_it)
+
+
+def test_pareto_and_router_options_are_validated(network):
+    points = point_frame(network, [("A", "4810551")])
+    with pytest.raises(ValueError, match="candidates must be"):
+        DetailedItineraries(
+            network,
+            ["4810551"],
+            ["1250551"],
+            "2022-02-22",
+            "08:30:00",
+            candidates="nonsense",
+        )
+    with pytest.raises(ValueError, match="requires candidates='pareto' with stop"):
+        DetailedItineraries(
+            network,
+            points,
+            points,
+            "2022-02-22",
+            "08:30:00",
+            candidates="pareto",
+            router="tbtr",
+        )

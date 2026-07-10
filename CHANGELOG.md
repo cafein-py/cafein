@@ -122,6 +122,17 @@
   emissions than the time-candidate objective, whose per-round
   arrivals never hold a cleaner-but-slower journey.
 
+- Emissions alternatives in ``DetailedItineraries`` —
+  ``DetailedItineraries(candidates="pareto")`` draws each OD pair's
+  alternatives (the ``option`` column) from the multicriteria
+  (arrival, emissions) McRAPTOR search at the given departure, in
+  place of the time-optimal engine, so the alternatives include the
+  cleaner-but-slower journeys the time candidates miss. ``router``
+  selects RAPTOR or trip-based (``"tbtr"``, stop ids only) and
+  ``bucket`` sets the emissions bucket width, mirroring
+  ``journey_frontier`` and ``TravelCostMatrix``; the default
+  ``candidates="time"`` keeps the (arrival, rides) alternatives.
+
 - The exact time × emissions Pareto set:
   ``cafein.exhaustive_frontier(network, origin, destination, date,
   departure)`` enumerates the mathematically complete frontier for one
