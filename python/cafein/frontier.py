@@ -3,7 +3,8 @@
 The frontier answers "what is the lowest-CO₂ way there, and what does it
 cost in time — and money?" from a candidate journey set annotated with
 emissions (and fares) post hoc, reduced to the rows no candidate beats
-on every annotated criterion. Two candidate sets are available:
+on every annotated criterion. The candidate set is selected by
+``candidates``:
 
 - ``candidates="time"``: the range-RAPTOR set — journeys optimal in
   (departure, arrival, rides). A journey that is slower *and* rides
@@ -17,6 +18,10 @@ on every annotated criterion. Two candidate sets are available:
   also holds the cleaner-but-slower-with-more-rides journeys the time
   candidates provably miss; ``exhaustive_frontier`` is its exact,
   brute-force reference.
+- ``candidates="relaxed"``: the ``"pareto"`` set widened by a time slack
+  to the suboptimal journeys arriving within the band.
+- ``candidates="diverse"``: distinct-corridor alternatives found by
+  iterative route penalization, riding disjoint line sets.
 """
 
 import math
@@ -72,7 +77,9 @@ def journey_frontier(
     misses; emissions are compared at ``bucket`` grams during the
     search and re-annotated exactly afterwards. ``candidates="relaxed"``
     widens that set by ``slack_seconds`` to also keep the suboptimal
-    journeys arriving within the band (capped by ``max_options``).
+    journeys arriving within the band (capped by ``max_options``), and
+    ``candidates="diverse"`` returns ``max_options`` distinct-corridor
+    alternatives by iterative route penalization.
 
     With a fare structure (`fares`), every candidate is also priced,
     the frame gains a ``fare`` column, and the fare joins the frontier
@@ -107,14 +114,18 @@ def journey_frontier(
     candidates : str (optional, default: "time")
         The candidate journey set: ``"time"`` for the range-RAPTOR
         time-optimal journeys, ``"pareto"`` for the McRAPTOR journeys
-        Pareto-optimal in (departure, arrival, emissions), or
+        Pareto-optimal in (departure, arrival, emissions),
         ``"relaxed"`` for the ``"pareto"`` set widened by
         ``slack_seconds`` to the suboptimal journeys arriving within the
         band — the "a bit slower but a real alternative" options that
-        strict Pareto drops. Both multicriteria sets require a network
-        with trip distances; journeys riding a trip without a resolved
-        emission factor never enter them. Coordinate queries route
-        door-to-door either way and include the walking-only journey.
+        strict Pareto drops — or ``"diverse"`` for ``max_options``
+        distinct-corridor alternatives, found by iterative route
+        penalization (the fastest journey, then the fastest avoiding its
+        routes, and so on) so the options ride disjoint line sets. All
+        three multicriteria sets require a network with trip distances;
+        journeys riding a trip without a resolved emission factor never
+        enter them. Coordinate queries route door-to-door either way and
+        include the walking-only journey.
     bucket : float (optional, default: 25.0)
         The emissions bucket width in grams CO₂e of the pareto search:
         journeys within one bucket of each other count as equal on
@@ -125,8 +136,8 @@ def journey_frontier(
         immediately; McTBTR (``"tbtr"``, stop ids only) precomputes the
         date's multicriteria transfer set first — slower for a single
         pair, built for batch reuse — and returns the same journeys.
-        Only used with ``candidates="pareto"``; ``"relaxed"`` requires
-        ``"raptor"``.
+        Only used with ``candidates="pareto"``; ``"relaxed"`` and
+        ``"diverse"`` require ``"raptor"``.
     slack_seconds : float (optional, default: 300.0)
         The time-slack band in seconds for ``candidates="relaxed"``: a
         journey is kept even when a cleaner or simpler one dominates it,
@@ -134,12 +145,15 @@ def journey_frontier(
         earlier. ``0`` reproduces the strict ``"pareto"`` frontier. Only
         used with ``candidates="relaxed"``.
     max_options : int (optional, default: None)
-        A cap on the suboptimal alternatives kept. The strict frontier is
-        always returned in full; the suboptimal journeys nearest to it
-        (smallest time-gap) fill the rest up to ``max_options``, so the
-        result can exceed ``max_options`` when the frontier itself is
-        larger. ``None`` returns every journey within the slack. Only
-        used with ``candidates="relaxed"``.
+        For ``candidates="relaxed"``, a cap on the suboptimal
+        alternatives kept: the strict frontier is always returned in
+        full and the suboptimal journeys nearest to it (smallest
+        time-gap) fill the rest up to ``max_options``, so the result can
+        exceed it when the frontier is larger; ``None`` returns every
+        journey within the slack. For ``candidates="diverse"``, the
+        number of distinct-corridor alternatives to return (``None``
+        defaults to 3); the search may return fewer when disjoint
+        corridors run out. Unused for ``"time"`` and ``"pareto"``.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         Street-search options for the walking access/egress, as in
         ``route_between_coordinates``. For stop origins/destinations they
@@ -159,25 +173,27 @@ def journey_frontier(
         on any criterion never are), and ``journey``, the annotated
         journey dict as returned by the routing calls.
     """
-    if candidates not in ("time", "pareto", "relaxed"):
-        raise ValueError("candidates must be 'time', 'pareto', or 'relaxed'")
+    if candidates not in ("time", "pareto", "relaxed", "diverse"):
+        raise ValueError("candidates must be 'time', 'pareto', 'relaxed', or 'diverse'")
     if router not in ("raptor", "tbtr"):
         raise ValueError("router must be 'raptor' or 'tbtr'")
     if router == "tbtr" and candidates != "pareto":
         raise ValueError("router='tbtr' requires candidates='pareto'")
-    if candidates == "relaxed":
-        if not (
-            isinstance(slack_seconds, (int, float))
-            and math.isfinite(slack_seconds)
-            and slack_seconds >= 0
-        ):
-            raise ValueError("slack_seconds must be a non-negative number of seconds")
-        if max_options is not None and (
+    if candidates == "relaxed" and not (
+        isinstance(slack_seconds, (int, float))
+        and math.isfinite(slack_seconds)
+        and slack_seconds >= 0
+    ):
+        raise ValueError("slack_seconds must be a non-negative number of seconds")
+    if candidates in ("relaxed", "diverse") and (
+        max_options is not None
+        and (
             not isinstance(max_options, int)
             or isinstance(max_options, bool)
             or max_options < 1
-        ):
-            raise ValueError("max_options must be a positive integer or None")
+        )
+    ):
+        raise ValueError("max_options must be a positive integer or None")
     slack = float(slack_seconds) if candidates == "relaxed" else 0.0
     options = max_options if candidates == "relaxed" else None
     multicriteria = candidates in ("pareto", "relaxed")
@@ -186,7 +202,27 @@ def journey_frontier(
         raise ValueError(
             "origin and destination must both be stop ids or both be coordinates"
         )
-    if stops[0]:
+    if candidates == "diverse":
+        trip_factors = emissions.trip_factors(network, factors, components)
+        journeys = _diverse_journeys(
+            network,
+            stops[0],
+            origin,
+            destination,
+            date,
+            departure,
+            window,
+            max_transfers,
+            factors,
+            components,
+            bucket,
+            router,
+            trip_factors,
+            (walking_speed_kmph, max_walking_time, max_snap_distance),
+            geometries,
+            max_options if max_options is not None else 3,
+        )
+    elif stops[0]:
         from cafein.network import _walk_options
 
         if multicriteria:
@@ -287,6 +323,93 @@ def journey_frontier(
     return (
         frame[ordered].sort_values(["travel_time", "emissions"]).reset_index(drop=True)
     )
+
+
+def _diverse_journeys(
+    network,
+    is_stop,
+    origin,
+    destination,
+    date,
+    departure,
+    window,
+    max_transfers,
+    factors,
+    components,
+    bucket,
+    router,
+    trip_factors,
+    walk,
+    geometries,
+    k,
+):
+    """``k`` route-disjoint alternatives by iterative route penalization:
+    the shortest-travel-time journey, then the shortest one avoiding its
+    routes, and so on until ``k`` are found or the search dries up — the same
+    order the returned frame sorts by. Each round bans the routes every
+    selected journey has ridden, so the alternatives use disjoint line sets.
+    The round's journeys are annotated so the pick breaks travel-time ties
+    toward the cleaner corridor."""
+    from cafein.network import _walk_options
+
+    def search(banned):
+        if is_stop:
+            return network._core.mc_route_between_stops(
+                origin,
+                destination,
+                date,
+                departure,
+                trip_factors,
+                window,
+                max_transfers,
+                bucket,
+                router,
+                *_walk_options(*walk),
+                geometries,
+                0.0,
+                None,
+                banned,
+            )
+        return network._core.mc_route_between_coordinates(
+            tuple(origin),
+            tuple(destination),
+            date,
+            departure,
+            trip_factors,
+            window,
+            max_transfers,
+            bucket,
+            *_walk_options(*walk),
+            geometries,
+            0.0,
+            None,
+            banned,
+        )
+
+    banned = []
+    selected = []
+    for _ in range(k):
+        journeys = search(banned)
+        if not journeys:
+            break
+        emissions.annotate(journeys, network, factors, components)
+        pick = min(
+            journeys,
+            key=lambda journey: (
+                journey["arrival"] - journey["departure"],
+                journey["emissions"] if journey["emissions"] is not None else math.inf,
+            ),
+        )
+        selected.append(pick)
+        routes = {
+            leg["route_id"]
+            for leg in pick["legs"]
+            if leg["type"] == "transit" and leg.get("route_id") is not None
+        }
+        if not routes:
+            break
+        banned = banned + [route for route in routes if route not in banned]
+    return selected
 
 
 def exhaustive_frontier(

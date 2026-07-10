@@ -1365,7 +1365,16 @@ mod tests {
             .map(|point| (point.arrival, point.grams, point.rides))
             .collect();
         let raptor = mcraptor::route(
-            &view, timetable, footpaths, geometry, factors, &request, 1e-6, 0, None,
+            &view,
+            timetable,
+            footpaths,
+            geometry,
+            factors,
+            &request,
+            1e-6,
+            0,
+            None,
+            &[],
         );
         assert_eq!(triples(&raptor, geometry, factors), oracle, "mcraptor");
         let engine = McTbtrEngine::for_date(
