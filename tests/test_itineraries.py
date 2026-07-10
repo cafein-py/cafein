@@ -300,3 +300,72 @@ def test_relaxed_itinerary_options_are_validated(network):
             candidates="relaxed",
             max_options=0,
         )
+
+
+def _itinerary_corridors(itineraries):
+    return [
+        frozenset(group.loc[group["leg_type"] == "transit", "route_id"])
+        for _, group in itineraries.groupby("option")
+    ]
+
+
+def test_diverse_itineraries_are_route_disjoint(network):
+    # A pair with several corridors: each option rides a route set disjoint
+    # from the others, ordered fastest-first.
+    origin, destination = "1370104", "4960238"
+    itineraries = DetailedItineraries(
+        network,
+        [origin],
+        [destination],
+        "2022-02-22",
+        "08:30:00",
+        max_transfers=6,
+        candidates="diverse",
+        max_options=3,
+    )
+    corridors = _itinerary_corridors(itineraries)
+    assert len(corridors) >= 2
+    for i, first in enumerate(corridors):
+        for second in corridors[i + 1 :]:
+            assert first.isdisjoint(second)
+    arrivals = [
+        int(group["arrival"].max()) for _, group in itineraries.groupby("option")
+    ]
+    assert arrivals == sorted(arrivals)
+
+
+def test_diverse_itineraries_stop_at_a_single_corridor(network):
+    # Only the K train reaches this pair; banning it leaves nothing, so a
+    # request for five alternatives returns the one corridor.
+    itineraries = DetailedItineraries(
+        network,
+        ["4810551"],
+        ["1250551"],
+        "2022-02-22",
+        "08:30:00",
+        candidates="diverse",
+        max_options=5,
+    )
+    assert itineraries["option"].nunique() == 1
+
+
+def test_diverse_itinerary_options_are_validated(network):
+    stops = (["4810551"], ["1250551"])
+    with pytest.raises(ValueError, match="requires candidates='pareto'"):
+        DetailedItineraries(
+            network,
+            *stops,
+            "2022-02-22",
+            "08:30:00",
+            candidates="diverse",
+            router="tbtr",
+        )
+    with pytest.raises(ValueError, match="max_options"):
+        DetailedItineraries(
+            network,
+            *stops,
+            "2022-02-22",
+            "08:30:00",
+            candidates="diverse",
+            max_options=0,
+        )

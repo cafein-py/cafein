@@ -35,8 +35,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
     A GeoDataFrame with one row per leg of every alternative journey
     between each origin and each destination — the time-optimal
     (arrival, rides) set by default, the (arrival, emissions) set with
-    ``candidates="pareto"``, or that set widened to nearby suboptimal
-    journeys with ``candidates="relaxed"``: ``from_id`` and ``to_id``
+    ``candidates="pareto"``, that set widened to nearby suboptimal
+    journeys with ``candidates="relaxed"``, or distinct-corridor options
+    with ``candidates="diverse"``: ``from_id`` and ``to_id``
     (the OD pair), ``option`` (the journey alternative, numbered per OD
     pair), ``segment`` (the leg's position in that journey), and the leg
     itself — ``leg_type`` (``access``, ``transit``, ``transfer``,
@@ -87,14 +88,18 @@ class DetailedItineraries(gpd.GeoDataFrame):
     components : list of str (optional)
         The life-cycle components to include (default: all four); see
         ``cafein.emissions.annotate``.
-    candidates : {"time", "pareto", "relaxed"} (optional, default: "time")
+    candidates : {"time", "pareto", "relaxed", "diverse"} (default: "time")
         Which alternatives to return per OD pair. ``"time"`` draws the
         time-optimal (arrival, rides) journeys of the RAPTOR engine;
         ``"pareto"`` draws the (arrival, emissions) journeys of the
         McRAPTOR engine — the cleaner-but-slower alternatives the
         time-optimal set misses — at the single given departure;
         ``"relaxed"`` widens the ``"pareto"`` set by ``slack_seconds`` to
-        the suboptimal journeys arriving within the band.
+        the suboptimal journeys arriving within the band; ``"diverse"``
+        returns ``max_options`` distinct-corridor alternatives, found by
+        iterative route penalization (the fastest journey, then the
+        fastest avoiding its routes, and so on) so the options ride
+        disjoint line sets.
     bucket : float (optional, default: 25.0)
         The emissions bucket width in grams CO₂e for the ``"pareto"``
         search's arrival tie-break; smaller keeps finer emission
@@ -103,7 +108,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         The engine backing ``candidates="pareto"`` between stops:
         multicriteria RAPTOR, or trip-based (``"tbtr"``). ``"tbtr"``
         requires ``candidates="pareto"`` with stop-id origins and
-        destinations; ``"relaxed"`` requires ``"raptor"``.
+        destinations; ``"relaxed"`` and ``"diverse"`` require ``"raptor"``.
     slack_seconds : float (optional, default: 300.0)
         The time-slack band in seconds for ``candidates="relaxed"``: a
         journey is kept even when a cleaner or simpler one dominates it,
@@ -111,10 +116,12 @@ class DetailedItineraries(gpd.GeoDataFrame):
         earlier. ``0`` reproduces ``candidates="pareto"``. Only used with
         ``candidates="relaxed"``.
     max_options : int (optional, default: None)
-        A cap on the suboptimal alternatives kept per OD pair. The strict
-        frontier is always returned; the suboptimal journeys nearest to it
-        fill the rest up to ``max_options``. ``None`` returns every
-        journey within the slack. Only used with ``candidates="relaxed"``.
+        For ``candidates="relaxed"``, a cap on the suboptimal alternatives
+        kept per OD pair — the frontier is always returned and the nearest
+        suboptimal journeys fill the rest, ``None`` keeping every journey
+        within the slack. For ``candidates="diverse"``, the number of
+        distinct-corridor alternatives per OD pair (``None`` defaults to
+        3); fewer are returned when the disjoint corridors run out.
     geometries : bool (optional, default: True)
         Attach each leg's geometry. Turn off to skip the geometry work
         when only the leg records are needed.
@@ -208,26 +215,28 @@ def _itineraries_frame(
     walk = (walking_speed_kmph, max_walking_time, max_snap_distance)
     if kind == "stops" and any(option is not None for option in walk):
         raise ValueError("walking options apply to point origins and destinations")
-    if candidates not in ("time", "pareto", "relaxed"):
-        raise ValueError("candidates must be 'time', 'pareto', or 'relaxed'")
+    if candidates not in ("time", "pareto", "relaxed", "diverse"):
+        raise ValueError("candidates must be 'time', 'pareto', 'relaxed', or 'diverse'")
     if router not in ("raptor", "tbtr"):
         raise ValueError("router must be 'raptor' or 'tbtr'")
     if router == "tbtr" and (candidates != "pareto" or kind != "stops"):
         raise ValueError("router='tbtr' requires candidates='pareto' with stop ids")
-    if candidates == "relaxed":
-        if not (
-            isinstance(slack_seconds, (int, float))
-            and math.isfinite(slack_seconds)
-            and slack_seconds >= 0
-        ):
-            raise ValueError("slack_seconds must be a non-negative number of seconds")
-        if max_options is not None and (
+    if candidates == "relaxed" and not (
+        isinstance(slack_seconds, (int, float))
+        and math.isfinite(slack_seconds)
+        and slack_seconds >= 0
+    ):
+        raise ValueError("slack_seconds must be a non-negative number of seconds")
+    if candidates in ("relaxed", "diverse") and (
+        max_options is not None
+        and (
             not isinstance(max_options, int)
             or isinstance(max_options, bool)
             or max_options < 1
-        ):
-            raise ValueError("max_options must be a positive integer or None")
-    multicriteria = candidates in ("pareto", "relaxed")
+        )
+    ):
+        raise ValueError("max_options must be a positive integer or None")
+    multicriteria = candidates in ("pareto", "relaxed", "diverse")
     slack = float(slack_seconds) if candidates == "relaxed" else 0.0
     options = max_options if candidates == "relaxed" else None
     # The multicriteria (McRAPTOR) candidates need the per-trip factor vector;
@@ -239,23 +248,42 @@ def _itineraries_frame(
     records = []
     for origin_id, origin_key in zip(origin_ids, origin_keys):
         for dest_id, dest_key in zip(dest_ids, dest_keys):
-            journeys = _route(
-                network,
-                kind,
-                origin_key,
-                dest_key,
-                date,
-                departure,
-                max_transfers,
-                geometries,
-                walk,
-                candidates,
-                router,
-                bucket,
-                slack,
-                options,
-                trip_factors,
-            )
+            if candidates == "diverse":
+                journeys = _route_diverse(
+                    network,
+                    kind,
+                    origin_key,
+                    dest_key,
+                    date,
+                    departure,
+                    max_transfers,
+                    geometries,
+                    walk,
+                    router,
+                    bucket,
+                    trip_factors,
+                    factors,
+                    components,
+                    max_options if max_options is not None else 3,
+                )
+            else:
+                journeys = _route(
+                    network,
+                    kind,
+                    origin_key,
+                    dest_key,
+                    date,
+                    departure,
+                    max_transfers,
+                    geometries,
+                    walk,
+                    candidates,
+                    router,
+                    bucket,
+                    slack,
+                    options,
+                    trip_factors,
+                )
             if not journeys:
                 continue
             network.annotate_emissions(journeys, factors, components)
@@ -389,6 +417,90 @@ def _route_pareto(
         slack,
         options,
     )
+
+
+def _route_diverse(
+    network,
+    kind,
+    origin_key,
+    dest_key,
+    date,
+    departure,
+    max_transfers,
+    geometries,
+    walk,
+    router,
+    bucket,
+    trip_factors,
+    factors,
+    components,
+    k,
+):
+    """``k`` route-disjoint alternatives for one OD pair, by iterative route
+    penalization: the shortest-travel-time journey, then the shortest one
+    avoiding its routes, and so on until ``k`` are found or the disjoint
+    corridors run out. Each round is annotated so the travel-time tie-break
+    is by emissions. Single departure (``window=None``)."""
+    from cafein.network import _walk_options
+
+    def search(banned):
+        if kind == "points":
+            return network._core.mc_route_between_coordinates(
+                origin_key,
+                dest_key,
+                date,
+                departure,
+                trip_factors,
+                None,
+                max_transfers,
+                bucket,
+                *_walk_options(*walk),
+                geometries,
+                0.0,
+                None,
+                banned,
+            )
+        return network._core.mc_route_between_stops(
+            origin_key,
+            dest_key,
+            date,
+            departure,
+            trip_factors,
+            None,
+            max_transfers,
+            bucket,
+            router,
+            *_walk_options(*walk),
+            geometries,
+            0.0,
+            None,
+            banned,
+        )
+
+    banned = []
+    selected = []
+    for _ in range(k):
+        journeys = search(banned)
+        if not journeys:
+            break
+        network.annotate_emissions(journeys, factors, components)
+        pick = min(
+            journeys,
+            key=lambda journey: (
+                journey["arrival"] - journey["departure"],
+                journey["emissions"] if journey["emissions"] is not None else math.inf,
+            ),
+        )
+        selected.append(pick)
+        routes = {
+            leg["route_id"]
+            for leg in pick["legs"]
+            if leg["type"] == "transit" and leg.get("route_id") is not None
+        }
+        if not routes:
+            break
+        banned = banned + [route for route in routes if route not in banned]
+    return selected
 
 
 def _leg_record(from_id, to_id, option, segment, leg):
