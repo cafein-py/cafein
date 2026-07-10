@@ -30,8 +30,10 @@ _COLUMNS = [
 class DetailedItineraries(gpd.GeoDataFrame):
     """Full journeys between origins and destinations, one row per leg.
 
-    A GeoDataFrame with one row per leg of every Pareto-optimal journey
-    between each origin and each destination: ``from_id`` and ``to_id``
+    A GeoDataFrame with one row per leg of every alternative journey
+    between each origin and each destination — the time-optimal
+    (arrival, rides) set by default, or the (arrival, emissions) set
+    with ``candidates="pareto"``: ``from_id`` and ``to_id``
     (the OD pair), ``option`` (the journey alternative, numbered per OD
     pair), ``segment`` (the leg's position in that journey), and the leg
     itself — ``leg_type`` (``access``, ``transit``, ``transfer``,
@@ -82,6 +84,21 @@ class DetailedItineraries(gpd.GeoDataFrame):
     components : list of str (optional)
         The life-cycle components to include (default: all four); see
         ``cafein.emissions.annotate``.
+    candidates : {"time", "pareto"} (optional, default: "time")
+        Which alternatives to return per OD pair. ``"time"`` draws the
+        time-optimal (arrival, rides) journeys of the RAPTOR engine;
+        ``"pareto"`` draws the (arrival, emissions) journeys of the
+        McRAPTOR engine — the cleaner-but-slower alternatives the
+        time-optimal set misses — at the single given departure.
+    bucket : float (optional, default: 25.0)
+        The emissions bucket width in grams CO₂e for the ``"pareto"``
+        search's arrival tie-break; smaller keeps finer emission
+        differences apart. Ignored for ``candidates="time"``.
+    router : {"raptor", "tbtr"} (optional, default: "raptor")
+        The engine backing ``candidates="pareto"`` between stops:
+        multicriteria RAPTOR, or trip-based (``"tbtr"``). ``"tbtr"``
+        requires ``candidates="pareto"`` with stop-id origins and
+        destinations.
     geometries : bool (optional, default: True)
         Attach each leg's geometry. Turn off to skip the geometry work
         when only the leg records are needed.
@@ -106,6 +123,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
         max_transfers=7,
         factors=None,
         components=None,
+        candidates="time",
+        bucket=25.0,
+        router="raptor",
         geometries=True,
         walking_speed_kmph=None,
         max_walking_time=None,
@@ -125,6 +145,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
             max_transfers=max_transfers,
             factors=factors,
             components=components,
+            candidates=candidates,
+            bucket=bucket,
+            router=router,
             geometries=geometries,
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
@@ -143,11 +166,16 @@ def _itineraries_frame(
     max_transfers,
     factors,
     components,
+    candidates,
+    bucket,
+    router,
     geometries,
     walking_speed_kmph,
     max_walking_time,
     max_snap_distance,
 ):
+    from cafein import emissions
+
     origin_ids, origin_keys, kind = _endpoints(origins, "origins")
     dest_ids, dest_keys, dest_kind = _endpoints(destinations, "destinations")
     if kind != dest_kind:
@@ -158,6 +186,19 @@ def _itineraries_frame(
     walk = (walking_speed_kmph, max_walking_time, max_snap_distance)
     if kind == "stops" and any(option is not None for option in walk):
         raise ValueError("walking options apply to point origins and destinations")
+    if candidates not in ("time", "pareto"):
+        raise ValueError("candidates must be 'time' or 'pareto'")
+    if router not in ("raptor", "tbtr"):
+        raise ValueError("router must be 'raptor' or 'tbtr'")
+    if router == "tbtr" and (candidates != "pareto" or kind != "stops"):
+        raise ValueError("router='tbtr' requires candidates='pareto' with stop ids")
+    # The emissions-Pareto (McRAPTOR) candidates need the per-trip factor vector;
+    # the time candidates get their emissions from the post-hoc annotation only.
+    trip_factors = (
+        emissions.trip_factors(network, factors, components)
+        if candidates == "pareto"
+        else None
+    )
 
     records = []
     for origin_id, origin_key in zip(origin_ids, origin_keys):
@@ -172,6 +213,10 @@ def _itineraries_frame(
                 max_transfers,
                 geometries,
                 walk,
+                candidates,
+                router,
+                bucket,
+                trip_factors,
             )
             if not journeys:
                 continue
@@ -209,8 +254,29 @@ def _route(
     max_transfers,
     geometries,
     walk,
+    candidates,
+    router,
+    bucket,
+    trip_factors,
 ):
-    """The Pareto-optimal journeys of one OD pair."""
+    """The Pareto-optimal journeys of one OD pair — the time-optimal
+    (arrival, rides) set, or the (arrival, emissions) McRAPTOR set with
+    ``candidates="pareto"``."""
+    if candidates == "pareto":
+        return _route_pareto(
+            network,
+            kind,
+            origin_key,
+            dest_key,
+            date,
+            departure,
+            max_transfers,
+            geometries,
+            walk,
+            router,
+            bucket,
+            trip_factors,
+        )
     if kind == "points":
         walking_speed_kmph, max_walking_time, max_snap_distance = walk
         return network.route_between_coordinates(
@@ -226,6 +292,53 @@ def _route(
         )
     return network.route_between_stops(
         origin_key, dest_key, date, departure, max_transfers, geometries=geometries
+    )
+
+
+def _route_pareto(
+    network,
+    kind,
+    origin_key,
+    dest_key,
+    date,
+    departure,
+    max_transfers,
+    geometries,
+    walk,
+    router,
+    bucket,
+    trip_factors,
+):
+    """The (arrival, emissions) McRAPTOR journeys of one OD pair — the
+    cleaner-but-slower alternatives the time-optimal set misses. Single
+    departure (``window=None``)."""
+    from cafein.network import _walk_options
+
+    if kind == "points":
+        return network._core.mc_route_between_coordinates(
+            origin_key,
+            dest_key,
+            date,
+            departure,
+            trip_factors,
+            None,
+            max_transfers,
+            bucket,
+            *_walk_options(*walk),
+            geometries,
+        )
+    return network._core.mc_route_between_stops(
+        origin_key,
+        dest_key,
+        date,
+        departure,
+        trip_factors,
+        None,
+        max_transfers,
+        bucket,
+        router,
+        *_walk_options(*walk),
+        geometries,
     )
 
 
