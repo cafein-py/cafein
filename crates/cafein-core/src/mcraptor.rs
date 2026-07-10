@@ -188,30 +188,81 @@ struct Rider {
 struct MatrixFold<'a> {
     /// Per stop: destination slot + 1, or 0 when not a destination.
     slots: &'a [u32],
+    /// Per stop: the destinations within a final walk of it —
+    /// ``(destination slot, walk seconds, walk meters)``. Empty unless a
+    /// street egress is folded (the door-to-door emissions matrix), in which
+    /// case a label alighting at the stop also credits each of those
+    /// destinations with the final walk added.
+    egress: &'a [Vec<(u32, u32, f64)>],
+    /// Whether a street egress is folded (door-to-door mode). When set, every
+    /// located destination carries its own egress self-entry — its connector to
+    /// its coordinate — so the zero-walk direct credit below is left to that
+    /// entry and skipped, matching the single-pair door-to-door route's arrival
+    /// at the coordinate.
+    egress_active: bool,
     budget: Option<u32>,
-    /// Per slot: (grams, seconds, label).
-    best: &'a mut [Option<(f64, u32, u32)>],
+    /// Per slot: (grams, seconds, label, egress meters).
+    best: &'a mut [Option<(f64, u32, u32, f64)>],
 }
 
 impl MatrixFold<'_> {
     fn fold(&mut self, label: &Label, index: u32) {
-        let slot = self.slots[label.stop.0 as usize];
-        if slot == 0 {
+        let base = label.arrival - label.departure;
+        let stop = label.stop.0 as usize;
+        // In closure mode the label alighting at its own stop, when that stop is
+        // a destination, is credited with no final walk. In door-to-door mode
+        // that credit is left to the egress map's self-entry (the destination's
+        // connector), so the arrival lands at the coordinate as the single-pair
+        // route reports it.
+        if !self.egress_active {
+            let slot = self.slots[stop];
+            if slot != 0 {
+                self.credit(slot as usize - 1, label.grams, base, index, 0.0);
+            }
             return;
         }
-        let seconds = label.arrival - label.departure;
+        // Door-to-door mode. An access seed has not ridden; it never folds a
+        // cell here. Its walking-only journey to a destination is the explicit
+        // coordinate-to-coordinate direct walk, overlaid in the matrix layer
+        // (`merge_direct_walk_cells`) where the diagonal is a true zero — folding
+        // the access label would instead credit the access-walk-to-the-stop cost.
+        if matches!(label.origin, Origin::Access) {
+            return;
+        }
+        // A label that has ridden (a ride's alight, or a transfer off one — every
+        // transfer label is a footpath off a ride, so `Access` above is the only
+        // zero-ride origin) takes a final egress walk, bounded by
+        // `max_walking_time`, to every reachable destination, matching what the
+        // single-pair route folds. Read by index so the immutable borrow of
+        // `egress` does not overlap `credit`'s mutable borrow of `best`.
+        for i in 0..self.egress[stop].len() {
+            let (dest, walk_seconds, walk_meters) = self.egress[stop][i];
+            self.credit(
+                dest as usize,
+                label.grams,
+                base.saturating_add(walk_seconds),
+                index,
+                walk_meters,
+            );
+        }
+    }
+
+    /// Keeps the cleanest (then fastest) crediting of `slot`; a travel-time
+    /// budget disqualifies outright. `egress_meters` is the final walk's
+    /// distance, zero when the label alights at the destination itself.
+    fn credit(&mut self, slot: usize, grams: f64, seconds: u32, index: u32, egress_meters: f64) {
         if self.budget.is_some_and(|budget| seconds > budget) {
             return;
         }
-        let best = &mut self.best[slot as usize - 1];
+        let best = &mut self.best[slot];
         let better = match best {
             None => true,
-            Some((grams, at, _)) => {
-                label.grams < *grams || (label.grams == *grams && seconds < *at)
+            Some((at_grams, at, _, _)) => {
+                grams < *at_grams || (grams == *at_grams && seconds < *at)
             }
         };
         if better {
-            *best = Some((label.grams, seconds, index));
+            *best = Some((grams, seconds, index, egress_meters));
         }
     }
 }
@@ -300,6 +351,9 @@ pub fn least_emissions_matrix(
     inputs: &CostInputs<'_>,
     requests: &[Request],
     destinations: &[StopIdx],
+    egress: &[Vec<(u32, u32, f64)>],
+    access_meters: &[Vec<(StopIdx, f64)>],
+    egress_active: bool,
     window: u32,
     budget: Option<u32>,
     bucket: f64,
@@ -308,13 +362,28 @@ pub fn least_emissions_matrix(
         bucket.is_finite() && bucket > 0.0,
         "the emissions bucket must be positive"
     );
+    assert_eq!(
+        egress.len(),
+        timetable.stop_count() as usize,
+        "the egress map must be per stop"
+    );
+    assert_eq!(
+        access_meters.len(),
+        requests.len(),
+        "the access-meter map must be per request"
+    );
+    // Door-to-door mode is set by the caller, not inferred from the egress map:
+    // an all-empty map (every located destination unsnappable or beyond the cap)
+    // must still keep the zero-walk direct credit off, leaving those
+    // destinations unreachable as the stop-as-coordinate route would.
     let mut slots = vec![0u32; timetable.stop_count() as usize];
     for (index, stop) in destinations.iter().enumerate() {
         slots[stop.0 as usize] = index as u32 + 1;
     }
     requests
         .par_iter()
-        .map(|request| {
+        .zip(access_meters.par_iter())
+        .map(|(request, access_meters)| {
             let mut search = Search::start(
                 view,
                 timetable,
@@ -324,10 +393,12 @@ pub fn least_emissions_matrix(
                 bucket,
             );
             let departures = departure_candidates(timetable, request, window);
-            let mut best: Vec<Option<(f64, u32, u32)>> = vec![None; destinations.len()];
+            let mut best: Vec<Option<(f64, u32, u32, f64)>> = vec![None; destinations.len()];
             for &departure in &departures {
                 let mut fold = Some(MatrixFold {
                     slots: &slots,
+                    egress,
+                    egress_active,
                     budget,
                     best: &mut best,
                 });
@@ -336,7 +407,9 @@ pub fn least_emissions_matrix(
             best.into_iter()
                 .enumerate()
                 .filter_map(|(slot, winner)| {
-                    winner.map(|winner| search.cost_row(inputs, winner, destinations[slot].0))
+                    winner.map(|winner| {
+                        search.cost_row(inputs, winner, destinations[slot].0, access_meters)
+                    })
                 })
                 .collect()
         })
@@ -602,11 +675,18 @@ impl<'a> Search<'a> {
     /// by leg, geometry legs reversed into ride order, fare legs
     /// priced in order. Emissions come from the label itself — the
     /// same cumulative-distance sums, already microgram-quantized.
-    fn cost_row(&self, inputs: &CostInputs<'_>, winner: (f64, u32, u32), to: u32) -> CostRow {
-        let (grams, seconds, mut at) = winner;
+    fn cost_row(
+        &self,
+        inputs: &CostInputs<'_>,
+        winner: (f64, u32, u32, f64),
+        to: u32,
+        access_meters: &[(StopIdx, f64)],
+    ) -> CostRow {
+        let (grams, seconds, mut at, egress_meters) = winner;
         let mut rides = 0u32;
         let mut transit_meters = 0.0;
-        let mut walk_meters = 0.0;
+        // The final walk to the destination (zero when the label alights there).
+        let mut walk_meters = egress_meters;
         let mut legs: Vec<(TripIdx, u16, u16)> = Vec::new();
         let mut fare_legs: Vec<FareLeg> = Vec::new();
         loop {
@@ -652,6 +732,14 @@ impl<'a> Search<'a> {
                 }
             }
         }
+        // The initial walk from the origin coordinate to the boarded stop, in
+        // door-to-door mode (empty access-meter map otherwise).
+        let access_stop = self.arena[at as usize].stop;
+        walk_meters += access_meters
+            .iter()
+            .find(|(stop, _)| *stop == access_stop)
+            .map(|(_, meters)| *meters)
+            .unwrap_or(0.0);
         let geometry = match (inputs.with_geometry, inputs.leg_geometry) {
             (true, Some(shapes)) => {
                 let parts: Vec<Vec<(f64, f64)>> = legs
@@ -1121,6 +1209,9 @@ mod tests {
             &inputs,
             &requests,
             &destinations,
+            &vec![Vec::new(); timetable.stop_count() as usize],
+            &vec![Vec::new(); requests.len()],
+            false,
             600,
             None,
             1e-6,
@@ -1179,6 +1270,9 @@ mod tests {
                 &inputs,
                 &requests,
                 &[StopIdx(3)],
+                &vec![Vec::new(); timetable.stop_count() as usize],
+                &vec![Vec::new(); requests.len()],
+                false,
                 600,
                 budget,
                 1e-6,
@@ -1250,6 +1344,9 @@ mod tests {
             &inputs,
             &requests,
             &[StopIdx(3)],
+            &vec![Vec::new(); timetable.stop_count() as usize],
+            &vec![Vec::new(); requests.len()],
+            false,
             100,
             None,
             1e-6,

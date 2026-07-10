@@ -111,8 +111,11 @@ class TravelCostMatrix(pd.DataFrame):
         contiguous block of the resolved origins, so ``n`` batch jobs
         cover all origins disjointly and their shards concatenate.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
-        The street-search options for point origins/destinations, as in
-        ``TransportNetwork.access_stops``; only valid with points.
+        The street-search options for the walking access/egress, as in
+        ``TransportNetwork.access_stops``. They bound the walking for point
+        origins/destinations, and for stop origins/destinations only when a
+        whole-day shortcut set routes them door-to-door; otherwise stop
+        matrices ignore them.
     """
 
     @property
@@ -247,8 +250,11 @@ class TravelTimeMatrix(pd.DataFrame):
         the date and fan the origins out over it; the results are
         identical. Windowed and point matrices run on RAPTOR only.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
-        The street-search options for point origins/destinations, as in
-        ``TransportNetwork.access_stops``; only valid with points.
+        The street-search options for the walking access/egress, as in
+        ``TransportNetwork.access_stops``. They bound the walking for point
+        origins/destinations, and for stop origins/destinations only when a
+        whole-day shortcut set routes them door-to-door; otherwise stop
+        matrices ignore them.
     """
 
     @property
@@ -531,14 +537,10 @@ def _cost_columns(
         from_ids = from_ids[_chunk_slice(len(from_ids), chunk)]
         to_stops = None if destinations is None else [str(d) for d in destinations]
         if optimize != "time":
-            # The emissions/fare (McRAPTOR) stop matrix keeps the closure until
-            # McULTRA, so it takes no walking options.
-            if not (
-                walking_speed_kmph is None
-                and max_walking_time is None
-                and max_snap_distance is None
-            ):
-                raise ValueError("walking options apply to point origins/destinations")
+            # The emissions (McRAPTOR) stop matrix relaxes a matching whole-day
+            # McULTRA set for the pareto objective, routing door-to-door with
+            # these walking options; otherwise it keeps the closure and ignores
+            # them, as the time path does.
             table = network._core.least_cost_matrix(
                 from_ids,
                 date,
@@ -553,6 +555,7 @@ def _cost_columns(
                 candidates,
                 bucket,
                 router,
+                *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
                 geometries,
             )
         else:

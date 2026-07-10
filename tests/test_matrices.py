@@ -740,12 +740,11 @@ def test_point_matrices_report_unsnapped_points(network_with_footpaths):
 
 
 def test_stop_matrices_gate_walking_options(network):
-    # Under a whole-day ULTRA set the time-optimal stop matrices route
-    # door-to-door, so the travel-time matrix and the optimize="time" cost matrix
-    # *accept* the walking options for stop origins (they bound that routing and
-    # are ignored without a set). The emissions/fare (McRAPTOR) stop cost matrices
-    # keep the closure until McULTRA and still reject them, and stop origins
-    # cannot mix with point destinations.
+    # Under a whole-day shortcut set the stop matrices route door-to-door, so the
+    # travel-time and cost matrices *accept* the walking options for stop origins
+    # (they bound that routing and are ignored without a set): time-optimal under
+    # ULTRA, emissions under McULTRA. Stop origins still cannot mix with point
+    # destinations.
     accepted = cost_matrix(
         network,
         origins=["4810551"],
@@ -753,15 +752,15 @@ def test_stop_matrices_gate_walking_options(network):
         max_walking_time=300.0,
     )
     assert len(accepted) >= 1
-    with pytest.raises(ValueError, match="point origins"):
-        cost_matrix(
-            network,
-            origins=["4810551"],
-            departure="08:30:00",
-            optimize="emissions",
-            window=1800,
-            walking_speed_kmph=5.0,
-        )
+    accepted_emissions = cost_matrix(
+        network,
+        origins=["4810551"],
+        departure="08:30:00",
+        optimize="emissions",
+        window=1800,
+        walking_speed_kmph=5.0,
+    )
+    assert len(accepted_emissions) >= 1
     with pytest.raises(ValueError, match="point origins"):
         network.travel_time_matrix(
             ["4810551"],
