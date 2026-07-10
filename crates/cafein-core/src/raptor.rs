@@ -631,7 +631,7 @@ fn window_samples<'a>(
 }
 
 /// Walking-only travel times from the request's access list, by stop.
-fn access_floor(stop_count: usize, request: &Request) -> Vec<u32> {
+pub(crate) fn access_floor(stop_count: usize, request: &Request) -> Vec<u32> {
     let mut floor = vec![UNREACHED; stop_count];
     for &(stop, duration) in &request.access {
         let slot = &mut floor[stop.0 as usize];
@@ -642,7 +642,7 @@ fn access_floor(stop_count: usize, request: &Request) -> Vec<u32> {
 
 /// One travel-time sample: the transit arrival over the mark, floored
 /// by the departure-independent walking-only time.
-fn travel_time(arrival: u32, mark: u32, walk_floor: u32) -> u32 {
+pub(crate) fn travel_time(arrival: u32, mark: u32, walk_floor: u32) -> u32 {
     let transit = if arrival == UNREACHED {
         UNREACHED
     } else {
@@ -654,7 +654,7 @@ fn travel_time(arrival: u32, mark: u32, walk_floor: u32) -> u32 {
 /// The nearest-rank percentile of ascending samples; ranks exactly
 /// between two samples round up (the upper median), keeping the
 /// convention reproducible across languages.
-fn nearest_rank(sorted: &[u32], percentile: f64) -> u32 {
+pub(crate) fn nearest_rank(sorted: &[u32], percentile: f64) -> u32 {
     let position = (percentile / 100.0) * (sorted.len() - 1) as f64;
     sorted[((position + 0.5).floor() as usize).min(sorted.len() - 1)]
 }

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Windowed TBTR stop matrices — ``router="tbtr"`` now answers
+  windowed/percentile stop travel-time matrices (``travel_time_matrix`` /
+  ``travel_times_from_stop`` / ``TravelTimeMatrix`` given a ``window``),
+  matching the RAPTOR cells exactly, over a descending profile scan on the
+  reduced trip-transfer set that reuses the ``compute_tbtr_transfers`` cache.
+  A windowed ``router="tbtr"`` request was previously rejected and ran on
+  RAPTOR; point matrices still run on RAPTOR.
+
 - Cached TBTR transfer set —
   ``TransportNetwork.compute_tbtr_transfers(date)`` precomputes and stores the
   trip-based transfer set for a date, so repeated single-departure stop

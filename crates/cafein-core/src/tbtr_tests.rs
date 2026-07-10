@@ -324,6 +324,77 @@ fn one_to_all_matches_raptor() {
     assert!(tbtr[3].is_some());
 }
 
+// The crossing over a window with two departures plus a footpath tail:
+// exercises the descending passes and the last-round walk relaxation.
+fn windowed_crossing() -> (Timetable, Transfers) {
+    let mut builder = TimetableBuilder::new(4);
+    let a = builder
+        .add_pattern(&[StopIdx(0), StopIdx(1), StopIdx(2)], 0)
+        .unwrap();
+    let b = builder.add_pattern(&[StopIdx(1), StopIdx(3)], 1).unwrap();
+    builder
+        .add_trip(a, vec![time(0), time(100), time(300)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(a, vec![time(150), time(250), time(450)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(b, vec![time(120), time(500)], 2, 0)
+        .unwrap();
+    builder
+        .add_trip(b, vec![time(300), time(650)], 3, 0)
+        .unwrap();
+    let footpaths = Transfers::from_edges(4, &[(StopIdx(2), StopIdx(3), 45, 40.0)]).unwrap();
+    (builder.finish(), footpaths)
+}
+
+#[test]
+fn window_samples_match_one_to_all() {
+    let (timetable, footpaths) = windowed_crossing();
+    let request = request(1, StopIdx(0), StopIdx(3), 0);
+    let engine = TbtrEngine::for_date(
+        &timetable,
+        &footpaths,
+        &request.active_services,
+        &request.active_services_previous,
+    );
+    let samples = engine.window_samples(&request, 400);
+    assert!(samples.len() >= 2);
+    // Each mark's travel times match a one_to_all launched there. The
+    // access floor (0 at the origin) reconciles the access stop, whose
+    // windowed label is the next boardable departure rather than the mark
+    // itself — the same correction RAPTOR's sampler relies on.
+    let floor = crate::raptor::access_floor(4, &request);
+    for (mark, snapshot) in &samples {
+        let direct = engine.one_to_all(*mark, &request.access, request.max_transfers);
+        for stop in 0..4 {
+            let windowed = crate::raptor::travel_time(snapshot[stop], *mark, floor[stop]);
+            let expected =
+                crate::raptor::travel_time(direct[stop].unwrap_or(u32::MAX), *mark, floor[stop]);
+            assert_eq!(windowed, expected, "mark {mark} stop {stop}");
+        }
+    }
+}
+
+#[test]
+fn percentile_matrix_matches_raptor() {
+    use crate::raptor::Raptor;
+
+    let (timetable, footpaths) = windowed_crossing();
+    let requests = vec![request(1, StopIdx(0), StopIdx(3), 0)];
+    let percentiles = [0.0, 25.0, 50.0, 75.0, 100.0];
+    let raptor = Raptor.percentile_matrix(&timetable, &footpaths, &requests, 400, &percentiles);
+    let engine = TbtrEngine::for_date(
+        &timetable,
+        &footpaths,
+        &requests[0].active_services,
+        &requests[0].active_services_previous,
+    );
+    let tbtr = engine.percentile_matrix(&requests, 400, &percentiles);
+    assert_eq!(tbtr, raptor);
+    assert!(raptor[0].iter().any(|&value| value != u32::MAX));
+}
+
 #[test]
 fn u_turns_are_dropped_at_generation() {
     // Line A rides 0→1→2; line B rides 1→2→(3); footpaths join

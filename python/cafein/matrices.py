@@ -245,10 +245,10 @@ class TravelTimeMatrix(pd.DataFrame):
         contiguous block of the resolved origins, so ``n`` batch jobs
         cover all origins disjointly and their rows concatenate.
     router : str (optional, default: "raptor")
-        The routing engine for single-departure stop matrices:
+        The routing engine for stop matrices:
         ``"raptor"``, or ``"tbtr"`` to precompute a TBTR day engine for
         the date and fan the origins out over it; the results are
-        identical. Windowed and point matrices run on RAPTOR only.
+        identical. Point matrices run on RAPTOR only.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         The street-search options for the walking access/egress, as in
         ``TransportNetwork.access_stops``. They bound the walking for point

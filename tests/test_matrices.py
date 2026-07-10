@@ -1088,6 +1088,32 @@ def test_travel_time_matrix_windowed_percentiles(network):
     assert (reachable.travel_time_p50 <= reachable.travel_time_p90).all()
 
 
+def test_windowed_tbtr_matches_raptor_and_reuses_cache(helsinki_gtfs):
+    # A windowed router="tbtr" stop matrix returns the same percentile cells
+    # as RAPTOR, ad hoc and off the compute_tbtr_transfers cache alike.
+    from cafein import TransportNetwork
+
+    network = TransportNetwork.from_gtfs([str(helsinki_gtfs)])
+    origins = ["4810551", "1040602", "1250551"]
+    common = dict(
+        date="2022-02-22", departure="08:00:00", window=1800, percentiles=[10, 50, 90]
+    )
+    raptor = TravelTimeMatrix(network, origins, **common)
+    ad_hoc = TravelTimeMatrix(network, origins, router="tbtr", **common)
+    assert ad_hoc.equals(raptor)
+    network.compute_tbtr_transfers("2022-02-22")
+    cached = TravelTimeMatrix(network, origins, router="tbtr", **common)
+    assert cached.equals(ad_hoc)
+
+
+def test_windowed_tbtr_rejects_point_matrices(network_with_footpaths):
+    origins = point_frame(network_with_footpaths, [("A", "1100602")])
+    with pytest.raises(ValueError, match="point matrices run on RAPTOR"):
+        network_with_footpaths.travel_time_matrix(
+            origins, "2022-02-22", "08:30:00", window=600, router="tbtr"
+        )
+
+
 def test_travel_time_matrix_over_points(network_with_footpaths):
     origins = point_frame(network_with_footpaths, [("A", "1100602")])
     destinations = point_frame(

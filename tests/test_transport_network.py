@@ -211,14 +211,34 @@ def test_tbtr_router_matches_raptor(network, network_with_footpaths):
     assert np.array_equal(raptor, tbtr)
 
 
+def test_tbtr_router_matches_raptor_windowed(network, network_with_footpaths):
+    stops = [stop for stop, _, _ in network.stops][:120]
+    common = dict(window=1800, percentiles=[10, 50, 90])
+    raptor = network.travel_time_matrix(stops, "2022-02-22", "08:30:00", **common)
+    tbtr = network.travel_time_matrix(
+        stops, "2022-02-22", "08:30:00", router="tbtr", **common
+    )
+    assert np.array_equal(raptor, tbtr)
+    # With footpaths installed the walks relax at query time; the
+    # percentile planes must still agree cell for cell.
+    raptor = network_with_footpaths.travel_time_matrix(
+        stops, "2022-02-22", "08:30:00", **common
+    )
+    tbtr = network_with_footpaths.travel_time_matrix(
+        stops, "2022-02-22", "08:30:00", router="tbtr", **common
+    )
+    assert np.array_equal(raptor, tbtr)
+
+
 def test_router_option_is_validated(network):
     with pytest.raises(ValueError, match="router must be"):
         network.travel_time_matrix(
             ["4810551"], "2022-02-22", "08:30:00", router="fastest"
         )
-    with pytest.raises(ValueError, match="single-departure"):
+    # The windowed path validates the router value too.
+    with pytest.raises(ValueError, match="router must be"):
         network.travel_time_matrix(
-            ["4810551"], "2022-02-22", "08:30:00", window=600, router="tbtr"
+            ["4810551"], "2022-02-22", "08:30:00", window=600, router="fastest"
         )
 
 

@@ -915,6 +915,172 @@ impl<'a> TbtrEngine<'a> {
             .collect()
     }
 
+    /// Travel-time percentiles over a departure window, per request — the
+    /// TBTR counterpart of [`Raptor::percentile_matrix`], fanned out over
+    /// requests with rayon. Semantics and output layout match RAPTOR's
+    /// exactly: `stop_count × percentiles.len()` nearest-rank travel times
+    /// flat by stop, `u32::MAX` for an unreachable percentile.
+    pub fn percentile_matrix(
+        &self,
+        requests: &[Request],
+        window: u32,
+        percentiles: &[f64],
+    ) -> Vec<Vec<u32>> {
+        let stop_count = self.timetable.stop_count() as usize;
+        requests
+            .par_iter()
+            .map(|request| {
+                let arrivals = self.window_samples(request, window);
+                let access_floor = crate::raptor::access_floor(stop_count, request);
+                let mut out = Vec::with_capacity(stop_count * percentiles.len());
+                let mut samples = vec![0u32; arrivals.len()];
+                for stop in 0..stop_count {
+                    for (sample, (mark, marked)) in samples.iter_mut().zip(&arrivals) {
+                        *sample =
+                            crate::raptor::travel_time(marked[stop], *mark, access_floor[stop]);
+                    }
+                    samples.sort_unstable();
+                    for &percentile in percentiles {
+                        out.push(crate::raptor::nearest_rank(&samples, percentile));
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
+    /// For every minute mark within `[departure, departure + window)`,
+    /// the per-stop earliest arrival when leaving at or after it — the
+    /// TBTR counterpart of RAPTOR's `window_samples`. One descending pass
+    /// per boardable departure candidate on shared state (persistent
+    /// reached horizons and per-(round, stop) `labels`, as in
+    /// [`profile`](Self::profile), but with no egress targets so every
+    /// stop is explored), snapshotting the labels at each mark. A mark's
+    /// travel times match [`one_to_all`](Self::one_to_all) run for that
+    /// departure once the access floor is applied — an access stop's raw
+    /// label is the next boardable departure, not the mark itself. Marks
+    /// come back ascending.
+    fn window_samples(&self, request: &Request, window: u32) -> Vec<(u32, Vec<u32>)> {
+        let rounds = request.max_transfers as usize + 1;
+        let stop_count = self.timetable.stop_count() as usize;
+        let candidates = crate::raptor::departure_candidates(self.timetable, request, window);
+        let mut reached = self.horizons(rounds);
+        let mut arena: Vec<Segment> = Vec::new();
+        let mut queues: Vec<Vec<(u32, u16)>> = vec![Vec::new(); rounds];
+        // Per-(round, stop) arrival labels persist across the descending
+        // departures; the last-round slot is the earliest arrival over all
+        // rounds, so it is what each mark snapshots.
+        let mut labels = vec![UNREACHED; stop_count * rounds];
+        let improve = move |labels: &mut Vec<u32>, stop: StopIdx, time: u32, round: usize| {
+            let base = stop.0 as usize * rounds;
+            let gate = time < labels[base + round];
+            for slot in &mut labels[base + round..base + rounds] {
+                if time < *slot {
+                    *slot = time;
+                }
+            }
+            gate
+        };
+        let mut walked: HashMap<u32, (u32, u32, u16)> = HashMap::new();
+        let sample_count = (window as u64).div_ceil(60).max(1) as u32;
+        let mut samples = Vec::with_capacity(sample_count as usize);
+        let mut next_candidate = 0;
+        for step in (0..sample_count).rev() {
+            let Some(mark) = request.departure.checked_add(step * 60) else {
+                continue;
+            };
+            while next_candidate < candidates.len() && candidates[next_candidate] >= mark {
+                let departure = candidates[next_candidate];
+                next_candidate += 1;
+                for &(stop, seconds) in &request.access {
+                    improve(&mut labels, stop, departure.saturating_add(seconds), 0);
+                }
+                self.seed(
+                    departure,
+                    &request.access,
+                    &mut reached,
+                    rounds,
+                    &mut arena,
+                    &mut queues[0],
+                );
+                for round in 0..rounds {
+                    if queues[round].is_empty() {
+                        break;
+                    }
+                    let segments = std::mem::take(&mut queues[round]);
+                    walked.clear();
+                    for &(segment, end) in &segments {
+                        let trip = arena[segment as usize].trip;
+                        let board = arena[segment as usize].board;
+                        let line = self.view.line_of(trip);
+                        let offset = self.view.line_day_offset(line);
+                        let stops = self.timetable.pattern_stops(self.view.line_pattern(line));
+                        let times = self.view.stored_times(self.timetable, trip);
+                        let last = (end as usize + 1).min(times.len());
+                        for alight in board + 1..last as u16 {
+                            let arrival = times[alight as usize].arrival - offset;
+                            let stop = stops[alight as usize];
+                            // Walks relax only from arrivals that improve the
+                            // stop's label — RAPTOR's marked-stop semantics.
+                            // Unlike `profile` this relaxes at the last round
+                            // too, so a stop reachable only by a final walk is
+                            // captured, matching `one_to_all`.
+                            if improve(&mut labels, stop, arrival, round) {
+                                for footpath in self.footpaths.from_stop(stop) {
+                                    let walked_at = arrival.saturating_add(footpath.duration);
+                                    if improve(&mut labels, footpath.to, walked_at, round) {
+                                        walked.insert(footpath.to.0, (walked_at, segment, alight));
+                                    }
+                                }
+                            }
+                            if round + 1 < rounds {
+                                for transfer in self.set.from_trip_position(trip, alight) {
+                                    enqueue(
+                                        &self.view,
+                                        &mut reached,
+                                        rounds,
+                                        round + 1,
+                                        &mut arena,
+                                        &mut queues[round + 1],
+                                        Segment {
+                                            trip: transfer.trip,
+                                            board: transfer.position,
+                                            origin: SegmentOrigin::Transfer {
+                                                parent: segment,
+                                                alight,
+                                            },
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if round + 1 < rounds {
+                        for (&stop, &(ready, parent, alight)) in &walked {
+                            self.board_walked(
+                                StopIdx(stop),
+                                ready,
+                                parent,
+                                alight,
+                                &mut reached,
+                                rounds,
+                                round + 1,
+                                &mut arena,
+                                &mut queues[round + 1],
+                            );
+                        }
+                    }
+                }
+            }
+            let snapshot = (0..stop_count)
+                .map(|stop| labels[stop * rounds + (rounds - 1)])
+                .collect();
+            samples.push((mark, snapshot));
+        }
+        samples.reverse();
+        samples
+    }
+
     /// Fresh per-(trip, round) reached horizons: a trip's is its
     /// pattern length.
     fn horizons(&self, rounds: usize) -> Vec<u16> {
