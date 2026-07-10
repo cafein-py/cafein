@@ -163,6 +163,12 @@
   ``mc_route_between_coordinates`` take ``banned_routes``); an empty mask
   is the unchanged search. ``router="raptor"`` only.
 
+- Route-diverse alternatives in ``DetailedItineraries`` —
+  ``DetailedItineraries(candidates="diverse", max_options=N)`` draws each
+  OD pair's ``option`` set from the same route-penalization search, so a
+  query returns up to ``N`` distinct-corridor journeys per OD, each riding
+  a route set disjoint from the others. ``router="raptor"`` only.
+
 - The exact time × emissions Pareto set:
   ``cafein.exhaustive_frontier(network, origin, destination, date,
   departure)`` enumerates the mathematically complete frontier for one
