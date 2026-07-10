@@ -851,6 +851,127 @@ def test_relaxed_candidate_options_are_validated(tmp_path):
         )
 
 
+def _option_corridors(frame):
+    return [
+        frozenset(
+            leg["route_id"] for leg in journey["legs"] if leg["type"] == "transit"
+        )
+        for journey in frame["journey"]
+    ]
+
+
+def test_diverse_candidates_split_bus_and_tram(tmp_path):
+    from cafein import TransportNetwork
+
+    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
+    network = TransportNetwork.from_gtfs([str(feed)])
+    frame = journey_frontier(
+        network,
+        "A",
+        "B",
+        "2022-02-22",
+        "08:00:00",
+        window=1,
+        candidates="diverse",
+        max_options=3,
+    )
+    # Two disjoint corridors — the fast bus chain then the tram — even though
+    # a third alternative was asked for: penalization stops when the routes
+    # run out.
+    corridors = _option_corridors(frame)
+    assert corridors == [{"BUS_IN", "BUS_OUT"}, {"TRAM"}]
+    assert corridors[0].isdisjoint(corridors[1])
+
+
+def test_diverse_max_options_one_returns_the_fastest(tmp_path):
+    from cafein import TransportNetwork
+
+    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
+    network = TransportNetwork.from_gtfs([str(feed)])
+    frame = journey_frontier(
+        network,
+        "A",
+        "B",
+        "2022-02-22",
+        "08:00:00",
+        window=1,
+        candidates="diverse",
+        max_options=1,
+    )
+    # Just the single fastest corridor — the 900 s bus chain, not the tram.
+    assert len(frame) == 1
+    assert _option_corridors(frame) == [{"BUS_IN", "BUS_OUT"}]
+    assert int(frame["travel_time"].iloc[0]) == 900
+
+
+def test_diverse_candidates_are_route_disjoint(network):
+    # A pair with several corridors: the alternatives ride mutually disjoint
+    # line sets, ordered fastest-first.
+    frame = journey_frontier(
+        network,
+        "1370104",
+        "4960238",
+        "2022-02-22",
+        "08:30:00",
+        window=1,
+        max_transfers=6,
+        candidates="diverse",
+        max_options=3,
+    )
+    corridors = _option_corridors(frame)
+    assert len(corridors) >= 2
+    for i, first in enumerate(corridors):
+        for second in corridors[i + 1 :]:
+            assert first.isdisjoint(second)
+    arrivals = [int(journey["arrival"]) for journey in frame["journey"]]
+    assert arrivals == sorted(arrivals)
+
+
+def test_diverse_candidates_stop_at_a_single_corridor(network):
+    # Only the K train reaches this pair; banning it leaves nothing, so a
+    # request for five alternatives returns the one corridor.
+    frame = journey_frontier(
+        network,
+        "4810551",
+        "1250551",
+        "2022-02-22",
+        "08:30:00",
+        window=1,
+        candidates="diverse",
+        max_options=5,
+    )
+    assert len(frame) == 1
+
+
+def test_diverse_candidate_options_are_validated(tmp_path):
+    from cafein import TransportNetwork
+
+    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
+    network = TransportNetwork.from_gtfs([str(feed)])
+    with pytest.raises(ValueError, match="candidates='pareto'"):
+        journey_frontier(
+            network,
+            "A",
+            "B",
+            "2022-02-22",
+            "08:00:00",
+            window=1,
+            candidates="diverse",
+            router="tbtr",
+        )
+    with pytest.raises(ValueError, match="max_options"):
+        journey_frontier(
+            network,
+            "A",
+            "B",
+            "2022-02-22",
+            "08:00:00",
+            window=1,
+            candidates="diverse",
+            max_options=0,
+        )
+
+
 def test_unmatched_factors_poison_but_do_not_block(network):
     # The Suomenlinna ferry has no shipped factor: its journeys carry
     # NaN emissions and never join the frontier.

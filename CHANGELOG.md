@@ -145,6 +145,17 @@
   recovers non-dominated journeys the bucketed strict search skips;
   ``router="raptor"`` only.
 
+- Route-diverse alternatives —
+  ``journey_frontier(candidates="diverse", max_options=N)`` returns up to
+  ``N`` distinct-corridor alternatives by iterative route penalization:
+  the fastest journey, then the fastest one avoiding its routes, and so
+  on, banning every ridden route each round so the options ride disjoint
+  line sets. It stops early when the disjoint corridors run out, so a
+  request can return fewer than ``N``. The McRAPTOR search gains a
+  route-index ban mask (``mc_route_between_stops`` /
+  ``mc_route_between_coordinates`` take ``banned_routes``); an empty mask
+  is the unchanged search. ``router="raptor"`` only.
+
 - The exact time × emissions Pareto set:
   ``cafein.exhaustive_frontier(network, origin, destination, date,
   departure)`` enumerates the mathematically complete frontier for one
