@@ -404,10 +404,10 @@ class TransportNetwork:
         """Precompute and cache the trip-based (TBTR) transfer set for `date`.
 
         The dominance-aware transfer set is TBTR's amortised asset: caching it
-        lets repeated single-departure stop ``travel_time_matrix(router="tbtr")``
-        calls on the same date reuse it instead of rebuilding it every call —
-        the "build once, query many" workload the trip-based engine is built
-        for. A query on a different date rebuilds ad hoc. The cache is held in
+        lets repeated stop ``travel_time_matrix(router="tbtr")`` calls on the
+        same date — single-departure and windowed alike — reuse it instead of
+        rebuilding it every call — the "build once, query many" workload the
+        trip-based engine is built for. A query on a different date rebuilds ad hoc. The cache is held in
         memory only (not persisted) and re-keyed when computed for a new date;
         ``has_tbtr_transfers`` reports whether one is present.
 
@@ -842,11 +842,11 @@ class TransportNetwork:
             contiguous block of the resolved origins, so ``n`` batch
             jobs cover all origins disjointly; rows follow the chunk.
         router : str (optional, default: "raptor")
-            The routing engine for single-departure stop matrices:
+            The routing engine for stop matrices:
             ``"raptor"``, or ``"tbtr"`` to precompute a TBTR day engine
             (Trip-Based Transit Routing: Witt's trip-transfer set) for
             the date and fan the origins out over it. The results are
-            identical. Windowed and point matrices run on RAPTOR only.
+            identical. Point matrices run on RAPTOR only.
         walking_speed_kmph, max_walking_time, max_snap_distance : float
             The street-search options, as in ``access_stops``. They apply to
             point origins, and to stop origins of the ``"raptor"`` matrix under
@@ -913,10 +913,10 @@ class TransportNetwork:
 
         if router not in ("raptor", "tbtr"):
             raise ValueError(f"router must be 'raptor' or 'tbtr', not {router!r}")
-        if router == "tbtr" and (window is not None or _is_point_frame(from_stops)):
+        if router == "tbtr" and _is_point_frame(from_stops):
             raise ValueError(
-                "router='tbtr' backs single-departure stop matrices only; "
-                "windowed and point matrices run on RAPTOR"
+                "router='tbtr' backs stop matrices only; "
+                "point matrices run on RAPTOR"
             )
         percentiles = _window_percentiles(window, percentiles, confidence)
         if _is_point_frame(from_stops):
@@ -971,6 +971,6 @@ class TransportNetwork:
             )
         else:
             matrix = self._core.travel_time_percentiles(
-                from_stops, date, departure, window, percentiles, max_transfers
+                from_stops, date, departure, window, percentiles, max_transfers, router
             )
         return matrix, from_stops, to_ids, percentiles

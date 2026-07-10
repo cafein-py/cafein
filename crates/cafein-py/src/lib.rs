@@ -58,9 +58,9 @@ struct TransportNetwork {
     mcultra_factor: Option<u64>,
     /// The cached time-only TBTR transfer set, when computed
     /// (`compute_tbtr_transfers`), keyed by the date string it was built for.
-    /// A `router="tbtr"` single-departure stop time matrix on the same date
-    /// reuses it (build once, query many); other queries rebuild ad-hoc. Held
-    /// in memory only (not yet persisted).
+    /// A `router="tbtr"` stop time matrix on the same date — single-departure
+    /// or windowed — reuses it (build once, query many); other queries rebuild
+    /// ad-hoc. Held in memory only (not yet persisted).
     tbtr_time_transfers: Option<(String, cafein_core::tbtr::TransferSet)>,
     geometry: Option<TripGeometry>,
     leg_geometry: Option<LegGeometry>,
@@ -1571,9 +1571,9 @@ impl TransportNetwork {
     /// Precompute and cache the trip-based (TBTR) transfer set for `date`.
     ///
     /// The dominance-aware transfer set is TBTR's amortised asset — "build
-    /// once, query many". Caching it lets repeated single-departure stop
-    /// `travel_time_matrix(router="tbtr")` calls on the same date reuse it
-    /// instead of rebuilding it every call, which is where the trip-based engine
+    /// once, query many". Caching it lets repeated stop `router="tbtr"` matrix
+    /// calls on the same date — single-departure or windowed — reuse it instead
+    /// of rebuilding it every call, which is where the trip-based engine
     /// pays off: large batches of queries on one network and date. A query on a
     /// different date rebuilds ad hoc. Held in memory only (not persisted);
     /// recomputing for a new date replaces the cached set.
@@ -3233,6 +3233,12 @@ impl TransportNetwork {
     ///     Percentiles in ``[0, 100]``, e.g. ``[10, 50, 90]``.
     /// max_transfers : int (optional, default: 7)
     ///     Maximum number of transfers between rides.
+    /// router : str (optional, default: "raptor")
+    ///     ``"raptor"``, or ``"tbtr"`` to answer the window over a TBTR
+    ///     day engine — the same reduced trip-transfer set the
+    ///     single-departure matrix uses (reusing the cached set from
+    ///     ``compute_tbtr_transfers`` when present). The results are
+    ///     identical.
     ///
     /// Returns
     /// -------
@@ -3240,7 +3246,7 @@ impl TransportNetwork {
     ///     A ``(len(from_stops), stop_count, len(percentiles))`` uint32
     ///     array of travel times in seconds; unreachable percentiles
     ///     hold the maximum uint32 value (4294967295).
-    #[pyo3(signature = (from_stops, date, departure, window, percentiles, max_transfers = 7))]
+    #[pyo3(signature = (from_stops, date, departure, window, percentiles, max_transfers = 7, router = "raptor"))]
     #[allow(clippy::too_many_arguments)]
     fn travel_time_percentiles<'py>(
         &self,
@@ -3251,8 +3257,14 @@ impl TransportNetwork {
         window: u32,
         percentiles: Vec<f64>,
         max_transfers: u8,
+        router: &str,
     ) -> PyResult<Bound<'py, PyArray3<u32>>> {
         validate_window(window, &percentiles)?;
+        if !matches!(router, "raptor" | "tbtr") {
+            return Err(PyValueError::new_err(format!(
+                "router must be 'raptor' or 'tbtr', not {router:?}"
+            )));
+        }
         let origins: Vec<StopIdx> = from_stops
             .iter()
             .map(|stop| self.resolve_stop(stop))
@@ -3273,15 +3285,43 @@ impl TransportNetwork {
             .collect();
         let stop_count = self.build.timetable.stop_count() as usize;
         let flat: Vec<u32> = py.allow_threads(|| {
-            Raptor
-                .percentile_matrix(
-                    &self.build.timetable,
-                    &self.transfers,
-                    &requests,
-                    window,
-                    &percentiles,
-                )
-                .concat()
+            if router == "tbtr" {
+                // Reuse the cached transfer set for this date when present,
+                // as the single-departure TBTR matrix does; else build ad hoc.
+                let cached = self
+                    .tbtr_time_transfers
+                    .as_ref()
+                    .filter(|(cached_date, _)| cached_date.as_str() == date)
+                    .map(|(_, set)| set.clone());
+                let engine = match cached {
+                    Some(set) => TbtrEngine::from_set(
+                        &self.build.timetable,
+                        &self.transfers,
+                        &active_services,
+                        &active_services_previous,
+                        set,
+                    ),
+                    None => TbtrEngine::for_date(
+                        &self.build.timetable,
+                        &self.transfers,
+                        &active_services,
+                        &active_services_previous,
+                    ),
+                };
+                engine
+                    .percentile_matrix(&requests, window, &percentiles)
+                    .concat()
+            } else {
+                Raptor
+                    .percentile_matrix(
+                        &self.build.timetable,
+                        &self.transfers,
+                        &requests,
+                        window,
+                        &percentiles,
+                    )
+                    .concat()
+            }
         });
         let rows = requests.len();
         flat.into_pyarray(py)
