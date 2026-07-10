@@ -311,6 +311,8 @@ struct Search<'a> {
     bucket: f64,
     /// The time-slack band, in seconds; 0 is the strict frontier.
     slack: u32,
+    /// Route-index mask of lines the search skips; empty means none.
+    banned_routes: &'a [bool],
     arena: Vec<Label>,
     bags: Vec<Bag>,
     destination: DestinationBag,
@@ -334,6 +336,7 @@ pub fn route(
     bucket: f64,
     slack: u32,
     max_options: Option<usize>,
+    banned_routes: &[bool],
 ) -> Vec<Journey> {
     profile(
         view,
@@ -346,6 +349,7 @@ pub fn route(
         bucket,
         slack,
         max_options,
+        banned_routes,
     )
 }
 
@@ -364,6 +368,7 @@ pub fn route_range(
     bucket: f64,
     slack: u32,
     max_options: Option<usize>,
+    banned_routes: &[bool],
 ) -> Vec<Journey> {
     let departures = departure_candidates(timetable, request, window);
     profile(
@@ -377,6 +382,7 @@ pub fn route_range(
         bucket,
         slack,
         max_options,
+        banned_routes,
     )
 }
 
@@ -440,6 +446,7 @@ pub fn least_emissions_matrix(
                 inputs.factors,
                 bucket,
                 0,
+                &[],
             );
             let departures = departure_candidates(timetable, request, window);
             let mut best: Vec<Option<(f64, u32, u32, f64)>> = vec![None; destinations.len()];
@@ -477,12 +484,22 @@ fn profile(
     bucket: f64,
     slack: u32,
     max_options: Option<usize>,
+    banned_routes: &[bool],
 ) -> Vec<Journey> {
     assert!(
         bucket.is_finite() && bucket > 0.0,
         "the emissions bucket must be positive"
     );
-    let mut search = Search::start(view, timetable, footpaths, geometry, factors, bucket, slack);
+    let mut search = Search::start(
+        view,
+        timetable,
+        footpaths,
+        geometry,
+        factors,
+        bucket,
+        slack,
+        banned_routes,
+    );
     for &departure in departures {
         search.pass(request, departure, &mut None);
     }
@@ -557,6 +574,7 @@ fn cap_entries(entries: &[Arrived], max_options: Option<usize>) -> Vec<&Arrived>
 }
 
 impl<'a> Search<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn start(
         view: &'a DayView,
         timetable: &'a Timetable,
@@ -565,6 +583,7 @@ impl<'a> Search<'a> {
         factors: &'a [f64],
         bucket: f64,
         slack: u32,
+        banned_routes: &'a [bool],
     ) -> Search<'a> {
         Search {
             view,
@@ -574,6 +593,7 @@ impl<'a> Search<'a> {
             factors,
             bucket,
             slack,
+            banned_routes,
             arena: Vec::new(),
             bags: vec![Bag::default(); timetable.stop_count() as usize],
             destination: DestinationBag::default(),
@@ -702,8 +722,20 @@ impl<'a> Search<'a> {
     /// `kappa`.
     fn scan_line(&mut self, line: u32, rides: u8, rode: &mut Vec<u32>) {
         let mut entries = std::mem::take(&mut self.queue[line as usize]);
-        entries.sort_unstable_by_key(|&(position, _)| position);
         let pattern = self.view.line_pattern(line);
+        // A banned route's lines are skipped entirely — route penalization
+        // re-searches without the corridors already committed.
+        if self
+            .banned_routes
+            .get(self.timetable.pattern_route(pattern) as usize)
+            .copied()
+            .unwrap_or(false)
+        {
+            entries.clear();
+            self.queue[line as usize] = entries;
+            return;
+        }
+        entries.sort_unstable_by_key(|&(position, _)| position);
         let stops = self.timetable.pattern_stops(pattern);
         let offset = self.view.line_day_offset(line);
         let mut riders: Vec<Rider> = Vec::new();
@@ -1098,7 +1130,16 @@ mod tests {
         let footpaths = Transfers::empty(4);
         let request = request(StopIdx(0), StopIdx(3), 3);
         let journeys = route(
-            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 0, None,
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            1e-6,
+            0,
+            None,
+            &[],
         );
         let points = pareto_oracle(
             &view,
@@ -1158,7 +1199,16 @@ mod tests {
         let footpaths = Transfers::empty(2);
         let request = request(StopIdx(0), StopIdx(1), 3);
         let strict = route(
-            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 0, None,
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            1e-6,
+            0,
+            None,
+            &[],
         );
         // Only the fast dirty line and the slow clean one; the middle line
         // is strictly dominated and dropped.
@@ -1177,7 +1227,16 @@ mod tests {
         // 200 s exceeds the 100 s the fast line beats the middle line by,
         // so the middle line (600, dominated by 500) is retained.
         let relaxed = route(
-            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 200, None,
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            1e-6,
+            200,
+            None,
+            &[],
         );
         assert_eq!(
             triples(&relaxed, &geometry, &factors),
@@ -1203,6 +1262,7 @@ mod tests {
             1e-6,
             200,
             Some(2),
+            &[],
         );
         assert_eq!(
             triples(&capped, &geometry, &factors),
@@ -1242,13 +1302,31 @@ mod tests {
         // Strict Pareto boards only the earliest trip; the later same-factor
         // trip arrives later at no lower emissions, so it is dropped.
         let strict = route(
-            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 0, None,
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            1e-6,
+            0,
+            None,
+            &[],
         );
         assert_eq!(triples(&strict, &geometry, &factors), vec![(500, 100.0, 1)]);
         // A 200 s slack boards the next departure too — the "one trip later"
         // alternative the strict line scan never surfaces.
         let relaxed = route(
-            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 200, None,
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            1e-6,
+            200,
+            None,
+            &[],
         );
         assert_eq!(
             triples(&relaxed, &geometry, &factors),
@@ -1293,7 +1371,16 @@ mod tests {
         let request = request(StopIdx(0), StopIdx(1), 3);
         // Strict Pareto keeps the two frontier trips only.
         let strict = route(
-            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 0, None,
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            1e-6,
+            0,
+            None,
+            &[],
         );
         assert_eq!(
             triples(&strict, &geometry, &factors),
@@ -1303,12 +1390,82 @@ mod tests {
         // frontier trip — far beyond the first departure, so measuring only
         // against the first would wrongly drop it.
         let relaxed = route(
-            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 200, None,
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            1e-6,
+            200,
+            None,
+            &[],
         );
         assert_eq!(
             triples(&relaxed, &geometry, &factors),
             vec![(500, 100.0, 1), (1300, 10.0, 1), (1400, 50.0, 1)]
         );
+    }
+
+    /// Two route-disjoint corridors between the same stops: a fast one on
+    /// route 0 and a slower one on route 1, same emissions.
+    fn two_corridor_fixture() -> (Timetable, TripGeometry, [f64; 2]) {
+        let mut builder = TimetableBuilder::new(2);
+        let fast = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+        let slow = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 1).unwrap();
+        builder
+            .add_trip(fast, vec![time(100), time(500)], 0, 0)
+            .unwrap();
+        builder
+            .add_trip(slow, vec![time(100), time(700)], 1, 0)
+            .unwrap();
+        let timetable = builder.finish();
+        let geometry = TripGeometry::from_trips(
+            &timetable,
+            vec![
+                (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+                (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            ],
+        )
+        .unwrap();
+        (timetable, geometry, [50.0, 50.0])
+    }
+
+    #[test]
+    fn a_route_ban_forces_the_other_corridor() {
+        let (timetable, geometry, factors) = two_corridor_fixture();
+        let view = DayView::universal(&timetable);
+        let footpaths = Transfers::empty(2);
+        let request = request(StopIdx(0), StopIdx(1), 3);
+        // No ban: the fast corridor wins; the slower same-emissions one is
+        // dominated and dropped.
+        let all = route(
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            1e-6,
+            0,
+            None,
+            &[],
+        );
+        assert_eq!(triples(&all, &geometry, &factors), vec![(500, 50.0, 1)]);
+        // Ban route 0: only the slower corridor on route 1 remains.
+        let banned = route(
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            1e-6,
+            0,
+            None,
+            &[true, false],
+        );
+        assert_eq!(triples(&banned, &geometry, &factors), vec![(700, 50.0, 1)]);
     }
 
     #[test]
@@ -1318,7 +1475,16 @@ mod tests {
         let footpaths = Transfers::empty(4);
         let request = request(StopIdx(0), StopIdx(3), 3);
         let journeys = route(
-            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e9, 0, None,
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            1e9,
+            0,
+            None,
+            &[],
         );
         assert_eq!(
             triples(&journeys, &geometry, &factors),
@@ -1366,7 +1532,16 @@ mod tests {
         let view = DayView::universal(&timetable);
         let request = request(StopIdx(0), StopIdx(2), 3);
         let journeys = route(
-            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 0, None,
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            1e-6,
+            0,
+            None,
+            &[],
         );
         assert_eq!(
             triples(&journeys, &geometry, &factors),
@@ -1401,7 +1576,16 @@ mod tests {
         let footpaths = Transfers::empty(2);
         let request = request(StopIdx(0), StopIdx(1), 1);
         let journeys = route(
-            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 0, None,
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            1e-6,
+            0,
+            None,
+            &[],
         );
         let points = pareto_oracle(
             &view,
@@ -1458,7 +1642,16 @@ mod tests {
         let view = DayView::universal(&timetable);
         let request = request(StopIdx(0), StopIdx(3), 3);
         let journeys = route(
-            &view, &timetable, &footpaths, &geometry, &factors, &request, 1e-6, 0, None,
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            1e-6,
+            0,
+            None,
+            &[],
         );
         let points = pareto_oracle(
             &view,
@@ -1517,6 +1710,7 @@ mod tests {
             1e-6,
             0,
             None,
+            &[],
         );
         assert!(journeys.is_empty());
     }
@@ -1735,7 +1929,17 @@ mod tests {
             max_transfers: 1,
         };
         let journeys = route_range(
-            &view, &timetable, &footpaths, &geometry, &factors, &request, 200, 1e-6, 0, None,
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            200,
+            1e-6,
+            0,
+            None,
+            &[],
         );
         let profile: Vec<(u32, u32)> = journeys
             .iter()
