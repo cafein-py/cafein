@@ -21,6 +21,10 @@ reports an isolated peak RSS, and appends one tagged result line to
     r5py-time     r5py   TravelTimeMatrix   (vs cafein-time)
     cafein-cost   cafein TravelCostMatrix   (time + distance + emissions)
     cafein-pareto cafein journey_frontier   (Pareto time x emissions, sample)
+
+The cafein side must run on a release extension — build it with
+``maturin develop --release``; the default ``maturin develop`` produces an
+unoptimized dev-profile module whose timings are meaningless.
 """
 
 import argparse
