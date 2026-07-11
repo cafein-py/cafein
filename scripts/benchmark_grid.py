@@ -284,7 +284,9 @@ def _single_params():
     # earliest-arrival query (a windowed cost matrix would optimise emissions,
     # a different product). cafein-time-single shares these settings so the two
     # differ only in the distance/emissions work.
-    params = {k: v for k, v in SHARED_PARAMS.items() if k not in ("window_s", "percentile")}
+    params = {
+        k: v for k, v in SHARED_PARAMS.items() if k not in ("window_s", "percentile")
+    }
     params["departure_mode"] = "single (08:30, earliest arrival)"
     return params
 
