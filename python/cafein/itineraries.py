@@ -94,8 +94,8 @@ class DetailedItineraries(gpd.GeoDataFrame):
         ``"pareto"`` draws the (arrival, emissions) journeys of the
         McRAPTOR engine — the cleaner-but-slower alternatives the
         time-optimal set misses — at the single given departure;
-        ``"relaxed"`` widens the ``"pareto"`` set by ``slack_seconds`` to
-        the suboptimal journeys arriving within the band; ``"diverse"``
+        ``"relaxed"`` widens the ``"pareto"`` set by a ``slack_seconds``
+        slack in the per-stop dominance; ``"diverse"``
         returns ``max_options`` distinct-corridor alternatives, found by
         iterative route penalization (the fastest journey, then the
         fastest avoiding its routes, and so on) so the options ride
@@ -113,11 +113,15 @@ class DetailedItineraries(gpd.GeoDataFrame):
         The time-slack band in seconds. For ``candidates="relaxed"`` a
         journey is kept even when a cleaner or simpler one dominates it,
         as long as that dominator is not more than ``slack_seconds``
-        earlier (``0`` reproduces ``candidates="pareto"``). For
+        earlier (``0`` reproduces ``candidates="pareto"``) — the same
+        suboptimal-arrival slack as r5py's ``suboptimalMinutes``, here at
+        the single given departure (``journey_frontier`` applies it across
+        a departure ``window``, the r5py-equivalent profile). For
         ``candidates="diverse"`` a positive value widens each penalization
         round's pool to that relaxed frontier (relaxed × diverse). ``None``
-        takes the per-family default — 300 s for ``"relaxed"``, ``0`` for
-        ``"diverse"``. Unused for ``"time"`` and ``"pareto"``.
+        takes the per-family default — 300 s for ``"relaxed"`` (r5py's
+        5-minute ``suboptimalMinutes``), ``0`` for ``"diverse"``. Unused
+        for ``"time"`` and ``"pareto"``.
     max_options : int (optional, default: None)
         For ``candidates="relaxed"``, a cap on the suboptimal alternatives
         kept per OD pair — the frontier is always returned and the nearest
@@ -412,7 +416,7 @@ def _route_pareto(
 ):
     """The (arrival, emissions) McRAPTOR journeys of one OD pair — the
     cleaner-but-slower alternatives the time-optimal set misses, widened by
-    ``slack`` seconds to the suboptimal ones within the band. Single
+    a ``slack``-second slack in the per-stop dominance. Single
     departure (``window=None``)."""
     from cafein.network import _walk_options
 
