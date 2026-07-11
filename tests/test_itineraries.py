@@ -378,6 +378,15 @@ def test_diverse_itinerary_options_are_validated(network):
             candidates="diverse",
             diversity="closest",
         )
+    with pytest.raises(ValueError, match="slack_seconds"):
+        DetailedItineraries(
+            network,
+            *stops,
+            "2022-02-22",
+            "08:30:00",
+            candidates="diverse",
+            slack_seconds=-1,
+        )
 
 
 def test_diverse_itineraries_spread_reaches_across_the_trade_off(network):

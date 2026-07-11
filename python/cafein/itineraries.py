@@ -109,12 +109,15 @@ class DetailedItineraries(gpd.GeoDataFrame):
         multicriteria RAPTOR, or trip-based (``"tbtr"``). ``"tbtr"``
         requires ``candidates="pareto"`` with stop-id origins and
         destinations; ``"relaxed"`` and ``"diverse"`` require ``"raptor"``.
-    slack_seconds : float (optional, default: 300.0)
-        The time-slack band in seconds for ``candidates="relaxed"``: a
+    slack_seconds : float (optional, default: None)
+        The time-slack band in seconds. For ``candidates="relaxed"`` a
         journey is kept even when a cleaner or simpler one dominates it,
         as long as that dominator is not more than ``slack_seconds``
-        earlier. ``0`` reproduces ``candidates="pareto"``. Only used with
-        ``candidates="relaxed"``.
+        earlier (``0`` reproduces ``candidates="pareto"``). For
+        ``candidates="diverse"`` a positive value widens each penalization
+        round's pool to that relaxed frontier (relaxed × diverse). ``None``
+        takes the per-family default — 300 s for ``"relaxed"``, ``0`` for
+        ``"diverse"``. Unused for ``"time"`` and ``"pareto"``.
     max_options : int (optional, default: None)
         For ``candidates="relaxed"``, a cap on the suboptimal alternatives
         kept per OD pair — the frontier is always returned and the nearest
@@ -157,7 +160,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         candidates="time",
         bucket=25.0,
         router="raptor",
-        slack_seconds=300.0,
+        slack_seconds=None,
         max_options=None,
         diversity="time",
         geometries=True,
@@ -232,10 +235,14 @@ def _itineraries_frame(
         raise ValueError("router must be 'raptor' or 'tbtr'")
     if router == "tbtr" and (candidates != "pareto" or kind != "stops"):
         raise ValueError("router='tbtr' requires candidates='pareto' with stop ids")
-    if candidates == "relaxed" and not (
-        isinstance(slack_seconds, (int, float))
-        and math.isfinite(slack_seconds)
-        and slack_seconds >= 0
+    if (
+        candidates in ("relaxed", "diverse")
+        and slack_seconds is not None
+        and not (
+            isinstance(slack_seconds, (int, float))
+            and math.isfinite(slack_seconds)
+            and slack_seconds >= 0
+        )
     ):
         raise ValueError("slack_seconds must be a non-negative number of seconds")
     if candidates in ("relaxed", "diverse") and (
@@ -250,7 +257,14 @@ def _itineraries_frame(
     if diversity not in ("time", "spread"):
         raise ValueError("diversity must be 'time' or 'spread'")
     multicriteria = candidates in ("pareto", "relaxed", "diverse")
-    slack = float(slack_seconds) if candidates == "relaxed" else 0.0
+    # slack_seconds defaults per family: 300 s for the "relaxed" band, 0 s
+    # (strict pareto per round) for "diverse"; a given value applies to either.
+    if candidates == "relaxed":
+        slack = 300.0 if slack_seconds is None else float(slack_seconds)
+    elif candidates == "diverse":
+        slack = 0.0 if slack_seconds is None else float(slack_seconds)
+    else:
+        slack = 0.0
     options = max_options if candidates == "relaxed" else None
     # The multicriteria (McRAPTOR) candidates need the per-trip factor vector;
     # the time candidates get their emissions from the post-hoc annotation only.
@@ -279,6 +293,7 @@ def _itineraries_frame(
                     components,
                     max_options if max_options is not None else 3,
                     diversity,
+                    slack,
                 )
             else:
                 journeys = _route(
@@ -450,13 +465,15 @@ def _route_diverse(
     components,
     k,
     diversity,
+    slack,
 ):
     """``k`` route-disjoint alternatives for one OD pair, by iterative route
     penalization: each round bans the routes the selected journeys rode, and
     ``_diverse_pick`` chooses the round's journey — fastest-first for
     ``diversity="time"``, or spread across the (travel_time, emissions)
     trade-off for ``diversity="spread"`` — until ``k`` are found or the disjoint
-    corridors run out. Single departure (``window=None``)."""
+    corridors run out. A positive ``slack`` widens each round's pool to the
+    relaxed frontier (relaxed × diverse). Single departure (``window=None``)."""
     from cafein.frontier import _diverse_pick, _diverse_reference, _fastest_key
     from cafein.network import _walk_options
 
@@ -473,7 +490,7 @@ def _route_diverse(
                 bucket,
                 *_walk_options(*walk),
                 geometries,
-                0.0,
+                slack,
                 None,
                 banned,
             )
@@ -489,7 +506,7 @@ def _route_diverse(
             router,
             *_walk_options(*walk),
             geometries,
-            0.0,
+            slack,
             None,
             banned,
         )

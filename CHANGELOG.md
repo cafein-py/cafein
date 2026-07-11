@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Relaxed × diverse — ``slack_seconds`` now applies to ``candidates="diverse"``
+  on ``journey_frontier`` / ``DetailedItineraries``: a positive value widens each
+  penalization round's McRAPTOR pool to the relaxed frontier, so a round can pick
+  a slightly suboptimal but more distinct corridor (most visible with
+  ``diversity="spread"``). Its default becomes ``None``, resolved per family —
+  300 s for ``"relaxed"`` and ``0`` (strict pareto per round) for ``"diverse"`` —
+  so existing calls are unchanged.
+
 - Diverse-route objective — ``journey_frontier`` and ``DetailedItineraries``
   take an optional ``diversity`` for ``candidates="diverse"``: ``"time"``
   (default, unchanged) picks the fastest journey each penalization round, while

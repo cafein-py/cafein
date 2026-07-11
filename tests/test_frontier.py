@@ -981,6 +981,70 @@ def test_diverse_candidate_options_are_validated(tmp_path):
             candidates="diverse",
             diversity="closest",
         )
+    with pytest.raises(ValueError, match="slack_seconds"):
+        journey_frontier(
+            network,
+            "A",
+            "B",
+            "2022-02-22",
+            "08:00:00",
+            window=1,
+            candidates="diverse",
+            slack_seconds=-1,
+        )
+
+
+def test_slack_seconds_defaults_are_per_family(network):
+    # The None-sentinel default resolves per family, so existing calls are
+    # unchanged: "relaxed" still defaults to a 300 s band, "diverse" to 0
+    # (strict pareto per round).
+    args = ("1370104", "4960238", "2022-02-22", "08:30:00")
+    relaxed_default = journey_frontier(
+        network, *args, window=1800, candidates="relaxed"
+    )
+    relaxed_300 = journey_frontier(
+        network, *args, window=1800, candidates="relaxed", slack_seconds=300.0
+    )
+    assert relaxed_default.equals(relaxed_300)
+    diverse_default = journey_frontier(
+        network, *args, window=1, max_transfers=6, candidates="diverse", max_options=3
+    )
+    diverse_0 = journey_frontier(
+        network,
+        *args,
+        window=1,
+        max_transfers=6,
+        candidates="diverse",
+        max_options=3,
+        slack_seconds=0.0,
+    )
+    assert diverse_default.equals(diverse_0)
+
+
+def test_relaxed_diverse_widens_the_round_pool(network):
+    # A positive slack_seconds widens each penalization round's McRAPTOR pool to
+    # the relaxed frontier (relaxed × diverse), so "spread" can pick a
+    # slightly-suboptimal but more distinct corridor than the strict-pareto pool
+    # offers — here a far, slower corridor the strict set never reaches.
+    common = dict(
+        window=1,
+        max_transfers=6,
+        candidates="diverse",
+        max_options=4,
+        diversity="spread",
+    )
+    args = ("1281160", "1320107", "2022-02-22", "08:30:00")
+    strict = journey_frontier(network, *args, slack_seconds=0.0, **common)
+    widened = journey_frontier(network, *args, slack_seconds=1800.0, **common)
+    # Same fastest seed, still route-disjoint, but a different corridor set that
+    # reaches further across the trade-off.
+    assert _option_corridors(widened)[0] == _option_corridors(strict)[0]
+    assert _option_corridors(widened) != _option_corridors(strict)
+    assert widened["travel_time"].max() > strict["travel_time"].max()
+    for corridors in (_option_corridors(strict), _option_corridors(widened)):
+        for i, first in enumerate(corridors):
+            for second in corridors[i + 1 :]:
+                assert first.isdisjoint(second)
 
 
 def test_diverse_time_reproduces_the_default(network):
