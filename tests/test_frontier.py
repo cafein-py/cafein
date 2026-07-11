@@ -860,6 +860,21 @@ def _option_corridors(frame):
     ]
 
 
+def _journey_signatures(frame):
+    return [
+        tuple(
+            (
+                leg["type"],
+                leg.get("route_id"),
+                int(leg["departure"]),
+                int(leg["arrival"]),
+            )
+            for leg in journey["legs"]
+        )
+        for journey in frame["journey"]
+    ]
+
+
 def test_diverse_candidates_split_bus_and_tram(tmp_path):
     from cafein import TransportNetwork
 
@@ -1045,6 +1060,49 @@ def test_relaxed_diverse_widens_the_round_pool(network):
         for i, first in enumerate(corridors):
             for second in corridors[i + 1 :]:
                 assert first.isdisjoint(second)
+
+
+def test_relaxed_window_is_the_r5py_equivalent(network):
+    # candidates="relaxed" over a departure window is R5's detailed-itinerary
+    # strategy: a McRAPTOR profile across the window under a per-stop suboptimal
+    # slack, with no route penalty. Compared over the same window against
+    # "diverse" (iterative route penalization onto disjoint corridors), relaxed
+    # does not force route-disjointness — trunk-sharing alternatives survive, as
+    # in R5 — and, because disjoint corridors run out while trunk-sharing ones do
+    # not, it surfaces more alternatives than the disjoint set.
+    args = ("1281160", "1320107", "2022-02-22", "08:30:00")
+    common = dict(window=600, max_transfers=6)
+    diverse = journey_frontier(
+        network,
+        *args,
+        **common,
+        candidates="diverse",
+        max_options=4,
+        diversity="spread",
+    )
+    relaxed = journey_frontier(
+        network,
+        *args,
+        **common,
+        candidates="relaxed",
+        slack_seconds=900,
+    )
+    div = _option_corridors(diverse)
+    rel = _option_corridors(relaxed)
+    # diverse forces pairwise route-disjoint corridors...
+    assert all(a.isdisjoint(b) for i, a in enumerate(div) for b in div[i + 1 :])
+    # ...relaxed does not: at least one pair of options shares a route.
+    assert any(not a.isdisjoint(b) for i, a in enumerate(rel) for b in rel[i + 1 :])
+    # over the same window, allowing trunk-sharing surfaces more alternatives
+    # than forcing disjointness — and diverse returns fewer than its
+    # max_options=4 cap, so the gap is exhausted disjoint corridors, not the cap.
+    assert len(diverse) < 4
+    assert len(relaxed) > len(diverse)
+    # like r5py, the alternatives are deduplicated: no two options are the same
+    # journey. (Arrivals span more than slack_seconds here — over a window the
+    # slack is a per-stop dominance margin, not a global arrival bound.)
+    signatures = _journey_signatures(relaxed)
+    assert len(signatures) == len(set(signatures))
 
 
 def test_diverse_time_reproduces_the_default(network):

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- r5py-equivalent alternatives — documented that ``journey_frontier`` with
+  ``candidates="relaxed"`` over a departure ``window`` is r5py/R5's
+  detailed-itinerary strategy: a McRAPTOR profile across the window kept within a
+  suboptimal-arrival slack, with no route penalty, so trunk-sharing options
+  survive (unlike ``candidates="diverse"``, which forces route-disjoint
+  corridors). ``window`` maps to r5py's ``departure_time_window`` and
+  ``slack_seconds`` to its ``suboptimalMinutes`` (whose 5-minute default is
+  ``slack_seconds``'s 300 s). Docstrings and a parity test only; no behaviour
+  change.
+
 - Relaxed × diverse — ``slack_seconds`` now applies to ``candidates="diverse"``
   on ``journey_frontier`` / ``DetailedItineraries``: a positive value widens each
   penalization round's McRAPTOR pool to the relaxed frontier, so a round can pick

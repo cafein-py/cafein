@@ -19,9 +19,19 @@ on every annotated criterion. The candidate set is selected by
   candidates provably miss; ``exhaustive_frontier`` is its exact,
   brute-force reference.
 - ``candidates="relaxed"``: the ``"pareto"`` set widened by a time slack
-  to the suboptimal journeys arriving within the band.
+  in the per-stop dominance — a journey a cleaner or simpler one would
+  dominate is kept unless that dominator is more than ``slack_seconds``
+  earlier. Taken over a departure ``window`` this matches r5py/R5's
+  detailed-itinerary alternatives — a McRAPTOR profile across the window
+  under a per-stop suboptimal slack, with no route penalty, so
+  trunk-sharing options survive — where ``window`` is r5py's
+  ``departure_time_window`` and ``slack_seconds`` its ``suboptimalMinutes``
+  (whose 5-minute default is ``slack_seconds``'s 300 s). Because the slack
+  acts per stop and departures spread across the window, kept journeys can
+  arrive more than ``slack_seconds`` after the fastest.
 - ``candidates="diverse"``: distinct-corridor alternatives found by
-  iterative route penalization, riding disjoint line sets.
+  iterative route penalization, riding disjoint line sets — unlike
+  ``"relaxed"``, the options are forced onto route-disjoint corridors.
 """
 
 import math
@@ -77,10 +87,11 @@ def journey_frontier(
     also finds the cleaner-but-slower journeys the time-optimal set
     misses; emissions are compared at ``bucket`` grams during the
     search and re-annotated exactly afterwards. ``candidates="relaxed"``
-    widens that set by ``slack_seconds`` to also keep the suboptimal
-    journeys arriving within the band (capped by ``max_options``), and
-    ``candidates="diverse"`` returns ``max_options`` distinct-corridor
-    alternatives by iterative route penalization.
+    widens that set by a ``slack_seconds`` slack in the per-stop
+    dominance, keeping suboptimal journeys a nearer one would prune
+    (capped by ``max_options``), and ``candidates="diverse"`` returns
+    ``max_options`` distinct-corridor alternatives by iterative route
+    penalization.
 
     With a fare structure (`fares`), every candidate is also priced,
     the frame gains a ``fare`` column, and the fare joins the frontier
@@ -116,10 +127,10 @@ def journey_frontier(
         The candidate journey set: ``"time"`` for the range-RAPTOR
         time-optimal journeys, ``"pareto"`` for the McRAPTOR journeys
         Pareto-optimal in (departure, arrival, emissions),
-        ``"relaxed"`` for the ``"pareto"`` set widened by
-        ``slack_seconds`` to the suboptimal journeys arriving within the
-        band — the "a bit slower but a real alternative" options that
-        strict Pareto drops — or ``"diverse"`` for ``max_options``
+        ``"relaxed"`` for the ``"pareto"`` set widened by a
+        ``slack_seconds`` slack in the per-stop dominance — the "a bit
+        slower but a real alternative" options that strict Pareto drops —
+        or ``"diverse"`` for ``max_options``
         distinct-corridor alternatives, found by iterative route
         penalization (the fastest journey, then the fastest avoiding its
         routes, and so on) so the options ride disjoint line sets. All
@@ -147,9 +158,9 @@ def journey_frontier(
         ``candidates="diverse"`` a positive value widens each penalization
         round's pool to that relaxed frontier (relaxed × diverse), so a
         round can pick a slightly suboptimal but more distinct corridor.
-        ``None`` takes the per-family default — 300 s for ``"relaxed"``,
-        ``0`` (strict pareto per round) for ``"diverse"``. Unused for
-        ``"time"`` and ``"pareto"``.
+        ``None`` takes the per-family default — 300 s for ``"relaxed"``
+        (r5py's 5-minute ``suboptimalMinutes``), ``0`` (strict pareto per
+        round) for ``"diverse"``. Unused for ``"time"`` and ``"pareto"``.
     max_options : int (optional, default: None)
         For ``candidates="relaxed"``, a cap on the suboptimal
         alternatives kept: the strict frontier is always returned in
