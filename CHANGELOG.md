@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Soft-penalty diverse — ``journey_frontier`` and ``DetailedItineraries`` take an
+  optional ``penalty`` for ``candidates="diverse"``: ``"ban"`` (default,
+  unchanged) hard-bans a chosen corridor's routes so the options stay fully
+  route-disjoint, while a positive number of seconds instead adds to a chosen
+  route's effective arrival per prior use — costly but still usable — so a
+  corridor that mostly differs yet shares a trunk can surface (the R5-style soft
+  penalty) and the set can hold more options before drying up. The penalty steers
+  the McRAPTOR search through the dominance only; reported journey times stay the
+  true (unpenalized) values.
+
 - r5py-equivalent alternatives — documented that ``journey_frontier`` with
   ``candidates="relaxed"`` over a departure ``window`` is r5py/R5's
   detailed-itinerary strategy: a McRAPTOR profile across the window kept within a

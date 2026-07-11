@@ -387,6 +387,57 @@ def test_diverse_itinerary_options_are_validated(network):
             candidates="diverse",
             slack_seconds=-1,
         )
+    for bad in (-5, 0, "nope"):
+        with pytest.raises(ValueError, match="penalty must be"):
+            DetailedItineraries(
+                network,
+                *stops,
+                "2022-02-22",
+                "08:30:00",
+                candidates="diverse",
+                penalty=bad,
+            )
+    with pytest.raises(ValueError, match="penalty applies only"):
+        DetailedItineraries(
+            network,
+            *stops,
+            "2022-02-22",
+            "08:30:00",
+            candidates="pareto",
+            penalty=300,
+        )
+
+
+def test_diverse_itineraries_soft_penalty_shares_trunks(network):
+    # penalty="ban" forces route-disjoint corridors; a positive penalty lets a
+    # corridor share a trunk route and surfaces more options before drying up.
+    origin, destination = "1281160", "1320107"
+    common = dict(
+        max_transfers=6, candidates="diverse", max_options=5, diversity="spread"
+    )
+    ban = DetailedItineraries(
+        network,
+        [origin],
+        [destination],
+        "2022-02-22",
+        "08:30:00",
+        penalty="ban",
+        **common,
+    )
+    soft = DetailedItineraries(
+        network,
+        [origin],
+        [destination],
+        "2022-02-22",
+        "08:30:00",
+        penalty=600,
+        **common,
+    )
+    bc = _itinerary_corridors(ban)
+    sc = _itinerary_corridors(soft)
+    assert all(a.isdisjoint(b) for i, a in enumerate(bc) for b in bc[i + 1 :])
+    assert any(not a.isdisjoint(b) for i, a in enumerate(sc) for b in sc[i + 1 :])
+    assert soft["option"].nunique() > ban["option"].nunique()
 
 
 def test_diverse_itineraries_spread_reaches_across_the_trade_off(network):

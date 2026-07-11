@@ -407,6 +407,43 @@ fn two_corridor_fixture() -> (Timetable, TripGeometry, [f64; 2]) {
     (timetable, geometry, [50.0, 50.0])
 }
 
+/// Two corridors 0→1 (a fast route 0, a slow route 1, equal emissions),
+/// then two onward trips 1→2: an early one only the fast corridor's
+/// arrival can catch, and a late one either can. Used to check that a
+/// penalty on the fast route does not prune its physically-earlier label
+/// at the hub, which alone catches the early connection.
+fn connection_fixture() -> (Timetable, TripGeometry, [f64; 4]) {
+    let mut builder = TimetableBuilder::new(3);
+    let fast = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let slow = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 1).unwrap();
+    let early = builder.add_pattern(&[StopIdx(1), StopIdx(2)], 2).unwrap();
+    let late = builder.add_pattern(&[StopIdx(1), StopIdx(2)], 3).unwrap();
+    builder
+        .add_trip(fast, vec![time(0), time(100)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(slow, vec![time(0), time(300)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(early, vec![time(150), time(200)], 2, 0)
+        .unwrap();
+    builder
+        .add_trip(late, vec![time(350), time(600)], 3, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(2), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(3), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    (timetable, geometry, [100.0, 100.0, 100.0, 100.0])
+}
+
 #[test]
 fn a_route_ban_forces_the_other_corridor() {
     let (timetable, geometry, factors) = two_corridor_fixture();
@@ -428,7 +465,8 @@ fn a_route_ban_forces_the_other_corridor() {
         &[],
     );
     assert_eq!(triples(&all, &geometry, &factors), vec![(500, 50.0, 1)]);
-    // Ban route 0: only the slower corridor on route 1 remains.
+    // Ban route 0 (the `u32::MAX` sentinel): only the slower corridor on
+    // route 1 remains.
     let banned = route(
         &view,
         &timetable,
@@ -439,9 +477,79 @@ fn a_route_ban_forces_the_other_corridor() {
         1e-6,
         0,
         None,
-        &[true, false],
+        &[u32::MAX, 0],
     );
     assert_eq!(triples(&banned, &geometry, &factors), vec![(700, 50.0, 1)]);
+}
+
+#[test]
+fn a_soft_route_penalty_flips_the_winner_but_reports_the_true_arrival() {
+    let (timetable, geometry, factors) = two_corridor_fixture();
+    let view = DayView::universal(&timetable);
+    let footpaths = Transfers::empty(2);
+    let request = request(StopIdx(0), StopIdx(1), 3);
+    // A penalty under the 200 s gap leaves the fast corridor (route 0) winning:
+    // its effective arrival 500 + 100 still beats the other's 700, and the
+    // journey reports its true 500 — the penalty lives only in the dominance.
+    let light = route(
+        &view,
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        &request,
+        1e-6,
+        0,
+        None,
+        &[100, 0],
+    );
+    assert_eq!(triples(&light, &geometry, &factors), vec![(500, 50.0, 1)]);
+    // A penalty over the gap flips the winner to route 1 (effective 750 > 700),
+    // and the surviving journey still reports its true 700, never 750.
+    let heavy = route(
+        &view,
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        &request,
+        1e-6,
+        0,
+        None,
+        &[250, 0],
+    );
+    assert_eq!(triples(&heavy, &geometry, &factors), vec![(700, 50.0, 1)]);
+}
+
+#[test]
+fn a_penalized_early_label_still_catches_its_connection() {
+    let (timetable, geometry, factors) = connection_fixture();
+    let view = DayView::universal(&timetable);
+    let footpaths = Transfers::empty(3);
+    let request = request(StopIdx(0), StopIdx(2), 3);
+    // Route 0 reaches the hub at 100, route 1 at 300; a 300 s penalty on route 0
+    // pushes its effective arrival (400) past route 1's (300). Dominating on the
+    // effective arrival alone would prune the route-0 label at the hub, losing
+    // the only corridor that catches the early 1→2 trip (departs 150). Because
+    // the stop bag also keeps the physically-earlier label, the search still
+    // reaches the destination at the true 200, not route 1's 600.
+    let journeys = route(
+        &view,
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        &request,
+        1e-6,
+        0,
+        None,
+        &[300, 0, 0, 0],
+    );
+    let arrivals: Vec<u32> = journeys.iter().map(|journey| journey.arrival).collect();
+    assert!(
+        arrivals.contains(&200),
+        "the penalized early corridor must still reach 200, got {arrivals:?}"
+    );
 }
 
 #[test]

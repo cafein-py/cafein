@@ -95,11 +95,12 @@ class DetailedItineraries(gpd.GeoDataFrame):
         McRAPTOR engine — the cleaner-but-slower alternatives the
         time-optimal set misses — at the single given departure;
         ``"relaxed"`` widens the ``"pareto"`` set by a ``slack_seconds``
-        slack in the per-stop dominance; ``"diverse"``
-        returns ``max_options`` distinct-corridor alternatives, found by
-        iterative route penalization (the fastest journey, then the
-        fastest avoiding its routes, and so on) so the options ride
-        disjoint line sets.
+        slack in the per-stop dominance; ``"diverse"`` returns
+        ``max_options`` distinct alternatives by iterative route
+        penalization — by default (``penalty="ban"``) banning each chosen
+        corridor's routes so the options ride disjoint line sets, or with a
+        numeric ``penalty`` making a used route costly but still usable so
+        corridors may share a trunk.
     bucket : float (optional, default: 25.0)
         The emissions bucket width in grams CO₂e for the ``"pareto"``
         search's arrival tie-break; smaller keeps finer emission
@@ -137,6 +138,14 @@ class DetailedItineraries(gpd.GeoDataFrame):
         journey farthest from the already-chosen corridors in the
         normalized (travel_time, emissions) plane, so the options span the
         trade-off. Unused for the other candidate sets.
+    penalty : str or float (optional, default: "ban")
+        How ``candidates="diverse"`` steers each round off the corridors
+        already chosen. ``"ban"`` (default) hard-bans every route a chosen
+        corridor rode, so the options ride fully route-disjoint line sets;
+        a positive number instead adds that many seconds to a chosen
+        route's effective arrival per prior use, so a corridor that mostly
+        differs yet shares a trunk can surface (the R5-style soft penalty).
+        Unused for the other candidate sets.
     geometries : bool (optional, default: True)
         Attach each leg's geometry. Turn off to skip the geometry work
         when only the leg records are needed.
@@ -167,6 +176,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         slack_seconds=None,
         max_options=None,
         diversity="time",
+        penalty="ban",
         geometries=True,
         walking_speed_kmph=None,
         max_walking_time=None,
@@ -192,6 +202,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
             slack_seconds=slack_seconds,
             max_options=max_options,
             diversity=diversity,
+            penalty=penalty,
             geometries=geometries,
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
@@ -216,6 +227,7 @@ def _itineraries_frame(
     slack_seconds,
     max_options,
     diversity,
+    penalty,
     geometries,
     walking_speed_kmph,
     max_walking_time,
@@ -260,6 +272,15 @@ def _itineraries_frame(
         raise ValueError("max_options must be a positive integer or None")
     if diversity not in ("time", "spread"):
         raise ValueError("diversity must be 'time' or 'spread'")
+    if penalty != "ban" and not (
+        isinstance(penalty, (int, float))
+        and not isinstance(penalty, bool)
+        and math.isfinite(penalty)
+        and round(penalty) >= 1
+    ):
+        raise ValueError("penalty must be 'ban' or a number of seconds >= 1")
+    if penalty != "ban" and candidates != "diverse":
+        raise ValueError("penalty applies only to candidates='diverse'")
     multicriteria = candidates in ("pareto", "relaxed", "diverse")
     # slack_seconds defaults per family: 300 s for the "relaxed" band, 0 s
     # (strict pareto per round) for "diverse"; a given value applies to either.
@@ -298,6 +319,7 @@ def _itineraries_frame(
                     max_options if max_options is not None else 3,
                     diversity,
                     slack,
+                    penalty,
                 )
             else:
                 journeys = _route(
@@ -470,18 +492,29 @@ def _route_diverse(
     k,
     diversity,
     slack,
+    penalty,
 ):
-    """``k`` route-disjoint alternatives for one OD pair, by iterative route
-    penalization: each round bans the routes the selected journeys rode, and
+    """``k`` distinct alternatives for one OD pair, by iterative route
+    penalization: each round the chosen corridors' routes are made costlier, and
     ``_diverse_pick`` chooses the round's journey — fastest-first for
     ``diversity="time"``, or spread across the (travel_time, emissions)
-    trade-off for ``diversity="spread"`` — until ``k`` are found or the disjoint
-    corridors run out. A positive ``slack`` widens each round's pool to the
-    relaxed frontier (relaxed × diverse). Single departure (``window=None``)."""
-    from cafein.frontier import _diverse_pick, _diverse_reference, _fastest_key
+    trade-off for ``diversity="spread"`` — until ``k`` are found or the search
+    dries up. ``penalty="ban"`` hard-bans a chosen corridor's routes, so the
+    alternatives ride fully route-disjoint line sets; a positive ``penalty``
+    instead adds that many seconds to each chosen route's effective arrival per
+    prior use, so a corridor sharing a trunk can still surface (soft penalty).
+    A positive ``slack`` widens each round's pool to the relaxed frontier
+    (relaxed × diverse). Single departure (``window=None``)."""
+    from cafein.frontier import (
+        _MAX_PENALTY,
+        _diverse_pick,
+        _diverse_reference,
+        _fastest_key,
+        _journey_key,
+    )
     from cafein.network import _walk_options
 
-    def search(banned):
+    def search(banned, route_penalties):
         if kind == "points":
             return network._core.mc_route_between_coordinates(
                 origin_key,
@@ -497,6 +530,7 @@ def _route_diverse(
                 slack,
                 None,
                 banned,
+                route_penalties,
             )
         return network._core.mc_route_between_stops(
             origin_key,
@@ -513,28 +547,47 @@ def _route_diverse(
             slack,
             None,
             banned,
+            route_penalties,
         )
 
     banned = []
+    penalties = {}
     selected = []
+    seen = set()
     reference = None
     for _ in range(k):
-        journeys = search(banned)
+        journeys = search(banned, list(penalties.items()))
         if not journeys:
             break
         network.annotate_emissions(journeys, factors, components)
         if reference is None:
             reference = _diverse_reference(journeys)
-        pick = _diverse_pick(journeys, selected, diversity, reference)
+        # A soft penalty leaves chosen journeys in the pool, so drop the ones
+        # already kept before picking; a ban removes them at the source.
+        fresh = [j for j in journeys if _journey_key(j) not in seen]
+        if not fresh:
+            break
+        pick = _diverse_pick(fresh, selected, diversity, reference)
         selected.append(pick)
-        routes = {
+        seen.add(_journey_key(pick))
+        route_ids = [
             leg["route_id"]
             for leg in pick["legs"]
             if leg["type"] == "transit" and leg.get("route_id") is not None
-        }
-        if not routes:
+        ]
+        if not route_ids:
             break
-        banned = banned + [route for route in routes if route not in banned]
+        if penalty == "ban":
+            # Banning is idempotent, so dedup against what is already banned.
+            for route in route_ids:
+                if route not in banned:
+                    banned.append(route)
+        else:
+            # One penalty step per route use: a corridor riding a route twice is
+            # penalized twice. Clamp below the ban sentinel (see _MAX_PENALTY).
+            step = int(round(penalty))
+            for route in route_ids:
+                penalties[route] = min(penalties.get(route, 0) + step, _MAX_PENALTY)
     # Return options travel-time sorted (as journey_frontier's frame is), so the
     # objective changes which corridors are chosen, not the option order.
     selected.sort(key=_fastest_key)
