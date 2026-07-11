@@ -66,6 +66,7 @@ class TransportNetwork:
         walking_speed_kmph=None,
         max_walking_time=None,
         max_snap_distance=None,
+        bounding_box=None,
         trip_distances=True,
         leg_geometries=True,
         ultra=False,
@@ -95,6 +96,13 @@ class TransportNetwork:
         max_snap_distance : float (optional, default: 1600)
             Maximum distance in meters from a stop to the walking
             network; stops farther away get no footpaths.
+        bounding_box : sequence of float or shapely geometry (optional)
+            Restrict the OSM walking network to this area, as
+            ``[min_lon, min_lat, max_lon, max_lat]`` or a shapely
+            geometry, so a region-wide extract can be cropped to the
+            stops' neighbourhood; stops snap only to the cropped network,
+            so those beyond `max_snap_distance` of it get no footpaths.
+            Only meaningful with `osm_pbf`.
         trip_distances : bool (optional, default: True)
             Compute per-trip travel distances through the fallback
             ladder (``cafein.geometry.trip_distances``), so transit legs
@@ -146,6 +154,7 @@ class TransportNetwork:
                 walking_speed_kmph=walking_speed_kmph,
                 max_walking_time=max_walking_time,
                 max_snap_distance=max_snap_distance,
+                bounding_box=bounding_box,
             )
             core.set_transfer_arrays(
                 footpaths.stop_ids,

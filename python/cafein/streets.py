@@ -126,6 +126,7 @@ def walking_footpaths(
     walking_speed_kmph=WALKING_SPEED_KMPH,
     max_walking_time=MAX_WALKING_TIME,
     max_snap_distance=MAX_SNAP_DISTANCE,
+    bounding_box=None,
 ):
     """Precompute stop-to-stop walking transfers from an OSM extract.
 
@@ -146,6 +147,13 @@ def walking_footpaths(
     max_snap_distance : float (optional, default: 1600)
         Maximum straight-line distance in meters from a stop to its
         nearest walking-network edge.
+    bounding_box : sequence of float or shapely geometry (optional)
+        Restrict the walking network to this area, as
+        ``[min_lon, min_lat, max_lon, max_lat]`` or a shapely geometry;
+        ways outside it are dropped, so a region-wide extract can be
+        cropped to the stops' neighbourhood. Stops then snap only to the
+        cropped network, so a stop with no edge within `max_snap_distance`
+        of it gets no footpaths.
 
     Returns
     -------
@@ -156,7 +164,7 @@ def walking_footpaths(
         iterating yields the legacy ``(from_stop, to_stop, seconds,
         meters)`` tuples.
     """
-    nodes, edges = _walking_network(osm_pbf)
+    nodes, edges = _walking_network(osm_pbf, bounding_box)
     return _network_footpaths(
         stops,
         nodes,
@@ -174,10 +182,11 @@ def walking_streets(
     walking_speed_kmph=WALKING_SPEED_KMPH,
     max_walking_time=MAX_WALKING_TIME,
     max_snap_distance=MAX_SNAP_DISTANCE,
+    bounding_box=None,
 ):
     """Both walking structures of an OSM extract, from one load.
 
-    Parameters are as in `walking_footpaths`.
+    Parameters are as in `walking_footpaths`, including `bounding_box`.
 
     Returns
     -------
@@ -191,7 +200,7 @@ def walking_streets(
         links as ``(stop_id, edge, fraction, connector_meters)`` snap
         records.
     """
-    nodes, edges = _walking_network(osm_pbf)
+    nodes, edges = _walking_network(osm_pbf, bounding_box)
     return _network_streets(
         stops,
         nodes,
@@ -220,7 +229,7 @@ _UNWALKABLE_FILTER = {
 mapped as areas, and ways that explicitly exclude pedestrians."""
 
 
-def _walking_network(osm_pbf):
+def _walking_network(osm_pbf, bounding_box=None):
     """The walkable street network of a PBF extract, as (nodes, edges).
 
     Extracted with cafein's own walkability rule rather than pyrosm's
@@ -233,7 +242,12 @@ def _walking_network(osm_pbf):
     """
     # The out-of-core engine streams the PBF instead of loading it into
     # memory, so country-scale extracts parse within bounded RAM.
-    osm = pyrosm.OSM(str(osm_pbf), engine="out_of_core", workers="auto")
+    osm = pyrosm.OSM(
+        str(osm_pbf),
+        bounding_box=bounding_box,
+        engine="out_of_core",
+        workers="auto",
+    )
     network = osm.get_network(
         network_type="walking",
         custom_filter=_UNWALKABLE_FILTER,

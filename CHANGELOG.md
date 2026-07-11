@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Walking-graph bounding box — ``TransportNetwork.from_gtfs`` and the
+  ``cafein.streets`` extractors (``walking_footpaths`` / ``walking_streets``)
+  take an optional ``bounding_box`` that restricts the OSM walking network to a
+  ``[min_lon, min_lat, max_lon, max_lat]`` area (or a shapely geometry), so a
+  region-wide extract can be cropped to the stops' neighbourhood; stops snap
+  only to the cropped network.
+
 - Windowed TBTR stop matrices — ``router="tbtr"`` now answers
   windowed/percentile stop travel-time matrices (``travel_time_matrix`` /
   ``travel_times_from_stop`` / ``TravelTimeMatrix`` given a ``window``),
