@@ -73,4 +73,6 @@ jobs:
         run: pip install -e . --no-build-isolation
       - name: Run Python tests
         shell: bash -el {0}
-        run: pytest --cov=cafein --cov-report=term-missing
+        # Parallelised across the runner's cores with pytest-xdist; the heavy
+        # per-test network builds distribute well, roughly halving wall-clock.
+        run: pytest -n auto --dist load --cov=cafein --cov-report=term-missing
