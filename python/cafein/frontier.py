@@ -344,7 +344,9 @@ def _diverse_reference(journeys):
     resolved emissions do not set the emissions range; if none resolve, that
     axis is zero-range and contributes nothing."""
     times = [journey["arrival"] - journey["departure"] for journey in journeys]
-    grams = [journey["emissions"] for journey in journeys if journey["emissions"] is not None]
+    grams = [
+        journey["emissions"] for journey in journeys if journey["emissions"] is not None
+    ]
     time_range = (min(times), max(times))
     grams_range = (min(grams), max(grams)) if grams else (0.0, 0.0)
     return time_range, grams_range

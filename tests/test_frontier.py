@@ -991,7 +991,13 @@ def test_diverse_time_reproduces_the_default(network):
         network, "1370104", "4960238", "2022-02-22", "08:30:00", **common
     )
     explicit = journey_frontier(
-        network, "1370104", "4960238", "2022-02-22", "08:30:00", diversity="time", **common
+        network,
+        "1370104",
+        "4960238",
+        "2022-02-22",
+        "08:30:00",
+        diversity="time",
+        **common,
     )
     assert explicit.equals(default)
 
@@ -1002,7 +1008,13 @@ def test_diverse_spread_reaches_across_the_trade_off(network):
     # reaches the far (slow-clean) corner the fastest-first set skips.
     common = dict(window=1, max_transfers=6, candidates="diverse", max_options=3)
     fast = journey_frontier(
-        network, "1370104", "4960238", "2022-02-22", "08:30:00", diversity="time", **common
+        network,
+        "1370104",
+        "4960238",
+        "2022-02-22",
+        "08:30:00",
+        diversity="time",
+        **common,
     )
     spread = journey_frontier(
         network,

@@ -390,7 +390,13 @@ def test_diverse_itineraries_spread_reaches_across_the_trade_off(network):
         return max(int(g["arrival"].max()) for _, g in itineraries.groupby("option"))
 
     fast = DetailedItineraries(
-        network, [origin], [destination], "2022-02-22", "08:30:00", diversity="time", **common
+        network,
+        [origin],
+        [destination],
+        "2022-02-22",
+        "08:30:00",
+        diversity="time",
+        **common,
     )
     spread = DetailedItineraries(
         network,
