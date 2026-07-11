@@ -122,6 +122,14 @@ class DetailedItineraries(gpd.GeoDataFrame):
         within the slack. For ``candidates="diverse"``, the number of
         distinct-corridor alternatives per OD pair (``None`` defaults to
         3); fewer are returned when the disjoint corridors run out.
+    diversity : str (optional, default: "time")
+        The objective for ``candidates="diverse"``: ``"time"`` picks the
+        fastest journey each penalization round (cleaner as tie-break),
+        biasing the options toward the fast end of the trade-off;
+        ``"spread"`` seeds on the fastest, then each later round picks the
+        journey farthest from the already-chosen corridors in the
+        normalized (travel_time, emissions) plane, so the options span the
+        trade-off. Unused for the other candidate sets.
     geometries : bool (optional, default: True)
         Attach each leg's geometry. Turn off to skip the geometry work
         when only the leg records are needed.
@@ -151,6 +159,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         router="raptor",
         slack_seconds=300.0,
         max_options=None,
+        diversity="time",
         geometries=True,
         walking_speed_kmph=None,
         max_walking_time=None,
@@ -175,6 +184,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
             router=router,
             slack_seconds=slack_seconds,
             max_options=max_options,
+            diversity=diversity,
             geometries=geometries,
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
@@ -198,6 +208,7 @@ def _itineraries_frame(
     router,
     slack_seconds,
     max_options,
+    diversity,
     geometries,
     walking_speed_kmph,
     max_walking_time,
@@ -236,6 +247,8 @@ def _itineraries_frame(
         )
     ):
         raise ValueError("max_options must be a positive integer or None")
+    if diversity not in ("time", "spread"):
+        raise ValueError("diversity must be 'time' or 'spread'")
     multicriteria = candidates in ("pareto", "relaxed", "diverse")
     slack = float(slack_seconds) if candidates == "relaxed" else 0.0
     options = max_options if candidates == "relaxed" else None
@@ -265,6 +278,7 @@ def _itineraries_frame(
                     factors,
                     components,
                     max_options if max_options is not None else 3,
+                    diversity,
                 )
             else:
                 journeys = _route(
@@ -435,12 +449,15 @@ def _route_diverse(
     factors,
     components,
     k,
+    diversity,
 ):
     """``k`` route-disjoint alternatives for one OD pair, by iterative route
-    penalization: the shortest-travel-time journey, then the shortest one
-    avoiding its routes, and so on until ``k`` are found or the disjoint
-    corridors run out. Each round is annotated so the travel-time tie-break
-    is by emissions. Single departure (``window=None``)."""
+    penalization: each round bans the routes the selected journeys rode, and
+    ``_diverse_pick`` chooses the round's journey — fastest-first for
+    ``diversity="time"``, or spread across the (travel_time, emissions)
+    trade-off for ``diversity="spread"`` — until ``k`` are found or the disjoint
+    corridors run out. Single departure (``window=None``)."""
+    from cafein.frontier import _diverse_pick, _diverse_reference, _fastest_key
     from cafein.network import _walk_options
 
     def search(banned):
@@ -479,18 +496,15 @@ def _route_diverse(
 
     banned = []
     selected = []
+    reference = None
     for _ in range(k):
         journeys = search(banned)
         if not journeys:
             break
         network.annotate_emissions(journeys, factors, components)
-        pick = min(
-            journeys,
-            key=lambda journey: (
-                journey["arrival"] - journey["departure"],
-                journey["emissions"] if journey["emissions"] is not None else math.inf,
-            ),
-        )
+        if reference is None:
+            reference = _diverse_reference(journeys)
+        pick = _diverse_pick(journeys, selected, diversity, reference)
         selected.append(pick)
         routes = {
             leg["route_id"]
@@ -500,6 +514,9 @@ def _route_diverse(
         if not routes:
             break
         banned = banned + [route for route in routes if route not in banned]
+    # Return options travel-time sorted (as journey_frontier's frame is), so the
+    # objective changes which corridors are chosen, not the option order.
+    selected.sort(key=_fastest_key)
     return selected
 
 

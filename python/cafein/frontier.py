@@ -58,6 +58,7 @@ def journey_frontier(
     router="raptor",
     slack_seconds=300.0,
     max_options=None,
+    diversity="time",
     walking_speed_kmph=None,
     max_walking_time=None,
     max_snap_distance=None,
@@ -154,6 +155,15 @@ def journey_frontier(
         number of distinct-corridor alternatives to return (``None``
         defaults to 3); the search may return fewer when disjoint
         corridors run out. Unused for ``"time"`` and ``"pareto"``.
+    diversity : str (optional, default: "time")
+        The objective for ``candidates="diverse"``: ``"time"`` picks the
+        fastest journey each penalization round (cleaner as tie-break), so
+        the options bias toward the fast end of the trade-off; ``"spread"``
+        seeds on the fastest, then each later round picks the journey
+        farthest from the already-chosen corridors in the normalized
+        (travel_time, emissions) plane, so the options span the trade-off
+        (a fast-dirty one, a slow-clean one, and evenly spaced middles).
+        Unused for the other candidate sets.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         Street-search options for the walking access/egress, as in
         ``route_between_coordinates``. For stop origins/destinations they
@@ -194,6 +204,8 @@ def journey_frontier(
         )
     ):
         raise ValueError("max_options must be a positive integer or None")
+    if diversity not in ("time", "spread"):
+        raise ValueError("diversity must be 'time' or 'spread'")
     slack = float(slack_seconds) if candidates == "relaxed" else 0.0
     options = max_options if candidates == "relaxed" else None
     multicriteria = candidates in ("pareto", "relaxed")
@@ -221,6 +233,7 @@ def journey_frontier(
             (walking_speed_kmph, max_walking_time, max_snap_distance),
             geometries,
             max_options if max_options is not None else 3,
+            diversity,
         )
     elif stops[0]:
         from cafein.network import _walk_options
@@ -325,6 +338,61 @@ def journey_frontier(
     )
 
 
+def _diverse_reference(journeys):
+    """The (travel_time, emissions) ranges of the first round's full frontier —
+    the stable scale the spread distance normalizes against. Journeys with no
+    resolved emissions do not set the emissions range; if none resolve, that
+    axis is zero-range and contributes nothing."""
+    times = [journey["arrival"] - journey["departure"] for journey in journeys]
+    grams = [journey["emissions"] for journey in journeys if journey["emissions"] is not None]
+    time_range = (min(times), max(times))
+    grams_range = (min(grams), max(grams)) if grams else (0.0, 0.0)
+    return time_range, grams_range
+
+
+def _diverse_point(journey, reference):
+    """A journey as a point in the normalized (travel_time, emissions) plane.
+    Unresolved emissions sit at the reference's dirty end; a zero-range axis
+    maps everything to 0 so it cannot skew the distance."""
+    (time_lo, time_hi), (grams_lo, grams_hi) = reference
+    travel_time = journey["arrival"] - journey["departure"]
+    grams = journey["emissions"]
+    if grams is None:
+        grams = grams_hi
+    time = 0.0 if time_hi == time_lo else (travel_time - time_lo) / (time_hi - time_lo)
+    emit = 0.0 if grams_hi == grams_lo else (grams - grams_lo) / (grams_hi - grams_lo)
+    return time, emit
+
+
+def _fastest_key(journey):
+    """The seed / ``diversity="time"`` order: shortest travel time, cleaner as
+    the tie-break (unresolved emissions last)."""
+    return (
+        journey["arrival"] - journey["departure"],
+        journey["emissions"] if journey["emissions"] is not None else math.inf,
+    )
+
+
+def _diverse_pick(journeys, selected, diversity, reference):
+    """The penalization round's pick, shared by ``journey_frontier`` and
+    ``DetailedItineraries``. The fastest journey seeds round one and drives
+    ``diversity="time"``; ``diversity="spread"`` then takes, each later round,
+    the journey farthest from the already-selected corridors in the normalized
+    (travel_time, emissions) plane (greedy farthest-point dispersion), so the
+    options span the trade-off rather than crowding its fast end."""
+    if diversity == "time" or not selected:
+        return min(journeys, key=_fastest_key)
+    chosen = [_diverse_point(journey, reference) for journey in selected]
+
+    def spread_key(journey):
+        point = _diverse_point(journey, reference)
+        nearest = min(math.hypot(point[0] - c[0], point[1] - c[1]) for c in chosen)
+        # Break ties toward the faster journey for a deterministic pick.
+        return nearest, -(journey["arrival"] - journey["departure"])
+
+    return max(journeys, key=spread_key)
+
+
 def _diverse_journeys(
     network,
     is_stop,
@@ -342,14 +410,16 @@ def _diverse_journeys(
     walk,
     geometries,
     k,
+    diversity,
 ):
-    """``k`` route-disjoint alternatives by iterative route penalization:
-    the shortest-travel-time journey, then the shortest one avoiding its
-    routes, and so on until ``k`` are found or the search dries up — the same
-    order the returned frame sorts by. Each round bans the routes every
-    selected journey has ridden, so the alternatives use disjoint line sets.
-    The round's journeys are annotated so the pick breaks travel-time ties
-    toward the cleaner corridor."""
+    """``k`` route-disjoint alternatives by iterative route penalization: each
+    round bans the routes every selected journey has ridden, so the alternatives
+    use disjoint line sets, and ``_diverse_pick`` chooses the round's journey —
+    fastest-first for ``diversity="time"``, or spread across the
+    (travel_time, emissions) trade-off for ``diversity="spread"`` — until ``k``
+    are found or the search dries up. The returned frame still sorts by
+    travel_time; the objective changes which corridors are chosen, not their
+    order."""
     from cafein.network import _walk_options
 
     def search(banned):
@@ -388,18 +458,15 @@ def _diverse_journeys(
 
     banned = []
     selected = []
+    reference = None
     for _ in range(k):
         journeys = search(banned)
         if not journeys:
             break
         emissions.annotate(journeys, network, factors, components)
-        pick = min(
-            journeys,
-            key=lambda journey: (
-                journey["arrival"] - journey["departure"],
-                journey["emissions"] if journey["emissions"] is not None else math.inf,
-            ),
-        )
+        if reference is None:
+            reference = _diverse_reference(journeys)
+        pick = _diverse_pick(journeys, selected, diversity, reference)
         selected.append(pick)
         routes = {
             leg["route_id"]

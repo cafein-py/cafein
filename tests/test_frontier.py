@@ -970,6 +970,60 @@ def test_diverse_candidate_options_are_validated(tmp_path):
             candidates="diverse",
             max_options=0,
         )
+    with pytest.raises(ValueError, match="diversity must be"):
+        journey_frontier(
+            network,
+            "A",
+            "B",
+            "2022-02-22",
+            "08:00:00",
+            window=1,
+            candidates="diverse",
+            diversity="closest",
+        )
+
+
+def test_diverse_time_reproduces_the_default(network):
+    # diversity="time" is the default objective, so it reproduces the diverse
+    # set returned without the argument.
+    common = dict(window=1, max_transfers=6, candidates="diverse", max_options=3)
+    default = journey_frontier(
+        network, "1370104", "4960238", "2022-02-22", "08:30:00", **common
+    )
+    explicit = journey_frontier(
+        network, "1370104", "4960238", "2022-02-22", "08:30:00", diversity="time", **common
+    )
+    assert explicit.equals(default)
+
+
+def test_diverse_spread_reaches_across_the_trade_off(network):
+    # The same disjoint corridors, but the objective changes which three are
+    # kept: "time" takes the three fastest; "spread" seeds on the fastest, then
+    # reaches the far (slow-clean) corner the fastest-first set skips.
+    common = dict(window=1, max_transfers=6, candidates="diverse", max_options=3)
+    fast = journey_frontier(
+        network, "1370104", "4960238", "2022-02-22", "08:30:00", diversity="time", **common
+    )
+    spread = journey_frontier(
+        network,
+        "1370104",
+        "4960238",
+        "2022-02-22",
+        "08:30:00",
+        diversity="spread",
+        **common,
+    )
+    assert len(spread) == len(fast) == 3
+    # Both seed on the same fastest corridor and stay route-disjoint.
+    assert _option_corridors(spread)[0] == _option_corridors(fast)[0]
+    # Spread reaches a corridor slower than any the fastest-first set kept.
+    assert spread["travel_time"].max() > fast["travel_time"].max()
+    assert _option_corridors(spread) != _option_corridors(fast)
+    # That far corner is cleaner than the fastest-first set's slowest corridor,
+    # so the options span the emissions trade-off, not only travel time.
+    spread_slowest = spread.loc[spread["travel_time"].idxmax()]
+    fast_slowest = fast.loc[fast["travel_time"].idxmax()]
+    assert spread_slowest["emissions"] < fast_slowest["emissions"]
 
 
 def test_unmatched_factors_poison_but_do_not_block(network):
