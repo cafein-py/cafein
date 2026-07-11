@@ -57,15 +57,22 @@ struct Label {
     /// The profile pass that grew this label's chain: label chains
     /// never cross passes, so travel time is `arrival - departure`.
     departure: u32,
+    /// Route-penalty seconds accumulated along the chain (soft-penalty
+    /// diverse); the bags dominate on `arrival + penalty` while the
+    /// reconstructed journey keeps the true `arrival`. Zero without
+    /// penalties.
+    penalty: u32,
     origin: Origin,
 }
 
-/// One bag entry; `key` is the grams bucket, `grams` the exact
-/// (microgram-quantized) value behind it, `rides` the transit legs the
-/// label used to reach the stop.
+/// One bag entry; `arrival` is the true arrival, `penalty` the
+/// accumulated route penalty (0 without one), `key` the grams bucket,
+/// `grams` the exact (microgram-quantized) value behind it, `rides` the
+/// transit legs the label used to reach the stop.
 #[derive(Debug, Clone, Copy)]
 struct Entry {
     arrival: u32,
+    penalty: u32,
     key: i64,
     grams: f64,
     rides: u8,
@@ -95,47 +102,64 @@ impl Bag {
     /// `rides = 0` throughout (its rounds are ranked in the trip bags,
     /// not here), so its dominance stays exactly `(arrival, key)`.
     pub(crate) fn insert(&mut self, arrival: u32, grams: f64, key: i64, rides: u8) -> bool {
-        self.insert_slack(arrival, grams, key, rides, 0)
+        self.insert_slack(arrival, 0, grams, key, rides, 0)
     }
 
-    /// `insert` under a time slack: an entry rejects the newcomer only
-    /// when it is at least `slack` seconds earlier (and no dirtier / no
-    /// more rides), so a journey dominated by a nearer one survives as a
-    /// suboptimal alternative. Same-class (`arrival`, `key`, `rides`)
-    /// duplicates still reduce to the cleanest representative, and eviction
-    /// likewise needs the full `slack` margin. `slack = 0` is exactly
-    /// strict `insert`; the trip-based and exhaustive engines only call the
-    /// strict form, so they keep unchanged dominance.
+    /// `insert` under a route penalty and a time slack. Dominance runs on
+    /// two time axes: an entry may reject the newcomer only when it reaches
+    /// the stop no later in **true arrival** — so it catches every onward
+    /// connection the newcomer could — and is at least `slack` seconds
+    /// earlier on the **effective arrival** (`arrival + penalty`), no
+    /// dirtier and on no more rides. A penalized label arriving physically
+    /// earlier is therefore never suppressed by an unpenalized one arriving
+    /// later, even though its effective arrival is worse. Same-class
+    /// (`arrival`, `penalty`, `key`, `rides`) duplicates reduce to the
+    /// cleanest representative, and eviction likewise needs the full `slack`
+    /// margin. Without penalties effective equals true, so this is exactly
+    /// the single-axis `(arrival, key, rides)` dominance; `slack = 0` is
+    /// strict `insert`, the only form the trip-based and exhaustive engines
+    /// call.
     pub(crate) fn insert_slack(
         &mut self,
         arrival: u32,
+        penalty: u32,
         grams: f64,
         key: i64,
         rides: u8,
         slack: u32,
     ) -> bool {
+        let effective = arrival.saturating_add(penalty);
         for entry in &self.entries {
-            if entry.key <= key && entry.rides <= rides {
-                if entry.arrival == arrival && entry.key == key && entry.rides == rides {
+            if entry.key <= key && entry.rides <= rides && entry.arrival <= arrival {
+                let entry_effective = entry.arrival.saturating_add(entry.penalty);
+                if entry.arrival == arrival
+                    && entry.penalty == penalty
+                    && entry.key == key
+                    && entry.rides == rides
+                {
                     if grams >= entry.grams {
                         return false;
                     }
-                } else if entry.arrival.saturating_add(slack) <= arrival {
+                } else if entry_effective.saturating_add(slack) <= effective {
                     return false;
                 }
             }
         }
         self.entries.retain(|entry| {
+            let entry_effective = entry.arrival.saturating_add(entry.penalty);
             !((key <= entry.key
                 && rides <= entry.rides
-                && arrival.saturating_add(slack) <= entry.arrival)
+                && arrival <= entry.arrival
+                && effective.saturating_add(slack) <= entry_effective)
                 || (entry.arrival == arrival
+                    && entry.penalty == penalty
                     && entry.key == key
                     && entry.rides == rides
                     && grams < entry.grams))
         });
         self.entries.push(Entry {
             arrival,
+            penalty,
             key,
             grams,
             rides,
@@ -150,9 +174,20 @@ impl Bag {
 struct Arrived {
     departure: u32,
     arrival: u32,
+    /// Accumulated route-penalty seconds; the frontier dominates on the
+    /// effective arrival while the journey reports the true `arrival`.
+    penalty: u32,
     key: i64,
     grams: f64,
     label: u32,
+}
+
+impl Arrived {
+    /// The penalized arrival the frontier dominates on: true `arrival`
+    /// plus accumulated route penalty (equal to `arrival` without one).
+    fn effective(&self) -> u32 {
+        self.arrival.saturating_add(self.penalty)
+    }
 }
 
 /// The destination bag: Pareto over (departure descending, arrival,
@@ -173,13 +208,13 @@ impl DestinationBag {
         for entry in &self.entries {
             if entry.departure >= candidate.departure && entry.key <= candidate.key {
                 if entry.departure == candidate.departure
-                    && entry.arrival == candidate.arrival
+                    && entry.effective() == candidate.effective()
                     && entry.key == candidate.key
                 {
                     if candidate.grams >= entry.grams {
                         return false;
                     }
-                } else if entry.arrival.saturating_add(slack) <= candidate.arrival {
+                } else if entry.effective().saturating_add(slack) <= candidate.effective() {
                     return false;
                 }
             }
@@ -187,9 +222,9 @@ impl DestinationBag {
         self.entries.retain(|entry| {
             !((candidate.departure >= entry.departure
                 && candidate.key <= entry.key
-                && candidate.arrival.saturating_add(slack) <= entry.arrival)
+                && candidate.effective().saturating_add(slack) <= entry.effective())
                 || (entry.departure == candidate.departure
-                    && entry.arrival == candidate.arrival
+                    && entry.effective() == candidate.effective()
                     && entry.key == candidate.key
                     && candidate.grams < entry.grams))
         });
@@ -212,6 +247,9 @@ struct Rider {
     factor: f64,
     parent: u32,
     departure: u32,
+    /// The boarding label's accumulated route penalty; a ride adds this
+    /// line's route penalty on top when it alights.
+    penalty: u32,
 }
 
 /// Per-destination fold state for the emissions matrix: the cleanest
@@ -311,8 +349,10 @@ struct Search<'a> {
     bucket: f64,
     /// The time-slack band, in seconds; 0 is the strict frontier.
     slack: u32,
-    /// Route-index mask of lines the search skips; empty means none.
-    banned_routes: &'a [bool],
+    /// Per route index: seconds added to a ride's effective arrival for
+    /// using it (soft-penalty diverse), `u32::MAX` to skip the route's
+    /// lines outright (a hard ban), 0 to leave it free. Empty means none.
+    route_penalties: &'a [u32],
     arena: Vec<Label>,
     bags: Vec<Bag>,
     destination: DestinationBag,
@@ -336,7 +376,7 @@ pub fn route(
     bucket: f64,
     slack: u32,
     max_options: Option<usize>,
-    banned_routes: &[bool],
+    route_penalties: &[u32],
 ) -> Vec<Journey> {
     profile(
         view,
@@ -349,7 +389,7 @@ pub fn route(
         bucket,
         slack,
         max_options,
-        banned_routes,
+        route_penalties,
     )
 }
 
@@ -368,7 +408,7 @@ pub fn route_range(
     bucket: f64,
     slack: u32,
     max_options: Option<usize>,
-    banned_routes: &[bool],
+    route_penalties: &[u32],
 ) -> Vec<Journey> {
     let departures = departure_candidates(timetable, request, window);
     profile(
@@ -382,7 +422,7 @@ pub fn route_range(
         bucket,
         slack,
         max_options,
-        banned_routes,
+        route_penalties,
     )
 }
 
@@ -484,7 +524,7 @@ fn profile(
     bucket: f64,
     slack: u32,
     max_options: Option<usize>,
-    banned_routes: &[bool],
+    route_penalties: &[u32],
 ) -> Vec<Journey> {
     assert!(
         bucket.is_finite() && bucket > 0.0,
@@ -498,7 +538,7 @@ fn profile(
         factors,
         bucket,
         slack,
-        banned_routes,
+        route_penalties,
     );
     for &departure in departures {
         search.pass(request, departure, &mut None);
@@ -517,9 +557,9 @@ fn profile(
 /// `max_options`.
 fn strictly_dominates(a: &Arrived, b: &Arrived) -> bool {
     a.departure >= b.departure
-        && a.arrival <= b.arrival
+        && a.effective() <= b.effective()
         && a.key <= b.key
-        && (a.departure > b.departure || a.arrival < b.arrival || a.key < b.key)
+        && (a.departure > b.departure || a.effective() < b.effective() || a.key < b.key)
 }
 
 /// The destination entries to assemble. Without a cap (or when the set
@@ -550,7 +590,7 @@ fn cap_entries(entries: &[Arrived], max_options: Option<usize>) -> Vec<&Arrived>
                     .iter()
                     .zip(&on_frontier)
                     .filter(|(other, &f)| f && strictly_dominates(other, entry))
-                    .map(|(other, _)| entry.arrival.saturating_sub(other.arrival))
+                    .map(|(other, _)| entry.effective().saturating_sub(other.effective()))
                     .min()
                     .unwrap_or(u32::MAX)
             };
@@ -583,7 +623,7 @@ impl<'a> Search<'a> {
         factors: &'a [f64],
         bucket: f64,
         slack: u32,
-        banned_routes: &'a [bool],
+        route_penalties: &'a [u32],
     ) -> Search<'a> {
         Search {
             view,
@@ -593,7 +633,7 @@ impl<'a> Search<'a> {
             factors,
             bucket,
             slack,
-            banned_routes,
+            route_penalties,
             arena: Vec::new(),
             bags: vec![Bag::default(); timetable.stop_count() as usize],
             destination: DestinationBag::default(),
@@ -620,12 +660,13 @@ impl<'a> Search<'a> {
             let arrival = departure.saturating_add(seconds);
             let label = self.arena.len() as u32;
             let key = self.key(0.0);
-            if self.bags[stop.0 as usize].insert_slack(arrival, 0.0, key, 0, self.slack) {
+            if self.bags[stop.0 as usize].insert_slack(arrival, 0, 0.0, key, 0, self.slack) {
                 self.arena.push(Label {
                     arrival,
                     grams: 0.0,
                     stop,
                     departure,
+                    penalty: 0,
                     origin: Origin::Access,
                 });
                 if let Some(fold) = fold {
@@ -673,14 +714,21 @@ impl<'a> Search<'a> {
                 for footpath in self.footpaths.from_stop(from.stop) {
                     let arrival = from.arrival.saturating_add(footpath.duration);
                     let walked = self.arena.len() as u32;
-                    if self.bags[footpath.to.0 as usize]
-                        .insert_slack(arrival, from.grams, key, rides, self.slack)
-                    {
+                    // A footpath adds no route penalty; it inherits the chain's.
+                    if self.bags[footpath.to.0 as usize].insert_slack(
+                        arrival,
+                        from.penalty,
+                        from.grams,
+                        key,
+                        rides,
+                        self.slack,
+                    ) {
                         self.arena.push(Label {
                             arrival,
                             grams: from.grams,
                             stop: footpath.to,
                             departure: from.departure,
+                            penalty: from.penalty,
                             origin: Origin::Walk {
                                 parent: label,
                                 duration: footpath.duration,
@@ -702,6 +750,7 @@ impl<'a> Search<'a> {
                             Arrived {
                                 departure,
                                 arrival,
+                                penalty: reached.penalty,
                                 key: self.key(reached.grams),
                                 grams: reached.grams,
                                 label,
@@ -723,14 +772,15 @@ impl<'a> Search<'a> {
     fn scan_line(&mut self, line: u32, rides: u8, rode: &mut Vec<u32>) {
         let mut entries = std::mem::take(&mut self.queue[line as usize]);
         let pattern = self.view.line_pattern(line);
-        // A banned route's lines are skipped entirely — route penalization
-        // re-searches without the corridors already committed.
-        if self
-            .banned_routes
+        let line_penalty = self
+            .route_penalties
             .get(self.timetable.pattern_route(pattern) as usize)
             .copied()
-            .unwrap_or(false)
-        {
+            .unwrap_or(0);
+        // A banned route (the `u32::MAX` sentinel) skips its lines entirely, so
+        // the re-search omits committed corridors; a finite penalty instead adds
+        // to each ride's effective arrival, making the route costly but usable.
+        if line_penalty == u32::MAX {
             entries.clear();
             self.queue[line as usize] = entries;
             return;
@@ -755,14 +805,18 @@ impl<'a> Search<'a> {
                 let grams = quantized(rider.grams + meters / 1000.0 * rider.factor);
                 let label = self.arena.len() as u32;
                 let key = self.key(grams);
+                // This ride pays the line's route penalty once, on top of the
+                // penalty its boarding chain already carried.
+                let penalty = rider.penalty.saturating_add(line_penalty);
                 if self.bags[stops[position].0 as usize]
-                    .insert_slack(arrival, grams, key, rides, self.slack)
+                    .insert_slack(arrival, penalty, grams, key, rides, self.slack)
                 {
                     self.arena.push(Label {
                         arrival,
                         grams,
                         stop: stops[position],
                         departure: rider.departure,
+                        penalty,
                         origin: Origin::Ride {
                             parent: rider.parent,
                             trip: rider.trip,
@@ -829,13 +883,19 @@ impl<'a> Search<'a> {
                             .leg_distance(self.view.backing(trip), 0, position as u16)
                             as f64;
                     let kappa = boarding.grams - travelled / 1000.0 * factor;
-                    if riders
-                        .iter()
-                        .any(|rider| rider.trip == trip && rider.kappa <= kappa)
-                    {
+                    // Same-trip riders reduce over both grams (`kappa`) and the
+                    // accumulated penalty: a cleaner rider that carries a larger
+                    // penalty must not suppress a dirtier one that alights on a
+                    // lower effective arrival.
+                    let penalty = boarding.penalty;
+                    if riders.iter().any(|rider| {
+                        rider.trip == trip && rider.kappa <= kappa && rider.penalty <= penalty
+                    }) {
                         continue;
                     }
-                    riders.retain(|rider| !(rider.trip == trip && kappa < rider.kappa));
+                    riders.retain(|rider| {
+                        !(rider.trip == trip && kappa <= rider.kappa && penalty <= rider.penalty)
+                    });
                     riders.push(Rider {
                         trip,
                         board: position as u16,
@@ -844,6 +904,7 @@ impl<'a> Search<'a> {
                         factor,
                         parent: label,
                         departure: boarding.departure,
+                        penalty,
                     });
                 }
             }

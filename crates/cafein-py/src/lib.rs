@@ -2852,7 +2852,7 @@ impl TransportNetwork {
     /// -------
     /// list of dict
     ///     Journeys shaped as in ``route_between_stops``.
-    #[pyo3(signature = (from_stop, to_stop, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, router = "raptor", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, banned_routes = vec![]))]
+    #[pyo3(signature = (from_stop, to_stop, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, router = "raptor", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, banned_routes = vec![], route_penalties = vec![]))]
     #[allow(clippy::too_many_arguments)]
     fn mc_route_between_stops(
         &self,
@@ -2873,6 +2873,7 @@ impl TransportNetwork {
         slack: f64,
         max_options: Option<usize>,
         banned_routes: Vec<String>,
+        route_penalties: Vec<(String, u64)>,
     ) -> PyResult<Py<PyList>> {
         if !bucket.is_finite() || bucket <= 0.0 {
             return Err(PyValueError::new_err(
@@ -2897,9 +2898,9 @@ impl TransportNetwork {
                 "relaxed candidates (slack > 0) require router='raptor'",
             ));
         }
-        if !banned_routes.is_empty() && router == "tbtr" {
+        if (!banned_routes.is_empty() || !route_penalties.is_empty()) && router == "tbtr" {
             return Err(PyValueError::new_err(
-                "route bans (diverse candidates) require router='raptor'",
+                "route bans/penalties (diverse candidates) require router='raptor'",
             ));
         }
         let Some(geometry) = &self.geometry else {
@@ -2955,6 +2956,7 @@ impl TransportNetwork {
                         slack,
                         max_options,
                         banned_routes,
+                        route_penalties,
                     );
                 }
             }
@@ -2967,7 +2969,7 @@ impl TransportNetwork {
             active_services_previous: self.active_services_previous(date)?,
             max_transfers,
         };
-        let banned_mask = self.route_ban_mask(&banned_routes);
+        let penalty_mask = self.route_penalty_mask(&banned_routes, &route_penalties);
         let journeys = py.allow_threads(|| {
             if router == "tbtr" {
                 let engine = McTbtrEngine::for_date(
@@ -3000,7 +3002,7 @@ impl TransportNetwork {
                     bucket,
                     slack,
                     max_options,
-                    &banned_mask,
+                    &penalty_mask,
                 ),
                 Some(window) => mcraptor::route_range(
                     &view,
@@ -3013,7 +3015,7 @@ impl TransportNetwork {
                     bucket,
                     slack,
                     max_options,
-                    &banned_mask,
+                    &penalty_mask,
                 ),
             }
         });
@@ -3047,7 +3049,7 @@ impl TransportNetwork {
     /// -------
     /// list of dict
     ///     Journeys shaped as in ``route_between_coordinates``.
-    #[pyo3(signature = (origin, destination, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, banned_routes = vec![]))]
+    #[pyo3(signature = (origin, destination, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, banned_routes = vec![], route_penalties = vec![]))]
     #[allow(clippy::too_many_arguments)]
     fn mc_route_between_coordinates(
         &self,
@@ -3067,6 +3069,7 @@ impl TransportNetwork {
         slack: f64,
         max_options: Option<usize>,
         banned_routes: Vec<String>,
+        route_penalties: Vec<(String, u64)>,
     ) -> PyResult<Py<PyList>> {
         if !bucket.is_finite() || bucket <= 0.0 {
             return Err(PyValueError::new_err(
@@ -3153,7 +3156,7 @@ impl TransportNetwork {
         // access/egress and direct walk above stay unchanged.
         let intermediate = self.emissions_transfers(factor_fingerprint(&per_trip));
         let slack = slack.round() as u32;
-        let banned_mask = self.route_ban_mask(&banned_routes);
+        let penalty_mask = self.route_penalty_mask(&banned_routes, &route_penalties);
         let journeys = py.allow_threads(|| {
             let view = DayView::for_date(
                 &self.build.timetable,
@@ -3171,7 +3174,7 @@ impl TransportNetwork {
                     bucket,
                     slack,
                     max_options,
-                    &banned_mask,
+                    &penalty_mask,
                 ),
                 Some(window) => mcraptor::route_range(
                     &view,
@@ -3184,7 +3187,7 @@ impl TransportNetwork {
                     bucket,
                     slack,
                     max_options,
-                    &banned_mask,
+                    &penalty_mask,
                 ),
             }
         });
@@ -5152,19 +5155,39 @@ impl TransportNetwork {
         }
     }
 
-    /// A route-index mask of the given public route ids (unknown ids
-    /// ignored), for the McRAPTOR line-ban search. Empty in, empty out —
-    /// the engine reads a missing index as unbanned.
-    fn route_ban_mask(&self, banned_routes: &[String]) -> Vec<bool> {
-        if banned_routes.is_empty() {
+    /// A route-index penalty mask for the McRAPTOR diverse search:
+    /// `u32::MAX` for banned public route ids (their lines are skipped),
+    /// the given seconds for penalized ids (added to a ride's effective
+    /// arrival, clamped below the ban sentinel), 0 otherwise. Unknown ids
+    /// are ignored and a ban wins over a penalty. Empty in, empty out —
+    /// the engine reads a missing index as free.
+    fn route_penalty_mask(
+        &self,
+        banned_routes: &[String],
+        route_penalties: &[(String, u64)],
+    ) -> Vec<u32> {
+        if banned_routes.is_empty() && route_penalties.is_empty() {
             return Vec::new();
         }
         let banned: std::collections::HashSet<&str> =
             banned_routes.iter().map(String::as_str).collect();
+        // A penalty is clamped below the ban sentinel; the `u64` boundary type
+        // absorbs large or accumulated Python values without overflowing.
+        let penalties: std::collections::HashMap<&str, u32> = route_penalties
+            .iter()
+            .map(|(id, seconds)| (id.as_str(), (*seconds).min((u32::MAX - 1) as u64) as u32))
+            .collect();
         self.feed
             .routes
             .iter()
-            .map(|route| banned.contains(self.public_id(route.feed, &route.id).as_str()))
+            .map(|route| {
+                let id = self.public_id(route.feed, &route.id);
+                if banned.contains(id.as_str()) {
+                    u32::MAX
+                } else {
+                    penalties.get(id.as_str()).copied().unwrap_or(0)
+                }
+            })
             .collect()
     }
 

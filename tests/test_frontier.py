@@ -1007,6 +1007,29 @@ def test_diverse_candidate_options_are_validated(tmp_path):
             candidates="diverse",
             slack_seconds=-1,
         )
+    for bad in (-5, 0, "nope"):
+        with pytest.raises(ValueError, match="penalty must be"):
+            journey_frontier(
+                network,
+                "A",
+                "B",
+                "2022-02-22",
+                "08:00:00",
+                window=1,
+                candidates="diverse",
+                penalty=bad,
+            )
+    with pytest.raises(ValueError, match="penalty applies only"):
+        journey_frontier(
+            network,
+            "A",
+            "B",
+            "2022-02-22",
+            "08:00:00",
+            window=1,
+            candidates="pareto",
+            penalty=300,
+        )
 
 
 def test_slack_seconds_defaults_are_per_family(network):
@@ -1158,6 +1181,89 @@ def test_diverse_spread_reaches_across_the_trade_off(network):
     spread_slowest = spread.loc[spread["travel_time"].idxmax()]
     fast_slowest = fast.loc[fast["travel_time"].idxmax()]
     assert spread_slowest["emissions"] < fast_slowest["emissions"]
+
+
+def test_diverse_penalty_ban_matches_the_default(network):
+    # penalty="ban" is the default hard-disjoint behaviour, unchanged.
+    args = ("1281160", "1320107", "2022-02-22", "08:30:00")
+    common = dict(
+        window=1,
+        max_transfers=6,
+        candidates="diverse",
+        max_options=4,
+        diversity="spread",
+    )
+    default = journey_frontier(network, *args, **common)
+    ban = journey_frontier(network, *args, penalty="ban", **common)
+    assert _option_corridors(default) == _option_corridors(ban)
+    assert _frontier_tuples(default) == _frontier_tuples(ban)
+
+
+def test_diverse_soft_penalty_shares_trunks_and_finds_more(network):
+    # A hard ban forces route-disjoint corridors and dries up fast; a soft
+    # penalty makes a used route costly-but-usable, so a corridor sharing a
+    # trunk can surface and the set holds more options.
+    args = ("1281160", "1320107", "2022-02-22", "08:30:00")
+    common = dict(
+        window=1,
+        max_transfers=6,
+        candidates="diverse",
+        max_options=5,
+        diversity="spread",
+    )
+    ban = journey_frontier(network, *args, penalty="ban", **common)
+    soft = journey_frontier(network, *args, penalty=600, **common)
+    bc = _option_corridors(ban)
+    sc = _option_corridors(soft)
+    # ban is fully route-disjoint...
+    assert all(a.isdisjoint(b) for i, a in enumerate(bc) for b in bc[i + 1 :])
+    # ...the soft penalty lets two options share a route...
+    assert any(not a.isdisjoint(b) for i, a in enumerate(sc) for b in sc[i + 1 :])
+    # ...and surfaces more options before drying up.
+    assert len(soft) > len(ban)
+    # The fastest seed is picked before any penalty applies, so it is unchanged.
+    assert soft["travel_time"].min() == ban["travel_time"].min()
+
+
+def test_diverse_soft_penalty_reports_true_times(network):
+    # The penalty steers the search through the dominance only; it must never
+    # inflate a reported time. A penalty far larger than any real trip leaves
+    # every reported travel time realistic (nowhere near the penalty).
+    frame = journey_frontier(
+        network,
+        "1281160",
+        "1320107",
+        "2022-02-22",
+        "08:30:00",
+        window=1,
+        max_transfers=6,
+        candidates="diverse",
+        max_options=4,
+        diversity="spread",
+        penalty=100000,
+    )
+    assert len(frame) >= 1
+    assert frame["travel_time"].max() < 10000
+
+
+def test_diverse_soft_penalty_clamps_a_huge_value(network):
+    # A penalty far beyond the engine's 32-bit cap (and the binding's integer
+    # width) is clamped on accumulation rather than overflowing the boundary
+    # conversion, so the call still returns journeys.
+    frame = journey_frontier(
+        network,
+        "1281160",
+        "1320107",
+        "2022-02-22",
+        "08:30:00",
+        window=1,
+        max_transfers=6,
+        candidates="diverse",
+        max_options=3,
+        diversity="spread",
+        penalty=10**20,
+    )
+    assert len(frame) >= 1
 
 
 def test_unmatched_factors_poison_but_do_not_block(network):
