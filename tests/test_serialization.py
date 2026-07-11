@@ -173,6 +173,32 @@ def test_round_trip_preserves_the_mcultra_set(artifact_path, tmp_path):
     assert restored._core._mcultra_factor is not None
 
 
+def test_round_trip_preserves_the_tbtr_transfer_cache(helsinki_gtfs, tmp_path):
+    # A cached time-only TBTR transfer set persists through save/load, so a
+    # loaded network reuses it (build once, ship the artifact, query many) and
+    # its router="tbtr" matrices reproduce cell for cell.
+    network = TransportNetwork.from_gtfs([str(helsinki_gtfs)])
+    origins = ["4810551", "1040602", "1250551"]
+    network.compute_tbtr_transfers("2022-02-22")
+    assert network.has_tbtr_transfers
+    before = network.travel_time_matrix(
+        origins, "2022-02-22", "08:30:00", router="tbtr"
+    )
+
+    path = tmp_path / "tbtr.cafein"
+    network.save(path)
+    loaded = TransportNetwork.load(path)
+    assert loaded.has_tbtr_transfers
+    after = loaded.travel_time_matrix(origins, "2022-02-22", "08:30:00", router="tbtr")
+    assert np.array_equal(before, after)
+
+    # A network that never cached one round-trips to no cache.
+    plain = TransportNetwork.from_gtfs([str(helsinki_gtfs)])
+    plain_path = tmp_path / "plain.cafein"
+    plain.save(plain_path)
+    assert not TransportNetwork.load(plain_path).has_tbtr_transfers
+
+
 def test_load_refuses_foreign_and_future_files(tmp_path):
     junk = tmp_path / "junk.cafein"
     junk.write_bytes(b"definitely not a network artifact")

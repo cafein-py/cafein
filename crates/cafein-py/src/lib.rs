@@ -60,7 +60,8 @@ struct TransportNetwork {
     /// (`compute_tbtr_transfers`), keyed by the date string it was built for.
     /// A `router="tbtr"` stop time matrix on the same date — single-departure
     /// or windowed — reuses it (build once, query many); other queries rebuild
-    /// ad-hoc. Held in memory only (not yet persisted).
+    /// ad-hoc. Persisted with the artifact and restored on load, keyed by its
+    /// date.
     tbtr_time_transfers: Option<(String, cafein_core::tbtr::TransferSet)>,
     geometry: Option<TripGeometry>,
     leg_geometry: Option<LegGeometry>,
@@ -112,7 +113,7 @@ struct CoordinateEnds {
 }
 
 const ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINET";
-const ARTIFACT_FORMAT: u32 = 7;
+const ARTIFACT_FORMAT: u32 = 8;
 /// Section tags in the container directory.
 const SECTION_META: u16 = 1;
 const SECTION_STREETS: u16 = 2;
@@ -152,6 +153,10 @@ struct ArtifactRef<'a> {
     /// run-once contraction need not be repeated. Its one-to-many buckets are
     /// derived state, rebuilt on load rather than persisted.
     walking_hierarchy: Option<&'a ContractionHierarchy>,
+    /// The cached time-only TBTR transfer set with the date it was built for,
+    /// when present; restored so a loaded network reuses it instead of
+    /// rebuilding the dominance-aware set.
+    tbtr_time_transfers: &'a Option<(String, cafein_core::tbtr::TransferSet)>,
 }
 
 /// The decoded part of the saved network, owned after reading.
@@ -170,6 +175,7 @@ struct Artifact {
     mcultra_window: Option<(u32, u32)>,
     mcultra_factor: Option<u64>,
     walking_hierarchy: Option<ContractionHierarchy>,
+    tbtr_time_transfers: Option<(String, cafein_core::tbtr::TransferSet)>,
 }
 
 /// The street layer's decoded state: link records (endpoints
@@ -947,6 +953,7 @@ fn assemble((artifact, streets, streets_bytes_read): LoadedArtifact) -> Transpor
         mcultra_window,
         mcultra_factor,
         walking_hierarchy,
+        tbtr_time_transfers,
     } = artifact;
     // The contraction persisted; its buckets are derived state, rebuilt here on
     // the loading thread exactly as `install_hierarchy` builds them for a fresh
@@ -972,7 +979,7 @@ fn assemble((artifact, streets, streets_bytes_read): LoadedArtifact) -> Transpor
         mcultra_transfers,
         mcultra_window,
         mcultra_factor,
-        tbtr_time_transfers: None,
+        tbtr_time_transfers,
         geometry,
         leg_geometry,
         streets,
@@ -1294,9 +1301,10 @@ impl TransportNetwork {
     ///
     /// The artifact carries everything queries need — the timetable,
     /// service calendar, transfers, trip distances, leg geometries,
-    /// and the street network — behind a versioned header, so batch
-    /// jobs can ``load`` the same file read-only instead of rebuilding
-    /// from GTFS and OSM inputs. The payload carries a checksum, so
+    /// the street network, and any computed accelerators (ULTRA/McULTRA
+    /// shortcut sets, walking hierarchy, cached TBTR transfers) — behind
+    /// a versioned header, so batch jobs can ``load`` the same file
+    /// read-only instead of rebuilding from GTFS and OSM inputs. The payload carries a checksum, so
     /// on-disk corruption is caught at load time. Build diagnostics
     /// (quarantine reports) are not persisted; their warnings belong
     /// to the build. The file is staged beside the destination and
@@ -1335,6 +1343,7 @@ impl TransportNetwork {
                 mcultra_window: self.mcultra_window,
                 mcultra_factor: self.mcultra_factor,
                 walking_hierarchy: self.streets.as_ref().and_then(StreetNetwork::hierarchy),
+                tbtr_time_transfers: &self.tbtr_time_transfers,
             };
             let meta = bincode::serialize(&artifact)
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -1575,8 +1584,8 @@ impl TransportNetwork {
     /// calls on the same date — single-departure or windowed — reuse it instead
     /// of rebuilding it every call, which is where the trip-based engine
     /// pays off: large batches of queries on one network and date. A query on a
-    /// different date rebuilds ad hoc. Held in memory only (not persisted);
-    /// recomputing for a new date replaces the cached set.
+    /// different date rebuilds ad hoc. The cached set is persisted with the
+    /// artifact (`save`/`load`); recomputing for a new date replaces it.
     fn compute_tbtr_transfers(&mut self, py: Python<'_>, date: &str) -> PyResult<()> {
         let active = self.active_services(date)?;
         let previous = self.active_services_previous(date)?;

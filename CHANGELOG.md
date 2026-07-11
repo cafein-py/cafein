@@ -23,9 +23,12 @@
   ``travel_time_matrix(router="tbtr")`` calls on that date reuse it (one clone
   per call) instead of rebuilding the dominance-aware set every call — the
   "build once, query many" workload TBTR is built for. A query on another date
-  rebuilds ad hoc; ``has_tbtr_transfers`` reports whether a set is cached. Held
-  in memory only. ``TbtrEngine::from_set`` builds the engine over a prebuilt
-  ``TransferSet``, which now derives ``Clone``.
+  rebuilds ad hoc; ``has_tbtr_transfers`` reports whether a set is cached. The
+  cached set is persisted with the network artifact (``save``/``load``), so a
+  shipped artifact carries it and a loaded network reuses it without rebuilding
+  (the artifact format is now 8; artifacts written by earlier builds do not
+  load). ``TbtrEngine::from_set`` builds the engine over a prebuilt
+  ``TransferSet``, which now derives ``Clone`` and is serialisable.
 
 - ULTRA shortcut set — ``TransportNetwork.compute_ultra_shortcuts``
   enumerates the ULTRA intermediate-transfer shortcuts (Baum et al.) over the

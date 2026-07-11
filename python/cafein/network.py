@@ -173,9 +173,10 @@ class TransportNetwork:
 
         The artifact carries everything queries need — the timetable,
         service calendar, transfers, trip distances, leg geometries,
-        the street network, and the ULTRA shortcut set with its compute
-        window (when computed) — so batch jobs can ``load`` the same
-        file read-only instead of rebuilding from GTFS and OSM inputs.
+        the street network, the ULTRA shortcut set with its compute
+        window, and any cached TBTR transfer set (when computed) — so
+        batch jobs can ``load`` the same file read-only instead of
+        rebuilding from GTFS and OSM inputs.
         Build diagnostics (quarantine warnings) are not persisted.
         The file is staged beside the destination and atomically
         renamed into place, so saving over an existing artifact never
@@ -416,9 +417,10 @@ class TransportNetwork:
         lets repeated stop ``travel_time_matrix(router="tbtr")`` calls on the
         same date — single-departure and windowed alike — reuse it instead of
         rebuilding it every call — the "build once, query many" workload the
-        trip-based engine is built for. A query on a different date rebuilds ad hoc. The cache is held in
-        memory only (not persisted) and re-keyed when computed for a new date;
-        ``has_tbtr_transfers`` reports whether one is present.
+        trip-based engine is built for. A query on a different date rebuilds ad
+        hoc. The cache is persisted with the artifact (``save``/``load``) and
+        re-keyed when computed for a new date; ``has_tbtr_transfers`` reports
+        whether one is present.
 
         Parameters
         ----------
