@@ -348,6 +348,35 @@ def test_helsinki_footpaths_cover_the_extract(helsinki_footpaths):
     assert 2_700_000 <= len(helsinki_footpaths) <= 3_000_000
 
 
+def test_bounding_box_crops_the_walking_network(
+    helsinki_gtfs, kantakaupunki_pbf, helsinki_footpaths
+):
+    # A central sub-box of the extract: strictly fewer stops reach the walking
+    # network than over the whole extract, so a region-wide PBF can be cropped
+    # to a neighbourhood.
+    with (
+        zipfile.ZipFile(helsinki_gtfs) as archive,
+        archive.open("stops.txt") as stops_file,
+    ):
+        frame = pd.read_csv(stops_file, dtype={"stop_id": str})
+    triples = list(
+        zip(
+            frame["stop_id"],
+            frame["stop_lat"].astype(float),
+            frame["stop_lon"].astype(float),
+        )
+    )
+    with pytest.warns(UserWarning):
+        cropped = streets.walking_footpaths(
+            str(kantakaupunki_pbf),
+            triples,
+            bounding_box=[24.93, 60.16, 24.96, 60.18],
+        )
+    cropped_origins = {from_stop for from_stop, _, _, _ in cropped}
+    full_origins = {from_stop for from_stop, _, _, _ in helsinki_footpaths}
+    assert 0 < len(cropped_origins) < len(full_origins)
+
+
 def test_helsinki_footpaths_pin_known_pairs(helsinki_footpaths):
     lookup = {(a, b): seconds for a, b, seconds, _ in helsinki_footpaths}
     # Kamppi metro platforms sit next to each other; the westbound

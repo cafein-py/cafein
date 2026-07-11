@@ -8,6 +8,10 @@ import pytest
 
 from cafein import TransportNetwork
 
+# Central Helsinki, covering the stops the hierarchy test routes between; a
+# contraction over this cropped walking graph is seconds, not minutes.
+HIERARCHY_BBOX = [24.90, 60.15, 25.00, 60.20]  # [min_lon, min_lat, max_lon, max_lat]
+
 
 @pytest.fixture(scope="module")
 def artifact_path(network_with_footpaths, tmp_path_factory):
@@ -104,13 +108,19 @@ def test_loaded_networks_save_again(reloaded, tmp_path):
 
 
 def test_round_trip_preserves_the_walking_hierarchy(
-    artifact_path, mmap_available, tmp_path
+    helsinki_gtfs, kantakaupunki_pbf, tmp_path
 ):
     # An installed contraction hierarchy: the run-once contraction persists and
     # its buckets rebuild on load, so a loaded network's walking searches match a
     # freshly contracted one — not the bounded-Dijkstra fallback of a network
-    # that lost its hierarchy.
-    accelerated = TransportNetwork.load(artifact_path)
+    # that lost its hierarchy. Built over a cropped central walking graph, since
+    # the serialize/rebuild path under test does not depend on the graph's size.
+    with pytest.warns(UserWarning):
+        accelerated = TransportNetwork.from_gtfs(
+            [str(helsinki_gtfs)],
+            osm_pbf=str(kantakaupunki_pbf),
+            bounding_box=HIERARCHY_BBOX,
+        )
     accelerated._core.install_walking_hierarchy()
     assert accelerated._core.has_walking_hierarchy
 
@@ -131,9 +141,10 @@ def test_round_trip_preserves_the_walking_hierarchy(
 
     # A lazy mapped load restores the hierarchy from META and rebuilds its
     # buckets without paging the STREETS section — validating a hierarchy
-    # artifact must not defeat the lazy load.
-    if mmap_available:
-        lazy = TransportNetwork.load(path, mmap=True)
+    # artifact must not defeat the lazy load. Probe the cropped artifact
+    # itself, so this test never builds the shared full-network artifact.
+    lazy = TransportNetwork.load(path, mmap=True)
+    if lazy.mapped:
         assert lazy._core.has_walking_hierarchy
         assert lazy._core._streets_bytes_read == 0
         assert lazy.access_stops(*origin) == accelerated.access_stops(*origin)
