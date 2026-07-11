@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Diverse-route objective — ``journey_frontier`` and ``DetailedItineraries``
+  take an optional ``diversity`` for ``candidates="diverse"``: ``"time"``
+  (default, unchanged) picks the fastest journey each penalization round, while
+  ``"spread"`` seeds on the fastest then picks, each later round, the journey
+  farthest from the already-chosen corridors in the normalized
+  (travel_time, emissions) plane (greedy farthest-point dispersion), so the
+  options span the trade-off rather than crowding its fast end.
+
 - Walking-graph bounding box — ``TransportNetwork.from_gtfs`` and the
   ``cafein.streets`` extractors (``walking_footpaths`` / ``walking_streets``)
   take an optional ``bounding_box`` that restricts the OSM walking network to a

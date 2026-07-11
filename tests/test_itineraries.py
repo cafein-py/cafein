@@ -369,3 +369,44 @@ def test_diverse_itinerary_options_are_validated(network):
             candidates="diverse",
             max_options=0,
         )
+    with pytest.raises(ValueError, match="diversity must be"):
+        DetailedItineraries(
+            network,
+            *stops,
+            "2022-02-22",
+            "08:30:00",
+            candidates="diverse",
+            diversity="closest",
+        )
+
+
+def test_diverse_itineraries_spread_reaches_across_the_trade_off(network):
+    # Same disjoint corridors, different objective: "spread" seeds on the
+    # fastest then reaches the far (slow) corner the fastest-first set skips.
+    origin, destination = "1370104", "4960238"
+    common = dict(max_transfers=6, candidates="diverse", max_options=3)
+
+    def latest(itineraries):
+        return max(int(g["arrival"].max()) for _, g in itineraries.groupby("option"))
+
+    fast = DetailedItineraries(
+        network,
+        [origin],
+        [destination],
+        "2022-02-22",
+        "08:30:00",
+        diversity="time",
+        **common,
+    )
+    spread = DetailedItineraries(
+        network,
+        [origin],
+        [destination],
+        "2022-02-22",
+        "08:30:00",
+        diversity="spread",
+        **common,
+    )
+    assert fast["option"].nunique() == spread["option"].nunique() == 3
+    assert _itinerary_corridors(spread) != _itinerary_corridors(fast)
+    assert latest(spread) > latest(fast)
