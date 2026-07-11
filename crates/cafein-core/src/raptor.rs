@@ -463,8 +463,24 @@ impl Raptor {
                 |pooled: &mut Option<Search>, request| {
                     let arrivals = window_samples(pooled, timetable, transfers, request, window);
                     let access_floor = access_floor(stop_count, request);
+                    let iterations = arrivals.len();
+                    // Transpose the per-iteration stop arrivals into a stop-major
+                    // table (R5's `invertTravelTimes`): a destination then reads
+                    // each nearby stop's iterations as one contiguous block, so
+                    // the hot propagation loop scans memory sequentially instead
+                    // of indexing a fresh per-iteration array at scattered stop
+                    // positions. Identical values and order — only the layout.
+                    let mut to_stop = vec![UNREACHED; stop_count * iterations];
+                    let mut departures = vec![0u32; iterations];
+                    for (iteration, (mark, marked)) in arrivals.iter().enumerate() {
+                        departures[iteration] = *mark;
+                        for (stop, &at_stop) in marked.iter().enumerate() {
+                            to_stop[stop * iterations + iteration] = at_stop;
+                        }
+                    }
                     let mut out = Vec::with_capacity(egress.len() * percentiles.len());
-                    let mut samples = vec![0u32; arrivals.len()];
+                    let mut at_point = vec![UNREACHED; iterations];
+                    let mut samples = vec![0u32; iterations];
                     for links in egress {
                         // The walking-only floor through any link is
                         // departure-independent, like the access floor.
@@ -475,20 +491,30 @@ impl Raptor {
                                 walk_floor = walk_floor.min(floor.saturating_add(seconds));
                             }
                         }
-                        for (sample, (mark, marked)) in samples.iter_mut().zip(&arrivals) {
-                            let mut at_point = UNREACHED;
-                            for &(stop, seconds, _) in links {
-                                let at_stop = marked[stop.0 as usize];
+                        for slot in at_point.iter_mut() {
+                            *slot = UNREACHED;
+                        }
+                        // Propagate every iteration from each nearby stop, reading
+                        // the stop's contiguous iteration block.
+                        for &(stop, seconds, _) in links {
+                            let base = stop.0 as usize * iterations;
+                            for (slot, &at_stop) in
+                                at_point.iter_mut().zip(&to_stop[base..base + iterations])
+                            {
                                 if at_stop == UNREACHED {
                                     continue;
                                 }
                                 if let Some(arrival) =
                                     at_stop.checked_add(seconds).filter(|&at| at != UNREACHED)
                                 {
-                                    at_point = at_point.min(arrival);
+                                    *slot = (*slot).min(arrival);
                                 }
                             }
-                            *sample = travel_time(at_point, *mark, walk_floor);
+                        }
+                        for (sample, (&at, &mark)) in
+                            samples.iter_mut().zip(at_point.iter().zip(&departures))
+                        {
+                            *sample = travel_time(at, mark, walk_floor);
                         }
                         samples.sort_unstable();
                         for &percentile in percentiles {
@@ -605,18 +631,18 @@ fn window_samples<'a>(
         }
         _ => pooled.insert(Search::new(timetable, transfers, request)),
     };
-    let candidates = departure_candidates(timetable, request, window);
-    let mut next_candidate = 0;
     let sample_count = (window as u64).div_ceil(60).max(1) as u32;
     let mut samples = Vec::with_capacity(sample_count as usize);
     for step in (0..sample_count).rev() {
         let Some(mark) = request.departure.checked_add(step * 60) else {
             continue;
         };
-        while next_candidate < candidates.len() && candidates[next_candidate] >= mark {
-            search.run(candidates[next_candidate]);
-            next_candidate += 1;
-        }
+        // One pass per minute mark, descending, bags shared (range-RAPTOR).
+        // A pass at `mark` boards every trip departing at or after `mark`, so
+        // after it the bags hold exactly the earliest arrivals for leaving at
+        // or after `mark` — running extra passes at the individual trip
+        // departures in between adds nothing to the minute-mark samples.
+        search.run(mark);
         samples.push((
             mark,
             search
