@@ -56,7 +56,7 @@ def journey_frontier(
     candidates="time",
     bucket=25.0,
     router="raptor",
-    slack_seconds=300.0,
+    slack_seconds=None,
     max_options=None,
     diversity="time",
     walking_speed_kmph=None,
@@ -139,12 +139,17 @@ def journey_frontier(
         pair, built for batch reuse — and returns the same journeys.
         Only used with ``candidates="pareto"``; ``"relaxed"`` and
         ``"diverse"`` require ``"raptor"``.
-    slack_seconds : float (optional, default: 300.0)
-        The time-slack band in seconds for ``candidates="relaxed"``: a
+    slack_seconds : float (optional, default: None)
+        The time-slack band in seconds. For ``candidates="relaxed"`` a
         journey is kept even when a cleaner or simpler one dominates it,
         as long as that dominator is not more than ``slack_seconds``
-        earlier. ``0`` reproduces the strict ``"pareto"`` frontier. Only
-        used with ``candidates="relaxed"``.
+        earlier; ``0`` reproduces the strict ``"pareto"`` frontier. For
+        ``candidates="diverse"`` a positive value widens each penalization
+        round's pool to that relaxed frontier (relaxed × diverse), so a
+        round can pick a slightly suboptimal but more distinct corridor.
+        ``None`` takes the per-family default — 300 s for ``"relaxed"``,
+        ``0`` (strict pareto per round) for ``"diverse"``. Unused for
+        ``"time"`` and ``"pareto"``.
     max_options : int (optional, default: None)
         For ``candidates="relaxed"``, a cap on the suboptimal
         alternatives kept: the strict frontier is always returned in
@@ -189,10 +194,14 @@ def journey_frontier(
         raise ValueError("router must be 'raptor' or 'tbtr'")
     if router == "tbtr" and candidates != "pareto":
         raise ValueError("router='tbtr' requires candidates='pareto'")
-    if candidates == "relaxed" and not (
-        isinstance(slack_seconds, (int, float))
-        and math.isfinite(slack_seconds)
-        and slack_seconds >= 0
+    if (
+        candidates in ("relaxed", "diverse")
+        and slack_seconds is not None
+        and not (
+            isinstance(slack_seconds, (int, float))
+            and math.isfinite(slack_seconds)
+            and slack_seconds >= 0
+        )
     ):
         raise ValueError("slack_seconds must be a non-negative number of seconds")
     if candidates in ("relaxed", "diverse") and (
@@ -206,7 +215,14 @@ def journey_frontier(
         raise ValueError("max_options must be a positive integer or None")
     if diversity not in ("time", "spread"):
         raise ValueError("diversity must be 'time' or 'spread'")
-    slack = float(slack_seconds) if candidates == "relaxed" else 0.0
+    # slack_seconds defaults per family: 300 s for the "relaxed" band, 0 s
+    # (strict pareto per round) for "diverse"; a given value applies to either.
+    if candidates == "relaxed":
+        slack = 300.0 if slack_seconds is None else float(slack_seconds)
+    elif candidates == "diverse":
+        slack = 0.0 if slack_seconds is None else float(slack_seconds)
+    else:
+        slack = 0.0
     options = max_options if candidates == "relaxed" else None
     multicriteria = candidates in ("pareto", "relaxed")
     stops = isinstance(origin, str), isinstance(destination, str)
@@ -234,6 +250,7 @@ def journey_frontier(
             geometries,
             max_options if max_options is not None else 3,
             diversity,
+            slack,
         )
     elif stops[0]:
         from cafein.network import _walk_options
@@ -413,15 +430,18 @@ def _diverse_journeys(
     geometries,
     k,
     diversity,
+    slack,
 ):
     """``k`` route-disjoint alternatives by iterative route penalization: each
     round bans the routes every selected journey has ridden, so the alternatives
     use disjoint line sets, and ``_diverse_pick`` chooses the round's journey —
     fastest-first for ``diversity="time"``, or spread across the
     (travel_time, emissions) trade-off for ``diversity="spread"`` — until ``k``
-    are found or the search dries up. The returned frame still sorts by
-    travel_time; the objective changes which corridors are chosen, not their
-    order."""
+    are found or the search dries up. A positive ``slack`` widens each round's
+    McRAPTOR pool to the relaxed frontier (relaxed × diverse), so a round can
+    pick a slightly suboptimal but more distinct corridor. The returned frame
+    still sorts by travel_time; the objective changes which corridors are
+    chosen, not their order."""
     from cafein.network import _walk_options
 
     def search(banned):
@@ -438,7 +458,7 @@ def _diverse_journeys(
                 router,
                 *_walk_options(*walk),
                 geometries,
-                0.0,
+                slack,
                 None,
                 banned,
             )
@@ -453,7 +473,7 @@ def _diverse_journeys(
             bucket,
             *_walk_options(*walk),
             geometries,
-            0.0,
+            slack,
             None,
             banned,
         )
