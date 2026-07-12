@@ -2694,14 +2694,14 @@ impl TransportNetwork {
         };
         let flat: Vec<u32> = py.allow_threads(|| {
             let rows: Vec<Vec<Option<u32>>> = if router == "tbtr" {
-                // Reuse the cached transfer set when it was precomputed for this
-                // date (`compute_tbtr_transfers`); one clone per matrix call, vs
-                // rebuilding the dominance-aware set. Otherwise build ad hoc.
+                // Reuse the cached transfer set when it was precomputed for
+                // this date (`compute_tbtr_transfers`), borrowed by the engine,
+                // vs rebuilding the dominance-aware set. Otherwise build ad hoc.
                 let cached = self
                     .tbtr_time_transfers
                     .as_ref()
                     .filter(|(cached_date, _)| cached_date.as_str() == date)
-                    .map(|(_, set)| set.clone());
+                    .map(|(_, set)| set);
                 let engine = match cached {
                     Some(set) => TbtrEngine::from_set(
                         &self.build.timetable,
@@ -3304,7 +3304,7 @@ impl TransportNetwork {
                     .tbtr_time_transfers
                     .as_ref()
                     .filter(|(cached_date, _)| cached_date.as_str() == date)
-                    .map(|(_, set)| set.clone());
+                    .map(|(_, set)| set);
                 let engine = match cached {
                     Some(set) => TbtrEngine::from_set(
                         &self.build.timetable,

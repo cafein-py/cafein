@@ -362,7 +362,9 @@ pub struct TbtrEngine<'a> {
     timetable: &'a Timetable,
     footpaths: &'a Transfers,
     view: DayView,
-    set: TransferSet,
+    /// Owned when built ad hoc (`for_date`), borrowed when the caller
+    /// cached the date's set (`from_set`) — the engine only reads it.
+    set: std::borrow::Cow<'a, TransferSet>,
     /// Reversed footpath adjacency: for each stop, the `(from, seconds)`
     /// edges walking *into* it — the one-hop closure behind egress
     /// stops, mirroring RAPTOR's post-round transfer relaxation.
@@ -418,7 +420,7 @@ impl<'a> TbtrEngine<'a> {
         let view = DayView::for_date(timetable, active_services, active_services_previous);
         let same_stop = Transfers::empty(timetable.stop_count());
         let set = TransferSet::for_view(&view, timetable, &same_stop).transfers;
-        Self::build_engine(timetable, footpaths, view, set)
+        Self::build_engine(timetable, footpaths, view, std::borrow::Cow::Owned(set))
     }
 
     /// The engine over a **prebuilt** transfer set — the reused path when the
@@ -431,17 +433,17 @@ impl<'a> TbtrEngine<'a> {
         footpaths: &'a Transfers,
         active_services: &[bool],
         active_services_previous: &[bool],
-        set: TransferSet,
+        set: &'a TransferSet,
     ) -> TbtrEngine<'a> {
         let view = DayView::for_date(timetable, active_services, active_services_previous);
-        Self::build_engine(timetable, footpaths, view, set)
+        Self::build_engine(timetable, footpaths, view, std::borrow::Cow::Borrowed(set))
     }
 
     fn build_engine(
         timetable: &'a Timetable,
         footpaths: &'a Transfers,
         view: DayView,
-        set: TransferSet,
+        set: std::borrow::Cow<'a, TransferSet>,
     ) -> TbtrEngine<'a> {
         // Reverse the footpath adjacency once per engine.
         let stop_count = timetable.stop_count() as usize;
