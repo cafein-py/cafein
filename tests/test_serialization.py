@@ -437,3 +437,32 @@ def test_mapped_artifacts_serve_concurrent_processes(
         results = pool.map(_mapped_walks, [(str(artifact_path), lat, lon)] * 2)
     expected = network_with_footpaths.access_stops(lat, lon)
     assert results == [expected, expected]
+
+
+def test_round_trip_preserves_the_mctbtr_transfer_cache(helsinki_gtfs, tmp_path):
+    # A cached multicriteria TBTR transfer set persists through save/load,
+    # so a loaded network answers router="tbtr" frontier queries without
+    # rebuilding the dominance-aware precompute.
+    from cafein.frontier import journey_frontier
+
+    network = TransportNetwork.from_gtfs([str(helsinki_gtfs)])
+    network.compute_mctbtr_transfers("2022-02-22")
+    assert network.has_mctbtr_transfers
+    args = ("1370104", "4960238", "2022-02-22", "08:30:00")
+    kwargs = dict(window=600, candidates="pareto", router="tbtr", bucket=1e-6)
+    before = journey_frontier(network, *args, **kwargs)
+    assert len(before) > 0
+
+    path = tmp_path / "mctbtr.cafein"
+    network.save(path)
+    loaded = TransportNetwork.load(path)
+    assert loaded.has_mctbtr_transfers
+    after = journey_frontier(loaded, *args, **kwargs)
+    for column in ("departure", "arrival", "rides", "emissions", "frontier"):
+        assert before[column].tolist() == after[column].tolist()
+
+    # A network that never cached one round-trips to no cache.
+    plain = TransportNetwork.from_gtfs([str(helsinki_gtfs)])
+    plain_path = tmp_path / "plain_mc.cafein"
+    plain.save(plain_path)
+    assert not TransportNetwork.load(plain_path).has_mctbtr_transfers

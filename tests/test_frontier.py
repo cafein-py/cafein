@@ -1689,3 +1689,67 @@ def test_journey_frontiers_tbtr_matches_raptor(network_with_footpaths):
             router="tbtr",
             max_slower=300,
         )
+
+
+def test_the_mctbtr_transfer_cache_answers_identically(tmp_path):
+    from cafein import TransportNetwork, journey_frontiers
+
+    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
+    network = TransportNetwork.from_gtfs([str(feed)])
+    args = (["A", "H"], ["B"], "2022-02-22", "08:00:00")
+    kwargs = dict(window=1800, bucket=1e-6, router="tbtr")
+    assert not network.has_mctbtr_transfers
+    adhoc = journey_frontiers(network, *args, **kwargs)
+    network.compute_mctbtr_transfers("2022-02-22")
+    assert network.has_mctbtr_transfers
+    cached = journey_frontiers(network, *args, **kwargs)
+    assert len(cached) == len(adhoc) > 0
+    for column in ("from_id", "to_id", "departure", "arrival", "rides", "frontier"):
+        assert cached[column].tolist() == adhoc[column].tolist()
+    assert cached["emissions"].tolist() == adhoc["emissions"].tolist()
+    # Another date misses the cache and still answers ad hoc.
+    other_day = journey_frontiers(
+        network, ["A", "H"], ["B"], "2022-02-23", "08:00:00", **kwargs
+    )
+    assert len(other_day) > 0
+    # Another factor configuration (a single LCA component) resolves to a
+    # different fingerprint: a cache miss that must match a cache-free
+    # network's ad-hoc answer, not the cached full-factor set's.
+    partial = journey_frontiers(network, *args, components=["vehicle"], **kwargs)
+    fresh = TransportNetwork.from_gtfs([str(feed)])
+    baseline = journey_frontiers(fresh, *args, components=["vehicle"], **kwargs)
+    assert len(partial) == len(baseline) > 0
+    for column in ("from_id", "to_id", "departure", "arrival", "rides", "frontier"):
+        assert partial[column].tolist() == baseline[column].tolist()
+    assert partial["emissions"].tolist() == baseline["emissions"].tolist()
+    assert partial["emissions"].sum() < cached["emissions"].sum()
+
+
+def test_the_mctbtr_transfer_cache_serves_point_frontiers(
+    helsinki_gtfs, kantakaupunki_pbf
+):
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    from cafein import TransportNetwork, journey_frontiers
+
+    network = TransportNetwork.from_gtfs(
+        [str(helsinki_gtfs)], osm_pbf=str(kantakaupunki_pbf)
+    )
+    coordinates = {stop: (lat, lon) for stop, lat, lon in network.stops}
+    ids = ["1100602", "1040280"]
+    points = gpd.GeoDataFrame(
+        {"id": ids},
+        geometry=[Point(coordinates[stop][1], coordinates[stop][0]) for stop in ids],
+        crs="EPSG:4326",
+    )
+    args = (points, points, "2022-02-22", "08:30:00")
+    kwargs = dict(window=600, max_transfers=3, bucket=1e-6, router="tbtr")
+    adhoc = journey_frontiers(network, *args, **kwargs)
+    network.compute_mctbtr_transfers("2022-02-22")
+    assert network.has_mctbtr_transfers
+    cached = journey_frontiers(network, *args, **kwargs)
+    assert len(cached) == len(adhoc) > 0
+    for column in ("from_id", "to_id", "departure", "arrival", "rides", "frontier"):
+        assert cached[column].tolist() == adhoc[column].tolist()
+    assert cached["emissions"].tolist() == adhoc["emissions"].tolist()

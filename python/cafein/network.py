@@ -277,6 +277,12 @@ class TransportNetwork:
         return self._core.has_tbtr_transfers
 
     @property
+    def has_mctbtr_transfers(self):
+        """Whether a cached multicriteria TBTR transfer set is present
+        (see ``compute_mctbtr_transfers``)."""
+        return self._core.has_mctbtr_transfers
+
+    @property
     def stops(self):
         """The stops as ``(stop_id, latitude, longitude)`` tuples."""
         return self._core.stops
@@ -428,6 +434,35 @@ class TransportNetwork:
             Service date as ``YYYY-MM-DD``.
         """
         return self._core.compute_tbtr_transfers(date)
+
+    def compute_mctbtr_transfers(self, date, factors=None, components=None):
+        """Precompute and cache the multicriteria TBTR transfer set.
+
+        The factor-aware transfer set is McTBTR's amortised asset — it is
+        far heavier to build than the time-only set, and every
+        ``router="tbtr"`` multicriteria query (``journey_frontier``,
+        ``journey_frontiers``, the emissions cost matrices) otherwise
+        rebuilds it per call. Caching it keys on the date **and** the
+        resolved per-trip factors: a query reuses the cache only when its
+        ``factors``/``components`` resolve to the same configuration given
+        here (the defaults match the defaults). Queries on another date or
+        factor set rebuild ad hoc. The cache is persisted with the
+        artifact (``save``/``load``) and replaced on recompute;
+        ``has_mctbtr_transfers`` reports whether one is present.
+
+        Parameters
+        ----------
+        date : str
+            Service date as ``YYYY-MM-DD``.
+        factors, components : optional
+            Emission-factor rows layered over the shipped defaults and the
+            LCA components to include, as in ``emissions.annotate`` — the
+            same arguments the queries will use.
+        """
+        from cafein import emissions
+
+        trip_factors = emissions.trip_factors(self, factors, components)
+        return self._core.compute_mctbtr_transfers(date, trip_factors)
 
     def set_leg_geometries(self, *leg_geometries):
         """Install per-trip leg geometries.

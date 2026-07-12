@@ -651,3 +651,36 @@ fn the_frontier_matrix_matches_the_one_pair_profile_per_cell() {
     assert_eq!(keys(&cells[0][2]), keys(&cells[0][0]));
     assert!(cells[1].iter().all(Vec::is_empty));
 }
+
+#[test]
+fn a_prebuilt_transfer_set_answers_like_for_date() {
+    let (timetable, geometry) = forked();
+    let factors = [10.0, 100.0, 10.0];
+    let footpaths = Transfers::empty(4);
+    let set = McTbtrEngine::transfers_for_date(&timetable, &geometry, &factors, &[true], &[]);
+    let owned = McTbtrEngine::for_date(&timetable, &footpaths, &geometry, &factors, &[true], &[]);
+    let borrowed = McTbtrEngine::from_set(
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        &[true],
+        &[],
+        &set,
+    );
+    let request = Request {
+        departure: 0,
+        access: vec![(StopIdx(0), 0)],
+        egress: vec![(StopIdx(3), 0)],
+        active_services: vec![true],
+        active_services_previous: Vec::new(),
+        max_transfers: 3,
+    };
+    let over_owned = owned.route_range(&request, 1000, 1e-6);
+    let over_borrowed = borrowed.route_range(&request, 1000, 1e-6);
+    assert!(!over_owned.is_empty());
+    assert_eq!(
+        triples(&over_owned, &geometry, &factors),
+        triples(&over_borrowed, &geometry, &factors)
+    );
+}
