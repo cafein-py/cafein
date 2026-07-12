@@ -3379,10 +3379,16 @@ impl TransportNetwork {
         let active_services_previous = self.active_services_previous(date)?;
         let destination_count = destinations.len();
         let (flat, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
-            let origin_links =
-                streets.link_many(&origins, speed, max_walking_time, max_snap_distance);
-            let destination_links =
-                streets.link_many(&destinations, speed, max_walking_time, max_snap_distance);
+            // One stop-search pass links both the origins (access) and the
+            // destinations (egress); see StreetNetwork::link_pointsets.
+            let mut linked = streets.link_pointsets(
+                &[&origins[..], &destinations[..]],
+                speed,
+                max_walking_time,
+                max_snap_distance,
+            );
+            let destination_links = linked.pop().unwrap();
+            let origin_links = linked.pop().unwrap();
             let unsnapped_from = unsnapped(&origin_links);
             let unsnapped_to = unsnapped(&destination_links);
             let requests: Vec<Request> = origin_links
@@ -3667,10 +3673,16 @@ impl TransportNetwork {
         let stop_count = self.build.timetable.stop_count() as usize;
         let destination_count = destinations.len();
         let (flat, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
-            let origin_links =
-                streets.link_many(&origins, speed, max_walking_time, max_snap_distance);
-            let destination_links =
-                streets.link_many(&destinations, speed, max_walking_time, max_snap_distance);
+            // One stop-search pass links both the origins (access) and the
+            // destinations (egress); see StreetNetwork::link_pointsets.
+            let mut linked = streets.link_pointsets(
+                &[&origins[..], &destinations[..]],
+                speed,
+                max_walking_time,
+                max_snap_distance,
+            );
+            let destination_links = linked.pop().unwrap();
+            let origin_links = linked.pop().unwrap();
             let unsnapped_from = unsnapped(&origin_links);
             let unsnapped_to = unsnapped(&destination_links);
             let requests: Vec<Request> = origin_links
@@ -3816,10 +3828,16 @@ impl TransportNetwork {
             fares: tables.as_ref(),
         };
         let (rows, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
-            let origin_links =
-                streets.link_many(&origins, speed, max_walking_time, max_snap_distance);
-            let destination_links =
-                streets.link_many(&destinations, speed, max_walking_time, max_snap_distance);
+            // One stop-search pass links both the origins (access) and the
+            // destinations (egress); see StreetNetwork::link_pointsets.
+            let mut linked = streets.link_pointsets(
+                &[&origins[..], &destinations[..]],
+                speed,
+                max_walking_time,
+                max_snap_distance,
+            );
+            let destination_links = linked.pop().unwrap();
+            let origin_links = linked.pop().unwrap();
             let unsnapped_from = unsnapped(&origin_links);
             let unsnapped_to = unsnapped(&destination_links);
             let mut requests = Vec::with_capacity(origin_links.len());
@@ -4329,10 +4347,16 @@ impl TransportNetwork {
             fares: tables.as_ref(),
         };
         let (rows, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
-            let origin_links =
-                streets.link_many(&origins, speed, max_walking_time, max_snap_distance);
-            let destination_links =
-                streets.link_many(&destinations, speed, max_walking_time, max_snap_distance);
+            // One stop-search pass links both the origins (access) and the
+            // destinations (egress); see StreetNetwork::link_pointsets.
+            let mut linked = streets.link_pointsets(
+                &[&origins[..], &destinations[..]],
+                speed,
+                max_walking_time,
+                max_snap_distance,
+            );
+            let destination_links = linked.pop().unwrap();
+            let origin_links = linked.pop().unwrap();
             let unsnapped_from = unsnapped(&origin_links);
             let unsnapped_to = unsnapped(&destination_links);
             let mut requests = Vec::with_capacity(origin_links.len());

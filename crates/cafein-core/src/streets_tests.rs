@@ -83,11 +83,7 @@ fn ch_matches_bounded_dijkstra_on_a_street_network() {
         net.arrays.adj_targets(),
         net.arrays.adj_meters(),
     );
-    let mut state = SearchState {
-        distances: HashMap::new(),
-        previous: HashMap::new(),
-        heap: BinaryHeap::new(),
-    };
+    let mut state = SearchState::default();
     for source in 0..net.vertex_count() {
         net.bounded_dijkstra(&[(source, 0.0)], f64::INFINITY, &mut state);
         for target in 0..net.vertex_count() {
@@ -144,11 +140,7 @@ fn ch_buckets_match_bounded_dijkstra_on_link_vertices() {
     targets.dedup();
     let cutoff = 1000.0;
     let buckets = ch.buckets(&targets, cutoff);
-    let mut state = SearchState {
-        distances: HashMap::new(),
-        previous: HashMap::new(),
-        heap: BinaryHeap::new(),
-    };
+    let mut state = SearchState::default();
     // Seed like a snap would: an interior vertex, with a couple of offsets.
     for seeds in [vec![(0u32, 0.0)], vec![(1u32, 10.0), (2u32, 0.0)]] {
         net.bounded_dijkstra(&seeds, cutoff, &mut state);
@@ -230,6 +222,89 @@ fn installing_a_hierarchy_keeps_the_walking_results() {
 /// The `(stop, seconds)` view of a walking-search result.
 fn timed(walks: &[WalkedStop]) -> Vec<(StopIdx, u32)> {
     walks.iter().map(|walk| (walk.stop, walk.seconds)).collect()
+}
+
+/// Asserts two link results (per point, walkable stops or `None`) agree on the
+/// stop set and rounded seconds, metres to 1e-6.
+fn assert_links_match(via: &[Option<Vec<WalkedStop>>], many: &[Option<Vec<WalkedStop>>]) {
+    assert_eq!(via.len(), many.len(), "point count differs");
+    for (a, b) in via.iter().zip(many) {
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                assert_eq!(timed(a), timed(b), "{a:?} vs {b:?}");
+                for (x, y) in a.iter().zip(b) {
+                    assert!((x.meters - y.meters).abs() < 1e-6, "{x:?} vs {y:?}");
+                }
+            }
+            (None, None) => {}
+            _ => panic!("snap disagreement: {a:?} vs {b:?}"),
+        }
+    }
+}
+
+#[test]
+fn link_pointsets_matches_link_many() {
+    // Linking from the stop side (link_pointsets) returns the same stop sets and
+    // rounded seconds as the per-point search (link_many), metres within 1e-6
+    // (the two search directions sum a path in opposite order). Checked over a
+    // spread of coordinates, both engines, and both a single set and two sets
+    // sharing one stop-search pass.
+    let mut net = network(
+        4,
+        3,
+        &[
+            (0, 1, 137.0, straight((0.0, 0.0), (137.0, 0.0))),
+            (1, 2, 149.0, straight((137.0, 0.0), (286.0, 0.0))),
+            (2, 3, 151.0, straight((286.0, 0.0), (437.0, 0.0))),
+            (0, 3, 500.0, straight((0.0, 0.0), (437.0, 0.0))),
+        ],
+        vec![
+            link(0, 0, 0.3, 1.0),
+            link(1, 1, 0.5, 2.0),
+            link(2, 2, 0.7, 1.5),
+        ],
+    )
+    .unwrap();
+    // The linking APIs take (latitude, longitude); `lonlat` builds the
+    // opposite order, so swap.
+    let point = |x: f64, y: f64| {
+        let (lon, lat) = lonlat(x, y);
+        (lat, lon)
+    };
+    let coords: Vec<(f64, f64)> = vec![
+        point(70.0, 0.0),      // mid edge 0
+        point(140.0, 0.0),     // near stop 1
+        point(400.0, 0.0),     // on edge 2 near stop 2
+        point(41.0, 0.0),      // same edge as stop 0's link
+        point(5000.0, 5000.0), // beyond the snap distance -> None
+    ];
+    let check = |net: &StreetNetwork| {
+        for &speed in &[1.0, 1.4] {
+            for &max_seconds in &[300.0, 900.0] {
+                let many = net.link_many(&coords, speed, max_seconds, 100.0);
+                // The comparison must not pass vacuously: the on-network
+                // points snap and reach stops, the far one stays None.
+                let linked = many.iter().filter(|links| links.is_some()).count();
+                assert_eq!(linked, 4, "expected 4 snapped points: {many:?}");
+                assert!(
+                    many.iter().flatten().any(|walks| !walks.is_empty()),
+                    "no point reached any stop: {many:?}"
+                );
+                let single = net.link_pointsets(&[&coords[..]], speed, max_seconds, 100.0);
+                assert_eq!(single.len(), 1);
+                assert_links_match(&single[0], &many);
+                // Two sets share one stop-search pass; each matches its link_many.
+                let (a, b) = coords.split_at(2);
+                let pair = net.link_pointsets(&[a, b], speed, max_seconds, 100.0);
+                assert_eq!(pair.len(), 2);
+                assert_links_match(&pair[0], &net.link_many(a, speed, max_seconds, 100.0));
+                assert_links_match(&pair[1], &net.link_many(b, speed, max_seconds, 100.0));
+            }
+        }
+    };
+    check(&net);
+    net.install_hierarchy();
+    check(&net);
 }
 
 /// Asserts designed walking times, allowing the one extra second that
