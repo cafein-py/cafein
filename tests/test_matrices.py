@@ -1106,11 +1106,31 @@ def test_windowed_tbtr_matches_raptor_and_reuses_cache(helsinki_gtfs):
     assert cached.equals(ad_hoc)
 
 
-def test_windowed_tbtr_rejects_point_matrices(network_with_footpaths):
-    origins = point_frame(network_with_footpaths, [("A", "1100602")])
-    with pytest.raises(ValueError, match="point matrices run on RAPTOR"):
-        network_with_footpaths.travel_time_matrix(
-            origins, "2022-02-22", "08:30:00", window=600, router="tbtr"
+def test_tbtr_point_matrices_match_raptor(network_with_footpaths):
+    # Door-to-door coordinate matrices agree cell for cell between the two
+    # engines — single departure and windowed percentiles, ad-hoc and cached
+    # transfer set alike.
+    origins = point_frame(network_with_footpaths, [("A", "1100602"), ("B", "1250551")])
+    destinations = point_frame(
+        network_with_footpaths, [("C", "1040280"), ("D", "4810551"), ("E", "1100602")]
+    )
+    single = dict(date="2022-02-22", departure="08:30:00")
+    windowed = dict(single, window=600, percentiles=[10, 50, 90])
+    for common in (single, windowed):
+        raptor = TravelTimeMatrix(
+            network_with_footpaths, origins, destinations, **common
+        )
+        ad_hoc = TravelTimeMatrix(
+            network_with_footpaths, origins, destinations, router="tbtr", **common
+        )
+        assert ad_hoc.equals(raptor)
+    network_with_footpaths.compute_tbtr_transfers("2022-02-22")
+    for common in (single, windowed):
+        cached = TravelTimeMatrix(
+            network_with_footpaths, origins, destinations, router="tbtr", **common
+        )
+        assert cached.equals(
+            TravelTimeMatrix(network_with_footpaths, origins, destinations, **common)
         )
 
 

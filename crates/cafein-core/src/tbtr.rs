@@ -951,6 +951,35 @@ impl<'a> TbtrEngine<'a> {
             .collect()
     }
 
+    /// Travel-time percentiles from each request to each destination
+    /// *point*, joined through the points' egress link tables — the TBTR
+    /// counterpart of [`Raptor::percentile_matrix_to_points`], sharing its
+    /// propagation (`propagate_point_percentiles`), so the two engines'
+    /// door-to-door windowed matrices agree cell for cell.
+    pub fn percentile_matrix_to_points(
+        &self,
+        requests: &[Request],
+        egress: &[Vec<(StopIdx, u32, f64)>],
+        window: u32,
+        percentiles: &[f64],
+    ) -> Vec<Vec<u32>> {
+        let stop_count = self.timetable.stop_count() as usize;
+        requests
+            .par_iter()
+            .map(|request| {
+                let arrivals = self.window_samples(request, window);
+                let access_floor = crate::raptor::access_floor(stop_count, request);
+                crate::raptor::propagate_point_percentiles(
+                    &arrivals,
+                    &access_floor,
+                    stop_count,
+                    egress,
+                    percentiles,
+                )
+            })
+            .collect()
+    }
+
     /// For every minute mark within `[departure, departure + window)`,
     /// the per-stop earliest arrival when leaving at or after it — the
     /// TBTR counterpart of RAPTOR's `window_samples`. One descending pass

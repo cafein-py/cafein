@@ -853,11 +853,11 @@ class TransportNetwork:
             contiguous block of the resolved origins, so ``n`` batch
             jobs cover all origins disjointly; rows follow the chunk.
         router : str (optional, default: "raptor")
-            The routing engine for stop matrices:
-            ``"raptor"``, or ``"tbtr"`` to precompute a TBTR day engine
-            (Trip-Based Transit Routing: Witt's trip-transfer set) for
-            the date and fan the origins out over it. The results are
-            identical. Point matrices run on RAPTOR only.
+            The routing engine: ``"raptor"``, or ``"tbtr"`` to
+            precompute a TBTR day engine (Trip-Based Transit Routing:
+            Witt's trip-transfer set) for the date and fan the origins
+            out over it, for stop and point matrices alike. The results
+            are identical.
         walking_speed_kmph, max_walking_time, max_snap_distance : float
             The street-search options, as in ``access_stops``. They apply to
             point origins, and to stop origins of the ``"raptor"`` matrix under
@@ -924,11 +924,6 @@ class TransportNetwork:
 
         if router not in ("raptor", "tbtr"):
             raise ValueError(f"router must be 'raptor' or 'tbtr', not {router!r}")
-        if router == "tbtr" and _is_point_frame(from_stops):
-            raise ValueError(
-                "router='tbtr' backs stop matrices only; "
-                "point matrices run on RAPTOR"
-            )
         percentiles = _window_percentiles(window, percentiles, confidence)
         if _is_point_frame(from_stops):
             from_ids, origin_points = _point_list(from_stops, "origins")
@@ -949,6 +944,7 @@ class TransportNetwork:
                     date,
                     departure,
                     max_transfers,
+                    router,
                     *walk,
                 )
             else:
@@ -960,6 +956,7 @@ class TransportNetwork:
                     window,
                     percentiles,
                     max_transfers,
+                    router,
                     *walk,
                 )
             _warn_unsnapped(table, from_ids, to_ids)

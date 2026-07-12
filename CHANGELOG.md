@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- TBTR point matrices — ``router="tbtr"`` now also backs the door-to-door
+  coordinate travel-time matrices (``travel_time_matrix`` and
+  ``TravelTimeMatrix`` with point origins/destinations, single departure and
+  windowed percentiles), reusing the cached ``compute_tbtr_transfers`` set
+  when its date matches. Results are identical to RAPTOR's, and both engines
+  share one door-to-door propagation.
+
 - Diverse rounds continue past a routeless pick — with ``candidates="diverse"``,
   selecting the walking-only journey (which bans and penalizes nothing) no
   longer ends the search: the rounds keep picking from the current pool, so a

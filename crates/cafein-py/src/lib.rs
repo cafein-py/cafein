@@ -3352,7 +3352,7 @@ impl TransportNetwork {
     ///     ``matrix``: a ``(len(origins), len(destinations),
     ///     len(percentiles))`` uint32 array; ``unsnapped_from`` /
     ///     ``unsnapped_to``: indices of points off the walking network.
-    #[pyo3(signature = (origins, destinations, date, departure, window, percentiles, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    #[pyo3(signature = (origins, destinations, date, departure, window, percentiles, max_transfers = 7, router = "raptor", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
     #[allow(clippy::too_many_arguments)]
     fn travel_time_percentiles_from_points(
         &self,
@@ -3364,10 +3364,14 @@ impl TransportNetwork {
         window: u32,
         percentiles: Vec<f64>,
         max_transfers: u8,
+        router: &str,
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
     ) -> PyResult<Py<PyDict>> {
+        if router != "raptor" && router != "tbtr" {
+            return Err(PyValueError::new_err("router must be 'raptor' or 'tbtr'"));
+        }
         let streets = self.installed_streets()?;
         validate_window(window, &percentiles)?;
         let speed =
@@ -3403,16 +3407,44 @@ impl TransportNetwork {
                 })
                 .collect();
             let egress = egress_tables(&destination_links);
-            let mut flat = Raptor
-                .percentile_matrix_to_points(
-                    &self.build.timetable,
-                    self.time_transfers(),
-                    &requests,
-                    &egress,
-                    window,
-                    &percentiles,
-                )
-                .concat();
+            let mut flat = if router == "tbtr" {
+                // Same cached-set reuse as the stop matrices; the engine
+                // borrows the precomputed set when the date matches.
+                let cached = self
+                    .tbtr_time_transfers
+                    .as_ref()
+                    .filter(|(cached_date, _)| cached_date.as_str() == date)
+                    .map(|(_, set)| set);
+                let engine = match cached {
+                    Some(set) => TbtrEngine::from_set(
+                        &self.build.timetable,
+                        self.time_transfers(),
+                        &active_services,
+                        &active_services_previous,
+                        set,
+                    ),
+                    None => TbtrEngine::for_date(
+                        &self.build.timetable,
+                        self.time_transfers(),
+                        &active_services,
+                        &active_services_previous,
+                    ),
+                };
+                engine
+                    .percentile_matrix_to_points(&requests, &egress, window, &percentiles)
+                    .concat()
+            } else {
+                Raptor
+                    .percentile_matrix_to_points(
+                        &self.build.timetable,
+                        self.time_transfers(),
+                        &requests,
+                        &egress,
+                        window,
+                        &percentiles,
+                    )
+                    .concat()
+            };
             // A direct walk is departure-independent, so it caps every
             // percentile of a cell's distribution alike.
             let walk = streets.walk_matrix(
@@ -3648,7 +3680,7 @@ impl TransportNetwork {
     ///     unreachable; ``unsnapped_from`` / ``unsnapped_to``: indices
     ///     of points farther than `max_snap_distance` from the walking
     ///     network (their rows/columns are unreachable).
-    #[pyo3(signature = (origins, destinations, date, departure, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    #[pyo3(signature = (origins, destinations, date, departure, max_transfers = 7, router = "raptor", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
     #[allow(clippy::too_many_arguments)]
     fn travel_time_matrix_from_points(
         &self,
@@ -3658,10 +3690,14 @@ impl TransportNetwork {
         date: &str,
         departure: &str,
         max_transfers: u8,
+        router: &str,
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
     ) -> PyResult<Py<PyDict>> {
+        if router != "raptor" && router != "tbtr" {
+            return Err(PyValueError::new_err("router must be 'raptor' or 'tbtr'"));
+        }
         let streets = self.installed_streets()?;
         let speed =
             validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
@@ -3697,8 +3733,38 @@ impl TransportNetwork {
                 })
                 .collect();
             let egress = egress_tables(&destination_links);
-            let rows =
-                Raptor.one_to_all_many(&self.build.timetable, self.time_transfers(), &requests);
+            let rows: Vec<Vec<Option<u32>>> = if router == "tbtr" {
+                // Reuse the cached transfer set when it was precomputed for
+                // this date (`compute_tbtr_transfers`), borrowed by the engine;
+                // otherwise build the day's set ad hoc.
+                let cached = self
+                    .tbtr_time_transfers
+                    .as_ref()
+                    .filter(|(cached_date, _)| cached_date.as_str() == date)
+                    .map(|(_, set)| set);
+                let engine = match cached {
+                    Some(set) => TbtrEngine::from_set(
+                        &self.build.timetable,
+                        self.time_transfers(),
+                        &active_services,
+                        &active_services_previous,
+                        set,
+                    ),
+                    None => TbtrEngine::for_date(
+                        &self.build.timetable,
+                        self.time_transfers(),
+                        &active_services,
+                        &active_services_previous,
+                    ),
+                };
+                let accesses: Vec<Vec<(StopIdx, u32)>> = requests
+                    .iter()
+                    .map(|request| request.access.clone())
+                    .collect();
+                engine.one_to_all_many(departure, &accesses, max_transfers)
+            } else {
+                Raptor.one_to_all_many(&self.build.timetable, self.time_transfers(), &requests)
+            };
             let mut flat = vec![u32::MAX; requests.len() * destination_count];
             for (origin, arrivals) in rows.iter().enumerate() {
                 debug_assert_eq!(arrivals.len(), stop_count);
