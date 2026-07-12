@@ -1031,3 +1031,76 @@ fn profiles_the_departure_window() {
         .collect();
     assert_eq!(profile, vec![(100, 300), (200, 400)]);
 }
+
+#[test]
+fn frontier_matrix_matches_the_one_pair_profile_per_cell() {
+    let (timetable, geometry, factors) = frontier_fixture();
+    let view = DayView::universal(&timetable);
+    let footpaths = Transfers::empty(4);
+    let destinations = [StopIdx(3), StopIdx(1), StopIdx(3)];
+    let requests: Vec<Request> = [StopIdx(0), StopIdx(2)]
+        .into_iter()
+        .map(|origin| Request {
+            departure: 0,
+            access: vec![(origin, 0)],
+            egress: Vec::new(),
+            active_services: vec![true],
+            active_services_previous: Vec::new(),
+            max_transfers: 3,
+        })
+        .collect();
+    let cells = frontier_matrix(
+        &view,
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        &requests,
+        &destinations,
+        &[],
+        false,
+        destinations.len(),
+        1000,
+        1e-6,
+    );
+    let keys = |journeys: &[Journey]| -> Vec<(u32, u32, u32, f64)> {
+        journeys
+            .iter()
+            .map(|journey| {
+                (
+                    journey.departure,
+                    journey.arrival,
+                    journey.rides() as u32,
+                    grams_of(journey, &geometry, &factors),
+                )
+            })
+            .collect()
+    };
+    for (request, row) in requests.iter().zip(&cells) {
+        for (&destination, cell) in destinations.iter().zip(row) {
+            let mut one_pair = request.clone();
+            one_pair.egress = vec![(destination, 0)];
+            let journeys = route_range(
+                &view,
+                &timetable,
+                &footpaths,
+                &geometry,
+                &factors,
+                &one_pair,
+                1000,
+                1e-6,
+                0,
+                None,
+                &[],
+            );
+            assert_eq!(keys(cell), keys(&journeys));
+        }
+    }
+    // The known frontier of the fixture: from stop 0 to stop 3 the
+    // fast dirty direct, the transfer combination, and the clean slow
+    // direct all survive; stop 2 reaches neither destination; the
+    // repeated destination stop gets the same cell as its first slot.
+    assert_eq!(cells[0][0].len(), 3);
+    assert!(cells[1][0].is_empty() && cells[1][1].is_empty());
+    assert_eq!(keys(&cells[0][2]), keys(&cells[0][0]));
+}

@@ -340,6 +340,51 @@ impl MatrixFold<'_> {
     }
 }
 
+/// Per-destination-slot frontier fold: every label reached after a
+/// round feeds its slot's destination bag exactly as the one-pair
+/// search feeds `Search::destination`, so a batched cell's frontier
+/// equals the single-pair query's. Stop mode credits a destination
+/// stop's own labels with no final walk; door-to-door mode
+/// (`egress_active`) walks each label's final egress instead, leaving
+/// the walking-only journey to the caller's direct-walk overlay.
+/// Access seeds never reach the fold — only ridden or transferred
+/// labels do, matching the one-pair egress check.
+struct FrontierFold<'a> {
+    /// Per stop: destination slot + 1, or 0 when not a destination.
+    slots: &'a [u32],
+    /// Per stop: `(destination slot, walk seconds, walk meters)` final
+    /// egress; consulted only in door-to-door mode.
+    egress: &'a [Vec<(u32, u32, f64)>],
+    egress_active: bool,
+    /// Per slot: the destination bag the cell's journeys assemble from.
+    bags: &'a mut [DestinationBag],
+}
+
+impl FrontierFold<'_> {
+    fn fold(&mut self, label: &Label, index: u32, departure: u32, key: i64, slack: u32) {
+        let arrived = |arrival: u32| Arrived {
+            departure,
+            arrival,
+            penalty: label.penalty,
+            key,
+            grams: label.grams,
+            label: index,
+        };
+        let stop = label.stop.0 as usize;
+        if !self.egress_active {
+            let slot = self.slots[stop];
+            if slot != 0 {
+                self.bags[slot as usize - 1].insert(arrived(label.arrival), slack);
+            }
+            return;
+        }
+        for &(slot, walk_seconds, _) in &self.egress[stop] {
+            self.bags[slot as usize]
+                .insert(arrived(label.arrival.saturating_add(walk_seconds)), slack);
+        }
+    }
+}
+
 struct Search<'a> {
     view: &'a DayView,
     timetable: &'a Timetable,
@@ -498,7 +543,7 @@ pub fn least_emissions_matrix(
                     budget,
                     best: &mut best,
                 });
-                search.pass(request, departure, &mut fold);
+                search.pass(request, departure, &mut fold, &mut None);
             }
             best.into_iter()
                 .enumerate()
@@ -508,6 +553,112 @@ pub fn least_emissions_matrix(
                     })
                 })
                 .collect()
+        })
+        .collect()
+}
+
+/// The batched Pareto frontiers: per request × destination slot, the
+/// (departure, arrival, emissions bucket) Pareto journeys of the
+/// departure window — each cell exactly the single-pair `route_range`
+/// set (strict frontier: no slack, no cap, no penalties). Stop mode
+/// takes the destination stops; door-to-door mode (`egress_active`)
+/// takes a per-stop final-egress map over `slot_count` destination
+/// points, the walking-only journey being the caller's overlay as in
+/// the one-pair coordinate route. One window profile per request
+/// serves every slot; requests fan out with rayon.
+#[allow(clippy::too_many_arguments)]
+pub fn frontier_matrix(
+    view: &DayView,
+    timetable: &Timetable,
+    footpaths: &Transfers,
+    geometry: &TripGeometry,
+    factors: &[f64],
+    requests: &[Request],
+    destinations: &[StopIdx],
+    egress: &[Vec<(u32, u32, f64)>],
+    egress_active: bool,
+    slot_count: usize,
+    window: u32,
+    bucket: f64,
+) -> Vec<Vec<Vec<Journey>>> {
+    assert!(
+        bucket.is_finite() && bucket > 0.0,
+        "the emissions bucket must be positive"
+    );
+    if egress_active {
+        assert_eq!(
+            egress.len(),
+            timetable.stop_count() as usize,
+            "the egress map must be per stop"
+        );
+    } else {
+        assert_eq!(
+            destinations.len(),
+            slot_count,
+            "stop mode takes one slot per destination stop"
+        );
+    }
+    // A stop holds one slot, so repeated destination stops share the
+    // first occurrence's slot and their cells are re-expanded to the
+    // requested order after assembly.
+    let mut slots = vec![0u32; timetable.stop_count() as usize];
+    let mut cell_of: Vec<usize> = Vec::with_capacity(destinations.len());
+    let mut unique = 0usize;
+    for &stop in destinations {
+        let slot = slots[stop.0 as usize];
+        if slot == 0 {
+            unique += 1;
+            slots[stop.0 as usize] = unique as u32;
+            cell_of.push(unique - 1);
+        } else {
+            cell_of.push(slot as usize - 1);
+        }
+    }
+    let bag_count = if egress_active { slot_count } else { unique };
+    requests
+        .par_iter()
+        .map(|request| {
+            let mut search = Search::start(
+                view,
+                timetable,
+                footpaths,
+                geometry,
+                factors,
+                bucket,
+                0,
+                &[],
+            );
+            let departures = departure_candidates(timetable, request, window);
+            let mut bags: Vec<DestinationBag> = std::iter::repeat_with(DestinationBag::default)
+                .take(bag_count)
+                .collect();
+            for &departure in &departures {
+                let mut frontier = Some(FrontierFold {
+                    slots: &slots,
+                    egress,
+                    egress_active,
+                    bags: &mut bags,
+                });
+                search.pass(request, departure, &mut None, &mut frontier);
+            }
+            let cells: Vec<Vec<Journey>> = bags
+                .iter()
+                .map(|bag| {
+                    let mut journeys: Vec<Journey> = bag
+                        .entries
+                        .iter()
+                        .map(|arrived| search.assemble(arrived))
+                        .collect();
+                    journeys.sort_by_key(|journey| {
+                        (journey.departure, journey.arrival, journey.rides())
+                    });
+                    journeys
+                })
+                .collect();
+            if egress_active || unique == destinations.len() {
+                return cells;
+            }
+            cell_of.iter().map(|&cell| cells[cell].clone()).collect()
         })
         .collect()
 }
@@ -541,7 +692,7 @@ fn profile(
         route_penalties,
     );
     for &departure in departures {
-        search.pass(request, departure, &mut None);
+        search.pass(request, departure, &mut None, &mut None);
     }
     let kept = cap_entries(&search.destination.entries, max_options);
     let mut journeys: Vec<Journey> = kept
@@ -653,8 +804,15 @@ impl<'a> Search<'a> {
     /// the emissions criterion by ranking the rides used (see
     /// `Bag::insert`). A matrix fold, when given, sees every label the
     /// pass creates (the access seeds are the zero-ride floor of the
-    /// origin's own cell).
-    fn pass(&mut self, request: &Request, departure: u32, fold: &mut Option<MatrixFold<'_>>) {
+    /// origin's own cell); a frontier fold sees the labels reached after
+    /// each round, exactly where the one-pair egress check runs.
+    fn pass(
+        &mut self,
+        request: &Request,
+        departure: u32,
+        fold: &mut Option<MatrixFold<'_>>,
+        frontier: &mut Option<FrontierFold<'_>>,
+    ) {
         let mut fresh: Vec<u32> = Vec::new();
         for &(stop, seconds) in &request.access {
             let arrival = departure.saturating_add(seconds);
@@ -742,6 +900,15 @@ impl<'a> Search<'a> {
                 let reached = self.arena[label as usize];
                 if let Some(fold) = fold {
                     fold.fold(&reached, label);
+                }
+                if let Some(frontier) = frontier {
+                    frontier.fold(
+                        &reached,
+                        label,
+                        departure,
+                        self.key(reached.grams),
+                        self.slack,
+                    );
                 }
                 for &(stop, seconds) in &request.egress {
                     if stop == reached.stop {

@@ -320,6 +320,12 @@ def journey_frontier(
         from cafein.fares import annotate_fares
 
         annotate_fares(journeys, fares)
+    return _frontier_frame(journeys, fares)
+
+
+def _frontier_frame(journeys, fares):
+    """Annotated journeys as the frontier frame: one row per journey with
+    the Pareto mark, sorted by travel time (cleaner as the tie-break)."""
     records = [
         {
             "departure": journey["departure"],
@@ -350,6 +356,145 @@ def journey_frontier(
     return (
         frame[ordered].sort_values(["travel_time", "emissions"]).reset_index(drop=True)
     )
+
+
+def journey_frontiers(
+    network,
+    origins,
+    destinations,
+    date,
+    departure,
+    window,
+    *,
+    max_transfers=7,
+    factors=None,
+    components=None,
+    fares=None,
+    bucket=25.0,
+    walking_speed_kmph=None,
+    max_walking_time=None,
+    max_snap_distance=None,
+    geometries=False,
+):
+    """Batched ``journey_frontier``: every (origin, destination) cell of two
+    point sets, from one window profile per origin.
+
+    The candidate set is the strict McRAPTOR pareto family
+    (``candidates="pareto"``): per cell, the journeys Pareto-optimal in
+    (departure, arrival, emissions) over the departure window — exactly the
+    frame ``journey_frontier`` returns for the same pair. One multicriteria
+    profile per origin serves all destinations, and origins run in parallel
+    with the GIL released, so a batch costs roughly one search per origin
+    rather than one per cell. Requires a network built with trip distances.
+
+    Parameters
+    ----------
+    network : TransportNetwork
+        The network to route on.
+    origins, destinations : list of str, or point GeoDataFrame
+        Stop ids, or point GeoDataFrames with an ``id`` column (any CRS;
+        reprojected to EPSG:4326) — both of the same kind. Coordinate
+        queries route door-to-door and include the walking-only journey;
+        stop-id queries board at the origin stop and route over the
+        footpath closure.
+    date, departure, window
+        The service date, window start, and window length, as in
+        ``journey_frontier``.
+    max_transfers, factors, components, fares, bucket
+        As in ``journey_frontier`` (``bucket`` is the pareto search's
+        emissions bucket width in grams).
+    walking_speed_kmph, max_walking_time, max_snap_distance : float
+        Street-search options for the coordinate queries, as in
+        ``route_between_coordinates``.
+    geometries : bool (optional, default: False)
+        Attach leg geometries to the returned journeys.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The long frame: ``from_id``, ``to_id``, and ``journey_frontier``'s
+        columns. Cells follow the requested (origin, destination) order,
+        rows within a cell the frame's travel-time sort; a cell with no
+        feasible journey contributes no rows.
+    """
+    stops = _frontier_ids(origins, "origins"), _frontier_ids(
+        destinations, "destinations"
+    )
+    if (stops[0] is None) != (stops[1] is None):
+        raise ValueError(
+            "origins and destinations must both be stop ids or both be point frames"
+        )
+    trip_factors = emissions.trip_factors(network, factors, components)
+    if stops[0] is not None:
+        from_ids, to_ids = stops
+        cells = network._core.mc_frontier_matrix(
+            from_ids,
+            to_ids,
+            date,
+            departure,
+            trip_factors,
+            window,
+            max_transfers,
+            bucket,
+            geometries,
+        )
+    else:
+        from cafein.matrices import _point_list, _warn_unsnapped
+        from cafein.network import _walk_options
+
+        from_ids, from_points = _point_list(origins, "origins")
+        to_ids, to_points = _point_list(destinations, "destinations")
+        table = network._core.mc_frontier_matrix_from_points(
+            from_points,
+            to_points,
+            date,
+            departure,
+            trip_factors,
+            window,
+            max_transfers,
+            bucket,
+            *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
+            geometries,
+        )
+        cells = table["journeys"]
+        _warn_unsnapped(table, from_ids, to_ids)
+    journeys = [journey for row in cells for cell in row for journey in cell]
+    emissions.annotate(journeys, network, factors, components)
+    if fares is not None:
+        from cafein.fares import annotate_fares
+
+        annotate_fares(journeys, fares)
+    frames = []
+    for from_id, row in zip(from_ids, cells):
+        for to_id, cell in zip(to_ids, row):
+            if not cell:
+                continue
+            frame = _frontier_frame(cell, fares)
+            frame.insert(0, "from_id", from_id)
+            frame.insert(1, "to_id", to_id)
+            frames.append(frame)
+    if frames:
+        return pd.concat(frames, ignore_index=True)
+    columns = ["from_id", "to_id", *(c for c in _COLUMNS if c != "journey")]
+    if fares is not None:
+        columns.append("fare")
+    columns.append("journey")
+    return pd.DataFrame(columns=columns)
+
+
+def _frontier_ids(values, role):
+    """The stop ids of a batched frontier input, or ``None`` for a point
+    frame (resolved later); anything else raises."""
+    from cafein.matrices import _is_point_frame
+
+    if _is_point_frame(values):
+        return None
+    ids = list(values)
+    if not ids or not all(isinstance(value, str) for value in ids):
+        raise ValueError(
+            f"{role} must be a non-empty list of stop ids or a point GeoDataFrame"
+        )
+    return ids
 
 
 def _diverse_reference(journeys):
