@@ -54,6 +54,23 @@ fn boarded(set: &TransferSet, trip: ViewTrip, position: u16) -> Vec<(u32, u16)> 
     list
 }
 
+/// Every kept transfer as (trip, alight, boarded trip, position).
+fn kept(set: &TransferSet, view: &DayView, timetable: &Timetable) -> Vec<(u32, u16, u32, u16)> {
+    let mut list = Vec::new();
+    for trip in 0..view.trip_count() {
+        let stops = timetable
+            .pattern_stops(view.line_pattern(view.line_of(ViewTrip(trip))))
+            .len();
+        for position in 0..stops as u16 {
+            for transfer in set.from_trip_position(ViewTrip(trip), position) {
+                list.push((trip, position, transfer.trip.0, transfer.position));
+            }
+        }
+    }
+    list.sort_unstable();
+    list
+}
+
 #[test]
 fn keeps_the_cleaner_slower_transfer() {
     let (timetable, geometry) = forked();
@@ -65,37 +82,52 @@ fn keeps_the_cleaner_slower_transfer() {
     assert_eq!(boarded(&time_set, ViewTrip(0), 1), vec![(1, 0)]);
     // Clean-but-slow (factor 10 vs 100): a true Pareto move, kept.
     let factors = [50.0, 100.0, 10.0];
-    let mc = transfer_set(&view, &timetable, &footpaths, &geometry, &factors).transfers;
+    let mc = transfer_set(&view, &timetable, &geometry, &factors).transfers;
     assert_eq!(boarded(&mc, ViewTrip(0), 1), vec![(1, 0), (2, 0)]);
     // With the slow line just as dirty, the mc reduction drops it
     // too — and matches the time set exactly here.
     let uniform = [50.0, 100.0, 100.0];
-    let same = transfer_set(&view, &timetable, &footpaths, &geometry, &uniform).transfers;
+    let same = transfer_set(&view, &timetable, &geometry, &uniform).transfers;
     assert_eq!(boarded(&same, ViewTrip(0), 1), vec![(1, 0)]);
 }
 
 #[test]
-fn the_mc_set_covers_the_time_set() {
+fn the_global_set_keeps_exactly_the_needed_transfers() {
+    // Per factor configuration: the expected global contents, and the
+    // retired per-trip local reduction's complete output on the same
+    // configuration — a frozen snapshot captured by running that
+    // implementation before its removal. The subset assertion
+    // enforces the plan's pruning-only-removes invariant against the
+    // baseline; the equality assertion pins the exact contents (the
+    // fork's only transfer event is (A, stop 1): a cleaner-but-slower
+    // fork holds a Pareto point and survives, an equally-dirty-or-
+    // worse one is witnessed away, and every other cell is empty).
     let (timetable, geometry) = forked();
     let view = DayView::universal(&timetable);
-    let footpaths = Transfers::empty(4);
-    let time_set = TransferSet::for_view(&view, &timetable, &footpaths).transfers;
-    for factors in [[50.0, 100.0, 10.0], [50.0, 50.0, 50.0], [1.0, 2.0, 3.0]] {
-        let mc = transfer_set(&view, &timetable, &footpaths, &geometry, &factors).transfers;
-        for trip in 0..view.trip_count() {
-            let stops = timetable
-                .pattern_stops(view.line_pattern(view.line_of(ViewTrip(trip))))
-                .len();
-            for position in 0..stops as u16 {
-                for kept in time_set.from_trip_position(ViewTrip(trip), position) {
-                    assert!(
-                        mc.from_trip_position(ViewTrip(trip), position)
-                            .contains(kept),
-                        "time-kept transfer missing under factors {factors:?}"
-                    );
-                }
-            }
-        }
+    type Case = (
+        [f64; 3],
+        Vec<(u32, u16, u32, u16)>,
+        Vec<(u32, u16, u32, u16)>,
+    );
+    let cases: [Case; 3] = [
+        (
+            [50.0, 100.0, 10.0],
+            vec![(0, 1, 1, 0), (0, 1, 2, 0)],
+            vec![(0, 1, 1, 0), (0, 1, 2, 0)],
+        ),
+        ([50.0, 50.0, 50.0], vec![(0, 1, 1, 0)], vec![(0, 1, 1, 0)]),
+        ([1.0, 2.0, 3.0], vec![(0, 1, 1, 0)], vec![(0, 1, 1, 0)]),
+    ];
+    for (factors, expected, local_baseline) in cases {
+        let build = transfer_set(&view, &timetable, &geometry, &factors);
+        let list = kept(&build.transfers, &view, &timetable);
+        assert!(
+            list.iter()
+                .all(|transfer| local_baseline.contains(transfer)),
+            "kept a transfer outside the local baseline under {factors:?}"
+        );
+        assert_eq!(list, expected, "under factors {factors:?}");
+        assert_eq!(build.generated, expected.len(), "under factors {factors:?}");
     }
 }
 
@@ -132,21 +164,33 @@ fn mixed_factor_lines_board_the_cleaner_later_trip() {
     )
     .unwrap();
     let view = DayView::universal(&timetable);
-    let footpaths = Transfers::empty(4);
+    // The retired local reduction's complete output on this fixture
+    // (a frozen snapshot captured by running it before its removal):
+    // the global set may only remove from it — here it keeps all of
+    // it, the dirty early trip and the cleaner later sibling.
     let mixed = [50.0, 100.0, 10.0];
-    let mc = transfer_set(&view, &timetable, &footpaths, &geometry, &mixed).transfers;
-    assert_eq!(boarded(&mc, ViewTrip(0), 1), vec![(1, 0), (2, 0)]);
-    // Uniform factors collapse to the earliest-trip rule.
+    let local_baseline = [(0, 1, 1, 0), (0, 1, 2, 0)];
+    let mc = transfer_set(&view, &timetable, &geometry, &mixed).transfers;
+    let list = kept(&mc, &view, &timetable);
+    assert!(list.iter().all(|t| local_baseline.contains(t)));
+    assert_eq!(list, vec![(0, 1, 1, 0), (0, 1, 2, 0)]);
+    // Uniform factors collapse to the earliest-trip rule; the local
+    // baseline shrinks to the earliest boarding alone.
     let uniform = [50.0, 100.0, 100.0];
-    let mc = transfer_set(&view, &timetable, &footpaths, &geometry, &uniform).transfers;
-    assert_eq!(boarded(&mc, ViewTrip(0), 1), vec![(1, 0)]);
+    let local_baseline = [(0, 1, 1, 0)];
+    let mc = transfer_set(&view, &timetable, &geometry, &uniform).transfers;
+    let list = kept(&mc, &view, &timetable);
+    assert!(list.iter().all(|t| local_baseline.contains(t)));
+    assert_eq!(list, vec![(0, 1, 1, 0)]);
 }
 
 #[test]
-fn same_line_reboarding_survives_only_toward_cleaner_siblings() {
-    // One line, dirty trip then clean trip: alighting the dirty
-    // trip mid-pattern may re-board the cleaner sibling at the same
-    // position; with uniform factors the sibling stays skipped.
+fn same_line_reboarding_is_witnessed_away_by_the_direct_boarding() {
+    // One line, dirty trip then clean trip: re-boarding the cleaner
+    // sibling mid-pattern is globally redundant — any rider who could
+    // catch the dirty trip could board the later sibling at the same
+    // stop directly, arriving identically with fewer grams and fewer
+    // rides. With uniform factors the sibling is never boarded at all.
     let mut builder = TimetableBuilder::new(3);
     let a = builder
         .add_pattern(&[StopIdx(0), StopIdx(1), StopIdx(2)], 0)
@@ -175,27 +219,25 @@ fn same_line_reboarding_survives_only_toward_cleaner_siblings() {
     )
     .unwrap();
     let view = DayView::universal(&timetable);
-    let footpaths = Transfers::empty(3);
     let mixed = [100.0, 10.0];
-    let mc = transfer_set(&view, &timetable, &footpaths, &geometry, &mixed).transfers;
-    assert_eq!(boarded(&mc, ViewTrip(0), 1), vec![(1, 1)]);
+    let mc = transfer_set(&view, &timetable, &geometry, &mixed).transfers;
+    assert_eq!(kept(&mc, &view, &timetable), vec![]);
     let uniform = [100.0, 100.0];
-    let mc = transfer_set(&view, &timetable, &footpaths, &geometry, &uniform).transfers;
-    assert_eq!(boarded(&mc, ViewTrip(0), 1), vec![]);
+    let mc = transfer_set(&view, &timetable, &geometry, &uniform).transfers;
+    assert_eq!(kept(&mc, &view, &timetable), vec![]);
 }
 
 #[test]
 fn unresolved_factors_are_excluded() {
     let (timetable, geometry) = forked();
     let view = DayView::universal(&timetable);
-    let footpaths = Transfers::empty(4);
     // The fast line's factor is unresolved: never boarded.
     let factors = [50.0, f64::NAN, 10.0];
-    let mc = transfer_set(&view, &timetable, &footpaths, &geometry, &factors).transfers;
+    let mc = transfer_set(&view, &timetable, &geometry, &factors).transfers;
     assert_eq!(boarded(&mc, ViewTrip(0), 1), vec![(2, 0)]);
     // An unresolved source trip gets no transfers at all.
     let factors = [f64::NAN, 100.0, 10.0];
-    let mc = transfer_set(&view, &timetable, &footpaths, &geometry, &factors).transfers;
+    let mc = transfer_set(&view, &timetable, &geometry, &factors).transfers;
     assert_eq!(boarded(&mc, ViewTrip(0), 1), vec![]);
 }
 
@@ -541,13 +583,13 @@ fn profiles_the_departure_window() {
 }
 
 #[test]
-fn u_turns_stay_dropped() {
-    // Alight A at stop 2, walk back to stop 1, and re-ride the
-    // 1→2 segment on B although B was catchable by alighting A at
-    // stop 1 directly: the classic U-turn, dropped even though B
-    // is cleaner — the earlier alight saves grams on A and rides
-    // the identical distance on B. Boarding B at stop 2 itself
-    // stays a plain, kept transfer.
+fn the_earlier_alight_is_the_canonical_transfer_point() {
+    // A rides 0→1→2 and B rides 1→2→3: alighting A at stop 1
+    // boards B at its start; staying aboard to stop 2 and
+    // transferring there arrives identically having ridden the
+    // dirtier vehicle further, so only the earlier alight's transfer
+    // survives. Footpaths never enter the set — walked transfers are
+    // the query's job.
     let mut builder = TimetableBuilder::new(4);
     let a = builder
         .add_pattern(&[StopIdx(0), StopIdx(1), StopIdx(2)], 0)
@@ -578,21 +620,41 @@ fn u_turns_stay_dropped() {
         ],
     )
     .unwrap();
-    let footpaths = Transfers::from_edges(
-        4,
-        &[
-            (StopIdx(1), StopIdx(2), 30, 30.0),
-            (StopIdx(2), StopIdx(1), 30, 30.0),
+    let view = DayView::universal(&timetable);
+    let factors = [100.0, 10.0];
+    let build = transfer_set(&view, &timetable, &geometry, &factors);
+    assert_eq!(
+        kept(&build.transfers, &view, &timetable),
+        vec![(0, 1, 1, 0)]
+    );
+}
+
+#[test]
+fn over_midnight_departures_do_not_underflow() {
+    // A previous-day trip's pre-midnight stop events are yesterday's
+    // departures: the source runs skip them instead of shifting them
+    // below zero.
+    let mut builder = TimetableBuilder::new(2);
+    let a = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    builder
+        .add_trip(a, vec![time(82_800), time(90_000)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(a, vec![time(100), time(200)], 1, 1)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
         ],
     )
     .unwrap();
-    let view = DayView::universal(&timetable);
-    let factors = [100.0, 10.0];
-    let mc = transfer_set(&view, &timetable, &footpaths, &geometry, &factors).transfers;
-    // From (A, position 2): the walk-back boarding of B at
-    // position 0 is the U-turn and is gone; boarding B at stop 2
-    // (position 1) survives.
-    assert_eq!(boarded(&mc, ViewTrip(0), 2), vec![(1, 1)]);
+    let view = DayView::for_date(&timetable, &[false, true], &[true, false]);
+    let factors = [10.0, 10.0];
+    let build = transfer_set(&view, &timetable, &geometry, &factors);
+    assert_eq!(kept(&build.transfers, &view, &timetable), vec![]);
 }
 
 #[test]

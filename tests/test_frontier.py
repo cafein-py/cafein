@@ -1699,9 +1699,11 @@ def test_the_mctbtr_transfer_cache_answers_identically(tmp_path):
     args = (["A", "H"], ["B"], "2022-02-22", "08:00:00")
     kwargs = dict(window=1800, bucket=1e-6, router="tbtr")
     assert not network.has_mctbtr_transfers
+    assert network.mctbtr_transfer_count is None
     adhoc = journey_frontiers(network, *args, **kwargs)
     network.compute_mctbtr_transfers("2022-02-22")
     assert network.has_mctbtr_transfers
+    assert network.mctbtr_transfer_count > 0
     cached = journey_frontiers(network, *args, **kwargs)
     assert len(cached) == len(adhoc) > 0
     for column in ("from_id", "to_id", "departure", "arrival", "rides", "frontier"):
