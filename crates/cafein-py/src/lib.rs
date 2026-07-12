@@ -3223,6 +3223,326 @@ impl TransportNetwork {
         Ok(result.unbind())
     }
 
+    /// Batched multicriteria Pareto frontiers between stops: per
+    /// (origin, destination) cell, the journeys of
+    /// ``mc_route_between_stops`` with strict pareto candidates, from
+    /// one window profile per origin, in parallel with the GIL
+    /// released. Routes over the closure footpaths (board at the
+    /// origin stop); a McULTRA emissions set upgrades only the
+    /// coordinate variant.
+    ///
+    /// Returns
+    /// -------
+    /// list of list of list of dict
+    ///     ``result[i][j]`` is the journey list from ``from_stops[i]``
+    ///     to ``to_stops[j]``, shaped as in ``mc_route_between_stops``.
+    #[pyo3(signature = (from_stops, to_stops, date, departure, factors, window, max_transfers = 7, bucket = 25.0, geometries = false))]
+    #[allow(clippy::too_many_arguments)]
+    fn mc_frontier_matrix(
+        &self,
+        py: Python<'_>,
+        from_stops: Vec<String>,
+        to_stops: Vec<String>,
+        date: &str,
+        departure: &str,
+        factors: Vec<(String, f64)>,
+        window: u32,
+        max_transfers: u8,
+        bucket: f64,
+        geometries: bool,
+    ) -> PyResult<Py<PyList>> {
+        if !bucket.is_finite() || bucket <= 0.0 {
+            return Err(PyValueError::new_err(
+                "bucket must be a positive number of grams",
+            ));
+        }
+        if window == 0 {
+            return Err(PyValueError::new_err(
+                "window must be a positive number of seconds",
+            ));
+        }
+        let Some(geometry) = &self.geometry else {
+            return Err(PyValueError::new_err(
+                "no trip distances installed; build the network with trip distances enabled",
+            ));
+        };
+        if geometries && self.leg_geometry.is_none() {
+            return Err(PyValueError::new_err(
+                "no leg geometries installed; build the network with leg geometries enabled",
+            ));
+        }
+        let origins: Vec<StopIdx> = from_stops
+            .iter()
+            .map(|stop| self.resolve_stop(stop))
+            .collect::<PyResult<_>>()?;
+        let destinations: Vec<StopIdx> = to_stops
+            .iter()
+            .map(|stop| self.resolve_stop(stop))
+            .collect::<PyResult<_>>()?;
+        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
+        for (trip_id, factor) in &factors {
+            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
+                per_trip[trip.0 as usize] = *factor;
+            }
+        }
+        let departure = parse_time(departure)?;
+        let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
+        let requests: Vec<Request> = origins
+            .into_iter()
+            .map(|origin| Request {
+                departure,
+                access: vec![(origin, 0)],
+                egress: Vec::new(),
+                active_services: active_services.clone(),
+                active_services_previous: active_services_previous.clone(),
+                max_transfers,
+            })
+            .collect();
+        let rows = py.allow_threads(|| {
+            let view = DayView::for_date(
+                &self.build.timetable,
+                &active_services,
+                &active_services_previous,
+            );
+            mcraptor::frontier_matrix(
+                &view,
+                &self.build.timetable,
+                &self.transfers,
+                geometry,
+                &per_trip,
+                &requests,
+                &destinations,
+                &[],
+                false,
+                destinations.len(),
+                window,
+                bucket,
+            )
+        });
+        let result = PyList::empty(py);
+        for row in &rows {
+            let cells = PyList::empty(py);
+            for cell in row {
+                let journeys = PyList::empty(py);
+                for journey in cell {
+                    journeys.append(self.journey_to_dict(
+                        py,
+                        journey,
+                        None,
+                        None,
+                        geometries,
+                        &self.transfers,
+                    )?)?;
+                }
+                cells.append(journeys)?;
+            }
+            result.append(cells)?;
+        }
+        Ok(result.unbind())
+    }
+
+    /// ``mc_frontier_matrix`` between coordinate points, linked through
+    /// the street network like the point matrices; each cell matches
+    /// ``mc_route_between_coordinates`` with strict pareto candidates —
+    /// including the walking-only journey and its domination rule
+    /// (transit journeys the walk beats are dropped per cell).
+    ///
+    /// Returns
+    /// -------
+    /// dict
+    ///     ``journeys`` — ``result[i][j]`` journey lists;
+    ///     ``unsnapped_from`` / ``unsnapped_to`` — indices of points
+    ///     off the walking network (their cells stay empty).
+    #[pyo3(signature = (origins, destinations, date, departure, factors, window, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false))]
+    #[allow(clippy::too_many_arguments)]
+    fn mc_frontier_matrix_from_points(
+        &self,
+        py: Python<'_>,
+        origins: Vec<(f64, f64)>,
+        destinations: Vec<(f64, f64)>,
+        date: &str,
+        departure: &str,
+        factors: Vec<(String, f64)>,
+        window: u32,
+        max_transfers: u8,
+        bucket: f64,
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+        geometries: bool,
+    ) -> PyResult<Py<PyDict>> {
+        if !bucket.is_finite() || bucket <= 0.0 {
+            return Err(PyValueError::new_err(
+                "bucket must be a positive number of grams",
+            ));
+        }
+        if window == 0 {
+            return Err(PyValueError::new_err(
+                "window must be a positive number of seconds",
+            ));
+        }
+        let Some(geometry) = &self.geometry else {
+            return Err(PyValueError::new_err(
+                "no trip distances installed; build the network with trip distances enabled",
+            ));
+        };
+        if geometries && self.leg_geometry.is_none() {
+            return Err(PyValueError::new_err(
+                "no leg geometries installed; build the network with leg geometries enabled",
+            ));
+        }
+        let streets = self.installed_streets()?;
+        let speed =
+            validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
+        validate_points(&origins)?;
+        validate_points(&destinations)?;
+        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
+        for (trip_id, factor) in &factors {
+            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
+                per_trip[trip.0 as usize] = *factor;
+            }
+        }
+        let departure = parse_time(departure)?;
+        let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
+        // The same intermediate set the one-pair coordinate route relaxes:
+        // the McULTRA emissions set matching these factors, else the closure.
+        let intermediate = self.emissions_transfers(factor_fingerprint(&per_trip));
+        let stop_count = self.build.timetable.stop_count() as usize;
+        let (rows, walk, origin_links, destination_links, unsnapped_from, unsnapped_to) = py
+            .allow_threads(|| {
+                let mut linked = streets.link_pointsets(
+                    &[&origins[..], &destinations[..]],
+                    speed,
+                    max_walking_time,
+                    max_snap_distance,
+                );
+                let destination_links = linked.pop().unwrap();
+                let origin_links = linked.pop().unwrap();
+                let unsnapped_from = unsnapped(&origin_links);
+                let unsnapped_to = unsnapped(&destination_links);
+                let requests: Vec<Request> = origin_links
+                    .iter()
+                    .map(|links| Request {
+                        departure,
+                        access: request_offsets(links.as_deref().unwrap_or(&[])),
+                        egress: Vec::new(),
+                        active_services: active_services.clone(),
+                        active_services_previous: active_services_previous.clone(),
+                        max_transfers,
+                    })
+                    .collect();
+                // Invert the destination links into the per-stop final-egress
+                // map the frontier fold walks.
+                let mut egress_map: Vec<Vec<(u32, u32, f64)>> = vec![Vec::new(); stop_count];
+                for (slot, links) in destination_links.iter().enumerate() {
+                    for link in links.as_deref().unwrap_or(&[]) {
+                        egress_map[link.stop.0 as usize].push((
+                            slot as u32,
+                            link.seconds,
+                            link.meters,
+                        ));
+                    }
+                }
+                let view = DayView::for_date(
+                    &self.build.timetable,
+                    &active_services,
+                    &active_services_previous,
+                );
+                let rows = mcraptor::frontier_matrix(
+                    &view,
+                    &self.build.timetable,
+                    intermediate,
+                    geometry,
+                    &per_trip,
+                    &requests,
+                    &[],
+                    &egress_map,
+                    true,
+                    destinations.len(),
+                    window,
+                    bucket,
+                );
+                let walk = streets.walk_matrix(
+                    &origins,
+                    &destinations,
+                    speed,
+                    max_walking_time,
+                    max_snap_distance,
+                );
+                (
+                    rows,
+                    walk,
+                    origin_links,
+                    destination_links,
+                    unsnapped_from,
+                    unsnapped_to,
+                )
+            });
+        let origin_snaps: Vec<Option<Snap>> = origins
+            .iter()
+            .map(|&(lat, lon)| streets.snap(lat, lon, max_snap_distance))
+            .collect();
+        let destination_snaps: Vec<Option<Snap>> = destinations
+            .iter()
+            .map(|&(lat, lon)| streets.snap(lat, lon, max_snap_distance))
+            .collect();
+        let cells = PyList::empty(py);
+        for (i, row) in rows.iter().enumerate() {
+            let row_list = PyList::empty(py);
+            for (j, cell) in row.iter().enumerate() {
+                let cell_list = PyList::empty(py);
+                // The walking-only alternative and its domination rule,
+                // exactly as the one-pair coordinate route.
+                let direct = if origins[i] == destinations[j] {
+                    Some((0, 0.0))
+                } else {
+                    walk[i][j]
+                };
+                let ends = match (origin_snaps[i], destination_snaps[j]) {
+                    (Some(origin_snap), Some(destination_snap)) => Some(CoordinateEnds {
+                        origin: origins[i],
+                        origin_snap,
+                        destination: destinations[j],
+                        destination_snap,
+                    }),
+                    _ => None,
+                };
+                if let (Some(walk), Some(ends)) = (direct, ends.as_ref()) {
+                    cell_list
+                        .append(self.walk_journey_dict(py, departure, walk, ends, geometries)?)?;
+                }
+                let walks = WalkMaps::new(
+                    origin_links[i].as_deref().unwrap_or(&[]),
+                    destination_links[j].as_deref().unwrap_or(&[]),
+                );
+                for journey in cell {
+                    if let Some((walk_seconds, _)) = direct {
+                        if journey.arrival - journey.departure >= walk_seconds {
+                            continue;
+                        }
+                    }
+                    cell_list.append(self.journey_to_dict(
+                        py,
+                        journey,
+                        Some(&walks),
+                        ends.as_ref(),
+                        geometries,
+                        intermediate,
+                    )?)?;
+                }
+                row_list.append(cell_list)?;
+            }
+            cells.append(row_list)?;
+        }
+        let result = PyDict::new(py);
+        result.set_item("journeys", cells)?;
+        result.set_item("unsnapped_from", unsnapped_from.into_pyarray(py))?;
+        result.set_item("unsnapped_to", unsnapped_to.into_pyarray(py))?;
+        Ok(result.unbind())
+    }
+
     /// Travel-time percentiles over a departure window, as a matrix.
     ///
     /// Every minute mark within ``[departure, departure + window)`` is

@@ -1303,3 +1303,135 @@ def test_unmatched_factors_poison_but_do_not_block(network):
     assert len(frame)
     assert frame["emissions"].isna().any()
     assert not frame.loc[frame["emissions"].isna(), "frontier"].any()
+
+
+def test_journey_frontiers_match_the_one_pair_frontier(network):
+    from cafein import journey_frontiers
+
+    origins = ["1370104", "4960238"]
+    destinations = ["4960238", "1370104"]
+    batched = journey_frontiers(
+        network, origins, destinations, "2022-02-22", "08:30:00", window=600
+    )
+    assert len(batched) > 0
+    for origin in origins:
+        for destination in destinations:
+            cell = batched[
+                (batched["from_id"] == origin) & (batched["to_id"] == destination)
+            ].reset_index(drop=True)
+            single = journey_frontier(
+                network,
+                origin,
+                destination,
+                "2022-02-22",
+                "08:30:00",
+                window=600,
+                candidates="pareto",
+            )
+            assert len(cell) == len(single)
+            for column in ("departure", "arrival", "travel_time", "rides", "frontier"):
+                assert cell[column].tolist() == single[column].tolist()
+            assert cell["emissions"].tolist() == pytest.approx(
+                single["emissions"].tolist(), nan_ok=True
+            )
+
+
+def test_journey_frontiers_route_door_to_door(network_with_footpaths):
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    from cafein import journey_frontiers
+
+    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+    ids = ["1100602", "1040280"]
+    points = gpd.GeoDataFrame(
+        {"id": ids},
+        geometry=[Point(coordinates[stop][1], coordinates[stop][0]) for stop in ids],
+        crs="EPSG:4326",
+    )
+    batched = journey_frontiers(
+        network_with_footpaths, points, points, "2022-02-22", "08:30:00", window=600
+    )
+    for origin in ids:
+        for destination in ids:
+            cell = batched[
+                (batched["from_id"] == origin) & (batched["to_id"] == destination)
+            ].reset_index(drop=True)
+            single = journey_frontier(
+                network_with_footpaths,
+                coordinates[origin],
+                coordinates[destination],
+                "2022-02-22",
+                "08:30:00",
+                window=600,
+                candidates="pareto",
+            )
+            assert len(cell) == len(single)
+            for column in ("departure", "arrival", "travel_time", "rides", "frontier"):
+                assert cell[column].tolist() == single[column].tolist()
+            assert cell["emissions"].tolist() == pytest.approx(
+                single["emissions"].tolist(), nan_ok=True
+            )
+    # The pair whose fastest journey is the walking-only one keeps its
+    # zero-emission anchor in the batched frame too.
+    walk_cell = batched[
+        (batched["from_id"] == "1100602") & (batched["to_id"] == "1040280")
+    ]
+    walk = walk_cell[walk_cell["rides"] == 0]
+    assert len(walk) == 1
+    assert walk.iloc[0]["emissions"] == 0.0
+    assert bool(walk.iloc[0]["frontier"])
+    # The diagonal is the degenerate zero-second walk.
+    diagonal = batched[
+        (batched["from_id"] == "1100602") & (batched["to_id"] == "1100602")
+    ]
+    assert diagonal["travel_time"].tolist() == [0]
+    assert diagonal["rides"].tolist() == [0]
+
+
+def test_journey_frontiers_skip_unreachable_cells(tmp_path):
+    from cafein import TransportNetwork, journey_frontiers
+
+    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
+    network = TransportNetwork.from_gtfs([str(feed)])
+    frame = journey_frontiers(
+        network, ["A", "H"], ["B", "A"], "2022-02-22", "08:00:00", window=1800
+    )
+    # Cells with no feasible journey (into A, which nothing serves)
+    # contribute no rows; the reachable cells follow the requested order.
+    cells = list(dict.fromkeys(zip(frame["from_id"], frame["to_id"])))
+    assert cells == [("A", "B"), ("H", "B")]
+    empty = journey_frontiers(
+        network, ["B"], ["A"], "2022-02-22", "08:00:00", window=1800
+    )
+    assert len(empty) == 0
+    assert list(empty.columns[:2]) == ["from_id", "to_id"]
+
+
+def test_journey_frontiers_validate_their_inputs(network_with_footpaths):
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    from cafein import journey_frontiers
+
+    points = gpd.GeoDataFrame(
+        {"id": ["p"]}, geometry=[Point(24.94, 60.17)], crs="EPSG:4326"
+    )
+    with pytest.raises(ValueError, match="both"):
+        journey_frontiers(
+            network_with_footpaths,
+            ["1100602"],
+            points,
+            "2022-02-22",
+            "08:30:00",
+            window=600,
+        )
+    with pytest.raises(ValueError, match="stop ids"):
+        journey_frontiers(
+            network_with_footpaths,
+            [],
+            ["1040280"],
+            "2022-02-22",
+            "08:30:00",
+            window=600,
+        )

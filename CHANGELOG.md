@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- ``journey_frontiers`` — a batched ``journey_frontier``: the strict pareto
+  frontier of every (origin, destination) cell between two point sets (stop
+  ids or point GeoDataFrames), as one long frame with ``from_id``/``to_id``
+  columns. One McRAPTOR window profile per origin serves all destinations
+  and origins run in parallel with the GIL released, so a batch costs about
+  one search per origin rather than one per cell; each cell equals the
+  one-pair ``journey_frontier(candidates="pareto")`` frame, including the
+  walking-only journey on coordinate queries.
+
 - TBTR point matrices — ``router="tbtr"`` now also backs the door-to-door
   coordinate travel-time matrices (``travel_time_matrix`` and
   ``TravelTimeMatrix`` with point origins/destinations, single departure and
