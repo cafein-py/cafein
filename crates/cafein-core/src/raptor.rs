@@ -463,65 +463,13 @@ impl Raptor {
                 |pooled: &mut Option<Search>, request| {
                     let arrivals = window_samples(pooled, timetable, transfers, request, window);
                     let access_floor = access_floor(stop_count, request);
-                    let iterations = arrivals.len();
-                    // Transpose the per-iteration stop arrivals into a stop-major
-                    // table (R5's `invertTravelTimes`): a destination then reads
-                    // each nearby stop's iterations as one contiguous block, so
-                    // the hot propagation loop scans memory sequentially instead
-                    // of indexing a fresh per-iteration array at scattered stop
-                    // positions. Identical values and order — only the layout.
-                    let mut to_stop = vec![UNREACHED; stop_count * iterations];
-                    let mut departures = vec![0u32; iterations];
-                    for (iteration, (mark, marked)) in arrivals.iter().enumerate() {
-                        departures[iteration] = *mark;
-                        for (stop, &at_stop) in marked.iter().enumerate() {
-                            to_stop[stop * iterations + iteration] = at_stop;
-                        }
-                    }
-                    let mut out = Vec::with_capacity(egress.len() * percentiles.len());
-                    let mut at_point = vec![UNREACHED; iterations];
-                    let mut samples = vec![0u32; iterations];
-                    for links in egress {
-                        // The walking-only floor through any link is
-                        // departure-independent, like the access floor.
-                        let mut walk_floor = UNREACHED;
-                        for &(stop, seconds, _) in links {
-                            let floor = access_floor[stop.0 as usize];
-                            if floor != UNREACHED {
-                                walk_floor = walk_floor.min(floor.saturating_add(seconds));
-                            }
-                        }
-                        for slot in at_point.iter_mut() {
-                            *slot = UNREACHED;
-                        }
-                        // Propagate every iteration from each nearby stop, reading
-                        // the stop's contiguous iteration block.
-                        for &(stop, seconds, _) in links {
-                            let base = stop.0 as usize * iterations;
-                            for (slot, &at_stop) in
-                                at_point.iter_mut().zip(&to_stop[base..base + iterations])
-                            {
-                                if at_stop == UNREACHED {
-                                    continue;
-                                }
-                                if let Some(arrival) =
-                                    at_stop.checked_add(seconds).filter(|&at| at != UNREACHED)
-                                {
-                                    *slot = (*slot).min(arrival);
-                                }
-                            }
-                        }
-                        for (sample, (&at, &mark)) in
-                            samples.iter_mut().zip(at_point.iter().zip(&departures))
-                        {
-                            *sample = travel_time(at, mark, walk_floor);
-                        }
-                        samples.sort_unstable();
-                        for &percentile in percentiles {
-                            out.push(nearest_rank(&samples, percentile));
-                        }
-                    }
-                    out
+                    propagate_point_percentiles(
+                        &arrivals,
+                        &access_floor,
+                        stop_count,
+                        egress,
+                        percentiles,
+                    )
                 },
             )
             .collect()
@@ -654,6 +602,71 @@ fn window_samples<'a>(
     }
     samples.reverse();
     samples
+}
+
+/// Propagates one origin's per-mark stop arrivals to destination points —
+/// the door-to-door percentile reduction shared by the RAPTOR and TBTR
+/// windowed point matrices. `arrivals` holds `(mark, per-stop earliest
+/// arrival)` samples ascending by mark; `egress` gives each point's
+/// `(stop, seconds, meters)` links. Transposes the samples into a
+/// stop-major table (R5's `invertTravelTimes`) so a destination reads each
+/// nearby stop's iterations as one contiguous block, floors every sample
+/// by the point's departure-independent walking-only time, and emits
+/// nearest-rank percentiles per point.
+pub(crate) fn propagate_point_percentiles(
+    arrivals: &[(u32, Vec<u32>)],
+    access_floor: &[u32],
+    stop_count: usize,
+    egress: &[Vec<(StopIdx, u32, f64)>],
+    percentiles: &[f64],
+) -> Vec<u32> {
+    let iterations = arrivals.len();
+    let mut to_stop = vec![UNREACHED; stop_count * iterations];
+    let mut departures = vec![0u32; iterations];
+    for (iteration, (mark, marked)) in arrivals.iter().enumerate() {
+        departures[iteration] = *mark;
+        for (stop, &at_stop) in marked.iter().enumerate() {
+            to_stop[stop * iterations + iteration] = at_stop;
+        }
+    }
+    let mut out = Vec::with_capacity(egress.len() * percentiles.len());
+    let mut at_point = vec![UNREACHED; iterations];
+    let mut samples = vec![0u32; iterations];
+    for links in egress {
+        // The walking-only floor through any link is departure-independent,
+        // like the access floor.
+        let mut walk_floor = UNREACHED;
+        for &(stop, seconds, _) in links {
+            let floor = access_floor[stop.0 as usize];
+            if floor != UNREACHED {
+                walk_floor = walk_floor.min(floor.saturating_add(seconds));
+            }
+        }
+        for slot in at_point.iter_mut() {
+            *slot = UNREACHED;
+        }
+        // Propagate every iteration from each nearby stop, reading the
+        // stop's contiguous iteration block.
+        for &(stop, seconds, _) in links {
+            let base = stop.0 as usize * iterations;
+            for (slot, &at_stop) in at_point.iter_mut().zip(&to_stop[base..base + iterations]) {
+                if at_stop == UNREACHED {
+                    continue;
+                }
+                if let Some(arrival) = at_stop.checked_add(seconds).filter(|&at| at != UNREACHED) {
+                    *slot = (*slot).min(arrival);
+                }
+            }
+        }
+        for (sample, (&at, &mark)) in samples.iter_mut().zip(at_point.iter().zip(&departures)) {
+            *sample = travel_time(at, mark, walk_floor);
+        }
+        samples.sort_unstable();
+        for &percentile in percentiles {
+            out.push(nearest_rank(&samples, percentile));
+        }
+    }
+    out
 }
 
 /// Walking-only travel times from the request's access list, by stop.
