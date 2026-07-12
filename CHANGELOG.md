@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- McTBTR frontiers — ``router="tbtr"`` now also backs ``journey_frontiers``
+  (stop ids and point GeoDataFrames) and the door-to-door coordinate
+  ``journey_frontier``, returning the same journeys as McRAPTOR. The
+  batched product builds one multicriteria transfer set per call and
+  serves every origin from it, folding per-destination frontiers during
+  the segment scan — no per-cell looping. ``max_slower`` stays
+  raptor-only. McTBTR's direct egress joins are now gated on stop-bag
+  admission like McRAPTOR's, so a same-stop query no longer returns
+  spurious round-trip journeys under ``router="tbtr"``.
+
 - ``max_slower`` — an opt-in restriction of the pareto frontier to the
   fast end of the trade-off, on ``journey_frontier`` and
   ``journey_frontiers`` (``candidates="pareto"``, ``router="raptor"``).
