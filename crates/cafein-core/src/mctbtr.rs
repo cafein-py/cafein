@@ -725,23 +725,27 @@ struct WalkBoard {
     duration: u32,
 }
 
-/// A round's pruning envelope: per arrival, the largest over
-/// destinations of the cleanest key reachable at or before it. A
-/// candidate at or above the envelope is dominated at *every*
-/// destination — its continuations only grow in arrival and grams, and
-/// passes descend, so nothing it leads to can join a new frontier entry
-/// anywhere (the same plain (arrival ≤, key ≤) dominance the one-pair
-/// pruning has always used). The bound is non-increasing in arrival
-/// while a segment's alights only grow in both axes, so a pruned alight
-/// ends its segment's expansion outright.
+/// The one-pair round's pruning envelope: per arrival, the cleanest
+/// key the destination has reached at or before it. A candidate at or
+/// above the envelope is dominated — its continuations only grow in
+/// arrival and grams, and passes descend, so nothing it leads to can
+/// join a new frontier entry (the same plain (arrival ≤, key ≤)
+/// dominance the one-pair pruning has always used). The bound is
+/// non-increasing in arrival while a segment's alights only grow in
+/// both axes, so a pruned alight ends its segment's expansion
+/// outright. The batched product runs unpruned: an all-slots envelope
+/// is a max over every destination rebuilt from every accumulated
+/// frontier each round — measured far costlier at scale than the
+/// expansion it trims, and one unserved slot disables it entirely.
 struct PruneEnvelope {
     arrivals: Vec<u32>,
     bounds: Vec<i64>,
 }
 
 impl PruneEnvelope {
-    /// Never prunes: some destination has no entry yet (or there is no
-    /// destination state at all, as in the emissions-matrix fold mode).
+    /// Never prunes: the destination has no entry yet, or the search
+    /// has no one-pair destination at all (the batched frontier and
+    /// emissions-matrix fold modes).
     fn none() -> PruneEnvelope {
         PruneEnvelope {
             arrivals: Vec::new(),
@@ -749,64 +753,31 @@ impl PruneEnvelope {
         }
     }
 
-    fn build<'e>(slots: impl Iterator<Item = &'e [Arrived]>) -> PruneEnvelope {
-        // Per slot: entries sorted by arrival under prefix-min keys; the
-        // envelope exists only from the arrival where every slot has an
-        // entry, and its bound is the max of the slots' prefix minima.
-        let mut per_slot: Vec<Vec<(u32, i64)>> = Vec::new();
-        for entries in slots {
-            if entries.is_empty() {
-                return PruneEnvelope::none();
-            }
-            let mut sorted: Vec<(u32, i64)> = entries
-                .iter()
-                .map(|entry| (entry.arrival, entry.key))
-                .collect();
-            sorted.sort_unstable();
-            let mut prefix = i64::MAX;
-            for slot in &mut sorted {
-                prefix = prefix.min(slot.1);
-                slot.1 = prefix;
-            }
-            sorted.dedup_by(|later, earlier| {
-                if earlier.0 == later.0 {
-                    earlier.1 = later.1;
-                    true
-                } else {
-                    false
-                }
-            });
-            per_slot.push(sorted);
-        }
-        if per_slot.is_empty() {
+    fn build(entries: &[Arrived]) -> PruneEnvelope {
+        // The destination's entries sorted by arrival under prefix-min
+        // keys: from each arrival, the cleanest key already achieved.
+        if entries.is_empty() {
             return PruneEnvelope::none();
         }
-        let start = per_slot
+        let mut sorted: Vec<(u32, i64)> = entries
             .iter()
-            .map(|slot| slot[0].0)
-            .max()
-            .expect("per_slot is non-empty");
-        let mut arrivals: Vec<u32> = per_slot
-            .iter()
-            .flat_map(|slot| slot.iter().map(|&(arrival, _)| arrival))
-            .filter(|&arrival| arrival >= start)
+            .map(|entry| (entry.arrival, entry.key))
             .collect();
-        arrivals.push(start);
-        arrivals.sort_unstable();
-        arrivals.dedup();
-        let bounds = arrivals
-            .iter()
-            .map(|&arrival| {
-                per_slot
-                    .iter()
-                    .map(|slot| {
-                        let at = slot.partition_point(|&(entry, _)| entry <= arrival) - 1;
-                        slot[at].1
-                    })
-                    .max()
-                    .expect("per_slot is non-empty")
-            })
-            .collect();
+        sorted.sort_unstable();
+        let mut prefix = i64::MAX;
+        for slot in &mut sorted {
+            prefix = prefix.min(slot.1);
+            slot.1 = prefix;
+        }
+        sorted.dedup_by(|later, earlier| {
+            if earlier.0 == later.0 {
+                earlier.1 = later.1;
+                true
+            } else {
+                false
+            }
+        });
+        let (arrivals, bounds) = sorted.into_iter().unzip();
         PruneEnvelope { arrivals, bounds }
     }
 
@@ -1021,7 +992,8 @@ impl<'a> McTbtrEngine<'a> {
                 // admitted footpath boardings are recorded. The
                 // expansion sweep then runs under the round's fully
                 // tightened pruning envelope — Baum et al.'s improved
-                // trip-based query, on both expansion channels.
+                // trip-based query, on both expansion channels. Only
+                // the one-pair profile prunes; see [`PruneEnvelope`].
                 let mut walk_boards: Vec<WalkBoard> = Vec::new();
                 let mut admitted: Vec<(u32, u16)> = Vec::new();
                 for &index in &segments {
@@ -1040,14 +1012,12 @@ impl<'a> McTbtrEngine<'a> {
                     );
                 }
                 if round < rounds {
-                    let envelope = match (&frontier, destination.is_empty()) {
-                        (Some(sink), _) => {
-                            PruneEnvelope::build(sink.bags.iter().map(|bag| bag.as_slice()))
-                        }
-                        (None, false) => {
-                            PruneEnvelope::build(std::iter::once(destination.as_slice()))
-                        }
-                        (None, true) => PruneEnvelope::none(),
+                    // Only the one-pair profile prunes; the batched
+                    // frontier and fold modes never build an envelope.
+                    let envelope = if frontier.is_none() && fold.is_none() {
+                        PruneEnvelope::build(&destination)
+                    } else {
+                        PruneEnvelope::none()
                     };
                     self.expand_admitted(
                         &admitted,
