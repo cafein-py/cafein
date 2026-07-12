@@ -181,13 +181,18 @@ def _time_column(frame):
     return next(c for c in frame.columns if str(c).startswith("travel_time"))
 
 
-def cafein_time():
+def cafein_time(router):
     from cafein import TravelTimeMatrix
 
     grid, origins = _load_points()
     # Travel time needs no trip distances; build the minimal network r5py's
     # time product is comparable to.
     network, build_seconds, build_rss = _build_cafein(trip_distances=False)
+    tbtr_set_seconds = None
+    if router == "tbtr":
+        started = time.perf_counter()
+        network.compute_tbtr_transfers(DATE)
+        tbtr_set_seconds = round(time.perf_counter() - started, 2)
     started = time.perf_counter()
     matrix = TravelTimeMatrix(
         network,
@@ -198,6 +203,7 @@ def cafein_time():
         window=WINDOW_S,
         percentiles=[PERCENTILE],
         max_transfers=MAX_TRANSFERS,
+        router=router,
         walking_speed_kmph=WALK_KMPH,
         max_walking_time=MAX_WALK_S,
         max_snap_distance=SNAP_DIST_M,
@@ -209,6 +215,8 @@ def cafein_time():
         {
             "benchmark": "cafein-time",
             "engine": "cafein",
+            "router": router,
+            "tbtr_set_seconds": tbtr_set_seconds,
             "product": "travel_time",
             "build_config": "trip_distances=False",
             "params": SHARED_PARAMS,
@@ -291,13 +299,18 @@ def _single_params():
     return params
 
 
-def cafein_time_single():
+def cafein_time_single(router):
     """Single-departure time-only baseline; paired with cafein-cost so their
     difference is the pure cost of computing distances and emissions."""
     from cafein import TravelTimeMatrix
 
     grid, origins = _load_points()
     network, build_seconds, build_rss = _build_cafein(trip_distances=False)
+    tbtr_set_seconds = None
+    if router == "tbtr":
+        started = time.perf_counter()
+        network.compute_tbtr_transfers(DATE)
+        tbtr_set_seconds = round(time.perf_counter() - started, 2)
     started = time.perf_counter()
     matrix = TravelTimeMatrix(
         network,
@@ -306,6 +319,7 @@ def cafein_time_single():
         date=DATE,
         departure=DEPARTURE,
         max_transfers=MAX_TRANSFERS,
+        router=router,
         walking_speed_kmph=WALK_KMPH,
         max_walking_time=MAX_WALK_S,
         max_snap_distance=SNAP_DIST_M,
@@ -316,6 +330,8 @@ def cafein_time_single():
         {
             "benchmark": "cafein-time-single",
             "engine": "cafein",
+            "router": router,
+            "tbtr_set_seconds": tbtr_set_seconds,
             "product": "travel_time",
             "build_config": "trip_distances=False",
             "params": _single_params(),
@@ -442,15 +458,22 @@ def main():
     parser.add_argument("--origins", type=int, default=250)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--pareto-pairs", type=int, default=120)
+    parser.add_argument(
+        "--router",
+        choices=["raptor", "tbtr"],
+        default="raptor",
+        help="cafein engine for the time benchmarks (tbtr also times its "
+        "transfer-set precompute)",
+    )
     args = parser.parse_args()
     if args.command == "prep":
         prep(args.origins, args.seed)
     elif args.command == "cafein-time":
-        cafein_time()
+        cafein_time(args.router)
     elif args.command == "r5py-time":
         r5py_time()
     elif args.command == "cafein-time-single":
-        cafein_time_single()
+        cafein_time_single(args.router)
     elif args.command == "cafein-cost":
         cafein_cost()
     elif args.command == "cafein-pareto":
