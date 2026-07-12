@@ -684,3 +684,207 @@ fn a_prebuilt_transfer_set_answers_like_for_date() {
         triples(&over_borrowed, &geometry, &factors)
     );
 }
+
+#[test]
+fn cleaner_chains_match_the_naive_suffix_walk() {
+    // One line, six trips with unresolved, dirtier, equal, and cleaner
+    // factors interleaved; the chain from any first boardable rank must
+    // visit exactly the trips the naive strictly-cleaner walk keeps.
+    let mut builder = TimetableBuilder::new(2);
+    let a = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    for (index, start) in (0..6).map(|i| (i, 100 + i * 100)) {
+        builder
+            .add_trip(a, vec![time(start), time(start + 50)], index, 0)
+            .unwrap();
+    }
+    let timetable = builder.finish();
+    let view = DayView::universal(&timetable);
+    let factors = [f64::NAN, 100.0, 120.0, 80.0, 80.0, 10.0];
+    let chains = CleanerChains::build(&view, &factors);
+    let naive = |first: u32| -> Vec<u32> {
+        let mut kept = Vec::new();
+        let mut cleanest = f64::INFINITY;
+        for rank in first..view.line_trips(0).end {
+            let factor = factors[view.backing(ViewTrip(rank)).0 as usize];
+            if !factor.is_finite() || factor >= cleanest {
+                continue;
+            }
+            cleanest = factor;
+            kept.push(rank);
+        }
+        kept
+    };
+    for first in 0..6 {
+        assert_eq!(
+            chains.candidates(first).collect::<Vec<_>>(),
+            naive(first),
+            "first boardable rank {first}"
+        );
+    }
+    assert_eq!(chains.candidates(0).collect::<Vec<_>>(), vec![1, 3, 5]);
+}
+
+#[test]
+fn the_expansion_break_respects_every_destination_slot() {
+    // A clean direct line serves the first destination early, so the
+    // through trip's alight there is dominated for that slot — but the
+    // through trip's later alight is the only path onward to the second
+    // destination, over a precomputed transfer. A pruning envelope built
+    // from the first slot alone would break the through trip's expansion
+    // and lose the second cell; the max-over-slots envelope must not
+    // prune while any slot is unserved.
+    let mut builder = TimetableBuilder::new(4);
+    let direct = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let through = builder
+        .add_pattern(&[StopIdx(0), StopIdx(1), StopIdx(2)], 1)
+        .unwrap();
+    let onward = builder.add_pattern(&[StopIdx(2), StopIdx(3)], 2).unwrap();
+    builder
+        .add_trip(direct, vec![time(100), time(200)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(through, vec![time(110), time(300), time(400)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(onward, vec![time(450), time(600)], 2, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (
+                TripIdx(1),
+                vec![0.0, 500.0, 1000.0],
+                DistanceProvenance::CrowFly,
+            ),
+            (TripIdx(2), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let factors = [10.0, 50.0, 10.0];
+    let footpaths = Transfers::empty(4);
+    let engine = McTbtrEngine::for_date(&timetable, &footpaths, &geometry, &factors, &[true], &[]);
+    let destinations = [StopIdx(1), StopIdx(3)];
+    let requests = vec![Request {
+        departure: 0,
+        access: vec![(StopIdx(0), 0)],
+        egress: Vec::new(),
+        active_services: vec![true],
+        active_services_previous: Vec::new(),
+        max_transfers: 2,
+    }];
+    let cells = engine.frontier_matrix(
+        &requests,
+        &destinations,
+        &[],
+        false,
+        destinations.len(),
+        1000,
+        1e-6,
+    );
+    // The second cell holds both transfer journeys the break must not
+    // lose: the plain through-and-onward ride, and the cleaner
+    // three-ride alternative that rides the direct line first and only
+    // the through trip's second (shorter, hence cleaner) half.
+    let mut reached: Vec<(u32, u32, u32)> = cells[0][1]
+        .iter()
+        .map(|journey| (journey.departure, journey.arrival, journey.rides() as u32))
+        .collect();
+    reached.sort_unstable();
+    assert_eq!(reached, vec![(100, 600, 3), (110, 600, 2)]);
+    // … and both cells equal the one-pair profile.
+    for (&destination, cell) in destinations.iter().zip(&cells[0]) {
+        let mut one_pair = requests[0].clone();
+        one_pair.egress = vec![(destination, 0)];
+        let journeys = engine.route_range(&one_pair, 1000, 1e-6);
+        let keys = |journeys: &[Journey]| -> Vec<(u32, u32, u32)> {
+            journeys
+                .iter()
+                .map(|journey| (journey.departure, journey.arrival, journey.rides() as u32))
+                .collect()
+        };
+        assert_eq!(keys(cell), keys(&journeys));
+    }
+}
+
+#[test]
+fn the_expansion_break_fires_once_every_slot_is_covered() {
+    // Clean direct lines serve both destinations in round one, so the
+    // dirty through trip's admitted alight at the transfer stop is
+    // dominated at *every* slot: the envelope prunes it, the break ends
+    // the trip's expansion, and the onward connection is never boarded —
+    // soundly, because its journey is dominated at the destination too,
+    // which the one-pair parity below pins.
+    let mut builder = TimetableBuilder::new(4);
+    let direct_near = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let direct_far = builder.add_pattern(&[StopIdx(0), StopIdx(3)], 1).unwrap();
+    let through = builder
+        .add_pattern(&[StopIdx(0), StopIdx(1), StopIdx(2)], 2)
+        .unwrap();
+    let onward = builder.add_pattern(&[StopIdx(2), StopIdx(3)], 3).unwrap();
+    builder
+        .add_trip(direct_near, vec![time(100), time(150)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(direct_far, vec![time(100), time(160)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(through, vec![time(100), time(400), time(500)], 2, 0)
+        .unwrap();
+    builder
+        .add_trip(onward, vec![time(550), time(700)], 3, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (
+                TripIdx(2),
+                vec![0.0, 1000.0, 2000.0],
+                DistanceProvenance::CrowFly,
+            ),
+            (TripIdx(3), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let factors = [10.0, 10.0, 50.0, 50.0];
+    let footpaths = Transfers::empty(4);
+    let engine = McTbtrEngine::for_date(&timetable, &footpaths, &geometry, &factors, &[true], &[]);
+    let destinations = [StopIdx(1), StopIdx(3)];
+    let requests = vec![Request {
+        departure: 0,
+        access: vec![(StopIdx(0), 0)],
+        egress: Vec::new(),
+        active_services: vec![true],
+        active_services_previous: Vec::new(),
+        max_transfers: 2,
+    }];
+    let cells = engine.frontier_matrix(
+        &requests,
+        &destinations,
+        &[],
+        false,
+        destinations.len(),
+        1000,
+        1e-6,
+    );
+    let keys = |journeys: &[Journey]| -> Vec<(u32, u32, u32)> {
+        journeys
+            .iter()
+            .map(|journey| (journey.departure, journey.arrival, journey.rides() as u32))
+            .collect()
+    };
+    // Only the clean directs survive — the through-and-onward journey is
+    // dominated at both slots, exactly what the break skipped computing.
+    assert_eq!(keys(&cells[0][0]), vec![(100, 150, 1)]);
+    assert_eq!(keys(&cells[0][1]), vec![(100, 160, 1)]);
+    for (&destination, cell) in destinations.iter().zip(&cells[0]) {
+        let mut one_pair = requests[0].clone();
+        one_pair.egress = vec![(destination, 0)];
+        let journeys = engine.route_range(&one_pair, 1000, 1e-6);
+        assert_eq!(keys(cell), keys(&journeys));
+    }
+}

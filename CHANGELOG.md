@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Faster McTBTR queries — boarding walks a precomputed per-line
+  "next strictly cleaner trip" chain instead of scanning every remaining
+  trip of the day (the same chain trims the transfer-set precompute),
+  and each search round now runs Baum et al.-style: the egress joins of
+  every scanned segment tighten the destination frontiers first, and the
+  transfer expansions and footpath boardings then run under the round's
+  pruning envelope, ending a segment's expansion outright at the first
+  alight the envelope dominates. One-pair door-to-door frontier queries
+  get measurably faster; results are unchanged (the envelope applies the
+  same dominance the one-pair pruning always used).
+
 - ``compute_mctbtr_transfers`` — precompute and cache the multicriteria
   TBTR transfer set, keyed by service date and the resolved per-trip
   emission factors. Every ``router="tbtr"`` multicriteria query whose

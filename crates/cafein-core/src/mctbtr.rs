@@ -56,13 +56,14 @@ pub fn transfer_set(
     geometry: &TripGeometry,
     factors: &[f64],
 ) -> TransferSetBuild {
+    let chains = CleanerChains::build(view, factors);
     let per_trip: Vec<(Vec<Vec<TripTransfer>>, usize)> = (0..view.trip_count())
         .into_par_iter()
         .map_init(
             || Bags::new(timetable.stop_count()),
             |bags, trip| {
                 let trip = ViewTrip(trip);
-                let mut generated = generate(view, timetable, footpaths, factors, trip);
+                let mut generated = generate(view, timetable, footpaths, factors, &chains, trip);
                 let count = generated.iter().map(Vec::len).sum();
                 reduce(
                     view,
@@ -79,6 +80,84 @@ pub fn transfer_set(
         )
         .collect();
     TransferSet::assemble(per_trip)
+}
+
+/// The boarding candidates of every line, precomputed: from any first
+/// boardable trip, the trips worth boarding are the first one with a
+/// resolved factor followed by its strictly-decreasing-factor chain —
+/// exactly the set the naive suffix walk keeps, without visiting the
+/// skipped trips. `first_candidate[rank]` is the first rank at or after
+/// `rank` in the same line whose factor resolves; `next_cleaner[rank]`
+/// is the next rank after `rank` in the same line whose factor is
+/// strictly cleaner. `u32::MAX` ends a chain.
+pub(crate) struct CleanerChains {
+    first_candidate: Vec<u32>,
+    next_cleaner: Vec<u32>,
+}
+
+impl CleanerChains {
+    pub(crate) fn build(view: &DayView, factors: &[f64]) -> CleanerChains {
+        let trips = view.trip_count() as usize;
+        let mut first_candidate = vec![u32::MAX; trips];
+        let mut next_cleaner = vec![u32::MAX; trips];
+        let mut stack: Vec<u32> = Vec::new();
+        for line in 0..view.line_count() {
+            // Backward over the line: the classic next-smaller-element
+            // stack yields each rank's next strictly cleaner trip, and
+            // the running first resolved rank fills `first_candidate`.
+            stack.clear();
+            let mut first = u32::MAX;
+            for rank in view.line_trips(line).rev() {
+                let factor = factors[view.backing(ViewTrip(rank)).0 as usize];
+                if factor.is_finite() {
+                    while let Some(&top) = stack.last() {
+                        let top_factor = factors[view.backing(ViewTrip(top)).0 as usize];
+                        if top_factor >= factor {
+                            stack.pop();
+                        } else {
+                            break;
+                        }
+                    }
+                    next_cleaner[rank as usize] = stack.last().copied().unwrap_or(u32::MAX);
+                    stack.push(rank);
+                    first = rank;
+                }
+                first_candidate[rank as usize] = first;
+            }
+        }
+        CleanerChains {
+            first_candidate,
+            next_cleaner,
+        }
+    }
+
+    /// The boarding candidates from the first boardable rank, in order:
+    /// the first resolved trip, then each strictly cleaner successor.
+    pub(crate) fn candidates(&self, first: u32) -> CleanerChain<'_> {
+        CleanerChain {
+            chains: self,
+            next: self.first_candidate[first as usize],
+            started: false,
+        }
+    }
+}
+
+pub(crate) struct CleanerChain<'a> {
+    chains: &'a CleanerChains,
+    next: u32,
+    started: bool,
+}
+
+impl Iterator for CleanerChain<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        if self.started && self.next != u32::MAX {
+            self.next = self.chains.next_cleaner[self.next as usize];
+        }
+        self.started = true;
+        (self.next != u32::MAX).then_some(self.next)
+    }
 }
 
 /// Grams CO₂e accumulated along `trip` from its first position to
@@ -101,6 +180,7 @@ fn generate(
     timetable: &Timetable,
     footpaths: &Transfers,
     factors: &[f64],
+    chains: &CleanerChains,
     trip: ViewTrip,
 ) -> Vec<Vec<TripTransfer>> {
     let line = view.line_of(trip);
@@ -125,15 +205,10 @@ fn generate(
                     let Some(first) = candidate else { continue };
                     // The earliest catchable trip plus the later trips
                     // whose factor strictly improves on every earlier
-                    // boardable one.
-                    let mut cleanest = f64::INFINITY;
-                    for rank in first.0..view.line_trips(candidate_line).end {
+                    // boardable one — the precomputed cleaner chain.
+                    for rank in chains.candidates(first.0) {
                         let boarded = ViewTrip(rank);
                         let boarded_factor = factors[view.backing(boarded).0 as usize];
-                        if !boarded_factor.is_finite() || boarded_factor >= cleanest {
-                            continue;
-                        }
-                        cleanest = boarded_factor;
                         if candidate_line == line
                             && boarded.0 >= trip.0
                             && served.position as usize >= alight
@@ -401,6 +476,114 @@ impl MatrixSink<'_> {
     }
 }
 
+/// A next-round boarding discovered by a round's join sweep, executed
+/// by its expansion sweep under the round's pruning envelope.
+struct WalkBoard {
+    segment: u32,
+    alight: u16,
+    to: StopIdx,
+    reached: u32,
+    grams: f64,
+    duration: u32,
+}
+
+/// A round's pruning envelope: per arrival, the largest over
+/// destinations of the cleanest key reachable at or before it. A
+/// candidate at or above the envelope is dominated at *every*
+/// destination — its continuations only grow in arrival and grams, and
+/// passes descend, so nothing it leads to can join a new frontier entry
+/// anywhere (the same plain (arrival ≤, key ≤) dominance the one-pair
+/// pruning has always used). The bound is non-increasing in arrival
+/// while a segment's alights only grow in both axes, so a pruned alight
+/// ends its segment's expansion outright.
+struct PruneEnvelope {
+    arrivals: Vec<u32>,
+    bounds: Vec<i64>,
+}
+
+impl PruneEnvelope {
+    /// Never prunes: some destination has no entry yet (or there is no
+    /// destination state at all, as in the emissions-matrix fold mode).
+    fn none() -> PruneEnvelope {
+        PruneEnvelope {
+            arrivals: Vec::new(),
+            bounds: Vec::new(),
+        }
+    }
+
+    fn build<'e>(slots: impl Iterator<Item = &'e [Arrived]>) -> PruneEnvelope {
+        // Per slot: entries sorted by arrival under prefix-min keys; the
+        // envelope exists only from the arrival where every slot has an
+        // entry, and its bound is the max of the slots' prefix minima.
+        let mut per_slot: Vec<Vec<(u32, i64)>> = Vec::new();
+        for entries in slots {
+            if entries.is_empty() {
+                return PruneEnvelope::none();
+            }
+            let mut sorted: Vec<(u32, i64)> = entries
+                .iter()
+                .map(|entry| (entry.arrival, entry.key))
+                .collect();
+            sorted.sort_unstable();
+            let mut prefix = i64::MAX;
+            for slot in &mut sorted {
+                prefix = prefix.min(slot.1);
+                slot.1 = prefix;
+            }
+            sorted.dedup_by(|later, earlier| {
+                if earlier.0 == later.0 {
+                    earlier.1 = later.1;
+                    true
+                } else {
+                    false
+                }
+            });
+            per_slot.push(sorted);
+        }
+        if per_slot.is_empty() {
+            return PruneEnvelope::none();
+        }
+        let start = per_slot
+            .iter()
+            .map(|slot| slot[0].0)
+            .max()
+            .expect("per_slot is non-empty");
+        let mut arrivals: Vec<u32> = per_slot
+            .iter()
+            .flat_map(|slot| slot.iter().map(|&(arrival, _)| arrival))
+            .filter(|&arrival| arrival >= start)
+            .collect();
+        arrivals.push(start);
+        arrivals.sort_unstable();
+        arrivals.dedup();
+        let bounds = arrivals
+            .iter()
+            .map(|&arrival| {
+                per_slot
+                    .iter()
+                    .map(|slot| {
+                        let at = slot.partition_point(|&(entry, _)| entry <= arrival) - 1;
+                        slot[at].1
+                    })
+                    .max()
+                    .expect("per_slot is non-empty")
+            })
+            .collect();
+        PruneEnvelope { arrivals, bounds }
+    }
+
+    fn prunes(&self, arrival: u32, key: i64) -> bool {
+        match self
+            .arrivals
+            .partition_point(|&at| at <= arrival)
+            .checked_sub(1)
+        {
+            None => false,
+            Some(index) => self.bounds[index] <= key,
+        }
+    }
+}
+
 /// Per-destination-slot frontier state for the batched product: every
 /// egress join the one-pair search would make feeds its slot's
 /// destination frontier instead, under the same `join` rules, so a
@@ -431,6 +614,7 @@ pub struct McTbtrEngine<'a> {
     factors: &'a [f64],
     view: DayView,
     set: std::borrow::Cow<'a, TransferSet>,
+    chains: CleanerChains,
 }
 
 impl<'a> McTbtrEngine<'a> {
@@ -470,6 +654,7 @@ impl<'a> McTbtrEngine<'a> {
             active_services_previous,
         );
         let view = DayView::for_date(timetable, active_services, active_services_previous);
+        let chains = CleanerChains::build(&view, factors);
         McTbtrEngine {
             timetable,
             footpaths,
@@ -477,6 +662,7 @@ impl<'a> McTbtrEngine<'a> {
             factors,
             view,
             set: std::borrow::Cow::Owned(set),
+            chains,
         }
     }
 
@@ -496,6 +682,7 @@ impl<'a> McTbtrEngine<'a> {
         set: &'a TransferSet,
     ) -> McTbtrEngine<'a> {
         let view = DayView::for_date(timetable, active_services, active_services_previous);
+        let chains = CleanerChains::build(&view, factors);
         McTbtrEngine {
             timetable,
             footpaths,
@@ -503,6 +690,7 @@ impl<'a> McTbtrEngine<'a> {
             factors,
             view,
             set: std::borrow::Cow::Borrowed(set),
+            chains,
         }
     }
 
@@ -594,21 +782,73 @@ impl<'a> McTbtrEngine<'a> {
             }
             for round in 1..=rounds {
                 let segments = std::mem::take(&mut queue[round]);
-                for index in segments {
-                    self.scan(
+                // The join sweep first: alights feed the stop bags and
+                // every destination (tightening the frontiers), and the
+                // admitted footpath boardings are recorded. The
+                // expansion sweep then runs under the round's fully
+                // tightened pruning envelope — Baum et al.'s improved
+                // trip-based query, on both expansion channels.
+                let mut walk_boards: Vec<WalkBoard> = Vec::new();
+                let mut admitted: Vec<(u32, u16)> = Vec::new();
+                for &index in &segments {
+                    self.scan_joins(
                         index,
                         round,
-                        rounds,
                         request,
                         key,
-                        &mut arena,
-                        &mut trip_bags,
+                        &arena,
                         &mut stop_bags,
                         &mut destination,
-                        &mut queue,
                         fold,
                         frontier,
+                        (round < rounds).then_some(&mut walk_boards),
+                        &mut admitted,
                     );
+                }
+                if round < rounds {
+                    let envelope = match (&frontier, destination.is_empty()) {
+                        (Some(sink), _) => {
+                            PruneEnvelope::build(sink.bags.iter().map(|bag| bag.as_slice()))
+                        }
+                        (None, false) => {
+                            PruneEnvelope::build(std::iter::once(destination.as_slice()))
+                        }
+                        (None, true) => PruneEnvelope::none(),
+                    };
+                    self.expand_admitted(
+                        &admitted,
+                        round,
+                        rounds,
+                        key,
+                        &envelope,
+                        &mut arena,
+                        &mut trip_bags,
+                        &mut queue,
+                    );
+                    for board in walk_boards {
+                        if envelope.prunes(board.reached, key(board.grams)) {
+                            continue;
+                        }
+                        let departure = arena[board.segment as usize].departure;
+                        let (parent, alight, duration) =
+                            (board.segment, board.alight, board.duration);
+                        self.board(
+                            board.to,
+                            board.reached,
+                            board.grams,
+                            departure,
+                            |_, _| SegOrigin::Walked {
+                                parent,
+                                alight,
+                                duration,
+                            },
+                            round,
+                            key,
+                            &mut arena,
+                            &mut trip_bags,
+                            &mut queue[round + 1],
+                        );
+                    }
                 }
             }
         }
@@ -646,14 +886,8 @@ impl<'a> McTbtrEngine<'a> {
                 else {
                     continue;
                 };
-                let mut cleanest = f64::INFINITY;
-                for rank in first.0..self.view.line_trips(line).end {
+                for rank in self.chains.candidates(first.0) {
                     let trip = ViewTrip(rank);
-                    let factor = self.factors[self.view.backing(trip).0 as usize];
-                    if !factor.is_finite() || factor >= cleanest {
-                        continue;
-                    }
-                    cleanest = factor;
                     let ridden = absolute_grams(
                         self.geometry,
                         &self.view,
@@ -679,24 +913,24 @@ impl<'a> McTbtrEngine<'a> {
         }
     }
 
-    /// Scans one segment: alight everywhere ahead, join the egress
-    /// (directly and over one footpath), relax query-time footpaths
-    /// into next-round boardings, and expand the precomputed transfers.
+    /// The join sweep over one segment: alight everywhere ahead, feed
+    /// the stop bags, join the egress (directly and over one footpath)
+    /// into every destination, and record the admitted footpath
+    /// boardings for the expansion sweep.
     #[allow(clippy::too_many_arguments)]
-    fn scan(
+    fn scan_joins(
         &self,
         index: u32,
         round: usize,
-        rounds: usize,
         request: &Request,
         key: impl Fn(f64) -> i64 + Copy,
-        arena: &mut Vec<Segment>,
-        trip_bags: &mut [TripBag],
+        arena: &[Segment],
         stop_bags: &mut [Bag],
         destination: &mut Vec<Arrived>,
-        queue: &mut [Vec<u32>],
         fold: &mut Option<MatrixSink<'_>>,
         frontier: &mut Option<FrontierSink<'_>>,
+        mut walk_boards: Option<&mut Vec<WalkBoard>>,
+        admitted: &mut Vec<(u32, u16)>,
     ) {
         let segment = arena[index as usize];
         let trip = segment.trip;
@@ -722,115 +956,152 @@ impl<'a> McTbtrEngine<'a> {
             // the stop on more rides cannot suppress a cleaner
             // fewer-rides arrival across the profile — the same
             // cross-pass soundness the McRAPTOR bag needs.
-            if stop_bags[stop.0 as usize].insert(arrival, grams, key(grams), round as u8) {
-                for &(egress, seconds) in &request.egress {
-                    if egress == stop {
-                        self.join(
-                            destination,
-                            key,
-                            segment.departure,
-                            arrival.saturating_add(seconds),
-                            grams,
-                            index,
-                            alight as u16,
-                            None,
-                        );
-                    }
-                }
-                if let Some(sink) = frontier {
-                    self.frontier_join(
-                        sink,
-                        stop,
+            if !stop_bags[stop.0 as usize].insert(arrival, grams, key(grams), round as u8) {
+                continue;
+            }
+            admitted.push((index, alight as u16));
+            for &(egress, seconds) in &request.egress {
+                if egress == stop {
+                    self.join(
+                        destination,
                         key,
                         segment.departure,
-                        arrival,
+                        arrival.saturating_add(seconds),
                         grams,
                         index,
                         alight as u16,
                         None,
                     );
                 }
+            }
+            if let Some(sink) = frontier {
+                self.frontier_join(
+                    sink,
+                    stop,
+                    key,
+                    segment.departure,
+                    arrival,
+                    grams,
+                    index,
+                    alight as u16,
+                    None,
+                );
+            }
+            if let Some(sink) = fold {
+                sink.fold(
+                    stop,
+                    arrival - segment.departure,
+                    grams,
+                    index,
+                    alight as u16,
+                    false,
+                );
+            }
+            for footpath in self.footpaths.from_stop(stop) {
+                let reached = arrival.saturating_add(footpath.duration);
+                if !stop_bags[footpath.to.0 as usize].insert(
+                    reached,
+                    grams,
+                    key(grams),
+                    round as u8,
+                ) {
+                    continue;
+                }
                 if let Some(sink) = fold {
                     sink.fold(
-                        stop,
-                        arrival - segment.departure,
+                        footpath.to,
+                        reached - segment.departure,
                         grams,
                         index,
                         alight as u16,
-                        false,
+                        true,
                     );
                 }
-                for footpath in self.footpaths.from_stop(stop) {
-                    let reached = arrival.saturating_add(footpath.duration);
-                    if !stop_bags[footpath.to.0 as usize].insert(
-                        reached,
-                        grams,
-                        key(grams),
-                        round as u8,
-                    ) {
-                        continue;
-                    }
-                    if let Some(sink) = fold {
-                        sink.fold(
-                            footpath.to,
-                            reached - segment.departure,
-                            grams,
-                            index,
-                            alight as u16,
-                            true,
-                        );
-                    }
-                    for &(egress, seconds) in &request.egress {
-                        if egress == footpath.to {
-                            self.join(
-                                destination,
-                                key,
-                                segment.departure,
-                                reached.saturating_add(seconds),
-                                grams,
-                                index,
-                                alight as u16,
-                                Some((footpath.to, footpath.duration)),
-                            );
-                        }
-                    }
-                    if let Some(sink) = frontier {
-                        self.frontier_join(
-                            sink,
-                            footpath.to,
+                for &(egress, seconds) in &request.egress {
+                    if egress == footpath.to {
+                        self.join(
+                            destination,
                             key,
                             segment.departure,
-                            reached,
+                            reached.saturating_add(seconds),
                             grams,
                             index,
                             alight as u16,
                             Some((footpath.to, footpath.duration)),
                         );
                     }
-                    if round < rounds {
-                        let duration = footpath.duration;
-                        self.board(
-                            footpath.to,
-                            reached,
-                            grams,
-                            segment.departure,
-                            |_, _| SegOrigin::Walked {
-                                parent: index,
-                                alight: alight as u16,
-                                duration,
-                            },
-                            round,
-                            key,
-                            arena,
-                            trip_bags,
-                            &mut queue[round + 1],
-                        );
-                    }
+                }
+                if let Some(sink) = frontier {
+                    self.frontier_join(
+                        sink,
+                        footpath.to,
+                        key,
+                        segment.departure,
+                        reached,
+                        grams,
+                        index,
+                        alight as u16,
+                        Some((footpath.to, footpath.duration)),
+                    );
+                }
+                if let Some(boards) = walk_boards.as_deref_mut() {
+                    boards.push(WalkBoard {
+                        segment: index,
+                        alight: alight as u16,
+                        to: footpath.to,
+                        reached,
+                        grams,
+                        duration: footpath.duration,
+                    });
                 }
             }
-            // Precomputed transfers, pruned against the destination.
-            if round < rounds && !self.pruned(destination, key, arrival, grams) {
-                for transfer in self.set.from_trip_position(trip, alight as u16) {
+        }
+    }
+
+    /// The expansion sweep, under the round's pruning envelope: the
+    /// join sweep's bag-admitted (segment, alight) pairs relax the
+    /// precomputed transfers — a dominated alight's transfers are
+    /// covered by its dominator's, whose reduction-complete transfer
+    /// set reaches every outcome no later, no dirtier, and on no more
+    /// rides, with a departure no earlier (passes descend). A pruned
+    /// pair ends its segment's expansion outright: arrivals and grams
+    /// only grow along the trip while the envelope's bound never rises.
+    #[allow(clippy::too_many_arguments)]
+    fn expand_admitted(
+        &self,
+        admitted: &[(u32, u16)],
+        round: usize,
+        rounds: usize,
+        key: impl Fn(f64) -> i64 + Copy,
+        envelope: &PruneEnvelope,
+        arena: &mut Vec<Segment>,
+        trip_bags: &mut [TripBag],
+        queue: &mut [Vec<u32>],
+    ) {
+        let mut at = 0;
+        while at < admitted.len() {
+            let (index, _) = admitted[at];
+            let segment = arena[index as usize];
+            let trip = segment.trip;
+            let line = self.view.line_of(trip);
+            let offset = self.view.line_day_offset(line);
+            let times = self.view.stored_times(self.timetable, trip);
+            let boarded_from =
+                absolute_grams(self.geometry, &self.view, self.factors, trip, segment.board);
+            while at < admitted.len() && admitted[at].0 == index {
+                let alight = admitted[at].1;
+                at += 1;
+                let arrival = times[alight as usize].arrival - offset;
+                let ridden = absolute_grams(self.geometry, &self.view, self.factors, trip, alight)
+                    - boarded_from;
+                let grams = quantized(segment.grams + ridden);
+                if envelope.prunes(arrival, key(grams)) {
+                    while at < admitted.len() && admitted[at].0 == index {
+                        at += 1;
+                    }
+                    break;
+                }
+                for transfer in self.set.from_trip_position(trip, alight) {
                     let boarded = transfer.trip;
                     let ridden = absolute_grams(
                         self.geometry,
@@ -851,7 +1122,7 @@ impl<'a> McTbtrEngine<'a> {
                             departure: segment.departure,
                             origin: SegOrigin::Transfer {
                                 parent: index,
-                                alight: alight as u16,
+                                alight,
                             },
                         });
                         queue[round + 1].push(next);
@@ -859,22 +1130,6 @@ impl<'a> McTbtrEngine<'a> {
                 }
             }
         }
-    }
-
-    /// Whether every continuation from (arrival, grams) is already
-    /// dominated at the destination — passes descend, so every stored
-    /// entry departs no earlier than the current pass.
-    fn pruned(
-        &self,
-        destination: &[Arrived],
-        key: impl Fn(f64) -> i64,
-        arrival: u32,
-        grams: f64,
-    ) -> bool {
-        let key = key(grams);
-        destination
-            .iter()
-            .any(|entry| entry.arrival <= arrival && entry.key <= key)
     }
 
     /// Inserts a destination candidate under (departure desc, arrival,
