@@ -787,14 +787,13 @@ fn cleaner_chains_match_the_naive_suffix_walk() {
 }
 
 #[test]
-fn the_expansion_break_respects_every_destination_slot() {
-    // A clean direct line serves the first destination early, so the
-    // through trip's alight there is dominated for that slot — but the
-    // through trip's later alight is the only path onward to the second
-    // destination, over a precomputed transfer. A pruning envelope built
-    // from the first slot alone would break the through trip's expansion
-    // and lose the second cell; the max-over-slots envelope must not
-    // prune while any slot is unserved.
+fn the_frontier_matrix_serves_a_slot_only_the_transfer_reaches() {
+    // A clean direct line serves the first destination early and
+    // dominates the through trip's alight there — but the through
+    // trip's later alight is the only path onward to the second
+    // destination, over a precomputed transfer. The batched search
+    // runs unpruned, so a slot served by nothing but the dominated
+    // trip's continuation keeps its cell.
     let mut builder = TimetableBuilder::new(4);
     let direct = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
     let through = builder
@@ -845,10 +844,10 @@ fn the_expansion_break_respects_every_destination_slot() {
         1000,
         1e-6,
     );
-    // The second cell holds both transfer journeys the break must not
-    // lose: the plain through-and-onward ride, and the cleaner
-    // three-ride alternative that rides the direct line first and only
-    // the through trip's second (shorter, hence cleaner) half.
+    // The second cell holds both transfer journeys: the plain
+    // through-and-onward ride, and the cleaner three-ride alternative
+    // that rides the direct line first and only the through trip's
+    // second (shorter, hence cleaner) half.
     let mut reached: Vec<(u32, u32, u32)> = cells[0][1]
         .iter()
         .map(|journey| (journey.departure, journey.arrival, journey.rides() as u32))
@@ -871,13 +870,11 @@ fn the_expansion_break_respects_every_destination_slot() {
 }
 
 #[test]
-fn the_expansion_break_fires_once_every_slot_is_covered() {
+fn dominated_through_journeys_stay_out_of_every_cell() {
     // Clean direct lines serve both destinations in round one, so the
-    // dirty through trip's admitted alight at the transfer stop is
-    // dominated at *every* slot: the envelope prunes it, the break ends
-    // the trip's expansion, and the onward connection is never boarded —
-    // soundly, because its journey is dominated at the destination too,
-    // which the one-pair parity below pins.
+    // dirty through trip's continuation is dominated at every
+    // destination: whatever the search explores, no cell may carry
+    // the through journey — the one-pair parity below pins it.
     let mut builder = TimetableBuilder::new(4);
     let direct_near = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
     let direct_far = builder.add_pattern(&[StopIdx(0), StopIdx(3)], 1).unwrap();
@@ -939,8 +936,8 @@ fn the_expansion_break_fires_once_every_slot_is_covered() {
             .map(|journey| (journey.departure, journey.arrival, journey.rides() as u32))
             .collect()
     };
-    // Only the clean directs survive — the through-and-onward journey is
-    // dominated at both slots, exactly what the break skipped computing.
+    // Only the clean directs survive — the through-and-onward journey
+    // is dominated at both slots and reaches neither cell.
     assert_eq!(keys(&cells[0][0]), vec![(100, 150, 1)]);
     assert_eq!(keys(&cells[0][1]), vec![(100, 160, 1)]);
     for (&destination, cell) in destinations.iter().zip(&cells[0]) {

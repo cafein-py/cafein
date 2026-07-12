@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Much faster batched McTBTR frontiers — the batched product no longer
+  builds a per-round all-destinations pruning envelope: rebuilding it
+  from every accumulated frontier each round cost far more at scale
+  than the expansion it trimmed, and one unserved destination disabled
+  it entirely. ``router="tbtr"`` ``journey_frontiers`` and the
+  emissions matrices now run the round sweeps unpruned (the one-pair
+  destination pruning is unchanged); results are identical.
+
 - The multicriteria TBTR transfer set is now built by global
   candidate/witness enumeration (after Baum et al. 2023): a transfer is
   kept only when some real origin context needs it on the
