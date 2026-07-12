@@ -1147,6 +1147,33 @@ def test_diverse_time_reproduces_the_default(network):
     assert explicit.equals(default)
 
 
+def test_diverse_spread_keeps_picking_past_the_walking_journey(network_with_footpaths):
+    # A routeless pick — the walking-only journey, spread's clean-slow corner —
+    # bans nothing, so the rounds keep selecting from the same pool instead of
+    # ending the search: the options hold the walk AND the transit corridors
+    # (this pair used to return two options, the fastest corridor and the walk).
+    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+    frame = journey_frontier(
+        network_with_footpaths,
+        coordinates["1100602"],
+        coordinates["1040280"],
+        "2022-02-22",
+        "08:30:00",
+        window=1,
+        candidates="diverse",
+        diversity="spread",
+        max_options=4,
+    )
+    corridors = _option_corridors(frame)
+    transit = [c for c in corridors if c]
+    assert len(frame) == 4
+    assert sum(1 for c in corridors if not c) == 1  # the walking-only option
+    assert len(transit) == 3
+    for i, first in enumerate(transit):
+        for second in transit[i + 1 :]:
+            assert first.isdisjoint(second)
+
+
 def test_diverse_spread_reaches_across_the_trade_off(network):
     # The same disjoint corridors, but the objective changes which three are
     # kept: "time" takes the three fastest; "spread" seeds on the fastest, then

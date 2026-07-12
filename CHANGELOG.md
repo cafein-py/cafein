@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Diverse rounds continue past a routeless pick — with ``candidates="diverse"``,
+  selecting the walking-only journey (which bans and penalizes nothing) no
+  longer ends the search: the rounds keep picking from the current pool, so a
+  ``diversity="spread"`` query returns the walk *and* the distinct transit
+  corridors up to ``max_options`` (previously it could stop at two options).
+  The penalization-round loop and the alternative-option validation are now
+  shared between ``journey_frontier`` and ``DetailedItineraries``.
+
 - Soft-penalty diverse — ``journey_frontier`` and ``DetailedItineraries`` take an
   optional ``penalty`` for ``candidates="diverse"``: ``"ban"`` (default,
   unchanged) hard-bans a chosen corridor's routes so the options stay fully
