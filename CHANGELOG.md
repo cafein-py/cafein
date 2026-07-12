@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- The multicriteria TBTR transfer set is now built by global
+  candidate/witness enumeration (after Baum et al. 2023): a transfer is
+  kept only when some real origin context needs it on the
+  (arrival, emissions) Pareto frontier, instead of surviving a per-trip
+  local reduction. The set gets substantially smaller; query results
+  are unchanged. Transfer sets cached before this change (in memory or
+  in a saved artifact) stay valid and give the same results — call
+  ``compute_mctbtr_transfers`` again to replace them with the smaller
+  set. ``mctbtr_transfer_count`` reports the cached set's size.
+
 - Faster McTBTR queries — boarding walks a precomputed per-line
   "next strictly cleaner trip" chain instead of scanning every remaining
   trip of the day (the same chain trims the transfer-set precompute),

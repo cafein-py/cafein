@@ -283,6 +283,12 @@ class TransportNetwork:
         return self._core.has_mctbtr_transfers
 
     @property
+    def mctbtr_transfer_count(self):
+        """Number of transfers in the cached multicriteria TBTR set, or
+        ``None`` when none is computed (see ``compute_mctbtr_transfers``)."""
+        return self._core.mctbtr_transfer_count
+
+    @property
     def stops(self):
         """The stops as ``(stop_id, latitude, longitude)`` tuples."""
         return self._core.stops

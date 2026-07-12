@@ -1683,6 +1683,13 @@ impl TransportNetwork {
         self.mctbtr_transfers.is_some()
     }
 
+    /// Number of transfers in the cached multicriteria TBTR set, or
+    /// `None` when none is computed.
+    #[getter]
+    fn mctbtr_transfer_count(&self) -> Option<usize> {
+        self.mctbtr_transfers.as_ref().map(|(_, _, set)| set.len())
+    }
+
     /// Compute the ULTRA intermediate-transfer shortcuts and store them.
     ///
     /// Runs the shortcut search over the unrestricted stop-to-stop

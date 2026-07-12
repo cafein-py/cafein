@@ -2,34 +2,30 @@
 //!
 //! This module holds the multicriteria transfer set — the precompute
 //! stage. Witt's transfer reduction is unsound under a second
-//! criterion (a covering transfer may ride a dirtier vehicle), so both
-//! generation and reduction become dominance-aware:
-//!
-//! - Generation boards, per (line, position), the earliest catchable
-//!   trip **plus** the strictly-decreasing-factor suffix of later
-//!   trips — transferring to a later-but-cleaner vehicle can hold a
-//!   true Pareto point. The same-line skip applies only to siblings
-//!   whose factor is no cleaner; U-turn drops stay (the
-//!   alight-one-stop-earlier alternative rides strictly less distance
-//!   on the current trip and the identical distance on the boarded
-//!   one). Trips without a resolved factor are never boarded and get
-//!   no transfers — journeys riding them are excluded from emissions
-//!   frontiers by contract.
-//! - Reduction keeps a transfer iff some onward stop (directly or over
-//!   a footpath) accepts its (arrival, grams) into a per-stop Pareto
-//!   bag. Grams sit on the trip-absolute scale — the cumulative
-//!   distance along the current trip times its factor — so every
-//!   compared journey shares the "riding this trip" prefix and
-//!   dominance is invariant to the actual boarding position, the same
-//!   argument as McRAPTOR's same-trip rider reduction. Dominance is
-//!   exact (no bucketing): the reduced set must stay complete for
-//!   every query bucket.
-//!
-//! Every transfer the time reduction keeps improves an arrival, so it
-//! also enters the bags: with every factor resolved, the multicriteria
-//! set is a superset of the time set (unresolved-factor trips are the
-//! deliberate exception — the time set boards them, this set never
-//! does).
+//! criterion (a covering transfer may ride a dirtier vehicle), so the
+//! set is built by **global candidate/witness enumeration** instead
+//! (Baum et al. 2023's integrated preprocessing, over (arrival,
+//! grams)): from every source stop and departure, ride the
+//! earliest-or-strictly-cleaner first trips, transfer same-stop onto
+//! second trips under the same boarding frontier, and keep a transfer only
+//! when a two-trip journey using it survives every witness in the
+//! per-stop Pareto bags (strict dominance always evicts; an exact tie
+//! resolves by a context-independent order — witness over candidate,
+//! then lower label identity — so every enumeration context elects
+//! the same canonical journey). Grams anchor at the real
+//! boarding, strictly stronger than a trip-local reduction: a
+//! transfer survives only where a genuine origin context needs it,
+//! and the set is deliberately **not** a superset of the time set.
+//! The same-line skip applies only to siblings whose factor is no
+//! cleaner; U-turn drops stay (the alight-one-stop-earlier
+//! alternative rides strictly less distance on the current trip and
+//! the identical distance on the boarded one). Trips without a
+//! resolved factor are never boarded and get no transfers — journeys
+//! riding them are excluded from emissions frontiers by contract.
+//! The set is footpath-blind: walked transfers are the query's job
+//! (it boards over installed footpaths from every scanned alight), so
+//! one set serves every footpath choice. Dominance is exact (no
+//! bucketing): the set must stay complete for every query bucket.
 
 use rayon::prelude::*;
 
@@ -41,44 +37,54 @@ use crate::mcraptor::Bag;
 use crate::raptor::{departure_candidates, CostInputs, CostRow};
 use crate::router::Request;
 use crate::tbtr::{
-    earliest_boardable, u_turn, DayView, TransferSet, TransferSetBuild, TripTransfer, ViewTrip,
+    earliest_boardable, DayView, TransferSet, TransferSetBuild, TripTransfer, ViewTrip,
 };
 use crate::timetable::{StopIdx, Timetable, TripIdx};
 use crate::transfers::Transfers;
 
-/// Builds the multicriteria transfer set of a day view, fanned out
-/// over virtual trips with rayon. `factors` are grams CO₂e per
-/// passenger-kilometre per backing trip, NaN where unresolved.
+/// Builds the multicriteria transfer set of a day view by **global
+/// candidate/witness enumeration** (Baum et al. 2023's integrated
+/// preprocessing, adapted to (arrival, grams) and cafein's trip-based
+/// set): from every source stop, a descending run per unique departure
+/// time boards the first-trip frontier, transfers same-stop onto
+/// second-trip candidates, and keeps a trip-transfer only when a two-trip journey
+/// using it survives every witness — one-trip journeys and competing
+/// alternatives from the same origin context. Fanned out over source
+/// stops with rayon; `factors` are grams CO₂e per passenger-kilometre
+/// per backing trip, NaN where unresolved. `TransferSetBuild::generated`
+/// reports the kept-transfer count (the enumeration never materializes
+/// an unreduced set).
 pub fn transfer_set(
     view: &DayView,
     timetable: &Timetable,
-    footpaths: &Transfers,
     geometry: &TripGeometry,
     factors: &[f64],
 ) -> TransferSetBuild {
     let chains = CleanerChains::build(view, factors);
-    let per_trip: Vec<(Vec<Vec<TripTransfer>>, usize)> = (0..view.trip_count())
+    let per_source: Vec<Vec<(u32, u16, TripTransfer)>> = (0..timetable.stop_count())
         .into_par_iter()
         .map_init(
-            || Bags::new(timetable.stop_count()),
-            |bags, trip| {
-                let trip = ViewTrip(trip);
-                let mut generated = generate(view, timetable, footpaths, factors, &chains, trip);
-                let count = generated.iter().map(Vec::len).sum();
-                reduce(
-                    view,
-                    timetable,
-                    footpaths,
-                    geometry,
-                    factors,
-                    trip,
-                    bags,
-                    &mut generated,
-                );
-                (generated, count)
-            },
+            || SetSearch::new(view, timetable, geometry, factors, &chains),
+            |search, stop| search.run(StopIdx(stop)),
         )
         .collect();
+    let mut all: Vec<(u32, u16, TripTransfer)> = per_source.into_iter().flatten().collect();
+    all.sort_unstable_by_key(|&(trip, alight, transfer)| {
+        (trip, alight, transfer.trip.0, transfer.position)
+    });
+    all.dedup();
+    let mut per_trip: Vec<(Vec<Vec<TripTransfer>>, usize)> = (0..view.trip_count())
+        .map(|trip| {
+            let line = view.line_of(ViewTrip(trip));
+            let positions = timetable.pattern_stops(view.line_pattern(line)).len();
+            (vec![Vec::new(); positions], 0)
+        })
+        .collect();
+    for (trip, alight, transfer) in all {
+        let (positions, kept) = &mut per_trip[trip as usize];
+        positions[alight as usize].push(transfer);
+        *kept += 1;
+    }
     TransferSet::assemble(per_trip)
 }
 
@@ -161,7 +167,8 @@ impl Iterator for CleanerChain<'_> {
 }
 
 /// Grams CO₂e accumulated along `trip` from its first position to
-/// `position` — the trip-absolute scale reduction compares on.
+/// `position`; callers subtract the boarding position's value to
+/// anchor a leg's grams at the real boarding.
 fn absolute_grams(
     geometry: &TripGeometry,
     view: &DayView,
@@ -173,177 +180,408 @@ fn absolute_grams(
     geometry.leg_distance(backing, 0, position) as f64 / 1000.0 * factors[backing.0 as usize]
 }
 
-/// The feasible multicriteria transfers of one virtual trip, per alight
-/// position.
-fn generate(
-    view: &DayView,
-    timetable: &Timetable,
-    footpaths: &Transfers,
-    factors: &[f64],
-    chains: &CleanerChains,
-    trip: ViewTrip,
-) -> Vec<Vec<TripTransfer>> {
-    let line = view.line_of(trip);
-    let pattern = view.line_pattern(line);
-    let offset = view.line_day_offset(line);
-    let stops = timetable.pattern_stops(pattern);
-    let times = view.stored_times(timetable, trip);
-    let mut per_position: Vec<Vec<TripTransfer>> = vec![Vec::new(); stops.len()];
-    let factor = factors[view.backing(trip).0 as usize];
-    if !factor.is_finite() {
-        return per_position;
-    }
-    let alight_from = view.first_boardable(trip) as usize + 1;
-    for (alight, kept) in per_position.iter_mut().enumerate().skip(alight_from) {
-        let arrival = times[alight].arrival - offset;
-        let stop = stops[alight];
-        let mut board_from = |at: StopIdx, ready: u32| {
-            for served in timetable.patterns_at_stop(at) {
-                for candidate_line in view.lines_of_pattern(served.pattern).into_iter().flatten() {
-                    let candidate =
-                        earliest_boardable(view, timetable, candidate_line, served.position, ready);
-                    let Some(first) = candidate else { continue };
-                    // The earliest catchable trip plus the later trips
-                    // whose factor strictly improves on every earlier
-                    // boardable one — the precomputed cleaner chain.
-                    for rank in chains.candidates(first.0) {
-                        let boarded = ViewTrip(rank);
-                        let boarded_factor = factors[view.backing(boarded).0 as usize];
-                        if candidate_line == line
-                            && boarded.0 >= trip.0
-                            && served.position as usize >= alight
-                            && boarded_factor >= factor
-                        {
-                            continue;
-                        }
-                        if u_turn(
-                            view,
-                            timetable,
-                            stops,
-                            times,
-                            offset,
-                            alight,
-                            boarded,
-                            served.position,
-                        ) {
-                            continue;
-                        }
-                        kept.push(TripTransfer {
-                            trip: boarded,
-                            position: served.position,
-                        });
-                    }
-                }
-            }
-        };
-        board_from(stop, arrival);
-        for footpath in footpaths.from_stop(stop) {
-            board_from(footpath.to, arrival.saturating_add(footpath.duration));
-        }
-    }
-    per_position
+/// A one-trip label during the set enumeration: the journey's arrival
+/// and grams at a stop, and — when it rode a trip — the alight event a
+/// kept transfer would depart from. `None` marks the zero-trip witness
+/// (staying at the source).
+#[derive(Debug, Clone, Copy)]
+struct OneCtx {
+    arrival: u32,
+    grams: f64,
+    event: Option<(ViewTrip, u16)>,
 }
 
-/// The dominance-aware reduction for one virtual trip: back-to-front
-/// over the alight positions, a transfer survives iff riding the
-/// boarded trip onward lands a (arrival, grams) point no kept
-/// alternative dominates, at some stop — directly or over a footpath.
-#[allow(clippy::too_many_arguments)]
-fn reduce(
-    view: &DayView,
-    timetable: &Timetable,
-    footpaths: &Transfers,
-    geometry: &TripGeometry,
-    factors: &[f64],
-    trip: ViewTrip,
-    bags: &mut Bags,
-    per_position: &mut [Vec<TripTransfer>],
-) {
-    bags.clear();
-    let offset = view.line_day_offset(view.line_of(trip));
-    let stops = timetable.pattern_stops(view.line_pattern(view.line_of(trip)));
-    let times = view.stored_times(timetable, trip);
-    let alight_from = view.first_boardable(trip) as usize + 1;
-    for alight in (alight_from..stops.len()).rev() {
-        let arrival = times[alight].arrival - offset;
-        let staying = absolute_grams(geometry, view, factors, trip, alight as u16);
-        bags.improve(stops[alight], arrival, staying);
-        for footpath in footpaths.from_stop(stops[alight]) {
-            bags.improve(
-                footpath.to,
-                arrival.saturating_add(footpath.duration),
-                staying,
-            );
+/// A two-trip label: the journey's arrival and grams, and the candidate
+/// transfer it would emit — `None` for witnesses (one- or zero-trip
+/// journeys mirrored into the two-trip bags).
+#[derive(Debug, Clone, Copy)]
+struct TwoCtx {
+    arrival: u32,
+    grams: f64,
+    pair: Option<(ViewTrip, u16, TripTransfer)>,
+}
+
+impl OneCtx {
+    /// The label's context-independent identity, witnesses first.
+    fn rank(&self) -> (u8, u32, u16) {
+        match self.event {
+            None => (0, 0, 0),
+            Some((trip, position)) => (1, trip.0, position),
         }
-        let alighted = staying;
-        per_position[alight].retain(|transfer| {
-            let boarded = transfer.trip;
-            let boarded_offset = view.day_offset(boarded);
-            let boarded_factor = factors[view.backing(boarded).0 as usize];
-            let boarded_stops = timetable.pattern_stops(view.line_pattern(view.line_of(boarded)));
-            let boarded_times = view.stored_times(timetable, boarded);
-            let boarded_from = absolute_grams(geometry, view, factors, boarded, transfer.position);
-            let mut keeps = false;
-            for k in transfer.position as usize + 1..boarded_stops.len() {
-                let reached = boarded_times[k].arrival - boarded_offset;
-                let ridden =
-                    absolute_grams(geometry, view, factors, boarded, k as u16) - boarded_from;
-                debug_assert!(boarded_factor.is_finite());
-                let grams = alighted + ridden;
-                if bags.improve(boarded_stops[k], reached, grams) {
-                    keeps = true;
-                }
-                for footpath in footpaths.from_stop(boarded_stops[k]) {
-                    if bags.improve(
-                        footpath.to,
-                        reached.saturating_add(footpath.duration),
-                        grams,
-                    ) {
-                        keeps = true;
-                    }
-                }
-            }
-            keeps
-        });
     }
 }
 
-/// Per-stop (arrival, grams) Pareto bags with cheap reuse: only the
-/// touched stops reset between trips.
-struct Bags {
-    labels: Vec<Vec<(u32, f64)>>,
+/// Whether `a` dominates `b` in a one-trip bag: strictly better on
+/// (arrival, grams), or an exact tie resolved by the global identity
+/// order — witnesses beat candidates, then the lower event wins. The
+/// tie order is context-independent so every enumeration context
+/// elects the same canonical label, keeping witness chains
+/// substitutable across contexts (an inconsistent tie-break can evict
+/// a transfer in every context that needs it, each citing the other).
+fn dominates_one(a: &OneCtx, b: &OneCtx) -> bool {
+    if a.arrival > b.arrival || a.grams > b.grams {
+        return false;
+    }
+    if a.arrival < b.arrival || a.grams < b.grams {
+        return true;
+    }
+    a.rank() <= b.rank()
+}
+
+/// The two-trip counterpart of [`dominates_one`], with the candidate
+/// transfer pair as the identity.
+fn dominates_two(a: &TwoCtx, b: &TwoCtx) -> bool {
+    if a.arrival > b.arrival || a.grams > b.grams {
+        return false;
+    }
+    if a.arrival < b.arrival || a.grams < b.grams {
+        return true;
+    }
+    a.rank() <= b.rank()
+}
+
+impl TwoCtx {
+    /// The label's context-independent identity, witnesses first.
+    fn rank(&self) -> (u8, u32, u16, u32, u16) {
+        match self.pair {
+            None => (0, 0, 0, 0, 0),
+            Some((first, alight, transfer)) => {
+                (1, first.0, alight, transfer.trip.0, transfer.position)
+            }
+        }
+    }
+
+    /// Whether `other` is the same frontier point — used at extraction
+    /// to detect a candidate its bag has since evicted.
+    fn same(&self, other: &TwoCtx) -> bool {
+        self.arrival == other.arrival
+            && self.grams.to_bits() == other.grams.to_bits()
+            && match (self.pair, other.pair) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            }
+    }
+}
+
+/// A per-worker enumeration from one source stop: per-stop one- and
+/// two-trip Pareto bags under [`dominates_one`]/[`dominates_two`] —
+/// strict dominance always evicts, an exact tie resolves by the
+/// global identity order — shared across the source's descending
+/// departure runs
+/// (a witness from a later departure is catchable from every earlier
+/// context, so its evictions are sound), with each run's candidates
+/// extracted **at the end of that run**, before any earlier-departure
+/// label exists.
+struct SetSearch<'a> {
+    view: &'a DayView,
+    timetable: &'a Timetable,
+    geometry: &'a TripGeometry,
+    factors: &'a [f64],
+    chains: &'a CleanerChains,
+    one: Vec<Vec<OneCtx>>,
+    two: Vec<Vec<TwoCtx>>,
     touched: Vec<u32>,
+    marked: Vec<bool>,
+    out: Vec<(u32, u16, TripTransfer)>,
 }
 
-impl Bags {
-    fn new(stop_count: u32) -> Bags {
-        Bags {
-            labels: vec![Vec::new(); stop_count as usize],
+impl<'a> SetSearch<'a> {
+    fn new(
+        view: &'a DayView,
+        timetable: &'a Timetable,
+        geometry: &'a TripGeometry,
+        factors: &'a [f64],
+        chains: &'a CleanerChains,
+    ) -> SetSearch<'a> {
+        let stops = timetable.stop_count() as usize;
+        SetSearch {
+            view,
+            timetable,
+            geometry,
+            factors,
+            chains,
+            one: vec![Vec::new(); stops],
+            two: vec![Vec::new(); stops],
             touched: Vec::new(),
+            marked: vec![false; stops],
+            out: Vec::new(),
         }
     }
 
-    fn clear(&mut self) {
-        for &stop in &self.touched {
-            self.labels[stop as usize].clear();
-        }
-        self.touched.clear();
-    }
-
-    /// Pareto insert; returns whether the point entered the bag.
-    fn improve(&mut self, stop: StopIdx, arrival: u32, grams: f64) -> bool {
-        let bag = &mut self.labels[stop.0 as usize];
-        for &(at, g) in bag.iter() {
-            if at <= arrival && g <= grams {
-                return false;
+    /// Every unique origin departure at `source`, descending.
+    fn departures_at(&self, source: StopIdx) -> Vec<u32> {
+        let mut departures = Vec::new();
+        for served in self.timetable.patterns_at_stop(source) {
+            let positions = self.timetable.pattern_stops(served.pattern).len();
+            if served.position as usize + 1 >= positions {
+                continue;
+            }
+            for line in self
+                .view
+                .lines_of_pattern(served.pattern)
+                .into_iter()
+                .flatten()
+            {
+                let offset = self.view.line_day_offset(line);
+                for rank in self.view.line_trips(line) {
+                    let times = self.view.stored_times(self.timetable, ViewTrip(rank));
+                    // A previous-day trip's pre-midnight events are
+                    // yesterday's departures, not boardable today.
+                    if let Some(departure) = times[served.position as usize]
+                        .departure
+                        .checked_sub(offset)
+                    {
+                        departures.push(departure);
+                    }
+                }
             }
         }
-        if bag.is_empty() {
+        departures.sort_unstable_by(|a, b| b.cmp(a));
+        departures.dedup();
+        departures
+    }
+
+    fn touch(&mut self, stop: StopIdx) {
+        if !self.marked[stop.0 as usize] {
+            self.marked[stop.0 as usize] = true;
             self.touched.push(stop.0);
         }
-        bag.retain(|&(at, g)| !(arrival <= at && grams <= g));
-        bag.push((arrival, grams));
+    }
+
+    fn insert_one(&mut self, stop: StopIdx, label: OneCtx) -> bool {
+        let bag = &self.one[stop.0 as usize];
+        if bag.iter().any(|entry| dominates_one(entry, &label)) {
+            return false;
+        }
+        self.touch(stop);
+        let bag = &mut self.one[stop.0 as usize];
+        bag.retain(|entry| !dominates_one(&label, entry));
+        bag.push(label);
         true
+    }
+
+    fn insert_two(&mut self, stop: StopIdx, label: TwoCtx) -> bool {
+        let bag = &self.two[stop.0 as usize];
+        if bag.iter().any(|entry| dominates_two(entry, &label)) {
+            return false;
+        }
+        self.touch(stop);
+        let bag = &mut self.two[stop.0 as usize];
+        bag.retain(|entry| !dominates_two(&label, entry));
+        bag.push(label);
+        true
+    }
+
+    fn run(&mut self, source: StopIdx) -> Vec<(u32, u16, TripTransfer)> {
+        for &stop in &self.touched {
+            self.one[stop as usize].clear();
+            self.two[stop as usize].clear();
+            self.marked[stop as usize] = false;
+        }
+        self.touched.clear();
+        self.out.clear();
+        for departure in self.departures_at(source) {
+            self.run_departure(source, departure);
+        }
+        std::mem::take(&mut self.out)
+    }
+
+    fn run_departure(&mut self, source: StopIdx, departure: u32) {
+        // The zero-trip witness: staying at the source.
+        self.insert_one(
+            source,
+            OneCtx {
+                arrival: departure,
+                grams: 0.0,
+                event: None,
+            },
+        );
+        self.insert_two(
+            source,
+            TwoCtx {
+                arrival: departure,
+                grams: 0.0,
+                pair: None,
+            },
+        );
+        // Round 1: the first-trip frontier from the source.
+        let mut fresh: Vec<(StopIdx, OneCtx)> = Vec::new();
+        for served in self.timetable.patterns_at_stop(source) {
+            let stops = self.timetable.pattern_stops(served.pattern);
+            if served.position as usize + 1 >= stops.len() {
+                continue;
+            }
+            for line in self
+                .view
+                .lines_of_pattern(served.pattern)
+                .into_iter()
+                .flatten()
+            {
+                let Some(first) =
+                    earliest_boardable(self.view, self.timetable, line, served.position, departure)
+                else {
+                    continue;
+                };
+                let offset = self.view.line_day_offset(line);
+                for rank in self.chains.candidates(first.0) {
+                    let trip = ViewTrip(rank);
+                    let times = self.view.stored_times(self.timetable, trip);
+                    let boarded_from = absolute_grams(
+                        self.geometry,
+                        self.view,
+                        self.factors,
+                        trip,
+                        served.position,
+                    );
+                    for alight in served.position as usize + 1..stops.len() {
+                        let arrival = times[alight].arrival - offset;
+                        let grams = quantized(
+                            absolute_grams(
+                                self.geometry,
+                                self.view,
+                                self.factors,
+                                trip,
+                                alight as u16,
+                            ) - boarded_from,
+                        );
+                        let label = OneCtx {
+                            arrival,
+                            grams,
+                            event: Some((trip, alight as u16)),
+                        };
+                        if self.insert_one(stops[alight], label) {
+                            fresh.push((stops[alight], label));
+                            self.insert_two(
+                                stops[alight],
+                                TwoCtx {
+                                    arrival,
+                                    grams,
+                                    pair: None,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Round 2: transfer same-stop onto second-trip candidates —
+        // walked transfers never enter the set; the query boards over
+        // installed footpaths from every scanned alight itself.
+        let mut inserted: Vec<(StopIdx, TwoCtx)> = Vec::new();
+        for (stop, context) in fresh {
+            let Some((first_trip, alight)) = context.event else {
+                continue;
+            };
+            self.board_second(
+                stop,
+                context.arrival,
+                first_trip,
+                alight,
+                context.grams,
+                &mut inserted,
+            );
+        }
+        // Extraction seals this departure's candidates before any
+        // earlier-departure label can exist.
+        for (stop, label) in inserted {
+            if self.two[stop.0 as usize]
+                .iter()
+                .any(|entry| entry.same(&label))
+            {
+                let (trip, alight, transfer) = label.pair.expect("recorded labels are candidates");
+                let record = (trip.0, alight, transfer);
+                if !self.out.contains(&record) {
+                    self.out.push(record);
+                }
+            }
+        }
+    }
+
+    /// Boards every second-trip candidate at `board` ready at `ready`,
+    /// riding it everywhere ahead, under the first trip's same-line
+    /// skip. The `u_turn` predicate is structurally unreachable here:
+    /// it requires boarding at the first trip's *previous* stop, while
+    /// a same-stop transfer boards at the alight stop itself — equal
+    /// only where a pattern repeats a stop consecutively, and that
+    /// repeat's later context is bag-dominated before round 2 runs
+    /// (it arrives no earlier and rides no less than the first
+    /// visit), so no candidate the filter could drop is generated.
+    fn board_second(
+        &mut self,
+        board: StopIdx,
+        ready: u32,
+        first_trip: ViewTrip,
+        alight: u16,
+        grams: f64,
+        inserted: &mut Vec<(StopIdx, TwoCtx)>,
+    ) {
+        let first_line = self.view.line_of(first_trip);
+        let first_factor = self.factors[self.view.backing(first_trip).0 as usize];
+        for served in self.timetable.patterns_at_stop(board) {
+            let stops = self.timetable.pattern_stops(served.pattern);
+            if served.position as usize + 1 >= stops.len() {
+                continue;
+            }
+            for line in self
+                .view
+                .lines_of_pattern(served.pattern)
+                .into_iter()
+                .flatten()
+            {
+                let Some(first) =
+                    earliest_boardable(self.view, self.timetable, line, served.position, ready)
+                else {
+                    continue;
+                };
+                let offset = self.view.line_day_offset(line);
+                for rank in self.chains.candidates(first.0) {
+                    let boarded = ViewTrip(rank);
+                    let boarded_factor = self.factors[self.view.backing(boarded).0 as usize];
+                    if line == first_line
+                        && boarded.0 >= first_trip.0
+                        && served.position >= alight
+                        && boarded_factor >= first_factor
+                    {
+                        continue;
+                    }
+                    let pair = Some((
+                        first_trip,
+                        alight,
+                        TripTransfer {
+                            trip: boarded,
+                            position: served.position,
+                        },
+                    ));
+                    let times = self.view.stored_times(self.timetable, boarded);
+                    let boarded_from = absolute_grams(
+                        self.geometry,
+                        self.view,
+                        self.factors,
+                        boarded,
+                        served.position,
+                    );
+                    for pos in served.position as usize + 1..stops.len() {
+                        let arrival = times[pos].arrival - offset;
+                        let ridden = absolute_grams(
+                            self.geometry,
+                            self.view,
+                            self.factors,
+                            boarded,
+                            pos as u16,
+                        ) - boarded_from;
+                        let label = TwoCtx {
+                            arrival,
+                            grams: quantized(grams + ridden),
+                            pair,
+                        };
+                        if self.insert_two(stops[pos], label) {
+                            inserted.push((stops[pos], label));
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -631,11 +869,7 @@ impl<'a> McTbtrEngine<'a> {
         active_services_previous: &[bool],
     ) -> TransferSet {
         let view = DayView::for_date(timetable, active_services, active_services_previous);
-        // Same-stop transfers only — installed footpaths relax at
-        // query time (the hybrid the time engine uses), so the dense
-        // transitively closed set never enters the precompute.
-        let none = Transfers::empty(timetable.stop_count());
-        transfer_set(&view, timetable, &none, geometry, factors).transfers
+        transfer_set(&view, timetable, geometry, factors).transfers
     }
 
     pub fn for_date(
