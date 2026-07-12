@@ -586,15 +586,24 @@ impl<'a> TbtrEngine<'a> {
         // not dominated.
         let stop_count = self.timetable.stop_count() as usize;
         let mut labels = vec![UNREACHED; stop_count * rounds];
+        // The label suffix is non-increasing across rounds (each slot is the
+        // min over rounds up to it), so a time that does not beat the first
+        // slot beats none, and the write loop can stop at the first
+        // non-improving slot — the hot footpath scans then cost one read per
+        // non-improving target.
         let improve = move |labels: &mut Vec<u32>, stop: StopIdx, time: u32, round: usize| {
             let base = stop.0 as usize * rounds;
-            let gate = time < labels[base + round];
+            if time >= labels[base + round] {
+                return false;
+            }
             for slot in &mut labels[base + round..base + rounds] {
                 if time < *slot {
                     *slot = time;
+                } else {
+                    break;
                 }
             }
-            gate
+            true
         };
         let mut walked: HashMap<u32, (u32, u32, u16)> = HashMap::new();
 
@@ -1001,15 +1010,24 @@ impl<'a> TbtrEngine<'a> {
         // departures; the last-round slot is the earliest arrival over all
         // rounds, so it is what each mark snapshots.
         let mut labels = vec![UNREACHED; stop_count * rounds];
+        // The label suffix is non-increasing across rounds (each slot is the
+        // min over rounds up to it), so a time that does not beat the first
+        // slot beats none, and the write loop can stop at the first
+        // non-improving slot — the hot footpath scans then cost one read per
+        // non-improving target.
         let improve = move |labels: &mut Vec<u32>, stop: StopIdx, time: u32, round: usize| {
             let base = stop.0 as usize * rounds;
-            let gate = time < labels[base + round];
+            if time >= labels[base + round] {
+                return false;
+            }
             for slot in &mut labels[base + round..base + rounds] {
                 if time < *slot {
                     *slot = time;
+                } else {
+                    break;
                 }
             }
-            gate
+            true
         };
         let mut walked: HashMap<u32, (u32, u32, u16)> = HashMap::new();
         let sample_count = (window as u64).div_ceil(60).max(1) as u32;
