@@ -63,6 +63,9 @@ struct TransportNetwork {
     /// ad-hoc. Persisted with the artifact and restored on load, keyed by its
     /// date.
     tbtr_time_transfers: Option<(String, cafein_core::tbtr::TransferSet)>,
+    /// The cached multicriteria TBTR transfer set with the date and the
+    /// factor fingerprint it was built for (`compute_mctbtr_transfers`).
+    mctbtr_transfers: Option<(String, u64, cafein_core::tbtr::TransferSet)>,
     geometry: Option<TripGeometry>,
     leg_geometry: Option<LegGeometry>,
     streets: Option<StreetNetwork>,
@@ -113,7 +116,7 @@ struct CoordinateEnds {
 }
 
 const ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINET";
-const ARTIFACT_FORMAT: u32 = 8;
+const ARTIFACT_FORMAT: u32 = 9;
 /// Section tags in the container directory.
 const SECTION_META: u16 = 1;
 const SECTION_STREETS: u16 = 2;
@@ -157,6 +160,9 @@ struct ArtifactRef<'a> {
     /// when present; restored so a loaded network reuses it instead of
     /// rebuilding the dominance-aware set.
     tbtr_time_transfers: &'a Option<(String, cafein_core::tbtr::TransferSet)>,
+    /// The cached multicriteria TBTR transfer set with its date and factor
+    /// fingerprint, when present.
+    mctbtr_transfers: &'a Option<(String, u64, cafein_core::tbtr::TransferSet)>,
 }
 
 /// The decoded part of the saved network, owned after reading.
@@ -176,6 +182,7 @@ struct Artifact {
     mcultra_factor: Option<u64>,
     walking_hierarchy: Option<ContractionHierarchy>,
     tbtr_time_transfers: Option<(String, cafein_core::tbtr::TransferSet)>,
+    mctbtr_transfers: Option<(String, u64, cafein_core::tbtr::TransferSet)>,
 }
 
 /// The street layer's decoded state: link records (endpoints
@@ -954,6 +961,7 @@ fn assemble((artifact, streets, streets_bytes_read): LoadedArtifact) -> Transpor
         mcultra_factor,
         walking_hierarchy,
         tbtr_time_transfers,
+        mctbtr_transfers,
     } = artifact;
     // The contraction persisted; its buckets are derived state, rebuilt here on
     // the loading thread exactly as `install_hierarchy` builds them for a fresh
@@ -980,6 +988,7 @@ fn assemble((artifact, streets, streets_bytes_read): LoadedArtifact) -> Transpor
         mcultra_window,
         mcultra_factor,
         tbtr_time_transfers,
+        mctbtr_transfers,
         geometry,
         leg_geometry,
         streets,
@@ -1312,6 +1321,7 @@ impl TransportNetwork {
             mcultra_window: None,
             mcultra_factor: None,
             tbtr_time_transfers: None,
+            mctbtr_transfers: None,
             geometry: None,
             leg_geometry: None,
             streets: None,
@@ -1369,6 +1379,7 @@ impl TransportNetwork {
                 mcultra_factor: self.mcultra_factor,
                 walking_hierarchy: self.streets.as_ref().and_then(StreetNetwork::hierarchy),
                 tbtr_time_transfers: &self.tbtr_time_transfers,
+                mctbtr_transfers: &self.mctbtr_transfers,
             };
             let meta = bincode::serialize(&artifact)
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -1626,6 +1637,50 @@ impl TransportNetwork {
     #[getter]
     fn has_tbtr_transfers(&self) -> bool {
         self.tbtr_time_transfers.is_some()
+    }
+
+    /// Precompute and cache the multicriteria TBTR transfer set for a
+    /// service date and a per-trip emission-factor configuration.
+    ///
+    /// Every ``router="tbtr"`` multicriteria query on the same date whose
+    /// factors match reuses the cached set instead of rebuilding the
+    /// dominance-aware precompute each call — the point of the trip-based
+    /// engine: large batches on one network, date, and factor set. A query
+    /// on another date or with other factors rebuilds ad hoc. The cached
+    /// set is persisted with the artifact (`save`/`load`); recomputing
+    /// replaces it.
+    fn compute_mctbtr_transfers(
+        &mut self,
+        py: Python<'_>,
+        date: &str,
+        factors: Vec<(String, f64)>,
+    ) -> PyResult<()> {
+        let Some(geometry) = &self.geometry else {
+            return Err(PyValueError::new_err(
+                "no trip distances installed; build the network with trip distances enabled",
+            ));
+        };
+        let active = self.active_services(date)?;
+        let previous = self.active_services_previous(date)?;
+        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
+        for (trip_id, factor) in &factors {
+            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
+                per_trip[trip.0 as usize] = *factor;
+            }
+        }
+        let timetable = &self.build.timetable;
+        let set = py.allow_threads(|| {
+            McTbtrEngine::transfers_for_date(timetable, geometry, &per_trip, &active, &previous)
+        });
+        self.mctbtr_transfers = Some((date.to_string(), factor_fingerprint(&per_trip), set));
+        Ok(())
+    }
+
+    /// Whether a cached multicriteria TBTR transfer set is present
+    /// (`compute_mctbtr_transfers`).
+    #[getter]
+    fn has_mctbtr_transfers(&self) -> bool {
+        self.mctbtr_transfers.is_some()
     }
 
     /// Compute the ULTRA intermediate-transfer shortcuts and store them.
@@ -1934,6 +1989,10 @@ impl TransportNetwork {
         self.mcultra_transfers = None;
         self.mcultra_window = None;
         self.mcultra_factor = None;
+        // The cached McTBTR transfer set reduced against the old distances'
+        // emissions; new distances invalidate it too (the time-only TBTR set
+        // is distance-free and stays).
+        self.mctbtr_transfers = None;
         Ok(())
     }
 
@@ -3010,11 +3069,11 @@ impl TransportNetwork {
         let penalty_mask = self.route_penalty_mask(&banned_routes, &route_penalties);
         let journeys = py.allow_threads(|| {
             if router == "tbtr" {
-                let engine = McTbtrEngine::for_date(
-                    &self.build.timetable,
+                let engine = self.mctbtr_engine(
                     &self.transfers,
                     geometry,
                     &per_trip,
+                    date,
                     &request.active_services,
                     &request.active_services_previous,
                 );
@@ -3221,11 +3280,11 @@ impl TransportNetwork {
         let penalty_mask = self.route_penalty_mask(&banned_routes, &route_penalties);
         let journeys = py.allow_threads(|| {
             if router == "tbtr" {
-                let engine = McTbtrEngine::for_date(
-                    &self.build.timetable,
+                let engine = self.mctbtr_engine(
                     intermediate,
                     geometry,
                     &per_trip,
+                    date,
                     &request.active_services,
                     &request.active_services_previous,
                 );
@@ -3391,11 +3450,11 @@ impl TransportNetwork {
             .collect();
         let rows = py.allow_threads(|| {
             if router == "tbtr" {
-                let engine = McTbtrEngine::for_date(
-                    &self.build.timetable,
+                let engine = self.mctbtr_engine(
                     &self.transfers,
                     geometry,
                     &per_trip,
+                    date,
                     &active_services,
                     &active_services_previous,
                 );
@@ -3566,11 +3625,11 @@ impl TransportNetwork {
                     }
                 }
                 let rows = if router == "tbtr" {
-                    let engine = McTbtrEngine::for_date(
-                        &self.build.timetable,
+                    let engine = self.mctbtr_engine(
                         intermediate,
                         geometry,
                         &per_trip,
+                        date,
                         &active_services,
                         &active_services_previous,
                     );
@@ -4688,11 +4747,11 @@ impl TransportNetwork {
         };
         let rows = py.allow_threads(|| {
             if candidates == "pareto" && router == "tbtr" {
-                let engine = McTbtrEngine::for_date(
-                    &self.build.timetable,
+                let engine = self.mctbtr_engine(
                     &self.transfers,
                     geometry,
                     &per_trip,
+                    date,
                     &active_services,
                     &active_services_previous,
                 );
@@ -5010,6 +5069,42 @@ impl TransportNetwork {
 }
 
 impl TransportNetwork {
+    /// The multicriteria TBTR engine for a query: over the cached
+    /// transfer set when its date and factor fingerprint match
+    /// (`compute_mctbtr_transfers`), else built ad hoc. The query-time
+    /// `footpaths` vary freely — the precompute never contains them.
+    fn mctbtr_engine<'a>(
+        &'a self,
+        footpaths: &'a Transfers,
+        geometry: &'a TripGeometry,
+        per_trip: &'a [f64],
+        date: &str,
+        active_services: &'a [bool],
+        active_services_previous: &'a [bool],
+    ) -> McTbtrEngine<'a> {
+        if let Some((cached_date, fingerprint, set)) = &self.mctbtr_transfers {
+            if cached_date == date && *fingerprint == factor_fingerprint(per_trip) {
+                return McTbtrEngine::from_set(
+                    &self.build.timetable,
+                    footpaths,
+                    geometry,
+                    per_trip,
+                    active_services,
+                    active_services_previous,
+                    set,
+                );
+            }
+        }
+        McTbtrEngine::for_date(
+            &self.build.timetable,
+            footpaths,
+            geometry,
+            per_trip,
+            active_services,
+            active_services_previous,
+        )
+    }
+
     /// The intermediate-transfer set for the **point-destination** time
     /// queries: the ULTRA shortcuts only when computed **for the whole
     /// service day**, else the closure footpaths. Used by door-to-door

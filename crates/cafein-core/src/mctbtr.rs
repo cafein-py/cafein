@@ -430,10 +430,30 @@ pub struct McTbtrEngine<'a> {
     geometry: &'a TripGeometry,
     factors: &'a [f64],
     view: DayView,
-    set: TransferSet,
+    set: std::borrow::Cow<'a, TransferSet>,
 }
 
 impl<'a> McTbtrEngine<'a> {
+    /// The date's multicriteria transfer set alone — what a caller
+    /// caches to skip the expensive precompute on later engines
+    /// (`from_set`). Keyed by the date's view and the factors; the
+    /// query-time footpaths never enter the precompute, so one set
+    /// serves every footpath choice.
+    pub fn transfers_for_date(
+        timetable: &Timetable,
+        geometry: &TripGeometry,
+        factors: &[f64],
+        active_services: &[bool],
+        active_services_previous: &[bool],
+    ) -> TransferSet {
+        let view = DayView::for_date(timetable, active_services, active_services_previous);
+        // Same-stop transfers only — installed footpaths relax at
+        // query time (the hybrid the time engine uses), so the dense
+        // transitively closed set never enters the precompute.
+        let none = Transfers::empty(timetable.stop_count());
+        transfer_set(&view, timetable, &none, geometry, factors).transfers
+    }
+
     pub fn for_date(
         timetable: &'a Timetable,
         footpaths: &'a Transfers,
@@ -442,19 +462,47 @@ impl<'a> McTbtrEngine<'a> {
         active_services: &[bool],
         active_services_previous: &[bool],
     ) -> McTbtrEngine<'a> {
+        let set = Self::transfers_for_date(
+            timetable,
+            geometry,
+            factors,
+            active_services,
+            active_services_previous,
+        );
         let view = DayView::for_date(timetable, active_services, active_services_previous);
-        // Same-stop transfers only — installed footpaths relax at
-        // query time (the hybrid the time engine uses), so the dense
-        // transitively closed set never enters the precompute.
-        let none = Transfers::empty(timetable.stop_count());
-        let set = transfer_set(&view, timetable, &none, geometry, factors).transfers;
         McTbtrEngine {
             timetable,
             footpaths,
             geometry,
             factors,
             view,
-            set,
+            set: std::borrow::Cow::Owned(set),
+        }
+    }
+
+    /// The engine over a **prebuilt** multicriteria transfer set — the
+    /// reused path when the caller cached the date's set
+    /// (`transfers_for_date`), skipping the dominance-aware precompute.
+    /// The set must have been built for these `active_services` and
+    /// these `factors`; only the cheap per-engine state (the day view)
+    /// is rebuilt.
+    pub fn from_set(
+        timetable: &'a Timetable,
+        footpaths: &'a Transfers,
+        geometry: &'a TripGeometry,
+        factors: &'a [f64],
+        active_services: &[bool],
+        active_services_previous: &[bool],
+        set: &'a TransferSet,
+    ) -> McTbtrEngine<'a> {
+        let view = DayView::for_date(timetable, active_services, active_services_previous);
+        McTbtrEngine {
+            timetable,
+            footpaths,
+            geometry,
+            factors,
+            view,
+            set: std::borrow::Cow::Borrowed(set),
         }
     }
 

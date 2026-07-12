@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- ``compute_mctbtr_transfers`` — precompute and cache the multicriteria
+  TBTR transfer set, keyed by service date and the resolved per-trip
+  emission factors. Every ``router="tbtr"`` multicriteria query whose
+  date and factors match reuses the cached set instead of rebuilding the
+  dominance-aware precompute per call; the cache persists with the
+  network artifact (``save``/``load``), so mass-scale frontier workers
+  load it ready-made. ``has_mctbtr_transfers`` reports its presence. The
+  artifact format bumps to 9; older artifacts ask to be rebuilt from
+  their inputs.
+
 - McTBTR frontiers — ``router="tbtr"`` now also backs ``journey_frontiers``
   (stop ids and point GeoDataFrames) and the door-to-door coordinate
   ``journey_frontier``, returning the same journeys as McRAPTOR. The
