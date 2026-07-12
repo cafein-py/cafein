@@ -408,6 +408,34 @@ def test_diverse_itinerary_options_are_validated(network):
         )
 
 
+def test_diverse_itineraries_keep_picking_past_the_walking_journey(
+    network_with_footpaths,
+):
+    # The point-set twin of the frontier test: a routeless (walking-only) pick
+    # must not end the penalization rounds; the options hold the walk and the
+    # route-disjoint transit corridors.
+    origins = point_frame(network_with_footpaths, [("A", "1100602")])
+    destinations = point_frame(network_with_footpaths, [("B", "1040280")])
+    itineraries = DetailedItineraries(
+        network_with_footpaths,
+        origins,
+        destinations,
+        "2022-02-22",
+        "08:30:00",
+        candidates="diverse",
+        diversity="spread",
+        max_options=4,
+    )
+    corridors = _itinerary_corridors(itineraries)
+    transit = [c for c in corridors if c]
+    assert itineraries["option"].nunique() == 4
+    assert sum(1 for c in corridors if not c) == 1  # the walking-only option
+    assert len(transit) == 3
+    for i, first in enumerate(transit):
+        for second in transit[i + 1 :]:
+            assert first.isdisjoint(second)
+
+
 def test_diverse_itineraries_soft_penalty_shares_trunks(network):
     # penalty="ban" forces route-disjoint corridors; a positive penalty lets a
     # corridor share a trunk route and surfaces more options before drying up.

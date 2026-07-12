@@ -217,45 +217,9 @@ def journey_frontier(
         raise ValueError("router must be 'raptor' or 'tbtr'")
     if router == "tbtr" and candidates != "pareto":
         raise ValueError("router='tbtr' requires candidates='pareto'")
-    if (
-        candidates in ("relaxed", "diverse")
-        and slack_seconds is not None
-        and not (
-            isinstance(slack_seconds, (int, float))
-            and math.isfinite(slack_seconds)
-            and slack_seconds >= 0
-        )
-    ):
-        raise ValueError("slack_seconds must be a non-negative number of seconds")
-    if candidates in ("relaxed", "diverse") and (
-        max_options is not None
-        and (
-            not isinstance(max_options, int)
-            or isinstance(max_options, bool)
-            or max_options < 1
-        )
-    ):
-        raise ValueError("max_options must be a positive integer or None")
-    if diversity not in ("time", "spread"):
-        raise ValueError("diversity must be 'time' or 'spread'")
-    if penalty != "ban" and not (
-        isinstance(penalty, (int, float))
-        and not isinstance(penalty, bool)
-        and math.isfinite(penalty)
-        and round(penalty) >= 1
-    ):
-        raise ValueError("penalty must be 'ban' or a number of seconds >= 1")
-    if penalty != "ban" and candidates != "diverse":
-        raise ValueError("penalty applies only to candidates='diverse'")
-    # slack_seconds defaults per family: 300 s for the "relaxed" band, 0 s
-    # (strict pareto per round) for "diverse"; a given value applies to either.
-    if candidates == "relaxed":
-        slack = 300.0 if slack_seconds is None else float(slack_seconds)
-    elif candidates == "diverse":
-        slack = 0.0 if slack_seconds is None else float(slack_seconds)
-    else:
-        slack = 0.0
-    options = max_options if candidates == "relaxed" else None
+    slack, options, rounds = _alternative_options(
+        candidates, slack_seconds, max_options, diversity, penalty
+    )
     multicriteria = candidates in ("pareto", "relaxed")
     stops = isinstance(origin, str), isinstance(destination, str)
     if stops[0] != stops[1]:
@@ -280,7 +244,7 @@ def journey_frontier(
             trip_factors,
             (walking_speed_kmph, max_walking_time, max_snap_distance),
             geometries,
-            max_options if max_options is not None else 3,
+            rounds,
             diversity,
             slack,
             penalty,
@@ -462,6 +426,114 @@ def _journey_key(journey):
     )
 
 
+def _alternative_options(candidates, slack_seconds, max_options, diversity, penalty):
+    """Validates the alternative-set knobs shared by ``journey_frontier`` and
+    ``DetailedItineraries`` and resolves their per-family defaults: the time
+    slack (300 s for ``"relaxed"``, 0 for ``"diverse"``), the relaxed
+    suboptimal cap, and the diverse round count (3 when uncapped)."""
+    if (
+        candidates in ("relaxed", "diverse")
+        and slack_seconds is not None
+        and not (
+            isinstance(slack_seconds, (int, float))
+            and math.isfinite(slack_seconds)
+            and slack_seconds >= 0
+        )
+    ):
+        raise ValueError("slack_seconds must be a non-negative number of seconds")
+    if candidates in ("relaxed", "diverse") and (
+        max_options is not None
+        and (
+            not isinstance(max_options, int)
+            or isinstance(max_options, bool)
+            or max_options < 1
+        )
+    ):
+        raise ValueError("max_options must be a positive integer or None")
+    if diversity not in ("time", "spread"):
+        raise ValueError("diversity must be 'time' or 'spread'")
+    if penalty != "ban" and not (
+        isinstance(penalty, (int, float))
+        and not isinstance(penalty, bool)
+        and math.isfinite(penalty)
+        and round(penalty) >= 1
+    ):
+        raise ValueError("penalty must be 'ban' or a number of seconds >= 1")
+    if penalty != "ban" and candidates != "diverse":
+        raise ValueError("penalty applies only to candidates='diverse'")
+    if candidates == "relaxed":
+        slack = 300.0 if slack_seconds is None else float(slack_seconds)
+    elif candidates == "diverse":
+        slack = 0.0 if slack_seconds is None else float(slack_seconds)
+    else:
+        slack = 0.0
+    options = max_options if candidates == "relaxed" else None
+    rounds = max_options if max_options is not None else 3
+    return slack, options, rounds
+
+
+def _diverse_rounds(search, annotate, k, diversity, penalty):
+    """The penalization-round loop shared by ``journey_frontier`` and
+    ``DetailedItineraries``: pick a journey, make its routes costlier,
+    search again — until ``k`` are selected or the alternatives dry up.
+
+    ``search(banned, route_penalties)`` runs one McRAPTOR round;
+    ``annotate(journeys)`` attaches emissions in place. ``penalty="ban"``
+    hard-bans a chosen corridor's routes so the options ride disjoint line
+    sets; a positive ``penalty`` adds that many seconds to a chosen route's
+    effective arrival per prior use (clamped at the engine's cap). Picks
+    deduplicate against already-selected journeys, and a pick with no transit
+    routes — the walking-only journey — changes no costs, so the loop keeps
+    selecting from the current pool instead of ending; only a routed pick
+    triggers the next search. Returns the selection fastest-first."""
+    banned = []
+    penalties = {}
+    selected = []
+    seen = set()
+    reference = None
+    pool = None
+    while len(selected) < k:
+        if pool is None:
+            pool = search(banned, list(penalties.items()))
+            if not pool:
+                break
+            annotate(pool)
+            if reference is None:
+                reference = _diverse_reference(pool)
+        # A soft penalty (or a routeless pick) leaves chosen journeys in the
+        # pool, so drop the ones already kept before picking; a ban removes
+        # them at the source.
+        fresh = [j for j in pool if _journey_key(j) not in seen]
+        if not fresh:
+            break
+        pick = _diverse_pick(fresh, selected, diversity, reference)
+        selected.append(pick)
+        seen.add(_journey_key(pick))
+        route_ids = [
+            leg["route_id"]
+            for leg in pick["legs"]
+            if leg["type"] == "transit" and leg.get("route_id") is not None
+        ]
+        if not route_ids:
+            # Nothing to ban or penalize: the next search would return this
+            # same pool, so keep picking from it.
+            continue
+        if penalty == "ban":
+            # Banning is idempotent, so dedup against what is already banned.
+            for route in route_ids:
+                if route not in banned:
+                    banned.append(route)
+        else:
+            # One penalty step per route use: a corridor riding a route twice
+            # is penalized twice. Clamp below the ban sentinel (_MAX_PENALTY).
+            step = int(round(penalty))
+            for route in route_ids:
+                penalties[route] = min(penalties.get(route, 0) + step, _MAX_PENALTY)
+        pool = None
+    selected.sort(key=_fastest_key)
+    return selected
+
+
 def _diverse_journeys(
     network,
     is_stop,
@@ -483,19 +555,11 @@ def _diverse_journeys(
     slack,
     penalty,
 ):
-    """``k`` distinct alternatives by iterative route penalization: each round
-    the previously chosen corridors' routes are made costlier, and
-    ``_diverse_pick`` chooses the round's journey — fastest-first for
-    ``diversity="time"``, or spread across the (travel_time, emissions)
-    trade-off for ``diversity="spread"`` — until ``k`` are found or the search
-    dries up. ``penalty="ban"`` hard-bans a chosen corridor's routes, so the
-    alternatives ride fully route-disjoint line sets; a positive ``penalty``
-    instead adds that many seconds to each chosen route's effective arrival per
-    prior use, so a corridor sharing a trunk can still surface (soft penalty).
-    A positive ``slack`` widens each round's McRAPTOR pool to the relaxed
-    frontier (relaxed × diverse). The returned frame still sorts by
-    travel_time; the objective changes which corridors are chosen, not their
-    order."""
+    """``k`` distinct alternatives for the frontier, by the shared
+    ``_diverse_rounds`` loop over windowed McRAPTOR searches. A positive
+    ``slack`` widens each round's pool to the relaxed frontier
+    (relaxed × diverse). The returned frame still sorts by travel_time; the
+    objective changes which corridors are chosen, not their order."""
     from cafein.network import _walk_options
 
     def search(banned, route_penalties):
@@ -534,45 +598,10 @@ def _diverse_journeys(
             route_penalties,
         )
 
-    banned = []
-    penalties = {}
-    selected = []
-    seen = set()
-    reference = None
-    for _ in range(k):
-        journeys = search(banned, list(penalties.items()))
-        if not journeys:
-            break
+    def annotate(journeys):
         emissions.annotate(journeys, network, factors, components)
-        if reference is None:
-            reference = _diverse_reference(journeys)
-        # A soft penalty leaves chosen journeys in the pool, so drop the ones
-        # already kept before picking; a ban removes them at the source.
-        fresh = [j for j in journeys if _journey_key(j) not in seen]
-        if not fresh:
-            break
-        pick = _diverse_pick(fresh, selected, diversity, reference)
-        selected.append(pick)
-        seen.add(_journey_key(pick))
-        route_ids = [
-            leg["route_id"]
-            for leg in pick["legs"]
-            if leg["type"] == "transit" and leg.get("route_id") is not None
-        ]
-        if not route_ids:
-            break
-        if penalty == "ban":
-            # Banning is idempotent, so dedup against what is already banned.
-            for route in route_ids:
-                if route not in banned:
-                    banned.append(route)
-        else:
-            # One penalty step per route use: a corridor riding a route twice is
-            # penalized twice. Clamp below the ban sentinel (see _MAX_PENALTY).
-            step = int(round(penalty))
-            for route in route_ids:
-                penalties[route] = min(penalties.get(route, 0) + step, _MAX_PENALTY)
-    return selected
+
+    return _diverse_rounds(search, annotate, k, diversity, penalty)
 
 
 def exhaustive_frontier(

@@ -234,6 +234,7 @@ def _itineraries_frame(
     max_snap_distance,
 ):
     from cafein import emissions
+    from cafein.frontier import _alternative_options
 
     origin_ids, origin_keys, kind = _endpoints(origins, "origins")
     dest_ids, dest_keys, dest_kind = _endpoints(destinations, "destinations")
@@ -251,46 +252,10 @@ def _itineraries_frame(
         raise ValueError("router must be 'raptor' or 'tbtr'")
     if router == "tbtr" and (candidates != "pareto" or kind != "stops"):
         raise ValueError("router='tbtr' requires candidates='pareto' with stop ids")
-    if (
-        candidates in ("relaxed", "diverse")
-        and slack_seconds is not None
-        and not (
-            isinstance(slack_seconds, (int, float))
-            and math.isfinite(slack_seconds)
-            and slack_seconds >= 0
-        )
-    ):
-        raise ValueError("slack_seconds must be a non-negative number of seconds")
-    if candidates in ("relaxed", "diverse") and (
-        max_options is not None
-        and (
-            not isinstance(max_options, int)
-            or isinstance(max_options, bool)
-            or max_options < 1
-        )
-    ):
-        raise ValueError("max_options must be a positive integer or None")
-    if diversity not in ("time", "spread"):
-        raise ValueError("diversity must be 'time' or 'spread'")
-    if penalty != "ban" and not (
-        isinstance(penalty, (int, float))
-        and not isinstance(penalty, bool)
-        and math.isfinite(penalty)
-        and round(penalty) >= 1
-    ):
-        raise ValueError("penalty must be 'ban' or a number of seconds >= 1")
-    if penalty != "ban" and candidates != "diverse":
-        raise ValueError("penalty applies only to candidates='diverse'")
+    slack, options, rounds = _alternative_options(
+        candidates, slack_seconds, max_options, diversity, penalty
+    )
     multicriteria = candidates in ("pareto", "relaxed", "diverse")
-    # slack_seconds defaults per family: 300 s for the "relaxed" band, 0 s
-    # (strict pareto per round) for "diverse"; a given value applies to either.
-    if candidates == "relaxed":
-        slack = 300.0 if slack_seconds is None else float(slack_seconds)
-    elif candidates == "diverse":
-        slack = 0.0 if slack_seconds is None else float(slack_seconds)
-    else:
-        slack = 0.0
-    options = max_options if candidates == "relaxed" else None
     # The multicriteria (McRAPTOR) candidates need the per-trip factor vector;
     # the time candidates get their emissions from the post-hoc annotation only.
     trip_factors = (
@@ -316,7 +281,7 @@ def _itineraries_frame(
                     trip_factors,
                     factors,
                     components,
-                    max_options if max_options is not None else 3,
+                    rounds,
                     diversity,
                     slack,
                     penalty,
@@ -494,24 +459,12 @@ def _route_diverse(
     slack,
     penalty,
 ):
-    """``k`` distinct alternatives for one OD pair, by iterative route
-    penalization: each round the chosen corridors' routes are made costlier, and
-    ``_diverse_pick`` chooses the round's journey — fastest-first for
-    ``diversity="time"``, or spread across the (travel_time, emissions)
-    trade-off for ``diversity="spread"`` — until ``k`` are found or the search
-    dries up. ``penalty="ban"`` hard-bans a chosen corridor's routes, so the
-    alternatives ride fully route-disjoint line sets; a positive ``penalty``
-    instead adds that many seconds to each chosen route's effective arrival per
-    prior use, so a corridor sharing a trunk can still surface (soft penalty).
-    A positive ``slack`` widens each round's pool to the relaxed frontier
-    (relaxed × diverse). Single departure (``window=None``)."""
-    from cafein.frontier import (
-        _MAX_PENALTY,
-        _diverse_pick,
-        _diverse_reference,
-        _fastest_key,
-        _journey_key,
-    )
+    """``k`` distinct alternatives for one OD pair, by the shared
+    ``_diverse_rounds`` loop over single-departure McRAPTOR searches
+    (``window=None``). A positive ``slack`` widens each round's pool to the
+    relaxed frontier (relaxed × diverse); options come back fastest-first, as
+    ``journey_frontier``'s frame sorts them."""
+    from cafein.frontier import _diverse_rounds
     from cafein.network import _walk_options
 
     def search(banned, route_penalties):
@@ -550,48 +503,10 @@ def _route_diverse(
             route_penalties,
         )
 
-    banned = []
-    penalties = {}
-    selected = []
-    seen = set()
-    reference = None
-    for _ in range(k):
-        journeys = search(banned, list(penalties.items()))
-        if not journeys:
-            break
+    def annotate(journeys):
         network.annotate_emissions(journeys, factors, components)
-        if reference is None:
-            reference = _diverse_reference(journeys)
-        # A soft penalty leaves chosen journeys in the pool, so drop the ones
-        # already kept before picking; a ban removes them at the source.
-        fresh = [j for j in journeys if _journey_key(j) not in seen]
-        if not fresh:
-            break
-        pick = _diverse_pick(fresh, selected, diversity, reference)
-        selected.append(pick)
-        seen.add(_journey_key(pick))
-        route_ids = [
-            leg["route_id"]
-            for leg in pick["legs"]
-            if leg["type"] == "transit" and leg.get("route_id") is not None
-        ]
-        if not route_ids:
-            break
-        if penalty == "ban":
-            # Banning is idempotent, so dedup against what is already banned.
-            for route in route_ids:
-                if route not in banned:
-                    banned.append(route)
-        else:
-            # One penalty step per route use: a corridor riding a route twice is
-            # penalized twice. Clamp below the ban sentinel (see _MAX_PENALTY).
-            step = int(round(penalty))
-            for route in route_ids:
-                penalties[route] = min(penalties.get(route, 0) + step, _MAX_PENALTY)
-    # Return options travel-time sorted (as journey_frontier's frame is), so the
-    # objective changes which corridors are chosen, not the option order.
-    selected.sort(key=_fastest_key)
-    return selected
+
+    return _diverse_rounds(search, annotate, k, diversity, penalty)
 
 
 def _leg_record(from_id, to_id, option, segment, leg):
