@@ -952,18 +952,17 @@ impl<'a> TbtrEngine<'a> {
     /// For every minute mark within `[departure, departure + window)`,
     /// the per-stop earliest arrival when leaving at or after it — the
     /// TBTR counterpart of RAPTOR's `window_samples`. One descending pass
-    /// per boardable departure candidate on shared state (persistent
-    /// reached horizons and per-(round, stop) `labels`, as in
-    /// [`profile`](Self::profile), but with no egress targets so every
-    /// stop is explored), snapshotting the labels at each mark. A mark's
-    /// travel times match [`one_to_all`](Self::one_to_all) run for that
-    /// departure once the access floor is applied — an access stop's raw
-    /// label is the next boardable departure, not the mark itself. Marks
-    /// come back ascending.
+    /// per minute mark on shared state (persistent reached horizons and
+    /// per-(round, stop) `labels`, as in [`profile`](Self::profile), but
+    /// with no egress targets so every stop is explored), snapshotting
+    /// the labels at each mark. A mark's travel times match
+    /// [`one_to_all`](Self::one_to_all) run for that departure once the
+    /// access floor is applied — an access stop's raw label is the next
+    /// boardable departure, not the mark itself. Marks come back
+    /// ascending.
     fn window_samples(&self, request: &Request, window: u32) -> Vec<(u32, Vec<u32>)> {
         let rounds = request.max_transfers as usize + 1;
         let stop_count = self.timetable.stop_count() as usize;
-        let candidates = crate::raptor::departure_candidates(self.timetable, request, window);
         let mut reached = self.horizons(rounds);
         let mut arena: Vec<Segment> = Vec::new();
         let mut queues: Vec<Vec<(u32, u16)>> = vec![Vec::new(); rounds];
@@ -984,14 +983,18 @@ impl<'a> TbtrEngine<'a> {
         let mut walked: HashMap<u32, (u32, u32, u16)> = HashMap::new();
         let sample_count = (window as u64).div_ceil(60).max(1) as u32;
         let mut samples = Vec::with_capacity(sample_count as usize);
-        let mut next_candidate = 0;
         for step in (0..sample_count).rev() {
             let Some(mark) = request.departure.checked_add(step * 60) else {
                 continue;
             };
-            while next_candidate < candidates.len() && candidates[next_candidate] >= mark {
-                let departure = candidates[next_candidate];
-                next_candidate += 1;
+            // One pass per minute mark, descending, on the shared labels and
+            // horizons (range-TBTR). Seeding at `mark` boards the earliest
+            // catchable trip per line — exactly `one_to_all(mark)` — so after
+            // the pass the labels hold the earliest arrivals for leaving at or
+            // after `mark`; per-trip-departure passes in between add nothing
+            // to the minute-mark samples.
+            {
+                let departure = mark;
                 for &(stop, seconds) in &request.access {
                     improve(&mut labels, stop, departure.saturating_add(seconds), 0);
                 }
