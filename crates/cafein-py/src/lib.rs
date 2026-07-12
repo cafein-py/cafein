@@ -1183,6 +1183,31 @@ fn egress_tables(links: &[Option<Vec<WalkedStop>>]) -> Vec<Vec<(StopIdx, u32, f6
         .collect()
 }
 
+/// Whether the walking-only journey stays within a ``max_slower`` band:
+/// its arrival must sit within the band of the fastest returned transit
+/// journey (the minimum of the per-pass anchors the search's output
+/// filter kept). Without the restriction, or when nothing rides, the
+/// walk always stays. Anchoring on the pre-walk-domination journey set
+/// is equivalent to anchoring on the emitted rows: a walk-dominated
+/// journey travels at least the walk's seconds and departs no earlier
+/// than the walk, so it arrives no earlier than the walk itself and can
+/// neither keep nor drop the walk differently than the kept set's
+/// fastest would.
+fn walk_within_band(
+    walk_seconds: u32,
+    departure: u32,
+    journeys: &[Journey],
+    max_slower: Option<u32>,
+) -> bool {
+    let Some(band) = max_slower else {
+        return true;
+    };
+    let Some(fastest) = journeys.iter().map(|journey| journey.arrival).min() else {
+        return true;
+    };
+    departure.saturating_add(walk_seconds) <= fastest.saturating_add(band)
+}
+
 /// A deterministic, NaN-safe fingerprint of a per-trip emission-factor vector,
 /// binding a McULTRA set to the factor configuration it was built with (a query
 /// with different factors falls back to the closure). Not a cryptographic digest.
@@ -2852,7 +2877,7 @@ impl TransportNetwork {
     /// -------
     /// list of dict
     ///     Journeys shaped as in ``route_between_stops``.
-    #[pyo3(signature = (from_stop, to_stop, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, router = "raptor", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, banned_routes = vec![], route_penalties = vec![]))]
+    #[pyo3(signature = (from_stop, to_stop, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, router = "raptor", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, banned_routes = vec![], route_penalties = vec![], max_slower = None))]
     #[allow(clippy::too_many_arguments)]
     fn mc_route_between_stops(
         &self,
@@ -2874,6 +2899,7 @@ impl TransportNetwork {
         max_options: Option<usize>,
         banned_routes: Vec<String>,
         route_penalties: Vec<(String, u64)>,
+        max_slower: Option<u32>,
     ) -> PyResult<Py<PyList>> {
         if !bucket.is_finite() || bucket <= 0.0 {
             return Err(PyValueError::new_err(
@@ -2901,6 +2927,16 @@ impl TransportNetwork {
         if (!banned_routes.is_empty() || !route_penalties.is_empty()) && router == "tbtr" {
             return Err(PyValueError::new_err(
                 "route bans/penalties (diverse candidates) require router='raptor'",
+            ));
+        }
+        if max_slower.is_some()
+            && (router == "tbtr"
+                || slack > 0.0
+                || !banned_routes.is_empty()
+                || !route_penalties.is_empty())
+        {
+            return Err(PyValueError::new_err(
+                "max_slower requires router='raptor' and strict pareto candidates",
             ));
         }
         let Some(geometry) = &self.geometry else {
@@ -2957,6 +2993,7 @@ impl TransportNetwork {
                         max_options,
                         banned_routes,
                         route_penalties,
+                        max_slower,
                     );
                 }
             }
@@ -3003,6 +3040,7 @@ impl TransportNetwork {
                     slack,
                     max_options,
                     &penalty_mask,
+                    max_slower,
                 ),
                 Some(window) => mcraptor::route_range(
                     &view,
@@ -3016,6 +3054,7 @@ impl TransportNetwork {
                     slack,
                     max_options,
                     &penalty_mask,
+                    max_slower,
                 ),
             }
         });
@@ -3049,7 +3088,7 @@ impl TransportNetwork {
     /// -------
     /// list of dict
     ///     Journeys shaped as in ``route_between_coordinates``.
-    #[pyo3(signature = (origin, destination, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, banned_routes = vec![], route_penalties = vec![]))]
+    #[pyo3(signature = (origin, destination, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, banned_routes = vec![], route_penalties = vec![], max_slower = None))]
     #[allow(clippy::too_many_arguments)]
     fn mc_route_between_coordinates(
         &self,
@@ -3070,6 +3109,7 @@ impl TransportNetwork {
         max_options: Option<usize>,
         banned_routes: Vec<String>,
         route_penalties: Vec<(String, u64)>,
+        max_slower: Option<u32>,
     ) -> PyResult<Py<PyList>> {
         if !bucket.is_finite() || bucket <= 0.0 {
             return Err(PyValueError::new_err(
@@ -3084,6 +3124,13 @@ impl TransportNetwork {
         if matches!(max_options, Some(0)) {
             return Err(PyValueError::new_err(
                 "max_options must be a positive integer",
+            ));
+        }
+        if max_slower.is_some()
+            && (slack > 0.0 || !banned_routes.is_empty() || !route_penalties.is_empty())
+        {
+            return Err(PyValueError::new_err(
+                "max_slower requires router='raptor' and strict pareto candidates",
             ));
         }
         let Some(geometry) = &self.geometry else {
@@ -3175,6 +3222,7 @@ impl TransportNetwork {
                     slack,
                     max_options,
                     &penalty_mask,
+                    max_slower,
                 ),
                 Some(window) => mcraptor::route_range(
                     &view,
@@ -3188,6 +3236,7 @@ impl TransportNetwork {
                     slack,
                     max_options,
                     &penalty_mask,
+                    max_slower,
                 ),
             }
         });
@@ -3199,7 +3248,9 @@ impl TransportNetwork {
             })
             .collect();
         let result = PyList::empty(py);
-        if let Some(walk) = direct {
+        if let Some(walk) = direct.filter(|&(walk_seconds, _)| {
+            walk_within_band(walk_seconds, request.departure, &journeys, max_slower)
+        }) {
             result.append(self.walk_journey_dict(
                 py,
                 request.departure,
@@ -3236,7 +3287,7 @@ impl TransportNetwork {
     /// list of list of list of dict
     ///     ``result[i][j]`` is the journey list from ``from_stops[i]``
     ///     to ``to_stops[j]``, shaped as in ``mc_route_between_stops``.
-    #[pyo3(signature = (from_stops, to_stops, date, departure, factors, window, max_transfers = 7, bucket = 25.0, geometries = false))]
+    #[pyo3(signature = (from_stops, to_stops, date, departure, factors, window, max_transfers = 7, bucket = 25.0, geometries = false, max_slower = None))]
     #[allow(clippy::too_many_arguments)]
     fn mc_frontier_matrix(
         &self,
@@ -3250,6 +3301,7 @@ impl TransportNetwork {
         max_transfers: u8,
         bucket: f64,
         geometries: bool,
+        max_slower: Option<u32>,
     ) -> PyResult<Py<PyList>> {
         if !bucket.is_finite() || bucket <= 0.0 {
             return Err(PyValueError::new_err(
@@ -3318,6 +3370,7 @@ impl TransportNetwork {
                 destinations.len(),
                 window,
                 bucket,
+                max_slower,
             )
         });
         let result = PyList::empty(py);
@@ -3354,7 +3407,7 @@ impl TransportNetwork {
     ///     ``journeys`` — ``result[i][j]`` journey lists;
     ///     ``unsnapped_from`` / ``unsnapped_to`` — indices of points
     ///     off the walking network (their cells stay empty).
-    #[pyo3(signature = (origins, destinations, date, departure, factors, window, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false))]
+    #[pyo3(signature = (origins, destinations, date, departure, factors, window, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, max_slower = None))]
     #[allow(clippy::too_many_arguments)]
     fn mc_frontier_matrix_from_points(
         &self,
@@ -3371,6 +3424,7 @@ impl TransportNetwork {
         max_walking_time: f64,
         max_snap_distance: f64,
         geometries: bool,
+        max_slower: Option<u32>,
     ) -> PyResult<Py<PyDict>> {
         if !bucket.is_finite() || bucket <= 0.0 {
             return Err(PyValueError::new_err(
@@ -3463,6 +3517,7 @@ impl TransportNetwork {
                     destinations.len(),
                     window,
                     bucket,
+                    max_slower,
                 );
                 let walk = streets.walk_matrix(
                     &origins,
@@ -3509,7 +3564,10 @@ impl TransportNetwork {
                     }),
                     _ => None,
                 };
-                if let (Some(walk), Some(ends)) = (direct, ends.as_ref()) {
+                let banded_walk = direct.filter(|&(walk_seconds, _)| {
+                    walk_within_band(walk_seconds, departure, cell, max_slower)
+                });
+                if let (Some(walk), Some(ends)) = (banded_walk, ends.as_ref()) {
                     cell_list
                         .append(self.walk_journey_dict(py, departure, walk, ends, geometries)?)?;
                 }

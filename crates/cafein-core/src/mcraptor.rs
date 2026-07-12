@@ -406,6 +406,12 @@ struct Search<'a> {
     /// routed (a non-empty `request.egress`); the matrix and batched
     /// folds have no single target.
     prune_target: bool,
+    /// The `max_slower` per-stop arrival cutoffs of the current pass —
+    /// the plain resolved-trip bound plus the band, floored at the
+    /// pass's destination bound so the fastest journey always survives.
+    /// Empty when the restriction is off; `max_slower` is pareto-only,
+    /// so no route penalties exist and true arrivals compare.
+    cutoff: Vec<u32>,
     /// Per line: the (position, label) boardings queued this round.
     queue: Vec<Vec<(u16, u32)>>,
     touched: Vec<u32>,
@@ -427,6 +433,7 @@ pub fn route(
     slack: u32,
     max_options: Option<usize>,
     route_penalties: &[u32],
+    max_slower: Option<u32>,
 ) -> Vec<Journey> {
     profile(
         view,
@@ -440,6 +447,7 @@ pub fn route(
         slack,
         max_options,
         route_penalties,
+        max_slower,
     )
 }
 
@@ -459,6 +467,7 @@ pub fn route_range(
     slack: u32,
     max_options: Option<usize>,
     route_penalties: &[u32],
+    max_slower: Option<u32>,
 ) -> Vec<Journey> {
     let departures = departure_candidates(timetable, request, window);
     profile(
@@ -473,6 +482,7 @@ pub fn route_range(
         slack,
         max_options,
         route_penalties,
+        max_slower,
     )
 }
 
@@ -562,6 +572,124 @@ pub fn least_emissions_matrix(
         .collect()
 }
 
+/// The plain time-only bounds behind `max_slower`: per departure pass
+/// (descending, range-RAPTOR shared state and round-capped like the
+/// multicriteria search) the earliest per-stop arrival over the trips
+/// with a **resolved emission factor** — the same trip set the
+/// multicriteria search can board, so its per-pass fastest journey
+/// always achieves the destination bound and the cutoff floor provably
+/// keeps that journey alive. Returns one per-stop snapshot per
+/// departure, in the departures' (descending) order; unreachable stops
+/// hold `u32::MAX`.
+fn resolved_bounds(
+    view: &DayView,
+    timetable: &Timetable,
+    footpaths: &Transfers,
+    factors: &[f64],
+    request: &Request,
+    departures: &[u32],
+) -> Vec<Vec<u32>> {
+    let stop_count = timetable.stop_count() as usize;
+    let mut best = vec![u32::MAX; stop_count];
+    let mut queue: Vec<Vec<(u16, u32)>> = vec![Vec::new(); view.line_count() as usize];
+    let mut touched: Vec<u32> = Vec::new();
+    let mut snapshots = Vec::with_capacity(departures.len());
+    for &departure in departures {
+        let mut fresh: Vec<StopIdx> = Vec::new();
+        for &(stop, seconds) in &request.access {
+            let arrival = departure.saturating_add(seconds);
+            if arrival < best[stop.0 as usize] {
+                best[stop.0 as usize] = arrival;
+                fresh.push(stop);
+            }
+        }
+        for _ in 1..=request.max_transfers as u32 + 1 {
+            if fresh.is_empty() {
+                break;
+            }
+            // Boarding times are captured at queueing so a round's own
+            // alights cannot fuel same-round boardings (round separation,
+            // matching the multicriteria search's label queue).
+            for &stop in &fresh {
+                let at = best[stop.0 as usize];
+                for served in timetable.patterns_at_stop(stop) {
+                    let positions = timetable.pattern_stops(served.pattern).len();
+                    if served.position as usize + 1 >= positions {
+                        continue;
+                    }
+                    for line in view.lines_of_pattern(served.pattern).into_iter().flatten() {
+                        if queue[line as usize].is_empty() {
+                            touched.push(line);
+                        }
+                        queue[line as usize].push((served.position, at));
+                    }
+                }
+            }
+            let mut rode: Vec<StopIdx> = Vec::new();
+            let lines = std::mem::take(&mut touched);
+            for &line in &lines {
+                let mut entries = std::mem::take(&mut queue[line as usize]);
+                entries.sort_unstable_by_key(|&(position, _)| position);
+                let pattern = view.line_pattern(line);
+                let stops = timetable.pattern_stops(pattern);
+                let offset = view.line_day_offset(line);
+                let mut current: Option<ViewTrip> = None;
+                let mut queued = 0usize;
+                for (position, &stop) in stops.iter().enumerate().skip(entries[0].0 as usize) {
+                    if let Some(trip) = current {
+                        let arrival = view.stored_times(timetable, trip)[position].arrival - offset;
+                        if arrival < best[stop.0 as usize] {
+                            best[stop.0 as usize] = arrival;
+                            rode.push(stop);
+                        }
+                    }
+                    while queued < entries.len() && entries[queued].0 as usize == position {
+                        let (_, at) = entries[queued];
+                        queued += 1;
+                        // The earliest boardable trip whose factor resolves.
+                        let Some(first) =
+                            earliest_boardable(view, timetable, line, position as u16, at)
+                        else {
+                            continue;
+                        };
+                        for rank in first.0..view.line_trips(line).end {
+                            let trip = ViewTrip(rank);
+                            if !factors[view.backing(trip).0 as usize].is_finite() {
+                                continue;
+                            }
+                            let departs =
+                                view.stored_times(timetable, trip)[position].departure - offset;
+                            let held_departs = current.map(|held| {
+                                view.stored_times(timetable, held)[position].departure - offset
+                            });
+                            if held_departs.is_none_or(|held| departs < held) {
+                                current = Some(trip);
+                            }
+                            break;
+                        }
+                    }
+                }
+                entries.clear();
+                queue[line as usize] = entries;
+            }
+            let mut next = rode.clone();
+            for &stop in &rode {
+                let at = best[stop.0 as usize];
+                for footpath in footpaths.from_stop(stop) {
+                    let arrival = at.saturating_add(footpath.duration);
+                    if arrival < best[footpath.to.0 as usize] {
+                        best[footpath.to.0 as usize] = arrival;
+                        next.push(footpath.to);
+                    }
+                }
+            }
+            fresh = next;
+        }
+        snapshots.push(best.clone());
+    }
+    snapshots
+}
+
 /// The batched Pareto frontiers: per request × destination slot, the
 /// (departure, arrival, emissions bucket) Pareto journeys of the
 /// departure window — each cell exactly the single-pair `route_range`
@@ -585,6 +713,7 @@ pub fn frontier_matrix(
     slot_count: usize,
     window: u32,
     bucket: f64,
+    max_slower: Option<u32>,
 ) -> Vec<Vec<Vec<Journey>>> {
     assert!(
         bucket.is_finite() && bucket > 0.0,
@@ -620,9 +749,51 @@ pub fn frontier_matrix(
         }
     }
     let bag_count = if egress_active { slot_count } else { unique };
+    // Every (stop, slot, final-walk seconds) pair, for the per-slot
+    // destination bounds of the `max_slower` restriction.
+    let slot_egress: Vec<(StopIdx, usize, u32)> = if max_slower.is_none() {
+        Vec::new()
+    } else if egress_active {
+        egress
+            .iter()
+            .enumerate()
+            .flat_map(|(stop, entries)| {
+                entries
+                    .iter()
+                    .map(move |&(slot, seconds, _)| (StopIdx(stop as u32), slot as usize, seconds))
+            })
+            .collect()
+    } else {
+        destinations
+            .iter()
+            .zip(&cell_of)
+            .map(|(&stop, &slot)| (stop, slot, 0))
+            .collect()
+    };
     requests
         .par_iter()
         .map(|request| {
+            // Per pass, the restriction's per-slot destination bounds; the
+            // cutoff floor is the farthest reachable slot's bound, so a
+            // label needed by any cell survives, and each cell's output
+            // band anchors at its own slot's bound.
+            let departures = departure_candidates(timetable, request, window);
+            let restricted = max_slower.map(|band| {
+                let bounds =
+                    resolved_bounds(view, timetable, footpaths, factors, request, &departures);
+                let floors: Vec<Vec<u32>> = bounds
+                    .iter()
+                    .map(|per_stop| {
+                        let mut slot_floors = vec![u32::MAX; bag_count];
+                        for &(stop, slot, seconds) in &slot_egress {
+                            let bound = per_stop[stop.0 as usize].saturating_add(seconds);
+                            slot_floors[slot] = slot_floors[slot].min(bound);
+                        }
+                        slot_floors
+                    })
+                    .collect();
+                (band, bounds, floors)
+            });
             let mut search = Search::start(
                 view,
                 timetable,
@@ -633,11 +804,19 @@ pub fn frontier_matrix(
                 0,
                 &[],
             );
-            let departures = departure_candidates(timetable, request, window);
             let mut bags: Vec<DestinationBag> = std::iter::repeat_with(DestinationBag::default)
                 .take(bag_count)
                 .collect();
-            for &departure in &departures {
+            for (index, &departure) in departures.iter().enumerate() {
+                if let Some((band, bounds, floors)) = &restricted {
+                    let floor = floors[index]
+                        .iter()
+                        .copied()
+                        .filter(|&floor| floor != u32::MAX)
+                        .max()
+                        .unwrap_or(u32::MAX);
+                    search.set_cutoff(&bounds[index], floor, *band);
+                }
                 let mut frontier = Some(FrontierFold {
                     slots: &slots,
                     egress,
@@ -648,10 +827,20 @@ pub fn frontier_matrix(
             }
             let cells: Vec<Vec<Journey>> = bags
                 .iter()
-                .map(|bag| {
+                .enumerate()
+                .map(|(slot, bag)| {
                     let mut journeys: Vec<Journey> = bag
                         .entries
                         .iter()
+                        .filter(|entry| match &restricted {
+                            None => true,
+                            Some((band, _, floors)) => {
+                                let index = departures
+                                    .binary_search_by(|probe| probe.cmp(&entry.departure).reverse())
+                                    .expect("every entry comes from a pass departure");
+                                entry.arrival <= floors[index][slot].saturating_add(*band)
+                            }
+                        })
                         .map(|arrived| search.assemble(arrived))
                         .collect();
                     journeys.sort_by_key(|journey| {
@@ -681,11 +870,31 @@ fn profile(
     slack: u32,
     max_options: Option<usize>,
     route_penalties: &[u32],
+    max_slower: Option<u32>,
 ) -> Vec<Journey> {
     assert!(
         bucket.is_finite() && bucket > 0.0,
         "the emissions bucket must be positive"
     );
+    // The `max_slower` restriction: per pass, the resolved-trip bounds
+    // anchor the per-stop band and the destination bound floors it (so
+    // the pass's fastest journey survives the pruning); the same floor
+    // drives the output band below.
+    let restricted = max_slower.map(|band| {
+        let bounds = resolved_bounds(view, timetable, footpaths, factors, request, departures);
+        let floors: Vec<u32> = bounds
+            .iter()
+            .map(|per_stop| {
+                request
+                    .egress
+                    .iter()
+                    .map(|&(stop, seconds)| per_stop[stop.0 as usize].saturating_add(seconds))
+                    .min()
+                    .unwrap_or(u32::MAX)
+            })
+            .collect();
+        (band, bounds, floors)
+    });
     let mut search = Search::start(
         view,
         timetable,
@@ -696,10 +905,35 @@ fn profile(
         slack,
         route_penalties,
     );
-    for &departure in departures {
+    for (index, &departure) in departures.iter().enumerate() {
+        if let Some((band, bounds, floors)) = &restricted {
+            search.set_cutoff(&bounds[index], floors[index], *band);
+        }
         search.pass(request, departure, &mut None, &mut None);
     }
-    let kept = cap_entries(&search.destination.entries, max_options);
+    // The output band: a journey stays within `max_slower` of its own
+    // pass's plain destination bound (an unreachable bound keeps
+    // everything — nothing anchors the band that pass).
+    let banded: Vec<Arrived>;
+    let entries: &[Arrived] = match &restricted {
+        Some((band, _, floors)) => {
+            banded = search
+                .destination
+                .entries
+                .iter()
+                .filter(|entry| {
+                    let index = departures
+                        .binary_search_by(|probe| probe.cmp(&entry.departure).reverse())
+                        .expect("every entry comes from a pass departure");
+                    entry.arrival <= floors[index].saturating_add(*band)
+                })
+                .copied()
+                .collect();
+            &banded
+        }
+        None => &search.destination.entries,
+    };
+    let kept = cap_entries(entries, max_options);
     let mut journeys: Vec<Journey> = kept
         .into_iter()
         .map(|arrived| search.assemble(arrived))
@@ -794,9 +1028,29 @@ impl<'a> Search<'a> {
             bags: vec![Bag::default(); timetable.stop_count() as usize],
             destination: DestinationBag::default(),
             prune_target: false,
+            cutoff: Vec::new(),
             queue: vec![Vec::new(); view.line_count() as usize],
             touched: Vec::new(),
         }
+    }
+
+    /// Installs the pass's `max_slower` cutoffs: per stop the plain
+    /// bound plus the band, floored at the pass's destination bound
+    /// (`floor`); unreachable stops never prune.
+    fn set_cutoff(&mut self, bounds: &[u32], floor: u32, band: u32) {
+        self.cutoff.clear();
+        self.cutoff.extend(bounds.iter().map(|&bound| {
+            if bound == u32::MAX {
+                u32::MAX
+            } else {
+                bound.saturating_add(band).max(floor)
+            }
+        }));
+    }
+
+    /// Whether the pass's `max_slower` cutoff drops an arrival at a stop.
+    fn beyond_cutoff(&self, stop: StopIdx, arrival: u32) -> bool {
+        !self.cutoff.is_empty() && arrival > self.cutoff[stop.0 as usize]
     }
 
     fn key(&self, grams: f64) -> i64 {
@@ -848,7 +1102,8 @@ impl<'a> Search<'a> {
             let arrival = departure.saturating_add(seconds);
             let label = self.arena.len() as u32;
             let key = self.key(0.0);
-            if self.target_pruned(departure, arrival, key, 0.0) {
+            if self.beyond_cutoff(stop, arrival) || self.target_pruned(departure, arrival, key, 0.0)
+            {
                 continue;
             }
             if self.bags[stop.0 as usize].insert_slack(arrival, 0, 0.0, key, 0, self.slack) {
@@ -905,12 +1160,14 @@ impl<'a> Search<'a> {
                 for footpath in self.footpaths.from_stop(from.stop) {
                     let arrival = from.arrival.saturating_add(footpath.duration);
                     let walked = self.arena.len() as u32;
-                    if self.target_pruned(
-                        from.departure,
-                        arrival.saturating_add(from.penalty),
-                        key,
-                        from.grams,
-                    ) {
+                    if self.beyond_cutoff(footpath.to, arrival)
+                        || self.target_pruned(
+                            from.departure,
+                            arrival.saturating_add(from.penalty),
+                            key,
+                            from.grams,
+                        )
+                    {
                         continue;
                     }
                     // A footpath adds no route penalty; it inherits the chain's.
@@ -1016,7 +1273,13 @@ impl<'a> Search<'a> {
                 // This ride pays the line's route penalty once, on top of the
                 // penalty its boarding chain already carried.
                 let penalty = rider.penalty.saturating_add(line_penalty);
-                if self.target_pruned(rider.departure, arrival.saturating_add(penalty), key, grams)
+                if self.beyond_cutoff(stops[position], arrival)
+                    || self.target_pruned(
+                        rider.departure,
+                        arrival.saturating_add(penalty),
+                        key,
+                        grams,
+                    )
                 {
                     continue;
                 }

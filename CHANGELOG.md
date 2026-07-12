@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- ``max_slower`` — an opt-in restriction of the pareto frontier to the
+  fast end of the trade-off, on ``journey_frontier`` and
+  ``journey_frontiers`` (``candidates="pareto"``, ``router="raptor"``).
+  Per departure pass, every returned journey arrives within
+  ``max_slower`` seconds of that pass's fastest resolved-factor arrival
+  (per cell in the batched product), and the fastest journey is always
+  among the rows; within the band the set is best-effort — the in-search
+  pruning is a per-stop prefix heuristic that shrinks the bags and the
+  search cost, not just the output. ``None`` (default) keeps the exact
+  frontier.
+
 - Target pruning in the one-pair multicriteria search — labels already
   dominated by the destination's frontier bag are dropped at creation
   (arrival, penalty, and emissions only grow along a journey, so a
