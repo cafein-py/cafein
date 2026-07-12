@@ -116,6 +116,7 @@ fn matches_the_oracle_with_a_vanishing_bucket() {
         0,
         None,
         &[],
+        None,
     );
     let points = pareto_oracle(
         &view,
@@ -185,6 +186,7 @@ fn zero_slack_matches_the_strict_frontier() {
         0,
         None,
         &[],
+        None,
     );
     // Only the fast dirty line and the slow clean one; the middle line
     // is strictly dominated and dropped.
@@ -213,6 +215,7 @@ fn a_time_slack_keeps_the_suboptimal_middle_line() {
         200,
         None,
         &[],
+        None,
     );
     assert_eq!(
         triples(&relaxed, &geometry, &factors),
@@ -239,6 +242,7 @@ fn max_options_keeps_the_frontier_over_the_suboptimal() {
         200,
         Some(2),
         &[],
+        None,
     );
     assert_eq!(
         triples(&capped, &geometry, &factors),
@@ -288,6 +292,7 @@ fn a_time_slack_boards_the_next_same_line_trip() {
         0,
         None,
         &[],
+        None,
     );
     assert_eq!(triples(&strict, &geometry, &factors), vec![(500, 100.0, 1)]);
     // A 200 s slack boards the next departure too — the "one trip later"
@@ -303,6 +308,7 @@ fn a_time_slack_boards_the_next_same_line_trip() {
         200,
         None,
         &[],
+        None,
     );
     assert_eq!(
         triples(&relaxed, &geometry, &factors),
@@ -357,6 +363,7 @@ fn a_time_slack_boards_the_next_trip_after_a_later_frontier() {
         0,
         None,
         &[],
+        None,
     );
     assert_eq!(
         triples(&strict, &geometry, &factors),
@@ -376,6 +383,7 @@ fn a_time_slack_boards_the_next_trip_after_a_later_frontier() {
         200,
         None,
         &[],
+        None,
     );
     assert_eq!(
         triples(&relaxed, &geometry, &factors),
@@ -463,6 +471,7 @@ fn a_route_ban_forces_the_other_corridor() {
         0,
         None,
         &[],
+        None,
     );
     assert_eq!(triples(&all, &geometry, &factors), vec![(500, 50.0, 1)]);
     // Ban route 0 (the `u32::MAX` sentinel): only the slower corridor on
@@ -478,6 +487,7 @@ fn a_route_ban_forces_the_other_corridor() {
         0,
         None,
         &[u32::MAX, 0],
+        None,
     );
     assert_eq!(triples(&banned, &geometry, &factors), vec![(700, 50.0, 1)]);
 }
@@ -502,6 +512,7 @@ fn a_soft_route_penalty_flips_the_winner_but_reports_the_true_arrival() {
         0,
         None,
         &[100, 0],
+        None,
     );
     assert_eq!(triples(&light, &geometry, &factors), vec![(500, 50.0, 1)]);
     // A penalty over the gap flips the winner to route 1 (effective 750 > 700),
@@ -517,6 +528,7 @@ fn a_soft_route_penalty_flips_the_winner_but_reports_the_true_arrival() {
         0,
         None,
         &[250, 0],
+        None,
     );
     assert_eq!(triples(&heavy, &geometry, &factors), vec![(700, 50.0, 1)]);
 }
@@ -544,6 +556,7 @@ fn a_penalized_early_label_still_catches_its_connection() {
         0,
         None,
         &[300, 0, 0, 0],
+        None,
     );
     let arrivals: Vec<u32> = journeys.iter().map(|journey| journey.arrival).collect();
     assert!(
@@ -569,6 +582,7 @@ fn a_wide_bucket_collapses_to_the_fastest_journey() {
         0,
         None,
         &[],
+        None,
     );
     assert_eq!(
         triples(&journeys, &geometry, &factors),
@@ -626,6 +640,7 @@ fn loop_backs_walk_nowhere() {
         0,
         None,
         &[],
+        None,
     );
     assert_eq!(
         triples(&journeys, &geometry, &factors),
@@ -670,6 +685,7 @@ fn waits_for_the_cleaner_trip_on_a_mixed_factor_line() {
         0,
         None,
         &[],
+        None,
     );
     let points = pareto_oracle(
         &view,
@@ -736,6 +752,7 @@ fn transfers_over_a_footpath_match_the_oracle() {
         0,
         None,
         &[],
+        None,
     );
     let points = pareto_oracle(
         &view,
@@ -795,6 +812,7 @@ fn skips_unresolved_factors() {
         0,
         None,
         &[],
+        None,
     );
     assert!(journeys.is_empty());
 }
@@ -1024,6 +1042,7 @@ fn profiles_the_departure_window() {
         0,
         None,
         &[],
+        None,
     );
     let profile: Vec<(u32, u32)> = journeys
         .iter()
@@ -1062,6 +1081,7 @@ fn frontier_matrix_matches_the_one_pair_profile_per_cell() {
         destinations.len(),
         1000,
         1e-6,
+        None,
     );
     let keys = |journeys: &[Journey]| -> Vec<(u32, u32, u32, f64)> {
         journeys
@@ -1092,6 +1112,7 @@ fn frontier_matrix_matches_the_one_pair_profile_per_cell() {
                 0,
                 None,
                 &[],
+                None,
             );
             assert_eq!(keys(cell), keys(&journeys));
         }
@@ -1160,9 +1181,144 @@ fn target_pruning_keeps_the_same_bucket_refinement() {
         0,
         None,
         &[],
+        None,
     );
     assert_eq!(journeys.len(), 1);
     assert_eq!(journeys[0].arrival, 500);
     assert_eq!(journeys[0].rides(), 2);
     assert_eq!(grams_of(&journeys[0], &geometry, &factors), 10.0);
+}
+
+#[test]
+fn max_slower_trims_the_slow_tail() {
+    let (timetable, geometry, factors) = relaxed_fixture();
+    let view = DayView::universal(&timetable);
+    let footpaths = Transfers::empty(2);
+    let request = request(StopIdx(0), StopIdx(1), 3);
+    let banded = |band: u32| {
+        route(
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            1e-6,
+            0,
+            None,
+            &[],
+            Some(band),
+        )
+    };
+    // The clean line arrives 200 s after the fast one: a 100 s band
+    // drops it, a 300 s band keeps the full frontier.
+    assert_eq!(
+        triples(&banded(100), &geometry, &factors),
+        vec![(500, 100.0, 1)]
+    );
+    assert_eq!(
+        triples(&banded(300), &geometry, &factors),
+        vec![(500, 100.0, 1), (700, 60.0, 1)]
+    );
+}
+
+#[test]
+fn max_slower_keeps_the_fastest_past_a_strayed_prefix() {
+    // Stop 1's plain bound (150) comes from a two-ride chain that
+    // exhausts the transfer budget, while the destination's only
+    // journey rides the slow direct line to stop 1 (arriving 400 —
+    // beyond bound + band) and continues. The cutoff floor at the
+    // destination bound must keep that prefix alive.
+    let mut builder = TimetableBuilder::new(5);
+    let fast_a = builder.add_pattern(&[StopIdx(0), StopIdx(4)], 0).unwrap();
+    let fast_b = builder.add_pattern(&[StopIdx(4), StopIdx(1)], 1).unwrap();
+    let slow = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 2).unwrap();
+    let onward = builder.add_pattern(&[StopIdx(1), StopIdx(3)], 3).unwrap();
+    builder
+        .add_trip(fast_a, vec![time(100), time(120)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(fast_b, vec![time(130), time(150)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(slow, vec![time(100), time(400)], 2, 0)
+        .unwrap();
+    builder
+        .add_trip(onward, vec![time(450), time(600)], 3, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 100.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 100.0], DistanceProvenance::CrowFly),
+            (TripIdx(2), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(3), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let factors = [10.0, 10.0, 10.0, 10.0];
+    let view = DayView::universal(&timetable);
+    let footpaths = Transfers::empty(5);
+    let request = request(StopIdx(0), StopIdx(3), 1);
+    let journeys = route(
+        &view,
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        &request,
+        1e-6,
+        0,
+        None,
+        &[],
+        Some(100),
+    );
+    assert_eq!(journeys.len(), 1);
+    assert_eq!(journeys[0].arrival, 600);
+    assert_eq!(journeys[0].rides(), 2);
+}
+
+#[test]
+fn max_slower_anchors_at_the_resolved_bound() {
+    // The truly fastest line's factor is unresolved, so the
+    // multicriteria search cannot ride it; the band must anchor at the
+    // fastest *resolved* arrival or the only reportable journey dies.
+    let mut builder = TimetableBuilder::new(2);
+    let unresolved = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let resolved = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 1).unwrap();
+    builder
+        .add_trip(unresolved, vec![time(100), time(500)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(resolved, vec![time(100), time(800)], 1, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let factors = [f64::NAN, 10.0];
+    let view = DayView::universal(&timetable);
+    let footpaths = Transfers::empty(2);
+    let request = request(StopIdx(0), StopIdx(1), 3);
+    let journeys = route(
+        &view,
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        &request,
+        1e-6,
+        0,
+        None,
+        &[],
+        Some(100),
+    );
+    assert_eq!(journeys.len(), 1);
+    assert_eq!(journeys[0].arrival, 800);
 }

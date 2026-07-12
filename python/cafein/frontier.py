@@ -72,6 +72,7 @@ def journey_frontier(
     max_options=None,
     diversity="time",
     penalty="ban",
+    max_slower=None,
     walking_speed_kmph=None,
     max_walking_time=None,
     max_snap_distance=None,
@@ -192,6 +193,18 @@ def journey_frontier(
         so a corridor that mostly differs yet shares a trunk can surface
         (the R5-style soft penalty), and the set can hold more options
         before it dries up. Unused for the other candidate sets.
+    max_slower : float (optional, default: None)
+        Restrict the ``"pareto"`` frontier (``router="raptor"`` only) to
+        journeys near the fast end: per departure pass, every returned
+        journey arrives within ``max_slower`` seconds of the pass's
+        fastest resolved-factor arrival, and that fastest journey is
+        always among the rows (the walking-only journey is dropped when
+        it falls outside the band of the fastest transit journey).
+        Within the band the set is best-effort, not complete — the
+        in-search pruning is a per-stop (prefix) heuristic, so a journey
+        whose final arrival is inside the band may still be excluded
+        when its prefix strays outside it. ``None`` (the default) keeps
+        today's exact behavior.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         Street-search options for the walking access/egress, as in
         ``route_between_coordinates``. For stop origins/destinations they
@@ -217,6 +230,7 @@ def journey_frontier(
         raise ValueError("router must be 'raptor' or 'tbtr'")
     if router == "tbtr" and candidates != "pareto":
         raise ValueError("router='tbtr' requires candidates='pareto'")
+    max_slower = _validated_max_slower(max_slower, candidates, router)
     slack, options, rounds = _alternative_options(
         candidates, slack_seconds, max_options, diversity, penalty
     )
@@ -268,6 +282,7 @@ def journey_frontier(
                 geometries,
                 slack,
                 options,
+                max_slower=max_slower,
             )
         else:
             journeys = network.route_between_stops(
@@ -301,6 +316,7 @@ def journey_frontier(
             geometries,
             slack,
             options,
+            max_slower=max_slower,
         )
     else:
         journeys = network.route_between_coordinates(
@@ -371,6 +387,7 @@ def journey_frontiers(
     components=None,
     fares=None,
     bucket=25.0,
+    max_slower=None,
     walking_speed_kmph=None,
     max_walking_time=None,
     max_snap_distance=None,
@@ -400,9 +417,11 @@ def journey_frontiers(
     date, departure, window
         The service date, window start, and window length, as in
         ``journey_frontier``.
-    max_transfers, factors, components, fares, bucket
+    max_transfers, factors, components, fares, bucket, max_slower
         As in ``journey_frontier`` (``bucket`` is the pareto search's
-        emissions bucket width in grams).
+        emissions bucket width in grams; ``max_slower`` restricts each
+        cell to its own band of the cell's per-pass fastest journey,
+        which always stays among the rows).
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         Street-search options for the coordinate queries, as in
         ``route_between_coordinates``.
@@ -424,6 +443,7 @@ def journey_frontiers(
         raise ValueError(
             "origins and destinations must both be stop ids or both be point frames"
         )
+    max_slower = _validated_max_slower(max_slower, "pareto", "raptor")
     trip_factors = emissions.trip_factors(network, factors, components)
     if stops[0] is not None:
         from_ids, to_ids = stops
@@ -437,6 +457,7 @@ def journey_frontiers(
             max_transfers,
             bucket,
             geometries,
+            max_slower=max_slower,
         )
     else:
         from cafein.matrices import _point_list, _warn_unsnapped
@@ -455,6 +476,7 @@ def journey_frontiers(
             bucket,
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
             geometries,
+            max_slower=max_slower,
         )
         cells = table["journeys"]
         _warn_unsnapped(table, from_ids, to_ids)
@@ -480,6 +502,20 @@ def journey_frontiers(
         columns.append("fare")
     columns.append("journey")
     return pd.DataFrame(columns=columns)
+
+
+def _validated_max_slower(max_slower, candidates, router):
+    """The validated ``max_slower`` band in whole seconds, or ``None``."""
+    if max_slower is None:
+        return None
+    if candidates != "pareto":
+        raise ValueError("max_slower requires candidates='pareto'")
+    if router != "raptor":
+        raise ValueError("max_slower requires router='raptor'")
+    band = float(max_slower)
+    if not math.isfinite(band) or band < 0:
+        raise ValueError("max_slower must be a non-negative number of seconds")
+    return int(round(band))
 
 
 def _frontier_ids(values, role):

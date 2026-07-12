@@ -1435,3 +1435,161 @@ def test_journey_frontiers_validate_their_inputs(network_with_footpaths):
             "08:30:00",
             window=600,
         )
+
+
+def test_max_slower_defaults_off_and_a_wide_band_changes_nothing(
+    network_with_footpaths,
+):
+    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+    origin, destination = coordinates["1100602"], coordinates["1040280"]
+    kwargs = dict(
+        window=600,
+        candidates="pareto",
+    )
+    unrestricted = journey_frontier(
+        network_with_footpaths, origin, destination, "2022-02-22", "08:30:00", **kwargs
+    )
+    wide = journey_frontier(
+        network_with_footpaths,
+        origin,
+        destination,
+        "2022-02-22",
+        "08:30:00",
+        max_slower=100_000,
+        **kwargs,
+    )
+    for column in ("departure", "arrival", "travel_time", "rides", "frontier"):
+        assert wide[column].tolist() == unrestricted[column].tolist()
+
+
+def test_max_slower_bands_the_frontier_and_keeps_the_fastest(network_with_footpaths):
+    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+    origin, destination = coordinates["1100602"], coordinates["1040280"]
+    unrestricted = journey_frontier(
+        network_with_footpaths,
+        origin,
+        destination,
+        "2022-02-22",
+        "08:30:00",
+        window=600,
+        candidates="pareto",
+    )
+    band = 120
+    banded = journey_frontier(
+        network_with_footpaths,
+        origin,
+        destination,
+        "2022-02-22",
+        "08:30:00",
+        window=600,
+        candidates="pareto",
+        max_slower=band,
+    )
+    assert 0 < len(banded) < len(unrestricted)
+    transit = unrestricted[unrestricted["rides"] >= 1]
+    banded_transit = banded[banded["rides"] >= 1]
+    # The fastest transit journey survives the restriction …
+    assert transit["arrival"].min() in banded_transit["arrival"].tolist()
+    # … and every kept row stays within its own pass's band: no more
+    # than `band` behind the fastest unrestricted arrival of the same
+    # departure.
+    for row in banded_transit.itertuples():
+        anchor = transit[transit["departure"] == row.departure]["arrival"].min()
+        assert row.arrival <= anchor + band
+
+
+def test_max_slower_is_validated(network_with_footpaths):
+    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+    origin, destination = coordinates["1100602"], coordinates["1040280"]
+    for candidates in ("time", "relaxed", "diverse"):
+        with pytest.raises(ValueError, match="candidates='pareto'"):
+            journey_frontier(
+                network_with_footpaths,
+                origin,
+                destination,
+                "2022-02-22",
+                "08:30:00",
+                window=600,
+                candidates=candidates,
+                max_slower=300,
+            )
+    with pytest.raises(ValueError, match="router='raptor'"):
+        journey_frontier(
+            network_with_footpaths,
+            "1100602",
+            "1040280",
+            "2022-02-22",
+            "08:30:00",
+            window=600,
+            candidates="pareto",
+            router="tbtr",
+            max_slower=300,
+        )
+    with pytest.raises(ValueError, match="non-negative"):
+        journey_frontier(
+            network_with_footpaths,
+            origin,
+            destination,
+            "2022-02-22",
+            "08:30:00",
+            window=600,
+            candidates="pareto",
+            max_slower=-1,
+        )
+
+
+def test_journey_frontiers_band_each_cell_independently(network_with_footpaths):
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    from cafein import journey_frontiers
+
+    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+    ids = ["1100602", "1040280"]
+    points = gpd.GeoDataFrame(
+        {"id": ids},
+        geometry=[Point(coordinates[stop][1], coordinates[stop][0]) for stop in ids],
+        crs="EPSG:4326",
+    )
+    band = 120
+    banded = journey_frontiers(
+        network_with_footpaths,
+        points,
+        points,
+        "2022-02-22",
+        "08:30:00",
+        window=600,
+        max_slower=band,
+    )
+    unrestricted = journey_frontiers(
+        network_with_footpaths, points, points, "2022-02-22", "08:30:00", window=600
+    )
+    for origin in ids:
+        for destination in ids:
+            cell = banded[
+                (banded["from_id"] == origin) & (banded["to_id"] == destination)
+            ]
+            full = unrestricted[
+                (unrestricted["from_id"] == origin)
+                & (unrestricted["to_id"] == destination)
+            ]
+            transit = full[full["rides"] >= 1]
+            banded_transit = cell[cell["rides"] >= 1]
+            if len(transit) == 0:
+                continue
+            # The cell's fastest transit journey survives, and every kept
+            # row sits within the cell's own per-pass band.
+            assert transit["arrival"].min() in banded_transit["arrival"].tolist()
+            for row in banded_transit.itertuples():
+                anchor = transit[transit["departure"] == row.departure]["arrival"].min()
+                assert row.arrival <= anchor + band
+    with pytest.raises(ValueError, match="non-negative"):
+        journey_frontiers(
+            network_with_footpaths,
+            points,
+            points,
+            "2022-02-22",
+            "08:30:00",
+            window=600,
+            max_slower=float("nan"),
+        )
