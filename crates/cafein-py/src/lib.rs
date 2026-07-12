@@ -2994,6 +2994,7 @@ impl TransportNetwork {
                         banned_routes,
                         route_penalties,
                         max_slower,
+                        router,
                     );
                 }
             }
@@ -3088,7 +3089,7 @@ impl TransportNetwork {
     /// -------
     /// list of dict
     ///     Journeys shaped as in ``route_between_coordinates``.
-    #[pyo3(signature = (origin, destination, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, banned_routes = vec![], route_penalties = vec![], max_slower = None))]
+    #[pyo3(signature = (origin, destination, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, banned_routes = vec![], route_penalties = vec![], max_slower = None, router = "raptor"))]
     #[allow(clippy::too_many_arguments)]
     fn mc_route_between_coordinates(
         &self,
@@ -3110,11 +3111,15 @@ impl TransportNetwork {
         banned_routes: Vec<String>,
         route_penalties: Vec<(String, u64)>,
         max_slower: Option<u32>,
+        router: &str,
     ) -> PyResult<Py<PyList>> {
         if !bucket.is_finite() || bucket <= 0.0 {
             return Err(PyValueError::new_err(
                 "bucket must be a positive number of grams",
             ));
+        }
+        if router != "raptor" && router != "tbtr" {
+            return Err(PyValueError::new_err("router must be 'raptor' or 'tbtr'"));
         }
         if !slack.is_finite() || slack < 0.0 {
             return Err(PyValueError::new_err(
@@ -3126,8 +3131,18 @@ impl TransportNetwork {
                 "max_options must be a positive integer",
             ));
         }
-        if max_slower.is_some()
+        if router == "tbtr"
             && (slack > 0.0 || !banned_routes.is_empty() || !route_penalties.is_empty())
+        {
+            return Err(PyValueError::new_err(
+                "route slacks, bans and penalties require router='raptor'",
+            ));
+        }
+        if max_slower.is_some()
+            && (router == "tbtr"
+                || slack > 0.0
+                || !banned_routes.is_empty()
+                || !route_penalties.is_empty())
         {
             return Err(PyValueError::new_err(
                 "max_slower requires router='raptor' and strict pareto candidates",
@@ -3205,6 +3220,20 @@ impl TransportNetwork {
         let slack = slack.round() as u32;
         let penalty_mask = self.route_penalty_mask(&banned_routes, &route_penalties);
         let journeys = py.allow_threads(|| {
+            if router == "tbtr" {
+                let engine = McTbtrEngine::for_date(
+                    &self.build.timetable,
+                    intermediate,
+                    geometry,
+                    &per_trip,
+                    &request.active_services,
+                    &request.active_services_previous,
+                );
+                return match window {
+                    None => engine.route(&request, bucket),
+                    Some(window) => engine.route_range(&request, window, bucket),
+                };
+            }
             let view = DayView::for_date(
                 &self.build.timetable,
                 &request.active_services,
@@ -3287,7 +3316,7 @@ impl TransportNetwork {
     /// list of list of list of dict
     ///     ``result[i][j]`` is the journey list from ``from_stops[i]``
     ///     to ``to_stops[j]``, shaped as in ``mc_route_between_stops``.
-    #[pyo3(signature = (from_stops, to_stops, date, departure, factors, window, max_transfers = 7, bucket = 25.0, geometries = false, max_slower = None))]
+    #[pyo3(signature = (from_stops, to_stops, date, departure, factors, window, max_transfers = 7, bucket = 25.0, geometries = false, max_slower = None, router = "raptor"))]
     #[allow(clippy::too_many_arguments)]
     fn mc_frontier_matrix(
         &self,
@@ -3302,10 +3331,19 @@ impl TransportNetwork {
         bucket: f64,
         geometries: bool,
         max_slower: Option<u32>,
+        router: &str,
     ) -> PyResult<Py<PyList>> {
         if !bucket.is_finite() || bucket <= 0.0 {
             return Err(PyValueError::new_err(
                 "bucket must be a positive number of grams",
+            ));
+        }
+        if router != "raptor" && router != "tbtr" {
+            return Err(PyValueError::new_err("router must be 'raptor' or 'tbtr'"));
+        }
+        if max_slower.is_some() && router == "tbtr" {
+            return Err(PyValueError::new_err(
+                "max_slower requires router='raptor' and strict pareto candidates",
             ));
         }
         if window == 0 {
@@ -3352,6 +3390,25 @@ impl TransportNetwork {
             })
             .collect();
         let rows = py.allow_threads(|| {
+            if router == "tbtr" {
+                let engine = McTbtrEngine::for_date(
+                    &self.build.timetable,
+                    &self.transfers,
+                    geometry,
+                    &per_trip,
+                    &active_services,
+                    &active_services_previous,
+                );
+                return engine.frontier_matrix(
+                    &requests,
+                    &destinations,
+                    &[],
+                    false,
+                    destinations.len(),
+                    window,
+                    bucket,
+                );
+            }
             let view = DayView::for_date(
                 &self.build.timetable,
                 &active_services,
@@ -3407,7 +3464,7 @@ impl TransportNetwork {
     ///     ``journeys`` — ``result[i][j]`` journey lists;
     ///     ``unsnapped_from`` / ``unsnapped_to`` — indices of points
     ///     off the walking network (their cells stay empty).
-    #[pyo3(signature = (origins, destinations, date, departure, factors, window, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, max_slower = None))]
+    #[pyo3(signature = (origins, destinations, date, departure, factors, window, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, max_slower = None, router = "raptor"))]
     #[allow(clippy::too_many_arguments)]
     fn mc_frontier_matrix_from_points(
         &self,
@@ -3425,10 +3482,19 @@ impl TransportNetwork {
         max_snap_distance: f64,
         geometries: bool,
         max_slower: Option<u32>,
+        router: &str,
     ) -> PyResult<Py<PyDict>> {
         if !bucket.is_finite() || bucket <= 0.0 {
             return Err(PyValueError::new_err(
                 "bucket must be a positive number of grams",
+            ));
+        }
+        if router != "raptor" && router != "tbtr" {
+            return Err(PyValueError::new_err("router must be 'raptor' or 'tbtr'"));
+        }
+        if max_slower.is_some() && router == "tbtr" {
+            return Err(PyValueError::new_err(
+                "max_slower requires router='raptor' and strict pareto candidates",
             ));
         }
         if window == 0 {
@@ -3499,26 +3565,46 @@ impl TransportNetwork {
                         ));
                     }
                 }
-                let view = DayView::for_date(
-                    &self.build.timetable,
-                    &active_services,
-                    &active_services_previous,
-                );
-                let rows = mcraptor::frontier_matrix(
-                    &view,
-                    &self.build.timetable,
-                    intermediate,
-                    geometry,
-                    &per_trip,
-                    &requests,
-                    &[],
-                    &egress_map,
-                    true,
-                    destinations.len(),
-                    window,
-                    bucket,
-                    max_slower,
-                );
+                let rows = if router == "tbtr" {
+                    let engine = McTbtrEngine::for_date(
+                        &self.build.timetable,
+                        intermediate,
+                        geometry,
+                        &per_trip,
+                        &active_services,
+                        &active_services_previous,
+                    );
+                    engine.frontier_matrix(
+                        &requests,
+                        &[],
+                        &egress_map,
+                        true,
+                        destinations.len(),
+                        window,
+                        bucket,
+                    )
+                } else {
+                    let view = DayView::for_date(
+                        &self.build.timetable,
+                        &active_services,
+                        &active_services_previous,
+                    );
+                    mcraptor::frontier_matrix(
+                        &view,
+                        &self.build.timetable,
+                        intermediate,
+                        geometry,
+                        &per_trip,
+                        &requests,
+                        &[],
+                        &egress_map,
+                        true,
+                        destinations.len(),
+                        window,
+                        bucket,
+                        max_slower,
+                    )
+                };
                 let walk = streets.walk_matrix(
                     &origins,
                     &destinations,

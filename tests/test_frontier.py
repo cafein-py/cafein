@@ -1593,3 +1593,99 @@ def test_journey_frontiers_band_each_cell_independently(network_with_footpaths):
             window=600,
             max_slower=float("nan"),
         )
+
+
+def test_the_tbtr_pareto_router_routes_door_to_door(network_with_footpaths):
+    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+    origin, destination = coordinates["1100602"], coordinates["1040280"]
+    frames = [
+        journey_frontier(
+            network_with_footpaths,
+            origin,
+            destination,
+            "2022-02-22",
+            "08:30:00",
+            window=600,
+            max_transfers=3,
+            candidates="pareto",
+            bucket=1e-6,
+            router=router,
+        )
+        for router in ("raptor", "tbtr")
+    ]
+    ordered = [
+        frame.sort_values(["departure", "arrival"]).reset_index(drop=True)
+        for frame in frames
+    ]
+    assert len(ordered[0]) == len(ordered[1]) > 0
+    for column in ("departure", "arrival", "rides", "frontier"):
+        assert ordered[0][column].tolist() == ordered[1][column].tolist()
+    assert ordered[0]["emissions"].tolist() == pytest.approx(
+        ordered[1]["emissions"].tolist(), nan_ok=True
+    )
+    # The walking-only journey survives on both engines.
+    for frame in ordered:
+        assert (frame["rides"] == 0).sum() == 1
+
+
+def test_journey_frontiers_tbtr_matches_raptor(network_with_footpaths):
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    from cafein import journey_frontiers
+
+    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+    ids = ["1100602", "1040280"]
+    points = gpd.GeoDataFrame(
+        {"id": ids},
+        geometry=[Point(coordinates[stop][1], coordinates[stop][0]) for stop in ids],
+        crs="EPSG:4326",
+    )
+    for origins, destinations in ((ids, ids), (points, points)):
+        frames = [
+            journey_frontiers(
+                network_with_footpaths,
+                origins,
+                destinations,
+                "2022-02-22",
+                "08:30:00",
+                window=600,
+                max_transfers=3,
+                bucket=1e-6,
+                router=router,
+            )
+            for router in ("raptor", "tbtr")
+        ]
+        ordered = [
+            frame.sort_values(["from_id", "to_id", "departure", "arrival"]).reset_index(
+                drop=True
+            )
+            for frame in frames
+        ]
+        assert len(ordered[0]) == len(ordered[1]) > 0
+        for column in ("from_id", "to_id", "departure", "arrival", "rides", "frontier"):
+            assert ordered[0][column].tolist() == ordered[1][column].tolist()
+        assert ordered[0]["emissions"].tolist() == pytest.approx(
+            ordered[1]["emissions"].tolist(), nan_ok=True
+        )
+    with pytest.raises(ValueError, match="router"):
+        journey_frontiers(
+            network_with_footpaths,
+            ids,
+            ids,
+            "2022-02-22",
+            "08:30:00",
+            window=600,
+            router="bfs",
+        )
+    with pytest.raises(ValueError, match="router='raptor'"):
+        journey_frontiers(
+            network_with_footpaths,
+            ids,
+            ids,
+            "2022-02-22",
+            "08:30:00",
+            window=600,
+            router="tbtr",
+            max_slower=300,
+        )

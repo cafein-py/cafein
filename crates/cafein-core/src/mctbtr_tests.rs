@@ -594,3 +594,60 @@ fn u_turns_stay_dropped() {
     // (position 1) survives.
     assert_eq!(boarded(&mc, ViewTrip(0), 2), vec![(1, 1)]);
 }
+
+#[test]
+fn the_frontier_matrix_matches_the_one_pair_profile_per_cell() {
+    let (timetable, geometry) = forked();
+    let factors = [10.0, 100.0, 10.0];
+    let footpaths = Transfers::empty(4);
+    let engine = McTbtrEngine::for_date(&timetable, &footpaths, &geometry, &factors, &[true], &[]);
+    let destinations = [StopIdx(3), StopIdx(2), StopIdx(3)];
+    let requests: Vec<Request> = [StopIdx(0), StopIdx(2)]
+        .into_iter()
+        .map(|origin| Request {
+            departure: 0,
+            access: vec![(origin, 0)],
+            egress: Vec::new(),
+            active_services: vec![true],
+            active_services_previous: Vec::new(),
+            max_transfers: 3,
+        })
+        .collect();
+    let cells = engine.frontier_matrix(
+        &requests,
+        &destinations,
+        &[],
+        false,
+        destinations.len(),
+        1000,
+        1e-6,
+    );
+    let keys = |journeys: &[Journey]| -> Vec<(u32, u32, u32, f64)> {
+        journeys
+            .iter()
+            .map(|journey| {
+                (
+                    journey.departure,
+                    journey.arrival,
+                    journey.rides() as u32,
+                    grams_of(journey, &geometry, &factors),
+                )
+            })
+            .collect()
+    };
+    for (request, row) in requests.iter().zip(&cells) {
+        for (&destination, cell) in destinations.iter().zip(row) {
+            let mut one_pair = request.clone();
+            one_pair.egress = vec![(destination, 0)];
+            let journeys = engine.route_range(&one_pair, 1000, 1e-6);
+            assert_eq!(keys(cell), keys(&journeys));
+        }
+    }
+    // Non-vacuity: the forked fixture's fast-dirty and slow-clean
+    // journeys both survive from stop 0 to stop 3, the repeated
+    // destination shares its first slot's cell, and the reverse origin
+    // reaches nothing.
+    assert_eq!(cells[0][0].len(), 2);
+    assert_eq!(keys(&cells[0][2]), keys(&cells[0][0]));
+    assert!(cells[1].iter().all(Vec::is_empty));
+}

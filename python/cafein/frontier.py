@@ -149,11 +149,12 @@ def journey_frontier(
         ``candidates="pareto"`` or ``"relaxed"``.
     router : str (optional, default: "raptor")
         The pareto search engine: McRAPTOR (``"raptor"``) answers
-        immediately; McTBTR (``"tbtr"``, stop ids only) precomputes the
-        date's multicriteria transfer set first — slower for a single
-        pair, built for batch reuse — and returns the same journeys.
-        Only used with ``candidates="pareto"``; ``"relaxed"`` and
-        ``"diverse"`` require ``"raptor"``.
+        immediately; McTBTR (``"tbtr"``) precomputes the date's
+        multicriteria transfer set first — slower for a single pair,
+        built for batch reuse — and returns the same journeys, for stop
+        ids and coordinates alike. Only used with
+        ``candidates="pareto"``; ``"relaxed"``, ``"diverse"``, and
+        ``max_slower`` require ``"raptor"``.
     slack_seconds : float (optional, default: None)
         The time-slack band in seconds. For ``candidates="relaxed"`` a
         journey is kept even when a cleaner or simpler one dominates it,
@@ -300,8 +301,6 @@ def journey_frontier(
     elif multicriteria:
         from cafein.network import _walk_options
 
-        if router == "tbtr":
-            raise ValueError("router='tbtr' requires stop ids, not coordinates")
         trip_factors = emissions.trip_factors(network, factors, components)
         journeys = network._core.mc_route_between_coordinates(
             tuple(origin),
@@ -317,6 +316,7 @@ def journey_frontier(
             slack,
             options,
             max_slower=max_slower,
+            router=router,
         )
     else:
         journeys = network.route_between_coordinates(
@@ -387,6 +387,7 @@ def journey_frontiers(
     components=None,
     fares=None,
     bucket=25.0,
+    router="raptor",
     max_slower=None,
     walking_speed_kmph=None,
     max_walking_time=None,
@@ -417,11 +418,14 @@ def journey_frontiers(
     date, departure, window
         The service date, window start, and window length, as in
         ``journey_frontier``.
-    max_transfers, factors, components, fares, bucket, max_slower
+    max_transfers, factors, components, fares, bucket, router, max_slower
         As in ``journey_frontier`` (``bucket`` is the pareto search's
-        emissions bucket width in grams; ``max_slower`` restricts each
-        cell to its own band of the cell's per-pass fastest journey,
-        which always stays among the rows).
+        emissions bucket width in grams; ``router="tbtr"`` answers over
+        the McTBTR engine — one multicriteria transfer set built per
+        call backs every origin — and returns the same journeys;
+        ``max_slower`` restricts each cell to its own band of the
+        cell's per-pass fastest journey, which always stays among the
+        rows, and requires ``"raptor"``).
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         Street-search options for the coordinate queries, as in
         ``route_between_coordinates``.
@@ -443,7 +447,9 @@ def journey_frontiers(
         raise ValueError(
             "origins and destinations must both be stop ids or both be point frames"
         )
-    max_slower = _validated_max_slower(max_slower, "pareto", "raptor")
+    if router not in ("raptor", "tbtr"):
+        raise ValueError("router must be 'raptor' or 'tbtr'")
+    max_slower = _validated_max_slower(max_slower, "pareto", router)
     trip_factors = emissions.trip_factors(network, factors, components)
     if stops[0] is not None:
         from_ids, to_ids = stops
@@ -458,6 +464,7 @@ def journey_frontiers(
             bucket,
             geometries,
             max_slower=max_slower,
+            router=router,
         )
     else:
         from cafein.matrices import _point_list, _warn_unsnapped
@@ -477,6 +484,7 @@ def journey_frontiers(
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
             geometries,
             max_slower=max_slower,
+            router=router,
         )
         cells = table["journeys"]
         _warn_unsnapped(table, from_ids, to_ids)

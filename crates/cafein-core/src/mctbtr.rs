@@ -401,6 +401,25 @@ impl MatrixSink<'_> {
     }
 }
 
+/// Per-destination-slot frontier state for the batched product: every
+/// egress join the one-pair search would make feeds its slot's
+/// destination frontier instead, under the same `join` rules, so a
+/// batched cell's journeys equal the single-pair query's. Stop mode
+/// joins a destination stop's own alights and footpath walks with no
+/// final walk; door-to-door mode (`egress_active`) walks each join
+/// through the per-stop final-egress map, the walking-only journey
+/// being the caller's overlay.
+struct FrontierSink<'a> {
+    /// Per stop: destination slot + 1, or 0 when not a destination.
+    slots: &'a [u32],
+    /// Per stop: `(destination slot, walk seconds, walk meters)` final
+    /// egress; consulted only in door-to-door mode.
+    egress: &'a [Vec<(u32, u32, f64)>],
+    egress_active: bool,
+    /// Per slot: the destination frontier the cell assembles from.
+    bags: &'a mut [Vec<Arrived>],
+}
+
 /// The multicriteria trip-based engine for one query date: the day
 /// view, the dominance-aware transfer set, and per-trip factors.
 /// Queries return the same journeys McRAPTOR's would — verified
@@ -459,7 +478,7 @@ impl<'a> McTbtrEngine<'a> {
         bucket: f64,
         fold: &mut Option<MatrixSink<'_>>,
     ) -> Vec<Journey> {
-        let (arena, destination) = self.passes(request, departures, bucket, fold);
+        let (arena, destination) = self.passes(request, departures, bucket, fold, &mut None);
         let mut journeys: Vec<Journey> = destination
             .iter()
             .map(|arrived| self.assemble(arrived, &arena))
@@ -476,6 +495,7 @@ impl<'a> McTbtrEngine<'a> {
         departures: &[u32],
         bucket: f64,
         fold: &mut Option<MatrixSink<'_>>,
+        frontier: &mut Option<FrontierSink<'_>>,
     ) -> (Vec<Segment>, Vec<Arrived>) {
         assert!(
             bucket.is_finite() && bucket > 0.0,
@@ -539,6 +559,7 @@ impl<'a> McTbtrEngine<'a> {
                         &mut destination,
                         &mut queue,
                         fold,
+                        frontier,
                     );
                 }
             }
@@ -627,6 +648,7 @@ impl<'a> McTbtrEngine<'a> {
         destination: &mut Vec<Arrived>,
         queue: &mut [Vec<u32>],
         fold: &mut Option<MatrixSink<'_>>,
+        frontier: &mut Option<FrontierSink<'_>>,
     ) {
         let segment = arena[index as usize];
         let trip = segment.trip;
@@ -643,28 +665,43 @@ impl<'a> McTbtrEngine<'a> {
                     - boarded_from;
             let grams = quantized(segment.grams + ridden);
             let stop = stops[alight];
-            // Direct egress joins.
-            for &(egress, seconds) in &request.egress {
-                if egress == stop {
-                    self.join(
-                        destination,
+            // Alights, direct egress joins, and query-time footpaths are
+            // all gated on stop-bag improvement (the T4b semantics) —
+            // the same admission McRAPTOR's egress check applies, so a
+            // dominated arrival (the origin's own access seed included)
+            // never joins a destination. Rank the rides used (this
+            // segment's round) so a later-departure pass that reached
+            // the stop on more rides cannot suppress a cleaner
+            // fewer-rides arrival across the profile — the same
+            // cross-pass soundness the McRAPTOR bag needs.
+            if stop_bags[stop.0 as usize].insert(arrival, grams, key(grams), round as u8) {
+                for &(egress, seconds) in &request.egress {
+                    if egress == stop {
+                        self.join(
+                            destination,
+                            key,
+                            segment.departure,
+                            arrival.saturating_add(seconds),
+                            grams,
+                            index,
+                            alight as u16,
+                            None,
+                        );
+                    }
+                }
+                if let Some(sink) = frontier {
+                    self.frontier_join(
+                        sink,
+                        stop,
                         key,
                         segment.departure,
-                        arrival.saturating_add(seconds),
+                        arrival,
                         grams,
                         index,
                         alight as u16,
                         None,
                     );
                 }
-            }
-            // Query-time footpaths, gated on stop-bag improvement (the
-            // T4b semantics); improving walks board and join. Rank the
-            // rides used (this segment's round) so a later-departure
-            // pass that reached the stop on more rides cannot suppress a
-            // cleaner fewer-rides arrival across the profile — the same
-            // cross-pass soundness the McRAPTOR bag needs.
-            if stop_bags[stop.0 as usize].insert(arrival, grams, key(grams), round as u8) {
                 if let Some(sink) = fold {
                     sink.fold(
                         stop,
@@ -708,6 +745,19 @@ impl<'a> McTbtrEngine<'a> {
                                 Some((footpath.to, footpath.duration)),
                             );
                         }
+                    }
+                    if let Some(sink) = frontier {
+                        self.frontier_join(
+                            sink,
+                            footpath.to,
+                            key,
+                            segment.departure,
+                            reached,
+                            grams,
+                            index,
+                            alight as u16,
+                            Some((footpath.to, footpath.duration)),
+                        );
                     }
                     if round < rounds {
                         let duration = footpath.duration;
@@ -821,6 +871,138 @@ impl<'a> McTbtrEngine<'a> {
         });
     }
 
+    /// Routes an egress join into every destination slot the stop
+    /// serves, under the one-pair `join` rules: the slot's own stop in
+    /// stop mode (no final walk), the per-stop final-egress map in
+    /// door-to-door mode (`arrival` is before the final walk).
+    #[allow(clippy::too_many_arguments)]
+    fn frontier_join(
+        &self,
+        sink: &mut FrontierSink<'_>,
+        stop: StopIdx,
+        key: impl Fn(f64) -> i64 + Copy,
+        departure: u32,
+        arrival: u32,
+        grams: f64,
+        leaf: u32,
+        alight: u16,
+        walk: Option<(StopIdx, u32)>,
+    ) {
+        if !sink.egress_active {
+            let slot = sink.slots[stop.0 as usize];
+            if slot != 0 {
+                self.join(
+                    &mut sink.bags[slot as usize - 1],
+                    key,
+                    departure,
+                    arrival,
+                    grams,
+                    leaf,
+                    alight,
+                    walk,
+                );
+            }
+            return;
+        }
+        for index in 0..sink.egress[stop.0 as usize].len() {
+            let (slot, seconds, _) = sink.egress[stop.0 as usize][index];
+            self.join(
+                &mut sink.bags[slot as usize],
+                key,
+                departure,
+                arrival.saturating_add(seconds),
+                grams,
+                leaf,
+                alight,
+                walk,
+            );
+        }
+    }
+
+    /// The batched Pareto frontiers over this engine's candidate set:
+    /// per request × destination slot, the (departure, arrival,
+    /// emissions bucket) Pareto journeys of the departure window —
+    /// each cell exactly the one-pair `route_range` set, the McTBTR
+    /// counterpart of `mcraptor::frontier_matrix`. Stop mode takes the
+    /// destination stops; door-to-door mode (`egress_active`) a
+    /// per-stop final-egress map over `slot_count` destination points,
+    /// the walking-only journey being the caller's overlay. One engine
+    /// build (one transfer set) serves every origin, fanned out with
+    /// rayon.
+    #[allow(clippy::too_many_arguments)]
+    pub fn frontier_matrix(
+        &self,
+        requests: &[Request],
+        destinations: &[StopIdx],
+        egress: &[Vec<(u32, u32, f64)>],
+        egress_active: bool,
+        slot_count: usize,
+        window: u32,
+        bucket: f64,
+    ) -> Vec<Vec<Vec<Journey>>> {
+        if egress_active {
+            assert_eq!(
+                egress.len(),
+                self.timetable.stop_count() as usize,
+                "the egress map must be per stop"
+            );
+        } else {
+            assert_eq!(
+                destinations.len(),
+                slot_count,
+                "stop mode takes one slot per destination stop"
+            );
+        }
+        // A stop holds one slot, so repeated destination stops share the
+        // first occurrence's slot and their cells are re-expanded to the
+        // requested order after assembly.
+        let mut slots = vec![0u32; self.timetable.stop_count() as usize];
+        let mut cell_of: Vec<usize> = Vec::with_capacity(destinations.len());
+        let mut unique = 0usize;
+        for &stop in destinations {
+            let slot = slots[stop.0 as usize];
+            if slot == 0 {
+                unique += 1;
+                slots[stop.0 as usize] = unique as u32;
+                cell_of.push(unique - 1);
+            } else {
+                cell_of.push(slot as usize - 1);
+            }
+        }
+        let bag_count = if egress_active { slot_count } else { unique };
+        requests
+            .par_iter()
+            .map(|request| {
+                let departures = departure_candidates(self.timetable, request, window);
+                let mut bags: Vec<Vec<Arrived>> = vec![Vec::new(); bag_count];
+                let mut sink = Some(FrontierSink {
+                    slots: &slots,
+                    egress,
+                    egress_active,
+                    bags: &mut bags,
+                });
+                let (arena, _) = self.passes(request, &departures, bucket, &mut None, &mut sink);
+                let cells: Vec<Vec<Journey>> = bags
+                    .iter()
+                    .map(|bag| {
+                        let mut journeys: Vec<Journey> = bag
+                            .iter()
+                            .map(|arrived| self.assemble(arrived, &arena))
+                            .collect();
+                        journeys.sort_by_key(|journey| {
+                            (journey.departure, journey.arrival, journey.rides())
+                        });
+                        journeys
+                    })
+                    .collect();
+                if egress_active || unique == destinations.len() {
+                    return cells;
+                }
+                cell_of.iter().map(|&cell| cells[cell].clone()).collect()
+            })
+            .collect()
+    }
+
     /// The least-emissions cost matrix over this engine's candidate
     /// set: per origin–destination cell, the cleanest journey (ties
     /// toward the shorter travel time) among the (departure, arrival,
@@ -851,7 +1033,8 @@ impl<'a> McTbtrEngine<'a> {
                     budget,
                     best: &mut best,
                 });
-                let (arena_out, _) = self.passes(request, &departures, bucket, &mut fold);
+                let (arena_out, _) =
+                    self.passes(request, &departures, bucket, &mut fold, &mut None);
                 best.into_iter()
                     .enumerate()
                     .filter_map(|(slot, winner)| {
