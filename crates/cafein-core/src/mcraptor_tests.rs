@@ -1104,3 +1104,65 @@ fn frontier_matrix_matches_the_one_pair_profile_per_cell() {
     assert!(cells[1][0].is_empty() && cells[1][1].is_empty());
     assert_eq!(keys(&cells[0][2]), keys(&cells[0][0]));
 }
+
+#[test]
+fn target_pruning_keeps_the_same_bucket_refinement() {
+    // A dirty direct ride reaches the destination in round one; a
+    // cleaner two-leg journey arrives at the *same* effective time and
+    // bucket one round later, through a different egress stop. Target
+    // pruning must keep its labels alive — the destination bag accepts
+    // it as the same-class refinement — so the reported journey is the
+    // clean one, exactly as without pruning.
+    let mut builder = TimetableBuilder::new(4);
+    let dirty = builder.add_pattern(&[StopIdx(0), StopIdx(3)], 0).unwrap();
+    let leg_a = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 1).unwrap();
+    let leg_b = builder.add_pattern(&[StopIdx(1), StopIdx(2)], 2).unwrap();
+    builder
+        .add_trip(dirty, vec![time(100), time(500)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(leg_a, vec![time(100), time(200)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(leg_b, vec![time(300), time(500)], 2, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 100.0], DistanceProvenance::CrowFly),
+            (TripIdx(2), vec![0.0, 900.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let factors = [100.0, 10.0, 10.0];
+    let view = DayView::universal(&timetable);
+    let footpaths = Transfers::empty(4);
+    let request = Request {
+        departure: 0,
+        access: vec![(StopIdx(0), 0)],
+        egress: vec![(StopIdx(3), 0), (StopIdx(2), 0)],
+        active_services: Vec::new(),
+        active_services_previous: Vec::new(),
+        max_transfers: 3,
+    };
+    // One bucket holds both journeys, so they compare equal on
+    // emissions during the search and the exact grams decide.
+    let journeys = route(
+        &view,
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        &request,
+        1000.0,
+        0,
+        None,
+        &[],
+    );
+    assert_eq!(journeys.len(), 1);
+    assert_eq!(journeys[0].arrival, 500);
+    assert_eq!(journeys[0].rides(), 2);
+    assert_eq!(grams_of(&journeys[0], &geometry, &factors), 10.0);
+}

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Target pruning in the one-pair multicriteria search — labels already
+  dominated by the destination's frontier bag are dropped at creation
+  (arrival, penalty, and emissions only grow along a journey, so a
+  dominated label can never contribute), keeping a same-bucket refinement
+  carve-out so reported journeys are bit-identical. Applies to
+  ``journey_frontier``'s ``pareto``, ``relaxed``, and ``diverse``
+  candidates and ``mc_route_between_stops``/``_coordinates``; the matrix
+  and batched products have no single target and are unchanged.
+
 - ``journey_frontiers`` — a batched ``journey_frontier``: the strict pareto
   frontier of every (origin, destination) cell between two point sets (stop
   ids or point GeoDataFrames), as one long frame with ``from_id``/``to_id``

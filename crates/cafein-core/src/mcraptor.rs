@@ -401,6 +401,11 @@ struct Search<'a> {
     arena: Vec<Label>,
     bags: Vec<Bag>,
     destination: DestinationBag,
+    /// Whether labels prune against the destination bag (target
+    /// pruning) — set per pass, only when a single destination is
+    /// routed (a non-empty `request.egress`); the matrix and batched
+    /// folds have no single target.
+    prune_target: bool,
     /// Per line: the (position, label) boardings queued this round.
     queue: Vec<Vec<(u16, u32)>>,
     touched: Vec<u32>,
@@ -788,6 +793,7 @@ impl<'a> Search<'a> {
             arena: Vec::new(),
             bags: vec![Bag::default(); timetable.stop_count() as usize],
             destination: DestinationBag::default(),
+            prune_target: false,
             queue: vec![Vec::new(); view.line_count() as usize],
             touched: Vec::new(),
         }
@@ -795,6 +801,29 @@ impl<'a> Search<'a> {
 
     fn key(&self, grams: f64) -> i64 {
         (grams / self.bucket).floor() as i64
+    }
+
+    /// Whether a label can be dropped against the destination bag:
+    /// along a journey the arrival, the penalty, and the grams only
+    /// grow, so a continuation's (departure, effective arrival, bucket)
+    /// never improves on the label's and `DestinationBag::insert`'s
+    /// rejection applies transitively. The carve-out keeps the label
+    /// when a continuation could still *refine* a same-class entry —
+    /// equal departure, effective arrival, and bucket with strictly
+    /// lower exact grams — which the bag accepts as a replacement.
+    fn target_pruned(&self, departure: u32, effective: u32, key: i64, grams: f64) -> bool {
+        if !self.prune_target {
+            return false;
+        }
+        self.destination.entries.iter().any(|entry| {
+            entry.departure >= departure
+                && entry.key <= key
+                && entry.effective().saturating_add(self.slack) <= effective
+                && !(entry.departure == departure
+                    && entry.effective() == effective
+                    && entry.key == key
+                    && grams < entry.grams)
+        })
     }
 
     /// One profile pass: seed the access labels at `departure`, then
@@ -813,11 +842,15 @@ impl<'a> Search<'a> {
         fold: &mut Option<MatrixFold<'_>>,
         frontier: &mut Option<FrontierFold<'_>>,
     ) {
+        self.prune_target = !request.egress.is_empty();
         let mut fresh: Vec<u32> = Vec::new();
         for &(stop, seconds) in &request.access {
             let arrival = departure.saturating_add(seconds);
             let label = self.arena.len() as u32;
             let key = self.key(0.0);
+            if self.target_pruned(departure, arrival, key, 0.0) {
+                continue;
+            }
             if self.bags[stop.0 as usize].insert_slack(arrival, 0, 0.0, key, 0, self.slack) {
                 self.arena.push(Label {
                     arrival,
@@ -872,6 +905,14 @@ impl<'a> Search<'a> {
                 for footpath in self.footpaths.from_stop(from.stop) {
                     let arrival = from.arrival.saturating_add(footpath.duration);
                     let walked = self.arena.len() as u32;
+                    if self.target_pruned(
+                        from.departure,
+                        arrival.saturating_add(from.penalty),
+                        key,
+                        from.grams,
+                    ) {
+                        continue;
+                    }
                     // A footpath adds no route penalty; it inherits the chain's.
                     if self.bags[footpath.to.0 as usize].insert_slack(
                         arrival,
@@ -975,6 +1016,10 @@ impl<'a> Search<'a> {
                 // This ride pays the line's route penalty once, on top of the
                 // penalty its boarding chain already carried.
                 let penalty = rider.penalty.saturating_add(line_penalty);
+                if self.target_pruned(rider.departure, arrival.saturating_add(penalty), key, grams)
+                {
+                    continue;
+                }
                 if self.bags[stops[position].0 as usize]
                     .insert_slack(arrival, penalty, grams, key, rides, self.slack)
                 {
