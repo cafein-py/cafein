@@ -720,11 +720,16 @@ pub(crate) struct SearchStats {
     pub closure_bag_rejections: u64,
     /// Entries the rejection scan walked on rejected calls.
     pub closure_bag_reject_entries_examined: u64,
-    /// The subset of those walked on shadow-cache misses — the walks a
-    /// production cache would still pay.
-    pub closure_bag_reject_entries_examined_on_miss: u64,
-    /// Rejected calls the shadow cache missed.
-    pub closure_bag_rejections_on_miss: u64,
+    /// Rejections certified by the front entry (no swap needed).
+    pub closure_mtf_front_rejections: u64,
+    /// Rejections whose witness was swapped to the front.
+    pub closure_mtf_swaps: u64,
+    /// Total one-based depth beyond the front across swapped
+    /// rejections (equals reject entries examined minus rejections).
+    pub closure_mtf_swap_distance: u64,
+    /// One-based rejecting depths: 1, 2, 3–4, 5–8, 9–16, 17–32,
+    /// 33–64, 65–128, and 129+.
+    pub closure_bag_reject_depth_histogram: [u64; 9],
     /// Entries the rejection scan walked on admitted calls.
     pub closure_bag_admit_entries_examined: u64,
     /// Entries the eviction walk examined on admitted calls.
@@ -732,12 +737,6 @@ pub(crate) struct SearchStats {
     /// Pre-call bag lengths: 0, 1, 2, 3–4, 5–8, 9–16, 17–32, 33–128,
     /// and 129+.
     pub closure_bag_length_histogram: [u64; 9],
-    /// Shadow rejections per witness way (way 0 = newest).
-    pub closure_shadow_hits: [u64; SHADOW_WAYS],
-    /// Shadow rejections the real bag then admitted — must stay zero.
-    pub closure_shadow_false_positives: u64,
-    /// Edge-only diagnostic prepass over the touched source slices.
-    pub closure_edge_prepass_ns: u64,
     pub direct_scan_ns: u64,
     pub closure_ns: u64,
     pub expand_ns: u64,
@@ -755,6 +754,21 @@ fn length_bucket(length: u32) -> usize {
         9..=16 => 5,
         17..=32 => 6,
         33..=128 => 7,
+        _ => 8,
+    }
+}
+
+/// Histogram bucket of a one-based rejecting depth.
+fn depth_bucket(depth: u32) -> usize {
+    match depth {
+        0..=1 => 0,
+        2 => 1,
+        3..=4 => 2,
+        5..=8 => 3,
+        9..=16 => 4,
+        17..=32 => 5,
+        33..=64 => 6,
+        65..=128 => 7,
         _ => 8,
     }
 }
@@ -777,9 +791,16 @@ impl SearchStats {
         self.closure_bag_calls += other.closure_bag_calls;
         self.closure_bag_rejections += other.closure_bag_rejections;
         self.closure_bag_reject_entries_examined += other.closure_bag_reject_entries_examined;
-        self.closure_bag_reject_entries_examined_on_miss +=
-            other.closure_bag_reject_entries_examined_on_miss;
-        self.closure_bag_rejections_on_miss += other.closure_bag_rejections_on_miss;
+        self.closure_mtf_front_rejections += other.closure_mtf_front_rejections;
+        self.closure_mtf_swaps += other.closure_mtf_swaps;
+        self.closure_mtf_swap_distance += other.closure_mtf_swap_distance;
+        for (mine, theirs) in self
+            .closure_bag_reject_depth_histogram
+            .iter_mut()
+            .zip(other.closure_bag_reject_depth_histogram)
+        {
+            *mine += theirs;
+        }
         self.closure_bag_admit_entries_examined += other.closure_bag_admit_entries_examined;
         self.closure_bag_retain_entries_examined += other.closure_bag_retain_entries_examined;
         for (mine, theirs) in self
@@ -789,15 +810,6 @@ impl SearchStats {
         {
             *mine += theirs;
         }
-        for (mine, theirs) in self
-            .closure_shadow_hits
-            .iter_mut()
-            .zip(other.closure_shadow_hits)
-        {
-            *mine += theirs;
-        }
-        self.closure_shadow_false_positives += other.closure_shadow_false_positives;
-        self.closure_edge_prepass_ns += other.closure_edge_prepass_ns;
         self.direct_scan_ns += other.direct_scan_ns;
         self.closure_ns += other.closure_ns;
         self.expand_ns += other.expand_ns;
@@ -818,13 +830,11 @@ impl SearchStats {
              segments_scanned_live={} \
              suffix_context_evaluations={} closure_bag_calls={} \
              closure_bag_rejections={} closure_bag_reject_entries_examined={} \
-             closure_bag_reject_entries_examined_on_miss={} \
-             closure_bag_rejections_on_miss={} \
+             closure_mtf_front_rejections={} closure_mtf_swaps={} \
+             closure_mtf_swap_distance={} closure_bag_reject_depth_histogram={} \
              closure_bag_admit_entries_examined={} \
              closure_bag_retain_entries_examined={} \
-             closure_bag_length_histogram={} closure_shadow_hits={} \
-             closure_shadow_false_positives={} \
-             closure_edge_prepass_ms={} direct_scan_ms={} closure_ms={} \
+             closure_bag_length_histogram={} direct_scan_ms={} closure_ms={} \
              expand_ms={} walk_board_ms={}",
             self.closure_edge_records_loaded,
             self.closure_label_edge_relaxations,
@@ -842,8 +852,14 @@ impl SearchStats {
             self.closure_bag_calls,
             self.closure_bag_rejections,
             self.closure_bag_reject_entries_examined,
-            self.closure_bag_reject_entries_examined_on_miss,
-            self.closure_bag_rejections_on_miss,
+            self.closure_mtf_front_rejections,
+            self.closure_mtf_swaps,
+            self.closure_mtf_swap_distance,
+            self.closure_bag_reject_depth_histogram
+                .iter()
+                .map(|count| count.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
             self.closure_bag_admit_entries_examined,
             self.closure_bag_retain_entries_examined,
             self.closure_bag_length_histogram
@@ -851,13 +867,6 @@ impl SearchStats {
                 .map(|count| count.to_string())
                 .collect::<Vec<_>>()
                 .join(","),
-            self.closure_shadow_hits
-                .iter()
-                .map(|count| count.to_string())
-                .collect::<Vec<_>>()
-                .join(","),
-            self.closure_shadow_false_positives,
-            self.closure_edge_prepass_ns / 1_000_000,
             self.direct_scan_ns / 1_000_000,
             self.closure_ns / 1_000_000,
             self.expand_ns / 1_000_000,
@@ -944,92 +953,6 @@ impl MatrixSink<'_> {
 }
 
 const NONE_U32: u32 = u32::MAX;
-
-/// A historical rejection certificate for one target stop: a point
-/// that is, or once was covered by, a stop-bag entry. Dominance is
-/// transitive (including the identical-slot exact-grams refinement),
-/// so a candidate the witness rejects would also be rejected by the
-/// live bag — even after the witness's covering entry was evicted.
-#[derive(Clone, Copy)]
-struct RejectWitness {
-    grams: f64,
-    key: i64,
-    arrival: u32,
-    rides: u8,
-    valid: bool,
-}
-
-impl RejectWitness {
-    const NONE: RejectWitness = RejectWitness {
-        grams: 0.0,
-        key: 0,
-        arrival: 0,
-        rides: 0,
-        valid: false,
-    };
-
-    /// Exactly the stop bag's strict rejection relation.
-    fn rejects(&self, arrival: u32, key: i64, grams: f64, rides: u8) -> bool {
-        self.valid
-            && self.arrival <= arrival
-            && self.key <= key
-            && self.rides <= rides
-            && !(self.arrival == arrival
-                && self.key == key
-                && self.rides == rides
-                && grams < self.grams)
-    }
-}
-
-/// Witness ways per stop in the shadow rejection cache.
-const SHADOW_WAYS: usize = 4;
-
-/// The adaptive rejection cache: per target stop, the most recent
-/// cache-missing candidates, newest first. Lives beside the stop bags
-/// for one origin query and is never reset while they persist.
-struct ClosureRejectCache {
-    ways: Box<[RejectWitness]>,
-}
-
-impl ClosureRejectCache {
-    fn new(stop_count: usize) -> Self {
-        ClosureRejectCache {
-            ways: vec![RejectWitness::NONE; stop_count * SHADOW_WAYS].into_boxed_slice(),
-        }
-    }
-
-    /// The rejecting way (0 = newest witness), or `None` on a miss.
-    fn classify(
-        &self,
-        stop: StopIdx,
-        arrival: u32,
-        key: i64,
-        grams: f64,
-        rides: u8,
-    ) -> Option<usize> {
-        let base = stop.0 as usize * SHADOW_WAYS;
-        self.ways[base..base + SHADOW_WAYS]
-            .iter()
-            .position(|witness| witness.rejects(arrival, key, grams, rides))
-    }
-
-    /// A cache miss becomes the newest witness whether the bag
-    /// admitted it (it is now an entry) or rejected it (some entry
-    /// covers it) — both are sound certificates. Older ways shift
-    /// down; the oldest falls out.
-    fn promote(&mut self, stop: StopIdx, arrival: u32, key: i64, grams: f64, rides: u8) {
-        let base = stop.0 as usize * SHADOW_WAYS;
-        self.ways
-            .copy_within(base..base + SHADOW_WAYS - 1, base + 1);
-        self.ways[base] = RejectWitness {
-            grams,
-            key,
-            arrival,
-            rides,
-            valid: true,
-        };
-    }
-}
 
 /// One direct admission queued for the round's closure sweep, linked
 /// per source stop in direct-scan order.
@@ -1384,19 +1307,16 @@ impl<'a> McTbtrEngine<'a> {
             vec![TripBag::default(); self.view.trip_count() as usize * rounds];
         let mut stop_bags: Vec<Bag> = vec![Bag::default(); self.timetable.stop_count() as usize];
         let mut closure = ClosureBatch::new(self.timetable.stop_count() as usize);
-        // Diagnostic modes (single-thread profiling runs only): the
-        // shadowed rejection cache and the edge-only prepass.
-        let mut shadow = std::env::var_os("CAFEIN_MCTBTR_PROF_OPS")
-            .map(|_| ClosureRejectCache::new(self.timetable.stop_count() as usize));
-        let edge_prepass = std::env::var_os("CAFEIN_MCTBTR_PROF_EDGES").is_some();
+        // Per-operation bag accounting (single-thread profiling runs).
+        let profile_bag_ops = std::env::var_os("CAFEIN_MCTBTR_PROF_OPS").is_some();
         let mut destination: Vec<Arrived> = Vec::new();
         for &departure in departures {
             // Seed: board from every access stop.
             for &(stop, seconds) in &request.access {
                 let ready = departure.saturating_add(seconds);
-                // rides = 0: the trip-based engine ranks rounds in its
-                // trip bags, so its stop bags dominate on (arrival, key)
-                // only — see mcraptor::Bag::insert.
+                // rides = 0: the access seed precedes every ride, so
+                // it ranks below all round-ranked arrivals — see
+                // mcraptor::Bag::insert.
                 let admitted = stop_bags[stop.0 as usize].insert(ready, 0.0, key(0.0), 0);
                 if !admitted {
                     continue;
@@ -1486,8 +1406,7 @@ impl<'a> McTbtrEngine<'a> {
                     fold,
                     frontier,
                     (round < rounds).then_some(&mut walk_boards),
-                    &mut shadow,
-                    edge_prepass,
+                    profile_bag_ops,
                     stats,
                 );
                 stats.closure_ns += closure_started.elapsed().as_nanos() as u64;
@@ -1773,25 +1692,9 @@ impl<'a> McTbtrEngine<'a> {
         fold: &mut Option<MatrixSink<'_>>,
         frontier: &mut Option<FrontierSink<'_>>,
         mut walk_boards: Option<&mut Vec<WalkBoard>>,
-        shadow: &mut Option<ClosureRejectCache>,
-        edge_prepass: bool,
+        profile_bag_ops: bool,
         stats: &mut SearchStats,
     ) {
-        if edge_prepass {
-            // Diagnostic: time one edge-only traversal of the same
-            // touched slices. It doubles edge traffic and warms the
-            // real sweep, so it belongs to separate profiling runs.
-            let started = std::time::Instant::now();
-            let mut checksum = 0u64;
-            for source in &closure.touched {
-                for edge in self.footpaths.from_stop(*source) {
-                    checksum =
-                        checksum.wrapping_add(((edge.duration as u64) << 32) | edge.to.0 as u64);
-                }
-            }
-            std::hint::black_box(checksum);
-            stats.closure_edge_prepass_ns += started.elapsed().as_nanos() as u64;
-        }
         for source_index in 0..closure.touched.len() {
             let source = closure.touched[source_index];
             stats.closure_source_batches += 1;
@@ -1817,8 +1720,7 @@ impl<'a> McTbtrEngine<'a> {
                 let (to, duration) = (edge.to, edge.duration);
                 for point in &closure.active {
                     let reached = point.arrival.saturating_add(duration);
-                    let admitted = if let Some(cache) = shadow.as_mut() {
-                        let hit = cache.classify(to, reached, point.key, point.grams, round as u8);
+                    let admitted = if profile_bag_ops {
                         let mut probes = InsertProbes::default();
                         let admitted = stop_bags[to.0 as usize].insert_probed(
                             reached,
@@ -1835,20 +1737,14 @@ impl<'a> McTbtrEngine<'a> {
                         } else {
                             stats.closure_bag_rejections += 1;
                             stats.closure_bag_reject_entries_examined += probes.examined as u64;
-                            if hit.is_none() {
-                                stats.closure_bag_rejections_on_miss += 1;
-                                stats.closure_bag_reject_entries_examined_on_miss +=
-                                    probes.examined as u64;
+                            if probes.examined == 1 {
+                                stats.closure_mtf_front_rejections += 1;
+                            } else {
+                                stats.closure_mtf_swaps += 1;
+                                stats.closure_mtf_swap_distance += (probes.examined - 1) as u64;
                             }
-                        }
-                        match hit {
-                            Some(way) => {
-                                stats.closure_shadow_hits[way] += 1;
-                                if admitted {
-                                    stats.closure_shadow_false_positives += 1;
-                                }
-                            }
-                            None => cache.promote(to, reached, point.key, point.grams, round as u8),
+                            stats.closure_bag_reject_depth_histogram
+                                [depth_bucket(probes.examined)] += 1;
                         }
                         admitted
                     } else {
