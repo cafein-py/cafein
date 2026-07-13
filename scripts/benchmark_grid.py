@@ -13,14 +13,19 @@ is hundreds of millions of pairs); it scales linearly in origins, so
 per-origin throughput extrapolates to the whole grid.
 
 Each benchmark is a separate subcommand so it builds its own network,
-reports an isolated peak RSS, and appends one tagged result line to
-``results.jsonl``:
+reports an isolated peak RSS (the batched family is the exception: its
+six variants share one process, so their peaks are cumulative), and
+appends one tagged result line to ``results.jsonl``:
 
     prep          build + save the grid and the origin sample
     cafein-time   cafein TravelTimeMatrix   (vs r5py-time)
     r5py-time     r5py   TravelTimeMatrix   (vs cafein-time)
     cafein-cost   cafein TravelCostMatrix   (time + distance + emissions)
     cafein-pareto cafein journey_frontier   (Pareto time x emissions, sample)
+    cafein-pareto-batched  the batched frontier family on one workload:
+                  journey_frontiers and frontier_table on both routers
+                  (tbtr over its precomputed cached transfer set), plus
+                  the max_slower=600/300 fast bands
 
 The cafein side must run on a release extension — build it with
 ``maturin develop --release``; the default ``maturin develop`` produces an
@@ -442,6 +447,88 @@ def cafein_pareto(pareto_pairs):
     )
 
 
+def cafein_pareto_batched(batch_origins, batch_destinations):
+    from cafein.frontier import frontier_table, journey_frontiers
+
+    grid, origins = _load_points()
+    network, build_seconds, build_rss = _build_cafein(trip_distances=True)
+    started = time.perf_counter()
+    network.compute_mctbtr_transfers(DATE)
+    set_seconds = round(time.perf_counter() - started, 2)
+    sample_origins = origins.iloc[:batch_origins]
+    sample_dests = grid.sample(min(batch_destinations, len(grid)), random_state=7)
+    pairs = len(sample_origins) * len(sample_dests)
+    variants = [
+        ("cafein-pareto-batched", journey_frontiers, {"router": "raptor"}),
+        ("cafein-pareto-batched-tbtr", journey_frontiers, {"router": "tbtr"}),
+        ("cafein-pareto-table", frontier_table, {"router": "raptor"}),
+        ("cafein-pareto-table-tbtr", frontier_table, {"router": "tbtr"}),
+        (
+            "cafein-pareto-batched-slower600",
+            journey_frontiers,
+            {"router": "raptor", "max_slower": 600},
+        ),
+        (
+            "cafein-pareto-batched-slower300",
+            journey_frontiers,
+            {"router": "raptor", "max_slower": 300},
+        ),
+    ]
+    for name, product, options in variants:
+        started = time.perf_counter()
+        frame = product(
+            network,
+            sample_origins,
+            sample_dests,
+            DATE,
+            DEPARTURE,
+            WINDOW_S,
+            max_transfers=MAX_TRANSFERS,
+            walking_speed_kmph=WALK_KMPH,
+            max_walking_time=MAX_WALK_S,
+            max_snap_distance=SNAP_DIST_M,
+            **options,
+        )
+        seconds = time.perf_counter() - started
+        params = {
+            **SHARED_PARAMS,
+            **options,
+            "note": "cafein-only; no r5py equivalent; peak RSS is cumulative "
+            "across the family's variants",
+        }
+        _record(
+            {
+                "benchmark": name,
+                "engine": "cafein",
+                "product": "pareto_time_x_emissions",
+                "build_config": "trip_distances=True",
+                "params": params,
+                "origins": int(len(sample_origins)),
+                "destinations": int(len(sample_dests)),
+                "pairs": pairs,
+                **(
+                    {"tbtr_set_seconds": set_seconds}
+                    if options.get("router") == "tbtr"
+                    else {}
+                ),
+                "build_seconds": build_seconds,
+                "build_rss_mb": build_rss,
+                "pareto_seconds": round(seconds, 2),
+                "pairs_per_second": round(pairs / seconds, 2),
+                "ms_per_pair": round(seconds / pairs * 1000, 2),
+                "frontier_rows": int(len(frame)),
+                "peak_rss_mb": round(peak_rss_mb(), 1),
+            }
+        )
+
+
+def positive_int(value):
+    count = int(value)
+    if count < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return count
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -453,11 +540,14 @@ def main():
             "cafein-time-single",
             "cafein-cost",
             "cafein-pareto",
+            "cafein-pareto-batched",
         ],
     )
     parser.add_argument("--origins", type=int, default=250)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--pareto-pairs", type=int, default=120)
+    parser.add_argument("--batch-origins", type=positive_int, default=50)
+    parser.add_argument("--batch-destinations", type=positive_int, default=500)
     parser.add_argument(
         "--router",
         choices=["raptor", "tbtr"],
@@ -478,6 +568,8 @@ def main():
         cafein_cost()
     elif args.command == "cafein-pareto":
         cafein_pareto(args.pareto_pairs)
+    elif args.command == "cafein-pareto-batched":
+        cafein_pareto_batched(args.batch_origins, args.batch_destinations)
 
 
 if __name__ == "__main__":
