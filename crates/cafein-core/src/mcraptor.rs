@@ -86,6 +86,26 @@ pub(crate) struct Bag {
     entries: Vec<Entry>,
 }
 
+/// The strict (`penalty = 0`, `slack = 0`) rejection relation: does
+/// `entry` reject the candidate? Equivalent to the rejection scan of
+/// `insert_slack(arrival, 0, grams, key, rides, 0)`, including the
+/// entry-penalty reads.
+fn rejects_strict(entry: &Entry, arrival: u32, grams: f64, key: i64, rides: u8) -> bool {
+    if entry.key <= key && entry.rides <= rides && entry.arrival <= arrival {
+        if entry.arrival == arrival
+            && entry.penalty == 0
+            && entry.key == key
+            && entry.rides == rides
+        {
+            grams >= entry.grams
+        } else {
+            entry.arrival.saturating_add(entry.penalty) <= arrival
+        }
+    } else {
+        false
+    }
+}
+
 impl Bag {
     /// Inserts unless an entry arriving no later, in the same or a
     /// cleaner bucket, AND on no more rides already dominates it; evicts
@@ -98,11 +118,48 @@ impl Bag {
     /// cleaner earlier one that still had transfers to spend. An entry
     /// equal on arrival, bucket and rides but strictly dirtier in exact
     /// grams is refined (replaced), keeping the bucket's representative
-    /// as clean as the search has seen. The trip-based engine passes
-    /// `rides = 0` throughout (its rounds are ranked in the trip bags,
-    /// not here), so its dominance stays exactly `(arrival, key)`.
+    /// as clean as the search has seen. The trip-based engine ranks the
+    /// transit round in `rides` for its direct and closure arrivals.
+    ///
+    /// The strict path self-organises the entry vector: a rejection
+    /// swaps its witness to slot 0 and an admission swaps the new entry
+    /// there, so the workload's recent certificates reject in one
+    /// probe. Entry order has no semantic consumer — rejection is an
+    /// existential query, eviction is set-based, and a cleaner exact
+    /// tie continues the scan rather than admitting early — so only the
+    /// private vector permutation differs from a stable-order bag.
     pub(crate) fn insert(&mut self, arrival: u32, grams: f64, key: i64, rides: u8) -> bool {
-        self.insert_slack(arrival, 0, grams, key, rides, 0)
+        for index in 0..self.entries.len() {
+            if rejects_strict(&self.entries[index], arrival, grams, key, rides) {
+                if index != 0 {
+                    self.entries.swap(0, index);
+                }
+                return false;
+            }
+        }
+        self.entries.retain(|entry| {
+            !((key <= entry.key
+                && rides <= entry.rides
+                && arrival <= entry.arrival
+                && arrival <= entry.arrival.saturating_add(entry.penalty))
+                || (entry.arrival == arrival
+                    && entry.penalty == 0
+                    && entry.key == key
+                    && entry.rides == rides
+                    && grams < entry.grams))
+        });
+        self.entries.push(Entry {
+            arrival,
+            penalty: 0,
+            key,
+            grams,
+            rides,
+        });
+        let last = self.entries.len() - 1;
+        if last != 0 {
+            self.entries.swap(0, last);
+        }
+        true
     }
 
     /// `insert` under a route penalty and a time slack. Dominance runs on
@@ -168,10 +225,10 @@ impl Bag {
     }
 
     /// Strict `insert` with probe accounting for the trip-based
-    /// engine's closure diagnostics: identical decisions to
-    /// `insert(arrival, grams, key, rides)`, recording the bag length
-    /// before the call and how many entries the rejection scan and
-    /// the eviction walk examined.
+    /// engine's closure diagnostics: identical decisions and identical
+    /// self-organising swaps, recording the bag length before the
+    /// call, the one-based rejecting depth (or the complete pre-call
+    /// length on admission), and the eviction-walk depth.
     pub(crate) fn insert_probed(
         &mut self,
         arrival: u32,
@@ -183,20 +240,13 @@ impl Bag {
         probes.length = self.entries.len() as u32;
         probes.examined = 0;
         probes.retained = 0;
-        for entry in &self.entries {
+        for index in 0..self.entries.len() {
             probes.examined += 1;
-            if entry.key <= key && entry.rides <= rides && entry.arrival <= arrival {
-                if entry.arrival == arrival
-                    && entry.penalty == 0
-                    && entry.key == key
-                    && entry.rides == rides
-                {
-                    if grams >= entry.grams {
-                        return false;
-                    }
-                } else if entry.arrival.saturating_add(entry.penalty) <= arrival {
-                    return false;
+            if rejects_strict(&self.entries[index], arrival, grams, key, rides) {
+                if index != 0 {
+                    self.entries.swap(0, index);
                 }
+                return false;
             }
         }
         let retained = &mut probes.retained;
@@ -219,7 +269,30 @@ impl Bag {
             grams,
             rides,
         });
+        let last = self.entries.len() - 1;
+        if last != 0 {
+            self.entries.swap(0, last);
+        }
         true
+    }
+
+    /// A bag with a prescribed entry order, for order-sensitivity
+    /// tests (reachable strict bags are antichains; tests may build
+    /// unreachable orders deliberately).
+    #[cfg(test)]
+    pub(crate) fn from_entries(entries: Vec<(u32, u32, i64, f64, u8)>) -> Bag {
+        Bag {
+            entries: entries
+                .into_iter()
+                .map(|(arrival, penalty, key, grams, rides)| Entry {
+                    arrival,
+                    penalty,
+                    key,
+                    grams,
+                    rides,
+                })
+                .collect(),
+        }
     }
 
     /// The bag's entries as comparable tuples, for differential tests.

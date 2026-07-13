@@ -1487,27 +1487,6 @@ fn one_admission_can_cancel_multiple_pending_segments() {
     assert_eq!(bag.entries.len(), 1);
 }
 
-#[test]
-fn shadow_cache_retires_the_oldest_witness() {
-    // Four incomparable witnesses fill the ways; a fifth retires the
-    // oldest, whose region then misses again.
-    let mut cache = ClosureRejectCache::new(1);
-    let stop = StopIdx(0);
-    for way in 0..5u32 {
-        // Later witnesses arrive earlier but dirtier: incomparable.
-        let arrival = 100 - 10 * way;
-        let key = 10 + way as i64 * 10;
-        assert_eq!(cache.classify(stop, arrival, key, key as f64, 1), None);
-        cache.promote(stop, arrival, key, key as f64, 1);
-    }
-    // The newest witness certifies its own region.
-    assert_eq!(cache.classify(stop, 60, 50, 50.0, 1), Some(0));
-    // The oldest (arrival 100, key 10) fell out: its region misses.
-    assert_eq!(cache.classify(stop, 100, 10, 10.0, 1), None);
-    // The second-oldest survives in the deepest way.
-    assert_eq!(cache.classify(stop, 90, 20, 20.0, 1), Some(3));
-}
-
 /// Two access lines whose riders both walk to stop 3 and board the
 /// same onward trip at position 0. The dirtier, later walker boards
 /// first (its source stop is swept first); the cleaner walker's
@@ -1649,80 +1628,54 @@ fn cancelled_segments_never_appear_as_segment_parents() {
 }
 
 #[test]
-fn historical_stop_witness_survives_covering_eviction() {
-    // The witness's covering bag entry is evicted by admissions the
-    // cache never sees (direct and access insertions bypass it); the
-    // historical certificate must still predict the bag's rejection.
-    let mut bag = Bag::default();
-    let mut cache = ClosureRejectCache::new(1);
-    let stop = StopIdx(0);
-    assert!(bag.insert(100, 50.0, 5, 1));
-    cache.promote(stop, 100, 5, 50.0, 1);
-    // An out-of-cache covering admission evicts the witness's entry.
-    assert!(bag.insert(90, 40.0, 4, 1));
-    // A candidate only the evicted witness certifies: the cache still
-    // rejects it, and so does the live bag (via the evictor).
-    assert_eq!(cache.classify(stop, 120, 6, 60.0, 2), Some(0));
-    assert!(!bag.insert(120, 60.0, 6, 2));
-    // Shift the witness into a deeper way with incomparable promotes,
-    // evict its evictor out of cache too, and the deep way still
-    // certifies through the two-step eviction chain.
-    assert_eq!(cache.classify(stop, 80, 9, 225.0, 1), None);
-    assert!(bag.insert(80, 225.0, 9, 1));
-    cache.promote(stop, 80, 9, 225.0, 1);
-    assert_eq!(cache.classify(stop, 70, 12, 300.0, 1), None);
-    assert!(bag.insert(70, 300.0, 12, 1));
-    cache.promote(stop, 70, 12, 300.0, 1);
-    assert!(bag.insert(85, 35.0, 3, 1));
-    assert_eq!(cache.classify(stop, 130, 7, 70.0, 2), Some(2));
-    assert!(!bag.insert(130, 70.0, 7, 2));
+fn cleaner_exact_tie_continues_to_later_witness() {
+    // A deliberately unreachable order: the refinable exact tie ahead
+    // of a non-tied witness. The scan must continue past the tie and
+    // let the later witness reject (and swap to the front).
+    let mut bag = Bag::from_entries(vec![(100, 0, 5, 50.0, 1), (90, 0, 4, 40.0, 1)]);
+    assert!(!bag.insert(100, 45.0, 5, 1));
+    assert_eq!(bag.snapshot()[0], (90, 0, 4, 40.0f64.to_bits(), 1));
 }
 
 #[test]
-fn rejected_candidate_is_a_sound_future_witness() {
-    let mut bag = Bag::default();
-    let mut cache = ClosureRejectCache::new(1);
-    let stop = StopIdx(0);
-    assert!(bag.insert(50, 10.0, 1, 0));
-    // A rejected candidate still promotes: some bag entry covers it.
-    assert_eq!(cache.classify(stop, 100, 9, 99.0, 1), None);
-    assert!(!bag.insert(100, 99.0, 9, 1));
-    cache.promote(stop, 100, 9, 99.0, 1);
-    // Anything it rejects, the bag rejects too.
-    assert_eq!(cache.classify(stop, 110, 9, 99.5, 1), Some(0));
-    assert!(!bag.insert(110, 99.5, 9, 1));
+fn non_tie_witness_and_refinable_tie_cannot_coexist() {
+    // Inserting the covering witness and the refinable tie in either
+    // order leaves a one-entry antichain with the same decision.
+    for pair in [
+        [(90u32, 40.0f64, 4i64, 1u8), (100, 50.0, 5, 1)],
+        [(100, 50.0, 5, 1), (90, 40.0, 4, 1)],
+    ] {
+        let mut bag = Bag::default();
+        for (arrival, grams, key, rides) in pair {
+            bag.insert(arrival, grams, key, rides);
+        }
+        assert_eq!(bag.snapshot().len(), 1);
+        assert!(!bag.insert(100, 45.0, 5, 1));
+    }
 }
 
-#[test]
-fn same_slot_cleaner_candidate_bypasses_a_dirtier_witness() {
-    let mut bag = Bag::default();
-    let mut cache = ClosureRejectCache::new(1);
-    let stop = StopIdx(0);
-    assert!(bag.insert(100, 50.0, 5, 1));
-    cache.promote(stop, 100, 5, 50.0, 1);
-    // Identical (arrival, key, rides) but strictly cleaner exact
-    // grams: the refinement path must reach the real bag.
-    assert_eq!(cache.classify(stop, 100, 5, 40.0, 1), None);
-    assert!(bag.insert(100, 40.0, 5, 1));
+/// The strict rejection relation on snapshot tuples.
+fn strict_rejects(
+    entry: (u32, u32, i64, u64, u8),
+    arrival: u32,
+    key: i64,
+    grams: f64,
+    rides: u8,
+) -> bool {
+    let (e_arrival, e_penalty, e_key, e_grams, e_rides) = entry;
+    let e_grams = f64::from_bits(e_grams);
+    e_key <= key
+        && e_rides <= rides
+        && e_arrival <= arrival
+        && if e_arrival == arrival && e_penalty == 0 && e_key == key && e_rides == rides {
+            grams >= e_grams
+        } else {
+            e_arrival + e_penalty <= arrival
+        }
 }
 
-#[test]
-fn higher_ride_witness_does_not_reject_a_lower_round() {
-    let mut bag = Bag::default();
-    let mut cache = ClosureRejectCache::new(1);
-    let stop = StopIdx(0);
-    assert!(bag.insert(100, 50.0, 5, 4));
-    cache.promote(stop, 100, 5, 50.0, 4);
-    // Same point on fewer rides: neither the cache nor the bag may
-    // suppress it.
-    assert_eq!(cache.classify(stop, 100, 5, 50.0, 2), None);
-    assert!(bag.insert(100, 50.0, 5, 2));
-}
-
-#[test]
-fn shadow_cache_has_no_false_positives() {
-    // Randomized differential: plain insert, probed insert, and the
-    // shadowed cache must agree on every decision and end state.
+/// A deterministic operation stream for the bag property tests.
+fn bag_operations(count: usize) -> Vec<(u32, i64, f64, u8)> {
     let mut state = 0x9e3779b97f4a7c15u64;
     let mut next = move |bound: u64| {
         state = state
@@ -1730,32 +1683,204 @@ fn shadow_cache_has_no_false_positives() {
             .wrapping_add(1442695040888963407);
         (state >> 33) % bound
     };
-    let stops = 4usize;
-    let mut plain = vec![Bag::default(); stops];
-    let mut probed = vec![Bag::default(); stops];
-    let mut cache = ClosureRejectCache::new(stops);
-    let (mut hits, mut misses) = (0u64, 0u64);
-    for _ in 0..20_000 {
+    (0..count)
+        .map(|_| {
+            let arrival = 100 + next(60) as u32;
+            let key = next(8) as i64;
+            let grams = key as f64 * 25.0 + next(25) as f64;
+            let rides = next(4) as u8;
+            (arrival, key, grams, rides)
+        })
+        .collect()
+}
+
+#[test]
+fn strict_bag_remains_an_antichain() {
+    // Cleaner buckets arrive later (anti-correlated axes), so genuine
+    // trade-offs survive and the final bag is nontrivial.
+    let mut bag = Bag::default();
+    let mut state = 0x2545f4914f6cdd1du64;
+    let mut next = move |bound: u64| {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) % bound
+    };
+    for _ in 0..5_000 {
+        let key = next(8) as i64;
+        let arrival = 100 + (7 - key as u32) * 12 + next(6) as u32;
+        let grams = key as f64 * 25.0 + next(25) as f64;
+        let rides = next(4) as u8;
+        bag.insert(arrival, grams, key, rides);
+    }
+    let entries = bag.snapshot();
+    assert!(entries.len() > 2);
+    for (position, &entry) in entries.iter().enumerate() {
+        for (other_position, &other) in entries.iter().enumerate() {
+            if position != other_position {
+                let (arrival, _, key, grams, rides) = other;
+                assert!(
+                    !strict_rejects(entry, arrival, key, f64::from_bits(grams), rides),
+                    "bag entries must be mutually incomparable"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn strict_rejection_relation_is_transitive() {
+    let pool = bag_operations(120);
+    let rejects = |a: (u32, i64, f64, u8), b: (u32, i64, f64, u8)| {
+        strict_rejects((a.0, 0, a.1, a.2.to_bits(), a.3), b.0, b.1, b.2, b.3)
+    };
+    for &a in &pool {
+        for &b in &pool {
+            for &c in &pool {
+                if rejects(a, b) && rejects(b, c) {
+                    assert!(rejects(a, c), "D must be transitive: {a:?} {b:?} {c:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rejecting_entry_swaps_to_front() {
+    let mut bag = Bag::default();
+    // Three mutually incomparable entries.
+    assert!(bag.insert(100, 30.0, 1, 2));
+    assert!(bag.insert(110, 5.0, 0, 2));
+    assert!(bag.insert(90, 55.0, 2, 2));
+    // The witness sits in the deepest slot; rejection swaps it front.
+    let witness = (110, 0, 0, 5.0f64.to_bits(), 2);
+    assert_eq!(bag.snapshot()[2], witness);
+    assert!(!bag.insert(120, 6.0, 0, 2));
+    assert_eq!(bag.snapshot()[0], witness);
+}
+
+#[test]
+fn front_rejection_does_not_change_order() {
+    let mut bag = Bag::default();
+    assert!(bag.insert(100, 30.0, 1, 2));
+    assert!(bag.insert(110, 5.0, 0, 2));
+    assert!(bag.insert(90, 55.0, 2, 2));
+    assert!(!bag.insert(120, 6.0, 0, 2));
+    let order = bag.snapshot();
+    // The front witness rejects again: no reordering.
+    assert!(!bag.insert(125, 7.0, 0, 2));
+    assert_eq!(bag.snapshot(), order);
+}
+
+#[test]
+fn admitted_entry_swaps_to_front() {
+    let mut bag = Bag::default();
+    assert!(bag.insert(100, 30.0, 1, 2));
+    assert!(bag.insert(110, 5.0, 0, 2));
+    assert_eq!(bag.snapshot()[0], (110, 0, 0, 5.0f64.to_bits(), 2));
+    assert!(bag.insert(90, 55.0, 2, 2));
+    assert_eq!(bag.snapshot()[0], (90, 0, 2, 55.0f64.to_bits(), 2));
+}
+
+#[test]
+fn swap_to_front_preserves_cleaner_exact_tie_refinement() {
+    let mut bag = Bag::default();
+    assert!(bag.insert(100, 50.0, 5, 1));
+    // An incomparable admission swaps ahead of the tie entry.
+    assert!(bag.insert(110, 10.0, 0, 3));
+    // The cleaner exact tie still replaces its dirtier sibling.
+    assert!(bag.insert(100, 45.0, 5, 1));
+    let entries = bag.snapshot();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0], (100, 0, 5, 45.0f64.to_bits(), 1));
+    assert!(!entries.contains(&(100, 0, 5, 50.0f64.to_bits(), 1)));
+}
+
+#[test]
+fn swap_to_front_preserves_the_rides_axis() {
+    let mut bag = Bag::default();
+    assert!(bag.insert(100, 50.0, 5, 4));
+    assert!(bag.insert(110, 10.0, 0, 4));
+    // The same point on fewer rides must still admit and evict.
+    assert!(bag.insert(100, 50.0, 5, 2));
+    let entries = bag.snapshot();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.contains(&(100, 0, 5, 50.0f64.to_bits(), 2)));
+    assert!(!entries.contains(&(100, 0, 5, 50.0f64.to_bits(), 4)));
+}
+
+#[test]
+fn self_organising_insert_matches_stable_strict_insert() {
+    // The unchanged stable-order insert_slack(penalty 0, slack 0) is
+    // the reference: identical decisions and identical entry sets
+    // after every operation, only the private order may differ.
+    let stops = 6usize;
+    let mut stable = vec![Bag::default(); stops];
+    let mut organised = vec![Bag::default(); stops];
+    let mut state = 0x51ab5f2d9e3779b9u64;
+    let mut next = move |bound: u64| {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) % bound
+    };
+    for _ in 0..100_000 {
         let stop = next(stops as u64) as usize;
-        let arrival = 100 + next(50) as u32;
+        let arrival = 100 + next(60) as u32;
         let key = next(8) as i64;
         let grams = key as f64 * 25.0 + next(25) as f64;
         let rides = next(4) as u8;
-        let expected = plain[stop].insert(arrival, grams, key, rides);
-        let hit = cache.classify(StopIdx(stop as u32), arrival, key, grams, rides);
-        let mut probes = InsertProbes::default();
-        let admitted = probed[stop].insert_probed(arrival, grams, key, rides, &mut probes);
-        assert_eq!(admitted, expected, "probed insert diverged");
-        assert!(probes.length as usize <= 20_000);
-        if hit.is_none() {
-            misses += 1;
-            cache.promote(StopIdx(stop as u32), arrival, key, grams, rides);
-        } else {
-            hits += 1;
-            assert!(!admitted, "shadow false positive");
-        }
-        assert_eq!(plain[stop].snapshot(), probed[stop].snapshot());
+        let expected = stable[stop].insert_slack(arrival, 0, grams, key, rides, 0);
+        let admitted = organised[stop].insert(arrival, grams, key, rides);
+        assert_eq!(admitted, expected);
+        let mut reference = stable[stop].snapshot();
+        let mut permuted = organised[stop].snapshot();
+        reference.sort_unstable();
+        permuted.sort_unstable();
+        assert_eq!(reference, permuted);
     }
-    assert!(hits > 0, "the cache never certified a rejection");
-    assert!(misses > 0, "the cache absorbed everything");
+}
+
+#[test]
+fn probed_self_organising_insert_matches_production_insert() {
+    // Production and probed variants must perform identical swaps:
+    // ordered snapshots, not just sets.
+    let mut production = Bag::default();
+    let mut probed = Bag::default();
+    for (arrival, key, grams, rides) in bag_operations(20_000) {
+        let mut probes = InsertProbes::default();
+        let expected = production.insert(arrival, grams, key, rides);
+        let admitted = probed.insert_probed(arrival, grams, key, rides, &mut probes);
+        assert_eq!(admitted, expected);
+        assert_eq!(production.snapshot(), probed.snapshot());
+    }
+}
+
+#[test]
+fn probe_counters_identify_front_and_nonfront_rejections() {
+    // The stage's counter identities over a random stream:
+    // front + swaps == rejections, sum(histogram) == rejections,
+    // swap distance == entries examined - rejections.
+    let mut bag = Bag::default();
+    let (mut front, mut swaps, mut distance) = (0u64, 0u64, 0u64);
+    let (mut rejections, mut examined) = (0u64, 0u64);
+    let mut histogram = [0u64; 9];
+    for (arrival, key, grams, rides) in bag_operations(20_000) {
+        let mut probes = InsertProbes::default();
+        if !bag.insert_probed(arrival, grams, key, rides, &mut probes) {
+            rejections += 1;
+            examined += probes.examined as u64;
+            if probes.examined == 1 {
+                front += 1;
+            } else {
+                swaps += 1;
+                distance += (probes.examined - 1) as u64;
+            }
+            histogram[depth_bucket(probes.examined)] += 1;
+        }
+    }
+    assert!(front > 0 && swaps > 0);
+    assert_eq!(front + swaps, rejections);
+    assert_eq!(histogram.iter().sum::<u64>(), rejections);
+    assert_eq!(distance, examined - rejections);
 }
