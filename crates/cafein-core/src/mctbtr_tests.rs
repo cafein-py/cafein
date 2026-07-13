@@ -1433,3 +1433,196 @@ fn profile_eviction_does_not_remove_a_cleaner_earlier_departure() {
     let tbtr = engine.route_range(&request, 400, 1e-6);
     assert_eq!(coordinates(&tbtr, &geometry, &factors), expected);
 }
+
+#[test]
+fn tripbag_eviction_cancels_a_pending_segment() {
+    let mut states = [SegmentState::Pending];
+    let mut bag = TripBag::default();
+    assert!(bag.admits(5, 100.0, 4, 0, |_| panic!("nothing to evict yet")));
+    let mut cancelled = Vec::new();
+    assert!(bag.admits(3, 50.0, 2, 1, |token| {
+        if states[token as usize] == SegmentState::Pending {
+            states[token as usize] = SegmentState::Cancelled;
+        }
+        cancelled.push(token);
+    }));
+    assert_eq!(cancelled, vec![0]);
+    assert_eq!(states[0], SegmentState::Cancelled);
+}
+
+#[test]
+fn tripbag_eviction_does_not_cancel_a_scanned_segment() {
+    let mut states = [SegmentState::Scanned];
+    let mut bag = TripBag::default();
+    assert!(bag.admits(5, 100.0, 4, 0, |_| ()));
+    assert!(bag.admits(3, 50.0, 2, 1, |token| {
+        if states[token as usize] == SegmentState::Pending {
+            states[token as usize] = SegmentState::Cancelled;
+        }
+    }));
+    assert_eq!(states[0], SegmentState::Scanned);
+}
+
+#[test]
+fn tripbag_rejection_does_not_allocate_a_segment() {
+    let mut bag = TripBag::default();
+    assert!(bag.admits(3, 50.0, 2, 0, |_| ()));
+    let mut fired = false;
+    assert!(!bag.admits(5, 100.0, 4, 1, |_| fired = true));
+    assert!(!fired, "a rejection must not evict anything");
+    assert_eq!(bag.entries.len(), 1);
+    assert_eq!(bag.entries[0].pending_segment, 0);
+}
+
+#[test]
+fn one_admission_can_cancel_multiple_pending_segments() {
+    let mut bag = TripBag::default();
+    assert!(bag.admits(5, 100.0, 5, 0, |_| ()));
+    assert!(bag.admits(6, 80.0, 4, 1, |_| ()));
+    assert_eq!(bag.entries.len(), 2);
+    let mut cancelled = Vec::new();
+    assert!(bag.admits(3, 20.0, 3, 2, |token| cancelled.push(token)));
+    cancelled.sort_unstable();
+    assert_eq!(cancelled, vec![0, 1]);
+    assert_eq!(bag.entries.len(), 1);
+}
+
+/// Two access lines whose riders both walk to stop 3 and board the
+/// same onward trip at position 0. The dirtier, later walker boards
+/// first (its source stop is swept first); the cleaner walker's
+/// admission then evicts that still-pending onward segment.
+fn cancelling() -> (Timetable, TripGeometry, Transfers) {
+    let mut builder = TimetableBuilder::new(6);
+    let dirty = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let clean = builder.add_pattern(&[StopIdx(0), StopIdx(2)], 1).unwrap();
+    let onward = builder.add_pattern(&[StopIdx(3), StopIdx(5)], 2).unwrap();
+    builder
+        .add_trip(dirty, vec![time(0), time(100)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(clean, vec![time(0), time(90)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(onward, vec![time(300), time(500)], 2, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(2), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let footpaths = Transfers::from_edges(
+        6,
+        &[
+            (StopIdx(1), StopIdx(3), 60, 60.0),
+            (StopIdx(2), StopIdx(3), 60, 60.0),
+        ],
+    )
+    .unwrap();
+    (timetable, geometry, footpaths)
+}
+
+const CANCELLING_FACTORS: [f64; 3] = [10.0, 5.0, 20.0];
+
+fn cancelling_request() -> Request {
+    Request {
+        departure: 0,
+        access: vec![(StopIdx(0), 0)],
+        egress: vec![(StopIdx(5), 0)],
+        active_services: vec![true; 6],
+        active_services_previous: vec![],
+        max_transfers: 2,
+    }
+}
+
+#[test]
+fn cancelled_segments_never_become_destination_leaves() {
+    let (timetable, geometry, footpaths) = cancelling();
+    let engine = McTbtrEngine::for_date(
+        &timetable,
+        &footpaths,
+        &geometry,
+        &CANCELLING_FACTORS,
+        &[true; 6],
+        &[],
+    );
+    let request = cancelling_request();
+    let mut fold = None;
+    let mut frontier = None;
+    let mut stats = SearchStats::default();
+    let (arena, destination) =
+        engine.passes(&request, &[0], 1e-6, &mut fold, &mut frontier, &mut stats);
+    assert_eq!(stats.segments_cancelled_pending, 1);
+    assert_eq!(stats.segments_skipped_cancelled, 1);
+    // The clean walker's onward segment is the only destination leaf;
+    // the debug chain check inside `passes` walked every ancestry.
+    assert_eq!(destination.len(), 1);
+    let _ = &arena;
+    let reached = destination[0];
+    assert_eq!((reached.departure, reached.arrival), (0, 500));
+    assert!((reached.grams - 25.0).abs() < 1e-9);
+    // The full profile agrees with the exhaustive oracle.
+    let view = DayView::universal(&timetable);
+    let oracle = pareto_oracle(
+        &view,
+        &timetable,
+        &footpaths,
+        &geometry,
+        &CANCELLING_FACTORS,
+        0,
+        &request.access,
+        &request.egress,
+        request.max_transfers,
+    );
+    let oracle: Vec<(u32, f64, u32)> = oracle
+        .iter()
+        .map(|point| (point.arrival, point.grams, point.rides))
+        .collect();
+    let journeys = engine.route(&request, 1e-6);
+    assert_eq!(triples(&journeys, &geometry, &CANCELLING_FACTORS), oracle);
+}
+
+#[test]
+fn cancelled_segments_never_appear_as_segment_parents() {
+    let (timetable, geometry, footpaths) = cancelling();
+    let engine = McTbtrEngine::for_date(
+        &timetable,
+        &footpaths,
+        &geometry,
+        &CANCELLING_FACTORS,
+        &[true; 6],
+        &[],
+    );
+    let request = cancelling_request();
+    let mut fold = None;
+    let mut frontier = None;
+    let mut stats = SearchStats::default();
+    let (arena, destination) =
+        engine.passes(&request, &[0], 1e-6, &mut fold, &mut frontier, &mut stats);
+    assert_eq!(stats.segments_cancelled_pending, 1);
+    // The cancelled onward boarding is the dirty walker's child.
+    let cancelled: Vec<u32> = (0..arena.len() as u32)
+        .filter(|&index| {
+            matches!(
+                arena[index as usize].origin,
+                SegOrigin::Walked { parent: 0, .. }
+            )
+        })
+        .collect();
+    assert_eq!(cancelled.len(), 1);
+    for segment in &arena {
+        match segment.origin {
+            SegOrigin::Transfer { parent, .. } | SegOrigin::Walked { parent, .. } => {
+                assert_ne!(parent, cancelled[0], "a cancelled segment gained a child");
+            }
+            SegOrigin::Access { .. } => {}
+        }
+    }
+    for arrived in &destination {
+        assert_ne!(arrived.leaf, cancelled[0], "a cancelled segment was a leaf");
+    }
+}

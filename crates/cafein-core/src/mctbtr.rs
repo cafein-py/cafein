@@ -614,25 +614,71 @@ struct Segment {
     origin: SegOrigin,
 }
 
+/// Queue lifecycle of an arena segment: enqueued, consumed by its
+/// round's scan, or cancelled by a covering trip-bag admission before
+/// scanning. Cancelled segments stay in the arena — indices are
+/// reconstruction identities.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SegmentState {
+    Pending = 0,
+    Scanned = 1,
+    Cancelled = 2,
+}
+
+/// One trip-bag admission: the (board, κ) point plus the queued
+/// segment to cancel if a covering admission evicts it before its
+/// round scans it.
+#[derive(Debug, Clone, Copy)]
+struct TripBagEntry {
+    kappa: f64,
+    key: i64,
+    pending_segment: u32,
+    board: u16,
+}
+
 /// The per-(trip, round) Pareto bag over (board, κ): boarding no later
 /// along the pattern with a κ in the same or a cleaner bucket covers
 /// every alight the newcomer could make. Equal slots refine toward the
-/// exact-cleaner κ.
+/// exact-cleaner κ. Evicting an entry reports its segment through the
+/// cancellation callback — the caller downgrades only still-pending
+/// segments, so scanned work (destination leaves, transfer and
+/// WalkBoard parents) is never revoked.
 #[derive(Debug, Clone, Default)]
 struct TripBag {
-    entries: Vec<(u16, f64, i64)>,
+    entries: Vec<TripBagEntry>,
 }
 
 impl TripBag {
-    fn admits(&mut self, board: u16, kappa: f64, key: i64) -> bool {
-        for &(b, k, kk) in &self.entries {
-            if b <= board && kk <= key && !(b == board && kk == key && kappa < k) {
+    fn admits(
+        &mut self,
+        board: u16,
+        kappa: f64,
+        key: i64,
+        pending_segment: u32,
+        mut cancel: impl FnMut(u32),
+    ) -> bool {
+        for entry in &self.entries {
+            if entry.board <= board
+                && entry.key <= key
+                && !(entry.board == board && entry.key == key && kappa < entry.kappa)
+            {
                 return false;
             }
         }
-        self.entries
-            .retain(|&(b, _, kk)| !(board <= b && key <= kk));
-        self.entries.push((board, kappa, key));
+        self.entries.retain(|entry| {
+            let covered = board <= entry.board && key <= entry.key;
+            if covered && entry.pending_segment != NONE_U32 {
+                cancel(entry.pending_segment);
+            }
+            !covered
+        });
+        self.entries.push(TripBagEntry {
+            kappa,
+            key,
+            pending_segment,
+            board,
+        });
         true
     }
 }
@@ -659,7 +705,13 @@ pub(crate) struct SearchStats {
     pub closure_source_batches: u64,
     /// Closure relaxations the target stop bag admitted.
     pub closure_target_admissions: u64,
+    /// WalkBoard records the closure sweep queued for boarding.
+    pub walk_boards_recorded: u64,
     pub segments_enqueued: u64,
+    /// Pending segments cancelled by covering trip-bag admissions.
+    pub segments_cancelled_pending: u64,
+    /// Queued segments skipped at dequeue because they were cancelled.
+    pub segments_skipped_cancelled: u64,
     pub segments_scanned_live: u64,
     pub suffix_context_evaluations: u64,
     pub direct_scan_ns: u64,
@@ -677,7 +729,10 @@ impl SearchStats {
         self.closure_points_batch_evicted += other.closure_points_batch_evicted;
         self.closure_source_batches += other.closure_source_batches;
         self.closure_target_admissions += other.closure_target_admissions;
+        self.walk_boards_recorded += other.walk_boards_recorded;
         self.segments_enqueued += other.segments_enqueued;
+        self.segments_cancelled_pending += other.segments_cancelled_pending;
+        self.segments_skipped_cancelled += other.segments_skipped_cancelled;
         self.segments_scanned_live += other.segments_scanned_live;
         self.suffix_context_evaluations += other.suffix_context_evaluations;
         self.direct_scan_ns += other.direct_scan_ns;
@@ -695,7 +750,9 @@ impl SearchStats {
              closure_label_edge_relaxations={} closure_points_offered={} \
              closure_points_live={} closure_points_batch_evicted={} \
              closure_source_batches={} closure_target_admissions={} \
-             segments_enqueued={} segments_scanned_live={} \
+             walk_boards_recorded={} segments_enqueued={} \
+             segments_cancelled_pending={} segments_skipped_cancelled={} \
+             segments_scanned_live={} \
              suffix_context_evaluations={} direct_scan_ms={} closure_ms={} \
              expand_ms={} walk_board_ms={}",
             self.closure_edge_records_loaded,
@@ -705,7 +762,10 @@ impl SearchStats {
             self.closure_points_batch_evicted,
             self.closure_source_batches,
             self.closure_target_admissions,
+            self.walk_boards_recorded,
             self.segments_enqueued,
+            self.segments_cancelled_pending,
+            self.segments_skipped_cancelled,
             self.segments_scanned_live,
             self.suffix_context_evaluations,
             self.direct_scan_ns / 1_000_000,
@@ -1142,6 +1202,7 @@ impl<'a> McTbtrEngine<'a> {
         let rounds = request.max_transfers as usize + 1;
         let key = |grams: f64| (grams / bucket).floor() as i64;
         let mut arena: Vec<Segment> = Vec::new();
+        let mut segment_states: Vec<SegmentState> = Vec::new();
         let mut queue: Vec<Vec<u32>> = vec![Vec::new(); rounds + 1];
         let mut trip_bags: Vec<TripBag> =
             vec![TripBag::default(); self.view.trip_count() as usize * rounds];
@@ -1179,12 +1240,29 @@ impl<'a> McTbtrEngine<'a> {
                     0,
                     key,
                     &mut arena,
+                    &mut segment_states,
                     &mut trip_bags,
                     &mut queue[1],
+                    stats,
                 );
             }
             for round in 1..=rounds {
-                let segments = std::mem::take(&mut queue[round]);
+                let queued = std::mem::take(&mut queue[round]);
+                // Consume in original queue order, dropping segments a
+                // covering admission cancelled before this round.
+                let mut segments = Vec::with_capacity(queued.len());
+                for index in queued {
+                    match segment_states[index as usize] {
+                        SegmentState::Pending => {
+                            segment_states[index as usize] = SegmentState::Scanned;
+                            segments.push(index);
+                        }
+                        SegmentState::Cancelled => stats.segments_skipped_cancelled += 1,
+                        SegmentState::Scanned => {
+                            debug_assert!(false, "a segment was queued twice")
+                        }
+                    }
+                }
                 // The direct scans first: alights feed the stop bags,
                 // every destination, and the closure batch. The
                 // edge-major closure sweep then relaxes each touched
@@ -1246,8 +1324,10 @@ impl<'a> McTbtrEngine<'a> {
                         key,
                         &envelope,
                         &mut arena,
+                        &mut segment_states,
                         &mut trip_bags,
                         &mut queue,
+                        stats,
                     );
                     stats.expand_ns += expand_started.elapsed().as_nanos() as u64;
                     let walk_started = std::time::Instant::now();
@@ -1271,8 +1351,10 @@ impl<'a> McTbtrEngine<'a> {
                             round,
                             key,
                             &mut arena,
+                            &mut segment_states,
                             &mut trip_bags,
                             &mut queue[round + 1],
+                            stats,
                         );
                     }
                     stats.walk_board_ns += walk_started.elapsed().as_nanos() as u64;
@@ -1280,6 +1362,24 @@ impl<'a> McTbtrEngine<'a> {
             }
         }
         stats.segments_enqueued += arena.len() as u64;
+        #[cfg(debug_assertions)]
+        for arrived in &destination {
+            // A cancelled segment was never scanned, so it can be
+            // neither a destination leaf nor any chain parent.
+            let mut cursor = arrived.leaf;
+            loop {
+                debug_assert!(
+                    segment_states[cursor as usize] != SegmentState::Cancelled,
+                    "a cancelled segment reached a destination chain"
+                );
+                match arena[cursor as usize].origin {
+                    SegOrigin::Access { .. } => break,
+                    SegOrigin::Transfer { parent, .. } | SegOrigin::Walked { parent, .. } => {
+                        cursor = parent
+                    }
+                }
+            }
+        }
         (arena, destination)
     }
 
@@ -1298,8 +1398,10 @@ impl<'a> McTbtrEngine<'a> {
         round: usize,
         key: impl Fn(f64) -> i64,
         arena: &mut Vec<Segment>,
+        segment_states: &mut Vec<SegmentState>,
         trip_bags: &mut [TripBag],
         queue: &mut Vec<u32>,
+        stats: &mut SearchStats,
     ) {
         let rounds_stride = trip_bags.len() / self.view.trip_count().max(1) as usize;
         for served in self.timetable.patterns_at_stop(stop) {
@@ -1325,8 +1427,20 @@ impl<'a> McTbtrEngine<'a> {
                     );
                     let kappa = quantized(grams - ridden);
                     let slot = rank as usize * rounds_stride + round;
-                    if trip_bags[slot].admits(served.position, kappa, key(kappa)) {
-                        let index = arena.len() as u32;
+                    let index = arena.len() as u32;
+                    let admitted = trip_bags[slot].admits(
+                        served.position,
+                        kappa,
+                        key(kappa),
+                        index,
+                        |cancelled| {
+                            if segment_states[cancelled as usize] == SegmentState::Pending {
+                                segment_states[cancelled as usize] = SegmentState::Cancelled;
+                                stats.segments_cancelled_pending += 1;
+                            }
+                        },
+                    );
+                    if admitted {
                         arena.push(Segment {
                             trip,
                             board: served.position,
@@ -1334,6 +1448,7 @@ impl<'a> McTbtrEngine<'a> {
                             departure,
                             origin: origin(trip, served.position),
                         });
+                        segment_states.push(SegmentState::Pending);
                         queue.push(index);
                     }
                 }
@@ -1550,6 +1665,7 @@ impl<'a> McTbtrEngine<'a> {
                         );
                     }
                     if let Some(boards) = walk_boards.as_deref_mut() {
+                        stats.walk_boards_recorded += 1;
                         boards.push(WalkBoard {
                             segment: point.segment,
                             alight: point.alight,
@@ -1583,8 +1699,10 @@ impl<'a> McTbtrEngine<'a> {
         key: impl Fn(f64) -> i64 + Copy,
         envelope: &PruneEnvelope,
         arena: &mut Vec<Segment>,
+        segment_states: &mut Vec<SegmentState>,
         trip_bags: &mut [TripBag],
         queue: &mut [Vec<u32>],
+        stats: &mut SearchStats,
     ) {
         let mut at = 0;
         while at < admitted.len() {
@@ -1621,8 +1739,20 @@ impl<'a> McTbtrEngine<'a> {
                     let kappa = quantized(grams - ridden);
                     let stride = rounds;
                     let slot = boarded.0 as usize * stride + round;
-                    if trip_bags[slot].admits(transfer.position, kappa, key(kappa)) {
-                        let next = arena.len() as u32;
+                    let next = arena.len() as u32;
+                    let admitted = trip_bags[slot].admits(
+                        transfer.position,
+                        kappa,
+                        key(kappa),
+                        next,
+                        |cancelled| {
+                            if segment_states[cancelled as usize] == SegmentState::Pending {
+                                segment_states[cancelled as usize] = SegmentState::Cancelled;
+                                stats.segments_cancelled_pending += 1;
+                            }
+                        },
+                    );
+                    if admitted {
                         arena.push(Segment {
                             trip: boarded,
                             board: transfer.position,
@@ -1633,6 +1763,7 @@ impl<'a> McTbtrEngine<'a> {
                                 alight,
                             },
                         });
+                        segment_states.push(SegmentState::Pending);
                         queue[round + 1].push(next);
                     }
                 }
