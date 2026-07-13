@@ -1,5 +1,6 @@
 """Time × emissions frontiers over the Helsinki network and a synthetic feed."""
 
+import math
 import zipfile
 
 import pytest
@@ -7,7 +8,7 @@ import pytest
 from cafein import journey_frontier, least_emissions
 
 
-def build_two_line_gtfs(path):
+def build_two_line_gtfs(path, tram_route_type=0):
     """Two stops joined by a fast two-bus chain (dirty) and a slow direct
     tram (clean), twice each within 08:00–08:30.
 
@@ -33,7 +34,7 @@ def build_two_line_gtfs(path):
             "route_id,route_short_name,route_type",
             "BUS_IN,B1,3",
             "BUS_OUT,B2,3",
-            "TRAM,T1,0",
+            f"TRAM,T1,{tram_route_type}",
         ],
         "trips.txt": [
             "route_id,service_id,trip_id",
@@ -1755,3 +1756,83 @@ def test_the_mctbtr_transfer_cache_serves_point_frontiers(
     for column in ("from_id", "to_id", "departure", "arrival", "rides", "frontier"):
         assert cached[column].tolist() == adhoc[column].tolist()
     assert cached["emissions"].tolist() == adhoc["emissions"].tolist()
+
+
+def test_frontier_table_matches_journey_frontiers(network_with_footpaths):
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    from cafein import frontier_table, journey_frontiers
+
+    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+    ids = ["1100602", "1040280", "1370104"]
+    points = gpd.GeoDataFrame(
+        {"id": ids},
+        geometry=[Point(coordinates[stop][1], coordinates[stop][0]) for stop in ids],
+        crs="EPSG:4326",
+    )
+    for origins, destinations in ((ids, ids), (points, points)):
+        for router in ("raptor", "tbtr"):
+            kwargs = dict(window=600, max_transfers=3, bucket=1e-6, router=router)
+            args = (origins, destinations, "2022-02-22", "08:30:00")
+            full = journey_frontiers(network_with_footpaths, *args, **kwargs)
+            table = frontier_table(network_with_footpaths, *args, **kwargs)
+            expected = full.drop(columns=["journey"])
+            assert list(table.columns) == list(expected.columns)
+            assert len(table) > 0
+            for column in expected.columns:
+                if column == "emissions":
+                    continue
+                assert table[column].tolist() == expected[column].tolist(), (
+                    router,
+                    column,
+                )
+            for ours, theirs in zip(
+                table["emissions"].tolist(), expected["emissions"].tolist()
+            ):
+                assert (math.isnan(ours) and math.isnan(theirs)) or ours == theirs
+
+
+def test_frontier_table_matches_on_the_two_line_fixture(tmp_path):
+    from cafein import TransportNetwork, frontier_table, journey_frontiers
+
+    # An exotic tram route_type leaves the tram journeys without a
+    # factor: NaN emissions rows that never join the frontier.
+    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip", tram_route_type=1702)
+    network = TransportNetwork.from_gtfs([str(feed)])
+    args = (["A", "H"], ["B", "A"], "2022-02-22", "08:00:00")
+    for router in ("raptor", "tbtr"):
+        kwargs = dict(window=1800, bucket=1e-6, router=router)
+        with pytest.warns(UserWarning, match="route_type"):
+            full = journey_frontiers(network, *args, **kwargs)
+        with pytest.warns(UserWarning, match="route_type"):
+            table = frontier_table(network, *args, **kwargs)
+        expected = full.drop(columns=["journey"])
+        for column in expected.columns:
+            if column == "emissions":
+                continue
+            assert table[column].tolist() == expected[column].tolist(), (router, column)
+        # Unresolved trips never board in the emissions search: the
+        # tram (the only one-ride A→B option) is absent rather than
+        # carried as a NaN row.
+        a_to_b = table[(table["from_id"] == "A") & (table["to_id"] == "B")]
+        assert len(a_to_b) > 0
+        assert all(rides == 2 for rides in a_to_b["rides"])
+        for ours, theirs in zip(
+            table["emissions"].tolist(), expected["emissions"].tolist()
+        ):
+            assert (math.isnan(ours) and math.isnan(theirs)) or ours == theirs
+    # A pair with no feasible journey contributes no rows; an all-empty
+    # result keeps the columns.
+    empty = frontier_table(network, ["B"], ["A"], "2022-02-22", "08:00:00", window=600)
+    assert len(empty) == 0
+    assert list(empty.columns) == [
+        "from_id",
+        "to_id",
+        "departure",
+        "arrival",
+        "travel_time",
+        "rides",
+        "emissions",
+        "frontier",
+    ]

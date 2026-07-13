@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- ``frontier_table`` — ``journey_frontiers`` as one flat frame without
+  journey payloads: the same per-cell pareto rows and ``frontier``
+  marks, flattened into columns on the Rust side instead of building a
+  Python journey per row, removing most of the batched frontier's
+  result-materialization cost. Takes ``journey_frontiers``' arguments
+  minus ``geometries``/``fares``; emissions match
+  ``emissions.annotate`` exactly, NaN where a transit leg's factor is
+  unresolved.
+
 - Much faster batched McTBTR frontiers — the batched product no longer
   builds a per-round all-destinations pruning envelope: rebuilding it
   from every accumulated frontier each round cost far more at scale
