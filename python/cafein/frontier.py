@@ -512,6 +512,114 @@ def journey_frontiers(
     return pd.DataFrame(columns=columns)
 
 
+def frontier_table(
+    network,
+    origins,
+    destinations,
+    date,
+    departure,
+    window,
+    *,
+    max_transfers=7,
+    factors=None,
+    components=None,
+    bucket=25.0,
+    router="raptor",
+    max_slower=None,
+    walking_speed_kmph=None,
+    max_walking_time=None,
+    max_snap_distance=None,
+):
+    """``journey_frontiers`` as one flat frame, without journey payloads.
+
+    The exact rows ``journey_frontiers`` returns for the same arguments,
+    minus the ``journey`` column: the per-cell pareto families with
+    their ``frontier`` marks, flattened Rust-side into columns instead
+    of materializing a Python journey per row. For mass-scale frontier
+    campaigns this removes most of the result-building cost; use
+    ``journey_frontiers`` when the journey payloads, leg geometries, or
+    fares are needed.
+
+    Parameters
+    ----------
+    network, origins, destinations, date, departure, window
+        As in ``journey_frontiers``.
+    max_transfers, factors, components, bucket, router, max_slower
+        As in ``journey_frontiers``.
+    walking_speed_kmph, max_walking_time, max_snap_distance : float
+        Street-search options for the coordinate queries, as in
+        ``route_between_coordinates``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Columns ``from_id``, ``to_id``, ``departure``, ``arrival``,
+        ``travel_time``, ``rides``, ``emissions`` (NaN where a transit
+        leg's factor is unresolved), and ``frontier``.
+    """
+    import numpy as np
+
+    stops = _frontier_ids(origins, "origins"), _frontier_ids(
+        destinations, "destinations"
+    )
+    if (stops[0] is None) != (stops[1] is None):
+        raise ValueError(
+            "origins and destinations must both be stop ids or both be point frames"
+        )
+    if router not in ("raptor", "tbtr"):
+        raise ValueError("router must be 'raptor' or 'tbtr'")
+    max_slower = _validated_max_slower(max_slower, "pareto", router)
+    trip_factors = emissions.trip_factors(network, factors, components)
+    if stops[0] is not None:
+        from_ids, to_ids = stops
+        table = network._core.mc_frontier_table(
+            from_ids,
+            to_ids,
+            date,
+            departure,
+            trip_factors,
+            window,
+            max_transfers,
+            bucket,
+            max_slower=max_slower,
+            router=router,
+        )
+    else:
+        from cafein.matrices import _point_list, _warn_unsnapped
+        from cafein.network import _walk_options
+
+        from_ids, from_points = _point_list(origins, "origins")
+        to_ids, to_points = _point_list(destinations, "destinations")
+        table = network._core.mc_frontier_table_from_points(
+            from_points,
+            to_points,
+            date,
+            departure,
+            trip_factors,
+            window,
+            max_transfers,
+            bucket,
+            *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
+            max_slower=max_slower,
+            router=router,
+        )
+        _warn_unsnapped(table, from_ids, to_ids)
+    from_id = np.asarray(from_ids, dtype=object)
+    to_id = np.asarray(to_ids, dtype=object)
+    return pd.DataFrame(
+        {
+            "from_id": from_id[table["from_index"]],
+            "to_id": to_id[table["to_index"]],
+            "departure": table["departure"].astype("int64"),
+            "arrival": table["arrival"].astype("int64"),
+            "travel_time": table["travel_time"].astype("int64"),
+            "rides": table["rides"].astype("int64"),
+            "emissions": table["emissions"],
+            "frontier": table["frontier"],
+        }
+    )
+
+
 def _validated_max_slower(max_slower, candidates, router):
     """The validated ``max_slower`` band in whole seconds, or ``None``."""
     if max_slower is None:
