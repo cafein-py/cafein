@@ -40,7 +40,7 @@ use crate::tbtr::{
     earliest_boardable, DayView, TransferSet, TransferSetBuild, TripTransfer, ViewTrip,
 };
 use crate::timetable::{StopIdx, Timetable, TripIdx};
-use crate::transfers::{Transfer, Transfers};
+use crate::transfers::Transfers;
 
 /// Builds the multicriteria transfer set of a day view by **global
 /// candidate/witness enumeration** (Baum et al. 2023's integrated
@@ -649,10 +649,21 @@ pub(crate) struct SearchStats {
     /// Label-against-edge relaxations (per admitted label per edge; in
     /// the label-major loop this equals the records loaded).
     pub closure_label_edge_relaxations: u64,
+    /// Direct admissions offered to the closure batch.
+    pub closure_points_offered: u64,
+    /// Live points compacted for relaxation across all source batches.
+    pub closure_points_live: u64,
+    /// Points killed by the batch-local gate before relaxation.
+    pub closure_points_batch_evicted: u64,
+    /// Touched source stops swept (one batch each).
+    pub closure_source_batches: u64,
+    /// Closure relaxations the target stop bag admitted.
+    pub closure_target_admissions: u64,
     pub segments_enqueued: u64,
     pub segments_scanned_live: u64,
     pub suffix_context_evaluations: u64,
     pub direct_scan_ns: u64,
+    pub closure_ns: u64,
     pub expand_ns: u64,
     pub walk_board_ns: u64,
 }
@@ -661,10 +672,16 @@ impl SearchStats {
     fn absorb(&mut self, other: &SearchStats) {
         self.closure_edge_records_loaded += other.closure_edge_records_loaded;
         self.closure_label_edge_relaxations += other.closure_label_edge_relaxations;
+        self.closure_points_offered += other.closure_points_offered;
+        self.closure_points_live += other.closure_points_live;
+        self.closure_points_batch_evicted += other.closure_points_batch_evicted;
+        self.closure_source_batches += other.closure_source_batches;
+        self.closure_target_admissions += other.closure_target_admissions;
         self.segments_enqueued += other.segments_enqueued;
         self.segments_scanned_live += other.segments_scanned_live;
         self.suffix_context_evaluations += other.suffix_context_evaluations;
         self.direct_scan_ns += other.direct_scan_ns;
+        self.closure_ns += other.closure_ns;
         self.expand_ns += other.expand_ns;
         self.walk_board_ns += other.walk_board_ns;
     }
@@ -675,15 +692,24 @@ impl SearchStats {
         }
         eprintln!(
             "MCTBTR-STATS {label} closure_edge_records_loaded={} \
-             closure_label_edge_relaxations={} segments_enqueued={} \
-             segments_scanned_live={} suffix_context_evaluations={} \
-             direct_scan_ms={} expand_ms={} walk_board_ms={}",
+             closure_label_edge_relaxations={} closure_points_offered={} \
+             closure_points_live={} closure_points_batch_evicted={} \
+             closure_source_batches={} closure_target_admissions={} \
+             segments_enqueued={} segments_scanned_live={} \
+             suffix_context_evaluations={} direct_scan_ms={} closure_ms={} \
+             expand_ms={} walk_board_ms={}",
             self.closure_edge_records_loaded,
             self.closure_label_edge_relaxations,
+            self.closure_points_offered,
+            self.closure_points_live,
+            self.closure_points_batch_evicted,
+            self.closure_source_batches,
+            self.closure_target_admissions,
             self.segments_enqueued,
             self.segments_scanned_live,
             self.suffix_context_evaluations,
             self.direct_scan_ns / 1_000_000,
+            self.closure_ns / 1_000_000,
             self.expand_ns / 1_000_000,
             self.walk_board_ns / 1_000_000,
         );
@@ -764,6 +790,121 @@ impl MatrixSink<'_> {
                 walked,
             });
         }
+    }
+}
+
+const NONE_U32: u32 = u32::MAX;
+
+/// One direct admission queued for the round's closure sweep, linked
+/// per source stop in direct-scan order.
+#[derive(Clone, Copy)]
+struct ClosurePoint {
+    grams: f64,
+    key: i64,
+    segment: u32,
+    arrival: u32,
+    next: u32,
+    alight: u16,
+    live: bool,
+}
+
+/// A live point compacted for relaxation, without the list link.
+#[derive(Clone, Copy)]
+struct ActiveClosurePoint {
+    grams: f64,
+    key: i64,
+    segment: u32,
+    arrival: u32,
+    alight: u16,
+}
+
+/// The round's pending closure sources: per-stop linked buckets of
+/// admitted direct points (stable indices, only touched stops reset)
+/// swept edge-major after the direct scans. A batch never spans two
+/// rounds, two departure passes, walked labels, or two requests.
+struct ClosureBatch {
+    heads: Box<[u32]>,
+    tails: Box<[u32]>,
+    touched: Vec<StopIdx>,
+    points: Vec<ClosurePoint>,
+    active: Vec<ActiveClosurePoint>,
+    evicted: u64,
+}
+
+impl ClosureBatch {
+    fn new(stop_count: usize) -> Self {
+        ClosureBatch {
+            heads: vec![NONE_U32; stop_count].into_boxed_slice(),
+            tails: vec![NONE_U32; stop_count].into_boxed_slice(),
+            touched: Vec::new(),
+            points: Vec::new(),
+            active: Vec::new(),
+            evicted: 0,
+        }
+    }
+
+    /// Queues a direct admission under the batch-local gate: the
+    /// fixed-round, fixed-departure (arrival, key) relation with the
+    /// stop bags' equal-slot exact-grams refinement. Rejection is rare
+    /// (the stop bag admitted the point already) but preserves the
+    /// invariant that no queued point covers another.
+    fn offer(
+        &mut self,
+        source: StopIdx,
+        segment: u32,
+        alight: u16,
+        arrival: u32,
+        grams: f64,
+        key: i64,
+    ) -> bool {
+        let slot = source.0 as usize;
+        let mut cursor = self.heads[slot];
+        while cursor != NONE_U32 {
+            let point = &mut self.points[cursor as usize];
+            let next = point.next;
+            if point.live {
+                if point.arrival <= arrival
+                    && point.key <= key
+                    && !(point.arrival == arrival && point.key == key && grams < point.grams)
+                {
+                    return false;
+                }
+                if arrival <= point.arrival && key <= point.key {
+                    point.live = false;
+                    self.evicted += 1;
+                }
+            }
+            cursor = next;
+        }
+        let index = self.points.len() as u32;
+        self.points.push(ClosurePoint {
+            grams,
+            key,
+            segment,
+            arrival,
+            next: NONE_U32,
+            alight,
+            live: true,
+        });
+        if self.heads[slot] == NONE_U32 {
+            self.heads[slot] = index;
+            self.touched.push(source);
+        } else {
+            self.points[self.tails[slot] as usize].next = index;
+        }
+        self.tails[slot] = index;
+        true
+    }
+
+    fn reset(&mut self) {
+        for &stop in &self.touched {
+            self.heads[stop.0 as usize] = NONE_U32;
+            self.tails[stop.0 as usize] = NONE_U32;
+        }
+        self.touched.clear();
+        self.points.clear();
+        self.active.clear();
+        self.evicted = 0;
     }
 }
 
@@ -1005,6 +1146,7 @@ impl<'a> McTbtrEngine<'a> {
         let mut trip_bags: Vec<TripBag> =
             vec![TripBag::default(); self.view.trip_count() as usize * rounds];
         let mut stop_bags: Vec<Bag> = vec![Bag::default(); self.timetable.stop_count() as usize];
+        let mut closure = ClosureBatch::new(self.timetable.stop_count() as usize);
         let mut destination: Vec<Arrived> = Vec::new();
         for &departure in departures {
             // Seed: board from every access stop.
@@ -1043,19 +1185,21 @@ impl<'a> McTbtrEngine<'a> {
             }
             for round in 1..=rounds {
                 let segments = std::mem::take(&mut queue[round]);
-                // The join sweep first: alights feed the stop bags and
-                // every destination (tightening the frontiers), and the
-                // admitted footpath boardings are recorded. The
-                // expansion sweep then runs under the round's fully
-                // tightened pruning envelope — Baum et al.'s improved
-                // trip-based query, on both expansion channels. Only
-                // the one-pair profile prunes; see [`PruneEnvelope`].
+                // The direct scans first: alights feed the stop bags,
+                // every destination, and the closure batch. The
+                // edge-major closure sweep then relaxes each touched
+                // source's live points (recording admitted footpath
+                // boardings), and only then the expansion sweep runs
+                // under the round's fully tightened pruning envelope —
+                // Baum et al.'s improved trip-based query, on both
+                // expansion channels. Only the one-pair profile
+                // prunes; see [`PruneEnvelope`].
                 let mut walk_boards: Vec<WalkBoard> = Vec::new();
                 let mut admitted: Vec<(u32, u16)> = Vec::new();
                 stats.segments_scanned_live += segments.len() as u64;
                 let scan_started = std::time::Instant::now();
                 for &index in &segments {
-                    self.scan_joins(
+                    self.scan_direct_alights(
                         index,
                         round,
                         request,
@@ -1065,12 +1209,27 @@ impl<'a> McTbtrEngine<'a> {
                         &mut destination,
                         fold,
                         frontier,
-                        (round < rounds).then_some(&mut walk_boards),
+                        &mut closure,
                         &mut admitted,
                         stats,
                     );
                 }
                 stats.direct_scan_ns += scan_started.elapsed().as_nanos() as u64;
+                let closure_started = std::time::Instant::now();
+                self.relax_closure_batch(
+                    &mut closure,
+                    round,
+                    request,
+                    key,
+                    &arena,
+                    &mut stop_bags,
+                    &mut destination,
+                    fold,
+                    frontier,
+                    (round < rounds).then_some(&mut walk_boards),
+                    stats,
+                );
+                stats.closure_ns += closure_started.elapsed().as_nanos() as u64;
                 if round < rounds {
                     // Only the one-pair profile prunes; the batched
                     // frontier and fold modes never build an envelope.
@@ -1182,12 +1341,12 @@ impl<'a> McTbtrEngine<'a> {
         }
     }
 
-    /// The join sweep over one segment: alight everywhere ahead, feed
-    /// the stop bags, join the egress (directly and over one footpath)
-    /// into every destination, and record the admitted footpath
-    /// boardings for the expansion sweep.
+    /// The direct scan over one segment: alight everywhere ahead,
+    /// feed the stop bags and every direct destination, record the
+    /// admitted pairs for the expansion sweep, and queue each
+    /// admission with the round's closure batch.
     #[allow(clippy::too_many_arguments)]
-    fn scan_joins(
+    fn scan_direct_alights(
         &self,
         index: u32,
         round: usize,
@@ -1198,12 +1357,11 @@ impl<'a> McTbtrEngine<'a> {
         destination: &mut Vec<Arrived>,
         fold: &mut Option<MatrixSink<'_>>,
         frontier: &mut Option<FrontierSink<'_>>,
-        mut walk_boards: Option<&mut Vec<WalkBoard>>,
+        closure: &mut ClosureBatch,
         admitted: &mut Vec<(u32, u16)>,
         stats: &mut SearchStats,
     ) {
         let segment = arena[index as usize];
-        let mut closure_edges = 0u64;
         let trip = segment.trip;
         let line = self.view.line_of(trip);
         let offset = self.view.line_day_offset(line);
@@ -1219,6 +1377,7 @@ impl<'a> McTbtrEngine<'a> {
                 absolute_grams(self.geometry, &self.view, self.factors, trip, alight as u16)
                     - boarded_from;
             let grams = quantized(segment.grams + ridden);
+            let bucket_key = key(grams);
             let stop = stops[alight];
             // Alights, direct egress joins, and query-time footpaths are
             // all gated on stop-bag improvement (the T4b semantics) —
@@ -1229,7 +1388,7 @@ impl<'a> McTbtrEngine<'a> {
             // the stop on more rides cannot suppress a cleaner
             // fewer-rides arrival across the profile — the same
             // cross-pass soundness the McRAPTOR bag needs.
-            if !stop_bags[stop.0 as usize].insert(arrival, grams, key(grams), round as u8) {
+            if !stop_bags[stop.0 as usize].insert(arrival, grams, bucket_key, round as u8) {
                 continue;
             }
             admitted.push((index, alight as u16));
@@ -1246,28 +1405,11 @@ impl<'a> McTbtrEngine<'a> {
                 fold,
                 frontier,
             );
-            for footpath in self.footpaths.from_stop(stop) {
-                closure_edges += 1;
-                self.relax_closure_edge(
-                    request,
-                    key,
-                    round,
-                    footpath,
-                    segment.departure,
-                    arrival,
-                    grams,
-                    index,
-                    alight as u16,
-                    stop_bags,
-                    destination,
-                    fold,
-                    frontier,
-                    &mut walk_boards,
-                );
+            if !self.footpaths.from_stop(stop).is_empty() {
+                stats.closure_points_offered += 1;
+                closure.offer(stop, index, alight as u16, arrival, grams, bucket_key);
             }
         }
-        stats.closure_edge_records_loaded += closure_edges;
-        stats.closure_label_edge_relaxations += closure_edges;
     }
 
     /// The direct-alight sink joins for a bag-admitted on-trip
@@ -1311,71 +1453,117 @@ impl<'a> McTbtrEngine<'a> {
         }
     }
 
-    /// The closure-target operations for one admitted point relaxed
-    /// over one footpath edge: bag admission at the target, then the
-    /// fold, egress, frontier, and WalkBoard joins.
+    /// The round's edge-major closure sweep: each touched source's
+    /// live points are compacted once, then every footpath edge is
+    /// loaded once and relaxed against all of them — the same target
+    /// admissions as label-major traversal (the relaxation map is
+    /// monotone on every dominance axis, so batch-gate evictions and
+    /// target rejections are always covered). On admission the fold,
+    /// egress, frontier, and WalkBoard joins run in the label-major
+    /// order; walking adds no emissions, so the stored exact grams and
+    /// key relax without new floating-point work. Resets the batch.
     #[allow(clippy::too_many_arguments)]
-    fn relax_closure_edge(
+    fn relax_closure_batch(
         &self,
+        closure: &mut ClosureBatch,
+        round: usize,
         request: &Request,
         key: impl Fn(f64) -> i64 + Copy,
-        round: usize,
-        footpath: &Transfer,
-        departure: u32,
-        arrival: u32,
-        grams: f64,
-        index: u32,
-        alight: u16,
+        arena: &[Segment],
         stop_bags: &mut [Bag],
         destination: &mut Vec<Arrived>,
         fold: &mut Option<MatrixSink<'_>>,
         frontier: &mut Option<FrontierSink<'_>>,
-        walk_boards: &mut Option<&mut Vec<WalkBoard>>,
+        mut walk_boards: Option<&mut Vec<WalkBoard>>,
+        stats: &mut SearchStats,
     ) {
-        let reached = arrival.saturating_add(footpath.duration);
-        if !stop_bags[footpath.to.0 as usize].insert(reached, grams, key(grams), round as u8) {
-            return;
-        }
-        if let Some(sink) = fold {
-            sink.fold(footpath.to, reached - departure, grams, index, alight, true);
-        }
-        for &(egress, seconds) in &request.egress {
-            if egress == footpath.to {
-                self.join(
-                    destination,
-                    key,
-                    departure,
-                    reached.saturating_add(seconds),
-                    grams,
-                    index,
-                    alight,
-                    Some((footpath.to, footpath.duration)),
-                );
+        for source_index in 0..closure.touched.len() {
+            let source = closure.touched[source_index];
+            stats.closure_source_batches += 1;
+            closure.active.clear();
+            let mut cursor = closure.heads[source.0 as usize];
+            while cursor != NONE_U32 {
+                let point = closure.points[cursor as usize];
+                if point.live {
+                    closure.active.push(ActiveClosurePoint {
+                        grams: point.grams,
+                        key: point.key,
+                        segment: point.segment,
+                        arrival: point.arrival,
+                        alight: point.alight,
+                    });
+                }
+                cursor = point.next;
+            }
+            stats.closure_points_live += closure.active.len() as u64;
+            for edge in self.footpaths.from_stop(source) {
+                stats.closure_edge_records_loaded += 1;
+                stats.closure_label_edge_relaxations += closure.active.len() as u64;
+                let (to, duration) = (edge.to, edge.duration);
+                for point in &closure.active {
+                    let reached = point.arrival.saturating_add(duration);
+                    if !stop_bags[to.0 as usize].insert(
+                        reached,
+                        point.grams,
+                        point.key,
+                        round as u8,
+                    ) {
+                        continue;
+                    }
+                    stats.closure_target_admissions += 1;
+                    let departure = arena[point.segment as usize].departure;
+                    if let Some(sink) = fold {
+                        sink.fold(
+                            to,
+                            reached - departure,
+                            point.grams,
+                            point.segment,
+                            point.alight,
+                            true,
+                        );
+                    }
+                    for &(egress, seconds) in &request.egress {
+                        if egress == to {
+                            self.join(
+                                destination,
+                                key,
+                                departure,
+                                reached.saturating_add(seconds),
+                                point.grams,
+                                point.segment,
+                                point.alight,
+                                Some((to, duration)),
+                            );
+                        }
+                    }
+                    if let Some(sink) = frontier {
+                        self.frontier_join(
+                            sink,
+                            to,
+                            key,
+                            departure,
+                            reached,
+                            point.grams,
+                            point.segment,
+                            point.alight,
+                            Some((to, duration)),
+                        );
+                    }
+                    if let Some(boards) = walk_boards.as_deref_mut() {
+                        boards.push(WalkBoard {
+                            segment: point.segment,
+                            alight: point.alight,
+                            to,
+                            reached,
+                            grams: point.grams,
+                            duration,
+                        });
+                    }
+                }
             }
         }
-        if let Some(sink) = frontier {
-            self.frontier_join(
-                sink,
-                footpath.to,
-                key,
-                departure,
-                reached,
-                grams,
-                index,
-                alight,
-                Some((footpath.to, footpath.duration)),
-            );
-        }
-        if let Some(boards) = walk_boards.as_deref_mut() {
-            boards.push(WalkBoard {
-                segment: index,
-                alight,
-                to: footpath.to,
-                reached,
-                grams,
-                duration: footpath.duration,
-            });
-        }
+        stats.closure_points_batch_evicted += closure.evicted;
+        closure.reset();
     }
 
     /// The expansion sweep, under the round's pruning envelope: the
