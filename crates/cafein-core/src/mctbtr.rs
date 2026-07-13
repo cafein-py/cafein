@@ -637,6 +637,59 @@ impl TripBag {
     }
 }
 
+/// Per-search work counters and round-level phase timers, owned by one
+/// `passes` call (no shared atomics: parallel origins each fill their
+/// own and the caller reduces them afterwards). Increments are plain
+/// integer adds so the instrumentation-off cost stays negligible; the
+/// report only prints under `CAFEIN_MCTBTR_PROF`.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SearchStats {
+    /// Closure edge records read from the CSR (one per edge per sweep).
+    pub closure_edge_records_loaded: u64,
+    /// Label-against-edge relaxations (per admitted label per edge; in
+    /// the label-major loop this equals the records loaded).
+    pub closure_label_edge_relaxations: u64,
+    pub segments_enqueued: u64,
+    pub segments_scanned_live: u64,
+    pub suffix_context_evaluations: u64,
+    pub direct_scan_ns: u64,
+    pub expand_ns: u64,
+    pub walk_board_ns: u64,
+}
+
+impl SearchStats {
+    fn absorb(&mut self, other: &SearchStats) {
+        self.closure_edge_records_loaded += other.closure_edge_records_loaded;
+        self.closure_label_edge_relaxations += other.closure_label_edge_relaxations;
+        self.segments_enqueued += other.segments_enqueued;
+        self.segments_scanned_live += other.segments_scanned_live;
+        self.suffix_context_evaluations += other.suffix_context_evaluations;
+        self.direct_scan_ns += other.direct_scan_ns;
+        self.expand_ns += other.expand_ns;
+        self.walk_board_ns += other.walk_board_ns;
+    }
+
+    fn report(&self, label: &str) {
+        if std::env::var("CAFEIN_MCTBTR_PROF").is_err() {
+            return;
+        }
+        eprintln!(
+            "MCTBTR-STATS {label} closure_edge_records_loaded={} \
+             closure_label_edge_relaxations={} segments_enqueued={} \
+             segments_scanned_live={} suffix_context_evaluations={} \
+             direct_scan_ms={} expand_ms={} walk_board_ms={}",
+            self.closure_edge_records_loaded,
+            self.closure_label_edge_relaxations,
+            self.segments_enqueued,
+            self.segments_scanned_live,
+            self.suffix_context_evaluations,
+            self.direct_scan_ns / 1_000_000,
+            self.expand_ns / 1_000_000,
+            self.walk_board_ns / 1_000_000,
+        );
+    }
+}
+
 /// A destination frontier entry: the leaf segment, where it alighted,
 /// and how the egress was joined.
 #[derive(Debug, Clone, Copy)]
@@ -919,7 +972,9 @@ impl<'a> McTbtrEngine<'a> {
         bucket: f64,
         fold: &mut Option<MatrixSink<'_>>,
     ) -> Vec<Journey> {
-        let (arena, destination) = self.passes(request, departures, bucket, fold, &mut None);
+        let mut stats = SearchStats::default();
+        let (arena, destination) =
+            self.passes(request, departures, bucket, fold, &mut None, &mut stats);
         let mut journeys: Vec<Journey> = destination
             .iter()
             .map(|arrived| self.assemble(arrived, &arena))
@@ -937,6 +992,7 @@ impl<'a> McTbtrEngine<'a> {
         bucket: f64,
         fold: &mut Option<MatrixSink<'_>>,
         frontier: &mut Option<FrontierSink<'_>>,
+        stats: &mut SearchStats,
     ) -> (Vec<Segment>, Vec<Arrived>) {
         assert!(
             bucket.is_finite() && bucket > 0.0,
@@ -996,6 +1052,8 @@ impl<'a> McTbtrEngine<'a> {
                 // the one-pair profile prunes; see [`PruneEnvelope`].
                 let mut walk_boards: Vec<WalkBoard> = Vec::new();
                 let mut admitted: Vec<(u32, u16)> = Vec::new();
+                stats.segments_scanned_live += segments.len() as u64;
+                let scan_started = std::time::Instant::now();
                 for &index in &segments {
                     self.scan_joins(
                         index,
@@ -1009,8 +1067,10 @@ impl<'a> McTbtrEngine<'a> {
                         frontier,
                         (round < rounds).then_some(&mut walk_boards),
                         &mut admitted,
+                        stats,
                     );
                 }
+                stats.direct_scan_ns += scan_started.elapsed().as_nanos() as u64;
                 if round < rounds {
                     // Only the one-pair profile prunes; the batched
                     // frontier and fold modes never build an envelope.
@@ -1019,6 +1079,7 @@ impl<'a> McTbtrEngine<'a> {
                     } else {
                         PruneEnvelope::none()
                     };
+                    let expand_started = std::time::Instant::now();
                     self.expand_admitted(
                         &admitted,
                         round,
@@ -1029,6 +1090,8 @@ impl<'a> McTbtrEngine<'a> {
                         &mut trip_bags,
                         &mut queue,
                     );
+                    stats.expand_ns += expand_started.elapsed().as_nanos() as u64;
+                    let walk_started = std::time::Instant::now();
                     for board in walk_boards {
                         if envelope.prunes(board.reached, key(board.grams)) {
                             continue;
@@ -1053,9 +1116,11 @@ impl<'a> McTbtrEngine<'a> {
                             &mut queue[round + 1],
                         );
                     }
+                    stats.walk_board_ns += walk_started.elapsed().as_nanos() as u64;
                 }
             }
         }
+        stats.segments_enqueued += arena.len() as u64;
         (arena, destination)
     }
 
@@ -1135,8 +1200,10 @@ impl<'a> McTbtrEngine<'a> {
         frontier: &mut Option<FrontierSink<'_>>,
         mut walk_boards: Option<&mut Vec<WalkBoard>>,
         admitted: &mut Vec<(u32, u16)>,
+        stats: &mut SearchStats,
     ) {
         let segment = arena[index as usize];
+        let mut closure_edges = 0u64;
         let trip = segment.trip;
         let line = self.view.line_of(trip);
         let offset = self.view.line_day_offset(line);
@@ -1144,6 +1211,8 @@ impl<'a> McTbtrEngine<'a> {
         let times = self.view.stored_times(self.timetable, trip);
         let boarded_from =
             absolute_grams(self.geometry, &self.view, self.factors, trip, segment.board);
+        stats.suffix_context_evaluations +=
+            (stops.len() - segment.board as usize).saturating_sub(1) as u64;
         for alight in segment.board as usize + 1..stops.len() {
             let arrival = times[alight].arrival - offset;
             let ridden =
@@ -1202,6 +1271,7 @@ impl<'a> McTbtrEngine<'a> {
                 );
             }
             for footpath in self.footpaths.from_stop(stop) {
+                closure_edges += 1;
                 let reached = arrival.saturating_add(footpath.duration);
                 if !stop_bags[footpath.to.0 as usize].insert(
                     reached,
@@ -1260,6 +1330,8 @@ impl<'a> McTbtrEngine<'a> {
                 }
             }
         }
+        stats.closure_edge_records_loaded += closure_edges;
+        stats.closure_label_edge_relaxations += closure_edges;
     }
 
     /// The expansion sweep, under the round's pruning envelope: the
@@ -1477,7 +1549,7 @@ impl<'a> McTbtrEngine<'a> {
             }
         }
         let bag_count = if egress_active { slot_count } else { unique };
-        requests
+        let collected: Vec<(Vec<Vec<Journey>>, SearchStats)> = requests
             .par_iter()
             .map(|request| {
                 let departures = departure_candidates(self.timetable, request, window);
@@ -1488,7 +1560,15 @@ impl<'a> McTbtrEngine<'a> {
                     egress_active,
                     bags: &mut bags,
                 });
-                let (arena, _) = self.passes(request, &departures, bucket, &mut None, &mut sink);
+                let mut stats = SearchStats::default();
+                let (arena, _) = self.passes(
+                    request,
+                    &departures,
+                    bucket,
+                    &mut None,
+                    &mut sink,
+                    &mut stats,
+                );
                 let cells: Vec<Vec<Journey>> = bags
                     .iter()
                     .map(|bag| {
@@ -1502,12 +1582,22 @@ impl<'a> McTbtrEngine<'a> {
                         journeys
                     })
                     .collect();
-                if egress_active || unique == destinations.len() {
-                    return cells;
-                }
-                cell_of.iter().map(|&cell| cells[cell].clone()).collect()
+                let cells = if egress_active || unique == destinations.len() {
+                    cells
+                } else {
+                    cell_of.iter().map(|&cell| cells[cell].clone()).collect()
+                };
+                (cells, stats)
             })
-            .collect()
+            .collect();
+        let mut reduced = SearchStats::default();
+        let mut result = Vec::with_capacity(collected.len());
+        for (cells, stats) in collected {
+            reduced.absorb(&stats);
+            result.push(cells);
+        }
+        reduced.report("frontier_matrix");
+        result
     }
 
     /// The least-emissions cost matrix over this engine's candidate
@@ -1540,8 +1630,14 @@ impl<'a> McTbtrEngine<'a> {
                     budget,
                     best: &mut best,
                 });
-                let (arena_out, _) =
-                    self.passes(request, &departures, bucket, &mut fold, &mut None);
+                let (arena_out, _) = self.passes(
+                    request,
+                    &departures,
+                    bucket,
+                    &mut fold,
+                    &mut None,
+                    &mut SearchStats::default(),
+                );
                 best.into_iter()
                     .enumerate()
                     .filter_map(|(slot, winner)| {
