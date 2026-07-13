@@ -705,8 +705,12 @@ pub(crate) struct SearchStats {
     pub closure_source_batches: u64,
     /// Closure relaxations the target stop bag admitted.
     pub closure_target_admissions: u64,
-    /// WalkBoard records the closure sweep queued for boarding.
+    /// WalkBoard boardings the closure sweep offered to the batch.
     pub walk_boards_recorded: u64,
+    /// Offers the exact-dominance gate removed (rejected or killed).
+    pub walk_boards_skipped_exact: u64,
+    /// Surviving records that reached a `board` call.
+    pub walk_board_calls_live: u64,
     pub segments_enqueued: u64,
     /// Pending segments cancelled by covering trip-bag admissions.
     pub segments_cancelled_pending: u64,
@@ -783,6 +787,8 @@ impl SearchStats {
         self.closure_source_batches += other.closure_source_batches;
         self.closure_target_admissions += other.closure_target_admissions;
         self.walk_boards_recorded += other.walk_boards_recorded;
+        self.walk_boards_skipped_exact += other.walk_boards_skipped_exact;
+        self.walk_board_calls_live += other.walk_board_calls_live;
         self.segments_enqueued += other.segments_enqueued;
         self.segments_cancelled_pending += other.segments_cancelled_pending;
         self.segments_skipped_cancelled += other.segments_skipped_cancelled;
@@ -825,7 +831,8 @@ impl SearchStats {
              closure_label_edge_relaxations={} closure_points_offered={} \
              closure_points_live={} closure_points_batch_evicted={} \
              closure_source_batches={} closure_target_admissions={} \
-             walk_boards_recorded={} segments_enqueued={} \
+             walk_boards_recorded={} walk_boards_skipped_exact={} \
+             walk_board_calls_live={} segments_enqueued={} \
              segments_cancelled_pending={} segments_skipped_cancelled={} \
              segments_scanned_live={} \
              suffix_context_evaluations={} closure_bag_calls={} \
@@ -844,6 +851,8 @@ impl SearchStats {
             self.closure_source_batches,
             self.closure_target_admissions,
             self.walk_boards_recorded,
+            self.walk_boards_skipped_exact,
+            self.walk_board_calls_live,
             self.segments_enqueued,
             self.segments_cancelled_pending,
             self.segments_skipped_cancelled,
@@ -1068,7 +1077,9 @@ impl ClosureBatch {
 }
 
 /// A next-round boarding discovered by a round's join sweep, executed
-/// by its expansion sweep under the round's pruning envelope.
+/// by its expansion sweep under the round's pruning envelope; linked
+/// per walk target for the batch's exact-dominance gate.
+#[derive(Clone, Copy)]
 struct WalkBoard {
     segment: u32,
     alight: u16,
@@ -1076,6 +1087,98 @@ struct WalkBoard {
     reached: u32,
     grams: f64,
     duration: u32,
+    next: u32,
+    live: bool,
+}
+
+/// The round's pending WalkBoard records in closure-admission order,
+/// linked per target stop. The gate uses exact (reached, grams)
+/// dominance — never the bucket key: bucket equality before the
+/// boarding κ subtraction does not survive it, so an exact-dirtier
+/// same-bucket record must not cover a cleaner one. A covering record
+/// reaches the stop no later with no more exact grams, so it can
+/// catch every service the covered record could, and subtracting the
+/// same boarding prefix preserves κ and its bucket. Survivors board
+/// in original order; a batch never spans two rounds, two departure
+/// passes, or two origin queries.
+struct WalkBoardBatch {
+    heads: Box<[u32]>,
+    tails: Box<[u32]>,
+    touched: Vec<StopIdx>,
+    records: Vec<WalkBoard>,
+    skipped: u64,
+}
+
+impl WalkBoardBatch {
+    fn new(stop_count: usize) -> Self {
+        WalkBoardBatch {
+            heads: vec![NONE_U32; stop_count].into_boxed_slice(),
+            tails: vec![NONE_U32; stop_count].into_boxed_slice(),
+            touched: Vec::new(),
+            records: Vec::new(),
+            skipped: 0,
+        }
+    }
+
+    /// Queues a boarding unless a pending record for the same target
+    /// covers it exactly; a queued candidate kills the pending records
+    /// it covers. Exact ties keep the earlier record.
+    #[allow(clippy::too_many_arguments)]
+    fn offer(
+        &mut self,
+        segment: u32,
+        alight: u16,
+        to: StopIdx,
+        reached: u32,
+        grams: f64,
+        duration: u32,
+    ) {
+        let slot = to.0 as usize;
+        let mut cursor = self.heads[slot];
+        while cursor != NONE_U32 {
+            let record = &mut self.records[cursor as usize];
+            let next = record.next;
+            if record.live {
+                if record.reached <= reached && record.grams <= grams {
+                    self.skipped += 1;
+                    return;
+                }
+                if reached <= record.reached && grams <= record.grams {
+                    record.live = false;
+                    self.skipped += 1;
+                }
+            }
+            cursor = next;
+        }
+        let index = self.records.len() as u32;
+        self.records.push(WalkBoard {
+            segment,
+            alight,
+            to,
+            reached,
+            grams,
+            duration,
+            next: NONE_U32,
+            live: true,
+        });
+        if self.heads[slot] == NONE_U32 {
+            self.heads[slot] = index;
+            self.touched.push(to);
+        } else {
+            self.records[self.tails[slot] as usize].next = index;
+        }
+        self.tails[slot] = index;
+    }
+
+    fn reset(&mut self) {
+        for &stop in &self.touched {
+            self.heads[stop.0 as usize] = NONE_U32;
+            self.tails[stop.0 as usize] = NONE_U32;
+        }
+        self.touched.clear();
+        self.records.clear();
+        self.skipped = 0;
+    }
 }
 
 /// The one-pair round's pruning envelope: per arrival, the cleanest
@@ -1307,6 +1410,7 @@ impl<'a> McTbtrEngine<'a> {
             vec![TripBag::default(); self.view.trip_count() as usize * rounds];
         let mut stop_bags: Vec<Bag> = vec![Bag::default(); self.timetable.stop_count() as usize];
         let mut closure = ClosureBatch::new(self.timetable.stop_count() as usize);
+        let mut walk_batch = WalkBoardBatch::new(self.timetable.stop_count() as usize);
         // Per-operation bag accounting (single-thread profiling runs).
         let profile_bag_ops = std::env::var_os("CAFEIN_MCTBTR_PROF_OPS").is_some();
         let mut destination: Vec<Arrived> = Vec::new();
@@ -1373,7 +1477,6 @@ impl<'a> McTbtrEngine<'a> {
                 // Baum et al.'s improved trip-based query, on both
                 // expansion channels. Only the one-pair profile
                 // prunes; see [`PruneEnvelope`].
-                let mut walk_boards: Vec<WalkBoard> = Vec::new();
                 let mut admitted: Vec<(u32, u16)> = Vec::new();
                 stats.segments_scanned_live += segments.len() as u64;
                 let scan_started = std::time::Instant::now();
@@ -1405,7 +1508,7 @@ impl<'a> McTbtrEngine<'a> {
                     &mut destination,
                     fold,
                     frontier,
-                    (round < rounds).then_some(&mut walk_boards),
+                    (round < rounds).then_some(&mut walk_batch),
                     profile_bag_ops,
                     stats,
                 );
@@ -1433,10 +1536,15 @@ impl<'a> McTbtrEngine<'a> {
                     );
                     stats.expand_ns += expand_started.elapsed().as_nanos() as u64;
                     let walk_started = std::time::Instant::now();
-                    for board in walk_boards {
+                    for index in 0..walk_batch.records.len() {
+                        let board = walk_batch.records[index];
+                        if !board.live {
+                            continue;
+                        }
                         if envelope.prunes(board.reached, key(board.grams)) {
                             continue;
                         }
+                        stats.walk_board_calls_live += 1;
                         let departure = arena[board.segment as usize].departure;
                         let (parent, alight, duration) =
                             (board.segment, board.alight, board.duration);
@@ -1460,6 +1568,8 @@ impl<'a> McTbtrEngine<'a> {
                         );
                     }
                     stats.walk_board_ns += walk_started.elapsed().as_nanos() as u64;
+                    stats.walk_boards_skipped_exact += walk_batch.skipped;
+                    walk_batch.reset();
                 }
             }
         }
@@ -1691,7 +1801,7 @@ impl<'a> McTbtrEngine<'a> {
         destination: &mut Vec<Arrived>,
         fold: &mut Option<MatrixSink<'_>>,
         frontier: &mut Option<FrontierSink<'_>>,
-        mut walk_boards: Option<&mut Vec<WalkBoard>>,
+        mut walk_boards: Option<&mut WalkBoardBatch>,
         profile_bag_ops: bool,
         stats: &mut SearchStats,
     ) {
@@ -1797,16 +1907,16 @@ impl<'a> McTbtrEngine<'a> {
                             Some((to, duration)),
                         );
                     }
-                    if let Some(boards) = walk_boards.as_deref_mut() {
+                    if let Some(batch) = walk_boards.as_deref_mut() {
                         stats.walk_boards_recorded += 1;
-                        boards.push(WalkBoard {
-                            segment: point.segment,
-                            alight: point.alight,
+                        batch.offer(
+                            point.segment,
+                            point.alight,
                             to,
                             reached,
-                            grams: point.grams,
+                            point.grams,
                             duration,
-                        });
+                        );
                     }
                 }
             }

@@ -1487,15 +1487,18 @@ fn one_admission_can_cancel_multiple_pending_segments() {
     assert_eq!(bag.entries.len(), 1);
 }
 
-/// Two access lines whose riders both walk to stop 3 and board the
-/// same onward trip at position 0. The dirtier, later walker boards
-/// first (its source stop is swept first); the cleaner walker's
-/// admission then evicts that still-pending onward segment.
+/// Two access lines whose riders walk to different stops (3 and 4)
+/// and board the same onward trip. The dirtier walker boards first at
+/// the deeper position; the cleaner walker's position-0 admission
+/// then evicts that still-pending onward segment. Distinct walk
+/// targets keep the WalkBoard gate out of the way.
 fn cancelling() -> (Timetable, TripGeometry, Transfers) {
     let mut builder = TimetableBuilder::new(6);
     let dirty = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
     let clean = builder.add_pattern(&[StopIdx(0), StopIdx(2)], 1).unwrap();
-    let onward = builder.add_pattern(&[StopIdx(3), StopIdx(5)], 2).unwrap();
+    let onward = builder
+        .add_pattern(&[StopIdx(4), StopIdx(3), StopIdx(5)], 2)
+        .unwrap();
     builder
         .add_trip(dirty, vec![time(0), time(100)], 0, 0)
         .unwrap();
@@ -1503,7 +1506,7 @@ fn cancelling() -> (Timetable, TripGeometry, Transfers) {
         .add_trip(clean, vec![time(0), time(90)], 1, 0)
         .unwrap();
     builder
-        .add_trip(onward, vec![time(300), time(500)], 2, 0)
+        .add_trip(onward, vec![time(300), time(400), time(500)], 2, 0)
         .unwrap();
     let timetable = builder.finish();
     let geometry = TripGeometry::from_trips(
@@ -1511,7 +1514,11 @@ fn cancelling() -> (Timetable, TripGeometry, Transfers) {
         vec![
             (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
             (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
-            (TripIdx(2), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (
+                TripIdx(2),
+                vec![0.0, 50.0, 2000.0],
+                DistanceProvenance::CrowFly,
+            ),
         ],
     )
     .unwrap();
@@ -1519,7 +1526,7 @@ fn cancelling() -> (Timetable, TripGeometry, Transfers) {
         6,
         &[
             (StopIdx(1), StopIdx(3), 60, 60.0),
-            (StopIdx(2), StopIdx(3), 60, 60.0),
+            (StopIdx(2), StopIdx(4), 60, 60.0),
         ],
     )
     .unwrap();
@@ -1558,13 +1565,15 @@ fn cancelled_segments_never_become_destination_leaves() {
         engine.passes(&request, &[0], 1e-6, &mut fold, &mut frontier, &mut stats);
     assert_eq!(stats.segments_cancelled_pending, 1);
     assert_eq!(stats.segments_skipped_cancelled, 1);
+    // Distinct walk targets: nothing for the WalkBoard gate here.
+    assert_eq!(stats.walk_boards_skipped_exact, 0);
     // The clean walker's onward segment is the only destination leaf;
     // the debug chain check inside `passes` walked every ancestry.
     assert_eq!(destination.len(), 1);
     let _ = &arena;
     let reached = destination[0];
     assert_eq!((reached.departure, reached.arrival), (0, 500));
-    assert!((reached.grams - 25.0).abs() < 1e-9);
+    assert!((reached.grams - 45.0).abs() < 1e-9);
     // The full profile agrees with the exhaustive oracle.
     let view = DayView::universal(&timetable);
     let oracle = pareto_oracle(
@@ -1883,4 +1892,244 @@ fn probe_counters_identify_front_and_nonfront_rejections() {
     assert_eq!(front + swaps, rejections);
     assert_eq!(histogram.iter().sum::<u64>(), rejections);
     assert_eq!(distance, examined - rejections);
+}
+
+#[test]
+fn later_pending_walk_board_exactly_dominates_an_earlier_record() {
+    let mut batch = WalkBoardBatch::new(4);
+    batch.offer(0, 1, StopIdx(3), 160, 10.0, 60);
+    batch.offer(1, 1, StopIdx(3), 150, 5.0, 60);
+    assert_eq!(batch.skipped, 1);
+    assert!(!batch.records[0].live);
+    assert!(batch.records[1].live);
+}
+
+#[test]
+fn same_bucket_exact_dirtier_walk_board_does_not_cover_cleaner_record() {
+    // Same 25 g stop bucket, exact-incomparable: the earlier but
+    // exact-dirtier record must not cover the later cleaner one.
+    let mut batch = WalkBoardBatch::new(4);
+    batch.offer(0, 1, StopIdx(3), 150, 10.0, 60);
+    batch.offer(1, 1, StopIdx(3), 160, 5.0, 60);
+    assert_eq!(batch.skipped, 0);
+    assert!(batch.records.iter().all(|record| record.live));
+}
+
+#[test]
+fn walk_board_survivors_keep_global_admission_order() {
+    let mut batch = WalkBoardBatch::new(6);
+    batch.offer(0, 1, StopIdx(3), 160, 10.0, 60);
+    batch.offer(1, 1, StopIdx(4), 200, 20.0, 60);
+    batch.offer(2, 1, StopIdx(3), 150, 5.0, 60);
+    batch.offer(3, 1, StopIdx(5), 100, 1.0, 60);
+    let survivors: Vec<u32> = batch
+        .records
+        .iter()
+        .filter(|record| record.live)
+        .map(|record| record.segment)
+        .collect();
+    assert_eq!(batch.skipped, 1);
+    assert_eq!(survivors, vec![1, 2, 3]);
+}
+
+/// Two access lines whose riders walk to the same stop 3; the later,
+/// cleaner walker exactly covers the earlier dirtier one.
+fn covering() -> (Timetable, TripGeometry, Transfers) {
+    let mut builder = TimetableBuilder::new(6);
+    let dirty = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let clean = builder.add_pattern(&[StopIdx(0), StopIdx(2)], 1).unwrap();
+    let onward = builder.add_pattern(&[StopIdx(3), StopIdx(5)], 2).unwrap();
+    builder
+        .add_trip(dirty, vec![time(0), time(100)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(clean, vec![time(0), time(90)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(onward, vec![time(300), time(500)], 2, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(2), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let footpaths = Transfers::from_edges(
+        6,
+        &[
+            (StopIdx(1), StopIdx(3), 60, 60.0),
+            (StopIdx(2), StopIdx(3), 60, 60.0),
+        ],
+    )
+    .unwrap();
+    (timetable, geometry, footpaths)
+}
+
+#[test]
+fn walk_board_dedup_and_tripbag_cancellation_produce_identical_frontiers() {
+    // The gate removes the covered walker before boarding, so the
+    // stage-3 cancellation never has to fire — same frontier.
+    let (timetable, geometry, footpaths) = covering();
+    let engine = McTbtrEngine::for_date(
+        &timetable,
+        &footpaths,
+        &geometry,
+        &CANCELLING_FACTORS,
+        &[true; 6],
+        &[],
+    );
+    let request = cancelling_request();
+    let mut fold = None;
+    let mut frontier = None;
+    let mut stats = SearchStats::default();
+    let (_, destination) =
+        engine.passes(&request, &[0], 1e-6, &mut fold, &mut frontier, &mut stats);
+    assert_eq!(stats.walk_boards_skipped_exact, 1);
+    assert_eq!(stats.segments_cancelled_pending, 0);
+    assert_eq!(destination.len(), 1);
+    assert_eq!((destination[0].departure, destination[0].arrival), (0, 500));
+    assert!((destination[0].grams - 25.0).abs() < 1e-9);
+    let view = DayView::universal(&timetable);
+    let oracle: Vec<(u32, f64, u32)> = pareto_oracle(
+        &view,
+        &timetable,
+        &footpaths,
+        &geometry,
+        &CANCELLING_FACTORS,
+        0,
+        &request.access,
+        &request.egress,
+        request.max_transfers,
+    )
+    .iter()
+    .map(|point| (point.arrival, point.grams, point.rides))
+    .collect();
+    let journeys = engine.route(&request, 1e-6);
+    assert_eq!(triples(&journeys, &geometry, &CANCELLING_FACTORS), oracle);
+}
+
+#[test]
+fn skipped_walk_board_never_becomes_a_segment_parent() {
+    let (timetable, geometry, footpaths) = covering();
+    let engine = McTbtrEngine::for_date(
+        &timetable,
+        &footpaths,
+        &geometry,
+        &CANCELLING_FACTORS,
+        &[true; 6],
+        &[],
+    );
+    let request = cancelling_request();
+    let mut fold = None;
+    let mut frontier = None;
+    let mut stats = SearchStats::default();
+    let (arena, destination) =
+        engine.passes(&request, &[0], 1e-6, &mut fold, &mut frontier, &mut stats);
+    assert_eq!(stats.walk_boards_skipped_exact, 1);
+    // The dirty walker (access segment 0) never boards: no segment
+    // may name it as a walked parent, and no leaf may reach it.
+    for segment in &arena {
+        assert!(
+            !matches!(segment.origin, SegOrigin::Walked { parent: 0, .. }),
+            "the covered walker gained a child"
+        );
+    }
+    for arrived in &destination {
+        assert_ne!(arrived.leaf, 0);
+    }
+}
+
+#[test]
+fn kappa_bucket_boundary_prevents_unsound_walk_board_dedup() {
+    // Same 25 g stop bucket: a bucket-key gate would let the earlier
+    // record cover the later, cleaner one. But boarding subtracts the
+    // prefix grams before bucketing κ, and bucket equality does not
+    // survive subtraction — at a 21 g prefix the κ buckets split, so
+    // the covered record would have held a strictly cleaner κ bucket.
+    let bucket = 25.0;
+    let (dirty, clean, prefix) = (24.0f64, 20.0f64, 21.0f64);
+    let stop_key = |grams: f64| (grams / bucket).floor() as i64;
+    assert_eq!(stop_key(dirty), stop_key(clean));
+    assert!(stop_key(dirty - prefix) > stop_key(clean - prefix));
+    // The exact gate keeps both; only exact dominance may cover.
+    let mut batch = WalkBoardBatch::new(4);
+    batch.offer(0, 1, StopIdx(3), 150, dirty, 60);
+    batch.offer(1, 1, StopIdx(3), 160, clean, 60);
+    assert_eq!(batch.skipped, 0);
+    assert!(batch.records.iter().all(|record| record.live));
+}
+
+#[test]
+fn earlier_first_trip_covers_a_later_ready_continuation() {
+    // The covering walker is ready early enough for an earlier trip
+    // the covered walker cannot catch; removing the covered record
+    // must not lose any frontier point.
+    let mut builder = TimetableBuilder::new(6);
+    let dirty = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let clean = builder.add_pattern(&[StopIdx(0), StopIdx(2)], 1).unwrap();
+    let onward = builder.add_pattern(&[StopIdx(3), StopIdx(5)], 2).unwrap();
+    builder
+        .add_trip(dirty, vec![time(0), time(290)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(clean, vec![time(0), time(90)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(onward, vec![time(200), time(500)], 2, 0)
+        .unwrap();
+    builder
+        .add_trip(onward, vec![time(400), time(700)], 3, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(2), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(3), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let footpaths = Transfers::from_edges(
+        6,
+        &[
+            (StopIdx(1), StopIdx(3), 60, 60.0),
+            (StopIdx(2), StopIdx(3), 60, 60.0),
+        ],
+    )
+    .unwrap();
+    let factors = [10.0, 5.0, 20.0, 20.0];
+    let engine =
+        McTbtrEngine::for_date(&timetable, &footpaths, &geometry, &factors, &[true; 6], &[]);
+    let request = cancelling_request();
+    let mut fold = None;
+    let mut frontier = None;
+    let mut stats = SearchStats::default();
+    let (_, destination) =
+        engine.passes(&request, &[0], 1e-6, &mut fold, &mut frontier, &mut stats);
+    assert_eq!(stats.walk_boards_skipped_exact, 1);
+    assert_eq!(destination.len(), 1);
+    assert_eq!(destination[0].arrival, 500);
+    let view = DayView::universal(&timetable);
+    let oracle: Vec<(u32, f64, u32)> = pareto_oracle(
+        &view,
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        0,
+        &request.access,
+        &request.egress,
+        request.max_transfers,
+    )
+    .iter()
+    .map(|point| (point.arrival, point.grams, point.rides))
+    .collect();
+    let journeys = engine.route(&request, 1e-6);
+    assert_eq!(triples(&journeys, &geometry, &factors), oracle);
 }
