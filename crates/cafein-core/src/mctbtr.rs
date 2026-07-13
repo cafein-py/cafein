@@ -40,7 +40,7 @@ use crate::tbtr::{
     earliest_boardable, DayView, TransferSet, TransferSetBuild, TripTransfer, ViewTrip,
 };
 use crate::timetable::{StopIdx, Timetable, TripIdx};
-use crate::transfers::Transfers;
+use crate::transfers::{Transfer, Transfers};
 
 /// Builds the multicriteria transfer set of a day view by **global
 /// candidate/witness enumeration** (Baum et al. 2023's integrated
@@ -1233,105 +1233,149 @@ impl<'a> McTbtrEngine<'a> {
                 continue;
             }
             admitted.push((index, alight as u16));
-            for &(egress, seconds) in &request.egress {
-                if egress == stop {
-                    self.join(
-                        destination,
-                        key,
-                        segment.departure,
-                        arrival.saturating_add(seconds),
-                        grams,
-                        index,
-                        alight as u16,
-                        None,
-                    );
-                }
-            }
-            if let Some(sink) = frontier {
-                self.frontier_join(
-                    sink,
-                    stop,
+            self.join_direct_alight(
+                request,
+                key,
+                segment.departure,
+                stop,
+                arrival,
+                grams,
+                index,
+                alight as u16,
+                destination,
+                fold,
+                frontier,
+            );
+            for footpath in self.footpaths.from_stop(stop) {
+                closure_edges += 1;
+                self.relax_closure_edge(
+                    request,
                     key,
+                    round,
+                    footpath,
                     segment.departure,
                     arrival,
                     grams,
                     index,
                     alight as u16,
-                    None,
+                    stop_bags,
+                    destination,
+                    fold,
+                    frontier,
+                    &mut walk_boards,
                 );
-            }
-            if let Some(sink) = fold {
-                sink.fold(
-                    stop,
-                    arrival - segment.departure,
-                    grams,
-                    index,
-                    alight as u16,
-                    false,
-                );
-            }
-            for footpath in self.footpaths.from_stop(stop) {
-                closure_edges += 1;
-                let reached = arrival.saturating_add(footpath.duration);
-                if !stop_bags[footpath.to.0 as usize].insert(
-                    reached,
-                    grams,
-                    key(grams),
-                    round as u8,
-                ) {
-                    continue;
-                }
-                if let Some(sink) = fold {
-                    sink.fold(
-                        footpath.to,
-                        reached - segment.departure,
-                        grams,
-                        index,
-                        alight as u16,
-                        true,
-                    );
-                }
-                for &(egress, seconds) in &request.egress {
-                    if egress == footpath.to {
-                        self.join(
-                            destination,
-                            key,
-                            segment.departure,
-                            reached.saturating_add(seconds),
-                            grams,
-                            index,
-                            alight as u16,
-                            Some((footpath.to, footpath.duration)),
-                        );
-                    }
-                }
-                if let Some(sink) = frontier {
-                    self.frontier_join(
-                        sink,
-                        footpath.to,
-                        key,
-                        segment.departure,
-                        reached,
-                        grams,
-                        index,
-                        alight as u16,
-                        Some((footpath.to, footpath.duration)),
-                    );
-                }
-                if let Some(boards) = walk_boards.as_deref_mut() {
-                    boards.push(WalkBoard {
-                        segment: index,
-                        alight: alight as u16,
-                        to: footpath.to,
-                        reached,
-                        grams,
-                        duration: footpath.duration,
-                    });
-                }
             }
         }
         stats.closure_edge_records_loaded += closure_edges;
         stats.closure_label_edge_relaxations += closure_edges;
+    }
+
+    /// The direct-alight sink joins for a bag-admitted on-trip
+    /// arrival: egress destinations, the frontier, and the fold.
+    #[allow(clippy::too_many_arguments)]
+    fn join_direct_alight(
+        &self,
+        request: &Request,
+        key: impl Fn(f64) -> i64 + Copy,
+        departure: u32,
+        stop: StopIdx,
+        arrival: u32,
+        grams: f64,
+        index: u32,
+        alight: u16,
+        destination: &mut Vec<Arrived>,
+        fold: &mut Option<MatrixSink<'_>>,
+        frontier: &mut Option<FrontierSink<'_>>,
+    ) {
+        for &(egress, seconds) in &request.egress {
+            if egress == stop {
+                self.join(
+                    destination,
+                    key,
+                    departure,
+                    arrival.saturating_add(seconds),
+                    grams,
+                    index,
+                    alight,
+                    None,
+                );
+            }
+        }
+        if let Some(sink) = frontier {
+            self.frontier_join(
+                sink, stop, key, departure, arrival, grams, index, alight, None,
+            );
+        }
+        if let Some(sink) = fold {
+            sink.fold(stop, arrival - departure, grams, index, alight, false);
+        }
+    }
+
+    /// The closure-target operations for one admitted point relaxed
+    /// over one footpath edge: bag admission at the target, then the
+    /// fold, egress, frontier, and WalkBoard joins.
+    #[allow(clippy::too_many_arguments)]
+    fn relax_closure_edge(
+        &self,
+        request: &Request,
+        key: impl Fn(f64) -> i64 + Copy,
+        round: usize,
+        footpath: &Transfer,
+        departure: u32,
+        arrival: u32,
+        grams: f64,
+        index: u32,
+        alight: u16,
+        stop_bags: &mut [Bag],
+        destination: &mut Vec<Arrived>,
+        fold: &mut Option<MatrixSink<'_>>,
+        frontier: &mut Option<FrontierSink<'_>>,
+        walk_boards: &mut Option<&mut Vec<WalkBoard>>,
+    ) {
+        let reached = arrival.saturating_add(footpath.duration);
+        if !stop_bags[footpath.to.0 as usize].insert(reached, grams, key(grams), round as u8) {
+            return;
+        }
+        if let Some(sink) = fold {
+            sink.fold(footpath.to, reached - departure, grams, index, alight, true);
+        }
+        for &(egress, seconds) in &request.egress {
+            if egress == footpath.to {
+                self.join(
+                    destination,
+                    key,
+                    departure,
+                    reached.saturating_add(seconds),
+                    grams,
+                    index,
+                    alight,
+                    Some((footpath.to, footpath.duration)),
+                );
+            }
+        }
+        if let Some(sink) = frontier {
+            self.frontier_join(
+                sink,
+                footpath.to,
+                key,
+                departure,
+                reached,
+                grams,
+                index,
+                alight,
+                Some((footpath.to, footpath.duration)),
+            );
+        }
+        if let Some(boards) = walk_boards.as_deref_mut() {
+            boards.push(WalkBoard {
+                segment: index,
+                alight,
+                to: footpath.to,
+                reached,
+                grams,
+                duration: footpath.duration,
+            });
+        }
     }
 
     /// The expansion sweep, under the round's pruning envelope: the
