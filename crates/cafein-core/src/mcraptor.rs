@@ -166,6 +166,89 @@ impl Bag {
         });
         true
     }
+
+    /// Strict `insert` with probe accounting for the trip-based
+    /// engine's closure diagnostics: identical decisions to
+    /// `insert(arrival, grams, key, rides)`, recording the bag length
+    /// before the call and how many entries the rejection scan and
+    /// the eviction walk examined.
+    pub(crate) fn insert_probed(
+        &mut self,
+        arrival: u32,
+        grams: f64,
+        key: i64,
+        rides: u8,
+        probes: &mut InsertProbes,
+    ) -> bool {
+        probes.length = self.entries.len() as u32;
+        probes.examined = 0;
+        probes.retained = 0;
+        for entry in &self.entries {
+            probes.examined += 1;
+            if entry.key <= key && entry.rides <= rides && entry.arrival <= arrival {
+                if entry.arrival == arrival
+                    && entry.penalty == 0
+                    && entry.key == key
+                    && entry.rides == rides
+                {
+                    if grams >= entry.grams {
+                        return false;
+                    }
+                } else if entry.arrival.saturating_add(entry.penalty) <= arrival {
+                    return false;
+                }
+            }
+        }
+        let retained = &mut probes.retained;
+        self.entries.retain(|entry| {
+            *retained += 1;
+            !((key <= entry.key
+                && rides <= entry.rides
+                && arrival <= entry.arrival
+                && arrival <= entry.arrival.saturating_add(entry.penalty))
+                || (entry.arrival == arrival
+                    && entry.penalty == 0
+                    && entry.key == key
+                    && entry.rides == rides
+                    && grams < entry.grams))
+        });
+        self.entries.push(Entry {
+            arrival,
+            penalty: 0,
+            key,
+            grams,
+            rides,
+        });
+        true
+    }
+
+    /// The bag's entries as comparable tuples, for differential tests.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> Vec<(u32, u32, i64, u64, u8)> {
+        self.entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.arrival,
+                    entry.penalty,
+                    entry.key,
+                    entry.grams.to_bits(),
+                    entry.rides,
+                )
+            })
+            .collect()
+    }
+}
+
+/// Per-call probe depths of one strict `insert_probed`.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct InsertProbes {
+    /// Entries walked by the rejection scan before returning.
+    pub examined: u32,
+    /// Entries the eviction walk examined (admissions only).
+    pub retained: u32,
+    /// Bag length before the call.
+    pub length: u32,
 }
 
 /// A destination frontier entry; `departure` is the profile pass that

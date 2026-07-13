@@ -33,7 +33,7 @@ use crate::exhaustive::quantized;
 use crate::fares::FareLeg;
 use crate::geometry::{wkb_multi_line_string, TripGeometry};
 use crate::journey::{Journey, Leg};
-use crate::mcraptor::Bag;
+use crate::mcraptor::{Bag, InsertProbes};
 use crate::raptor::{departure_candidates, CostInputs, CostRow};
 use crate::router::Request;
 use crate::tbtr::{
@@ -714,10 +714,49 @@ pub(crate) struct SearchStats {
     pub segments_skipped_cancelled: u64,
     pub segments_scanned_live: u64,
     pub suffix_context_evaluations: u64,
+    /// Closure-path stop-bag calls (diagnostic runs only).
+    pub closure_bag_calls: u64,
+    /// Calls the stop bag rejected (diagnostic runs only).
+    pub closure_bag_rejections: u64,
+    /// Entries the rejection scan walked on rejected calls.
+    pub closure_bag_reject_entries_examined: u64,
+    /// The subset of those walked on shadow-cache misses — the walks a
+    /// production cache would still pay.
+    pub closure_bag_reject_entries_examined_on_miss: u64,
+    /// Rejected calls the shadow cache missed.
+    pub closure_bag_rejections_on_miss: u64,
+    /// Entries the rejection scan walked on admitted calls.
+    pub closure_bag_admit_entries_examined: u64,
+    /// Entries the eviction walk examined on admitted calls.
+    pub closure_bag_retain_entries_examined: u64,
+    /// Pre-call bag lengths: 0, 1, 2, 3–4, 5–8, 9–16, 17–32, 33–128,
+    /// and 129+.
+    pub closure_bag_length_histogram: [u64; 9],
+    /// Shadow rejections per witness way (way 0 = newest).
+    pub closure_shadow_hits: [u64; SHADOW_WAYS],
+    /// Shadow rejections the real bag then admitted — must stay zero.
+    pub closure_shadow_false_positives: u64,
+    /// Edge-only diagnostic prepass over the touched source slices.
+    pub closure_edge_prepass_ns: u64,
     pub direct_scan_ns: u64,
     pub closure_ns: u64,
     pub expand_ns: u64,
     pub walk_board_ns: u64,
+}
+
+/// Histogram bucket of a pre-call bag length.
+fn length_bucket(length: u32) -> usize {
+    match length {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3..=4 => 3,
+        5..=8 => 4,
+        9..=16 => 5,
+        17..=32 => 6,
+        33..=128 => 7,
+        _ => 8,
+    }
 }
 
 impl SearchStats {
@@ -735,6 +774,30 @@ impl SearchStats {
         self.segments_skipped_cancelled += other.segments_skipped_cancelled;
         self.segments_scanned_live += other.segments_scanned_live;
         self.suffix_context_evaluations += other.suffix_context_evaluations;
+        self.closure_bag_calls += other.closure_bag_calls;
+        self.closure_bag_rejections += other.closure_bag_rejections;
+        self.closure_bag_reject_entries_examined += other.closure_bag_reject_entries_examined;
+        self.closure_bag_reject_entries_examined_on_miss +=
+            other.closure_bag_reject_entries_examined_on_miss;
+        self.closure_bag_rejections_on_miss += other.closure_bag_rejections_on_miss;
+        self.closure_bag_admit_entries_examined += other.closure_bag_admit_entries_examined;
+        self.closure_bag_retain_entries_examined += other.closure_bag_retain_entries_examined;
+        for (mine, theirs) in self
+            .closure_bag_length_histogram
+            .iter_mut()
+            .zip(other.closure_bag_length_histogram)
+        {
+            *mine += theirs;
+        }
+        for (mine, theirs) in self
+            .closure_shadow_hits
+            .iter_mut()
+            .zip(other.closure_shadow_hits)
+        {
+            *mine += theirs;
+        }
+        self.closure_shadow_false_positives += other.closure_shadow_false_positives;
+        self.closure_edge_prepass_ns += other.closure_edge_prepass_ns;
         self.direct_scan_ns += other.direct_scan_ns;
         self.closure_ns += other.closure_ns;
         self.expand_ns += other.expand_ns;
@@ -753,7 +816,15 @@ impl SearchStats {
              walk_boards_recorded={} segments_enqueued={} \
              segments_cancelled_pending={} segments_skipped_cancelled={} \
              segments_scanned_live={} \
-             suffix_context_evaluations={} direct_scan_ms={} closure_ms={} \
+             suffix_context_evaluations={} closure_bag_calls={} \
+             closure_bag_rejections={} closure_bag_reject_entries_examined={} \
+             closure_bag_reject_entries_examined_on_miss={} \
+             closure_bag_rejections_on_miss={} \
+             closure_bag_admit_entries_examined={} \
+             closure_bag_retain_entries_examined={} \
+             closure_bag_length_histogram={} closure_shadow_hits={} \
+             closure_shadow_false_positives={} \
+             closure_edge_prepass_ms={} direct_scan_ms={} closure_ms={} \
              expand_ms={} walk_board_ms={}",
             self.closure_edge_records_loaded,
             self.closure_label_edge_relaxations,
@@ -768,6 +839,25 @@ impl SearchStats {
             self.segments_skipped_cancelled,
             self.segments_scanned_live,
             self.suffix_context_evaluations,
+            self.closure_bag_calls,
+            self.closure_bag_rejections,
+            self.closure_bag_reject_entries_examined,
+            self.closure_bag_reject_entries_examined_on_miss,
+            self.closure_bag_rejections_on_miss,
+            self.closure_bag_admit_entries_examined,
+            self.closure_bag_retain_entries_examined,
+            self.closure_bag_length_histogram
+                .iter()
+                .map(|count| count.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            self.closure_shadow_hits
+                .iter()
+                .map(|count| count.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            self.closure_shadow_false_positives,
+            self.closure_edge_prepass_ns / 1_000_000,
             self.direct_scan_ns / 1_000_000,
             self.closure_ns / 1_000_000,
             self.expand_ns / 1_000_000,
@@ -854,6 +944,92 @@ impl MatrixSink<'_> {
 }
 
 const NONE_U32: u32 = u32::MAX;
+
+/// A historical rejection certificate for one target stop: a point
+/// that is, or once was covered by, a stop-bag entry. Dominance is
+/// transitive (including the identical-slot exact-grams refinement),
+/// so a candidate the witness rejects would also be rejected by the
+/// live bag — even after the witness's covering entry was evicted.
+#[derive(Clone, Copy)]
+struct RejectWitness {
+    grams: f64,
+    key: i64,
+    arrival: u32,
+    rides: u8,
+    valid: bool,
+}
+
+impl RejectWitness {
+    const NONE: RejectWitness = RejectWitness {
+        grams: 0.0,
+        key: 0,
+        arrival: 0,
+        rides: 0,
+        valid: false,
+    };
+
+    /// Exactly the stop bag's strict rejection relation.
+    fn rejects(&self, arrival: u32, key: i64, grams: f64, rides: u8) -> bool {
+        self.valid
+            && self.arrival <= arrival
+            && self.key <= key
+            && self.rides <= rides
+            && !(self.arrival == arrival
+                && self.key == key
+                && self.rides == rides
+                && grams < self.grams)
+    }
+}
+
+/// Witness ways per stop in the shadow rejection cache.
+const SHADOW_WAYS: usize = 4;
+
+/// The adaptive rejection cache: per target stop, the most recent
+/// cache-missing candidates, newest first. Lives beside the stop bags
+/// for one origin query and is never reset while they persist.
+struct ClosureRejectCache {
+    ways: Box<[RejectWitness]>,
+}
+
+impl ClosureRejectCache {
+    fn new(stop_count: usize) -> Self {
+        ClosureRejectCache {
+            ways: vec![RejectWitness::NONE; stop_count * SHADOW_WAYS].into_boxed_slice(),
+        }
+    }
+
+    /// The rejecting way (0 = newest witness), or `None` on a miss.
+    fn classify(
+        &self,
+        stop: StopIdx,
+        arrival: u32,
+        key: i64,
+        grams: f64,
+        rides: u8,
+    ) -> Option<usize> {
+        let base = stop.0 as usize * SHADOW_WAYS;
+        self.ways[base..base + SHADOW_WAYS]
+            .iter()
+            .position(|witness| witness.rejects(arrival, key, grams, rides))
+    }
+
+    /// A cache miss becomes the newest witness whether the bag
+    /// admitted it (it is now an entry) or rejected it (some entry
+    /// covers it) — both are sound certificates. Older ways shift
+    /// down; the oldest falls out.
+    fn promote(&mut self, stop: StopIdx, arrival: u32, key: i64, grams: f64, rides: u8) {
+        let base = stop.0 as usize * SHADOW_WAYS;
+        self.ways
+            .copy_within(base..base + SHADOW_WAYS - 1, base + 1);
+        self.ways[base] = RejectWitness {
+            grams,
+            key,
+            arrival,
+            rides,
+            valid: true,
+        };
+    }
+}
 
 /// One direct admission queued for the round's closure sweep, linked
 /// per source stop in direct-scan order.
@@ -1208,6 +1384,11 @@ impl<'a> McTbtrEngine<'a> {
             vec![TripBag::default(); self.view.trip_count() as usize * rounds];
         let mut stop_bags: Vec<Bag> = vec![Bag::default(); self.timetable.stop_count() as usize];
         let mut closure = ClosureBatch::new(self.timetable.stop_count() as usize);
+        // Diagnostic modes (single-thread profiling runs only): the
+        // shadowed rejection cache and the edge-only prepass.
+        let mut shadow = std::env::var_os("CAFEIN_MCTBTR_PROF_OPS")
+            .map(|_| ClosureRejectCache::new(self.timetable.stop_count() as usize));
+        let edge_prepass = std::env::var_os("CAFEIN_MCTBTR_PROF_EDGES").is_some();
         let mut destination: Vec<Arrived> = Vec::new();
         for &departure in departures {
             // Seed: board from every access stop.
@@ -1305,6 +1486,8 @@ impl<'a> McTbtrEngine<'a> {
                     fold,
                     frontier,
                     (round < rounds).then_some(&mut walk_boards),
+                    &mut shadow,
+                    edge_prepass,
                     stats,
                 );
                 stats.closure_ns += closure_started.elapsed().as_nanos() as u64;
@@ -1590,8 +1773,25 @@ impl<'a> McTbtrEngine<'a> {
         fold: &mut Option<MatrixSink<'_>>,
         frontier: &mut Option<FrontierSink<'_>>,
         mut walk_boards: Option<&mut Vec<WalkBoard>>,
+        shadow: &mut Option<ClosureRejectCache>,
+        edge_prepass: bool,
         stats: &mut SearchStats,
     ) {
+        if edge_prepass {
+            // Diagnostic: time one edge-only traversal of the same
+            // touched slices. It doubles edge traffic and warms the
+            // real sweep, so it belongs to separate profiling runs.
+            let started = std::time::Instant::now();
+            let mut checksum = 0u64;
+            for source in &closure.touched {
+                for edge in self.footpaths.from_stop(*source) {
+                    checksum =
+                        checksum.wrapping_add(((edge.duration as u64) << 32) | edge.to.0 as u64);
+                }
+            }
+            std::hint::black_box(checksum);
+            stats.closure_edge_prepass_ns += started.elapsed().as_nanos() as u64;
+        }
         for source_index in 0..closure.touched.len() {
             let source = closure.touched[source_index];
             stats.closure_source_batches += 1;
@@ -1617,12 +1817,49 @@ impl<'a> McTbtrEngine<'a> {
                 let (to, duration) = (edge.to, edge.duration);
                 for point in &closure.active {
                     let reached = point.arrival.saturating_add(duration);
-                    if !stop_bags[to.0 as usize].insert(
-                        reached,
-                        point.grams,
-                        point.key,
-                        round as u8,
-                    ) {
+                    let admitted = if let Some(cache) = shadow.as_mut() {
+                        let hit = cache.classify(to, reached, point.key, point.grams, round as u8);
+                        let mut probes = InsertProbes::default();
+                        let admitted = stop_bags[to.0 as usize].insert_probed(
+                            reached,
+                            point.grams,
+                            point.key,
+                            round as u8,
+                            &mut probes,
+                        );
+                        stats.closure_bag_calls += 1;
+                        stats.closure_bag_length_histogram[length_bucket(probes.length)] += 1;
+                        if admitted {
+                            stats.closure_bag_admit_entries_examined += probes.examined as u64;
+                            stats.closure_bag_retain_entries_examined += probes.retained as u64;
+                        } else {
+                            stats.closure_bag_rejections += 1;
+                            stats.closure_bag_reject_entries_examined += probes.examined as u64;
+                            if hit.is_none() {
+                                stats.closure_bag_rejections_on_miss += 1;
+                                stats.closure_bag_reject_entries_examined_on_miss +=
+                                    probes.examined as u64;
+                            }
+                        }
+                        match hit {
+                            Some(way) => {
+                                stats.closure_shadow_hits[way] += 1;
+                                if admitted {
+                                    stats.closure_shadow_false_positives += 1;
+                                }
+                            }
+                            None => cache.promote(to, reached, point.key, point.grams, round as u8),
+                        }
+                        admitted
+                    } else {
+                        stop_bags[to.0 as usize].insert(
+                            reached,
+                            point.grams,
+                            point.key,
+                            round as u8,
+                        )
+                    };
+                    if !admitted {
                         continue;
                     }
                     stats.closure_target_admissions += 1;

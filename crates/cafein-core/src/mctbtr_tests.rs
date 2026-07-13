@@ -1487,6 +1487,27 @@ fn one_admission_can_cancel_multiple_pending_segments() {
     assert_eq!(bag.entries.len(), 1);
 }
 
+#[test]
+fn shadow_cache_retires_the_oldest_witness() {
+    // Four incomparable witnesses fill the ways; a fifth retires the
+    // oldest, whose region then misses again.
+    let mut cache = ClosureRejectCache::new(1);
+    let stop = StopIdx(0);
+    for way in 0..5u32 {
+        // Later witnesses arrive earlier but dirtier: incomparable.
+        let arrival = 100 - 10 * way;
+        let key = 10 + way as i64 * 10;
+        assert_eq!(cache.classify(stop, arrival, key, key as f64, 1), None);
+        cache.promote(stop, arrival, key, key as f64, 1);
+    }
+    // The newest witness certifies its own region.
+    assert_eq!(cache.classify(stop, 60, 50, 50.0, 1), Some(0));
+    // The oldest (arrival 100, key 10) fell out: its region misses.
+    assert_eq!(cache.classify(stop, 100, 10, 10.0, 1), None);
+    // The second-oldest survives in the deepest way.
+    assert_eq!(cache.classify(stop, 90, 20, 20.0, 1), Some(3));
+}
+
 /// Two access lines whose riders both walk to stop 3 and board the
 /// same onward trip at position 0. The dirtier, later walker boards
 /// first (its source stop is swept first); the cleaner walker's
@@ -1625,4 +1646,116 @@ fn cancelled_segments_never_appear_as_segment_parents() {
     for arrived in &destination {
         assert_ne!(arrived.leaf, cancelled[0], "a cancelled segment was a leaf");
     }
+}
+
+#[test]
+fn historical_stop_witness_survives_covering_eviction() {
+    // The witness's covering bag entry is evicted by admissions the
+    // cache never sees (direct and access insertions bypass it); the
+    // historical certificate must still predict the bag's rejection.
+    let mut bag = Bag::default();
+    let mut cache = ClosureRejectCache::new(1);
+    let stop = StopIdx(0);
+    assert!(bag.insert(100, 50.0, 5, 1));
+    cache.promote(stop, 100, 5, 50.0, 1);
+    // An out-of-cache covering admission evicts the witness's entry.
+    assert!(bag.insert(90, 40.0, 4, 1));
+    // A candidate only the evicted witness certifies: the cache still
+    // rejects it, and so does the live bag (via the evictor).
+    assert_eq!(cache.classify(stop, 120, 6, 60.0, 2), Some(0));
+    assert!(!bag.insert(120, 60.0, 6, 2));
+    // Shift the witness into a deeper way with incomparable promotes,
+    // evict its evictor out of cache too, and the deep way still
+    // certifies through the two-step eviction chain.
+    assert_eq!(cache.classify(stop, 80, 9, 225.0, 1), None);
+    assert!(bag.insert(80, 225.0, 9, 1));
+    cache.promote(stop, 80, 9, 225.0, 1);
+    assert_eq!(cache.classify(stop, 70, 12, 300.0, 1), None);
+    assert!(bag.insert(70, 300.0, 12, 1));
+    cache.promote(stop, 70, 12, 300.0, 1);
+    assert!(bag.insert(85, 35.0, 3, 1));
+    assert_eq!(cache.classify(stop, 130, 7, 70.0, 2), Some(2));
+    assert!(!bag.insert(130, 70.0, 7, 2));
+}
+
+#[test]
+fn rejected_candidate_is_a_sound_future_witness() {
+    let mut bag = Bag::default();
+    let mut cache = ClosureRejectCache::new(1);
+    let stop = StopIdx(0);
+    assert!(bag.insert(50, 10.0, 1, 0));
+    // A rejected candidate still promotes: some bag entry covers it.
+    assert_eq!(cache.classify(stop, 100, 9, 99.0, 1), None);
+    assert!(!bag.insert(100, 99.0, 9, 1));
+    cache.promote(stop, 100, 9, 99.0, 1);
+    // Anything it rejects, the bag rejects too.
+    assert_eq!(cache.classify(stop, 110, 9, 99.5, 1), Some(0));
+    assert!(!bag.insert(110, 99.5, 9, 1));
+}
+
+#[test]
+fn same_slot_cleaner_candidate_bypasses_a_dirtier_witness() {
+    let mut bag = Bag::default();
+    let mut cache = ClosureRejectCache::new(1);
+    let stop = StopIdx(0);
+    assert!(bag.insert(100, 50.0, 5, 1));
+    cache.promote(stop, 100, 5, 50.0, 1);
+    // Identical (arrival, key, rides) but strictly cleaner exact
+    // grams: the refinement path must reach the real bag.
+    assert_eq!(cache.classify(stop, 100, 5, 40.0, 1), None);
+    assert!(bag.insert(100, 40.0, 5, 1));
+}
+
+#[test]
+fn higher_ride_witness_does_not_reject_a_lower_round() {
+    let mut bag = Bag::default();
+    let mut cache = ClosureRejectCache::new(1);
+    let stop = StopIdx(0);
+    assert!(bag.insert(100, 50.0, 5, 4));
+    cache.promote(stop, 100, 5, 50.0, 4);
+    // Same point on fewer rides: neither the cache nor the bag may
+    // suppress it.
+    assert_eq!(cache.classify(stop, 100, 5, 50.0, 2), None);
+    assert!(bag.insert(100, 50.0, 5, 2));
+}
+
+#[test]
+fn shadow_cache_has_no_false_positives() {
+    // Randomized differential: plain insert, probed insert, and the
+    // shadowed cache must agree on every decision and end state.
+    let mut state = 0x9e3779b97f4a7c15u64;
+    let mut next = move |bound: u64| {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) % bound
+    };
+    let stops = 4usize;
+    let mut plain = vec![Bag::default(); stops];
+    let mut probed = vec![Bag::default(); stops];
+    let mut cache = ClosureRejectCache::new(stops);
+    let (mut hits, mut misses) = (0u64, 0u64);
+    for _ in 0..20_000 {
+        let stop = next(stops as u64) as usize;
+        let arrival = 100 + next(50) as u32;
+        let key = next(8) as i64;
+        let grams = key as f64 * 25.0 + next(25) as f64;
+        let rides = next(4) as u8;
+        let expected = plain[stop].insert(arrival, grams, key, rides);
+        let hit = cache.classify(StopIdx(stop as u32), arrival, key, grams, rides);
+        let mut probes = InsertProbes::default();
+        let admitted = probed[stop].insert_probed(arrival, grams, key, rides, &mut probes);
+        assert_eq!(admitted, expected, "probed insert diverged");
+        assert!(probes.length as usize <= 20_000);
+        if hit.is_none() {
+            misses += 1;
+            cache.promote(StopIdx(stop as u32), arrival, key, grams, rides);
+        } else {
+            hits += 1;
+            assert!(!admitted, "shadow false positive");
+        }
+        assert_eq!(plain[stop].snapshot(), probed[stop].snapshot());
+    }
+    assert!(hits > 0, "the cache never certified a rejection");
+    assert!(misses > 0, "the cache absorbed everything");
 }
