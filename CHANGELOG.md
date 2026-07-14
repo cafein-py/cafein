@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-07-14
 
 - Much faster multicriteria engines. A measured, staged performance
   programme rewrote both engines' hot paths: McTBTR relaxes query
