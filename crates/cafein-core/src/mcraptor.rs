@@ -495,7 +495,6 @@ pub(crate) struct McRaptorStats {
     pub route_scan_ns: u64,
     pub footpath_ns: u64,
     pub sink_ns: u64,
-    pub footpath_edge_prepass_ns: u64,
 
     pub departure_passes: u64,
     pub rounds_entered: u64,
@@ -540,10 +539,6 @@ pub(crate) struct McRaptorStats {
     pub labels_created: u64,
     pub total_bag_entries_at_round_end: u64,
     pub maximum_stop_bag_length: u64,
-
-    pub access_floor_rejectable_route: u64,
-    pub access_floor_rejectable_footpath: u64,
-    pub access_floor_nonfront_saved_probes: u64,
 }
 
 impl McRaptorStats {
@@ -553,7 +548,6 @@ impl McRaptorStats {
         self.route_scan_ns += other.route_scan_ns;
         self.footpath_ns += other.footpath_ns;
         self.sink_ns += other.sink_ns;
-        self.footpath_edge_prepass_ns += other.footpath_edge_prepass_ns;
         self.departure_passes += other.departure_passes;
         self.rounds_entered += other.rounds_entered;
         self.rounds_ended_empty += other.rounds_ended_empty;
@@ -604,9 +598,6 @@ impl McRaptorStats {
         self.maximum_stop_bag_length = self
             .maximum_stop_bag_length
             .max(other.maximum_stop_bag_length);
-        self.access_floor_rejectable_route += other.access_floor_rejectable_route;
-        self.access_floor_rejectable_footpath += other.access_floor_rejectable_footpath;
-        self.access_floor_nonfront_saved_probes += other.access_floor_nonfront_saved_probes;
     }
 
     pub(crate) fn report(&self, label: &str) {
@@ -622,7 +613,7 @@ impl McRaptorStats {
         };
         eprintln!(
             "MCRAPTOR-STATS {label} access_ms={} queue_collect_ms={} \
-             route_scan_ms={} footpath_ms={} sink_ms={} edge_prepass_ms={} \
+             route_scan_ms={} footpath_ms={} sink_ms={} \
              departure_passes={} rounds_entered={} rounds_ended_empty={} \
              max_round_reached={} access_offers={} access_admissions={} \
              queue_labels={} queue_entries={} lines_touched={} \
@@ -640,16 +631,12 @@ impl McRaptorStats {
              rode_stale={} batch_points_offered={} batch_points_rejected={} \
              batch_points_evicted={} batch_points_live={} \
              batch_source_stops={} labels_created={} \
-             total_bag_entries_at_round_end={} maximum_stop_bag_length={} \
-             access_floor_rejectable_route={} \
-             access_floor_rejectable_footpath={} \
-             access_floor_nonfront_saved_probes={}",
+             total_bag_entries_at_round_end={} maximum_stop_bag_length={}",
             self.access_ns / 1_000_000,
             self.queue_collect_ns / 1_000_000,
             self.route_scan_ns / 1_000_000,
             self.footpath_ns / 1_000_000,
             self.sink_ns / 1_000_000,
-            self.footpath_edge_prepass_ns / 1_000_000,
             self.departure_passes,
             self.rounds_entered,
             self.rounds_ended_empty,
@@ -686,9 +673,6 @@ impl McRaptorStats {
             self.labels_created,
             self.total_bag_entries_at_round_end,
             self.maximum_stop_bag_length,
-            self.access_floor_rejectable_route,
-            self.access_floor_rejectable_footpath,
-            self.access_floor_nonfront_saved_probes,
         );
     }
 }
@@ -1054,9 +1038,6 @@ struct Search<'a> {
     /// diagnostic environment flags read once at `start`.
     stats: Box<McRaptorStats>,
     ops: bool,
-    edges_prepass: bool,
-    /// Diagnostic minimum zero-gram access arrival per stop (ops runs).
-    access_floor: Vec<u32>,
     /// The edge-major footpath batch (strict searches only); general
     /// searches keep the label-major loop.
     batch: Option<FootpathBatch>,
@@ -1745,23 +1726,12 @@ impl<'a> Search<'a> {
             strict_bags: slack == 0 && route_penalties.is_empty(),
             stats: Box::default(),
             ops: std::env::var_os("CAFEIN_MCRAPTOR_PROF_OPS").is_some(),
-            edges_prepass: std::env::var_os("CAFEIN_MCRAPTOR_PROF_EDGES").is_some(),
-            access_floor: Vec::new(),
             batch: None,
         };
         if search.strict_bags {
             search.batch = Some(FootpathBatch::new(timetable.stop_count() as usize));
         }
-        search.arm_diagnostics();
         search
-    }
-
-    /// Sizes the diagnostic structures when the flags ask for them.
-    fn arm_diagnostics(&mut self) {
-        if !self.ops {
-            return;
-        }
-        self.access_floor = vec![u32::MAX; self.timetable.stop_count() as usize];
     }
 
     /// Installs the pass's `max_slower` cutoffs: per stop the plain
@@ -1849,10 +1819,6 @@ impl<'a> Search<'a> {
                 self.slack,
             ) {
                 self.stats.access_admissions += 1;
-                if self.ops {
-                    let floor = &mut self.access_floor[stop.0 as usize];
-                    *floor = (*floor).min(arrival);
-                }
                 self.arena.push(Label {
                     arrival,
                     grams: 0.0,
@@ -1913,23 +1879,6 @@ impl<'a> Search<'a> {
             self.stats.rode_labels += rode.len() as u64;
             if self.ops {
                 self.audit_rode(&rode, rides);
-            }
-            if self.edges_prepass {
-                // Diagnostic: time one edge-only traversal of the same
-                // label-major slices. It warms the real loop, so it
-                // belongs to separate profiling runs.
-                let started = std::time::Instant::now();
-                let mut checksum = 0u64;
-                for &label in &rode {
-                    let stop = self.arena[label as usize].stop;
-                    for footpath in self.footpaths.from_stop(stop) {
-                        checksum = checksum.wrapping_add(
-                            ((footpath.duration as u64) << 32) | footpath.to.0 as u64,
-                        );
-                    }
-                }
-                std::hint::black_box(checksum);
-                self.stats.footpath_edge_prepass_ns += started.elapsed().as_nanos() as u64;
             }
             // One footpath hop from the improving ride labels; the
             // closed transfer contract makes chains redundant.
@@ -1998,19 +1947,6 @@ impl<'a> Search<'a> {
             fresh = next;
         }
         self.stats.labels_created = self.arena.len() as u64;
-    }
-
-    /// Whether the diagnostic access-floor entry is an exact rejecting
-    /// witness for a candidate under the bag's slack relation: the
-    /// floor carries zero grams, penalty, and rides, so it wins every
-    /// axis when its key and both arrival comparisons hold (a ridden
-    /// candidate can never be its exact-class tie).
-    fn access_floor_rejects(&self, stop: StopIdx, arrival: u32, penalty: u32, key: i64) -> bool {
-        let floor = self.access_floor[stop.0 as usize];
-        floor != u32::MAX
-            && key >= 0
-            && floor <= arrival
-            && floor.saturating_add(self.slack) <= arrival.saturating_add(penalty)
     }
 
     /// The round's stale-`rode` audit (diagnostic runs): a label is
@@ -2134,7 +2070,7 @@ impl<'a> Search<'a> {
 
     /// The diagnostic twin of `relax_footpaths_batched`: identical
     /// decisions and permutations through the probed strict insert,
-    /// plus depth histograms and the access-floor attribution.
+    /// plus the probe-depth histograms.
     fn relax_footpaths_batched_probed(
         &mut self,
         batch: &mut FootpathBatch,
@@ -2215,13 +2151,6 @@ impl<'a> Search<'a> {
                         self.stats.footpath_reject_entries_examined += probes.examined as u64;
                         self.stats.footpath_reject_depth_histogram
                             [depth_bucket(probes.examined)] += 1;
-                        if self.access_floor_rejects(footpath.to, arrival, 0, point.key) {
-                            self.stats.access_floor_rejectable_footpath += 1;
-                            if probes.examined > 1 {
-                                self.stats.access_floor_nonfront_saved_probes +=
-                                    (probes.examined - 1) as u64;
-                            }
-                        }
                     }
                 }
             }
@@ -2305,8 +2234,8 @@ impl<'a> Search<'a> {
     }
 
     /// The diagnostic twin of `relax_footpaths`: identical decisions
-    /// through the probed insert, plus depth histograms and the
-    /// access-floor attribution. Runs only under the ops flag.
+    /// through the probed insert, plus the probe-depth histograms.
+    /// Runs only under the ops flag.
     fn relax_footpaths_probed(&mut self, rode: &[u32], rides: u8, next: &mut Vec<u32>) {
         for &label in rode {
             let from = self.arena[label as usize];
@@ -2362,13 +2291,6 @@ impl<'a> Search<'a> {
                 } else {
                     self.stats.footpath_reject_entries_examined += probes.examined as u64;
                     self.stats.footpath_reject_depth_histogram[depth_bucket(probes.examined)] += 1;
-                    if self.access_floor_rejects(footpath.to, arrival, from.penalty, key) {
-                        self.stats.access_floor_rejectable_footpath += 1;
-                        if probes.examined > 1 {
-                            self.stats.access_floor_nonfront_saved_probes +=
-                                (probes.examined - 1) as u64;
-                        }
-                    }
                 }
             }
             let calls = slice.len() as u64 - cutoff_pruned - target_pruned;
@@ -2453,10 +2375,6 @@ impl<'a> Search<'a> {
                 );
                 bag_calls += 1;
                 if !admitted {
-                    if self.ops && self.access_floor_rejects(stops[position], arrival, penalty, key)
-                    {
-                        self.stats.access_floor_rejectable_route += 1;
-                    }
                     continue;
                 }
                 admissions += 1;

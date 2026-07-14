@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Much faster multicriteria engines. A measured, staged performance
+  programme rewrote both engines' hot paths: McTBTR relaxes query
+  footpaths edge-major per source stop, cancels superseded pending
+  trip segments before scanning them, and self-organises its stop
+  bags (the rejecting entry swaps to the front); McRAPTOR gained the
+  same self-organising bags and edge-major footpath batching for its
+  strict searches. Every emissions-aware product — ``journey_frontiers``,
+  ``frontier_table``, and the ``candidates="pareto"`` cost matrices —
+  runs several times faster on both routers at every measured walking
+  radius and thread count; exact-resolution results are unchanged
+  (byte-identical at a vanishing emissions bucket), and coarse-bucket
+  results move only within the bucket's documented representative
+  freedom. Diverse-journey searches (slack, route penalties) and the
+  time-only products are untouched.
+
+
 - ``frontier_table`` — ``journey_frontiers`` as one flat frame without
   journey payloads: the same per-cell pareto rows and ``frontier``
   marks, flattened into columns on the Rust side instead of building a
