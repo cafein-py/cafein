@@ -1468,3 +1468,242 @@ fn attribution_counters_hold_their_identities() {
     assert!(stats.batch_points_offered > 0);
     assert!(stats.batch_edge_records_predicted <= stats.footpath_edge_records_loaded);
 }
+
+#[test]
+fn insert_label_strict_self_organises_and_general_keeps_order() {
+    // Three mutually incomparable entries; a rejection through the
+    // strict path swaps its witness to the front, while the general
+    // path leaves the stable order untouched.
+    let seed = [
+        (100u32, 30.0f64, 1i64, 2u8),
+        (110, 5.0, 0, 2),
+        (90, 55.0, 2, 2),
+    ];
+    let mut strict = Bag::default();
+    let mut general = Bag::default();
+    for (arrival, grams, key, rides) in seed {
+        assert!(strict.insert_label(true, arrival, 0, grams, key, rides, 0));
+        assert!(general.insert_label(false, arrival, 0, grams, key, rides, 0));
+    }
+    // The strict path already self-organised on admission; capture
+    // both orders, reject via the deepest witness, and compare.
+    let strict_before = strict.snapshot();
+    let general_before = general.snapshot();
+    let witness_index = strict_before
+        .iter()
+        .position(|&(arrival, ..)| arrival == 110)
+        .unwrap();
+    assert!(witness_index > 0, "the witness must start off-front");
+    assert!(!strict.insert_label(true, 120, 0, 6.0, 0, 2, 0));
+    assert!(!general.insert_label(false, 120, 0, 6.0, 0, 2, 0));
+    assert_eq!(strict.snapshot()[0], strict_before[witness_index]);
+    assert_eq!(general.snapshot(), general_before);
+}
+
+#[test]
+fn slack_and_penalty_searches_never_use_the_strict_path() {
+    let mut builder = TimetableBuilder::new(2);
+    let line = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    builder
+        .add_trip(line, vec![time(0), time(100)], 0, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![(TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly)],
+    )
+    .unwrap();
+    let view = DayView::universal(&timetable);
+    let footpaths = Transfers::empty(2);
+    let factors = [10.0];
+    let strict = Search::start(
+        &view,
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        25.0,
+        0,
+        &[],
+    );
+    assert!(strict.strict_bags);
+    let slack = Search::start(
+        &view,
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        25.0,
+        120,
+        &[],
+    );
+    assert!(!slack.strict_bags);
+    let penalties = [300u32];
+    let penalised = Search::start(
+        &view, &timetable, &footpaths, &geometry, &factors, 25.0, 0, &penalties,
+    );
+    assert!(!penalised.strict_bags);
+    let bans = [u32::MAX];
+    let banned = Search::start(
+        &view, &timetable, &footpaths, &geometry, &factors, 25.0, 0, &bans,
+    );
+    assert!(!banned.strict_bags);
+}
+
+#[test]
+fn forced_strict_and_forced_general_paths_have_identical_coordinates() {
+    // A three-line interchange with footpaths, routed twice: once as
+    // the strict search dispatches it, once with the mode forced
+    // general. Order independence makes every entry identical.
+    let mut builder = TimetableBuilder::new(6);
+    let feeder = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let express = builder.add_pattern(&[StopIdx(0), StopIdx(3)], 1).unwrap();
+    let onward = builder.add_pattern(&[StopIdx(2), StopIdx(3)], 2).unwrap();
+    builder
+        .add_trip(feeder, vec![time(0), time(100)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(feeder, vec![time(300), time(400)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(express, vec![time(50), time(700)], 2, 0)
+        .unwrap();
+    builder
+        .add_trip(onward, vec![time(250), time(500)], 3, 0)
+        .unwrap();
+    builder
+        .add_trip(onward, vec![time(550), time(800)], 4, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(2), vec![0.0, 2500.0], DistanceProvenance::CrowFly),
+            (TripIdx(3), vec![0.0, 1500.0], DistanceProvenance::CrowFly),
+            (TripIdx(4), vec![0.0, 1500.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let footpaths = Transfers::from_edges(
+        6,
+        &[
+            (StopIdx(1), StopIdx(2), 60, 60.0),
+            (StopIdx(1), StopIdx(4), 90, 90.0),
+        ],
+    )
+    .unwrap();
+    let factors = [10.0, 60.0, 20.0, 30.0, 5.0];
+    let view = DayView::universal(&timetable);
+    let request = request(StopIdx(0), StopIdx(3), 2);
+    for bucket in [1e-6, 25.0] {
+        let mut strict = Search::start(
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            bucket,
+            0,
+            &[],
+        );
+        let mut general = Search::start(
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            bucket,
+            0,
+            &[],
+        );
+        general.strict_bags = false;
+        for departure in [300u32, 100, 0] {
+            strict.pass(&request, departure, &mut None, &mut None);
+            general.pass(&request, departure, &mut None, &mut None);
+        }
+        let entries = |search: &Search| {
+            let mut list: Vec<(u32, u32, i64, u64)> = search
+                .destination
+                .entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.departure,
+                        entry.arrival,
+                        entry.key,
+                        entry.grams.to_bits(),
+                    )
+                })
+                .collect();
+            list.sort_unstable();
+            list
+        };
+        assert_eq!(entries(&strict), entries(&general));
+    }
+}
+
+#[test]
+fn general_bag_decisions_are_order_independent() {
+    // Drive one stable bag and one whose entries are deterministically
+    // permuted between operations: for every slack and penalty mix the
+    // decisions and entry sets must match — the recorded soundness
+    // basis for ever self-organising the general path.
+    let mut state = 0xd1310ba698dfb5acu64;
+    let mut next = move |bound: u64| {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) % bound
+    };
+    for &slack in &[0u32, 45, 180] {
+        let mut stable = Bag::default();
+        let mut permuted = Bag::default();
+        for step in 0..8_000u64 {
+            let arrival = 100 + next(70) as u32;
+            let penalty = [0, 0, 30, 90][next(4) as usize];
+            let key = next(5) as i64;
+            let grams = key as f64 * 25.0 + next(25) as f64;
+            let rides = next(3) as u8;
+            let expected = stable.insert_slack(arrival, penalty, grams, key, rides, slack);
+            let admitted = permuted.insert_slack(arrival, penalty, grams, key, rides, slack);
+            assert_eq!(admitted, expected);
+            let mut reference = stable.snapshot();
+            let mut shuffled = permuted.snapshot();
+            reference.sort_unstable();
+            shuffled.sort_unstable();
+            assert_eq!(reference, shuffled);
+            // Rotate the permuted bag's entries deterministically.
+            let mut entries = permuted.snapshot();
+            if entries.len() > 1 {
+                let cut = (step % entries.len() as u64) as usize;
+                entries.rotate_left(cut);
+                permuted = Bag::from_entries(
+                    entries
+                        .into_iter()
+                        .map(|(arrival, penalty, key, grams, rides)| {
+                            (arrival, penalty, key, f64::from_bits(grams), rides)
+                        })
+                        .collect(),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cleaner_general_exact_tie_continues_to_a_later_witness() {
+    // An unreachable order with the refinable exact class ahead of a
+    // slack-margin witness: the scan continues past the tie and the
+    // witness still rejects, in either order.
+    for entries in [
+        vec![(200, 30, 5, 50.0, 1), (100, 0, 4, 40.0, 1)],
+        vec![(100, 0, 4, 40.0, 1), (200, 30, 5, 50.0, 1)],
+    ] {
+        let mut bag = Bag::from_entries(entries);
+        // Candidate ties the (200, 30) entry with cleaner grams, but
+        // the (100, 0) witness covers it under slack 60.
+        assert!(!bag.insert_slack(200, 30, 45.0, 5, 1, 60));
+    }
+}
