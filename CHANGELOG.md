@@ -1,467 +1,128 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-07-14
 
-- Much faster multicriteria engines. A measured, staged performance
-  programme rewrote both engines' hot paths: McTBTR relaxes query
-  footpaths edge-major per source stop, cancels superseded pending
-  trip segments before scanning them, and self-organises its stop
-  bags (the rejecting entry swaps to the front); McRAPTOR gained the
-  same self-organising bags and edge-major footpath batching for its
-  strict searches. Every emissions-aware product — ``journey_frontiers``,
-  ``frontier_table``, and the ``candidates="pareto"`` cost matrices —
-  runs several times faster on both routers at every measured walking
-  radius and thread count; exact-resolution results are unchanged
-  (byte-identical at a vanishing emissions bucket), and coarse-bucket
-  results move only within the bucket's documented representative
-  freedom. Diverse-journey searches (slack, route penalties) and the
-  time-only products are untouched.
+- Much faster multicriteria routing — every emissions-aware product
+  (``journey_frontiers``, ``frontier_table``, the ``candidates="pareto"``
+  cost matrices) runs several times faster on both McRAPTOR and McTBTR, and
+  the McTBTR transfer set is smaller; results are unchanged.
+  ([#116](https://github.com/cafein-py/cafein/pull/116),
+  [#120](https://github.com/cafein-py/cafein/pull/120),
+  [#122](https://github.com/cafein-py/cafein/pull/122),
+  [#123](https://github.com/cafein-py/cafein/pull/123),
+  [#135](https://github.com/cafein-py/cafein/pull/135))
 
+- Time × emissions Pareto frontiers — ``cafein.journey_frontier(...)``
+  returns candidate journeys between two stops or door-to-door coordinates
+  with a ``frontier`` flag; ``candidates="pareto"`` runs a true
+  multicriteria (departure, arrival, emissions) search that finds the
+  cleaner-but-slower journeys time-optimal routing misses (``bucket`` sets
+  the comparison width, ``max_slower`` restricts to the fast end).
+  ``least_emissions`` picks the cleanest,
+  ``TravelCostMatrix(optimize="emissions")`` gives the lowest-emission
+  journey per OD pair, ``DetailedItineraries(candidates="pareto")`` supplies
+  emissions alternatives, and ``exhaustive_frontier`` is a brute-force
+  verification oracle.
+  ([#43](https://github.com/cafein-py/cafein/pull/43),
+  [#44](https://github.com/cafein-py/cafein/pull/44),
+  [#56](https://github.com/cafein-py/cafein/pull/56),
+  [#57](https://github.com/cafein-py/cafein/pull/57),
+  [#89](https://github.com/cafein-py/cafein/pull/89),
+  [#117](https://github.com/cafein-py/cafein/pull/117))
 
-- ``frontier_table`` — ``journey_frontiers`` as one flat frame without
-  journey payloads: the same per-cell pareto rows and ``frontier``
-  marks, flattened into columns on the Rust side instead of building a
-  Python journey per row, removing most of the batched frontier's
-  result-materialization cost. Takes ``journey_frontiers``' arguments
-  minus ``geometries``/``fares``; emissions match
-  ``emissions.annotate`` exactly, NaN where a transit leg's factor is
-  unresolved.
+- Batched Pareto frontiers — ``journey_frontiers`` computes the strict
+  frontier of every (origin, destination) cell between two point sets as one
+  long frame, and ``frontier_table`` returns the same without per-journey
+  payloads for much lower materialization cost at scale.
+  ([#115](https://github.com/cafein-py/cafein/pull/115),
+  [#124](https://github.com/cafein-py/cafein/pull/124))
 
-- Much faster batched McTBTR frontiers — the batched product no longer
-  builds a per-round all-destinations pruning envelope: rebuilding it
-  from every accumulated frontier each round cost far more at scale
-  than the expansion it trimmed, and one unserved destination disabled
-  it entirely. ``router="tbtr"`` ``journey_frontiers`` and the
-  emissions matrices now run the round sweeps unpruned (the one-pair
-  destination pruning is unchanged); results are identical.
-
-- The multicriteria TBTR transfer set is now built by global
-  candidate/witness enumeration (after Baum et al. 2023): a transfer is
-  kept only when some real origin context needs it on the
-  (arrival, emissions) Pareto frontier, instead of surviving a per-trip
-  local reduction. The set gets substantially smaller; query results
-  are unchanged. Transfer sets cached before this change (in memory or
-  in a saved artifact) stay valid and give the same results — call
-  ``compute_mctbtr_transfers`` again to replace them with the smaller
-  set. ``mctbtr_transfer_count`` reports the cached set's size.
-
-- Faster McTBTR queries — boarding walks a precomputed per-line
-  "next strictly cleaner trip" chain instead of scanning every remaining
-  trip of the day (the same chain trims the transfer-set precompute),
-  and each search round now runs Baum et al.-style: the egress joins of
-  every scanned segment tighten the destination frontiers first, and the
-  transfer expansions and footpath boardings then run under the round's
-  pruning envelope, ending a segment's expansion outright at the first
-  alight the envelope dominates. One-pair door-to-door frontier queries
-  get measurably faster; results are unchanged (the envelope applies the
-  same dominance the one-pair pruning always used).
-
-- ``compute_mctbtr_transfers`` — precompute and cache the multicriteria
-  TBTR transfer set, keyed by service date and the resolved per-trip
-  emission factors. Every ``router="tbtr"`` multicriteria query whose
-  date and factors match reuses the cached set instead of rebuilding the
-  dominance-aware precompute per call; the cache persists with the
-  network artifact (``save``/``load``), so mass-scale frontier workers
-  load it ready-made. ``has_mctbtr_transfers`` reports its presence. The
-  artifact format bumps to 9; older artifacts ask to be rebuilt from
-  their inputs.
-
-- McTBTR frontiers — ``router="tbtr"`` now also backs ``journey_frontiers``
-  (stop ids and point GeoDataFrames) and the door-to-door coordinate
-  ``journey_frontier``, returning the same journeys as McRAPTOR. The
-  batched product builds one multicriteria transfer set per call and
-  serves every origin from it, folding per-destination frontiers during
-  the segment scan — no per-cell looping. ``max_slower`` stays
-  raptor-only. McTBTR's direct egress joins are now gated on stop-bag
-  admission like McRAPTOR's, so a same-stop query no longer returns
-  spurious round-trip journeys under ``router="tbtr"``.
-
-- ``max_slower`` — an opt-in restriction of the pareto frontier to the
-  fast end of the trade-off, on ``journey_frontier`` and
-  ``journey_frontiers`` (``candidates="pareto"``, ``router="raptor"``).
-  Per departure pass, every returned journey arrives within
-  ``max_slower`` seconds of that pass's fastest resolved-factor arrival
-  (per cell in the batched product), and the fastest journey is always
-  among the rows; within the band the set is best-effort — the in-search
-  pruning is a per-stop prefix heuristic that shrinks the bags and the
-  search cost, not just the output. ``None`` (default) keeps the exact
-  frontier.
-
-- Target pruning in the one-pair multicriteria search — labels already
-  dominated by the destination's frontier bag are dropped at creation
-  (arrival, penalty, and emissions only grow along a journey, so a
-  dominated label can never contribute), keeping a same-bucket refinement
-  carve-out so reported journeys are bit-identical. Applies to
-  ``journey_frontier``'s ``pareto``, ``relaxed``, and ``diverse``
-  candidates and ``mc_route_between_stops``/``_coordinates``; the matrix
-  and batched products have no single target and are unchanged.
-
-- ``journey_frontiers`` — a batched ``journey_frontier``: the strict pareto
-  frontier of every (origin, destination) cell between two point sets (stop
-  ids or point GeoDataFrames), as one long frame with ``from_id``/``to_id``
-  columns. One McRAPTOR window profile per origin serves all destinations
-  and origins run in parallel with the GIL released, so a batch costs about
-  one search per origin rather than one per cell; each cell equals the
-  one-pair ``journey_frontier(candidates="pareto")`` frame, including the
-  walking-only journey on coordinate queries.
-
-- TBTR point matrices — ``router="tbtr"`` now also backs the door-to-door
-  coordinate travel-time matrices (``travel_time_matrix`` and
-  ``TravelTimeMatrix`` with point origins/destinations, single departure and
-  windowed percentiles), reusing the cached ``compute_tbtr_transfers`` set
-  when its date matches. Results are identical to RAPTOR's, and both engines
-  share one door-to-door propagation.
-
-- Diverse rounds continue past a routeless pick — with ``candidates="diverse"``,
-  selecting the walking-only journey (which bans and penalizes nothing) no
-  longer ends the search: the rounds keep picking from the current pool, so a
-  ``diversity="spread"`` query returns the walk *and* the distinct transit
-  corridors up to ``max_options`` (previously it could stop at two options).
-  The penalization-round loop and the alternative-option validation are now
-  shared between ``journey_frontier`` and ``DetailedItineraries``.
-
-- Soft-penalty diverse — ``journey_frontier`` and ``DetailedItineraries`` take an
-  optional ``penalty`` for ``candidates="diverse"``: ``"ban"`` (default,
-  unchanged) hard-bans a chosen corridor's routes so the options stay fully
-  route-disjoint, while a positive number of seconds instead adds to a chosen
-  route's effective arrival per prior use — costly but still usable — so a
-  corridor that mostly differs yet shares a trunk can surface (the R5-style soft
-  penalty) and the set can hold more options before drying up. The penalty steers
-  the McRAPTOR search through the dominance only; reported journey times stay the
-  true (unpenalized) values.
-
-- r5py-equivalent alternatives — documented that ``journey_frontier`` with
-  ``candidates="relaxed"`` over a departure ``window`` is r5py/R5's
-  detailed-itinerary strategy: a McRAPTOR profile across the window kept within a
-  suboptimal-arrival slack, with no route penalty, so trunk-sharing options
-  survive (unlike ``candidates="diverse"``, which forces route-disjoint
-  corridors). ``window`` maps to r5py's ``departure_time_window`` and
-  ``slack_seconds`` to its ``suboptimalMinutes`` (whose 5-minute default is
-  ``slack_seconds``'s 300 s). Docstrings and a parity test only; no behaviour
-  change.
-
-- Relaxed × diverse — ``slack_seconds`` now applies to ``candidates="diverse"``
-  on ``journey_frontier`` / ``DetailedItineraries``: a positive value widens each
-  penalization round's McRAPTOR pool to the relaxed frontier, so a round can pick
-  a slightly suboptimal but more distinct corridor (most visible with
-  ``diversity="spread"``). Its default becomes ``None``, resolved per family —
-  300 s for ``"relaxed"`` and ``0`` (strict pareto per round) for ``"diverse"`` —
-  so existing calls are unchanged.
-
-- Diverse-route objective — ``journey_frontier`` and ``DetailedItineraries``
-  take an optional ``diversity`` for ``candidates="diverse"``: ``"time"``
-  (default, unchanged) picks the fastest journey each penalization round, while
-  ``"spread"`` seeds on the fastest then picks, each later round, the journey
-  farthest from the already-chosen corridors in the normalized
-  (travel_time, emissions) plane (greedy farthest-point dispersion), so the
-  options span the trade-off rather than crowding its fast end.
-
-- Walking-graph bounding box — ``TransportNetwork.from_gtfs`` and the
-  ``cafein.streets`` extractors (``walking_footpaths`` / ``walking_streets``)
-  take an optional ``bounding_box`` that restricts the OSM walking network to a
-  ``[min_lon, min_lat, max_lon, max_lat]`` area (or a shapely geometry), so a
-  region-wide extract can be cropped to the stops' neighbourhood; stops snap
-  only to the cropped network.
-
-- Windowed TBTR stop matrices — ``router="tbtr"`` now answers
-  windowed/percentile stop travel-time matrices (``travel_time_matrix`` /
-  ``travel_times_from_stop`` / ``TravelTimeMatrix`` given a ``window``),
-  matching the RAPTOR cells exactly, over a descending profile scan on the
-  reduced trip-transfer set that reuses the ``compute_tbtr_transfers`` cache.
-  A windowed ``router="tbtr"`` request was previously rejected and ran on
-  RAPTOR; point matrices still run on RAPTOR.
-
-- Cached TBTR transfer set —
-  ``TransportNetwork.compute_tbtr_transfers(date)`` precomputes and stores the
-  trip-based transfer set for a date, so repeated single-departure stop
-  ``travel_time_matrix(router="tbtr")`` calls on that date reuse it (one clone
-  per call) instead of rebuilding the dominance-aware set every call — the
-  "build once, query many" workload TBTR is built for. A query on another date
-  rebuilds ad hoc; ``has_tbtr_transfers`` reports whether a set is cached. The
-  cached set is persisted with the network artifact (``save``/``load``), so a
-  shipped artifact carries it and a loaded network reuses it without rebuilding
-  (the artifact format is now 8; artifacts written by earlier builds do not
-  load). ``TbtrEngine::from_set`` builds the engine over a prebuilt
-  ``TransferSet``, which now derives ``Clone`` and is serialisable.
-
-- ULTRA shortcut set — ``TransportNetwork.compute_ultra_shortcuts``
-  enumerates the ULTRA intermediate-transfer shortcuts (Baum et al.) over the
-  unrestricted stop-to-stop walking graph of the installed street network: the
-  minimal set of alight-to-board walks a Pareto-optimal two-trip journey needs,
-  computed in parallel over station representatives.
-  ``walking_speed_kmph``/``max_transfer_time`` set the pace and walk cutoff,
-  and ``min_departure``/``max_departure`` bound the source-departure window
-  (the whole service day by default; a whole-day metropolitan build is a heavy
-  run-once operation). The set is held in memory as
-  ``(origin, destination, seconds, meters)`` tuples, exposed as
-  ``ultra_shortcut_count`` and ``ultra_shortcuts``.
-
-- ULTRA point-destination time routing — a **whole-day** set (the default
-  window) is relaxed by the **point-destination** time queries in place of the
-  closure footpaths, giving them unrestricted intermediate walking:
-  ``route_between_coordinates`` and the point-set matrices
-  (``TravelTimeMatrix``/``TravelCostMatrix`` from point origins and
-  destinations, ``DetailedItineraries``), where the access/egress street search
-  supplies the initial and final walks. ULTRA shortcuts are complete only for
-  the intermediate transfers of the (arrival, transfers) criteria, so
-  stop-to-stop time queries and all emissions/fare queries keep the closure. A
-  partial-window set (a narrower ``min_departure``/``max_departure``) is stored
-  and inspectable but not relaxed by routing, since a journey's source departure
-  can fall outside a bounded window.
-
-- ULTRA persistence and build-time compute — the shortcut set and its compute
-  window are persisted by ``save`` and restored by ``load`` (artifact format 7;
-  artifacts written by older versions are refused), so the run-once
-  preprocessing is reusable and a loaded partial-window set stays unused.
-  ``from_gtfs(ultra=True)`` computes the whole-day set at build time (off by
-  default; requires an OSM extract and uses ``walking_speed_kmph``).
-
-- ULTRA door-to-door stop routing — under a whole-day set,
-  ``route_between_stops`` routes **door-to-door** between the two stops'
-  coordinates (unrestricted initial, intermediate, and final walking, matching
-  ``route_between_coordinates``), with
-  ``walking_speed_kmph``/``max_walking_time``/``max_snap_distance`` bounding
-  that walking; without the set it keeps today's board-at-origin closure
-  routing.
-
-- ULTRA door-to-door one-to-all time queries —
-  ``travel_times_from_stop``, ``travel_times_from_coordinate``, and the
-  ``"raptor"`` ``travel_time_matrix`` reach every stop **door-to-door** under a
-  whole-day set: a per-destination egress (``StreetNetwork::link_many`` on each
-  stop's coordinate, capped at ``max_walking_time``) folds one **bounded** final
-  walk into the arrivals, treating each origin and destination stop as its
-  coordinate and gaining the same three walking arguments — so they agree with
-  ``route_between_coordinates`` (arrival at the stop's coordinate). The matrix
-  partitions its origins per row (snappable origins route door-to-door, an
-  off-network origin falls back to the closure), preserving input order. Without
-  a whole-day set they keep the closure, tau-direct search. Requires a network
-  built with an OSM extract.
-
-- ULTRA door-to-door time-optimal stop cost matrix — ``TravelCostMatrix`` /
-  ``travel_cost_matrix`` with ``optimize="time"`` over stop origins and
-  destinations routes door-to-door under a whole-day set: it is the point cost
-  matrix over the stops' coordinates (same location-based egress), so its
-  ``travel_time`` equals the ``travel_time_matrix`` cell while it also annotates
-  distance, emissions, and fare, and it gains the same three walking arguments.
-  Snappable origins route door-to-door and off-network origins fall back to the
-  closure, per row. The fare stop matrix keeps the closure; the emissions stop
-  matrix (``optimize="emissions"``, ``candidates="pareto"``) routes door-to-door
-  the same way under a whole-day **McULTRA** set — location-based access, the
-  shortcut set's intermediate walking, a street final walk folded per
-  destination, and the direct walk winning any cell it is cleanest on, one
-  cleanest journey per cell — with unsnappable origins falling back to the
-  closure. Both stop matrices now accept the walking arguments.
-
-- McTBTR groundwork — the multicriteria transfer set: the compute core
-  gains a dominance-aware variant of the TBTR transfer precompute for
-  the (arrival, emissions) criteria. Witt's reduction is unsound under
-  a second criterion, so generation boards later-but-cleaner trips
-  besides the earliest catchable one and the reduction keeps a
-  transfer whenever it lands an (arrival, grams) point nothing else
-  dominates — a provable superset of the time-optimal set. The
-  McTBTR query engine scans segments over that set with per-(trip,
-  round) (board position, κ) Pareto bags, query-time footpath
-  relaxation (the same hybrid as the time engine), and
-  departure-window passes, returning the same journeys as McRAPTOR —
-  verified against it and the exhaustive oracle on synthetic fixtures
-  and on the Helsinki network with footpaths. Select it with
-  ``journey_frontier(candidates="pareto", router="tbtr")`` (stop ids;
-  the engine precomputes the date's transfer set first, so it is
-  built for batch reuse rather than single pairs) — and at matrix
-  scale with ``TravelCostMatrix(optimize="emissions",
-  candidates="pareto", router="tbtr")``, where one engine build
-  serves every origin.
-
-- Footpath transfers cross into the routing core as flat arrays:
-  ``cafein.streets.walking_footpaths`` (and ``walking_streets``) now
-  return a ``Footpaths`` container — stop ids named once, the closed
-  edge set as numpy index/seconds/meters arrays — instead of a list
-  with one Python tuple per edge, and ``set_transfers`` accepts it
-  alongside the legacy tuple list, which remains supported for
-  hand-built edge sets. Iterating a ``Footpaths`` yields the legacy
-  tuples.
-
-- McRAPTOR — the true multicriteria search:
-  ``journey_frontier(..., candidates="pareto")`` draws its candidate
-  journeys from a multicriteria RAPTOR over (departure, arrival,
-  emissions) instead of the time-optimal profile, and so also finds
-  the cleaner-but-slower journeys the time candidates provably miss
-  (the gap ``exhaustive_frontier`` measured). Emissions compare at a
-  configurable bucket width during the search — ``bucket=25.0`` grams
-  by default — bounding label-bag sizes while keeping arrivals exact;
-  a vanishing bucket reproduces the exhaustive oracle's frontier,
-  verified against it on synthetic fixtures and on the Helsinki
-  network with and without footpaths. Journeys riding a trip without
-  a resolved emission factor never enter the candidates. Boarding
-  looks past the earliest catchable trip when a later trip's factor
-  strictly improves, so waiting for a cleaner vehicle is searched too.
-  Coordinate queries route door-to-door like the time candidates:
-  walking access and egress, the zero-emission walking-only journey
-  anchoring the clean end, and the same walk-domination rule.
-  ``TravelCostMatrix(optimize="emissions", candidates="pareto")``
-  draws each cell's candidates from the same widened set (stop
-  origins and destinations), so a cell can report strictly lower
-  emissions than the time-candidate objective, whose per-round
-  arrivals never hold a cleaner-but-slower journey.
-
-- Emissions alternatives in ``DetailedItineraries`` —
-  ``DetailedItineraries(candidates="pareto")`` draws each OD pair's
-  alternatives (the ``option`` column) from the multicriteria
-  (arrival, emissions) McRAPTOR search at the given departure, in
-  place of the time-optimal engine, so the alternatives include the
-  cleaner-but-slower journeys the time candidates miss. ``router``
-  selects RAPTOR or trip-based (``"tbtr"``, stop ids only) and
-  ``bucket`` sets the emissions bucket width, mirroring
-  ``journey_frontier`` and ``TravelCostMatrix``; the default
-  ``candidates="time"`` keeps the (arrival, rides) alternatives.
-
-- Relaxed suboptimal alternatives — ``journey_frontier(candidates=
-  "relaxed", slack_seconds=…)`` widens the McRAPTOR search by a time
-  slack: a journey is kept even when a cleaner or simpler one dominates
-  it, as long as that dominator is not more than ``slack_seconds``
-  earlier, surfacing the near-frontier journeys strict Pareto drops.
-  ``slack_seconds=0`` reproduces ``candidates="pareto"`` exactly.
-  ``max_options`` caps the suboptimal alternatives kept — the strict
-  frontier is always returned, so a cap never hides an optimal journey.
-  The relaxation lives in the McRAPTOR label dominance, so it also
-  recovers non-dominated journeys the bucketed strict search skips;
+- Relaxed alternatives — ``candidates="relaxed"`` on ``journey_frontier``
+  and ``DetailedItineraries`` also returns near-frontier journeys within
+  ``slack_seconds`` of a dominator (``max_options`` caps them); over a
+  departure ``window`` this is r5py/R5's detailed-itinerary strategy.
   ``router="raptor"`` only.
+  ([#90](https://github.com/cafein-py/cafein/pull/90),
+  [#91](https://github.com/cafein-py/cafein/pull/91),
+  [#104](https://github.com/cafein-py/cafein/pull/104))
 
-- Relaxed alternatives in ``DetailedItineraries`` —
-  ``DetailedItineraries(candidates="relaxed", slack_seconds=…)`` draws
-  each OD pair's ``option`` set from the same slack-widened McRAPTOR
-  search, so a query returns the suboptimal journeys within the band
-  alongside the frontier, capped by ``max_options``.
-  ``candidates="relaxed"`` requires ``router="raptor"``.
+- Route-diverse alternatives — ``candidates="diverse"`` on
+  ``journey_frontier`` and ``DetailedItineraries`` returns up to
+  ``max_options`` distinct-corridor journeys, with
+  ``diversity="time"``/``"spread"``, a hard route ban or a soft ``penalty``,
+  and ``slack_seconds`` to widen each round. ``router="raptor"`` only.
+  ([#92](https://github.com/cafein-py/cafein/pull/92),
+  [#93](https://github.com/cafein-py/cafein/pull/93),
+  [#102](https://github.com/cafein-py/cafein/pull/102),
+  [#103](https://github.com/cafein-py/cafein/pull/103),
+  [#105](https://github.com/cafein-py/cafein/pull/105),
+  [#109](https://github.com/cafein-py/cafein/pull/109))
 
-- Route-diverse alternatives —
-  ``journey_frontier(candidates="diverse", max_options=N)`` returns up to
-  ``N`` distinct-corridor alternatives by iterative route penalization:
-  the fastest journey, then the fastest one avoiding its routes, and so
-  on, banning every ridden route each round so the options ride disjoint
-  line sets. It stops early when the disjoint corridors run out, so a
-  request can return fewer than ``N``. The McRAPTOR search gains a
-  route-index ban mask (``mc_route_between_stops`` /
-  ``mc_route_between_coordinates`` take ``banned_routes``); an empty mask
-  is the unchanged search. ``router="raptor"`` only.
+- McTBTR — a multicriteria (arrival, emissions) trip-based engine returning
+  the same journeys as McRAPTOR, selected with ``router="tbtr"`` on
+  ``journey_frontier`` / ``journey_frontiers`` and
+  ``TravelCostMatrix(optimize="emissions", candidates="pareto")``.
+  ``compute_mctbtr_transfers`` precomputes and caches its transfer set,
+  persisted with the artifact (format 9); ``has_mctbtr_transfers`` reports
+  it.
+  ([#61](https://github.com/cafein-py/cafein/pull/61),
+  [#118](https://github.com/cafein-py/cafein/pull/118),
+  [#119](https://github.com/cafein-py/cafein/pull/119))
 
-- Route-diverse alternatives in ``DetailedItineraries`` —
-  ``DetailedItineraries(candidates="diverse", max_options=N)`` draws each
-  OD pair's ``option`` set from the same route-penalization search, so a
-  query returns up to ``N`` distinct-corridor journeys per OD, each riding
-  a route set disjoint from the others. ``router="raptor"`` only.
+- Trip-Based Transit Routing (TBTR) — a second time-optimal engine whose
+  (arrival, rides) results exactly match RAPTOR's, selected with
+  ``router="tbtr"`` on stop and door-to-door coordinate travel-time matrices
+  (single departure and windowed percentiles). ``compute_tbtr_transfers``
+  precomputes and caches its transfer set, persisted with the artifact
+  (format 8); ``has_tbtr_transfers`` reports it. RAPTOR stays the default.
+  ([#53](https://github.com/cafein-py/cafein/pull/53),
+  [#97](https://github.com/cafein-py/cafein/pull/97),
+  [#98](https://github.com/cafein-py/cafein/pull/98),
+  [#111](https://github.com/cafein-py/cafein/pull/111))
 
-- The exact time × emissions Pareto set:
-  ``cafein.exhaustive_frontier(network, origin, destination, date,
-  departure)`` enumerates the mathematically complete frontier for one
-  departure between two stops — every boardable trip considered,
-  microgram-quantized gram labels, the same journey rules as the
-  routers. It is a brute-force oracle for verifying frontiers and
-  inspecting true Pareto sets at sampled-pair scale, orders of
-  magnitude slower than ``journey_frontier`` — whose documented
-  interim contract it also measures: on the Helsinki fixture the
-  time-Pareto candidate set does miss cleaner-but-slower journeys with
-  more rides (pinned in the tests), the gap a true multicriteria
-  search will close.
+- ULTRA unrestricted-walking routing — ``compute_ultra_shortcuts``
+  enumerates intermediate-transfer shortcuts over the full stop-to-stop
+  walking graph so that, under a whole-day set, ``route_between_stops``,
+  ``route_between_coordinates``, the one-to-all time queries, and the
+  point/stop travel-time and cost matrices route door-to-door with
+  unrestricted intermediate walking (emissions cells use a McULTRA set);
+  off-network origins fall back to the closure. The set is persisted by
+  ``save`` / ``load`` (artifact format 7) and can be built with
+  ``from_gtfs(ultra=True)``.
+  ([#67](https://github.com/cafein-py/cafein/pull/67),
+  [#71](https://github.com/cafein-py/cafein/pull/71),
+  [#72](https://github.com/cafein-py/cafein/pull/72),
+  [#74](https://github.com/cafein-py/cafein/pull/74),
+  [#75](https://github.com/cafein-py/cafein/pull/75),
+  [#77](https://github.com/cafein-py/cafein/pull/77))
 
-- Trip-Based Transit Routing (TBTR): the compute core gains Witt's
-  TBTR as a second routing engine — a precomputed, reduced
-  trip-to-trip transfer set over a query date's trip universe
-  (previous-day over-midnight trips included as shifted lines) and a
-  segment-scanning query engine whose (arrival, rides) results are
-  exactly RAPTOR's, verified pair for pair on the Helsinki fixture
-  across earliest-arrival queries, departure-window profiles, and
-  one-to-all sweeps. Single-departure stop matrices can select it:
-  ``travel_time_matrix(..., router="tbtr")`` and
-  ``TravelTimeMatrix(..., router=)`` precompute a TBTR day engine and
-  fan the origins out over it. The precomputed set covers same-stop
-  transfers; installed footpaths relax at query time, RAPTOR-style, so
-  the transitively closed footpath set — quadratic in dense areas —
-  never enters the precompute. RAPTOR remains the default engine
-  everywhere.
+- Monetary costs — the new ``cafein.fares`` module prices journeys after
+  routing, with a rule-based structure mirroring r5r's (r5r zip format,
+  ``load_fare_structure`` / ``save_fare_structure``) and a zone-based
+  structure from GTFS fare files (``zone_fare_structure``, as HSL ships).
+  The fare joins the frontier as a third criterion (``journey_frontier(...,
+  fares=structure)``, ``least_fare``), and ``TravelCostMatrix`` /
+  ``travel_cost_table`` accept ``fares=`` and ``optimize="fare"``.
+  ([#46](https://github.com/cafein-py/cafein/pull/46),
+  [#47](https://github.com/cafein-py/cafein/pull/47))
 
-- GTFS ingest robustness: blank interior stop times — legal at
-  non-timepoint stops — are now filled by linear interpolation between
-  the surrounding timed stops when the timetable is built, as
-  timepoint-only feeds expect of their consumers (a warning reports how
-  many trips were repaired; trips missing a first or last time are
-  still quarantined). An invalid cosmetic ``route_color``/
-  ``route_text_color`` value no longer rejects a whole feed: the reader
-  retries on an in-memory copy with the colour columns dropped, never
-  touching the input. r5r's Porto Alegre sample feeds now load
-  unmodified, and ``scripts/compare_fares_vs_r5r.py`` no longer
-  sanitizes feed copies.
+- Walking-graph bounding box — ``from_gtfs`` and the ``cafein.streets``
+  extractors take an optional ``bounding_box`` restricting the OSM walking
+  network to a ``[min_lon, min_lat, max_lon, max_lat]`` area or shapely
+  geometry.
+  ([#99](https://github.com/cafein-py/cafein/pull/99))
 
-- Fares as a criterion: with a fare structure
-  (``journey_frontier(..., fares=structure)``), the fare now joins the
-  frontier as a third criterion — a slower or dirtier journey stays on
-  the frontier when it is strictly cheaper — and ``least_fare(frontier,
-  within=...)`` picks the cheapest journey within a travel-time budget.
-  At matrix scale, ``TravelCostMatrix``/``travel_cost_table`` accept
-  ``fares=`` and gain a ``fare`` column pricing each cell's reported
-  journey, and ``optimize="fare"`` (with ``window=``/``within=``)
-  reports the cheapest journey of the departure window per pair, over
-  the same candidate set as the least-emission mode with the same
-  zero-ride (zero-fare) floor. Matrix rows carry no leg sequences, so
-  both fare models are priced inside the compute core at
-  candidate-reconstruction time — routing itself remains fare-free,
-  like the emissions firewall.
+- Footpath transfers cross into the routing core as flat arrays —
+  ``walking_footpaths`` / ``walking_streets`` now return a ``Footpaths``
+  container instead of Python tuples; ``set_transfers`` accepts it alongside
+  the legacy tuple list.
+  ([#60](https://github.com/cafein-py/cafein/pull/60))
 
-- Monetary costs: the new ``cafein.fares`` module prices journeys after
-  routing, from their leg sequence and timing. Two fare models ship: a
-  **rule-based structure mirroring r5r's** — global
-  ``max_discounted_transfers``/``transfer_time_allowance``/``fare_cap``
-  plus the editable ``fares_per_type``/``fares_per_transfer``/
-  ``fares_per_route`` DataFrames, seeded from a network with
-  ``setup_fare_structure(network, base_fare)``, priced exactly as r5r's
-  rule-based calculator, and read/written in r5r's zip format
-  (``load_fare_structure``/``save_fare_structure``) so the two tools
-  share fare definitions (on merged multi-feed networks, re-key the
-  loaded ``fares_per_route`` to cafein's feed-qualified route ids, as
-  the comparison script demonstrates) — and a **zone-based structure
-  from GTFS fare
-  files** (``zone_fare_structure``): ``fare_attributes``/``fare_rules``
-  ``contains_id`` zone sets, as Helsinki Region Transport ships, where
-  a journey pays the cheapest chain of zone tickets covering the zones
-  it touches within their transfer windows. ``annotate_fares(journeys,
-  structure)`` attaches ``fare`` to routed journeys, and
-  ``journey_frontier(..., fares=structure)`` adds the ``fare`` column
-  to the frontier frame (and, per the entry above, makes it a
-  criterion). Route- or
-  origin/destination-keyed fare rules are not modelled. The Porto
-  Alegre fare structure and sample feeds r5r bundles are pinned into
-  the test data, and a manual comparison script
-  (``scripts/compare_fares_vs_r5r.py``) runs r5r's fare-aware Pareto
-  frontier on them and checks that every cafein fare is a level of the
-  shared structure.
-
-- Least-emission matrices: ``TravelCostMatrix(...,
-  optimize="emissions", window=..., within=...)`` reports, per OD pair,
-  the lowest-emission journey of a departure window instead of the
-  fastest — optionally within the ``within`` travel-time budget (the
-  cleanest way to work, shop, or school that still gets you there in
-  time). Candidates per pair are the window's (departure, arrival,
-  rides)-Pareto set — the same ride candidates ``journey_frontier``
-  sees — plus a zero-ride, zero-emission floor (the origin itself for
-  stop pairs; the walking-only alternative for point pairs), with ties
-  resolving toward the shorter travel time;
-  pairs with no qualifying journey of resolved emissions are absent.
-  Works for stop and point matrices alike, with the same chunking and
-  parallel origin fan-out.
-
-- Time × emissions Pareto frontiers: ``cafein.journey_frontier(network,
-  origin, destination, date, departure, window)`` routes a departure
-  window between two stops or door-to-door coordinates, attaches
-  emissions to every candidate journey, and returns them as a DataFrame
-  with a ``frontier`` flag — the journeys no candidate beats on both
-  travel time and emissions. ``cafein.least_emissions(frontier,
-  within=...)`` picks the cleanest journey, optionally within a
-  travel-time budget. The candidates are the range-RAPTOR Pareto set
-  over (departure, arrival, rides): slower-but-simpler journeys and the
-  walking-only journey (door-to-door) are on offer, while a journey both
-  slower and more-transferring than every time-optimal alternative is
-  not — the documented contract of this frontier. Journeys whose ridden
-  trips lack an emission factor carry NaN and never join the frontier.
+- GTFS ingest robustness — blank interior stop times at non-timepoint stops
+  are filled by interpolation, and an invalid cosmetic ``route_color`` /
+  ``route_text_color`` no longer rejects a feed. r5r's Porto Alegre sample
+  feeds now load unmodified.
+  ([#48](https://github.com/cafein-py/cafein/pull/48))
 
 ## 0.3.0 — 2026-07-05
 
