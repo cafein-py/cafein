@@ -1464,9 +1464,11 @@ fn attribution_counters_hold_their_identities() {
         stats.footpath_bag_length_histogram.iter().sum::<u64>(),
         stats.footpath_bag_calls
     );
-    // The strict shadow armed (slack 0, no penalties) and saw offers.
+    // The strict batch saw offers and swept sources; only rode
+    // labels enter, never walked ones.
     assert!(stats.batch_points_offered > 0);
-    assert!(stats.batch_edge_records_predicted <= stats.footpath_edge_records_loaded);
+    assert!(stats.batch_source_stops > 0);
+    assert!(stats.batch_points_offered <= stats.rode_labels);
 }
 
 #[test]
@@ -1498,6 +1500,55 @@ fn insert_label_strict_self_organises_and_general_keeps_order() {
     assert!(!general.insert_label(false, 120, 0, 6.0, 0, 2, 0));
     assert_eq!(strict.snapshot()[0], strict_before[witness_index]);
     assert_eq!(general.snapshot(), general_before);
+}
+
+#[test]
+fn footpath_batch_rejects_a_covered_rode_label() {
+    let mut batch = FootpathBatch::new(4);
+    batch.offer(StopIdx(3), 0, 150, 0, 5.0);
+    batch.offer(StopIdx(3), 1, 160, 0, 10.0);
+    assert_eq!(batch.rejected, 1);
+    assert_eq!(batch.points.len(), 1);
+}
+
+#[test]
+fn later_rode_label_evicts_an_earlier_pending_point() {
+    let mut batch = FootpathBatch::new(4);
+    batch.offer(StopIdx(3), 0, 160, 1, 30.0);
+    batch.offer(StopIdx(3), 1, 150, 0, 5.0);
+    assert_eq!(batch.evicted, 1);
+    assert!(!batch.points[0].live);
+    assert!(batch.points[1].live);
+}
+
+#[test]
+fn cleaner_exact_tie_survives_batching() {
+    // An exact (arrival, key) tie with strictly cleaner grams
+    // replaces the dirtier pending point rather than being rejected.
+    let mut batch = FootpathBatch::new(4);
+    batch.offer(StopIdx(3), 0, 150, 0, 10.0);
+    batch.offer(StopIdx(3), 1, 150, 0, 5.0);
+    assert_eq!(batch.rejected, 0);
+    assert_eq!(batch.evicted, 1);
+    assert!(!batch.points[0].live);
+    assert!(batch.points[1].live);
+    assert_eq!(batch.points[1].grams, 5.0);
+}
+
+#[test]
+fn batch_resets_between_rounds() {
+    let mut batch = FootpathBatch::new(4);
+    batch.offer(StopIdx(3), 0, 160, 1, 30.0);
+    batch.offer(StopIdx(3), 1, 150, 0, 5.0);
+    batch.reset();
+    assert!(batch.touched.is_empty());
+    assert!(batch.points.is_empty());
+    assert_eq!((batch.rejected, batch.evicted), (0, 0));
+    assert!(batch.heads.iter().all(|&head| head == NONE_U32));
+    // A fresh round sees a clean gate.
+    batch.offer(StopIdx(3), 2, 200, 2, 55.0);
+    assert_eq!(batch.points.len(), 1);
+    assert!(batch.points[0].live);
 }
 
 #[test]
@@ -1548,6 +1599,11 @@ fn slack_and_penalty_searches_never_use_the_strict_path() {
         &view, &timetable, &footpaths, &geometry, &factors, 25.0, 0, &bans,
     );
     assert!(!banned.strict_bags);
+    // Only the strict search owns an edge-major batch.
+    assert!(strict.batch.is_some());
+    assert!(slack.batch.is_none());
+    assert!(penalised.batch.is_none());
+    assert!(banned.batch.is_none());
 }
 
 #[test]
@@ -1619,6 +1675,7 @@ fn forced_strict_and_forced_general_paths_have_identical_coordinates() {
             &[],
         );
         general.strict_bags = false;
+        general.batch = None;
         for departure in [300u32, 100, 0] {
             strict.pass(&request, departure, &mut None, &mut None);
             general.pass(&request, departure, &mut None, &mut None);
