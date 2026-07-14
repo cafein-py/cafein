@@ -1322,3 +1322,149 @@ fn max_slower_anchors_at_the_resolved_bound() {
     assert_eq!(journeys.len(), 1);
     assert_eq!(journeys[0].arrival, 800);
 }
+
+#[test]
+fn probed_insert_slack_matches_the_stable_insert_slack() {
+    // The R0 probe variant must make identical decisions and keep the
+    // identical entry order across slack bands, penalties, exact-class
+    // refinements, and ride ranks.
+    let mut state = 0x9e3779b97f4a7c15u64;
+    let mut next = move |bound: u64| {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) % bound
+    };
+    for &slack in &[0u32, 120] {
+        let mut stable = Bag::default();
+        let mut probed = Bag::default();
+        for _ in 0..20_000 {
+            let arrival = 100 + next(90) as u32;
+            let penalty = [0, 0, 0, 60][next(4) as usize];
+            let key = next(6) as i64;
+            let grams = key as f64 * 25.0 + next(25) as f64;
+            let rides = next(4) as u8;
+            let expected = stable.insert_slack(arrival, penalty, grams, key, rides, slack);
+            let mut probes = InsertProbes::default();
+            let admitted =
+                probed.insert_slack_probed(arrival, penalty, grams, key, rides, slack, &mut probes);
+            assert_eq!(admitted, expected);
+            assert!(probes.examined as usize <= probes.length as usize + 1);
+            assert_eq!(stable.snapshot(), probed.snapshot());
+        }
+    }
+}
+
+#[test]
+fn probed_insert_slack_matches_on_unreachable_orders() {
+    // Deliberately unreachable entry orders (slack bags are not
+    // antichains): decisions and order must still agree.
+    let entries = vec![
+        (100, 0, 5, 50.0, 1),
+        (90, 60, 4, 40.0, 1),
+        (100, 0, 5, 45.0, 1),
+        (95, 0, 4, 40.0, 2),
+    ];
+    for &slack in &[0u32, 30, 120] {
+        let mut stable = Bag::from_entries(entries.clone());
+        let mut probed = Bag::from_entries(entries.clone());
+        for candidate in [
+            (100u32, 0u32, 5i64, 44.0f64, 1u8),
+            (96, 0, 4, 39.0, 2),
+            (130, 0, 6, 60.0, 3),
+            (90, 60, 4, 40.0, 1),
+        ] {
+            let (arrival, penalty, key, grams, rides) = candidate;
+            let expected = stable.insert_slack(arrival, penalty, grams, key, rides, slack);
+            let mut probes = InsertProbes::default();
+            let admitted =
+                probed.insert_slack_probed(arrival, penalty, grams, key, rides, slack, &mut probes);
+            assert_eq!(admitted, expected);
+            assert_eq!(stable.snapshot(), probed.snapshot());
+        }
+    }
+}
+
+#[test]
+fn attribution_counters_hold_their_identities() {
+    // Drive a small search with the diagnostics armed and check the
+    // R0 identities on the collected counters.
+    let mut builder = TimetableBuilder::new(6);
+    let feeder = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let onward = builder
+        .add_pattern(&[StopIdx(2), StopIdx(3), StopIdx(5)], 1)
+        .unwrap();
+    builder
+        .add_trip(feeder, vec![time(0), time(100)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(onward, vec![time(300), time(400), time(500)], 1, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (
+                TripIdx(1),
+                vec![0.0, 1000.0, 2000.0],
+                DistanceProvenance::CrowFly,
+            ),
+        ],
+    )
+    .unwrap();
+    let footpaths = Transfers::from_edges(
+        6,
+        &[
+            (StopIdx(1), StopIdx(2), 60, 60.0),
+            (StopIdx(1), StopIdx(4), 60, 60.0),
+            (StopIdx(3), StopIdx(4), 60, 60.0),
+        ],
+    )
+    .unwrap();
+    let factors = [10.0, 20.0];
+    let view = DayView::universal(&timetable);
+    let mut search = Search::start(
+        &view,
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        25.0,
+        0,
+        &[],
+    );
+    search.ops = true;
+    search.arm_diagnostics();
+    let request = request(StopIdx(0), StopIdx(5), 2);
+    for departure in [100u32, 0] {
+        search.pass(&request, departure, &mut None, &mut None);
+    }
+    let stats = &search.stats;
+    assert!(stats.footpath_bag_calls > 0);
+    assert_eq!(
+        stats.footpath_bag_calls,
+        stats.footpath_bag_rejections + stats.footpath_target_admissions
+    );
+    assert_eq!(
+        stats.footpath_label_edge_relaxations,
+        stats.footpath_cutoff_pruned + stats.footpath_target_pruned + stats.footpath_bag_calls
+    );
+    assert_eq!(stats.rode_labels, stats.rode_represented + stats.rode_stale);
+    assert_eq!(
+        stats.batch_points_offered,
+        stats.batch_points_rejected + stats.batch_points_evicted + stats.batch_points_live
+    );
+    assert!(stats.route_bag_calls >= stats.route_bag_admissions);
+    assert_eq!(
+        stats.footpath_reject_depth_histogram.iter().sum::<u64>(),
+        stats.footpath_bag_rejections
+    );
+    assert_eq!(
+        stats.footpath_bag_length_histogram.iter().sum::<u64>(),
+        stats.footpath_bag_calls
+    );
+    // The strict shadow armed (slack 0, no penalties) and saw offers.
+    assert!(stats.batch_points_offered > 0);
+    assert!(stats.batch_edge_records_predicted <= stats.footpath_edge_records_loaded);
+}

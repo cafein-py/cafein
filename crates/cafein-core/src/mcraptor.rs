@@ -295,6 +295,85 @@ impl Bag {
         }
     }
 
+    /// Stable-order `insert_slack` with probe accounting for the
+    /// R0 attribution runs: identical decisions and identical entry
+    /// order to `insert_slack`, recording the bag length before the
+    /// call, the one-based depth of the rejection scan (or the
+    /// complete pre-call length on admission), and the eviction-walk
+    /// depth.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_slack_probed(
+        &mut self,
+        arrival: u32,
+        penalty: u32,
+        grams: f64,
+        key: i64,
+        rides: u8,
+        slack: u32,
+        probes: &mut InsertProbes,
+    ) -> bool {
+        probes.length = self.entries.len() as u32;
+        probes.examined = 0;
+        probes.retained = 0;
+        let effective = arrival.saturating_add(penalty);
+        for entry in &self.entries {
+            probes.examined += 1;
+            if entry.key <= key && entry.rides <= rides && entry.arrival <= arrival {
+                let entry_effective = entry.arrival.saturating_add(entry.penalty);
+                if entry.arrival == arrival
+                    && entry.penalty == penalty
+                    && entry.key == key
+                    && entry.rides == rides
+                {
+                    if grams >= entry.grams {
+                        return false;
+                    }
+                } else if entry_effective.saturating_add(slack) <= effective {
+                    return false;
+                }
+            }
+        }
+        let retained = &mut probes.retained;
+        self.entries.retain(|entry| {
+            *retained += 1;
+            let entry_effective = entry.arrival.saturating_add(entry.penalty);
+            !((key <= entry.key
+                && rides <= entry.rides
+                && arrival <= entry.arrival
+                && effective.saturating_add(slack) <= entry_effective)
+                || (entry.arrival == arrival
+                    && entry.penalty == penalty
+                    && entry.key == key
+                    && entry.rides == rides
+                    && grams < entry.grams))
+        });
+        self.entries.push(Entry {
+            arrival,
+            penalty,
+            key,
+            grams,
+            rides,
+        });
+        true
+    }
+
+    /// The number of retained entries, for diagnostic bag censuses.
+    fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the exact label tuple is still retained — the stale-
+    /// `rode` audit's membership test.
+    fn contains_exact(&self, arrival: u32, penalty: u32, key: i64, grams: f64, rides: u8) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.arrival == arrival
+                && entry.penalty == penalty
+                && entry.key == key
+                && entry.grams == grams
+                && entry.rides == rides
+        })
+    }
+
     /// The bag's entries as comparable tuples, for differential tests.
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> Vec<(u32, u32, i64, u64, u8)> {
@@ -322,6 +401,341 @@ pub(crate) struct InsertProbes {
     pub retained: u32,
     /// Bag length before the call.
     pub length: u32,
+}
+
+/// Histogram bucket of a pre-call bag length.
+fn length_bucket(length: u32) -> usize {
+    match length {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3..=4 => 3,
+        5..=8 => 4,
+        9..=16 => 5,
+        17..=32 => 6,
+        33..=128 => 7,
+        _ => 8,
+    }
+}
+
+/// Histogram bucket of a one-based rejecting depth.
+fn depth_bucket(depth: u32) -> usize {
+    match depth {
+        0..=1 => 0,
+        2 => 1,
+        3..=4 => 2,
+        5..=8 => 3,
+        9..=16 => 4,
+        17..=32 => 5,
+        33..=64 => 6,
+        65..=128 => 7,
+        _ => 8,
+    }
+}
+
+const NONE_U32: u32 = u32::MAX;
+
+/// Per-search attribution counters and round-level phase timers for
+/// the McRAPTOR port programme's R0 stage: plain query-local integers
+/// (no shared atomics; parallel origins each fill their own and the
+/// caller reduces them afterwards). Per-operation fields fill only in
+/// single-thread diagnostic runs; the report prints only under
+/// `CAFEIN_MCRAPTOR_PROF`.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct McRaptorStats {
+    pub access_ns: u64,
+    pub queue_collect_ns: u64,
+    pub route_scan_ns: u64,
+    pub footpath_ns: u64,
+    pub sink_ns: u64,
+    pub footpath_edge_prepass_ns: u64,
+
+    pub departure_passes: u64,
+    pub rounds_entered: u64,
+    pub rounds_ended_empty: u64,
+    pub max_round_reached: u32,
+
+    pub access_offers: u64,
+    pub access_admissions: u64,
+    pub queue_labels: u64,
+    pub queue_entries: u64,
+    pub lines_touched: u64,
+
+    pub line_positions: u64,
+    pub rider_evaluations: u64,
+    pub route_bag_calls: u64,
+    pub route_bag_admissions: u64,
+    pub rode_labels: u64,
+
+    pub footpath_edge_records_loaded: u64,
+    pub footpath_label_edge_relaxations: u64,
+    pub footpath_cutoff_pruned: u64,
+    pub footpath_target_pruned: u64,
+    pub footpath_bag_calls: u64,
+    pub footpath_bag_rejections: u64,
+    pub footpath_target_admissions: u64,
+
+    pub footpath_reject_entries_examined: u64,
+    pub footpath_admit_entries_examined: u64,
+    pub footpath_retain_entries_examined: u64,
+    pub footpath_reject_depth_histogram: [u64; 9],
+    pub footpath_bag_length_histogram: [u64; 9],
+
+    pub rode_represented: u64,
+    pub rode_stale: u64,
+    pub batch_points_offered: u64,
+    pub batch_points_rejected: u64,
+    pub batch_points_evicted: u64,
+    pub batch_points_live: u64,
+    pub batch_source_stops: u64,
+    pub batch_edge_records_predicted: u64,
+    pub batch_relaxations_predicted: u64,
+
+    pub labels_created: u64,
+    pub total_bag_entries_at_round_end: u64,
+    pub maximum_stop_bag_length: u64,
+
+    pub access_floor_rejectable_route: u64,
+    pub access_floor_rejectable_footpath: u64,
+    pub access_floor_nonfront_saved_probes: u64,
+}
+
+impl McRaptorStats {
+    pub(crate) fn absorb(&mut self, other: &McRaptorStats) {
+        self.access_ns += other.access_ns;
+        self.queue_collect_ns += other.queue_collect_ns;
+        self.route_scan_ns += other.route_scan_ns;
+        self.footpath_ns += other.footpath_ns;
+        self.sink_ns += other.sink_ns;
+        self.footpath_edge_prepass_ns += other.footpath_edge_prepass_ns;
+        self.departure_passes += other.departure_passes;
+        self.rounds_entered += other.rounds_entered;
+        self.rounds_ended_empty += other.rounds_ended_empty;
+        self.max_round_reached = self.max_round_reached.max(other.max_round_reached);
+        self.access_offers += other.access_offers;
+        self.access_admissions += other.access_admissions;
+        self.queue_labels += other.queue_labels;
+        self.queue_entries += other.queue_entries;
+        self.lines_touched += other.lines_touched;
+        self.line_positions += other.line_positions;
+        self.rider_evaluations += other.rider_evaluations;
+        self.route_bag_calls += other.route_bag_calls;
+        self.route_bag_admissions += other.route_bag_admissions;
+        self.rode_labels += other.rode_labels;
+        self.footpath_edge_records_loaded += other.footpath_edge_records_loaded;
+        self.footpath_label_edge_relaxations += other.footpath_label_edge_relaxations;
+        self.footpath_cutoff_pruned += other.footpath_cutoff_pruned;
+        self.footpath_target_pruned += other.footpath_target_pruned;
+        self.footpath_bag_calls += other.footpath_bag_calls;
+        self.footpath_bag_rejections += other.footpath_bag_rejections;
+        self.footpath_target_admissions += other.footpath_target_admissions;
+        self.footpath_reject_entries_examined += other.footpath_reject_entries_examined;
+        self.footpath_admit_entries_examined += other.footpath_admit_entries_examined;
+        self.footpath_retain_entries_examined += other.footpath_retain_entries_examined;
+        for (mine, theirs) in self
+            .footpath_reject_depth_histogram
+            .iter_mut()
+            .zip(other.footpath_reject_depth_histogram)
+        {
+            *mine += theirs;
+        }
+        for (mine, theirs) in self
+            .footpath_bag_length_histogram
+            .iter_mut()
+            .zip(other.footpath_bag_length_histogram)
+        {
+            *mine += theirs;
+        }
+        self.rode_represented += other.rode_represented;
+        self.rode_stale += other.rode_stale;
+        self.batch_points_offered += other.batch_points_offered;
+        self.batch_points_rejected += other.batch_points_rejected;
+        self.batch_points_evicted += other.batch_points_evicted;
+        self.batch_points_live += other.batch_points_live;
+        self.batch_source_stops += other.batch_source_stops;
+        self.batch_edge_records_predicted += other.batch_edge_records_predicted;
+        self.batch_relaxations_predicted += other.batch_relaxations_predicted;
+        self.labels_created += other.labels_created;
+        self.total_bag_entries_at_round_end += other.total_bag_entries_at_round_end;
+        self.maximum_stop_bag_length = self
+            .maximum_stop_bag_length
+            .max(other.maximum_stop_bag_length);
+        self.access_floor_rejectable_route += other.access_floor_rejectable_route;
+        self.access_floor_rejectable_footpath += other.access_floor_rejectable_footpath;
+        self.access_floor_nonfront_saved_probes += other.access_floor_nonfront_saved_probes;
+    }
+
+    pub(crate) fn report(&self, label: &str) {
+        if std::env::var_os("CAFEIN_MCRAPTOR_PROF").is_none() {
+            return;
+        }
+        let histogram = |counts: &[u64; 9]| {
+            counts
+                .iter()
+                .map(|count| count.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        eprintln!(
+            "MCRAPTOR-STATS {label} access_ms={} queue_collect_ms={} \
+             route_scan_ms={} footpath_ms={} sink_ms={} edge_prepass_ms={} \
+             departure_passes={} rounds_entered={} rounds_ended_empty={} \
+             max_round_reached={} access_offers={} access_admissions={} \
+             queue_labels={} queue_entries={} lines_touched={} \
+             line_positions={} rider_evaluations={} route_bag_calls={} \
+             route_bag_admissions={} rode_labels={} \
+             footpath_edge_records_loaded={} \
+             footpath_label_edge_relaxations={} footpath_cutoff_pruned={} \
+             footpath_target_pruned={} footpath_bag_calls={} \
+             footpath_bag_rejections={} footpath_target_admissions={} \
+             footpath_reject_entries_examined={} \
+             footpath_admit_entries_examined={} \
+             footpath_retain_entries_examined={} \
+             footpath_reject_depth_histogram={} \
+             footpath_bag_length_histogram={} rode_represented={} \
+             rode_stale={} batch_points_offered={} batch_points_rejected={} \
+             batch_points_evicted={} batch_points_live={} \
+             batch_source_stops={} batch_edge_records_predicted={} \
+             batch_relaxations_predicted={} labels_created={} \
+             total_bag_entries_at_round_end={} maximum_stop_bag_length={} \
+             access_floor_rejectable_route={} \
+             access_floor_rejectable_footpath={} \
+             access_floor_nonfront_saved_probes={}",
+            self.access_ns / 1_000_000,
+            self.queue_collect_ns / 1_000_000,
+            self.route_scan_ns / 1_000_000,
+            self.footpath_ns / 1_000_000,
+            self.sink_ns / 1_000_000,
+            self.footpath_edge_prepass_ns / 1_000_000,
+            self.departure_passes,
+            self.rounds_entered,
+            self.rounds_ended_empty,
+            self.max_round_reached,
+            self.access_offers,
+            self.access_admissions,
+            self.queue_labels,
+            self.queue_entries,
+            self.lines_touched,
+            self.line_positions,
+            self.rider_evaluations,
+            self.route_bag_calls,
+            self.route_bag_admissions,
+            self.rode_labels,
+            self.footpath_edge_records_loaded,
+            self.footpath_label_edge_relaxations,
+            self.footpath_cutoff_pruned,
+            self.footpath_target_pruned,
+            self.footpath_bag_calls,
+            self.footpath_bag_rejections,
+            self.footpath_target_admissions,
+            self.footpath_reject_entries_examined,
+            self.footpath_admit_entries_examined,
+            self.footpath_retain_entries_examined,
+            histogram(&self.footpath_reject_depth_histogram),
+            histogram(&self.footpath_bag_length_histogram),
+            self.rode_represented,
+            self.rode_stale,
+            self.batch_points_offered,
+            self.batch_points_rejected,
+            self.batch_points_evicted,
+            self.batch_points_live,
+            self.batch_source_stops,
+            self.batch_edge_records_predicted,
+            self.batch_relaxations_predicted,
+            self.labels_created,
+            self.total_bag_entries_at_round_end,
+            self.maximum_stop_bag_length,
+            self.access_floor_rejectable_route,
+            self.access_floor_rejectable_footpath,
+            self.access_floor_nonfront_saved_probes,
+        );
+    }
+}
+
+/// One pending point of the R2 batch shadow: strict (arrival, key)
+/// with the exact-grams refinement, linked per source stop.
+#[derive(Clone, Copy)]
+struct ShadowPoint {
+    arrival: u32,
+    key: i64,
+    grams: f64,
+    next: u32,
+    live: bool,
+}
+
+/// The shadow of R2's per-(round, source stop) batch gate: fed the
+/// round's `rode` labels in production order without changing the
+/// traversal, it predicts the edge-major sweep's records and
+/// relaxations before R2 exists. Strict mode only.
+struct ShadowBatch {
+    heads: Box<[u32]>,
+    tails: Box<[u32]>,
+    touched: Vec<StopIdx>,
+    points: Vec<ShadowPoint>,
+    rejected: u64,
+    evicted: u64,
+}
+
+impl ShadowBatch {
+    fn new(stop_count: usize) -> ShadowBatch {
+        ShadowBatch {
+            heads: vec![NONE_U32; stop_count].into_boxed_slice(),
+            tails: vec![NONE_U32; stop_count].into_boxed_slice(),
+            touched: Vec::new(),
+            points: Vec::new(),
+            rejected: 0,
+            evicted: 0,
+        }
+    }
+
+    fn offer(&mut self, source: StopIdx, arrival: u32, key: i64, grams: f64) {
+        let slot = source.0 as usize;
+        let mut cursor = self.heads[slot];
+        while cursor != NONE_U32 {
+            let point = &mut self.points[cursor as usize];
+            let next = point.next;
+            if point.live {
+                if point.arrival <= arrival
+                    && point.key <= key
+                    && !(point.arrival == arrival && point.key == key && grams < point.grams)
+                {
+                    self.rejected += 1;
+                    return;
+                }
+                if arrival <= point.arrival && key <= point.key {
+                    point.live = false;
+                    self.evicted += 1;
+                }
+            }
+            cursor = next;
+        }
+        let index = self.points.len() as u32;
+        self.points.push(ShadowPoint {
+            arrival,
+            key,
+            grams,
+            next: NONE_U32,
+            live: true,
+        });
+        if self.heads[slot] == NONE_U32 {
+            self.heads[slot] = index;
+            self.touched.push(source);
+        } else {
+            self.points[self.tails[slot] as usize].next = index;
+        }
+        self.tails[slot] = index;
+    }
+
+    fn reset(&mut self) {
+        for &stop in &self.touched {
+            self.heads[stop.0 as usize] = NONE_U32;
+            self.tails[stop.0 as usize] = NONE_U32;
+        }
+        self.touched.clear();
+        self.points.clear();
+        self.rejected = 0;
+        self.evicted = 0;
+    }
 }
 
 /// A destination frontier entry; `departure` is the profile pass that
@@ -571,6 +985,16 @@ struct Search<'a> {
     /// Per line: the (position, label) boardings queued this round.
     queue: Vec<Vec<(u16, u32)>>,
     touched: Vec<u32>,
+    /// R0 attribution state: counters always fill (plain adds); the
+    /// per-operation probes, audits, and shadows run only under the
+    /// diagnostic environment flags read once at `start`.
+    stats: Box<McRaptorStats>,
+    ops: bool,
+    edges_prepass: bool,
+    /// Diagnostic minimum zero-gram access arrival per stop (ops runs).
+    access_floor: Vec<u32>,
+    /// The R2 batch shadow (ops runs, strict searches only).
+    shadow: Option<ShadowBatch>,
 }
 
 /// The multicriteria journeys for a single departure: the Pareto set
@@ -690,7 +1114,7 @@ pub fn least_emissions_matrix(
     for (index, stop) in destinations.iter().enumerate() {
         slots[stop.0 as usize] = index as u32 + 1;
     }
-    requests
+    let runs: Vec<(Vec<CostRow>, Box<McRaptorStats>)> = requests
         .par_iter()
         .zip(access_meters.par_iter())
         .map(|(request, access_meters)| {
@@ -716,16 +1140,26 @@ pub fn least_emissions_matrix(
                 });
                 search.pass(request, departure, &mut fold, &mut None);
             }
-            best.into_iter()
+            let rows = best
+                .into_iter()
                 .enumerate()
                 .filter_map(|(slot, winner)| {
                     winner.map(|winner| {
                         search.cost_row(inputs, winner, destinations[slot].0, access_meters)
                     })
                 })
-                .collect()
+                .collect();
+            (rows, search.stats)
         })
-        .collect()
+        .collect();
+    if std::env::var_os("CAFEIN_MCRAPTOR_PROF").is_some() {
+        let mut reduced = McRaptorStats::default();
+        for (_, stats) in &runs {
+            reduced.absorb(stats);
+        }
+        reduced.report("least_emissions_matrix");
+    }
+    runs.into_iter().map(|run| run.0).collect()
 }
 
 /// The plain time-only bounds behind `max_slower`: per departure pass
@@ -926,9 +1360,10 @@ pub fn frontier_matrix(
             .map(|(&stop, &slot)| (stop, slot, 0))
             .collect()
     };
-    requests
+    let runs: Vec<(Vec<Vec<Journey>>, Box<McRaptorStats>, u64)> = requests
         .par_iter()
         .map(|request| {
+            let origin_started = std::time::Instant::now();
             // Per pass, the restriction's per-slot destination bounds; the
             // cutoff floor is the farthest reachable slot's bound, so a
             // label needed by any cell survives, and each cell's output
@@ -1005,12 +1440,66 @@ pub fn frontier_matrix(
                     journeys
                 })
                 .collect();
-            if egress_active || unique == destinations.len() {
-                return cells;
-            }
-            cell_of.iter().map(|&cell| cells[cell].clone()).collect()
+            let cells: Vec<Vec<Journey>> = if egress_active || unique == destinations.len() {
+                cells
+            } else {
+                cell_of.iter().map(|&cell| cells[cell].clone()).collect()
+            };
+            (
+                cells,
+                search.stats,
+                origin_started.elapsed().as_nanos() as u64,
+            )
         })
-        .collect()
+        .collect();
+    if std::env::var_os("CAFEIN_MCRAPTOR_PROF").is_some() && !runs.is_empty() {
+        // The per-origin service-time distribution: each timer starts
+        // inside the Rayon task, so queue waiting is excluded.
+        let mut walls: Vec<u64> = runs.iter().map(|run| run.2).collect();
+        walls.sort_unstable();
+        let total_relaxations: u64 = runs
+            .iter()
+            .map(|run| run.1.footpath_label_edge_relaxations)
+            .sum();
+        let mut slowest_share = 0.0f64;
+        for (index, (cells, stats, wall)) in runs.iter().enumerate() {
+            let rows: usize = cells.iter().map(|cell| cell.len()).sum();
+            eprintln!(
+                "MCRAPTOR-ORIGIN index={index} wall_ms={} departure_passes={} \
+                 rounds={} rode_labels={} footpath_relaxations={} \
+                 bag_calls={} labels_created={} rows={rows}",
+                wall / 1_000_000,
+                stats.departure_passes,
+                stats.rounds_entered,
+                stats.rode_labels,
+                stats.footpath_label_edge_relaxations,
+                stats.route_bag_calls + stats.footpath_bag_calls,
+                stats.labels_created,
+            );
+            if *wall == walls[walls.len() - 1] && total_relaxations > 0 {
+                slowest_share =
+                    stats.footpath_label_edge_relaxations as f64 / total_relaxations as f64;
+            }
+        }
+        let percentile = |fraction: f64| walls[((walls.len() - 1) as f64 * fraction) as usize];
+        let p50 = percentile(0.5);
+        eprintln!(
+            "MCRAPTOR-ORIGINS min_ms={} p50_ms={} p90_ms={} max_ms={} \
+             max_over_p50={:.2} slowest_relaxation_share={:.3}",
+            walls[0] / 1_000_000,
+            p50 / 1_000_000,
+            percentile(0.9) / 1_000_000,
+            walls[walls.len() - 1] / 1_000_000,
+            walls[walls.len() - 1] as f64 / p50.max(1) as f64,
+            slowest_share,
+        );
+        let mut reduced = McRaptorStats::default();
+        for (_, stats, _) in &runs {
+            reduced.absorb(stats);
+        }
+        reduced.report("frontier_matrix");
+    }
+    runs.into_iter().map(|run| run.0).collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1095,6 +1584,7 @@ fn profile(
         .map(|arrived| search.assemble(arrived))
         .collect();
     journeys.sort_by_key(|journey| (journey.departure, journey.arrival, journey.rides()));
+    search.stats.report("profile");
     journeys
 }
 
@@ -1171,7 +1661,7 @@ impl<'a> Search<'a> {
         slack: u32,
         route_penalties: &'a [u32],
     ) -> Search<'a> {
-        Search {
+        let mut search = Search {
             view,
             timetable,
             footpaths,
@@ -1187,6 +1677,26 @@ impl<'a> Search<'a> {
             cutoff: Vec::new(),
             queue: vec![Vec::new(); view.line_count() as usize],
             touched: Vec::new(),
+            stats: Box::default(),
+            ops: std::env::var_os("CAFEIN_MCRAPTOR_PROF_OPS").is_some(),
+            edges_prepass: std::env::var_os("CAFEIN_MCRAPTOR_PROF_EDGES").is_some(),
+            access_floor: Vec::new(),
+            shadow: None,
+        };
+        search.arm_diagnostics();
+        search
+    }
+
+    /// Sizes the diagnostic structures when the flags ask for them;
+    /// the shadow batch only exists for strict searches.
+    fn arm_diagnostics(&mut self) {
+        if !self.ops {
+            return;
+        }
+        let stops = self.timetable.stop_count() as usize;
+        self.access_floor = vec![u32::MAX; stops];
+        if self.slack == 0 && self.route_penalties.is_empty() {
+            self.shadow = Some(ShadowBatch::new(stops));
         }
     }
 
@@ -1253,16 +1763,24 @@ impl<'a> Search<'a> {
         frontier: &mut Option<FrontierFold<'_>>,
     ) {
         self.prune_target = !request.egress.is_empty();
+        self.stats.departure_passes += 1;
         let mut fresh: Vec<u32> = Vec::new();
+        let phase = std::time::Instant::now();
         for &(stop, seconds) in &request.access {
             let arrival = departure.saturating_add(seconds);
             let label = self.arena.len() as u32;
             let key = self.key(0.0);
+            self.stats.access_offers += 1;
             if self.beyond_cutoff(stop, arrival) || self.target_pruned(departure, arrival, key, 0.0)
             {
                 continue;
             }
             if self.bags[stop.0 as usize].insert_slack(arrival, 0, 0.0, key, 0, self.slack) {
+                self.stats.access_admissions += 1;
+                if self.ops {
+                    let floor = &mut self.access_floor[stop.0 as usize];
+                    *floor = (*floor).min(arrival);
+                }
                 self.arena.push(Label {
                     arrival,
                     grams: 0.0,
@@ -1277,11 +1795,18 @@ impl<'a> Search<'a> {
                 fresh.push(label);
             }
         }
+        self.stats.access_ns += phase.elapsed().as_nanos() as u64;
         for round in 1..=request.max_transfers as u32 + 1 {
             if fresh.is_empty() {
+                self.stats.rounds_ended_empty += 1;
                 break;
             }
+            self.stats.rounds_entered += 1;
+            self.stats.max_round_reached = self.stats.max_round_reached.max(round);
             let rides = round as u8;
+            let phase = std::time::Instant::now();
+            self.stats.queue_labels += fresh.len() as u64;
+            let mut queued_entries = 0u64;
             for &label in &fresh {
                 let stop = self.arena[label as usize].stop;
                 for served in self.timetable.patterns_at_stop(stop) {
@@ -1299,57 +1824,52 @@ impl<'a> Search<'a> {
                             self.touched.push(line);
                         }
                         self.queue[line as usize].push((served.position, label));
+                        queued_entries += 1;
                     }
                 }
             }
+            self.stats.queue_entries += queued_entries;
+            self.stats.queue_collect_ns += phase.elapsed().as_nanos() as u64;
+            let phase = std::time::Instant::now();
             let mut rode: Vec<u32> = Vec::new();
             let touched = std::mem::take(&mut self.touched);
+            self.stats.lines_touched += touched.len() as u64;
             for &line in &touched {
                 self.scan_line(line, rides, &mut rode);
             }
-            // One footpath hop from the improving ride labels; the
-            // closed transfer contract makes chains redundant.
-            let mut next = rode.clone();
-            for &label in &rode {
-                let from = self.arena[label as usize];
-                let key = self.key(from.grams);
-                for footpath in self.footpaths.from_stop(from.stop) {
-                    let arrival = from.arrival.saturating_add(footpath.duration);
-                    let walked = self.arena.len() as u32;
-                    if self.beyond_cutoff(footpath.to, arrival)
-                        || self.target_pruned(
-                            from.departure,
-                            arrival.saturating_add(from.penalty),
-                            key,
-                            from.grams,
-                        )
-                    {
-                        continue;
-                    }
-                    // A footpath adds no route penalty; it inherits the chain's.
-                    if self.bags[footpath.to.0 as usize].insert_slack(
-                        arrival,
-                        from.penalty,
-                        from.grams,
-                        key,
-                        rides,
-                        self.slack,
-                    ) {
-                        self.arena.push(Label {
-                            arrival,
-                            grams: from.grams,
-                            stop: footpath.to,
-                            departure: from.departure,
-                            penalty: from.penalty,
-                            origin: Origin::Walk {
-                                parent: label,
-                                duration: footpath.duration,
-                            },
-                        });
-                        next.push(walked);
+            self.stats.route_scan_ns += phase.elapsed().as_nanos() as u64;
+            self.stats.rode_labels += rode.len() as u64;
+            if self.ops {
+                self.audit_rode(&rode, rides);
+            }
+            if self.edges_prepass {
+                // Diagnostic: time one edge-only traversal of the same
+                // label-major slices. It warms the real loop, so it
+                // belongs to separate profiling runs.
+                let started = std::time::Instant::now();
+                let mut checksum = 0u64;
+                for &label in &rode {
+                    let stop = self.arena[label as usize].stop;
+                    for footpath in self.footpaths.from_stop(stop) {
+                        checksum = checksum.wrapping_add(
+                            ((footpath.duration as u64) << 32) | footpath.to.0 as u64,
+                        );
                     }
                 }
+                std::hint::black_box(checksum);
+                self.stats.footpath_edge_prepass_ns += started.elapsed().as_nanos() as u64;
             }
+            // One footpath hop from the improving ride labels; the
+            // closed transfer contract makes chains redundant.
+            let phase = std::time::Instant::now();
+            let mut next = rode.clone();
+            if self.ops {
+                self.relax_footpaths_probed(&rode, rides, &mut next);
+            } else {
+                self.relax_footpaths(&rode, rides, &mut next);
+            }
+            self.stats.footpath_ns += phase.elapsed().as_nanos() as u64;
+            let phase = std::time::Instant::now();
             for &label in &next {
                 let reached = self.arena[label as usize];
                 if let Some(fold) = fold {
@@ -1381,7 +1901,225 @@ impl<'a> Search<'a> {
                     }
                 }
             }
+            self.stats.sink_ns += phase.elapsed().as_nanos() as u64;
+            if self.ops {
+                let mut total = 0u64;
+                let mut longest = 0u64;
+                for bag in &self.bags {
+                    let length = bag.entry_count() as u64;
+                    total += length;
+                    longest = longest.max(length);
+                }
+                self.stats.total_bag_entries_at_round_end += total;
+                self.stats.maximum_stop_bag_length =
+                    self.stats.maximum_stop_bag_length.max(longest);
+            }
             fresh = next;
+        }
+        self.stats.labels_created = self.arena.len() as u64;
+    }
+
+    /// Whether the diagnostic access-floor entry is an exact rejecting
+    /// witness for a candidate under the bag's slack relation: the
+    /// floor carries zero grams, penalty, and rides, so it wins every
+    /// axis when its key and both arrival comparisons hold (a ridden
+    /// candidate can never be its exact-class tie).
+    fn access_floor_rejects(&self, stop: StopIdx, arrival: u32, penalty: u32, key: i64) -> bool {
+        let floor = self.access_floor[stop.0 as usize];
+        floor != u32::MAX
+            && key >= 0
+            && floor <= arrival
+            && floor.saturating_add(self.slack) <= arrival.saturating_add(penalty)
+    }
+
+    /// The round's stale-`rode` audit and R2 batch shadow (diagnostic
+    /// runs): a label is represented while its exact tuple is still in
+    /// its bag; the shadow replays the strict batch gate over the
+    /// round's labels without changing production traversal.
+    fn audit_rode(&mut self, rode: &[u32], rides: u8) {
+        for &label in rode {
+            let from = self.arena[label as usize];
+            let key = self.key(from.grams);
+            if self.bags[from.stop.0 as usize].contains_exact(
+                from.arrival,
+                from.penalty,
+                key,
+                from.grams,
+                rides,
+            ) {
+                self.stats.rode_represented += 1;
+            } else {
+                self.stats.rode_stale += 1;
+            }
+        }
+        let Some(shadow) = self.shadow.as_mut() else {
+            return;
+        };
+        // (audit continues below)
+        for &label in rode {
+            let from = self.arena[label as usize];
+            let key = (from.grams / self.bucket).floor() as i64;
+            shadow.offer(from.stop, from.arrival, key, from.grams);
+            self.stats.batch_points_offered += 1;
+        }
+        self.stats.batch_points_rejected += shadow.rejected;
+        self.stats.batch_points_evicted += shadow.evicted;
+        for &source in &shadow.touched {
+            self.stats.batch_source_stops += 1;
+            let degree = self.footpaths.from_stop(source).len() as u64;
+            self.stats.batch_edge_records_predicted += degree;
+            let mut live = 0u64;
+            let mut cursor = shadow.heads[source.0 as usize];
+            while cursor != NONE_U32 {
+                let point = shadow.points[cursor as usize];
+                if point.live {
+                    live += 1;
+                }
+                cursor = point.next;
+            }
+            self.stats.batch_points_live += live;
+            self.stats.batch_relaxations_predicted += degree * live;
+        }
+        shadow.reset();
+    }
+
+    /// The production footpath hop: one relaxation per (rode label,
+    /// closure edge), kept free of per-edge instrumentation — the
+    /// counters accumulate in locals and flush per label so the inner
+    /// loop compiles exactly as before the R0 stage.
+    fn relax_footpaths(&mut self, rode: &[u32], rides: u8, next: &mut Vec<u32>) {
+        for &label in rode {
+            let from = self.arena[label as usize];
+            let key = self.key(from.grams);
+            let slice = self.footpaths.from_stop(from.stop);
+            let mut cutoff_pruned = 0u64;
+            let mut target_pruned = 0u64;
+            let mut admissions = 0u64;
+            for footpath in slice {
+                let arrival = from.arrival.saturating_add(footpath.duration);
+                let walked = self.arena.len() as u32;
+                if self.beyond_cutoff(footpath.to, arrival) {
+                    cutoff_pruned += 1;
+                    continue;
+                }
+                if self.target_pruned(
+                    from.departure,
+                    arrival.saturating_add(from.penalty),
+                    key,
+                    from.grams,
+                ) {
+                    target_pruned += 1;
+                    continue;
+                }
+                // A footpath adds no route penalty; it inherits the chain's.
+                if self.bags[footpath.to.0 as usize].insert_slack(
+                    arrival,
+                    from.penalty,
+                    from.grams,
+                    key,
+                    rides,
+                    self.slack,
+                ) {
+                    admissions += 1;
+                    self.arena.push(Label {
+                        arrival,
+                        grams: from.grams,
+                        stop: footpath.to,
+                        departure: from.departure,
+                        penalty: from.penalty,
+                        origin: Origin::Walk {
+                            parent: label,
+                            duration: footpath.duration,
+                        },
+                    });
+                    next.push(walked);
+                }
+            }
+            let calls = slice.len() as u64 - cutoff_pruned - target_pruned;
+            self.stats.footpath_edge_records_loaded += slice.len() as u64;
+            self.stats.footpath_label_edge_relaxations += slice.len() as u64;
+            self.stats.footpath_cutoff_pruned += cutoff_pruned;
+            self.stats.footpath_target_pruned += target_pruned;
+            self.stats.footpath_bag_calls += calls;
+            self.stats.footpath_target_admissions += admissions;
+            self.stats.footpath_bag_rejections += calls - admissions;
+        }
+    }
+
+    /// The diagnostic twin of `relax_footpaths`: identical decisions
+    /// through the probed insert, plus depth histograms and the
+    /// access-floor attribution. Runs only under the ops flag.
+    fn relax_footpaths_probed(&mut self, rode: &[u32], rides: u8, next: &mut Vec<u32>) {
+        for &label in rode {
+            let from = self.arena[label as usize];
+            let key = self.key(from.grams);
+            let slice = self.footpaths.from_stop(from.stop);
+            let mut cutoff_pruned = 0u64;
+            let mut target_pruned = 0u64;
+            let mut admissions = 0u64;
+            for footpath in slice {
+                let arrival = from.arrival.saturating_add(footpath.duration);
+                let walked = self.arena.len() as u32;
+                if self.beyond_cutoff(footpath.to, arrival) {
+                    cutoff_pruned += 1;
+                    continue;
+                }
+                if self.target_pruned(
+                    from.departure,
+                    arrival.saturating_add(from.penalty),
+                    key,
+                    from.grams,
+                ) {
+                    target_pruned += 1;
+                    continue;
+                }
+                let mut probes = InsertProbes::default();
+                let admitted = self.bags[footpath.to.0 as usize].insert_slack_probed(
+                    arrival,
+                    from.penalty,
+                    from.grams,
+                    key,
+                    rides,
+                    self.slack,
+                    &mut probes,
+                );
+                self.stats.footpath_bag_length_histogram[length_bucket(probes.length)] += 1;
+                if admitted {
+                    self.stats.footpath_admit_entries_examined += probes.examined as u64;
+                    self.stats.footpath_retain_entries_examined += probes.retained as u64;
+                    admissions += 1;
+                    self.arena.push(Label {
+                        arrival,
+                        grams: from.grams,
+                        stop: footpath.to,
+                        departure: from.departure,
+                        penalty: from.penalty,
+                        origin: Origin::Walk {
+                            parent: label,
+                            duration: footpath.duration,
+                        },
+                    });
+                    next.push(walked);
+                } else {
+                    self.stats.footpath_reject_entries_examined += probes.examined as u64;
+                    self.stats.footpath_reject_depth_histogram[depth_bucket(probes.examined)] += 1;
+                    if self.access_floor_rejects(footpath.to, arrival, from.penalty, key) {
+                        self.stats.access_floor_rejectable_footpath += 1;
+                        if probes.examined > 1 {
+                            self.stats.access_floor_nonfront_saved_probes +=
+                                (probes.examined - 1) as u64;
+                        }
+                    }
+                }
+            }
+            let calls = slice.len() as u64 - cutoff_pruned - target_pruned;
+            self.stats.footpath_edge_records_loaded += slice.len() as u64;
+            self.stats.footpath_label_edge_relaxations += slice.len() as u64;
+            self.stats.footpath_cutoff_pruned += cutoff_pruned;
+            self.stats.footpath_target_pruned += target_pruned;
+            self.stats.footpath_bag_calls += calls;
+            self.stats.footpath_target_admissions += admissions;
+            self.stats.footpath_bag_rejections += calls - admissions;
         }
     }
 
@@ -1411,8 +2149,14 @@ impl<'a> Search<'a> {
         let offset = self.view.line_day_offset(line);
         let mut riders: Vec<Rider> = Vec::new();
         let mut queued = 0;
+        let mut positions = 0u64;
+        let mut evaluations = 0u64;
+        let mut bag_calls = 0u64;
+        let mut admissions = 0u64;
         for position in entries[0].0 as usize..stops.len() {
+            positions += 1;
             for rider in &riders {
+                evaluations += 1;
                 if (rider.board as usize) >= position {
                     continue;
                 }
@@ -1439,8 +2183,17 @@ impl<'a> Search<'a> {
                 {
                     continue;
                 }
-                if self.bags[stops[position].0 as usize]
-                    .insert_slack(arrival, penalty, grams, key, rides, self.slack)
+                let admitted = self.bags[stops[position].0 as usize]
+                    .insert_slack(arrival, penalty, grams, key, rides, self.slack);
+                bag_calls += 1;
+                if !admitted {
+                    if self.ops && self.access_floor_rejects(stops[position], arrival, penalty, key)
+                    {
+                        self.stats.access_floor_rejectable_route += 1;
+                    }
+                    continue;
+                }
+                admissions += 1;
                 {
                     self.arena.push(Label {
                         arrival,
@@ -1542,6 +2295,10 @@ impl<'a> Search<'a> {
         }
         entries.clear();
         self.queue[line as usize] = entries;
+        self.stats.line_positions += positions;
+        self.stats.rider_evaluations += evaluations;
+        self.stats.route_bag_calls += bag_calls;
+        self.stats.route_bag_admissions += admissions;
     }
 
     /// Walks a winning label's chain into a cost row, mirroring the
