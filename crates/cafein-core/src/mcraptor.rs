@@ -357,6 +357,53 @@ impl Bag {
         true
     }
 
+    /// The R1 dispatch: a strict search (zero slack, no route
+    /// penalties) inserts through the self-organising strict path —
+    /// identical decisions, recent witnesses swapped to the front —
+    /// while slack and penalty searches keep the stable-order general
+    /// path byte-for-byte. Set evolution is order-independent in both
+    /// relations, so which path ran is invisible in results.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_label(
+        &mut self,
+        strict: bool,
+        arrival: u32,
+        penalty: u32,
+        grams: f64,
+        key: i64,
+        rides: u8,
+        slack: u32,
+    ) -> bool {
+        if strict {
+            debug_assert!(penalty == 0, "a strict search carries no penalty");
+            self.insert(arrival, grams, key, rides)
+        } else {
+            self.insert_slack(arrival, penalty, grams, key, rides, slack)
+        }
+    }
+
+    /// The probed twin of `insert_label`: identical decisions and
+    /// identical permutations per mode, with probe accounting.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_label_probed(
+        &mut self,
+        strict: bool,
+        arrival: u32,
+        penalty: u32,
+        grams: f64,
+        key: i64,
+        rides: u8,
+        slack: u32,
+        probes: &mut InsertProbes,
+    ) -> bool {
+        if strict {
+            debug_assert!(penalty == 0, "a strict search carries no penalty");
+            self.insert_probed(arrival, grams, key, rides, probes)
+        } else {
+            self.insert_slack_probed(arrival, penalty, grams, key, rides, slack, probes)
+        }
+    }
+
     /// The number of retained entries, for diagnostic bag censuses.
     fn entry_count(&self) -> usize {
         self.entries.len()
@@ -985,6 +1032,9 @@ struct Search<'a> {
     /// Per line: the (position, label) boardings queued this round.
     queue: Vec<Vec<(u16, u32)>>,
     touched: Vec<u32>,
+    /// A strict search (zero slack, no route penalties): stop-bag
+    /// admissions dispatch to the self-organising strict insert.
+    strict_bags: bool,
     /// R0 attribution state: counters always fill (plain adds); the
     /// per-operation probes, audits, and shadows run only under the
     /// diagnostic environment flags read once at `start`.
@@ -1677,6 +1727,7 @@ impl<'a> Search<'a> {
             cutoff: Vec::new(),
             queue: vec![Vec::new(); view.line_count() as usize],
             touched: Vec::new(),
+            strict_bags: slack == 0 && route_penalties.is_empty(),
             stats: Box::default(),
             ops: std::env::var_os("CAFEIN_MCRAPTOR_PROF_OPS").is_some(),
             edges_prepass: std::env::var_os("CAFEIN_MCRAPTOR_PROF_EDGES").is_some(),
@@ -1775,7 +1826,15 @@ impl<'a> Search<'a> {
             {
                 continue;
             }
-            if self.bags[stop.0 as usize].insert_slack(arrival, 0, 0.0, key, 0, self.slack) {
+            if self.bags[stop.0 as usize].insert_label(
+                self.strict_bags,
+                arrival,
+                0,
+                0.0,
+                key,
+                0,
+                self.slack,
+            ) {
                 self.stats.access_admissions += 1;
                 if self.ops {
                     let floor = &mut self.access_floor[stop.0 as usize];
@@ -2012,7 +2071,8 @@ impl<'a> Search<'a> {
                     continue;
                 }
                 // A footpath adds no route penalty; it inherits the chain's.
-                if self.bags[footpath.to.0 as usize].insert_slack(
+                if self.bags[footpath.to.0 as usize].insert_label(
+                    self.strict_bags,
                     arrival,
                     from.penalty,
                     from.grams,
@@ -2074,7 +2134,8 @@ impl<'a> Search<'a> {
                     continue;
                 }
                 let mut probes = InsertProbes::default();
-                let admitted = self.bags[footpath.to.0 as usize].insert_slack_probed(
+                let admitted = self.bags[footpath.to.0 as usize].insert_label_probed(
+                    self.strict_bags,
                     arrival,
                     from.penalty,
                     from.grams,
@@ -2183,8 +2244,15 @@ impl<'a> Search<'a> {
                 {
                     continue;
                 }
-                let admitted = self.bags[stops[position].0 as usize]
-                    .insert_slack(arrival, penalty, grams, key, rides, self.slack);
+                let admitted = self.bags[stops[position].0 as usize].insert_label(
+                    self.strict_bags,
+                    arrival,
+                    penalty,
+                    grams,
+                    key,
+                    rides,
+                    self.slack,
+                );
                 bag_calls += 1;
                 if !admitted {
                     if self.ops && self.access_floor_rejects(stops[position], arrival, penalty, key)
