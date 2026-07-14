@@ -1435,7 +1435,6 @@ fn attribution_counters_hold_their_identities() {
         &[],
     );
     search.ops = true;
-    search.arm_diagnostics();
     let request = request(StopIdx(0), StopIdx(5), 2);
     for departure in [100u32, 0] {
         search.pass(&request, departure, &mut None, &mut None);
