@@ -356,3 +356,117 @@ fn kept_transfers_are_feasible_and_earliest() {
         }
     }
 }
+
+#[test]
+fn cost_rows_match_raptor_across_sampled_origins() {
+    use cafein_core::geometry::{DistanceProvenance, TripGeometry};
+    use cafein_core::raptor::{CostInputs, Objective};
+
+    let Some((timetable, services, _)) = helsinki() else {
+        return;
+    };
+    let date = NaiveDate::from_ymd_opt(2022, 2, 22).unwrap();
+    let active = services.active_on(date);
+    let active_previous = services.active_on(date.pred_opt().unwrap());
+    let footpaths = Transfers::empty(timetable.stop_count());
+    // Synthetic per-trip distances and factors, deterministic and
+    // distinct, so any election divergence between the engines shows
+    // in the aggregates even without the Python-side distance ladder.
+    let trips: Vec<_> = (0..timetable.trip_count())
+        .map(cafein_core::timetable::TripIdx)
+        .map(|trip| {
+            let stops = timetable.pattern_stops(timetable.trip_pattern(trip)).len();
+            let step = 250.0 + (trip.0 % 13) as f32 * 17.0;
+            (
+                trip,
+                (0..stops).map(|k| k as f32 * step).collect::<Vec<f32>>(),
+                DistanceProvenance::CrowFly,
+            )
+        })
+        .collect();
+    let geometry = TripGeometry::from_trips(timetable, trips).unwrap();
+    let factors: Vec<f64> = (0..timetable.trip_count())
+        .map(|trip| 20.0 + (trip % 11) as f64 * 7.0)
+        .collect();
+    let inputs = CostInputs {
+        geometry: &geometry,
+        factors: &factors,
+        leg_geometry: None,
+        with_geometry: false,
+        fares: None,
+    };
+    let destinations: Vec<StopIdx> = (0..timetable.stop_count())
+        .step_by(97)
+        .map(StopIdx)
+        .collect();
+    let requests: Vec<Request> = (5..timetable.stop_count())
+        .step_by(1481)
+        .map(|origin| Request {
+            departure: 8 * 3600 + 30 * 60,
+            access: vec![(StopIdx(origin), 0)],
+            egress: Vec::new(),
+            active_services: active.clone(),
+            active_services_previous: active_previous.clone(),
+            max_transfers: 4,
+        })
+        .collect();
+    assert!(requests.len() >= 5);
+    let engine = TbtrEngine::for_date(timetable, &footpaths, &active, &active_previous);
+    let compare = |tbtr: &[Vec<cafein_core::raptor::CostRow>],
+                   raptor: &[Vec<cafein_core::raptor::CostRow>]| {
+        assert_eq!(tbtr.len(), raptor.len());
+        for (origin, (t_rows, r_rows)) in tbtr.iter().zip(raptor).enumerate() {
+            assert_eq!(t_rows.len(), r_rows.len(), "rows for origin {origin}");
+            for (t, r) in t_rows.iter().zip(r_rows) {
+                assert_eq!(
+                    (t.to, t.seconds, t.rides),
+                    (r.to, r.seconds, r.rides),
+                    "origin {origin}"
+                );
+                assert_eq!(
+                    t.transit_meters.to_bits(),
+                    r.transit_meters.to_bits(),
+                    "origin {origin} -> {}: transit meters {} vs {}",
+                    r.to,
+                    t.transit_meters,
+                    r.transit_meters
+                );
+                assert_eq!(
+                    t.walk_meters.to_bits(),
+                    r.walk_meters.to_bits(),
+                    "origin {origin} -> {}: walk meters",
+                    r.to
+                );
+                assert_eq!(
+                    t.emission_grams.to_bits(),
+                    r.emission_grams.to_bits(),
+                    "origin {origin} -> {}: grams",
+                    r.to
+                );
+            }
+        }
+    };
+    let raptor = Raptor.cost_matrix(timetable, &footpaths, &inputs, &requests, &destinations);
+    let tbtr = engine.cost_matrix(&inputs, &requests, &destinations);
+    assert!(raptor.iter().any(|rows| !rows.is_empty()));
+    compare(&tbtr, &raptor);
+    let raptor = Raptor.least_cost_matrix(
+        timetable,
+        &footpaths,
+        &inputs,
+        &requests,
+        &destinations,
+        1800,
+        Some(3600),
+        Objective::Emissions,
+    );
+    let tbtr = engine.least_cost_matrix(
+        &inputs,
+        &requests,
+        &destinations,
+        1800,
+        Some(3600),
+        Objective::Emissions,
+    );
+    compare(&tbtr, &raptor);
+}

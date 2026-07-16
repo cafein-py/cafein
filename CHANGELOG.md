@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Fixed over-midnight boarding missing a faster previous-day trip. The
+  day streams were merged by departure time when boarding, but a
+  previous-day trip can depart later on the query clock and still
+  arrive earlier; routing now scans the two streams independently, so
+  such journeys are found.
+- Equal-arrival journeys are elected canonically: when two journeys tie
+  exactly on arrival and ride count, RAPTOR and the trip-based cost
+  paths now both keep the same representative — chosen by a shared,
+  documented order over the journeys' rides and walks — instead of
+  whichever chain each engine's scan happened to meet first. Reported
+  times and ride counts are unchanged; on tied cells the representative
+  journey's distance, emissions, fare, and geometry may differ from
+  earlier builds, and are now identical across engines and stable
+  across releases.
+
 - The time-only TBTR transfer set is tie-complete: the precompute now
   retains same-ride equal-arrival competitor transfers (boarding a
   different trip; same-trip later boardings stay pruned), so the coming

@@ -19,6 +19,7 @@ use rayon::prelude::*;
 use crate::fares::{FareLeg, FareTables};
 use crate::geometry::{wkb_multi_line_string, LegGeometry, TripGeometry};
 use crate::journey::{Journey, Leg};
+use crate::path_key::{challenger_wins, PathToken};
 use crate::router::{Request, TransitRouter};
 use crate::timetable::{PatternIdx, StopIdx, Timetable, TripIdx};
 use crate::transfers::Transfers;
@@ -90,7 +91,11 @@ impl Objective {
 /// Keeps the better of an existing candidate and a challenger on the
 /// objective: a lower key wins, equal keys resolve toward the shorter
 /// travel time. NaN keys never qualify.
-fn fold_better(current: &mut Option<CostRow>, challenger: CostRow, objective: Objective) {
+pub(crate) fn fold_better(
+    current: &mut Option<CostRow>,
+    challenger: CostRow,
+    objective: Objective,
+) {
     let key = objective.key(&challenger);
     if key.is_nan() {
         return;
@@ -107,6 +112,63 @@ fn fold_better(current: &mut Option<CostRow>, challenger: CostRow, objective: Ob
     }
 }
 
+/// Appends the destination-to-origin canonical tokens of the chain
+/// behind `labels[round][stop]` and returns its root departure. Reads
+/// the same label chains `walk_costs` walks, in the time/topology
+/// domain only.
+fn chain_tokens_into(
+    labels: &[Vec<Label>],
+    timetable: &Timetable,
+    stop: usize,
+    round: usize,
+    out: &mut Vec<PathToken>,
+) -> u32 {
+    let mut at = stop;
+    let mut r = round;
+    loop {
+        match labels[r][at] {
+            Label::Transit {
+                trip,
+                board_position,
+                alight_position,
+                day_offset,
+            } => {
+                out.push(PathToken::Ride {
+                    trip: trip.0,
+                    day_offset,
+                    board: board_position,
+                    alight: alight_position,
+                });
+                let pattern = timetable.trip_pattern(trip);
+                at = timetable.pattern_stops(pattern)[board_position as usize].0 as usize;
+                r -= 1;
+            }
+            Label::Transfer {
+                from_stop,
+                duration,
+            } => {
+                out.push(PathToken::Walk {
+                    from: from_stop.0,
+                    to: at as u32,
+                    duration,
+                });
+                at = from_stop.0 as usize;
+            }
+            Label::Access {
+                departure,
+                duration,
+            } => {
+                out.push(PathToken::Access {
+                    stop: at as u32,
+                    duration,
+                });
+                return departure;
+            }
+            Label::Unreached => unreachable!("canonical key walked an unreached label"),
+        }
+    }
+}
+
 /// Seconds in a service day: a previous-day trip's stored times are shifted
 /// back by this to place it on the queried day's clock.
 const DAY_SECONDS: u32 = 86_400;
@@ -115,8 +177,13 @@ const DAY_SECONDS: u32 = 86_400;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Label {
     Unreached,
-    /// Reached directly from the origin.
-    Access,
+    /// Reached directly from the origin, leaving at `departure` and
+    /// walking `duration` — the chain root the canonical path key
+    /// compares.
+    Access {
+        departure: u32,
+        duration: u32,
+    },
     /// Alighted from a trip boarded at `board_position` of its pattern.
     /// `day_offset` is subtracted from the trip's stored times to place
     /// them on the queried day (nonzero for a previous-day trip).
@@ -699,7 +766,7 @@ pub(crate) fn nearest_rank(sorted: &[u32], percentile: f64) -> u32 {
 }
 
 /// RAPTOR state shared by the passes of one query.
-struct Search<'a> {
+pub(crate) struct Search<'a> {
     timetable: &'a Timetable,
     transfers: &'a Transfers,
     request: &'a Request,
@@ -719,10 +786,17 @@ struct Search<'a> {
     /// First marked position per pattern for the current round.
     queue_position: Vec<u16>,
     queued_patterns: Vec<PatternIdx>,
+    /// Reusable scratch for canonical-key comparisons on exact ties.
+    key_scratch_a: Vec<PathToken>,
+    key_scratch_b: Vec<PathToken>,
 }
 
 impl<'a> Search<'a> {
-    fn new(timetable: &'a Timetable, transfers: &'a Transfers, request: &'a Request) -> Self {
+    pub(crate) fn new(
+        timetable: &'a Timetable,
+        transfers: &'a Transfers,
+        request: &'a Request,
+    ) -> Self {
         let stop_count = timetable.stop_count() as usize;
         let rounds = request.max_transfers as usize + 1;
         Search {
@@ -737,6 +811,8 @@ impl<'a> Search<'a> {
             is_marked: vec![false; stop_count],
             queue_position: vec![u16::MAX; timetable.pattern_count() as usize],
             queued_patterns: Vec::new(),
+            key_scratch_a: Vec::new(),
+            key_scratch_b: Vec::new(),
         }
     }
 
@@ -905,7 +981,7 @@ impl<'a> Search<'a> {
                         .unwrap_or(0.0);
                     at = from_stop;
                 }
-                Label::Access => {
+                Label::Access { .. } => {
                     if let Some(access) = access_meters {
                         walk_meters += access.get(&at).copied().unwrap_or(0.0);
                     }
@@ -1076,10 +1152,85 @@ impl<'a> Search<'a> {
         journeys
     }
 
+    /// Records an alighting from `trip` at `position`: a strict
+    /// improvement writes through; an exact same-round tie keeps the
+    /// canonical chain and re-marks the stop so the replacement
+    /// propagates.
+    #[allow(clippy::too_many_arguments)]
+    fn alight_at(
+        &mut self,
+        timetable: &Timetable,
+        round: usize,
+        stops: &[StopIdx],
+        position: usize,
+        trip: TripIdx,
+        board_position: u16,
+        day_offset: u32,
+    ) {
+        let stop = stops[position].0 as usize;
+        let arrival = timetable.trip_stop_times(trip)[position]
+            .arrival
+            .saturating_sub(day_offset);
+        if arrival < self.best[round][stop] {
+            self.tau[round][stop] = arrival;
+            for best in &mut self.best[round..] {
+                best[stop] = best[stop].min(arrival);
+            }
+            self.labels[round][stop] = Label::Transit {
+                trip,
+                board_position,
+                alight_position: position as u16,
+                day_offset,
+            };
+            if !self.is_marked[stop] {
+                self.is_marked[stop] = true;
+                self.marked.push(stops[position]);
+            }
+        } else if arrival == self.tau[round][stop] && arrival != UNREACHED {
+            let mut challenger = std::mem::take(&mut self.key_scratch_a);
+            let mut incumbent = std::mem::take(&mut self.key_scratch_b);
+            challenger.clear();
+            challenger.push(PathToken::Ride {
+                trip: trip.0,
+                day_offset,
+                board: board_position,
+                alight: position as u16,
+            });
+            let root = chain_tokens_into(
+                &self.labels,
+                timetable,
+                stops[board_position as usize].0 as usize,
+                round - 1,
+                &mut challenger,
+            );
+            incumbent.clear();
+            let incumbent_root =
+                chain_tokens_into(&self.labels, timetable, stop, round, &mut incumbent);
+            if challenger_wins(root, &challenger, incumbent_root, &incumbent) {
+                self.labels[round][stop] = Label::Transit {
+                    trip,
+                    board_position,
+                    alight_position: position as u16,
+                    day_offset,
+                };
+                if !self.is_marked[stop] {
+                    self.is_marked[stop] = true;
+                    self.marked.push(stops[position]);
+                }
+            }
+            self.key_scratch_a = challenger;
+            self.key_scratch_b = incumbent;
+        }
+    }
+
     /// One RAPTOR pass from `departure`, improving the shared state.
-    fn run(&mut self, departure: u32) {
+    pub(crate) fn run(&mut self, departure: u32) {
         let timetable = self.timetable;
         let request = self.request;
+        let has_previous = request
+            .active_services_previous
+            .iter()
+            .any(|&active| active);
 
         // Leftover marks from the previous pass describe stops whose
         // labels are already final for later departures; they carry no
@@ -1100,7 +1251,10 @@ impl<'a> Search<'a> {
             let index = stop.0 as usize;
             if arrival < self.tau[0][index] {
                 self.tau[0][index] = arrival;
-                self.labels[0][index] = Label::Access;
+                self.labels[0][index] = Label::Access {
+                    departure,
+                    duration,
+                };
                 for best in &mut self.best {
                     best[index] = best[index].min(arrival);
                 }
@@ -1108,6 +1262,29 @@ impl<'a> Search<'a> {
                     self.is_marked[index] = true;
                     self.marked.push(stop);
                 }
+            } else if arrival == self.tau[0][index] && arrival != UNREACHED {
+                let mut challenger = std::mem::take(&mut self.key_scratch_a);
+                let mut incumbent = std::mem::take(&mut self.key_scratch_b);
+                challenger.clear();
+                challenger.push(PathToken::Access {
+                    stop: stop.0,
+                    duration,
+                });
+                incumbent.clear();
+                let incumbent_root =
+                    chain_tokens_into(&self.labels, timetable, index, 0, &mut incumbent);
+                if challenger_wins(departure, &challenger, incumbent_root, &incumbent) {
+                    self.labels[0][index] = Label::Access {
+                        departure,
+                        duration,
+                    };
+                    if !self.is_marked[index] {
+                        self.is_marked[index] = true;
+                        self.marked.push(stop);
+                    }
+                }
+                self.key_scratch_a = challenger;
+                self.key_scratch_b = incumbent;
             }
         }
 
@@ -1133,30 +1310,22 @@ impl<'a> Search<'a> {
                 let start_position = self.queue_position[pattern.0 as usize];
                 self.queue_position[pattern.0 as usize] = u16::MAX;
                 let stops = timetable.pattern_stops(pattern);
-                let mut current: Option<(TripIdx, u16, u32)> = None;
+                let mut currents: [Option<(TripIdx, u16)>; 2] = [None, None];
 
                 for position in start_position as usize..stops.len() {
                     let stop = stops[position].0 as usize;
 
-                    if let Some((trip, board_position, day_offset)) = current {
-                        let arrival = timetable.trip_stop_times(trip)[position]
-                            .arrival
-                            .saturating_sub(day_offset);
-                        if arrival < self.best[round][stop] {
-                            self.tau[round][stop] = arrival;
-                            for best in &mut self.best[round..] {
-                                best[stop] = best[stop].min(arrival);
-                            }
-                            self.labels[round][stop] = Label::Transit {
+                    for (current, day_offset) in currents.into_iter().zip([0, DAY_SECONDS]) {
+                        if let Some((trip, board_position)) = current {
+                            self.alight_at(
+                                timetable,
+                                round,
+                                stops,
+                                position,
                                 trip,
                                 board_position,
-                                alight_position: position as u16,
                                 day_offset,
-                            };
-                            if !self.is_marked[stop] {
-                                self.is_marked[stop] = true;
-                                self.marked.push(stops[position]);
-                            }
+                            );
                         }
                     }
 
@@ -1165,42 +1334,59 @@ impl<'a> Search<'a> {
                     // has already recorded any improvement at this position;
                     // boarding at a pattern's last position is pointless
                     // because there is no later stop to alight at, and other
-                    // patterns serving this stop are queued separately.
+                    // patterns serving this stop are queued separately. The
+                    // day streams board independently: merged across days
+                    // departures are not FIFO — yesterday's tail can depart
+                    // later here yet arrive earlier downstream — so each
+                    // stream rides its own earliest trip and the arrival
+                    // writes settle the competition.
                     let reached = self.tau[round - 1][stop];
                     if reached == UNREACHED || position + 1 == stops.len() {
                         continue;
                     }
-                    let can_catch_earlier = match current {
-                        Some((trip, _, day_offset)) => {
+                    for (stream, current) in currents.iter_mut().enumerate() {
+                        let active: &[bool] = if stream == 0 {
+                            &request.active_services
+                        } else if has_previous {
+                            &request.active_services_previous
+                        } else {
+                            continue;
+                        };
+                        // A previous-day trip stored at `t` runs at
+                        // `t - DAY_SECONDS`, so it is boardable from
+                        // `reached` when `t >= reached + DAY_SECONDS`.
+                        let threshold = if stream == 0 {
                             reached
-                                <= timetable.trip_stop_times(trip)[position]
-                                    .departure
-                                    .saturating_sub(day_offset)
-                        }
-                        None => true,
-                    };
-                    if can_catch_earlier {
-                        if let Some((trip, day_offset)) =
-                            earliest_trip(timetable, request, pattern, position, reached)
-                        {
-                            // Board the earlier-departing vehicle; across
-                            // service days trip index no longer orders
-                            // departures, so compare the shifted times.
-                            let departure = timetable.trip_stop_times(trip)[position]
-                                .departure
-                                .saturating_sub(day_offset);
-                            let replaces = match current {
-                                Some((current_trip, _, current_offset)) => {
-                                    departure
-                                        < timetable.trip_stop_times(current_trip)[position]
-                                            .departure
-                                            .saturating_sub(current_offset)
-                                }
-                                None => true,
-                            };
-                            if replaces {
-                                current = Some((trip, position as u16, day_offset));
+                        } else {
+                            match reached.checked_add(DAY_SECONDS) {
+                                Some(threshold) => threshold,
+                                None => continue,
                             }
+                        };
+                        let can_catch_earlier = match *current {
+                            Some((trip, _)) => {
+                                threshold <= timetable.trip_stop_times(trip)[position].departure
+                            }
+                            None => true,
+                        };
+                        if !can_catch_earlier {
+                            continue;
+                        }
+                        let Some(trip) =
+                            earliest_active_trip(timetable, active, pattern, position, threshold)
+                        else {
+                            continue;
+                        };
+                        // Stored times order a single day's FIFO stream.
+                        let replaces = match *current {
+                            Some((current_trip, _)) => {
+                                timetable.trip_stop_times(trip)[position].departure
+                                    < timetable.trip_stop_times(current_trip)[position].departure
+                            }
+                            None => true,
+                        };
+                        if replaces {
+                            *current = Some((trip, position as u16));
                         }
                     }
                 }
@@ -1237,6 +1423,37 @@ impl<'a> Search<'a> {
                             self.is_marked[to] = true;
                             self.marked.push(transfer.to);
                         }
+                    } else if arrival == self.tau[round][to] && arrival != UNREACHED {
+                        let mut challenger = std::mem::take(&mut self.key_scratch_a);
+                        let mut incumbent = std::mem::take(&mut self.key_scratch_b);
+                        challenger.clear();
+                        challenger.push(PathToken::Walk {
+                            from: stop.0,
+                            to: transfer.to.0,
+                            duration: transfer.duration,
+                        });
+                        let root = chain_tokens_into(
+                            &self.labels,
+                            timetable,
+                            stop.0 as usize,
+                            round,
+                            &mut challenger,
+                        );
+                        incumbent.clear();
+                        let incumbent_root =
+                            chain_tokens_into(&self.labels, timetable, to, round, &mut incumbent);
+                        if challenger_wins(root, &challenger, incumbent_root, &incumbent) {
+                            self.labels[round][to] = Label::Transfer {
+                                from_stop: stop,
+                                duration: transfer.duration,
+                            };
+                            if !self.is_marked[to] {
+                                self.is_marked[to] = true;
+                                self.marked.push(transfer.to);
+                            }
+                        }
+                        self.key_scratch_a = challenger;
+                        self.key_scratch_b = incumbent;
                     }
                 }
             }
@@ -1343,7 +1560,7 @@ impl<'a> Search<'a> {
                     });
                     stop = from_stop;
                 }
-                Label::Access => {
+                Label::Access { .. } => {
                     legs.push(Leg::Access {
                         to_stop: stop,
                         departure,
@@ -1361,58 +1578,6 @@ impl<'a> Search<'a> {
             arrival: departure_at_stop.saturating_add(egress_duration),
             legs,
         }
-    }
-}
-
-/// The earliest trip of `pattern` boardable at `position` no earlier than
-/// `reached`, and the day offset to subtract from its stored times. Today's
-/// services board at their stored times; the previous day's board a day
-/// earlier, so their over-midnight tail is reachable in the small hours.
-/// The two are compared on the queried day's clock and the earlier one wins.
-fn earliest_trip(
-    timetable: &Timetable,
-    request: &Request,
-    pattern: PatternIdx,
-    position: usize,
-    reached: u32,
-) -> Option<(TripIdx, u32)> {
-    let today = earliest_active_trip(
-        timetable,
-        &request.active_services,
-        pattern,
-        position,
-        reached,
-    )
-    .map(|trip| (trip, 0));
-    // A previous-day trip stored at time `t` runs at `t - DAY_SECONDS`, so
-    // it is boardable from `reached` when `t >= reached + DAY_SECONDS`.
-    let previous = reached
-        .checked_add(DAY_SECONDS)
-        .and_then(|threshold| {
-            earliest_active_trip(
-                timetable,
-                &request.active_services_previous,
-                pattern,
-                position,
-                threshold,
-            )
-        })
-        .map(|trip| (trip, DAY_SECONDS));
-    match (today, previous) {
-        (Some(today), Some(previous)) => {
-            let departure = |(trip, offset): (TripIdx, u32)| {
-                timetable.trip_stop_times(trip)[position]
-                    .departure
-                    .saturating_sub(offset)
-            };
-            Some(if departure(previous) < departure(today) {
-                previous
-            } else {
-                today
-            })
-        }
-        (today, None) => today,
-        (None, previous) => previous,
     }
 }
 
