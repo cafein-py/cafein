@@ -49,7 +49,7 @@ pub trait TransitRouter: Sync {
     ) -> Vec<Journey>;
 }
 
-/// Whether a `router="auto"` time-only query runs on the trip-based engine.
+/// Whether a `router="auto"` time-criterion query runs on the trip-based engine.
 ///
 /// Only when a cached time transfer set was precomputed for the query's
 /// service date: the trip-based engine's advantage is riding a precomputed

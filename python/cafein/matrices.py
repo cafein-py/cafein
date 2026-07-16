@@ -30,7 +30,8 @@ class TravelCostMatrix(pd.DataFrame):
     reported with a warning and yield no rows. From stop origins,
     ``walk_distance`` covers transfers only.
 
-    One RAPTOR run serves each origin, fanned out over all cores; each
+    One run of the selected engine (see ``router``) serves each
+    origin, fanned out over all cores; each
     pair's costs come from its fastest journey (ties resolved toward
     fewer rides) — or, with ``optimize="emissions"`` or
     ``optimize="fare"``, from the cleanest or cheapest journey of a
@@ -89,15 +90,17 @@ class TravelCostMatrix(pd.DataFrame):
         as in ``journey_frontier``. Only used with
         ``candidates="pareto"``.
     router : str (optional, default: "auto")
-        The pareto search engine, as in ``journey_frontier``: McRAPTOR
-        (``"raptor"``) or McTBTR (``"tbtr"``), which precomputes the
-        date's multicriteria transfer set once and fans every origin
-        out over it. ``"auto"`` (the default) runs on McTBTR when a
-        cached transfer set (``compute_mctbtr_transfers``) matches the
-        query's date and factors and no matching whole-day McULTRA set
-        serves the stop matrix door-to-door (which only the McRAPTOR
-        path does), else on McRAPTOR. Only used with
-        ``candidates="pareto"``.
+        The routing engine. With time candidates the engines are RAPTOR
+        (``"raptor"``) and TBTR (``"tbtr"``), the latter over the
+        cached time transfer set (``compute_tbtr_transfers``) when its
+        date matches, else over a set built for the query; ``"auto"``
+        runs on TBTR when the cached set matches the date — unless a
+        whole-day ULTRA set serves the stop matrix door-to-door, which
+        only the RAPTOR path does — else on RAPTOR. With
+        ``candidates="pareto"`` the engines are McRAPTOR and McTBTR and
+        ``"auto"`` requires the cached multicriteria set
+        (``compute_mctbtr_transfers``) to match the query's date and
+        factors, mirroring ``journey_frontier``.
     factors : DataFrame or path (optional)
         Extra emission-factor rows layered over the shipped defaults;
         see ``cafein.emissions.load_factors``.
@@ -378,6 +381,7 @@ def travel_cost_table(
     fares=None,
     geometries=False,
     chunk=None,
+    router="auto",
     walking_speed_kmph=None,
     max_walking_time=None,
     max_snap_distance=None,
@@ -385,8 +389,9 @@ def travel_cost_table(
     """The travel-cost matrix as a pyarrow Table — the shard-writing form.
 
     Semantics and parameters follow `TravelCostMatrix` — including the
-    windowed optimize modes with their ``window``/``within`` and the
-    ``fares`` pricing, though always over the time candidates
+    windowed optimize modes with their ``window``/``within``, the
+    ``fares`` pricing, and the ``router`` engine choice, though always
+    over the time candidates
     (no ``candidates``/``bucket``); the output is an
     Arrow table with ``from_id`` and ``to_id`` dictionary-encoded over
     the origin and destination identifiers, the numeric columns wrapping
@@ -423,6 +428,7 @@ def travel_cost_table(
         fares=fares,
         geometries=geometries,
         chunk=chunk,
+        router=router,
         walking_speed_kmph=walking_speed_kmph,
         max_walking_time=max_walking_time,
         max_snap_distance=max_snap_distance,
@@ -494,8 +500,6 @@ def _cost_columns(
         raise ValueError("candidates must be 'time' or 'pareto'")
     if router not in ("auto", "raptor", "tbtr"):
         raise ValueError("router must be 'auto', 'raptor', or 'tbtr'")
-    if router == "tbtr" and candidates != "pareto":
-        raise ValueError("router='tbtr' requires candidates='pareto'")
     if candidates == "pareto":
         if optimize != "emissions":
             raise ValueError("candidates='pareto' requires optimize='emissions'")
@@ -525,6 +529,7 @@ def _cost_columns(
                 fare_tables,
                 within,
                 max_transfers,
+                router,
                 *walk,
                 geometries,
             )
@@ -536,6 +541,7 @@ def _cost_columns(
                 departure,
                 trip_factors,
                 max_transfers,
+                router,
                 *walk,
                 geometries,
                 fare_tables,
@@ -578,6 +584,7 @@ def _cost_columns(
                 trip_factors,
                 max_transfers,
                 to_stops,
+                router,
                 *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
                 geometries,
                 fare_tables,

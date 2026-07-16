@@ -1095,3 +1095,28 @@ def test_auto_router_prefers_the_mcultra_door_to_door_path(
     # Door-to-door cells differ from the closure's, so the preference is
     # observable despite the matching McTBTR cache.
     assert auto != matrix(router="tbtr")
+
+
+def test_whole_day_set_keeps_auto_cost_rows_door_to_door(
+    central_gtfs, kantakaupunki_pbf
+):
+    from cafein import TravelCostMatrix
+
+    with pytest.warns(UserWarning):
+        net = TransportNetwork.from_gtfs(
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=60
+        )
+    net.compute_ultra_shortcuts(max_transfer_time=600.0)  # whole day
+    # With a matching cached trip-based set installed, only the ULTRA
+    # precedence keeps auto on the door-to-door RAPTOR path.
+    net.compute_tbtr_transfers(QUERY_DATE)
+    origins = [stop for stop, lat, _ in net.stops if lat is not None][:3]
+    args = (net, origins, None, QUERY_DATE, QUERY_TIME)
+    auto = TravelCostMatrix(*args)
+    raptor = TravelCostMatrix(*args, router="raptor")
+    tbtr = TravelCostMatrix(*args, router="tbtr")
+    assert len(auto) > 0
+    assert auto.equals(raptor)
+    # The explicit trip-based engine keeps the closure — a different
+    # surface than the unrestricted door-to-door walks.
+    assert not tbtr.equals(raptor)

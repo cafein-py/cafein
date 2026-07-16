@@ -2924,29 +2924,12 @@ impl TransportNetwork {
         };
         let flat: Vec<u32> = py.allow_threads(|| {
             let rows: Vec<Vec<Option<u32>>> = if router == "tbtr" {
-                // Reuse the cached transfer set when it was precomputed for
-                // this date (`compute_tbtr_transfers`), borrowed by the engine,
-                // vs rebuilding the dominance-aware set. Otherwise build ad hoc.
-                let cached = self
-                    .tbtr_time_transfers
-                    .as_ref()
-                    .filter(|(cached_date, _)| cached_date.as_str() == date)
-                    .map(|(_, set)| set);
-                let engine = match cached {
-                    Some(set) => TbtrEngine::from_set(
-                        &self.build.timetable,
-                        &self.transfers,
-                        &active_services,
-                        &active_services_previous,
-                        set,
-                    ),
-                    None => TbtrEngine::for_date(
-                        &self.build.timetable,
-                        &self.transfers,
-                        &active_services,
-                        &active_services_previous,
-                    ),
-                };
+                let engine = self.tbtr_engine(
+                    &self.transfers,
+                    date,
+                    &active_services,
+                    &active_services_previous,
+                );
                 let accesses: Vec<Vec<(StopIdx, u32)>> =
                     origins.iter().map(|&origin| vec![(origin, 0)]).collect();
                 engine.one_to_all_many(departure, &accesses, max_transfers)
@@ -4222,28 +4205,12 @@ impl TransportNetwork {
         let stop_count = self.build.timetable.stop_count() as usize;
         let flat: Vec<u32> = py.allow_threads(|| {
             if router == "tbtr" {
-                // Reuse the cached transfer set for this date when present,
-                // as the single-departure TBTR matrix does; else build ad hoc.
-                let cached = self
-                    .tbtr_time_transfers
-                    .as_ref()
-                    .filter(|(cached_date, _)| cached_date.as_str() == date)
-                    .map(|(_, set)| set);
-                let engine = match cached {
-                    Some(set) => TbtrEngine::from_set(
-                        &self.build.timetable,
-                        &self.transfers,
-                        &active_services,
-                        &active_services_previous,
-                        set,
-                    ),
-                    None => TbtrEngine::for_date(
-                        &self.build.timetable,
-                        &self.transfers,
-                        &active_services,
-                        &active_services_previous,
-                    ),
-                };
+                let engine = self.tbtr_engine(
+                    &self.transfers,
+                    date,
+                    &active_services,
+                    &active_services_previous,
+                );
                 engine
                     .percentile_matrix(&requests, window, &percentiles)
                     .concat()
@@ -4337,28 +4304,12 @@ impl TransportNetwork {
                 .collect();
             let egress = egress_tables(&destination_links);
             let mut flat = if router == "tbtr" {
-                // Same cached-set reuse as the stop matrices; the engine
-                // borrows the precomputed set when the date matches.
-                let cached = self
-                    .tbtr_time_transfers
-                    .as_ref()
-                    .filter(|(cached_date, _)| cached_date.as_str() == date)
-                    .map(|(_, set)| set);
-                let engine = match cached {
-                    Some(set) => TbtrEngine::from_set(
-                        &self.build.timetable,
-                        self.time_transfers(),
-                        &active_services,
-                        &active_services_previous,
-                        set,
-                    ),
-                    None => TbtrEngine::for_date(
-                        &self.build.timetable,
-                        self.time_transfers(),
-                        &active_services,
-                        &active_services_previous,
-                    ),
-                };
+                let engine = self.tbtr_engine(
+                    self.time_transfers(),
+                    date,
+                    &active_services,
+                    &active_services_previous,
+                );
                 engine
                     .percentile_matrix_to_points(&requests, &egress, window, &percentiles)
                     .concat()
@@ -4438,6 +4389,12 @@ impl TransportNetwork {
     /// fares : dict (optional)
     ///     Flat fare tables from ``cafein.fares``; prices each pair's
     ///     journey into the ``fare`` array.
+    /// router : str (optional, default: "auto")
+    ///     ``"auto"`` runs on TBTR when the cached time transfer set
+    ///     (``compute_tbtr_transfers``) matches the date — unless a
+    ///     whole-day ULTRA set serves the matrix door-to-door, which
+    ///     only the RAPTOR path does — else on RAPTOR; explicit values
+    ///     pick the engine directly, ``"tbtr"`` keeping the closure.
     ///
     /// Returns
     /// -------
@@ -4449,7 +4406,7 @@ impl TransportNetwork {
     ///     NaN when unresolved), ``fare`` (NaN without `fares` or when
     ///     unpriceable), and with `geometries` a ``geometry`` list of
     ///     WKB bytes.
-    #[pyo3(signature = (from_stops, date, departure, factors, max_transfers = 7, to_stops = None, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, fares = None))]
+    #[pyo3(signature = (from_stops, date, departure, factors, max_transfers = 7, to_stops = None, router = "auto", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, fares = None))]
     #[allow(clippy::too_many_arguments)]
     fn travel_cost_matrix(
         &self,
@@ -4460,12 +4417,16 @@ impl TransportNetwork {
         factors: Vec<(String, f64)>,
         max_transfers: u8,
         to_stops: Option<Vec<String>>,
+        router: &str,
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
         geometries: bool,
         fares: Option<Bound<'_, PyDict>>,
     ) -> PyResult<Py<PyDict>> {
+        if !matches!(router, "auto" | "raptor" | "tbtr") {
+            return Err(invalid_router(router));
+        }
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
                 "no trip distances installed; build the network with trip distances enabled",
@@ -4517,7 +4478,8 @@ impl TransportNetwork {
         // Under a whole-day set, snappable origins route door-to-door (the stop
         // cost matrix as a point cost matrix over the stops' coordinates);
         // validate the walking speed only when at least one origin is usable.
-        let ultra_usable = self.ultra_active()
+        let ultra_usable = router != "tbtr"
+            && self.ultra_active()
             && self.streets.as_ref().is_some_and(|streets| {
                 origins.iter().any(|&origin| {
                     self.stop_coordinate(origin).is_some_and(|coordinate| {
@@ -4535,6 +4497,13 @@ impl TransportNetwork {
             )?)
         } else {
             None
+        };
+        // Auto prefers the door-to-door ULTRA path over an engine switch —
+        // it must never trade semantics for speed.
+        let router = if ultra_usable {
+            "raptor"
+        } else {
+            self.resolve_time_router(router, date)?
         };
         let rows = py.allow_threads(|| {
             if let Some(speed) = ultra_speed {
@@ -4567,13 +4536,23 @@ impl TransportNetwork {
                         max_transfers,
                     })
                     .collect();
-                Raptor.cost_matrix(
-                    &self.build.timetable,
-                    &self.transfers,
-                    &inputs,
-                    &requests,
-                    &destinations,
-                )
+                if router == "tbtr" {
+                    let engine = self.tbtr_engine(
+                        &self.transfers,
+                        date,
+                        &active_services,
+                        &active_services_previous,
+                    );
+                    engine.cost_matrix(&inputs, &requests, &destinations)
+                } else {
+                    Raptor.cost_matrix(
+                        &self.build.timetable,
+                        &self.transfers,
+                        &inputs,
+                        &requests,
+                        &destinations,
+                    )
+                }
             }
         });
         cost_rows_dict(py, rows, geometries)
@@ -4668,29 +4647,12 @@ impl TransportNetwork {
                 .collect();
             let egress = egress_tables(&destination_links);
             let rows: Vec<Vec<Option<u32>>> = if router == "tbtr" {
-                // Reuse the cached transfer set when it was precomputed for
-                // this date (`compute_tbtr_transfers`), borrowed by the engine;
-                // otherwise build the day's set ad hoc.
-                let cached = self
-                    .tbtr_time_transfers
-                    .as_ref()
-                    .filter(|(cached_date, _)| cached_date.as_str() == date)
-                    .map(|(_, set)| set);
-                let engine = match cached {
-                    Some(set) => TbtrEngine::from_set(
-                        &self.build.timetable,
-                        self.time_transfers(),
-                        &active_services,
-                        &active_services_previous,
-                        set,
-                    ),
-                    None => TbtrEngine::for_date(
-                        &self.build.timetable,
-                        self.time_transfers(),
-                        &active_services,
-                        &active_services_previous,
-                    ),
-                };
+                let engine = self.tbtr_engine(
+                    self.time_transfers(),
+                    date,
+                    &active_services,
+                    &active_services_previous,
+                );
                 let accesses: Vec<Vec<(StopIdx, u32)>> = requests
                     .iter()
                     .map(|request| request.access.clone())
@@ -4760,6 +4722,10 @@ impl TransportNetwork {
     /// the access and egress walks counted in ``walk_distance``.
     /// Requires an installed street network and trip distances.
     ///
+    /// ``router="auto"`` (the default) runs on TBTR when the cached time
+    /// transfer set (``compute_tbtr_transfers``) matches the date, else
+    /// on RAPTOR; explicit values pick the engine directly.
+    ///
     /// Returns
     /// -------
     /// dict
@@ -4767,7 +4733,7 @@ impl TransportNetwork {
     ///     origin and destination point lists — plus
     ///     ``unsnapped_from`` / ``unsnapped_to`` with the indices of
     ///     points off the walking network.
-    #[pyo3(signature = (origins, destinations, date, departure, factors, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, fares = None))]
+    #[pyo3(signature = (origins, destinations, date, departure, factors, max_transfers = 7, router = "auto", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, fares = None))]
     #[allow(clippy::too_many_arguments)]
     fn travel_cost_matrix_from_points(
         &self,
@@ -4778,12 +4744,17 @@ impl TransportNetwork {
         departure: &str,
         factors: Vec<(String, f64)>,
         max_transfers: u8,
+        router: &str,
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
         geometries: bool,
         fares: Option<Bound<'_, PyDict>>,
     ) -> PyResult<Py<PyDict>> {
+        if !matches!(router, "auto" | "raptor" | "tbtr") {
+            return Err(invalid_router(router));
+        }
+        let router = self.resolve_time_router(router, date)?;
         let streets = self.installed_streets()?;
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
@@ -4860,14 +4831,24 @@ impl TransportNetwork {
                 );
             }
             let egress = egress_tables(&destination_links);
-            let mut rows = Raptor.cost_matrix_to_points(
-                &self.build.timetable,
-                self.time_transfers(),
-                &inputs,
-                &requests,
-                &access_meters,
-                &egress,
-            );
+            let mut rows = if router == "tbtr" {
+                let engine = self.tbtr_engine(
+                    self.time_transfers(),
+                    date,
+                    &active_services,
+                    &active_services_previous,
+                );
+                engine.cost_matrix_to_points(&inputs, &requests, &access_meters, &egress)
+            } else {
+                Raptor.cost_matrix_to_points(
+                    &self.build.timetable,
+                    self.time_transfers(),
+                    &inputs,
+                    &requests,
+                    &access_meters,
+                    &egress,
+                )
+            };
             // Walking directly can beat transit: such cells become
             // walking-only rows — zero rides, zero emissions, the walk
             // as the distance. The time fill is one street search per
@@ -4973,7 +4954,9 @@ impl TransportNetwork {
     /// McTBTR when the cached multicriteria transfer set matches the
     /// query's date and factors and no matching whole-day McULTRA set
     /// serves the stop matrix door-to-door (only the McRAPTOR path does),
-    /// else on McRAPTOR.
+    /// else on McRAPTOR. Time and fare candidates run on TBTR when the
+    /// cached time transfer set (``compute_tbtr_transfers``) matches the
+    /// date, else on RAPTOR; explicit values pick the engine directly.
     #[pyo3(signature = (from_stops, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, to_stops = None, candidates = "time", bucket = 25.0, router = "auto", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false))]
     #[allow(clippy::too_many_arguments)]
     fn least_cost_matrix(
@@ -4999,11 +4982,6 @@ impl TransportNetwork {
     ) -> PyResult<Py<PyDict>> {
         if !matches!(router, "auto" | "raptor" | "tbtr") {
             return Err(invalid_router(router));
-        }
-        if router == "tbtr" && candidates != "pareto" {
-            return Err(PyValueError::new_err(
-                "router='tbtr' requires candidates='pareto'",
-            ));
         }
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
@@ -5073,8 +5051,8 @@ impl TransportNetwork {
         // matrix routes door-to-door: a location-based initial walk per origin,
         // the shortcut set for the intermediate transfers, and a street final
         // walk folded per destination. Without a matching set (or a street
-        // network) it keeps the closure and board-at-origin access; TBTR and the
-        // time objective always keep the closure.
+        // network) it keeps the closure and board-at-origin access; the trip-based
+        // engines and the time and fare candidates always keep the closure.
         let stop_count = self.build.timetable.stop_count() as usize;
         let fingerprint = factor_fingerprint(&per_trip);
         let matrix_mcultra = candidates == "pareto"
@@ -5082,11 +5060,14 @@ impl TransportNetwork {
             && !std::ptr::eq(self.emissions_transfers(fingerprint), &self.transfers)
             && self.streets.is_some();
         // Auto prefers the door-to-door McULTRA path over an engine switch;
-        // the time and fare candidate sets have no trip-based path at all.
+        // pareto candidates resolve on the McTBTR cache, time and fare
+        // candidates on the cached time set.
         let router = if matrix_mcultra {
             "raptor"
+        } else if candidates == "pareto" {
+            self.resolve_mc_router(router, date, &per_trip, false)?
         } else {
-            self.resolve_mc_router(router, date, &per_trip, candidates != "pareto")?
+            self.resolve_time_router(router, date)?
         };
         // Origins that do not take a location-based initial walk (no coordinate,
         // no snap, or no stop reachable within the cap) are marked `!located`;
@@ -5272,6 +5253,21 @@ impl TransportNetwork {
                     }
                 }
                 rows
+            } else if router == "tbtr" {
+                let engine = self.tbtr_engine(
+                    &self.transfers,
+                    date,
+                    &active_services,
+                    &active_services_previous,
+                );
+                engine.least_cost_matrix(
+                    &inputs,
+                    &requests,
+                    &destinations,
+                    window,
+                    budget,
+                    objective,
+                )
             } else {
                 Raptor.least_cost_matrix(
                     &self.build.timetable,
@@ -5292,7 +5288,11 @@ impl TransportNetwork {
     /// the street network like ``travel_cost_matrix_from_points`` —
     /// including the walking-only alternative, whose zero emissions
     /// (and zero fare) win any cell they qualify for within the budget.
-    #[pyo3(signature = (origins, destinations, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false))]
+    ///
+    /// ``router="auto"`` (the default) runs on TBTR when the cached time
+    /// transfer set (``compute_tbtr_transfers``) matches the date, else
+    /// on RAPTOR; explicit values pick the engine directly.
+    #[pyo3(signature = (origins, destinations, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, router = "auto", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false))]
     #[allow(clippy::too_many_arguments)]
     fn least_cost_matrix_from_points(
         &self,
@@ -5307,11 +5307,16 @@ impl TransportNetwork {
         fares: Option<Bound<'_, PyDict>>,
         budget: Option<u32>,
         max_transfers: u8,
+        router: &str,
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
         geometries: bool,
     ) -> PyResult<Py<PyDict>> {
+        if !matches!(router, "auto" | "raptor" | "tbtr") {
+            return Err(invalid_router(router));
+        }
+        let router = self.resolve_time_router(router, date)?;
         let streets = self.installed_streets()?;
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
@@ -5397,17 +5402,35 @@ impl TransportNetwork {
             // time-complete, so relaxing it here could drop time-relevant
             // transfers; the emissions-complete coordinate path is the McRAPTOR
             // one (`mc_route_between_coordinates`, `candidates="pareto"`).
-            let mut rows = Raptor.least_cost_matrix_to_points(
-                &self.build.timetable,
-                &self.transfers,
-                &inputs,
-                &requests,
-                &access_meters,
-                &egress,
-                window,
-                budget,
-                objective,
-            );
+            let mut rows = if router == "tbtr" {
+                let engine = self.tbtr_engine(
+                    &self.transfers,
+                    date,
+                    &active_services,
+                    &active_services_previous,
+                );
+                engine.least_cost_matrix_to_points(
+                    &inputs,
+                    &requests,
+                    &access_meters,
+                    &egress,
+                    window,
+                    budget,
+                    objective,
+                )
+            } else {
+                Raptor.least_cost_matrix_to_points(
+                    &self.build.timetable,
+                    &self.transfers,
+                    &inputs,
+                    &requests,
+                    &access_meters,
+                    &egress,
+                    window,
+                    budget,
+                    objective,
+                )
+            };
             // The walking-only alternative: zero grams and zero fare,
             // so within the budget it wins any cell (equal-key cells
             // resolve toward the shorter travel time, as everywhere).
@@ -5511,6 +5534,36 @@ impl TransportNetwork {
             }
             other => Err(invalid_router(other)),
         }
+    }
+
+    /// The time TBTR engine for a query: over the cached transfer set
+    /// when its date matches (`compute_tbtr_transfers`), else built ad
+    /// hoc. The query-time `footpaths` vary freely — the precompute
+    /// never contains them.
+    fn tbtr_engine<'a>(
+        &'a self,
+        footpaths: &'a Transfers,
+        date: &str,
+        active_services: &'a [bool],
+        active_services_previous: &'a [bool],
+    ) -> TbtrEngine<'a> {
+        if let Some((cached_date, set)) = &self.tbtr_time_transfers {
+            if cached_date == date {
+                return TbtrEngine::from_set(
+                    &self.build.timetable,
+                    footpaths,
+                    active_services,
+                    active_services_previous,
+                    set,
+                );
+            }
+        }
+        TbtrEngine::for_date(
+            &self.build.timetable,
+            footpaths,
+            active_services,
+            active_services_previous,
+        )
     }
 
     /// The engine a multicriteria query's `router` runs on. `"auto"`
