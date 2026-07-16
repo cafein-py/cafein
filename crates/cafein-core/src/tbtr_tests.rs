@@ -220,16 +220,14 @@ fn equal_arrival_same_ride_competitors_both_survive_reduction() {
             position: 0,
         }]
     );
-    // Retention makes RAPTOR's elected chain reconstructible; electing it
-    // deterministically is the cost-matrix stage's scan-order work (the
-    // query scan still boards walked stops in HashMap order, so the
-    // equal-arrival winner varies per process). Times must agree either
-    // way.
+    // With the deterministic walked scratch, the reconstructed journey
+    // is RAPTOR's, leg for leg — a pin on this fixture (the engine-wide
+    // election-alignment proof is the cost-matrix stage's referee).
     let request = request(3, StopIdx(0), StopIdx(3), 0);
     let raptor = Raptor.route(&timetable, &footpaths, &request);
     let tbtr = Tbtr.route(&timetable, &footpaths, &request);
     assert_eq!(pareto(&raptor), vec![(100, 2)]);
-    assert_eq!(pareto(&tbtr), pareto(&raptor));
+    assert_eq!(tbtr, raptor);
 }
 
 #[test]
@@ -280,13 +278,13 @@ fn a_same_trip_tie_is_pruned_even_when_another_trip_holds_the_label() {
         trip: ViewTrip(2),
         position: 0,
     }));
-    // As above: leg-identical election is the cost-matrix stage's
-    // scan-order work; the retained set guarantees the winner exists.
+    // As above: with deterministic walked boarding the election is
+    // RAPTOR's, leg for leg, pinned on this fixture.
     let request = request(3, StopIdx(0), StopIdx(5), 0);
     let raptor = Raptor.route(&timetable, &footpaths, &request);
     let tbtr = Tbtr.route(&timetable, &footpaths, &request);
     assert_eq!(pareto(&raptor), vec![(1000, 2)]);
-    assert_eq!(pareto(&tbtr), pareto(&raptor));
+    assert_eq!(tbtr, raptor);
 }
 
 #[test]

@@ -376,6 +376,53 @@ pub struct TbtrEngine<'a> {
     incoming: Vec<(StopIdx, u32)>,
 }
 
+/// Dense per-stop scratch for the stops a round's footpaths improved,
+/// drained in first-improvement insertion order. A `HashMap` here would
+/// board walked stops in random per-process order: arrivals would not
+/// change (strict-improvement labels are order-independent), but at an
+/// exact arrival tie the first-enqueued segment wins the label, so
+/// journey reconstruction would elect a different equal journey from
+/// process to process.
+struct WalkedScratch {
+    /// `(ready, parent segment, alight position)` per stop;
+    /// `ready == UNREACHED` marks an empty slot.
+    slots: Vec<(u32, u32, u16)>,
+    touched: Vec<u32>,
+}
+
+impl WalkedScratch {
+    fn new(stop_count: usize) -> WalkedScratch {
+        WalkedScratch {
+            slots: vec![(UNREACHED, 0, 0); stop_count],
+            touched: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        for &stop in &self.touched {
+            self.slots[stop as usize].0 = UNREACHED;
+        }
+        self.touched.clear();
+    }
+
+    /// Records (or overwrites, keeping the stop's original insertion
+    /// rank) the walk that improved `stop`, exactly as the map insert
+    /// this replaces did.
+    fn insert(&mut self, stop: u32, value: (u32, u32, u16)) {
+        let slot = &mut self.slots[stop as usize];
+        if slot.0 == UNREACHED {
+            self.touched.push(stop);
+        }
+        *slot = value;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (u32, (u32, u32, u16))> + '_ {
+        self.touched
+            .iter()
+            .map(move |&stop| (stop, self.slots[stop as usize]))
+    }
+}
+
 /// A queued trip segment: `trip` boarded at `board`, reached through
 /// `origin`.
 struct Segment {
@@ -609,7 +656,7 @@ impl<'a> TbtrEngine<'a> {
             }
             true
         };
-        let mut walked: HashMap<u32, (u32, u32, u16)> = HashMap::new();
+        let mut walked = WalkedScratch::new(self.timetable.stop_count() as usize);
 
         for &departure in departures {
             // Access stops carry their labels from the start: a ride
@@ -737,7 +784,7 @@ impl<'a> TbtrEngine<'a> {
                     }
                 }
                 if round + 1 < rounds {
-                    for (&stop, &(ready, parent, alight)) in &walked {
+                    for (stop, (ready, parent, alight)) in walked.iter() {
                         self.board_walked(
                             StopIdx(stop),
                             ready,
@@ -830,7 +877,7 @@ impl<'a> TbtrEngine<'a> {
         let mut reached = self.horizons(rounds);
         let mut arena: Vec<Segment> = Vec::new();
         let mut queues: Vec<Vec<(u32, u16)>> = vec![Vec::new(); rounds];
-        let mut walked: HashMap<u32, (u32, u32, u16)> = HashMap::new();
+        let mut walked = WalkedScratch::new(self.timetable.stop_count() as usize);
         self.seed(
             departure,
             access,
@@ -894,7 +941,7 @@ impl<'a> TbtrEngine<'a> {
                 }
             }
             if round + 1 < rounds {
-                for (&stop, &(ready, parent, alight)) in &walked {
+                for (stop, (ready, parent, alight)) in walked.iter() {
                     self.board_walked(
                         StopIdx(stop),
                         ready,
@@ -1033,7 +1080,7 @@ impl<'a> TbtrEngine<'a> {
             }
             true
         };
-        let mut walked: HashMap<u32, (u32, u32, u16)> = HashMap::new();
+        let mut walked = WalkedScratch::new(self.timetable.stop_count() as usize);
         let sample_count = (window as u64).div_ceil(60).max(1) as u32;
         let mut samples = Vec::with_capacity(sample_count as usize);
         for step in (0..sample_count).rev() {
@@ -1112,7 +1159,7 @@ impl<'a> TbtrEngine<'a> {
                         }
                     }
                     if round + 1 < rounds {
-                        for (&stop, &(ready, parent, alight)) in &walked {
+                        for (stop, (ready, parent, alight)) in walked.iter() {
                             self.board_walked(
                                 StopIdx(stop),
                                 ready,
