@@ -1177,3 +1177,377 @@ fn same_trip_same_board_uses_the_earlier_ready_parent() {
     );
     assert_eq!((tbtr.seconds, tbtr.rides), (raptor.seconds, raptor.rides));
 }
+
+fn next(state: &mut u64) -> u32 {
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    (*state >> 33) as u32
+}
+
+struct GeneratedNetwork {
+    timetable: Timetable,
+    geometry: crate::geometry::TripGeometry,
+    leg_geometry: crate::geometry::LegGeometry,
+    footpaths: Transfers,
+    factors: Vec<f64>,
+    fares: crate::fares::FareTables,
+}
+
+/// A seeded 2–8-stop network with coarse-grid times (so exact ties
+/// occur), clique footpaths (transitively closed by the triangle
+/// inequality), distinct per-trip distances, some unresolved emission
+/// factors, one unpriceable route, and per-trip leg polylines. Seeds
+/// where `seed % 3 == 2` add trips past 24:00 for previous-day tails.
+fn generated_network(seed: u64) -> GeneratedNetwork {
+    use crate::fares::{FareTables, RuleFares};
+    use crate::geometry::{DistanceProvenance, LegGeometry, TripGeometry};
+
+    let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+    let stops = 2 + (seed % 7) as u32;
+    let mut builder = TimetableBuilder::new(stops);
+    let patterns = 2 + next(&mut state) % 3;
+    for pattern in 0..patterns {
+        let length = 2 + next(&mut state) % (stops.min(4) - 1).max(1);
+        let mut walk = vec![StopIdx(next(&mut state) % stops)];
+        while (walk.len() as u32) < length {
+            let previous = walk.last().unwrap().0;
+            walk.push(StopIdx(
+                (previous + 1 + next(&mut state) % (stops - 1)) % stops,
+            ));
+        }
+        let handle = builder.add_pattern(&walk, pattern).unwrap();
+        let segment = 60 * (1 + next(&mut state) % 3);
+        let base = 60 * (next(&mut state) % 8);
+        let late = seed % 3 == 2 && pattern == 0;
+        for trip in 0..2 + next(&mut state) % 3 {
+            let start = base + trip * (240 + 60 * (next(&mut state) % 3));
+            let start = if late { start + 86_100 } else { start };
+            let times = (0..walk.len() as u32)
+                .map(|k| time(start + k * segment))
+                .collect();
+            builder
+                .add_trip(handle, times, trip, next(&mut state) % 2)
+                .unwrap();
+        }
+    }
+    let timetable = builder.finish();
+    let trips: Vec<_> = (0..timetable.trip_count())
+        .map(TripIdx)
+        .map(|trip| {
+            let count = timetable.pattern_stops(timetable.trip_pattern(trip)).len();
+            let step = 200.0 + (trip.0 % 13) as f32 * 23.0;
+            (
+                trip,
+                (0..count).map(|k| k as f32 * step).collect::<Vec<f32>>(),
+                DistanceProvenance::CrowFly,
+            )
+        })
+        .collect();
+    let geometry = TripGeometry::from_trips(&timetable, trips).unwrap();
+    let mut polylines = Vec::new();
+    let mut polyline_trips = Vec::new();
+    for trip in 0..timetable.trip_count() {
+        let count = timetable
+            .pattern_stops(timetable.trip_pattern(TripIdx(trip)))
+            .len();
+        let measures: Vec<f64> = (0..count).map(|k| k as f64).collect();
+        polylines.push((
+            (0..count)
+                .map(|k| trip as f64 * 0.001 + k as f64 * 0.01)
+                .collect::<Vec<f64>>(),
+            (0..count)
+                .map(|k| 60.0 + trip as f64 * 0.002 + k as f64 * 0.005)
+                .collect::<Vec<f64>>(),
+            measures.clone(),
+        ));
+        polyline_trips.push((TripIdx(trip), trip, measures));
+    }
+    let leg_geometry = LegGeometry::new(&timetable, &polylines, polyline_trips).unwrap();
+    let factors: Vec<f64> = (0..timetable.trip_count())
+        .map(|trip| {
+            if trip % 5 == 3 {
+                f64::NAN
+            } else {
+                15.0 + (trip % 9) as f64 * 9.0
+            }
+        })
+        .collect();
+    let group: Vec<u32> = (0..stops)
+        .filter(|stop| (stop + seed as u32).is_multiple_of(3))
+        .collect();
+    let mut edges = Vec::new();
+    for &a in &group {
+        for &b in &group {
+            if a != b {
+                let gap = a.abs_diff(b);
+                edges.push((
+                    StopIdx(a),
+                    StopIdx(b),
+                    60 + 30 * gap,
+                    45.0 + 80.0 * gap as f64,
+                ));
+            }
+        }
+    }
+    let footpaths = Transfers::from_edges(stops, &edges).unwrap();
+    let fares = FareTables::RuleBased(RuleFares {
+        route_type: (0..patterns).map(|route| route % 2).collect(),
+        route_fare: (0..patterns)
+            .map(|route| {
+                if route == 1 {
+                    f64::NAN
+                } else {
+                    2.0 + route as f64
+                }
+            })
+            .collect(),
+        unlimited_transfers: vec![false, true],
+        allow_same_route: vec![false, true],
+        pair_fare: vec![4.5, f64::NAN, 3.0, 0.0],
+        max_discounted_transfers: 1,
+        transfer_allowance: 600.0,
+        fare_cap: f64::INFINITY,
+    });
+    GeneratedNetwork {
+        timetable,
+        geometry,
+        leg_geometry,
+        footpaths,
+        factors,
+        fares,
+    }
+}
+
+/// Every `CostRow` field: integers exactly, floats by `to_bits` (NaN
+/// included), geometry WKB byte-for-byte, in row order.
+fn assert_full_rows_agree(
+    label: &str,
+    tbtr: &[Vec<crate::raptor::CostRow>],
+    raptor: &[Vec<crate::raptor::CostRow>],
+) {
+    assert_eq!(tbtr.len(), raptor.len(), "{label}: origin count");
+    for (origin, (t_rows, r_rows)) in tbtr.iter().zip(raptor).enumerate() {
+        assert_eq!(
+            t_rows.len(),
+            r_rows.len(),
+            "{label}: rows for origin {origin}"
+        );
+        for (t, r) in t_rows.iter().zip(r_rows) {
+            let cell = format!("{label}: origin {origin} -> {}", r.to);
+            assert_eq!(t.to, r.to, "{cell}: to");
+            assert_eq!(t.seconds, r.seconds, "{cell}: seconds");
+            assert_eq!(t.rides, r.rides, "{cell}: rides");
+            assert_eq!(
+                t.transit_meters.to_bits(),
+                r.transit_meters.to_bits(),
+                "{cell}: transit meters {} vs {}",
+                t.transit_meters,
+                r.transit_meters
+            );
+            assert_eq!(
+                t.walk_meters.to_bits(),
+                r.walk_meters.to_bits(),
+                "{cell}: walk meters {} vs {}",
+                t.walk_meters,
+                r.walk_meters
+            );
+            assert_eq!(
+                t.emission_grams.to_bits(),
+                r.emission_grams.to_bits(),
+                "{cell}: grams {} vs {}",
+                t.emission_grams,
+                r.emission_grams
+            );
+            assert_eq!(t.fare.to_bits(), r.fare.to_bits(), "{cell}: fare");
+            assert_eq!(t.geometry, r.geometry, "{cell}: geometry WKB");
+        }
+    }
+}
+
+#[test]
+fn generated_networks_match_raptor_across_the_sweep() {
+    use std::collections::HashMap;
+
+    use crate::raptor::{CostInputs, Objective, Raptor};
+
+    let mut cells = 0usize;
+    let mut ridden = 0usize;
+    let mut unresolved_grams = 0usize;
+    let mut unpriceable = 0usize;
+    let mut priced = 0usize;
+    let mut drawn = 0usize;
+    for seed in 0..7u64 {
+        let net = generated_network(seed);
+        let inputs = CostInputs {
+            geometry: &net.geometry,
+            factors: &net.factors,
+            leg_geometry: Some(&net.leg_geometry),
+            with_geometry: true,
+            fares: Some(&net.fares),
+        };
+        let previous = seed % 3 == 2;
+        let engine = TbtrEngine::for_date(
+            &net.timetable,
+            &net.footpaths,
+            &[true, true],
+            &[previous, previous],
+        );
+        let stops = net.timetable.stop_count();
+        let destinations: Vec<StopIdx> = (0..stops).map(StopIdx).collect();
+        let requests = |departure: u32, max_transfers: u8| -> Vec<Request> {
+            (0..stops)
+                .map(|origin| Request {
+                    departure,
+                    access: vec![(StopIdx(origin), 30), (StopIdx((origin + 1) % stops), 90)],
+                    egress: Vec::new(),
+                    active_services: vec![true, true],
+                    active_services_previous: vec![previous, previous],
+                    max_transfers,
+                })
+                .collect()
+        };
+        for max_transfers in [1, 2, 4] {
+            for departure in [0, 240, 600] {
+                let batch = requests(departure, max_transfers);
+                let raptor = Raptor.cost_matrix(
+                    &net.timetable,
+                    &net.footpaths,
+                    &inputs,
+                    &batch,
+                    &destinations,
+                );
+                let tbtr = engine.cost_matrix(&inputs, &batch, &destinations);
+                assert_full_rows_agree(
+                    &format!("seed {seed} mt {max_transfers} dep {departure}"),
+                    &tbtr,
+                    &raptor,
+                );
+                for row in raptor.iter().flatten() {
+                    cells += 1;
+                    if row.rides > 0 {
+                        ridden += 1;
+                        unresolved_grams += row.emission_grams.is_nan() as usize;
+                        unpriceable += row.fare.is_nan() as usize;
+                        priced += !row.fare.is_nan() as usize;
+                        drawn += row.geometry.is_some() as usize;
+                    }
+                }
+            }
+        }
+        // A real boundary budget: an actual journey duration from the
+        // plain matrix, so the admission test lands exactly on it.
+        let baseline = Raptor.cost_matrix(
+            &net.timetable,
+            &net.footpaths,
+            &inputs,
+            &requests(0, 4),
+            &destinations,
+        );
+        let mut durations: Vec<u32> = baseline.iter().flatten().map(|row| row.seconds).collect();
+        durations.sort_unstable();
+        let boundary = durations.get(durations.len() / 2).copied();
+        for max_transfers in [1, 2, 4] {
+            let batch = requests(0, max_transfers);
+            for window in [600, 1800] {
+                for budget in [None, boundary, Some(1)] {
+                    for objective in [Objective::Emissions, Objective::Fare] {
+                        let raptor = Raptor.least_cost_matrix(
+                            &net.timetable,
+                            &net.footpaths,
+                            &inputs,
+                            &batch,
+                            &destinations,
+                            window,
+                            budget,
+                            objective,
+                        );
+                        let tbtr = engine.least_cost_matrix(
+                            &inputs,
+                            &batch,
+                            &destinations,
+                            window,
+                            budget,
+                            objective,
+                        );
+                        assert_full_rows_agree(
+                            &format!(
+                                "seed {seed} mt {max_transfers} window {window} \
+                                 budget {budget:?} {objective:?}"
+                            ),
+                            &tbtr,
+                            &raptor,
+                        );
+                    }
+                }
+            }
+        }
+        // The point forms over the same networks: two destination
+        // points (one with an equal-link election chance), access
+        // meters on both access stops.
+        let batch = requests(0, 4);
+        let access_meters: Vec<HashMap<StopIdx, f64>> = (0..stops)
+            .map(|origin| {
+                HashMap::from([
+                    (StopIdx(origin), 40.0),
+                    (StopIdx((origin + 1) % stops), 110.0),
+                ])
+            })
+            .collect();
+        let egress: Vec<Vec<(StopIdx, u32, f64)>> = vec![
+            vec![
+                (StopIdx(stops - 1), 30, 25.0),
+                (StopIdx(stops / 2), 30, 35.0),
+            ],
+            vec![(StopIdx(0), 45, 20.0)],
+        ];
+        let raptor = Raptor.cost_matrix_to_points(
+            &net.timetable,
+            &net.footpaths,
+            &inputs,
+            &batch,
+            &access_meters,
+            &egress,
+        );
+        let tbtr = engine.cost_matrix_to_points(&inputs, &batch, &access_meters, &egress);
+        assert_full_rows_agree(&format!("seed {seed} points"), &tbtr, &raptor);
+        for window in [600, 1800] {
+            for budget in [None, boundary, Some(1)] {
+                for objective in [Objective::Emissions, Objective::Fare] {
+                    let raptor = Raptor.least_cost_matrix_to_points(
+                        &net.timetable,
+                        &net.footpaths,
+                        &inputs,
+                        &batch,
+                        &access_meters,
+                        &egress,
+                        window,
+                        budget,
+                        objective,
+                    );
+                    let tbtr = engine.least_cost_matrix_to_points(
+                        &inputs,
+                        &batch,
+                        &access_meters,
+                        &egress,
+                        window,
+                        budget,
+                        objective,
+                    );
+                    assert_full_rows_agree(
+                        &format!("seed {seed} points window {window} budget {budget:?}"),
+                        &tbtr,
+                        &raptor,
+                    );
+                }
+            }
+        }
+    }
+    // The sweep must genuinely exercise what it claims to compare.
+    assert!(cells > 500, "only {cells} cells compared");
+    assert!(ridden > 100, "only {ridden} ridden rows");
+    assert!(unresolved_grams > 0, "no NaN emission factor was ridden");
+    assert!(unpriceable > 0, "no unpriceable journey was ridden");
+    assert!(priced > 0, "no priced journey was ridden");
+    assert!(drawn > 0, "no geometry was produced");
+}
