@@ -1320,8 +1320,6 @@ impl<'a> TbtrEngine<'a> {
         samples
     }
 
-    /// Fresh per-(trip, round) reached horizons: a trip's is its
-    /// pattern length.
     /// One scan of a departure onto a `MatrixState`: the profile scan
     /// stripped of destination targets and journey assembly, writing
     /// exact-round arrivals and winner records instead — with the
@@ -2418,6 +2416,8 @@ impl<'a> TbtrEngine<'a> {
         }
     }
 
+    /// Fresh per-(trip, round) reached horizons: a trip's is its
+    /// pattern length.
     fn horizons(&self, rounds: usize) -> Vec<u16> {
         let mut horizons = Vec::with_capacity(self.view.trip_count() as usize * rounds);
         for trip in 0..self.view.trip_count() {
