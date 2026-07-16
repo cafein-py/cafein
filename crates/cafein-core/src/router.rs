@@ -48,3 +48,51 @@ pub trait TransitRouter: Sync {
         request: &Request,
     ) -> Vec<Journey>;
 }
+
+/// Whether a `router="auto"` time-only query runs on the trip-based engine.
+///
+/// Only when a cached time transfer set was precomputed for the query's
+/// service date: the trip-based engine's advantage is riding a precomputed
+/// set, and an ad-hoc per-call build would make one-shot queries pay for it.
+pub fn auto_time_tbtr(cached_date: Option<&str>, date: &str) -> bool {
+    cached_date == Some(date)
+}
+
+/// Whether a `router="auto"` multicriteria query runs on the trip-based
+/// engine.
+///
+/// Only when a cached multicriteria transfer set was precomputed for the
+/// query's service date **and** resolved per-trip factor fingerprint, and the
+/// query asks nothing the trip-based engine cannot answer (`needs_raptor`:
+/// relaxed or diverse candidates, `max_slower`, or a door-to-door upgrade
+/// only the RAPTOR path has).
+pub fn auto_mc_tbtr(
+    cached: Option<(&str, u64)>,
+    date: &str,
+    fingerprint: u64,
+    needs_raptor: bool,
+) -> bool {
+    !needs_raptor && cached == Some((date, fingerprint))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{auto_mc_tbtr, auto_time_tbtr};
+
+    #[test]
+    fn auto_time_requires_matching_cached_date() {
+        assert!(auto_time_tbtr(Some("2022-02-22"), "2022-02-22"));
+        assert!(!auto_time_tbtr(Some("2022-02-21"), "2022-02-22"));
+        assert!(!auto_time_tbtr(None, "2022-02-22"));
+    }
+
+    #[test]
+    fn auto_mc_requires_matching_cache_and_supported_query() {
+        let cached = Some(("2022-02-22", 7_u64));
+        assert!(auto_mc_tbtr(cached, "2022-02-22", 7, false));
+        assert!(!auto_mc_tbtr(cached, "2022-02-23", 7, false));
+        assert!(!auto_mc_tbtr(cached, "2022-02-22", 8, false));
+        assert!(!auto_mc_tbtr(cached, "2022-02-22", 7, true));
+        assert!(!auto_mc_tbtr(None, "2022-02-22", 7, false));
+    }
+}

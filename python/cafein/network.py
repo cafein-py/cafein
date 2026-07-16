@@ -836,7 +836,7 @@ class TransportNetwork:
         percentiles=None,
         confidence=None,
         chunk=None,
-        router="raptor",
+        router="auto",
         walking_speed_kmph=None,
         max_walking_time=None,
         max_snap_distance=None,
@@ -893,12 +893,17 @@ class TransportNetwork:
             Compute only origin chunk ``k`` of ``n``: a deterministic
             contiguous block of the resolved origins, so ``n`` batch
             jobs cover all origins disjointly; rows follow the chunk.
-        router : str (optional, default: "raptor")
+        router : str (optional, default: "auto")
             The routing engine: ``"raptor"``, or ``"tbtr"`` to
             precompute a TBTR day engine (Trip-Based Transit Routing:
             Witt's trip-transfer set) for the date and fan the origins
             out over it, for stop and point matrices alike. The results
-            are identical.
+            are identical. ``"auto"`` (the default) runs on TBTR when a
+            cached transfer set (``compute_tbtr_transfers``) matches
+            the date, except for stop matrices under a whole-day ULTRA
+            set, where only the RAPTOR path routes door-to-door and
+            auto prefers it; point matrices share the ULTRA set on
+            both engines, so the cache alone decides there.
         walking_speed_kmph, max_walking_time, max_snap_distance : float
             The street-search options, as in ``access_stops``. They apply to
             point origins, and to stop origins of the ``"raptor"`` matrix under
@@ -948,7 +953,7 @@ class TransportNetwork:
         walking_speed_kmph,
         max_walking_time,
         max_snap_distance,
-        router="raptor",
+        router="auto",
     ):
         """The travel-time matrix with its origin and destination id
         axes and the resolved percentile list (``None`` without a
@@ -963,8 +968,10 @@ class TransportNetwork:
             _warn_unsnapped,
         )
 
-        if router not in ("raptor", "tbtr"):
-            raise ValueError(f"router must be 'raptor' or 'tbtr', not {router!r}")
+        if router not in ("auto", "raptor", "tbtr"):
+            raise ValueError(
+                f"router must be 'auto', 'raptor', or 'tbtr', not {router!r}"
+            )
         percentiles = _window_percentiles(window, percentiles, confidence)
         if _is_point_frame(from_stops):
             from_ids, origin_points = _point_list(from_stops, "origins")
