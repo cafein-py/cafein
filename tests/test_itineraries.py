@@ -193,7 +193,6 @@ def test_pareto_candidates_add_the_cleaner_slower_journey(network):
 
 
 def test_pareto_and_router_options_are_validated(network):
-    points = point_frame(network, [("A", "4810551")])
     with pytest.raises(ValueError, match="candidates must be"):
         DetailedItineraries(
             network,
@@ -203,15 +202,25 @@ def test_pareto_and_router_options_are_validated(network):
             "08:30:00",
             candidates="nonsense",
         )
-    with pytest.raises(ValueError, match="requires candidates='pareto' with stop"):
+    with pytest.raises(ValueError, match="requires candidates='pareto'"):
         DetailedItineraries(
             network,
-            points,
-            points,
+            ["4810551"],
+            ["1250551"],
+            "2022-02-22",
+            "08:30:00",
+            candidates="time",
+            router="tbtr",
+        )
+    with pytest.raises(ValueError, match="'auto', 'raptor', or 'tbtr'"):
+        DetailedItineraries(
+            network,
+            ["4810551"],
+            ["1250551"],
             "2022-02-22",
             "08:30:00",
             candidates="pareto",
-            router="tbtr",
+            router="nonsense",
         )
 
 

@@ -1020,3 +1020,78 @@ def test_mcultra_routes_the_emissions_matrix_door_to_door(
     assert diagonal is not None
     assert diagonal["travel_time"] == 0
     assert diagonal["emissions"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_auto_router_prefers_the_ultra_door_to_door_path(
+    central_gtfs, kantakaupunki_pbf
+):
+    """`router="auto"` must never trade the whole-day set's door-to-door
+    semantics for an engine switch: with both a whole-day ULTRA set and a
+    cached TBTR set present, the auto stop matrix follows the RAPTOR
+    door-to-door path, not the TBTR closure."""
+    import numpy as np
+
+    with pytest.warns(UserWarning):
+        net = TransportNetwork.from_gtfs(
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf)
+        )
+    net.compute_ultra_shortcuts(max_transfer_time=600.0)  # whole day
+    net.compute_tbtr_transfers(QUERY_DATE)
+    origins = [stop for stop, _lat, _lon in net.stops][:5]
+    args = (origins, QUERY_DATE, QUERY_TIME)
+    auto = net.travel_time_matrix(*args)
+    raptor = net.travel_time_matrix(*args, router="raptor")
+    tbtr = net.travel_time_matrix(*args, router="tbtr")
+    assert np.array_equal(auto, raptor)
+    # The door-to-door rows differ from the closure's, so the preference is
+    # observable (at minimum, an origin pays its walk to the platform).
+    assert not np.array_equal(auto, tbtr)
+
+
+def test_auto_router_prefers_the_mcultra_door_to_door_path(
+    central_gtfs, kantakaupunki_pbf
+):
+    """The multicriteria analogue of the ULTRA preference: with both a
+    matching whole-day McULTRA set and a cached McTBTR set installed, the
+    auto pareto cost matrix follows the McRAPTOR door-to-door path, not the
+    McTBTR closure."""
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelCostMatrix, emissions
+
+    with pytest.warns(UserWarning):
+        net = TransportNetwork.from_gtfs(
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=300
+        )
+    default = emissions.trip_factors(net)
+    count = net._core.compute_mcultra_shortcuts(3.6, 300.0, default, 0, 4_294_967_294)
+    assert count > 0
+    net.compute_mctbtr_transfers(QUERY_DATE)
+    assert net.has_mctbtr_transfers
+    origins = [stop for stop, lat, _lon in net.stops if lat is not None][:8]
+
+    def matrix(**extra):
+        frame = TravelCostMatrix(
+            net,
+            origins,
+            origins,
+            QUERY_DATE,
+            QUERY_TIME,
+            optimize="emissions",
+            candidates="pareto",
+            window=1800,
+            walking_speed_kmph=3.6,
+            max_walking_time=300.0,
+            max_snap_distance=1600.0,
+            **extra,
+        )
+        return sorted(
+            frame[["from_id", "to_id", "travel_time", "emissions"]]
+            .round(3)
+            .itertuples(index=False, name=None)
+        )
+
+    auto = matrix()
+    assert auto == matrix(router="raptor")
+    # Door-to-door cells differ from the closure's, so the preference is
+    # observable despite the matching McTBTR cache.
+    assert auto != matrix(router="tbtr")

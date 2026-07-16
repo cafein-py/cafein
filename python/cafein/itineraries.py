@@ -105,11 +105,14 @@ class DetailedItineraries(gpd.GeoDataFrame):
         The emissions bucket width in grams CO₂e for the ``"pareto"``
         search's arrival tie-break; smaller keeps finer emission
         differences apart. Ignored for ``candidates="time"``.
-    router : {"raptor", "tbtr"} (optional, default: "raptor")
-        The engine backing ``candidates="pareto"`` between stops:
-        multicriteria RAPTOR, or trip-based (``"tbtr"``). ``"tbtr"``
-        requires ``candidates="pareto"`` with stop-id origins and
-        destinations; ``"relaxed"`` and ``"diverse"`` require ``"raptor"``.
+    router : {"auto", "raptor", "tbtr"} (optional, default: "auto")
+        The engine backing ``candidates="pareto"``: multicriteria RAPTOR,
+        or trip-based (``"tbtr"``), for stop-id and point origins and
+        destinations alike. ``"auto"`` (the default) runs on McTBTR when
+        a cached transfer set (``compute_mctbtr_transfers``) matches the
+        query's date and factors, else on McRAPTOR. ``"tbtr"`` requires
+        ``candidates="pareto"``; ``"relaxed"`` and ``"diverse"`` require
+        ``"raptor"`` (``"auto"`` resolves to it).
     slack_seconds : float (optional, default: None)
         The time-slack band in seconds. For ``candidates="relaxed"`` a
         journey is kept even when a cleaner or simpler one dominates it,
@@ -172,7 +175,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         components=None,
         candidates="time",
         bucket=25.0,
-        router="raptor",
+        router="auto",
         slack_seconds=None,
         max_options=None,
         diversity="time",
@@ -248,10 +251,14 @@ def _itineraries_frame(
         raise ValueError("walking options apply to point origins and destinations")
     if candidates not in ("time", "pareto", "relaxed", "diverse"):
         raise ValueError("candidates must be 'time', 'pareto', 'relaxed', or 'diverse'")
-    if router not in ("raptor", "tbtr"):
-        raise ValueError("router must be 'raptor' or 'tbtr'")
-    if router == "tbtr" and (candidates != "pareto" or kind != "stops"):
-        raise ValueError("router='tbtr' requires candidates='pareto' with stop ids")
+    if router not in ("auto", "raptor", "tbtr"):
+        raise ValueError("router must be 'auto', 'raptor', or 'tbtr'")
+    if router == "tbtr" and candidates != "pareto":
+        raise ValueError("router='tbtr' requires candidates='pareto'")
+    if router == "auto" and candidates in ("relaxed", "diverse"):
+        # Unimplemented on McTBTR; resolve here so every penalization
+        # round of a diverse search runs on the same engine.
+        router = "raptor"
     slack, options, rounds = _alternative_options(
         candidates, slack_seconds, max_options, diversity, penalty
     )
@@ -421,6 +428,7 @@ def _route_pareto(
             geometries,
             slack,
             options,
+            router=router,
         )
     return network._core.mc_route_between_stops(
         origin_key,
@@ -484,6 +492,7 @@ def _route_diverse(
                 None,
                 banned,
                 route_penalties,
+                router=router,
             )
         return network._core.mc_route_between_stops(
             origin_key,

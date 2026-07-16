@@ -88,11 +88,16 @@ class TravelCostMatrix(pd.DataFrame):
         The emissions bucket width in grams CO₂e of the pareto search,
         as in ``journey_frontier``. Only used with
         ``candidates="pareto"``.
-    router : str (optional, default: "raptor")
+    router : str (optional, default: "auto")
         The pareto search engine, as in ``journey_frontier``: McRAPTOR
         (``"raptor"``) or McTBTR (``"tbtr"``), which precomputes the
         date's multicriteria transfer set once and fans every origin
-        out over it. Only used with ``candidates="pareto"``.
+        out over it. ``"auto"`` (the default) runs on McTBTR when a
+        cached transfer set (``compute_mctbtr_transfers``) matches the
+        query's date and factors and no matching whole-day McULTRA set
+        serves the stop matrix door-to-door (which only the McRAPTOR
+        path does), else on McRAPTOR. Only used with
+        ``candidates="pareto"``.
     factors : DataFrame or path (optional)
         Extra emission-factor rows layered over the shipped defaults;
         see ``cafein.emissions.load_factors``.
@@ -139,7 +144,7 @@ class TravelCostMatrix(pd.DataFrame):
         fares=None,
         candidates="time",
         bucket=25.0,
-        router="raptor",
+        router="auto",
         geometries=False,
         chunk=None,
         walking_speed_kmph=None,
@@ -244,10 +249,16 @@ class TravelTimeMatrix(pd.DataFrame):
         Compute only origin chunk ``k`` of ``n``: a deterministic
         contiguous block of the resolved origins, so ``n`` batch jobs
         cover all origins disjointly and their rows concatenate.
-    router : str (optional, default: "raptor")
+    router : str (optional, default: "auto")
         The routing engine: ``"raptor"``, or ``"tbtr"`` to precompute a
         TBTR day engine for the date and fan the origins out over it,
         for stop and point matrices alike; the results are identical.
+        ``"auto"`` (the default) runs on TBTR when a cached transfer
+        set (``compute_tbtr_transfers``) matches the date, except for
+        stop matrices under a whole-day ULTRA set, where only the
+        RAPTOR path routes door-to-door and auto prefers it; point
+        matrices share the ULTRA set on both engines, so the cache
+        alone decides there.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         The street-search options for the walking access/egress, as in
         ``TransportNetwork.access_stops``. They bound the walking for point
@@ -273,7 +284,7 @@ class TravelTimeMatrix(pd.DataFrame):
         percentiles=None,
         confidence=None,
         chunk=None,
-        router="raptor",
+        router="auto",
         walking_speed_kmph=None,
         max_walking_time=None,
         max_snap_distance=None,
@@ -312,7 +323,7 @@ def _time_columns(
     walking_speed_kmph,
     max_walking_time,
     max_snap_distance,
-    router="raptor",
+    router="auto",
 ):
     """The reachable cells of the travel-time matrix, in long format."""
     if date is None or departure is None:
@@ -461,7 +472,7 @@ def _cost_columns(
     fares=None,
     candidates="time",
     bucket=25.0,
-    router="raptor",
+    router="auto",
 ):
     """The core's cost arrays plus the origin and destination ids."""
     from cafein import emissions
@@ -481,8 +492,8 @@ def _cost_columns(
         raise ValueError("optimize='fare' requires a fare structure (fares=)")
     if candidates not in ("time", "pareto"):
         raise ValueError("candidates must be 'time' or 'pareto'")
-    if router not in ("raptor", "tbtr"):
-        raise ValueError("router must be 'raptor' or 'tbtr'")
+    if router not in ("auto", "raptor", "tbtr"):
+        raise ValueError("router must be 'auto', 'raptor', or 'tbtr'")
     if router == "tbtr" and candidates != "pareto":
         raise ValueError("router='tbtr' requires candidates='pareto'")
     if candidates == "pareto":

@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- ``router="auto"`` — the new default for every ``router`` parameter: a
+  query runs on the trip-based engine (TBTR/McTBTR) when the network
+  carries a matching precomputed transfer set for it
+  (``compute_tbtr_transfers`` / ``compute_mctbtr_transfers``, persisted
+  with the artifact) and the query asks nothing that engine cannot
+  answer; otherwise it runs on RAPTOR/McRAPTOR, as before. Explicit
+  ``router="raptor"``/``"tbtr"`` behave exactly as they did.
+
+- ``DetailedItineraries(candidates="pareto")`` accepts ``router="tbtr"``
+  with point origins and destinations too; the stop-ids-only restriction
+  is lifted.
+
 ## 0.4.0 — 2026-07-14
 
 - Much faster multicriteria routing — every emissions-aware product

@@ -1331,6 +1331,13 @@ fn walk_within_band(
     departure.saturating_add(walk_seconds) <= fastest.saturating_add(band)
 }
 
+/// The error every routing entry raises for an unknown `router` value.
+fn invalid_router(router: &str) -> PyErr {
+    PyValueError::new_err(format!(
+        "router must be 'auto', 'raptor', or 'tbtr', not {router:?}"
+    ))
+}
+
 /// A deterministic, NaN-safe fingerprint of a per-trip emission-factor vector,
 /// binding a McULTRA set to the factor configuration it was built with (a query
 /// with different factors falls back to the closure). Not a cryptographic digest.
@@ -2818,13 +2825,16 @@ impl TransportNetwork {
     ///     Departure time at every origin as ``HH:MM:SS``.
     /// max_transfers : int (optional, default: 7)
     ///     Maximum number of transfers between rides.
-    /// router : str (optional, default: "raptor")
+    /// router : str (optional, default: "auto")
     ///     The routing engine: ``"raptor"``, or ``"tbtr"`` to build a
     ///     TBTR day engine (view + reduced trip-transfer set) for the
     ///     date and fan the origins out over it. The results are
     ///     identical; TBTR trades a per-date precompute for faster
     ///     scans. The precomputed set covers same-stop transfers;
     ///     installed footpaths relax at query time, RAPTOR-style.
+    ///     ``"auto"`` runs on TBTR when the cached set
+    ///     (``compute_tbtr_transfers``) matches the date and no whole-day
+    ///     ULTRA set serves the query door-to-door, else on RAPTOR.
     /// walking_speed_kmph, max_walking_time, max_snap_distance : float
     ///     Bound the door-to-door walking of the ``"raptor"`` router under a
     ///     whole-day ULTRA set (defaults 3.6 km/h, 7200 s, 1600 m); ignored
@@ -2844,7 +2854,7 @@ impl TransportNetwork {
     ///     times in seconds; row order follows `from_stops`, column
     ///     order follows ``stops``. Unreachable pairs hold the maximum
     ///     uint32 value (4294967295).
-    #[pyo3(signature = (from_stops, date, departure, max_transfers = 7, router = "raptor", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    #[pyo3(signature = (from_stops, date, departure, max_transfers = 7, router = "auto", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
     #[allow(clippy::too_many_arguments)]
     fn travel_time_matrix<'py>(
         &self,
@@ -2858,10 +2868,8 @@ impl TransportNetwork {
         max_walking_time: f64,
         max_snap_distance: f64,
     ) -> PyResult<Bound<'py, PyArray2<u32>>> {
-        if !matches!(router, "raptor" | "tbtr") {
-            return Err(PyValueError::new_err(format!(
-                "router must be 'raptor' or 'tbtr', not {router:?}"
-            )));
+        if !matches!(router, "auto" | "raptor" | "tbtr") {
+            return Err(invalid_router(router));
         }
         let origins: Vec<StopIdx> = from_stops
             .iter()
@@ -2877,7 +2885,7 @@ impl TransportNetwork {
         // (error creation needs the GIL that `allow_threads` releases) and only
         // when at least one origin is usable — a matrix whose origins all fall
         // back ignores the walking options, as `travel_times_from_stop` does.
-        let ultra_usable = router == "raptor"
+        let ultra_usable = router != "tbtr"
             && self.ultra_active()
             && self.streets.as_ref().is_some_and(|streets| {
                 origins.iter().any(|&origin| {
@@ -2896,6 +2904,13 @@ impl TransportNetwork {
             )?)
         } else {
             None
+        };
+        // Auto prefers the door-to-door ULTRA path over an engine switch —
+        // it must never trade semantics for speed.
+        let router = if ultra_usable {
+            "raptor"
+        } else {
+            self.resolve_time_router(router, date)?
         };
         let flat: Vec<u32> = py.allow_threads(|| {
             let rows: Vec<Vec<Option<u32>>> = if router == "tbtr" {
@@ -3048,16 +3063,20 @@ impl TransportNetwork {
     /// resolved factor are skipped — journeys riding them can never sit
     /// on an emissions frontier. Requires installed trip distances.
     ///
-    /// ``router`` picks the engine: McRAPTOR (``"raptor"``, the
-    /// default) answers immediately; McTBTR (``"tbtr"``) precomputes
-    /// the day's multicriteria transfer set first — slower for one
-    /// pair, built for batch reuse — and returns the same journeys.
+    /// ``router`` picks the engine: McRAPTOR (``"raptor"``) answers
+    /// immediately; McTBTR (``"tbtr"``) precomputes the day's
+    /// multicriteria transfer set first — slower for one pair, built
+    /// for batch reuse — and returns the same journeys. ``"auto"``
+    /// (the default) runs on McTBTR when the cached set
+    /// (``compute_mctbtr_transfers``) matches the query's date and
+    /// factors and the query asks nothing McTBTR cannot answer, else
+    /// on McRAPTOR.
     ///
     /// Returns
     /// -------
     /// list of dict
     ///     Journeys shaped as in ``route_between_stops``.
-    #[pyo3(signature = (from_stop, to_stop, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, router = "raptor", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, banned_routes = vec![], route_penalties = vec![], max_slower = None))]
+    #[pyo3(signature = (from_stop, to_stop, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, router = "auto", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, banned_routes = vec![], route_penalties = vec![], max_slower = None))]
     #[allow(clippy::too_many_arguments)]
     fn mc_route_between_stops(
         &self,
@@ -3086,8 +3105,8 @@ impl TransportNetwork {
                 "bucket must be a positive number of grams",
             ));
         }
-        if router != "raptor" && router != "tbtr" {
-            return Err(PyValueError::new_err("router must be 'raptor' or 'tbtr'"));
+        if !matches!(router, "auto" | "raptor" | "tbtr") {
+            return Err(invalid_router(router));
         }
         if !slack.is_finite() || slack < 0.0 {
             return Err(PyValueError::new_err(
@@ -3137,9 +3156,10 @@ impl TransportNetwork {
         // intermediate walking is paired with a full street-graph initial and
         // final walk — the McRAPTOR analogue of ULTRA `route_between_stops`. The
         // set covers only the intermediate transfers, so it needs those endpoint
-        // searches; TBTR and a factor mismatch keep today's board-at-origin
-        // closure routing.
-        if router == "raptor"
+        // searches; explicit TBTR and a factor mismatch keep today's
+        // board-at-origin closure routing (`"auto"` reroutes and resolves on
+        // the coordinate path, whose engines share the McULTRA set).
+        if router != "tbtr"
             && !std::ptr::eq(
                 self.emissions_transfers(factor_fingerprint(&per_trip)),
                 &self.transfers,
@@ -3179,6 +3199,15 @@ impl TransportNetwork {
                 }
             }
         }
+        let router = self.resolve_mc_router(
+            router,
+            date,
+            &per_trip,
+            slack > 0.0
+                || !banned_routes.is_empty()
+                || !route_penalties.is_empty()
+                || max_slower.is_some(),
+        )?;
         let request = Request {
             departure: parse_time(departure)?,
             access: vec![(origin, 0)],
@@ -3269,7 +3298,13 @@ impl TransportNetwork {
     /// -------
     /// list of dict
     ///     Journeys shaped as in ``route_between_coordinates``.
-    #[pyo3(signature = (origin, destination, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, banned_routes = vec![], route_penalties = vec![], max_slower = None, router = "raptor"))]
+    ///
+    /// ``router="auto"`` (the default) runs on McTBTR when the cached
+    /// multicriteria transfer set (``compute_mctbtr_transfers``) matches
+    /// the query's date and factors and the query asks nothing McTBTR
+    /// cannot answer, else on McRAPTOR; explicit values pick the engine
+    /// directly.
+    #[pyo3(signature = (origin, destination, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, banned_routes = vec![], route_penalties = vec![], max_slower = None, router = "auto"))]
     #[allow(clippy::too_many_arguments)]
     fn mc_route_between_coordinates(
         &self,
@@ -3298,8 +3333,8 @@ impl TransportNetwork {
                 "bucket must be a positive number of grams",
             ));
         }
-        if router != "raptor" && router != "tbtr" {
-            return Err(PyValueError::new_err("router must be 'raptor' or 'tbtr'"));
+        if !matches!(router, "auto" | "raptor" | "tbtr") {
+            return Err(invalid_router(router));
         }
         if !slack.is_finite() || slack < 0.0 {
             return Err(PyValueError::new_err(
@@ -3395,7 +3430,17 @@ impl TransportNetwork {
         };
         // Door-to-door emissions: relax the McULTRA set for the intermediate
         // transfers when one is installed for this factor configuration; the
-        // access/egress and direct walk above stay unchanged.
+        // access/egress and direct walk above stay unchanged. Both engines
+        // share that set, so `"auto"` resolves on the cache alone.
+        let router = self.resolve_mc_router(
+            router,
+            date,
+            &per_trip,
+            slack > 0.0
+                || !banned_routes.is_empty()
+                || !route_penalties.is_empty()
+                || max_slower.is_some(),
+        )?;
         let intermediate = self.emissions_transfers(factor_fingerprint(&per_trip));
         let slack = slack.round() as u32;
         let penalty_mask = self.route_penalty_mask(&banned_routes, &route_penalties);
@@ -3496,7 +3541,13 @@ impl TransportNetwork {
     /// list of list of list of dict
     ///     ``result[i][j]`` is the journey list from ``from_stops[i]``
     ///     to ``to_stops[j]``, shaped as in ``mc_route_between_stops``.
-    #[pyo3(signature = (from_stops, to_stops, date, departure, factors, window, max_transfers = 7, bucket = 25.0, geometries = false, max_slower = None, router = "raptor"))]
+    ///
+    /// ``router="auto"`` (the default) runs on McTBTR when the cached
+    /// multicriteria transfer set (``compute_mctbtr_transfers``) matches
+    /// the query's date and factors and the query asks nothing McTBTR
+    /// cannot answer, else on McRAPTOR; explicit values pick the engine
+    /// directly.
+    #[pyo3(signature = (from_stops, to_stops, date, departure, factors, window, max_transfers = 7, bucket = 25.0, geometries = false, max_slower = None, router = "auto"))]
     #[allow(clippy::too_many_arguments)]
     fn mc_frontier_matrix(
         &self,
@@ -3518,8 +3569,8 @@ impl TransportNetwork {
                 "bucket must be a positive number of grams",
             ));
         }
-        if router != "raptor" && router != "tbtr" {
-            return Err(PyValueError::new_err("router must be 'raptor' or 'tbtr'"));
+        if !matches!(router, "auto" | "raptor" | "tbtr") {
+            return Err(invalid_router(router));
         }
         if max_slower.is_some() && router == "tbtr" {
             return Err(PyValueError::new_err(
@@ -3555,6 +3606,7 @@ impl TransportNetwork {
                 per_trip[trip.0 as usize] = *factor;
             }
         }
+        let router = self.resolve_mc_router(router, date, &per_trip, max_slower.is_some())?;
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
@@ -3644,7 +3696,13 @@ impl TransportNetwork {
     ///     ``journeys`` — ``result[i][j]`` journey lists;
     ///     ``unsnapped_from`` / ``unsnapped_to`` — indices of points
     ///     off the walking network (their cells stay empty).
-    #[pyo3(signature = (origins, destinations, date, departure, factors, window, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, max_slower = None, router = "raptor"))]
+    ///
+    /// ``router="auto"`` (the default) runs on McTBTR when the cached
+    /// multicriteria transfer set (``compute_mctbtr_transfers``) matches
+    /// the query's date and factors and the query asks nothing McTBTR
+    /// cannot answer, else on McRAPTOR; explicit values pick the engine
+    /// directly.
+    #[pyo3(signature = (origins, destinations, date, departure, factors, window, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, max_slower = None, router = "auto"))]
     #[allow(clippy::too_many_arguments)]
     fn mc_frontier_matrix_from_points(
         &self,
@@ -3669,8 +3727,8 @@ impl TransportNetwork {
                 "bucket must be a positive number of grams",
             ));
         }
-        if router != "raptor" && router != "tbtr" {
-            return Err(PyValueError::new_err("router must be 'raptor' or 'tbtr'"));
+        if !matches!(router, "auto" | "raptor" | "tbtr") {
+            return Err(invalid_router(router));
         }
         if max_slower.is_some() && router == "tbtr" {
             return Err(PyValueError::new_err(
@@ -3703,6 +3761,7 @@ impl TransportNetwork {
                 per_trip[trip.0 as usize] = *factor;
             }
         }
+        let router = self.resolve_mc_router(router, date, &per_trip, max_slower.is_some())?;
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
@@ -3810,7 +3869,13 @@ impl TransportNetwork {
     ///     ``departure``, ``arrival``, ``travel_time``, ``rides``,
     ///     ``emissions`` (NaN where a transit factor is unresolved),
     ///     and ``frontier``.
-    #[pyo3(signature = (from_stops, to_stops, date, departure, factors, window, max_transfers = 7, bucket = 25.0, max_slower = None, router = "raptor"))]
+    ///
+    /// ``router="auto"`` (the default) runs on McTBTR when the cached
+    /// multicriteria transfer set (``compute_mctbtr_transfers``) matches
+    /// the query's date and factors and the query asks nothing McTBTR
+    /// cannot answer, else on McRAPTOR; explicit values pick the engine
+    /// directly.
+    #[pyo3(signature = (from_stops, to_stops, date, departure, factors, window, max_transfers = 7, bucket = 25.0, max_slower = None, router = "auto"))]
     #[allow(clippy::too_many_arguments)]
     fn mc_frontier_table(
         &self,
@@ -3831,8 +3896,8 @@ impl TransportNetwork {
                 "bucket must be a positive number of grams",
             ));
         }
-        if router != "raptor" && router != "tbtr" {
-            return Err(PyValueError::new_err("router must be 'raptor' or 'tbtr'"));
+        if !matches!(router, "auto" | "raptor" | "tbtr") {
+            return Err(invalid_router(router));
         }
         if max_slower.is_some() && router == "tbtr" {
             return Err(PyValueError::new_err(
@@ -3863,6 +3928,7 @@ impl TransportNetwork {
                 per_trip[trip.0 as usize] = *factor;
             }
         }
+        let router = self.resolve_mc_router(router, date, &per_trip, max_slower.is_some())?;
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
@@ -3944,7 +4010,13 @@ impl TransportNetwork {
     ///     ``mc_frontier_table``'s columns plus ``unsnapped_from`` /
     ///     ``unsnapped_to`` (indices of points off the walking
     ///     network; their cells stay empty).
-    #[pyo3(signature = (origins, destinations, date, departure, factors, window, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, max_slower = None, router = "raptor"))]
+    ///
+    /// ``router="auto"`` (the default) runs on McTBTR when the cached
+    /// multicriteria transfer set (``compute_mctbtr_transfers``) matches
+    /// the query's date and factors and the query asks nothing McTBTR
+    /// cannot answer, else on McRAPTOR; explicit values pick the engine
+    /// directly.
+    #[pyo3(signature = (origins, destinations, date, departure, factors, window, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, max_slower = None, router = "auto"))]
     #[allow(clippy::too_many_arguments)]
     fn mc_frontier_table_from_points(
         &self,
@@ -3968,8 +4040,8 @@ impl TransportNetwork {
                 "bucket must be a positive number of grams",
             ));
         }
-        if router != "raptor" && router != "tbtr" {
-            return Err(PyValueError::new_err("router must be 'raptor' or 'tbtr'"));
+        if !matches!(router, "auto" | "raptor" | "tbtr") {
+            return Err(invalid_router(router));
         }
         if max_slower.is_some() && router == "tbtr" {
             return Err(PyValueError::new_err(
@@ -3997,6 +4069,7 @@ impl TransportNetwork {
                 per_trip[trip.0 as usize] = *factor;
             }
         }
+        let router = self.resolve_mc_router(router, date, &per_trip, max_slower.is_some())?;
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
@@ -4089,12 +4162,13 @@ impl TransportNetwork {
     ///     Percentiles in ``[0, 100]``, e.g. ``[10, 50, 90]``.
     /// max_transfers : int (optional, default: 7)
     ///     Maximum number of transfers between rides.
-    /// router : str (optional, default: "raptor")
+    /// router : str (optional, default: "auto")
     ///     ``"raptor"``, or ``"tbtr"`` to answer the window over a TBTR
     ///     day engine — the same reduced trip-transfer set the
     ///     single-departure matrix uses (reusing the cached set from
     ///     ``compute_tbtr_transfers`` when present). The results are
-    ///     identical.
+    ///     identical. ``"auto"`` runs on TBTR when the cached set matches
+    ///     the date, else on RAPTOR.
     ///
     /// Returns
     /// -------
@@ -4102,7 +4176,7 @@ impl TransportNetwork {
     ///     A ``(len(from_stops), stop_count, len(percentiles))`` uint32
     ///     array of travel times in seconds; unreachable percentiles
     ///     hold the maximum uint32 value (4294967295).
-    #[pyo3(signature = (from_stops, date, departure, window, percentiles, max_transfers = 7, router = "raptor"))]
+    #[pyo3(signature = (from_stops, date, departure, window, percentiles, max_transfers = 7, router = "auto"))]
     #[allow(clippy::too_many_arguments)]
     fn travel_time_percentiles<'py>(
         &self,
@@ -4116,11 +4190,7 @@ impl TransportNetwork {
         router: &str,
     ) -> PyResult<Bound<'py, PyArray3<u32>>> {
         validate_window(window, &percentiles)?;
-        if !matches!(router, "raptor" | "tbtr") {
-            return Err(PyValueError::new_err(format!(
-                "router must be 'raptor' or 'tbtr', not {router:?}"
-            )));
-        }
+        let router = self.resolve_time_router(router, date)?;
         let origins: Vec<StopIdx> = from_stops
             .iter()
             .map(|stop| self.resolve_stop(stop))
@@ -4196,7 +4266,11 @@ impl TransportNetwork {
     ///     ``matrix``: a ``(len(origins), len(destinations),
     ///     len(percentiles))`` uint32 array; ``unsnapped_from`` /
     ///     ``unsnapped_to``: indices of points off the walking network.
-    #[pyo3(signature = (origins, destinations, date, departure, window, percentiles, max_transfers = 7, router = "raptor", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    ///
+    /// ``router="auto"`` (the default) runs on TBTR when the cached time
+    /// transfer set (``compute_tbtr_transfers``) matches the date, else on
+    /// RAPTOR; explicit values pick the engine directly.
+    #[pyo3(signature = (origins, destinations, date, departure, window, percentiles, max_transfers = 7, router = "auto", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
     #[allow(clippy::too_many_arguments)]
     fn travel_time_percentiles_from_points(
         &self,
@@ -4213,9 +4287,10 @@ impl TransportNetwork {
         max_walking_time: f64,
         max_snap_distance: f64,
     ) -> PyResult<Py<PyDict>> {
-        if router != "raptor" && router != "tbtr" {
-            return Err(PyValueError::new_err("router must be 'raptor' or 'tbtr'"));
+        if !matches!(router, "auto" | "raptor" | "tbtr") {
+            return Err(invalid_router(router));
         }
+        let router = self.resolve_time_router(router, date)?;
         let streets = self.installed_streets()?;
         validate_window(window, &percentiles)?;
         let speed =
@@ -4524,7 +4599,11 @@ impl TransportNetwork {
     ///     unreachable; ``unsnapped_from`` / ``unsnapped_to``: indices
     ///     of points farther than `max_snap_distance` from the walking
     ///     network (their rows/columns are unreachable).
-    #[pyo3(signature = (origins, destinations, date, departure, max_transfers = 7, router = "raptor", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    ///
+    /// ``router="auto"`` (the default) runs on TBTR when the cached time
+    /// transfer set (``compute_tbtr_transfers``) matches the date, else on
+    /// RAPTOR; explicit values pick the engine directly.
+    #[pyo3(signature = (origins, destinations, date, departure, max_transfers = 7, router = "auto", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
     #[allow(clippy::too_many_arguments)]
     fn travel_time_matrix_from_points(
         &self,
@@ -4539,9 +4618,10 @@ impl TransportNetwork {
         max_walking_time: f64,
         max_snap_distance: f64,
     ) -> PyResult<Py<PyDict>> {
-        if router != "raptor" && router != "tbtr" {
-            return Err(PyValueError::new_err("router must be 'raptor' or 'tbtr'"));
+        if !matches!(router, "auto" | "raptor" | "tbtr") {
+            return Err(invalid_router(router));
         }
+        let router = self.resolve_time_router(router, date)?;
         let streets = self.installed_streets()?;
         let speed =
             validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
@@ -4878,7 +4958,13 @@ impl TransportNetwork {
     /// emissions bucket) Pareto set instead, which also holds the
     /// cleaner-but-slower journeys the time-optimal set misses; cells
     /// can therefore report strictly lower emissions.
-    #[pyo3(signature = (from_stops, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, to_stops = None, candidates = "time", bucket = 25.0, router = "raptor", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false))]
+    ///
+    /// ``router="auto"`` (the default) runs the pareto candidates on
+    /// McTBTR when the cached multicriteria transfer set matches the
+    /// query's date and factors and no matching whole-day McULTRA set
+    /// serves the stop matrix door-to-door (only the McRAPTOR path does),
+    /// else on McRAPTOR.
+    #[pyo3(signature = (from_stops, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, to_stops = None, candidates = "time", bucket = 25.0, router = "auto", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false))]
     #[allow(clippy::too_many_arguments)]
     fn least_cost_matrix(
         &self,
@@ -4901,8 +4987,8 @@ impl TransportNetwork {
         max_snap_distance: f64,
         geometries: bool,
     ) -> PyResult<Py<PyDict>> {
-        if router != "raptor" && router != "tbtr" {
-            return Err(PyValueError::new_err("router must be 'raptor' or 'tbtr'"));
+        if !matches!(router, "auto" | "raptor" | "tbtr") {
+            return Err(invalid_router(router));
         }
         if router == "tbtr" && candidates != "pareto" {
             return Err(PyValueError::new_err(
@@ -4982,9 +5068,16 @@ impl TransportNetwork {
         let stop_count = self.build.timetable.stop_count() as usize;
         let fingerprint = factor_fingerprint(&per_trip);
         let matrix_mcultra = candidates == "pareto"
-            && router == "raptor"
+            && router != "tbtr"
             && !std::ptr::eq(self.emissions_transfers(fingerprint), &self.transfers)
             && self.streets.is_some();
+        // Auto prefers the door-to-door McULTRA path over an engine switch;
+        // the time and fare candidate sets have no trip-based path at all.
+        let router = if matrix_mcultra {
+            "raptor"
+        } else {
+            self.resolve_mc_router(router, date, &per_trip, candidates != "pareto")?
+        };
         // Origins that do not take a location-based initial walk (no coordinate,
         // no snap, or no stop reachable within the cap) are marked `!located`;
         // routed over the intermediate-only set they would lose the closure's
@@ -5390,6 +5483,63 @@ impl TransportNetwork {
 }
 
 impl TransportNetwork {
+    /// The engine a time-only query's `router` runs on. `"auto"` resolves
+    /// to the trip-based engine only when the cached time transfer set
+    /// (`compute_tbtr_transfers`) matches the query's date; explicit values
+    /// pass through unchanged.
+    fn resolve_time_router(&self, router: &str, date: &str) -> PyResult<&'static str> {
+        match router {
+            "raptor" => Ok("raptor"),
+            "tbtr" => Ok("tbtr"),
+            "auto" => {
+                let cached = self.tbtr_time_transfers.as_ref().map(|(d, _)| d.as_str());
+                Ok(if cafein_core::router::auto_time_tbtr(cached, date) {
+                    "tbtr"
+                } else {
+                    "raptor"
+                })
+            }
+            other => Err(invalid_router(other)),
+        }
+    }
+
+    /// The engine a multicriteria query's `router` runs on. `"auto"`
+    /// resolves to the trip-based engine only when the cached McTBTR set
+    /// (`compute_mctbtr_transfers`) matches the query's date and factor
+    /// fingerprint and the query asks nothing McTBTR cannot answer
+    /// (`needs_raptor`); explicit values pass through unchanged.
+    fn resolve_mc_router(
+        &self,
+        router: &str,
+        date: &str,
+        per_trip: &[f64],
+        needs_raptor: bool,
+    ) -> PyResult<&'static str> {
+        match router {
+            "raptor" => Ok("raptor"),
+            "tbtr" => Ok("tbtr"),
+            "auto" => {
+                let cached = self
+                    .mctbtr_transfers
+                    .as_ref()
+                    .map(|(d, fingerprint, _)| (d.as_str(), *fingerprint));
+                Ok(
+                    if cafein_core::router::auto_mc_tbtr(
+                        cached,
+                        date,
+                        factor_fingerprint(per_trip),
+                        needs_raptor,
+                    ) {
+                        "tbtr"
+                    } else {
+                        "raptor"
+                    },
+                )
+            }
+            other => Err(invalid_router(other)),
+        }
+    }
+
     /// The multicriteria TBTR engine for a query: over the cached
     /// transfer set when its date and factor fingerprint match
     /// (`compute_mctbtr_transfers`), else built ad hoc. The query-time

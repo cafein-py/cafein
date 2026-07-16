@@ -67,7 +67,7 @@ def journey_frontier(
     fares=None,
     candidates="time",
     bucket=25.0,
-    router="raptor",
+    router="auto",
     slack_seconds=None,
     max_options=None,
     diversity="time",
@@ -147,14 +147,18 @@ def journey_frontier(
         journeys within one bucket of each other count as equal on
         emissions while searching, bounding its cost. Only used with
         ``candidates="pareto"`` or ``"relaxed"``.
-    router : str (optional, default: "raptor")
+    router : str (optional, default: "auto")
         The pareto search engine: McRAPTOR (``"raptor"``) answers
         immediately; McTBTR (``"tbtr"``) precomputes the date's
         multicriteria transfer set first — slower for a single pair,
         built for batch reuse — and returns the same journeys, for stop
-        ids and coordinates alike. Only used with
-        ``candidates="pareto"``; ``"relaxed"``, ``"diverse"``, and
-        ``max_slower`` require ``"raptor"``.
+        ids and coordinates alike. ``"auto"`` (the default) runs on
+        McTBTR when a cached transfer set
+        (``compute_mctbtr_transfers``) matches the query's date and
+        factors and the query asks nothing McTBTR cannot answer, else
+        on McRAPTOR. Only used with ``candidates="pareto"``;
+        ``"relaxed"``, ``"diverse"``, and ``max_slower`` require
+        ``"raptor"`` (``"auto"`` resolves to it).
     slack_seconds : float (optional, default: None)
         The time-slack band in seconds. For ``candidates="relaxed"`` a
         journey is kept even when a cleaner or simpler one dominates it,
@@ -227,10 +231,14 @@ def journey_frontier(
     """
     if candidates not in ("time", "pareto", "relaxed", "diverse"):
         raise ValueError("candidates must be 'time', 'pareto', 'relaxed', or 'diverse'")
-    if router not in ("raptor", "tbtr"):
-        raise ValueError("router must be 'raptor' or 'tbtr'")
+    if router not in ("auto", "raptor", "tbtr"):
+        raise ValueError("router must be 'auto', 'raptor', or 'tbtr'")
     if router == "tbtr" and candidates != "pareto":
         raise ValueError("router='tbtr' requires candidates='pareto'")
+    if router == "auto" and candidates in ("relaxed", "diverse"):
+        # Unimplemented on McTBTR; resolve here so every penalization
+        # round of a diverse search runs on the same engine.
+        router = "raptor"
     max_slower = _validated_max_slower(max_slower, candidates, router)
     slack, options, rounds = _alternative_options(
         candidates, slack_seconds, max_options, diversity, penalty
@@ -387,7 +395,7 @@ def journey_frontiers(
     components=None,
     fares=None,
     bucket=25.0,
-    router="raptor",
+    router="auto",
     max_slower=None,
     walking_speed_kmph=None,
     max_walking_time=None,
@@ -447,8 +455,8 @@ def journey_frontiers(
         raise ValueError(
             "origins and destinations must both be stop ids or both be point frames"
         )
-    if router not in ("raptor", "tbtr"):
-        raise ValueError("router must be 'raptor' or 'tbtr'")
+    if router not in ("auto", "raptor", "tbtr"):
+        raise ValueError("router must be 'auto', 'raptor', or 'tbtr'")
     max_slower = _validated_max_slower(max_slower, "pareto", router)
     trip_factors = emissions.trip_factors(network, factors, components)
     if stops[0] is not None:
@@ -524,7 +532,7 @@ def frontier_table(
     factors=None,
     components=None,
     bucket=25.0,
-    router="raptor",
+    router="auto",
     max_slower=None,
     walking_speed_kmph=None,
     max_walking_time=None,
@@ -566,8 +574,8 @@ def frontier_table(
         raise ValueError(
             "origins and destinations must both be stop ids or both be point frames"
         )
-    if router not in ("raptor", "tbtr"):
-        raise ValueError("router must be 'raptor' or 'tbtr'")
+    if router not in ("auto", "raptor", "tbtr"):
+        raise ValueError("router must be 'auto', 'raptor', or 'tbtr'")
     max_slower = _validated_max_slower(max_slower, "pareto", router)
     trip_factors = emissions.trip_factors(network, factors, components)
     if stops[0] is not None:
@@ -626,7 +634,7 @@ def _validated_max_slower(max_slower, candidates, router):
         return None
     if candidates != "pareto":
         raise ValueError("max_slower requires candidates='pareto'")
-    if router != "raptor":
+    if router == "tbtr":
         raise ValueError("max_slower requires router='raptor'")
     band = float(max_slower)
     if not math.isfinite(band) or band < 0:
@@ -893,6 +901,7 @@ def _diverse_journeys(
             None,
             banned,
             route_penalties,
+            router=router,
         )
 
     def annotate(journeys):

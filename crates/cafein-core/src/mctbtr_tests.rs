@@ -370,6 +370,50 @@ fn the_engine_matches_the_oracle_on_the_forked_fixture() {
 }
 
 #[test]
+fn the_auto_policy_switch_never_changes_fixture_results() {
+    use crate::router::{auto_mc_tbtr, auto_time_tbtr};
+
+    // Both engines match the oracle on the fixture (asserted inside), so
+    // whichever engine the auto policy selects for a cache state answers
+    // identically — the policy switch can never change results.
+    let (timetable, geometry) = forked();
+    let footpaths = Transfers::empty(4);
+    engines_agree(
+        &timetable,
+        &geometry,
+        &footpaths,
+        &[50.0, 100.0, 10.0],
+        StopIdx(0),
+        StopIdx(3),
+        3,
+    );
+    // The multicriteria decision table over that equivalence: uncached,
+    // date-mismatched, factor-mismatched, and semantic-fallback states run
+    // McRAPTOR; only a matching cache with a supported query runs McTBTR.
+    let fingerprint = 7;
+    let cached = Some(("2022-02-22", fingerprint));
+    assert!(!auto_mc_tbtr(None, "2022-02-22", fingerprint, false));
+    assert!(!auto_mc_tbtr(
+        Some(("2022-02-21", fingerprint)),
+        "2022-02-22",
+        fingerprint,
+        false
+    ));
+    assert!(!auto_mc_tbtr(
+        Some(("2022-02-22", 8)),
+        "2022-02-22",
+        fingerprint,
+        false
+    ));
+    assert!(!auto_mc_tbtr(cached, "2022-02-22", fingerprint, true));
+    assert!(auto_mc_tbtr(cached, "2022-02-22", fingerprint, false));
+    // The time-only table: only a date-matching cached set runs TBTR.
+    assert!(!auto_time_tbtr(None, "2022-02-22"));
+    assert!(!auto_time_tbtr(Some("2022-02-21"), "2022-02-22"));
+    assert!(auto_time_tbtr(Some("2022-02-22"), "2022-02-22"));
+}
+
+#[test]
 fn the_engine_matches_the_oracle_over_footpaths() {
     // Ride, walk a footpath, ride again — the walked transfer is a
     // query-time relaxation, not a precomputed one.
