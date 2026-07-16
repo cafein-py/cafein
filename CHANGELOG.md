@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fixed over-midnight boarding missing a faster previous-day trip. The
+  day streams were merged by departure time when boarding, but a
+  previous-day trip can depart later on the query clock and still
+  arrive earlier; routing now scans the two streams independently, so
+  such journeys are found.
 - Equal-arrival journeys are elected canonically: when two journeys tie
   exactly on arrival and ride count, RAPTOR and the trip-based cost
   paths now both keep the same representative — chosen by a shared,

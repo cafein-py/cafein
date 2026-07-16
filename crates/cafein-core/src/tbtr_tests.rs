@@ -1374,13 +1374,23 @@ fn generated_network(seed: u64) -> GeneratedNetwork {
         let late = seed % 3 == 2 && pattern == 0;
         for trip in 0..2 + next(&mut state) % 3 {
             let start = base + trip * (240 + 60 * (next(&mut state) % 3));
-            let start = if late { start + 86_100 } else { start };
             let times = (0..walk.len() as u32)
                 .map(|k| time(start + k * segment))
                 .collect();
             builder
                 .add_trip(handle, times, trip, next(&mut state) % 2)
                 .unwrap();
+            if late {
+                // Yesterday's over-midnight shadow: departs 30 seconds
+                // after today's trip on the query clock but runs its
+                // stops faster, so the merged day streams are not FIFO.
+                let times = (0..walk.len() as u32)
+                    .map(|k| time(start + 86_430 + k * 30))
+                    .collect();
+                builder
+                    .add_trip(handle, times, trip, next(&mut state) % 2)
+                    .unwrap();
+            }
         }
     }
     let timetable = builder.finish();
@@ -1716,4 +1726,49 @@ fn generated_networks_match_raptor_across_the_sweep() {
     assert!(unpriceable > 0, "no unpriceable journey was ridden");
     assert!(priced > 0, "no priced journey was ridden");
     assert!(drawn > 0, "no geometry was produced");
+}
+
+#[test]
+fn a_previous_day_overtaker_is_not_missed() {
+    use crate::geometry::{DistanceProvenance, TripGeometry};
+
+    // Today's trip departs the origin at 550 and arrives at 900;
+    // yesterday's over-midnight trip departs at 560 on the query
+    // clock but arrives at 580. The merged streams are not FIFO:
+    // boarding by departure alone rides today's trip and misses the
+    // earlier arrival, so both engines must scan the day streams
+    // separately.
+    let mut builder = TimetableBuilder::new(2);
+    let line = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    builder
+        .add_trip(line, vec![time(550), time(900)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(line, vec![time(86_960), time(86_980)], 1, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 700.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 450.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let (tbtr, raptor) = cost_cell(
+        &timetable,
+        &geometry,
+        &Transfers::empty(2),
+        &[10.0, 20.0],
+        &[true],
+        &[true],
+        StopIdx(1),
+    );
+    assert_eq!((raptor.seconds, raptor.rides), (580, 1));
+    assert_eq!(raptor.transit_meters, 450.0);
+    assert_eq!(
+        tbtr.transit_meters.to_bits(),
+        raptor.transit_meters.to_bits()
+    );
+    assert_eq!((tbtr.seconds, tbtr.rides), (raptor.seconds, raptor.rides));
 }

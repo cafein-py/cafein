@@ -1152,10 +1152,85 @@ impl<'a> Search<'a> {
         journeys
     }
 
+    /// Records an alighting from `trip` at `position`: a strict
+    /// improvement writes through; an exact same-round tie keeps the
+    /// canonical chain and re-marks the stop so the replacement
+    /// propagates.
+    #[allow(clippy::too_many_arguments)]
+    fn alight_at(
+        &mut self,
+        timetable: &Timetable,
+        round: usize,
+        stops: &[StopIdx],
+        position: usize,
+        trip: TripIdx,
+        board_position: u16,
+        day_offset: u32,
+    ) {
+        let stop = stops[position].0 as usize;
+        let arrival = timetable.trip_stop_times(trip)[position]
+            .arrival
+            .saturating_sub(day_offset);
+        if arrival < self.best[round][stop] {
+            self.tau[round][stop] = arrival;
+            for best in &mut self.best[round..] {
+                best[stop] = best[stop].min(arrival);
+            }
+            self.labels[round][stop] = Label::Transit {
+                trip,
+                board_position,
+                alight_position: position as u16,
+                day_offset,
+            };
+            if !self.is_marked[stop] {
+                self.is_marked[stop] = true;
+                self.marked.push(stops[position]);
+            }
+        } else if arrival == self.tau[round][stop] && arrival != UNREACHED {
+            let mut challenger = std::mem::take(&mut self.key_scratch_a);
+            let mut incumbent = std::mem::take(&mut self.key_scratch_b);
+            challenger.clear();
+            challenger.push(PathToken::Ride {
+                trip: trip.0,
+                day_offset,
+                board: board_position,
+                alight: position as u16,
+            });
+            let root = chain_tokens_into(
+                &self.labels,
+                timetable,
+                stops[board_position as usize].0 as usize,
+                round - 1,
+                &mut challenger,
+            );
+            incumbent.clear();
+            let incumbent_root =
+                chain_tokens_into(&self.labels, timetable, stop, round, &mut incumbent);
+            if challenger_wins(root, &challenger, incumbent_root, &incumbent) {
+                self.labels[round][stop] = Label::Transit {
+                    trip,
+                    board_position,
+                    alight_position: position as u16,
+                    day_offset,
+                };
+                if !self.is_marked[stop] {
+                    self.is_marked[stop] = true;
+                    self.marked.push(stops[position]);
+                }
+            }
+            self.key_scratch_a = challenger;
+            self.key_scratch_b = incumbent;
+        }
+    }
+
     /// One RAPTOR pass from `departure`, improving the shared state.
     pub(crate) fn run(&mut self, departure: u32) {
         let timetable = self.timetable;
         let request = self.request;
+        let has_previous = request
+            .active_services_previous
+            .iter()
+            .any(|&active| active);
 
         // Leftover marks from the previous pass describe stops whose
         // labels are already final for later departures; they carry no
@@ -1235,72 +1310,22 @@ impl<'a> Search<'a> {
                 let start_position = self.queue_position[pattern.0 as usize];
                 self.queue_position[pattern.0 as usize] = u16::MAX;
                 let stops = timetable.pattern_stops(pattern);
-                let mut current: Option<(TripIdx, u16, u32)> = None;
+                let mut currents: [Option<(TripIdx, u16)>; 2] = [None, None];
 
                 for position in start_position as usize..stops.len() {
                     let stop = stops[position].0 as usize;
 
-                    if let Some((trip, board_position, day_offset)) = current {
-                        let arrival = timetable.trip_stop_times(trip)[position]
-                            .arrival
-                            .saturating_sub(day_offset);
-                        if arrival < self.best[round][stop] {
-                            self.tau[round][stop] = arrival;
-                            for best in &mut self.best[round..] {
-                                best[stop] = best[stop].min(arrival);
-                            }
-                            self.labels[round][stop] = Label::Transit {
+                    for (current, day_offset) in currents.into_iter().zip([0, DAY_SECONDS]) {
+                        if let Some((trip, board_position)) = current {
+                            self.alight_at(
+                                timetable,
+                                round,
+                                stops,
+                                position,
                                 trip,
                                 board_position,
-                                alight_position: position as u16,
                                 day_offset,
-                            };
-                            if !self.is_marked[stop] {
-                                self.is_marked[stop] = true;
-                                self.marked.push(stops[position]);
-                            }
-                        } else if arrival == self.tau[round][stop] && arrival != UNREACHED {
-                            // An exact tie in the same exact-ride round:
-                            // keep the canonical chain, and re-mark the
-                            // stop so the replacement propagates.
-                            let mut challenger = std::mem::take(&mut self.key_scratch_a);
-                            let mut incumbent = std::mem::take(&mut self.key_scratch_b);
-                            challenger.clear();
-                            challenger.push(PathToken::Ride {
-                                trip: trip.0,
-                                day_offset,
-                                board: board_position,
-                                alight: position as u16,
-                            });
-                            let root = chain_tokens_into(
-                                &self.labels,
-                                timetable,
-                                stops[board_position as usize].0 as usize,
-                                round - 1,
-                                &mut challenger,
                             );
-                            incumbent.clear();
-                            let incumbent_root = chain_tokens_into(
-                                &self.labels,
-                                timetable,
-                                stop,
-                                round,
-                                &mut incumbent,
-                            );
-                            if challenger_wins(root, &challenger, incumbent_root, &incumbent) {
-                                self.labels[round][stop] = Label::Transit {
-                                    trip,
-                                    board_position,
-                                    alight_position: position as u16,
-                                    day_offset,
-                                };
-                                if !self.is_marked[stop] {
-                                    self.is_marked[stop] = true;
-                                    self.marked.push(stops[position]);
-                                }
-                            }
-                            self.key_scratch_a = challenger;
-                            self.key_scratch_b = incumbent;
                         }
                     }
 
@@ -1309,42 +1334,59 @@ impl<'a> Search<'a> {
                     // has already recorded any improvement at this position;
                     // boarding at a pattern's last position is pointless
                     // because there is no later stop to alight at, and other
-                    // patterns serving this stop are queued separately.
+                    // patterns serving this stop are queued separately. The
+                    // day streams board independently: merged across days
+                    // departures are not FIFO — yesterday's tail can depart
+                    // later here yet arrive earlier downstream — so each
+                    // stream rides its own earliest trip and the arrival
+                    // writes settle the competition.
                     let reached = self.tau[round - 1][stop];
                     if reached == UNREACHED || position + 1 == stops.len() {
                         continue;
                     }
-                    let can_catch_earlier = match current {
-                        Some((trip, _, day_offset)) => {
+                    for (stream, current) in currents.iter_mut().enumerate() {
+                        let active: &[bool] = if stream == 0 {
+                            &request.active_services
+                        } else if has_previous {
+                            &request.active_services_previous
+                        } else {
+                            continue;
+                        };
+                        // A previous-day trip stored at `t` runs at
+                        // `t - DAY_SECONDS`, so it is boardable from
+                        // `reached` when `t >= reached + DAY_SECONDS`.
+                        let threshold = if stream == 0 {
                             reached
-                                <= timetable.trip_stop_times(trip)[position]
-                                    .departure
-                                    .saturating_sub(day_offset)
-                        }
-                        None => true,
-                    };
-                    if can_catch_earlier {
-                        if let Some((trip, day_offset)) =
-                            earliest_trip(timetable, request, pattern, position, reached)
-                        {
-                            // Board the earlier-departing vehicle; across
-                            // service days trip index no longer orders
-                            // departures, so compare the shifted times.
-                            let departure = timetable.trip_stop_times(trip)[position]
-                                .departure
-                                .saturating_sub(day_offset);
-                            let replaces = match current {
-                                Some((current_trip, _, current_offset)) => {
-                                    departure
-                                        < timetable.trip_stop_times(current_trip)[position]
-                                            .departure
-                                            .saturating_sub(current_offset)
-                                }
-                                None => true,
-                            };
-                            if replaces {
-                                current = Some((trip, position as u16, day_offset));
+                        } else {
+                            match reached.checked_add(DAY_SECONDS) {
+                                Some(threshold) => threshold,
+                                None => continue,
                             }
+                        };
+                        let can_catch_earlier = match *current {
+                            Some((trip, _)) => {
+                                threshold <= timetable.trip_stop_times(trip)[position].departure
+                            }
+                            None => true,
+                        };
+                        if !can_catch_earlier {
+                            continue;
+                        }
+                        let Some(trip) =
+                            earliest_active_trip(timetable, active, pattern, position, threshold)
+                        else {
+                            continue;
+                        };
+                        // Stored times order a single day's FIFO stream.
+                        let replaces = match *current {
+                            Some((current_trip, _)) => {
+                                timetable.trip_stop_times(trip)[position].departure
+                                    < timetable.trip_stop_times(current_trip)[position].departure
+                            }
+                            None => true,
+                        };
+                        if replaces {
+                            *current = Some((trip, position as u16));
                         }
                     }
                 }
@@ -1536,58 +1578,6 @@ impl<'a> Search<'a> {
             arrival: departure_at_stop.saturating_add(egress_duration),
             legs,
         }
-    }
-}
-
-/// The earliest trip of `pattern` boardable at `position` no earlier than
-/// `reached`, and the day offset to subtract from its stored times. Today's
-/// services board at their stored times; the previous day's board a day
-/// earlier, so their over-midnight tail is reachable in the small hours.
-/// The two are compared on the queried day's clock and the earlier one wins.
-fn earliest_trip(
-    timetable: &Timetable,
-    request: &Request,
-    pattern: PatternIdx,
-    position: usize,
-    reached: u32,
-) -> Option<(TripIdx, u32)> {
-    let today = earliest_active_trip(
-        timetable,
-        &request.active_services,
-        pattern,
-        position,
-        reached,
-    )
-    .map(|trip| (trip, 0));
-    // A previous-day trip stored at time `t` runs at `t - DAY_SECONDS`, so
-    // it is boardable from `reached` when `t >= reached + DAY_SECONDS`.
-    let previous = reached
-        .checked_add(DAY_SECONDS)
-        .and_then(|threshold| {
-            earliest_active_trip(
-                timetable,
-                &request.active_services_previous,
-                pattern,
-                position,
-                threshold,
-            )
-        })
-        .map(|trip| (trip, DAY_SECONDS));
-    match (today, previous) {
-        (Some(today), Some(previous)) => {
-            let departure = |(trip, offset): (TripIdx, u32)| {
-                timetable.trip_stop_times(trip)[position]
-                    .departure
-                    .saturating_sub(offset)
-            };
-            Some(if departure(previous) < departure(today) {
-                previous
-            } else {
-                today
-            })
-        }
-        (today, None) => today,
-        (None, previous) => previous,
     }
 }
 
