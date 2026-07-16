@@ -16,8 +16,8 @@ dist/
 .coverage.*
 htmlcov/
 
-# Docs
-docs/_build/
+# Docs (kept out of git for now)
+/docs/
 
 # Downloaded test datasets (fetched by scripts/fetch_test_data.py)
 tests/data/
