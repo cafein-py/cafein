@@ -212,34 +212,6 @@ impl TransitRouter for Raptor {
 }
 
 impl Raptor {
-    /// Temporary referee diagnostic: per reached round, the canonical
-    /// token chain behind one stop's label after a single-departure run.
-    #[doc(hidden)]
-    pub fn debug_route_chains(
-        &self,
-        timetable: &Timetable,
-        transfers: &Transfers,
-        request: &Request,
-        stop: StopIdx,
-    ) -> Vec<(usize, u32, u32, Vec<String>)> {
-        let mut search = Search::new(timetable, transfers, request);
-        search.run(request.departure);
-        let mut chains = Vec::new();
-        for round in 0..=search.rounds {
-            let (tau, tokens, root) = search.debug_chain_tokens(stop, round);
-            if tau == UNREACHED {
-                continue;
-            }
-            chains.push((
-                round,
-                tau,
-                root,
-                tokens.iter().map(|token| format!("{token:?}")).collect(),
-            ));
-        }
-        chains
-    }
-
     /// Earliest arrival at every stop for a single departure.
     ///
     /// One run serves all destinations — the matrix primitive: matrices
@@ -878,24 +850,6 @@ impl<'a> Search<'a> {
 
     /// The fastest journey's aggregated costs to a destination point
     /// over its egress links; `None` when no link's stop is reachable.
-    /// Temporary referee diagnostic: the canonical tokens behind
-    /// `tau[round][stop]`.
-    fn debug_chain_tokens(&self, stop: StopIdx, round: usize) -> (u32, Vec<PathToken>, u32) {
-        let tau = self.tau[round][stop.0 as usize];
-        if tau == UNREACHED {
-            return (tau, Vec::new(), 0);
-        }
-        let mut tokens = Vec::new();
-        let root = chain_tokens_into(
-            &self.labels,
-            self.timetable,
-            stop.0 as usize,
-            round,
-            &mut tokens,
-        );
-        (tau, tokens, root)
-    }
-
     fn costs_to_point(
         &self,
         point: u32,

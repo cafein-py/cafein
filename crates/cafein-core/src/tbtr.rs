@@ -490,7 +490,6 @@ enum StopWinner {
 /// passes, rTBTR-style); `reset` recycles it for the next origin.
 pub struct MatrixState {
     rounds: usize,
-    stop_count: usize,
     reached: Vec<u16>,
     arena: Vec<Segment>,
     queues: Vec<Vec<(u32, u16)>>,
@@ -521,7 +520,6 @@ impl MatrixState {
         let stop_count = engine.timetable.stop_count() as usize;
         MatrixState {
             rounds,
-            stop_count,
             reached: engine.horizons(rounds),
             arena: Vec::new(),
             queues: vec![Vec::new(); rounds],
@@ -1384,7 +1382,11 @@ impl<'a> TbtrEngine<'a> {
                     // stop's at-most-round label — RAPTOR's marked-stop
                     // semantics; the same improvements write the
                     // exact-round winner the cost reconstruction walks.
-                    if improve_labels(&mut state.labels, rounds, stop, arrival, round) {
+                    if improve_labels(&mut state.labels, rounds, stop, arrival, round)
+                        || (arrival == state.tau_at(stop, round + 1)
+                            && arrival != UNREACHED
+                            && self.alight_tie_wins(state, stop, round + 1, segment, alight))
+                    {
                         state.record(
                             stop,
                             round + 1,
@@ -1392,16 +1394,6 @@ impl<'a> TbtrEngine<'a> {
                             StopWinner::Alight { segment, alight },
                         );
                         self.relax_matrix_walks(state, stop, arrival, segment, alight, round);
-                    } else if arrival == state.tau_at(stop, round + 1) && arrival != UNREACHED {
-                        if self.alight_tie_wins(state, stop, round + 1, segment, alight) {
-                            state.record(
-                                stop,
-                                round + 1,
-                                arrival,
-                                StopWinner::Alight { segment, alight },
-                            );
-                            self.relax_matrix_walks(state, stop, arrival, segment, alight, round);
-                        }
                     }
                     if round + 1 < rounds {
                         for transfer in self.set.from_trip_position(trip, alight) {
@@ -1891,69 +1883,6 @@ impl<'a> TbtrEngine<'a> {
                 self.segment_tokens_into(state, segment, alight, out)
             }
         }
-    }
-
-    /// Temporary referee diagnostic: the canonical token chains behind a
-    /// stop's matrix winners, Debug-formatted per reached round slot.
-    #[doc(hidden)]
-    pub fn debug_matrix_chains(
-        &self,
-        state: &MatrixState,
-        stop: StopIdx,
-    ) -> Vec<(usize, u32, u32, Vec<String>)> {
-        let mut chains = Vec::new();
-        for round in 0..=state.rounds {
-            let tau = state.tau_at(stop, round);
-            if tau == UNREACHED {
-                continue;
-            }
-            let mut tokens = Vec::new();
-            let root = self.winner_tokens_into(state, stop, round, &mut tokens);
-            chains.push((
-                round,
-                tau,
-                root,
-                tokens.iter().map(|token| format!("{token:?}")).collect(),
-            ));
-        }
-        chains
-    }
-
-    /// Temporary referee diagnostic: the retained transfers leaving a
-    /// backing trip at a position, as (backing trip, board position).
-    #[doc(hidden)]
-    pub fn debug_transfers_from(&self, backing: u32, position: u16) -> Vec<(u32, u16)> {
-        let mut found = Vec::new();
-        for view_trip in 0..self.view.trip_count() {
-            if self.view.backing(ViewTrip(view_trip)).0 != backing {
-                continue;
-            }
-            for transfer in self.set.from_trip_position(ViewTrip(view_trip), position) {
-                found.push((self.view.backing(transfer.trip).0, transfer.position));
-            }
-        }
-        found
-    }
-
-    /// Temporary referee diagnostic: every arena segment of a backing
-    /// trip after a pass, as (board, parent backing or access stop).
-    #[doc(hidden)]
-    pub fn debug_boardings_of(&self, state: &MatrixState, backing: u32) -> Vec<(u16, String)> {
-        state
-            .arena
-            .iter()
-            .filter(|segment| self.view.backing(segment.trip).0 == backing)
-            .map(|segment| {
-                let origin = match &segment.origin {
-                    SegmentOrigin::Access { stop, .. } => format!("access@{}", stop.0),
-                    SegmentOrigin::Transfer { parent, alight } => {
-                        let parent_trip = self.view.backing(state.arena[*parent as usize].trip);
-                        format!("from trip {} alight {alight}", parent_trip.0)
-                    }
-                };
-                (segment.board, origin)
-            })
-            .collect()
     }
 
     /// The duration of the (deduplicated) footpath between two stops.

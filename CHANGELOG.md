@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Equal-arrival journeys are elected canonically: when two journeys tie
+  exactly on arrival and ride count, RAPTOR and the trip-based cost
+  paths now both keep the same representative — chosen by a shared,
+  documented order over the journeys' rides and walks — instead of
+  whichever chain each engine's scan happened to meet first. Reported
+  times and ride counts are unchanged; on tied cells the representative
+  journey's distance, emissions, fare, and geometry may differ from
+  earlier builds, and are now identical across engines and stable
+  across releases.
+
 - The time-only TBTR transfer set is tie-complete: the precompute now
   retains same-ride equal-arrival competitor transfers (boarding a
   different trip; same-trip later boardings stay pruned), so the coming
