@@ -8,7 +8,11 @@
 //! the earliest boardable trip; a reduction pass then drops transfers
 //! that improve no stop's arrival over staying on the trip or over the
 //! transfers already kept — typically the large majority — leaving the
-//! set the query engine scans.
+//! set the query engine scans. The reduction is tie-complete: a
+//! transfer that exactly ties a kept competitor from a *different*
+//! trip is retained too (as is each trip's earliest tied boarding), so
+//! cost reconstruction can elect the same journey RAPTOR's
+//! tie-breaking does; ties against staying on the trip still prune.
 //!
 //! Both passes run over a [`DayView`]: the virtual trips one query
 //! date sees. Restricting to a date before the reduction is what keeps
@@ -1467,11 +1471,19 @@ pub(crate) fn u_turn(
                 - view.day_offset(boarded) as i64
 }
 
-/// Witt's transfer reduction for one virtual trip: walking the alight
-/// positions back to front, a transfer survives only if riding the
-/// boarded trip onward improves the arrival at some stop (directly or
-/// over a footpath) over staying on the trip or over the transfers
-/// already kept. Labels are per-trip scratch state, pooled per worker.
+/// Witt's transfer reduction for one virtual trip, tie-complete: walking
+/// the alight positions back to front, each alight runs two phases.
+/// First every candidate of the alight contributes to the labels
+/// (alongside the stays), so same-alight competitors converge on each
+/// trip's earliest tied boarding; then the alight's candidates are
+/// retained exactly when they witness a label — a strict best, or their
+/// trip's minimal tied boarding. A tie against staying on the trip
+/// prunes (fewer rides wins, as in RAPTOR's round-ascending tie-break);
+/// a tie between different boarded trips keeps both, since which one
+/// RAPTOR elects depends on the query. Only same-or-later alight state
+/// ever competes — an earlier alight's labels are unavailable to a
+/// query that boards between the two positions — which the backward
+/// walk preserves. Labels are per-trip scratch state, pooled per worker.
 fn reduce(
     view: &DayView,
     timetable: &Timetable,
@@ -1487,36 +1499,79 @@ fn reduce(
     let alight_from = view.first_boardable(trip) as usize + 1;
     for alight in (alight_from..stops.len()).rev() {
         let arrival = times[alight].arrival - offset;
-        labels.improve(stops[alight], arrival);
+        labels.improve_stay(stops[alight], arrival);
         for footpath in footpaths.from_stop(stops[alight]) {
-            labels.improve(footpath.to, arrival.saturating_add(footpath.duration));
+            labels.improve_stay(footpath.to, arrival.saturating_add(footpath.duration));
+        }
+        for transfer in per_position[alight].iter() {
+            let boarded_offset = view.day_offset(transfer.trip);
+            let boarded_stops =
+                timetable.pattern_stops(view.line_pattern(view.line_of(transfer.trip)));
+            let boarded_times = view.stored_times(timetable, transfer.trip);
+            for k in transfer.position as usize + 1..boarded_stops.len() {
+                let reached = boarded_times[k].arrival - boarded_offset;
+                labels.improve_transfer(
+                    boarded_stops[k],
+                    reached,
+                    transfer.trip,
+                    transfer.position,
+                );
+                for footpath in footpaths.from_stop(boarded_stops[k]) {
+                    labels.improve_transfer(
+                        footpath.to,
+                        reached.saturating_add(footpath.duration),
+                        transfer.trip,
+                        transfer.position,
+                    );
+                }
+            }
         }
         per_position[alight].retain(|transfer| {
             let boarded_offset = view.day_offset(transfer.trip);
             let boarded_stops =
                 timetable.pattern_stops(view.line_pattern(view.line_of(transfer.trip)));
             let boarded_times = view.stored_times(timetable, transfer.trip);
-            let mut keeps = false;
             for k in transfer.position as usize + 1..boarded_stops.len() {
                 let reached = boarded_times[k].arrival - boarded_offset;
-                if labels.improve(boarded_stops[k], reached) {
-                    keeps = true;
+                if labels.witnesses(boarded_stops[k], reached, transfer.trip, transfer.position) {
+                    return true;
                 }
                 for footpath in footpaths.from_stop(boarded_stops[k]) {
-                    if labels.improve(footpath.to, reached.saturating_add(footpath.duration)) {
-                        keeps = true;
+                    if labels.witnesses(
+                        footpath.to,
+                        reached.saturating_add(footpath.duration),
+                        transfer.trip,
+                        transfer.position,
+                    ) {
+                        return true;
                     }
                 }
             }
-            keeps
+            false
         });
     }
 }
 
 /// Per-stop earliest-arrival scratch labels with cheap reuse: only the
-/// touched stops reset between trips.
+/// touched stops reset between trips. Each label carries how it was
+/// reached, so an exact arrival tie can distinguish a fewer-rides stay
+/// (the candidate loses outright, as it would against RAPTOR's
+/// round-ascending tie-break) from same-ride competitors. A tied label
+/// tracks every retained trip with its minimum boarding position —
+/// RAPTOR boards a trip at its earliest catchable position, so among
+/// same-trip ties only the earliest boarding is electable, however many
+/// other trips tie in between.
 struct Labels {
     arrival: Vec<u32>,
+    /// Whether the label's arrival level is stay-witnessed (equal
+    /// candidates die against it). Meaningful only while `arrival` is
+    /// set; guarded by the `UNREACHED` checks below.
+    stay: Vec<bool>,
+    /// The transfer-witnessed trips at the label's arrival level, each
+    /// with the minimum boarding position retained so far. Tiny in
+    /// practice (a tie rarely involves more than a couple of trips), so
+    /// a linear scan beats any keyed structure.
+    ties: Vec<Vec<(ViewTrip, u16)>>,
     touched: Vec<u32>,
 }
 
@@ -1524,6 +1579,8 @@ impl Labels {
     fn new(stop_count: u32) -> Labels {
         Labels {
             arrival: vec![UNREACHED; stop_count as usize],
+            stay: vec![false; stop_count as usize],
+            ties: vec![Vec::new(); stop_count as usize],
             touched: Vec::new(),
         }
     }
@@ -1531,21 +1588,75 @@ impl Labels {
     fn clear(&mut self) {
         for &stop in &self.touched {
             self.arrival[stop as usize] = UNREACHED;
+            self.ties[stop as usize].clear();
         }
         self.touched.clear();
     }
 
-    fn improve(&mut self, stop: StopIdx, time: u32) -> bool {
+    /// A stay-side improvement: strictly earlier claims the label, and an
+    /// exact tie demotes the label to Stay — the stayed path rides less,
+    /// so equal candidates must stop surviving off it. (A tie at
+    /// `UNREACHED` is a saturated walk, not a label; state behind an
+    /// `UNREACHED` slot is stale and must stay unread.)
+    fn improve_stay(&mut self, stop: StopIdx, time: u32) {
         let slot = &mut self.arrival[stop.0 as usize];
         if time < *slot {
             if *slot == UNREACHED {
                 self.touched.push(stop.0);
             }
             *slot = time;
-            true
-        } else {
-            false
+            self.stay[stop.0 as usize] = true;
+            self.ties[stop.0 as usize].clear();
+        } else if time == *slot && time != UNREACHED {
+            self.stay[stop.0 as usize] = true;
+            self.ties[stop.0 as usize].clear();
         }
+    }
+
+    /// A candidate transfer's contribution to the labels: strictly
+    /// earlier claims the label outright. An exact tie never survives a
+    /// fewer-rides stay (nor a stale label behind an `UNREACHED` slot);
+    /// against other transfers the tied trips accumulate, each at its
+    /// minimum boarding position — a *different* trip is a genuinely
+    /// distinct journey whose election depends on the query, while a
+    /// same-trip later boarding can never be elected (RAPTOR boards at
+    /// the earliest catchable position), whichever competitor happens to
+    /// have contributed first.
+    fn improve_transfer(&mut self, stop: StopIdx, time: u32, trip: ViewTrip, position: u16) {
+        let slot = &mut self.arrival[stop.0 as usize];
+        if time < *slot {
+            if *slot == UNREACHED {
+                self.touched.push(stop.0);
+            }
+            *slot = time;
+            self.stay[stop.0 as usize] = false;
+            let ties = &mut self.ties[stop.0 as usize];
+            ties.clear();
+            ties.push((trip, position));
+        } else if time == *slot && time != UNREACHED && !self.stay[stop.0 as usize] {
+            let ties = &mut self.ties[stop.0 as usize];
+            for (kept, kept_position) in ties.iter_mut() {
+                if *kept == trip {
+                    if position < *kept_position {
+                        *kept_position = position;
+                    }
+                    return;
+                }
+            }
+            ties.push((trip, position));
+        }
+    }
+
+    /// Whether a candidate's reach of `stop` at `time` witnesses the
+    /// final label: the arrival matches, no fewer-rides stay claimed it,
+    /// and the candidate is its trip's minimal tied boarding there.
+    fn witnesses(&self, stop: StopIdx, time: u32, trip: ViewTrip, position: u16) -> bool {
+        time != UNREACHED
+            && self.arrival[stop.0 as usize] == time
+            && !self.stay[stop.0 as usize]
+            && self.ties[stop.0 as usize]
+                .iter()
+                .any(|&(kept, kept_position)| kept == trip && kept_position == position)
     }
 }
 

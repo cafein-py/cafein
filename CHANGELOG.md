@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- The time-only TBTR transfer set is tie-complete: the precompute now
+  retains same-ride equal-arrival competitor transfers (boarding a
+  different trip; same-trip later boardings stay pruned), so the coming
+  trip-based cost matrices can reconstruct the exact journey RAPTOR's
+  tie-breaking elects. Query results are unchanged; the artifact format
+  bumps to 10 (sets persisted by earlier formats lack the competitors
+  and ask to be rebuilt), and ``tbtr_transfer_count`` reports the cached
+  set's size.
+
 - ``router="auto"`` — the new default for every ``router`` parameter: a
   query runs on the trip-based engine (TBTR/McTBTR) when the network
   carries a matching precomputed transfer set for it

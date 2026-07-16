@@ -277,6 +277,12 @@ class TransportNetwork:
         return self._core.has_tbtr_transfers
 
     @property
+    def tbtr_transfer_count(self):
+        """Number of transfers in the cached time-only TBTR set, or
+        ``None`` when none is computed (see ``compute_tbtr_transfers``)."""
+        return self._core.tbtr_transfer_count
+
+    @property
     def has_mctbtr_transfers(self):
         """Whether a cached multicriteria TBTR transfer set is present
         (see ``compute_mctbtr_transfers``)."""

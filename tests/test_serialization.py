@@ -225,6 +225,15 @@ def test_load_refuses_previous_format_versions(tmp_path):
     )
     with pytest.raises(ValueError, match=r"format 3 \(written by cafein 0\.2\.0\)"):
         TransportNetwork.load(old)
+    # Format 9 (pre tie-complete TBTR transfer sets) refuses the same way:
+    # a cached set persisted by it lacks the equal-arrival competitors the
+    # cost-row reconstruction contract needs.
+    nine = tmp_path / "v9.cafein"
+    nine.write_bytes(
+        b"CAFEINET" + (9).to_bytes(4, "little") + (5).to_bytes(2, "little") + b"0.4.0"
+    )
+    with pytest.raises(ValueError, match=r"format 9 \(written by cafein 0\.4\.0\)"):
+        TransportNetwork.load(nine)
 
 
 def test_load_refuses_corrupted_payloads(tmp_path):

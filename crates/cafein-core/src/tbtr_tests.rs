@@ -175,6 +175,144 @@ fn pareto(journeys: &[Journey]) -> Vec<(u32, usize)> {
 }
 
 #[test]
+fn equal_arrival_same_ride_competitors_both_survive_reduction() {
+    use crate::raptor::Raptor;
+
+    // Sol's tie counterexample: a source trip rides O→X→Y; trip B leaves
+    // X, trip C leaves Y, and both reach D at the same second with the
+    // same ride count. They are different journeys (different boarded
+    // trips and transfer stops), so the tie-complete reduction must keep
+    // both transfers — the old strict-improvement rule kept only C
+    // (backward walk visits Y first) and made RAPTOR's elected chain
+    // unreconstructible.
+    let mut builder = TimetableBuilder::new(4);
+    let source = builder
+        .add_pattern(&[StopIdx(0), StopIdx(1), StopIdx(2)], 0)
+        .unwrap();
+    let b = builder.add_pattern(&[StopIdx(1), StopIdx(3)], 1).unwrap();
+    let c = builder.add_pattern(&[StopIdx(2), StopIdx(3)], 2).unwrap();
+    builder
+        .add_trip(source, vec![time(0), time(20), time(40)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(b, vec![time(50), time(100)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(c, vec![time(60), time(100)], 2, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let footpaths = Transfers::empty(4);
+    let build = TransferSet::build(&timetable, &footpaths);
+    let kept = build.transfers;
+    // Both equal competitors survive: X→B off position 1, Y→C off
+    // position 2.
+    assert_eq!(
+        kept.from_trip_position(ViewTrip(0), 1),
+        &[TripTransfer {
+            trip: ViewTrip(1),
+            position: 0,
+        }]
+    );
+    assert_eq!(
+        kept.from_trip_position(ViewTrip(0), 2),
+        &[TripTransfer {
+            trip: ViewTrip(2),
+            position: 0,
+        }]
+    );
+    // Retention makes RAPTOR's elected chain reconstructible; electing it
+    // deterministically is the cost-matrix stage's scan-order work (the
+    // query scan still boards walked stops in HashMap order, so the
+    // equal-arrival winner varies per process). Times must agree either
+    // way.
+    let request = request(3, StopIdx(0), StopIdx(3), 0);
+    let raptor = Raptor.route(&timetable, &footpaths, &request);
+    let tbtr = Tbtr.route(&timetable, &footpaths, &request);
+    assert_eq!(pareto(&raptor), vec![(100, 2)]);
+    assert_eq!(pareto(&tbtr), pareto(&raptor));
+}
+
+#[test]
+fn a_same_trip_tie_is_pruned_even_when_another_trip_holds_the_label() {
+    use crate::raptor::Raptor;
+
+    // Three equal-arrival candidates off one alight, encountered in the
+    // order A, B-at-its-later-position, B-at-its-earlier-position: after
+    // A claims the label, both B boardings tie it cross-trip, but only
+    // B's earliest boarding is electable (RAPTOR boards a trip at its
+    // earliest catchable position). The later B boarding must be pruned
+    // however the tie list is ordered.
+    let mut builder = TimetableBuilder::new(6);
+    let source = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let a = builder.add_pattern(&[StopIdx(2), StopIdx(5)], 1).unwrap();
+    let b = builder
+        .add_pattern(&[StopIdx(4), StopIdx(3), StopIdx(5)], 2)
+        .unwrap();
+    builder
+        .add_trip(source, vec![time(0), time(100)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(a, vec![time(200), time(1000)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(b, vec![time(200), time(300), time(1000)], 2, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let footpaths = Transfers::from_edges(
+        6,
+        &[
+            (StopIdx(1), StopIdx(2), 60, 50.0),
+            (StopIdx(1), StopIdx(3), 60, 50.0),
+            (StopIdx(1), StopIdx(4), 60, 50.0),
+        ],
+    )
+    .unwrap();
+    let build = TransferSet::build(&timetable, &footpaths);
+    let kept = build.transfers.from_trip_position(ViewTrip(0), 1);
+    assert_eq!(kept.len(), 2);
+    assert!(kept.contains(&TripTransfer {
+        trip: ViewTrip(1),
+        position: 0,
+    }));
+    // B survives only at its earliest boarding; the later boarding died
+    // despite tying the label while trip A held it.
+    assert!(kept.contains(&TripTransfer {
+        trip: ViewTrip(2),
+        position: 0,
+    }));
+    // As above: leg-identical election is the cost-matrix stage's
+    // scan-order work; the retained set guarantees the winner exists.
+    let request = request(3, StopIdx(0), StopIdx(5), 0);
+    let raptor = Raptor.route(&timetable, &footpaths, &request);
+    let tbtr = Tbtr.route(&timetable, &footpaths, &request);
+    assert_eq!(pareto(&raptor), vec![(1000, 2)]);
+    assert_eq!(pareto(&tbtr), pareto(&raptor));
+}
+
+#[test]
+fn a_tie_against_staying_on_the_trip_still_prunes() {
+    // The source trip itself reaches D; a transfer at X to trip B ties
+    // its arrival with one more ride. RAPTOR's round-ascending tie-break
+    // elects the stayed (fewer-rides) journey, so the transfer stays
+    // prunable — tie-completeness must not weaken the Stay side.
+    let mut builder = TimetableBuilder::new(3);
+    let source = builder
+        .add_pattern(&[StopIdx(0), StopIdx(1), StopIdx(2)], 0)
+        .unwrap();
+    let b = builder.add_pattern(&[StopIdx(1), StopIdx(2)], 1).unwrap();
+    builder
+        .add_trip(source, vec![time(0), time(20), time(100)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(b, vec![time(50), time(100)], 1, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let build = TransferSet::build(&timetable, &Transfers::empty(3));
+    assert_eq!(build.generated, 1);
+    assert!(build.transfers.is_empty());
+}
+
+#[test]
 fn query_matches_raptor_on_the_crossing() {
     use crate::raptor::Raptor;
 
@@ -430,10 +568,20 @@ fn u_turns_are_dropped_at_generation() {
     // B are generated (from stop 1 at either end of its footpath,
     // and at stop 2 directly).
     assert_eq!(build.generated, 3);
-    // The reduction then collapses them to one representative — all
-    // three ride the same B trip to the same arrivals, and the
-    // latest alight position is processed first.
-    assert!(set.from_trip_position(ViewTrip(0), 1).is_empty());
+    // The tie-complete reduction still prunes same-trip redundancy: all
+    // three boardings ride the same B trip to the same arrivals, and
+    // RAPTOR boards a trip at its earliest catchable position, so the
+    // footpath boarding at the later position can never be elected and
+    // is dropped. The earliest-position boarding survives off alight 1;
+    // the direct boarding kept first off alight 2 remains as retained
+    // slack (the backward walk had already committed it).
+    assert_eq!(
+        set.from_trip_position(ViewTrip(0), 1),
+        &[TripTransfer {
+            trip: ViewTrip(1),
+            position: 0,
+        }]
+    );
     assert_eq!(
         set.from_trip_position(ViewTrip(0), 2),
         &[TripTransfer {
