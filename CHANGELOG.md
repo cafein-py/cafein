@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- The cost matrices take `router=`: `TravelCostMatrix` (time
+  candidates), `travel_cost_table`, and the point forms now run on the
+  trip-based engine with `router="tbtr"` — over the cached time
+  transfer set (`compute_tbtr_transfers`) when its date matches — and
+  `router="auto"` picks it up automatically, keeping the door-to-door
+  (Mc)ULTRA paths on RAPTOR. Rows are identical whichever engine
+  answers.
+
 - Fixed over-midnight boarding missing a faster previous-day trip. The
   day streams were merged by departure time when boarding, but a
   previous-day trip can depart later on the query clock and still

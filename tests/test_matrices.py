@@ -342,7 +342,8 @@ def test_the_tbtr_pareto_matrix_matches_mcraptor(network):
     for column in ["travel_time", "transfers", "transit_distance", "walk_distance"]:
         assert cells[0][column] == cells[1][column]
     assert cells[0]["emissions"] == pytest.approx(cells[1]["emissions"], abs=1e-6)
-    with pytest.raises(ValueError, match="candidates='pareto'"):
+    # Time candidates ride the trip-based engine too, with identical rows.
+    time_cells = [
         TravelCostMatrix(
             network,
             [origin],
@@ -351,8 +352,13 @@ def test_the_tbtr_pareto_matrix_matches_mcraptor(network):
             "08:30:00",
             optimize="emissions",
             window=1,
-            router="tbtr",
+            max_transfers=4,
+            router=router,
         )
+        for router in ("raptor", "tbtr")
+    ]
+    assert len(time_cells[0]) > 0
+    assert time_cells[1].equals(time_cells[0])
 
 
 def test_pareto_matrices_validate_their_options(network):

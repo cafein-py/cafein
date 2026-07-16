@@ -101,8 +101,10 @@ def test_explicit_router_constraints_are_unchanged(two_line_network):
         journey_frontier(*args, candidates="pareto", router="tbtr", max_slower=60)
     with pytest.raises(ValueError, match="'auto', 'raptor', or 'tbtr'"):
         journey_frontier(*args, candidates="pareto", router="fastest")
-    with pytest.raises(ValueError, match="requires candidates='pareto'"):
-        TravelCostMatrix(two_line_network, ["A"], ["B"], DATE, DEPARTURE, router="tbtr")
+    with pytest.raises(ValueError, match="'auto', 'raptor', or 'tbtr'"):
+        TravelCostMatrix(
+            two_line_network, ["A"], ["B"], DATE, DEPARTURE, router="fastest"
+        )
 
 
 def test_auto_time_matrix_matches_both_engines(two_line_network):
@@ -174,3 +176,129 @@ def test_detailed_itineraries_pareto_points_accept_tbtr(network_with_footpaths):
     )
     assert len(tbtr) > 0
     assert tbtr.drop(columns="geometry").equals(raptor.drop(columns="geometry"))
+
+
+def test_cost_matrix_routers_agree_across_cache_states(two_line_network):
+    from cafein import TravelCostMatrix
+    from test_frontier import two_line_fares
+
+    args = (two_line_network, ["A", "H"], None, DATE, DEPARTURE)
+    kwargs = dict(fares=two_line_fares())
+    raptor = TravelCostMatrix(*args, router="raptor", **kwargs)
+    assert len(raptor) > 0
+    # Without a cached set auto resolves to RAPTOR; explicit TBTR builds
+    # its set ad hoc. Rows are identical either way.
+    assert TravelCostMatrix(*args, **kwargs).equals(raptor)
+    assert TravelCostMatrix(*args, router="tbtr", **kwargs).equals(raptor)
+    # A cache for another date is ignored under auto; a matching one is
+    # ridden. The rows never change with the dispatch.
+    two_line_network.compute_tbtr_transfers("2022-02-23")
+    assert TravelCostMatrix(*args, **kwargs).equals(raptor)
+    two_line_network.compute_tbtr_transfers(DATE)
+    assert TravelCostMatrix(*args, **kwargs).equals(raptor)
+    assert TravelCostMatrix(*args, router="tbtr", **kwargs).equals(raptor)
+
+
+def test_windowed_cost_matrix_routers_agree(two_line_network):
+    from cafein import TravelCostMatrix
+    from test_frontier import two_line_fares
+
+    args = (two_line_network, ["A"], ["B"], DATE, DEPARTURE)
+    for kwargs in (
+        dict(optimize="emissions", window=1800, geometries=True),
+        # The fastest journey takes exactly 1800 s: the boundary budget.
+        dict(optimize="emissions", window=1800, within=1800),
+        dict(
+            optimize="fare",
+            window=1800,
+            fares=two_line_fares(),
+            geometries=True,
+        ),
+    ):
+        raptor = TravelCostMatrix(*args, router="raptor", **kwargs)
+        assert len(raptor) > 0
+        assert TravelCostMatrix(*args, router="tbtr", **kwargs).equals(raptor)
+        assert TravelCostMatrix(*args, **kwargs).equals(raptor)
+    # A rejecting budget empties the cells on both engines alike.
+    kwargs = dict(optimize="emissions", window=1800, within=60)
+    assert TravelCostMatrix(*args, router="raptor", **kwargs).empty
+    assert TravelCostMatrix(*args, router="tbtr", **kwargs).empty
+    two_line_network.compute_tbtr_transfers(DATE)
+    kwargs = dict(optimize="emissions", window=1800)
+    raptor = TravelCostMatrix(*args, router="raptor", **kwargs)
+    assert TravelCostMatrix(*args, **kwargs).equals(raptor)
+
+
+def test_cost_routers_agree_with_geometry_and_fares(network, helsinki_gtfs):
+    from cafein import TravelCostMatrix
+    from cafein import fares as fare_module
+
+    hsl = fare_module.zone_fare_structure(helsinki_gtfs)
+    args = (network, ["4810551", "1040602"], ["1250551"], "2022-02-22", "08:30:00")
+    kwargs = dict(geometries=True, fares=hsl)
+    # The HSL ferries have no shipped factor; the warning is part of the
+    # factor-resolution contract, not of this assertion.
+    with pytest.warns(UserWarning, match="route_type"):
+        raptor = TravelCostMatrix(*args, router="raptor", **kwargs)
+    with pytest.warns(UserWarning, match="route_type"):
+        tbtr = TravelCostMatrix(*args, router="tbtr", **kwargs)
+    assert len(raptor) > 0
+    assert raptor.fare.notna().any()
+    assert raptor.geometry.notna().any()
+    assert tbtr.equals(raptor)
+
+
+def test_point_cost_matrices_accept_tbtr(network_with_footpaths, helsinki_gtfs):
+    from cafein import TravelCostMatrix
+    from cafein import fares as fare_module
+
+    origins = gpd.GeoDataFrame(
+        {"id": ["origin"]}, geometry=[Point(24.9330, 60.1689)], crs="EPSG:4326"
+    )
+    destinations = gpd.GeoDataFrame(
+        {"id": ["destination"]}, geometry=[Point(24.9505, 60.1690)], crs="EPSG:4326"
+    )
+    args = (network_with_footpaths, origins, destinations, DATE, "08:30:00")
+    # The full payload — geometry and fare columns included.
+    payload = dict(
+        geometries=True, fares=fare_module.zone_fare_structure(helsinki_gtfs)
+    )
+    with pytest.warns(UserWarning, match="route_type"):
+        fastest_raptor = TravelCostMatrix(*args, router="raptor", **payload)
+    with pytest.warns(UserWarning, match="route_type"):
+        fastest_tbtr = TravelCostMatrix(*args, router="tbtr", **payload)
+    assert len(fastest_raptor) > 0
+    assert fastest_raptor.geometry.notna().any()
+    assert fastest_tbtr.equals(fastest_raptor)
+    kwargs = dict(optimize="emissions", window=1800, **payload)
+    with pytest.warns(UserWarning, match="route_type"):
+        least_raptor = TravelCostMatrix(*args, router="raptor", **kwargs)
+    with pytest.warns(UserWarning, match="route_type"):
+        least_tbtr = TravelCostMatrix(*args, router="tbtr", **kwargs)
+    assert len(least_raptor) > 0
+    assert least_tbtr.equals(least_raptor)
+
+
+def test_arrow_cost_table_accepts_router(two_line_network):
+    pytest.importorskip("pyarrow")
+    from cafein import TravelCostMatrix, travel_cost_table
+
+    args = (two_line_network, ["A", "H"], None, DATE, DEPARTURE)
+    table = travel_cost_table(*args, router="tbtr")
+    frame = TravelCostMatrix(*args, router="tbtr")
+    assert table.num_rows == len(frame) > 0
+    assert table.column("travel_time").to_pylist() == list(frame.travel_time)
+    assert table.column("transit_distance").to_pylist() == list(frame.transit_distance)
+    assert table.equals(travel_cost_table(*args, router="raptor"))
+
+
+def test_a_saved_cached_set_serves_auto_cost_rows(two_line_network, tmp_path):
+    from cafein import TransportNetwork, TravelCostMatrix
+
+    raptor = TravelCostMatrix(two_line_network, ["A"], None, DATE, DEPARTURE)
+    two_line_network.compute_tbtr_transfers(DATE)
+    path = tmp_path / "network.cafein"
+    two_line_network.save(path)
+    loaded = TransportNetwork.load(path)
+    assert loaded.has_tbtr_transfers
+    assert TravelCostMatrix(loaded, ["A"], None, DATE, DEPARTURE).equals(raptor)
