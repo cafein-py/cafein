@@ -1048,3 +1048,132 @@ fn point_and_fare_cost_rows_match_raptor() {
         }
     }
 }
+
+/// The two engines' single cost row for one OD on a tiny fixture.
+fn cost_cell(
+    timetable: &Timetable,
+    geometry: &crate::geometry::TripGeometry,
+    factors: &[f64],
+    services: usize,
+    destination: StopIdx,
+) -> (crate::raptor::CostRow, crate::raptor::CostRow) {
+    use crate::raptor::{CostInputs, Raptor};
+
+    let inputs = CostInputs {
+        geometry,
+        factors,
+        leg_geometry: None,
+        with_geometry: false,
+        fares: None,
+    };
+    let footpaths = Transfers::empty(timetable.stop_count());
+    let request = Request {
+        departure: 0,
+        access: vec![(StopIdx(0), 0)],
+        egress: Vec::new(),
+        active_services: vec![true; services],
+        active_services_previous: vec![false; services],
+        max_transfers: 4,
+    };
+    let requests = [request];
+    let destinations = [destination];
+    let raptor = Raptor.cost_matrix(timetable, &footpaths, &inputs, &requests, &destinations);
+    let engine = TbtrEngine::for_date(
+        timetable,
+        &footpaths,
+        &vec![true; services],
+        &vec![false; services],
+    );
+    let tbtr = engine.cost_matrix(&inputs, &requests, &destinations);
+    (tbtr[0][0].clone(), raptor[0][0].clone())
+}
+
+#[test]
+fn canonical_tie_is_independent_of_route_vs_segment_scan_order() {
+    use crate::geometry::{DistanceProvenance, TripGeometry};
+
+    // Two equal-time first rides (distinct trips on distinct patterns)
+    // catch the same connecting trip at the same position with the same
+    // ready time: only the canonical key can decide, and both engines
+    // must elect the smaller trip — asserted by the prescribed row, not
+    // merely by cross-engine agreement.
+    let mut builder = TimetableBuilder::new(3);
+    let x = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let y = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 1).unwrap();
+    let z = builder.add_pattern(&[StopIdx(1), StopIdx(2)], 2).unwrap();
+    builder
+        .add_trip(x, vec![time(100), time(200)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(y, vec![time(100), time(200)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(z, vec![time(300), time(400)], 2, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 500.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 700.0], DistanceProvenance::CrowFly),
+            (TripIdx(2), vec![0.0, 900.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let (tbtr, raptor) = cost_cell(&timetable, &geometry, &[10.0, 20.0, 30.0], 3, StopIdx(2));
+    // The canonical winner rides trip 0 (the smaller trip index), never
+    // trip 1: 500 m + 900 m.
+    assert_eq!(raptor.transit_meters, 1400.0);
+    assert_eq!(
+        tbtr.transit_meters.to_bits(),
+        raptor.transit_meters.to_bits()
+    );
+    assert_eq!(
+        tbtr.emission_grams.to_bits(),
+        raptor.emission_grams.to_bits()
+    );
+    assert_eq!((tbtr.seconds, tbtr.rides), (raptor.seconds, raptor.rides));
+}
+
+#[test]
+fn same_trip_same_board_uses_the_earlier_ready_parent() {
+    use crate::geometry::{DistanceProvenance, TripGeometry};
+
+    // Two upstream chains catch the same trip at the same position, but
+    // one parent reaches the boarding stop strictly earlier. The
+    // earlier-ready parent wins even though the later one rides the
+    // smaller trip index — ready first, canonical key only on exact
+    // ready ties (RAPTOR boards from the stop's label).
+    let mut builder = TimetableBuilder::new(3);
+    // Trip 0 (the smaller index) arrives later; trip 1 earlier.
+    let y = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let x = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 1).unwrap();
+    let z = builder.add_pattern(&[StopIdx(1), StopIdx(2)], 2).unwrap();
+    builder
+        .add_trip(y, vec![time(100), time(250)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(x, vec![time(100), time(150)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(z, vec![time(300), time(400)], 2, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 700.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 500.0], DistanceProvenance::CrowFly),
+            (TripIdx(2), vec![0.0, 900.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let (tbtr, raptor) = cost_cell(&timetable, &geometry, &[10.0, 20.0, 30.0], 3, StopIdx(2));
+    // The earlier-ready parent (trip 1, 500 m) wins: 500 m + 900 m.
+    assert_eq!(raptor.transit_meters, 1400.0);
+    assert_eq!(
+        tbtr.transit_meters.to_bits(),
+        raptor.transit_meters.to_bits()
+    );
+    assert_eq!((tbtr.seconds, tbtr.rides), (raptor.seconds, raptor.rides));
+}
