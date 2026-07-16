@@ -746,3 +746,133 @@ fn cost_rows_match_raptor_on_the_tie_fixtures() {
         4,
     );
 }
+
+#[test]
+fn least_cost_rows_match_raptor_on_the_tie_fixtures() {
+    use crate::geometry::{DistanceProvenance, TripGeometry};
+    use crate::raptor::{CostInputs, Objective, Raptor};
+
+    // The three-way tie fixture again, now over a departure window with
+    // both objectives and budgets that pass, bind exactly, and reject.
+    let mut builder = TimetableBuilder::new(6);
+    let source = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let a = builder.add_pattern(&[StopIdx(2), StopIdx(5)], 1).unwrap();
+    let b = builder
+        .add_pattern(&[StopIdx(4), StopIdx(3), StopIdx(5)], 2)
+        .unwrap();
+    builder
+        .add_trip(source, vec![time(0), time(100)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(source, vec![time(300), time(400)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(a, vec![time(200), time(1000)], 2, 0)
+        .unwrap();
+    builder
+        .add_trip(a, vec![time(500), time(1200)], 3, 0)
+        .unwrap();
+    builder
+        .add_trip(b, vec![time(200), time(300), time(1000)], 4, 0)
+        .unwrap();
+    builder
+        .add_trip(b, vec![time(500), time(600), time(1400)], 5, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 700.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 700.0], DistanceProvenance::CrowFly),
+            (TripIdx(2), vec![0.0, 900.0], DistanceProvenance::CrowFly),
+            (TripIdx(3), vec![0.0, 950.0], DistanceProvenance::CrowFly),
+            (
+                TripIdx(4),
+                vec![0.0, 400.0, 1300.0],
+                DistanceProvenance::CrowFly,
+            ),
+            (
+                TripIdx(5),
+                vec![0.0, 420.0, 1350.0],
+                DistanceProvenance::CrowFly,
+            ),
+        ],
+    )
+    .unwrap();
+    let footpaths = Transfers::from_edges(
+        6,
+        &[
+            (StopIdx(1), StopIdx(2), 60, 50.0),
+            (StopIdx(1), StopIdx(3), 60, 55.0),
+            (StopIdx(1), StopIdx(4), 60, 65.0),
+        ],
+    )
+    .unwrap();
+    // NaN factor on one trip exercises unresolved-emission candidates.
+    let factors = [40.0, 40.0, 90.0, f64::NAN, 25.0, 25.0];
+    let inputs = CostInputs {
+        geometry: &geometry,
+        factors: &factors,
+        leg_geometry: None,
+        with_geometry: false,
+        fares: None,
+    };
+    let stop_count = timetable.stop_count();
+    let destinations: Vec<StopIdx> = (0..stop_count).map(StopIdx).collect();
+    let requests: Vec<Request> = (0..stop_count)
+        .map(|origin| Request {
+            departure: 0,
+            access: vec![(StopIdx(origin), 0)],
+            egress: Vec::new(),
+            active_services: vec![true; 6],
+            active_services_previous: vec![false; 6],
+            max_transfers: 4,
+        })
+        .collect();
+    let engine = TbtrEngine::for_date(&timetable, &footpaths, &[true; 6], &[false; 6]);
+    for objective in [Objective::Emissions, Objective::Fare] {
+        for budget in [None, Some(1000), Some(999), Some(10)] {
+            let raptor = Raptor.least_cost_matrix(
+                &timetable,
+                &footpaths,
+                &inputs,
+                &requests,
+                &destinations,
+                600,
+                budget,
+                objective,
+            );
+            let tbtr =
+                engine.least_cost_matrix(&inputs, &requests, &destinations, 600, budget, objective);
+            assert_eq!(tbtr.len(), raptor.len());
+            for (origin, (t_rows, r_rows)) in tbtr.iter().zip(&raptor).enumerate() {
+                assert_eq!(
+                    t_rows.len(),
+                    r_rows.len(),
+                    "rows for origin {origin} ({objective:?}, {budget:?})"
+                );
+                for (t, r) in t_rows.iter().zip(r_rows) {
+                    let cell = format!("origin {origin} -> {} ({objective:?}, {budget:?})", r.to);
+                    assert_eq!(t.to, r.to, "{cell}: to");
+                    assert_eq!(t.seconds, r.seconds, "{cell}: seconds");
+                    assert_eq!(t.rides, r.rides, "{cell}: rides");
+                    assert_eq!(
+                        t.transit_meters.to_bits(),
+                        r.transit_meters.to_bits(),
+                        "{cell}: transit meters"
+                    );
+                    assert_eq!(
+                        t.walk_meters.to_bits(),
+                        r.walk_meters.to_bits(),
+                        "{cell}: walk meters"
+                    );
+                    assert_eq!(
+                        t.emission_grams.to_bits(),
+                        r.emission_grams.to_bits(),
+                        "{cell}: grams"
+                    );
+                }
+            }
+        }
+    }
+}

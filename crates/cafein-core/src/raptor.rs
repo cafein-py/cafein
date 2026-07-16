@@ -90,7 +90,11 @@ impl Objective {
 /// Keeps the better of an existing candidate and a challenger on the
 /// objective: a lower key wins, equal keys resolve toward the shorter
 /// travel time. NaN keys never qualify.
-fn fold_better(current: &mut Option<CostRow>, challenger: CostRow, objective: Objective) {
+pub(crate) fn fold_better(
+    current: &mut Option<CostRow>,
+    challenger: CostRow,
+    objective: Objective,
+) {
     let key = objective.key(&challenger);
     if key.is_nan() {
         return;

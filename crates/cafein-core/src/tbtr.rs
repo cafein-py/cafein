@@ -1646,6 +1646,95 @@ impl<'a> TbtrEngine<'a> {
             .collect()
     }
 
+    /// The objective-best journey's costs within a travel-time budget,
+    /// per destination, over a departure window — the TBTR counterpart
+    /// of `Raptor::least_cost_matrix`, with `Search::fold_best`'s exact
+    /// admission order: per-round suffix thresholds first (strict), the
+    /// budget second, reconstruction third, the objective fold last.
+    #[allow(clippy::too_many_arguments)]
+    pub fn least_cost_matrix(
+        &self,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        destinations: &[StopIdx],
+        window: u32,
+        budget: Option<u32>,
+        objective: crate::raptor::Objective,
+    ) -> Vec<Vec<CostRow>> {
+        requests
+            .par_iter()
+            .map_init(
+                || None,
+                |pooled: &mut Option<MatrixState>, request| {
+                    let state = match pooled {
+                        Some(state) if state.rounds == request.max_transfers as usize + 1 => {
+                            state.reset(self);
+                            state
+                        }
+                        _ => pooled.insert(MatrixState::new(self, request.max_transfers)),
+                    };
+                    let departures =
+                        crate::raptor::departure_candidates(self.timetable, request, window);
+                    let mut thresholds = vec![UNREACHED; destinations.len() * (state.rounds + 1)];
+                    let mut best: Vec<Option<CostRow>> = vec![None; destinations.len()];
+                    for &departure in &departures {
+                        self.matrix_pass(departure, &request.access, state);
+                        self.fold_matrix_best(
+                            state,
+                            departure,
+                            destinations,
+                            budget,
+                            inputs,
+                            None,
+                            objective,
+                            &mut thresholds,
+                            &mut best,
+                        );
+                    }
+                    best.into_iter().flatten().collect()
+                },
+            )
+            .collect()
+    }
+
+    /// One pass's fold onto the per-destination bests — the mirror of
+    /// `Search::fold_best`. Stale slots from later departures fail the
+    /// strict threshold and are never reconstructed, so each fold reads
+    /// a consistent snapshot of what its pass improved.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_matrix_best(
+        &self,
+        state: &MatrixState,
+        departure: u32,
+        destinations: &[StopIdx],
+        budget: Option<u32>,
+        inputs: &CostInputs<'_>,
+        access_meters: Option<&HashMap<StopIdx, f64>>,
+        objective: crate::raptor::Objective,
+        thresholds: &mut [u32],
+        best: &mut [Option<CostRow>],
+    ) {
+        for (slot, &stop) in destinations.iter().enumerate() {
+            let thresholds = &mut thresholds[slot * (state.rounds + 1)..][..state.rounds + 1];
+            for round in 0..=state.rounds {
+                let arrival = state.tau_at(stop, round);
+                if arrival >= thresholds[round] {
+                    continue;
+                }
+                for threshold in &mut thresholds[round..] {
+                    *threshold = (*threshold).min(arrival);
+                }
+                let seconds = arrival - departure;
+                if budget.is_some_and(|budget| seconds > budget) {
+                    continue;
+                }
+                let mut row = self.matrix_cost_row(state, stop, round, inputs, access_meters);
+                row.seconds = seconds;
+                crate::raptor::fold_better(&mut best[slot], row, objective);
+            }
+        }
+    }
+
     fn horizons(&self, rounds: usize) -> Vec<u16> {
         let mut horizons = Vec::with_capacity(self.view.trip_count() as usize * rounds);
         for trip in 0..self.view.trip_count() {
