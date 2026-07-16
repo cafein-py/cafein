@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use rayon::prelude::*;
 
 use crate::journey::{Journey, Leg};
+use crate::path_key::{challenger_wins, PathToken};
 use crate::raptor::{CostInputs, CostRow};
 use crate::router::{Request, TransitRouter};
 use crate::timetable::{PatternIdx, StopIdx, StopTime, Timetable, TripIdx};
@@ -433,8 +434,13 @@ struct Segment {
 }
 
 enum SegmentOrigin {
-    /// Seeded from the origin: the access stop and its walk.
-    Access { stop: StopIdx, seconds: u32 },
+    /// Seeded from the origin: the access stop, its walk, and the
+    /// pass departure that seeded it (the canonical chain root).
+    Access {
+        stop: StopIdx,
+        seconds: u32,
+        departure: u32,
+    },
     /// Reached by a transfer leaving `parent` at `alight`.
     Transfer { parent: u32, alight: u16 },
 }
@@ -456,8 +462,13 @@ struct Target {
 #[derive(Clone, Copy)]
 enum StopWinner {
     Unreached,
-    /// Reached by the access walk alone (round 0).
-    Access,
+    /// Reached by the access walk alone (round 0), leaving at
+    /// `departure` and walking `seconds` — the chain root the canonical
+    /// path key compares.
+    Access {
+        departure: u32,
+        seconds: u32,
+    },
     /// Alighted `arena[segment]` at `alight`.
     Alight {
         segment: u32,
@@ -492,6 +503,15 @@ pub struct MatrixState {
     /// and their same-round walks — RAPTOR's `tau` shape.
     tau: Vec<u32>,
     winners: Vec<StopWinner>,
+    /// The unscanned queue owner per `(view trip, round)` (an arena
+    /// index; `u32::MAX` empty): an equal-boarding segment offered
+    /// while the owner is still pending replaces its origin when the
+    /// challenger's parent chain is canonical — the pre-label tie site
+    /// a horizon rejection would otherwise discard silently.
+    pending: Vec<u32>,
+    /// Reusable scratch for canonical-key comparisons on exact ties.
+    key_scratch_a: Vec<crate::path_key::PathToken>,
+    key_scratch_b: Vec<crate::path_key::PathToken>,
 }
 
 impl MatrixState {
@@ -509,6 +529,9 @@ impl MatrixState {
             walked: WalkedScratch::new(stop_count),
             tau: vec![UNREACHED; stop_count * (rounds + 1)],
             winners: vec![StopWinner::Unreached; stop_count * (rounds + 1)],
+            pending: vec![u32::MAX; engine.view.trip_count() as usize * rounds],
+            key_scratch_a: Vec::new(),
+            key_scratch_b: Vec::new(),
         }
     }
 
@@ -525,6 +548,7 @@ impl MatrixState {
         self.walked.clear();
         self.tau.fill(UNREACHED);
         self.winners.fill(StopWinner::Unreached);
+        self.pending.fill(u32::MAX);
     }
 
     fn tau_at(&self, stop: StopIdx, round: usize) -> u32 {
@@ -536,6 +560,33 @@ impl MatrixState {
         self.tau[slot] = arrival;
         self.winners[slot] = winner;
     }
+
+    fn winner_at(&self, stop: StopIdx, round: usize) -> StopWinner {
+        self.winners[stop.0 as usize * (self.rounds + 1) + round]
+    }
+}
+
+/// The profile scan's at-most-round label improvement, shared by the
+/// matrix pass: a suffix write over the non-increasing round axis.
+fn improve_labels(
+    labels: &mut [u32],
+    rounds: usize,
+    stop: StopIdx,
+    time: u32,
+    round: usize,
+) -> bool {
+    let base = stop.0 as usize * rounds;
+    if time >= labels[base + round] {
+        return false;
+    }
+    for slot in &mut labels[base + round..base + rounds] {
+        if time < *slot {
+            *slot = time;
+        } else {
+            break;
+        }
+    }
+    true
 }
 
 impl<'a> TbtrEngine<'a> {
@@ -1275,46 +1326,48 @@ impl<'a> TbtrEngine<'a> {
     /// pattern length.
     /// One scan of a departure onto a `MatrixState`: the profile scan
     /// stripped of destination targets and journey assembly, writing
-    /// exact-round arrivals and winner records instead. State persists
-    /// across strictly decreasing departures (rTBTR), so an origin's
-    /// window runs passes on one state; `reset` recycles it between
-    /// origins.
+    /// exact-round arrivals and winner records instead — with the
+    /// canonical path key electing among exact arrival ties at every
+    /// site an equal-time alternative could otherwise be discarded
+    /// (access seeds, alights, walks, and equal boardings of a pending
+    /// queue owner). State persists across strictly decreasing
+    /// departures (rTBTR); `reset` recycles it between origins.
     pub fn matrix_pass(&self, departure: u32, access: &[(StopIdx, u32)], state: &mut MatrixState) {
         let rounds = state.rounds;
-        let improve = |labels: &mut Vec<u32>, stop: StopIdx, time: u32, round: usize| {
-            let base = stop.0 as usize * rounds;
-            if time >= labels[base + round] {
-                return false;
-            }
-            for slot in &mut labels[base + round..base + rounds] {
-                if time < *slot {
-                    *slot = time;
-                } else {
-                    break;
-                }
-            }
-            true
-        };
         for &(stop, seconds) in access {
             let at = departure.saturating_add(seconds);
-            improve(&mut state.labels, stop, at, 0);
+            improve_labels(&mut state.labels, rounds, stop, at, 0);
             if at < state.tau_at(stop, 0) {
-                state.record(stop, 0, at, StopWinner::Access);
+                state.record(stop, 0, at, StopWinner::Access { departure, seconds });
+            } else if at == state.tau_at(stop, 0) && at != UNREACHED {
+                let mut challenger = std::mem::take(&mut state.key_scratch_a);
+                let mut incumbent = std::mem::take(&mut state.key_scratch_b);
+                challenger.clear();
+                challenger.push(PathToken::Access {
+                    stop: stop.0,
+                    duration: seconds,
+                });
+                incumbent.clear();
+                let incumbent_root = self.winner_tokens_into(state, stop, 0, &mut incumbent);
+                if challenger_wins(departure, &challenger, incumbent_root, &incumbent) {
+                    state.record(stop, 0, at, StopWinner::Access { departure, seconds });
+                }
+                state.key_scratch_a = challenger;
+                state.key_scratch_b = incumbent;
             }
         }
-        self.seed(
-            departure,
-            access,
-            &mut state.reached,
-            rounds,
-            &mut state.arena,
-            &mut state.queues[0],
-        );
+        self.seed_matrix(departure, access, state);
         for round in 0..rounds {
             if state.queues[round].is_empty() {
                 break;
             }
             let segments = std::mem::take(&mut state.queues[round]);
+            // The drained queue is scanned: its owners stop being
+            // pending for origin replacement.
+            for &(segment, _) in &segments {
+                let trip = state.arena[segment as usize].trip;
+                state.pending[trip.0 as usize * rounds + round] = u32::MAX;
+            }
             state.walked.clear();
             for &(segment, end) in &segments {
                 let trip = state.arena[segment as usize].trip;
@@ -1330,42 +1383,31 @@ impl<'a> TbtrEngine<'a> {
                     // Walks relax only from arrivals that improve the
                     // stop's at-most-round label — RAPTOR's marked-stop
                     // semantics; the same improvements write the
-                    // exact-round winner the reconstruction walks.
-                    if improve(&mut state.labels, stop, arrival, round) {
+                    // exact-round winner the cost reconstruction walks.
+                    if improve_labels(&mut state.labels, rounds, stop, arrival, round) {
                         state.record(
                             stop,
                             round + 1,
                             arrival,
                             StopWinner::Alight { segment, alight },
                         );
-                        for footpath in self.footpaths.from_stop(stop) {
-                            let walked_at = arrival.saturating_add(footpath.duration);
-                            if improve(&mut state.labels, footpath.to, walked_at, round) {
-                                state.record(
-                                    footpath.to,
-                                    round + 1,
-                                    walked_at,
-                                    StopWinner::Walked {
-                                        segment,
-                                        alight,
-                                        from: stop,
-                                    },
-                                );
-                                state
-                                    .walked
-                                    .insert(footpath.to.0, (walked_at, segment, alight));
-                            }
+                        self.relax_matrix_walks(state, stop, arrival, segment, alight, round);
+                    } else if arrival == state.tau_at(stop, round + 1) && arrival != UNREACHED {
+                        if self.alight_tie_wins(state, stop, round + 1, segment, alight) {
+                            state.record(
+                                stop,
+                                round + 1,
+                                arrival,
+                                StopWinner::Alight { segment, alight },
+                            );
+                            self.relax_matrix_walks(state, stop, arrival, segment, alight, round);
                         }
                     }
                     if round + 1 < rounds {
                         for transfer in self.set.from_trip_position(trip, alight) {
-                            enqueue(
-                                &self.view,
-                                &mut state.reached,
-                                rounds,
+                            self.enqueue_matrix(
+                                state,
                                 round + 1,
-                                &mut state.arena,
-                                &mut state.queues[round + 1],
                                 Segment {
                                     trip: transfer.trip,
                                     board: transfer.position,
@@ -1380,22 +1422,548 @@ impl<'a> TbtrEngine<'a> {
                 }
             }
             if round + 1 < rounds {
-                let boardings: Vec<(u32, (u32, u32, u16))> = state.walked.iter().collect();
-                for (stop, (ready, parent, alight)) in boardings {
-                    self.board_walked(
+                let improved: Vec<u32> = state.walked.iter().map(|(stop, _)| stop).collect();
+                for stop in improved {
+                    // Board from the stop's *final* winner: a canonical
+                    // tie replacement may have installed a different
+                    // walked chain, or a direct alight — whose boardings
+                    // the precomputed transfer set already covers.
+                    let StopWinner::Walked {
+                        segment, alight, ..
+                    } = state.winner_at(StopIdx(stop), round + 1)
+                    else {
+                        continue;
+                    };
+                    let ready = state.tau_at(StopIdx(stop), round + 1);
+                    self.board_walked_matrix(
+                        state,
                         StopIdx(stop),
                         ready,
-                        parent,
+                        segment,
                         alight,
-                        &mut state.reached,
-                        rounds,
                         round + 1,
-                        &mut state.arena,
-                        &mut state.queues[round + 1],
                     );
                 }
             }
         }
+    }
+
+    /// One footpath hop from a freshly recorded alight, with the same
+    /// strict-then-canonical admission as the alight itself.
+    fn relax_matrix_walks(
+        &self,
+        state: &mut MatrixState,
+        stop: StopIdx,
+        arrival: u32,
+        segment: u32,
+        alight: u16,
+        round: usize,
+    ) {
+        let rounds = state.rounds;
+        for footpath in self.footpaths.from_stop(stop) {
+            let walked_at = arrival.saturating_add(footpath.duration);
+            if improve_labels(&mut state.labels, rounds, footpath.to, walked_at, round) {
+                state.record(
+                    footpath.to,
+                    round + 1,
+                    walked_at,
+                    StopWinner::Walked {
+                        segment,
+                        alight,
+                        from: stop,
+                    },
+                );
+                state
+                    .walked
+                    .insert(footpath.to.0, (walked_at, segment, alight));
+            } else if walked_at == state.tau_at(footpath.to, round + 1) && walked_at != UNREACHED {
+                let mut challenger = std::mem::take(&mut state.key_scratch_a);
+                let mut incumbent = std::mem::take(&mut state.key_scratch_b);
+                challenger.clear();
+                challenger.push(PathToken::Walk {
+                    from: stop.0,
+                    to: footpath.to.0,
+                    duration: footpath.duration,
+                });
+                let root = self.segment_tokens_into(state, segment, alight, &mut challenger);
+                incumbent.clear();
+                let incumbent_root =
+                    self.winner_tokens_into(state, footpath.to, round + 1, &mut incumbent);
+                let wins = challenger_wins(root, &challenger, incumbent_root, &incumbent);
+                state.key_scratch_a = challenger;
+                state.key_scratch_b = incumbent;
+                if wins {
+                    state.record(
+                        footpath.to,
+                        round + 1,
+                        walked_at,
+                        StopWinner::Walked {
+                            segment,
+                            alight,
+                            from: stop,
+                        },
+                    );
+                    state
+                        .walked
+                        .insert(footpath.to.0, (walked_at, segment, alight));
+                }
+            }
+        }
+    }
+
+    /// Whether an equal-arrival alight canonically replaces the winner
+    /// at `(stop, round_slot)`.
+    fn alight_tie_wins(
+        &self,
+        state: &mut MatrixState,
+        stop: StopIdx,
+        round_slot: usize,
+        segment: u32,
+        alight: u16,
+    ) -> bool {
+        let mut challenger = std::mem::take(&mut state.key_scratch_a);
+        let mut incumbent = std::mem::take(&mut state.key_scratch_b);
+        challenger.clear();
+        let root = self.segment_tokens_into(state, segment, alight, &mut challenger);
+        incumbent.clear();
+        let incumbent_root = self.winner_tokens_into(state, stop, round_slot, &mut incumbent);
+        let wins = challenger_wins(root, &challenger, incumbent_root, &incumbent);
+        state.key_scratch_a = challenger;
+        state.key_scratch_b = incumbent;
+        wins
+    }
+
+    /// Seeds round 0 onto the matrix state, electing canonically among
+    /// equal boardings.
+    fn seed_matrix(&self, departure: u32, access: &[(StopIdx, u32)], state: &mut MatrixState) {
+        for &(stop, seconds) in access {
+            let ready = departure.saturating_add(seconds);
+            for served in self.timetable.patterns_at_stop(stop) {
+                for line in self
+                    .view
+                    .lines_of_pattern(served.pattern)
+                    .into_iter()
+                    .flatten()
+                {
+                    let Some(boarded) = earliest_boardable(
+                        &self.view,
+                        self.timetable,
+                        line,
+                        served.position,
+                        ready,
+                    ) else {
+                        continue;
+                    };
+                    self.enqueue_matrix(
+                        state,
+                        0,
+                        Segment {
+                            trip: boarded,
+                            board: served.position,
+                            origin: SegmentOrigin::Access {
+                                stop,
+                                seconds,
+                                departure,
+                            },
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Boards every line catchable at a walked stop, canonically.
+    fn board_walked_matrix(
+        &self,
+        state: &mut MatrixState,
+        stop: StopIdx,
+        ready: u32,
+        parent: u32,
+        alight: u16,
+        round: usize,
+    ) {
+        for served in self.timetable.patterns_at_stop(stop) {
+            for line in self
+                .view
+                .lines_of_pattern(served.pattern)
+                .into_iter()
+                .flatten()
+            {
+                let Some(boarded) =
+                    earliest_boardable(&self.view, self.timetable, line, served.position, ready)
+                else {
+                    continue;
+                };
+                self.enqueue_matrix(
+                    state,
+                    round,
+                    Segment {
+                        trip: boarded,
+                        board: served.position,
+                        origin: SegmentOrigin::Transfer { parent, alight },
+                    },
+                );
+            }
+        }
+    }
+
+    /// `enqueue` with the pre-label tie site: an equal boarding of a
+    /// still-pending queue owner replaces the owner's origin when the
+    /// challenger's parent chain is canonical. A horizon rejection
+    /// would otherwise discard the canonical chain before any label
+    /// write could compare it.
+    fn enqueue_matrix(&self, state: &mut MatrixState, round: usize, segment: Segment) {
+        let rounds = state.rounds;
+        let trip = segment.trip;
+        let board = segment.board;
+        let slot = trip.0 as usize * rounds + round;
+        if board > state.reached[slot] {
+            return;
+        }
+        if board < state.reached[slot] {
+            // A strictly earlier boarding while the owner is still
+            // pending replaces it in place, inheriting its scan end: a
+            // same-trip later boarding reaches every shared position at
+            // the same second and is never electable (RAPTOR boards at
+            // the earliest catchable position), so its chain must not
+            // keep the positions beyond the merged range to itself.
+            let owner = state.pending[slot];
+            if owner != u32::MAX {
+                state.arena[owner as usize].board = board;
+                state.arena[owner as usize].origin = segment.origin;
+                let line_end = self.view.line_trips(self.view.line_of(trip)).end;
+                for later in trip.0..line_end {
+                    let base = later as usize * rounds;
+                    for horizon in &mut state.reached[base + round..base + rounds] {
+                        *horizon = (*horizon).min(board);
+                    }
+                }
+                return;
+            }
+        }
+        if board == state.reached[slot] {
+            let owner = state.pending[slot];
+            if owner != u32::MAX && state.arena[owner as usize].board == board {
+                let owner_origin = match &state.arena[owner as usize].origin {
+                    SegmentOrigin::Access {
+                        stop,
+                        seconds,
+                        departure,
+                    } => SegmentOrigin::Access {
+                        stop: *stop,
+                        seconds: *seconds,
+                        departure: *departure,
+                    },
+                    SegmentOrigin::Transfer { parent, alight } => SegmentOrigin::Transfer {
+                        parent: *parent,
+                        alight: *alight,
+                    },
+                };
+                // RAPTOR boards from the stop's label — the earliest
+                // arrival — so the parent that reaches the boarding
+                // first wins outright; the canonical key only breaks an
+                // exact ready tie.
+                let challenger_ready = self.origin_ready(state, &segment.origin, board, trip);
+                let owner_ready = self.origin_ready(state, &owner_origin, board, trip);
+                if challenger_ready < owner_ready {
+                    state.arena[owner as usize].origin = segment.origin;
+                } else if challenger_ready == owner_ready {
+                    let mut challenger = std::mem::take(&mut state.key_scratch_a);
+                    let mut incumbent = std::mem::take(&mut state.key_scratch_b);
+                    challenger.clear();
+                    let root = self.origin_tokens_into(
+                        state,
+                        &segment.origin,
+                        board,
+                        trip,
+                        &mut challenger,
+                    );
+                    incumbent.clear();
+                    let incumbent_root =
+                        self.origin_tokens_into(state, &owner_origin, board, trip, &mut incumbent);
+                    let wins = challenger_wins(root, &challenger, incumbent_root, &incumbent);
+                    state.key_scratch_a = challenger;
+                    state.key_scratch_b = incumbent;
+                    if wins {
+                        state.arena[owner as usize].origin = segment.origin;
+                    }
+                }
+            }
+            return;
+        }
+        state.queues[round].push((state.arena.len() as u32, state.reached[slot]));
+        state.pending[slot] = state.arena.len() as u32;
+        state.arena.push(segment);
+        let line_end = self.view.line_trips(self.view.line_of(trip)).end;
+        for later in trip.0..line_end {
+            let base = later as usize * rounds;
+            for horizon in &mut state.reached[base + round..base + rounds] {
+                *horizon = (*horizon).min(board);
+            }
+        }
+    }
+
+    /// When the chain behind a boarding is ready at its boarding stop:
+    /// the parent's alight arrival plus the walk into the stop, or the
+    /// access arrival.
+    fn origin_ready(
+        &self,
+        state: &MatrixState,
+        origin: &SegmentOrigin,
+        board: u16,
+        trip: ViewTrip,
+    ) -> u32 {
+        let line = self.view.line_of(trip);
+        let board_stop = self.timetable.pattern_stops(self.view.line_pattern(line))[board as usize];
+        match origin {
+            SegmentOrigin::Access {
+                stop,
+                seconds,
+                departure,
+            } => {
+                let at = departure.saturating_add(*seconds);
+                if *stop != board_stop {
+                    at.saturating_add(self.walk_duration(*stop, board_stop))
+                } else {
+                    at
+                }
+            }
+            SegmentOrigin::Transfer { parent, alight } => {
+                let parent_entry = &state.arena[*parent as usize];
+                let parent_line = self.view.line_of(parent_entry.trip);
+                let parent_stop = self
+                    .timetable
+                    .pattern_stops(self.view.line_pattern(parent_line))[*alight as usize];
+                let times = self.view.stored_times(self.timetable, parent_entry.trip);
+                let at = times[*alight as usize].arrival - self.view.line_day_offset(parent_line);
+                if parent_stop != board_stop {
+                    at.saturating_add(self.walk_duration(parent_stop, board_stop))
+                } else {
+                    at
+                }
+            }
+        }
+    }
+
+    /// Appends the canonical tokens of the chain *behind* a boarding —
+    /// the walk into the boarding stop (if any) plus the parent chain —
+    /// and returns its root departure.
+    fn origin_tokens_into(
+        &self,
+        state: &MatrixState,
+        origin: &SegmentOrigin,
+        board: u16,
+        trip: ViewTrip,
+        out: &mut Vec<PathToken>,
+    ) -> u32 {
+        let line = self.view.line_of(trip);
+        let board_stop = self.timetable.pattern_stops(self.view.line_pattern(line))[board as usize];
+        match origin {
+            SegmentOrigin::Access {
+                stop,
+                seconds,
+                departure,
+            } => {
+                if *stop != board_stop {
+                    out.push(PathToken::Walk {
+                        from: stop.0,
+                        to: board_stop.0,
+                        duration: self.walk_duration(*stop, board_stop),
+                    });
+                }
+                out.push(PathToken::Access {
+                    stop: stop.0,
+                    duration: *seconds,
+                });
+                *departure
+            }
+            SegmentOrigin::Transfer { parent, alight } => {
+                let parent_entry = &state.arena[*parent as usize];
+                let parent_line = self.view.line_of(parent_entry.trip);
+                let parent_stop = self
+                    .timetable
+                    .pattern_stops(self.view.line_pattern(parent_line))[*alight as usize];
+                if parent_stop != board_stop {
+                    out.push(PathToken::Walk {
+                        from: parent_stop.0,
+                        to: board_stop.0,
+                        duration: self.walk_duration(parent_stop, board_stop),
+                    });
+                }
+                self.segment_tokens_into(state, *parent, *alight, out)
+            }
+        }
+    }
+
+    /// Appends the canonical tokens of an alighted segment chain,
+    /// destination → origin, and returns its root departure.
+    fn segment_tokens_into(
+        &self,
+        state: &MatrixState,
+        segment: u32,
+        alight: u16,
+        out: &mut Vec<PathToken>,
+    ) -> u32 {
+        let mut segment = segment;
+        let mut alight = alight;
+        loop {
+            let entry = &state.arena[segment as usize];
+            let backing = self.view.backing(entry.trip);
+            out.push(PathToken::Ride {
+                trip: backing.0,
+                day_offset: self.view.day_offset(entry.trip),
+                board: entry.board,
+                alight,
+            });
+            match &entry.origin {
+                SegmentOrigin::Access {
+                    stop,
+                    seconds,
+                    departure,
+                } => {
+                    out.push(PathToken::Access {
+                        stop: stop.0,
+                        duration: *seconds,
+                    });
+                    return *departure;
+                }
+                SegmentOrigin::Transfer {
+                    parent,
+                    alight: parent_alight,
+                } => {
+                    let line = self.view.line_of(entry.trip);
+                    let board_stop = self.timetable.pattern_stops(self.view.line_pattern(line))
+                        [entry.board as usize];
+                    let parent_entry = &state.arena[*parent as usize];
+                    let parent_line = self.view.line_of(parent_entry.trip);
+                    let parent_stop = self
+                        .timetable
+                        .pattern_stops(self.view.line_pattern(parent_line))
+                        [*parent_alight as usize];
+                    if parent_stop != board_stop {
+                        out.push(PathToken::Walk {
+                            from: parent_stop.0,
+                            to: board_stop.0,
+                            duration: self.walk_duration(parent_stop, board_stop),
+                        });
+                    }
+                    let next = *parent;
+                    alight = *parent_alight;
+                    segment = next;
+                }
+            }
+        }
+    }
+
+    /// Appends the canonical tokens behind a stop's recorded winner and
+    /// returns its root departure.
+    fn winner_tokens_into(
+        &self,
+        state: &MatrixState,
+        stop: StopIdx,
+        round_slot: usize,
+        out: &mut Vec<PathToken>,
+    ) -> u32 {
+        match state.winner_at(stop, round_slot) {
+            StopWinner::Unreached => {
+                unreachable!("canonical key walked an unreached winner")
+            }
+            StopWinner::Access { departure, seconds } => {
+                out.push(PathToken::Access {
+                    stop: stop.0,
+                    duration: seconds,
+                });
+                departure
+            }
+            StopWinner::Alight { segment, alight } => {
+                self.segment_tokens_into(state, segment, alight, out)
+            }
+            StopWinner::Walked {
+                segment,
+                alight,
+                from,
+            } => {
+                out.push(PathToken::Walk {
+                    from: from.0,
+                    to: stop.0,
+                    duration: self.walk_duration(from, stop),
+                });
+                self.segment_tokens_into(state, segment, alight, out)
+            }
+        }
+    }
+
+    /// Temporary referee diagnostic: the canonical token chains behind a
+    /// stop's matrix winners, Debug-formatted per reached round slot.
+    #[doc(hidden)]
+    pub fn debug_matrix_chains(
+        &self,
+        state: &MatrixState,
+        stop: StopIdx,
+    ) -> Vec<(usize, u32, u32, Vec<String>)> {
+        let mut chains = Vec::new();
+        for round in 0..=state.rounds {
+            let tau = state.tau_at(stop, round);
+            if tau == UNREACHED {
+                continue;
+            }
+            let mut tokens = Vec::new();
+            let root = self.winner_tokens_into(state, stop, round, &mut tokens);
+            chains.push((
+                round,
+                tau,
+                root,
+                tokens.iter().map(|token| format!("{token:?}")).collect(),
+            ));
+        }
+        chains
+    }
+
+    /// Temporary referee diagnostic: the retained transfers leaving a
+    /// backing trip at a position, as (backing trip, board position).
+    #[doc(hidden)]
+    pub fn debug_transfers_from(&self, backing: u32, position: u16) -> Vec<(u32, u16)> {
+        let mut found = Vec::new();
+        for view_trip in 0..self.view.trip_count() {
+            if self.view.backing(ViewTrip(view_trip)).0 != backing {
+                continue;
+            }
+            for transfer in self.set.from_trip_position(ViewTrip(view_trip), position) {
+                found.push((self.view.backing(transfer.trip).0, transfer.position));
+            }
+        }
+        found
+    }
+
+    /// Temporary referee diagnostic: every arena segment of a backing
+    /// trip after a pass, as (board, parent backing or access stop).
+    #[doc(hidden)]
+    pub fn debug_boardings_of(&self, state: &MatrixState, backing: u32) -> Vec<(u16, String)> {
+        state
+            .arena
+            .iter()
+            .filter(|segment| self.view.backing(segment.trip).0 == backing)
+            .map(|segment| {
+                let origin = match &segment.origin {
+                    SegmentOrigin::Access { stop, .. } => format!("access@{}", stop.0),
+                    SegmentOrigin::Transfer { parent, alight } => {
+                        let parent_trip = self.view.backing(state.arena[*parent as usize].trip);
+                        format!("from trip {} alight {alight}", parent_trip.0)
+                    }
+                };
+                (segment.board, origin)
+            })
+            .collect()
+    }
+
+    /// The duration of the (deduplicated) footpath between two stops.
+    fn walk_duration(&self, from: StopIdx, to: StopIdx) -> u32 {
+        self.footpaths
+            .from_stop(from)
+            .iter()
+            .find(|transfer| transfer.to == to)
+            .map(|transfer| transfer.duration)
+            .unwrap_or(0)
     }
 
     /// The fastest journey's aggregated costs to `stop`, mirroring
@@ -1453,7 +2021,7 @@ impl<'a> TbtrEngine<'a> {
             StopWinner::Unreached => {
                 unreachable!("cost reconstruction hit an unreached winner")
             }
-            StopWinner::Access => {
+            StopWinner::Access { .. } => {
                 if let Some(access) = access_meters {
                     walk_meters += access.get(&stop).copied().unwrap_or(0.0);
                 }
@@ -1973,7 +2541,11 @@ impl<'a> TbtrEngine<'a> {
                         Segment {
                             trip: boarded,
                             board: served.position,
-                            origin: SegmentOrigin::Access { stop, seconds },
+                            origin: SegmentOrigin::Access {
+                                stop,
+                                seconds,
+                                departure,
+                            },
                         },
                     );
                 }
@@ -2042,7 +2614,7 @@ impl<'a> TbtrEngine<'a> {
                 alight_time: times[alight_position as usize].arrival - offset,
             });
             match segment.origin {
-                SegmentOrigin::Access { stop, seconds } => {
+                SegmentOrigin::Access { stop, seconds, .. } => {
                     if stop != board_stop {
                         unreachable!("access seeds board at their own stop");
                     }

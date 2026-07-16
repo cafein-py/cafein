@@ -19,6 +19,7 @@ use rayon::prelude::*;
 use crate::fares::{FareLeg, FareTables};
 use crate::geometry::{wkb_multi_line_string, LegGeometry, TripGeometry};
 use crate::journey::{Journey, Leg};
+use crate::path_key::{challenger_wins, PathToken};
 use crate::router::{Request, TransitRouter};
 use crate::timetable::{PatternIdx, StopIdx, Timetable, TripIdx};
 use crate::transfers::Transfers;
@@ -111,6 +112,63 @@ pub(crate) fn fold_better(
     }
 }
 
+/// Appends the destination-to-origin canonical tokens of the chain
+/// behind `labels[round][stop]` and returns its root departure. Reads
+/// the same label chains `walk_costs` walks, in the time/topology
+/// domain only.
+fn chain_tokens_into(
+    labels: &[Vec<Label>],
+    timetable: &Timetable,
+    stop: usize,
+    round: usize,
+    out: &mut Vec<PathToken>,
+) -> u32 {
+    let mut at = stop;
+    let mut r = round;
+    loop {
+        match labels[r][at] {
+            Label::Transit {
+                trip,
+                board_position,
+                alight_position,
+                day_offset,
+            } => {
+                out.push(PathToken::Ride {
+                    trip: trip.0,
+                    day_offset,
+                    board: board_position,
+                    alight: alight_position,
+                });
+                let pattern = timetable.trip_pattern(trip);
+                at = timetable.pattern_stops(pattern)[board_position as usize].0 as usize;
+                r -= 1;
+            }
+            Label::Transfer {
+                from_stop,
+                duration,
+            } => {
+                out.push(PathToken::Walk {
+                    from: from_stop.0,
+                    to: at as u32,
+                    duration,
+                });
+                at = from_stop.0 as usize;
+            }
+            Label::Access {
+                departure,
+                duration,
+            } => {
+                out.push(PathToken::Access {
+                    stop: at as u32,
+                    duration,
+                });
+                return departure;
+            }
+            Label::Unreached => unreachable!("canonical key walked an unreached label"),
+        }
+    }
+}
+
 /// Seconds in a service day: a previous-day trip's stored times are shifted
 /// back by this to place it on the queried day's clock.
 const DAY_SECONDS: u32 = 86_400;
@@ -119,8 +177,13 @@ const DAY_SECONDS: u32 = 86_400;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Label {
     Unreached,
-    /// Reached directly from the origin.
-    Access,
+    /// Reached directly from the origin, leaving at `departure` and
+    /// walking `duration` — the chain root the canonical path key
+    /// compares.
+    Access {
+        departure: u32,
+        duration: u32,
+    },
     /// Alighted from a trip boarded at `board_position` of its pattern.
     /// `day_offset` is subtracted from the trip's stored times to place
     /// them on the queried day (nonzero for a previous-day trip).
@@ -149,6 +212,34 @@ impl TransitRouter for Raptor {
 }
 
 impl Raptor {
+    /// Temporary referee diagnostic: per reached round, the canonical
+    /// token chain behind one stop's label after a single-departure run.
+    #[doc(hidden)]
+    pub fn debug_route_chains(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        request: &Request,
+        stop: StopIdx,
+    ) -> Vec<(usize, u32, u32, Vec<String>)> {
+        let mut search = Search::new(timetable, transfers, request);
+        search.run(request.departure);
+        let mut chains = Vec::new();
+        for round in 0..=search.rounds {
+            let (tau, tokens, root) = search.debug_chain_tokens(stop, round);
+            if tau == UNREACHED {
+                continue;
+            }
+            chains.push((
+                round,
+                tau,
+                root,
+                tokens.iter().map(|token| format!("{token:?}")).collect(),
+            ));
+        }
+        chains
+    }
+
     /// Earliest arrival at every stop for a single departure.
     ///
     /// One run serves all destinations — the matrix primitive: matrices
@@ -703,7 +794,7 @@ pub(crate) fn nearest_rank(sorted: &[u32], percentile: f64) -> u32 {
 }
 
 /// RAPTOR state shared by the passes of one query.
-struct Search<'a> {
+pub(crate) struct Search<'a> {
     timetable: &'a Timetable,
     transfers: &'a Transfers,
     request: &'a Request,
@@ -723,10 +814,17 @@ struct Search<'a> {
     /// First marked position per pattern for the current round.
     queue_position: Vec<u16>,
     queued_patterns: Vec<PatternIdx>,
+    /// Reusable scratch for canonical-key comparisons on exact ties.
+    key_scratch_a: Vec<PathToken>,
+    key_scratch_b: Vec<PathToken>,
 }
 
 impl<'a> Search<'a> {
-    fn new(timetable: &'a Timetable, transfers: &'a Transfers, request: &'a Request) -> Self {
+    pub(crate) fn new(
+        timetable: &'a Timetable,
+        transfers: &'a Transfers,
+        request: &'a Request,
+    ) -> Self {
         let stop_count = timetable.stop_count() as usize;
         let rounds = request.max_transfers as usize + 1;
         Search {
@@ -741,6 +839,8 @@ impl<'a> Search<'a> {
             is_marked: vec![false; stop_count],
             queue_position: vec![u16::MAX; timetable.pattern_count() as usize],
             queued_patterns: Vec::new(),
+            key_scratch_a: Vec::new(),
+            key_scratch_b: Vec::new(),
         }
     }
 
@@ -778,6 +878,24 @@ impl<'a> Search<'a> {
 
     /// The fastest journey's aggregated costs to a destination point
     /// over its egress links; `None` when no link's stop is reachable.
+    /// Temporary referee diagnostic: the canonical tokens behind
+    /// `tau[round][stop]`.
+    fn debug_chain_tokens(&self, stop: StopIdx, round: usize) -> (u32, Vec<PathToken>, u32) {
+        let tau = self.tau[round][stop.0 as usize];
+        if tau == UNREACHED {
+            return (tau, Vec::new(), 0);
+        }
+        let mut tokens = Vec::new();
+        let root = chain_tokens_into(
+            &self.labels,
+            self.timetable,
+            stop.0 as usize,
+            round,
+            &mut tokens,
+        );
+        (tau, tokens, root)
+    }
+
     fn costs_to_point(
         &self,
         point: u32,
@@ -909,7 +1027,7 @@ impl<'a> Search<'a> {
                         .unwrap_or(0.0);
                     at = from_stop;
                 }
-                Label::Access => {
+                Label::Access { .. } => {
                     if let Some(access) = access_meters {
                         walk_meters += access.get(&at).copied().unwrap_or(0.0);
                     }
@@ -1081,7 +1199,7 @@ impl<'a> Search<'a> {
     }
 
     /// One RAPTOR pass from `departure`, improving the shared state.
-    fn run(&mut self, departure: u32) {
+    pub(crate) fn run(&mut self, departure: u32) {
         let timetable = self.timetable;
         let request = self.request;
 
@@ -1104,7 +1222,10 @@ impl<'a> Search<'a> {
             let index = stop.0 as usize;
             if arrival < self.tau[0][index] {
                 self.tau[0][index] = arrival;
-                self.labels[0][index] = Label::Access;
+                self.labels[0][index] = Label::Access {
+                    departure,
+                    duration,
+                };
                 for best in &mut self.best {
                     best[index] = best[index].min(arrival);
                 }
@@ -1112,6 +1233,29 @@ impl<'a> Search<'a> {
                     self.is_marked[index] = true;
                     self.marked.push(stop);
                 }
+            } else if arrival == self.tau[0][index] && arrival != UNREACHED {
+                let mut challenger = std::mem::take(&mut self.key_scratch_a);
+                let mut incumbent = std::mem::take(&mut self.key_scratch_b);
+                challenger.clear();
+                challenger.push(PathToken::Access {
+                    stop: stop.0,
+                    duration,
+                });
+                incumbent.clear();
+                let incumbent_root =
+                    chain_tokens_into(&self.labels, timetable, index, 0, &mut incumbent);
+                if challenger_wins(departure, &challenger, incumbent_root, &incumbent) {
+                    self.labels[0][index] = Label::Access {
+                        departure,
+                        duration,
+                    };
+                    if !self.is_marked[index] {
+                        self.is_marked[index] = true;
+                        self.marked.push(stop);
+                    }
+                }
+                self.key_scratch_a = challenger;
+                self.key_scratch_b = incumbent;
             }
         }
 
@@ -1161,6 +1305,48 @@ impl<'a> Search<'a> {
                                 self.is_marked[stop] = true;
                                 self.marked.push(stops[position]);
                             }
+                        } else if arrival == self.tau[round][stop] && arrival != UNREACHED {
+                            // An exact tie in the same exact-ride round:
+                            // keep the canonical chain, and re-mark the
+                            // stop so the replacement propagates.
+                            let mut challenger = std::mem::take(&mut self.key_scratch_a);
+                            let mut incumbent = std::mem::take(&mut self.key_scratch_b);
+                            challenger.clear();
+                            challenger.push(PathToken::Ride {
+                                trip: trip.0,
+                                day_offset,
+                                board: board_position,
+                                alight: position as u16,
+                            });
+                            let root = chain_tokens_into(
+                                &self.labels,
+                                timetable,
+                                stops[board_position as usize].0 as usize,
+                                round - 1,
+                                &mut challenger,
+                            );
+                            incumbent.clear();
+                            let incumbent_root = chain_tokens_into(
+                                &self.labels,
+                                timetable,
+                                stop,
+                                round,
+                                &mut incumbent,
+                            );
+                            if challenger_wins(root, &challenger, incumbent_root, &incumbent) {
+                                self.labels[round][stop] = Label::Transit {
+                                    trip,
+                                    board_position,
+                                    alight_position: position as u16,
+                                    day_offset,
+                                };
+                                if !self.is_marked[stop] {
+                                    self.is_marked[stop] = true;
+                                    self.marked.push(stops[position]);
+                                }
+                            }
+                            self.key_scratch_a = challenger;
+                            self.key_scratch_b = incumbent;
                         }
                     }
 
@@ -1241,6 +1427,37 @@ impl<'a> Search<'a> {
                             self.is_marked[to] = true;
                             self.marked.push(transfer.to);
                         }
+                    } else if arrival == self.tau[round][to] && arrival != UNREACHED {
+                        let mut challenger = std::mem::take(&mut self.key_scratch_a);
+                        let mut incumbent = std::mem::take(&mut self.key_scratch_b);
+                        challenger.clear();
+                        challenger.push(PathToken::Walk {
+                            from: stop.0,
+                            to: transfer.to.0,
+                            duration: transfer.duration,
+                        });
+                        let root = chain_tokens_into(
+                            &self.labels,
+                            timetable,
+                            stop.0 as usize,
+                            round,
+                            &mut challenger,
+                        );
+                        incumbent.clear();
+                        let incumbent_root =
+                            chain_tokens_into(&self.labels, timetable, to, round, &mut incumbent);
+                        if challenger_wins(root, &challenger, incumbent_root, &incumbent) {
+                            self.labels[round][to] = Label::Transfer {
+                                from_stop: stop,
+                                duration: transfer.duration,
+                            };
+                            if !self.is_marked[to] {
+                                self.is_marked[to] = true;
+                                self.marked.push(transfer.to);
+                            }
+                        }
+                        self.key_scratch_a = challenger;
+                        self.key_scratch_b = incumbent;
                     }
                 }
             }
@@ -1347,7 +1564,7 @@ impl<'a> Search<'a> {
                     });
                     stop = from_stop;
                 }
-                Label::Access => {
+                Label::Access { .. } => {
                     legs.push(Leg::Access {
                         to_stop: stop,
                         departure,

@@ -470,3 +470,112 @@ fn cost_rows_match_raptor_across_sampled_origins() {
     );
     compare(&tbtr, &raptor);
 }
+
+#[test]
+#[ignore = "diagnostic for the canonical-election divergence"]
+fn diagnose_origin_1486_to_3104() {
+    let Some((timetable, services, _)) = helsinki() else {
+        return;
+    };
+    let date = NaiveDate::from_ymd_opt(2022, 2, 22).unwrap();
+    let active = services.active_on(date);
+    let previous = services.active_on(date.pred_opt().unwrap());
+    let footpaths = Transfers::empty(timetable.stop_count());
+    let request = Request {
+        departure: 8 * 3600 + 30 * 60,
+        access: vec![(StopIdx(1486), 0)],
+        egress: vec![(StopIdx(3104), 0)],
+        active_services: active.clone(),
+        active_services_previous: previous.clone(),
+        max_transfers: 4,
+    };
+    let raptor = Raptor.route(timetable, &footpaths, &request);
+    let engine = TbtrEngine::for_date(timetable, &footpaths, &active, &previous);
+    let tbtr = engine.query(request.departure, &request.access, &request.egress, 4);
+    for (name, journeys) in [("raptor", &raptor), ("tbtr", &tbtr)] {
+        for journey in journeys {
+            eprintln!(
+                "{name}: dep {} arr {} rides {}",
+                journey.departure,
+                journey.arrival,
+                journey.rides()
+            );
+            for leg in &journey.legs {
+                eprintln!("  {leg:?}");
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "diagnostic: matrix winner chains for the divergence"]
+fn diagnose_matrix_chains_1486_to_3104() {
+    use cafein_core::tbtr::MatrixState;
+
+    let dest: u32 = std::env::var("CAFEIN_DIAG_STOP")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3104);
+
+    let Some((timetable, services, _)) = helsinki() else {
+        return;
+    };
+    let date = NaiveDate::from_ymd_opt(2022, 2, 22).unwrap();
+    let active = services.active_on(date);
+    let previous = services.active_on(date.pred_opt().unwrap());
+    let footpaths = Transfers::empty(timetable.stop_count());
+    let engine = TbtrEngine::for_date(timetable, &footpaths, &active, &previous);
+    let mut state = MatrixState::new(&engine, 4);
+    engine.matrix_pass(8 * 3600 + 30 * 60, &[(StopIdx(1486), 0)], &mut state);
+    for (round, tau, root, tokens) in engine.debug_matrix_chains(&state, StopIdx(dest)) {
+        eprintln!("tbtr slot {round}: tau {tau} root {root}");
+        for token in tokens {
+            eprintln!("  {token}");
+        }
+    }
+    let request = Request {
+        departure: 8 * 3600 + 30 * 60,
+        access: vec![(StopIdx(1486), 0)],
+        egress: Vec::new(),
+        active_services: active.clone(),
+        active_services_previous: previous.clone(),
+        max_transfers: 4,
+    };
+    for (round, tau, root, tokens) in
+        Raptor.debug_route_chains(timetable, &footpaths, &request, StopIdx(dest))
+    {
+        eprintln!("raptor round {round}: tau {tau} root {root}");
+        for token in tokens {
+            eprintln!("  {token}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "diagnostic: offers of trip 111990"]
+fn diagnose_offers_of_111990() {
+    use cafein_core::tbtr::MatrixState;
+
+    let Some((timetable, services, _)) = helsinki() else {
+        return;
+    };
+    let date = NaiveDate::from_ymd_opt(2022, 2, 22).unwrap();
+    let active = services.active_on(date);
+    let previous = services.active_on(date.pred_opt().unwrap());
+    let footpaths = Transfers::empty(timetable.stop_count());
+    let engine = TbtrEngine::for_date(timetable, &footpaths, &active, &previous);
+    eprintln!(
+        "retained transfers 107304@20: {:?}",
+        engine.debug_transfers_from(107304, 20)
+    );
+    let mut state = MatrixState::new(&engine, 4);
+    engine.matrix_pass(8 * 3600 + 30 * 60, &[(StopIdx(1486), 0)], &mut state);
+    eprintln!(
+        "arena boardings of 111990: {:?}",
+        engine.debug_boardings_of(&state, 111990)
+    );
+    eprintln!(
+        "arena boardings of 107304: {:?}",
+        engine.debug_boardings_of(&state, 107304)
+    );
+}
