@@ -1053,8 +1053,10 @@ fn point_and_fare_cost_rows_match_raptor() {
 fn cost_cell(
     timetable: &Timetable,
     geometry: &crate::geometry::TripGeometry,
+    footpaths: &Transfers,
     factors: &[f64],
-    services: usize,
+    active: &[bool],
+    previous: &[bool],
     destination: StopIdx,
 ) -> (crate::raptor::CostRow, crate::raptor::CostRow) {
     use crate::raptor::{CostInputs, Raptor};
@@ -1066,24 +1068,18 @@ fn cost_cell(
         with_geometry: false,
         fares: None,
     };
-    let footpaths = Transfers::empty(timetable.stop_count());
     let request = Request {
         departure: 0,
         access: vec![(StopIdx(0), 0)],
         egress: Vec::new(),
-        active_services: vec![true; services],
-        active_services_previous: vec![false; services],
+        active_services: active.to_vec(),
+        active_services_previous: previous.to_vec(),
         max_transfers: 4,
     };
     let requests = [request];
     let destinations = [destination];
-    let raptor = Raptor.cost_matrix(timetable, &footpaths, &inputs, &requests, &destinations);
-    let engine = TbtrEngine::for_date(
-        timetable,
-        &footpaths,
-        &vec![true; services],
-        &vec![false; services],
-    );
+    let raptor = Raptor.cost_matrix(timetable, footpaths, &inputs, &requests, &destinations);
+    let engine = TbtrEngine::for_date(timetable, footpaths, active, previous);
     let tbtr = engine.cost_matrix(&inputs, &requests, &destinations);
     (tbtr[0][0].clone(), raptor[0][0].clone())
 }
@@ -1120,7 +1116,15 @@ fn canonical_tie_is_independent_of_route_vs_segment_scan_order() {
         ],
     )
     .unwrap();
-    let (tbtr, raptor) = cost_cell(&timetable, &geometry, &[10.0, 20.0, 30.0], 3, StopIdx(2));
+    let (tbtr, raptor) = cost_cell(
+        &timetable,
+        &geometry,
+        &Transfers::empty(3),
+        &[10.0, 20.0, 30.0],
+        &[true; 3],
+        &[false; 3],
+        StopIdx(2),
+    );
     // The canonical winner rides trip 0 (the smaller trip index), never
     // trip 1: 500 m + 900 m.
     assert_eq!(raptor.transit_meters, 1400.0);
@@ -1168,12 +1172,160 @@ fn same_trip_same_board_uses_the_earlier_ready_parent() {
         ],
     )
     .unwrap();
-    let (tbtr, raptor) = cost_cell(&timetable, &geometry, &[10.0, 20.0, 30.0], 3, StopIdx(2));
+    let (tbtr, raptor) = cost_cell(
+        &timetable,
+        &geometry,
+        &Transfers::empty(3),
+        &[10.0, 20.0, 30.0],
+        &[true; 3],
+        &[false; 3],
+        StopIdx(2),
+    );
     // The earlier-ready parent (trip 1, 500 m) wins: 500 m + 900 m.
     assert_eq!(raptor.transit_meters, 1400.0);
     assert_eq!(
         tbtr.transit_meters.to_bits(),
         raptor.transit_meters.to_bits()
+    );
+    assert_eq!((tbtr.seconds, tbtr.rides), (raptor.seconds, raptor.rides));
+}
+
+#[test]
+fn a_tied_arrival_prefers_fewer_rides_in_both_engines() {
+    use crate::geometry::{DistanceProvenance, TripGeometry};
+
+    // A direct ride and a two-ride chain arrive at exactly the same
+    // time: destination selection keeps the first strictly-minimal
+    // arrival scanning rounds ascending, so both engines report the
+    // one-ride journey and its distance.
+    let mut builder = TimetableBuilder::new(3);
+    let direct = builder.add_pattern(&[StopIdx(0), StopIdx(2)], 0).unwrap();
+    let first = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 1).unwrap();
+    let second = builder.add_pattern(&[StopIdx(1), StopIdx(2)], 2).unwrap();
+    builder
+        .add_trip(direct, vec![time(100), time(1000)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(first, vec![time(100), time(300)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(second, vec![time(400), time(1000)], 2, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 650.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 300.0], DistanceProvenance::CrowFly),
+            (TripIdx(2), vec![0.0, 400.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let (tbtr, raptor) = cost_cell(
+        &timetable,
+        &geometry,
+        &Transfers::empty(3),
+        &[10.0, 20.0, 30.0],
+        &[true; 3],
+        &[false; 3],
+        StopIdx(2),
+    );
+    assert_eq!((raptor.seconds, raptor.rides), (1000, 1));
+    assert_eq!(raptor.transit_meters, 650.0);
+    assert_eq!(
+        tbtr.transit_meters.to_bits(),
+        raptor.transit_meters.to_bits()
+    );
+    assert_eq!(
+        tbtr.emission_grams.to_bits(),
+        raptor.emission_grams.to_bits()
+    );
+    assert_eq!((tbtr.seconds, tbtr.rides), (raptor.seconds, raptor.rides));
+}
+
+#[test]
+fn a_direct_ride_beats_an_equal_walked_arrival_in_both_engines() {
+    use crate::geometry::{DistanceProvenance, TripGeometry};
+
+    // Ride to the destination at 1000, or alight one stop short at 940
+    // and walk 60 seconds: the same round, arrival, and ride count. The
+    // canonical key ranks a ride ahead of a walk, so both engines keep
+    // the direct journey — no footpath meters in the row.
+    let mut builder = TimetableBuilder::new(3);
+    let direct = builder.add_pattern(&[StopIdx(0), StopIdx(2)], 0).unwrap();
+    let short = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 1).unwrap();
+    builder
+        .add_trip(direct, vec![time(100), time(1000)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(short, vec![time(100), time(940)], 1, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 500.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 800.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let footpaths = Transfers::from_edges(3, &[(StopIdx(1), StopIdx(2), 60, 70.0)]).unwrap();
+    let (tbtr, raptor) = cost_cell(
+        &timetable,
+        &geometry,
+        &footpaths,
+        &[10.0, 20.0],
+        &[true; 2],
+        &[false; 2],
+        StopIdx(2),
+    );
+    assert_eq!((raptor.seconds, raptor.rides), (1000, 1));
+    assert_eq!(raptor.transit_meters, 500.0);
+    assert_eq!(raptor.walk_meters, 0.0);
+    assert_eq!(
+        tbtr.transit_meters.to_bits(),
+        raptor.transit_meters.to_bits()
+    );
+    assert_eq!(tbtr.walk_meters.to_bits(), raptor.walk_meters.to_bits());
+    assert_eq!((tbtr.seconds, tbtr.rides), (raptor.seconds, raptor.rides));
+}
+
+#[test]
+fn previous_day_tails_produce_identical_cost_rows() {
+    use crate::geometry::{DistanceProvenance, TripGeometry};
+
+    // The only supply is yesterday's trip running past 24:00: both
+    // engines board it through the previous-day view and report the
+    // same full row.
+    let mut builder = TimetableBuilder::new(2);
+    let line = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    builder
+        .add_trip(line, vec![time(86_500), time(86_800)], 0, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![(TripIdx(0), vec![0.0, 550.0], DistanceProvenance::CrowFly)],
+    )
+    .unwrap();
+    let (tbtr, raptor) = cost_cell(
+        &timetable,
+        &geometry,
+        &Transfers::empty(2),
+        &[10.0],
+        &[false],
+        &[true],
+        StopIdx(1),
+    );
+    assert_eq!((raptor.seconds, raptor.rides), (400, 1));
+    assert_eq!(raptor.transit_meters, 550.0);
+    assert_eq!(
+        tbtr.transit_meters.to_bits(),
+        raptor.transit_meters.to_bits()
+    );
+    assert_eq!(
+        tbtr.emission_grams.to_bits(),
+        raptor.emission_grams.to_bits()
     );
     assert_eq!((tbtr.seconds, tbtr.rides), (raptor.seconds, raptor.rides));
 }
@@ -1485,7 +1637,6 @@ fn generated_networks_match_raptor_across_the_sweep() {
         // The point forms over the same networks: two destination
         // points (one with an equal-link election chance), access
         // meters on both access stops.
-        let batch = requests(0, 4);
         let access_meters: Vec<HashMap<StopIdx, f64>> = (0..stops)
             .map(|origin| {
                 HashMap::from([
@@ -1501,44 +1652,59 @@ fn generated_networks_match_raptor_across_the_sweep() {
             ],
             vec![(StopIdx(0), 45, 20.0)],
         ];
-        let raptor = Raptor.cost_matrix_to_points(
-            &net.timetable,
-            &net.footpaths,
-            &inputs,
-            &batch,
-            &access_meters,
-            &egress,
-        );
-        let tbtr = engine.cost_matrix_to_points(&inputs, &batch, &access_meters, &egress);
-        assert_full_rows_agree(&format!("seed {seed} points"), &tbtr, &raptor);
-        for window in [600, 1800] {
-            for budget in [None, boundary, Some(1)] {
-                for objective in [Objective::Emissions, Objective::Fare] {
-                    let raptor = Raptor.least_cost_matrix_to_points(
-                        &net.timetable,
-                        &net.footpaths,
-                        &inputs,
-                        &batch,
-                        &access_meters,
-                        &egress,
-                        window,
-                        budget,
-                        objective,
-                    );
-                    let tbtr = engine.least_cost_matrix_to_points(
-                        &inputs,
-                        &batch,
-                        &access_meters,
-                        &egress,
-                        window,
-                        budget,
-                        objective,
-                    );
-                    assert_full_rows_agree(
-                        &format!("seed {seed} points window {window} budget {budget:?}"),
-                        &tbtr,
-                        &raptor,
-                    );
+        for max_transfers in [1, 2, 4] {
+            for departure in [0, 240, 600] {
+                let batch = requests(departure, max_transfers);
+                let raptor = Raptor.cost_matrix_to_points(
+                    &net.timetable,
+                    &net.footpaths,
+                    &inputs,
+                    &batch,
+                    &access_meters,
+                    &egress,
+                );
+                let tbtr = engine.cost_matrix_to_points(&inputs, &batch, &access_meters, &egress);
+                assert_full_rows_agree(
+                    &format!("seed {seed} points mt {max_transfers} dep {departure}"),
+                    &tbtr,
+                    &raptor,
+                );
+            }
+        }
+        for max_transfers in [1, 2, 4] {
+            let batch = requests(0, max_transfers);
+            for window in [600, 1800] {
+                for budget in [None, boundary, Some(1)] {
+                    for objective in [Objective::Emissions, Objective::Fare] {
+                        let raptor = Raptor.least_cost_matrix_to_points(
+                            &net.timetable,
+                            &net.footpaths,
+                            &inputs,
+                            &batch,
+                            &access_meters,
+                            &egress,
+                            window,
+                            budget,
+                            objective,
+                        );
+                        let tbtr = engine.least_cost_matrix_to_points(
+                            &inputs,
+                            &batch,
+                            &access_meters,
+                            &egress,
+                            window,
+                            budget,
+                            objective,
+                        );
+                        assert_full_rows_agree(
+                            &format!(
+                                "seed {seed} points mt {max_transfers} window {window} \
+                                 budget {budget:?}"
+                            ),
+                            &tbtr,
+                            &raptor,
+                        );
+                    }
                 }
             }
         }
