@@ -116,7 +116,10 @@ struct CoordinateEnds {
 }
 
 const ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINET";
-const ARTIFACT_FORMAT: u32 = 9;
+// 10: the persisted time TBTR transfer set became tie-complete (same-ride
+// equal-arrival competitors retained for cost-row reconstruction); sets
+// written by earlier formats lack the competitors and must be rebuilt.
+const ARTIFACT_FORMAT: u32 = 10;
 /// Section tags in the container directory.
 const SECTION_META: u16 = 1;
 const SECTION_STREETS: u16 = 2;
@@ -1758,6 +1761,13 @@ impl TransportNetwork {
     #[getter]
     fn has_tbtr_transfers(&self) -> bool {
         self.tbtr_time_transfers.is_some()
+    }
+
+    /// Number of transfers in the cached time-only TBTR set, or
+    /// `None` when none is computed.
+    #[getter]
+    fn tbtr_transfer_count(&self) -> Option<usize> {
+        self.tbtr_time_transfers.as_ref().map(|(_, set)| set.len())
     }
 
     /// Precompute and cache the multicriteria TBTR transfer set for a

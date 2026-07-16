@@ -39,10 +39,14 @@ fn reduction_keeps_a_fraction_of_the_feasible_transfers() {
     assert!(!build.transfers.is_empty());
     assert!(build.transfers.len() < build.generated);
     // Pinned counts: deterministic for the pinned fixture. The
-    // reduction keeps ~12 % of the feasible transfers, in line with
-    // the reductions Witt reports.
+    // tie-complete reduction keeps ~34 % of the feasible transfers
+    // (Witt's strict-improvement rule kept ~12 %; the difference is
+    // same-ride equal-arrival competitors, retained so the cost
+    // matrices can reconstruct the journey RAPTOR's tie-break elects —
+    // an equal transfer fails the scan's strict horizon test, so query
+    // walls are unchanged).
     assert_eq!(build.generated, 42_937_748);
-    assert_eq!(build.transfers.len(), 5_064_961);
+    assert_eq!(build.transfers.len(), 14_527_982);
 }
 
 #[test]
@@ -62,9 +66,11 @@ fn a_date_view_shrinks_the_universe_and_the_set() {
     assert!(!build.transfers.is_empty());
     assert!(build.transfers.len() < universal.transfers.len());
     // Pinned for the fixture: the Tuesday universe holds 24 280 of the
-    // 195 351 trips (the feed spans weeks of service days).
+    // 195 351 trips (the feed spans weeks of service days). The set
+    // count includes the tie-complete reduction's retained equal
+    // competitors.
     assert_eq!(view.trip_count(), 24_280);
-    assert_eq!(build.transfers.len(), 576_932);
+    assert_eq!(build.transfers.len(), 1_580_419);
 }
 
 #[test]
