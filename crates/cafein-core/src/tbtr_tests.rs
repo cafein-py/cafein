@@ -588,3 +588,161 @@ fn u_turns_are_dropped_at_generation() {
         }]
     );
 }
+
+/// Full-row referee: both engines' cost matrices agree bit-for-bit —
+/// integers exactly, floats by `to_bits` (NaN included).
+fn cost_rows_agree(
+    timetable: &Timetable,
+    geometry: &crate::geometry::TripGeometry,
+    footpaths: &Transfers,
+    factors: &[f64],
+    services: usize,
+    max_transfers: u8,
+) {
+    use crate::raptor::{CostInputs, Raptor};
+
+    let inputs = CostInputs {
+        geometry,
+        factors,
+        leg_geometry: None,
+        with_geometry: false,
+        fares: None,
+    };
+    let stop_count = timetable.stop_count();
+    let destinations: Vec<StopIdx> = (0..stop_count).map(StopIdx).collect();
+    let requests: Vec<Request> = (0..stop_count)
+        .map(|origin| Request {
+            departure: 0,
+            access: vec![(StopIdx(origin), 0)],
+            egress: Vec::new(),
+            active_services: vec![true; services],
+            active_services_previous: vec![false; services],
+            max_transfers,
+        })
+        .collect();
+    let raptor = Raptor.cost_matrix(timetable, footpaths, &inputs, &requests, &destinations);
+    let engine = TbtrEngine::for_date(
+        timetable,
+        footpaths,
+        &vec![true; services],
+        &vec![false; services],
+    );
+    let tbtr = engine.cost_matrix(&inputs, &requests, &destinations);
+    assert_eq!(tbtr.len(), raptor.len());
+    for (origin, (t_rows, r_rows)) in tbtr.iter().zip(&raptor).enumerate() {
+        assert_eq!(t_rows.len(), r_rows.len(), "row count for origin {origin}");
+        for (t, r) in t_rows.iter().zip(r_rows) {
+            let cell = format!("origin {origin} -> stop {}", r.to);
+            assert_eq!(t.to, r.to, "{cell}: to");
+            assert_eq!(t.seconds, r.seconds, "{cell}: seconds");
+            assert_eq!(t.rides, r.rides, "{cell}: rides");
+            assert_eq!(
+                t.transit_meters.to_bits(),
+                r.transit_meters.to_bits(),
+                "{cell}: transit meters {} vs {}",
+                t.transit_meters,
+                r.transit_meters
+            );
+            assert_eq!(
+                t.walk_meters.to_bits(),
+                r.walk_meters.to_bits(),
+                "{cell}: walk meters {} vs {}",
+                t.walk_meters,
+                r.walk_meters
+            );
+            assert_eq!(
+                t.emission_grams.to_bits(),
+                r.emission_grams.to_bits(),
+                "{cell}: grams {} vs {}",
+                t.emission_grams,
+                r.emission_grams
+            );
+        }
+    }
+}
+
+#[test]
+fn cost_rows_match_raptor_on_the_tie_fixtures() {
+    use crate::geometry::{DistanceProvenance, TripGeometry};
+
+    // The three-way tie fixture: distinct distances and factors per trip
+    // make any election divergence visible in the row aggregates.
+    let mut builder = TimetableBuilder::new(6);
+    let source = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let a = builder.add_pattern(&[StopIdx(2), StopIdx(5)], 1).unwrap();
+    let b = builder
+        .add_pattern(&[StopIdx(4), StopIdx(3), StopIdx(5)], 2)
+        .unwrap();
+    builder
+        .add_trip(source, vec![time(0), time(100)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(a, vec![time(200), time(1000)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(b, vec![time(200), time(300), time(1000)], 2, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 700.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 900.0], DistanceProvenance::CrowFly),
+            (
+                TripIdx(2),
+                vec![0.0, 400.0, 1300.0],
+                DistanceProvenance::CrowFly,
+            ),
+        ],
+    )
+    .unwrap();
+    let footpaths = Transfers::from_edges(
+        6,
+        &[
+            (StopIdx(1), StopIdx(2), 60, 50.0),
+            (StopIdx(1), StopIdx(3), 60, 55.0),
+            (StopIdx(1), StopIdx(4), 60, 65.0),
+        ],
+    )
+    .unwrap();
+    cost_rows_agree(&timetable, &geometry, &footpaths, &[40.0, 90.0, 25.0], 3, 4);
+
+    // Sol's cross-trip counterexample, same treatment.
+    let mut builder = TimetableBuilder::new(4);
+    let source = builder
+        .add_pattern(&[StopIdx(0), StopIdx(1), StopIdx(2)], 0)
+        .unwrap();
+    let b = builder.add_pattern(&[StopIdx(1), StopIdx(3)], 1).unwrap();
+    let c = builder.add_pattern(&[StopIdx(2), StopIdx(3)], 2).unwrap();
+    builder
+        .add_trip(source, vec![time(0), time(20), time(40)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(b, vec![time(50), time(100)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(c, vec![time(60), time(100)], 2, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (
+                TripIdx(0),
+                vec![0.0, 300.0, 800.0],
+                DistanceProvenance::CrowFly,
+            ),
+            (TripIdx(1), vec![0.0, 1100.0], DistanceProvenance::CrowFly),
+            (TripIdx(2), vec![0.0, 600.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    cost_rows_agree(
+        &timetable,
+        &geometry,
+        &Transfers::empty(4),
+        &[40.0, 90.0, 25.0],
+        3,
+        4,
+    );
+}

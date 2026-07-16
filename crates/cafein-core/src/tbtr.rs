@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use rayon::prelude::*;
 
 use crate::journey::{Journey, Leg};
+use crate::raptor::{CostInputs, CostRow};
 use crate::router::{Request, TransitRouter};
 use crate::timetable::{PatternIdx, StopIdx, StopTime, Timetable, TripIdx};
 use crate::transfers::Transfers;
@@ -449,6 +450,92 @@ struct Target {
     via: Option<(StopIdx, u32)>,
     /// Seconds of the final egress walk.
     egress_seconds: u32,
+}
+
+/// How a stop's exact-round arrival in a matrix pass was achieved.
+#[derive(Clone, Copy)]
+enum StopWinner {
+    Unreached,
+    /// Reached by the access walk alone (round 0).
+    Access,
+    /// Alighted `arena[segment]` at `alight`.
+    Alight {
+        segment: u32,
+        alight: u16,
+    },
+    /// Walked a footpath from `from` after alighting `arena[segment]`
+    /// at `alight`.
+    Walked {
+        segment: u32,
+        alight: u16,
+        from: StopIdx,
+    },
+}
+
+/// Pooled per-worker state for the cost-matrix passes: the profile
+/// scan's scratch plus exact-round arrivals and the winner records the
+/// cost reconstruction walks. One state serves an origin's descending
+/// departures (horizons, labels, arena, and winners persist across
+/// passes, rTBTR-style); `reset` recycles it for the next origin.
+pub struct MatrixState {
+    rounds: usize,
+    stop_count: usize,
+    reached: Vec<u16>,
+    arena: Vec<Segment>,
+    queues: Vec<Vec<(u32, u16)>>,
+    /// The at-most-round arrival gate, `stop × rounds` with the suffix
+    /// write of the profile scan.
+    labels: Vec<u32>,
+    walked: WalkedScratch,
+    /// Exact-round arrivals, `stop × (rounds + 1)`; slot 0 is the
+    /// access-only round, slot `q + 1` holds queue round `q`'s alights
+    /// and their same-round walks — RAPTOR's `tau` shape.
+    tau: Vec<u32>,
+    winners: Vec<StopWinner>,
+}
+
+impl MatrixState {
+    /// Fresh state sized for an engine and a round count.
+    pub fn new(engine: &TbtrEngine<'_>, max_transfers: u8) -> MatrixState {
+        let rounds = max_transfers as usize + 1;
+        let stop_count = engine.timetable.stop_count() as usize;
+        MatrixState {
+            rounds,
+            stop_count,
+            reached: engine.horizons(rounds),
+            arena: Vec::new(),
+            queues: vec![Vec::new(); rounds],
+            labels: vec![UNREACHED; stop_count * rounds],
+            walked: WalkedScratch::new(stop_count),
+            tau: vec![UNREACHED; stop_count * (rounds + 1)],
+            winners: vec![StopWinner::Unreached; stop_count * (rounds + 1)],
+        }
+    }
+
+    /// Recycles the buffers for another origin on the same engine.
+    pub fn reset(&mut self, engine: &TbtrEngine<'_>) {
+        self.reached.clear();
+        self.reached
+            .extend_from_slice(&engine.horizons(self.rounds));
+        self.arena.clear();
+        for queue in &mut self.queues {
+            queue.clear();
+        }
+        self.labels.fill(UNREACHED);
+        self.walked.clear();
+        self.tau.fill(UNREACHED);
+        self.winners.fill(StopWinner::Unreached);
+    }
+
+    fn tau_at(&self, stop: StopIdx, round: usize) -> u32 {
+        self.tau[stop.0 as usize * (self.rounds + 1) + round]
+    }
+
+    fn record(&mut self, stop: StopIdx, round: usize, arrival: u32, winner: StopWinner) {
+        let slot = stop.0 as usize * (self.rounds + 1) + round;
+        self.tau[slot] = arrival;
+        self.winners[slot] = winner;
+    }
 }
 
 impl<'a> TbtrEngine<'a> {
@@ -1186,6 +1273,379 @@ impl<'a> TbtrEngine<'a> {
 
     /// Fresh per-(trip, round) reached horizons: a trip's is its
     /// pattern length.
+    /// One scan of a departure onto a `MatrixState`: the profile scan
+    /// stripped of destination targets and journey assembly, writing
+    /// exact-round arrivals and winner records instead. State persists
+    /// across strictly decreasing departures (rTBTR), so an origin's
+    /// window runs passes on one state; `reset` recycles it between
+    /// origins.
+    pub fn matrix_pass(&self, departure: u32, access: &[(StopIdx, u32)], state: &mut MatrixState) {
+        let rounds = state.rounds;
+        let improve = |labels: &mut Vec<u32>, stop: StopIdx, time: u32, round: usize| {
+            let base = stop.0 as usize * rounds;
+            if time >= labels[base + round] {
+                return false;
+            }
+            for slot in &mut labels[base + round..base + rounds] {
+                if time < *slot {
+                    *slot = time;
+                } else {
+                    break;
+                }
+            }
+            true
+        };
+        for &(stop, seconds) in access {
+            let at = departure.saturating_add(seconds);
+            improve(&mut state.labels, stop, at, 0);
+            if at < state.tau_at(stop, 0) {
+                state.record(stop, 0, at, StopWinner::Access);
+            }
+        }
+        self.seed(
+            departure,
+            access,
+            &mut state.reached,
+            rounds,
+            &mut state.arena,
+            &mut state.queues[0],
+        );
+        for round in 0..rounds {
+            if state.queues[round].is_empty() {
+                break;
+            }
+            let segments = std::mem::take(&mut state.queues[round]);
+            state.walked.clear();
+            for &(segment, end) in &segments {
+                let trip = state.arena[segment as usize].trip;
+                let board = state.arena[segment as usize].board;
+                let line = self.view.line_of(trip);
+                let offset = self.view.line_day_offset(line);
+                let stops = self.timetable.pattern_stops(self.view.line_pattern(line));
+                let times = self.view.stored_times(self.timetable, trip);
+                let last = (end as usize + 1).min(times.len()) as u16;
+                for alight in board + 1..last {
+                    let arrival = times[alight as usize].arrival - offset;
+                    let stop = stops[alight as usize];
+                    // Walks relax only from arrivals that improve the
+                    // stop's at-most-round label — RAPTOR's marked-stop
+                    // semantics; the same improvements write the
+                    // exact-round winner the reconstruction walks.
+                    if improve(&mut state.labels, stop, arrival, round) {
+                        state.record(
+                            stop,
+                            round + 1,
+                            arrival,
+                            StopWinner::Alight { segment, alight },
+                        );
+                        for footpath in self.footpaths.from_stop(stop) {
+                            let walked_at = arrival.saturating_add(footpath.duration);
+                            if improve(&mut state.labels, footpath.to, walked_at, round) {
+                                state.record(
+                                    footpath.to,
+                                    round + 1,
+                                    walked_at,
+                                    StopWinner::Walked {
+                                        segment,
+                                        alight,
+                                        from: stop,
+                                    },
+                                );
+                                state
+                                    .walked
+                                    .insert(footpath.to.0, (walked_at, segment, alight));
+                            }
+                        }
+                    }
+                    if round + 1 < rounds {
+                        for transfer in self.set.from_trip_position(trip, alight) {
+                            enqueue(
+                                &self.view,
+                                &mut state.reached,
+                                rounds,
+                                round + 1,
+                                &mut state.arena,
+                                &mut state.queues[round + 1],
+                                Segment {
+                                    trip: transfer.trip,
+                                    board: transfer.position,
+                                    origin: SegmentOrigin::Transfer {
+                                        parent: segment,
+                                        alight,
+                                    },
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            if round + 1 < rounds {
+                let boardings: Vec<(u32, (u32, u32, u16))> = state.walked.iter().collect();
+                for (stop, (ready, parent, alight)) in boardings {
+                    self.board_walked(
+                        StopIdx(stop),
+                        ready,
+                        parent,
+                        alight,
+                        &mut state.reached,
+                        rounds,
+                        round + 1,
+                        &mut state.arena,
+                        &mut state.queues[round + 1],
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fastest journey's aggregated costs to `stop`, mirroring
+    /// `Search::costs_to`: rounds scan ascending, only a strictly
+    /// earlier arrival replaces the winner — fewest rides on ties.
+    fn matrix_costs_to(
+        &self,
+        state: &MatrixState,
+        stop: StopIdx,
+        departure: u32,
+        inputs: &CostInputs<'_>,
+        access_meters: Option<&HashMap<StopIdx, f64>>,
+    ) -> Option<CostRow> {
+        let mut best_round = 0;
+        let mut best_arrival = UNREACHED;
+        for round in 0..=state.rounds {
+            let arrival = state.tau_at(stop, round);
+            if arrival < best_arrival {
+                best_arrival = arrival;
+                best_round = round;
+            }
+        }
+        if best_arrival == UNREACHED {
+            return None;
+        }
+        let mut row = self.matrix_cost_row(state, stop, best_round, inputs, access_meters);
+        row.seconds = best_arrival - departure;
+        Some(row)
+    }
+
+    /// The aggregated costs of the journey behind the winner at
+    /// `(stop, round)`, walking its chain destination → origin in the
+    /// same order (and with the same floating-point accumulation
+    /// sequence) as `Raptor::walk_costs`, so identical journeys yield
+    /// bit-identical rows.
+    fn matrix_cost_row(
+        &self,
+        state: &MatrixState,
+        stop: StopIdx,
+        round: usize,
+        inputs: &CostInputs<'_>,
+        access_meters: Option<&HashMap<StopIdx, f64>>,
+    ) -> CostRow {
+        let mut rides = 0u32;
+        let mut transit_meters = 0.0;
+        let mut walk_meters = 0.0;
+        let mut grams = 0.0;
+        let mut resolved = true;
+        let mut legs: Vec<(TripIdx, u16, u16)> = Vec::new();
+        let mut fare_legs: Vec<crate::fares::FareLeg> = Vec::new();
+        let slot = stop.0 as usize * (state.rounds + 1) + round;
+        // Resolve the destination-side walk, if any, then follow the
+        // segment chain of the alighted arena entry.
+        let (mut segment, mut alight_position, mut at) = match state.winners[slot] {
+            StopWinner::Unreached => {
+                unreachable!("cost reconstruction hit an unreached winner")
+            }
+            StopWinner::Access => {
+                if let Some(access) = access_meters {
+                    walk_meters += access.get(&stop).copied().unwrap_or(0.0);
+                }
+                return self.finish_cost_row(
+                    stop.0,
+                    rides,
+                    transit_meters,
+                    walk_meters,
+                    grams,
+                    resolved,
+                    legs,
+                    fare_legs,
+                    inputs,
+                );
+            }
+            StopWinner::Alight { segment, alight } => (segment, alight, stop),
+            StopWinner::Walked {
+                segment,
+                alight,
+                from,
+            } => {
+                walk_meters += self
+                    .footpaths
+                    .from_stop(from)
+                    .iter()
+                    .find(|transfer| transfer.to == stop)
+                    .map(|transfer| transfer.meters)
+                    .unwrap_or(0.0);
+                (segment, alight, from)
+            }
+        };
+        loop {
+            let entry = &state.arena[segment as usize];
+            let backing = self.view.backing(entry.trip);
+            let offset = self.view.day_offset(entry.trip);
+            rides += 1;
+            let meters = inputs
+                .geometry
+                .leg_distance(backing, entry.board, alight_position)
+                as f64;
+            transit_meters += meters;
+            let factor = inputs.factors[backing.0 as usize];
+            if factor.is_finite() {
+                grams += meters / 1000.0 * factor;
+            } else {
+                resolved = false;
+            }
+            if inputs.with_geometry {
+                legs.push((backing, entry.board, alight_position));
+            }
+            let pattern = self.timetable.trip_pattern(backing);
+            let board_stop = self.timetable.pattern_stops(pattern)[entry.board as usize];
+            if inputs.fares.is_some() {
+                fare_legs.push(crate::fares::FareLeg {
+                    route: self.timetable.pattern_route(pattern),
+                    board_stop: board_stop.0,
+                    alight_stop: at.0,
+                    board_time: self.timetable.trip_stop_times(backing)[entry.board as usize]
+                        .departure
+                        .saturating_sub(offset),
+                });
+            }
+            match entry.origin {
+                SegmentOrigin::Access { stop: origin, .. } => {
+                    if board_stop != origin {
+                        walk_meters += self
+                            .footpaths
+                            .from_stop(origin)
+                            .iter()
+                            .find(|transfer| transfer.to == board_stop)
+                            .map(|transfer| transfer.meters)
+                            .unwrap_or(0.0);
+                    }
+                    if let Some(access) = access_meters {
+                        walk_meters += access.get(&origin).copied().unwrap_or(0.0);
+                    }
+                    break;
+                }
+                SegmentOrigin::Transfer { parent, alight } => {
+                    let parent_entry = &state.arena[parent as usize];
+                    let parent_line = self.view.line_of(parent_entry.trip);
+                    let parent_stops = self
+                        .timetable
+                        .pattern_stops(self.view.line_pattern(parent_line));
+                    let parent_stop = parent_stops[alight as usize];
+                    if parent_stop != board_stop {
+                        walk_meters += self
+                            .footpaths
+                            .from_stop(parent_stop)
+                            .iter()
+                            .find(|transfer| transfer.to == board_stop)
+                            .map(|transfer| transfer.meters)
+                            .unwrap_or(0.0);
+                    }
+                    at = parent_stop;
+                    alight_position = alight;
+                    segment = parent;
+                }
+            }
+        }
+        self.finish_cost_row(
+            stop.0,
+            rides,
+            transit_meters,
+            walk_meters,
+            grams,
+            resolved,
+            legs,
+            fare_legs,
+            inputs,
+        )
+    }
+
+    /// Assembles the row tail exactly as `Raptor::walk_costs` does:
+    /// geometry legs reversed into ride order, fares priced in ride
+    /// order, NaN-poisoned emissions.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_cost_row(
+        &self,
+        to: u32,
+        rides: u32,
+        transit_meters: f64,
+        walk_meters: f64,
+        grams: f64,
+        resolved: bool,
+        legs: Vec<(TripIdx, u16, u16)>,
+        mut fare_legs: Vec<crate::fares::FareLeg>,
+        inputs: &CostInputs<'_>,
+    ) -> CostRow {
+        let geometry = match (inputs.with_geometry, inputs.leg_geometry) {
+            (true, Some(shapes)) => {
+                let parts: Vec<Vec<(f64, f64)>> = legs
+                    .iter()
+                    .rev()
+                    .map(|&(trip, board, alight)| shapes.leg_coordinates(trip, board, alight))
+                    .collect();
+                Some(crate::geometry::wkb_multi_line_string(&parts))
+            }
+            _ => None,
+        };
+        let fare = match inputs.fares {
+            Some(tables) => {
+                fare_legs.reverse();
+                tables.price(&fare_legs)
+            }
+            None => f64::NAN,
+        };
+        CostRow {
+            to,
+            seconds: 0,
+            rides,
+            transit_meters,
+            walk_meters,
+            emission_grams: if resolved { grams } else { f64::NAN },
+            fare,
+            geometry,
+        }
+    }
+
+    /// The fastest journey's aggregated costs from each request to each
+    /// destination — the TBTR counterpart of `Raptor::cost_matrix`,
+    /// fanned out over the origins with pooled per-worker state.
+    pub fn cost_matrix(
+        &self,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        destinations: &[StopIdx],
+    ) -> Vec<Vec<CostRow>> {
+        requests
+            .par_iter()
+            .map_init(
+                || None,
+                |pooled: &mut Option<MatrixState>, request| {
+                    let state = match pooled {
+                        Some(state) if state.rounds == request.max_transfers as usize + 1 => {
+                            state.reset(self);
+                            state
+                        }
+                        _ => pooled.insert(MatrixState::new(self, request.max_transfers)),
+                    };
+                    self.matrix_pass(request.departure, &request.access, state);
+                    destinations
+                        .iter()
+                        .filter_map(|&stop| {
+                            self.matrix_costs_to(state, stop, request.departure, inputs, None)
+                        })
+                        .collect()
+                },
+            )
+            .collect()
+    }
+
     fn horizons(&self, rounds: usize) -> Vec<u16> {
         let mut horizons = Vec::with_capacity(self.view.trip_count() as usize * rounds);
         for trip in 0..self.view.trip_count() {
