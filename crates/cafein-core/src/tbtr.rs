@@ -1735,6 +1735,192 @@ impl<'a> TbtrEngine<'a> {
         }
     }
 
+    /// The fastest journey's costs to each destination *point*, joined
+    /// through egress link tables — the TBTR counterpart of
+    /// `Raptor::cost_matrix_to_points`, including `costs_to_point`'s
+    /// link election: the first strictly smaller joined arrival wins,
+    /// with no ride-count comparison across equal links.
+    pub fn cost_matrix_to_points(
+        &self,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        access_meters: &[HashMap<StopIdx, f64>],
+        egress: &[Vec<(StopIdx, u32, f64)>],
+    ) -> Vec<Vec<CostRow>> {
+        assert_eq!(requests.len(), access_meters.len());
+        requests
+            .par_iter()
+            .zip(access_meters.par_iter())
+            .map_init(
+                || None,
+                |pooled: &mut Option<MatrixState>, (request, access)| {
+                    let state = match pooled {
+                        Some(state) if state.rounds == request.max_transfers as usize + 1 => {
+                            state.reset(self);
+                            state
+                        }
+                        _ => pooled.insert(MatrixState::new(self, request.max_transfers)),
+                    };
+                    self.matrix_pass(request.departure, &request.access, state);
+                    egress
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(point, links)| {
+                            self.matrix_costs_to_point(
+                                state,
+                                point as u32,
+                                links,
+                                request.departure,
+                                inputs,
+                                access,
+                            )
+                        })
+                        .collect()
+                },
+            )
+            .collect()
+    }
+
+    /// `Raptor::costs_to_point`'s mirror over the matrix state.
+    fn matrix_costs_to_point(
+        &self,
+        state: &MatrixState,
+        point: u32,
+        egress: &[(StopIdx, u32, f64)],
+        departure: u32,
+        inputs: &CostInputs<'_>,
+        access_meters: &HashMap<StopIdx, f64>,
+    ) -> Option<CostRow> {
+        let mut chosen: Option<(u32, StopIdx, f64)> = None;
+        for &(stop, seconds, meters) in egress {
+            let at_stop = (0..=state.rounds)
+                .map(|round| state.tau_at(stop, round))
+                .min()
+                .expect("a matrix state always has a round");
+            if at_stop == UNREACHED {
+                continue;
+            }
+            let Some(arrival) = at_stop.checked_add(seconds).filter(|&at| at != UNREACHED) else {
+                continue;
+            };
+            if chosen.is_none_or(|(current, _, _)| arrival < current) {
+                chosen = Some((arrival, stop, meters));
+            }
+        }
+        let (arrival, stop, egress_meters) = chosen?;
+        let mut row = self.matrix_costs_to(state, stop, departure, inputs, Some(access_meters))?;
+        row.to = point;
+        row.seconds = arrival - departure;
+        row.walk_meters += egress_meters;
+        Some(row)
+    }
+
+    /// `Raptor::least_cost_matrix_to_points`'s TBTR counterpart.
+    #[allow(clippy::too_many_arguments)]
+    pub fn least_cost_matrix_to_points(
+        &self,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        access_meters: &[HashMap<StopIdx, f64>],
+        egress: &[Vec<(StopIdx, u32, f64)>],
+        window: u32,
+        budget: Option<u32>,
+        objective: crate::raptor::Objective,
+    ) -> Vec<Vec<CostRow>> {
+        assert_eq!(requests.len(), access_meters.len());
+        requests
+            .par_iter()
+            .zip(access_meters.par_iter())
+            .map_init(
+                || None,
+                |pooled: &mut Option<MatrixState>, (request, access)| {
+                    let state = match pooled {
+                        Some(state) if state.rounds == request.max_transfers as usize + 1 => {
+                            state.reset(self);
+                            state
+                        }
+                        _ => pooled.insert(MatrixState::new(self, request.max_transfers)),
+                    };
+                    let departures =
+                        crate::raptor::departure_candidates(self.timetable, request, window);
+                    let mut thresholds = vec![UNREACHED; egress.len() * (state.rounds + 1)];
+                    let mut best: Vec<Option<CostRow>> = vec![None; egress.len()];
+                    for &departure in &departures {
+                        self.matrix_pass(departure, &request.access, state);
+                        self.fold_matrix_best_points(
+                            state,
+                            departure,
+                            egress,
+                            budget,
+                            inputs,
+                            access,
+                            objective,
+                            &mut thresholds,
+                            &mut best,
+                        );
+                    }
+                    best.into_iter().flatten().collect()
+                },
+            )
+            .collect()
+    }
+
+    /// `Search::fold_best_points`' mirror: rounds from 1 (the access
+    /// floor is the caller's direct-walk overlay), the first strictly
+    /// smaller joined link wins each round, thresholds and budget in
+    /// the same order.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_matrix_best_points(
+        &self,
+        state: &MatrixState,
+        departure: u32,
+        egress: &[Vec<(StopIdx, u32, f64)>],
+        budget: Option<u32>,
+        inputs: &CostInputs<'_>,
+        access_meters: &HashMap<StopIdx, f64>,
+        objective: crate::raptor::Objective,
+        thresholds: &mut [u32],
+        best: &mut [Option<CostRow>],
+    ) {
+        for (point, links) in egress.iter().enumerate() {
+            let thresholds = &mut thresholds[point * (state.rounds + 1)..][..state.rounds + 1];
+            for round in 1..=state.rounds {
+                let mut chosen: Option<(u32, StopIdx, f64)> = None;
+                for &(stop, seconds, meters) in links {
+                    let at_stop = state.tau_at(stop, round);
+                    if at_stop == UNREACHED {
+                        continue;
+                    }
+                    let Some(arrival) = at_stop.checked_add(seconds).filter(|&at| at != UNREACHED)
+                    else {
+                        continue;
+                    };
+                    if chosen.is_none_or(|(current, _, _)| arrival < current) {
+                        chosen = Some((arrival, stop, meters));
+                    }
+                }
+                let Some((arrival, stop, egress_meters)) = chosen else {
+                    continue;
+                };
+                if arrival >= thresholds[round] {
+                    continue;
+                }
+                for threshold in &mut thresholds[round..] {
+                    *threshold = (*threshold).min(arrival);
+                }
+                let seconds = arrival - departure;
+                if budget.is_some_and(|budget| seconds > budget) {
+                    continue;
+                }
+                let mut row = self.matrix_cost_row(state, stop, round, inputs, Some(access_meters));
+                row.to = point as u32;
+                row.seconds = seconds;
+                row.walk_meters += egress_meters;
+                crate::raptor::fold_better(&mut best[point], row, objective);
+            }
+        }
+    }
+
     fn horizons(&self, rounds: usize) -> Vec<u16> {
         let mut horizons = Vec::with_capacity(self.view.trip_count() as usize * rounds);
         for trip in 0..self.view.trip_count() {
