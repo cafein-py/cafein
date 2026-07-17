@@ -1928,3 +1928,110 @@ fn probe_counters_identify_front_and_nonfront_rejections() {
     assert_eq!(histogram.iter().sum::<u64>(), rejections);
     assert_eq!(distance, examined - rejections);
 }
+
+/// A cost row's fields with NaN-safe float bits, for equality
+/// assertions.
+type CellKey = (u32, u32, u32, u64, u64, u64, u64);
+
+#[test]
+fn repeated_destination_stops_keep_every_matrix_cell() {
+    // Duplicate destination stops used to share one last-wins slot:
+    // the earlier occurrences' cells vanished from the matrix.
+    let (timetable, geometry) = forked();
+    let factors = [50.0, 100.0, 10.0];
+    let footpaths = Transfers::empty(4);
+    let inputs = CostInputs {
+        geometry: &geometry,
+        factors: &factors,
+        leg_geometry: None,
+        with_geometry: false,
+        fares: None,
+    };
+    let requests = vec![Request {
+        departure: 0,
+        access: vec![(StopIdx(0), 0)],
+        egress: Vec::new(),
+        active_services: vec![true],
+        active_services_previous: vec![false],
+        max_transfers: 3,
+    }];
+    let engine = McTbtrEngine::for_date(
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        &requests[0].active_services,
+        &requests[0].active_services_previous,
+    );
+    let destinations = [StopIdx(3), StopIdx(0), StopIdx(3)];
+    let rows = engine.least_emissions_matrix(&inputs, &requests, &destinations, 600, None, 1e-6);
+    let row = &rows[0];
+    assert_eq!(
+        row.iter().map(|cell| cell.to).collect::<Vec<_>>(),
+        [3, 0, 3]
+    );
+    assert_eq!(row[0].seconds, row[2].seconds);
+    assert_eq!(
+        row[0].emission_grams.to_bits(),
+        row[2].emission_grams.to_bits()
+    );
+}
+
+#[test]
+fn the_transfer_cap_saturates_at_the_ride_count_limit() {
+    // The trip bags hold ride counts in a `u8`: 255 transfers used to
+    // wrap the last round's rides to zero.
+    let (timetable, geometry) = forked();
+    let factors = [50.0, 100.0, 10.0];
+    let footpaths = Transfers::empty(4);
+    let inputs = CostInputs {
+        geometry: &geometry,
+        factors: &factors,
+        leg_geometry: None,
+        with_geometry: false,
+        fares: None,
+    };
+    let request = |max_transfers: u8| {
+        vec![Request {
+            departure: 0,
+            access: vec![(StopIdx(0), 0)],
+            egress: Vec::new(),
+            active_services: vec![true],
+            active_services_previous: vec![false],
+            max_transfers,
+        }]
+    };
+    let engine = McTbtrEngine::for_date(
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        &[true],
+        &[false],
+    );
+    let capped =
+        engine.least_emissions_matrix(&inputs, &request(254), &[StopIdx(3)], 600, None, 1e-6);
+    let saturated =
+        engine.least_emissions_matrix(&inputs, &request(255), &[StopIdx(3)], 600, None, 1e-6);
+    assert!(!capped[0].is_empty());
+    let cells = |rows: &Vec<Vec<CostRow>>| -> Vec<Vec<CellKey>> {
+        rows.iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| {
+                        (
+                            cell.to,
+                            cell.seconds,
+                            cell.rides,
+                            cell.transit_meters.to_bits(),
+                            cell.walk_meters.to_bits(),
+                            cell.emission_grams.to_bits(),
+                            cell.fare.to_bits(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    assert_eq!(cells(&capped), cells(&saturated));
+}

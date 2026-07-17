@@ -477,7 +477,10 @@ impl<'a> Search<'a> {
         fold: &mut Option<MatrixFold<'_>>,
         frontier: &mut Option<FrontierFold<'_>>,
     ) {
-        self.prune_target = !request.egress.is_empty();
+        // Single-target pruning is sound only for the one-pair query: a
+        // fold serves many destination cells, and a pruned label may be
+        // another cell's winner.
+        self.prune_target = !request.egress.is_empty() && fold.is_none() && frontier.is_none();
         self.stats.departure_passes += 1;
         let mut fresh: Vec<u32> = Vec::new();
         let phase = std::time::Instant::now();
@@ -515,7 +518,10 @@ impl<'a> Search<'a> {
             }
         }
         self.stats.access_ns += phase.elapsed().as_nanos() as u64;
-        for round in 1..=request.max_transfers as u32 + 1 {
+        // The bags store ride counts as `u8`, so 255 rides (254
+        // transfers) is the representable cap; beyond it the count would
+        // wrap and evict labels as zero-ride candidates.
+        for round in 1..=request.max_transfers.min(254) as u32 + 1 {
             if fresh.is_empty() {
                 self.stats.rounds_ended_empty += 1;
                 break;

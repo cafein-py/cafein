@@ -582,10 +582,9 @@ fn walk_paths_follow_the_street() {
     assert!((direct_meters - 50.0).abs() < 0.5);
     assert_eq!(short.len(), 4);
 
-    // Disconnected components yield no path.
-    let island = network // separate component
-        .walk_path((origin.1, origin.0), &from, (origin.1, origin.0), &from);
-    assert!(island.is_some());
+    // The same snapped point routes to itself: a zero-length path.
+    let same_point = network.walk_path((origin.1, origin.0), &from, (origin.1, origin.0), &from);
+    assert!(same_point.is_some());
 }
 
 #[test]
@@ -1291,6 +1290,35 @@ fn walks_to_many_snapped_points() {
     assert_eq!(matrix[0][2], Some((0, 0.0)));
 }
 
+/// A test backing whose buffer is 8-byte aligned, as a real mapping's
+/// is; a plain `Vec<u8>` only guarantees byte alignment.
+struct AlignedBytes {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl AlignedBytes {
+    fn from_bytes(bytes: &[u8]) -> AlignedBytes {
+        let mut words = vec![0u64; bytes.len().div_ceil(8)];
+        // SAFETY: the word buffer is at least `bytes.len()` bytes.
+        unsafe {
+            std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), bytes.len())
+                .copy_from_slice(bytes);
+        }
+        AlignedBytes {
+            words,
+            len: bytes.len(),
+        }
+    }
+}
+
+impl Backing for AlignedBytes {
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: the words hold `len` initialized bytes.
+        unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast::<u8>(), self.len) }
+    }
+}
+
 /// Lays a network's parts out as a mapped artifact would: each array's
 /// native-endian bytes at the next 8-byte boundary of one buffer.
 fn mapped_from(owned: &StreetNetwork) -> StreetNetwork {
@@ -1321,7 +1349,7 @@ fn mapped_from(owned: &StreetNetwork) -> StreetNetwork {
     let index_boxes = push(&mut bytes, &parts.index_boxes);
     let index_payload = push(&mut bytes, &parts.index_payload);
     StreetNetwork::from_mapped(MappedStreets {
-        backing: std::sync::Arc::new(bytes),
+        backing: std::sync::Arc::new(AlignedBytes::from_bytes(&bytes)),
         vertex_count: parts.vertex_count,
         links: parts.links,
         adjacency_offsets,
@@ -1387,7 +1415,8 @@ fn mapped_adoption_refuses_misaligned_or_truncated_ranges() {
     )
     .unwrap();
     let parts = owned.to_parts();
-    let backing: std::sync::Arc<dyn Backing> = std::sync::Arc::new(vec![0u8; 64]);
+    let backing: std::sync::Arc<dyn Backing> =
+        std::sync::Arc::new(AlignedBytes::from_bytes(&[0u8; 64]));
     let spec = |lengths: (u64, u64)| MappedStreets {
         backing: backing.clone(),
         vertex_count: parts.vertex_count,

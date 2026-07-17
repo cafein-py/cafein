@@ -116,10 +116,27 @@ pub fn least_emissions_matrix(
     // an all-empty map (every located destination unsnappable or beyond the cap)
     // must still keep the zero-walk direct credit off, leaving those
     // destinations unreachable as the stop-as-coordinate route would.
+    // A stop holds one slot, so repeated destination stops share the
+    // first occurrence's slot and their rows are re-expanded to the
+    // requested order after folding, as `frontier_matrix` does.
     let mut slots = vec![0u32; timetable.stop_count() as usize];
-    for (index, stop) in destinations.iter().enumerate() {
-        slots[stop.0 as usize] = index as u32 + 1;
+    let mut cell_of: Vec<usize> = Vec::with_capacity(destinations.len());
+    let mut unique = 0usize;
+    for &stop in destinations {
+        let slot = slots[stop.0 as usize];
+        if slot == 0 {
+            unique += 1;
+            slots[stop.0 as usize] = unique as u32;
+            cell_of.push(unique - 1);
+        } else {
+            cell_of.push(slot as usize - 1);
+        }
     }
+    let cell_count = if egress_active {
+        destinations.len()
+    } else {
+        unique
+    };
     let runs: Vec<(Vec<CostRow>, Box<McRaptorStats>)> = requests
         .par_iter()
         .zip(access_meters.par_iter())
@@ -135,7 +152,7 @@ pub fn least_emissions_matrix(
                 &[],
             );
             let departures = departure_candidates(timetable, request, window);
-            let mut best: Vec<Option<(f64, u32, u32, f64)>> = vec![None; destinations.len()];
+            let mut best: Vec<Option<(f64, u32, u32, f64)>> = vec![None; cell_count];
             for &departure in &departures {
                 let mut fold = Some(MatrixFold {
                     slots: &slots,
@@ -146,15 +163,25 @@ pub fn least_emissions_matrix(
                 });
                 search.pass(request, departure, &mut fold, &mut None);
             }
-            let rows = best
-                .into_iter()
-                .enumerate()
-                .filter_map(|(slot, winner)| {
-                    winner.map(|winner| {
-                        search.cost_row(inputs, winner, destinations[slot].0, access_meters)
+            let rows = if egress_active {
+                best.into_iter()
+                    .enumerate()
+                    .filter_map(|(slot, winner)| {
+                        winner.map(|winner| {
+                            search.cost_row(inputs, winner, destinations[slot].0, access_meters)
+                        })
                     })
-                })
-                .collect();
+                    .collect()
+            } else {
+                destinations
+                    .iter()
+                    .zip(&cell_of)
+                    .filter_map(|(&stop, &cell)| {
+                        best[cell]
+                            .map(|winner| search.cost_row(inputs, winner, stop.0, access_meters))
+                    })
+                    .collect()
+            };
             (rows, search.stats)
         })
         .collect();
@@ -199,7 +226,9 @@ pub(super) fn resolved_bounds(
                 fresh.push(stop);
             }
         }
-        for _ in 1..=request.max_transfers as u32 + 1 {
+        // The same saturation as `Search::pass`: the bound must not come
+        // from a round the multicriteria search cannot reach.
+        for _ in 1..=request.max_transfers.min(254) as u32 + 1 {
             if fresh.is_empty() {
                 break;
             }
