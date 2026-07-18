@@ -92,15 +92,58 @@ impl<'a> McTbtrEngine<'a> {
 
     /// The Pareto set over (arrival, emissions bucket) for a single
     /// departure, as full journeys.
-    pub fn route(&self, request: &Request, bucket: f64) -> Vec<Journey> {
-        self.profile(request, &[request.departure], bucket, &mut None)
+    pub fn route(&self, request: &Request, bucket: f64, max_slower: Option<u32>) -> Vec<Journey> {
+        self.profile(request, &[request.departure], bucket, max_slower, &mut None)
     }
 
     /// The departure-window profile over (departure, arrival,
     /// emissions bucket).
-    pub fn route_range(&self, request: &Request, window: u32, bucket: f64) -> Vec<Journey> {
+    pub fn route_range(
+        &self,
+        request: &Request,
+        window: u32,
+        bucket: f64,
+        max_slower: Option<u32>,
+    ) -> Vec<Journey> {
         let departures = departure_candidates(self.timetable, request, window);
-        self.profile(request, &departures, bucket, &mut None)
+        self.profile(request, &departures, bucket, max_slower, &mut None)
+    }
+
+    /// The `max_slower` restriction, precomputed per departure pass
+    /// outside the scan: per-stop survival cutoffs (resolved-trip bound
+    /// plus the band, floored at the destination bound so the fastest
+    /// journey always survives) and the destination floors the output
+    /// band anchors at. Mirrors McRAPTOR's `set_cutoff` construction.
+    fn max_slower_restriction(
+        &self,
+        request: &Request,
+        departures: &[u32],
+        band: u32,
+    ) -> (Vec<Vec<u32>>, Vec<u32>) {
+        let mut cutoffs = resolved_bounds(
+            &self.view,
+            self.timetable,
+            self.footpaths,
+            self.factors,
+            request,
+            departures,
+        );
+        let mut floors = Vec::with_capacity(cutoffs.len());
+        for per_stop in &mut cutoffs {
+            let floor = request
+                .egress
+                .iter()
+                .map(|&(stop, seconds)| per_stop[stop.0 as usize].saturating_add(seconds))
+                .min()
+                .unwrap_or(u32::MAX);
+            for bound in per_stop.iter_mut() {
+                if *bound != u32::MAX {
+                    *bound = bound.saturating_add(band).max(floor);
+                }
+            }
+            floors.push(floor);
+        }
+        (cutoffs, floors)
     }
 
     fn profile(
@@ -108,13 +151,30 @@ impl<'a> McTbtrEngine<'a> {
         request: &Request,
         departures: &[u32],
         bucket: f64,
+        max_slower: Option<u32>,
         fold: &mut Option<MatrixSink<'_>>,
     ) -> Vec<Journey> {
         let mut stats = SearchStats::default();
-        let (arena, destination) =
-            self.passes(request, departures, bucket, fold, &mut None, &mut stats);
+        let restriction =
+            max_slower.map(|band| self.max_slower_restriction(request, departures, band));
+        let cutoffs = restriction.as_ref().map(|(cutoffs, _)| cutoffs.as_slice());
+        let (arena, destination) = self.passes(
+            request, departures, bucket, cutoffs, fold, &mut None, &mut stats,
+        );
         let mut journeys: Vec<Journey> = destination
             .iter()
+            .filter(|arrived| match (&restriction, max_slower) {
+                // The output band: keep the strict-frontier entries
+                // whose arrival lies within the band of their own
+                // pass's destination bound, as McRAPTOR's profile does.
+                (Some((_, floors)), Some(band)) => {
+                    let pass = departures
+                        .binary_search_by(|probe| probe.cmp(&arrived.departure).reverse())
+                        .expect("every destination entry comes from a pass departure");
+                    arrived.arrival <= floors[pass].saturating_add(band)
+                }
+                _ => true,
+            })
             .map(|arrived| self.assemble(arrived, &arena))
             .collect();
         journeys.sort_by_key(|journey| (journey.departure, journey.arrival, journey.rides()));
@@ -123,11 +183,13 @@ impl<'a> McTbtrEngine<'a> {
 
     /// The pass loop shared by the journey profile and the matrix:
     /// returns the segment arena and the destination frontier.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn passes(
         &self,
         request: &Request,
         departures: &[u32],
         bucket: f64,
+        cutoffs: Option<&[Vec<u32>]>,
         fold: &mut Option<MatrixSink<'_>>,
         frontier: &mut Option<FrontierSink<'_>>,
         stats: &mut SearchStats,
@@ -150,10 +212,14 @@ impl<'a> McTbtrEngine<'a> {
         // Per-operation bag accounting (single-thread profiling runs).
         let profile_bag_ops = std::env::var_os("CAFEIN_MCTBTR_PROF_OPS").is_some();
         let mut destination: Vec<Arrived> = Vec::new();
-        for &departure in departures {
+        for (pass, &departure) in departures.iter().enumerate() {
+            let cutoff = cutoffs.map(|cutoffs| cutoffs[pass].as_slice());
             // Seed: board from every access stop.
             for &(stop, seconds) in &request.access {
                 let ready = departure.saturating_add(seconds);
+                if beyond_cutoff(cutoff, stop, ready) {
+                    continue;
+                }
                 // rides = 0: the access seed precedes every ride, so
                 // it ranks below all round-ranked arrivals — see
                 // mcraptor::Bag::insert.
@@ -222,6 +288,7 @@ impl<'a> McTbtrEngine<'a> {
                         index,
                         round,
                         request,
+                        cutoff,
                         key,
                         &arena,
                         &mut stop_bags,
@@ -239,6 +306,7 @@ impl<'a> McTbtrEngine<'a> {
                     &mut closure,
                     round,
                     request,
+                    cutoff,
                     key,
                     &arena,
                     &mut stop_bags,
@@ -408,6 +476,7 @@ impl<'a> McTbtrEngine<'a> {
         index: u32,
         round: usize,
         request: &Request,
+        cutoff: Option<&[u32]>,
         key: impl Fn(f64) -> i64 + Copy,
         arena: &[Segment],
         stop_bags: &mut [Bag],
@@ -430,6 +499,9 @@ impl<'a> McTbtrEngine<'a> {
             (stops.len() - segment.board as usize).saturating_sub(1) as u64;
         for alight in segment.board as usize + 1..stops.len() {
             let arrival = times[alight].arrival - offset;
+            if beyond_cutoff(cutoff, stops[alight], arrival) {
+                continue;
+            }
             let ridden =
                 absolute_grams(self.geometry, &self.view, self.factors, trip, alight as u16)
                     - boarded_from;
@@ -525,6 +597,7 @@ impl<'a> McTbtrEngine<'a> {
         closure: &mut ClosureBatch,
         round: usize,
         request: &Request,
+        cutoff: Option<&[u32]>,
         key: impl Fn(f64) -> i64 + Copy,
         arena: &[Segment],
         stop_bags: &mut [Bag],
@@ -560,6 +633,9 @@ impl<'a> McTbtrEngine<'a> {
                 let (to, duration) = (edge.to, edge.duration);
                 for point in &closure.active {
                     let reached = point.arrival.saturating_add(duration);
+                    if beyond_cutoff(cutoff, to, reached) {
+                        continue;
+                    }
                     let admitted = if profile_bag_ops {
                         let mut probes = InsertProbes::default();
                         let admitted = stop_bags[to.0 as usize].insert_probed(
@@ -833,4 +909,11 @@ impl<'a> McTbtrEngine<'a> {
             );
         }
     }
+}
+
+/// Whether an arrival falls past the pass's `max_slower` cutoff for a
+/// stop; no cutoff table means no restriction. One indexed compare —
+/// the scan's only hot-path addition under `max_slower`.
+fn beyond_cutoff(cutoff: Option<&[u32]>, stop: StopIdx, at: u32) -> bool {
+    cutoff.is_some_and(|cutoff| at > cutoff[stop.0 as usize])
 }

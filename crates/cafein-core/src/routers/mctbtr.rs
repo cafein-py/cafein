@@ -48,6 +48,7 @@ mod scan;
 mod set;
 mod stats;
 
+use super::mc_bounds::resolved_bounds;
 pub use engine::McTbtrEngine;
 use scan::*;
 pub use set::transfer_set;

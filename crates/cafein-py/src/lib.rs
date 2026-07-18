@@ -3221,8 +3221,8 @@ impl TransportNetwork {
                     &request.active_services_previous,
                 );
                 return match window {
-                    None => engine.route(&request, bucket),
-                    Some(window) => engine.route_range(&request, window, bucket),
+                    None => engine.route(&request, bucket, None),
+                    Some(window) => engine.route_range(&request, window, bucket, None),
                 };
             }
             let view = DayView::for_date(
@@ -3448,8 +3448,8 @@ impl TransportNetwork {
                     &request.active_services_previous,
                 );
                 return match window {
-                    None => engine.route(&request, bucket),
-                    Some(window) => engine.route_range(&request, window, bucket),
+                    None => engine.route(&request, bucket, None),
+                    Some(window) => engine.route_range(&request, window, bucket, None),
                 };
             }
             let view = DayView::for_date(
