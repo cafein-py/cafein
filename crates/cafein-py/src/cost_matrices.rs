@@ -1156,3 +1156,208 @@ impl TransportNetwork {
         rows
     }
 }
+
+/// Parses the flat fare tables `cafein.fares` produces, validating the
+/// arrays against the network's route and stop counts.
+pub(super) fn fare_tables(
+    spec: &Bound<'_, PyDict>,
+    route_count: usize,
+    stop_count: usize,
+) -> PyResult<FareTables> {
+    fn item<'py, T: FromPyObject<'py>>(spec: &Bound<'py, PyDict>, key: &str) -> PyResult<T> {
+        spec.get_item(key)?
+            .ok_or_else(|| PyValueError::new_err(format!("fare tables are missing {key:?}")))?
+            .extract()
+    }
+    if spec.contains("stop_zone")? {
+        let stop_zone: Vec<u32> = item(spec, "stop_zone")?;
+        if stop_zone.len() != stop_count {
+            return Err(PyValueError::new_err(
+                "the fare tables' stop_zone must cover every stop",
+            ));
+        }
+        if stop_zone.iter().any(|&zone| zone != NO_FARE && zone >= 128) {
+            return Err(PyValueError::new_err(
+                "fare zone indexes must stay below 128",
+            ));
+        }
+        let products: Vec<(f64, u128, f64, u32)> = item(spec, "products")?;
+        let products = products
+            .into_iter()
+            .map(|(price, zones, duration, transfers)| ZoneProduct {
+                price,
+                zones,
+                duration,
+                transfers,
+            })
+            .collect();
+        Ok(FareTables::Zone(ZoneFares {
+            stop_zone,
+            products,
+        }))
+    } else {
+        let tables = RuleFares {
+            route_type: item(spec, "route_type")?,
+            route_fare: item(spec, "route_fare")?,
+            unlimited_transfers: item(spec, "unlimited_transfers")?,
+            allow_same_route: item(spec, "allow_same_route")?,
+            pair_fare: item(spec, "pair_fare")?,
+            max_discounted_transfers: item(spec, "max_discounted_transfers")?,
+            transfer_allowance: item(spec, "transfer_allowance")?,
+            fare_cap: item(spec, "fare_cap")?,
+        };
+        let count = tables.unlimited_transfers.len();
+        if tables.route_type.len() != route_count || tables.route_fare.len() != route_count {
+            return Err(PyValueError::new_err(
+                "the fare tables' route arrays must cover every route",
+            ));
+        }
+        if tables.allow_same_route.len() != count || tables.pair_fare.len() != count * count {
+            return Err(PyValueError::new_err(
+                "the fare tables' type arrays disagree on the type count",
+            ));
+        }
+        if tables
+            .route_type
+            .iter()
+            .any(|&kind| kind != NO_FARE && kind as usize >= count)
+        {
+            return Err(PyValueError::new_err(
+                "the fare tables' route types must index the type arrays",
+            ));
+        }
+        Ok(FareTables::RuleBased(tables))
+    }
+}
+
+/// Parses the objective a windowed candidate fold minimises.
+pub(super) fn parse_objective(objective: &str, fares: Option<&FareTables>) -> PyResult<Objective> {
+    match objective {
+        "emissions" => Ok(Objective::Emissions),
+        "fare" if fares.is_none() => Err(PyValueError::new_err(
+            "the 'fare' objective requires fare tables",
+        )),
+        "fare" => Ok(Objective::Fare),
+        other => Err(PyValueError::new_err(format!(
+            "objective must be 'emissions' or 'fare', not {other:?}"
+        ))),
+    }
+}
+
+/// Flattens per-origin cost rows into the columnar dict the Python
+/// matrices consume: equal-length arrays for the surviving pairs, plus
+/// a WKB list when geometries ride along.
+pub(super) fn cost_rows_dict(
+    py: Python<'_>,
+    rows: Vec<Vec<CostRow>>,
+    geometries: bool,
+) -> PyResult<Py<PyDict>> {
+    let total: usize = rows.iter().map(Vec::len).sum();
+    let mut from = Vec::with_capacity(total);
+    let mut to = Vec::with_capacity(total);
+    let mut travel_time = Vec::with_capacity(total);
+    let mut rides = Vec::with_capacity(total);
+    let mut transit_distance = Vec::with_capacity(total);
+    let mut walk_distance = Vec::with_capacity(total);
+    let mut emissions = Vec::with_capacity(total);
+    let mut fare = Vec::with_capacity(total);
+    let wkbs = PyList::empty(py);
+    for (origin, origin_rows) in rows.into_iter().enumerate() {
+        for row in origin_rows {
+            from.push(origin as u32);
+            to.push(row.to);
+            travel_time.push(row.seconds);
+            rides.push(row.rides);
+            transit_distance.push(row.transit_meters);
+            walk_distance.push(row.walk_meters);
+            emissions.push(row.emission_grams);
+            fare.push(row.fare);
+            if geometries {
+                match row.geometry {
+                    Some(wkb) => wkbs.append(PyBytes::new(py, &wkb))?,
+                    None => wkbs.append(py.None())?,
+                }
+            }
+        }
+    }
+    let result = PyDict::new(py);
+    result.set_item("from", from.into_pyarray(py))?;
+    result.set_item("to", to.into_pyarray(py))?;
+    result.set_item("travel_time", travel_time.into_pyarray(py))?;
+    result.set_item("rides", rides.into_pyarray(py))?;
+    result.set_item("transit_distance", transit_distance.into_pyarray(py))?;
+    result.set_item("walk_distance", walk_distance.into_pyarray(py))?;
+    result.set_item("emissions", emissions.into_pyarray(py))?;
+    result.set_item("fare", fare.into_pyarray(py))?;
+    if geometries {
+        result.set_item("geometry", wkbs)?;
+    }
+    Ok(result.unbind())
+}
+
+/// Whether the walking-only journey stays within a ``max_slower`` band:
+/// its arrival must sit within the band of the fastest returned transit
+/// journey (the minimum of the per-pass anchors the search's output
+/// filter kept). Without the restriction, or when nothing rides, the
+/// walk always stays. Anchoring on the pre-walk-domination journey set
+/// is equivalent to anchoring on the emitted rows: a walk-dominated
+/// journey travels at least the walk's seconds and departs no earlier
+/// than the walk, so it arrives no earlier than the walk itself and can
+/// neither keep nor drop the walk differently than the kept set's
+/// fastest would.
+pub(super) fn walk_within_band(
+    walk_seconds: u32,
+    departure: u32,
+    journeys: &[Journey],
+    max_slower: Option<u32>,
+) -> bool {
+    let Some(band) = max_slower else {
+        return true;
+    };
+    let Some(fastest) = journeys.iter().map(|journey| journey.arrival).min() else {
+        return true;
+    };
+    departure.saturating_add(walk_seconds) <= fastest.saturating_add(band)
+}
+
+/// Overlays an origin's explicit direct street walks onto its emissions cost
+/// cells: a walking-only journey — zero rides, its walked metres, zero emissions
+/// under today's walking factor — wins a destination cell whenever nothing
+/// transit-side is cleaner. `walks` is `(destination slot, walk seconds, walk
+/// metres)` with the diagonal (origin coordinate == destination coordinate)
+/// already zeroed by the caller; a walk beyond the travel-time `budget` is
+/// dropped. `priced` prices the walk at zero fare when a fare model is present.
+pub(super) fn merge_direct_walk_cells(
+    row: &mut Vec<CostRow>,
+    walks: &[(u32, u32, f64)],
+    destinations: &[StopIdx],
+    budget: Option<u32>,
+    priced: bool,
+) {
+    for &(slot, seconds, meters) in walks {
+        if budget.is_some_and(|cap| seconds > cap) {
+            continue;
+        }
+        let to = destinations[slot as usize].0;
+        let cell = CostRow {
+            to,
+            seconds,
+            rides: 0,
+            transit_meters: 0.0,
+            walk_meters: meters,
+            emission_grams: 0.0,
+            fare: if priced { 0.0 } else { f64::NAN },
+            geometry: None,
+        };
+        match row.iter_mut().find(|existing| existing.to == to) {
+            Some(existing) => {
+                if 0.0 < existing.emission_grams
+                    || (existing.emission_grams == 0.0 && seconds < existing.seconds)
+                {
+                    *existing = cell;
+                }
+            }
+            None => row.push(cell),
+        }
+    }
+}

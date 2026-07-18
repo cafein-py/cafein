@@ -353,3 +353,118 @@ impl TransportNetwork {
         Ok(dict.unbind())
     }
 }
+
+/// Rejects an empty or out-of-range window/percentile specification.
+pub(super) fn validate_window(window: u32, percentiles: &[f64]) -> PyResult<()> {
+    if window == 0 {
+        return Err(PyValueError::new_err("window must be at least 1 second"));
+    }
+    if percentiles.is_empty() {
+        return Err(PyValueError::new_err("percentiles must not be empty"));
+    }
+    for &percentile in percentiles {
+        if !percentile.is_finite() || !(0.0..=100.0).contains(&percentile) {
+            return Err(PyValueError::new_err(
+                "percentiles must be finite and within [0, 100]",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects non-finite point coordinates with the offending index.
+pub(super) fn validate_points(points: &[(f64, f64)]) -> PyResult<()> {
+    for (index, &(lat, lon)) in points.iter().enumerate() {
+        if !lat.is_finite() || !lon.is_finite() {
+            return Err(PyValueError::new_err(format!(
+                "point {index} has non-finite coordinates"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The error every routing entry raises for an unknown `router` value.
+pub(super) fn invalid_router(router: &str) -> PyErr {
+    PyValueError::new_err(format!(
+        "router must be 'auto', 'raptor', or 'tbtr', not {router:?}"
+    ))
+}
+
+/// A deterministic, NaN-safe fingerprint of a per-trip emission-factor vector,
+/// binding a McULTRA set to the factor configuration it was built with (a query
+/// with different factors falls back to the closure). Not a cryptographic digest.
+pub(super) fn factor_fingerprint(per_trip: &[f64]) -> u64 {
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = 0xcbf29ce484222325u64;
+    for &factor in per_trip {
+        hash = (hash ^ factor.to_bits()).wrapping_mul(PRIME);
+    }
+    (hash ^ per_trip.len() as u64).wrapping_mul(PRIME)
+}
+
+/// Parses ``HH:MM:SS`` into seconds past the service day's start; hours may
+/// exceed 23 for over-midnight times, following GTFS.
+pub(super) fn parse_time(value: &str) -> PyResult<u32> {
+    let parts: Vec<&str> = value.split(':').collect();
+    let invalid = || PyValueError::new_err(format!("invalid time '{value}': expected HH:MM:SS"));
+    if parts.len() != 3 {
+        return Err(invalid());
+    }
+    let hours: u32 = parts[0].parse().map_err(|_| invalid())?;
+    let minutes: u32 = parts[1].parse().map_err(|_| invalid())?;
+    let seconds: u32 = parts[2].parse().map_err(|_| invalid())?;
+    if minutes > 59 || seconds > 59 {
+        return Err(invalid());
+    }
+    hours
+        .checked_mul(3600)
+        .and_then(|in_seconds| in_seconds.checked_add(minutes * 60 + seconds))
+        .ok_or_else(invalid)
+}
+
+pub(super) fn to_py_error(error: cafein_gtfs::Error) -> PyErr {
+    PyValueError::new_err(error.to_string())
+}
+
+/// The numeric GTFS route_type of a parsed route type; named variants map
+/// to their standard codes, extended codes pass through.
+pub(super) fn route_type_code(route_type: &RouteType) -> i32 {
+    match route_type {
+        RouteType::Tramway => 0,
+        RouteType::Subway => 1,
+        RouteType::Rail => 2,
+        RouteType::Bus => 3,
+        RouteType::Ferry => 4,
+        RouteType::CableCar => 5,
+        RouteType::Gondola => 6,
+        RouteType::Funicular => 7,
+        RouteType::Coach => 200,
+        RouteType::Air => 1100,
+        RouteType::Taxi => 1500,
+        RouteType::Other(code) => *code as i32,
+    }
+}
+
+pub(super) fn provenance_name(tier: DistanceProvenance) -> &'static str {
+    match tier {
+        DistanceProvenance::ShapeDist => "shape_dist",
+        DistanceProvenance::ShapeLinRef => "shape_linref",
+        DistanceProvenance::OsmRelation => "osm_relation",
+        DistanceProvenance::MapMatched => "map_matched",
+        DistanceProvenance::CrowFly => "crow_fly",
+    }
+}
+
+pub(super) fn parse_provenance(value: &str) -> PyResult<DistanceProvenance> {
+    match value {
+        "shape_dist" => Ok(DistanceProvenance::ShapeDist),
+        "shape_linref" => Ok(DistanceProvenance::ShapeLinRef),
+        "osm_relation" => Ok(DistanceProvenance::OsmRelation),
+        "map_matched" => Ok(DistanceProvenance::MapMatched),
+        "crow_fly" => Ok(DistanceProvenance::CrowFly),
+        other => Err(PyValueError::new_err(format!(
+            "unknown distance provenance '{other}'"
+        ))),
+    }
+}

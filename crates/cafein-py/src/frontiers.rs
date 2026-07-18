@@ -1250,3 +1250,117 @@ impl TransportNetwork {
         })
     }
 }
+
+/// The six batched door-to-door frontier parts `point_frontier_rows`
+/// hands both the journey and table forms.
+pub(super) type PointFrontierParts = (
+    Vec<Vec<Vec<Journey>>>,
+    Vec<Vec<Option<(u32, f64)>>>,
+    Vec<Option<Vec<WalkedStop>>>,
+    Vec<Option<Vec<WalkedStop>>>,
+    Vec<u32>,
+    Vec<u32>,
+);
+
+/// One frontier-table row of a journey: (departure, arrival, rides,
+/// emissions). Emissions mirror `cafein.emissions.annotate`: walking
+/// legs contribute nothing, each transit leg contributes its
+/// leg-distance in kilometres times the trip's factor, summed in leg
+/// order, and any unresolved transit factor turns the journey's total
+/// into NaN.
+pub(super) fn frontier_row(
+    geometry: &TripGeometry,
+    per_trip: &[f64],
+    journey: &Journey,
+) -> (u32, u32, u32, f64) {
+    let mut total = 0.0;
+    let mut complete = true;
+    for leg in &journey.legs {
+        if let Leg::Transit {
+            trip,
+            board_position,
+            alight_position,
+            ..
+        } = leg
+        {
+            let factor = per_trip[trip.0 as usize];
+            if factor.is_nan() {
+                complete = false;
+            } else {
+                let distance =
+                    geometry.leg_distance(*trip, *board_position, *alight_position) as f64;
+                total += distance / 1000.0 * factor;
+            }
+        }
+    }
+    (
+        journey.departure,
+        journey.arrival,
+        journey.rides() as u32,
+        if complete { total } else { f64::NAN },
+    )
+}
+
+/// The flat columns of a batched frontier table, filled cell by cell in
+/// the requested (origin, destination) order.
+#[derive(Default)]
+pub(super) struct FrontierColumns {
+    from_index: Vec<u32>,
+    to_index: Vec<u32>,
+    departure: Vec<u32>,
+    arrival: Vec<u32>,
+    travel_time: Vec<u32>,
+    rides: Vec<u32>,
+    emissions: Vec<f64>,
+    frontier: Vec<bool>,
+}
+
+impl FrontierColumns {
+    /// Appends one cell's rows, sorted and Pareto-marked exactly as the
+    /// journey frame: a stable sort by (travel_time, emissions) with
+    /// NaN emissions last within equal travel times, and the frontier
+    /// mask over (travel_time, emissions) where a NaN row never joins
+    /// the frontier and never dominates.
+    fn push_cell(&mut self, from: u32, to: u32, mut rows: Vec<(u32, u32, u32, f64)>) {
+        rows.sort_by(|a, b| {
+            let time = (a.1 - a.0).cmp(&(b.1 - b.0));
+            time.then_with(|| match (a.3.is_nan(), b.3.is_nan()) {
+                (false, false) => a.3.partial_cmp(&b.3).expect("no NaN"),
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+            })
+        });
+        for (i, &(departure, arrival, rides, grams)) in rows.iter().enumerate() {
+            let time = arrival - departure;
+            let on = !grams.is_nan()
+                && !rows.iter().enumerate().any(|(j, &(dj, aj, _, gj))| {
+                    j != i && !gj.is_nan() && {
+                        let tj = aj - dj;
+                        tj <= time && gj <= grams && (tj < time || gj < grams)
+                    }
+                });
+            self.from_index.push(from);
+            self.to_index.push(to);
+            self.departure.push(departure);
+            self.arrival.push(arrival);
+            self.travel_time.push(time);
+            self.rides.push(rides);
+            self.emissions.push(grams);
+            self.frontier.push(on);
+        }
+    }
+
+    fn into_dict(self, py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item("from_index", self.from_index.into_pyarray(py))?;
+        dict.set_item("to_index", self.to_index.into_pyarray(py))?;
+        dict.set_item("departure", self.departure.into_pyarray(py))?;
+        dict.set_item("arrival", self.arrival.into_pyarray(py))?;
+        dict.set_item("travel_time", self.travel_time.into_pyarray(py))?;
+        dict.set_item("rides", self.rides.into_pyarray(py))?;
+        dict.set_item("emissions", self.emissions.into_pyarray(py))?;
+        dict.set_item("frontier", self.frontier.into_pyarray(py))?;
+        Ok(dict)
+    }
+}

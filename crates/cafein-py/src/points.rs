@@ -253,3 +253,101 @@ impl TransportNetwork {
         }
     }
 }
+
+/// The `(stop, seconds)` request offsets of a walking-search result.
+pub(super) fn request_offsets(walks: &[WalkedStop]) -> Vec<(StopIdx, u32)> {
+    walks.iter().map(|walk| (walk.stop, walk.seconds)).collect()
+}
+
+/// A coordinate query's endpoints, for drawing its walk legs.
+pub(super) struct CoordinateEnds {
+    pub(super) origin: (f64, f64),
+    pub(super) origin_snap: Snap,
+    pub(super) destination: (f64, f64),
+    pub(super) destination_snap: Snap,
+}
+
+/// The indices of points the linking could not snap.
+pub(super) fn unsnapped(links: &[Option<Vec<WalkedStop>>]) -> Vec<u32> {
+    links
+        .iter()
+        .enumerate()
+        .filter_map(|(index, links)| links.is_none().then_some(index as u32))
+        .collect()
+}
+
+/// Each destination point's `(stop, seconds, meters)` egress table;
+/// unsnapped points get an empty table and stay unreachable.
+pub(super) fn egress_tables(links: &[Option<Vec<WalkedStop>>]) -> Vec<Vec<(StopIdx, u32, f64)>> {
+    links
+        .iter()
+        .map(|links| {
+            links
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|walk| (walk.stop, walk.seconds, walk.meters))
+                .collect()
+        })
+        .collect()
+}
+
+/// The walking speed in m/s of validated street-query parameters, or a
+/// `ValueError` naming the parameter that is out of range.
+pub(super) fn validated_walking_speed(
+    walking_speed_kmph: f64,
+    max_walking_time: f64,
+    max_snap_distance: f64,
+) -> PyResult<f64> {
+    if !walking_speed_kmph.is_finite() || walking_speed_kmph <= 0.0 {
+        return Err(PyValueError::new_err(
+            "walking_speed_kmph must be a positive, finite number",
+        ));
+    }
+    if !max_walking_time.is_finite() || max_walking_time < 0.0 {
+        return Err(PyValueError::new_err(
+            "max_walking_time must be a non-negative, finite number",
+        ));
+    }
+    if !max_snap_distance.is_finite() || max_snap_distance < 0.0 {
+        return Err(PyValueError::new_err(
+            "max_snap_distance must be a non-negative, finite number",
+        ));
+    }
+    Ok(walking_speed_kmph / 3.6)
+}
+
+/// The stops walkable from a coordinate, or a `ValueError` when the
+/// coordinate is invalid or off the network; `side` prefixes the message
+/// (e.g. `"origin "`) to name the endpoint.
+pub(super) fn coordinate_links(
+    streets: &StreetNetwork,
+    coordinate: (f64, f64),
+    walking_speed: f64,
+    max_walking_time: f64,
+    max_snap_distance: f64,
+    side: &str,
+) -> PyResult<Vec<WalkedStop>> {
+    let (lat, lon) = coordinate;
+    if !lat.is_finite() || !lon.is_finite() {
+        return Err(PyValueError::new_err(format!(
+            "{side}lat and lon must be finite"
+        )));
+    }
+    streets
+        .access_stops(lat, lon, walking_speed, max_walking_time, max_snap_distance)
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "{side}({lat}, {lon}) is farther than {max_snap_distance} m \
+                 from the walking network"
+            ))
+        })
+}
+
+/// Encodes coordinates as a little-endian WKB LineString (XY).
+pub(super) fn wkb_line_string<'py>(
+    py: Python<'py>,
+    coordinates: &[(f64, f64)],
+) -> Bound<'py, PyBytes> {
+    PyBytes::new(py, &cafein_core::geometry::wkb_line_string(coordinates))
+}
