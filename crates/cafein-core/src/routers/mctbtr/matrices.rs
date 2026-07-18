@@ -23,6 +23,7 @@ impl<'a> McTbtrEngine<'a> {
         slot_count: usize,
         window: u32,
         bucket: f64,
+        max_slower: Option<u32>,
     ) -> Vec<Vec<Vec<Journey>>> {
         if egress_active {
             assert_eq!(
@@ -54,10 +55,73 @@ impl<'a> McTbtrEngine<'a> {
             }
         }
         let bag_count = if egress_active { slot_count } else { unique };
+        // Every (stop, slot, final-walk seconds) pair, for the per-slot
+        // destination bounds of the `max_slower` restriction.
+        let slot_egress: Vec<(StopIdx, usize, u32)> = if max_slower.is_none() {
+            Vec::new()
+        } else if egress_active {
+            egress
+                .iter()
+                .enumerate()
+                .flat_map(|(stop, entries)| {
+                    entries.iter().map(move |&(slot, seconds, _)| {
+                        (StopIdx(stop as u32), slot as usize, seconds)
+                    })
+                })
+                .collect()
+        } else {
+            destinations
+                .iter()
+                .zip(&cell_of)
+                .map(|(&stop, &slot)| (stop, slot, 0))
+                .collect()
+        };
         let collected: Vec<(Vec<Vec<Journey>>, SearchStats)> = requests
             .par_iter()
             .map(|request| {
                 let departures = departure_candidates(self.timetable, request, window);
+                // Per pass, the per-slot destination bounds and the
+                // survival cutoffs (bound + band, floored at the
+                // farthest reachable slot's bound so every cell's
+                // fastest journey survives), as McRAPTOR's matrix does.
+                let restricted = max_slower.map(|band| {
+                    let mut cutoffs = resolved_bounds(
+                        &self.view,
+                        self.timetable,
+                        self.footpaths,
+                        self.factors,
+                        request,
+                        &departures,
+                    );
+                    let floors: Vec<Vec<u32>> = cutoffs
+                        .iter()
+                        .map(|per_stop| {
+                            let mut slot_floors = vec![u32::MAX; bag_count];
+                            for &(stop, slot, seconds) in &slot_egress {
+                                let bound = per_stop[stop.0 as usize].saturating_add(seconds);
+                                slot_floors[slot] = slot_floors[slot].min(bound);
+                            }
+                            slot_floors
+                        })
+                        .collect();
+                    for (per_stop, slot_floors) in cutoffs.iter_mut().zip(&floors) {
+                        let global_floor = slot_floors
+                            .iter()
+                            .copied()
+                            .filter(|&floor| floor != u32::MAX)
+                            .max()
+                            .unwrap_or(u32::MAX);
+                        for bound in per_stop.iter_mut() {
+                            if *bound != u32::MAX {
+                                *bound = bound.saturating_add(band).max(global_floor);
+                            }
+                        }
+                    }
+                    (band, cutoffs, floors)
+                });
+                let cutoffs = restricted
+                    .as_ref()
+                    .map(|(_, cutoffs, _)| cutoffs.as_slice());
                 let mut bags: Vec<Vec<Arrived>> = vec![Vec::new(); bag_count];
                 let mut sink = Some(FrontierSink {
                     slots: &slots,
@@ -70,15 +134,31 @@ impl<'a> McTbtrEngine<'a> {
                     request,
                     &departures,
                     bucket,
+                    cutoffs,
                     &mut None,
                     &mut sink,
                     &mut stats,
                 );
                 let cells: Vec<Vec<Journey>> = bags
                     .iter()
-                    .map(|bag| {
+                    .enumerate()
+                    .map(|(slot, bag)| {
                         let mut journeys: Vec<Journey> = bag
                             .iter()
+                            .filter(|arrived| match &restricted {
+                                // The output band, per cell against its
+                                // own pass's slot bound — at readout,
+                                // never inside the sink.
+                                Some((band, _, floors)) => {
+                                    let pass = departures
+                                        .binary_search_by(|probe| {
+                                            probe.cmp(&arrived.departure).reverse()
+                                        })
+                                        .expect("every frontier entry comes from a pass");
+                                    arrived.arrival <= floors[pass][slot].saturating_add(*band)
+                                }
+                                None => true,
+                            })
                             .map(|arrived| self.assemble(arrived, &arena))
                             .collect();
                         journeys.sort_by_key(|journey| {
@@ -151,6 +231,7 @@ impl<'a> McTbtrEngine<'a> {
                     request,
                     &departures,
                     bucket,
+                    None,
                     &mut fold,
                     &mut None,
                     &mut SearchStats::default(),

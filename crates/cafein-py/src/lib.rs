@@ -3122,13 +3122,10 @@ impl TransportNetwork {
             ));
         }
         if max_slower.is_some()
-            && (router == "tbtr"
-                || slack > 0.0
-                || !banned_routes.is_empty()
-                || !route_penalties.is_empty())
+            && (slack > 0.0 || !banned_routes.is_empty() || !route_penalties.is_empty())
         {
             return Err(PyValueError::new_err(
-                "max_slower requires router='raptor' and strict pareto candidates",
+                "max_slower requires strict pareto candidates",
             ));
         }
         let Some(geometry) = &self.geometry else {
@@ -3196,10 +3193,7 @@ impl TransportNetwork {
             router,
             date,
             &per_trip,
-            slack > 0.0
-                || !banned_routes.is_empty()
-                || !route_penalties.is_empty()
-                || max_slower.is_some(),
+            slack > 0.0 || !banned_routes.is_empty() || !route_penalties.is_empty(),
         )?;
         let request = Request {
             departure: parse_time(departure)?,
@@ -3221,8 +3215,8 @@ impl TransportNetwork {
                     &request.active_services_previous,
                 );
                 return match window {
-                    None => engine.route(&request, bucket),
-                    Some(window) => engine.route_range(&request, window, bucket),
+                    None => engine.route(&request, bucket, max_slower),
+                    Some(window) => engine.route_range(&request, window, bucket, max_slower),
                 };
             }
             let view = DayView::for_date(
@@ -3347,13 +3341,10 @@ impl TransportNetwork {
             ));
         }
         if max_slower.is_some()
-            && (router == "tbtr"
-                || slack > 0.0
-                || !banned_routes.is_empty()
-                || !route_penalties.is_empty())
+            && (slack > 0.0 || !banned_routes.is_empty() || !route_penalties.is_empty())
         {
             return Err(PyValueError::new_err(
-                "max_slower requires router='raptor' and strict pareto candidates",
+                "max_slower requires strict pareto candidates",
             ));
         }
         let Some(geometry) = &self.geometry else {
@@ -3429,10 +3420,7 @@ impl TransportNetwork {
             router,
             date,
             &per_trip,
-            slack > 0.0
-                || !banned_routes.is_empty()
-                || !route_penalties.is_empty()
-                || max_slower.is_some(),
+            slack > 0.0 || !banned_routes.is_empty() || !route_penalties.is_empty(),
         )?;
         let intermediate = self.emissions_transfers(factor_fingerprint(&per_trip));
         let slack = slack.round() as u32;
@@ -3448,8 +3436,8 @@ impl TransportNetwork {
                     &request.active_services_previous,
                 );
                 return match window {
-                    None => engine.route(&request, bucket),
-                    Some(window) => engine.route_range(&request, window, bucket),
+                    None => engine.route(&request, bucket, max_slower),
+                    Some(window) => engine.route_range(&request, window, bucket, max_slower),
                 };
             }
             let view = DayView::for_date(
@@ -3565,11 +3553,6 @@ impl TransportNetwork {
         if !matches!(router, "auto" | "raptor" | "tbtr") {
             return Err(invalid_router(router));
         }
-        if max_slower.is_some() && router == "tbtr" {
-            return Err(PyValueError::new_err(
-                "max_slower requires router='raptor' and strict pareto candidates",
-            ));
-        }
         if window == 0 {
             return Err(PyValueError::new_err(
                 "window must be a positive number of seconds",
@@ -3599,7 +3582,7 @@ impl TransportNetwork {
                 per_trip[trip.0 as usize] = *factor;
             }
         }
-        let router = self.resolve_mc_router(router, date, &per_trip, max_slower.is_some())?;
+        let router = self.resolve_mc_router(router, date, &per_trip, false)?;
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
@@ -3632,6 +3615,7 @@ impl TransportNetwork {
                     destinations.len(),
                     window,
                     bucket,
+                    max_slower,
                 );
             }
             let view = DayView::for_date(
@@ -3723,11 +3707,6 @@ impl TransportNetwork {
         if !matches!(router, "auto" | "raptor" | "tbtr") {
             return Err(invalid_router(router));
         }
-        if max_slower.is_some() && router == "tbtr" {
-            return Err(PyValueError::new_err(
-                "max_slower requires router='raptor' and strict pareto candidates",
-            ));
-        }
         if window == 0 {
             return Err(PyValueError::new_err(
                 "window must be a positive number of seconds",
@@ -3754,7 +3733,7 @@ impl TransportNetwork {
                 per_trip[trip.0 as usize] = *factor;
             }
         }
-        let router = self.resolve_mc_router(router, date, &per_trip, max_slower.is_some())?;
+        let router = self.resolve_mc_router(router, date, &per_trip, false)?;
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
@@ -3892,11 +3871,6 @@ impl TransportNetwork {
         if !matches!(router, "auto" | "raptor" | "tbtr") {
             return Err(invalid_router(router));
         }
-        if max_slower.is_some() && router == "tbtr" {
-            return Err(PyValueError::new_err(
-                "max_slower requires router='raptor' and strict pareto candidates",
-            ));
-        }
         if window == 0 {
             return Err(PyValueError::new_err(
                 "window must be a positive number of seconds",
@@ -3921,7 +3895,7 @@ impl TransportNetwork {
                 per_trip[trip.0 as usize] = *factor;
             }
         }
-        let router = self.resolve_mc_router(router, date, &per_trip, max_slower.is_some())?;
+        let router = self.resolve_mc_router(router, date, &per_trip, false)?;
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
@@ -3954,6 +3928,7 @@ impl TransportNetwork {
                     destinations.len(),
                     window,
                     bucket,
+                    max_slower,
                 );
             }
             let view = DayView::for_date(
@@ -4036,11 +4011,6 @@ impl TransportNetwork {
         if !matches!(router, "auto" | "raptor" | "tbtr") {
             return Err(invalid_router(router));
         }
-        if max_slower.is_some() && router == "tbtr" {
-            return Err(PyValueError::new_err(
-                "max_slower requires router='raptor' and strict pareto candidates",
-            ));
-        }
         if window == 0 {
             return Err(PyValueError::new_err(
                 "window must be a positive number of seconds",
@@ -4062,7 +4032,7 @@ impl TransportNetwork {
                 per_trip[trip.0 as usize] = *factor;
             }
         }
-        let router = self.resolve_mc_router(router, date, &per_trip, max_slower.is_some())?;
+        let router = self.resolve_mc_router(router, date, &per_trip, false)?;
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
@@ -6270,6 +6240,7 @@ impl TransportNetwork {
                     destinations.len(),
                     window,
                     bucket,
+                    max_slower,
                 )
             } else {
                 let view = DayView::for_date(

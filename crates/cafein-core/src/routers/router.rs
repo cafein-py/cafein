@@ -63,9 +63,14 @@ pub fn auto_time_tbtr(cached_date: Option<&str>, date: &str) -> bool {
 ///
 /// Only when a cached multicriteria transfer set was precomputed for the
 /// query's service date **and** resolved per-trip factor fingerprint, and the
-/// query asks nothing the trip-based engine cannot answer (`needs_raptor`:
-/// relaxed or diverse candidates, `max_slower`, or a door-to-door upgrade
-/// only the RAPTOR path has).
+/// query asks nothing the trip-based engine cannot answer (`needs_raptor`).
+/// The boundary is a contract, not a gap: the persisted set is reduced
+/// under strict unpenalized dominance at build time, so positive slack
+/// and route bans or penalties (the relaxed and diverse candidates) can
+/// invalidate transfers discarded against build-time witnesses and stay
+/// on McRAPTOR, as does a door-to-door upgrade only the RAPTOR path
+/// has. `max_slower` restricts the strict search and runs on either
+/// engine.
 pub fn auto_mc_tbtr(
     cached: Option<(&str, u64)>,
     date: &str,

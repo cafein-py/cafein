@@ -38,6 +38,7 @@ mod products;
 mod search;
 mod stats;
 
+pub(crate) use super::mc_bounds::resolved_bounds;
 use bag::*;
 pub(crate) use bag::{Bag, InsertProbes};
 pub use products::{frontier_matrix, least_emissions_matrix, route, route_range};

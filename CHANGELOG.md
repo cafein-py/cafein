@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- `max_slower` runs on the trip-based multicriteria engine:
+  `router="tbtr"` accepts it on the one-pair and batched frontier
+  forms, cell-for-cell equal to McRAPTOR, and `router="auto"` rides a
+  matching cached McTBTR set instead of falling back. Relaxed and
+  diverse candidates stay on McRAPTOR by contract: the precomputed
+  transfer set is reduced under strict unpenalized dominance, which
+  slack and route penalties would invalidate.
+- Fixed the `max_slower` restriction bounds losing a destination when
+  a faster arrival from another departure pass had exhausted the
+  transfer cap: the resolved-trip sweep is now ride-aware, so a
+  fewer-rides label that still has capacity to continue is never
+  suppressed and the band always anchors at each pass's true fastest
+  journey.
+
 - Fixed repeated destination stops losing cells in the pareto
   (McRAPTOR/McTBTR) least-emissions matrices: duplicate `to_stops`
   shared one slot with last-wins, so only the final occurrence

@@ -338,7 +338,7 @@ fn engines_agree(
         &request.active_services,
         &request.active_services_previous,
     );
-    let tbtr = engine.route(&request, 1e-6);
+    let tbtr = engine.route(&request, 1e-6, None);
     assert_eq!(triples(&tbtr, geometry, factors), oracle, "mctbtr");
     oracle
 }
@@ -618,7 +618,7 @@ fn profiles_the_departure_window() {
         &request.active_services,
         &request.active_services_previous,
     );
-    let journeys = engine.route_range(&request, 200, 1e-6);
+    let journeys = engine.route_range(&request, 200, 1e-6, None);
     let profile: Vec<(u32, u32)> = journeys
         .iter()
         .map(|journey| (journey.departure, journey.arrival))
@@ -727,6 +727,7 @@ fn the_frontier_matrix_matches_the_one_pair_profile_per_cell() {
         destinations.len(),
         1000,
         1e-6,
+        None,
     );
     let keys = |journeys: &[Journey]| -> Vec<(u32, u32, u32, f64)> {
         journeys
@@ -745,7 +746,7 @@ fn the_frontier_matrix_matches_the_one_pair_profile_per_cell() {
         for (&destination, cell) in destinations.iter().zip(row) {
             let mut one_pair = request.clone();
             one_pair.egress = vec![(destination, 0)];
-            let journeys = engine.route_range(&one_pair, 1000, 1e-6);
+            let journeys = engine.route_range(&one_pair, 1000, 1e-6, None);
             assert_eq!(keys(cell), keys(&journeys));
         }
     }
@@ -782,8 +783,8 @@ fn a_prebuilt_transfer_set_answers_like_for_date() {
         active_services_previous: Vec::new(),
         max_transfers: 3,
     };
-    let over_owned = owned.route_range(&request, 1000, 1e-6);
-    let over_borrowed = borrowed.route_range(&request, 1000, 1e-6);
+    let over_owned = owned.route_range(&request, 1000, 1e-6, None);
+    let over_borrowed = borrowed.route_range(&request, 1000, 1e-6, None);
     assert!(!over_owned.is_empty());
     assert_eq!(
         triples(&over_owned, &geometry, &factors),
@@ -887,6 +888,7 @@ fn the_frontier_matrix_serves_a_slot_only_the_transfer_reaches() {
         destinations.len(),
         1000,
         1e-6,
+        None,
     );
     // The second cell holds both transfer journeys: the plain
     // through-and-onward ride, and the cleaner three-ride alternative
@@ -902,7 +904,7 @@ fn the_frontier_matrix_serves_a_slot_only_the_transfer_reaches() {
     for (&destination, cell) in destinations.iter().zip(&cells[0]) {
         let mut one_pair = requests[0].clone();
         one_pair.egress = vec![(destination, 0)];
-        let journeys = engine.route_range(&one_pair, 1000, 1e-6);
+        let journeys = engine.route_range(&one_pair, 1000, 1e-6, None);
         let keys = |journeys: &[Journey]| -> Vec<(u32, u32, u32)> {
             journeys
                 .iter()
@@ -973,6 +975,7 @@ fn dominated_through_journeys_stay_out_of_every_cell() {
         destinations.len(),
         1000,
         1e-6,
+        None,
     );
     let keys = |journeys: &[Journey]| -> Vec<(u32, u32, u32)> {
         journeys
@@ -987,7 +990,7 @@ fn dominated_through_journeys_stay_out_of_every_cell() {
     for (&destination, cell) in destinations.iter().zip(&cells[0]) {
         let mut one_pair = requests[0].clone();
         one_pair.egress = vec![(destination, 0)];
-        let journeys = engine.route_range(&one_pair, 1000, 1e-6);
+        let journeys = engine.route_range(&one_pair, 1000, 1e-6, None);
         assert_eq!(keys(cell), keys(&journeys));
     }
 }
@@ -1147,7 +1150,7 @@ fn dense_closure_profile_matches_the_exhaustive_oracle() {
         &request.active_services,
         &request.active_services_previous,
     );
-    let tbtr = engine.route_range(&request, 400, 1e-6);
+    let tbtr = engine.route_range(&request, 400, 1e-6, None);
     assert_eq!(
         coordinates(&tbtr, &geometry, &DENSE_FACTORS),
         expected,
@@ -1205,11 +1208,12 @@ fn dense_closure_frontier_matrix_matches_one_pair_queries() {
             destinations.len(),
             400,
             bucket,
+            None,
         );
         for (&destination, cell) in destinations.iter().zip(&cells[0]) {
             let mut one_pair = request.clone();
             one_pair.egress = vec![(destination, 0)];
-            let journeys = engine.route_range(&one_pair, 400, bucket);
+            let journeys = engine.route_range(&one_pair, 400, bucket, None);
             assert_eq!(
                 coordinates(cell, &geometry, &DENSE_FACTORS),
                 coordinates(&journeys, &geometry, &DENSE_FACTORS),
@@ -1272,7 +1276,7 @@ fn default_bucket_preserves_dense_closure_journeys() {
         &[true; 9],
         &[],
     );
-    let journeys = engine.route_range(&dense_request(StopIdx(8)), 400, 25.0);
+    let journeys = engine.route_range(&dense_request(StopIdx(8)), 400, 25.0, None);
     type Frozen = (u32, u32, usize, Vec<(u8, u32, u32, u32, u32)>);
     let frozen: Vec<Frozen> = journeys
         .iter()
@@ -1366,7 +1370,7 @@ fn equal_cost_closure_ancestries_are_coordinate_equivalent() {
         active_services_previous: vec![],
         max_transfers: 2,
     };
-    let journeys = engine.route_range(&request, 100, 1e-6);
+    let journeys = engine.route_range(&request, 100, 1e-6, None);
     assert_eq!(
         coordinates(&journeys, &geometry, &factors),
         vec![(0, 500, 50.0, 2)]
@@ -1474,7 +1478,7 @@ fn profile_eviction_does_not_remove_a_cleaner_earlier_departure() {
     assert_eq!(expected.len(), 2, "both passes must survive the fold");
     let engine =
         McTbtrEngine::for_date(&timetable, &footpaths, &geometry, &factors, &[true; 6], &[]);
-    let tbtr = engine.route_range(&request, 400, 1e-6);
+    let tbtr = engine.route_range(&request, 400, 1e-6, None);
     assert_eq!(coordinates(&tbtr, &geometry, &factors), expected);
 }
 
@@ -1598,8 +1602,15 @@ fn cancelled_segments_never_become_destination_leaves() {
     let mut fold = None;
     let mut frontier = None;
     let mut stats = SearchStats::default();
-    let (arena, destination) =
-        engine.passes(&request, &[0], 1e-6, &mut fold, &mut frontier, &mut stats);
+    let (arena, destination) = engine.passes(
+        &request,
+        &[0],
+        1e-6,
+        None,
+        &mut fold,
+        &mut frontier,
+        &mut stats,
+    );
     assert_eq!(stats.segments_cancelled_pending, 1);
     assert_eq!(stats.segments_skipped_cancelled, 1);
     // The clean walker's onward segment is the only destination leaf;
@@ -1626,7 +1637,7 @@ fn cancelled_segments_never_become_destination_leaves() {
         .iter()
         .map(|point| (point.arrival, point.grams, point.rides))
         .collect();
-    let journeys = engine.route(&request, 1e-6);
+    let journeys = engine.route(&request, 1e-6, None);
     assert_eq!(triples(&journeys, &geometry, &CANCELLING_FACTORS), oracle);
 }
 
@@ -1645,8 +1656,15 @@ fn cancelled_segments_never_appear_as_segment_parents() {
     let mut fold = None;
     let mut frontier = None;
     let mut stats = SearchStats::default();
-    let (arena, destination) =
-        engine.passes(&request, &[0], 1e-6, &mut fold, &mut frontier, &mut stats);
+    let (arena, destination) = engine.passes(
+        &request,
+        &[0],
+        1e-6,
+        None,
+        &mut fold,
+        &mut frontier,
+        &mut stats,
+    );
     assert_eq!(stats.segments_cancelled_pending, 1);
     // The cancelled onward boarding is the dirty walker's child.
     let cancelled: Vec<u32> = (0..arena.len() as u32)
@@ -2034,4 +2052,248 @@ fn the_transfer_cap_saturates_at_the_ride_count_limit() {
             .collect()
     };
     assert_eq!(cells(&capped), cells(&saturated));
+}
+
+#[test]
+fn max_slower_bands_match_mcraptor() {
+    // The strict frontier at the fork holds the fast dirty journey and
+    // the slow clean one; the band keeps or drops the slow entry
+    // identically on both engines.
+    let (timetable, geometry) = forked();
+    let factors = [50.0, 100.0, 10.0];
+    let footpaths = Transfers::empty(4);
+    let view = DayView::universal(&timetable);
+    let request = Request {
+        departure: 0,
+        access: vec![(StopIdx(0), 0)],
+        egress: vec![(StopIdx(3), 0)],
+        active_services: vec![true],
+        active_services_previous: vec![false],
+        max_transfers: 3,
+    };
+    let engine = McTbtrEngine::for_date(
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        &request.active_services,
+        &request.active_services_previous,
+    );
+    let mut sizes = Vec::new();
+    for band in [None, Some(600), Some(0)] {
+        let raptor = mcraptor::route(
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            1e-6,
+            0,
+            None,
+            &[],
+            band,
+        );
+        let tbtr = engine.route(&request, 1e-6, band);
+        assert!(!raptor.is_empty(), "band {band:?}");
+        assert_eq!(
+            triples(&tbtr, &geometry, &factors),
+            triples(&raptor, &geometry, &factors),
+            "band {band:?}"
+        );
+        sizes.push(raptor.len());
+    }
+    // The band genuinely bites: the unrestricted frontier keeps the
+    // slow clean journey, the zero band only the fastest.
+    assert!(sizes[0] > sizes[2]);
+    for band in [None, Some(600), Some(0)] {
+        let raptor = mcraptor::route_range(
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            600,
+            1e-6,
+            0,
+            None,
+            &[],
+            band,
+        );
+        let tbtr = engine.route_range(&request, 600, 1e-6, band);
+        assert_eq!(
+            triples(&tbtr, &geometry, &factors),
+            triples(&raptor, &geometry, &factors),
+            "window band {band:?}"
+        );
+    }
+}
+
+#[test]
+fn max_slower_frontier_matrix_matches_the_one_pair_and_mcraptor() {
+    // The consult's envelope gate: the one-pair query (prune envelope
+    // active) must equal its own one-cell frontier matrix (no
+    // envelope) and McRAPTOR's, under the same band — the strict
+    // frontier filtered at readout, never a widened scan.
+    let (timetable, geometry) = forked();
+    let factors = [50.0, 100.0, 10.0];
+    let footpaths = Transfers::empty(4);
+    let view = DayView::universal(&timetable);
+    let one_pair = Request {
+        departure: 0,
+        access: vec![(StopIdx(0), 0)],
+        egress: vec![(StopIdx(3), 0)],
+        active_services: vec![true],
+        active_services_previous: vec![false],
+        max_transfers: 3,
+    };
+    let matrix_request = Request {
+        egress: Vec::new(),
+        ..one_pair.clone()
+    };
+    let engine = McTbtrEngine::for_date(
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        &one_pair.active_services,
+        &one_pair.active_services_previous,
+    );
+    let no_egress = vec![Vec::new(); timetable.stop_count() as usize];
+    let mut sizes = Vec::new();
+    for band in [None, Some(600), Some(0)] {
+        let pair = engine.route_range(&one_pair, 600, 1e-6, band);
+        let cells = engine.frontier_matrix(
+            std::slice::from_ref(&matrix_request),
+            &[StopIdx(3)],
+            &no_egress,
+            false,
+            1,
+            600,
+            1e-6,
+            band,
+        );
+        let raptor = mcraptor::frontier_matrix(
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            std::slice::from_ref(&matrix_request),
+            &[StopIdx(3)],
+            &no_egress,
+            false,
+            1,
+            600,
+            1e-6,
+            band,
+        );
+        let cell = triples(&cells[0][0], &geometry, &factors);
+        assert!(!cell.is_empty(), "band {band:?}");
+        assert_eq!(triples(&pair, &geometry, &factors), cell, "band {band:?}");
+        assert_eq!(
+            triples(&raptor[0][0], &geometry, &factors),
+            cell,
+            "band {band:?}"
+        );
+        sizes.push(cell.len());
+    }
+    // The matrix band bites too.
+    assert!(sizes[0] > sizes[2]);
+}
+
+#[test]
+fn the_band_survives_cross_pass_ride_suppression() {
+    // The ride-aware bounds regression, product level: the late pass
+    // reaches M faster on two rides (the cap), the early pass needs
+    // its own slower one-ride label at M to reach D at 450 — and a
+    // slow direct line departs in the same pass and arrives at 2000.
+    // A ride-blind bound loses 450, anchors the band at the slow
+    // arrival, and fails to trim it.
+    let mut builder = TimetableBuilder::new(4);
+    let a1 = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let a2 = builder.add_pattern(&[StopIdx(1), StopIdx(2)], 1).unwrap();
+    let b = builder.add_pattern(&[StopIdx(0), StopIdx(2)], 2).unwrap();
+    let cd = builder.add_pattern(&[StopIdx(2), StopIdx(3)], 3).unwrap();
+    let slow = builder.add_pattern(&[StopIdx(0), StopIdx(3)], 4).unwrap();
+    builder
+        .add_trip(a1, vec![time(300), time(320)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(a2, vec![time(340), time(360)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(b, vec![time(10), time(380)], 2, 0)
+        .unwrap();
+    builder
+        .add_trip(cd, vec![time(400), time(450)], 3, 0)
+        .unwrap();
+    builder
+        .add_trip(slow, vec![time(10), time(2000)], 4, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        (0..5)
+            .map(|trip| {
+                (
+                    TripIdx(trip),
+                    vec![0.0, 1000.0],
+                    DistanceProvenance::CrowFly,
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    let factors = [10.0; 5];
+    let footpaths = Transfers::empty(4);
+    let view = DayView::universal(&timetable);
+    let request = Request {
+        departure: 0,
+        access: vec![(StopIdx(0), 0)],
+        egress: vec![(StopIdx(3), 0)],
+        active_services: vec![true],
+        active_services_previous: vec![false],
+        max_transfers: 1,
+    };
+    let engine = McTbtrEngine::for_date(
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        &request.active_services,
+        &request.active_services_previous,
+    );
+    for band in [None, Some(0)] {
+        let raptor = mcraptor::route_range(
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            600,
+            1e-6,
+            0,
+            None,
+            &[],
+            band,
+        );
+        let tbtr = engine.route_range(&request, 600, 1e-6, band);
+        assert_eq!(
+            triples(&tbtr, &geometry, &factors),
+            triples(&raptor, &geometry, &factors),
+            "band {band:?}"
+        );
+        let arrivals: Vec<u32> = raptor.iter().map(|journey| journey.arrival).collect();
+        assert!(arrivals.contains(&450), "band {band:?}: {arrivals:?}");
+        // The zero band keeps each pass's fastest and trims the slow
+        // direct arrival; unrestricted, it stays a frontier member.
+        assert_eq!(
+            arrivals.contains(&2000),
+            band.is_none(),
+            "band {band:?}: {arrivals:?}"
+        );
+    }
 }
