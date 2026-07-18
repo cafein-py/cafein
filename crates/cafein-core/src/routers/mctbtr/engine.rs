@@ -136,7 +136,9 @@ impl<'a> McTbtrEngine<'a> {
             bucket.is_finite() && bucket > 0.0,
             "the emissions bucket must be positive"
         );
-        let rounds = request.max_transfers as usize + 1;
+        // The trip bags store ride counts as `u8`, so 255 rides (254
+        // transfers) is the representable cap.
+        let rounds = request.max_transfers.min(254) as usize + 1;
         let key = |grams: f64| (grams / bucket).floor() as i64;
         let mut arena: Vec<Segment> = Vec::new();
         let mut segment_states: Vec<SegmentState> = Vec::new();

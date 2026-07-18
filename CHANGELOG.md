@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Fixed repeated destination stops losing cells in the pareto
+  (McRAPTOR/McTBTR) least-emissions matrices: duplicate `to_stops`
+  shared one slot with last-wins, so only the final occurrence
+  received a row. Every occurrence now reports its cell, in the
+  requested order.
+- Fixed `max_transfers=255` wrapping the multicriteria engines'
+  internal ride counter; the cap now saturates at the representable
+  254 transfers.
+
 - The cost matrices take `router=`: `TravelCostMatrix` (time
   candidates), `travel_cost_table`, and the point forms now run on the
   trip-based engine with `router="tbtr"` — over the cached time

@@ -121,15 +121,27 @@ impl<'a> McTbtrEngine<'a> {
         budget: Option<u32>,
         bucket: f64,
     ) -> Vec<Vec<CostRow>> {
+        // A stop holds one slot, so repeated destination stops share the
+        // first occurrence's slot and their rows are re-expanded to the
+        // requested order after folding.
         let mut slots = vec![0u32; self.timetable.stop_count() as usize];
-        for (index, stop) in destinations.iter().enumerate() {
-            slots[stop.0 as usize] = index as u32 + 1;
+        let mut cell_of: Vec<usize> = Vec::with_capacity(destinations.len());
+        let mut unique = 0usize;
+        for &stop in destinations {
+            let slot = slots[stop.0 as usize];
+            if slot == 0 {
+                unique += 1;
+                slots[stop.0 as usize] = unique as u32;
+                cell_of.push(unique - 1);
+            } else {
+                cell_of.push(slot as usize - 1);
+            }
         }
         requests
             .par_iter()
             .map(|request| {
                 let departures = departure_candidates(self.timetable, request, window);
-                let mut best: Vec<Option<Winner>> = vec![None; destinations.len()];
+                let mut best: Vec<Option<Winner>> = vec![None; unique];
                 let mut fold = Some(MatrixSink {
                     slots: &slots,
                     budget,
@@ -143,12 +155,11 @@ impl<'a> McTbtrEngine<'a> {
                     &mut None,
                     &mut SearchStats::default(),
                 );
-                best.into_iter()
-                    .enumerate()
-                    .filter_map(|(slot, winner)| {
-                        winner.map(|winner| {
-                            self.cost_row(inputs, &winner, &arena_out, destinations[slot])
-                        })
+                destinations
+                    .iter()
+                    .zip(&cell_of)
+                    .filter_map(|(&stop, &cell)| {
+                        best[cell].map(|winner| self.cost_row(inputs, &winner, &arena_out, stop))
                     })
                     .collect()
             })

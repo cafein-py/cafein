@@ -1763,3 +1763,234 @@ fn cleaner_general_exact_tie_continues_to_a_later_witness() {
         assert!(!bag.insert_slack(200, 30, 45.0, 5, 1, 60));
     }
 }
+
+/// A cost row's fields with NaN-safe float bits, for equality
+/// assertions.
+type CellKey = (u32, u32, u32, u64, u64, u64, u64);
+
+#[test]
+fn repeated_destination_stops_keep_every_matrix_cell() {
+    // Duplicate destination stops used to share one last-wins slot:
+    // the earlier occurrences' cells vanished from the matrix.
+    let (timetable, geometry, factors) = frontier_fixture();
+    let view = DayView::universal(&timetable);
+    let footpaths = Transfers::empty(4);
+    let inputs = CostInputs {
+        geometry: &geometry,
+        factors: &factors,
+        leg_geometry: None,
+        with_geometry: false,
+        fares: None,
+    };
+    let requests = vec![Request {
+        departure: 0,
+        access: vec![(StopIdx(0), 0)],
+        egress: Vec::new(),
+        active_services: vec![true],
+        active_services_previous: vec![false],
+        max_transfers: 3,
+    }];
+    let destinations = [StopIdx(3), StopIdx(0), StopIdx(3)];
+    let rows = least_emissions_matrix(
+        &view,
+        &timetable,
+        &footpaths,
+        &inputs,
+        &requests,
+        &destinations,
+        &vec![Vec::new(); timetable.stop_count() as usize],
+        &vec![Vec::new(); requests.len()],
+        false,
+        600,
+        None,
+        1e-6,
+    );
+    let row = &rows[0];
+    assert_eq!(
+        row.iter().map(|cell| cell.to).collect::<Vec<_>>(),
+        [3, 0, 3]
+    );
+    assert_eq!(row[0].seconds, row[2].seconds);
+    assert_eq!(
+        row[0].emission_grams.to_bits(),
+        row[2].emission_grams.to_bits()
+    );
+}
+
+#[test]
+fn a_matrix_request_with_egress_is_not_target_pruned() {
+    // The one-pair query prunes against its egress targets; a matrix
+    // fold serves every destination cell, so a request that retains
+    // egress entries must not prune other cells' labels. The witness:
+    // the egress stop is reached fast and clean in round one, so the
+    // second destination's slower, dirtier round-two chain is exactly
+    // what one-pair pruning would cut.
+    let mut builder = TimetableBuilder::new(4);
+    let fast = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let first = builder.add_pattern(&[StopIdx(0), StopIdx(2)], 1).unwrap();
+    let second = builder.add_pattern(&[StopIdx(2), StopIdx(3)], 2).unwrap();
+    builder
+        .add_trip(fast, vec![time(0), time(100)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(first, vec![time(0), time(200)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(second, vec![time(250), time(300)], 2, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(2), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let factors = [10.0, 100.0, 100.0];
+    let view = DayView::universal(&timetable);
+    let footpaths = Transfers::empty(4);
+    let inputs = CostInputs {
+        geometry: &geometry,
+        factors: &factors,
+        leg_geometry: None,
+        with_geometry: false,
+        fares: None,
+    };
+    let request = |egress: Vec<(StopIdx, u32)>| {
+        vec![Request {
+            departure: 0,
+            access: vec![(StopIdx(0), 0)],
+            egress,
+            active_services: vec![true],
+            active_services_previous: vec![false],
+            max_transfers: 3,
+        }]
+    };
+    let matrix = |requests: &[Request]| {
+        least_emissions_matrix(
+            &view,
+            &timetable,
+            &footpaths,
+            &inputs,
+            requests,
+            &[StopIdx(1), StopIdx(3)],
+            &vec![Vec::new(); timetable.stop_count() as usize],
+            &vec![Vec::new(); requests.len()],
+            false,
+            600,
+            None,
+            1e-6,
+        )
+    };
+    let plain = matrix(&request(Vec::new()));
+    let with_egress = matrix(&request(vec![(StopIdx(1), 0)]));
+    assert!(plain[0].iter().any(|row| row.to == 3));
+    let cells = |rows: &Vec<Vec<CostRow>>| -> Vec<Vec<CellKey>> {
+        rows.iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| {
+                        (
+                            cell.to,
+                            cell.seconds,
+                            cell.rides,
+                            cell.transit_meters.to_bits(),
+                            cell.walk_meters.to_bits(),
+                            cell.emission_grams.to_bits(),
+                            cell.fare.to_bits(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    assert_eq!(cells(&plain), cells(&with_egress));
+}
+
+#[test]
+fn the_transfer_cap_saturates_at_the_ride_count_limit() {
+    // Ride counts live in a `u8`: 255 transfers used to wrap the last
+    // round's rides to zero and evict labels as zero-ride candidates.
+    let (timetable, geometry, factors) = frontier_fixture();
+    let view = DayView::universal(&timetable);
+    let footpaths = Transfers::empty(4);
+    let inputs = CostInputs {
+        geometry: &geometry,
+        factors: &factors,
+        leg_geometry: None,
+        with_geometry: false,
+        fares: None,
+    };
+    let request = |max_transfers: u8| {
+        vec![Request {
+            departure: 0,
+            access: vec![(StopIdx(0), 0)],
+            egress: Vec::new(),
+            active_services: vec![true],
+            active_services_previous: vec![false],
+            max_transfers,
+        }]
+    };
+    let matrix = |requests: &[Request]| {
+        least_emissions_matrix(
+            &view,
+            &timetable,
+            &footpaths,
+            &inputs,
+            requests,
+            &[StopIdx(3)],
+            &vec![Vec::new(); timetable.stop_count() as usize],
+            &vec![Vec::new(); requests.len()],
+            false,
+            600,
+            None,
+            1e-6,
+        )
+    };
+    let capped = matrix(&request(254));
+    let saturated = matrix(&request(255));
+    assert!(!capped[0].is_empty());
+    // The `max_slower` plain-time bounds saturate identically.
+    let frontier = |max_transfers: u8| {
+        frontier_matrix(
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request(max_transfers),
+            &[StopIdx(3)],
+            &vec![Vec::new(); timetable.stop_count() as usize],
+            false,
+            1,
+            600,
+            1e-6,
+            Some(0),
+        )
+    };
+    let frontier_capped = frontier(254);
+    assert!(!frontier_capped[0][0].is_empty());
+    assert_eq!(frontier_capped, frontier(255));
+    let cells = |rows: &Vec<Vec<CostRow>>| -> Vec<Vec<CellKey>> {
+        rows.iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| {
+                        (
+                            cell.to,
+                            cell.seconds,
+                            cell.rides,
+                            cell.transit_meters.to_bits(),
+                            cell.walk_meters.to_bits(),
+                            cell.emission_grams.to_bits(),
+                            cell.fare.to_bits(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    assert_eq!(cells(&capped), cells(&saturated));
+}
