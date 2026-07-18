@@ -201,7 +201,7 @@ def journey_frontier(
         (the R5-style soft penalty), and the set can hold more options
         before it dries up. Unused for the other candidate sets.
     max_slower : float (optional, default: None)
-        Restrict the ``"pareto"`` frontier (``router="raptor"`` only) to
+        Restrict the ``"pareto"`` frontier (on either engine) to
         journeys near the fast end: per departure pass, every returned
         journey arrives within ``max_slower`` seconds of the pass's
         fastest resolved-factor arrival, and that fastest journey is

@@ -9,6 +9,12 @@
   diverse candidates stay on McRAPTOR by contract: the precomputed
   transfer set is reduced under strict unpenalized dominance, which
   slack and route penalties would invalidate.
+- Fixed the `max_slower` restriction bounds losing a destination when
+  a faster arrival from another departure pass had exhausted the
+  transfer cap: the resolved-trip sweep is now ride-aware, so a
+  fewer-rides label that still has capacity to continue is never
+  suppressed and the band always anchors at each pass's true fastest
+  journey.
 
 - Fixed repeated destination stops losing cells in the pareto
   (McRAPTOR/McTBTR) least-emissions matrices: duplicate `to_stops`

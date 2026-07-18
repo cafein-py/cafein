@@ -2202,3 +2202,98 @@ fn max_slower_frontier_matrix_matches_the_one_pair_and_mcraptor() {
     // The matrix band bites too.
     assert!(sizes[0] > sizes[2]);
 }
+
+#[test]
+fn the_band_survives_cross_pass_ride_suppression() {
+    // The ride-aware bounds regression, product level: the late pass
+    // reaches M faster on two rides (the cap), the early pass needs
+    // its own slower one-ride label at M to reach D at 450 — and a
+    // slow direct line departs in the same pass and arrives at 2000.
+    // A ride-blind bound loses 450, anchors the band at the slow
+    // arrival, and fails to trim it.
+    let mut builder = TimetableBuilder::new(4);
+    let a1 = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let a2 = builder.add_pattern(&[StopIdx(1), StopIdx(2)], 1).unwrap();
+    let b = builder.add_pattern(&[StopIdx(0), StopIdx(2)], 2).unwrap();
+    let cd = builder.add_pattern(&[StopIdx(2), StopIdx(3)], 3).unwrap();
+    let slow = builder.add_pattern(&[StopIdx(0), StopIdx(3)], 4).unwrap();
+    builder
+        .add_trip(a1, vec![time(300), time(320)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(a2, vec![time(340), time(360)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(b, vec![time(10), time(380)], 2, 0)
+        .unwrap();
+    builder
+        .add_trip(cd, vec![time(400), time(450)], 3, 0)
+        .unwrap();
+    builder
+        .add_trip(slow, vec![time(10), time(2000)], 4, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        (0..5)
+            .map(|trip| {
+                (
+                    TripIdx(trip),
+                    vec![0.0, 1000.0],
+                    DistanceProvenance::CrowFly,
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    let factors = [10.0; 5];
+    let footpaths = Transfers::empty(4);
+    let view = DayView::universal(&timetable);
+    let request = Request {
+        departure: 0,
+        access: vec![(StopIdx(0), 0)],
+        egress: vec![(StopIdx(3), 0)],
+        active_services: vec![true],
+        active_services_previous: vec![false],
+        max_transfers: 1,
+    };
+    let engine = McTbtrEngine::for_date(
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        &request.active_services,
+        &request.active_services_previous,
+    );
+    for band in [None, Some(0)] {
+        let raptor = mcraptor::route_range(
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request,
+            600,
+            1e-6,
+            0,
+            None,
+            &[],
+            band,
+        );
+        let tbtr = engine.route_range(&request, 600, 1e-6, band);
+        assert_eq!(
+            triples(&tbtr, &geometry, &factors),
+            triples(&raptor, &geometry, &factors),
+            "band {band:?}"
+        );
+        let arrivals: Vec<u32> = raptor.iter().map(|journey| journey.arrival).collect();
+        assert!(arrivals.contains(&450), "band {band:?}: {arrivals:?}");
+        // The zero band keeps each pass's fastest and trims the slow
+        // direct arrival; unrestricted, it stays a frontier member.
+        assert_eq!(
+            arrivals.contains(&2000),
+            band.is_none(),
+            "band {band:?}: {arrivals:?}"
+        );
+    }
+}
