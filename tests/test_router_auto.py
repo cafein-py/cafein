@@ -83,7 +83,6 @@ def test_raptor_only_features_run_under_the_auto_default(two_line_network):
     for kwargs in (
         {"candidates": "relaxed"},
         {"candidates": "diverse", "max_options": 2},
-        {"candidates": "pareto", "max_slower": 0},
     ):
         auto = frontier_frame(two_line_network, **kwargs)
         raptor = frontier_frame(two_line_network, router="raptor", **kwargs)
@@ -97,8 +96,8 @@ def test_explicit_router_constraints_are_unchanged(two_line_network):
     args = (two_line_network, "A", "B", DATE, DEPARTURE, 1800)
     with pytest.raises(ValueError, match="requires candidates='pareto'"):
         journey_frontier(*args, candidates="relaxed", router="tbtr")
-    with pytest.raises(ValueError, match="max_slower requires router='raptor'"):
-        journey_frontier(*args, candidates="pareto", router="tbtr", max_slower=60)
+    with pytest.raises(ValueError, match="max_slower requires candidates='pareto'"):
+        journey_frontier(*args, candidates="relaxed", max_slower=60)
     with pytest.raises(ValueError, match="'auto', 'raptor', or 'tbtr'"):
         journey_frontier(*args, candidates="pareto", router="fastest")
     with pytest.raises(ValueError, match="'auto', 'raptor', or 'tbtr'"):
@@ -302,3 +301,45 @@ def test_a_saved_cached_set_serves_auto_cost_rows(two_line_network, tmp_path):
     loaded = TransportNetwork.load(path)
     assert loaded.has_tbtr_transfers
     assert TravelCostMatrix(loaded, ["A"], None, DATE, DEPARTURE).equals(raptor)
+
+
+def test_max_slower_rides_the_trip_based_engine(two_line_network, capfd, monkeypatch):
+    from cafein import journey_frontiers
+
+    args = (two_line_network, ["A"], ["B"], DATE, DEPARTURE, 1800)
+    kwargs = dict(max_slower=600)
+    raptor = journey_frontiers(*args, router="raptor", **kwargs)
+    assert len(raptor) > 0
+    # Explicit TBTR accepts the band and answers cell-for-cell.
+    tbtr = journey_frontiers(*args, router="tbtr", **kwargs)
+    for column in ("from_id", "to_id", *FRONTIER_COLUMNS):
+        assert tbtr[column].tolist() == raptor[column].tolist()
+    # Auto rides a matching cached set with the band, rows unchanged —
+    # the stats flag is the direct dispatch observable, so parity alone
+    # cannot mask a fallback to McRAPTOR.
+    two_line_network.compute_mctbtr_transfers(DATE)
+    monkeypatch.setenv("CAFEIN_MCTBTR_PROF", "1")
+    capfd.readouterr()
+    auto = journey_frontiers(*args, **kwargs)
+    assert "MCTBTR-STATS" in capfd.readouterr().err
+    for column in ("from_id", "to_id", *FRONTIER_COLUMNS):
+        assert auto[column].tolist() == raptor[column].tolist()
+    # The band itself bites: the unrestricted frontier is larger.
+    assert len(journey_frontiers(*args)) >= len(raptor)
+
+
+def test_one_pair_max_slower_accepts_tbtr(two_line_network):
+    from cafein import journey_frontier
+
+    args = (two_line_network, "A", "B", DATE, DEPARTURE, 1800)
+    raptor = frontier_frame(
+        two_line_network, candidates="pareto", router="raptor", max_slower=600
+    )
+    assert len(raptor) > 0
+    tbtr = frontier_frame(
+        two_line_network, candidates="pareto", router="tbtr", max_slower=600
+    )
+    assert tbtr.equals(raptor)
+    # The capability contract is unchanged for the widened candidates.
+    with pytest.raises(ValueError, match="requires candidates='pareto'"):
+        journey_frontier(*args, candidates="relaxed", router="tbtr")

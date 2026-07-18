@@ -1514,7 +1514,8 @@ def test_max_slower_is_validated(network_with_footpaths):
                 candidates=candidates,
                 max_slower=300,
             )
-    with pytest.raises(ValueError, match="router='raptor'"):
+    # max_slower rides the trip-based engine, cell-for-cell equal.
+    banded = [
         journey_frontier(
             network_with_footpaths,
             "1100602",
@@ -1523,9 +1524,13 @@ def test_max_slower_is_validated(network_with_footpaths):
             "08:30:00",
             window=600,
             candidates="pareto",
-            router="tbtr",
+            router=router,
             max_slower=300,
         )
+        for router in ("raptor", "tbtr")
+    ]
+    assert len(banded[0]) > 0
+    assert banded[1].equals(banded[0])
     with pytest.raises(ValueError, match="non-negative"):
         journey_frontier(
             network_with_footpaths,
@@ -1679,7 +1684,8 @@ def test_journey_frontiers_tbtr_matches_raptor(network_with_footpaths):
             window=600,
             router="bfs",
         )
-    with pytest.raises(ValueError, match="router='raptor'"):
+    # max_slower rides the trip-based engine on the batched form too.
+    banded = [
         journey_frontiers(
             network_with_footpaths,
             ids,
@@ -1687,9 +1693,13 @@ def test_journey_frontiers_tbtr_matches_raptor(network_with_footpaths):
             "2022-02-22",
             "08:30:00",
             window=600,
-            router="tbtr",
+            router=router,
             max_slower=300,
         )
+        for router in ("raptor", "tbtr")
+    ]
+    assert len(banded[0]) > 0
+    assert banded[1].equals(banded[0])
 
 
 def test_the_mctbtr_transfer_cache_answers_identically(tmp_path):
