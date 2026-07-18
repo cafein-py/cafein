@@ -3632,6 +3632,7 @@ impl TransportNetwork {
                     destinations.len(),
                     window,
                     bucket,
+                    None,
                 );
             }
             let view = DayView::for_date(
@@ -3954,6 +3955,7 @@ impl TransportNetwork {
                     destinations.len(),
                     window,
                     bucket,
+                    None,
                 );
             }
             let view = DayView::for_date(
@@ -6270,6 +6272,7 @@ impl TransportNetwork {
                     destinations.len(),
                     window,
                     bucket,
+                    None,
                 )
             } else {
                 let view = DayView::for_date(

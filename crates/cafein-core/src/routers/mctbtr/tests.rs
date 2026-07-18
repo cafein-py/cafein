@@ -727,6 +727,7 @@ fn the_frontier_matrix_matches_the_one_pair_profile_per_cell() {
         destinations.len(),
         1000,
         1e-6,
+        None,
     );
     let keys = |journeys: &[Journey]| -> Vec<(u32, u32, u32, f64)> {
         journeys
@@ -887,6 +888,7 @@ fn the_frontier_matrix_serves_a_slot_only_the_transfer_reaches() {
         destinations.len(),
         1000,
         1e-6,
+        None,
     );
     // The second cell holds both transfer journeys: the plain
     // through-and-onward ride, and the cleaner three-ride alternative
@@ -973,6 +975,7 @@ fn dominated_through_journeys_stay_out_of_every_cell() {
         destinations.len(),
         1000,
         1e-6,
+        None,
     );
     let keys = |journeys: &[Journey]| -> Vec<(u32, u32, u32)> {
         journeys
@@ -1205,6 +1208,7 @@ fn dense_closure_frontier_matrix_matches_one_pair_queries() {
             destinations.len(),
             400,
             bucket,
+            None,
         );
         for (&destination, cell) in destinations.iter().zip(&cells[0]) {
             let mut one_pair = request.clone();
@@ -2124,4 +2128,77 @@ fn max_slower_bands_match_mcraptor() {
             "window band {band:?}"
         );
     }
+}
+
+#[test]
+fn max_slower_frontier_matrix_matches_the_one_pair_and_mcraptor() {
+    // The consult's envelope gate: the one-pair query (prune envelope
+    // active) must equal its own one-cell frontier matrix (no
+    // envelope) and McRAPTOR's, under the same band — the strict
+    // frontier filtered at readout, never a widened scan.
+    let (timetable, geometry) = forked();
+    let factors = [50.0, 100.0, 10.0];
+    let footpaths = Transfers::empty(4);
+    let view = DayView::universal(&timetable);
+    let one_pair = Request {
+        departure: 0,
+        access: vec![(StopIdx(0), 0)],
+        egress: vec![(StopIdx(3), 0)],
+        active_services: vec![true],
+        active_services_previous: vec![false],
+        max_transfers: 3,
+    };
+    let matrix_request = Request {
+        egress: Vec::new(),
+        ..one_pair.clone()
+    };
+    let engine = McTbtrEngine::for_date(
+        &timetable,
+        &footpaths,
+        &geometry,
+        &factors,
+        &one_pair.active_services,
+        &one_pair.active_services_previous,
+    );
+    let no_egress = vec![Vec::new(); timetable.stop_count() as usize];
+    let mut sizes = Vec::new();
+    for band in [None, Some(600), Some(0)] {
+        let pair = engine.route_range(&one_pair, 600, 1e-6, band);
+        let cells = engine.frontier_matrix(
+            std::slice::from_ref(&matrix_request),
+            &[StopIdx(3)],
+            &no_egress,
+            false,
+            1,
+            600,
+            1e-6,
+            band,
+        );
+        let raptor = mcraptor::frontier_matrix(
+            &view,
+            &timetable,
+            &footpaths,
+            &geometry,
+            &factors,
+            std::slice::from_ref(&matrix_request),
+            &[StopIdx(3)],
+            &no_egress,
+            false,
+            1,
+            600,
+            1e-6,
+            band,
+        );
+        let cell = triples(&cells[0][0], &geometry, &factors);
+        assert!(!cell.is_empty(), "band {band:?}");
+        assert_eq!(triples(&pair, &geometry, &factors), cell, "band {band:?}");
+        assert_eq!(
+            triples(&raptor[0][0], &geometry, &factors),
+            cell,
+            "band {band:?}"
+        );
+        sizes.push(cell.len());
+    }
+    // The matrix band bites too.
+    assert!(sizes[0] > sizes[2]);
 }
