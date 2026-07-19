@@ -1,29 +1,33 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-07-19
 
-- Query-time exclusion sets: `exclude_routes=`, `exclude_trips=`, and
-  `exclude_stops=` (GTFS ids) on `route_between_stops`,
-  `route_between_coordinates`, `journey_frontier`, and
-  `DetailedItineraries` — one built network serves many disruption
-  scenarios ("line X closed", "stop Y shut") and per-individual
-  accessibility filters, no rebuild — and on the time-query products:
-  `travel_times_from_stop`, `travel_times_from_coordinate`,
-  `travel_time_matrix`, and `TravelTimeMatrix` (stop, point, and
-  percentile forms), the batched frontiers (`journey_frontiers`,
-  `frontier_table`, stop and point forms, composing with
-  `max_slower`), and the cost matrices (`TravelCostMatrix`,
-  `travel_cost_table`, every optimize mode and candidate set), where `router="auto"` falls back to the RAPTOR
-  engines and the door-to-door (Mc)ULTRA upgrades stay on
-  unrestricted queries. An excluded stop refuses
-  boarding, alighting, transfers, and access/egress while vehicles
-  still ride through it; an excluded origin or destination yields no
-  journeys; unknown route and trip ids are ignored. Exclusions compose
-  with the diverse candidates' bans and penalties, run on the RAPTOR
-  engines (`"auto"` falls back; the precomputed trip-based and
-  (Mc)ULTRA sets are reduced against witnesses the removed supply may
-  have carried), and answer exactly as a network built without that
-  supply.
+- Query-time exclusion sets: ``exclude_routes=``, ``exclude_trips=``,
+  and ``exclude_stops=`` (GTFS ids) on every routing product — the
+  one-pair queries (``route_between_stops``,
+  ``route_between_coordinates``, ``journey_frontier``,
+  ``DetailedItineraries``), the time queries
+  (``travel_times_from_stop``, ``travel_times_from_coordinate``,
+  ``travel_time_matrix``, ``TravelTimeMatrix``; stop, point, and
+  percentile forms), the batched frontiers (``journey_frontiers``,
+  ``frontier_table``, stop and point forms, composing with
+  ``max_slower``), and the cost matrices (``TravelCostMatrix``,
+  ``travel_cost_table``, every optimize mode and candidate set). One
+  built network serves many disruption scenarios ("line X closed",
+  "stop Y shut") and per-individual accessibility filters, with no
+  rebuild. An excluded stop refuses boarding, alighting, transfers,
+  and access/egress while vehicles still ride through it; an excluded
+  origin or destination yields no journeys; unknown route and trip ids
+  are ignored; exclusions compose with the diverse candidates' bans
+  and penalties. Excluded queries answer exactly as a network built
+  without that supply: they run on the RAPTOR engines
+  (``router="auto"`` falls back, explicit ``"tbtr"`` raises; the
+  precomputed trip-based and (Mc)ULTRA sets are reduced against
+  witnesses the removed supply may have carried).
+  ([#154](https://github.com/cafein-py/cafein/pull/154),
+  [#155](https://github.com/cafein-py/cafein/pull/155),
+  [#156](https://github.com/cafein-py/cafein/pull/156),
+  [#157](https://github.com/cafein-py/cafein/pull/157))
 
 - The cached McULTRA and McTBTR transfer sets are bound to the per-trip
   emission-factor configuration they were built with by the full factor
@@ -31,6 +35,7 @@
   collision could silently reuse a set built for other factors. Saved
   artifacts use format 11; artifacts written by earlier versions are
   refused with the usual rebuild message.
+  ([#158](https://github.com/cafein-py/cafein/pull/158))
 
 ## 0.5.0 — 2026-07-19
 
