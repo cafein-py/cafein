@@ -17,7 +17,7 @@ use cafein_core::mcraptor;
 use cafein_core::mctbtr::McTbtrEngine;
 use cafein_core::mcultra::compute_mcultra_shortcuts;
 use cafein_core::raptor::{CostInputs, CostRow, Objective, Raptor};
-use cafein_core::router::{Exclusions, Request, TransitRouter};
+use cafein_core::router::{factor_fingerprint, same_factors, Exclusions, Request, TransitRouter};
 use cafein_core::streets::{
     Backing, MappedStreets, Snap, StopLink, StoredLink, StreetNetwork, StreetNetworkParts,
     WalkedStop,
@@ -48,14 +48,15 @@ struct TransportNetwork {
     /// The McULTRA (emissions-aware) shortcut set, when computed
     /// (`compute_mcultra_shortcuts`): the coordinate emissions engines relax it
     /// in place of the closure when a whole-day set is present and the query's
-    /// factor vector matches the one it was built for (`mcultra_factor`).
+    /// factor vector matches the one it was built for (`mcultra_factors`).
     /// Persisted with the artifact and restored on load, with its window and
-    /// factor fingerprint.
+    /// factor vector.
     mcultra_transfers: Option<Transfers>,
     mcultra_window: Option<(u32, u32)>,
-    /// A fingerprint of the per-trip emission-factor vector the McULTRA set was
-    /// built with; a query using different factors falls back to the closure.
-    mcultra_factor: Option<u64>,
+    /// The per-trip emission-factor vector the McULTRA set was built with,
+    /// compared exactly (`same_factors`); a query using different factors
+    /// falls back to the closure.
+    mcultra_factors: Option<Vec<f64>>,
     /// The cached time-only TBTR transfer set, when computed
     /// (`compute_tbtr_transfers`), keyed by the date string it was built for.
     /// A `router="tbtr"` stop time matrix on the same date — single-departure
@@ -64,8 +65,8 @@ struct TransportNetwork {
     /// date.
     tbtr_time_transfers: Option<(String, cafein_core::tbtr::TransferSet)>,
     /// The cached multicriteria TBTR transfer set with the date and the
-    /// factor fingerprint it was built for (`compute_mctbtr_transfers`).
-    mctbtr_transfers: Option<(String, u64, cafein_core::tbtr::TransferSet)>,
+    /// factor vector it was built for (`compute_mctbtr_transfers`).
+    mctbtr_transfers: Option<(String, Vec<f64>, cafein_core::tbtr::TransferSet)>,
     geometry: Option<TripGeometry>,
     leg_geometry: Option<LegGeometry>,
     streets: Option<StreetNetwork>,

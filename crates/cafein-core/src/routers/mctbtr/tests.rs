@@ -391,23 +391,23 @@ fn the_auto_policy_switch_never_changes_fixture_results() {
     // The multicriteria decision table over that equivalence: uncached,
     // date-mismatched, factor-mismatched, and semantic-fallback states run
     // McRAPTOR; only a matching cache with a supported query runs McTBTR.
-    let fingerprint = 7;
-    let cached = Some(("2022-02-22", fingerprint));
-    assert!(!auto_mc_tbtr(None, "2022-02-22", fingerprint, false));
+    let factors = [50.0, 100.0, 10.0];
+    let cached = Some(("2022-02-22", &factors[..]));
+    assert!(!auto_mc_tbtr(None, "2022-02-22", &factors, false));
     assert!(!auto_mc_tbtr(
-        Some(("2022-02-21", fingerprint)),
+        Some(("2022-02-21", &factors[..])),
         "2022-02-22",
-        fingerprint,
+        &factors,
         false
     ));
     assert!(!auto_mc_tbtr(
-        Some(("2022-02-22", 8)),
+        Some(("2022-02-22", &[50.0, 100.0, 11.0][..])),
         "2022-02-22",
-        fingerprint,
+        &factors,
         false
     ));
-    assert!(!auto_mc_tbtr(cached, "2022-02-22", fingerprint, true));
-    assert!(auto_mc_tbtr(cached, "2022-02-22", fingerprint, false));
+    assert!(!auto_mc_tbtr(cached, "2022-02-22", &factors, true));
+    assert!(auto_mc_tbtr(cached, "2022-02-22", &factors, false));
     // The time-only table: only a date-matching cached set runs TBTR.
     assert!(!auto_time_tbtr(None, "2022-02-22", false));
     assert!(!auto_time_tbtr(Some("2022-02-21"), "2022-02-22", false));

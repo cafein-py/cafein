@@ -196,10 +196,7 @@ impl TransportNetwork {
         // the coordinate path, whose engines share the McULTRA set).
         if router != "tbtr"
             && exclusions.is_none()
-            && !std::ptr::eq(
-                self.emissions_transfers(factor_fingerprint(&per_trip)),
-                &self.transfers,
-            )
+            && !std::ptr::eq(self.emissions_transfers(&per_trip), &self.transfers)
         {
             if let (Some(streets), Some(from_xy), Some(to_xy)) = (
                 self.streets.as_ref(),
@@ -493,7 +490,7 @@ impl TransportNetwork {
         let intermediate = if exclusions.is_some() {
             &self.transfers
         } else {
-            self.emissions_transfers(factor_fingerprint(&per_trip))
+            self.emissions_transfers(&per_trip)
         };
         let slack = slack.round() as u32;
         let penalty_mask = self.route_penalty_mask(&banned_routes, &route_penalties);
@@ -835,7 +832,7 @@ impl TransportNetwork {
         let intermediate = if exclusions.is_some() {
             &self.transfers
         } else {
-            self.emissions_transfers(factor_fingerprint(&per_trip))
+            self.emissions_transfers(&per_trip)
         };
         let (rows, walk, origin_links, destination_links, unsnapped_from, unsnapped_to) = self
             .point_frontier_rows(
@@ -1160,7 +1157,7 @@ impl TransportNetwork {
         let intermediate = if exclusions.is_some() {
             &self.transfers
         } else {
-            self.emissions_transfers(factor_fingerprint(&per_trip))
+            self.emissions_transfers(&per_trip)
         };
         let (rows, walk, _, _, unsnapped_from, unsnapped_to) = self.point_frontier_rows(
             py,

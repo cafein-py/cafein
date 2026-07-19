@@ -565,7 +565,6 @@ impl TransportNetwork {
         // network) it keeps the closure and board-at-origin access; the trip-based
         // engines and the time and fare candidates always keep the closure.
         let stop_count = self.build.timetable.stop_count() as usize;
-        let fingerprint = factor_fingerprint(&per_trip);
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         if exclusions.is_some() && router == "tbtr" {
             return Err(PyValueError::new_err(
@@ -575,7 +574,7 @@ impl TransportNetwork {
         let matrix_mcultra = candidates == "pareto"
             && router != "tbtr"
             && exclusions.is_none()
-            && !std::ptr::eq(self.emissions_transfers(fingerprint), &self.transfers)
+            && !std::ptr::eq(self.emissions_transfers(&per_trip), &self.transfers)
             && self.streets.is_some();
         // Auto prefers the door-to-door McULTRA path over an engine switch;
         // pareto candidates resolve on the McTBTR cache, time and fare
@@ -631,7 +630,7 @@ impl TransportNetwork {
             )
         };
         let matrix_transfers = if matrix_mcultra {
-            self.emissions_transfers(fingerprint)
+            self.emissions_transfers(&per_trip)
         } else {
             &self.transfers
         };
