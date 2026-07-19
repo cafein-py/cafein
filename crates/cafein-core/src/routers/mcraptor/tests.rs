@@ -18,6 +18,7 @@ fn request(access: StopIdx, egress: StopIdx, max_transfers: u8) -> Request {
         active_services: Vec::new(),
         active_services_previous: Vec::new(),
         max_transfers,
+        exclusions: None,
     }
 }
 
@@ -838,6 +839,7 @@ fn the_emissions_matrix_sees_past_the_time_candidates() {
         active_services: vec![true],
         active_services_previous: vec![false],
         max_transfers: 3,
+        exclusions: None,
     }];
     let destinations = [StopIdx(0), StopIdx(3)];
     let rows = least_emissions_matrix(
@@ -899,6 +901,7 @@ fn a_budget_caps_the_matrix_travel_time() {
         active_services: vec![true],
         active_services_previous: vec![false],
         max_transfers: 3,
+        exclusions: None,
     }];
     let cell = |budget: Option<u32>| {
         let rows = least_emissions_matrix(
@@ -974,6 +977,7 @@ fn matrix_rows_carry_their_transfer_walks() {
         active_services: vec![true],
         active_services_previous: vec![false],
         max_transfers: 3,
+        exclusions: None,
     }];
     let rows = least_emissions_matrix(
         &view,
@@ -1029,6 +1033,7 @@ fn profiles_the_departure_window() {
         active_services: vec![true],
         active_services_previous: vec![false],
         max_transfers: 1,
+        exclusions: None,
     };
     let journeys = route_range(
         &view,
@@ -1066,6 +1071,7 @@ fn frontier_matrix_matches_the_one_pair_profile_per_cell() {
             active_services: vec![true],
             active_services_previous: Vec::new(),
             max_transfers: 3,
+            exclusions: None,
         })
         .collect();
     let cells = frontier_matrix(
@@ -1167,6 +1173,7 @@ fn target_pruning_keeps_the_same_bucket_refinement() {
         active_services: Vec::new(),
         active_services_previous: Vec::new(),
         max_transfers: 3,
+        exclusions: None,
     };
     // One bucket holds both journeys, so they compare equal on
     // emissions during the search and the exact grams decide.
@@ -1433,6 +1440,7 @@ fn attribution_counters_hold_their_identities() {
         25.0,
         0,
         &[],
+        None,
     );
     search.ops = true;
     let request = request(StopIdx(0), StopIdx(5), 2);
@@ -1575,6 +1583,7 @@ fn slack_and_penalty_searches_never_use_the_strict_path() {
         25.0,
         0,
         &[],
+        None,
     );
     assert!(strict.strict_bags);
     let slack = Search::start(
@@ -1586,16 +1595,17 @@ fn slack_and_penalty_searches_never_use_the_strict_path() {
         25.0,
         120,
         &[],
+        None,
     );
     assert!(!slack.strict_bags);
     let penalties = [300u32];
     let penalised = Search::start(
-        &view, &timetable, &footpaths, &geometry, &factors, 25.0, 0, &penalties,
+        &view, &timetable, &footpaths, &geometry, &factors, 25.0, 0, &penalties, None,
     );
     assert!(!penalised.strict_bags);
     let bans = [u32::MAX];
     let banned = Search::start(
-        &view, &timetable, &footpaths, &geometry, &factors, 25.0, 0, &bans,
+        &view, &timetable, &footpaths, &geometry, &factors, 25.0, 0, &bans, None,
     );
     assert!(!banned.strict_bags);
     // Only the strict search owns an edge-major batch.
@@ -1662,6 +1672,7 @@ fn forced_strict_and_forced_general_paths_have_identical_coordinates() {
             bucket,
             0,
             &[],
+            None,
         );
         let mut general = Search::start(
             &view,
@@ -1672,6 +1683,7 @@ fn forced_strict_and_forced_general_paths_have_identical_coordinates() {
             bucket,
             0,
             &[],
+            None,
         );
         general.strict_bags = false;
         general.batch = None;
@@ -1789,6 +1801,7 @@ fn repeated_destination_stops_keep_every_matrix_cell() {
         active_services: vec![true],
         active_services_previous: vec![false],
         max_transfers: 3,
+        exclusions: None,
     }];
     let destinations = [StopIdx(3), StopIdx(0), StopIdx(3)];
     let rows = least_emissions_matrix(
@@ -1866,6 +1879,7 @@ fn a_matrix_request_with_egress_is_not_target_pruned() {
             active_services: vec![true],
             active_services_previous: vec![false],
             max_transfers: 3,
+            exclusions: None,
         }]
     };
     let matrix = |requests: &[Request]| {
@@ -1931,6 +1945,7 @@ fn the_transfer_cap_saturates_at_the_ride_count_limit() {
             active_services: vec![true],
             active_services_previous: vec![false],
             max_transfers,
+            exclusions: None,
         }]
     };
     let matrix = |requests: &[Request]| {
@@ -1993,4 +2008,210 @@ fn the_transfer_cap_saturates_at_the_ride_count_limit() {
             .collect()
     };
     assert_eq!(cells(&capped), cells(&saturated));
+}
+
+/// The exclusion fixture: A rides 0→1 (route 0), B rides 1→3 (route
+/// 1), C rides 0→3 through 2 (route 2). Unrestricted, A+B wins at 300;
+/// without B (or stop 1), C wins at 400 riding through 2.
+fn exclusion_fixture(with_b: bool, with_a: bool) -> (Timetable, TripGeometry, Vec<f64>) {
+    let mut builder = TimetableBuilder::new(4);
+    let mut factors = Vec::new();
+    let mut distances = Vec::new();
+    let mut trips = 0u32;
+    if with_a {
+        let a = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+        builder.add_trip(a, vec![time(0), time(100)], 0, 0).unwrap();
+        factors.push(10.0);
+        distances.push((
+            TripIdx(trips),
+            vec![0.0, 1000.0],
+            DistanceProvenance::CrowFly,
+        ));
+        trips += 1;
+    }
+    if with_b {
+        let b = builder.add_pattern(&[StopIdx(1), StopIdx(3)], 1).unwrap();
+        builder
+            .add_trip(b, vec![time(150), time(300)], 0, 0)
+            .unwrap();
+        factors.push(10.0);
+        distances.push((
+            TripIdx(trips),
+            vec![0.0, 1000.0],
+            DistanceProvenance::CrowFly,
+        ));
+        trips += 1;
+    }
+    let c = builder
+        .add_pattern(&[StopIdx(0), StopIdx(2), StopIdx(3)], 2)
+        .unwrap();
+    builder
+        .add_trip(c, vec![time(0), time(200), time(400)], 0, 0)
+        .unwrap();
+    factors.push(10.0);
+    distances.push((
+        TripIdx(trips),
+        vec![0.0, 1000.0, 2000.0],
+        DistanceProvenance::CrowFly,
+    ));
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(&timetable, distances).unwrap();
+    (timetable, geometry, factors)
+}
+
+fn exclude(
+    stops: &[u32],
+    trips: &[u32],
+    routes: &[u32],
+) -> Option<std::sync::Arc<crate::router::Exclusions>> {
+    let mask = |ids: &[u32]| -> Vec<bool> {
+        match ids.iter().max() {
+            None => Vec::new(),
+            Some(&top) => {
+                let mut mask = vec![false; top as usize + 1];
+                for &id in ids {
+                    mask[id as usize] = true;
+                }
+                mask
+            }
+        }
+    };
+    Some(std::sync::Arc::new(crate::router::Exclusions::new(
+        mask(stops),
+        mask(trips),
+        mask(routes),
+    )))
+}
+
+#[test]
+fn exclusions_match_the_rebuilt_network() {
+    // The oracle: a query with exclusions equals the same query on a
+    // timetable genuinely built without the excluded supply.
+    let (full, geometry, factors) = exclusion_fixture(true, true);
+    let (without_b, oracle_geometry, oracle_factors) = exclusion_fixture(false, true);
+    let footpaths = Transfers::empty(4);
+    let request = |exclusions| Request {
+        departure: 0,
+        access: vec![(StopIdx(0), 0)],
+        egress: vec![(StopIdx(3), 0)],
+        active_services: vec![true],
+        active_services_previous: vec![false],
+        max_transfers: 3,
+        exclusions,
+    };
+    let journeys = |timetable: &Timetable, geometry: &TripGeometry, factors: &[f64], exclusions| {
+        let view = DayView::universal(timetable);
+        route(
+            &view,
+            timetable,
+            &footpaths,
+            geometry,
+            factors,
+            &request(exclusions),
+            1e-6,
+            0,
+            None,
+            &[],
+            None,
+        )
+        .iter()
+        .map(|journey| (journey.arrival, journey.rides()))
+        .collect::<Vec<_>>()
+    };
+    let unrestricted = journeys(&full, &geometry, &factors, None);
+    assert!(unrestricted.contains(&(300, 2)));
+    let oracle = journeys(&without_b, &oracle_geometry, &oracle_factors, None);
+    assert!(oracle.contains(&(400, 1)) && !oracle.contains(&(300, 2)));
+    // Excluding route 1, its trip, or its boarding stop each equals the
+    // rebuilt network (for the stop, line A also becomes useless).
+    assert_eq!(
+        journeys(&full, &geometry, &factors, exclude(&[], &[], &[1])),
+        oracle
+    );
+    assert_eq!(
+        journeys(&full, &geometry, &factors, exclude(&[], &[1], &[])),
+        oracle
+    );
+    assert_eq!(
+        journeys(&full, &geometry, &factors, exclude(&[1], &[], &[])),
+        oracle
+    );
+}
+
+#[test]
+fn riding_through_an_excluded_stop_is_allowed() {
+    // Stop 2 is only ridden through by line C: excluding it changes
+    // nothing — a closed station still has vehicles passing.
+    let (full, geometry, factors) = exclusion_fixture(true, true);
+    let footpaths = Transfers::empty(4);
+    let view = DayView::universal(&full);
+    let request = |exclusions| Request {
+        departure: 0,
+        access: vec![(StopIdx(0), 0)],
+        egress: vec![(StopIdx(3), 0)],
+        active_services: vec![true],
+        active_services_previous: vec![false],
+        max_transfers: 3,
+        exclusions,
+    };
+    let triples = |exclusions| {
+        route(
+            &view,
+            &full,
+            &footpaths,
+            &geometry,
+            &factors,
+            &request(exclusions),
+            1e-6,
+            0,
+            None,
+            &[],
+            None,
+        )
+        .iter()
+        .map(|journey| (journey.arrival, journey.rides()))
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(triples(exclude(&[2], &[], &[])), triples(None));
+    // An excluded origin, though, takes no access: nothing routes.
+    assert!(triples(exclude(&[0], &[], &[])).is_empty());
+    // And an excluded destination joins no egress.
+    assert!(triples(exclude(&[3], &[], &[])).is_empty());
+}
+
+#[test]
+fn exclusions_compose_with_route_penalties() {
+    // A penalty on route 2 plus an exclusion of route 1: the exclusion
+    // removes A+B outright, and the penalized C is still returned —
+    // costly but usable, the exclusion winning where both apply.
+    let (full, geometry, factors) = exclusion_fixture(true, true);
+    let footpaths = Transfers::empty(4);
+    let view = DayView::universal(&full);
+    let penalties = [0, 0, 600];
+    let journeys = route(
+        &view,
+        &full,
+        &footpaths,
+        &geometry,
+        &factors,
+        &Request {
+            departure: 0,
+            access: vec![(StopIdx(0), 0)],
+            egress: vec![(StopIdx(3), 0)],
+            active_services: vec![true],
+            active_services_previous: vec![false],
+            max_transfers: 3,
+            exclusions: exclude(&[], &[], &[1]),
+        },
+        1e-6,
+        0,
+        None,
+        &penalties,
+        None,
+    );
+    let triples: Vec<_> = journeys
+        .iter()
+        .map(|journey| (journey.arrival, journey.rides()))
+        .collect();
+    assert_eq!(triples, vec![(400, 1)]);
 }

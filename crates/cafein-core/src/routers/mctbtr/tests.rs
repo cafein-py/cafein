@@ -300,6 +300,7 @@ fn engines_agree(
         active_services: vec![true; 8],
         active_services_previous: vec![false; 8],
         max_transfers,
+        exclusions: None,
     };
     let points = pareto_oracle(
         &view,
@@ -526,6 +527,7 @@ fn the_matrix_matches_the_mcraptor_matrix() {
         active_services: vec![true],
         active_services_previous: vec![false],
         max_transfers: 3,
+        exclusions: None,
     }];
     let destinations = [StopIdx(0), StopIdx(3)];
     let engine = McTbtrEngine::for_date(
@@ -609,6 +611,7 @@ fn profiles_the_departure_window() {
         active_services: vec![true],
         active_services_previous: vec![false],
         max_transfers: 1,
+        exclusions: None,
     };
     let engine = McTbtrEngine::for_date(
         &timetable,
@@ -717,6 +720,7 @@ fn the_frontier_matrix_matches_the_one_pair_profile_per_cell() {
             active_services: vec![true],
             active_services_previous: Vec::new(),
             max_transfers: 3,
+            exclusions: None,
         })
         .collect();
     let cells = engine.frontier_matrix(
@@ -782,6 +786,7 @@ fn a_prebuilt_transfer_set_answers_like_for_date() {
         active_services: vec![true],
         active_services_previous: Vec::new(),
         max_transfers: 3,
+        exclusions: None,
     };
     let over_owned = owned.route_range(&request, 1000, 1e-6, None);
     let over_borrowed = borrowed.route_range(&request, 1000, 1e-6, None);
@@ -879,6 +884,7 @@ fn the_frontier_matrix_serves_a_slot_only_the_transfer_reaches() {
         active_services: vec![true],
         active_services_previous: Vec::new(),
         max_transfers: 2,
+        exclusions: None,
     }];
     let cells = engine.frontier_matrix(
         &requests,
@@ -966,6 +972,7 @@ fn dominated_through_journeys_stay_out_of_every_cell() {
         active_services: vec![true],
         active_services_previous: Vec::new(),
         max_transfers: 2,
+        exclusions: None,
     }];
     let cells = engine.frontier_matrix(
         &requests,
@@ -1073,6 +1080,7 @@ fn dense_request(egress: StopIdx) -> Request {
         active_services: vec![true; 9],
         active_services_previous: vec![false; 9],
         max_transfers: 2,
+        exclusions: None,
     }
 }
 
@@ -1199,6 +1207,7 @@ fn dense_closure_frontier_matrix_matches_one_pair_queries() {
             active_services: vec![true; 9],
             active_services_previous: vec![],
             max_transfers: 2,
+            exclusions: None,
         };
         let cells = engine.frontier_matrix(
             std::slice::from_ref(&request),
@@ -1369,6 +1378,7 @@ fn equal_cost_closure_ancestries_are_coordinate_equivalent() {
         active_services: vec![true; 6],
         active_services_previous: vec![],
         max_transfers: 2,
+        exclusions: None,
     };
     let journeys = engine.route_range(&request, 100, 1e-6, None);
     assert_eq!(
@@ -1443,6 +1453,7 @@ fn profile_eviction_does_not_remove_a_cleaner_earlier_departure() {
         active_services: vec![true; 6],
         active_services_previous: vec![],
         max_transfers: 2,
+        exclusions: None,
     };
     let mut points: Vec<(u32, u32, f64, u32)> = Vec::new();
     for departure in [300u32, 0] {
@@ -1584,6 +1595,7 @@ fn cancelling_request() -> Request {
         active_services: vec![true; 6],
         active_services_previous: vec![],
         max_transfers: 2,
+        exclusions: None,
     }
 }
 
@@ -1972,6 +1984,7 @@ fn repeated_destination_stops_keep_every_matrix_cell() {
         active_services: vec![true],
         active_services_previous: vec![false],
         max_transfers: 3,
+        exclusions: None,
     }];
     let engine = McTbtrEngine::for_date(
         &timetable,
@@ -2017,6 +2030,7 @@ fn the_transfer_cap_saturates_at_the_ride_count_limit() {
             active_services: vec![true],
             active_services_previous: vec![false],
             max_transfers,
+            exclusions: None,
         }]
     };
     let engine = McTbtrEngine::for_date(
@@ -2070,6 +2084,7 @@ fn max_slower_bands_match_mcraptor() {
         active_services: vec![true],
         active_services_previous: vec![false],
         max_transfers: 3,
+        exclusions: None,
     };
     let engine = McTbtrEngine::for_date(
         &timetable,
@@ -2147,6 +2162,7 @@ fn max_slower_frontier_matrix_matches_the_one_pair_and_mcraptor() {
         active_services: vec![true],
         active_services_previous: vec![false],
         max_transfers: 3,
+        exclusions: None,
     };
     let matrix_request = Request {
         egress: Vec::new(),
@@ -2256,6 +2272,7 @@ fn the_band_survives_cross_pass_ride_suppression() {
         active_services: vec![true],
         active_services_previous: vec![false],
         max_transfers: 1,
+        exclusions: None,
     };
     let engine = McTbtrEngine::for_date(
         &timetable,

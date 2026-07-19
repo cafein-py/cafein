@@ -28,7 +28,7 @@ use crate::fares::FareLeg;
 use crate::geometry::{wkb_multi_line_string, TripGeometry};
 use crate::journey::{Journey, Leg};
 use crate::raptor::{departure_candidates, CostInputs, CostRow};
-use crate::router::Request;
+use crate::router::{Exclusions, Request};
 use crate::tbtr::{earliest_boardable, DayView, ViewTrip};
 use crate::timetable::{StopIdx, Timetable, TripIdx};
 use crate::transfers::Transfers;

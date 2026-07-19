@@ -164,6 +164,7 @@ fn request(services: usize, origin: StopIdx, destination: StopIdx, departure: u3
         active_services: vec![true; services],
         active_services_previous: vec![false; services],
         max_transfers: 7,
+        exclusions: None,
     }
 }
 
@@ -618,6 +619,7 @@ fn cost_rows_agree(
             active_services: vec![true; services],
             active_services_previous: vec![false; services],
             max_transfers,
+            exclusions: None,
         })
         .collect();
     let raptor = Raptor.cost_matrix(timetable, footpaths, &inputs, &requests, &destinations);
@@ -827,6 +829,7 @@ fn least_cost_rows_match_raptor_on_the_tie_fixtures() {
             active_services: vec![true; 6],
             active_services_previous: vec![false; 6],
             max_transfers: 4,
+            exclusions: None,
         })
         .collect();
     let engine = TbtrEngine::for_date(&timetable, &footpaths, &[true; 6], &[false; 6]);
@@ -971,6 +974,7 @@ fn point_and_fare_cost_rows_match_raptor() {
             active_services: vec![true; 6],
             active_services_previous: vec![false; 6],
             max_transfers: 4,
+            exclusions: None,
         })
         .collect();
     let access_meters: Vec<HashMap<StopIdx, f64>> = (0..2)
@@ -1075,6 +1079,7 @@ fn cost_cell(
         active_services: active.to_vec(),
         active_services_previous: previous.to_vec(),
         max_transfers: 4,
+        exclusions: None,
     };
     let requests = [request];
     let destinations = [destination];
@@ -1566,6 +1571,7 @@ fn generated_networks_match_raptor_across_the_sweep() {
                     active_services: vec![true, true],
                     active_services_previous: vec![previous, previous],
                     max_transfers,
+                    exclusions: None,
                 })
                 .collect()
         };

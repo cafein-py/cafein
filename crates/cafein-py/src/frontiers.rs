@@ -97,7 +97,7 @@ impl TransportNetwork {
     /// -------
     /// list of dict
     ///     Journeys shaped as in ``route_between_stops``.
-    #[pyo3(signature = (from_stop, to_stop, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, router = "auto", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, banned_routes = vec![], route_penalties = vec![], max_slower = None))]
+    #[pyo3(signature = (from_stop, to_stop, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, router = "auto", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], banned_routes = vec![], route_penalties = vec![], max_slower = None))]
     #[allow(clippy::too_many_arguments)]
     fn mc_route_between_stops(
         &self,
@@ -117,6 +117,9 @@ impl TransportNetwork {
         geometries: bool,
         slack: f64,
         max_options: Option<usize>,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
         banned_routes: Vec<String>,
         route_penalties: Vec<(String, u64)>,
         max_slower: Option<u32>,
@@ -149,6 +152,12 @@ impl TransportNetwork {
                 "route bans/penalties (diverse candidates) require router='raptor'",
             ));
         }
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        if exclusions.is_some() && router == "tbtr" {
+            return Err(PyValueError::new_err(
+                "route/trip/stop exclusions require router='raptor'",
+            ));
+        }
         if max_slower.is_some()
             && (slack > 0.0 || !banned_routes.is_empty() || !route_penalties.is_empty())
         {
@@ -163,6 +172,14 @@ impl TransportNetwork {
         };
         let origin = self.resolve_stop(from_stop)?;
         let destination = self.resolve_stop(to_stop)?;
+        // An excluded endpoint is unreachable by contract - also on the
+        // door-to-door path, which could otherwise reach the stop's
+        // coordinates through a neighbour or a direct walk.
+        if let Some(excluded) = exclusions.as_deref() {
+            if excluded.excludes_stop(origin) || excluded.excludes_stop(destination) {
+                return Ok(PyList::empty(py).unbind());
+            }
+        }
         let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
         for (trip_id, factor) in &factors {
             if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
@@ -178,6 +195,7 @@ impl TransportNetwork {
         // board-at-origin closure routing (`"auto"` reroutes and resolves on
         // the coordinate path, whose engines share the McULTRA set).
         if router != "tbtr"
+            && exclusions.is_none()
             && !std::ptr::eq(
                 self.emissions_transfers(factor_fingerprint(&per_trip)),
                 &self.transfers,
@@ -209,6 +227,9 @@ impl TransportNetwork {
                         geometries,
                         slack,
                         max_options,
+                        exclude_routes,
+                        exclude_trips,
+                        exclude_stops,
                         banned_routes,
                         route_penalties,
                         max_slower,
@@ -221,7 +242,10 @@ impl TransportNetwork {
             router,
             date,
             &per_trip,
-            slack > 0.0 || !banned_routes.is_empty() || !route_penalties.is_empty(),
+            slack > 0.0
+                || !banned_routes.is_empty()
+                || !route_penalties.is_empty()
+                || exclusions.is_some(),
         )?;
         let request = Request {
             departure: parse_time(departure)?,
@@ -230,6 +254,7 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             active_services_previous: self.active_services_previous(date)?,
             max_transfers,
+            exclusions: exclusions.clone(),
         };
         let penalty_mask = self.route_penalty_mask(&banned_routes, &route_penalties);
         let journeys = py.allow_threads(|| {
@@ -319,7 +344,7 @@ impl TransportNetwork {
     /// the query's date and factors and the query asks nothing McTBTR
     /// cannot answer, else on McRAPTOR; explicit values pick the engine
     /// directly.
-    #[pyo3(signature = (origin, destination, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, banned_routes = vec![], route_penalties = vec![], max_slower = None, router = "auto"))]
+    #[pyo3(signature = (origin, destination, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], banned_routes = vec![], route_penalties = vec![], max_slower = None, router = "auto"))]
     #[allow(clippy::too_many_arguments)]
     fn mc_route_between_coordinates(
         &self,
@@ -338,6 +363,9 @@ impl TransportNetwork {
         geometries: bool,
         slack: f64,
         max_options: Option<usize>,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
         banned_routes: Vec<String>,
         route_penalties: Vec<(String, u64)>,
         max_slower: Option<u32>,
@@ -366,6 +394,12 @@ impl TransportNetwork {
         {
             return Err(PyValueError::new_err(
                 "route slacks, bans and penalties require router='raptor'",
+            ));
+        }
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        if exclusions.is_some() && router == "tbtr" {
+            return Err(PyValueError::new_err(
+                "route/trip/stop exclusions require router='raptor'",
             ));
         }
         if max_slower.is_some()
@@ -423,6 +457,7 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             active_services_previous: self.active_services_previous(date)?,
             max_transfers,
+            exclusions: exclusions.clone(),
         };
         // The walking-only alternative, exactly as in
         // route_between_coordinates: zero emissions, available at
@@ -448,9 +483,18 @@ impl TransportNetwork {
             router,
             date,
             &per_trip,
-            slack > 0.0 || !banned_routes.is_empty() || !route_penalties.is_empty(),
+            slack > 0.0
+                || !banned_routes.is_empty()
+                || !route_penalties.is_empty()
+                || exclusions.is_some(),
         )?;
-        let intermediate = self.emissions_transfers(factor_fingerprint(&per_trip));
+        // Exclusions keep the closure: the McULTRA shortcut set's witness
+        // pruning is not robust under supply removal.
+        let intermediate = if exclusions.is_some() {
+            &self.transfers
+        } else {
+            self.emissions_transfers(factor_fingerprint(&per_trip))
+        };
         let slack = slack.round() as u32;
         let penalty_mask = self.route_penalty_mask(&banned_routes, &route_penalties);
         let journeys = py.allow_threads(|| {
@@ -623,6 +667,7 @@ impl TransportNetwork {
                 active_services: active_services.clone(),
                 active_services_previous: active_services_previous.clone(),
                 max_transfers,
+                exclusions: None,
             })
             .collect();
         let rows = py.allow_threads(|| {
@@ -936,6 +981,7 @@ impl TransportNetwork {
                 active_services: active_services.clone(),
                 active_services_previous: active_services_previous.clone(),
                 max_transfers,
+                exclusions: None,
             })
             .collect();
         let rows = py.allow_threads(|| {
@@ -1181,6 +1227,7 @@ impl TransportNetwork {
                     active_services: active_services.to_vec(),
                     active_services_previous: active_services_previous.to_vec(),
                     max_transfers,
+                    exclusions: None,
                 })
                 .collect();
             // Invert the destination links into the per-stop final-egress

@@ -58,6 +58,7 @@ fn finds_the_earliest_direct_k_train() {
             .services
             .active_on(date.pred_opt().expect("date has a previous day")),
         max_transfers: 4,
+        exclusions: None,
     };
     let transfers = Transfers::empty(build.timetable.stop_count());
     let journeys = Raptor.route(&build.timetable, &transfers, &request);
@@ -110,6 +111,7 @@ fn profiles_a_departure_window() {
             .services
             .active_on(date.pred_opt().expect("date has a previous day")),
         max_transfers: 4,
+        exclusions: None,
     };
     let transfers = Transfers::empty(build.timetable.stop_count());
     let journeys = Raptor.route_range(&build.timetable, &transfers, &request, 1800);
@@ -172,6 +174,7 @@ fn journeys_are_time_consistent() {
             .services
             .active_on(date.pred_opt().expect("date has a previous day")),
         max_transfers: 4,
+        exclusions: None,
     };
     let transfers = Transfers::empty(build.timetable.stop_count());
     for journey in Raptor.route(&build.timetable, &transfers, &request) {

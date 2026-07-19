@@ -52,6 +52,7 @@ fn request(from: StopIdx, to: StopIdx, departure: u32) -> Request {
         active_services: vec![true, false],
         active_services_previous: Vec::new(),
         max_transfers: 3,
+        exclusions: None,
     }
 }
 
@@ -545,6 +546,7 @@ fn emits_the_pareto_set_over_rides_and_arrival() {
             active_services: vec![true],
             active_services_previous: Vec::new(),
             max_transfers: 3,
+            exclusions: None,
         },
     );
     assert_eq!(journeys.len(), 2);
@@ -567,6 +569,7 @@ fn chooses_between_access_and_egress_alternatives() {
             active_services: vec![true, false],
             active_services_previous: Vec::new(),
             max_transfers: 3,
+            exclusions: None,
         },
     );
     // Best: board B at stop 1 (reached at 10, dep 250), arrive 3 at
@@ -610,6 +613,7 @@ fn terminal_stops_still_board_their_other_patterns() {
             active_services: vec![true],
             active_services_previous: Vec::new(),
             max_transfers: 3,
+            exclusions: None,
         },
     );
     assert_eq!(journeys.len(), 1);
@@ -835,6 +839,7 @@ fn range_shifts_candidates_by_the_access_duration() {
             active_services: vec![true],
             active_services_previous: Vec::new(),
             max_transfers: 3,
+            exclusions: None,
         },
         200,
     );
@@ -906,6 +911,7 @@ fn boards_the_previous_days_over_midnight_trip() {
         active_services: vec![false],
         active_services_previous: vec![false],
         max_transfers: 1,
+        exclusions: None,
     };
 
     // Neither day runs the service: the night trip is unreachable.
@@ -963,6 +969,7 @@ fn range_profiles_previous_day_over_midnight_trips() {
         active_services: vec![false],
         active_services_previous: vec![true],
         max_transfers: 1,
+        exclusions: None,
     };
     // The window covers 00:00–02:00; the shifted 01:00 departure lands
     // in it and profiles as leaving at 01:00, arriving 01:10.

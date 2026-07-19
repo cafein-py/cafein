@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Query-time exclusion sets: `exclude_routes=`, `exclude_trips=`, and
+  `exclude_stops=` (GTFS ids) on `route_between_stops`,
+  `route_between_coordinates`, `journey_frontier`, and
+  `DetailedItineraries` — one built network serves many disruption
+  scenarios ("line X closed", "stop Y shut") and per-individual
+  accessibility filters, no rebuild. An excluded stop refuses
+  boarding, alighting, transfers, and access/egress while vehicles
+  still ride through it; an excluded origin or destination yields no
+  journeys; unknown route and trip ids are ignored. Exclusions compose
+  with the diverse candidates' bans and penalties, run on the RAPTOR
+  engines (`"auto"` falls back; the precomputed trip-based and
+  (Mc)ULTRA sets are reduced against witnesses the removed supply may
+  have carried), and answer exactly as a network built without that
+  supply.
+
 ## 0.5.0 — 2026-07-19
 
 - ``router="auto"`` — the new default for every ``router`` parameter: a

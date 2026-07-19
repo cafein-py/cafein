@@ -149,6 +149,12 @@ class DetailedItineraries(gpd.GeoDataFrame):
         route's effective arrival per prior use, so a corridor that mostly
         differs yet shares a trunk can surface (the R5-style soft penalty).
         Unused for the other candidate sets.
+    exclude_routes, exclude_trips, exclude_stops : list of str (optional)
+        GTFS ids of supply the itineraries must not use — disruption
+        and accessibility filters, as in ``route_between_stops``.
+        Excluded stops refuse boarding, alighting, transfers, and
+        access/egress while vehicles still ride through them; excluded
+        origins or destinations yield no rows.
     geometries : bool (optional, default: True)
         Attach each leg's geometry. Turn off to skip the geometry work
         when only the leg records are needed.
@@ -180,6 +186,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
         max_options=None,
         diversity="time",
         penalty="ban",
+        exclude_routes=(),
+        exclude_trips=(),
+        exclude_stops=(),
         geometries=True,
         walking_speed_kmph=None,
         max_walking_time=None,
@@ -206,6 +215,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
             max_options=max_options,
             diversity=diversity,
             penalty=penalty,
+            exclude_routes=exclude_routes,
+            exclude_trips=exclude_trips,
+            exclude_stops=exclude_stops,
             geometries=geometries,
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
@@ -231,13 +243,16 @@ def _itineraries_frame(
     max_options,
     diversity,
     penalty,
+    exclude_routes,
+    exclude_trips,
+    exclude_stops,
     geometries,
     walking_speed_kmph,
     max_walking_time,
     max_snap_distance,
 ):
     from cafein import emissions
-    from cafein.frontier import _alternative_options
+    from cafein.frontier import _alternative_options, _exclusion_lists
 
     origin_ids, origin_keys, kind = _endpoints(origins, "origins")
     dest_ids, dest_keys, dest_kind = _endpoints(destinations, "destinations")
@@ -262,6 +277,7 @@ def _itineraries_frame(
     slack, options, rounds = _alternative_options(
         candidates, slack_seconds, max_options, diversity, penalty
     )
+    exclusions = _exclusion_lists(exclude_routes, exclude_trips, exclude_stops)
     multicriteria = candidates in ("pareto", "relaxed", "diverse")
     # The multicriteria (McRAPTOR) candidates need the per-trip factor vector;
     # the time candidates get their emissions from the post-hoc annotation only.
@@ -292,6 +308,7 @@ def _itineraries_frame(
                     diversity,
                     slack,
                     penalty,
+                    exclusions,
                 )
             else:
                 journeys = _route(
@@ -310,6 +327,7 @@ def _itineraries_frame(
                     slack,
                     options,
                     trip_factors,
+                    exclusions,
                 )
             if not journeys:
                 continue
@@ -353,6 +371,7 @@ def _route(
     slack,
     options,
     trip_factors,
+    exclusions,
 ):
     """The Pareto-optimal journeys of one OD pair — the time-optimal
     (arrival, rides) set, or the (arrival, emissions) McRAPTOR set with
@@ -373,6 +392,7 @@ def _route(
             slack,
             options,
             trip_factors,
+            exclusions,
         )
     if kind == "points":
         walking_speed_kmph, max_walking_time, max_snap_distance = walk
@@ -382,13 +402,24 @@ def _route(
             date,
             departure,
             max_transfers,
+            exclude_routes=exclusions[0],
+            exclude_trips=exclusions[1],
+            exclude_stops=exclusions[2],
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
             geometries=geometries,
         )
     return network.route_between_stops(
-        origin_key, dest_key, date, departure, max_transfers, geometries=geometries
+        origin_key,
+        dest_key,
+        date,
+        departure,
+        max_transfers,
+        exclude_routes=exclusions[0],
+        exclude_trips=exclusions[1],
+        exclude_stops=exclusions[2],
+        geometries=geometries,
     )
 
 
@@ -407,6 +438,7 @@ def _route_pareto(
     slack,
     options,
     trip_factors,
+    exclusions,
 ):
     """The (arrival, emissions) McRAPTOR journeys of one OD pair — the
     cleaner-but-slower alternatives the time-optimal set misses, widened by
@@ -428,6 +460,9 @@ def _route_pareto(
             geometries,
             slack,
             options,
+            exclude_routes=exclusions[0],
+            exclude_trips=exclusions[1],
+            exclude_stops=exclusions[2],
             router=router,
         )
     return network._core.mc_route_between_stops(
@@ -444,6 +479,9 @@ def _route_pareto(
         geometries,
         slack,
         options,
+        exclude_routes=exclusions[0],
+        exclude_trips=exclusions[1],
+        exclude_stops=exclusions[2],
     )
 
 
@@ -466,6 +504,7 @@ def _route_diverse(
     diversity,
     slack,
     penalty,
+    exclusions,
 ):
     """``k`` distinct alternatives for one OD pair, by the shared
     ``_diverse_rounds`` loop over single-departure McRAPTOR searches
@@ -490,8 +529,11 @@ def _route_diverse(
                 geometries,
                 slack,
                 None,
-                banned,
-                route_penalties,
+                exclude_routes=exclusions[0],
+                exclude_trips=exclusions[1],
+                exclude_stops=exclusions[2],
+                banned_routes=banned,
+                route_penalties=route_penalties,
                 router=router,
             )
         return network._core.mc_route_between_stops(
@@ -508,8 +550,11 @@ def _route_diverse(
             geometries,
             slack,
             None,
-            banned,
-            route_penalties,
+            exclude_routes=exclusions[0],
+            exclude_trips=exclusions[1],
+            exclude_stops=exclusions[2],
+            banned_routes=banned,
+            route_penalties=route_penalties,
         )
 
     def annotate(journeys):

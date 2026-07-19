@@ -1,8 +1,46 @@
 //! The routing request and the router interface.
 
 use crate::journey::Journey;
-use crate::timetable::{StopIdx, Timetable};
+use crate::timetable::{StopIdx, Timetable, TripIdx};
 use crate::transfers::Transfers;
+
+/// Query-time supply exclusions: stops, trips, and routes the journey
+/// must not use. Empty vectors mean the family has no exclusions; an
+/// absent or out-of-range bit reads as not excluded. A vehicle may
+/// still ride through an excluded stop — the stop only refuses
+/// boarding, alighting, transfers, and access/egress. Shared across a
+/// matrix's per-origin requests through the `Arc`.
+#[derive(Debug)]
+pub struct Exclusions {
+    stops: Vec<bool>,
+    trips: Vec<bool>,
+    routes: Vec<bool>,
+}
+
+impl Exclusions {
+    pub fn new(stops: Vec<bool>, trips: Vec<bool>, routes: Vec<bool>) -> Exclusions {
+        Exclusions {
+            stops,
+            trips,
+            routes,
+        }
+    }
+
+    #[inline]
+    pub fn excludes_stop(&self, stop: StopIdx) -> bool {
+        self.stops.get(stop.0 as usize).copied().unwrap_or(false)
+    }
+
+    #[inline]
+    pub fn excludes_trip(&self, trip: TripIdx) -> bool {
+        self.trips.get(trip.0 as usize).copied().unwrap_or(false)
+    }
+
+    #[inline]
+    pub fn excludes_route(&self, route: u32) -> bool {
+        self.routes.get(route as usize).copied().unwrap_or(false)
+    }
+}
 
 /// A single-departure routing request.
 ///
@@ -31,6 +69,8 @@ pub struct Request {
     pub active_services_previous: Vec<bool>,
     /// Journeys may use at most `max_transfers + 1` transit legs.
     pub max_transfers: u8,
+    /// Query-time supply exclusions; `None` is the unrestricted query.
+    pub exclusions: Option<std::sync::Arc<Exclusions>>,
 }
 
 /// A public-transport routing algorithm.
