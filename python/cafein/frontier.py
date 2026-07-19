@@ -425,6 +425,9 @@ def journey_frontiers(
     bucket=25.0,
     router="auto",
     max_slower=None,
+    exclude_routes=(),
+    exclude_trips=(),
+    exclude_stops=(),
     walking_speed_kmph=None,
     max_walking_time=None,
     max_snap_distance=None,
@@ -454,7 +457,8 @@ def journey_frontiers(
     date, departure, window
         The service date, window start, and window length, as in
         ``journey_frontier``.
-    max_transfers, factors, components, fares, bucket, router, max_slower
+    max_transfers, factors, components, fares, bucket, router, max_slower,
+    exclude_routes, exclude_trips, exclude_stops
         As in ``journey_frontier`` (``bucket`` is the pareto search's
         emissions bucket width in grams; ``router="tbtr"`` answers over
         the McTBTR engine — one multicriteria transfer set built per
@@ -486,6 +490,7 @@ def journey_frontiers(
     if router not in ("auto", "raptor", "tbtr"):
         raise ValueError("router must be 'auto', 'raptor', or 'tbtr'")
     max_slower = _validated_max_slower(max_slower, "pareto", router)
+    exclusions = _exclusion_lists(exclude_routes, exclude_trips, exclude_stops)
     trip_factors = emissions.trip_factors(network, factors, components)
     if stops[0] is not None:
         from_ids, to_ids = stops
@@ -499,6 +504,9 @@ def journey_frontiers(
             max_transfers,
             bucket,
             geometries,
+            exclude_routes=exclusions[0],
+            exclude_trips=exclusions[1],
+            exclude_stops=exclusions[2],
             max_slower=max_slower,
             router=router,
         )
@@ -519,6 +527,9 @@ def journey_frontiers(
             bucket,
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
             geometries,
+            exclude_routes=exclusions[0],
+            exclude_trips=exclusions[1],
+            exclude_stops=exclusions[2],
             max_slower=max_slower,
             router=router,
         )
@@ -562,6 +573,9 @@ def frontier_table(
     bucket=25.0,
     router="auto",
     max_slower=None,
+    exclude_routes=(),
+    exclude_trips=(),
+    exclude_stops=(),
     walking_speed_kmph=None,
     max_walking_time=None,
     max_snap_distance=None,
@@ -580,7 +594,8 @@ def frontier_table(
     ----------
     network, origins, destinations, date, departure, window
         As in ``journey_frontiers``.
-    max_transfers, factors, components, bucket, router, max_slower
+    max_transfers, factors, components, bucket, router, max_slower,
+    exclude_routes, exclude_trips, exclude_stops
         As in ``journey_frontiers``.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         Street-search options for the coordinate queries, as in
@@ -605,6 +620,7 @@ def frontier_table(
     if router not in ("auto", "raptor", "tbtr"):
         raise ValueError("router must be 'auto', 'raptor', or 'tbtr'")
     max_slower = _validated_max_slower(max_slower, "pareto", router)
+    exclusions = _exclusion_lists(exclude_routes, exclude_trips, exclude_stops)
     trip_factors = emissions.trip_factors(network, factors, components)
     if stops[0] is not None:
         from_ids, to_ids = stops
@@ -617,6 +633,9 @@ def frontier_table(
             window,
             max_transfers,
             bucket,
+            exclude_routes=exclusions[0],
+            exclude_trips=exclusions[1],
+            exclude_stops=exclusions[2],
             max_slower=max_slower,
             router=router,
         )
@@ -636,6 +655,9 @@ def frontier_table(
             max_transfers,
             bucket,
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
+            exclude_routes=exclusions[0],
+            exclude_trips=exclusions[1],
+            exclude_stops=exclusions[2],
             max_slower=max_slower,
             router=router,
         )

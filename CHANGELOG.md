@@ -10,8 +10,11 @@
   accessibility filters, no rebuild — and on the time-query products:
   `travel_times_from_stop`, `travel_times_from_coordinate`,
   `travel_time_matrix`, and `TravelTimeMatrix` (stop, point, and
-  percentile forms), where `router="auto"` falls back to RAPTOR and
-  the door-to-door ULTRA upgrades stay on unrestricted queries. An excluded stop refuses
+  percentile forms) and the batched frontiers (`journey_frontiers`,
+  `frontier_table`, stop and point forms, composing with
+  `max_slower`), where `router="auto"` falls back to the RAPTOR
+  engines and the door-to-door (Mc)ULTRA upgrades stay on
+  unrestricted queries. An excluded stop refuses
   boarding, alighting, transfers, and access/egress while vehicles
   still ride through it; an excluded origin or destination yields no
   journeys; unknown route and trip ids are ignored. Exclusions compose

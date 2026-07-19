@@ -319,3 +319,93 @@ def test_matrix_exclusions_router_contract(two_line_network):
     # An excluded origin has no rows at all.
     empty = TravelTimeMatrix(two_line_network, ["A"], exclude_stops=["A"], **kwargs)
     assert empty.empty
+
+
+def test_batched_frontiers_match_a_rebuilt_feed(two_line_network, tmp_path):
+    from cafein import TransportNetwork, frontier_table, journey_frontiers
+
+    legs = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    excluded = sorted(used(legs, "route_id"))[0]
+    source = build_two_line_gtfs(tmp_path / "full.zip")
+    rebuilt = TransportNetwork.from_gtfs(
+        [str(filtered_feed(source, tmp_path / "without.zip", excluded))]
+    )
+    args = (["A"], ["B"], DATE, DEPARTURE, 1800)
+    frame = journey_frontiers(two_line_network, *args, exclude_routes=[excluded])
+    oracle = journey_frontiers(rebuilt, *args)
+    assert len(frame) > 0
+    assert frame.equals(oracle)
+    flat = frontier_table(two_line_network, *args, exclude_routes=[excluded])
+    flat_oracle = frontier_table(rebuilt, *args)
+    assert flat.equals(flat_oracle)
+    # The band composes: its bounds count only the surviving supply —
+    # on the journey and flat-table forms alike.
+    banded = journey_frontiers(
+        two_line_network, *args, exclude_routes=[excluded], max_slower=0
+    )
+    assert banded.equals(journey_frontiers(rebuilt, *args, max_slower=0))
+    banded_flat = frontier_table(
+        two_line_network, *args, exclude_routes=[excluded], max_slower=0
+    )
+    assert banded_flat.equals(frontier_table(rebuilt, *args, max_slower=0))
+
+
+def test_batched_frontier_router_contract(two_line_network, capfd, monkeypatch):
+    from cafein import journey_frontiers
+
+    legs = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    excluded = sorted(used(legs, "route_id"))
+    args = (two_line_network, ["A"], ["B"], DATE, DEPARTURE, 1800)
+    with pytest.raises(ValueError, match="exclusions require router='raptor'"):
+        journey_frontiers(*args, router="tbtr", exclude_routes=excluded)
+    # Auto falls back even over a matching cached set: the batched path
+    # emits its stats flag only when McTBTR actually runs.
+    two_line_network.compute_mctbtr_transfers(DATE)
+    monkeypatch.setenv("CAFEIN_MCTBTR_PROF", "1")
+    capfd.readouterr()
+    auto = journey_frontiers(*args, exclude_routes=excluded)
+    assert "MCTBTR-STATS" not in capfd.readouterr().err
+    raptor = journey_frontiers(*args, router="raptor", exclude_routes=excluded)
+    assert auto.equals(raptor)
+    # Unknown-only ids stay on the cached engine.
+    capfd.readouterr()
+    unknown = journey_frontiers(*args, exclude_routes=["no-such-route"])
+    assert "MCTBTR-STATS" in capfd.readouterr().err
+    assert len(unknown) > 0
+
+
+def test_point_frontiers_take_exclusions(network_with_footpaths):
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    from cafein import frontier_table, journey_frontiers
+
+    origins = gpd.GeoDataFrame(
+        {"id": ["origin"]}, geometry=[Point(24.9330, 60.1689)], crs="EPSG:4326"
+    )
+    destinations = gpd.GeoDataFrame(
+        {"id": ["destination"]}, geometry=[Point(24.9505, 60.1690)], crs="EPSG:4326"
+    )
+    legs = network_with_footpaths.route_between_coordinates(
+        (60.1689, 24.9330), (60.1690, 24.9505), "2022-02-22", "08:30:00"
+    )
+    ridden = sorted(used(legs, "route_id"))
+    assert ridden
+    args = (
+        network_with_footpaths,
+        origins,
+        destinations,
+        "2022-02-22",
+        "08:30:00",
+        1800,
+    )
+    for wrapper in (journey_frontiers, frontier_table):
+        baseline = wrapper(*args)
+        excluded = wrapper(*args, exclude_routes=ridden)
+        raptor = wrapper(*args, router="raptor", exclude_routes=ridden)
+        # The point form honours the exclusions (auto equals raptor under
+        # them) and genuinely loses the excluded corridors.
+        assert excluded.equals(raptor)
+        assert not excluded.equals(baseline)
+        with pytest.raises(ValueError, match="exclusions require router='raptor'"):
+            wrapper(*args, router="tbtr", exclude_routes=ridden)
