@@ -153,6 +153,51 @@ impl TransportNetwork {
     /// arrival, clamped below the ban sentinel), 0 otherwise. Unknown ids
     /// are ignored and a ban wins over a penalty. Empty in, empty out —
     /// the engine reads a missing index as free.
+    /// The query-time exclusion masks from public ids, or `None` when
+    /// every list is empty. Unknown route and trip ids are ignored (a
+    /// disruption list may name supply absent from this feed); stop ids
+    /// must resolve, as everywhere else.
+    pub(super) fn exclusion_masks(
+        &self,
+        exclude_routes: &[String],
+        exclude_trips: &[String],
+        exclude_stops: &[String],
+    ) -> PyResult<Option<std::sync::Arc<Exclusions>>> {
+        if exclude_routes.is_empty() && exclude_trips.is_empty() && exclude_stops.is_empty() {
+            return Ok(None);
+        }
+        let routes = if exclude_routes.is_empty() {
+            Vec::new()
+        } else {
+            let excluded: std::collections::HashSet<&str> =
+                exclude_routes.iter().map(String::as_str).collect();
+            self.feed
+                .routes
+                .iter()
+                .map(|route| excluded.contains(self.public_id(route.feed, &route.id).as_str()))
+                .collect()
+        };
+        let mut trips = Vec::new();
+        if !exclude_trips.is_empty() {
+            trips = vec![false; self.build.timetable.trip_count() as usize];
+            for trip_id in exclude_trips {
+                if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
+                    trips[trip.0 as usize] = true;
+                }
+            }
+        }
+        let mut stops = Vec::new();
+        if !exclude_stops.is_empty() {
+            stops = vec![false; self.build.timetable.stop_count() as usize];
+            for stop_id in exclude_stops {
+                stops[self.resolve_stop(stop_id)?.0 as usize] = true;
+            }
+        }
+        Ok(Some(std::sync::Arc::new(Exclusions::new(
+            stops, trips, routes,
+        ))))
+    }
+
     pub(super) fn route_penalty_mask(
         &self,
         banned_routes: &[String],

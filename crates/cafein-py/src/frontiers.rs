@@ -97,7 +97,7 @@ impl TransportNetwork {
     /// -------
     /// list of dict
     ///     Journeys shaped as in ``route_between_stops``.
-    #[pyo3(signature = (from_stop, to_stop, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, router = "auto", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, banned_routes = vec![], route_penalties = vec![], max_slower = None))]
+    #[pyo3(signature = (from_stop, to_stop, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, router = "auto", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], banned_routes = vec![], route_penalties = vec![], max_slower = None))]
     #[allow(clippy::too_many_arguments)]
     fn mc_route_between_stops(
         &self,
@@ -117,6 +117,9 @@ impl TransportNetwork {
         geometries: bool,
         slack: f64,
         max_options: Option<usize>,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
         banned_routes: Vec<String>,
         route_penalties: Vec<(String, u64)>,
         max_slower: Option<u32>,
@@ -149,6 +152,13 @@ impl TransportNetwork {
                 "route bans/penalties (diverse candidates) require router='raptor'",
             ));
         }
+        if (!exclude_routes.is_empty() || !exclude_trips.is_empty() || !exclude_stops.is_empty())
+            && router == "tbtr"
+        {
+            return Err(PyValueError::new_err(
+                "route/trip/stop exclusions require router='raptor'",
+            ));
+        }
         if max_slower.is_some()
             && (slack > 0.0 || !banned_routes.is_empty() || !route_penalties.is_empty())
         {
@@ -156,6 +166,7 @@ impl TransportNetwork {
                 "max_slower requires strict pareto candidates",
             ));
         }
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
                 "no trip distances installed; build the network with trip distances enabled",
@@ -209,6 +220,9 @@ impl TransportNetwork {
                         geometries,
                         slack,
                         max_options,
+                        exclude_routes,
+                        exclude_trips,
+                        exclude_stops,
                         banned_routes,
                         route_penalties,
                         max_slower,
@@ -221,7 +235,12 @@ impl TransportNetwork {
             router,
             date,
             &per_trip,
-            slack > 0.0 || !banned_routes.is_empty() || !route_penalties.is_empty(),
+            slack > 0.0
+                || !banned_routes.is_empty()
+                || !route_penalties.is_empty()
+                || !exclude_routes.is_empty()
+                || !exclude_trips.is_empty()
+                || !exclude_stops.is_empty(),
         )?;
         let request = Request {
             departure: parse_time(departure)?,
@@ -230,7 +249,7 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             active_services_previous: self.active_services_previous(date)?,
             max_transfers,
-            exclusions: None,
+            exclusions: exclusions.clone(),
         };
         let penalty_mask = self.route_penalty_mask(&banned_routes, &route_penalties);
         let journeys = py.allow_threads(|| {
@@ -320,7 +339,7 @@ impl TransportNetwork {
     /// the query's date and factors and the query asks nothing McTBTR
     /// cannot answer, else on McRAPTOR; explicit values pick the engine
     /// directly.
-    #[pyo3(signature = (origin, destination, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, banned_routes = vec![], route_penalties = vec![], max_slower = None, router = "auto"))]
+    #[pyo3(signature = (origin, destination, date, departure, factors, window = None, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, slack = 0.0, max_options = None, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], banned_routes = vec![], route_penalties = vec![], max_slower = None, router = "auto"))]
     #[allow(clippy::too_many_arguments)]
     fn mc_route_between_coordinates(
         &self,
@@ -339,6 +358,9 @@ impl TransportNetwork {
         geometries: bool,
         slack: f64,
         max_options: Option<usize>,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
         banned_routes: Vec<String>,
         route_penalties: Vec<(String, u64)>,
         max_slower: Option<u32>,
@@ -369,6 +391,13 @@ impl TransportNetwork {
                 "route slacks, bans and penalties require router='raptor'",
             ));
         }
+        if (!exclude_routes.is_empty() || !exclude_trips.is_empty() || !exclude_stops.is_empty())
+            && router == "tbtr"
+        {
+            return Err(PyValueError::new_err(
+                "route/trip/stop exclusions require router='raptor'",
+            ));
+        }
         if max_slower.is_some()
             && (slack > 0.0 || !banned_routes.is_empty() || !route_penalties.is_empty())
         {
@@ -376,6 +405,7 @@ impl TransportNetwork {
                 "max_slower requires strict pareto candidates",
             ));
         }
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
                 "no trip distances installed; build the network with trip distances enabled",
@@ -424,7 +454,7 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             active_services_previous: self.active_services_previous(date)?,
             max_transfers,
-            exclusions: None,
+            exclusions: exclusions.clone(),
         };
         // The walking-only alternative, exactly as in
         // route_between_coordinates: zero emissions, available at
@@ -450,9 +480,20 @@ impl TransportNetwork {
             router,
             date,
             &per_trip,
-            slack > 0.0 || !banned_routes.is_empty() || !route_penalties.is_empty(),
+            slack > 0.0
+                || !banned_routes.is_empty()
+                || !route_penalties.is_empty()
+                || !exclude_routes.is_empty()
+                || !exclude_trips.is_empty()
+                || !exclude_stops.is_empty(),
         )?;
-        let intermediate = self.emissions_transfers(factor_fingerprint(&per_trip));
+        // Exclusions keep the closure: the McULTRA shortcut set's witness
+        // pruning is not robust under supply removal.
+        let intermediate = if exclusions.is_some() {
+            &self.transfers
+        } else {
+            self.emissions_transfers(factor_fingerprint(&per_trip))
+        };
         let slack = slack.round() as u32;
         let penalty_mask = self.route_penalty_mask(&banned_routes, &route_penalties);
         let journeys = py.allow_threads(|| {

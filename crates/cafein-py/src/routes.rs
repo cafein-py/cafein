@@ -55,7 +55,7 @@ impl TransportNetwork {
     ///     time, number of rides) leaving at the departure time; with it,
     ///     the departure-window profile. Each journey carries its legs;
     ///     times are seconds past the service day's start.
-    #[pyo3(signature = (from_stop, to_stop, date, departure, max_transfers = 7, window = None, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true))]
+    #[pyo3(signature = (from_stop, to_stop, date, departure, max_transfers = 7, window = None, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true))]
     #[allow(clippy::too_many_arguments)]
     fn route_between_stops(
         &self,
@@ -66,6 +66,9 @@ impl TransportNetwork {
         departure: &str,
         max_transfers: u8,
         window: Option<u32>,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
@@ -95,6 +98,9 @@ impl TransportNetwork {
                         departure,
                         max_transfers,
                         window,
+                        exclude_routes,
+                        exclude_trips,
+                        exclude_stops,
                         walking_speed_kmph,
                         max_walking_time,
                         max_snap_distance,
@@ -110,7 +116,7 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             active_services_previous: self.active_services_previous(date)?,
             max_transfers,
-            exclusions: None,
+            exclusions: self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?,
         };
         self.route_request(py, &request, window, None, None, geometries)
     }
@@ -156,7 +162,7 @@ impl TransportNetwork {
     /// list of dict
     ///     Journeys as in ``route_between_stops``; arrivals include the
     ///     egress walk.
-    #[pyo3(signature = (origin, destination, date, departure, max_transfers = 7, window = None, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true))]
+    #[pyo3(signature = (origin, destination, date, departure, max_transfers = 7, window = None, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true))]
     #[allow(clippy::too_many_arguments)]
     fn route_between_coordinates(
         &self,
@@ -167,11 +173,15 @@ impl TransportNetwork {
         departure: &str,
         max_transfers: u8,
         window: Option<u32>,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
         geometries: bool,
     ) -> PyResult<Py<PyList>> {
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         let streets = self.installed_streets()?;
         let speed =
             validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
@@ -211,7 +221,7 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             active_services_previous: self.active_services_previous(date)?,
             max_transfers,
-            exclusions: None,
+            exclusions: exclusions.clone(),
         };
         // The walking-only alternative: door to door over the streets,
         // no vehicle, available at every departure. It dominates a
@@ -233,8 +243,14 @@ impl TransportNetwork {
                 .swap_remove(0)
         };
         // One choice for both routing and the leg-distance lookup, so an
-        // ULTRA-routed leg is measured in the ULTRA set.
-        let transfers = self.time_transfers();
+        // ULTRA-routed leg is measured in the ULTRA set. Exclusions keep
+        // the closure: the shortcut set's witness pruning is not robust
+        // under supply removal.
+        let transfers = if request.exclusions.is_some() {
+            &self.transfers
+        } else {
+            self.time_transfers()
+        };
         let journeys = match window {
             None => Raptor.route(&self.build.timetable, transfers, &request),
             Some(window) => Raptor.route_range(&self.build.timetable, transfers, &request, window),

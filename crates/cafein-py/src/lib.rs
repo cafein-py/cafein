@@ -17,7 +17,7 @@ use cafein_core::mcraptor;
 use cafein_core::mctbtr::McTbtrEngine;
 use cafein_core::mcultra::compute_mcultra_shortcuts;
 use cafein_core::raptor::{CostInputs, CostRow, Objective, Raptor};
-use cafein_core::router::{Request, TransitRouter};
+use cafein_core::router::{Exclusions, Request, TransitRouter};
 use cafein_core::streets::{
     Backing, MappedStreets, Snap, StopLink, StoredLink, StreetNetwork, StreetNetworkParts,
     WalkedStop,

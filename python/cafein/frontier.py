@@ -73,6 +73,9 @@ def journey_frontier(
     diversity="time",
     penalty="ban",
     max_slower=None,
+    exclude_routes=(),
+    exclude_trips=(),
+    exclude_stops=(),
     walking_speed_kmph=None,
     max_walking_time=None,
     max_snap_distance=None,
@@ -245,6 +248,7 @@ def journey_frontier(
         # penalization round of a diverse search runs on one engine.
         router = "raptor"
     max_slower = _validated_max_slower(max_slower, candidates, router)
+    exclusions = _exclusion_lists(exclude_routes, exclude_trips, exclude_stops)
     slack, options, rounds = _alternative_options(
         candidates, slack_seconds, max_options, diversity, penalty
     )
@@ -276,6 +280,7 @@ def journey_frontier(
             diversity,
             slack,
             penalty,
+            exclusions,
         )
     elif stops[0]:
         from cafein.network import _walk_options
@@ -297,6 +302,9 @@ def journey_frontier(
                 slack,
                 options,
                 max_slower=max_slower,
+                exclude_routes=exclusions[0],
+                exclude_trips=exclusions[1],
+                exclude_stops=exclusions[2],
             )
         else:
             journeys = network.route_between_stops(
@@ -306,6 +314,9 @@ def journey_frontier(
                 departure,
                 max_transfers,
                 window,
+                exclude_routes=exclusions[0],
+                exclude_trips=exclusions[1],
+                exclude_stops=exclusions[2],
                 walking_speed_kmph=walking_speed_kmph,
                 max_walking_time=max_walking_time,
                 max_snap_distance=max_snap_distance,
@@ -329,6 +340,9 @@ def journey_frontier(
             slack,
             options,
             max_slower=max_slower,
+            exclude_routes=exclusions[0],
+            exclude_trips=exclusions[1],
+            exclude_stops=exclusions[2],
             router=router,
         )
     else:
@@ -339,6 +353,9 @@ def journey_frontier(
             departure,
             max_transfers,
             window,
+            exclude_routes=exclusions[0],
+            exclude_trips=exclusions[1],
+            exclude_stops=exclusions[2],
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
@@ -633,6 +650,15 @@ def frontier_table(
     )
 
 
+def _exclusion_lists(exclude_routes, exclude_trips, exclude_stops):
+    """The three exclusion id lists as strings, in one tuple."""
+    return (
+        [str(route) for route in exclude_routes],
+        [str(trip) for trip in exclude_trips],
+        [str(stop) for stop in exclude_stops],
+    )
+
+
 def _validated_max_slower(max_slower, candidates, router):
     """The validated ``max_slower`` band in whole seconds, or ``None``."""
     if max_slower is None:
@@ -862,6 +888,7 @@ def _diverse_journeys(
     diversity,
     slack,
     penalty,
+    exclusions,
 ):
     """``k`` distinct alternatives for the frontier, by the shared
     ``_diverse_rounds`` loop over windowed McRAPTOR searches. A positive
@@ -886,8 +913,11 @@ def _diverse_journeys(
                 geometries,
                 slack,
                 None,
-                banned,
-                route_penalties,
+                exclude_routes=exclusions[0],
+                exclude_trips=exclusions[1],
+                exclude_stops=exclusions[2],
+                banned_routes=banned,
+                route_penalties=route_penalties,
             )
         return network._core.mc_route_between_coordinates(
             tuple(origin),
@@ -902,8 +932,11 @@ def _diverse_journeys(
             geometries,
             slack,
             None,
-            banned,
-            route_penalties,
+            exclude_routes=exclusions[0],
+            exclude_trips=exclusions[1],
+            exclude_stops=exclusions[2],
+            banned_routes=banned,
+            route_penalties=route_penalties,
             router=router,
         )
 

@@ -569,6 +569,9 @@ class TransportNetwork:
         max_transfers=7,
         window=None,
         *,
+        exclude_routes=(),
+        exclude_trips=(),
+        exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
         max_snap_distance=None,
@@ -629,6 +632,14 @@ class TransportNetwork:
             Maximum straight-line distance in meters from a stop to the
             walking network (whole-day ULTRA only; ignored otherwise).
 
+        exclude_routes, exclude_trips, exclude_stops : list of str (optional)
+            GTFS ids of supply the journey must not use — for
+            disruption scenarios and per-individual accessibility
+            filters. An excluded stop refuses boarding, alighting,
+            transfers, and access/egress, but vehicles still ride
+            through it; an excluded origin or destination yields no
+            journeys. Unknown route and trip ids are ignored.
+
         Returns
         -------
         list of dict
@@ -644,6 +655,9 @@ class TransportNetwork:
             departure,
             max_transfers,
             window,
+            [str(route) for route in exclude_routes],
+            [str(trip) for trip in exclude_trips],
+            [str(stop) for stop in exclude_stops],
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
             geometries,
         )
@@ -657,6 +671,9 @@ class TransportNetwork:
         max_transfers=7,
         window=None,
         *,
+        exclude_routes=(),
+        exclude_trips=(),
+        exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
         max_snap_distance=None,
@@ -698,6 +715,14 @@ class TransportNetwork:
             Maximum straight-line distance in meters from each
             coordinate to the walking network.
 
+        exclude_routes, exclude_trips, exclude_stops : list of str (optional)
+            GTFS ids of supply the journey must not use — for
+            disruption scenarios and per-individual accessibility
+            filters. An excluded stop refuses boarding, alighting,
+            transfers, and access/egress, but vehicles still ride
+            through it; an excluded origin or destination yields no
+            journeys. Unknown route and trip ids are ignored.
+
         Returns
         -------
         list of dict
@@ -711,6 +736,9 @@ class TransportNetwork:
             departure,
             max_transfers,
             window,
+            [str(route) for route in exclude_routes],
+            [str(trip) for trip in exclude_trips],
+            [str(stop) for stop in exclude_stops],
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
             geometries,
         )
