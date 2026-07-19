@@ -493,6 +493,9 @@ impl<'a> Search<'a> {
         board_position: u16,
         day_offset: u32,
     ) {
+        if self.stop_excluded(stops[position]) {
+            return;
+        }
         let stop = stops[position].0 as usize;
         let arrival = timetable.trip_stop_times(trip)[position]
             .arrival
@@ -549,6 +552,16 @@ impl<'a> Search<'a> {
         }
     }
 
+    /// Whether the request's exclusions refuse this stop for boarding,
+    /// alighting, transfers, and access/egress (riding through stays
+    /// allowed).
+    fn stop_excluded(&self, stop: StopIdx) -> bool {
+        self.request
+            .exclusions
+            .as_deref()
+            .is_some_and(|excluded| excluded.excludes_stop(stop))
+    }
+
     /// One RAPTOR pass from `departure`, improving the shared state.
     pub(crate) fn run(&mut self, departure: u32) {
         let timetable = self.timetable;
@@ -557,6 +570,7 @@ impl<'a> Search<'a> {
             .active_services_previous
             .iter()
             .any(|&active| active);
+        let exclusions = request.exclusions.as_deref();
 
         // Leftover marks from the previous pass describe stops whose
         // labels are already final for later departures; they carry no
@@ -566,6 +580,9 @@ impl<'a> Search<'a> {
         }
 
         for &(stop, duration) in &request.access {
+            if self.stop_excluded(stop) {
+                continue;
+            }
             // Skip access whose arrival cannot be represented below the
             // UNREACHED sentinel; wrapping or saturating would corrupt it.
             let Some(arrival) = departure
@@ -698,9 +715,9 @@ impl<'a> Search<'a> {
                         if !can_catch_earlier {
                             continue;
                         }
-                        let Some(trip) =
-                            earliest_active_trip(timetable, active, pattern, position, threshold)
-                        else {
+                        let Some(trip) = earliest_active_trip(
+                            timetable, active, exclusions, pattern, position, threshold,
+                        ) else {
                             continue;
                         };
                         // Stored times order a single day's FIFO stream.
@@ -729,6 +746,9 @@ impl<'a> Search<'a> {
                 .collect();
             for (stop, departure_at_stop) in transit_marked {
                 for transfer in self.transfers.from_stop(stop) {
+                    if self.stop_excluded(transfer.to) {
+                        continue;
+                    }
                     let Some(arrival) = departure_at_stop
                         .checked_add(transfer.duration)
                         .filter(|&at| at != UNREACHED)
@@ -796,6 +816,9 @@ impl<'a> Search<'a> {
         for round in 1..=self.rounds {
             let mut best_egress: Option<(u32, StopIdx, u32)> = None;
             for &(stop, duration) in &self.request.egress {
+                if self.stop_excluded(stop) {
+                    continue;
+                }
                 let at_stop = self.tau[round][stop.0 as usize];
                 if at_stop == UNREACHED {
                     continue;
@@ -913,10 +936,15 @@ impl<'a> Search<'a> {
 pub(super) fn earliest_active_trip(
     timetable: &Timetable,
     active: &[bool],
+    exclusions: Option<&Exclusions>,
     pattern: PatternIdx,
     position: usize,
     reached: u32,
 ) -> Option<TripIdx> {
+    if exclusions.is_some_and(|excluded| excluded.excludes_route(timetable.pattern_route(pattern)))
+    {
+        return None;
+    }
     let range = timetable.pattern_trip_range(pattern);
     let (mut low, mut high) = (range.start, range.end);
     while low < high {
@@ -932,5 +960,6 @@ pub(super) fn earliest_active_trip(
             .get(timetable.trip_service(trip) as usize)
             .copied()
             .unwrap_or(false)
+            && !exclusions.is_some_and(|excluded| excluded.excludes_trip(trip))
     })
 }

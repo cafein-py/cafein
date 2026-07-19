@@ -20,7 +20,7 @@ use crate::fares::{FareLeg, FareTables};
 use crate::geometry::{wkb_multi_line_string, LegGeometry, TripGeometry};
 use crate::journey::{Journey, Leg};
 use crate::path_key::{challenger_wins, PathToken};
-use crate::router::{Request, TransitRouter};
+use crate::router::{Exclusions, Request, TransitRouter};
 use crate::timetable::{PatternIdx, StopIdx, Timetable, TripIdx};
 use crate::transfers::Transfers;
 
