@@ -28,7 +28,9 @@ class TravelCostMatrix(pd.DataFrame):
     the walk as ``walk_distance``. The access and egress walks count
     toward ``walk_distance``, and points off the walking network are
     reported with a warning and yield no rows. From stop origins,
-    ``walk_distance`` covers transfers only.
+    ``walk_distance`` covers transfers only — unless a whole-day
+    (Mc)ULTRA set upgrades the stop matrix to door-to-door routing,
+    which walks the access and egress ends too.
 
     One run of the selected engine (see ``router``) serves each
     origin, fanned out over all cores; each
@@ -89,6 +91,10 @@ class TravelCostMatrix(pd.DataFrame):
         The emissions bucket width in grams CO₂e of the pareto search,
         as in ``journey_frontier``. Only used with
         ``candidates="pareto"``.
+    exclude_routes, exclude_trips, exclude_stops : list of str (optional)
+        GTFS ids of supply the journeys must not use - disruption and
+        accessibility filters, as in ``route_between_stops``. Runs on
+        the RAPTOR engines (``"auto"`` resolves to them).
     router : str (optional, default: "auto")
         The routing engine. With time candidates the engines are RAPTOR
         (``"raptor"``) and TBTR (``"tbtr"``), the latter over the
@@ -148,6 +154,9 @@ class TravelCostMatrix(pd.DataFrame):
         candidates="time",
         bucket=25.0,
         router="auto",
+        exclude_routes=(),
+        exclude_trips=(),
+        exclude_stops=(),
         geometries=False,
         chunk=None,
         walking_speed_kmph=None,
@@ -170,6 +179,9 @@ class TravelCostMatrix(pd.DataFrame):
             candidates=candidates,
             bucket=bucket,
             router=router,
+            exclude_routes=exclude_routes,
+            exclude_trips=exclude_trips,
+            exclude_stops=exclude_stops,
             geometries=geometries,
             chunk=chunk,
             walking_speed_kmph=walking_speed_kmph,
@@ -394,6 +406,9 @@ def travel_cost_table(
     geometries=False,
     chunk=None,
     router="auto",
+    exclude_routes=(),
+    exclude_trips=(),
+    exclude_stops=(),
     walking_speed_kmph=None,
     max_walking_time=None,
     max_snap_distance=None,
@@ -441,6 +456,9 @@ def travel_cost_table(
         geometries=geometries,
         chunk=chunk,
         router=router,
+        exclude_routes=exclude_routes,
+        exclude_trips=exclude_trips,
+        exclude_stops=exclude_stops,
         walking_speed_kmph=walking_speed_kmph,
         max_walking_time=max_walking_time,
         max_snap_distance=max_snap_distance,
@@ -491,8 +509,16 @@ def _cost_columns(
     candidates="time",
     bucket=25.0,
     router="auto",
+    exclude_routes=(),
+    exclude_trips=(),
+    exclude_stops=(),
 ):
     """The core's cost arrays plus the origin and destination ids."""
+    exclusions = (
+        [str(route) for route in exclude_routes],
+        [str(trip) for trip in exclude_trips],
+        [str(stop) for stop in exclude_stops],
+    )
     from cafein import emissions
     from cafein.network import _walk_options
 
@@ -542,6 +568,7 @@ def _cost_columns(
                 within,
                 max_transfers,
                 router,
+                *exclusions,
                 *walk,
                 geometries,
             )
@@ -554,6 +581,7 @@ def _cost_columns(
                 trip_factors,
                 max_transfers,
                 router,
+                *exclusions,
                 *walk,
                 geometries,
                 fare_tables,
@@ -583,6 +611,7 @@ def _cost_columns(
                 candidates,
                 bucket,
                 router,
+                *exclusions,
                 *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
                 geometries,
             )
@@ -597,6 +626,7 @@ def _cost_columns(
                 max_transfers,
                 to_stops,
                 router,
+                *exclusions,
                 *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
                 geometries,
                 fare_tables,
