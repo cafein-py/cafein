@@ -10,6 +10,8 @@ authors.workspace = true
 [lib]
 name = "_cafein"
 crate-type = ["cdylib"]
+test = false
+doctest = false
 
 [dependencies]
 bincode.workspace = true
