@@ -152,9 +152,8 @@ impl TransportNetwork {
                 "route bans/penalties (diverse candidates) require router='raptor'",
             ));
         }
-        if (!exclude_routes.is_empty() || !exclude_trips.is_empty() || !exclude_stops.is_empty())
-            && router == "tbtr"
-        {
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        if exclusions.is_some() && router == "tbtr" {
             return Err(PyValueError::new_err(
                 "route/trip/stop exclusions require router='raptor'",
             ));
@@ -166,7 +165,6 @@ impl TransportNetwork {
                 "max_slower requires strict pareto candidates",
             ));
         }
-        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
                 "no trip distances installed; build the network with trip distances enabled",
@@ -247,9 +245,7 @@ impl TransportNetwork {
             slack > 0.0
                 || !banned_routes.is_empty()
                 || !route_penalties.is_empty()
-                || !exclude_routes.is_empty()
-                || !exclude_trips.is_empty()
-                || !exclude_stops.is_empty(),
+                || exclusions.is_some(),
         )?;
         let request = Request {
             departure: parse_time(departure)?,
@@ -400,9 +396,8 @@ impl TransportNetwork {
                 "route slacks, bans and penalties require router='raptor'",
             ));
         }
-        if (!exclude_routes.is_empty() || !exclude_trips.is_empty() || !exclude_stops.is_empty())
-            && router == "tbtr"
-        {
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        if exclusions.is_some() && router == "tbtr" {
             return Err(PyValueError::new_err(
                 "route/trip/stop exclusions require router='raptor'",
             ));
@@ -414,7 +409,6 @@ impl TransportNetwork {
                 "max_slower requires strict pareto candidates",
             ));
         }
-        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
                 "no trip distances installed; build the network with trip distances enabled",
@@ -492,9 +486,7 @@ impl TransportNetwork {
             slack > 0.0
                 || !banned_routes.is_empty()
                 || !route_penalties.is_empty()
-                || !exclude_routes.is_empty()
-                || !exclude_trips.is_empty()
-                || !exclude_stops.is_empty(),
+                || exclusions.is_some(),
         )?;
         // Exclusions keep the closure: the McULTRA shortcut set's witness
         // pruning is not robust under supply removal.

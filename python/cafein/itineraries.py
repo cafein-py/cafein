@@ -149,6 +149,12 @@ class DetailedItineraries(gpd.GeoDataFrame):
         route's effective arrival per prior use, so a corridor that mostly
         differs yet shares a trunk can surface (the R5-style soft penalty).
         Unused for the other candidate sets.
+    exclude_routes, exclude_trips, exclude_stops : list of str (optional)
+        GTFS ids of supply the itineraries must not use — disruption
+        and accessibility filters, as in ``route_between_stops``.
+        Excluded stops refuse boarding, alighting, transfers, and
+        access/egress while vehicles still ride through them; excluded
+        origins or destinations yield no rows.
     geometries : bool (optional, default: True)
         Attach each leg's geometry. Turn off to skip the geometry work
         when only the leg records are needed.

@@ -88,7 +88,9 @@ def test_frontier_exclusions_force_the_raptor_family(
     kwargs = dict(candidates="pareto")
     baseline = journey_frontier(*args, **kwargs)
     assert len(baseline) > 0
-    routes = ["r1", "r2"]
+    legs = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    routes = sorted(used(legs, "route_id"))
+    assert routes
     with pytest.raises(ValueError, match="exclusions require router='raptor'"):
         journey_frontier(*args, router="tbtr", exclude_routes=routes, **kwargs)
     # Auto falls back to McRAPTOR even with a matching cached set: the
@@ -193,6 +195,56 @@ def test_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
     oracle = rebuilt.route_between_stops("A", "B", DATE, DEPARTURE)
     assert normalized(with_exclusions) == normalized(oracle)
     assert with_exclusions
+
+
+def test_frontier_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
+    from cafein import TransportNetwork, journey_frontier
+
+    columns = ["departure", "arrival", "travel_time", "rides", "frontier"]
+    baseline = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    excluded = sorted(used(baseline, "route_id"))[0]
+    source = build_two_line_gtfs(tmp_path / "full.zip")
+    rebuilt = TransportNetwork.from_gtfs(
+        [str(filtered_feed(source, tmp_path / "without.zip", excluded))]
+    )
+    for candidates in ("time", "pareto", "relaxed"):
+        with_exclusions = journey_frontier(
+            two_line_network,
+            "A",
+            "B",
+            DATE,
+            DEPARTURE,
+            1800,
+            candidates=candidates,
+            exclude_routes=[excluded],
+        )
+        oracle = journey_frontier(
+            rebuilt, "A", "B", DATE, DEPARTURE, 1800, candidates=candidates
+        )
+        assert len(with_exclusions) > 0, candidates
+        assert with_exclusions[columns].equals(oracle[columns]), candidates
+
+
+def test_unknown_only_ids_leave_the_router_untouched(two_line_network):
+    from cafein import journey_frontier
+
+    # Unknown-only lists resolve to no exclusions: explicit TBTR stays
+    # accepted, so a disruption list naming absent supply cannot flip
+    # the engine.
+    two_line_network.compute_mctbtr_transfers(DATE)
+    frame = journey_frontier(
+        two_line_network,
+        "A",
+        "B",
+        DATE,
+        DEPARTURE,
+        1800,
+        candidates="pareto",
+        router="tbtr",
+        exclude_routes=["no-such-route"],
+        exclude_trips=["no-such-trip"],
+    )
+    assert len(frame) > 0
 
 
 def test_itineraries_take_exclusions(network_with_footpaths):
