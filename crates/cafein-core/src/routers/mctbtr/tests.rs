@@ -409,9 +409,9 @@ fn the_auto_policy_switch_never_changes_fixture_results() {
     assert!(!auto_mc_tbtr(cached, "2022-02-22", fingerprint, true));
     assert!(auto_mc_tbtr(cached, "2022-02-22", fingerprint, false));
     // The time-only table: only a date-matching cached set runs TBTR.
-    assert!(!auto_time_tbtr(None, "2022-02-22"));
-    assert!(!auto_time_tbtr(Some("2022-02-21"), "2022-02-22"));
-    assert!(auto_time_tbtr(Some("2022-02-22"), "2022-02-22"));
+    assert!(!auto_time_tbtr(None, "2022-02-22", false));
+    assert!(!auto_time_tbtr(Some("2022-02-21"), "2022-02-22", false));
+    assert!(auto_time_tbtr(Some("2022-02-22"), "2022-02-22", false));
 }
 
 #[test]

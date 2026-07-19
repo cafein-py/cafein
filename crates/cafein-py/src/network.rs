@@ -791,19 +791,43 @@ impl TransportNetwork {
     /// to the trip-based engine only when the cached time transfer set
     /// (`compute_tbtr_transfers`) matches the query's date; explicit values
     /// pass through unchanged.
-    pub(super) fn resolve_time_router(&self, router: &str, date: &str) -> PyResult<&'static str> {
+    pub(super) fn resolve_time_router(
+        &self,
+        router: &str,
+        date: &str,
+        needs_raptor: bool,
+    ) -> PyResult<&'static str> {
         match router {
             "raptor" => Ok("raptor"),
+            "tbtr" if needs_raptor => Err(PyValueError::new_err(
+                "route/trip/stop exclusions require router='raptor'",
+            )),
             "tbtr" => Ok("tbtr"),
             "auto" => {
                 let cached = self.tbtr_time_transfers.as_ref().map(|(d, _)| d.as_str());
-                Ok(if cafein_core::router::auto_time_tbtr(cached, date) {
-                    "tbtr"
-                } else {
-                    "raptor"
-                })
+                Ok(
+                    if cafein_core::router::auto_time_tbtr(cached, date, needs_raptor) {
+                        "tbtr"
+                    } else {
+                        "raptor"
+                    },
+                )
             }
             other => Err(invalid_router(other)),
+        }
+    }
+
+    /// The intermediate transfers for a query that may carry
+    /// exclusions: any exclusion keeps the closure — the ULTRA shortcut
+    /// sets' witness pruning is not robust under supply removal.
+    pub(super) fn exclusion_transfers(
+        &self,
+        exclusions: &Option<std::sync::Arc<Exclusions>>,
+    ) -> &Transfers {
+        if exclusions.is_some() {
+            &self.transfers
+        } else {
+            self.time_transfers()
         }
     }
 

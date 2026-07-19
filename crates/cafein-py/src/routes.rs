@@ -328,7 +328,7 @@ impl TransportNetwork {
     /// dict
     ///     Travel time in seconds to every reachable stop, keyed by
     ///     stop_id; unreachable stops are absent.
-    #[pyo3(signature = (origin, date, departure, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    #[pyo3(signature = (origin, date, departure, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
     #[allow(clippy::too_many_arguments)]
     fn travel_times_from_coordinate(
         &self,
@@ -337,6 +337,9 @@ impl TransportNetwork {
         date: &str,
         departure: &str,
         max_transfers: u8,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
@@ -353,6 +356,7 @@ impl TransportNetwork {
             "origin ",
         )?;
         let departure = parse_time(departure)?;
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         let request = Request {
             departure,
             access: request_offsets(&access),
@@ -360,15 +364,19 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             active_services_previous: self.active_services_previous(date)?,
             max_transfers,
-            exclusions: None,
+            exclusions: exclusions.clone(),
         };
         // Under a whole-day ULTRA set the intermediate transfers use the
         // shortcuts and a bounded final walk (`<= max_walking_time`) reaches
         // the remaining stops; otherwise this is the closure, tau-direct search
         // (`time_transfers` is the closure then, and the fold is skipped).
-        let mut arrivals =
-            Raptor.one_to_all(&self.build.timetable, self.time_transfers(), &request);
-        if self.ultra_active() {
+        // Exclusions keep the closure and skip the shortcut fold.
+        let mut arrivals = Raptor.one_to_all(
+            &self.build.timetable,
+            self.exclusion_transfers(&exclusions),
+            &request,
+        );
+        if self.ultra_active() && exclusions.is_none() {
             let egress = self.final_egress(streets, speed, max_walking_time, max_snap_distance);
             self.fold_final_transfers(&mut arrivals, &egress);
         }
@@ -409,7 +417,7 @@ impl TransportNetwork {
     ///     the origin maps to 0; under a whole-day ULTRA set it is the
     ///     door-to-door time from the origin stop's coordinate and may cost
     ///     the short walk to the platform.
-    #[pyo3(signature = (from_stop, date, departure, max_transfers = 7, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    #[pyo3(signature = (from_stop, date, departure, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
     #[allow(clippy::too_many_arguments)]
     fn travel_times_from_stop(
         &self,
@@ -418,18 +426,22 @@ impl TransportNetwork {
         date: &str,
         departure: &str,
         max_transfers: u8,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
     ) -> PyResult<Py<PyDict>> {
         let origin = self.resolve_stop(from_stop)?;
         let departure = parse_time(departure)?;
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         // With a whole-day ULTRA set, treat the origin stop as its coordinate
         // and reach every stop door-to-door (coordinate access, ULTRA
         // intermediate transfers, one final walk bounded by max_walking_time);
         // otherwise board at the origin stop and relax the closure (today's
-        // behaviour).
-        if self.ultra_active() {
+        // behaviour). Exclusions keep the closure.
+        if self.ultra_active() && exclusions.is_none() {
             if let (Some(streets), Some(coordinate)) =
                 (self.streets.as_ref(), self.stop_coordinate(origin))
             {
@@ -475,7 +487,7 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             active_services_previous: self.active_services_previous(date)?,
             max_transfers,
-            exclusions: None,
+            exclusions,
         };
         let arrivals = Raptor.one_to_all(&self.build.timetable, &self.transfers, &request);
         self.arrivals_dict(py, &arrivals, departure)
