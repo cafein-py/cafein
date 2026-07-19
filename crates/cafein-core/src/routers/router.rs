@@ -4,15 +4,6 @@ use crate::journey::Journey;
 use crate::timetable::{StopIdx, Timetable, TripIdx};
 use crate::transfers::Transfers;
 
-/// A single-departure routing request.
-///
-/// The request describes one service day: times are seconds past that day's
-/// start, and `active_services` says which services run on it. The previous
-/// day's over-midnight trips are also considered, shifted back one day, so a
-/// query early on the service day still catches trips whose stored times run
-/// past `24:00:00` on the day before (`active_services_previous`). Access and
-/// egress lists come from the street-side search and must already cover
-/// everything reachable on foot from the origin and to the destination.
 /// Query-time supply exclusions: stops, trips, and routes the journey
 /// must not use. Empty vectors mean the family has no exclusions; an
 /// absent or out-of-range bit reads as not excluded. A vehicle may
@@ -51,6 +42,15 @@ impl Exclusions {
     }
 }
 
+/// A single-departure routing request.
+///
+/// The request describes one service day: times are seconds past that day's
+/// start, and `active_services` says which services run on it. The previous
+/// day's over-midnight trips are also considered, shifted back one day, so a
+/// query early on the service day still catches trips whose stored times run
+/// past `24:00:00` on the day before (`active_services_previous`). Access and
+/// egress lists come from the street-side search and must already cover
+/// everything reachable on foot from the origin and to the destination.
 #[derive(Debug, Clone)]
 pub struct Request {
     /// Departure time at the origin.

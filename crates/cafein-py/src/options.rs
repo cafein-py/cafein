@@ -193,6 +193,16 @@ impl TransportNetwork {
                 stops[self.resolve_stop(stop_id)?.0 as usize] = true;
             }
         }
+        // Unknown-only lists resolve to nothing: no exclusion object, so
+        // router selection and the shortcut bypass stay untouched.
+        if !routes
+            .iter()
+            .chain(&trips)
+            .chain(&stops)
+            .any(|&excluded| excluded)
+        {
+            return Ok(None);
+        }
         Ok(Some(std::sync::Arc::new(Exclusions::new(
             stops, trips, routes,
         ))))

@@ -76,10 +76,20 @@ impl TransportNetwork {
     ) -> PyResult<Py<PyList>> {
         let origin = self.resolve_stop(from_stop)?;
         let destination = self.resolve_stop(to_stop)?;
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        // An excluded endpoint is unreachable by contract - also on the
+        // door-to-door path, which could otherwise reach the stop's
+        // coordinates through a neighbour or a direct walk.
+        if let Some(excluded) = exclusions.as_deref() {
+            if excluded.excludes_stop(origin) || excluded.excludes_stop(destination) {
+                return Ok(PyList::empty(py).unbind());
+            }
+        }
         // With a whole-day ULTRA set, route door-to-door between the stops'
         // coordinates for unrestricted walking; otherwise board at the origin
-        // stop and relax the closure (today's behaviour).
-        if self.ultra_active() {
+        // stop and relax the closure (today's behaviour). Exclusions keep
+        // the closure path.
+        if self.ultra_active() && exclusions.is_none() {
             if let (Some(streets), Some(from_xy), Some(to_xy)) = (
                 self.streets.as_ref(),
                 self.stop_coordinate(origin),
@@ -116,7 +126,7 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             active_services_previous: self.active_services_previous(date)?,
             max_transfers,
-            exclusions: self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?,
+            exclusions,
         };
         self.route_request(py, &request, window, None, None, geometries)
     }

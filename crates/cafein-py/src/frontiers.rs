@@ -174,6 +174,14 @@ impl TransportNetwork {
         };
         let origin = self.resolve_stop(from_stop)?;
         let destination = self.resolve_stop(to_stop)?;
+        // An excluded endpoint is unreachable by contract - also on the
+        // door-to-door path, which could otherwise reach the stop's
+        // coordinates through a neighbour or a direct walk.
+        if let Some(excluded) = exclusions.as_deref() {
+            if excluded.excludes_stop(origin) || excluded.excludes_stop(destination) {
+                return Ok(PyList::empty(py).unbind());
+            }
+        }
         let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
         for (trip_id, factor) in &factors {
             if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
@@ -189,6 +197,7 @@ impl TransportNetwork {
         // board-at-origin closure routing (`"auto"` reroutes and resolves on
         // the coordinate path, whose engines share the McULTRA set).
         if router != "tbtr"
+            && exclusions.is_none()
             && !std::ptr::eq(
                 self.emissions_transfers(factor_fingerprint(&per_trip)),
                 &self.transfers,

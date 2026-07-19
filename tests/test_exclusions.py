@@ -103,33 +103,96 @@ def test_frontier_exclusions_force_the_raptor_family(
 
 
 def test_exclusions_compose_with_diverse_alternatives(two_line_network):
-    from cafein import journey_frontier
+    from cafein import DetailedItineraries
 
-    baseline = journey_frontier(
+    baseline = DetailedItineraries(
         two_line_network,
-        "A",
-        "B",
+        ["A"],
+        ["B"],
         DATE,
         DEPARTURE,
-        1800,
         candidates="diverse",
         max_options=2,
+        geometries=False,
     )
-    assert len(baseline) > 0
-    # A hard exclusion on top of the diverse penalization loop still
-    # returns alternatives, none riding the excluded route.
-    composed = journey_frontier(
+    ridden = set(baseline["route_id"].dropna())
+    assert len(ridden) > 1
+    excluded = sorted(ridden)[0]
+    # A hard exclusion on top of the diverse penalization loop: every
+    # round honours it, and the surviving alternatives ride the rest.
+    composed = DetailedItineraries(
         two_line_network,
-        "A",
-        "B",
+        ["A"],
+        ["B"],
         DATE,
         DEPARTURE,
-        1800,
         candidates="diverse",
         max_options=2,
-        exclude_routes=["r2"],
+        geometries=False,
+        exclude_routes=[excluded],
     )
-    assert len(composed) >= 0  # the loop completes under the union
+    assert len(composed) > 0
+    assert excluded not in set(composed["route_id"].dropna())
+
+
+def filtered_feed(source, target, drop_route):
+    """The two-line feed with one route's supply genuinely removed."""
+    import csv
+    import io
+    import zipfile
+
+    with zipfile.ZipFile(source) as archive:
+        tables = {name: archive.read(name).decode() for name in archive.namelist()}
+
+    def rows(name):
+        return list(csv.DictReader(io.StringIO(tables[name])))
+
+    dropped_trips = {
+        row["trip_id"] for row in rows("trips.txt") if row["route_id"] == drop_route
+    }
+
+    def write(name, keep):
+        kept = [row for row in rows(name) if keep(row)]
+        out = io.StringIO()
+        writer = csv.DictWriter(out, fieldnames=kept[0].keys())
+        writer.writeheader()
+        writer.writerows(kept)
+        tables[name] = out.getvalue()
+
+    write("routes.txt", lambda row: row["route_id"] != drop_route)
+    write("trips.txt", lambda row: row["route_id"] != drop_route)
+    write("stop_times.txt", lambda row: row["trip_id"] not in dropped_trips)
+    with zipfile.ZipFile(target, "w") as archive:
+        for name, text in tables.items():
+            archive.writestr(name, text)
+    return target
+
+
+def test_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
+    from cafein import TransportNetwork
+
+    baseline = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    excluded = sorted(used(baseline, "route_id"))[0]
+
+    def normalized(journeys):
+        return [
+            (
+                journey["arrival"],
+                [leg["trip_id"] for leg in journey["legs"] if leg["type"] == "transit"],
+            )
+            for journey in journeys
+        ]
+
+    with_exclusions = two_line_network.route_between_stops(
+        "A", "B", DATE, DEPARTURE, exclude_routes=[excluded]
+    )
+    source = build_two_line_gtfs(tmp_path / "full.zip")
+    rebuilt = TransportNetwork.from_gtfs(
+        [str(filtered_feed(source, tmp_path / "without.zip", excluded))]
+    )
+    oracle = rebuilt.route_between_stops("A", "B", DATE, DEPARTURE)
+    assert normalized(with_exclusions) == normalized(oracle)
+    assert with_exclusions
 
 
 def test_itineraries_take_exclusions(network_with_footpaths):
