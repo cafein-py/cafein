@@ -600,7 +600,7 @@ impl TransportNetwork {
     /// the query's date and factors and the query asks nothing McTBTR
     /// cannot answer, else on McRAPTOR; explicit values pick the engine
     /// directly.
-    #[pyo3(signature = (from_stops, to_stops, date, departure, factors, window, max_transfers = 7, bucket = 25.0, geometries = false, max_slower = None, router = "auto"))]
+    #[pyo3(signature = (from_stops, to_stops, date, departure, factors, window, max_transfers = 7, bucket = 25.0, geometries = false, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], max_slower = None, router = "auto"))]
     #[allow(clippy::too_many_arguments)]
     fn mc_frontier_matrix(
         &self,
@@ -614,6 +614,9 @@ impl TransportNetwork {
         max_transfers: u8,
         bucket: f64,
         geometries: bool,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
         max_slower: Option<u32>,
         router: &str,
     ) -> PyResult<Py<PyList>> {
@@ -654,7 +657,13 @@ impl TransportNetwork {
                 per_trip[trip.0 as usize] = *factor;
             }
         }
-        let router = self.resolve_mc_router(router, date, &per_trip, false)?;
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        if exclusions.is_some() && router == "tbtr" {
+            return Err(PyValueError::new_err(
+                "route/trip/stop exclusions require router='raptor'",
+            ));
+        }
+        let router = self.resolve_mc_router(router, date, &per_trip, exclusions.is_some())?;
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
@@ -667,7 +676,7 @@ impl TransportNetwork {
                 active_services: active_services.clone(),
                 active_services_previous: active_services_previous.clone(),
                 max_transfers,
-                exclusions: None,
+                exclusions: exclusions.clone(),
             })
             .collect();
         let rows = py.allow_threads(|| {
@@ -752,7 +761,7 @@ impl TransportNetwork {
     /// the query's date and factors and the query asks nothing McTBTR
     /// cannot answer, else on McRAPTOR; explicit values pick the engine
     /// directly.
-    #[pyo3(signature = (origins, destinations, date, departure, factors, window, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, max_slower = None, router = "auto"))]
+    #[pyo3(signature = (origins, destinations, date, departure, factors, window, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], max_slower = None, router = "auto"))]
     #[allow(clippy::too_many_arguments)]
     fn mc_frontier_matrix_from_points(
         &self,
@@ -769,6 +778,9 @@ impl TransportNetwork {
         max_walking_time: f64,
         max_snap_distance: f64,
         geometries: bool,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
         max_slower: Option<u32>,
         router: &str,
     ) -> PyResult<Py<PyDict>> {
@@ -806,13 +818,25 @@ impl TransportNetwork {
                 per_trip[trip.0 as usize] = *factor;
             }
         }
-        let router = self.resolve_mc_router(router, date, &per_trip, false)?;
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        if exclusions.is_some() && router == "tbtr" {
+            return Err(PyValueError::new_err(
+                "route/trip/stop exclusions require router='raptor'",
+            ));
+        }
+        let router = self.resolve_mc_router(router, date, &per_trip, exclusions.is_some())?;
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
         // The same intermediate set the one-pair coordinate route relaxes:
         // the McULTRA emissions set matching these factors, else the closure.
-        let intermediate = self.emissions_transfers(factor_fingerprint(&per_trip));
+        // Exclusions keep the closure: the McULTRA shortcut set's witness
+        // pruning is not robust under supply removal.
+        let intermediate = if exclusions.is_some() {
+            &self.transfers
+        } else {
+            self.emissions_transfers(factor_fingerprint(&per_trip))
+        };
         let (rows, walk, origin_links, destination_links, unsnapped_from, unsnapped_to) = self
             .point_frontier_rows(
                 py,
@@ -834,6 +858,7 @@ impl TransportNetwork {
                 max_snap_distance,
                 &active_services,
                 &active_services_previous,
+                &exclusions,
             );
         let origin_snaps: Vec<Option<Snap>> = origins
             .iter()
@@ -920,7 +945,7 @@ impl TransportNetwork {
     /// the query's date and factors and the query asks nothing McTBTR
     /// cannot answer, else on McRAPTOR; explicit values pick the engine
     /// directly.
-    #[pyo3(signature = (from_stops, to_stops, date, departure, factors, window, max_transfers = 7, bucket = 25.0, max_slower = None, router = "auto"))]
+    #[pyo3(signature = (from_stops, to_stops, date, departure, factors, window, max_transfers = 7, bucket = 25.0, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], max_slower = None, router = "auto"))]
     #[allow(clippy::too_many_arguments)]
     fn mc_frontier_table(
         &self,
@@ -933,6 +958,9 @@ impl TransportNetwork {
         window: u32,
         max_transfers: u8,
         bucket: f64,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
         max_slower: Option<u32>,
         router: &str,
     ) -> PyResult<Py<PyDict>> {
@@ -968,7 +996,13 @@ impl TransportNetwork {
                 per_trip[trip.0 as usize] = *factor;
             }
         }
-        let router = self.resolve_mc_router(router, date, &per_trip, false)?;
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        if exclusions.is_some() && router == "tbtr" {
+            return Err(PyValueError::new_err(
+                "route/trip/stop exclusions require router='raptor'",
+            ));
+        }
+        let router = self.resolve_mc_router(router, date, &per_trip, exclusions.is_some())?;
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
@@ -981,7 +1015,7 @@ impl TransportNetwork {
                 active_services: active_services.clone(),
                 active_services_previous: active_services_previous.clone(),
                 max_transfers,
-                exclusions: None,
+                exclusions: exclusions.clone(),
             })
             .collect();
         let rows = py.allow_threads(|| {
@@ -1058,7 +1092,7 @@ impl TransportNetwork {
     /// the query's date and factors and the query asks nothing McTBTR
     /// cannot answer, else on McRAPTOR; explicit values pick the engine
     /// directly.
-    #[pyo3(signature = (origins, destinations, date, departure, factors, window, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, max_slower = None, router = "auto"))]
+    #[pyo3(signature = (origins, destinations, date, departure, factors, window, max_transfers = 7, bucket = 25.0, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], max_slower = None, router = "auto"))]
     #[allow(clippy::too_many_arguments)]
     fn mc_frontier_table_from_points(
         &self,
@@ -1074,6 +1108,9 @@ impl TransportNetwork {
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
         max_slower: Option<u32>,
         router: &str,
     ) -> PyResult<Py<PyDict>> {
@@ -1106,13 +1143,25 @@ impl TransportNetwork {
                 per_trip[trip.0 as usize] = *factor;
             }
         }
-        let router = self.resolve_mc_router(router, date, &per_trip, false)?;
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        if exclusions.is_some() && router == "tbtr" {
+            return Err(PyValueError::new_err(
+                "route/trip/stop exclusions require router='raptor'",
+            ));
+        }
+        let router = self.resolve_mc_router(router, date, &per_trip, exclusions.is_some())?;
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
         // The same intermediate set the one-pair coordinate route relaxes:
         // the McULTRA emissions set matching these factors, else the closure.
-        let intermediate = self.emissions_transfers(factor_fingerprint(&per_trip));
+        // Exclusions keep the closure: the McULTRA shortcut set's witness
+        // pruning is not robust under supply removal.
+        let intermediate = if exclusions.is_some() {
+            &self.transfers
+        } else {
+            self.emissions_transfers(factor_fingerprint(&per_trip))
+        };
         let (rows, walk, _, _, unsnapped_from, unsnapped_to) = self.point_frontier_rows(
             py,
             streets,
@@ -1133,6 +1182,7 @@ impl TransportNetwork {
             max_snap_distance,
             &active_services,
             &active_services_previous,
+            &exclusions,
         );
         let origin_snaps: Vec<Option<Snap>> = origins
             .iter()
@@ -1205,6 +1255,7 @@ impl TransportNetwork {
         max_snap_distance: f64,
         active_services: &[bool],
         active_services_previous: &[bool],
+        exclusions: &Option<std::sync::Arc<Exclusions>>,
     ) -> PointFrontierParts {
         let stop_count = self.build.timetable.stop_count() as usize;
         py.allow_threads(|| {
@@ -1227,7 +1278,7 @@ impl TransportNetwork {
                     active_services: active_services.to_vec(),
                     active_services_previous: active_services_previous.to_vec(),
                     max_transfers,
-                    exclusions: None,
+                    exclusions: exclusions.clone(),
                 })
                 .collect();
             // Invert the destination links into the per-stop final-egress
