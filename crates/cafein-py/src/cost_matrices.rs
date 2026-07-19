@@ -41,6 +41,8 @@ impl TransportNetwork {
     ///     whole-day ULTRA set serves the matrix door-to-door, which
     ///     only the RAPTOR path does — else on RAPTOR; explicit values
     ///     pick the engine directly, ``"tbtr"`` keeping the closure.
+    ///     Route/trip/stop exclusions run on RAPTOR: ``"auto"``
+    ///     resolves to it and explicit ``"tbtr"`` is rejected.
     ///
     /// Returns
     /// -------
@@ -52,7 +54,7 @@ impl TransportNetwork {
     ///     NaN when unresolved), ``fare`` (NaN without `fares` or when
     ///     unpriceable), and with `geometries` a ``geometry`` list of
     ///     WKB bytes.
-    #[pyo3(signature = (from_stops, date, departure, factors, max_transfers = 7, to_stops = None, router = "auto", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, fares = None))]
+    #[pyo3(signature = (from_stops, date, departure, factors, max_transfers = 7, to_stops = None, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, fares = None))]
     #[allow(clippy::too_many_arguments)]
     fn travel_cost_matrix(
         &self,
@@ -64,6 +66,9 @@ impl TransportNetwork {
         max_transfers: u8,
         to_stops: Option<Vec<String>>,
         router: &str,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
@@ -124,7 +129,9 @@ impl TransportNetwork {
         // Under a whole-day set, snappable origins route door-to-door (the stop
         // cost matrix as a point cost matrix over the stops' coordinates);
         // validate the walking speed only when at least one origin is usable.
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         let ultra_usable = router != "tbtr"
+            && exclusions.is_none()
             && self.ultra_active()
             && self.streets.as_ref().is_some_and(|streets| {
                 origins.iter().any(|&origin| {
@@ -149,7 +156,7 @@ impl TransportNetwork {
         let router = if ultra_usable {
             "raptor"
         } else {
-            self.resolve_time_router(router, date, false)?
+            self.resolve_time_router(router, date, exclusions.is_some())?
         };
         let rows = py.allow_threads(|| {
             if let Some(speed) = ultra_speed {
@@ -180,7 +187,7 @@ impl TransportNetwork {
                         active_services: active_services.clone(),
                         active_services_previous: active_services_previous.clone(),
                         max_transfers,
-                        exclusions: None,
+                        exclusions: exclusions.clone(),
                     })
                     .collect();
                 if router == "tbtr" {
@@ -216,7 +223,9 @@ impl TransportNetwork {
     ///
     /// ``router="auto"`` (the default) runs on TBTR when the cached time
     /// transfer set (``compute_tbtr_transfers``) matches the date, else
-    /// on RAPTOR; explicit values pick the engine directly.
+    /// on RAPTOR; explicit values pick the engine directly. Route/trip/stop
+    /// exclusions run on the RAPTOR engines: ``"auto"`` resolves to
+    /// them and explicit ``"tbtr"`` is rejected.
     ///
     /// Returns
     /// -------
@@ -225,7 +234,7 @@ impl TransportNetwork {
     ///     origin and destination point lists — plus
     ///     ``unsnapped_from`` / ``unsnapped_to`` with the indices of
     ///     points off the walking network.
-    #[pyo3(signature = (origins, destinations, date, departure, factors, max_transfers = 7, router = "auto", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, fares = None))]
+    #[pyo3(signature = (origins, destinations, date, departure, factors, max_transfers = 7, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, fares = None))]
     #[allow(clippy::too_many_arguments)]
     fn travel_cost_matrix_from_points(
         &self,
@@ -237,6 +246,9 @@ impl TransportNetwork {
         factors: Vec<(String, f64)>,
         max_transfers: u8,
         router: &str,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
@@ -246,7 +258,8 @@ impl TransportNetwork {
         if !matches!(router, "auto" | "raptor" | "tbtr") {
             return Err(invalid_router(router));
         }
-        let router = self.resolve_time_router(router, date, false)?;
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        let router = self.resolve_time_router(router, date, exclusions.is_some())?;
         let streets = self.installed_streets()?;
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
@@ -314,7 +327,7 @@ impl TransportNetwork {
                     active_services: active_services.clone(),
                     active_services_previous: active_services_previous.clone(),
                     max_transfers,
-                    exclusions: None,
+                    exclusions: exclusions.clone(),
                 });
                 access_meters.push(
                     links
@@ -326,7 +339,7 @@ impl TransportNetwork {
             let egress = egress_tables(&destination_links);
             let mut rows = if router == "tbtr" {
                 let engine = self.tbtr_engine(
-                    self.time_transfers(),
+                    self.exclusion_transfers(&exclusions),
                     date,
                     &active_services,
                     &active_services_previous,
@@ -335,7 +348,7 @@ impl TransportNetwork {
             } else {
                 Raptor.cost_matrix_to_points(
                     &self.build.timetable,
-                    self.time_transfers(),
+                    self.exclusion_transfers(&exclusions),
                     &inputs,
                     &requests,
                     &access_meters,
@@ -449,8 +462,10 @@ impl TransportNetwork {
     /// serves the stop matrix door-to-door (only the McRAPTOR path does),
     /// else on McRAPTOR. Time and fare candidates run on TBTR when the
     /// cached time transfer set (``compute_tbtr_transfers``) matches the
-    /// date, else on RAPTOR; explicit values pick the engine directly.
-    #[pyo3(signature = (from_stops, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, to_stops = None, candidates = "time", bucket = 25.0, router = "auto", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false))]
+    /// date, else on RAPTOR; explicit values pick the engine directly. Route/trip/stop
+    /// exclusions run on the RAPTOR engines: ``"auto"`` resolves to
+    /// them and explicit ``"tbtr"`` is rejected.
+    #[pyo3(signature = (from_stops, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, to_stops = None, candidates = "time", bucket = 25.0, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false))]
     #[allow(clippy::too_many_arguments)]
     fn least_cost_matrix(
         &self,
@@ -468,6 +483,9 @@ impl TransportNetwork {
         candidates: &str,
         bucket: f64,
         router: &str,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
@@ -548,8 +566,15 @@ impl TransportNetwork {
         // engines and the time and fare candidates always keep the closure.
         let stop_count = self.build.timetable.stop_count() as usize;
         let fingerprint = factor_fingerprint(&per_trip);
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        if exclusions.is_some() && router == "tbtr" {
+            return Err(PyValueError::new_err(
+                "route/trip/stop exclusions require router='raptor'",
+            ));
+        }
         let matrix_mcultra = candidates == "pareto"
             && router != "tbtr"
+            && exclusions.is_none()
             && !std::ptr::eq(self.emissions_transfers(fingerprint), &self.transfers)
             && self.streets.is_some();
         // Auto prefers the door-to-door McULTRA path over an engine switch;
@@ -558,9 +583,9 @@ impl TransportNetwork {
         let router = if matrix_mcultra {
             "raptor"
         } else if candidates == "pareto" {
-            self.resolve_mc_router(router, date, &per_trip, false)?
+            self.resolve_mc_router(router, date, &per_trip, exclusions.is_some())?
         } else {
-            self.resolve_time_router(router, date, false)?
+            self.resolve_time_router(router, date, exclusions.is_some())?
         };
         // Origins that do not take a location-based initial walk (no coordinate,
         // no snap, or no stop reachable within the cap) are marked `!located`;
@@ -634,7 +659,7 @@ impl TransportNetwork {
                 active_services: active_services.clone(),
                 active_services_previous: active_services_previous.clone(),
                 max_transfers,
-                exclusions: None,
+                exclusions: exclusions.clone(),
             })
             .collect();
         let inputs = CostInputs {
@@ -696,7 +721,7 @@ impl TransportNetwork {
                             active_services: active_services.clone(),
                             active_services_previous: active_services_previous.clone(),
                             max_transfers,
-                            exclusions: None,
+                            exclusions: exclusions.clone(),
                         })
                         .collect();
                     let closure_egress = vec![Vec::new(); stop_count];
@@ -786,8 +811,10 @@ impl TransportNetwork {
     ///
     /// ``router="auto"`` (the default) runs on TBTR when the cached time
     /// transfer set (``compute_tbtr_transfers``) matches the date, else
-    /// on RAPTOR; explicit values pick the engine directly.
-    #[pyo3(signature = (origins, destinations, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, router = "auto", walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false))]
+    /// on RAPTOR; explicit values pick the engine directly. Route/trip/stop
+    /// exclusions run on the RAPTOR engines: ``"auto"`` resolves to
+    /// them and explicit ``"tbtr"`` is rejected.
+    #[pyo3(signature = (origins, destinations, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false))]
     #[allow(clippy::too_many_arguments)]
     fn least_cost_matrix_from_points(
         &self,
@@ -803,6 +830,9 @@ impl TransportNetwork {
         budget: Option<u32>,
         max_transfers: u8,
         router: &str,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
@@ -811,7 +841,8 @@ impl TransportNetwork {
         if !matches!(router, "auto" | "raptor" | "tbtr") {
             return Err(invalid_router(router));
         }
-        let router = self.resolve_time_router(router, date, false)?;
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        let router = self.resolve_time_router(router, date, exclusions.is_some())?;
         let streets = self.installed_streets()?;
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
@@ -883,7 +914,7 @@ impl TransportNetwork {
                     active_services: active_services.clone(),
                     active_services_previous: active_services_previous.clone(),
                     max_transfers,
-                    exclusions: None,
+                    exclusions: exclusions.clone(),
                 });
                 access_meters.push(
                     links

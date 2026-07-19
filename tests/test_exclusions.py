@@ -409,3 +409,130 @@ def test_point_frontiers_take_exclusions(network_with_footpaths):
         assert not excluded.equals(baseline)
         with pytest.raises(ValueError, match="exclusions require router='raptor'"):
             wrapper(*args, router="tbtr", exclude_routes=ridden)
+
+
+def test_cost_matrices_match_a_rebuilt_feed(two_line_network, tmp_path):
+    import pytest as _pytest
+
+    from cafein import TransportNetwork, TravelCostMatrix, travel_cost_table
+
+    legs = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    excluded = sorted(used(legs, "route_id"))[0]
+    source = build_two_line_gtfs(tmp_path / "full.zip")
+    rebuilt = TransportNetwork.from_gtfs(
+        [str(filtered_feed(source, tmp_path / "without.zip", excluded))]
+    )
+    args = (["A"], None, DATE, DEPARTURE)
+    fastest = TravelCostMatrix(two_line_network, *args, exclude_routes=[excluded])
+    assert len(fastest) > 0
+    assert fastest.equals(TravelCostMatrix(rebuilt, *args))
+    windowed = TravelCostMatrix(
+        two_line_network,
+        *args,
+        optimize="emissions",
+        window=1800,
+        exclude_routes=[excluded],
+    )
+    assert windowed.equals(
+        TravelCostMatrix(rebuilt, *args, optimize="emissions", window=1800)
+    )
+    _pytest.importorskip("pyarrow")
+    flat = travel_cost_table(two_line_network, *args, exclude_routes=[excluded])
+    assert flat.equals(travel_cost_table(rebuilt, *args))
+
+
+def test_cost_matrix_router_contract(two_line_network):
+    from cafein import TravelCostMatrix
+
+    two_line_network.compute_tbtr_transfers(DATE)
+    two_line_network.compute_mctbtr_transfers(DATE)
+    legs = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    excluded = sorted(used(legs, "route_id"))
+    args = (two_line_network, ["A"], ["B"], DATE, DEPARTURE)
+    for kwargs in (
+        {},
+        {"optimize": "emissions", "window": 1800},
+        {"optimize": "emissions", "window": 1800, "candidates": "pareto"},
+    ):
+        with pytest.raises(ValueError, match="exclusions require router='raptor'"):
+            TravelCostMatrix(*args, router="tbtr", exclude_routes=excluded, **kwargs)
+        auto = TravelCostMatrix(*args, exclude_routes=excluded, **kwargs)
+        raptor = TravelCostMatrix(
+            *args, router="raptor", exclude_routes=excluded, **kwargs
+        )
+        assert auto.equals(raptor)
+    # Unknown-only ids leave the cached engines accepted; an excluded
+    # origin has no rows.
+    unknown = TravelCostMatrix(*args, router="tbtr", exclude_routes=["no-such-route"])
+
+    assert len(unknown) > 0
+    empty = TravelCostMatrix(*args, exclude_stops=["A"])
+    assert empty.empty
+
+
+def test_cost_matrix_unknown_ids_keep_the_cache(two_line_network, capfd, monkeypatch):
+    from cafein import TravelCostMatrix
+
+    two_line_network.compute_mctbtr_transfers(DATE)
+    monkeypatch.setenv("CAFEIN_MCTBTR_PROF", "1")
+    legs = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    excluded = sorted(used(legs, "route_id"))
+    kwargs = dict(optimize="emissions", window=1800, candidates="pareto")
+    args = (two_line_network, ["A"], ["B"], DATE, DEPARTURE)
+    # The cost path's dispatch observable is inverted: the McRAPTOR
+    # stats flag prints only when the fallback engine actually runs, so
+    # unknown-only ids (which keep the cached McTBTR engine) stay
+    # silent and real exclusions report.
+    monkeypatch.setenv("CAFEIN_MCRAPTOR_PROF", "1")
+    capfd.readouterr()
+    TravelCostMatrix(*args, exclude_routes=["no-such-route"], **kwargs)
+    assert "MCRAPTOR-STATS" not in capfd.readouterr().err
+    capfd.readouterr()
+    TravelCostMatrix(*args, exclude_routes=excluded, **kwargs)
+    assert "MCRAPTOR-STATS" in capfd.readouterr().err
+
+
+def test_point_cost_matrices_take_exclusions(network_with_footpaths):
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    from cafein import TravelCostMatrix
+
+    # A long pair (Korso-ish to the centre) where transit wins, so the
+    # walking alternative cannot mask the exclusions.
+    coords = {
+        stop: (lat, lon)
+        for stop, lat, lon in network_with_footpaths.stops
+        if lat is not None
+    }
+    from_lat, from_lon = coords["1100602"]
+    to_lat, to_lon = coords["1040280"]
+    origins = gpd.GeoDataFrame(
+        {"id": ["origin"]}, geometry=[Point(from_lon, from_lat)], crs="EPSG:4326"
+    )
+    destinations = gpd.GeoDataFrame(
+        {"id": ["destination"]}, geometry=[Point(to_lon, to_lat)], crs="EPSG:4326"
+    )
+    legs = network_with_footpaths.route_between_coordinates(
+        (from_lat, from_lon), (to_lat, to_lon), "2022-02-22", "08:30:00"
+    )
+    ridden = sorted(used(legs, "route_id"))
+    assert ridden
+    args = (network_with_footpaths, origins, destinations, "2022-02-22", "08:30:00")
+    for kwargs in ({}, {"optimize": "emissions", "window": 1800}):
+        with pytest.warns(UserWarning, match="route_type"):
+            baseline = TravelCostMatrix(*args, **kwargs)
+        with pytest.warns(UserWarning, match="route_type"):
+            excluded = TravelCostMatrix(*args, exclude_routes=ridden, **kwargs)
+        with pytest.warns(UserWarning, match="route_type"):
+            raptor = TravelCostMatrix(
+                *args, router="raptor", exclude_routes=ridden, **kwargs
+            )
+        # The point forms honour the exclusions: auto equals raptor
+        # under them, and the fastest form loses its excluded corridor
+        # (the emissions pick may already avoid it).
+        assert excluded.equals(raptor)
+        if not kwargs:
+            assert not excluded.equals(baseline)
+        with pytest.raises(ValueError, match="exclusions require router='raptor'"):
+            TravelCostMatrix(*args, router="tbtr", exclude_routes=ridden, **kwargs)
