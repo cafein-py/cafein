@@ -2,72 +2,73 @@
 
 ## Unreleased
 
-- `max_slower` runs on the trip-based multicriteria engine:
-  `router="tbtr"` accepts it on the one-pair and batched frontier
-  forms, cell-for-cell equal to McRAPTOR, and `router="auto"` rides a
-  matching cached McTBTR set instead of falling back. Relaxed and
-  diverse candidates stay on McRAPTOR by contract: the precomputed
-  transfer set is reduced under strict unpenalized dominance, which
-  slack and route penalties would invalidate.
-- Fixed the `max_slower` restriction bounds losing a destination when
-  a faster arrival from another departure pass had exhausted the
-  transfer cap: the resolved-trip sweep is now ride-aware, so a
-  fewer-rides label that still has capacity to continue is never
-  suppressed and the band always anchors at each pass's true fastest
-  journey.
-
-- Fixed repeated destination stops losing cells in the pareto
-  (McRAPTOR/McTBTR) least-emissions matrices: duplicate `to_stops`
-  shared one slot with last-wins, so only the final occurrence
-  received a row. Every occurrence now reports its cell, in the
-  requested order.
-- Fixed `max_transfers=255` wrapping the multicriteria engines'
-  internal ride counter; the cap now saturates at the representable
-  254 transfers.
-
-- The cost matrices take `router=`: `TravelCostMatrix` (time
-  candidates), `travel_cost_table`, and the point forms now run on the
-  trip-based engine with `router="tbtr"` — over the cached time
-  transfer set (`compute_tbtr_transfers`) when its date matches — and
-  `router="auto"` picks it up automatically, keeping the door-to-door
-  (Mc)ULTRA paths on RAPTOR. Rows are identical whichever engine
-  answers.
-
-- Fixed over-midnight boarding missing a faster previous-day trip. The
-  day streams were merged by departure time when boarding, but a
-  previous-day trip can depart later on the query clock and still
-  arrive earlier; routing now scans the two streams independently, so
-  such journeys are found.
-- Equal-arrival journeys are elected canonically: when two journeys tie
-  exactly on arrival and ride count, RAPTOR and the trip-based cost
-  paths now both keep the same representative — chosen by a shared,
-  documented order over the journeys' rides and walks — instead of
-  whichever chain each engine's scan happened to meet first. Reported
-  times and ride counts are unchanged; on tied cells the representative
-  journey's distance, emissions, fare, and geometry may differ from
-  earlier builds, and are now identical across engines and stable
-  across releases.
-
-- The time-only TBTR transfer set is tie-complete: the precompute now
-  retains same-ride equal-arrival competitor transfers (boarding a
-  different trip; same-trip later boardings stay pruned), so the coming
-  trip-based cost matrices can reconstruct the exact journey RAPTOR's
-  tie-breaking elects. Query results are unchanged; the artifact format
-  bumps to 10 (sets persisted by earlier formats lack the competitors
-  and ask to be rebuilt), and ``tbtr_transfer_count`` reports the cached
-  set's size.
+## 0.5.0 — 2026-07-19
 
 - ``router="auto"`` — the new default for every ``router`` parameter: a
   query runs on the trip-based engine (TBTR/McTBTR) when the network
-  carries a matching precomputed transfer set for it
+  carries a matching precomputed transfer set
   (``compute_tbtr_transfers`` / ``compute_mctbtr_transfers``, persisted
   with the artifact) and the query asks nothing that engine cannot
   answer; otherwise it runs on RAPTOR/McRAPTOR, as before. Explicit
   ``router="raptor"``/``"tbtr"`` behave exactly as they did.
+  ([#143](https://github.com/cafein-py/cafein/pull/143))
+
+- The cost matrices run on the trip-based engine —
+  ``TravelCostMatrix``, ``travel_cost_table``, and the point forms
+  accept ``router="tbtr"`` (and ``"auto"`` picks it up over a cached
+  time transfer set), with rows identical to RAPTOR's whichever engine
+  answers; the door-to-door (Mc)ULTRA paths stay on RAPTOR. The
+  precomputed time transfer set retains equal-arrival competitor
+  transfers to make that exactness possible; the artifact format bumps
+  to 10 (older cached sets ask to be rebuilt), and
+  ``tbtr_transfer_count`` reports the cached set's size.
+  ([#144](https://github.com/cafein-py/cafein/pull/144),
+  [#145](https://github.com/cafein-py/cafein/pull/145),
+  [#146](https://github.com/cafein-py/cafein/pull/146),
+  [#147](https://github.com/cafein-py/cafein/pull/147))
+
+- ``max_slower`` runs on the trip-based multicriteria engine too:
+  accepted with ``router="tbtr"`` on the one-pair and batched frontier
+  forms, cell-for-cell equal to McRAPTOR, and ``router="auto"`` rides a
+  matching cached McTBTR set instead of falling back. Relaxed and
+  diverse candidates stay on McRAPTOR by contract: the precomputed set
+  is reduced under strict unpenalized dominance, which slack and route
+  penalties would invalidate.
+  ([#151](https://github.com/cafein-py/cafein/pull/151))
+
+- Equal-arrival journeys are elected canonically: when two journeys tie
+  exactly on arrival and ride count, every engine keeps the same
+  representative — chosen by a shared, documented order over the
+  journeys' rides and walks — instead of whichever chain a scan met
+  first. Times and ride counts are unchanged; on tied cells the
+  representative's distance, emissions, fare, and geometry may differ
+  from earlier releases, and are now identical across engines and
+  stable across releases.
+  ([#146](https://github.com/cafein-py/cafein/pull/146))
 
 - ``DetailedItineraries(candidates="pareto")`` accepts ``router="tbtr"``
-  with point origins and destinations too; the stop-ids-only restriction
-  is lifted.
+  with point origins and destinations too; the stop-ids-only
+  restriction is lifted.
+  ([#143](https://github.com/cafein-py/cafein/pull/143))
+
+- Fixed over-midnight boarding missing a faster previous-day trip: the
+  two service-day streams were merged by departure time when boarding,
+  but yesterday's trip can depart later on the query clock and still
+  arrive earlier; routing now scans the streams independently.
+  ([#146](https://github.com/cafein-py/cafein/pull/146))
+
+- Fixed repeated destination stops losing cells in the pareto
+  least-emissions matrices (only the last occurrence of a duplicated
+  ``to_stops`` entry received a row), and ``max_transfers=255``
+  wrapping the multicriteria ride counter (the cap now saturates at
+  254 transfers).
+  ([#150](https://github.com/cafein-py/cafein/pull/150))
+
+- Fixed the ``max_slower`` restriction losing a destination bound when
+  a faster arrival from another departure pass had exhausted the
+  transfer cap: the bound sweep is now ride-aware, so the band always
+  anchors at each pass's true fastest journey.
+  ([#151](https://github.com/cafein-py/cafein/pull/151))
 
 ## 0.4.0 — 2026-07-14
 
