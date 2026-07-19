@@ -18,6 +18,7 @@ fn request(access: StopIdx, egress: StopIdx, max_transfers: u8) -> Request {
         active_services: Vec::new(),
         active_services_previous: Vec::new(),
         max_transfers,
+        exclusions: None,
     }
 }
 
@@ -838,6 +839,7 @@ fn the_emissions_matrix_sees_past_the_time_candidates() {
         active_services: vec![true],
         active_services_previous: vec![false],
         max_transfers: 3,
+        exclusions: None,
     }];
     let destinations = [StopIdx(0), StopIdx(3)];
     let rows = least_emissions_matrix(
@@ -899,6 +901,7 @@ fn a_budget_caps_the_matrix_travel_time() {
         active_services: vec![true],
         active_services_previous: vec![false],
         max_transfers: 3,
+        exclusions: None,
     }];
     let cell = |budget: Option<u32>| {
         let rows = least_emissions_matrix(
@@ -974,6 +977,7 @@ fn matrix_rows_carry_their_transfer_walks() {
         active_services: vec![true],
         active_services_previous: vec![false],
         max_transfers: 3,
+        exclusions: None,
     }];
     let rows = least_emissions_matrix(
         &view,
@@ -1029,6 +1033,7 @@ fn profiles_the_departure_window() {
         active_services: vec![true],
         active_services_previous: vec![false],
         max_transfers: 1,
+        exclusions: None,
     };
     let journeys = route_range(
         &view,
@@ -1066,6 +1071,7 @@ fn frontier_matrix_matches_the_one_pair_profile_per_cell() {
             active_services: vec![true],
             active_services_previous: Vec::new(),
             max_transfers: 3,
+            exclusions: None,
         })
         .collect();
     let cells = frontier_matrix(
@@ -1167,6 +1173,7 @@ fn target_pruning_keeps_the_same_bucket_refinement() {
         active_services: Vec::new(),
         active_services_previous: Vec::new(),
         max_transfers: 3,
+        exclusions: None,
     };
     // One bucket holds both journeys, so they compare equal on
     // emissions during the search and the exact grams decide.
@@ -1789,6 +1796,7 @@ fn repeated_destination_stops_keep_every_matrix_cell() {
         active_services: vec![true],
         active_services_previous: vec![false],
         max_transfers: 3,
+        exclusions: None,
     }];
     let destinations = [StopIdx(3), StopIdx(0), StopIdx(3)];
     let rows = least_emissions_matrix(
@@ -1866,6 +1874,7 @@ fn a_matrix_request_with_egress_is_not_target_pruned() {
             active_services: vec![true],
             active_services_previous: vec![false],
             max_transfers: 3,
+            exclusions: None,
         }]
     };
     let matrix = |requests: &[Request]| {
@@ -1931,6 +1940,7 @@ fn the_transfer_cap_saturates_at_the_ride_count_limit() {
             active_services: vec![true],
             active_services_previous: vec![false],
             max_transfers,
+            exclusions: None,
         }]
     };
     let matrix = |requests: &[Request]| {

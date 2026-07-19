@@ -103,6 +103,7 @@ fn queries_match_raptor_across_sampled_pairs() {
                     active_services: active.clone(),
                     active_services_previous: active_previous.clone(),
                     max_transfers: 4,
+                    exclusions: None,
                 };
                 let raptor = Raptor.route(timetable, &footpaths, &request);
                 let tbtr = engine.query(
@@ -150,6 +151,7 @@ fn range_profiles_and_one_to_all_match_raptor() {
                     active_services: active.clone(),
                     active_services_previous: active_previous.clone(),
                     max_transfers: 4,
+                    exclusions: None,
                 };
                 let raptor = Raptor.route_range(timetable, &footpaths, &request, 1800);
                 let tbtr = engine.route_range(&request, 1800);
@@ -172,6 +174,7 @@ fn range_profiles_and_one_to_all_match_raptor() {
             active_services: active.clone(),
             active_services_previous: active_previous.clone(),
             max_transfers: 4,
+            exclusions: None,
         };
         let raptor = Raptor.one_to_all(timetable, &footpaths, &request);
         let tbtr = engine.one_to_all(request.departure, &request.access, request.max_transfers);
@@ -271,6 +274,7 @@ fn footpath_queries_match_raptor() {
                 active_services: active.clone(),
                 active_services_previous: active_previous.clone(),
                 max_transfers: 4,
+                exclusions: None,
             };
             let raptor = Raptor.route(timetable, &footpaths, &request);
             let tbtr = engine.query(
@@ -302,6 +306,7 @@ fn footpath_queries_match_raptor() {
             active_services: active.clone(),
             active_services_previous: active_previous.clone(),
             max_transfers: 4,
+            exclusions: None,
         };
         let raptor = Raptor.one_to_all(timetable, &footpaths, &request);
         let tbtr = engine.one_to_all(request.departure, &request.access, request.max_transfers);
@@ -408,6 +413,7 @@ fn cost_rows_match_raptor_across_sampled_origins() {
             active_services: active.clone(),
             active_services_previous: active_previous.clone(),
             max_transfers: 4,
+            exclusions: None,
         })
         .collect();
     assert!(requests.len() >= 5);

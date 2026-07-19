@@ -230,6 +230,7 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             active_services_previous: self.active_services_previous(date)?,
             max_transfers,
+            exclusions: None,
         };
         let penalty_mask = self.route_penalty_mask(&banned_routes, &route_penalties);
         let journeys = py.allow_threads(|| {
@@ -423,6 +424,7 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             active_services_previous: self.active_services_previous(date)?,
             max_transfers,
+            exclusions: None,
         };
         // The walking-only alternative, exactly as in
         // route_between_coordinates: zero emissions, available at
@@ -623,6 +625,7 @@ impl TransportNetwork {
                 active_services: active_services.clone(),
                 active_services_previous: active_services_previous.clone(),
                 max_transfers,
+                exclusions: None,
             })
             .collect();
         let rows = py.allow_threads(|| {
@@ -936,6 +939,7 @@ impl TransportNetwork {
                 active_services: active_services.clone(),
                 active_services_previous: active_services_previous.clone(),
                 max_transfers,
+                exclusions: None,
             })
             .collect();
         let rows = py.allow_threads(|| {
@@ -1181,6 +1185,7 @@ impl TransportNetwork {
                     active_services: active_services.to_vec(),
                     active_services_previous: active_services_previous.to_vec(),
                     max_transfers,
+                    exclusions: None,
                 })
                 .collect();
             // Invert the destination links into the per-stop final-egress

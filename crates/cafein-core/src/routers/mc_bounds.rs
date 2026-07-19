@@ -192,6 +192,7 @@ mod tests {
             active_services: vec![true],
             active_services_previous: vec![false],
             max_transfers: 1,
+            exclusions: None,
         };
         let bounds = resolved_bounds(
             &view,

@@ -180,6 +180,7 @@ impl TransportNetwork {
                         active_services: active_services.clone(),
                         active_services_previous: active_services_previous.clone(),
                         max_transfers,
+                        exclusions: None,
                     })
                     .collect();
                 if router == "tbtr" {
@@ -313,6 +314,7 @@ impl TransportNetwork {
                     active_services: active_services.clone(),
                     active_services_previous: active_services_previous.clone(),
                     max_transfers,
+                    exclusions: None,
                 });
                 access_meters.push(
                     links
@@ -632,6 +634,7 @@ impl TransportNetwork {
                 active_services: active_services.clone(),
                 active_services_previous: active_services_previous.clone(),
                 max_transfers,
+                exclusions: None,
             })
             .collect();
         let inputs = CostInputs {
@@ -693,6 +696,7 @@ impl TransportNetwork {
                             active_services: active_services.clone(),
                             active_services_previous: active_services_previous.clone(),
                             max_transfers,
+                            exclusions: None,
                         })
                         .collect();
                     let closure_egress = vec![Vec::new(); stop_count];
@@ -879,6 +883,7 @@ impl TransportNetwork {
                     active_services: active_services.clone(),
                     active_services_previous: active_services_previous.clone(),
                     max_transfers,
+                    exclusions: None,
                 });
                 access_meters.push(
                     links
@@ -1105,6 +1110,7 @@ impl TransportNetwork {
                     active_services: active_services.to_vec(),
                     active_services_previous: active_services_previous.to_vec(),
                     max_transfers,
+                    exclusions: None,
                 });
                 access_meters.push(
                     links
@@ -1140,6 +1146,7 @@ impl TransportNetwork {
                     active_services: active_services.to_vec(),
                     active_services_previous: active_services_previous.to_vec(),
                     max_transfers,
+                    exclusions: None,
                 })
                 .collect();
             let fallback_rows = Raptor.cost_matrix(

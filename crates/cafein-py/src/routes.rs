@@ -110,6 +110,7 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             active_services_previous: self.active_services_previous(date)?,
             max_transfers,
+            exclusions: None,
         };
         self.route_request(py, &request, window, None, None, geometries)
     }
@@ -210,6 +211,7 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             active_services_previous: self.active_services_previous(date)?,
             max_transfers,
+            exclusions: None,
         };
         // The walking-only alternative: door to door over the streets,
         // no vehicle, available at every departure. It dominates a
@@ -332,6 +334,7 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             active_services_previous: self.active_services_previous(date)?,
             max_transfers,
+            exclusions: None,
         };
         // Under a whole-day ULTRA set the intermediate transfers use the
         // shortcuts and a bounded final walk (`<= max_walking_time`) reaches
@@ -428,6 +431,7 @@ impl TransportNetwork {
                         active_services: self.active_services(date)?,
                         active_services_previous: self.active_services_previous(date)?,
                         max_transfers,
+                        exclusions: None,
                     };
                     let mut arrivals =
                         Raptor.one_to_all(&self.build.timetable, self.time_transfers(), &request);
@@ -445,6 +449,7 @@ impl TransportNetwork {
             active_services: self.active_services(date)?,
             active_services_previous: self.active_services_previous(date)?,
             max_transfers,
+            exclusions: None,
         };
         let arrivals = Raptor.one_to_all(&self.build.timetable, &self.transfers, &request);
         self.arrivals_dict(py, &arrivals, departure)

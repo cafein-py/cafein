@@ -147,6 +147,7 @@ impl TransportNetwork {
                         active_services: active_services.clone(),
                         active_services_previous: active_services_previous.clone(),
                         max_transfers,
+                        exclusions: None,
                     })
                     .collect();
                 Raptor.one_to_all_many(&self.build.timetable, &self.transfers, &requests)
@@ -232,6 +233,7 @@ impl TransportNetwork {
                 active_services: active_services.clone(),
                 active_services_previous: active_services_previous.clone(),
                 max_transfers,
+                exclusions: None,
             })
             .collect();
         let stop_count = self.build.timetable.stop_count() as usize;
@@ -332,6 +334,7 @@ impl TransportNetwork {
                     active_services: active_services.clone(),
                     active_services_previous: active_services_previous.clone(),
                     max_transfers,
+                    exclusions: None,
                 })
                 .collect();
             let egress = egress_tables(&destination_links);
@@ -476,6 +479,7 @@ impl TransportNetwork {
                     active_services: active_services.clone(),
                     active_services_previous: active_services_previous.clone(),
                     max_transfers,
+                    exclusions: None,
                 })
                 .collect();
             let egress = egress_tables(&destination_links);
@@ -613,6 +617,7 @@ impl TransportNetwork {
             active_services: active_services.to_vec(),
             active_services_previous: active_services_previous.to_vec(),
             max_transfers,
+            exclusions: None,
         };
         let mut rows: Vec<Vec<Option<u32>>> = vec![Vec::new(); origins.len()];
         if !usable.is_empty() {
