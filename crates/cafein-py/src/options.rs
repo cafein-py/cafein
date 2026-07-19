@@ -446,18 +446,6 @@ pub(super) fn invalid_router(router: &str) -> PyErr {
     ))
 }
 
-/// A deterministic, NaN-safe fingerprint of a per-trip emission-factor vector,
-/// binding a McULTRA set to the factor configuration it was built with (a query
-/// with different factors falls back to the closure). Not a cryptographic digest.
-pub(super) fn factor_fingerprint(per_trip: &[f64]) -> u64 {
-    const PRIME: u64 = 0x100000001b3;
-    let mut hash = 0xcbf29ce484222325u64;
-    for &factor in per_trip {
-        hash = (hash ^ factor.to_bits()).wrapping_mul(PRIME);
-    }
-    (hash ^ per_trip.len() as u64).wrapping_mul(PRIME)
-}
-
 /// Parses ``HH:MM:SS`` into seconds past the service day's start; hours may
 /// exceed 23 for over-midnight times, following GTFS.
 pub(super) fn parse_time(value: &str) -> PyResult<u32> {

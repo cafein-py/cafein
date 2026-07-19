@@ -98,12 +98,36 @@ pub fn auto_time_tbtr(cached_date: Option<&str>, date: &str, needs_raptor: bool)
     !needs_raptor && cached_date == Some(date)
 }
 
+/// Whether two per-trip emission-factor vectors are the same configuration.
+///
+/// Bitwise equality per element: the vectors are NaN-padded for trips without
+/// a factor, so float `==` would never match two identical configurations.
+/// This exact comparison — not a hash — is the equality proof binding a
+/// cached multicriteria set to the factors it was built with.
+pub fn same_factors(a: &[f64], b: &[f64]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+/// A deterministic, NaN-safe fingerprint of a per-trip emission-factor
+/// vector, for inspection only — cache equality is proven by `same_factors`,
+/// never by this hash, whose collisions would silently reuse a set built for
+/// other factors. Not a cryptographic digest.
+pub fn factor_fingerprint(per_trip: &[f64]) -> u64 {
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = 0xcbf29ce484222325u64;
+    for &factor in per_trip {
+        hash = (hash ^ factor.to_bits()).wrapping_mul(PRIME);
+    }
+    (hash ^ per_trip.len() as u64).wrapping_mul(PRIME)
+}
+
 /// Whether a `router="auto"` multicriteria query runs on the trip-based
 /// engine.
 ///
 /// Only when a cached multicriteria transfer set was precomputed for the
-/// query's service date **and** resolved per-trip factor fingerprint, and the
-/// query asks nothing the trip-based engine cannot answer (`needs_raptor`).
+/// query's service date **and** exactly the resolved per-trip factor vector
+/// (`same_factors`), and the query asks nothing the trip-based engine cannot
+/// answer (`needs_raptor`).
 /// The boundary is a contract, not a gap: the persisted set is reduced
 /// under strict unpenalized dominance at build time, so positive slack
 /// and route bans or penalties (the relaxed and diverse candidates) can
@@ -112,17 +136,20 @@ pub fn auto_time_tbtr(cached_date: Option<&str>, date: &str, needs_raptor: bool)
 /// has. `max_slower` restricts the strict search and runs on either
 /// engine.
 pub fn auto_mc_tbtr(
-    cached: Option<(&str, u64)>,
+    cached: Option<(&str, &[f64])>,
     date: &str,
-    fingerprint: u64,
+    per_trip: &[f64],
     needs_raptor: bool,
 ) -> bool {
-    !needs_raptor && cached == Some((date, fingerprint))
+    !needs_raptor
+        && cached.is_some_and(|(cached_date, factors)| {
+            cached_date == date && same_factors(factors, per_trip)
+        })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{auto_mc_tbtr, auto_time_tbtr};
+    use super::{auto_mc_tbtr, auto_time_tbtr, factor_fingerprint, same_factors};
 
     #[test]
     fn auto_time_requires_matching_cached_date() {
@@ -135,11 +162,51 @@ mod tests {
 
     #[test]
     fn auto_mc_requires_matching_cache_and_supported_query() {
-        let cached = Some(("2022-02-22", 7_u64));
-        assert!(auto_mc_tbtr(cached, "2022-02-22", 7, false));
-        assert!(!auto_mc_tbtr(cached, "2022-02-23", 7, false));
-        assert!(!auto_mc_tbtr(cached, "2022-02-22", 8, false));
-        assert!(!auto_mc_tbtr(cached, "2022-02-22", 7, true));
-        assert!(!auto_mc_tbtr(None, "2022-02-22", 7, false));
+        let factors = [f64::NAN, 74.0, 101.0];
+        let cached = Some(("2022-02-22", &factors[..]));
+        assert!(auto_mc_tbtr(cached, "2022-02-22", &factors, false));
+        assert!(!auto_mc_tbtr(cached, "2022-02-23", &factors, false));
+        let other = [f64::NAN, 74.0, 88.0];
+        assert!(!auto_mc_tbtr(cached, "2022-02-22", &other, false));
+        assert!(!auto_mc_tbtr(cached, "2022-02-22", &factors, true));
+        assert!(!auto_mc_tbtr(None, "2022-02-22", &factors, false));
+    }
+
+    #[test]
+    fn factor_equality_is_bitwise_and_exact() {
+        // NaN-padded identical vectors are the same configuration (float `==`
+        // would say no), and a prefix is not.
+        assert!(same_factors(&[f64::NAN, 74.0], &[f64::NAN, 74.0]));
+        assert!(!same_factors(&[f64::NAN, 74.0], &[f64::NAN]));
+
+        // A crafted FNV collision: solve the second element with the modular
+        // inverse of the FNV prime so both vectors hash identically. Under
+        // fingerprint equality a set built for `a` would serve a query
+        // resolving to `b`; the exact comparison refuses it.
+        const PRIME: u64 = 0x100000001b3;
+        let mut inverse = PRIME;
+        for _ in 0..6 {
+            // Newton's iteration doubles the correct low bits each round.
+            inverse = inverse.wrapping_mul(2u64.wrapping_sub(PRIME.wrapping_mul(inverse)));
+        }
+        assert_eq!(PRIME.wrapping_mul(inverse), 1);
+        let offset = 0xcbf29ce484222325u64;
+        let a = [74.0f64, 101.0];
+        let after_first = (offset ^ a[0].to_bits()).wrapping_mul(PRIME);
+        let target = (after_first ^ a[1].to_bits()).wrapping_mul(PRIME);
+        let b_first = 75.0f64;
+        let after_b_first = (offset ^ b_first.to_bits()).wrapping_mul(PRIME);
+        let b = [
+            b_first,
+            f64::from_bits(target.wrapping_mul(inverse) ^ after_b_first),
+        ];
+        assert_eq!(factor_fingerprint(&a), factor_fingerprint(&b));
+        assert!(!same_factors(&a, &b));
+        assert!(!auto_mc_tbtr(
+            Some(("2022-02-22", &a[..])),
+            "2022-02-22",
+            &b,
+            false
+        ));
     }
 }

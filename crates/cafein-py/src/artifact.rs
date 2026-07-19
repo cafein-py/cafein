@@ -49,7 +49,7 @@ impl TransportNetwork {
                 ultra_window: self.ultra_window,
                 mcultra_transfers: &self.mcultra_transfers,
                 mcultra_window: self.mcultra_window,
-                mcultra_factor: self.mcultra_factor,
+                mcultra_factors: &self.mcultra_factors,
                 walking_hierarchy: self.streets.as_ref().and_then(StreetNetwork::hierarchy),
                 tbtr_time_transfers: &self.tbtr_time_transfers,
                 mctbtr_transfers: &self.mctbtr_transfers,
@@ -202,10 +202,10 @@ impl TransportNetwork {
 
 pub(super) const ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINET";
 
-// 10: the persisted time TBTR transfer set became tie-complete (same-ride
-// equal-arrival competitors retained for cost-row reconstruction); sets
-// written by earlier formats lack the competitors and must be rebuilt.
-pub(super) const ARTIFACT_FORMAT: u32 = 10;
+// 11: the McULTRA/McTBTR factor binding stores the full per-trip factor
+// vector (exact equality proof) instead of a 64-bit fingerprint; earlier
+// formats carry only the hash and must be rebuilt.
+pub(super) const ARTIFACT_FORMAT: u32 = 11;
 
 /// Section tags in the container directory.
 pub(super) const SECTION_META: u16 = 1;
@@ -240,11 +240,11 @@ pub(super) struct ArtifactRef<'a> {
     ultra_transfers: &'a Option<Transfers>,
     ultra_window: Option<(u32, u32)>,
     /// The McULTRA (emissions-aware) shortcut set with its window and the
-    /// factor-vector fingerprint it was built for; restored so the heavy
-    /// run-once preprocessing need not be repeated and the factor contract holds.
+    /// factor vector it was built for; restored so the heavy run-once
+    /// preprocessing need not be repeated and the factor contract holds.
     mcultra_transfers: &'a Option<Transfers>,
     mcultra_window: Option<(u32, u32)>,
-    mcultra_factor: Option<u64>,
+    mcultra_factors: &'a Option<Vec<f64>>,
     /// The walking contraction hierarchy, when installed; restored so the
     /// run-once contraction need not be repeated. Its one-to-many buckets are
     /// derived state, rebuilt on load rather than persisted.
@@ -254,8 +254,8 @@ pub(super) struct ArtifactRef<'a> {
     /// rebuilding the dominance-aware set.
     tbtr_time_transfers: &'a Option<(String, cafein_core::tbtr::TransferSet)>,
     /// The cached multicriteria TBTR transfer set with its date and factor
-    /// fingerprint, when present.
-    mctbtr_transfers: &'a Option<(String, u64, cafein_core::tbtr::TransferSet)>,
+    /// vector, when present.
+    mctbtr_transfers: &'a Option<(String, Vec<f64>, cafein_core::tbtr::TransferSet)>,
 }
 
 /// The decoded part of the saved network, owned after reading.
@@ -272,10 +272,10 @@ pub(super) struct Artifact {
     ultra_window: Option<(u32, u32)>,
     mcultra_transfers: Option<Transfers>,
     mcultra_window: Option<(u32, u32)>,
-    mcultra_factor: Option<u64>,
+    mcultra_factors: Option<Vec<f64>>,
     walking_hierarchy: Option<ContractionHierarchy>,
     tbtr_time_transfers: Option<(String, cafein_core::tbtr::TransferSet)>,
-    mctbtr_transfers: Option<(String, u64, cafein_core::tbtr::TransferSet)>,
+    mctbtr_transfers: Option<(String, Vec<f64>, cafein_core::tbtr::TransferSet)>,
 }
 
 /// The street layer's decoded state: link records (endpoints
@@ -1050,7 +1050,7 @@ pub(super) fn assemble(
         ultra_window,
         mcultra_transfers,
         mcultra_window,
-        mcultra_factor,
+        mcultra_factors,
         walking_hierarchy,
         tbtr_time_transfers,
         mctbtr_transfers,
@@ -1078,7 +1078,7 @@ pub(super) fn assemble(
         ultra_window,
         mcultra_transfers,
         mcultra_window,
-        mcultra_factor,
+        mcultra_factors,
         tbtr_time_transfers,
         mctbtr_transfers,
         geometry,

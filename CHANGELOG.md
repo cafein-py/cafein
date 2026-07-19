@@ -25,6 +25,13 @@
   have carried), and answer exactly as a network built without that
   supply.
 
+- The cached McULTRA and McTBTR transfer sets are bound to the per-trip
+  emission-factor configuration they were built with by the full factor
+  vector, compared exactly, instead of a 64-bit fingerprint whose
+  collision could silently reuse a set built for other factors. Saved
+  artifacts use format 11; artifacts written by earlier versions are
+  refused with the usual rebuild message.
+
 ## 0.5.0 — 2026-07-19
 
 - ``router="auto"`` — the new default for every ``router`` parameter: a

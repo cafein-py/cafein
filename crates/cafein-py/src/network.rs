@@ -51,7 +51,7 @@ impl TransportNetwork {
             ultra_window: None,
             mcultra_transfers: None,
             mcultra_window: None,
-            mcultra_factor: None,
+            mcultra_factors: None,
             tbtr_time_transfers: None,
             mctbtr_transfers: None,
             geometry: None,
@@ -106,15 +106,16 @@ impl TransportNetwork {
         self.mcultra_window
     }
 
-    /// The McULTRA set's stored factor-vector fingerprint, or `None`. For
-    /// inspection/tests (the fingerprint binds the set to its factor config).
+    /// A fingerprint of the McULTRA set's stored factor vector, or `None`.
+    /// For inspection/tests only — the activation gate compares the vector
+    /// itself (`same_factors`), never this hash.
     #[getter]
     fn _mcultra_factor(&self) -> Option<u64> {
-        self.mcultra_factor
+        self.mcultra_factors.as_deref().map(factor_fingerprint)
     }
 
     /// Whether an emissions query with these `factors` would relax the installed
-    /// McULTRA set (a whole-day set whose factor fingerprint matches) rather than
+    /// McULTRA set (a whole-day set whose factor vector matches) rather than
     /// the closure. Exposes the `emissions_transfers` gate for inspection/tests.
     fn mcultra_active_for(&self, factors: Vec<(String, f64)>) -> bool {
         let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
@@ -123,10 +124,7 @@ impl TransportNetwork {
                 per_trip[trip.0 as usize] = *factor;
             }
         }
-        !std::ptr::eq(
-            self.emissions_transfers(factor_fingerprint(&per_trip)),
-            &self.transfers,
-        )
+        !std::ptr::eq(self.emissions_transfers(&per_trip), &self.transfers)
     }
 
     /// The computed ULTRA shortcuts as `(origin_stop_id, destination_stop_id,
@@ -217,7 +215,7 @@ impl TransportNetwork {
         let set = py.allow_threads(|| {
             McTbtrEngine::transfers_for_date(timetable, geometry, &per_trip, &active, &previous)
         });
-        self.mctbtr_transfers = Some((date.to_string(), factor_fingerprint(&per_trip), set));
+        self.mctbtr_transfers = Some((date.to_string(), per_trip, set));
         Ok(())
     }
 
@@ -393,10 +391,9 @@ impl TransportNetwork {
             })
             .map_err(PyValueError::new_err)?;
         let count = set.edge_count();
-        let fingerprint = factor_fingerprint(&per_trip);
         self.mcultra_transfers = Some(set);
         self.mcultra_window = Some((min_departure, max_departure));
-        self.mcultra_factor = Some(fingerprint);
+        self.mcultra_factors = Some(per_trip);
         Ok(count)
     }
 
@@ -540,7 +537,7 @@ impl TransportNetwork {
         // transfers; new distances invalidate the set (ULTRA is distance-free).
         self.mcultra_transfers = None;
         self.mcultra_window = None;
-        self.mcultra_factor = None;
+        self.mcultra_factors = None;
         // The cached McTBTR transfer set reduced against the old distances'
         // emissions; new distances invalidate it too (the time-only TBTR set
         // is distance-free and stays).
@@ -641,7 +638,7 @@ impl TransportNetwork {
         self.ultra_window = None;
         self.mcultra_transfers = None;
         self.mcultra_window = None;
-        self.mcultra_factor = None;
+        self.mcultra_factors = None;
         Ok(())
     }
 
@@ -864,7 +861,7 @@ impl TransportNetwork {
     /// The engine a multicriteria query's `router` runs on. `"auto"`
     /// resolves to the trip-based engine only when the cached McTBTR set
     /// (`compute_mctbtr_transfers`) matches the query's date and factor
-    /// fingerprint and the query asks nothing McTBTR cannot answer
+    /// vector and the query asks nothing McTBTR cannot answer
     /// (`needs_raptor`); explicit values pass through unchanged.
     pub(super) fn resolve_mc_router(
         &self,
@@ -880,14 +877,9 @@ impl TransportNetwork {
                 let cached = self
                     .mctbtr_transfers
                     .as_ref()
-                    .map(|(d, fingerprint, _)| (d.as_str(), *fingerprint));
+                    .map(|(d, factors, _)| (d.as_str(), factors.as_slice()));
                 Ok(
-                    if cafein_core::router::auto_mc_tbtr(
-                        cached,
-                        date,
-                        factor_fingerprint(per_trip),
-                        needs_raptor,
-                    ) {
+                    if cafein_core::router::auto_mc_tbtr(cached, date, per_trip, needs_raptor) {
                         "tbtr"
                     } else {
                         "raptor"
@@ -899,7 +891,7 @@ impl TransportNetwork {
     }
 
     /// The multicriteria TBTR engine for a query: over the cached
-    /// transfer set when its date and factor fingerprint match
+    /// transfer set when its date and factor vector match
     /// (`compute_mctbtr_transfers`), else built ad hoc. The query-time
     /// `footpaths` vary freely — the precompute never contains them.
     pub(super) fn mctbtr_engine<'a>(
@@ -911,8 +903,8 @@ impl TransportNetwork {
         active_services: &'a [bool],
         active_services_previous: &'a [bool],
     ) -> McTbtrEngine<'a> {
-        if let Some((cached_date, fingerprint, set)) = &self.mctbtr_transfers {
-            if cached_date == date && *fingerprint == factor_fingerprint(per_trip) {
+        if let Some((cached_date, factors, set)) = &self.mctbtr_transfers {
+            if cached_date == date && same_factors(factors, per_trip) {
                 return McTbtrEngine::from_set(
                     &self.build.timetable,
                     footpaths,
@@ -966,18 +958,22 @@ impl TransportNetwork {
         )
     }
 
-    /// The transfer set the coordinate emissions engines relax for a query using
-    /// factors with fingerprint `factor`: the whole-day McULTRA set when one is
-    /// installed for that exact factor configuration, else the closure. A
-    /// partial-window or factor-mismatched set is never silently used (§Factor
-    /// contract).
-    pub(super) fn emissions_transfers(&self, factor: u64) -> &Transfers {
+    /// The transfer set the coordinate emissions engines relax for a query
+    /// resolving to the factor vector `per_trip`: the whole-day McULTRA set
+    /// when one is installed for exactly that factor configuration
+    /// (`same_factors`), else the closure. A partial-window or
+    /// factor-mismatched set is never silently used (§Factor contract).
+    pub(super) fn emissions_transfers(&self, per_trip: &[f64]) -> &Transfers {
         match (
             self.mcultra_transfers.as_ref(),
             self.mcultra_window,
-            self.mcultra_factor,
+            self.mcultra_factors.as_deref(),
         ) {
-            (Some(set), Some((0, hi)), Some(built)) if hi >= u32::MAX - 1 && built == factor => set,
+            (Some(set), Some((0, hi)), Some(built))
+                if hi >= u32::MAX - 1 && same_factors(built, per_trip) =>
+            {
+                set
+            }
             _ => &self.transfers,
         }
     }
