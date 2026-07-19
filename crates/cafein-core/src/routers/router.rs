@@ -94,8 +94,8 @@ pub trait TransitRouter: Sync {
 /// Only when a cached time transfer set was precomputed for the query's
 /// service date: the trip-based engine's advantage is riding a precomputed
 /// set, and an ad-hoc per-call build would make one-shot queries pay for it.
-pub fn auto_time_tbtr(cached_date: Option<&str>, date: &str) -> bool {
-    cached_date == Some(date)
+pub fn auto_time_tbtr(cached_date: Option<&str>, date: &str, needs_raptor: bool) -> bool {
+    !needs_raptor && cached_date == Some(date)
 }
 
 /// Whether a `router="auto"` multicriteria query runs on the trip-based
@@ -126,9 +126,11 @@ mod tests {
 
     #[test]
     fn auto_time_requires_matching_cached_date() {
-        assert!(auto_time_tbtr(Some("2022-02-22"), "2022-02-22"));
-        assert!(!auto_time_tbtr(Some("2022-02-21"), "2022-02-22"));
-        assert!(!auto_time_tbtr(None, "2022-02-22"));
+        assert!(auto_time_tbtr(Some("2022-02-22"), "2022-02-22", false));
+        assert!(!auto_time_tbtr(Some("2022-02-21"), "2022-02-22", false));
+        assert!(!auto_time_tbtr(None, "2022-02-22", false));
+        // Exclusions force RAPTOR even over a matching cache.
+        assert!(!auto_time_tbtr(Some("2022-02-22"), "2022-02-22", true));
     }
 
     #[test]

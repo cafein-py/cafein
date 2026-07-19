@@ -750,6 +750,9 @@ class TransportNetwork:
         departure,
         max_transfers=7,
         *,
+        exclude_routes=(),
+        exclude_trips=(),
+        exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
         max_snap_distance=None,
@@ -793,6 +796,9 @@ class TransportNetwork:
             date,
             departure,
             max_transfers,
+            [str(route) for route in exclude_routes],
+            [str(trip) for trip in exclude_trips],
+            [str(stop) for stop in exclude_stops],
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
         )
 
@@ -803,6 +809,9 @@ class TransportNetwork:
         departure,
         max_transfers=7,
         *,
+        exclude_routes=(),
+        exclude_trips=(),
+        exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
         max_snap_distance=None,
@@ -855,6 +864,9 @@ class TransportNetwork:
             date,
             departure,
             max_transfers,
+            [str(route) for route in exclude_routes],
+            [str(trip) for trip in exclude_trips],
+            [str(stop) for stop in exclude_stops],
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
         )
 
@@ -865,6 +877,9 @@ class TransportNetwork:
         departure,
         max_transfers=7,
         *,
+        exclude_routes=(),
+        exclude_trips=(),
+        exclude_stops=(),
         destinations=None,
         window=None,
         percentiles=None,
@@ -960,6 +975,9 @@ class TransportNetwork:
             date,
             departure,
             max_transfers,
+            exclude_routes=exclude_routes,
+            exclude_trips=exclude_trips,
+            exclude_stops=exclude_stops,
             destinations=destinations,
             window=window,
             percentiles=percentiles,
@@ -988,6 +1006,9 @@ class TransportNetwork:
         max_walking_time,
         max_snap_distance,
         router="auto",
+        exclude_routes=(),
+        exclude_trips=(),
+        exclude_stops=(),
     ):
         """The travel-time matrix with its origin and destination id
         axes and the resolved percentile list (``None`` without a
@@ -1027,6 +1048,9 @@ class TransportNetwork:
                     departure,
                     max_transfers,
                     router,
+                    [str(route) for route in exclude_routes],
+                    [str(trip) for trip in exclude_trips],
+                    [str(stop) for stop in exclude_stops],
                     *walk,
                 )
             else:
@@ -1039,6 +1063,9 @@ class TransportNetwork:
                     percentiles,
                     max_transfers,
                     router,
+                    [str(route) for route in exclude_routes],
+                    [str(trip) for trip in exclude_trips],
+                    [str(stop) for stop in exclude_stops],
                     *walk,
                 )
             _warn_unsnapped(table, from_ids, to_ids)
@@ -1057,10 +1084,22 @@ class TransportNetwork:
                 departure,
                 max_transfers,
                 router,
+                [str(route) for route in exclude_routes],
+                [str(trip) for trip in exclude_trips],
+                [str(stop) for stop in exclude_stops],
                 *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
             )
         else:
             matrix = self._core.travel_time_percentiles(
-                from_stops, date, departure, window, percentiles, max_transfers, router
+                from_stops,
+                date,
+                departure,
+                window,
+                percentiles,
+                max_transfers,
+                router,
+                [str(route) for route in exclude_routes],
+                [str(trip) for trip in exclude_trips],
+                [str(stop) for stop in exclude_stops],
             )
         return matrix, from_stops, to_ids, percentiles

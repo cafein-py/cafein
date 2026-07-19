@@ -270,3 +270,52 @@ def test_itineraries_take_exclusions(network_with_footpaths):
         exclude_routes=sorted(ridden),
     )
     assert not (set(rerouted["route_id"].dropna()) & ridden)
+
+
+def test_matrix_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
+    from cafein import TransportNetwork, TravelTimeMatrix
+
+    legs = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    excluded = sorted(used(legs, "route_id"))[0]
+    source = build_two_line_gtfs(tmp_path / "full.zip")
+    rebuilt = TransportNetwork.from_gtfs(
+        [str(filtered_feed(source, tmp_path / "without.zip", excluded))]
+    )
+    kwargs = dict(date=DATE, departure=DEPARTURE)
+    with_exclusions = TravelTimeMatrix(
+        two_line_network, exclude_routes=[excluded], **kwargs
+    )
+    oracle = TravelTimeMatrix(rebuilt, **kwargs)
+    assert len(with_exclusions) > 0
+    assert with_exclusions.equals(oracle)
+    # The one-to-all query agrees with the rebuilt feed too.
+    assert two_line_network.travel_times_from_stop(
+        "A", DATE, DEPARTURE, exclude_routes=[excluded]
+    ) == rebuilt.travel_times_from_stop("A", DATE, DEPARTURE)
+
+
+def test_matrix_exclusions_router_contract(two_line_network):
+    from cafein import TravelTimeMatrix
+
+    two_line_network.compute_tbtr_transfers(DATE)
+    kwargs = dict(date=DATE, departure=DEPARTURE)
+    legs = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    excluded = sorted(used(legs, "route_id"))
+    with pytest.raises(ValueError, match="exclusions require router='raptor'"):
+        TravelTimeMatrix(
+            two_line_network, router="tbtr", exclude_routes=excluded, **kwargs
+        )
+    # Auto falls back to RAPTOR with unchanged rows even over a matching
+    # cached set; unknown-only ids leave explicit TBTR accepted.
+    auto = TravelTimeMatrix(two_line_network, exclude_routes=excluded, **kwargs)
+    raptor = TravelTimeMatrix(
+        two_line_network, router="raptor", exclude_routes=excluded, **kwargs
+    )
+    assert auto.equals(raptor)
+    unknown = TravelTimeMatrix(
+        two_line_network, router="tbtr", exclude_routes=["no-such-route"], **kwargs
+    )
+    assert len(unknown) > 0
+    # An excluded origin has no rows at all.
+    empty = TravelTimeMatrix(two_line_network, ["A"], exclude_stops=["A"], **kwargs)
+    assert empty.empty

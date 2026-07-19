@@ -7,7 +7,11 @@
   `route_between_coordinates`, `journey_frontier`, and
   `DetailedItineraries` — one built network serves many disruption
   scenarios ("line X closed", "stop Y shut") and per-individual
-  accessibility filters, no rebuild. An excluded stop refuses
+  accessibility filters, no rebuild — and on the time-query products:
+  `travel_times_from_stop`, `travel_times_from_coordinate`,
+  `travel_time_matrix`, and `TravelTimeMatrix` (stop, point, and
+  percentile forms), where `router="auto"` falls back to RAPTOR and
+  the door-to-door ULTRA upgrades stay on unrestricted queries. An excluded stop refuses
   boarding, alighting, transfers, and access/egress while vehicles
   still ride through it; an excluded origin or destination yields no
   journeys; unknown route and trip ids are ignored. Exclusions compose

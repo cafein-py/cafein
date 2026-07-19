@@ -149,7 +149,7 @@ impl TransportNetwork {
         let router = if ultra_usable {
             "raptor"
         } else {
-            self.resolve_time_router(router, date)?
+            self.resolve_time_router(router, date, false)?
         };
         let rows = py.allow_threads(|| {
             if let Some(speed) = ultra_speed {
@@ -246,7 +246,7 @@ impl TransportNetwork {
         if !matches!(router, "auto" | "raptor" | "tbtr") {
             return Err(invalid_router(router));
         }
-        let router = self.resolve_time_router(router, date)?;
+        let router = self.resolve_time_router(router, date, false)?;
         let streets = self.installed_streets()?;
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
@@ -560,7 +560,7 @@ impl TransportNetwork {
         } else if candidates == "pareto" {
             self.resolve_mc_router(router, date, &per_trip, false)?
         } else {
-            self.resolve_time_router(router, date)?
+            self.resolve_time_router(router, date, false)?
         };
         // Origins that do not take a location-based initial walk (no coordinate,
         // no snap, or no stop reachable within the cap) are marked `!located`;
@@ -811,7 +811,7 @@ impl TransportNetwork {
         if !matches!(router, "auto" | "raptor" | "tbtr") {
             return Err(invalid_router(router));
         }
-        let router = self.resolve_time_router(router, date)?;
+        let router = self.resolve_time_router(router, date, false)?;
         let streets = self.installed_streets()?;
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
