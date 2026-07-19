@@ -10,6 +10,8 @@ authors.workspace = true
 [lib]
 name = "_cafein"
 crate-type = ["cdylib"]
+test = false
+doctest = false
 
 [dependencies]
 bincode.workspace = true
@@ -18,6 +20,6 @@ cafein-gtfs.workspace = true
 chrono.workspace = true
 memmap2.workspace = true
 numpy.workspace = true
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310", "multiple-pymethods"] }
 rayon.workspace = true
 serde.workspace = true
