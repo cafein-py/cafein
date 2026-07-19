@@ -203,6 +203,12 @@ def journey_frontier(
         so a corridor that mostly differs yet shares a trunk can surface
         (the R5-style soft penalty), and the set can hold more options
         before it dries up. Unused for the other candidate sets.
+    exclude_routes, exclude_trips, exclude_stops : list of str (optional)
+        GTFS ids of supply the journeys must not use — disruption and
+        accessibility filters, as in route_between_stops. Runs on
+        the McRAPTOR path ("auto" resolves to it); excluded stops
+        refuse boarding, alighting, transfers, and access/egress while
+        vehicles still ride through them.
     max_slower : float (optional, default: None)
         Restrict the ``"pareto"`` frontier (on either engine) to
         journeys near the fast end: per departure pass, every returned
