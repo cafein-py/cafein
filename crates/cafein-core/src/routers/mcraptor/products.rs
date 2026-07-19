@@ -150,6 +150,7 @@ pub fn least_emissions_matrix(
                 bucket,
                 0,
                 &[],
+                request.exclusions.as_deref(),
             );
             let departures = departure_candidates(timetable, request, window);
             let mut best: Vec<Option<(f64, u32, u32, f64)>> = vec![None; cell_count];
@@ -309,6 +310,7 @@ pub fn frontier_matrix(
                 bucket,
                 0,
                 &[],
+                request.exclusions.as_deref(),
             );
             let mut bags: Vec<DestinationBag> = std::iter::repeat_with(DestinationBag::default)
                 .take(bag_count)
@@ -464,6 +466,7 @@ pub(super) fn profile(
         bucket,
         slack,
         route_penalties,
+        request.exclusions.as_deref(),
     );
     for (index, &departure) in departures.iter().enumerate() {
         if let Some((band, bounds, floors)) = &restricted {

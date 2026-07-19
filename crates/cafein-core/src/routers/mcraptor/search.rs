@@ -346,6 +346,7 @@ pub(super) struct Search<'a> {
     /// using it (soft-penalty diverse), `u32::MAX` to skip the route's
     /// lines outright (a hard ban), 0 to leave it free. Empty means none.
     pub(super) route_penalties: &'a [u32],
+    pub(super) exclusions: Option<&'a Exclusions>,
     pub(super) arena: Vec<Label>,
     pub(super) bags: Vec<Bag>,
     pub(super) destination: DestinationBag,
@@ -387,6 +388,7 @@ impl<'a> Search<'a> {
         bucket: f64,
         slack: u32,
         route_penalties: &'a [u32],
+        exclusions: Option<&'a Exclusions>,
     ) -> Search<'a> {
         let mut search = Search {
             view,
@@ -397,6 +399,7 @@ impl<'a> Search<'a> {
             bucket,
             slack,
             route_penalties,
+            exclusions,
             arena: Vec::new(),
             bags: vec![Bag::default(); timetable.stop_count() as usize],
             destination: DestinationBag::default(),
@@ -489,7 +492,9 @@ impl<'a> Search<'a> {
             let label = self.arena.len() as u32;
             let key = self.key(0.0);
             self.stats.access_offers += 1;
-            if self.beyond_cutoff(stop, arrival) || self.target_pruned(departure, arrival, key, 0.0)
+            if self.stop_excluded(stop)
+                || self.beyond_cutoff(stop, arrival)
+                || self.target_pruned(departure, arrival, key, 0.0)
             {
                 continue;
             }
@@ -602,6 +607,9 @@ impl<'a> Search<'a> {
                     );
                 }
                 for &(stop, seconds) in &request.egress {
+                    if self.stop_excluded(stop) {
+                        continue;
+                    }
                     if stop == reached.stop {
                         let arrival = reached.arrival.saturating_add(seconds);
                         self.destination.insert(
@@ -710,7 +718,7 @@ impl<'a> Search<'a> {
                 for point in &batch.active {
                     let arrival = point.arrival.saturating_add(footpath.duration);
                     let walked = self.arena.len() as u32;
-                    if self.beyond_cutoff(footpath.to, arrival) {
+                    if self.stop_excluded(footpath.to) || self.beyond_cutoff(footpath.to, arrival) {
                         cutoff_pruned += 1;
                         continue;
                     }
@@ -801,7 +809,7 @@ impl<'a> Search<'a> {
                 for point in &batch.active {
                     let arrival = point.arrival.saturating_add(footpath.duration);
                     let walked = self.arena.len() as u32;
-                    if self.beyond_cutoff(footpath.to, arrival) {
+                    if self.stop_excluded(footpath.to) || self.beyond_cutoff(footpath.to, arrival) {
                         cutoff_pruned += 1;
                         continue;
                     }
@@ -871,7 +879,7 @@ impl<'a> Search<'a> {
             for footpath in slice {
                 let arrival = from.arrival.saturating_add(footpath.duration);
                 let walked = self.arena.len() as u32;
-                if self.beyond_cutoff(footpath.to, arrival) {
+                if self.stop_excluded(footpath.to) || self.beyond_cutoff(footpath.to, arrival) {
                     cutoff_pruned += 1;
                     continue;
                 }
@@ -934,7 +942,7 @@ impl<'a> Search<'a> {
             for footpath in slice {
                 let arrival = from.arrival.saturating_add(footpath.duration);
                 let walked = self.arena.len() as u32;
-                if self.beyond_cutoff(footpath.to, arrival) {
+                if self.stop_excluded(footpath.to) || self.beyond_cutoff(footpath.to, arrival) {
                     cutoff_pruned += 1;
                     continue;
                 }
@@ -996,6 +1004,13 @@ impl<'a> Search<'a> {
     /// the earliest boardable trip, later trips join while their factor
     /// strictly improves; same-trip riders reduce to the lowest
     /// `kappa`.
+    /// Whether the exclusions refuse this stop for boarding, alighting,
+    /// transfers, and access/egress (riding through stays allowed).
+    fn stop_excluded(&self, stop: StopIdx) -> bool {
+        self.exclusions
+            .is_some_and(|excluded| excluded.excludes_stop(stop))
+    }
+
     fn scan_line(&mut self, line: u32, rides: u8, rode: &mut Vec<u32>) {
         let mut entries = std::mem::take(&mut self.queue[line as usize]);
         let pattern = self.view.line_pattern(line);
@@ -1007,7 +1022,10 @@ impl<'a> Search<'a> {
         // A banned route (the `u32::MAX` sentinel) skips its lines entirely, so
         // the re-search omits committed corridors; a finite penalty instead adds
         // to each ride's effective arrival, making the route costly but usable.
-        if line_penalty == u32::MAX {
+        let route_excluded = self
+            .exclusions
+            .is_some_and(|excluded| excluded.excludes_route(self.timetable.pattern_route(pattern)));
+        if line_penalty == u32::MAX || route_excluded {
             entries.clear();
             self.queue[line as usize] = entries;
             return;
@@ -1041,7 +1059,8 @@ impl<'a> Search<'a> {
                 // This ride pays the line's route penalty once, on top of the
                 // penalty its boarding chain already carried.
                 let penalty = rider.penalty.saturating_add(line_penalty);
-                if self.beyond_cutoff(stops[position], arrival)
+                if self.stop_excluded(stops[position])
+                    || self.beyond_cutoff(stops[position], arrival)
                     || self.target_pruned(
                         rider.departure,
                         arrival.saturating_add(penalty),
@@ -1107,7 +1126,11 @@ impl<'a> Search<'a> {
                 for rank in first.0..self.view.line_trips(line).end {
                     let trip = ViewTrip(rank);
                     let factor = self.factors[self.view.backing(trip).0 as usize];
-                    if !factor.is_finite() {
+                    if !factor.is_finite()
+                        || self
+                            .exclusions
+                            .is_some_and(|excluded| excluded.excludes_trip(self.view.backing(trip)))
+                    {
                         continue;
                     }
                     if factor < cleanest {

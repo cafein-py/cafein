@@ -29,6 +29,9 @@ pub(crate) fn resolved_bounds(
     departures: &[u32],
 ) -> Vec<Vec<u32>> {
     let stop_count = timetable.stop_count() as usize;
+    // The bound must count exactly the supply the restricted search can
+    // use, so the exclusion masks apply here identically.
+    let exclusions = request.exclusions.as_deref();
     // The same saturation as `Search::pass`: the bound must not come
     // from a round the multicriteria search cannot reach.
     let rounds = request.max_transfers.min(254) as usize + 1;
@@ -53,6 +56,9 @@ pub(crate) fn resolved_bounds(
     for &departure in departures {
         let mut fresh: Vec<StopIdx> = Vec::new();
         for &(stop, seconds) in &request.access {
+            if exclusions.is_some_and(|excluded| excluded.excludes_stop(stop)) {
+                continue;
+            }
             let arrival = departure.saturating_add(seconds);
             if improve(&mut best, 0, stop, arrival) {
                 fresh.push(stop);
@@ -69,6 +75,11 @@ pub(crate) fn resolved_bounds(
             for &stop in &fresh {
                 let at = best[round - 1][stop.0 as usize];
                 for served in timetable.patterns_at_stop(stop) {
+                    if exclusions.is_some_and(|excluded| {
+                        excluded.excludes_route(timetable.pattern_route(served.pattern))
+                    }) {
+                        continue;
+                    }
                     let positions = timetable.pattern_stops(served.pattern).len();
                     if served.position as usize + 1 >= positions {
                         continue;
@@ -94,7 +105,9 @@ pub(crate) fn resolved_bounds(
                 for (position, &stop) in stops.iter().enumerate().skip(entries[0].0 as usize) {
                     if let Some(trip) = current {
                         let arrival = view.stored_times(timetable, trip)[position].arrival - offset;
-                        if improve(&mut best, round, stop, arrival) {
+                        if !exclusions.is_some_and(|excluded| excluded.excludes_stop(stop))
+                            && improve(&mut best, round, stop, arrival)
+                        {
                             rode.push(stop);
                         }
                     }
@@ -109,7 +122,11 @@ pub(crate) fn resolved_bounds(
                         };
                         for rank in first.0..view.line_trips(line).end {
                             let trip = ViewTrip(rank);
-                            if !factors[view.backing(trip).0 as usize].is_finite() {
+                            if !factors[view.backing(trip).0 as usize].is_finite()
+                                || exclusions.is_some_and(|excluded| {
+                                    excluded.excludes_trip(view.backing(trip))
+                                })
+                            {
                                 continue;
                             }
                             let departs =
@@ -132,6 +149,9 @@ pub(crate) fn resolved_bounds(
                 let at = best[round][stop.0 as usize];
                 for footpath in footpaths.from_stop(stop) {
                     let arrival = at.saturating_add(footpath.duration);
+                    if exclusions.is_some_and(|excluded| excluded.excludes_stop(footpath.to)) {
+                        continue;
+                    }
                     if improve(&mut best, round, footpath.to, arrival) {
                         next.push(footpath.to);
                     }

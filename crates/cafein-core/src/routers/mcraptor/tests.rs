@@ -1440,6 +1440,7 @@ fn attribution_counters_hold_their_identities() {
         25.0,
         0,
         &[],
+        None,
     );
     search.ops = true;
     let request = request(StopIdx(0), StopIdx(5), 2);
@@ -1582,6 +1583,7 @@ fn slack_and_penalty_searches_never_use_the_strict_path() {
         25.0,
         0,
         &[],
+        None,
     );
     assert!(strict.strict_bags);
     let slack = Search::start(
@@ -1593,16 +1595,17 @@ fn slack_and_penalty_searches_never_use_the_strict_path() {
         25.0,
         120,
         &[],
+        None,
     );
     assert!(!slack.strict_bags);
     let penalties = [300u32];
     let penalised = Search::start(
-        &view, &timetable, &footpaths, &geometry, &factors, 25.0, 0, &penalties,
+        &view, &timetable, &footpaths, &geometry, &factors, 25.0, 0, &penalties, None,
     );
     assert!(!penalised.strict_bags);
     let bans = [u32::MAX];
     let banned = Search::start(
-        &view, &timetable, &footpaths, &geometry, &factors, 25.0, 0, &bans,
+        &view, &timetable, &footpaths, &geometry, &factors, 25.0, 0, &bans, None,
     );
     assert!(!banned.strict_bags);
     // Only the strict search owns an edge-major batch.
@@ -1669,6 +1672,7 @@ fn forced_strict_and_forced_general_paths_have_identical_coordinates() {
             bucket,
             0,
             &[],
+            None,
         );
         let mut general = Search::start(
             &view,
@@ -1679,6 +1683,7 @@ fn forced_strict_and_forced_general_paths_have_identical_coordinates() {
             bucket,
             0,
             &[],
+            None,
         );
         general.strict_bags = false;
         general.batch = None;
