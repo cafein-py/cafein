@@ -1364,6 +1364,8 @@ fn mapped_from(owned: &StreetNetwork) -> StreetNetwork {
         cumulative,
         index_boxes,
         index_payload,
+        attributes: None,
+        elevations: None,
     })
     .unwrap()
 }
@@ -1433,6 +1435,8 @@ fn mapped_adoption_refuses_misaligned_or_truncated_ranges() {
         cumulative: (0, 2),
         index_boxes: (0, 4),
         index_payload: (0, 2),
+        attributes: None,
+        elevations: None,
     };
     // An f64 array at a 4-byte offset is misaligned; one past the
     // buffer is out of bounds.

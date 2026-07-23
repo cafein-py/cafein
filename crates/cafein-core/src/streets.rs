@@ -114,6 +114,9 @@ pub enum StreetError {
     /// A mapped array range is out of bounds, misaligned, or shaped
     /// inconsistently with the index payload.
     InvalidMapping,
+    /// A multimodal attribute or elevation array does not match the graph's
+    /// edge, adjacency-slot, or coordinate count.
+    InvalidAttributes,
 }
 
 impl std::fmt::Display for StreetError {
@@ -155,6 +158,12 @@ impl std::fmt::Display for StreetError {
             StreetError::InvalidMapping => {
                 write!(f, "a mapped street array is out of bounds or misaligned")
             }
+            StreetError::InvalidAttributes => {
+                write!(
+                    f,
+                    "a multimodal attribute or elevation array does not match the graph shape"
+                )
+            }
         }
     }
 }
@@ -169,7 +178,7 @@ mod search;
 mod snap;
 
 use geo::*;
-pub use graph::{Backing, MappedStreets, StreetNetwork, StreetNetworkParts};
+pub use graph::{Backing, MappedStreets, StreetAttributes, StreetNetwork, StreetNetworkParts};
 use index::*;
 use search::*;
 

@@ -3,6 +3,10 @@
 
 use super::*;
 
+/// The six installed street-attribute arrays, in canonical order, as the
+/// inspection getter returns them to Python.
+type StreetAttributeArrays = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u16>);
+
 #[pymethods]
 impl TransportNetwork {
     /// Build a network from one or several GTFS zip archives.
@@ -663,6 +667,91 @@ impl TransportNetwork {
         self.streets
             .as_ref()
             .is_some_and(StreetNetwork::has_hierarchy)
+    }
+
+    /// Attaches synthetic multimodal edge attributes to the installed street
+    /// network, for exercising the format-12 round-trip before the real
+    /// producers (OSM extraction, profile compiler) exist. Internal surface;
+    /// each array must match the graph's slot/edge shape.
+    fn _install_street_attributes(
+        &mut self,
+        adj_access: Vec<u8>,
+        adj_facility: Vec<u8>,
+        edge_highway: Vec<u8>,
+        edge_surface: Vec<u8>,
+        edge_smoothness: Vec<u8>,
+        edge_flags: Vec<u16>,
+    ) -> PyResult<()> {
+        let streets = self
+            .streets
+            .as_mut()
+            .ok_or_else(|| PyValueError::new_err("no street network is installed"))?;
+        streets
+            .install_street_attributes(StreetAttributes {
+                adj_access,
+                adj_facility,
+                edge_highway,
+                edge_surface,
+                edge_smoothness,
+                edge_flags,
+            })
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
+    /// Attaches synthetic per-coordinate elevations. Internal surface.
+    fn _install_elevations(&mut self, elevations: Vec<f32>) -> PyResult<()> {
+        let streets = self
+            .streets
+            .as_mut()
+            .ok_or_else(|| PyValueError::new_err("no street network is installed"))?;
+        streets
+            .install_elevations(elevations)
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
+    /// The installed street attributes as `(adj_access, adj_facility,
+    /// edge_highway, edge_surface, edge_smoothness, edge_flags)`, or `None`.
+    /// Internal inspection surface for the round-trip tests.
+    fn _street_attributes(&self) -> Option<StreetAttributeArrays> {
+        let attributes = self.streets.as_ref()?.street_attributes()?;
+        Some((
+            attributes.adj_access.clone(),
+            attributes.adj_facility.clone(),
+            attributes.edge_highway.clone(),
+            attributes.edge_surface.clone(),
+            attributes.edge_smoothness.clone(),
+            attributes.edge_flags.clone(),
+        ))
+    }
+
+    /// The installed per-coordinate elevations, or `None`. Internal surface.
+    fn _street_elevations(&self) -> Option<Vec<f32>> {
+        self.streets.as_ref()?.elevations().map(<[f32]>::to_vec)
+    }
+
+    /// The installed street network's `(adjacency_slots, edges, coordinates)`
+    /// counts, for sizing synthetic attributes in tests. Internal surface.
+    fn _street_attribute_shape(&self) -> Option<(u32, u32, u32)> {
+        let streets = self.streets.as_ref()?;
+        Some((
+            2 * streets.edge_count(),
+            streets.edge_count(),
+            streets.coordinate_count(),
+        ))
+    }
+
+    /// The number of street-array descriptors this network would save: the 13
+    /// core arrays, plus six for an attribute group and one for elevations.
+    /// Internal surface for the walk-only-vs-multimodal descriptor red-check.
+    fn _street_descriptor_count(&self) -> Option<usize> {
+        let streets = self.streets.as_ref()?;
+        Some(
+            13 + if streets.street_attributes().is_some() {
+                6
+            } else {
+                0
+            } + usize::from(streets.elevations().is_some()),
+        )
     }
 
     /// Walking times to every transit stop reachable from a coordinate.

@@ -140,10 +140,32 @@ impl Arrays {
     array_accessor!(index_payload, u32);
 }
 
+/// The optional multimodal edge attributes: per-adjacency-slot mode
+/// permissions and facility flags, and per-physical-edge class codes. All
+/// six arrays are present together (a multimodal build) or the group is
+/// absent (walk-only). Always owned — small relative to the CSR, and kept
+/// out of the mapped path so it needs no `u8`/`u16` slice mapping yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreetAttributes {
+    /// Mode-permission bits per adjacency slot (`2·edges`).
+    pub adj_access: Vec<u8>,
+    /// Facility/directional flags per adjacency slot (`2·edges`).
+    pub adj_facility: Vec<u8>,
+    /// Highway-class code per physical edge.
+    pub edge_highway: Vec<u8>,
+    /// Surface code per physical edge.
+    pub edge_surface: Vec<u8>,
+    /// Smoothness code per physical edge.
+    pub edge_smoothness: Vec<u8>,
+    /// Packed edge flags per physical edge.
+    pub edge_flags: Vec<u16>,
+}
+
 /// Where each street array lives inside a mapped artifact: byte offsets
 /// into the backing store plus element counts, as the artifact's
 /// descriptor table records them. The index level starts are not mapped —
-/// they are a pure function of the leaf count and are recomputed.
+/// they are a pure function of the leaf count and are recomputed. The
+/// optional multimodal arrays are decoded owned (see [`StreetAttributes`]).
 pub struct MappedStreets {
     pub backing: std::sync::Arc<dyn Backing>,
     pub vertex_count: u32,
@@ -162,6 +184,11 @@ pub struct MappedStreets {
     pub cumulative: (u64, u64),
     pub index_boxes: (u64, u64),
     pub index_payload: (u64, u64),
+    /// The optional multimodal attributes, decoded owned by the loader when
+    /// the artifact carries them, else `None` (a walk-only artifact).
+    pub attributes: Option<StreetAttributes>,
+    /// The optional per-coordinate elevations, decoded owned, else `None`.
+    pub elevations: Option<Vec<f32>>,
 }
 
 /// The walking street graph with its spatial index and stop links.
@@ -204,6 +231,14 @@ pub(super) struct StreetGraph {
     /// extraction, so it holds, but an asymmetric graph is marked ineligible
     /// and falls back to the per-point search.
     pub(super) symmetric: std::sync::OnceLock<bool>,
+    /// The optional multimodal edge attributes (mode permissions, facility
+    /// flags, class codes). `None` on a walk-only build; the current routing
+    /// never reads them. Persisted with the artifact when present.
+    pub(super) attributes: Option<StreetAttributes>,
+    /// The optional per-coordinate elevations, aligned one-to-one with the
+    /// geometry `lons`/`lats`/`cumulative`. `None` unless elevation was
+    /// enabled; persisted with the artifact when present.
+    pub(super) elevations: Option<Vec<f32>>,
 }
 
 /// The GTFS-derived stop links: how each snapped stop enters the graph, the
@@ -441,6 +476,8 @@ impl StreetNetwork {
             level_starts: index.level_starts,
             contraction: None,
             symmetric: std::sync::OnceLock::new(),
+            attributes: None,
+            elevations: None,
         };
         Ok(StreetNetwork {
             graph,
@@ -482,6 +519,49 @@ impl StreetNetwork {
         }
     }
 
+    /// The installed multimodal edge attributes, when present.
+    pub fn street_attributes(&self) -> Option<&StreetAttributes> {
+        self.graph.attributes.as_ref()
+    }
+
+    /// The installed per-coordinate elevations, when present.
+    pub fn elevations(&self) -> Option<&[f32]> {
+        self.graph.elevations.as_deref()
+    }
+
+    /// Attaches multimodal edge attributes to the graph, replacing any
+    /// installed set. Every array must match the graph's shape: the two
+    /// adjacency-slot arrays span `2·edges`, the four per-edge arrays span
+    /// `edges`; otherwise the attributes are rejected and none are installed.
+    pub fn install_street_attributes(
+        &mut self,
+        attributes: StreetAttributes,
+    ) -> Result<(), StreetError> {
+        let slots = 2 * self.edge_count() as usize;
+        let edges = self.edge_count() as usize;
+        if attributes.adj_access.len() != slots
+            || attributes.adj_facility.len() != slots
+            || attributes.edge_highway.len() != edges
+            || attributes.edge_surface.len() != edges
+            || attributes.edge_smoothness.len() != edges
+            || attributes.edge_flags.len() != edges
+        {
+            return Err(StreetError::InvalidAttributes);
+        }
+        self.graph.attributes = Some(attributes);
+        Ok(())
+    }
+
+    /// Attaches per-coordinate elevations, replacing any installed set. The
+    /// array must have one value per stored geometry coordinate.
+    pub fn install_elevations(&mut self, elevations: Vec<f32>) -> Result<(), StreetError> {
+        if elevations.len() != self.arrays().lons().len() {
+            return Err(StreetError::InvalidAttributes);
+        }
+        self.graph.elevations = Some(elevations);
+        Ok(())
+    }
+
     /// Number of street vertices.
     pub fn vertex_count(&self) -> u32 {
         self.arrays().adjacency_offsets().len() as u32 - 1
@@ -490,6 +570,11 @@ impl StreetNetwork {
     /// Number of street edges.
     pub fn edge_count(&self) -> u32 {
         (self.arrays().endpoints().len() / 2) as u32
+    }
+
+    /// Number of stored geometry coordinates (the elevation array's length).
+    pub fn coordinate_count(&self) -> u32 {
+        self.arrays().lons().len() as u32
     }
 
     /// Number of stop links.
@@ -606,6 +691,8 @@ impl StreetNetwork {
             index_payload: self.arrays().index_payload().to_vec(),
             index_level_starts: self.graph.level_starts.clone(),
             links: self.stop_links.links.clone(),
+            attributes: self.graph.attributes.clone(),
+            elevations: self.graph.elevations.clone(),
         }
     }
 
@@ -638,6 +725,8 @@ impl StreetNetwork {
                 level_starts: parts.index_level_starts,
                 contraction: None,
                 symmetric: std::sync::OnceLock::new(),
+                attributes: parts.attributes,
+                elevations: parts.elevations,
             },
             stop_links: StopLinks {
                 links: parts.links,
@@ -691,6 +780,8 @@ impl StreetNetwork {
                 level_starts,
                 contraction: None,
                 symmetric: std::sync::OnceLock::new(),
+                attributes: spec.attributes,
+                elevations: spec.elevations,
             },
             stop_links: StopLinks {
                 links: spec.links,
@@ -725,6 +816,10 @@ pub struct StreetNetworkParts {
     pub index_payload: Vec<u32>,
     pub index_level_starts: Vec<u32>,
     pub links: Vec<StoredLink>,
+    /// The optional multimodal edge attributes, present on a multimodal build.
+    pub attributes: Option<StreetAttributes>,
+    /// The optional per-coordinate elevations, present when elevation is on.
+    pub elevations: Option<Vec<f32>>,
 }
 
 /// The `(vertex, link index)` pairs behind [`StreetNetwork::links_at`],
