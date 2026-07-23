@@ -196,7 +196,9 @@ def _install_synthetic_attributes(core, seed=0):
     return core._street_attributes(), core._street_elevations()
 
 
-def test_round_trip_preserves_street_attributes(artifact_path, mmap_available, tmp_path):
+def test_round_trip_preserves_street_attributes(
+    artifact_path, mmap_available, tmp_path
+):
     # The optional multimodal arrays (format 12) round-trip through save/load,
     # owned and mapped, exactly as attached — the schema the OSM extraction and
     # profile compiler will fill later. A fresh load off the walk-only artifact
@@ -284,8 +286,10 @@ def test_load_rejects_malformed_optional_descriptor(
     net.save(path)
     # The EdgeFlags descriptor is `array=18 (u32), kind=U16=1 (u32), count=edges
     # (u64), offset (u64)`; overstate the count so the layout no longer fits.
-    needle = (18).to_bytes(4, "little") + (1).to_bytes(4, "little") + edges.to_bytes(
-        8, "little"
+    needle = (
+        (18).to_bytes(4, "little")
+        + (1).to_bytes(4, "little")
+        + edges.to_bytes(8, "little")
     )
 
     def overstate_count(meta):
@@ -308,7 +312,11 @@ def test_install_street_attributes_rejects_wrong_shape(artifact_path):
     slots, edges, coordinates = net._core._street_attribute_shape()
     with pytest.raises(ValueError, match="does not match the graph shape"):
         net._core._install_street_attributes(
-            [0] * (slots - 1), [0] * slots, [0] * edges, [0] * edges, [0] * edges,
+            [0] * (slots - 1),
+            [0] * slots,
+            [0] * edges,
+            [0] * edges,
+            [0] * edges,
             [0] * edges,
         )
     with pytest.raises(ValueError, match="does not match the graph shape"):
