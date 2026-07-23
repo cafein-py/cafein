@@ -62,9 +62,9 @@ impl StreetNetwork {
     /// intersects the envelope, through the array accessors.
     pub(super) fn query_index_into(&self, envelope: &Envelope, matches: &mut Vec<(u32, u32)>) {
         query_packed_index(
-            self.arrays.index_boxes(),
-            self.arrays.index_payload(),
-            &self.level_starts,
+            self.arrays().index_boxes(),
+            self.arrays().index_payload(),
+            self.level_starts(),
             envelope,
             matches,
         );
@@ -105,7 +105,7 @@ impl StreetNetwork {
         let (px, py) = (ax + t * dx, ay + t * dy);
         let connector = (px * px + py * py).sqrt();
 
-        let end = self.arrays.coordinate_offsets()[edge as usize + 1] as usize;
+        let end = self.arrays().coordinate_offsets()[edge as usize + 1] as usize;
         let along = self.along(a) + t * (self.along(b) - self.along(a));
         let total = self.along(end - 1);
         let fraction = if total > 0.0 { along / total } else { 0.0 };

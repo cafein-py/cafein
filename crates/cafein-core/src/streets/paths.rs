@@ -19,8 +19,8 @@ impl StreetNetwork {
         to_point: (f64, f64),
         to: &Snap,
     ) -> Option<(Vec<(f64, f64)>, f64)> {
-        let from_length = self.arrays.lengths()[from.edge as usize];
-        let to_length = self.arrays.lengths()[to.edge as usize];
+        let from_length = self.arrays().lengths()[from.edge as usize];
+        let to_length = self.arrays().lengths()[to.edge as usize];
         // The direct candidate: both points on one edge.
         let direct = (from.edge == to.edge).then(|| {
             from.connector + (from.fraction - to.fraction).abs() * from_length + to.connector
@@ -134,10 +134,10 @@ impl StreetNetwork {
         state: &mut SearchState,
     ) {
         state.prepare_with_previous(self.vertex_count() as usize);
-        let adjacency_offsets = self.arrays.adjacency_offsets();
-        let adj_targets = self.arrays.adj_targets();
-        let adj_meters = self.arrays.adj_meters();
-        let adj_edges = self.arrays.adj_edges();
+        let adjacency_offsets = self.arrays().adjacency_offsets();
+        let adj_targets = self.arrays().adj_targets();
+        let adj_meters = self.arrays().adj_meters();
+        let adj_edges = self.arrays().adj_edges();
         for &(vertex, distance) in sources {
             if distance < state.distance(vertex) {
                 state.set_distance(vertex, distance);
@@ -174,8 +174,8 @@ impl StreetNetwork {
 
     /// The `(lon, lat)` point at a fraction of an edge's true length.
     pub(super) fn point_at(&self, edge: u32, fraction: f64) -> (f64, f64) {
-        let start = self.arrays.coordinate_offsets()[edge as usize] as usize;
-        let end = self.arrays.coordinate_offsets()[edge as usize + 1] as usize;
+        let start = self.arrays().coordinate_offsets()[edge as usize] as usize;
+        let end = self.arrays().coordinate_offsets()[edge as usize + 1] as usize;
         let total = self.along(end - 1);
         self.interpolate(start, end, fraction.clamp(0.0, 1.0) * total)
     }
@@ -189,8 +189,8 @@ impl StreetNetwork {
         from_fraction: f64,
         to_fraction: f64,
     ) -> Vec<(f64, f64)> {
-        let start = self.arrays.coordinate_offsets()[edge as usize] as usize;
-        let end = self.arrays.coordinate_offsets()[edge as usize + 1] as usize;
+        let start = self.arrays().coordinate_offsets()[edge as usize] as usize;
+        let end = self.arrays().coordinate_offsets()[edge as usize + 1] as usize;
         let total = self.along(end - 1);
         let (low, high, reversed) = if from_fraction <= to_fraction {
             (from_fraction, to_fraction, false)
@@ -255,9 +255,9 @@ impl StreetNetwork {
         state: &mut SearchState,
     ) {
         state.prepare(self.vertex_count() as usize);
-        let adjacency_offsets = self.arrays.adjacency_offsets();
-        let adj_targets = self.arrays.adj_targets();
-        let adj_meters = self.arrays.adj_meters();
+        let adjacency_offsets = self.arrays().adjacency_offsets();
+        let adj_targets = self.arrays().adj_targets();
+        let adj_meters = self.arrays().adj_meters();
         for &(vertex, distance) in sources {
             if distance <= cutoff + 1e-9 && distance < state.distance(vertex) {
                 state.set_distance(vertex, distance);
