@@ -202,10 +202,10 @@ impl TransportNetwork {
 
 pub(super) const ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINET";
 
-// 11: the McULTRA/McTBTR factor binding stores the full per-trip factor
-// vector (exact equality proof) instead of a 64-bit fingerprint; earlier
-// formats carry only the hash and must be rebuilt.
-pub(super) const ARTIFACT_FORMAT: u32 = 11;
+// 12: the STREETS section may carry the optional multimodal arrays
+// (directional permissions, edge attributes, elevations) after the core
+// graph; walk-only artifacts omit them. Earlier formats must be rebuilt.
+pub(super) const ARTIFACT_FORMAT: u32 = 12;
 
 /// Section tags in the container directory.
 pub(super) const SECTION_META: u16 = 1;
@@ -300,7 +300,9 @@ pub(super) struct ArrayDescriptor {
     offset: u64,
 }
 
-/// The street arrays, in their fixed on-disk order.
+/// The street arrays, in their fixed on-disk order. The first thirteen are
+/// the mandatory core graph; the trailing seven are the optional multimodal
+/// arrays (a walk-only artifact omits them).
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum StreetArray {
     AdjacencyOffsets,
@@ -316,11 +318,20 @@ pub(super) enum StreetArray {
     IndexBoxes,
     IndexPayload,
     IndexLevelStarts,
+    AdjAccess,
+    AdjFacility,
+    EdgeHighway,
+    EdgeSurface,
+    EdgeSmoothness,
+    EdgeFlags,
+    CoordinateElevations,
 }
 
 /// Element type of a raw street array.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum ArrayKind {
+    U8,
+    U16,
     U32,
     I32,
     F32,
@@ -330,6 +341,8 @@ pub(super) enum ArrayKind {
 impl ArrayKind {
     fn size(self) -> u64 {
         match self {
+            ArrayKind::U8 => 1,
+            ArrayKind::U16 => 2,
             ArrayKind::U32 | ArrayKind::I32 | ArrayKind::F32 => 4,
             ArrayKind::F64 => 8,
         }
@@ -353,6 +366,30 @@ pub(super) const STREET_ARRAY_ORDER: [(StreetArray, ArrayKind); 13] = [
     (StreetArray::IndexBoxes, ArrayKind::I32),
     (StreetArray::IndexPayload, ArrayKind::U32),
     (StreetArray::IndexLevelStarts, ArrayKind::U32),
+];
+
+/// The optional multimodal street arrays, in their canonical on-disk order.
+/// A present artifact stores an order-preserving subsequence of these after
+/// the core arrays: the six attribute arrays as a group (all or none), and
+/// the elevations independently.
+pub(super) const OPTIONAL_STREET_ARRAY_ORDER: [(StreetArray, ArrayKind); 7] = [
+    (StreetArray::AdjAccess, ArrayKind::U8),
+    (StreetArray::AdjFacility, ArrayKind::U8),
+    (StreetArray::EdgeHighway, ArrayKind::U8),
+    (StreetArray::EdgeSurface, ArrayKind::U8),
+    (StreetArray::EdgeSmoothness, ArrayKind::U8),
+    (StreetArray::EdgeFlags, ArrayKind::U16),
+    (StreetArray::CoordinateElevations, ArrayKind::F32),
+];
+
+/// The six attribute arrays that form the all-or-none multimodal group.
+pub(super) const STREET_ATTRIBUTE_ARRAYS: [StreetArray; 6] = [
+    StreetArray::AdjAccess,
+    StreetArray::AdjFacility,
+    StreetArray::EdgeHighway,
+    StreetArray::EdgeSurface,
+    StreetArray::EdgeSmoothness,
+    StreetArray::EdgeFlags,
 ];
 
 /// A read-only memory map of an artifact file, kept alive by the street
@@ -478,6 +515,16 @@ pub(super) fn encode_streets(parts: &StreetNetworkParts) -> (Vec<ArrayDescriptor
             bytes.extend_from_slice(&encode(value)[..size]);
         }
     }
+    fn u8_bytes(value: u8) -> [u8; 8] {
+        let mut buffer = [0u8; 8];
+        buffer[0] = value;
+        buffer
+    }
+    fn u16_bytes(value: u16) -> [u8; 8] {
+        let mut buffer = [0u8; 8];
+        buffer[..2].copy_from_slice(&value.to_le_bytes());
+        buffer
+    }
     fn u32_bytes(value: u32) -> [u8; 8] {
         let mut buffer = [0u8; 8];
         buffer[..4].copy_from_slice(&value.to_le_bytes());
@@ -537,6 +584,26 @@ pub(super) fn encode_streets(parts: &StreetNetworkParts) -> (Vec<ArrayDescriptor
         &parts.index_level_starts,
         u32_bytes,
     );
+    // The optional multimodal arrays follow the core graph, in canonical
+    // order: the attribute group (all six together) then the elevations.
+    if let Some(attributes) = &parts.attributes {
+        push(b, d, AdjAccess, U8, &attributes.adj_access, u8_bytes);
+        push(b, d, AdjFacility, U8, &attributes.adj_facility, u8_bytes);
+        push(b, d, EdgeHighway, U8, &attributes.edge_highway, u8_bytes);
+        push(b, d, EdgeSurface, U8, &attributes.edge_surface, u8_bytes);
+        push(
+            b,
+            d,
+            EdgeSmoothness,
+            U8,
+            &attributes.edge_smoothness,
+            u8_bytes,
+        );
+        push(b, d, EdgeFlags, U16, &attributes.edge_flags, u16_bytes);
+    }
+    if let Some(elevations) = &parts.elevations {
+        push(b, d, CoordinateElevations, F32, elevations, f32_bytes);
+    }
     (descriptors, bytes)
 }
 
@@ -573,21 +640,43 @@ pub(super) fn validate_street_shape(
     section_length: u64,
     stop_count: u32,
 ) -> PyResult<Vec<u32>> {
-    if meta.descriptors.len() != STREET_ARRAY_ORDER.len() {
+    // The core arrays come first, in fixed order; the optional multimodal
+    // arrays follow as an order-preserving subsequence of the canonical
+    // optional order (any absent, but never reordered or duplicated).
+    if meta.descriptors.len() < STREET_ARRAY_ORDER.len() {
         return Err(corrupted(path, "street descriptor table shape"));
     }
-    // The arrays must occupy the section exactly as the writer laid them
-    // out: sequential, each at the next aligned position — no gaps,
-    // overlaps, or aliasing. Checked arithmetic throughout.
-    let mut expected_offset = 0u64;
-    let mut last_end = 0u64;
-    for (descriptor, &(array, kind)) in meta.descriptors.iter().zip(&STREET_ARRAY_ORDER) {
+    let (core, optional) = meta.descriptors.split_at(STREET_ARRAY_ORDER.len());
+    for (descriptor, &(array, kind)) in core.iter().zip(&STREET_ARRAY_ORDER) {
         if descriptor.array != array || descriptor.kind != kind {
             return Err(corrupted(path, "street descriptor table shape"));
         }
+    }
+    let mut expected = OPTIONAL_STREET_ARRAY_ORDER.iter().peekable();
+    for descriptor in optional {
+        loop {
+            match expected.next() {
+                Some(&(array, kind)) if descriptor.array == array => {
+                    if descriptor.kind != kind {
+                        return Err(corrupted(path, "street descriptor table shape"));
+                    }
+                    break;
+                }
+                Some(_) => continue,
+                None => return Err(corrupted(path, "street descriptor table shape")),
+            }
+        }
+    }
+    // The arrays must occupy the section exactly as the writer laid them
+    // out: sequential, each at the next aligned position — no gaps,
+    // overlaps, or aliasing. Checked arithmetic throughout, over the core
+    // and any optional arrays alike.
+    let mut expected_offset = 0u64;
+    let mut last_end = 0u64;
+    for descriptor in &meta.descriptors {
         let extent = descriptor
             .count
-            .checked_mul(kind.size())
+            .checked_mul(descriptor.kind.size())
             .and_then(|length| descriptor.offset.checked_add(length));
         let Some(end) = extent.filter(|&end| end <= section_length) else {
             return Err(corrupted(path, "street array bounds"));
@@ -625,6 +714,35 @@ pub(super) fn validate_street_shape(
     if !consistent {
         return Err(corrupted(path, "street array consistency"));
     }
+    // Optional arrays: the six attributes are an all-or-none group, and every
+    // present optional array must match the graph's slot/edge/coordinate
+    // count. The subsequence order was checked above; here it is the group
+    // completeness and the lengths.
+    let slots = count(1);
+    let optional = |array: StreetArray| {
+        meta.descriptors[STREET_ARRAY_ORDER.len()..]
+            .iter()
+            .find(|d| d.array == array)
+    };
+    let attributes_present = STREET_ATTRIBUTE_ARRAYS
+        .iter()
+        .filter(|&&a| optional(a).is_some())
+        .count();
+    if attributes_present != 0 && attributes_present != STREET_ATTRIBUTE_ARRAYS.len() {
+        return Err(corrupted(path, "street attribute group"));
+    }
+    let attribute_length =
+        |array: StreetArray, expected: u64| optional(array).is_none_or(|d| d.count == expected);
+    let attributes_consistent = attribute_length(StreetArray::AdjAccess, slots)
+        && attribute_length(StreetArray::AdjFacility, slots)
+        && attribute_length(StreetArray::EdgeHighway, edges)
+        && attribute_length(StreetArray::EdgeSurface, edges)
+        && attribute_length(StreetArray::EdgeSmoothness, edges)
+        && attribute_length(StreetArray::EdgeFlags, edges)
+        && attribute_length(StreetArray::CoordinateElevations, coordinates);
+    if !attributes_consistent {
+        return Err(corrupted(path, "street array consistency"));
+    }
     for link in &meta.links {
         if u64::from(link.edge) >= edges
             || link.stop.0 >= stop_count
@@ -638,6 +756,67 @@ pub(super) fn validate_street_shape(
         }
     }
     Ok(expected_levels)
+}
+
+/// Reads the optional multimodal arrays owned, located by descriptor
+/// identity — shared by the owned decode and the mapped load, which also
+/// keeps them owned. `section` is the whole STREETS section; descriptor
+/// offsets are relative to it. The shape validation has confirmed the
+/// attribute group is complete and every length matches, so a present group
+/// yields `Some` and reading only pages in the optional bytes.
+pub(super) fn decode_optional_street_arrays(
+    section: &[u8],
+    descriptors: &[ArrayDescriptor],
+) -> (Option<StreetAttributes>, Option<Vec<f32>>) {
+    fn slice<'a>(section: &'a [u8], descriptor: &ArrayDescriptor) -> &'a [u8] {
+        let start = descriptor.offset as usize;
+        let end = start + (descriptor.count * descriptor.kind.size()) as usize;
+        &section[start..end]
+    }
+    let find = |array: StreetArray| descriptors.iter().find(|d| d.array == array);
+    let read_u8 = |array| find(array).map(|d| slice(section, d).to_vec());
+    let read_u16 = |array| {
+        find(array).map(|d| {
+            slice(section, d)
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+                .collect::<Vec<u16>>()
+        })
+    };
+    let read_f32 = |array| {
+        find(array).map(|d| {
+            slice(section, d)
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect::<Vec<f32>>()
+        })
+    };
+    let attributes = match (
+        read_u8(StreetArray::AdjAccess),
+        read_u8(StreetArray::AdjFacility),
+        read_u8(StreetArray::EdgeHighway),
+        read_u8(StreetArray::EdgeSurface),
+        read_u8(StreetArray::EdgeSmoothness),
+        read_u16(StreetArray::EdgeFlags),
+    ) {
+        (
+            Some(adj_access),
+            Some(adj_facility),
+            Some(edge_highway),
+            Some(edge_surface),
+            Some(edge_smoothness),
+            Some(edge_flags),
+        ) => Some(StreetAttributes {
+            adj_access,
+            adj_facility,
+            edge_highway,
+            edge_surface,
+            edge_smoothness,
+            edge_flags,
+        }),
+        _ => None,
+    };
+    (attributes, read_f32(StreetArray::CoordinateElevations))
 }
 
 /// Decodes the street arrays into owned parts and cross-checks their
@@ -682,6 +861,7 @@ pub(super) fn decode_streets(
         })
     };
 
+    let (attributes, elevations) = decode_optional_street_arrays(section, &meta.descriptors);
     let parts = StreetNetworkParts {
         vertex_count: meta.vertex_count,
         adjacency_offsets: u32s(0),
@@ -698,6 +878,8 @@ pub(super) fn decode_streets(
         index_payload: u32s(11),
         index_level_starts: u32s(12),
         links: meta.links,
+        attributes,
+        elevations,
     };
 
     // Interior values: offsets monotonic with at least two coordinates
@@ -1003,6 +1185,19 @@ pub(super) fn load_mapped(
                 .iter()
                 .map(|descriptor| (layout.streets_offset + descriptor.offset, descriptor.count))
                 .collect();
+            // The core CSR/geometry arrays stay mapped; the optional
+            // multimodal arrays are decoded owned, paging in only their
+            // bytes (a walk-only artifact has none and stays fully lazy).
+            let section = &bytes[layout.streets_offset as usize
+                ..(layout.streets_offset + layout.streets_length) as usize];
+            let (attributes, elevations) =
+                decode_optional_street_arrays(section, &streets_meta.descriptors);
+            if verify != Some(true) {
+                streets_read += streets_meta.descriptors[STREET_ARRAY_ORDER.len()..]
+                    .iter()
+                    .map(|descriptor| descriptor.count * descriptor.kind.size())
+                    .sum::<u64>();
+            }
             let spec = MappedStreets {
                 backing,
                 vertex_count: streets_meta.vertex_count,
@@ -1019,6 +1214,8 @@ pub(super) fn load_mapped(
                 cumulative: ranges[9],
                 index_boxes: ranges[10],
                 index_payload: ranges[11],
+                attributes,
+                elevations,
             };
             Some(
                 StreetNetwork::from_mapped(spec)

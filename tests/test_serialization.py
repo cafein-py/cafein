@@ -173,6 +173,148 @@ def test_round_trip_preserves_the_mcultra_set(artifact_path, tmp_path):
     assert restored._core._mcultra_factor is not None
 
 
+def _install_synthetic_attributes(core, seed=0):
+    """Attach random attribute + elevation arrays sized to a street network,
+    returning what was installed for a round-trip comparison."""
+    slots, edges, coordinates = core._street_attribute_shape()
+    rng = np.random.default_rng(seed)
+
+    def u8(n):
+        return list(map(int, rng.integers(0, 256, n, dtype=np.uint8)))
+
+    core._install_street_attributes(
+        u8(slots),
+        u8(slots),
+        u8(edges),
+        u8(edges),
+        u8(edges),
+        list(map(int, rng.integers(0, 65536, edges, dtype=np.uint16))),
+    )
+    core._install_elevations(
+        list(map(float, rng.standard_normal(coordinates).astype(np.float32)))
+    )
+    return core._street_attributes(), core._street_elevations()
+
+
+def test_round_trip_preserves_street_attributes(artifact_path, mmap_available, tmp_path):
+    # The optional multimodal arrays (format 12) round-trip through save/load,
+    # owned and mapped, exactly as attached — the schema the OSM extraction and
+    # profile compiler will fill later. A fresh load off the walk-only artifact
+    # is an independent network, so the shared fixture stays walk-only.
+    net = TransportNetwork.load(artifact_path)
+    attributes, elevations = _install_synthetic_attributes(net._core)
+    assert attributes is not None
+    # 13 core + 6 attribute + 1 elevation arrays.
+    assert net._core._street_descriptor_count() == 20
+
+    path = tmp_path / "attributed.cafein"
+    net.save(path)
+    owned = TransportNetwork.load(path)
+    assert owned._core._street_descriptor_count() == 20
+    assert owned._core._street_attributes() == attributes
+    assert owned._core._street_elevations() == elevations
+
+    if mmap_available:
+        mapped = TransportNetwork.load(path, mmap=True)
+        assert mapped.mapped
+        # The optional arrays are decoded owned, so a mapped load pages in
+        # their bytes (unlike the fully lazy walk-only case below).
+        assert mapped._core._streets_bytes_read > 0
+        assert mapped._core._street_attributes() == attributes
+        assert mapped._core._street_elevations() == elevations
+
+
+def test_walk_only_artifact_has_no_multimodal_arrays(
+    artifact_path, mmap_available, tmp_path
+):
+    # A walk-only build writes only the 13 core street arrays — no optional
+    # descriptors, no attributes, no elevations — and a mapped load stays fully
+    # lazy (zero STREETS bytes read). Attaching the multimodal arrays to the
+    # same graph strictly grows the STREETS section, so the walk-only payload
+    # demonstrably omits those bytes rather than padding them in.
+    owned = TransportNetwork.load(artifact_path)
+    assert owned._core._street_descriptor_count() == 13
+    assert owned._core._street_attributes() is None
+    assert owned._core._street_elevations() is None
+
+    _, walk_only_length = _streets_section(artifact_path)
+    attributed = TransportNetwork.load(artifact_path)
+    _install_synthetic_attributes(attributed._core)
+    attributed_path = tmp_path / "attributed.cafein"
+    attributed.save(attributed_path)
+    _, attributed_length = _streets_section(attributed_path)
+    assert attributed_length > walk_only_length
+
+    if mmap_available:
+        lazy = TransportNetwork.load(artifact_path, mmap=True)
+        assert lazy.mapped
+        assert lazy._core._streets_bytes_read == 0
+        assert lazy._core._street_attributes() is None
+
+
+def _corrupt_meta(path, edit):
+    """Rewrite an artifact's META section through `edit`, fixing its CRC so the
+    load reaches the street-shape validation instead of failing the checksum."""
+    import zlib
+
+    blob = bytearray(path.read_bytes())
+    assert blob[:8] == b"CAFEINET"
+    version_length = int.from_bytes(blob[12:14], "little")
+    directory = 14 + version_length + 4
+    assert int.from_bytes(blob[directory : directory + 2], "little") == 1  # META
+    offset = int.from_bytes(blob[directory + 2 : directory + 10], "little")
+    length = int.from_bytes(blob[directory + 10 : directory + 18], "little")
+    meta = bytearray(blob[offset : offset + length])
+    edit(meta)
+    blob[offset : offset + length] = meta
+    crc = zlib.crc32(bytes(meta)) & 0xFFFFFFFF
+    blob[directory + 18 : directory + 22] = crc.to_bytes(4, "little")
+    path.write_bytes(bytes(blob))
+
+
+def test_load_rejects_malformed_optional_descriptor(
+    artifact_path, mmap_available, tmp_path
+):
+    # A corrupted optional-array descriptor (here EdgeFlags' element count) must
+    # be rejected by the format-12 shape validation, not trusted into a query.
+    net = TransportNetwork.load(artifact_path)
+    _install_synthetic_attributes(net._core)
+    _, edges, _ = net._core._street_attribute_shape()
+    path = tmp_path / "malformed.cafein"
+    net.save(path)
+    # The EdgeFlags descriptor is `array=18 (u32), kind=U16=1 (u32), count=edges
+    # (u64), offset (u64)`; overstate the count so the layout no longer fits.
+    needle = (18).to_bytes(4, "little") + (1).to_bytes(4, "little") + edges.to_bytes(
+        8, "little"
+    )
+
+    def overstate_count(meta):
+        at = meta.find(needle)
+        assert at != -1, "EdgeFlags descriptor not found"
+        meta[at + 8 : at + 16] = (edges + 1).to_bytes(8, "little")
+
+    _corrupt_meta(path, overstate_count)
+    with pytest.raises(ValueError, match="is corrupted"):
+        TransportNetwork.load(path)
+    if mmap_available:
+        with pytest.raises(ValueError, match="is corrupted"):
+            TransportNetwork.load(path, mmap=True)
+
+
+def test_install_street_attributes_rejects_wrong_shape(artifact_path):
+    # The install path validates lengths against the graph, so a mis-sized
+    # array is refused rather than persisted into a corrupt artifact.
+    net = TransportNetwork.load(artifact_path)
+    slots, edges, coordinates = net._core._street_attribute_shape()
+    with pytest.raises(ValueError, match="does not match the graph shape"):
+        net._core._install_street_attributes(
+            [0] * (slots - 1), [0] * slots, [0] * edges, [0] * edges, [0] * edges,
+            [0] * edges,
+        )
+    with pytest.raises(ValueError, match="does not match the graph shape"):
+        net._core._install_elevations([0.0] * (coordinates + 1))
+
+
 def test_round_trip_preserves_the_tbtr_transfer_cache(helsinki_gtfs, tmp_path):
     # A cached time-only TBTR transfer set persists through save/load, so a
     # loaded network reuses it (build once, ship the artifact, query many) and
@@ -234,6 +376,14 @@ def test_load_refuses_previous_format_versions(tmp_path):
     )
     with pytest.raises(ValueError, match=r"format 9 \(written by cafein 0\.4\.0\)"):
         TransportNetwork.load(nine)
+    # Format 11 (pre the optional multimodal street arrays) refuses too: the
+    # current format is 12.
+    eleven = tmp_path / "v11.cafein"
+    eleven.write_bytes(
+        b"CAFEINET" + (11).to_bytes(4, "little") + (5).to_bytes(2, "little") + b"0.6.0"
+    )
+    with pytest.raises(ValueError, match=r"format 11 \(written by cafein 0\.6\.0\)"):
+        TransportNetwork.load(eleven)
 
 
 def test_load_refuses_corrupted_payloads(tmp_path):

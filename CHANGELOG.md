@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- The saved artifact's STREETS section can now carry optional multimodal
+  street arrays after the core walking graph — per-adjacency-slot mode
+  permissions and facility flags, per-edge class codes, and per-coordinate
+  elevations — laying the on-disk groundwork for cycling and e-scooter
+  routing. A walk-only build writes none of them and is byte-for-byte a
+  walking artifact. The format bumps to 12; artifacts written by earlier
+  versions are refused with the usual rebuild message.
+
 ## 0.6.0 — 2026-07-19
 
 - Query-time exclusion sets: ``exclude_routes=``, ``exclude_trips=``,
