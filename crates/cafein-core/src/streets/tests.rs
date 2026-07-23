@@ -79,9 +79,9 @@ fn ch_matches_bounded_dijkstra_on_a_street_network() {
     .unwrap();
     let ch = crate::ch::ContractionHierarchy::build(
         net.vertex_count(),
-        net.arrays.adjacency_offsets(),
-        net.arrays.adj_targets(),
-        net.arrays.adj_meters(),
+        net.arrays().adjacency_offsets(),
+        net.arrays().adj_targets(),
+        net.arrays().adj_meters(),
     );
     let mut state = SearchState::default();
     for source in 0..net.vertex_count() {
@@ -127,12 +127,12 @@ fn ch_buckets_match_bounded_dijkstra_on_link_vertices() {
     .unwrap();
     let ch = crate::ch::ContractionHierarchy::build(
         net.vertex_count(),
-        net.arrays.adjacency_offsets(),
-        net.arrays.adj_targets(),
-        net.arrays.adj_meters(),
+        net.arrays().adjacency_offsets(),
+        net.arrays().adj_targets(),
+        net.arrays().adj_meters(),
     );
     let mut targets: Vec<u32> = net
-        .links
+        .links()
         .iter()
         .flat_map(|link| [link.from, link.to])
         .collect();
@@ -470,9 +470,9 @@ fn densifies_long_segments() {
         vec![],
     )
     .unwrap();
-    let count = network.arrays.coordinate_offsets()[1] as usize;
+    let count = network.arrays().coordinate_offsets()[1] as usize;
     assert!(count >= 51, "expected >=51 densified points, got {count}");
-    for pair in network.arrays.lats().windows(2) {
+    for pair in network.arrays().lats().windows(2) {
         let seg = segment_length(25.0, degrees(pair[0]), 25.0, degrees(pair[1]));
         assert!(seg <= MAX_SEGMENT_METERS + 1e-6, "segment {seg} m too long");
     }
@@ -505,10 +505,10 @@ fn densifies_wide_latitude_segments() {
     )
     .unwrap();
     for (lons, lats) in network
-        .arrays
+        .arrays()
         .lons()
         .windows(2)
-        .zip(network.arrays.lats().windows(2))
+        .zip(network.arrays().lats().windows(2))
     {
         let seg = segment_length(
             degrees(lons[0]),

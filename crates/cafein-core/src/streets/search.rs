@@ -166,19 +166,17 @@ impl StreetNetwork {
         let mut seeds: Vec<(u32, f64)> = Vec::with_capacity(snaps.len() * 2);
         for snap in snaps {
             let (from, to) = self.edge_endpoints(snap.edge);
-            let length = self.arrays.lengths()[snap.edge as usize];
+            let length = self.arrays().lengths()[snap.edge as usize];
             seeds.push((from, snap.connector + snap.fraction * length));
             seeds.push((to, snap.connector + (1.0 - snap.fraction) * length));
         }
         // The reached per-vertex distances, from the contraction hierarchy when
         // installed, else a bounded Dijkstra over the graph. Both feed the same
         // link join, so the `WalkedStop`s are identical.
-        match &self.hierarchy {
-            Some(index) => CH_SCRATCH.with(|cell| {
+        match self.ch() {
+            Some((contraction, buckets)) => CH_SCRATCH.with(|cell| {
                 let scratch = &mut cell.borrow_mut();
-                index
-                    .hierarchy
-                    .one_to_many(&index.buckets, &seeds, cutoff, scratch);
+                contraction.one_to_many(buckets, &seeds, cutoff, scratch);
                 self.link_join(snaps, cutoff, walking_speed, scratch.best())
             }),
             None => SEARCH_STATE.with(|cell| {
@@ -221,9 +219,9 @@ impl StreetNetwork {
         candidates.dedup();
         let mut nearest: HashMap<StopIdx, f64> = HashMap::new();
         for index in candidates {
-            let link = &self.links[index as usize];
+            let link = &self.links()[index as usize];
             let (link_from, link_to) = (link.from, link.to);
-            let link_length = self.arrays.lengths()[link.edge as usize];
+            let link_length = self.arrays().lengths()[link.edge as usize];
             let mut meters = f64::min(
                 distance(link_from) + link.fraction * link_length,
                 distance(link_to) + (1.0 - link.fraction) * link_length,
@@ -232,7 +230,7 @@ impl StreetNetwork {
             // reaching an endpoint; keep the shortest over all.
             for snap in snaps {
                 if snap.edge == link.edge {
-                    let length = self.arrays.lengths()[snap.edge as usize];
+                    let length = self.arrays().lengths()[snap.edge as usize];
                     let direct = snap.connector
                         + (link.fraction - snap.fraction).abs() * length
                         + link.connector;
@@ -299,7 +297,7 @@ impl StreetNetwork {
         // them — a stop can snap to several edges — mirroring how
         // access_stops reaches a stop through any of its links.
         let mut by_stop: HashMap<StopIdx, Vec<Snap>> = HashMap::new();
-        for link in &self.links {
+        for link in self.links() {
             by_stop.entry(link.stop).or_default().push(Snap {
                 edge: link.edge,
                 fraction: link.fraction,
@@ -345,7 +343,7 @@ impl StreetNetwork {
         }
         let cutoff = max_seconds * walking_speed;
         let (from_u, from_v) = self.edge_endpoints(from.edge);
-        let from_length = self.arrays.lengths()[from.edge as usize];
+        let from_length = self.arrays().lengths()[from.edge as usize];
         SEARCH_STATE.with(|cell| {
             let state = &mut cell.borrow_mut();
             self.bounded_dijkstra(
@@ -360,7 +358,7 @@ impl StreetNetwork {
                 .iter()
                 .map(|target| {
                     let target = target.as_ref()?;
-                    let length = self.arrays.lengths()[target.edge as usize];
+                    let length = self.arrays().lengths()[target.edge as usize];
                     let (u, v) = self.edge_endpoints(target.edge);
                     let mut meters = f64::min(
                         state.distance(u) + target.fraction * length,
@@ -422,8 +420,8 @@ impl StreetNetwork {
 
     /// The indices of the links whose edge touches a vertex.
     pub(super) fn links_at(&self, vertex: u32) -> impl Iterator<Item = u32> + '_ {
-        let start = self.vertex_links.partition_point(|&(v, _)| v < vertex);
-        self.vertex_links[start..]
+        let start = self.vertex_links().partition_point(|&(v, _)| v < vertex);
+        self.vertex_links()[start..]
             .iter()
             .take_while(move |&&(v, _)| v == vertex)
             .map(|&(_, link)| link)
@@ -496,7 +494,7 @@ impl StreetNetwork {
         // from every stop is only worth it when there are more points to link
         // than stops to search; below that the per-point search is cheaper.
         let mut by_stop: HashMap<StopIdx, Vec<Snap>> = HashMap::new();
-        for link in &self.links {
+        for link in self.links() {
             by_stop.entry(link.stop).or_default().push(Snap {
                 edge: link.edge,
                 fraction: link.fraction,
@@ -532,7 +530,7 @@ impl StreetNetwork {
         for (point, snap) in snaps.iter().enumerate() {
             let Some(snap) = snap else { continue };
             let (from, to) = self.edge_endpoints(snap.edge);
-            let length = self.arrays.lengths()[snap.edge as usize];
+            let length = self.arrays().lengths()[snap.edge as usize];
             by_vertex[from as usize].push((point as u32, snap.connector + snap.fraction * length));
             by_vertex[to as usize].push((
                 point as u32,
@@ -557,7 +555,7 @@ impl StreetNetwork {
                 let mut seeds: Vec<(u32, f64)> = Vec::with_capacity(snaps.len() * 2);
                 for snap in &snaps {
                     let (from, to) = self.edge_endpoints(snap.edge);
-                    let length = self.arrays.lengths()[snap.edge as usize];
+                    let length = self.arrays().lengths()[snap.edge as usize];
                     seeds.push((from, snap.connector + snap.fraction * length));
                     seeds.push((to, snap.connector + (1.0 - snap.fraction) * length));
                 }
@@ -638,7 +636,7 @@ impl StreetNetwork {
             let Some(on_edge) = by_edge.get(&snap.edge) else {
                 continue;
             };
-            let length = self.arrays.lengths()[snap.edge as usize];
+            let length = self.arrays().lengths()[snap.edge as usize];
             for &(point, fraction, connector) in on_edge {
                 let metres = connector + (snap.fraction - fraction).abs() * length + snap.connector;
                 if metres <= cutoff + 1e-9 {
@@ -654,10 +652,10 @@ impl StreetNetwork {
     /// reverse with equal metres. Computed once, then cached; walking is
     /// undirected in the OSM extraction, so it holds.
     pub(super) fn is_symmetric(&self) -> bool {
-        *self.symmetric.get_or_init(|| {
-            let offsets = self.arrays.adjacency_offsets();
-            let targets = self.arrays.adj_targets();
-            let meters = self.arrays.adj_meters();
+        *self.graph.symmetric.get_or_init(|| {
+            let offsets = self.arrays().adjacency_offsets();
+            let targets = self.arrays().adj_targets();
+            let meters = self.arrays().adj_meters();
             let mut directed: std::collections::HashSet<(u32, u32, u64)> =
                 std::collections::HashSet::with_capacity(targets.len());
             for from in 0..offsets.len().saturating_sub(1) {
@@ -676,7 +674,7 @@ impl StreetNetwork {
     /// A stop's snap link as a [`Snap`], when the stop is linked. A
     /// stop with several links yields the nearest one.
     pub fn stop_snap(&self, stop: StopIdx) -> Option<Snap> {
-        self.links
+        self.links()
             .iter()
             .filter(|link| link.stop == stop)
             .min_by(|a, b| a.connector.total_cmp(&b.connector))

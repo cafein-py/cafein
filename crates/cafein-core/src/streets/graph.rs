@@ -166,43 +166,63 @@ pub struct MappedStreets {
 
 /// The walking street graph with its spatial index and stop links.
 ///
-/// The large persisted arrays live behind [`Arrays`] — owned vectors or
-/// typed views into a mapped artifact; queries are identical over both.
+/// The graph-owned data (CSR, geometry, spatial index, and the run-once
+/// contraction) is separated from the GTFS-derived stop links: a later
+/// street-only network can hold the [`StreetGraph`] without any timetable,
+/// while a `TransportNetwork` pairs it with its [`StopLinks`]. Every existing
+/// method reads through the two members as a façade, so the public API is
+/// unchanged.
 #[derive(Debug)]
 pub struct StreetNetwork {
+    pub(super) graph: StreetGraph,
+    pub(super) stop_links: StopLinks,
+}
+
+/// The graph-owned street data. None of it depends on the GTFS stops, so it
+/// can back a timetable-free network: the persisted CSR and geometry arrays
+/// behind [`Arrays`] (owned vectors or typed views into a mapped artifact;
+/// queries are identical over both), the spatial-index level starts, the
+/// lazily computed walking symmetry, and the optional run-once contraction.
+#[derive(Debug)]
+pub(super) struct StreetGraph {
     pub(super) arrays: Arrays,
     /// Start of each level in the index boxes (leaves at 0), plus a
     /// tail; derived from the leaf count, tiny, and always owned.
     pub(super) level_starts: Vec<u32>,
+    /// An optional contraction hierarchy accelerating the bounded one-to-many
+    /// walking searches (`access_stops`/`stop_transfers`/…). Built on demand by
+    /// [`install_hierarchy`](StreetNetwork::install_hierarchy); when absent the
+    /// searches use `bounded_dijkstra`. Graph-level state that persists with the
+    /// artifact; its stop-side buckets are derived and live on [`StopLinks`],
+    /// present exactly when [`StopLinks::buckets`] is (`install_hierarchy_from`
+    /// sets both, so [`StreetNetwork::ch`] reads them as a pair).
+    pub(super) contraction: Option<crate::ch::ContractionHierarchy>,
+    /// Whether the walking adjacency is symmetric, so a search from a stop
+    /// gives the same distances as a search to it — the invariant that lets
+    /// [`link_pointsets`](StreetNetwork::link_pointsets) link from the stop
+    /// side. Computed once, lazily; walking is undirected in the OSM
+    /// extraction, so it holds, but an asymmetric graph is marked ineligible
+    /// and falls back to the per-point search.
+    pub(super) symmetric: std::sync::OnceLock<bool>,
+}
+
+/// The GTFS-derived stop links: how each snapped stop enters the graph, the
+/// vertex→link index, and the contraction's stop-side one-to-many buckets.
+/// All of it is a function of the stops, so a street-only graph carries none.
+#[derive(Debug)]
+pub(super) struct StopLinks {
     /// How each snapped stop enters the graph, endpoints denormalised.
     pub(super) links: Vec<StoredLink>,
     /// `(vertex, link index)` pairs sorted by vertex — every link listed
     /// under both endpoints of its edge — so a search finds the links
     /// near its reached vertices without scanning all links.
     pub(super) vertex_links: Vec<(u32, u32)>,
-    /// An optional contraction hierarchy accelerating the bounded one-to-many
-    /// walking searches (`access_stops`/`stop_transfers`/…). Built on demand by
-    /// [`install_hierarchy`](Self::install_hierarchy); when absent the searches
-    /// use `bounded_dijkstra`. The contraction persists with the artifact; its
-    /// buckets are derived state, rebuilt on load.
-    pub(super) hierarchy: Option<ChIndex>,
-    /// Whether the walking adjacency is symmetric, so a search from a stop
-    /// gives the same distances as a search to it — the invariant that lets
-    /// [`link_pointsets`](Self::link_pointsets) link from the stop side.
-    /// Computed once, lazily; walking is undirected in the OSM extraction, so
-    /// it holds, but an asymmetric graph is marked ineligible and falls back
-    /// to the per-point search.
-    pub(super) symmetric: std::sync::OnceLock<bool>,
-}
-
-/// A contraction hierarchy plus the one-to-many buckets over the stops'
-/// link-endpoint vertices — the acceleration index for `reachable_from_snaps`.
-#[derive(Debug)]
-pub(super) struct ChIndex {
-    pub(super) hierarchy: crate::ch::ContractionHierarchy,
-    /// Built **unbounded** (over the link-endpoint vertices), so a query at any
-    /// finite cutoff is within the buckets' build cutoff.
-    pub(super) buckets: crate::ch::Buckets,
+    /// The contraction's **unbounded** one-to-many buckets over the stops'
+    /// link-endpoint vertices (so a query at any finite cutoff is within the
+    /// buckets' build cutoff) — the acceleration index for
+    /// `reachable_from_snaps`. Derived state rebuilt on load, present exactly
+    /// when [`StreetGraph::contraction`] is.
+    pub(super) buckets: Option<crate::ch::Buckets>,
 }
 
 impl StreetNetwork {
@@ -403,7 +423,7 @@ impl StreetNetwork {
         let endpoints: Vec<u32> = edges.iter().flat_map(|&(from, to, _)| [from, to]).collect();
         let vertex_links = build_vertex_links(&links);
 
-        Ok(StreetNetwork {
+        let graph = StreetGraph {
             arrays: Arrays::Owned(OwnedArrays {
                 adjacency_offsets,
                 adj_targets,
@@ -419,36 +439,72 @@ impl StreetNetwork {
                 index_payload: index.payload,
             }),
             level_starts: index.level_starts,
-            links,
-            vertex_links,
-            hierarchy: None,
+            contraction: None,
             symmetric: std::sync::OnceLock::new(),
+        };
+        Ok(StreetNetwork {
+            graph,
+            stop_links: StopLinks {
+                links,
+                vertex_links,
+                buckets: None,
+            },
         })
+    }
+
+    /// The graph-owned CSR and geometry arrays.
+    pub(super) fn arrays(&self) -> &Arrays {
+        &self.graph.arrays
+    }
+
+    /// The spatial-index level starts.
+    pub(super) fn level_starts(&self) -> &[u32] {
+        &self.graph.level_starts
+    }
+
+    /// The stop links.
+    pub(super) fn links(&self) -> &[StoredLink] {
+        &self.stop_links.links
+    }
+
+    /// The vertex→link index.
+    pub(super) fn vertex_links(&self) -> &[(u32, u32)] {
+        &self.stop_links.vertex_links
+    }
+
+    /// The installed contraction and its stop-side buckets, when both are
+    /// present — they always are together, since `install_hierarchy_from` sets
+    /// the pair. The bounded one-to-many walking search runs over them.
+    pub(super) fn ch(&self) -> Option<(&crate::ch::ContractionHierarchy, &crate::ch::Buckets)> {
+        match (&self.graph.contraction, &self.stop_links.buckets) {
+            (Some(contraction), Some(buckets)) => Some((contraction, buckets)),
+            _ => None,
+        }
     }
 
     /// Number of street vertices.
     pub fn vertex_count(&self) -> u32 {
-        self.arrays.adjacency_offsets().len() as u32 - 1
+        self.arrays().adjacency_offsets().len() as u32 - 1
     }
 
     /// Number of street edges.
     pub fn edge_count(&self) -> u32 {
-        (self.arrays.endpoints().len() / 2) as u32
+        (self.arrays().endpoints().len() / 2) as u32
     }
 
     /// Number of stop links.
     pub fn link_count(&self) -> usize {
-        self.links.len()
+        self.stop_links.links.len()
     }
 
     /// Whether the arrays are views into a mapped artifact.
     pub fn is_mapped(&self) -> bool {
-        matches!(self.arrays, Arrays::Mapped(_))
+        matches!(self.graph.arrays, Arrays::Mapped(_))
     }
 
     /// Whether a contraction-hierarchy index is installed.
     pub fn has_hierarchy(&self) -> bool {
-        self.hierarchy.is_some()
+        self.graph.contraction.is_some()
     }
 
     /// Builds and installs a contraction hierarchy over the walking graph, plus
@@ -461,9 +517,9 @@ impl StreetNetwork {
     pub fn install_hierarchy(&mut self) {
         let hierarchy = crate::ch::ContractionHierarchy::build(
             self.vertex_count(),
-            self.arrays.adjacency_offsets(),
-            self.arrays.adj_targets(),
-            self.arrays.adj_meters(),
+            self.arrays().adjacency_offsets(),
+            self.arrays().adj_targets(),
+            self.arrays().adj_meters(),
         );
         self.install_hierarchy_from(hierarchy);
     }
@@ -476,6 +532,7 @@ impl StreetNetwork {
     /// contraction, so a loaded network matches a freshly built one.
     pub fn install_hierarchy_from(&mut self, hierarchy: crate::ch::ContractionHierarchy) {
         let mut endpoints: Vec<u32> = self
+            .stop_links
             .links
             .iter()
             .flat_map(|link| [link.from, link.to])
@@ -483,13 +540,14 @@ impl StreetNetwork {
         endpoints.sort_unstable();
         endpoints.dedup();
         let buckets = hierarchy.buckets(&endpoints, f64::INFINITY);
-        self.hierarchy = Some(ChIndex { hierarchy, buckets });
+        self.graph.contraction = Some(hierarchy);
+        self.stop_links.buckets = Some(buckets);
     }
 
     /// The installed contraction hierarchy, if any — the run-once contraction
     /// result. Persisted with the artifact; the buckets are rebuilt on load.
     pub fn hierarchy(&self) -> Option<&crate::ch::ContractionHierarchy> {
-        self.hierarchy.as_ref().map(|index| &index.hierarchy)
+        self.graph.contraction.as_ref()
     }
 
     /// A fingerprint of this network's walking-graph CSR, matching what a
@@ -497,15 +555,15 @@ impl StreetNetwork {
     /// loaded artifact with a mismatched graph is refused.
     pub fn graph_fingerprint(&self) -> u64 {
         crate::ch::csr_fingerprint(
-            self.arrays.adjacency_offsets(),
-            self.arrays.adj_targets(),
-            self.arrays.adj_meters(),
+            self.arrays().adjacency_offsets(),
+            self.arrays().adj_targets(),
+            self.arrays().adj_meters(),
         )
     }
 
     /// An edge's `(from, to)` endpoint vertices.
     pub(super) fn edge_endpoints(&self, edge: u32) -> (u32, u32) {
-        let endpoints = self.arrays.endpoints();
+        let endpoints = self.arrays().endpoints();
         (
             endpoints[2 * edge as usize],
             endpoints[2 * edge as usize + 1],
@@ -515,39 +573,39 @@ impl StreetNetwork {
     /// A stored coordinate as float degrees.
     pub(super) fn coordinate(&self, position: usize) -> (f64, f64) {
         (
-            degrees(self.arrays.lons()[position]),
-            degrees(self.arrays.lats()[position]),
+            degrees(self.arrays().lons()[position]),
+            degrees(self.arrays().lats()[position]),
         )
     }
 
     /// A stored cumulative along-distance as f64 meters.
     pub(super) fn along(&self, position: usize) -> f64 {
-        f64::from(self.arrays.cumulative()[position])
+        f64::from(self.arrays().cumulative()[position])
     }
 
     /// The network's serializable state.
     pub fn to_parts(&self) -> StreetNetworkParts {
         StreetNetworkParts {
             vertex_count: self.vertex_count(),
-            adjacency_offsets: self.arrays.adjacency_offsets().to_vec(),
-            adj_targets: self.arrays.adj_targets().to_vec(),
-            adj_meters: self.arrays.adj_meters().to_vec(),
-            adj_edges: self.arrays.adj_edges().to_vec(),
-            endpoints: self.arrays.endpoints().to_vec(),
-            lengths: self.arrays.lengths().to_vec(),
-            coordinate_offsets: self.arrays.coordinate_offsets().to_vec(),
-            lons: self.arrays.lons().to_vec(),
-            lats: self.arrays.lats().to_vec(),
-            cumulative: self.arrays.cumulative().to_vec(),
+            adjacency_offsets: self.arrays().adjacency_offsets().to_vec(),
+            adj_targets: self.arrays().adj_targets().to_vec(),
+            adj_meters: self.arrays().adj_meters().to_vec(),
+            adj_edges: self.arrays().adj_edges().to_vec(),
+            endpoints: self.arrays().endpoints().to_vec(),
+            lengths: self.arrays().lengths().to_vec(),
+            coordinate_offsets: self.arrays().coordinate_offsets().to_vec(),
+            lons: self.arrays().lons().to_vec(),
+            lats: self.arrays().lats().to_vec(),
+            cumulative: self.arrays().cumulative().to_vec(),
             index_boxes: self
-                .arrays
+                .arrays()
                 .index_boxes()
                 .iter()
                 .flat_map(|envelope| *envelope)
                 .collect(),
-            index_payload: self.arrays.index_payload().to_vec(),
-            index_level_starts: self.level_starts.clone(),
-            links: self.links.clone(),
+            index_payload: self.arrays().index_payload().to_vec(),
+            index_level_starts: self.graph.level_starts.clone(),
+            links: self.stop_links.links.clone(),
         }
     }
 
@@ -558,29 +616,34 @@ impl StreetNetwork {
     pub fn from_parts(parts: StreetNetworkParts) -> StreetNetwork {
         let vertex_links = build_vertex_links(&parts.links);
         StreetNetwork {
-            arrays: Arrays::Owned(OwnedArrays {
-                adjacency_offsets: parts.adjacency_offsets,
-                adj_targets: parts.adj_targets,
-                adj_meters: parts.adj_meters,
-                adj_edges: parts.adj_edges,
-                endpoints: parts.endpoints,
-                lengths: parts.lengths,
-                coordinate_offsets: parts.coordinate_offsets,
-                lons: parts.lons,
-                lats: parts.lats,
-                cumulative: parts.cumulative,
-                index_boxes: parts
-                    .index_boxes
-                    .chunks_exact(4)
-                    .map(|chunk| [chunk[0], chunk[1], chunk[2], chunk[3]])
-                    .collect(),
-                index_payload: parts.index_payload,
-            }),
-            level_starts: parts.index_level_starts,
-            links: parts.links,
-            vertex_links,
-            hierarchy: None,
-            symmetric: std::sync::OnceLock::new(),
+            graph: StreetGraph {
+                arrays: Arrays::Owned(OwnedArrays {
+                    adjacency_offsets: parts.adjacency_offsets,
+                    adj_targets: parts.adj_targets,
+                    adj_meters: parts.adj_meters,
+                    adj_edges: parts.adj_edges,
+                    endpoints: parts.endpoints,
+                    lengths: parts.lengths,
+                    coordinate_offsets: parts.coordinate_offsets,
+                    lons: parts.lons,
+                    lats: parts.lats,
+                    cumulative: parts.cumulative,
+                    index_boxes: parts
+                        .index_boxes
+                        .chunks_exact(4)
+                        .map(|chunk| [chunk[0], chunk[1], chunk[2], chunk[3]])
+                        .collect(),
+                    index_payload: parts.index_payload,
+                }),
+                level_starts: parts.index_level_starts,
+                contraction: None,
+                symmetric: std::sync::OnceLock::new(),
+            },
+            stop_links: StopLinks {
+                links: parts.links,
+                vertex_links,
+                buckets: None,
+            },
         }
     }
 
@@ -623,12 +686,17 @@ impl StreetNetwork {
         }
         let vertex_links = build_vertex_links(&spec.links);
         Ok(StreetNetwork {
-            arrays: Arrays::Mapped(arrays),
-            level_starts,
-            links: spec.links,
-            vertex_links,
-            hierarchy: None,
-            symmetric: std::sync::OnceLock::new(),
+            graph: StreetGraph {
+                arrays: Arrays::Mapped(arrays),
+                level_starts,
+                contraction: None,
+                symmetric: std::sync::OnceLock::new(),
+            },
+            stop_links: StopLinks {
+                links: spec.links,
+                vertex_links,
+                buckets: None,
+            },
         })
     }
 }
