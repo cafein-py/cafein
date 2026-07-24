@@ -175,19 +175,25 @@ def test_round_trip_preserves_the_mcultra_set(artifact_path, tmp_path):
 
 def _install_synthetic_attributes(core, seed=0):
     """Attach random attribute + elevation arrays sized to a street network,
-    returning what was installed for a round-trip comparison."""
+    returning what was installed for a round-trip comparison. Class codes stay
+    within their tables (the install validates them)."""
+    from cafein import _osm
+
     slots, edges, coordinates = core._street_attribute_shape()
     rng = np.random.default_rng(seed)
 
     def u8(n):
         return list(map(int, rng.integers(0, 256, n, dtype=np.uint8)))
 
+    def codes(n, count):
+        return list(map(int, rng.integers(0, count, n, dtype=np.uint8)))
+
     core._install_street_attributes(
         u8(slots),
         u8(slots),
-        u8(edges),
-        u8(edges),
-        u8(edges),
+        codes(edges, len(_osm.HIGHWAY_CODES)),
+        codes(edges, len(_osm.SURFACE_CODES)),
+        codes(edges, len(_osm.SMOOTHNESS_CODES)),
         list(map(int, rng.integers(0, 65536, edges, dtype=np.uint16))),
     )
     core._install_elevations(

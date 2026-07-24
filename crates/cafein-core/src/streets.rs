@@ -115,7 +115,8 @@ pub enum StreetError {
     /// inconsistently with the index payload.
     InvalidMapping,
     /// A multimodal attribute or elevation array does not match the graph's
-    /// edge, adjacency-slot, or coordinate count.
+    /// edge, adjacency-slot, or coordinate count, or a class code is outside
+    /// its table (highway / surface / smoothness).
     InvalidAttributes,
 }
 
@@ -161,7 +162,8 @@ impl std::fmt::Display for StreetError {
             StreetError::InvalidAttributes => {
                 write!(
                     f,
-                    "a multimodal attribute or elevation array does not match the graph shape"
+                    "a multimodal attribute or elevation array does not match the graph shape, \
+                     or a class code is outside its table"
                 )
             }
         }
@@ -174,12 +176,19 @@ mod geo;
 mod graph;
 mod index;
 mod paths;
+mod profile;
 mod search;
 mod snap;
 
 use geo::*;
 pub use graph::{Backing, MappedStreets, StreetAttributes, StreetNetwork, StreetNetworkParts};
 use index::*;
+pub use profile::{
+    CompiledStreetProfile, ProfileError, StreetMode, StreetProfileDefinition, FLAG_BRIDGE,
+    FLAG_DISMOUNT, FLAG_INDOOR, FLAG_LIT, FLAG_SEGREGATED, FLAG_STEPS, FLAG_TUNNEL,
+    HIGHWAY_CODE_COUNT, MODE_BICYCLE, MODE_E_SCOOTER, MODE_WALK, SMOOTHNESS_CODE_COUNT,
+    SURFACE_CODE_COUNT,
+};
 use search::*;
 
 #[cfg(test)]

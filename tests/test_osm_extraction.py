@@ -8,6 +8,27 @@ from cafein import _osm
 W, B, S = _osm.WALK, _osm.BICYCLE, _osm.E_SCOOTER
 
 
+def test_mode_and_flag_bits_match_the_rust_abi():
+    # These integer values cross to the Rust profile compiler (streets/profile.rs)
+    # as the raw u8/u16 attribute arrays, so a change here is a breaking ABI
+    # change and must be mirrored on the Rust side (and vice versa).
+    assert (_osm.WALK, _osm.BICYCLE, _osm.E_SCOOTER) == (1, 2, 4)
+    assert (
+        _osm.FLAG_DISMOUNT,
+        _osm.FLAG_BRIDGE,
+        _osm.FLAG_TUNNEL,
+        _osm.FLAG_INDOOR,
+        _osm.FLAG_STEPS,
+        _osm.FLAG_SEGREGATED,
+        _osm.FLAG_LIT,
+    ) == (1, 2, 4, 8, 16, 32, 64)
+    assert (
+        len(_osm.HIGHWAY_CODES),
+        len(_osm.SURFACE_CODES),
+        len(_osm.SMOOTHNESS_CODES),
+    ) == (27, 17, 9)
+
+
 def _perm(**tags):
     forward, reverse, flags, unknown_access, unknown_highway = _osm._row_permissions(
         tags
