@@ -129,5 +129,9 @@ fn _cafein(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<TransportNetwork>()?;
     m.add_class::<streets::StreetNetwork>()?;
+    m.add(
+        "STREET_DISTANCE_PROVENANCE",
+        cafein_core::streets::STREET_DISTANCE_PROVENANCE,
+    )?;
     Ok(())
 }

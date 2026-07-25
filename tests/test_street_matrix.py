@@ -224,3 +224,267 @@ def test_a_cutoff_admitting_nothing_leaves_even_the_diagonal_unreachable(
     assert len(matrix) == 0
     origin = coordinates(origins)[0]
     assert streets.travel_time(origin, origin, mode="bicycle", max_time=cutoff) is None
+
+
+# ---- Cost matrix ----
+
+from cafein import TravelCostMatrix  # noqa: E402
+from cafein._cafein import STREET_DISTANCE_PROVENANCE  # noqa: E402
+
+
+def _on_network_points(streets, shift=0.0):
+    """Two coordinates lying on the street network, optionally nudged off it.
+
+    A route's shape runs origin, origin-snap, ..., destination-snap,
+    destination, so its second and second-to-last vertices are the snap points
+    — exactly on an edge rather than merely near one.
+    """
+    probe = gpd.GeoDataFrame(
+        {"id": ["a", "b"]},
+        geometry=gpd.points_from_xy([24.9320, 24.9420], [60.1690, 60.1740]),
+        crs="EPSG:4326",
+    )
+    route = TravelCostMatrix(
+        streets,
+        probe.iloc[[0]],
+        probe.iloc[[1]],
+        transport_mode="walk",
+        geometries=True,
+    )
+    shape = route.iloc[0].geometry.coords
+    ends = [shape[1], shape[-2]]
+    return gpd.GeoDataFrame(
+        {"id": ["a", "b"]},
+        geometry=gpd.points_from_xy(
+            [lon for lon, _ in ends], [lat + shift for _, lat in ends]
+        ),
+        crs="EPSG:4326",
+    )
+
+
+COST_COLUMNS = [
+    "from_id",
+    "to_id",
+    "travel_time",
+    "distance",
+    "network_distance",
+    "connector_distance",
+    "distance_provenance",
+]
+
+
+def test_cost_matrix_columns_and_dtypes(streets, origins, destinations):
+    costs = TravelCostMatrix(streets, origins, destinations, transport_mode="bicycle")
+    assert list(costs.columns) == COST_COLUMNS
+    assert costs.travel_time.dtype == np.uint32
+    for column in ("distance", "network_distance", "connector_distance"):
+        assert costs[column].dtype == np.float64
+    assert pd.api.types.is_string_dtype(costs.distance_provenance)
+    assert (costs.distance_provenance == STREET_DISTANCE_PROVENANCE).all()
+    assert type(costs.iloc[:1]) is pd.DataFrame
+
+
+def test_cost_matrix_columns_with_geometries(streets, origins, destinations):
+    costs = TravelCostMatrix(
+        streets, origins, destinations, transport_mode="bicycle", geometries=True
+    )
+    assert list(costs.columns) == COST_COLUMNS + ["geometry"]
+    assert costs.geometry.dtype == object
+
+
+def test_cost_matrix_distance_is_the_sum_of_its_parts(streets, origins, destinations):
+    costs = TravelCostMatrix(streets, origins, destinations, transport_mode="bicycle")
+    assert len(costs) > 0
+    total = costs.network_distance + costs.connector_distance
+    assert np.allclose(costs.distance, total)
+    assert (costs.network_distance >= 0).all()
+    assert (costs.connector_distance >= 0).all()
+
+
+def test_cost_matrix_times_match_the_time_matrix(streets, origins, destinations):
+    # The two computers run the same search; they must not disagree.
+    times = TravelTimeMatrix(streets, origins, destinations, transport_mode="bicycle")
+    costs = TravelCostMatrix(streets, origins, destinations, transport_mode="bicycle")
+    timed = {(r.from_id, r.to_id): r.travel_time for r in times.itertuples(index=False)}
+    costed = {
+        (r.from_id, r.to_id): r.travel_time for r in costs.itertuples(index=False)
+    }
+    assert timed == costed
+
+
+def test_cost_matrix_matches_single_pair_reconstruction(streets, origins, destinations):
+    # Each row must equal what a one-pair matrix reports for the same
+    # coordinates — time and both reconstructed distances, not just the time.
+    whole = TravelCostMatrix(streets, origins, destinations, transport_mode="walk")
+    rows = {
+        (r.from_id, r.to_id): (r.travel_time, r.network_distance, r.connector_distance)
+        for r in whole.itertuples(index=False)
+    }
+    assert rows
+    for index, from_id in enumerate(origins["id"]):
+        for column, to_id in enumerate(destinations["id"]):
+            single = TravelCostMatrix(
+                streets,
+                origins.iloc[[index]],
+                destinations.iloc[[column]],
+                transport_mode="walk",
+            )
+            if single.empty:
+                assert (from_id, to_id) not in rows
+                continue
+            only = single.iloc[0]
+            assert rows[(from_id, to_id)] == pytest.approx(
+                (only.travel_time, only.network_distance, only.connector_distance)
+            )
+
+
+def test_connectors_are_zero_on_the_network_and_positive_off_it(streets):
+    # Coordinates lifted from the network's own geometry snap onto it with no
+    # connector; the same pair nudged away pays one at each end.
+    costs = TravelCostMatrix(
+        streets, _on_network_points(streets), transport_mode="walk"
+    )
+    off_diagonal = costs[costs.from_id != costs.to_id]
+    assert len(off_diagonal) > 0
+    assert (off_diagonal.connector_distance < 1.0).all()
+    assert (off_diagonal.network_distance > 0).all()
+
+    offset = _on_network_points(streets, shift=0.0004)  # ~45 m north
+    away = TravelCostMatrix(streets, offset, transport_mode="walk")
+    away_off_diagonal = away[away.from_id != away.to_id]
+    assert (away_off_diagonal.connector_distance > 1.0).all()
+
+
+def test_cycling_detours_cover_more_network_than_walking(
+    streets, origins, destinations
+):
+    # Where a bicycle may not use the most direct way it detours, so its
+    # network distance over the shared pairs is longer somewhere and never
+    # shorter by more than rounding.
+    walk = TravelCostMatrix(
+        streets, origins, destinations, transport_mode="walk", max_street_time=3600
+    )
+    bicycle = TravelCostMatrix(
+        streets, origins, destinations, transport_mode="bicycle", max_street_time=3600
+    )
+    walked = {
+        (r.from_id, r.to_id): r.network_distance
+        for r in walk.itertuples(index=False)
+        if r.from_id != r.to_id
+    }
+    rode = {
+        (r.from_id, r.to_id): r.network_distance
+        for r in bicycle.itertuples(index=False)
+        if r.from_id != r.to_id
+    }
+    shared = set(walked) & set(rode)
+    assert shared
+    assert any(rode[pair] > walked[pair] + 1.0 for pair in shared)
+
+
+def test_cost_matrix_geometry(streets, origins, destinations):
+    costs = TravelCostMatrix(
+        streets, origins, destinations, transport_mode="bicycle", geometries=True
+    )
+    assert "geometry" in costs.columns
+    off_diagonal = costs[costs.from_id != costs.to_id]
+    assert len(off_diagonal) > 0
+    for shape in off_diagonal.geometry:
+        assert shape.geom_type == "LineString"
+        assert len(shape.coords) >= 2
+    # A route's shape starts at its origin and ends at its destination.
+    places = dict(zip(origins["id"], coordinates(origins)))
+    targets = dict(zip(destinations["id"], coordinates(destinations)))
+    row = off_diagonal.iloc[0]
+    start, end = row.geometry.coords[0], row.geometry.coords[-1]
+    assert abs(start[1] - places[row.from_id][0]) < 1e-6
+    assert abs(end[1] - targets[row.to_id][0]) < 1e-6
+
+
+def test_cost_matrix_rejects_a_street_mode_on_a_transport_network(network):
+    with pytest.raises(ValueError, match="is a street mode"):
+        TravelCostMatrix(
+            network, None, None, "2022-02-22", "08:30:00", transport_mode="bicycle"
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"date": "2022-02-22"},
+        {"optimize": "emissions"},
+        {"factors": object()},
+        {"components": ["vehicle"]},
+        {"router": "raptor"},
+        {"max_transfers": 3},
+    ],
+)
+def test_cost_matrix_rejects_transit_only_arguments(streets, origins, kwargs):
+    name = next(iter(kwargs))
+    with pytest.raises(ValueError, match=f"{name}.*no meaning for a street matrix"):
+        TravelCostMatrix(streets, origins, transport_mode="bicycle", **kwargs)
+
+
+def test_cost_matrix_requires_an_explicit_mode(streets, origins):
+    with pytest.raises(TypeError, match="explicit transport_mode"):
+        TravelCostMatrix(streets, origins)
+
+
+@pytest.mark.parametrize("cutoff", [-1.0, float("nan"), float("inf")])
+def test_cost_matrix_cutoff_admitting_nothing_yields_no_rows(streets, origins, cutoff):
+    # Including the diagonal: a same-coordinate pair is still a route the
+    # cutoff must admit, exactly as the time matrix has it.
+    costs = TravelCostMatrix(
+        streets, origins, transport_mode="bicycle", max_street_time=cutoff
+    )
+    assert len(costs) == 0
+
+
+def test_diagonal_geometry_is_a_valid_line(streets, origins):
+    # Destinations default to the origins, so the diagonal is present; its
+    # zero-length route must still be a usable LineString.
+    costs = TravelCostMatrix(
+        streets, origins, transport_mode="bicycle", geometries=True
+    )
+    diagonal = costs[costs.from_id == costs.to_id]
+    assert len(diagonal) == len(origins)
+    for shape in diagonal.geometry:
+        # Degenerate by nature — a route to the same coordinate has no extent —
+        # but it must still round-trip through WKB as a two-point LineString
+        # rather than the one-point shape shapely refuses to read.
+        assert shape.geom_type == "LineString"
+        assert len(shape.coords) == 2
+        assert shape.length == 0.0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"departure": "08:30:00"},
+        {"window": 600},
+        {"within": 600},
+        {"candidates": "pareto"},
+        {"bucket": 50.0},
+        {"fares": object()},
+        {"exclude_routes": ["1001"]},
+        {"exclude_trips": ["t1"]},
+        {"exclude_stops": ["s1"]},
+        {"walking_speed_kmph": 5.0},
+        {"max_walking_time": 600.0},
+    ],
+)
+def test_cost_matrix_rejects_the_remaining_transit_arguments(streets, origins, kwargs):
+    name = next(iter(kwargs))
+    with pytest.raises(ValueError, match=f"{name}.*no meaning for a street matrix"):
+        TravelCostMatrix(streets, origins, transport_mode="bicycle", **kwargs)
+
+
+def test_cost_matrix_warns_on_unsnappable_origins(streets, destinations):
+    far = gpd.GeoDataFrame(
+        {"id": ["atlantic"]},
+        geometry=gpd.points_from_xy([-30.0], [0.0]),
+        crs="EPSG:4326",
+    )
+    with pytest.warns(UserWarning, match="atlantic"):
+        costs = TravelCostMatrix(streets, far, destinations, transport_mode="bicycle")
+    assert len(costs) == 0
