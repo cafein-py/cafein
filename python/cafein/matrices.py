@@ -42,13 +42,28 @@ class TravelCostMatrix(pd.DataFrame):
     distances (the default), and with leg geometries for
     ``geometries=True``. Slices and copies degrade to plain DataFrames.
 
+    Given a ``StreetNetwork`` instead, the matrix is a standalone street
+    computation over the compiled profile of ``transport_mode``, bounded
+    by ``max_street_time``. Its columns are ``from_id``, ``to_id``,
+    ``travel_time``, ``distance``, ``network_distance``,
+    ``connector_distance``, ``distance_provenance``, and — with
+    ``geometries=True`` — the route as a shapely LineString.
+    ``network_distance`` sums the stored edge lengths the route
+    traversed and ``connector_distance`` the straight lines from each
+    coordinate to its snap point; ``distance`` is their sum, reported
+    alongside rather than instead of them because the two are measured
+    differently. Street emissions are not computed yet, so there is no
+    ``emissions`` column and the arguments configuring it are rejected,
+    as are ``date``, ``departure``, and the other timetable-only ones.
+
     Parameters
     ----------
-    network : TransportNetwork
-        The network to compute on.
+    network : TransportNetwork or StreetNetwork
+        The network to compute on. A ``StreetNetwork`` takes the
+        standalone street path and requires ``transport_mode``.
     origins : list of str, or GeoDataFrame (optional)
         Origin stop_ids (every stop when omitted), or points with an
-        ``id`` column.
+        ``id`` column. A street matrix needs points.
     destinations : list of str, or GeoDataFrame (optional)
         Destination stop_ids (every stop when omitted), or points; with
         point origins the destinations default to the origins.
@@ -129,7 +144,14 @@ class TravelCostMatrix(pd.DataFrame):
         ``TransportNetwork.access_stops``. They bound the walking for point
         origins/destinations, and for stop origins/destinations only when a
         whole-day shortcut set routes them door-to-door; otherwise stop
-        matrices ignore them.
+        matrices ignore them. Only ``max_snap_distance`` applies to a
+        ``StreetNetwork``, whose speeds come from the mode's profile.
+    transport_mode : str (optional)
+        The mode to route. Required for a ``StreetNetwork``, where it is
+        one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``.
+    max_street_time : float (optional)
+        Cutoff in seconds for a ``StreetNetwork`` matrix (default:
+        ``cafein.street_network.MAX_STREET_TIME``, 7200).
     """
 
     @property
@@ -162,7 +184,50 @@ class TravelCostMatrix(pd.DataFrame):
         walking_speed_kmph=None,
         max_walking_time=None,
         max_snap_distance=None,
+        transport_mode=None,
+        max_street_time=None,
     ):
+        if _is_street_network(network):
+            data = _street_cost_columns(
+                network,
+                origins,
+                destinations,
+                transport_mode=transport_mode,
+                max_street_time=max_street_time,
+                max_snap_distance=max_snap_distance,
+                chunk=chunk,
+                geometries=geometries,
+                transit_only={
+                    "date": date,
+                    "departure": departure,
+                    "window": window,
+                    "within": within,
+                    "fares": fares,
+                    "walking_speed_kmph": walking_speed_kmph,
+                    "max_walking_time": max_walking_time,
+                    # Emissions configuration: street emissions are not
+                    # computed yet, so accepting these would imply they were.
+                    "factors": factors,
+                    "components": components,
+                    "max_transfers": None if max_transfers == 7 else max_transfers,
+                    "optimize": None if optimize == "time" else optimize,
+                    "candidates": None if candidates == "time" else candidates,
+                    "bucket": None if bucket == 25.0 else bucket,
+                    "router": None if router == "auto" else router,
+                    "exclude_routes": tuple(exclude_routes) or None,
+                    "exclude_trips": tuple(exclude_trips) or None,
+                    "exclude_stops": tuple(exclude_stops) or None,
+                },
+            )
+            super().__init__(pd.DataFrame(data))
+            return
+        if transport_mode is not None and transport_mode != "public_transport":
+            raise ValueError(
+                f"transport_mode={transport_mode!r} is a street mode; pass a "
+                "StreetNetwork to route on it"
+            )
+        if max_street_time is not None:
+            raise ValueError("max_street_time applies to a StreetNetwork matrix")
         table, from_ids, to_ids = _cost_columns(
             network,
             origins,
@@ -394,8 +459,27 @@ def _is_street_network(network):
     return isinstance(network, StreetNetwork)
 
 
-def _street_time_columns(
-    network,
+class _StreetQuery:
+    """A validated street-matrix query: the resolved point sets and bounds."""
+
+    def __init__(
+        self,
+        from_ids,
+        to_ids,
+        origin_points,
+        destination_points,
+        max_seconds,
+        max_snap_distance,
+    ):
+        self.from_ids = from_ids
+        self.to_ids = to_ids
+        self.origin_points = origin_points
+        self.destination_points = destination_points
+        self.max_seconds = max_seconds
+        self.max_snap_distance = max_snap_distance
+
+
+def _street_query(
     origins,
     destinations,
     *,
@@ -405,7 +489,12 @@ def _street_time_columns(
     chunk,
     transit_only,
 ):
-    """The reachable cells of a street travel-time matrix, in long format."""
+    """Validates a street-matrix call and resolves its points and bounds.
+
+    Shared by every street matrix so their argument rules cannot drift apart.
+    `transit_only` maps each timetable-only argument to its value, or to `None`
+    when it was left at the default.
+    """
     from cafein import street_network, streets
 
     if transport_mode is None:
@@ -448,10 +537,11 @@ def _street_time_columns(
     if chunk is not None:
         span = _chunk_slice(len(from_ids), chunk)
         from_ids, origin_points = from_ids[span], origin_points[span]
-    table = network._core.travel_time_matrix(
+    return _StreetQuery(
+        from_ids,
+        to_ids,
         origin_points,
         destination_points,
-        transport_mode,
         float(
             street_network.MAX_STREET_TIME
             if max_street_time is None
@@ -462,6 +552,92 @@ def _street_time_columns(
             if max_snap_distance is None
             else max_snap_distance
         ),
+    )
+
+
+def _street_cost_columns(
+    network,
+    origins,
+    destinations,
+    *,
+    transport_mode,
+    max_street_time,
+    max_snap_distance,
+    chunk,
+    geometries,
+    transit_only,
+):
+    """The reachable cells of a street cost matrix, in long format."""
+    from cafein._cafein import STREET_DISTANCE_PROVENANCE
+
+    query = _street_query(
+        origins,
+        destinations,
+        transport_mode=transport_mode,
+        max_street_time=max_street_time,
+        max_snap_distance=max_snap_distance,
+        chunk=chunk,
+        transit_only=transit_only,
+    )
+    table = network._core.cost_matrix(
+        query.origin_points,
+        query.destination_points,
+        transport_mode,
+        query.max_seconds,
+        query.max_snap_distance,
+        bool(geometries),
+    )
+    _warn_unsnapped(table, query.from_ids, query.to_ids)
+    from_ids = np.asarray(query.from_ids, dtype=object)
+    to_ids = np.asarray(query.to_ids, dtype=object)
+    network_distance = table["network_distance"]
+    connector_distance = table["connector_distance"]
+    data = {
+        "from_id": from_ids[table["from"]],
+        "to_id": to_ids[table["to"]],
+        "travel_time": table["travel_time"],
+        # Reported alongside its parts, not instead of them: the two are
+        # measured differently (stored edge lengths versus straight connectors).
+        "distance": network_distance + connector_distance,
+        "network_distance": network_distance,
+        "connector_distance": connector_distance,
+        "distance_provenance": np.full(
+            len(network_distance), STREET_DISTANCE_PROVENANCE, dtype=object
+        ),
+    }
+    if geometries:
+        data["geometry"] = shapely.from_wkb(np.array(table["geometry"], dtype=object))
+    return data
+
+
+def _street_time_columns(
+    network,
+    origins,
+    destinations,
+    *,
+    transport_mode,
+    max_street_time,
+    max_snap_distance,
+    chunk,
+    transit_only,
+):
+    """The reachable cells of a street travel-time matrix, in long format."""
+    query = _street_query(
+        origins,
+        destinations,
+        transport_mode=transport_mode,
+        max_street_time=max_street_time,
+        max_snap_distance=max_snap_distance,
+        chunk=chunk,
+        transit_only=transit_only,
+    )
+    from_ids, to_ids = query.from_ids, query.to_ids
+    table = network._core.travel_time_matrix(
+        query.origin_points,
+        query.destination_points,
+        transport_mode,
+        query.max_seconds,
+        query.max_snap_distance,
     )
     _warn_unsnapped(table, from_ids, to_ids)
     matrix = table["matrix"]

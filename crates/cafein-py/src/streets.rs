@@ -8,10 +8,13 @@
 use numpy::{IntoPyArray, PyArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict, PyList};
 
+use rayon::prelude::*;
+
+use cafein_core::geometry::wkb_line_string;
 use cafein_core::streets::{
-    Backing, CompiledStreetProfile, EdgeAttributes, MappedStreets, Snap,
+    Backing, CompiledStreetProfile, EdgeAttributes, MappedStreets, Snap, StreetLeg,
     StreetNetwork as CoreStreetNetwork, StreetProfileDefinition,
 };
 
@@ -214,6 +217,113 @@ impl StreetNetwork {
         )?;
         table.set_item("unsnapped_from", unsnapped_from.into_pyarray(py))?;
         table.set_item("unsnapped_to", unsnapped_to.into_pyarray(py))?;
+        Ok(table.into())
+    }
+
+    /// The origins × destinations cost rows under `mode`, in long format.
+    ///
+    /// Only the reachable cells are returned — a cost row is far heavier than a
+    /// time cell, so a dense matrix of them would be mostly waste. Coordinates
+    /// are `(latitude, longitude)`; `geometries` attaches each row's shape as
+    /// WKB.
+    #[allow(clippy::too_many_arguments)]
+    fn cost_matrix(
+        &mut self,
+        py: Python<'_>,
+        origins: Vec<(f64, f64)>,
+        destinations: Vec<(f64, f64)>,
+        mode: &str,
+        max_seconds: f64,
+        max_snap_distance: f64,
+        geometries: bool,
+    ) -> PyResult<Py<PyDict>> {
+        let index = self.compiled(mode)?;
+        let (_, profile) = &self.profiles[index];
+        let rows = py.allow_threads(|| {
+            let snap = |&(latitude, longitude): &(f64, f64)| {
+                self.inner
+                    .snap_for_profile(latitude, longitude, max_snap_distance, profile)
+            };
+            let targets: Vec<((f64, f64), Option<Snap>)> = destinations
+                .par_iter()
+                .map(|&point| (point, snap(&point)))
+                .collect();
+            let origin_snaps: Vec<Option<Snap>> = origins.par_iter().map(snap).collect();
+            // The same-coordinate zero is still a route the cutoff has to
+            // admit, so a cutoff admitting nothing leaves the cell unreachable
+            // — matching the single route and the time matrix.
+            let routable = max_seconds.is_finite() && max_seconds >= 0.0;
+            let legs: Vec<Vec<Option<StreetLeg>>> = origin_snaps
+                .par_iter()
+                .zip(&origins)
+                .map(|(origin, &point)| match origin {
+                    None => vec![None; destinations.len()],
+                    Some(from) => {
+                        let mut row = self.inner.directed_legs_to_snaps(
+                            point,
+                            from,
+                            &targets,
+                            profile,
+                            max_seconds,
+                        );
+                        if routable {
+                            // A coordinate is no distance and no time from
+                            // itself. Its shape is the degenerate two-point
+                            // line, so it stays a valid LineString.
+                            for (leg, (destination, target)) in row.iter_mut().zip(&targets) {
+                                if *destination == point && target.is_some() {
+                                    *leg = Some(StreetLeg {
+                                        seconds: 0,
+                                        network_meters: 0.0,
+                                        connector_meters: 0.0,
+                                        geometry: vec![(point.1, point.0), (point.1, point.0)],
+                                    });
+                                }
+                            }
+                        }
+                        row
+                    }
+                })
+                .collect();
+            (legs, origin_snaps, targets)
+        });
+        let (legs, origin_snaps, targets) = rows;
+        let (mut from, mut to, mut seconds) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut network, mut connector) = (Vec::new(), Vec::new());
+        let shapes = PyList::empty(py);
+        for (origin, row) in legs.iter().enumerate() {
+            for (destination, leg) in row.iter().enumerate() {
+                let Some(leg) = leg else { continue };
+                from.push(origin as u32);
+                to.push(destination as u32);
+                seconds.push(leg.seconds);
+                network.push(leg.network_meters);
+                connector.push(leg.connector_meters);
+                if geometries {
+                    shapes.append(PyBytes::new(py, &wkb_line_string(&leg.geometry)))?;
+                }
+            }
+        }
+        let unsnapped = |snaps: &[Option<Snap>]| -> Vec<u32> {
+            snaps
+                .iter()
+                .enumerate()
+                .filter(|(_, snap)| snap.is_none())
+                .map(|(index, _)| index as u32)
+                .collect()
+        };
+        let table = PyDict::new(py);
+        table.set_item("from", from.into_pyarray(py))?;
+        table.set_item("to", to.into_pyarray(py))?;
+        table.set_item("travel_time", seconds.into_pyarray(py))?;
+        table.set_item("network_distance", network.into_pyarray(py))?;
+        table.set_item("connector_distance", connector.into_pyarray(py))?;
+        if geometries {
+            table.set_item("geometry", shapes)?;
+        }
+        table.set_item("unsnapped_from", unsnapped(&origin_snaps).into_pyarray(py))?;
+        let target_snaps: Vec<Option<Snap>> = targets.into_iter().map(|(_, snap)| snap).collect();
+        table.set_item("unsnapped_to", unsnapped(&target_snaps).into_pyarray(py))?;
         Ok(table.into())
     }
 
