@@ -172,6 +172,7 @@ impl std::fmt::Display for StreetError {
 
 impl std::error::Error for StreetError {}
 
+mod directed;
 mod geo;
 mod graph;
 mod index;
