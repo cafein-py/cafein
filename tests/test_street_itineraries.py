@@ -20,9 +20,9 @@ COLUMNS = [
     "departure",
     "arrival",
     "travel_time",
-    "distance",
-    "network_distance",
-    "connector_distance",
+    "distance_m",
+    "network_distance_m",
+    "connector_distance_m",
     "distance_provenance",
     "geometry",
 ]
@@ -72,7 +72,12 @@ def test_agrees_with_the_cost_matrix(streets, places):
     # Both read the same reconstruction; they must not disagree.
     routes = DetailedItineraries(streets, places, transport_mode="bicycle")
     costs = TravelCostMatrix(streets, places, transport_mode="bicycle")
-    columns = ["travel_time", "distance", "network_distance", "connector_distance"]
+    columns = [
+        "travel_time",
+        "distance_m",
+        "network_distance_m",
+        "connector_distance_m",
+    ]
     from_routes = {
         (r.from_id, r.to_id): tuple(getattr(r, c) for c in columns)
         for r in routes.itertuples(index=False)
@@ -122,8 +127,8 @@ def test_the_diagonal_is_a_readable_zero_length_leg(streets, places):
     diagonal = routes[routes.from_id == routes.to_id]
     assert len(diagonal) == len(places)
     assert (diagonal.travel_time == 0).all()
-    # Subscripted, not attribute access: `.distance` is geopandas' own method.
-    assert (diagonal["distance"] == 0).all()
+    # Subscripted, not attribute access: `.distance_m` is geopandas' own method.
+    assert (diagonal["distance_m"] == 0).all()
     coordinates = dict(zip(places["id"], zip(places.geometry.y, places.geometry.x)))
     for row in diagonal.itertuples(index=False):
         shape = row.geometry
@@ -204,7 +209,7 @@ def test_the_column_dtypes_are_the_same_with_or_without_a_departure(
     assert routes.travel_time.dtype == np.uint32
     assert routes.option.dtype == np.int64
     assert routes.segment.dtype == np.int64
-    for column in ("distance", "network_distance", "connector_distance"):
+    for column in ("distance_m", "network_distance_m", "connector_distance_m"):
         assert routes[column].dtype == np.float64
     for column in ("from_id", "to_id", "leg_type", "mode"):
         assert pd.api.types.is_string_dtype(routes[column])
