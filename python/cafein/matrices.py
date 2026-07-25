@@ -12,7 +12,7 @@ class TravelCostMatrix(pd.DataFrame):
 
     A pandas DataFrame with one row per reachable OD pair: ``from_id``
     and ``to_id``, ``travel_time`` (seconds), ``transfers``,
-    ``transit_distance`` and ``walk_distance`` (meters), and
+    ``transit_distance_m`` and ``walk_distance_m`` (meters), and
     ``emissions`` (grams CO₂e over the ridden legs; NaN where a ridden
     trip has no matching factor row). With ``geometries=True`` each row
     adds ``geometry``, the ridden legs as a shapely MultiLineString in
@@ -25,10 +25,10 @@ class TravelCostMatrix(pd.DataFrame):
     travel time is its fastest walk–ride–walk chain or the direct street
     walk (within ``max_walking_time``), whichever is faster — a
     walking-only pair reports zero ``transfers``, zero emissions, and
-    the walk as ``walk_distance``. The access and egress walks count
-    toward ``walk_distance``, and points off the walking network are
+    the walk as ``walk_distance_m``. The access and egress walks
+    count toward ``walk_distance_m``, and points off the walking network are
     reported with a warning and yield no rows. From stop origins,
-    ``walk_distance`` covers transfers only — unless a whole-day
+    ``walk_distance_m`` covers transfers only — unless a whole-day
     (Mc)ULTRA set upgrades the stop matrix to door-to-door routing,
     which walks the access and egress ends too.
 
@@ -260,8 +260,8 @@ class TravelCostMatrix(pd.DataFrame):
             "to_id": np.array(to_ids, dtype=object)[table["to"]],
             "travel_time": table["travel_time"],
             "transfers": np.maximum(table["rides"], 1) - 1,
-            "transit_distance": table["transit_distance"],
-            "walk_distance": table["walk_distance"],
+            "transit_distance_m": table["transit_distance"],
+            "walk_distance_m": table["walk_distance"],
             "emissions": table["emissions"],
         }
         if fares is not None:
@@ -798,8 +798,8 @@ def travel_cost_table(
         ),
         "travel_time": pyarrow.array(table["travel_time"]),
         "transfers": pyarrow.array(np.maximum(table["rides"], 1) - 1),
-        "transit_distance": pyarrow.array(table["transit_distance"]),
-        "walk_distance": pyarrow.array(table["walk_distance"]),
+        "transit_distance_m": pyarrow.array(table["transit_distance"]),
+        "walk_distance_m": pyarrow.array(table["walk_distance"]),
         "emissions": pyarrow.array(table["emissions"]),
     }
     if fares is not None:

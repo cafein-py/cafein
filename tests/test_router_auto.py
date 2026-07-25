@@ -287,7 +287,9 @@ def test_arrow_cost_table_accepts_router(two_line_network):
     frame = TravelCostMatrix(*args, router="tbtr")
     assert table.num_rows == len(frame) > 0
     assert table.column("travel_time").to_pylist() == list(frame.travel_time)
-    assert table.column("transit_distance").to_pylist() == list(frame.transit_distance)
+    assert table.column("transit_distance_m").to_pylist() == list(
+        frame.transit_distance_m
+    )
     assert table.equals(travel_cost_table(*args, router="raptor"))
 
 

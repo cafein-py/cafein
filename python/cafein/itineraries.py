@@ -29,7 +29,7 @@ _COLUMNS = [
     "trip_id",
     "route_id",
     "route_short_name",
-    "distance",
+    "distance_m",
     "distance_provenance",
     "emissions",
     "geometry",
@@ -53,7 +53,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
     seconds, ``from_stop`` and ``to_stop`` (the boarding and alighting
     stops; ``None`` at the walked ends of a door-to-door journey),
     ``trip_id``/``route_id``/``route_short_name`` on transit legs,
-    ``distance`` (meters) and its ``distance_provenance``, ``emissions``
+    ``distance_m`` (meters) and its ``distance_provenance``, ``emissions``
     (grams CO₂e; ``0`` on walks, ``NaN`` where a ridden trip has no
     matching factor), and ``geometry`` — the leg's shape in EPSG:4326,
     a transit polyline or a walked street path, absent where a leg has
@@ -668,7 +668,7 @@ def _leg_record(from_id, to_id, option, segment, leg):
         "trip_id": leg.get("trip_id"),
         "route_id": leg.get("route_id"),
         "route_short_name": leg.get("route_short_name"),
-        "distance": leg.get("distance"),
+        "distance_m": leg.get("distance_m"),
         "distance_provenance": leg.get("distance_provenance"),
         "emissions": leg.get("emissions"),
         "geometry": shapely.from_wkb(wkb) if wkb is not None else None,

@@ -39,7 +39,7 @@ def test_stop_itinerary_pins_the_k_train(network):
     assert transit["departure"] == 8 * 3600 + 36 * 60
     assert transit["arrival"] == 8 * 3600 + 58 * 60
     assert transit["travel_time"] == 22 * 60
-    assert transit["distance"] == pytest.approx(16_786, abs=1)
+    assert transit["distance_m"] == pytest.approx(16_786, abs=1)
     assert transit["distance_provenance"] == "shape_dist"
     # 16.786 km at the shipped 25 g/pkm urban-rail factor.
     assert transit["emissions"] == pytest.approx(419.65, abs=0.1)
@@ -78,7 +78,7 @@ def test_geometries_can_be_switched_off(network):
     assert itineraries["geometry"].isna().all()
     # The leg records themselves are unaffected.
     transit = itineraries[itineraries["leg_type"] == "transit"].iloc[0]
-    assert transit["distance"] == pytest.approx(16_786, abs=1)
+    assert transit["distance_m"] == pytest.approx(16_786, abs=1)
 
 
 def test_door_to_door_itinerary_walks_the_streets(network_with_footpaths):

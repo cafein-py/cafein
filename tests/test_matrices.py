@@ -71,8 +71,8 @@ def test_cost_rows_pin_the_k_train(network):
     assert (row.from_id, row.to_id) == ("4810551", "1250551")
     assert row.travel_time == 28 * 60
     assert row.transfers == 0
-    assert row.transit_distance == pytest.approx(16_786, abs=1)
-    assert row.walk_distance == 0.0
+    assert row.transit_distance_m == pytest.approx(16_786, abs=1)
+    assert row.walk_distance_m == 0.0
     # 16.786 km at the shipped 25 g/pkm urban-rail factor.
     assert row.emissions == pytest.approx(419.65, abs=0.1)
     assert row.geometry.geom_type == "MultiLineString"
@@ -90,13 +90,13 @@ def test_cost_rows_count_walks_and_transfers(network_with_footpaths):
     m2 = matrix[matrix.to_id == "1040280"].iloc[0]
     assert m2.travel_time == 9 * 60 + 20
     assert m2.transfers == 0
-    assert m2.transit_distance == pytest.approx(4_132, abs=1)
-    assert 19 <= m2.walk_distance <= 20
+    assert m2.transit_distance_m == pytest.approx(4_132, abs=1)
+    assert 19 <= m2.walk_distance_m <= 20
     assert m2.emissions == pytest.approx(4.132 * 25, abs=0.1)
     # Reaching the K train takes a second vehicle.
     korso = matrix[matrix.to_id == "1250551"].iloc[0]
     assert korso.transfers >= 1
-    assert korso.walk_distance > 100
+    assert korso.walk_distance_m > 100
 
 
 def test_cost_matrix_matches_the_travel_time_matrix(network):
@@ -116,7 +116,7 @@ def test_cost_matrix_matches_the_travel_time_matrix(network):
     ]
     assert self_row.travel_time == 0
     assert self_row.transfers == 0
-    assert self_row.transit_distance == 0.0
+    assert self_row.transit_distance_m == 0.0
     assert self_row.emissions == 0.0
 
 
@@ -171,8 +171,8 @@ def test_point_matrices_walk_ride_and_walk(network_with_footpaths):
     ].iloc[0]
     assert 558 <= m2.travel_time <= 562
     assert m2.transfers == 0
-    assert m2.transit_distance == pytest.approx(4_132, abs=1)
-    assert 27 <= m2.walk_distance <= 31
+    assert m2.transit_distance_m == pytest.approx(4_132, abs=1)
+    assert 27 <= m2.walk_distance_m <= 31
     assert m2.emissions == pytest.approx(4.132 * 25, abs=0.1)
     # A destination best reached on foot appears as a pure walk.
     walk = matrix[
@@ -180,8 +180,8 @@ def test_point_matrices_walk_ride_and_walk(network_with_footpaths):
     ].iloc[0]
     assert 19 <= walk.travel_time <= 21
     assert walk.transfers == 0
-    assert walk.transit_distance == 0.0
-    assert 19 <= walk.walk_distance <= 21
+    assert walk.transit_distance_m == 0.0
+    assert 19 <= walk.walk_distance_m <= 21
     assert walk.emissions == 0.0
     # The point travel-time matrix agrees pair by pair.
     times = network_with_footpaths.travel_time_matrix(
@@ -339,7 +339,7 @@ def test_the_tbtr_pareto_matrix_matches_mcraptor(network):
         ).iloc[0]
         for router in ("raptor", "tbtr")
     ]
-    for column in ["travel_time", "transfers", "transit_distance", "walk_distance"]:
+    for column in ["travel_time", "transfers", "transit_distance_m", "walk_distance_m"]:
         assert cells[0][column] == cells[1][column]
     assert cells[0]["emissions"] == pytest.approx(cells[1]["emissions"], abs=1e-6)
     # Time candidates ride the trip-based engine too, with identical rows.
@@ -417,9 +417,9 @@ def test_point_emission_cells_prefer_walking(network_with_footpaths):
     row = matrix.iloc[0]
     assert row.emissions == 0.0
     assert row.transfers == 0
-    assert row.transit_distance == 0.0
+    assert row.transit_distance_m == 0.0
     assert 19 <= row.travel_time <= 21
-    assert 19 <= row.walk_distance <= 21
+    assert 19 <= row.walk_distance_m <= 21
 
 
 def test_point_emission_cells_match_the_frontier(network_with_footpaths):
@@ -572,7 +572,7 @@ def test_point_fare_cells_prefer_walking(network_with_footpaths, helsinki_gtfs):
     row = matrix.iloc[0]
     assert row.fare == 0.0
     assert row.transfers == 0
-    assert row.transit_distance == 0.0
+    assert row.transit_distance_m == 0.0
     assert 19 <= row.travel_time <= 21
 
 
@@ -714,8 +714,8 @@ def test_point_matrices_take_the_direct_walk(tmp_path):
     row = matrix.iloc[0]
     assert row["travel_time"] == times[0, 0]
     assert row["transfers"] == 0
-    assert row["transit_distance"] == 0.0
-    assert row["walk_distance"] == pytest.approx(100.0, abs=0.5)
+    assert row["transit_distance_m"] == 0.0
+    assert row["walk_distance_m"] == pytest.approx(100.0, abs=0.5)
     assert row["emissions"] == 0.0
     assert row["geometry"].geom_type == "MultiLineString"
 

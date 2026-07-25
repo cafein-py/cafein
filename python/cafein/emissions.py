@@ -208,7 +208,7 @@ def annotate(journeys, network, factors=None, components=None):
             if leg["type"] != "transit":
                 leg["emissions"] = 0.0
                 continue
-            if leg.get("distance") is None:
+            if leg.get("distance_m") is None:
                 raise ValueError(
                     "journey legs carry no distances; build the network "
                     "with trip distances enabled"
@@ -222,7 +222,7 @@ def annotate(journeys, network, factors=None, components=None):
                 complete = False
                 unmatched.add(route_type)
             else:
-                leg["emissions"] = leg["distance"] / 1000.0 * factor
+                leg["emissions"] = leg["distance_m"] / 1000.0 * factor
                 total += leg["emissions"]
         journey["emissions"] = total if complete else None
     if unmatched:

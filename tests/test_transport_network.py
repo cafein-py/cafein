@@ -50,10 +50,10 @@ def test_transit_legs_carry_distance_and_provenance(network):
         "4810551", "1250551", "2022-02-22", "08:30:00"
     )
     access, transit, egress = journeys[0]["legs"]
-    assert transit["distance"] == pytest.approx(16_786, abs=1)
+    assert transit["distance_m"] == pytest.approx(16_786, abs=1)
     assert transit["distance_provenance"] == "shape_dist"
-    assert access["distance"] is None
-    assert egress["distance"] is None
+    assert access["distance_m"] is None
+    assert egress["distance_m"] is None
     assert network.distance_provenance_counts == {"shape_dist": 195_351}
 
 
@@ -73,7 +73,7 @@ def test_transit_legs_carry_wkb_geometry(network):
     assert shapely.get_num_coordinates(line) > 10
     series = gpd.GeoSeries([line], crs="EPSG:4326")
     length = float(series.to_crs(series.estimate_utm_crs()).length.iloc[0])
-    assert length == pytest.approx(transit["distance"], rel=0.01)
+    assert length == pytest.approx(transit["distance_m"], rel=0.01)
     coordinates = {stop: (lon, lat) for stop, lat, lon in network.stops}
     assert line.coords[0] == pytest.approx(coordinates["4810551"], abs=1e-3)
     assert line.coords[-1] == pytest.approx(coordinates["1250551"], abs=1e-3)
@@ -110,7 +110,7 @@ def test_geometry_output_is_controllable(tmp_path):
         1
     ]
     assert transit["geometry"] is None
-    assert transit["distance"] is not None
+    assert transit["distance_m"] is not None
 
 
 def test_set_leg_geometries_validates_its_payload(tmp_path):
@@ -328,7 +328,7 @@ def test_street_stops_are_reachable_only_over_footpaths(
     assert transfer["to_stop"] == "1040280"
     assert transfer["arrival"] - transfer["departure"] == 20
     # Transfer legs carry the footpath's exact meters (1 m/s walking).
-    assert 19 <= transfer["distance"] <= 20
+    assert 19 <= transfer["distance_m"] <= 20
     assert egress["type"] == "egress"
 
 
@@ -417,8 +417,8 @@ def test_routes_door_to_door_between_coordinates(network_with_footpaths):
     assert walk_only["rides"] == 0
     (walk_leg,) = walk_only["legs"]
     assert walk_leg["type"] == "walk"
-    assert 3_000 <= walk_leg["distance"] <= 6_000
-    assert walk_only["arrival"] - walk_only["departure"] >= walk_leg["distance"]
+    assert 3_000 <= walk_leg["distance_m"] <= 6_000
+    assert walk_only["arrival"] - walk_only["departure"] >= walk_leg["distance_m"]
     assert first["rides"] == 1
     assert abs(first["arrival"] - stop_journeys[0]["arrival"]) <= 2
 
@@ -427,13 +427,13 @@ def test_routes_door_to_door_between_coordinates(network_with_footpaths):
     assert access["to_stop"] == "1100602"
     # Walk distances are the exact street-path meters; the leg duration
     # is the same walk rounded up to whole seconds at 1 m/s (3.6 km/h).
-    assert 0 <= access["distance"] <= 15
-    assert access["distance"] <= access["arrival"] - access["departure"]
+    assert 0 <= access["distance_m"] <= 15
+    assert access["distance_m"] <= access["arrival"] - access["departure"]
     assert transit["trip_id"] == "31M2_20220222_Ti_2_0817"
     assert transit["departure"] == 8 * 3600 + 31 * 60
     assert egress["type"] == "egress"
     assert egress["from_stop"] == "1040602"
-    assert 19 <= egress["distance"] <= 23
+    assert 19 <= egress["distance_m"] <= 23
 
 
 def test_door_to_door_window_profiles_departures(network_with_footpaths):
@@ -531,10 +531,10 @@ def test_a_synthetic_network_routes_door_to_door(tmp_path):
     assert first["arrival"] == 8 * 3600 + 10 * 60 + 200
     access, transit, egress = first["legs"]
     assert access["to_stop"] == "S1"
-    assert access["distance"] == 0.0
+    assert access["distance_m"] == 0.0
     assert transit["trip_id"] == "T_OK"
     assert egress["from_stop"] == "S2"
-    assert egress["distance"] == pytest.approx(200.0)
+    assert egress["distance_m"] == pytest.approx(200.0)
 
     # A destination best reached on foot yields a walking-only journey:
     # ~50 m along the edge (0.0009° of its 0.035842° cost length).
@@ -544,7 +544,7 @@ def test_a_synthetic_network_routes_door_to_door(tmp_path):
     assert walk_only["rides"] == 0
     (walk_leg,) = walk_only["legs"]
     assert walk_leg["type"] == "walk"
-    assert walk_leg["distance"] == pytest.approx(50.2, abs=1.0)
+    assert walk_leg["distance_m"] == pytest.approx(50.2, abs=1.0)
     assert walk_only["arrival"] - walk_only["departure"] in (50, 51)
 
     # A destination at the origin's own coordinate is a zero walk.
@@ -553,7 +553,7 @@ def test_a_synthetic_network_routes_door_to_door(tmp_path):
     )
     assert still["rides"] == 0
     assert still["arrival"] == still["departure"]
-    assert still["legs"][0]["distance"] == 0.0
+    assert still["legs"][0]["distance_m"] == 0.0
 
     # Beyond the walking cutoff there is neither a ride nor a walk.
     assert (
@@ -773,7 +773,7 @@ def test_set_transfers_routes_over_footpaths(tmp_path):
     transfer = first["legs"][2]
     assert transfer["from_stop"] == "S2"
     assert transfer["to_stop"] == "0:S1"
-    assert transfer["distance"] == 118.5
+    assert transfer["distance_m"] == 118.5
 
 
 def test_set_transfers_rejects_unknown_stops(tmp_path):
@@ -853,7 +853,7 @@ def test_trip_distances_default_to_the_ladder(tmp_path):
         network = TransportNetwork.from_gtfs([str(feed)])
     journeys = network.route_between_stops("S1", "S2", "2022-02-22", "07:30:00")
     transit = journeys[0]["legs"][1]
-    assert transit["distance"] == pytest.approx(1243 * 1.4, rel=0.01)
+    assert transit["distance_m"] == pytest.approx(1243 * 1.4, rel=0.01)
     assert transit["distance_provenance"] == "crow_fly"
 
 
@@ -864,7 +864,7 @@ def test_trip_distances_can_be_disabled(tmp_path):
     assert network.distance_provenance_counts == {}
     journeys = network.route_between_stops("S1", "S2", "2022-02-22", "07:30:00")
     transit = journeys[0]["legs"][1]
-    assert transit["distance"] is None
+    assert transit["distance_m"] is None
     assert transit["distance_provenance"] is None
 
 
@@ -943,7 +943,9 @@ def test_walk_legs_carry_street_paths(network_with_footpaths):
     (walk_leg,) = journeys[0]["legs"]
     direct = shapely.from_wkb(walk_leg["geometry"])
     assert direct.geom_type == "LineString"
-    assert utm_length(direct) == pytest.approx(walk_leg["distance"], rel=0.02, abs=0.5)
+    assert utm_length(direct) == pytest.approx(
+        walk_leg["distance_m"], rel=0.02, abs=0.5
+    )
     assert direct.coords[0] == pytest.approx((origin[1], origin[0]), abs=1e-6)
     assert direct.coords[-1] == pytest.approx(
         (destination[1], destination[0]), abs=1e-6
@@ -951,10 +953,10 @@ def test_walk_legs_carry_street_paths(network_with_footpaths):
     access, transit, egress = journeys[1]["legs"]
     walk = shapely.from_wkb(access["geometry"])
     assert walk.geom_type == "LineString"
-    assert utm_length(walk) == pytest.approx(access["distance"], rel=0.02, abs=0.5)
+    assert utm_length(walk) == pytest.approx(access["distance_m"], rel=0.02, abs=0.5)
     assert walk.coords[0] == pytest.approx((origin[1], origin[0]), abs=1e-6)
     walk = shapely.from_wkb(egress["geometry"])
-    assert utm_length(walk) == pytest.approx(egress["distance"], rel=0.02, abs=0.5)
+    assert utm_length(walk) == pytest.approx(egress["distance_m"], rel=0.02, abs=0.5)
     assert walk.coords[-1] == pytest.approx((destination[1], destination[0]), abs=1e-6)
 
     # Transfer legs draw their street path on stop-to-stop journeys too.
@@ -963,7 +965,7 @@ def test_walk_legs_carry_street_paths(network_with_footpaths):
     )
     access, transit, transfer, egress = journeys[0]["legs"]
     walk = shapely.from_wkb(transfer["geometry"])
-    assert utm_length(walk) == pytest.approx(transfer["distance"], rel=0.02, abs=0.5)
+    assert utm_length(walk) == pytest.approx(transfer["distance_m"], rel=0.02, abs=0.5)
     kamppi = stop_coordinates(network_with_footpaths, "1040602")
     street_stop = stop_coordinates(network_with_footpaths, "1040280")
     assert walk.coords[0] == pytest.approx((kamppi[1], kamppi[0]), abs=1e-6)

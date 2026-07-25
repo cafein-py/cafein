@@ -84,7 +84,7 @@ impl TransportNetwork {
         entry.set_item("type", "walk")?;
         entry.set_item("departure", departure)?;
         entry.set_item("arrival", arrival)?;
-        entry.set_item("distance", meters)?;
+        entry.set_item("distance_m", meters)?;
         entry.set_item("distance_provenance", py.None())?;
         let geometry = geometries
             .then(|| {
@@ -285,7 +285,7 @@ impl TransportNetwork {
                     entry.set_item("departure", departure)?;
                     entry.set_item("arrival", arrival)?;
                     entry.set_item(
-                        "distance",
+                        "distance_m",
                         walks.and_then(|walks| walks.access.get(&to_stop)).copied(),
                     )?;
                     entry.set_item("distance_provenance", py.None())?;
@@ -317,7 +317,7 @@ impl TransportNetwork {
                     match &self.geometry {
                         Some(geometry) => {
                             entry.set_item(
-                                "distance",
+                                "distance_m",
                                 geometry.leg_distance(trip, board_position, alight_position) as f64,
                             )?;
                             entry.set_item(
@@ -326,7 +326,7 @@ impl TransportNetwork {
                             )?;
                         }
                         None => {
-                            entry.set_item("distance", py.None())?;
+                            entry.set_item("distance_m", py.None())?;
                             entry.set_item("distance_provenance", py.None())?;
                         }
                     }
@@ -368,7 +368,7 @@ impl TransportNetwork {
                     entry.set_item("to_stop", self.public_stop_id(to_stop))?;
                     entry.set_item("departure", departure)?;
                     entry.set_item("arrival", arrival)?;
-                    entry.set_item("distance", meters)?;
+                    entry.set_item("distance_m", meters)?;
                     entry.set_item("distance_provenance", py.None())?;
                     let geometry = geometries
                         .then(|| {
@@ -389,7 +389,7 @@ impl TransportNetwork {
                     entry.set_item("departure", departure)?;
                     entry.set_item("arrival", arrival)?;
                     entry.set_item(
-                        "distance",
+                        "distance_m",
                         walks
                             .and_then(|walks| walks.egress.get(&from_stop))
                             .copied(),
