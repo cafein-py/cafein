@@ -1,5 +1,7 @@
 """The standalone street network: build from OSM, route between coordinates."""
 
+import os
+
 import numpy as np
 import shapely
 
@@ -82,6 +84,43 @@ class StreetNetwork:
                 facility.tolist(),
             )
         )
+
+    def save(self, path):
+        """Save the network as a reusable artifact.
+
+        Carries the street graph, its geometry, and the multimodal permission
+        and attribute arrays behind a versioned, checksummed header, so batch
+        jobs can ``load`` the file instead of re-running the OSM extraction.
+        """
+        self._core.save(os.fspath(path))
+
+    @classmethod
+    def load(cls, path, *, mmap=False, verify=None):
+        """Load a network saved with `save`.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path
+            The artifact to load.
+        mmap : bool or str
+            ``False`` reads the arrays into memory; ``True`` maps the file and
+            uses the street arrays in place, falling back to the owned load
+            where mapping is unavailable; ``'require'`` errors instead of
+            falling back.
+        verify : bool, optional
+            Whether to checksum the street section. Defaults to on for owned
+            loads and off for mapped ones, where the check would page in the
+            whole section the mapped load exists to avoid.
+        """
+        modes = {False: "off", True: "auto", "require": "require"}
+        if mmap not in modes:
+            raise ValueError(f"mmap must be False, True, or 'require', not {mmap!r}")
+        return cls(_CoreStreetNetwork.load(os.fspath(path), modes[mmap], verify))
+
+    @property
+    def mapped(self):
+        """Whether the street arrays are views of a memory-mapped artifact."""
+        return self._core.mapped
 
     @property
     def vertex_count(self):
