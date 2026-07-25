@@ -21,9 +21,9 @@ _COLUMNS = [
     "option",
     "segment",
     "leg_type",
-    "departure",
-    "arrival",
-    "travel_time",
+    "departure_s",
+    "arrival_s",
+    "travel_time_s",
     "from_stop",
     "to_stop",
     "trip_id",
@@ -660,9 +660,9 @@ def _leg_record(from_id, to_id, option, segment, leg):
         "option": option,
         "segment": segment,
         "leg_type": leg_type,
-        "departure": leg["departure"],
-        "arrival": leg["arrival"],
-        "travel_time": leg["arrival"] - leg["departure"],
+        "departure_s": leg["departure_s"],
+        "arrival_s": leg["arrival_s"],
+        "travel_time_s": leg["arrival_s"] - leg["departure_s"],
         "from_stop": from_stop,
         "to_stop": to_stop,
         "trip_id": leg.get("trip_id"),
@@ -682,9 +682,9 @@ STREET_COLUMNS = [
     "segment",
     "leg_type",
     "mode",
-    "departure",
-    "arrival",
-    "travel_time",
+    "departure_s",
+    "arrival_s",
+    "travel_time_s",
     "distance_m",
     "network_distance_m",
     "connector_distance_m",
@@ -728,7 +728,7 @@ def _street_itineraries_frame(
     _warn_unsnapped(table, query.from_ids, query.to_ids)
     from_ids = np.asarray(query.from_ids, dtype=object)
     to_ids = np.asarray(query.to_ids, dtype=object)
-    travel_time = table["travel_time"]
+    travel_time = table["travel_time_s"]
     rows = len(travel_time)
     # A street network has no timetable, so absolute times exist only when a
     # departure is supplied to place the leg on a clock.
@@ -755,9 +755,9 @@ def _street_itineraries_frame(
             # direct walk already does; `mode` is the unambiguous field.
             "leg_type": np.full(rows, transport_mode, dtype=object),
             "mode": np.full(rows, transport_mode, dtype=object),
-            "departure": starts,
-            "arrival": arrivals,
-            "travel_time": travel_time,
+            "departure_s": starts,
+            "arrival_s": arrivals,
+            "travel_time_s": travel_time,
             "distance_m": network_distance + connector_distance,
             "network_distance_m": network_distance,
             "connector_distance_m": connector_distance,

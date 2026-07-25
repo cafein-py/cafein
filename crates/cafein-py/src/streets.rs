@@ -315,7 +315,7 @@ impl StreetNetwork {
         let table = PyDict::new(py);
         table.set_item("from", from.into_pyarray(py))?;
         table.set_item("to", to.into_pyarray(py))?;
-        table.set_item("travel_time", seconds.into_pyarray(py))?;
+        table.set_item("travel_time_s", seconds.into_pyarray(py))?;
         table.set_item("network_distance", network.into_pyarray(py))?;
         table.set_item("connector_distance", connector.into_pyarray(py))?;
         if geometries {

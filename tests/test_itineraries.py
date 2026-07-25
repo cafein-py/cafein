@@ -36,9 +36,9 @@ def test_stop_itinerary_pins_the_k_train(network):
     assert transit["route_short_name"] == "K"
     assert transit["from_stop"] == "4810551"
     assert transit["to_stop"] == "1250551"
-    assert transit["departure"] == 8 * 3600 + 36 * 60
-    assert transit["arrival"] == 8 * 3600 + 58 * 60
-    assert transit["travel_time"] == 22 * 60
+    assert transit["departure_s"] == 8 * 3600 + 36 * 60
+    assert transit["arrival_s"] == 8 * 3600 + 58 * 60
+    assert transit["travel_time_s"] == 22 * 60
     assert transit["distance_m"] == pytest.approx(16_786, abs=1)
     assert transit["distance_provenance"] == "shape_dist"
     # 16.786 km at the shipped 25 g/pkm urban-rail factor.
@@ -59,7 +59,7 @@ def test_options_are_a_pareto_set(network):
     # earlier, matching the routing Pareto contract.
     arrivals, rides = {}, {}
     for option, group in itineraries.groupby("option"):
-        arrivals[option] = group["arrival"].max()
+        arrivals[option] = group["arrival_s"].max()
         rides[option] = (group["leg_type"] == "transit").sum()
     for option in sorted(arrivals)[1:]:
         assert rides[option] > rides[option - 1]
@@ -226,7 +226,7 @@ def test_pareto_and_router_options_are_validated(network):
 
 def _option_summaries(itineraries):
     return sorted(
-        (int(group["arrival"].max()), int((group["leg_type"] == "transit").sum()))
+        (int(group["arrival_s"].max()), int((group["leg_type"] == "transit").sum()))
         for _, group in itineraries.groupby("option")
     )
 
@@ -338,7 +338,7 @@ def test_diverse_itineraries_are_route_disjoint(network):
         for second in corridors[i + 1 :]:
             assert first.isdisjoint(second)
     arrivals = [
-        int(group["arrival"].max()) for _, group in itineraries.groupby("option")
+        int(group["arrival_s"].max()) for _, group in itineraries.groupby("option")
     ]
     assert arrivals == sorted(arrivals)
 
@@ -484,7 +484,7 @@ def test_diverse_itineraries_spread_reaches_across_the_trade_off(network):
     common = dict(max_transfers=6, candidates="diverse", max_options=3)
 
     def latest(itineraries):
-        return max(int(g["arrival"].max()) for _, g in itineraries.groupby("option"))
+        return max(int(g["arrival_s"].max()) for _, g in itineraries.groupby("option"))
 
     fast = DetailedItineraries(
         network,

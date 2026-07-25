@@ -145,13 +145,13 @@ def test_frontier_trades_time_against_emissions(two_line_frontier):
     buses = frame[frame["rides"] == 2]
     assert len(trams) == 2 and len(buses) == 2
     assert buses["emissions"].min() > trams["emissions"].max()
-    assert set(trams["travel_time"]) == {1800}
-    assert set(buses["travel_time"]) == {900, 1380}
+    assert set(trams["travel_time_s"]) == {1800}
+    assert set(buses["travel_time_s"]) == {900, 1380}
 
     # The fast-dirty chain and the slow-clean trams are on the frontier;
     # the 08:15 chain — slower at equal emissions — is not.
-    assert set(frame.loc[frame["frontier"], "travel_time"]) == {900, 1800}
-    assert set(frame.loc[~frame["frontier"], "travel_time"]) == {1380}
+    assert set(frame.loc[frame["frontier"], "travel_time_s"]) == {900, 1800}
+    assert set(frame.loc[~frame["frontier"], "travel_time_s"]) == {1380}
 
     # The budget view: within 15 minutes only the bus chain qualifies;
     # unconstrained, the tram's lower emissions win; an impossible
@@ -168,12 +168,12 @@ def test_dominated_candidates_leave_the_frontier(two_line_frontier):
     on_frontier = frame[frame["frontier"]]
     for _, row in frame[~frame["frontier"]].iterrows():
         assert (
-            (on_frontier["travel_time"] <= row["travel_time"])
+            (on_frontier["travel_time_s"] <= row["travel_time_s"])
             & (on_frontier["emissions"] <= row["emissions"])
         ).any()
     # Frontier rows sorted by time: emissions strictly decrease across
     # distinct travel times, and tie only at equal travel times.
-    times = on_frontier["travel_time"].tolist()
+    times = on_frontier["travel_time_s"].tolist()
     grams = on_frontier["emissions"].tolist()
     for (t1, g1), (t2, g2) in zip(zip(times, grams), zip(times[1:], grams[1:])):
         assert t1 <= t2
@@ -194,14 +194,14 @@ def test_fares_join_the_frontier(tmp_path):
         window=1800,
         fares=two_line_fares(),
     )
-    by_time = {row["travel_time"]: row for _, row in frame.iterrows()}
+    by_time = {row["travel_time_s"]: row for _, row in frame.iterrows()}
     assert by_time[900]["fare"] == pytest.approx(10.0)
     assert by_time[1380]["fare"] == pytest.approx(8.0)
     assert by_time[1800]["fare"] == pytest.approx(6.0)
     # Cheapness returns the 08:15 bus chain to the frontier: dominated
     # on (time, emissions) — see the base test — but strictly cheaper
     # than the fast chain, whose short transfer pays the pair total.
-    assert set(frame.loc[frame["frontier"], "travel_time"]) == {900, 1380, 1800}
+    assert set(frame.loc[frame["frontier"], "travel_time_s"]) == {900, 1380, 1800}
     # The budget view over money: cheapest overall is the tram, the
     # bus chains under tightening time budgets, nothing within a minute.
     assert least_fare(frame)["fare"] == pytest.approx(6.0)
@@ -232,7 +232,7 @@ def test_unpriceable_candidates_leave_the_frontier(tmp_path):
     trams = frame[frame["rides"] == 1]
     assert trams["fare"].isna().all()
     assert not trams["frontier"].any()
-    assert set(frame.loc[frame["frontier"], "travel_time"]) == {900, 1380}
+    assert set(frame.loc[frame["frontier"], "travel_time_s"]) == {900, 1380}
 
 
 def test_door_to_door_frontier_anchors_on_walking(network_with_footpaths):
@@ -258,7 +258,7 @@ def test_door_to_door_frontier_anchors_on_walking(network_with_footpaths):
     assert fastest["rides"] >= 1
     assert fastest["frontier"]
     assert fastest["emissions"] > 0
-    budget = least_emissions(frame, within=int(fastest["travel_time"]))
+    budget = least_emissions(frame, within=int(fastest["travel_time_s"]))
     assert budget["emissions"] == fastest["emissions"]
     # The fast end matches the single-departure oracle: the frontier
     # holds a ride arriving with the pinned fastest journey, and nothing
@@ -266,11 +266,11 @@ def test_door_to_door_frontier_anchors_on_walking(network_with_footpaths):
     oracle = network_with_footpaths.route_between_coordinates(
         coordinates["1100602"], coordinates["1040280"], "2022-02-22", "08:30:00"
     )
-    fastest_arrival = min(journey["arrival"] for journey in oracle)
-    assert frame["arrival"].min() == fastest_arrival
-    at_oracle = frame[(frame["arrival"] == fastest_arrival) & (frame["rides"] >= 1)]
+    fastest_arrival = min(journey["arrival_s"] for journey in oracle)
+    assert frame["arrival_s"].min() == fastest_arrival
+    at_oracle = frame[(frame["arrival_s"] == fastest_arrival) & (frame["rides"] >= 1)]
     assert bool(at_oracle["frontier"].any())
-    assert fastest["travel_time"] <= fastest_arrival - (8 * 3600 + 30 * 60)
+    assert fastest["travel_time_s"] <= fastest_arrival - (8 * 3600 + 30 * 60)
 
 
 def test_frontier_rejects_mixed_endpoints(network_with_footpaths):
@@ -324,7 +324,7 @@ def test_exhaustive_frontier_agrees_with_hand_checkable_candidates(tmp_path):
     )
     interim = journey_frontier(network, "A", "B", "2022-02-22", "08:00:00", window=1)
     assert len(true_set) == 2
-    assert true_set["arrival"].tolist() == interim["arrival"].tolist()
+    assert true_set["arrival_s"].tolist() == interim["arrival_s"].tolist()
     assert true_set["rides"].tolist() == interim["rides"].tolist()
     assert true_set["emissions"].tolist() == pytest.approx(
         interim["emissions"].tolist()
@@ -340,7 +340,7 @@ def test_exhaustive_frontier_finds_points_the_interim_misses(network):
         network, "4810551", "1250551", "2022-02-22", "08:30:00", max_transfers=4
     )
     assert len(direct) == 1
-    assert direct.iloc[0]["arrival"] == 32_280
+    assert direct.iloc[0]["arrival_s"] == 32_280
     assert direct.iloc[0]["rides"] == 1
     assert direct.iloc[0]["emissions"] == pytest.approx(419.65, abs=0.1)
 
@@ -398,7 +398,7 @@ def test_pareto_candidates_match_the_oracle_on_the_two_line_feed(tmp_path):
         bucket=1e-6,
     )
     assert frame["frontier"].all()
-    assert frame["arrival"].tolist() == true_set["arrival"].tolist()
+    assert frame["arrival_s"].tolist() == true_set["arrival_s"].tolist()
     assert frame["rides"].tolist() == true_set["rides"].tolist()
     assert frame["emissions"].tolist() == pytest.approx(true_set["emissions"].tolist())
 
@@ -422,9 +422,9 @@ def test_pareto_window_candidates_cover_the_time_candidates(tmp_path):
         candidates="pareto",
         bucket=1e-6,
     )
-    columns = ["departure", "arrival", "rides", "emissions", "frontier"]
+    columns = ["departure_s", "arrival_s", "rides", "emissions", "frontier"]
     ordered = [
-        frame.sort_values(["departure", "arrival"]) for frame in (interim, pareto)
+        frame.sort_values(["departure_s", "arrival_s"]) for frame in (interim, pareto)
     ]
     for column in columns:
         assert ordered[0][column].tolist() == pytest.approx(ordered[1][column].tolist())
@@ -452,7 +452,7 @@ def test_pareto_candidates_close_the_interim_gap(network):
         bucket=1e-6,
     )
     on = exact[exact["frontier"]]
-    assert on["arrival"].tolist() == true_set["arrival"].tolist()
+    assert on["arrival_s"].tolist() == true_set["arrival_s"].tolist()
     assert on["rides"].tolist() == true_set["rides"].tolist()
     assert on["emissions"].tolist() == pytest.approx(
         true_set["emissions"].tolist(), abs=1e-3
@@ -512,7 +512,7 @@ def test_pareto_candidates_match_the_oracle_over_footpaths(network_with_footpath
     )
     on = exact[exact["frontier"]]
     assert len(true_set) == 20
-    assert on["arrival"].tolist() == true_set["arrival"].tolist()
+    assert on["arrival_s"].tolist() == true_set["arrival_s"].tolist()
     assert on["rides"].tolist() == true_set["rides"].tolist()
     assert on["emissions"].tolist() == pytest.approx(
         true_set["emissions"].tolist(), abs=1e-3
@@ -570,7 +570,7 @@ def test_pareto_candidates_route_door_to_door(network_with_footpaths):
     # Whatever rides beats walking — the walk-domination rule.
     transit = frame[frame["rides"] >= 1]
     assert len(transit) > 0
-    assert (transit["travel_time"] < walk.iloc[0]["travel_time"]).all()
+    assert (transit["travel_time_s"] < walk.iloc[0]["travel_time_s"]).all()
     # Soundness against the time-optimal door-to-door profile: every
     # resolved interim candidate is dominated or equalled by a pareto
     # candidate, and both engines agree on the fastest arrival.
@@ -589,7 +589,9 @@ def test_pareto_candidates_route_door_to_door(network_with_footpaths):
             and candidate.emissions <= row.emissions + 1e-6
             for candidate in frame.itertuples()
         )
-    assert transit["arrival"].min() == interim[interim["rides"] >= 1]["arrival"].min()
+    assert (
+        transit["arrival_s"].min() == interim[interim["rides"] >= 1]["arrival_s"].min()
+    )
 
 
 def test_the_tbtr_pareto_router_matches_mcraptor(network_with_footpaths):
@@ -624,7 +626,7 @@ def test_the_tbtr_pareto_router_matches_mcraptor(network_with_footpaths):
     ]
     for frame in frames:
         on = frame[frame["frontier"]]
-        assert on["arrival"].tolist() == true_set["arrival"].tolist()
+        assert on["arrival_s"].tolist() == true_set["arrival_s"].tolist()
         assert on["rides"].tolist() == true_set["rides"].tolist()
         assert on["emissions"].tolist() == pytest.approx(
             true_set["emissions"].tolist(), abs=1e-3
@@ -647,9 +649,9 @@ def test_the_tbtr_pareto_router_matches_mcraptor(network_with_footpaths):
         )
         for router in ("raptor", "tbtr")
     ]
-    columns = ["departure", "arrival", "rides", "emissions", "frontier"]
+    columns = ["departure_s", "arrival_s", "rides", "emissions", "frontier"]
     ordered = [
-        frame.sort_values(["departure", "arrival"]).reset_index(drop=True)
+        frame.sort_values(["departure_s", "arrival_s"]).reset_index(drop=True)
         for frame in profiles
     ]
     for column in columns:
@@ -867,8 +869,8 @@ def _journey_signatures(frame):
             (
                 leg["type"],
                 leg.get("route_id"),
-                int(leg["departure"]),
-                int(leg["arrival"]),
+                int(leg["departure_s"]),
+                int(leg["arrival_s"]),
             )
             for leg in journey["legs"]
         )
@@ -917,7 +919,7 @@ def test_diverse_max_options_one_returns_the_fastest(tmp_path):
     # Just the single fastest corridor — the 900 s bus chain, not the tram.
     assert len(frame) == 1
     assert _option_corridors(frame) == [{"BUS_IN", "BUS_OUT"}]
-    assert int(frame["travel_time"].iloc[0]) == 900
+    assert int(frame["travel_time_s"].iloc[0]) == 900
 
 
 def test_diverse_candidates_are_route_disjoint(network):
@@ -939,7 +941,7 @@ def test_diverse_candidates_are_route_disjoint(network):
     for i, first in enumerate(corridors):
         for second in corridors[i + 1 :]:
             assert first.isdisjoint(second)
-    arrivals = [int(journey["arrival"]) for journey in frame["journey"]]
+    arrivals = [int(journey["arrival_s"]) for journey in frame["journey"]]
     assert arrivals == sorted(arrivals)
 
 
@@ -1079,7 +1081,7 @@ def test_relaxed_diverse_widens_the_round_pool(network):
     # reaches further across the trade-off.
     assert _option_corridors(widened)[0] == _option_corridors(strict)[0]
     assert _option_corridors(widened) != _option_corridors(strict)
-    assert widened["travel_time"].max() > strict["travel_time"].max()
+    assert widened["travel_time_s"].max() > strict["travel_time_s"].max()
     for corridors in (_option_corridors(strict), _option_corridors(widened)):
         for i, first in enumerate(corridors):
             for second in corridors[i + 1 :]:
@@ -1202,12 +1204,12 @@ def test_diverse_spread_reaches_across_the_trade_off(network):
     # Both seed on the same fastest corridor and stay route-disjoint.
     assert _option_corridors(spread)[0] == _option_corridors(fast)[0]
     # Spread reaches a corridor slower than any the fastest-first set kept.
-    assert spread["travel_time"].max() > fast["travel_time"].max()
+    assert spread["travel_time_s"].max() > fast["travel_time_s"].max()
     assert _option_corridors(spread) != _option_corridors(fast)
     # That far corner is cleaner than the fastest-first set's slowest corridor,
     # so the options span the emissions trade-off, not only travel time.
-    spread_slowest = spread.loc[spread["travel_time"].idxmax()]
-    fast_slowest = fast.loc[fast["travel_time"].idxmax()]
+    spread_slowest = spread.loc[spread["travel_time_s"].idxmax()]
+    fast_slowest = fast.loc[fast["travel_time_s"].idxmax()]
     assert spread_slowest["emissions"] < fast_slowest["emissions"]
 
 
@@ -1250,7 +1252,7 @@ def test_diverse_soft_penalty_shares_trunks_and_finds_more(network):
     # ...and surfaces more options before drying up.
     assert len(soft) > len(ban)
     # The fastest seed is picked before any penalty applies, so it is unchanged.
-    assert soft["travel_time"].min() == ban["travel_time"].min()
+    assert soft["travel_time_s"].min() == ban["travel_time_s"].min()
 
 
 def test_diverse_soft_penalty_reports_true_times(network):
@@ -1271,7 +1273,7 @@ def test_diverse_soft_penalty_reports_true_times(network):
         penalty=100000,
     )
     assert len(frame) >= 1
-    assert frame["travel_time"].max() < 10000
+    assert frame["travel_time_s"].max() < 10000
 
 
 def test_diverse_soft_penalty_clamps_a_huge_value(network):
@@ -1330,7 +1332,13 @@ def test_journey_frontiers_match_the_one_pair_frontier(network):
                 candidates="pareto",
             )
             assert len(cell) == len(single)
-            for column in ("departure", "arrival", "travel_time", "rides", "frontier"):
+            for column in (
+                "departure_s",
+                "arrival_s",
+                "travel_time_s",
+                "rides",
+                "frontier",
+            ):
                 assert cell[column].tolist() == single[column].tolist()
             assert cell["emissions"].tolist() == pytest.approx(
                 single["emissions"].tolist(), nan_ok=True
@@ -1368,7 +1376,13 @@ def test_journey_frontiers_route_door_to_door(network_with_footpaths):
                 candidates="pareto",
             )
             assert len(cell) == len(single)
-            for column in ("departure", "arrival", "travel_time", "rides", "frontier"):
+            for column in (
+                "departure_s",
+                "arrival_s",
+                "travel_time_s",
+                "rides",
+                "frontier",
+            ):
                 assert cell[column].tolist() == single[column].tolist()
             assert cell["emissions"].tolist() == pytest.approx(
                 single["emissions"].tolist(), nan_ok=True
@@ -1386,7 +1400,7 @@ def test_journey_frontiers_route_door_to_door(network_with_footpaths):
     diagonal = batched[
         (batched["from_id"] == "1100602") & (batched["to_id"] == "1100602")
     ]
-    assert diagonal["travel_time"].tolist() == [0]
+    assert diagonal["travel_time_s"].tolist() == [0]
     assert diagonal["rides"].tolist() == [0]
 
 
@@ -1459,7 +1473,7 @@ def test_max_slower_defaults_off_and_a_wide_band_changes_nothing(
         max_slower=100_000,
         **kwargs,
     )
-    for column in ("departure", "arrival", "travel_time", "rides", "frontier"):
+    for column in ("departure_s", "arrival_s", "travel_time_s", "rides", "frontier"):
         assert wide[column].tolist() == unrestricted[column].tolist()
 
 
@@ -1490,12 +1504,12 @@ def test_max_slower_bands_the_frontier_and_keeps_the_fastest(network_with_footpa
     transit = unrestricted[unrestricted["rides"] >= 1]
     banded_transit = banded[banded["rides"] >= 1]
     # The fastest transit journey survives the restriction …
-    assert transit["arrival"].min() in banded_transit["arrival"].tolist()
+    assert transit["arrival_s"].min() in banded_transit["arrival_s"].tolist()
     # … and every kept row stays within its own pass's band: no more
     # than `band` behind the fastest unrestricted arrival of the same
     # departure.
     for row in banded_transit.itertuples():
-        anchor = transit[transit["departure"] == row.departure]["arrival"].min()
+        anchor = transit[transit["departure_s"] == row.departure]["arrival_s"].min()
         assert row.arrival <= anchor + band
 
 
@@ -1585,9 +1599,11 @@ def test_journey_frontiers_band_each_cell_independently(network_with_footpaths):
                 continue
             # The cell's fastest transit journey survives, and every kept
             # row sits within the cell's own per-pass band.
-            assert transit["arrival"].min() in banded_transit["arrival"].tolist()
+            assert transit["arrival_s"].min() in banded_transit["arrival_s"].tolist()
             for row in banded_transit.itertuples():
-                anchor = transit[transit["departure"] == row.departure]["arrival"].min()
+                anchor = transit[transit["departure_s"] == row.departure][
+                    "arrival_s"
+                ].min()
                 assert row.arrival <= anchor + band
     with pytest.raises(ValueError, match="non-negative"):
         journey_frontiers(
@@ -1620,11 +1636,11 @@ def test_the_tbtr_pareto_router_routes_door_to_door(network_with_footpaths):
         for router in ("raptor", "tbtr")
     ]
     ordered = [
-        frame.sort_values(["departure", "arrival"]).reset_index(drop=True)
+        frame.sort_values(["departure_s", "arrival_s"]).reset_index(drop=True)
         for frame in frames
     ]
     assert len(ordered[0]) == len(ordered[1]) > 0
-    for column in ("departure", "arrival", "rides", "frontier"):
+    for column in ("departure_s", "arrival_s", "rides", "frontier"):
         assert ordered[0][column].tolist() == ordered[1][column].tolist()
     assert ordered[0]["emissions"].tolist() == pytest.approx(
         ordered[1]["emissions"].tolist(), nan_ok=True
@@ -1663,13 +1679,20 @@ def test_journey_frontiers_tbtr_matches_raptor(network_with_footpaths):
             for router in ("raptor", "tbtr")
         ]
         ordered = [
-            frame.sort_values(["from_id", "to_id", "departure", "arrival"]).reset_index(
-                drop=True
-            )
+            frame.sort_values(
+                ["from_id", "to_id", "departure_s", "arrival_s"]
+            ).reset_index(drop=True)
             for frame in frames
         ]
         assert len(ordered[0]) == len(ordered[1]) > 0
-        for column in ("from_id", "to_id", "departure", "arrival", "rides", "frontier"):
+        for column in (
+            "from_id",
+            "to_id",
+            "departure_s",
+            "arrival_s",
+            "rides",
+            "frontier",
+        ):
             assert ordered[0][column].tolist() == ordered[1][column].tolist()
         assert ordered[0]["emissions"].tolist() == pytest.approx(
             ordered[1]["emissions"].tolist(), nan_ok=True
@@ -1717,7 +1740,7 @@ def test_the_mctbtr_transfer_cache_answers_identically(tmp_path):
     assert network.mctbtr_transfer_count > 0
     cached = journey_frontiers(network, *args, **kwargs)
     assert len(cached) == len(adhoc) > 0
-    for column in ("from_id", "to_id", "departure", "arrival", "rides", "frontier"):
+    for column in ("from_id", "to_id", "departure_s", "arrival_s", "rides", "frontier"):
         assert cached[column].tolist() == adhoc[column].tolist()
     assert cached["emissions"].tolist() == adhoc["emissions"].tolist()
     # Another date misses the cache and still answers ad hoc.
@@ -1732,7 +1755,7 @@ def test_the_mctbtr_transfer_cache_answers_identically(tmp_path):
     fresh = TransportNetwork.from_gtfs([str(feed)])
     baseline = journey_frontiers(fresh, *args, components=["vehicle"], **kwargs)
     assert len(partial) == len(baseline) > 0
-    for column in ("from_id", "to_id", "departure", "arrival", "rides", "frontier"):
+    for column in ("from_id", "to_id", "departure_s", "arrival_s", "rides", "frontier"):
         assert partial[column].tolist() == baseline[column].tolist()
     assert partial["emissions"].tolist() == baseline["emissions"].tolist()
     assert partial["emissions"].sum() < cached["emissions"].sum()
@@ -1763,7 +1786,7 @@ def test_the_mctbtr_transfer_cache_serves_point_frontiers(
     assert network.has_mctbtr_transfers
     cached = journey_frontiers(network, *args, **kwargs)
     assert len(cached) == len(adhoc) > 0
-    for column in ("from_id", "to_id", "departure", "arrival", "rides", "frontier"):
+    for column in ("from_id", "to_id", "departure_s", "arrival_s", "rides", "frontier"):
         assert cached[column].tolist() == adhoc[column].tolist()
     assert cached["emissions"].tolist() == adhoc["emissions"].tolist()
 
@@ -1839,9 +1862,9 @@ def test_frontier_table_matches_on_the_two_line_fixture(tmp_path):
     assert list(empty.columns) == [
         "from_id",
         "to_id",
-        "departure",
-        "arrival",
-        "travel_time",
+        "departure_s",
+        "arrival_s",
+        "travel_time_s",
         "rides",
         "emissions",
         "frontier",

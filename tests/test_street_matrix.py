@@ -73,9 +73,9 @@ def test_matrix_cells_match_single_routes(streets, origins, destinations, mode):
 
 def test_matrix_columns_and_long_format(streets, origins, destinations):
     matrix = TravelTimeMatrix(streets, origins, destinations, transport_mode="bicycle")
-    assert list(matrix.columns) == ["from_id", "to_id", "travel_time"]
+    assert list(matrix.columns) == ["from_id", "to_id", "travel_time_s"]
     assert len(matrix) <= len(origins) * len(destinations)
-    assert matrix["travel_time"].dtype == np.uint32
+    assert matrix["travel_time_s"].dtype == np.uint32
     # Slices degrade to plain DataFrames, as the transit matrix does.
     assert type(matrix.iloc[:1]) is pd.DataFrame
 
@@ -187,7 +187,7 @@ def test_max_street_time_on_a_transport_network_is_rejected(network):
     "kwargs",
     [
         {"date": "2022-02-22"},
-        {"departure": "08:30:00"},
+        {"departure_s": "08:30:00"},
         {"max_transfers": 3},
         {"router": "raptor"},
         {"window": 600},
@@ -265,7 +265,7 @@ def _on_network_points(streets, shift=0.0):
 COST_COLUMNS = [
     "from_id",
     "to_id",
-    "travel_time",
+    "travel_time_s",
     "distance_m",
     "network_distance_m",
     "connector_distance_m",
@@ -464,7 +464,7 @@ def test_diagonal_geometry_is_a_valid_line(streets, origins):
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"departure": "08:30:00"},
+        {"departure_s": "08:30:00"},
         {"window": 600},
         {"within": 600},
         {"candidates": "pareto"},

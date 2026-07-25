@@ -43,9 +43,9 @@ import pandas as pd
 from cafein import emissions
 
 _COLUMNS = [
-    "departure",
-    "arrival",
-    "travel_time",
+    "departure_s",
+    "arrival_s",
+    "travel_time_s",
     "rides",
     "emissions",
     "frontier",
@@ -380,9 +380,9 @@ def _frontier_frame(journeys, fares):
     the Pareto mark, sorted by travel time (cleaner as the tie-break)."""
     records = [
         {
-            "departure": journey["departure"],
-            "arrival": journey["arrival"],
-            "travel_time": journey["arrival"] - journey["departure"],
+            "departure_s": journey["departure_s"],
+            "arrival_s": journey["arrival_s"],
+            "travel_time_s": journey["arrival_s"] - journey["departure_s"],
             "rides": journey["rides"],
             "emissions": (
                 math.nan if journey["emissions"] is None else journey["emissions"]
@@ -397,7 +397,7 @@ def _frontier_frame(journeys, fares):
         columns.insert(columns.index("journey"), "fare")
     frame = pd.DataFrame(records, columns=columns)
     frame["frontier"] = _frontier_mask(
-        frame["travel_time"].tolist(),
+        frame["travel_time_s"].tolist(),
         frame["emissions"].tolist(),
         frame["fare"].tolist() if fares is not None else None,
     )
@@ -406,7 +406,9 @@ def _frontier_frame(journeys, fares):
         ordered.append("fare")
     ordered.append("journey")
     return (
-        frame[ordered].sort_values(["travel_time", "emissions"]).reset_index(drop=True)
+        frame[ordered]
+        .sort_values(["travel_time_s", "emissions"])
+        .reset_index(drop=True)
     )
 
 
@@ -668,9 +670,9 @@ def frontier_table(
         {
             "from_id": from_id[table["from_index"]],
             "to_id": to_id[table["to_index"]],
-            "departure": table["departure"].astype("int64"),
-            "arrival": table["arrival"].astype("int64"),
-            "travel_time": table["travel_time"].astype("int64"),
+            "departure_s": table["departure_s"].astype("int64"),
+            "arrival_s": table["arrival_s"].astype("int64"),
+            "travel_time_s": table["travel_time_s"].astype("int64"),
             "rides": table["rides"].astype("int64"),
             "emissions": table["emissions"],
             "frontier": table["frontier"],
@@ -719,7 +721,7 @@ def _diverse_reference(journeys):
     the stable scale the spread distance normalizes against. Journeys with no
     resolved emissions do not set the emissions range; if none resolve, that
     axis is zero-range and contributes nothing."""
-    times = [journey["arrival"] - journey["departure"] for journey in journeys]
+    times = [journey["arrival_s"] - journey["departure_s"] for journey in journeys]
     grams = [
         journey["emissions"] for journey in journeys if journey["emissions"] is not None
     ]
@@ -733,7 +735,7 @@ def _diverse_point(journey, reference):
     Unresolved emissions sit at the reference's dirty end; a zero-range axis
     maps everything to 0 so it cannot skew the distance."""
     (time_lo, time_hi), (grams_lo, grams_hi) = reference
-    travel_time = journey["arrival"] - journey["departure"]
+    travel_time = journey["arrival_s"] - journey["departure_s"]
     grams = journey["emissions"]
     if grams is None:
         grams = grams_hi
@@ -746,7 +748,7 @@ def _fastest_key(journey):
     """The seed / ``diversity="time"`` order: shortest travel time, cleaner as
     the tie-break (unresolved emissions last)."""
     return (
-        journey["arrival"] - journey["departure"],
+        journey["arrival_s"] - journey["departure_s"],
         journey["emissions"] if journey["emissions"] is not None else math.inf,
     )
 
@@ -766,7 +768,7 @@ def _diverse_pick(journeys, selected, diversity, reference):
         point = _diverse_point(journey, reference)
         nearest = min(math.hypot(point[0] - c[0], point[1] - c[1]) for c in chosen)
         # Break ties toward the faster journey for a deterministic pick.
-        return nearest, -(journey["arrival"] - journey["departure"])
+        return nearest, -(journey["arrival_s"] - journey["departure_s"])
 
     return max(journeys, key=spread_key)
 
@@ -783,7 +785,12 @@ def _journey_key(journey):
     departures, so a soft-penalty round never re-selects an already-kept
     journey."""
     return tuple(
-        (leg["type"], leg.get("route_id"), int(leg["departure"]), int(leg["arrival"]))
+        (
+            leg["type"],
+            leg.get("route_id"),
+            int(leg["departure_s"]),
+            int(leg["arrival_s"]),
+        )
         for leg in journey["legs"]
     )
 
@@ -1030,9 +1037,9 @@ def exhaustive_frontier(
     )
     hours, minutes, seconds = departure.split(":")
     start = int(hours) * 3600 + int(minutes) * 60 + int(seconds)
-    frame = pd.DataFrame(points, columns=["arrival", "emissions", "rides"])
-    frame["travel_time"] = frame["arrival"] - start
-    return frame[["arrival", "travel_time", "rides", "emissions"]]
+    frame = pd.DataFrame(points, columns=["arrival_s", "emissions", "rides"])
+    frame["travel_time_s"] = frame["arrival_s"] - start
+    return frame[["arrival_s", "travel_time_s", "rides", "emissions"]]
 
 
 def least_emissions(frontier, within=None):
@@ -1061,10 +1068,10 @@ def least_emissions(frontier, within=None):
     """
     rows = frontier[frontier["emissions"].notna()]
     if within is not None:
-        rows = rows[rows["travel_time"] <= within]
+        rows = rows[rows["travel_time_s"] <= within]
     if rows.empty:
         return None
-    return rows.sort_values(["emissions", "travel_time"]).iloc[0]
+    return rows.sort_values(["emissions", "travel_time_s"]).iloc[0]
 
 
 def least_fare(frontier, within=None):
@@ -1097,10 +1104,10 @@ def least_fare(frontier, within=None):
         )
     rows = frontier[frontier["fare"].notna()]
     if within is not None:
-        rows = rows[rows["travel_time"] <= within]
+        rows = rows[rows["travel_time_s"] <= within]
     if rows.empty:
         return None
-    return rows.sort_values(["fare", "travel_time", "emissions"]).iloc[0]
+    return rows.sort_values(["fare", "travel_time_s", "emissions"]).iloc[0]
 
 
 def _frontier_mask(times, grams, fares=None):

@@ -77,13 +77,13 @@ impl TransportNetwork {
     ) -> PyResult<Py<PyDict>> {
         let arrival = departure.saturating_add(walk_seconds);
         let dict = PyDict::new(py);
-        dict.set_item("departure", departure)?;
-        dict.set_item("arrival", arrival)?;
+        dict.set_item("departure_s", departure)?;
+        dict.set_item("arrival_s", arrival)?;
         dict.set_item("rides", 0)?;
         let entry = PyDict::new(py);
         entry.set_item("type", "walk")?;
-        entry.set_item("departure", departure)?;
-        entry.set_item("arrival", arrival)?;
+        entry.set_item("departure_s", departure)?;
+        entry.set_item("arrival_s", arrival)?;
         entry.set_item("distance_m", meters)?;
         entry.set_item("distance_provenance", py.None())?;
         let geometry = geometries
@@ -268,8 +268,8 @@ impl TransportNetwork {
     ) -> PyResult<Py<PyDict>> {
         let timetable = &self.build.timetable;
         let dict = PyDict::new(py);
-        dict.set_item("departure", journey.departure)?;
-        dict.set_item("arrival", journey.arrival)?;
+        dict.set_item("departure_s", journey.departure)?;
+        dict.set_item("arrival_s", journey.arrival)?;
         dict.set_item("rides", journey.rides())?;
         let legs = PyList::empty(py);
         for leg in &journey.legs {
@@ -282,8 +282,8 @@ impl TransportNetwork {
                 } => {
                     entry.set_item("type", "access")?;
                     entry.set_item("to_stop", self.public_stop_id(to_stop))?;
-                    entry.set_item("departure", departure)?;
-                    entry.set_item("arrival", arrival)?;
+                    entry.set_item("departure_s", departure)?;
+                    entry.set_item("arrival_s", arrival)?;
                     entry.set_item(
                         "distance_m",
                         walks.and_then(|walks| walks.access.get(&to_stop)).copied(),
@@ -312,8 +312,8 @@ impl TransportNetwork {
                     entry.set_item("route_short_name", route.short_name.as_deref())?;
                     entry.set_item("board_stop", self.public_stop_id(board_stop))?;
                     entry.set_item("alight_stop", self.public_stop_id(alight_stop))?;
-                    entry.set_item("departure", board_time)?;
-                    entry.set_item("arrival", alight_time)?;
+                    entry.set_item("departure_s", board_time)?;
+                    entry.set_item("arrival_s", alight_time)?;
                     match &self.geometry {
                         Some(geometry) => {
                             entry.set_item(
@@ -366,8 +366,8 @@ impl TransportNetwork {
                     entry.set_item("type", "transfer")?;
                     entry.set_item("from_stop", self.public_stop_id(from_stop))?;
                     entry.set_item("to_stop", self.public_stop_id(to_stop))?;
-                    entry.set_item("departure", departure)?;
-                    entry.set_item("arrival", arrival)?;
+                    entry.set_item("departure_s", departure)?;
+                    entry.set_item("arrival_s", arrival)?;
                     entry.set_item("distance_m", meters)?;
                     entry.set_item("distance_provenance", py.None())?;
                     let geometry = geometries
@@ -386,8 +386,8 @@ impl TransportNetwork {
                 } => {
                     entry.set_item("type", "egress")?;
                     entry.set_item("from_stop", self.public_stop_id(from_stop))?;
-                    entry.set_item("departure", departure)?;
-                    entry.set_item("arrival", arrival)?;
+                    entry.set_item("departure_s", departure)?;
+                    entry.set_item("arrival_s", arrival)?;
                     entry.set_item(
                         "distance_m",
                         walks

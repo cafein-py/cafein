@@ -13,8 +13,8 @@ def ride(route_id, board, board_stop="X", alight_stop="Y"):
     return {
         "type": "transit",
         "route_id": route_id,
-        "departure": board,
-        "arrival": board + 300,
+        "departure_s": board,
+        "arrival_s": board + 300,
         "board_stop": board_stop,
         "alight_stop": alight_stop,
     }
@@ -22,8 +22,8 @@ def ride(route_id, board, board_stop="X", alight_stop="Y"):
 
 def journey(*legs):
     return {
-        "departure": legs[0]["departure"] if legs else 0,
-        "arrival": legs[-1]["arrival"] if legs else 0,
+        "departure_s": legs[0]["departure_s"] if legs else 0,
+        "arrival_s": legs[-1]["arrival_s"] if legs else 0,
         "rides": sum(leg["type"] == "transit" for leg in legs),
         "legs": list(legs),
     }

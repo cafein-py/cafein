@@ -1450,9 +1450,9 @@ impl FrontierColumns {
         let dict = PyDict::new(py);
         dict.set_item("from_index", self.from_index.into_pyarray(py))?;
         dict.set_item("to_index", self.to_index.into_pyarray(py))?;
-        dict.set_item("departure", self.departure.into_pyarray(py))?;
-        dict.set_item("arrival", self.arrival.into_pyarray(py))?;
-        dict.set_item("travel_time", self.travel_time.into_pyarray(py))?;
+        dict.set_item("departure_s", self.departure.into_pyarray(py))?;
+        dict.set_item("arrival_s", self.arrival.into_pyarray(py))?;
+        dict.set_item("travel_time_s", self.travel_time.into_pyarray(py))?;
         dict.set_item("rides", self.rides.into_pyarray(py))?;
         dict.set_item("emissions", self.emissions.into_pyarray(py))?;
         dict.set_item("frontier", self.frontier.into_pyarray(py))?;

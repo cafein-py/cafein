@@ -258,7 +258,7 @@ class TravelCostMatrix(pd.DataFrame):
         data = {
             "from_id": np.array(from_ids, dtype=object)[table["from"]],
             "to_id": np.array(to_ids, dtype=object)[table["to"]],
-            "travel_time": table["travel_time"],
+            "travel_time_s": table["travel_time_s"],
             "transfers": np.maximum(table["rides"], 1) - 1,
             "transit_distance_m": table["transit_distance"],
             "walk_distance_m": table["walk_distance"],
@@ -597,7 +597,7 @@ def _street_cost_columns(
     data = {
         "from_id": from_ids[table["from"]],
         "to_id": to_ids[table["to"]],
-        "travel_time": table["travel_time"],
+        "travel_time_s": table["travel_time_s"],
         # Reported alongside its parts, not instead of them: the two are
         # measured differently (stored edge lengths versus straight connectors).
         "distance_m": network_distance + connector_distance,
@@ -649,7 +649,7 @@ def _street_time_columns(
     return {
         "from_id": from_ids[rows],
         "to_id": to_ids[columns],
-        "travel_time": matrix[rows, columns],
+        "travel_time_s": matrix[rows, columns],
     }
 
 
@@ -702,14 +702,14 @@ def _time_columns(
         return {
             "from_id": from_ids[rows],
             "to_id": to_ids[columns],
-            "travel_time": matrix[rows, columns],
+            "travel_time_s": matrix[rows, columns],
         }
     rows, columns = np.nonzero((matrix != unreachable).any(axis=2))
     values = matrix[rows, columns, :].astype(float)
     values[values == unreachable] = np.nan
     data = {"from_id": from_ids[rows], "to_id": to_ids[columns]}
     for index, percentile in enumerate(resolved):
-        data[f"travel_time_p{percentile:g}"] = values[:, index]
+        data[f"travel_time_p{percentile:g}_s"] = values[:, index]
     return data
 
 
@@ -796,7 +796,7 @@ def travel_cost_table(
             pyarrow.array(table["to"]),
             pyarrow.array(to_ids, type=pyarrow.string()),
         ),
-        "travel_time": pyarrow.array(table["travel_time"]),
+        "travel_time_s": pyarrow.array(table["travel_time_s"]),
         "transfers": pyarrow.array(np.maximum(table["rides"], 1) - 1),
         "transit_distance_m": pyarrow.array(table["transit_distance"]),
         "walk_distance_m": pyarrow.array(table["walk_distance"]),

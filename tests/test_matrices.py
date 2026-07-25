@@ -227,7 +227,7 @@ def test_point_matrices_from_arbitrary_locations(network_with_footpaths):
                 origin, destination, "2022-02-22", "08:30:00"
             )
             assert journeys
-            fastest = min(journey["arrival"] for journey in journeys)
+            fastest = min(journey["arrival_s"] for journey in journeys)
             assert fastest - departure == times[i, j]
     # A building off the street network warns and yields no rows.
     nowhere = gpd.GeoDataFrame(
@@ -271,11 +271,11 @@ def test_least_emission_cells_match_the_frontier(tmp_path):
     # within 15 minutes, nothing within a minute.
     cleanest, oracle = cell(), least_emissions(frontier)
     assert cleanest["emissions"] == pytest.approx(oracle["emissions"])
-    assert cleanest["travel_time"] == oracle["travel_time"] == 1800
+    assert cleanest["travel_time_s"] == oracle["travel_time_s"] == 1800
     assert cleanest["transfers"] == 0
     budgeted, oracle = cell(within=900), least_emissions(frontier, within=900)
     assert budgeted["emissions"] == pytest.approx(oracle["emissions"])
-    assert budgeted["travel_time"] == oracle["travel_time"] == 900
+    assert budgeted["travel_time_s"] == oracle["travel_time_s"] == 900
     assert budgeted["transfers"] == 1
     assert cell(within=60) is None
 
@@ -312,7 +312,7 @@ def test_pareto_candidates_lower_the_emission_cells(network):
     )
     point = true_set.loc[true_set["emissions"].idxmin()]
     assert pareto["emissions"] == pytest.approx(point["emissions"], abs=1e-3)
-    assert pareto["travel_time"] == point["travel_time"]
+    assert pareto["travel_time_s"] == point["travel_time_s"]
     # The default bucket keeps the gap closed.
     assert cell(candidates="pareto")["emissions"] < interim["emissions"]
 
@@ -339,7 +339,12 @@ def test_the_tbtr_pareto_matrix_matches_mcraptor(network):
         ).iloc[0]
         for router in ("raptor", "tbtr")
     ]
-    for column in ["travel_time", "transfers", "transit_distance_m", "walk_distance_m"]:
+    for column in [
+        "travel_time_s",
+        "transfers",
+        "transit_distance_m",
+        "walk_distance_m",
+    ]:
         assert cells[0][column] == cells[1][column]
     assert cells[0]["emissions"] == pytest.approx(cells[1]["emissions"], abs=1e-6)
     # Time candidates ride the trip-based engine too, with identical rows.
@@ -449,7 +454,7 @@ def test_point_emission_cells_match_the_frontier(network_with_footpaths):
     )
     row = matrix.iloc[0]
     assert row.emissions == pytest.approx(oracle["emissions"])
-    assert row.travel_time == oracle["travel_time"]
+    assert row.travel_time == oracle["travel_time_s"]
     assert row.transfers == oracle["rides"] - 1
 
 
@@ -485,7 +490,7 @@ def test_least_fare_cells_match_the_frontier(tmp_path):
     for within in (None, 1380, 900):
         row, oracle = cell(within), least_fare(frontier, within=within)
         assert row["fare"] == pytest.approx(oracle["fare"])
-        assert row["travel_time"] == oracle["travel_time"]
+        assert row["travel_time_s"] == oracle["travel_time_s"]
     assert cell(within=60) is None
 
 
@@ -508,7 +513,7 @@ def test_fare_columns_price_the_reported_journeys(network, helsinki_gtfs):
         "4810551", "1250551", "2022-02-22", "08:30:00"
     )
     fare_module.annotate_fares(journeys, hsl)
-    fastest = min(journeys, key=lambda journey: journey["arrival"])
+    fastest = min(journeys, key=lambda journey: journey["arrival_s"])
     assert row.fare == pytest.approx(fastest["fare"])
     # A seeded rule-based structure prices per boarding: the base fare,
     # one discounted transfer at the pair total (= base), then full
@@ -521,7 +526,7 @@ def test_fare_columns_price_the_reported_journeys(network, helsinki_gtfs):
         fares=seeded,
     )
     expected = np.where(
-        bulk["travel_time"] == 0, 0.0, np.maximum(bulk["transfers"], 1) * 3.0
+        bulk["travel_time_s"] == 0, 0.0, np.maximum(bulk["transfers"], 1) * 3.0
     )
     assert bulk["fare"].to_numpy() == pytest.approx(expected)
 
@@ -712,7 +717,7 @@ def test_point_matrices_take_the_direct_walk(tmp_path):
         network, origins, destinations, "2022-02-22", "07:30:00", geometries=True
     )
     row = matrix.iloc[0]
-    assert row["travel_time"] == times[0, 0]
+    assert row["travel_time_s"] == times[0, 0]
     assert row["transfers"] == 0
     assert row["transit_distance_m"] == 0.0
     assert row["walk_distance_m"] == pytest.approx(100.0, abs=0.5)
@@ -953,7 +958,7 @@ def test_arrow_table_matches_the_dataframe(network, tmp_path):
     assert pyarrow.types.is_dictionary(table.schema.field("from_id").type)
     assert table.column("from_id").to_pylist() == list(frame.from_id)
     assert table.column("to_id").to_pylist() == list(frame.to_id)
-    assert table.column("travel_time").to_pylist() == list(frame.travel_time)
+    assert table.column("travel_time_s").to_pylist() == list(frame.travel_time)
     assert table.column("transfers").to_pylist() == list(frame.transfers)
     assert table.column("emissions").to_pylist() == pytest.approx(list(frame.emissions))
     decoded = shapely.from_wkb(table.column("geometry").to_pylist()[0])
@@ -994,7 +999,7 @@ def test_travel_time_matrix_unstacks_the_wide_matrix(network):
     wide = network.travel_time_matrix(origins, "2022-02-22", "08:30:00")
     stops = [stop for stop, _lat, _lon in network.stops]
     matrix = TravelTimeMatrix(network, origins, date="2022-02-22", departure="08:30:00")
-    assert list(matrix.columns) == ["from_id", "to_id", "travel_time"]
+    assert list(matrix.columns) == ["from_id", "to_id", "travel_time_s"]
     # Every reachable wide cell is a row; unreachable cells are absent.
     assert len(matrix) == int((wide != UNREACHABLE).sum())
     long = {
@@ -1073,9 +1078,9 @@ def test_travel_time_matrix_windowed_percentiles(network):
     assert list(matrix.columns) == [
         "from_id",
         "to_id",
-        "travel_time_p10",
-        "travel_time_p50",
-        "travel_time_p90",
+        "travel_time_p10_s",
+        "travel_time_p50_s",
+        "travel_time_p90_s",
     ]
     # Each row equals the corresponding wide percentile plane, cell for
     # cell, with unreachable percentile cells read as NaN.
@@ -1090,8 +1095,8 @@ def test_travel_time_matrix_windowed_percentiles(network):
                 assert long_value == wide_value
     # Percentiles are ordered within a reachable row.
     reachable = matrix.dropna()
-    assert (reachable.travel_time_p10 <= reachable.travel_time_p50).all()
-    assert (reachable.travel_time_p50 <= reachable.travel_time_p90).all()
+    assert (reachable.travel_time_p10_s <= reachable.travel_time_p50_s).all()
+    assert (reachable.travel_time_p50_s <= reachable.travel_time_p90_s).all()
 
 
 def test_windowed_tbtr_matches_raptor_and_reuses_cache(helsinki_gtfs):

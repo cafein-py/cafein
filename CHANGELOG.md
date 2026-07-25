@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **Breaking:** every time column now carries its unit in its name too.
+  ``travel_time`` becomes ``travel_time_s``, the departure-window
+  percentiles become ``travel_time_p<p>_s``, and the journey and leg
+  clocks become ``departure_s`` and ``arrival_s`` — in the frames and in
+  the dicts ``route_between_stops`` and ``route_between_coordinates``
+  return alike. The unit is worth stating: r5py, which cafein offers an
+  alternative to, reports travel times in **minutes**, so an unqualified
+  ``travel_time`` invited a silently 60-fold error. Both clocks remain
+  seconds since midnight of the *service date* and can exceed 86400 for
+  journeys running past midnight. Method and parameter names are
+  unchanged (``StreetNetwork.travel_time``, ``max_street_time``,
+  ``max_walking_time``, and the ``departure=`` argument).
+
+- ``cafein.to_minutes(frame)`` converts a result's seconds columns to
+  minutes: each ``*_s`` column becomes a floating-point ``*_min`` column
+  in a copy, leaving the exact integer seconds in the original. It takes
+  the frame as an argument rather than living on the result classes,
+  which degrade to plain pandas on any slice or filter, so it keeps
+  working on anything derived from a result. Pass ``columns=`` to
+  convert only some.
+
 - **Breaking:** every distance column now carries its unit in its name.
   ``TravelCostMatrix`` and ``travel_cost_table`` report
   ``transit_distance_m`` and ``walk_distance_m`` in place of

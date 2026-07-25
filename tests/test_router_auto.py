@@ -9,9 +9,9 @@ from test_frontier import build_two_line_gtfs
 
 DATE, DEPARTURE = "2022-02-22", "08:00:00"
 FRONTIER_COLUMNS = [
-    "departure",
-    "arrival",
-    "travel_time",
+    "departure_s",
+    "arrival_s",
+    "travel_time_s",
     "rides",
     "emissions",
     "frontier",
@@ -286,7 +286,7 @@ def test_arrow_cost_table_accepts_router(two_line_network):
     table = travel_cost_table(*args, router="tbtr")
     frame = TravelCostMatrix(*args, router="tbtr")
     assert table.num_rows == len(frame) > 0
-    assert table.column("travel_time").to_pylist() == list(frame.travel_time)
+    assert table.column("travel_time_s").to_pylist() == list(frame.travel_time)
     assert table.column("transit_distance_m").to_pylist() == list(
         frame.transit_distance_m
     )
