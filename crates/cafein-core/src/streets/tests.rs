@@ -1812,3 +1812,428 @@ fn positive_length_arc_never_costs_zero() {
     let compiled = net.compile_profile(&extreme).unwrap();
     assert!(compiled.arc_millis.iter().all(|&cost| cost >= 1));
 }
+
+// --- Directed profile-aware search -------------------------------------------
+
+fn directed_slot(net: &StreetNetwork, from: u32, to: u32) -> usize {
+    let offsets = net.arrays().adjacency_offsets();
+    let targets = net.arrays().adj_targets();
+    (offsets[from as usize] as usize..offsets[from as usize + 1] as usize)
+        .find(|&slot| targets[slot] == to)
+        .expect("no arc between the vertices")
+}
+
+/// Uniform attributes permitting walk+bicycle everywhere, then clearing the
+/// bicycle bit on every directed arc `from → to` (all parallel edges too).
+fn bike_access_forbidding(net: &StreetNetwork, forbidden: &[(u32, u32)]) -> StreetAttributes {
+    let mut attributes = uniform_attributes(net, MODE_WALK | MODE_BICYCLE, 0);
+    let offsets = net.arrays().adjacency_offsets();
+    let targets = net.arrays().adj_targets();
+    for &(from, to) in forbidden {
+        let start = offsets[from as usize] as usize;
+        let end = offsets[from as usize + 1] as usize;
+        for (offset, &target) in targets[start..end].iter().enumerate() {
+            if target == to {
+                attributes.adj_access[start + offset] &= !MODE_BICYCLE;
+            }
+        }
+    }
+    attributes
+}
+
+fn hand_dijkstra(net: &StreetNetwork, arc_millis: &[u32], source: u32) -> Vec<u64> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let offsets = net.arrays().adjacency_offsets();
+    let targets = net.arrays().adj_targets();
+    let mut dist = vec![u64::MAX; net.vertex_count() as usize];
+    let mut heap = BinaryHeap::new();
+    dist[source as usize] = 0;
+    heap.push(Reverse((0u64, source)));
+    while let Some(Reverse((d, v))) = heap.pop() {
+        if d > dist[v as usize] {
+            continue;
+        }
+        for slot in offsets[v as usize] as usize..offsets[v as usize + 1] as usize {
+            if arc_millis[slot] == u32::MAX {
+                continue;
+            }
+            let next = d + u64::from(arc_millis[slot]);
+            let target = targets[slot] as usize;
+            if next < dist[target] {
+                dist[target] = next;
+                heap.push(Reverse((next, targets[slot])));
+            }
+        }
+    }
+    dist
+}
+
+#[test]
+fn directed_dijkstra_matches_a_plain_dijkstra() {
+    let mut net = triangle();
+    net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
+        .unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let expected = hand_dijkstra(&net, &bike.arc_millis, 0);
+    let got = net.directed_distances(&bike, &[(0, 0)], u64::MAX);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn directed_travel_time_is_the_on_edge_plus_arc_time() {
+    let mut net = triangle();
+    net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
+        .unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    // A snap mid-edge on the first edge (0,1) to a snap mid-edge on the last
+    // edge (2,3), no connectors. The route leaves toward vertex 1, crosses the
+    // middle edge (1,2), and arrives on the last edge from vertex 2.
+    let from = Snap {
+        edge: directed_edge(&net, 0, 1),
+        fraction: 0.25,
+        connector: 0.0,
+    };
+    let to = Snap {
+        edge: directed_edge(&net, 2, 3),
+        fraction: 0.5,
+        connector: 0.0,
+    };
+    let arc = |a, b| bike.arc_millis[directed_slot(&net, a, b)];
+    let leave = (f64::from(arc(0, 1)) * 0.75).ceil() as u64;
+    let cross = u64::from(arc(1, 2));
+    let arrive = (f64::from(arc(2, 3)) * 0.5).ceil() as u64;
+    let expected = seconds((leave + cross + arrive) as f64 / 1000.0);
+    assert_eq!(
+        net.directed_travel_time(&from, &to, &bike, 1e9),
+        Some(expected)
+    );
+    // The undirected graph is symmetric, so the reverse trip costs the same.
+    assert_eq!(
+        net.directed_travel_time(&to, &from, &bike, 1e9),
+        net.directed_travel_time(&from, &to, &bike, 1e9)
+    );
+}
+
+fn directed_edge(net: &StreetNetwork, from: u32, to: u32) -> u32 {
+    net.arrays().adj_edges()[directed_slot(net, from, to)]
+}
+
+#[test]
+fn directed_search_respects_one_way_arcs() {
+    // Make the middle edge (1,2) one-way in the 1->2 direction only. A trip
+    // that must cross it forward still works; the reverse trip has no path.
+    let mut net = triangle();
+    net.install_street_attributes(bike_access_forbidding(&net, &[(2, 1)]))
+        .unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let on_first = Snap {
+        edge: directed_edge(&net, 0, 1),
+        fraction: 0.5,
+        connector: 0.0,
+    };
+    let on_last = Snap {
+        edge: directed_edge(&net, 2, 3),
+        fraction: 0.5,
+        connector: 0.0,
+    };
+    // first -> last crosses (1,2) forward: reachable.
+    assert!(net
+        .directed_travel_time(&on_first, &on_last, &bike, 1e9)
+        .is_some());
+    // last -> first would need (2,1), which the bicycle may not use: no path.
+    assert_eq!(
+        net.directed_travel_time(&on_last, &on_first, &bike, 1e9),
+        None
+    );
+}
+
+#[test]
+fn directed_same_edge_direct_and_blocked() {
+    let mut net = triangle();
+    // Forbid the reverse (1,0) arc of the first edge.
+    net.install_street_attributes(bike_access_forbidding(&net, &[(1, 0)]))
+        .unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let edge = directed_edge(&net, 0, 1);
+    let near = Snap {
+        edge,
+        fraction: 0.25,
+        connector: 0.0,
+    };
+    let far = Snap {
+        edge,
+        fraction: 0.75,
+        connector: 0.0,
+    };
+    // near -> far runs forward (0->1) directly along the edge.
+    let arc = bike.arc_millis[directed_slot(&net, 0, 1)];
+    let direct = seconds((f64::from(arc) * 0.5).ceil() / 1000.0);
+    assert_eq!(
+        net.directed_travel_time(&near, &far, &bike, 1e9),
+        Some(direct)
+    );
+    // far -> near would run reverse (1->0) directly, which is forbidden, and a
+    // single edge offers no detour: no path.
+    assert_eq!(net.directed_travel_time(&far, &near, &bike, 1e9), None);
+}
+
+/// A cycle 0->1->2->0 with a longer parallel edge between 0 and 1, so shortest
+/// paths have detours and a parallel-edge choice.
+fn loop_network() -> StreetNetwork {
+    network(
+        3,
+        0,
+        &[
+            (0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0))),
+            (1, 2, 120.0, straight((100.0, 0.0), (100.0, 120.0))),
+            (2, 0, 140.0, straight((100.0, 120.0), (0.0, 0.0))),
+            (0, 1, 300.0, vec![(0.0, 0.0), (50.0, -80.0), (100.0, 0.0)]),
+        ],
+        vec![],
+    )
+    .unwrap()
+}
+
+fn hand_dijkstra_bounded(
+    net: &StreetNetwork,
+    arc_millis: &[u32],
+    source: u32,
+    cutoff: u64,
+) -> Vec<u64> {
+    hand_dijkstra(net, arc_millis, source)
+        .into_iter()
+        .map(|d| if d <= cutoff { d } else { u64::MAX })
+        .collect()
+}
+
+#[test]
+fn directed_search_matches_oracle_over_sources_cutoffs_and_parallels() {
+    let mut net = loop_network();
+    net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
+        .unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    for source in 0..net.vertex_count() {
+        assert_eq!(
+            net.directed_distances(&bike, &[(source, 0)], u64::MAX),
+            hand_dijkstra(&net, &bike.arc_millis, source),
+        );
+        // A bound that reaches some but not all vertices.
+        let cutoff = 30_000;
+        assert_eq!(
+            net.directed_distances(&bike, &[(source, 0)], cutoff),
+            hand_dijkstra_bounded(&net, &bike.arc_millis, source, cutoff),
+        );
+    }
+    // The parallel edge choice: 0 -> 1 takes the shorter of the two edges.
+    let short = bike.arc_millis[directed_slot(&net, 0, 1)];
+    assert_eq!(
+        net.directed_distances(&bike, &[(0, 0)], u64::MAX)[1],
+        u64::from(short)
+    );
+}
+
+#[test]
+fn directed_search_detours_around_forbidden_arcs() {
+    // Forbid every 0 -> 1 arc; vertex 1 is then reachable from 0 only around
+    // the cycle 0 -> 2 -> 1, and the directed search finds that detour.
+    let mut net = loop_network();
+    net.install_street_attributes(bike_access_forbidding(&net, &[(0, 1)]))
+        .unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let detour = u64::from(bike.arc_millis[directed_slot(&net, 0, 2)])
+        + u64::from(bike.arc_millis[directed_slot(&net, 2, 1)]);
+    assert_eq!(
+        net.directed_distances(&bike, &[(0, 0)], u64::MAX)[1],
+        detour
+    );
+    // The oracle agrees over the forbidden graph.
+    assert_eq!(
+        net.directed_distances(&bike, &[(0, 0)], u64::MAX),
+        hand_dijkstra(&net, &bike.arc_millis, 0),
+    );
+}
+
+#[test]
+fn directed_same_edge_falls_back_to_a_detour() {
+    // Two snaps on the first 0->1 edge, with its direct reverse (1->0) forbidden.
+    // far -> near cannot run back along the edge but detours 1 -> 2 -> 0.
+    let mut net = loop_network();
+    let edge = directed_edge(&net, 0, 1);
+    net.install_street_attributes(bike_access_forbidding(&net, &[(1, 0)]))
+        .unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let near = Snap {
+        edge,
+        fraction: 0.25,
+        connector: 0.0,
+    };
+    let far = Snap {
+        edge,
+        fraction: 0.75,
+        connector: 0.0,
+    };
+    // near -> far is the direct forward run.
+    assert!(net.directed_travel_time(&near, &far, &bike, 1e9).is_some());
+    // far -> near has no direct reverse but a cycle detour exists, so it routes.
+    assert!(net.directed_travel_time(&far, &near, &bike, 1e9).is_some());
+}
+
+#[test]
+fn directed_snap_at_a_vertex_seeds_it_without_a_reverse_arc() {
+    // A snap exactly at fraction 0 sits on the `from` vertex; it must seed that
+    // vertex even when the reverse arc is forbidden (no arc traversal needed).
+    let mut net = loop_network();
+    let edge = directed_edge(&net, 0, 1);
+    net.install_street_attributes(bike_access_forbidding(&net, &[(1, 0)]))
+        .unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    // Origin at vertex 0 (fraction 0 on the 0->1 edge), destination mid-edge on
+    // (1,2): reachable forward via vertex 1 despite the forbidden 1->0 arc.
+    let origin = Snap {
+        edge,
+        fraction: 0.0,
+        connector: 0.0,
+    };
+    let dest = Snap {
+        edge: directed_edge(&net, 1, 2),
+        fraction: 0.5,
+        connector: 0.0,
+    };
+    assert!(net
+        .directed_travel_time(&origin, &dest, &bike, 1e9)
+        .is_some());
+}
+
+fn self_loop_network() -> (StreetNetwork, u32, [usize; 2]) {
+    // A self-loop at vertex 1 plus an edge to vertex 0. Returns the network,
+    // the loop edge id, and the loop's two distinct adjacency slots.
+    let net = network(
+        2,
+        0,
+        &[
+            (0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0))),
+            (1, 1, 60.0, vec![(100.0, 0.0), (140.0, 40.0), (100.0, 0.0)]),
+        ],
+        vec![],
+    )
+    .unwrap();
+    let loop_edge = (0..net.edge_count())
+        .find(|&e| net.edge_endpoints(e) == (1, 1))
+        .unwrap();
+    let edges = net.arrays().adj_edges();
+    let slots: Vec<usize> = (net.arrays().adjacency_offsets()[1] as usize
+        ..net.arrays().adjacency_offsets()[2] as usize)
+        .filter(|&slot| edges[slot] == loop_edge)
+        .collect();
+    assert_eq!(slots.len(), 2, "a self-loop has two distinct arcs");
+    let pair = [slots[0], slots[1]];
+    (net, loop_edge, pair)
+}
+
+#[test]
+fn directed_self_loop_arcs_are_gated_independently() {
+    // Forbidding exactly one of the loop's two arcs must leave the other
+    // usable, so a mid-loop snap still routes out to vertex 0's edge; forbidding
+    // both makes it unreachable. An implementation that merged the two slots
+    // would fail the one-forbidden case.
+    let route = |forbidden: &[usize]| {
+        let (mut net, loop_edge, _) = self_loop_network();
+        let mut attributes = uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0);
+        for &slot in forbidden {
+            attributes.adj_access[slot] &= !MODE_BICYCLE;
+        }
+        net.install_street_attributes(attributes).unwrap();
+        let bike = net
+            .compile_profile(&StreetProfileDefinition::bicycle())
+            .unwrap();
+        let on_loop = Snap {
+            edge: loop_edge,
+            fraction: 0.5,
+            connector: 0.0,
+        };
+        let on_first = Snap {
+            edge: directed_edge(&net, 0, 1),
+            fraction: 0.5,
+            connector: 0.0,
+        };
+        net.directed_travel_time(&on_loop, &on_first, &bike, 1e9)
+    };
+    let (_, _, [slot_a, slot_b]) = self_loop_network();
+    // Leaving the mid-loop snap uses the surviving arc (7.5 s over half the
+    // 60 m loop at 4 m/s) then half the 100 m edge to vertex 0's side (12.5 s).
+    assert_eq!(route(&[slot_a]), Some(20));
+    assert_eq!(route(&[slot_b]), Some(20));
+    assert_eq!(route(&[slot_a, slot_b]), None);
+}
+
+#[test]
+fn directed_millisecond_accumulation_never_overflows() {
+    // A colossal connector must not panic or wrap into a bogus short route; it
+    // simply exceeds any sane cutoff and yields no route.
+    let mut net = triangle();
+    net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
+        .unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let huge = Snap {
+        edge: directed_edge(&net, 0, 1),
+        fraction: 0.5,
+        connector: 1e18,
+    };
+    let normal = Snap {
+        edge: directed_edge(&net, 2, 3),
+        fraction: 0.5,
+        connector: 0.0,
+    };
+    assert_eq!(
+        net.directed_travel_time(&huge, &normal, &bike, 3600.0),
+        None
+    );
+}
+
+#[test]
+fn directed_travel_time_respects_a_fractional_cutoff() {
+    // A snap at each end of the 400 m first edge routes directly forward: exactly
+    // 100 s (400 m / 4 m/s). The cutoff is a floor, so 99.999 s rejects it while
+    // 100 s accepts it — a route just beyond the requested duration is excluded.
+    let mut net = triangle();
+    net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
+        .unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let edge = directed_edge(&net, 0, 1);
+    let start = Snap {
+        edge,
+        fraction: 0.0,
+        connector: 0.0,
+    };
+    let end = Snap {
+        edge,
+        fraction: 1.0,
+        connector: 0.0,
+    };
+    assert_eq!(
+        net.directed_travel_time(&start, &end, &bike, 100.0),
+        Some(100)
+    );
+    assert_eq!(net.directed_travel_time(&start, &end, &bike, 99.999), None);
+}
