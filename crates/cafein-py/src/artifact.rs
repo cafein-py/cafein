@@ -19,8 +19,6 @@ impl TransportNetwork {
     /// atomically renamed into place, so saving over an artifact never
     /// rewrites it under live mapped readers.
     fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
-        use std::io::Write;
-
         let parts = self.streets.as_ref().map(StreetNetwork::to_parts);
         py.allow_threads(|| {
             let (streets_meta, streets_bytes) = match &parts {
@@ -56,84 +54,7 @@ impl TransportNetwork {
             };
             let meta = bincode::serialize(&artifact)
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
-
-            // Layout: header | directory | META … pad … | STREETS. The
-            // STREETS section starts on `STREETS_ALIGNMENT`, so a mapped
-            // load never shares an OS page between the sections; without
-            // a street network there is nothing to align (or to pad —
-            // padding bytes sit outside every section CRC).
-            let version = env!("CARGO_PKG_VERSION").as_bytes();
-            let header = 8 + 4 + 2 + version.len() as u64;
-            let directory = 4 + 2 * (2 + 8 + 8 + 4) as u64;
-            let meta_offset = header + directory;
-            let meta_end = meta_offset + meta.len() as u64;
-            let streets_offset = if streets_bytes.is_empty() {
-                meta_end
-            } else {
-                meta_end.div_ceil(STREETS_ALIGNMENT) * STREETS_ALIGNMENT
-            };
-
-            // Stage into a sibling temp file and atomically rename over
-            // the destination: an artifact must never be rewritten in
-            // place under live mapped readers, whose mappings keep the
-            // replaced inode valid. The name is unique per process and
-            // save, and creation is exclusive, so concurrent saves never
-            // share a staging path and a stale file or symlink at it
-            // fails the save instead of being written through.
-            static SAVE_SEQUENCE: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let sequence = SAVE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let temporary = format!("{path}.tmp-{}-{sequence}", std::process::id());
-            let write = || -> PyResult<()> {
-                let file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&temporary)
-                    .map_err(io_error)?;
-                let mut writer = std::io::BufWriter::new(file);
-                writer.write_all(ARTIFACT_MAGIC).map_err(io_error)?;
-                writer
-                    .write_all(&ARTIFACT_FORMAT.to_le_bytes())
-                    .map_err(io_error)?;
-                writer
-                    .write_all(&(version.len() as u16).to_le_bytes())
-                    .map_err(io_error)?;
-                writer.write_all(version).map_err(io_error)?;
-                writer.write_all(&2u32.to_le_bytes()).map_err(io_error)?;
-                for (tag, offset, bytes) in [
-                    (SECTION_META, meta_offset, &meta),
-                    (SECTION_STREETS, streets_offset, &streets_bytes),
-                ] {
-                    writer.write_all(&tag.to_le_bytes()).map_err(io_error)?;
-                    writer.write_all(&offset.to_le_bytes()).map_err(io_error)?;
-                    writer
-                        .write_all(&(bytes.len() as u64).to_le_bytes())
-                        .map_err(io_error)?;
-                    writer
-                        .write_all(&crc32(bytes).to_le_bytes())
-                        .map_err(io_error)?;
-                }
-                writer.write_all(&meta).map_err(io_error)?;
-                let padding = streets_offset - meta_offset - meta.len() as u64;
-                writer
-                    .write_all(&vec![0u8; padding as usize])
-                    .map_err(io_error)?;
-                writer.write_all(&streets_bytes).map_err(io_error)?;
-                writer.flush().map_err(io_error)?;
-                writer.get_ref().sync_all().map_err(io_error)?;
-                // Replacing keeps the destination's permissions, as the
-                // old truncate-in-place write did.
-                if let Ok(metadata) = std::fs::metadata(path) {
-                    writer
-                        .get_ref()
-                        .set_permissions(metadata.permissions())
-                        .map_err(io_error)?;
-                }
-                std::fs::rename(&temporary, path).map_err(io_error)
-            };
-            write().inspect_err(|_| {
-                let _ = std::fs::remove_file(&temporary);
-            })
+            write_container(path, ARTIFACT_MAGIC, ARTIFACT_FORMAT, &meta, &streets_bytes)
         })
     }
 
@@ -193,14 +114,109 @@ impl TransportNetwork {
     }
 
     /// STREETS-section bytes the load explicitly read — 0 for a lazy
-    /// mapped load. Internal; the laziness tests assert on it.
+    /// mapped load of a walk-only artifact; one carrying the optional
+    /// multimodal arrays reports those, which are decoded owned.
+    /// Internal; the laziness tests assert on it.
     #[getter]
     fn _streets_bytes_read(&self) -> u64 {
         self.streets_bytes_read
     }
 }
 
+/// Writes a container: `header | directory | META … pad … | STREETS`.
+///
+/// The STREETS section starts on `STREETS_ALIGNMENT`, so a mapped load never
+/// shares an OS page between the sections; with no street bytes there is
+/// nothing to align (or to pad — padding sits outside every section CRC).
+/// `magic` and `format` identify the artifact kind, so a network artifact and a
+/// street artifact can never be mistaken for one another.
+pub(super) fn write_container(
+    path: &str,
+    magic: &[u8; 8],
+    format: u32,
+    meta: &[u8],
+    streets_bytes: &[u8],
+) -> PyResult<()> {
+    use std::io::Write;
+
+    let version = env!("CARGO_PKG_VERSION").as_bytes();
+    let header = 8 + 4 + 2 + version.len() as u64;
+    let directory = 4 + 2 * (2 + 8 + 8 + 4) as u64;
+    let meta_offset = header + directory;
+    let meta_end = meta_offset + meta.len() as u64;
+    let streets_offset = if streets_bytes.is_empty() {
+        meta_end
+    } else {
+        meta_end.div_ceil(STREETS_ALIGNMENT) * STREETS_ALIGNMENT
+    };
+
+    // Stage into a sibling temp file and atomically rename over the
+    // destination: an artifact must never be rewritten in place under live
+    // mapped readers, whose mappings keep the replaced inode valid. The name is
+    // unique per process and save, and creation is exclusive, so concurrent
+    // saves never share a staging path and a stale file or symlink at it fails
+    // the save instead of being written through.
+    static SAVE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SAVE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = format!("{path}.tmp-{}-{sequence}", std::process::id());
+    let write = || -> PyResult<()> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(io_error)?;
+        let mut writer = std::io::BufWriter::new(file);
+        writer.write_all(magic).map_err(io_error)?;
+        writer.write_all(&format.to_le_bytes()).map_err(io_error)?;
+        writer
+            .write_all(&(version.len() as u16).to_le_bytes())
+            .map_err(io_error)?;
+        writer.write_all(version).map_err(io_error)?;
+        writer.write_all(&2u32.to_le_bytes()).map_err(io_error)?;
+        for (tag, offset, bytes) in [
+            (SECTION_META, meta_offset, meta),
+            (SECTION_STREETS, streets_offset, streets_bytes),
+        ] {
+            writer.write_all(&tag.to_le_bytes()).map_err(io_error)?;
+            writer.write_all(&offset.to_le_bytes()).map_err(io_error)?;
+            writer
+                .write_all(&(bytes.len() as u64).to_le_bytes())
+                .map_err(io_error)?;
+            writer
+                .write_all(&crc32(bytes).to_le_bytes())
+                .map_err(io_error)?;
+        }
+        writer.write_all(meta).map_err(io_error)?;
+        let padding = streets_offset - meta_offset - meta.len() as u64;
+        writer
+            .write_all(&vec![0u8; padding as usize])
+            .map_err(io_error)?;
+        writer.write_all(streets_bytes).map_err(io_error)?;
+        writer.flush().map_err(io_error)?;
+        writer.get_ref().sync_all().map_err(io_error)?;
+        // Replacing keeps the destination's permissions, as the old
+        // truncate-in-place write did.
+        if let Ok(metadata) = std::fs::metadata(path) {
+            writer
+                .get_ref()
+                .set_permissions(metadata.permissions())
+                .map_err(io_error)?;
+        }
+        std::fs::rename(&temporary, path).map_err(io_error)
+    };
+    write().inspect_err(|_| {
+        let _ = std::fs::remove_file(&temporary);
+    })
+}
+
 pub(super) const ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINET";
+
+/// The street-only artifact's magic and format. A distinct magic keeps the two
+/// kinds apart: loading one as the other reports the wrong kind rather than
+/// failing later in a checksum or a decode.
+pub(super) const STREET_ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINST";
+
+pub(super) const STREET_ARTIFACT_FORMAT: u32 = 1;
 
 // 12: the STREETS section may carry the optional multimodal arrays
 // (directional permissions, edge attributes, elevations) after the core
@@ -284,9 +300,9 @@ pub(super) struct Artifact {
 /// STREETS section.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct StreetsMeta {
-    vertex_count: u32,
-    links: Vec<StoredLink>,
-    descriptors: Vec<ArrayDescriptor>,
+    pub(super) vertex_count: u32,
+    pub(super) links: Vec<StoredLink>,
+    pub(super) descriptors: Vec<ArrayDescriptor>,
 }
 
 /// One raw array inside the STREETS section. Offsets are relative to the
@@ -295,9 +311,9 @@ pub(super) struct StreetsMeta {
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Debug)]
 pub(super) struct ArrayDescriptor {
     array: StreetArray,
-    kind: ArrayKind,
-    count: u64,
-    offset: u64,
+    pub(super) kind: ArrayKind,
+    pub(super) count: u64,
+    pub(super) offset: u64,
 }
 
 /// The street arrays, in their fixed on-disk order. The first thirteen are
@@ -339,7 +355,7 @@ pub(super) enum ArrayKind {
 }
 
 impl ArrayKind {
-    fn size(self) -> u64 {
+    pub(super) fn size(self) -> u64 {
         match self {
             ArrayKind::U8 => 1,
             ArrayKind::U16 => 2,
@@ -410,12 +426,12 @@ pub(super) enum MmapMode {
 /// The section directory of a parsed container: everything `load` needs
 /// to locate the sections, checksums still unchecked.
 pub(super) struct ContainerLayout {
-    meta_offset: u64,
-    meta_length: u64,
-    meta_crc: u32,
-    streets_offset: u64,
-    streets_length: u64,
-    streets_crc: u32,
+    pub(super) meta_offset: u64,
+    pub(super) meta_length: u64,
+    pub(super) meta_crc: u32,
+    pub(super) streets_offset: u64,
+    pub(super) streets_length: u64,
+    pub(super) streets_crc: u32,
 }
 
 /// The stop and trip lookup tables derived from a feed and timetable.
@@ -980,7 +996,12 @@ pub(super) fn decode_streets(
 /// Parses and bounds-checks a container's header and section directory.
 /// Checksums are the caller's job — the two load paths verify different
 /// sections.
-pub(super) fn parse_container(path: &str, bytes: &[u8]) -> PyResult<ContainerLayout> {
+pub(super) fn parse_container(
+    path: &str,
+    bytes: &[u8],
+    magic: &[u8; 8],
+    expected_format: u32,
+) -> PyResult<ContainerLayout> {
     let total = bytes.len() as u64;
     let take = |offset: usize, length: usize| -> PyResult<&[u8]> {
         offset
@@ -988,17 +1009,22 @@ pub(super) fn parse_container(path: &str, bytes: &[u8]) -> PyResult<ContainerLay
             .and_then(|end| bytes.get(offset..end))
             .ok_or_else(|| corrupted(path, "truncated header"))
     };
-    if take(0, 8)? != ARTIFACT_MAGIC {
+    let kind = if magic == STREET_ARTIFACT_MAGIC {
+        "street"
+    } else {
+        "network"
+    };
+    if take(0, 8)? != magic {
         return Err(PyValueError::new_err(format!(
-            "'{path}' is not a cafein network artifact"
+            "'{path}' is not a cafein {kind} artifact"
         )));
     }
     let format = u32::from_le_bytes(take(8, 4)?.try_into().unwrap());
     let version_length = u16::from_le_bytes(take(12, 2)?.try_into().unwrap()) as usize;
     let version = String::from_utf8_lossy(take(14, version_length)?).into_owned();
-    if format != ARTIFACT_FORMAT {
+    if format != expected_format {
         return Err(PyValueError::new_err(format!(
-            "'{path}' uses artifact format {format} (written by cafein \
+            "'{path}' uses {kind} artifact format {format} (written by cafein \
              {version}), which this cafein ({}) cannot read; rebuild \
              the network from its inputs and save it again",
             env!("CARGO_PKG_VERSION"),
@@ -1088,7 +1114,7 @@ pub(super) fn validate_walking_hierarchy(
 /// META is always checked before anything is decoded.
 pub(super) fn load_owned(path: &str, verify: Option<bool>) -> PyResult<LoadedArtifact> {
     let bytes = std::fs::read(path).map_err(io_error)?;
-    let layout = parse_container(path, &bytes)?;
+    let layout = parse_container(path, &bytes, ARTIFACT_MAGIC, ARTIFACT_FORMAT)?;
     let meta =
         &bytes[layout.meta_offset as usize..(layout.meta_offset + layout.meta_length) as usize];
     let section = &bytes
@@ -1150,7 +1176,7 @@ pub(super) fn load_mapped(
     };
     let backing = std::sync::Arc::new(MappedArtifact(map));
     let bytes = backing.bytes();
-    let layout = parse_container(path, bytes)?;
+    let layout = parse_container(path, bytes, ARTIFACT_MAGIC, ARTIFACT_FORMAT)?;
     let meta =
         &bytes[layout.meta_offset as usize..(layout.meta_offset + layout.meta_length) as usize];
     if crc32(meta) != layout.meta_crc {
