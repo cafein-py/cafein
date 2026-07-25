@@ -25,7 +25,7 @@ def transit_leg(distance, trip="T1", route="R-BUS"):
         "type": "transit",
         "trip_id": trip,
         "route_id": route,
-        "distance": distance,
+        "distance_m": distance,
     }
 
 

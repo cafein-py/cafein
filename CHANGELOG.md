@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Breaking:** every distance column now carries its unit in its name.
+  ``TravelCostMatrix`` and ``travel_cost_table`` report
+  ``transit_distance_m`` and ``walk_distance_m`` in place of
+  ``transit_distance`` and ``walk_distance``, and
+  ``DetailedItineraries`` reports ``distance_m`` in place of
+  ``distance``. The journey legs that ``route_between_stops`` and
+  ``route_between_coordinates`` return carry ``distance_m`` in place of
+  ``distance`` too, so the same quantity has one name whether it is read
+  from a leg or from a frame. Code reading the old names must be
+  updated. Besides
+  stating the unit at the point of use, the new name for the itinerary
+  column no longer collides with ``GeoDataFrame.distance``, the
+  geopandas method that shadowed the column on attribute access, so
+  ``legs.distance_m`` reads the column where ``legs.distance`` returned
+  the method. ``distance_provenance`` is unchanged, carrying a tier name
+  rather than a measurement.
+
 - The saved artifact's STREETS section can now carry optional multimodal
   street arrays after the core walking graph — per-adjacency-slot mode
   permissions and facility flags, per-edge class codes, and per-coordinate

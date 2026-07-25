@@ -136,7 +136,7 @@ def test_frontier_trades_time_against_emissions(two_line_frontier):
     # (bus 92 g/pkm, tram 25 g/pkm) over the ladder's leg distances.
     for _, row in frame.iterrows():
         expected = sum(
-            leg["distance"] / 1000 * (92 if leg["trip_id"].startswith("BUS") else 25)
+            leg["distance_m"] / 1000 * (92 if leg["trip_id"].startswith("BUS") else 25)
             for leg in row["journey"]["legs"]
             if leg["type"] == "transit"
         )

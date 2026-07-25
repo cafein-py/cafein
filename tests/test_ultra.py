@@ -175,7 +175,7 @@ def test_point_destination_routing(central_gtfs, kantakaupunki_pbf):
             for leg in journey["legs"]:
                 if leg["type"] == "transfer":
                     saw_transfer = True
-                    assert leg["distance"] is not None
+                    assert leg["distance_m"] is not None
     assert saw_transfer
 
 
@@ -600,8 +600,8 @@ def test_travel_cost_matrix_transit_columns_match_the_point_matrix(
     cols = [
         "travel_time",
         "transfers",
-        "transit_distance",
-        "walk_distance",
+        "transit_distance_m",
+        "walk_distance_m",
         "emissions",
     ]
 
@@ -612,7 +612,7 @@ def test_travel_cost_matrix_transit_columns_match_the_point_matrix(
                 round(float(row[c]), 3) for c in cols
             )
             for _, row in frame.iterrows()
-            if row["transit_distance"] > 0
+            if row["transit_distance_m"] > 0
         }
 
     with warnings.catch_warnings():
@@ -640,7 +640,7 @@ def test_travel_cost_matrix_transit_columns_match_the_point_matrix(
     assert stop_matrix and stop_matrix == point_matrix
     # A ridden door-to-door cell carries emissions and an access/egress walk.
     assert any(
-        cell[cols.index("emissions")] > 0 and cell[cols.index("walk_distance")] > 0
+        cell[cols.index("emissions")] > 0 and cell[cols.index("walk_distance_m")] > 0
         for cell in stop_matrix.values()
     )
 
