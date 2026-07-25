@@ -161,6 +161,22 @@ pub struct StreetAttributes {
     pub edge_flags: Vec<u16>,
 }
 
+/// Per-edge directional attributes handed to [`StreetNetwork::new_multimodal`],
+/// one entry per physical edge in the caller's input edge order (the same order
+/// as `edges`). The `*_forward` slices describe the stored geometry direction
+/// (`from → to`), the `*_reverse` slices the opposite; the constructor threads
+/// each onto the matching directed arc after the internal reorder.
+pub struct EdgeAttributes<'a> {
+    pub highway: &'a [u8],
+    pub surface: &'a [u8],
+    pub smoothness: &'a [u8],
+    pub flags: &'a [u16],
+    pub access_forward: &'a [u8],
+    pub access_reverse: &'a [u8],
+    pub facility_forward: &'a [u8],
+    pub facility_reverse: &'a [u8],
+}
+
 /// Where each street array lives inside a mapped artifact: byte offsets
 /// into the backing store plus element counts, as the artifact's
 /// descriptor table records them. The index level starts are not mapped —
@@ -261,12 +277,13 @@ pub(super) struct StopLinks {
 }
 
 impl StreetNetwork {
-    /// Builds the network from flat edge arrays and stop links.
+    /// Builds a **walk-only** network from flat edge arrays and stop links.
     ///
     /// `edges` carries `(from, to, meters)` per edge; edge `i`'s geometry
     /// runs from its `from` vertex through coordinates
     /// `coordinate_offsets[i]..coordinate_offsets[i + 1]` of the
-    /// longitude/latitude arrays.
+    /// longitude/latitude arrays. The network carries no multimodal
+    /// attributes; see [`StreetNetwork::new_multimodal`].
     pub fn new(
         vertex_count: u32,
         stop_count: u32,
@@ -275,6 +292,72 @@ impl StreetNetwork {
         longitudes: &[f64],
         latitudes: &[f64],
         links: Vec<StopLink>,
+    ) -> Result<StreetNetwork, StreetError> {
+        Self::build_network(
+            vertex_count,
+            stop_count,
+            edges,
+            coordinate_offsets,
+            longitudes,
+            latitudes,
+            links,
+            None,
+        )
+    }
+
+    /// Builds a multimodal network from the union graph's flat edge arrays,
+    /// stop links, and per-edge directional [`EdgeAttributes`].
+    ///
+    /// Every attribute slice carries one entry per physical edge in `edges`'
+    /// input order. The forward permissions land on each edge's `from → to`
+    /// arc and the reverse permissions on its `to → from` arc, so directional
+    /// (one-way / contraflow) access stays on the correct directed arc through
+    /// the internal reorder. Elevations, when present, are installed separately.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_multimodal(
+        vertex_count: u32,
+        stop_count: u32,
+        edges: &[(u32, u32, f64)],
+        coordinate_offsets: &[u32],
+        longitudes: &[f64],
+        latitudes: &[f64],
+        links: Vec<StopLink>,
+        attributes: EdgeAttributes,
+    ) -> Result<StreetNetwork, StreetError> {
+        let edge_count = edges.len();
+        if attributes.highway.len() != edge_count
+            || attributes.surface.len() != edge_count
+            || attributes.smoothness.len() != edge_count
+            || attributes.flags.len() != edge_count
+            || attributes.access_forward.len() != edge_count
+            || attributes.access_reverse.len() != edge_count
+            || attributes.facility_forward.len() != edge_count
+            || attributes.facility_reverse.len() != edge_count
+        {
+            return Err(StreetError::InvalidAttributes);
+        }
+        Self::build_network(
+            vertex_count,
+            stop_count,
+            edges,
+            coordinate_offsets,
+            longitudes,
+            latitudes,
+            links,
+            Some(attributes),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_network(
+        vertex_count: u32,
+        stop_count: u32,
+        edges: &[(u32, u32, f64)],
+        coordinate_offsets: &[u32],
+        longitudes: &[f64],
+        latitudes: &[f64],
+        links: Vec<StopLink>,
+        attributes: Option<EdgeAttributes>,
     ) -> Result<StreetNetwork, StreetError> {
         if coordinate_offsets.len() != edges.len() + 1
             || coordinate_offsets.first() != Some(&0)
@@ -374,10 +457,31 @@ impl StreetNetwork {
                 .zip(&fixed_lats[start..end])
                 .map(|(&lon, &lat)| (lon, lat))
         };
+        // Coincident edges — identical geometry, length, and endpoints — are
+        // interchangeable only when their attributes also match; break any
+        // remaining tie by the attribute values so a multimodal layout stays a
+        // pure function of the edge set, not its input order (walk-only builds
+        // carry no attributes, so this tie-breaker is inert).
+        let attribute_key = |edge: u32| {
+            attributes.as_ref().map(|a| {
+                let edge = edge as usize;
+                (
+                    a.highway[edge],
+                    a.surface[edge],
+                    a.smoothness[edge],
+                    a.flags[edge],
+                    a.access_forward[edge],
+                    a.access_reverse[edge],
+                    a.facility_forward[edge],
+                    a.facility_reverse[edge],
+                )
+            })
+        };
         order.sort_unstable_by(|&a, &b| {
             keys[a as usize]
                 .cmp(&keys[b as usize])
                 .then_with(|| geometry_points(a).cmp(geometry_points(b)))
+                .then_with(|| attribute_key(a).cmp(&attribute_key(b)))
         });
 
         let mut edge_map = vec![0u32; edges.len()];
@@ -443,13 +547,33 @@ impl StreetNetwork {
         let mut adj_targets = vec![0u32; edges.len() * 2];
         let mut adj_meters = vec![0f64; edges.len() * 2];
         let mut adj_edges = vec![0u32; edges.len() * 2];
+        // Per-arc permission/facility bits, filled only for a multimodal build;
+        // the `(from → to)` slot takes the originating edge's forward value and
+        // the `(to → from)` slot its reverse value.
+        let slots = if attributes.is_some() {
+            edges.len() * 2
+        } else {
+            0
+        };
+        let mut adj_access = vec![0u8; slots];
+        let mut adj_facility = vec![0u8; slots];
         let mut cursor = adjacency_offsets.clone();
         for (index, &(from, to, meters)) in edges.iter().enumerate() {
-            for (a, b) in [(from, to), (to, from)] {
+            let source = order[index] as usize;
+            for (direction, (a, b)) in [(from, to), (to, from)].into_iter().enumerate() {
                 let slot = cursor[a as usize] as usize;
                 adj_targets[slot] = b;
                 adj_meters[slot] = meters;
                 adj_edges[slot] = index as u32;
+                if let Some(attrs) = &attributes {
+                    let (access, facility) = if direction == 0 {
+                        (attrs.access_forward[source], attrs.facility_forward[source])
+                    } else {
+                        (attrs.access_reverse[source], attrs.facility_reverse[source])
+                    };
+                    adj_access[slot] = access;
+                    adj_facility[slot] = facility;
+                }
                 cursor[a as usize] += 1;
             }
         }
@@ -457,6 +581,27 @@ impl StreetNetwork {
         let index = build_index(&dense_offsets, &lons, &lats);
         let endpoints: Vec<u32> = edges.iter().flat_map(|&(from, to, _)| [from, to]).collect();
         let vertex_links = build_vertex_links(&links);
+
+        // The per-edge codes arrive in input order; permute them into internal
+        // edge order (`order[new] == old`) and validate the assembled group.
+        let attributes = match attributes {
+            Some(attrs) => {
+                let permute = |src: &[u8]| -> Vec<u8> {
+                    order.iter().map(|&old| src[old as usize]).collect()
+                };
+                let street = StreetAttributes {
+                    adj_access,
+                    adj_facility,
+                    edge_highway: permute(attrs.highway),
+                    edge_surface: permute(attrs.surface),
+                    edge_smoothness: permute(attrs.smoothness),
+                    edge_flags: order.iter().map(|&old| attrs.flags[old as usize]).collect(),
+                };
+                check_street_attributes(&street, edges.len())?;
+                Some(street)
+            }
+            None => None,
+        };
 
         let graph = StreetGraph {
             arrays: Arrays::Owned(OwnedArrays {
@@ -476,7 +621,7 @@ impl StreetNetwork {
             level_starts: index.level_starts,
             contraction: None,
             symmetric: std::sync::OnceLock::new(),
-            attributes: None,
+            attributes,
             elevations: None,
         };
         Ok(StreetNetwork {

@@ -2237,3 +2237,320 @@ fn directed_travel_time_respects_a_fractional_cutoff() {
     );
     assert_eq!(net.directed_travel_time(&start, &end, &bike, 99.999), None);
 }
+
+// ---- Multimodal construction (`new_multimodal`) ----
+
+/// Per-edge attributes for a multimodal test build, one entry per input edge.
+struct Attrs {
+    highway: Vec<u8>,
+    surface: Vec<u8>,
+    smoothness: Vec<u8>,
+    flags: Vec<u16>,
+    access_forward: Vec<u8>,
+    access_reverse: Vec<u8>,
+    facility_forward: Vec<u8>,
+    facility_reverse: Vec<u8>,
+}
+
+/// Builds a network through `new_multimodal`, laying out geometry exactly as
+/// [`network`] does.
+fn multimodal_network(
+    vertex_count: u32,
+    edges: &[TestEdge],
+    attrs: &Attrs,
+) -> Result<StreetNetwork, StreetError> {
+    let mut offsets = vec![0u32];
+    let mut longitudes = Vec::new();
+    let mut latitudes = Vec::new();
+    for (_, _, _, path) in edges {
+        for &(x, y) in path {
+            let (lon, lat) = lonlat(x, y);
+            longitudes.push(lon);
+            latitudes.push(lat);
+        }
+        offsets.push(longitudes.len() as u32);
+    }
+    let flat: Vec<(u32, u32, f64)> = edges
+        .iter()
+        .map(|&(from, to, meters, _)| (from, to, meters))
+        .collect();
+    StreetNetwork::new_multimodal(
+        vertex_count,
+        0,
+        &flat,
+        &offsets,
+        &longitudes,
+        &latitudes,
+        vec![],
+        EdgeAttributes {
+            highway: &attrs.highway,
+            surface: &attrs.surface,
+            smoothness: &attrs.smoothness,
+            flags: &attrs.flags,
+            access_forward: &attrs.access_forward,
+            access_reverse: &attrs.access_reverse,
+            facility_forward: &attrs.facility_forward,
+            facility_reverse: &attrs.facility_reverse,
+        },
+    )
+}
+
+#[test]
+fn new_multimodal_aligns_attributes_through_the_reorder() {
+    // Five colinear edges given out of spatial order so the Hilbert reorder
+    // permutes them. Each input edge carries its index as a unique highway code
+    // and direction-tagged facility bits (`2·i` forward, `2·i + 1` reverse), so
+    // every internal edge and directed arc can be traced back to the input edge
+    // and direction it came from.
+    let edges: Vec<TestEdge> = vec![
+        (2, 3, 100.0, straight((200.0, 0.0), (300.0, 0.0))),
+        (0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0))),
+        (4, 5, 100.0, straight((400.0, 0.0), (500.0, 0.0))),
+        (1, 2, 100.0, straight((100.0, 0.0), (200.0, 0.0))),
+        (3, 4, 100.0, straight((300.0, 0.0), (400.0, 0.0))),
+    ];
+    let n = edges.len();
+    let attrs = Attrs {
+        highway: (0..n as u8).collect(),
+        surface: (0..n as u8).collect(),
+        smoothness: (0..n as u8).collect(),
+        flags: (0..n).map(|i| (i as u16) * 7 + 1).collect(),
+        access_forward: vec![MODE_WALK | MODE_BICYCLE | MODE_E_SCOOTER; n],
+        access_reverse: vec![MODE_WALK; n],
+        facility_forward: (0..n as u8).map(|i| 2 * i).collect(),
+        facility_reverse: (0..n as u8).map(|i| 2 * i + 1).collect(),
+    };
+    let net = multimodal_network(6, &edges, &attrs).unwrap();
+    let built = net.street_attributes().unwrap();
+
+    // Name each internal edge by its geometry, not by any attribute array: its
+    // stored first coordinate is the verbatim (quantised) first coordinate of
+    // the input edge it came from, and the reorder is defined by that geometry.
+    // So `source_edge` is an independent oracle — a permutation applied
+    // consistently but wrongly to every attribute array would still fail below.
+    let lons = net.arrays().lons();
+    let lats = net.arrays().lats();
+    let offsets = net.arrays().coordinate_offsets();
+    let first_keys: Vec<(i32, i32)> = edges
+        .iter()
+        .map(|(_, _, _, path)| {
+            let (lon, lat) = lonlat(path[0].0, path[0].1);
+            (quantize(lon), quantize(lat))
+        })
+        .collect();
+    let source_edge = |internal: usize| -> usize {
+        let start = offsets[internal] as usize;
+        first_keys
+            .iter()
+            .position(|&key| key == (lons[start], lats[start]))
+            .unwrap()
+    };
+
+    // The reorder is non-trivial: at least one internal edge is not its input.
+    assert!((0..n).any(|e| source_edge(e) != e));
+
+    // Per-edge codes travel with their edge: highway (verified against the
+    // geometry-named source, not assumed), surface, smoothness, and flags.
+    for e in 0..n {
+        let i = source_edge(e);
+        assert_eq!(built.edge_highway[e] as usize, i);
+        assert_eq!(built.edge_surface[e] as usize, i);
+        assert_eq!(built.edge_smoothness[e] as usize, i);
+        assert_eq!(built.edge_flags[e], (i as u16) * 7 + 1);
+    }
+
+    // Per-arc permissions land on the correct directed arc: the arc toward an
+    // edge's `to` endpoint carries the forward values, toward `from` the reverse.
+    let targets = net.arrays().adj_targets();
+    let arc_edges = net.arrays().adj_edges();
+    for slot in 0..2 * n {
+        let e = arc_edges[slot] as usize;
+        let i = source_edge(e);
+        let (from, to) = net.edge_endpoints(e as u32);
+        assert_ne!(from, to);
+        let forward = targets[slot] == to;
+        assert_eq!(
+            built.adj_facility[slot] as usize,
+            if forward { 2 * i } else { 2 * i + 1 }
+        );
+        assert_eq!(
+            built.adj_access[slot],
+            if forward {
+                MODE_WALK | MODE_BICYCLE | MODE_E_SCOOTER
+            } else {
+                MODE_WALK
+            }
+        );
+    }
+}
+
+#[test]
+fn new_multimodal_routes_along_permitted_arc_directions() {
+    // A two-edge path where bicycles may travel only along the stored geometry
+    // direction, while walking is permitted both ways.
+    let edges: Vec<TestEdge> = vec![
+        (0, 1, 200.0, straight((0.0, 0.0), (200.0, 0.0))),
+        (1, 2, 200.0, straight((200.0, 0.0), (400.0, 0.0))),
+    ];
+    let n = edges.len();
+    let attrs = Attrs {
+        highway: vec![0; n],
+        surface: vec![0; n],
+        smoothness: vec![0; n],
+        flags: vec![0; n],
+        access_forward: vec![MODE_WALK | MODE_BICYCLE; n],
+        access_reverse: vec![MODE_WALK; n],
+        facility_forward: vec![0; n],
+        facility_reverse: vec![0; n],
+    };
+    let net = multimodal_network(3, &edges, &attrs).unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let walk = net
+        .compile_profile(&StreetProfileDefinition::walk())
+        .unwrap();
+    let origin = lonlat(10.0, 0.0);
+    let target = lonlat(390.0, 0.0);
+    let from = net.snap(origin.1, origin.0, 50.0).unwrap();
+    let to = net.snap(target.1, target.0, 50.0).unwrap();
+    // Bicycle: reachable forward, forbidden against the arc direction.
+    assert!(net
+        .directed_travel_time(&from, &to, &bike, 3600.0)
+        .is_some());
+    assert!(net
+        .directed_travel_time(&to, &from, &bike, 3600.0)
+        .is_none());
+    // Walking: permitted both ways.
+    assert!(net
+        .directed_travel_time(&from, &to, &walk, 3600.0)
+        .is_some());
+    assert!(net
+        .directed_travel_time(&to, &from, &walk, 3600.0)
+        .is_some());
+}
+
+#[test]
+fn new_multimodal_walk_matches_the_walk_only_build() {
+    // Identical geometry built two ways: an all-permissive multimodal graph and
+    // the attribute-free walk-only graph route walking identically.
+    let edges: Vec<TestEdge> = vec![
+        (0, 1, 200.0, straight((0.0, 0.0), (200.0, 0.0))),
+        (1, 2, 150.0, straight((200.0, 0.0), (350.0, 0.0))),
+    ];
+    let n = edges.len();
+    let every_mode = MODE_WALK | MODE_BICYCLE | MODE_E_SCOOTER;
+    let permissive = Attrs {
+        highway: vec![0; n],
+        surface: vec![0; n],
+        smoothness: vec![0; n],
+        flags: vec![0; n],
+        access_forward: vec![every_mode; n],
+        access_reverse: vec![every_mode; n],
+        facility_forward: vec![0; n],
+        facility_reverse: vec![0; n],
+    };
+    let multimodal = multimodal_network(3, &edges, &permissive).unwrap();
+    let walk_only = network(3, 0, &edges, vec![]).unwrap();
+    let walk_m = multimodal
+        .compile_profile(&StreetProfileDefinition::walk())
+        .unwrap();
+    let walk_w = walk_only
+        .compile_profile(&StreetProfileDefinition::walk())
+        .unwrap();
+    let origin = lonlat(10.0, 0.0);
+    let target = lonlat(340.0, 0.0);
+    let from_m = multimodal.snap(origin.1, origin.0, 50.0).unwrap();
+    let to_m = multimodal.snap(target.1, target.0, 50.0).unwrap();
+    let from_w = walk_only.snap(origin.1, origin.0, 50.0).unwrap();
+    let to_w = walk_only.snap(target.1, target.0, 50.0).unwrap();
+    assert_eq!(
+        multimodal.directed_travel_time(&from_m, &to_m, &walk_m, 3600.0),
+        walk_only.directed_travel_time(&from_w, &to_w, &walk_w, 3600.0)
+    );
+}
+
+#[test]
+fn new_multimodal_rejects_misshaped_or_out_of_range_attributes() {
+    let edges: Vec<TestEdge> = vec![
+        (0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0))),
+        (1, 2, 100.0, straight((100.0, 0.0), (200.0, 0.0))),
+    ];
+    let n = edges.len();
+    let ok = || Attrs {
+        highway: vec![0; n],
+        surface: vec![0; n],
+        smoothness: vec![0; n],
+        flags: vec![0; n],
+        access_forward: vec![MODE_WALK; n],
+        access_reverse: vec![MODE_WALK; n],
+        facility_forward: vec![0; n],
+        facility_reverse: vec![0; n],
+    };
+    // A per-edge slice of the wrong length is rejected before construction.
+    let mut short = ok();
+    short.highway.pop();
+    assert_eq!(
+        multimodal_network(3, &edges, &short).unwrap_err(),
+        StreetError::InvalidAttributes
+    );
+    // An out-of-range class code is rejected by the attribute validator.
+    let mut bad_code = ok();
+    bad_code.highway[0] = HIGHWAY_CODE_COUNT as u8;
+    assert_eq!(
+        multimodal_network(3, &edges, &bad_code).unwrap_err(),
+        StreetError::InvalidAttributes
+    );
+}
+
+#[test]
+fn new_multimodal_orders_coincident_edges_deterministically() {
+    // Two geometrically identical parallel edges that differ only in their
+    // permissions are not interchangeable: the build must lay them out the same
+    // way whatever order they arrive in, so the attributes and routing are
+    // stable. Without the attribute tie-breaker the unstable sort would leave
+    // their internal numbering — and any coincident snap — input-order-dependent.
+    let bike_ok = MODE_WALK | MODE_BICYCLE;
+    let walk_only = MODE_WALK;
+    let attrs_for = |highway: [u8; 2], forward: [u8; 2], reverse: [u8; 2]| Attrs {
+        highway: highway.to_vec(),
+        surface: vec![0; 2],
+        smoothness: vec![0; 2],
+        flags: vec![0; 2],
+        access_forward: forward.to_vec(),
+        access_reverse: reverse.to_vec(),
+        facility_forward: vec![0; 2],
+        facility_reverse: vec![0; 2],
+    };
+    // Edge A allows bikes forward only, edge B in reverse only.
+    let edge_a: TestEdge = (0, 1, 200.0, straight((0.0, 0.0), (200.0, 0.0)));
+    let edge_b: TestEdge = (0, 1, 200.0, straight((0.0, 0.0), (200.0, 0.0)));
+    let net_ab = multimodal_network(
+        2,
+        &[edge_a.clone(), edge_b.clone()],
+        &attrs_for([1, 2], [bike_ok, walk_only], [walk_only, bike_ok]),
+    )
+    .unwrap();
+    let net_ba = multimodal_network(
+        2,
+        &[edge_b, edge_a],
+        &attrs_for([2, 1], [walk_only, bike_ok], [bike_ok, walk_only]),
+    )
+    .unwrap();
+
+    // Input order changes neither the internal layout's attributes...
+    assert_eq!(net_ab.street_attributes(), net_ba.street_attributes());
+    // ...nor the routing over it.
+    let route = |net: &StreetNetwork| {
+        let bike = net
+            .compile_profile(&StreetProfileDefinition::bicycle())
+            .unwrap();
+        let origin = lonlat(10.0, 0.0);
+        let target = lonlat(190.0, 0.0);
+        let from = net.snap(origin.1, origin.0, 50.0).unwrap();
+        let to = net.snap(target.1, target.0, 50.0).unwrap();
+        net.directed_travel_time(&from, &to, &bike, 3600.0)
+    };
+    assert_eq!(route(&net_ab), route(&net_ba));
+    assert!(route(&net_ab).is_some());
+}
