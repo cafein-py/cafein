@@ -235,10 +235,22 @@ class TravelTimeMatrix(pd.DataFrame):
     warning and stay unreachable. Slices and copies degrade to plain
     DataFrames.
 
+    Given a ``StreetNetwork`` instead, the matrix is a standalone street
+    computation: one bounded search per origin over the compiled profile
+    of ``transport_mode`` (``"walk"``, ``"bicycle"``, ``"e_bike"``, or
+    ``"e_scooter"``), bounded by ``max_street_time``. It needs no
+    timetable, so ``date`` and ``departure`` do not apply, and the
+    arguments that only mean something to a timetable — ``max_transfers``,
+    ``router``, the departure-window percentiles, the transit exclusions,
+    and the walking-speed options, whose speeds come from the profile —
+    are rejected. Origins and destinations are point GeoDataFrames;
+    a point routes to itself in zero seconds.
+
     Parameters
     ----------
-    network : TransportNetwork
-        The network to compute on.
+    network : TransportNetwork or StreetNetwork
+        The network to compute on. A ``StreetNetwork`` takes the
+        standalone street path and requires ``transport_mode``.
     origins : list of str, or GeoDataFrame (optional)
         Origin stop_ids (every stop when omitted), or points with an
         ``id`` column.
@@ -279,7 +291,17 @@ class TravelTimeMatrix(pd.DataFrame):
         ``TransportNetwork.access_stops``. They bound the walking for point
         origins/destinations, and for stop origins/destinations only when a
         whole-day shortcut set routes them door-to-door; otherwise stop
-        matrices ignore them.
+        matrices ignore them. Only ``max_snap_distance`` applies to a
+        ``StreetNetwork``, whose speeds come from the mode's profile.
+    transport_mode : str (optional)
+        The mode to route. Required for a ``StreetNetwork``, where it is
+        one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``;
+        for a ``TransportNetwork`` only ``"public_transport"`` (the
+        default meaning) applies.
+    max_street_time : float (optional)
+        Cutoff in seconds for a ``StreetNetwork`` matrix, beyond which a
+        destination counts as unreachable (default:
+        ``cafein.street_network.MAX_STREET_TIME``, 7200).
     """
 
     @property
@@ -306,7 +328,43 @@ class TravelTimeMatrix(pd.DataFrame):
         walking_speed_kmph=None,
         max_walking_time=None,
         max_snap_distance=None,
+        transport_mode=None,
+        max_street_time=None,
     ):
+        if _is_street_network(network):
+            data = _street_time_columns(
+                network,
+                origins,
+                destinations,
+                transport_mode=transport_mode,
+                max_street_time=max_street_time,
+                max_snap_distance=max_snap_distance,
+                chunk=chunk,
+                transit_only={
+                    "date": date,
+                    "departure": departure,
+                    "window": window,
+                    "percentiles": percentiles,
+                    "confidence": confidence,
+                    "walking_speed_kmph": walking_speed_kmph,
+                    "max_walking_time": max_walking_time,
+                    "max_transfers": None if max_transfers == 7 else max_transfers,
+                    "router": None if router == "auto" else router,
+                    "exclude_routes": tuple(exclude_routes) or None,
+                    "exclude_trips": tuple(exclude_trips) or None,
+                    "exclude_stops": tuple(exclude_stops) or None,
+                },
+            )
+            super().__init__(pd.DataFrame(data))
+            return
+        if transport_mode is not None and transport_mode != "public_transport":
+            raise ValueError(
+                f"transport_mode={transport_mode!r} is a street mode; pass a "
+                "StreetNetwork to route on it (street legs within a "
+                "public-transport journey are a separate feature)"
+            )
+        if max_street_time is not None:
+            raise ValueError("max_street_time applies to a StreetNetwork matrix")
         data = _time_columns(
             network,
             origins,
@@ -327,6 +385,94 @@ class TravelTimeMatrix(pd.DataFrame):
             max_snap_distance=max_snap_distance,
         )
         super().__init__(pd.DataFrame(data))
+
+
+def _is_street_network(network):
+    """Whether `network` is a standalone street network rather than a transit one."""
+    from cafein.street_network import StreetNetwork
+
+    return isinstance(network, StreetNetwork)
+
+
+def _street_time_columns(
+    network,
+    origins,
+    destinations,
+    *,
+    transport_mode,
+    max_street_time,
+    max_snap_distance,
+    chunk,
+    transit_only,
+):
+    """The reachable cells of a street travel-time matrix, in long format."""
+    from cafein import street_network, streets
+
+    if transport_mode is None:
+        raise TypeError(
+            "a StreetNetwork matrix needs an explicit transport_mode, one of "
+            f"{', '.join(repr(mode) for mode in street_network.STREET_MODES)}"
+        )
+    if transport_mode == "public_transport":
+        raise ValueError(
+            "transport_mode='public_transport' needs a TransportNetwork; a "
+            "StreetNetwork carries no timetable"
+        )
+    if transport_mode not in street_network.STREET_MODES:
+        raise ValueError(
+            f"unknown transport_mode {transport_mode!r}; expected one of "
+            f"{', '.join(repr(mode) for mode in street_network.STREET_MODES)}"
+        )
+    unsupported = sorted(
+        name for name, value in transit_only.items() if value is not None
+    )
+    if unsupported:
+        raise ValueError(
+            f"{', '.join(unsupported)} have no meaning for a street matrix, "
+            "which carries no timetable and takes its speeds from the profile"
+        )
+    if not _is_point_frame(origins):
+        raise TypeError(
+            "a street matrix needs origins as a GeoDataFrame of points; stop "
+            "ids belong to a TransportNetwork"
+        )
+    from_ids, origin_points = _point_list(origins, "origins")
+    if destinations is None:
+        to_ids, destination_points = list(from_ids), list(origin_points)
+    elif not _is_point_frame(destinations):
+        raise TypeError(
+            "a street matrix needs destinations as a GeoDataFrame of points"
+        )
+    else:
+        to_ids, destination_points = _point_list(destinations, "destinations")
+    if chunk is not None:
+        span = _chunk_slice(len(from_ids), chunk)
+        from_ids, origin_points = from_ids[span], origin_points[span]
+    table = network._core.travel_time_matrix(
+        origin_points,
+        destination_points,
+        transport_mode,
+        float(
+            street_network.MAX_STREET_TIME
+            if max_street_time is None
+            else max_street_time
+        ),
+        float(
+            streets.MAX_SNAP_DISTANCE
+            if max_snap_distance is None
+            else max_snap_distance
+        ),
+    )
+    _warn_unsnapped(table, from_ids, to_ids)
+    matrix = table["matrix"]
+    from_ids = np.asarray(from_ids, dtype=object)
+    to_ids = np.asarray(to_ids, dtype=object)
+    rows, columns = np.nonzero(matrix != np.iinfo(np.uint32).max)
+    return {
+        "from_id": from_ids[rows],
+        "to_id": to_ids[columns],
+        "travel_time": matrix[rows, columns],
+    }
 
 
 def _time_columns(

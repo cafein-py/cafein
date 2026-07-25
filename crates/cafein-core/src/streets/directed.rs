@@ -4,8 +4,9 @@
 //! graph, this module routes over a [`CompiledStreetProfile`]'s per-arc
 //! millisecond costs: each directed arc (adjacency slot) costs
 //! `arc_millis[slot]`, and the `u32::MAX` sentinel marks an arc the mode may
-//! not use. It is the substrate the standalone cycling / e-scooter routes and
-//! matrices build on (later PRs); the walking loop is untouched.
+//! not use. It carries the standalone cycling / e-scooter point-to-point routes
+//! and time matrices; distances, geometry, and emissions need the predecessor
+//! tree this search does not yet record. The walking loop is untouched.
 //!
 //! Only the **forward** search is implemented here — a door-to-door route and
 //! an origins×destinations matrix are forward searches from each origin,
@@ -315,33 +316,130 @@ impl StreetNetwork {
         profile: &CompiledStreetProfile,
         max_seconds: f64,
     ) -> Option<u32> {
+        self.directed_times_to_snaps(from, std::slice::from_ref(&Some(*to)), profile, max_seconds)
+            [0]
+    }
+
+    /// The directed travel times from `from` to each of `targets`, in whole
+    /// seconds, or `None` per target that is unsnapped or beyond `max_seconds`.
+    ///
+    /// One bounded search serves the whole row: every target reads the same
+    /// settled labels, so a matrix row costs one street search rather than one
+    /// per pair. Sharing [`arrival_millis`](Self::arrival_millis) with the
+    /// single route keeps the two answers identical cell for cell.
+    pub fn directed_times_to_snaps(
+        &self,
+        from: &Snap,
+        targets: &[Option<Snap>],
+        profile: &CompiledStreetProfile,
+        max_seconds: f64,
+    ) -> Vec<Option<u32>> {
         if !max_seconds.is_finite() || max_seconds < 0.0 {
-            return None;
+            return vec![None; targets.len()];
         }
         // Floor, not ceil: an integer-millisecond route is within `max_seconds`
         // exactly when it is `<= floor(max_seconds * 1000)`, so a route just
         // beyond the requested duration is not admitted.
         let cutoff = (max_seconds * 1000.0).floor() as u64;
+        let seeds = self.directed_seeds(from, profile);
+        DIRECTED_STATE.with(|cell| {
+            let state = &mut cell.borrow_mut();
+            // With no seed the search settles nothing; `prepare` inside still
+            // clears the previous query, so the labels read as unreached.
+            self.directed_dijkstra(profile, &seeds, cutoff, state);
+            targets
+                .iter()
+                .map(|target| {
+                    let to = target.as_ref()?;
+                    let millis = self.arrival_millis(from, to, profile, cutoff, state)?;
+                    Some(seconds(millis as f64 / 1000.0))
+                })
+                .collect()
+        })
+    }
+
+    /// The best millisecond cost from `from` to `to` given a completed search
+    /// from `from`'s seeds: the destination's arrival offsets against the
+    /// settled labels, and the direct same-edge candidate.
+    fn arrival_millis(
+        &self,
+        from: &Snap,
+        to: &Snap,
+        profile: &CompiledStreetProfile,
+        cutoff: u64,
+        state: &DirectedState,
+    ) -> Option<u64> {
         let mut best = self
             .same_edge_millis(from, to, profile)
             .filter(|&ms| ms <= cutoff);
-        let seeds = self.directed_seeds(from, profile);
-        let egress = self.directed_egress(to, profile);
-        if !seeds.is_empty() && !egress.is_empty() {
-            DIRECTED_STATE.with(|cell| {
-                let state = &mut cell.borrow_mut();
-                self.directed_dijkstra(profile, &seeds, cutoff, state);
-                for &(vertex, offset) in &egress {
-                    let reached = state.time(vertex);
-                    if reached != u64::MAX {
-                        let total = reached.saturating_add(offset);
-                        if total <= cutoff {
-                            best = Some(best.map_or(total, |b| b.min(total)));
+        for (vertex, offset) in self.directed_egress(to, profile) {
+            let reached = state.time(vertex);
+            if reached != u64::MAX {
+                let total = reached.saturating_add(offset);
+                if total <= cutoff {
+                    best = Some(best.map_or(total, |b| b.min(total)));
+                }
+            }
+        }
+        best
+    }
+
+    /// The origins × destinations travel-time matrix under `profile`, with the
+    /// index lists of the coordinates that did not snap.
+    ///
+    /// Both sides snap through [`snap_for_profile`](Self::snap_for_profile), so
+    /// no query starts or ends on an edge the mode may not use. Origins fan out
+    /// over the thread pool; each row depends only on its own origin and rayon
+    /// preserves input order, so the matrix is the same however the work is
+    /// scheduled. A destination at its origin's own coordinate is zero away —
+    /// routing it through the network would charge that coordinate's connector
+    /// twice, leaving a point a positive time from itself.
+    pub fn directed_matrix(
+        &self,
+        origins: &[(f64, f64)],
+        destinations: &[(f64, f64)],
+        profile: &CompiledStreetProfile,
+        max_seconds: f64,
+        max_snap_distance: f64,
+    ) -> (Vec<Vec<Option<u32>>>, Vec<u32>, Vec<u32>) {
+        let snap = |&(latitude, longitude): &(f64, f64)| {
+            self.snap_for_profile(latitude, longitude, max_snap_distance, profile)
+        };
+        let target_snaps: Vec<Option<Snap>> = destinations.par_iter().map(snap).collect();
+        let origin_snaps: Vec<Option<Snap>> = origins.par_iter().map(snap).collect();
+        // The same-coordinate zero is a route the cutoff still has to admit: a
+        // cutoff that admits nothing (negative or non-finite) leaves the cell
+        // unreachable, exactly as the single route reports it.
+        let routable = max_seconds.is_finite() && max_seconds >= 0.0;
+        let rows: Vec<Vec<Option<u32>>> = origin_snaps
+            .par_iter()
+            .zip(origins)
+            .map(|(origin, &coordinate)| match origin {
+                None => vec![None; destinations.len()],
+                Some(from) => {
+                    let mut row =
+                        self.directed_times_to_snaps(from, &target_snaps, profile, max_seconds);
+                    if routable {
+                        for ((cell, &destination), target) in
+                            row.iter_mut().zip(destinations).zip(&target_snaps)
+                        {
+                            if destination == coordinate && target.is_some() {
+                                *cell = Some(0);
+                            }
                         }
                     }
+                    row
                 }
-            });
-        }
-        best.map(|ms| seconds(ms as f64 / 1000.0))
+            })
+            .collect();
+        let unsnapped = |snaps: &[Option<Snap>]| -> Vec<u32> {
+            snaps
+                .iter()
+                .enumerate()
+                .filter(|(_, snap)| snap.is_none())
+                .map(|(index, _)| index as u32)
+                .collect()
+        };
+        (rows, unsnapped(&origin_snaps), unsnapped(&target_snaps))
     }
 }
