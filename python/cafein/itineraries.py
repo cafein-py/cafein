@@ -79,8 +79,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
     ``option`` and ``segment`` are ``0``, ``mode`` names the mode and
     ``leg_type`` repeats it (a direct non-walking leg takes its mode as
     its structural position, as a direct walk already does), and the
-    distance columns are ``distance`` with its ``network_distance`` and
-    ``connector_distance`` parts and ``distance_provenance``. A street
+    distance columns are ``distance`` (meters) with its
+    ``network_distance`` and ``connector_distance`` parts, in meters
+    too, and ``distance_provenance``. A street
     network has no timetable, so ``departure`` and ``arrival`` are null
     unless ``departure`` is given purely to place the leg on a clock, and
     ``date`` and the timetable-only arguments are rejected. Street
