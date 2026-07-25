@@ -9,10 +9,17 @@ from . import _osm, streets
 from ._cafein import StreetNetwork as _CoreStreetNetwork
 
 MODES = ("walk", "bicycle", "e_scooter")
-"""The modes built by default; `e_bike` routes on the bicycle permissions."""
+"""The modes built by default — those with their own permission bit."""
 
-MAX_STREET_TIME = 3600.0
-"""Default routing cutoff in seconds."""
+STREET_MODES = ("walk", "bicycle", "e_bike", "e_scooter")
+"""The modes that can be routed. `e_bike` has no permission bit of its own — it
+rides the bicycle permissions with its own speed profile — so it is routable
+without being a separate build mode."""
+
+MAX_STREET_TIME = 7200.0
+"""Default routing cutoff in seconds, matching the street-time ceiling the
+transit path already applies to access and egress
+(`streets.MAX_ACCESS_EGRESS_TIME`)."""
 
 
 class StreetNetwork:

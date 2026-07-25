@@ -5,8 +5,10 @@
 //! extraction, routable by any compiled profile. Journeys never enter it, so
 //! it holds no timetable, transfers, or stop links.
 
+use numpy::{IntoPyArray, PyArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use cafein_core::streets::{
     Backing, CompiledStreetProfile, EdgeAttributes, MappedStreets, Snap,
@@ -171,6 +173,48 @@ impl StreetNetwork {
         }
         let (inner, bytes_read) = py.allow_threads(|| load_street_owned(path, verify))?;
         Ok(StreetNetwork::adopt(inner, bytes_read))
+    }
+
+    /// The origins × destinations travel-time matrix under `mode`, in whole
+    /// seconds with `u32::MAX` for unreachable.
+    ///
+    /// Returns `matrix` alongside the index lists of the coordinates that did
+    /// not snap, matching the dict the transit point matrices return.
+    /// Coordinates are `(latitude, longitude)` in EPSG:4326.
+    fn travel_time_matrix(
+        &mut self,
+        py: Python<'_>,
+        origins: Vec<(f64, f64)>,
+        destinations: Vec<(f64, f64)>,
+        mode: &str,
+        max_seconds: f64,
+        max_snap_distance: f64,
+    ) -> PyResult<Py<PyDict>> {
+        let index = self.compiled(mode)?;
+        let (_, profile) = &self.profiles[index];
+        let destination_count = destinations.len();
+        let (rows, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
+            self.inner.directed_matrix(
+                &origins,
+                &destinations,
+                profile,
+                max_seconds,
+                max_snap_distance,
+            )
+        });
+        let mut flat = Vec::with_capacity(rows.len() * destination_count);
+        for row in &rows {
+            flat.extend(row.iter().map(|cell| cell.unwrap_or(u32::MAX)));
+        }
+        let table = PyDict::new(py);
+        table.set_item(
+            "matrix",
+            flat.into_pyarray(py)
+                .reshape([rows.len(), destination_count])?,
+        )?;
+        table.set_item("unsnapped_from", unsnapped_from.into_pyarray(py))?;
+        table.set_item("unsnapped_to", unsnapped_to.into_pyarray(py))?;
+        Ok(table.into())
     }
 
     /// Whether the street arrays are memory-mapped views of the artifact.
