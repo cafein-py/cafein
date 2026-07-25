@@ -532,22 +532,16 @@ impl StreetNetwork {
     /// Attaches multimodal edge attributes to the graph, replacing any
     /// installed set. Every array must match the graph's shape: the two
     /// adjacency-slot arrays span `2·edges`, the four per-edge arrays span
-    /// `edges`; otherwise the attributes are rejected and none are installed.
+    /// `edges`. The class codes must also be within their tables (highway /
+    /// surface / smoothness) — an out-of-range code signals a malformed input
+    /// or a drifted Python/Rust code ABI and is rejected rather than silently
+    /// treated as a default. On rejection any previously installed attributes
+    /// are left unchanged.
     pub fn install_street_attributes(
         &mut self,
         attributes: StreetAttributes,
     ) -> Result<(), StreetError> {
-        let slots = 2 * self.edge_count() as usize;
-        let edges = self.edge_count() as usize;
-        if attributes.adj_access.len() != slots
-            || attributes.adj_facility.len() != slots
-            || attributes.edge_highway.len() != edges
-            || attributes.edge_surface.len() != edges
-            || attributes.edge_smoothness.len() != edges
-            || attributes.edge_flags.len() != edges
-        {
-            return Err(StreetError::InvalidAttributes);
-        }
+        check_street_attributes(&attributes, self.edge_count() as usize)?;
         self.graph.attributes = Some(attributes);
         Ok(())
     }
@@ -699,10 +693,15 @@ impl StreetNetwork {
     /// Adopts a network from its serialized parts — nothing street-sized
     /// is rebuilt (the spatial index arrives as arrays); the one derived
     /// rebuild is the L-sized vertex→link index, from the links'
-    /// denormalised endpoints.
-    pub fn from_parts(parts: StreetNetworkParts) -> StreetNetwork {
+    /// denormalised endpoints. Any persisted multimodal attributes are
+    /// re-validated (shape and class-code ranges), so a malformed or
+    /// ABI-drifted artifact is refused rather than compiled into wrong costs.
+    pub fn from_parts(parts: StreetNetworkParts) -> Result<StreetNetwork, StreetError> {
+        if let Some(attributes) = &parts.attributes {
+            check_street_attributes(attributes, parts.lengths.len())?;
+        }
         let vertex_links = build_vertex_links(&parts.links);
-        StreetNetwork {
+        Ok(StreetNetwork {
             graph: StreetGraph {
                 arrays: Arrays::Owned(OwnedArrays {
                     adjacency_offsets: parts.adjacency_offsets,
@@ -733,7 +732,7 @@ impl StreetNetwork {
                 vertex_links,
                 buckets: None,
             },
-        }
+        })
     }
 
     /// Adopts a network whose arrays stay typed views into a mapped
@@ -772,6 +771,9 @@ impl StreetNetwork {
         let level_starts = level_starts_for(arrays.index_payload.len / 2);
         if *level_starts.last().unwrap() as usize != arrays.index_boxes.len {
             return Err(StreetError::InvalidMapping);
+        }
+        if let Some(attributes) = &spec.attributes {
+            check_street_attributes(attributes, arrays.lengths.len)?;
         }
         let vertex_links = build_vertex_links(&spec.links);
         Ok(StreetNetwork {
@@ -820,6 +822,36 @@ pub struct StreetNetworkParts {
     pub attributes: Option<StreetAttributes>,
     /// The optional per-coordinate elevations, present when elevation is on.
     pub elevations: Option<Vec<f32>>,
+}
+
+/// Validates a multimodal attribute set against a graph of `edges` edges: the
+/// two adjacency-slot arrays span `2·edges`, the four per-edge arrays span
+/// `edges`, and every highway / surface / smoothness code is within its table.
+/// Shared by installation and both load paths, so a malformed input or a
+/// drifted Python/Rust code ABI is rejected wherever attributes enter — never
+/// reaching the compiler, which can then index its multiplier tables directly.
+pub(super) fn check_street_attributes(
+    attributes: &StreetAttributes,
+    edges: usize,
+) -> Result<(), StreetError> {
+    let slots = 2 * edges;
+    if attributes.adj_access.len() != slots
+        || attributes.adj_facility.len() != slots
+        || attributes.edge_highway.len() != edges
+        || attributes.edge_surface.len() != edges
+        || attributes.edge_smoothness.len() != edges
+        || attributes.edge_flags.len() != edges
+    {
+        return Err(StreetError::InvalidAttributes);
+    }
+    let in_range = |codes: &[u8], count: usize| codes.iter().all(|&code| (code as usize) < count);
+    if !in_range(&attributes.edge_highway, HIGHWAY_CODE_COUNT)
+        || !in_range(&attributes.edge_surface, SURFACE_CODE_COUNT)
+        || !in_range(&attributes.edge_smoothness, SMOOTHNESS_CODE_COUNT)
+    {
+        return Err(StreetError::InvalidAttributes);
+    }
+    Ok(())
 }
 
 /// The `(vertex, link index)` pairs behind [`StreetNetwork::links_at`],

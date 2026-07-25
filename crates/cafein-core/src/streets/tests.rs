@@ -1444,3 +1444,371 @@ fn mapped_adoption_refuses_misaligned_or_truncated_ranges() {
     assert!(StreetNetwork::from_mapped(spec((56, 2))).is_err());
     assert!(StreetNetwork::from_mapped(spec((56, 1))).is_ok());
 }
+
+fn triangle() -> StreetNetwork {
+    network(
+        4,
+        0,
+        &[
+            (0, 1, 400.0, straight((0.0, 0.0), (400.0, 0.0))),
+            (1, 2, 300.0, straight((400.0, 0.0), (400.0, 300.0))),
+            (2, 3, 200.0, straight((400.0, 300.0), (600.0, 300.0))),
+        ],
+        vec![],
+    )
+    .unwrap()
+}
+
+fn uniform_attributes(network: &StreetNetwork, access: u8, flags: u16) -> StreetAttributes {
+    let edges = network.edge_count() as usize;
+    let slots = 2 * edges;
+    StreetAttributes {
+        adj_access: vec![access; slots],
+        adj_facility: vec![0; slots],
+        edge_highway: vec![0; edges],
+        edge_surface: vec![0; edges],
+        edge_smoothness: vec![0; edges],
+        edge_flags: vec![flags; edges],
+    }
+}
+
+#[test]
+fn profile_compiles_permitted_arc_costs() {
+    // A permitted arc costs ceil(length / speed * 1000) ms; the bicycle
+    // default is 4 m/s.
+    let mut net = triangle();
+    net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
+        .unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let meters = net.arrays().adj_meters().to_vec();
+    assert_eq!(bike.arc_millis.len(), meters.len());
+    for (&length, &cost) in meters.iter().zip(&bike.arc_millis) {
+        assert_eq!(cost, (length / 4.0 * 1000.0).ceil() as u32);
+    }
+}
+
+#[test]
+fn profile_forbids_arcs_missing_the_mode() {
+    // With walk-only access, the walking profile permits every arc while the
+    // bicycle profile forbids every arc (u32::MAX).
+    let mut net = triangle();
+    net.install_street_attributes(uniform_attributes(&net, MODE_WALK, 0))
+        .unwrap();
+    let walk = net
+        .compile_profile(&StreetProfileDefinition::walk())
+        .unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    assert!(walk.arc_millis.iter().all(|&cost| cost != u32::MAX));
+    assert!(bike.arc_millis.iter().all(|&cost| cost == u32::MAX));
+}
+
+#[test]
+fn profile_applies_class_multipliers() {
+    // Halving the base speed on every arc's highway class (code 0) doubles the
+    // traversal time.
+    let mut net = triangle();
+    net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
+        .unwrap();
+    let mut slow = StreetProfileDefinition::bicycle();
+    slow.highway_multipliers[0] = 0.5;
+    let compiled = net.compile_profile(&slow).unwrap();
+    let meters = net.arrays().adj_meters().to_vec();
+    for (&length, &cost) in meters.iter().zip(&compiled.arc_millis) {
+        assert_eq!(cost, (length / (4.0 * 0.5) * 1000.0).ceil() as u32);
+    }
+}
+
+#[test]
+fn profile_dismount_arc_falls_to_walk_speed() {
+    // A dismount arc costs walking time for the bicycle, not bicycle time.
+    let mut net = triangle();
+    net.install_street_attributes(uniform_attributes(
+        &net,
+        MODE_WALK | MODE_BICYCLE,
+        FLAG_DISMOUNT,
+    ))
+    .unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let meters = net.arrays().adj_meters().to_vec();
+    for (&length, &cost) in meters.iter().zip(&bike.arc_millis) {
+        assert_eq!(cost, (length / 1.0 * 1000.0).ceil() as u32);
+    }
+}
+
+#[test]
+fn profile_walk_compiles_without_attributes() {
+    // A graph without installed attributes has no per-mode permissions: the
+    // walking profile permits every arc, while a non-walk profile has nothing
+    // to route by and is rejected rather than returning an all-forbidden set.
+    let net = triangle();
+    let walk = net
+        .compile_profile(&StreetProfileDefinition::walk())
+        .unwrap();
+    let meters = net.arrays().adj_meters().to_vec();
+    for (&length, &walk_cost) in meters.iter().zip(&walk.arc_millis) {
+        assert_eq!(walk_cost, (length * 1000.0).ceil() as u32);
+    }
+    assert_eq!(
+        net.compile_profile(&StreetProfileDefinition::bicycle())
+            .unwrap_err(),
+        ProfileError::MissingAttributes
+    );
+}
+
+#[test]
+fn compile_rejects_pathological_costs_and_codes() {
+    let mut net = triangle();
+    net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
+        .unwrap();
+    // A dismount speed above max_speed would let on-network arcs beat the A*
+    // bound, so it is rejected by validation.
+    let mut fast_dismount = StreetProfileDefinition::bicycle();
+    fast_dismount.dismount_speed = 10.0; // > max_speed 4
+    assert_eq!(
+        net.compile_profile(&fast_dismount).unwrap_err(),
+        ProfileError::MaxSpeedTooLow
+    );
+    // A physically implausible speed overflows the millisecond range and is
+    // rejected rather than silently clamped. (All speeds tiny so the max-speed
+    // bound is satisfied and compilation reaches the overflowing cost.)
+    let mut crawl = StreetProfileDefinition::bicycle();
+    crawl.base_speed = 1e-9;
+    crawl.dismount_speed = 1e-9;
+    crawl.connector_speed = 1e-9;
+    crawl.max_speed = 1e-9;
+    assert_eq!(
+        net.compile_profile(&crawl).unwrap_err(),
+        ProfileError::ArcCostOverflow
+    );
+    // An out-of-range class code is a drifted-ABI signal and is refused at
+    // install, not defaulted to a neutral multiplier.
+    let mut fresh = triangle();
+    let mut attributes = uniform_attributes(&fresh, MODE_WALK | MODE_BICYCLE, 0);
+    attributes.edge_highway[0] = HIGHWAY_CODE_COUNT as u8;
+    assert_eq!(
+        fresh.install_street_attributes(attributes),
+        Err(StreetError::InvalidAttributes)
+    );
+}
+
+#[test]
+fn builtin_profile_speeds_and_modes() {
+    assert_eq!(StreetProfileDefinition::walk().base_speed, 1.0);
+    assert_eq!(StreetProfileDefinition::bicycle().base_speed, 4.0);
+    assert_eq!(StreetProfileDefinition::e_bike().base_speed, 4.0);
+    assert_eq!(StreetProfileDefinition::e_scooter().base_speed, 15.0 / 3.6);
+    assert_eq!(StreetProfileDefinition::walk().mode, StreetMode::Walk);
+    assert_eq!(StreetProfileDefinition::bicycle().mode, StreetMode::Bicycle);
+    assert_eq!(
+        StreetProfileDefinition::e_scooter().mode,
+        StreetMode::EScooter
+    );
+    // A flat profile's max speed equals its base speed and its multiplier
+    // tables match the class-code counts.
+    let bike = StreetProfileDefinition::bicycle();
+    assert_eq!(bike.max_speed, 4.0);
+    assert_eq!(bike.highway_multipliers.len(), HIGHWAY_CODE_COUNT);
+    assert_eq!(bike.surface_multipliers.len(), SURFACE_CODE_COUNT);
+    assert_eq!(bike.smoothness_multipliers.len(), SMOOTHNESS_CODE_COUNT);
+}
+
+#[test]
+fn profile_definition_equality_binds_exactly() {
+    let mut modified = StreetProfileDefinition::bicycle();
+    assert_eq!(modified, StreetProfileDefinition::bicycle());
+    modified.surface_multipliers[2] = 0.75;
+    assert_ne!(modified, StreetProfileDefinition::bicycle());
+    // e-bike routes like a bicycle but is a distinct definition (its vehicle
+    // class differs), so equality separates them.
+    assert_ne!(
+        StreetProfileDefinition::e_bike(),
+        StreetProfileDefinition::bicycle()
+    );
+}
+
+#[test]
+fn compile_rejects_invalid_definitions() {
+    // Attributes installed so the final valid case reaches (and passes) the
+    // compile loop; the validation errors below fire before it is consulted.
+    let mut net = triangle();
+    net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
+        .unwrap();
+    // A non-finite or non-positive speed is rejected.
+    let mut zero = StreetProfileDefinition::bicycle();
+    zero.base_speed = 0.0;
+    assert_eq!(
+        net.compile_profile(&zero).unwrap_err(),
+        ProfileError::NonPositiveSpeed
+    );
+    let mut infinite = StreetProfileDefinition::bicycle();
+    infinite.base_speed = f64::INFINITY;
+    assert_eq!(
+        net.compile_profile(&infinite).unwrap_err(),
+        ProfileError::NonPositiveSpeed
+    );
+    // A wrong-length multiplier table is rejected.
+    let mut short = StreetProfileDefinition::bicycle();
+    short.surface_multipliers.pop();
+    assert_eq!(
+        net.compile_profile(&short).unwrap_err(),
+        ProfileError::InvalidMultipliers
+    );
+    // A max_speed below the greatest attainable speed is rejected.
+    let mut fast = StreetProfileDefinition::bicycle();
+    fast.highway_multipliers[5] = 2.0; // attainable = 8 m/s > max_speed 4
+    assert_eq!(
+        net.compile_profile(&fast).unwrap_err(),
+        ProfileError::MaxSpeedTooLow
+    );
+    fast.max_speed = 8.0;
+    assert!(net.compile_profile(&fast).is_ok());
+}
+
+#[test]
+fn load_rejects_invalid_persisted_attributes() {
+    // A drifted-ABI or corrupted artifact must be refused on adoption, not
+    // compiled into wrong costs. The owned (`from_parts`) and mapped
+    // (`from_mapped`) paths run the same attribute check; the owned path is
+    // exercised here through the public parts round-trip.
+    let mut net = triangle();
+    net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
+        .unwrap();
+    // A well-formed set adopts.
+    assert!(StreetNetwork::from_parts(net.to_parts()).is_ok());
+    // An out-of-range class code is rejected.
+    let mut bad_code = net.to_parts();
+    bad_code.attributes.as_mut().unwrap().edge_surface[0] = SURFACE_CODE_COUNT as u8;
+    assert_eq!(
+        StreetNetwork::from_parts(bad_code).unwrap_err(),
+        StreetError::InvalidAttributes
+    );
+    // A wrong-length attribute array is rejected.
+    let mut wrong_len = net.to_parts();
+    wrong_len.attributes.as_mut().unwrap().edge_highway.pop();
+    assert_eq!(
+        StreetNetwork::from_parts(wrong_len).unwrap_err(),
+        StreetError::InvalidAttributes
+    );
+}
+
+#[test]
+fn dismount_is_a_per_edge_flag_on_both_directions() {
+    // `bicycle=dismount` is a way-level flag in `edge_flags`, so it slows both
+    // of the dismount edge's arcs and no others.
+    let mut net = triangle();
+    let mut attributes = uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0);
+    attributes.edge_flags[1] = FLAG_DISMOUNT;
+    net.install_street_attributes(attributes).unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let meters = net.arrays().adj_meters().to_vec();
+    let adj_edges = net.arrays().adj_edges().to_vec();
+    for ((&length, &edge), &cost) in meters.iter().zip(&adj_edges).zip(&bike.arc_millis) {
+        let speed = if edge == 1 { 1.0 } else { 4.0 };
+        assert_eq!(cost, (length / speed * 1000.0).ceil() as u32);
+    }
+    // The one dismount edge contributes exactly two (both-direction) arcs.
+    assert_eq!(adj_edges.iter().filter(|&&edge| edge == 1).count(), 2);
+}
+
+#[test]
+fn attribute_free_walk_bound_includes_base_speed() {
+    // On an attribute-free graph the class multipliers are not applied, so a
+    // walk profile runs at base_speed: max_speed below base_speed is rejected
+    // even when every multiplier is below one.
+    let net = triangle();
+    let mut slow = StreetProfileDefinition::walk();
+    slow.highway_multipliers.fill(0.5);
+    slow.max_speed = 0.5; // below base_speed 1.0
+    assert_eq!(
+        net.compile_profile(&slow).unwrap_err(),
+        ProfileError::MaxSpeedTooLow
+    );
+    slow.max_speed = 1.0;
+    let walk = net.compile_profile(&slow).unwrap();
+    let meters = net.arrays().adj_meters().to_vec();
+    for (&length, &cost) in meters.iter().zip(&walk.arc_millis) {
+        assert_eq!(cost, (length / 1.0 * 1000.0).ceil() as u32);
+    }
+}
+
+#[test]
+fn profile_abi_constants_mirror_the_python_contract() {
+    // These must match python/cafein/_osm.py exactly — the raw u8/u16 attribute
+    // arrays cross the language boundary as these integers, so a change on
+    // either side is a breaking ABI change that must be made on both.
+    assert_eq!((MODE_WALK, MODE_BICYCLE, MODE_E_SCOOTER), (1, 2, 4));
+    assert_eq!(
+        (
+            FLAG_DISMOUNT,
+            FLAG_BRIDGE,
+            FLAG_TUNNEL,
+            FLAG_INDOOR,
+            FLAG_STEPS,
+            FLAG_SEGREGATED,
+            FLAG_LIT,
+        ),
+        (1, 2, 4, 8, 16, 32, 64)
+    );
+    assert_eq!(
+        (
+            HIGHWAY_CODE_COUNT,
+            SURFACE_CODE_COUNT,
+            SMOOTHNESS_CODE_COUNT
+        ),
+        (27, 17, 9)
+    );
+}
+
+#[test]
+fn profile_rounds_arc_costs_up() {
+    // 3 m/s makes several arcs' millisecond costs fractional; the compiler must
+    // round up, not truncate.
+    let mut net = triangle();
+    net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
+        .unwrap();
+    let mut three = StreetProfileDefinition::bicycle();
+    three.base_speed = 3.0;
+    three.max_speed = 3.0;
+    let compiled = net.compile_profile(&three).unwrap();
+    let meters = net.arrays().adj_meters().to_vec();
+    let mut saw_fractional = false;
+    for (&length, &cost) in meters.iter().zip(&compiled.arc_millis) {
+        let exact = length / 3.0 * 1000.0;
+        assert_eq!(cost, exact.ceil() as u32);
+        if exact.fract() != 0.0 {
+            saw_fractional = true;
+        }
+    }
+    assert!(
+        saw_fractional,
+        "expected at least one fractional-millisecond arc"
+    );
+}
+
+#[test]
+fn positive_length_arc_never_costs_zero() {
+    // A tiny length with an extreme speed underflows the raw product to `0.0`;
+    // a positive-length arc must still cost at least 1 ms.
+    let mut net = network(
+        2,
+        0,
+        &[(0, 1, 1e-200, straight((0.0, 0.0), (10.0, 0.0)))],
+        vec![],
+    )
+    .unwrap();
+    net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
+        .unwrap();
+    let mut extreme = StreetProfileDefinition::bicycle();
+    extreme.base_speed = 1e300;
+    extreme.max_speed = 1e300;
+    let compiled = net.compile_profile(&extreme).unwrap();
+    assert!(compiled.arc_millis.iter().all(|&cost| cost >= 1));
+}

@@ -1109,12 +1109,11 @@ pub(super) fn load_owned(path: &str, verify: Option<bool>) -> PyResult<LoadedArt
         Some(streets_meta) => {
             let expected_levels =
                 validate_street_shape(path, &streets_meta, layout.streets_length, stop_count)?;
-            Some(StreetNetwork::from_parts(decode_streets(
-                path,
-                streets_meta,
-                section,
-                expected_levels,
-            )?))
+            let parts = decode_streets(path, streets_meta, section, expected_levels)?;
+            Some(
+                StreetNetwork::from_parts(parts)
+                    .map_err(|_| corrupted(path, "street attributes"))?,
+            )
         }
         None => None,
     };
