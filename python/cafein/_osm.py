@@ -4,9 +4,8 @@ The walking build (`streets._walking_network`) stays the default; this module
 adds the union extraction the cycling / e-scooter modes need: one `pyrosm`
 pass over the broadly-filtered network, its tags normalised into flat per-edge
 codes and per-direction mode-permission masks, with connectivity pruned
-separately for each mode. Nothing here feeds the routing graph yet — that is a
-later step; the output is the multimodal edge data the format-12 arrays will
-carry.
+separately for each mode. `StreetNetwork.from_osm` consumes that output as the
+multimodal edge data the format-12 arrays carry.
 """
 
 import numpy as np
@@ -544,7 +543,9 @@ def normalise_codes(edges):
     return edge_highway, edge_surface, edge_smoothness, flags
 
 
-def prune_components_per_profile(u, v, vertex_count, access_forward, access_reverse):
+def prune_components_per_profile(
+    u, v, vertex_count, access_forward, access_reverse, modes=None
+):
     """Clear each mode's permission from the components too small to route on.
 
     `u`, `v` are the edges' endpoint vertex indices (as `streets._vertex_
@@ -554,10 +555,25 @@ def prune_components_per_profile(u, v, vertex_count, access_forward, access_reve
     components over that mode's permitted arcs have the mode's bit cleared (in
     both directions); the physical edge stays as long as another mode still uses
     it. Returns the pruned (access_forward, access_reverse).
+
+    `modes` names the modes to prune, defaulting to all of them. Pruning is the
+    only thing a mode selection changes: no edge is dropped, so a mode left out
+    here keeps its raw permissions and can still be compiled later without
+    rebuilding the graph.
     """
+    if modes is None:
+        bits = list(MODES.values())
+    else:
+        unknown = [mode for mode in modes if mode not in MODES]
+        if unknown:
+            raise ValueError(
+                f"unknown street mode(s) {sorted(unknown)}; "
+                f"expected any of {sorted(MODES)}"
+            )
+        bits = [MODES[mode] for mode in modes]
     forward = access_forward.copy()
     reverse = access_reverse.copy()
-    for bit in MODES.values():
+    for bit in bits:
         usable = ((forward | reverse) & bit) != 0
         if not usable.any():
             continue

@@ -116,6 +116,7 @@ mod network;
 mod options;
 mod points;
 mod routes;
+mod streets;
 mod time_matrices;
 
 use artifact::*;
@@ -127,5 +128,6 @@ use points::*;
 fn _cafein(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<TransportNetwork>()?;
+    m.add_class::<streets::StreetNetwork>()?;
     Ok(())
 }

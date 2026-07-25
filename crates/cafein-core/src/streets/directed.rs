@@ -84,31 +84,65 @@ impl StreetNetwork {
             .find(|&slot| targets[slot] == to && edges[slot] == edge)
     }
 
-    /// The two directed arcs of a snapped edge as `(forward, reverse)` slot
-    /// options: `forward` is the `from → to` arc, `reverse` is `to → from`,
-    /// each `Some(slot)` only when the profile permits that direction. A
+    /// The two directed arcs of a physical edge as `(forward, reverse)` slot
+    /// options: `forward` is the `from → to` arc, `reverse` is `to → from`. A
     /// self-loop (`from == to`) has both arcs at the one vertex, so its two
     /// distinct slots are taken directly rather than found by target.
+    fn edge_slots(&self, edge: u32) -> (Option<usize>, Option<usize>) {
+        let (from, to) = self.edge_endpoints(edge);
+        if from == to {
+            let offsets = self.arrays().adjacency_offsets();
+            let edges = self.arrays().adj_edges();
+            let mut slots = (offsets[from as usize] as usize..offsets[from as usize + 1] as usize)
+                .filter(|&slot| edges[slot] == edge);
+            (slots.next(), slots.next())
+        } else {
+            (
+                self.slot_between(from, to, edge),
+                self.slot_between(to, from, edge),
+            )
+        }
+    }
+
+    /// [`edge_slots`](Self::edge_slots) keeping only the directions `profile`
+    /// permits.
     fn snap_arcs(
         &self,
         snap: &Snap,
         profile: &CompiledStreetProfile,
     ) -> (Option<usize>, Option<usize>) {
-        let (from, to) = self.edge_endpoints(snap.edge);
+        let (forward, reverse) = self.edge_slots(snap.edge);
         let permitted =
             |slot: Option<usize>| slot.filter(|&slot| profile.arc_millis[slot] != u32::MAX);
-        if from == to {
-            let offsets = self.arrays().adjacency_offsets();
-            let edges = self.arrays().adj_edges();
-            let mut slots = (offsets[from as usize] as usize..offsets[from as usize + 1] as usize)
-                .filter(|&slot| edges[slot] == snap.edge);
-            (permitted(slots.next()), permitted(slots.next()))
-        } else {
-            (
-                permitted(self.slot_between(from, to, snap.edge)),
-                permitted(self.slot_between(to, from, snap.edge)),
-            )
-        }
+        (permitted(forward), permitted(reverse))
+    }
+
+    /// Whether `profile` may traverse `edge` in either direction.
+    fn edge_permits(&self, edge: u32, profile: &CompiledStreetProfile) -> bool {
+        let (forward, reverse) = self.edge_slots(edge);
+        [forward, reverse]
+            .into_iter()
+            .flatten()
+            .any(|slot| profile.arc_millis[slot] != u32::MAX)
+    }
+
+    /// Snaps a coordinate to the nearest edge `profile` can actually use.
+    ///
+    /// The plain [`snap`](Self::snap) is mode-blind, so it can land a bicycle
+    /// query on a footway the mode may not enter — leaving the search with no
+    /// permitted arc to start from and reporting the destination unreachable.
+    /// This skips those edges, so a route starts from the nearest street the
+    /// mode is allowed on.
+    pub fn snap_for_profile(
+        &self,
+        latitude: f64,
+        longitude: f64,
+        max_snap_distance: f64,
+        profile: &CompiledStreetProfile,
+    ) -> Option<Snap> {
+        self.snap_filtered(latitude, longitude, max_snap_distance, |edge| {
+            self.edge_permits(edge, profile)
+        })
     }
 
     /// The starting frontier for a coordinate snapped at `snap`, leaving toward

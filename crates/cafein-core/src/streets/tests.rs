@@ -2504,6 +2504,47 @@ fn new_multimodal_rejects_misshaped_or_out_of_range_attributes() {
 }
 
 #[test]
+fn snap_for_profile_skips_edges_the_mode_may_not_use() {
+    // A footway right next to the query and a road slightly farther away. The
+    // mode-blind snap takes the footway; a bicycle must skip it and reach the
+    // road, or its route would start on an arc it may never traverse.
+    let edges: Vec<TestEdge> = vec![
+        (0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0))),
+        (2, 3, 100.0, straight((0.0, 40.0), (100.0, 40.0))),
+    ];
+    let walk_bit = MODE_WALK;
+    let both = MODE_WALK | MODE_BICYCLE;
+    let attrs = Attrs {
+        highway: vec![0; 2],
+        surface: vec![0; 2],
+        smoothness: vec![0; 2],
+        flags: vec![0; 2],
+        // Edge 0 (the near one) is walk-only; edge 1 admits bicycles.
+        access_forward: vec![walk_bit, both],
+        access_reverse: vec![walk_bit, both],
+        facility_forward: vec![0; 2],
+        facility_reverse: vec![0; 2],
+    };
+    let net = multimodal_network(4, &edges, &attrs).unwrap();
+    let walk = net
+        .compile_profile(&StreetProfileDefinition::walk())
+        .unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let (lon, lat) = lonlat(50.0, 5.0); // 5 m from the footway, 35 m from the road
+    let blind = net.snap(lat, lon, 100.0).unwrap();
+    let walked = net.snap_for_profile(lat, lon, 100.0, &walk).unwrap();
+    let biked = net.snap_for_profile(lat, lon, 100.0, &bike).unwrap();
+    // Walking keeps the nearest edge; the bicycle takes the farther, usable one.
+    assert_eq!(walked, blind);
+    assert_ne!(biked.edge, blind.edge);
+    assert!(biked.connector > blind.connector);
+    // Nothing usable within the allowance still fails to snap.
+    assert_eq!(net.snap_for_profile(lat, lon, 10.0, &bike), None);
+}
+
+#[test]
 fn new_multimodal_orders_coincident_edges_deterministically() {
     // Two geometrically identical parallel edges that differ only in their
     // permissions are not interchangeable: the build must lay them out the same
