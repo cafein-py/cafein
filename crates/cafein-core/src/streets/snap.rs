@@ -7,6 +7,21 @@ impl StreetNetwork {
     /// meters through the packed segment index. Non-finite coordinates or a
     /// non-finite or negative allowance never snap.
     pub fn snap(&self, latitude: f64, longitude: f64, max_snap_distance: f64) -> Option<Snap> {
+        self.snap_filtered(latitude, longitude, max_snap_distance, |_| true)
+    }
+
+    /// [`snap`](Self::snap) restricted to the edges `usable` accepts.
+    ///
+    /// A rejected edge is treated as absent, so the result is the nearest
+    /// *acceptable* edge rather than the nearest edge overall — the ring search
+    /// keeps expanding past a rejected neighbour instead of failing on it.
+    pub(super) fn snap_filtered(
+        &self,
+        latitude: f64,
+        longitude: f64,
+        max_snap_distance: f64,
+        usable: impl Fn(u32) -> bool,
+    ) -> Option<Snap> {
         if !latitude.is_finite()
             || !longitude.is_finite()
             || !max_snap_distance.is_finite()
@@ -31,6 +46,9 @@ impl StreetNetwork {
             self.query_index_into(&envelope, &mut candidates);
             let mut best: Option<Snap> = None;
             for &(edge, start) in &candidates {
+                if !usable(edge) {
+                    continue;
+                }
                 let (connector, fraction) = self.foot_on_segment(latitude, longitude, edge, start);
                 if connector <= max_snap_distance
                     && best.is_none_or(|current| {

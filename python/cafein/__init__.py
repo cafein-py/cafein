@@ -2,6 +2,7 @@
 
 __all__ = [
     "TransportNetwork",
+    "StreetNetwork",
     "TravelCostMatrix",
     "TravelTimeMatrix",
     "DetailedItineraries",
@@ -23,6 +24,10 @@ def __getattr__(name):
         from cafein.network import TransportNetwork
 
         return TransportNetwork
+    if name == "StreetNetwork":
+        from cafein.street_network import StreetNetwork
+
+        return StreetNetwork
     if name == "TravelCostMatrix":
         from cafein.matrices import TravelCostMatrix
 

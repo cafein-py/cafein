@@ -421,3 +421,34 @@ def test_union_pruning_clears_disconnected_bicycle_arcs(union_extract):
     bike_after = int((pruned_f & _osm.BICYCLE != 0).sum())
     assert walk_after > 0.9 * walk_before
     assert bike_after < bike_before
+
+
+def test_pruning_touches_only_the_named_modes(union_extract):
+    from cafein.streets import _vertex_endpoints
+
+    nodes, edges = union_extract
+    forward, reverse, _, _ = _osm.edge_permissions(edges)
+    u, v = _vertex_endpoints(nodes, edges)
+    bike_only_f, bike_only_r = _osm.prune_components_per_profile(
+        u, v, len(nodes), forward, reverse, modes=["bicycle"]
+    )
+    # The named mode is pruned...
+    assert int((bike_only_f & _osm.BICYCLE != 0).sum()) < int(
+        (forward & _osm.BICYCLE != 0).sum()
+    )
+    # ...while every other mode's bits are left exactly as they arrived.
+    for bit in (_osm.WALK, _osm.E_SCOOTER):
+        assert np.array_equal(bike_only_f & bit, forward & bit)
+        assert np.array_equal(bike_only_r & bit, reverse & bit)
+
+
+def test_pruning_rejects_an_unknown_mode(union_extract):
+    from cafein.streets import _vertex_endpoints
+
+    nodes, edges = union_extract
+    forward, reverse, _, _ = _osm.edge_permissions(edges)
+    u, v = _vertex_endpoints(nodes, edges)
+    with pytest.raises(ValueError, match="unknown street mode"):
+        _osm.prune_components_per_profile(
+            u, v, len(nodes), forward, reverse, modes=["hovercraft"]
+        )
