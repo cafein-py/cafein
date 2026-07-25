@@ -266,9 +266,9 @@ COST_COLUMNS = [
     "from_id",
     "to_id",
     "travel_time",
-    "distance",
-    "network_distance",
-    "connector_distance",
+    "distance_m",
+    "network_distance_m",
+    "connector_distance_m",
     "distance_provenance",
 ]
 
@@ -277,7 +277,7 @@ def test_cost_matrix_columns_and_dtypes(streets, origins, destinations):
     costs = TravelCostMatrix(streets, origins, destinations, transport_mode="bicycle")
     assert list(costs.columns) == COST_COLUMNS
     assert costs.travel_time.dtype == np.uint32
-    for column in ("distance", "network_distance", "connector_distance"):
+    for column in ("distance_m", "network_distance_m", "connector_distance_m"):
         assert costs[column].dtype == np.float64
     assert pd.api.types.is_string_dtype(costs.distance_provenance)
     assert (costs.distance_provenance == STREET_DISTANCE_PROVENANCE).all()
@@ -295,10 +295,10 @@ def test_cost_matrix_columns_with_geometries(streets, origins, destinations):
 def test_cost_matrix_distance_is_the_sum_of_its_parts(streets, origins, destinations):
     costs = TravelCostMatrix(streets, origins, destinations, transport_mode="bicycle")
     assert len(costs) > 0
-    total = costs.network_distance + costs.connector_distance
-    assert np.allclose(costs.distance, total)
-    assert (costs.network_distance >= 0).all()
-    assert (costs.connector_distance >= 0).all()
+    total = costs.network_distance_m + costs.connector_distance_m
+    assert np.allclose(costs.distance_m, total)
+    assert (costs.network_distance_m >= 0).all()
+    assert (costs.connector_distance_m >= 0).all()
 
 
 def test_cost_matrix_times_match_the_time_matrix(streets, origins, destinations):
@@ -317,7 +317,11 @@ def test_cost_matrix_matches_single_pair_reconstruction(streets, origins, destin
     # coordinates — time and both reconstructed distances, not just the time.
     whole = TravelCostMatrix(streets, origins, destinations, transport_mode="walk")
     rows = {
-        (r.from_id, r.to_id): (r.travel_time, r.network_distance, r.connector_distance)
+        (r.from_id, r.to_id): (
+            r.travel_time,
+            r.network_distance_m,
+            r.connector_distance_m,
+        )
         for r in whole.itertuples(index=False)
     }
     assert rows
@@ -334,7 +338,7 @@ def test_cost_matrix_matches_single_pair_reconstruction(streets, origins, destin
                 continue
             only = single.iloc[0]
             assert rows[(from_id, to_id)] == pytest.approx(
-                (only.travel_time, only.network_distance, only.connector_distance)
+                (only.travel_time, only.network_distance_m, only.connector_distance_m)
             )
 
 
@@ -346,13 +350,13 @@ def test_connectors_are_zero_on_the_network_and_positive_off_it(streets):
     )
     off_diagonal = costs[costs.from_id != costs.to_id]
     assert len(off_diagonal) > 0
-    assert (off_diagonal.connector_distance < 1.0).all()
-    assert (off_diagonal.network_distance > 0).all()
+    assert (off_diagonal.connector_distance_m < 1.0).all()
+    assert (off_diagonal.network_distance_m > 0).all()
 
     offset = _on_network_points(streets, shift=0.0004)  # ~45 m north
     away = TravelCostMatrix(streets, offset, transport_mode="walk")
     away_off_diagonal = away[away.from_id != away.to_id]
-    assert (away_off_diagonal.connector_distance > 1.0).all()
+    assert (away_off_diagonal.connector_distance_m > 1.0).all()
 
 
 def test_cycling_detours_cover_more_network_than_walking(
@@ -368,12 +372,12 @@ def test_cycling_detours_cover_more_network_than_walking(
         streets, origins, destinations, transport_mode="bicycle", max_street_time=3600
     )
     walked = {
-        (r.from_id, r.to_id): r.network_distance
+        (r.from_id, r.to_id): r.network_distance_m
         for r in walk.itertuples(index=False)
         if r.from_id != r.to_id
     }
     rode = {
-        (r.from_id, r.to_id): r.network_distance
+        (r.from_id, r.to_id): r.network_distance_m
         for r in bicycle.itertuples(index=False)
         if r.from_id != r.to_id
     }

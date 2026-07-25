@@ -3,10 +3,17 @@
 import math
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import shapely
 
-from cafein.matrices import _is_point_frame, _point_list
+from cafein.matrices import (
+    _is_point_frame,
+    _is_street_network,
+    _point_list,
+    _street_query,
+    _warn_unsnapped,
+)
 
 _COLUMNS = [
     "from_id",
@@ -67,12 +74,27 @@ class DetailedItineraries(gpd.GeoDataFrame):
     pandas operations return ordinary GeoDataFrame views that no longer
     re-route.
 
+    Given a ``StreetNetwork`` instead, each reachable pair is a single
+    street leg under ``transport_mode``, bounded by ``max_street_time``:
+    ``option`` and ``segment`` are ``0``, ``mode`` names the mode and
+    ``leg_type`` repeats it (a direct non-walking leg takes its mode as
+    its structural position, as a direct walk already does), and the
+    distance columns carry their unit in the name — ``distance_m`` with
+    its ``network_distance_m`` and ``connector_distance_m`` parts — plus
+    ``distance_provenance``. A street
+    network has no timetable, so ``departure`` and ``arrival`` are null
+    unless ``departure`` is given purely to place the leg on a clock, and
+    ``date`` and the timetable-only arguments are rejected. Street
+    emissions are not computed yet, so there is no ``emissions`` column.
+
     Parameters
     ----------
-    network : TransportNetwork
-        The network to route on.
+    network : TransportNetwork or StreetNetwork
+        The network to route on. A ``StreetNetwork`` takes the standalone
+        street path and requires ``transport_mode``.
     origins : list of str, or GeoDataFrame
-        Origin stop_ids, or points with an ``id`` column.
+        Origin stop_ids, or points with an ``id`` column. A street
+        network needs points.
     destinations : list of str, or GeoDataFrame
         Destination stop_ids, or points with an ``id`` column; the same
         kind as `origins`.
@@ -161,7 +183,16 @@ class DetailedItineraries(gpd.GeoDataFrame):
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         The street-search options for point origins/destinations, as in
         ``TransportNetwork.route_between_coordinates``; only valid with
-        points.
+        points. Only ``max_snap_distance`` applies to a ``StreetNetwork``,
+        whose speeds come from the mode's profile.
+    transport_mode : str (optional)
+        The mode to route. Required for a ``StreetNetwork``, where it is
+        one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``.
+        A ``TransportNetwork`` routes public transport and takes none.
+    max_street_time : float (optional)
+        Cutoff in seconds for a ``StreetNetwork``, beyond which a
+        destination counts as unreachable (default:
+        ``cafein.street_network.MAX_STREET_TIME``, 7200).
     """
 
     @property
@@ -193,12 +224,57 @@ class DetailedItineraries(gpd.GeoDataFrame):
         walking_speed_kmph=None,
         max_walking_time=None,
         max_snap_distance=None,
+        transport_mode=None,
+        max_street_time=None,
     ):
+        # Before the reconstruction guard below: a StreetNetwork has no
+        # `route_between_stops` either, so it would be mistaken for frame data.
+        if _is_street_network(network):
+            super().__init__(
+                _street_itineraries_frame(
+                    network,
+                    origins,
+                    destinations,
+                    departure=departure,
+                    transport_mode=transport_mode,
+                    max_street_time=max_street_time,
+                    max_snap_distance=max_snap_distance,
+                    geometries=geometries,
+                    transit_only={
+                        "date": date,
+                        "factors": factors,
+                        "components": components,
+                        "slack_seconds": slack_seconds,
+                        "max_options": max_options,
+                        "walking_speed_kmph": walking_speed_kmph,
+                        "max_walking_time": max_walking_time,
+                        "max_transfers": None if max_transfers == 7 else max_transfers,
+                        "candidates": None if candidates == "time" else candidates,
+                        "bucket": None if bucket == 25.0 else bucket,
+                        "router": None if router == "auto" else router,
+                        "diversity": None if diversity == "time" else diversity,
+                        "penalty": None if penalty == "ban" else penalty,
+                        "exclude_routes": tuple(exclude_routes) or None,
+                        "exclude_trips": tuple(exclude_trips) or None,
+                        "exclude_stops": tuple(exclude_stops) or None,
+                    },
+                ),
+                geometry="geometry",
+                crs="EPSG:4326",
+            )
+            return
         if not hasattr(network, "route_between_stops"):
             # pandas/geopandas reconstruct subclasses by passing data in
             # the first position; wrap it as an ordinary GeoDataFrame.
             super().__init__(network)
             return
+        if transport_mode is not None and transport_mode != "public_transport":
+            raise ValueError(
+                f"transport_mode={transport_mode!r} is a street mode; pass a "
+                "StreetNetwork to route on it"
+            )
+        if max_street_time is not None:
+            raise ValueError("max_street_time applies to a StreetNetwork")
         frame = _itineraries_frame(
             network,
             origins,
@@ -597,6 +673,107 @@ def _leg_record(from_id, to_id, option, segment, leg):
         "emissions": leg.get("emissions"),
         "geometry": shapely.from_wkb(wkb) if wkb is not None else None,
     }
+
+
+STREET_COLUMNS = [
+    "from_id",
+    "to_id",
+    "option",
+    "segment",
+    "leg_type",
+    "mode",
+    "departure",
+    "arrival",
+    "travel_time",
+    "distance_m",
+    "network_distance_m",
+    "connector_distance_m",
+    "distance_provenance",
+    "geometry",
+]
+
+
+def _street_itineraries_frame(
+    network,
+    origins,
+    destinations,
+    *,
+    departure,
+    transport_mode,
+    max_street_time,
+    max_snap_distance,
+    geometries,
+    transit_only,
+):
+    """Street routes as one leg per reachable pair."""
+    from cafein._cafein import STREET_DISTANCE_PROVENANCE
+
+    query = _street_query(
+        origins,
+        destinations,
+        transport_mode=transport_mode,
+        max_street_time=max_street_time,
+        max_snap_distance=max_snap_distance,
+        chunk=None,
+        transit_only=transit_only,
+    )
+    table = network._core.cost_matrix(
+        query.origin_points,
+        query.destination_points,
+        transport_mode,
+        query.max_seconds,
+        query.max_snap_distance,
+        bool(geometries),
+    )
+    _warn_unsnapped(table, query.from_ids, query.to_ids)
+    from_ids = np.asarray(query.from_ids, dtype=object)
+    to_ids = np.asarray(query.to_ids, dtype=object)
+    travel_time = table["travel_time"]
+    rows = len(travel_time)
+    # A street network has no timetable, so absolute times exist only when a
+    # departure is supplied to place the leg on a clock.
+    if departure is None:
+        starts = pd.array([None] * rows, dtype="Int64")
+        arrivals = pd.array([None] * rows, dtype="Int64")
+    else:
+        hours, minutes, seconds = str(departure).split(":")
+        start = int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+        starts = pd.array(np.full(rows, start, dtype=np.int64), dtype="Int64")
+        arrivals = pd.array(
+            np.asarray(travel_time, dtype=np.int64) + start, dtype="Int64"
+        )
+    network_distance = table["network_distance"]
+    connector_distance = table["connector_distance"]
+    frame = pd.DataFrame(
+        {
+            "from_id": from_ids[table["from"]],
+            "to_id": to_ids[table["to"]],
+            # One journey of one leg per pair.
+            "option": np.zeros(rows, dtype=np.int64),
+            "segment": np.zeros(rows, dtype=np.int64),
+            # A direct non-walking leg takes its mode as `leg_type`, as a
+            # direct walk already does; `mode` is the unambiguous field.
+            "leg_type": np.full(rows, transport_mode, dtype=object),
+            "mode": np.full(rows, transport_mode, dtype=object),
+            "departure": starts,
+            "arrival": arrivals,
+            "travel_time": travel_time,
+            "distance_m": network_distance + connector_distance,
+            "network_distance_m": network_distance,
+            "connector_distance_m": connector_distance,
+            "distance_provenance": np.full(
+                rows, STREET_DISTANCE_PROVENANCE, dtype=object
+            ),
+        },
+        columns=[column for column in STREET_COLUMNS if column != "geometry"],
+    )
+    if geometries:
+        shapes = list(shapely.from_wkb(np.array(table["geometry"], dtype=object)))
+    else:
+        # The core never built them, so there is nothing to decode.
+        shapes = [None] * rows
+    geometry = gpd.GeoSeries(shapes, index=frame.index, crs="EPSG:4326")
+    return gpd.GeoDataFrame(frame, geometry=geometry, crs="EPSG:4326")
 
 
 def _to_geodataframe(records):

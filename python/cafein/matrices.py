@@ -45,16 +45,18 @@ class TravelCostMatrix(pd.DataFrame):
     Given a ``StreetNetwork`` instead, the matrix is a standalone street
     computation over the compiled profile of ``transport_mode``, bounded
     by ``max_street_time``. Its columns are ``from_id``, ``to_id``,
-    ``travel_time``, ``distance``, ``network_distance``,
-    ``connector_distance``, ``distance_provenance``, and — with
-    ``geometries=True`` — the route as a shapely LineString.
-    ``network_distance`` sums the stored edge lengths the route
-    traversed and ``connector_distance`` the straight lines from each
-    coordinate to its snap point; ``distance`` is their sum, reported
-    alongside rather than instead of them because the two are measured
-    differently. Street emissions are not computed yet, so there is no
-    ``emissions`` column and the arguments configuring it are rejected,
-    as are ``date``, ``departure``, and the other timetable-only ones.
+    ``travel_time``, ``distance_m``, ``network_distance_m``,
+    ``connector_distance_m``, ``distance_provenance``, and — with
+    ``geometries=True`` — the route as a shapely LineString. The
+    distances carry their unit in the name: ``network_distance_m`` sums
+    the stored edge lengths the route traversed and
+    ``connector_distance_m`` the straight lines from each coordinate to
+    its snap point, and ``distance_m`` is their sum, reported alongside
+    rather than instead of them because the two are measured
+    differently. Street emissions are
+    not computed yet, so there is no ``emissions`` column and the
+    arguments configuring it are rejected, as are ``date``,
+    ``departure``, and the other timetable-only ones.
 
     Parameters
     ----------
@@ -598,9 +600,9 @@ def _street_cost_columns(
         "travel_time": table["travel_time"],
         # Reported alongside its parts, not instead of them: the two are
         # measured differently (stored edge lengths versus straight connectors).
-        "distance": network_distance + connector_distance,
-        "network_distance": network_distance,
-        "connector_distance": connector_distance,
+        "distance_m": network_distance + connector_distance,
+        "network_distance_m": network_distance,
+        "connector_distance_m": connector_distance,
         "distance_provenance": np.full(
             len(network_distance), STREET_DISTANCE_PROVENANCE, dtype=object
         ),
