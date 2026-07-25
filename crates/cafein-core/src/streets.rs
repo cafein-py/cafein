@@ -182,7 +182,9 @@ mod search;
 mod snap;
 
 use geo::*;
-pub use graph::{Backing, MappedStreets, StreetAttributes, StreetNetwork, StreetNetworkParts};
+pub use graph::{
+    Backing, EdgeAttributes, MappedStreets, StreetAttributes, StreetNetwork, StreetNetworkParts,
+};
 use index::*;
 pub use profile::{
     CompiledStreetProfile, ProfileError, StreetMode, StreetProfileDefinition, FLAG_BRIDGE,
