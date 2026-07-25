@@ -2595,3 +2595,332 @@ fn new_multimodal_orders_coincident_edges_deterministically() {
     assert_eq!(route(&net_ab), route(&net_ba));
     assert!(route(&net_ab).is_some());
 }
+
+// ---- Distance and geometry reconstruction ----
+
+/// A 4-vertex ladder: a 300 m south side, a 300 m north side, and rungs, with
+/// every arc open to walking and cycling.
+fn ladder_network() -> StreetNetwork {
+    let edges: Vec<TestEdge> = vec![
+        (0, 1, 300.0, straight((0.0, 0.0), (300.0, 0.0))),
+        (2, 3, 300.0, straight((0.0, 80.0), (300.0, 80.0))),
+        (0, 2, 80.0, straight((0.0, 0.0), (0.0, 80.0))),
+        (1, 3, 80.0, straight((300.0, 0.0), (300.0, 80.0))),
+    ];
+    let n = edges.len();
+    let both = MODE_WALK | MODE_BICYCLE;
+    let attrs = Attrs {
+        highway: vec![0; n],
+        surface: vec![0; n],
+        smoothness: vec![0; n],
+        flags: vec![0; n],
+        access_forward: vec![both; n],
+        access_reverse: vec![both; n],
+        facility_forward: vec![0; n],
+        facility_reverse: vec![0; n],
+    };
+    multimodal_network(4, &edges, &attrs).unwrap()
+}
+
+fn leg_between(
+    net: &StreetNetwork,
+    profile: &CompiledStreetProfile,
+    from: (f64, f64),
+    to: (f64, f64),
+) -> StreetLeg {
+    let (from_lon, from_lat) = lonlat(from.0, from.1);
+    let (to_lon, to_lat) = lonlat(to.0, to.1);
+    let from_snap = net
+        .snap_for_profile(from_lat, from_lon, 200.0, profile)
+        .unwrap();
+    let to_snap = net
+        .snap_for_profile(to_lat, to_lon, 200.0, profile)
+        .unwrap();
+    net.directed_leg(
+        (from_lat, from_lon),
+        &from_snap,
+        (to_lat, to_lon),
+        &to_snap,
+        profile,
+        3600.0,
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_leg_reports_the_distance_of_the_path_it_took() {
+    // Along the south side: 60 m in to 240 m in is 180 m of network, and the
+    // two coordinates sit on the edge so neither pays a connector.
+    let net = ladder_network();
+    let walk = net
+        .compile_profile(&StreetProfileDefinition::walk())
+        .unwrap();
+    let leg = leg_between(&net, &walk, (60.0, 0.0), (240.0, 0.0));
+    assert!((leg.network_meters - 180.0).abs() < 1.0);
+    assert!(leg.connector_meters < 1.0);
+}
+
+#[test]
+fn a_leg_reports_its_connectors_separately_from_the_network() {
+    // Both coordinates sit 20 m off the south side, so the network distance is
+    // unchanged while the connectors add up to roughly 40 m.
+    let net = ladder_network();
+    let walk = net
+        .compile_profile(&StreetProfileDefinition::walk())
+        .unwrap();
+    let leg = leg_between(&net, &walk, (60.0, -20.0), (240.0, -20.0));
+    assert!((leg.network_meters - 180.0).abs() < 1.0);
+    assert!((leg.connector_meters - 40.0).abs() < 2.0);
+}
+
+#[test]
+fn a_leg_agrees_with_the_time_search() {
+    // The reconstruction must not disturb the answer: every leg's seconds are
+    // the time search's, for both modes and several pairs.
+    let net = ladder_network();
+    for definition in [
+        StreetProfileDefinition::walk(),
+        StreetProfileDefinition::bicycle(),
+    ] {
+        let profile = net.compile_profile(&definition).unwrap();
+        for (from, to) in [
+            ((10.0, 0.0), (290.0, 0.0)),
+            ((10.0, 0.0), (290.0, 80.0)),
+            ((150.0, 80.0), (20.0, 0.0)),
+        ] {
+            let (from_lon, from_lat) = lonlat(from.0, from.1);
+            let (to_lon, to_lat) = lonlat(to.0, to.1);
+            let from_snap = net
+                .snap_for_profile(from_lat, from_lon, 200.0, &profile)
+                .unwrap();
+            let to_snap = net
+                .snap_for_profile(to_lat, to_lon, 200.0, &profile)
+                .unwrap();
+            let leg = net
+                .directed_leg(
+                    (from_lat, from_lon),
+                    &from_snap,
+                    (to_lat, to_lon),
+                    &to_snap,
+                    &profile,
+                    3600.0,
+                )
+                .unwrap();
+            assert_eq!(
+                Some(leg.seconds),
+                net.directed_travel_time(&from_snap, &to_snap, &profile, 3600.0)
+            );
+        }
+    }
+}
+
+#[test]
+fn a_same_edge_leg_stays_on_its_edge() {
+    // Two snaps on one edge route directly along it: the geometry runs from the
+    // origin to the destination without visiting either endpoint.
+    let net = ladder_network();
+    let walk = net
+        .compile_profile(&StreetProfileDefinition::walk())
+        .unwrap();
+    let leg = leg_between(&net, &walk, (100.0, 0.0), (200.0, 0.0));
+    assert!((leg.network_meters - 100.0).abs() < 1.0);
+    let (_, south_east) = lonlat(300.0, 0.0);
+    assert!(leg
+        .geometry
+        .iter()
+        .all(|&(_, lat)| (lat - south_east).abs() < 1e-9));
+    // Ordered from the origin to the destination.
+    assert!(leg.geometry.first().unwrap().0 < leg.geometry.last().unwrap().0);
+}
+
+#[test]
+fn a_leg_detours_when_the_direct_direction_is_forbidden() {
+    // The south side is one-way west→east for bicycles, so a bicycle heading
+    // east→west may still snap to it (one direction is open) but must ride the
+    // ladder around. Snaps are constructed directly, so the test exercises the
+    // rejected same-edge candidate rather than a re-snap onto another edge.
+    let edges: Vec<TestEdge> = vec![
+        (0, 1, 300.0, straight((0.0, 0.0), (300.0, 0.0))),
+        (2, 3, 300.0, straight((0.0, 80.0), (300.0, 80.0))),
+        (0, 2, 80.0, straight((0.0, 0.0), (0.0, 80.0))),
+        (1, 3, 80.0, straight((300.0, 0.0), (300.0, 80.0))),
+    ];
+    let both = MODE_WALK | MODE_BICYCLE;
+    let attrs = Attrs {
+        highway: vec![0; 4],
+        surface: vec![0; 4],
+        smoothness: vec![0; 4],
+        flags: vec![0; 4],
+        // South side: bicycles only west→east. Everything else is open.
+        access_forward: vec![both, both, both, both],
+        access_reverse: vec![MODE_WALK, both, both, both],
+        facility_forward: vec![0; 4],
+        facility_reverse: vec![0; 4],
+    };
+    let net = multimodal_network(4, &edges, &attrs).unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let south = net
+        .arrays()
+        .adj_edges()
+        .iter()
+        .copied()
+        .find(|&edge| {
+            net.arrays().lengths()[edge as usize] == 300.0
+                && net.point_at(edge, 0.0).1 < net.point_at(edge, 0.5).1 + 1e-9
+                && (net.point_at(edge, 0.0).1 - lonlat(0.0, 0.0).1).abs() < 1e-9
+        })
+        .expect("the south edge");
+    // Ride east→west along the south edge: from 290 m back to 10 m.
+    let start = Snap {
+        edge: south,
+        fraction: 290.0 / 300.0,
+        connector: 0.0,
+    };
+    let end = Snap {
+        edge: south,
+        fraction: 10.0 / 300.0,
+        connector: 0.0,
+    };
+    let start_point = lonlat(290.0, 0.0);
+    let end_point = lonlat(10.0, 0.0);
+    let leg = net
+        .directed_leg(
+            (start_point.1, start_point.0),
+            &start,
+            (end_point.1, end_point.0),
+            &end,
+            &bike,
+            3600.0,
+        )
+        .unwrap();
+    // 10 m to the east corner, up 80, 300 west, down 80, then 10 m east.
+    assert!((leg.network_meters - 480.0).abs() < 1.0);
+    assert!(leg.connector_meters < 1e-9);
+    // The geometry rounds the ladder: it must reach both northern corners.
+    let north_east = lonlat(300.0, 80.0);
+    let north_west = lonlat(0.0, 80.0);
+    // Stored coordinates sit on the fixed-point grid, so compare at grid scale.
+    let touches = |target: (f64, f64)| {
+        leg.geometry
+            .iter()
+            .any(|&(lon, lat)| (lon - target.0).abs() < 1e-6 && (lat - target.1).abs() < 1e-6)
+    };
+    assert!(touches(north_east));
+    assert!(touches(north_west));
+    // And it is the detour, not the 280 m direct line.
+    assert!(leg.network_meters > 400.0);
+}
+
+#[test]
+fn a_self_loop_leg_follows_the_permitted_side() {
+    // A loop edge from vertex 1 back to itself, hung off a stub. The snap sits
+    // at a fifth of the way round, so the *near* side is the short way back —
+    // but that direction is forbidden, and the leg must report the long way
+    // round it actually rides, not the near side its vertex would suggest.
+    let edges: Vec<TestEdge> = vec![
+        (0, 1, 50.0, straight((0.0, 0.0), (50.0, 0.0))),
+        (
+            1,
+            1,
+            400.0,
+            vec![
+                (50.0, 0.0),
+                (150.0, 0.0),
+                (150.0, 100.0),
+                (50.0, 100.0),
+                (50.0, 0.0),
+            ],
+        ),
+    ];
+    let both = MODE_WALK | MODE_BICYCLE;
+    let attrs = Attrs {
+        highway: vec![0; 2],
+        surface: vec![0; 2],
+        smoothness: vec![0; 2],
+        flags: vec![0; 2],
+        // The loop runs one way only, in its stored direction.
+        access_forward: vec![both, both],
+        access_reverse: vec![both, MODE_WALK],
+        facility_forward: vec![0; 2],
+        facility_reverse: vec![0; 2],
+    };
+    let net = multimodal_network(2, &edges, &attrs).unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let loop_edge = (0..net.edge_count())
+        .find(|&edge| {
+            let (u, v) = net.edge_endpoints(edge);
+            u == v
+        })
+        .expect("the loop edge");
+    let stub = 1 - loop_edge;
+    // From a fifth of the way round the loop, back to the stub's far end. The
+    // near side (a fifth, backwards) is forbidden, so the ride continues
+    // forwards around the remaining four fifths.
+    let from = Snap {
+        edge: loop_edge,
+        fraction: 0.2,
+        connector: 0.0,
+    };
+    let to = Snap {
+        edge: stub,
+        fraction: 0.0,
+        connector: 0.0,
+    };
+    let from_point = net.point_at(loop_edge, 0.2);
+    let to_point = net.point_at(stub, 0.0);
+    let leg = net
+        .directed_leg(
+            (from_point.1, from_point.0),
+            &from,
+            (to_point.1, to_point.0),
+            &to,
+            &bike,
+            3600.0,
+        )
+        .unwrap();
+    // Four fifths of the 400 m loop, then the 50 m stub — not the 80 m
+    // near-side shortcut the snap fraction alone would imply.
+    assert!((leg.network_meters - (320.0 + 50.0)).abs() < 1.0);
+    assert_eq!(
+        Some(leg.seconds),
+        net.directed_travel_time(&from, &to, &bike, 3600.0)
+    );
+}
+#[test]
+fn the_row_form_matches_leg_by_leg() {
+    // One search serving many destinations, with its memoised prefix metres,
+    // must produce exactly what the per-pair reconstruction does.
+    let net = ladder_network();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let origin = lonlat(10.0, 0.0);
+    let origin_point = (origin.1, origin.0);
+    let from = net
+        .snap_for_profile(origin.1, origin.0, 200.0, &bike)
+        .unwrap();
+    let places = [(290.0, 0.0), (150.0, 80.0), (290.0, 80.0), (20.0, 80.0)];
+    let targets: Vec<((f64, f64), Option<Snap>)> = places
+        .iter()
+        .map(|&(x, y)| {
+            let (lon, lat) = lonlat(x, y);
+            ((lat, lon), net.snap_for_profile(lat, lon, 200.0, &bike))
+        })
+        .collect();
+    let row = net.directed_legs_to_snaps(origin_point, &from, &targets, &bike, 3600.0);
+    for (index, (point, snap)) in targets.iter().enumerate() {
+        let expected = net.directed_leg(
+            origin_point,
+            &from,
+            *point,
+            snap.as_ref().unwrap(),
+            &bike,
+            3600.0,
+        );
+        assert_eq!(row[index], expected);
+    }
+}
