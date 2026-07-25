@@ -48,13 +48,14 @@ class TravelCostMatrix(pd.DataFrame):
     ``travel_time``, ``distance``, ``network_distance``,
     ``connector_distance``, ``distance_provenance``, and — with
     ``geometries=True`` — the route as a shapely LineString.
-    ``network_distance`` sums the stored edge lengths the route
-    traversed and ``connector_distance`` the straight lines from each
-    coordinate to its snap point; ``distance`` is their sum, reported
-    alongside rather than instead of them because the two are measured
-    differently. Street emissions are not computed yet, so there is no
-    ``emissions`` column and the arguments configuring it are rejected,
-    as are ``date``, ``departure``, and the other timetable-only ones.
+    All three distances are in meters: ``network_distance`` sums the
+    stored edge lengths the route traversed and ``connector_distance``
+    the straight lines from each coordinate to its snap point, and
+    ``distance`` is their sum, reported alongside rather than instead of
+    them because the two are measured differently. Street emissions are
+    not computed yet, so there is no ``emissions`` column and the
+    arguments configuring it are rejected, as are ``date``,
+    ``departure``, and the other timetable-only ones.
 
     Parameters
     ----------
