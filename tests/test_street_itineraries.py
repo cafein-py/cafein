@@ -17,9 +17,9 @@ COLUMNS = [
     "segment",
     "leg_type",
     "mode",
-    "departure",
-    "arrival",
-    "travel_time",
+    "departure_s",
+    "arrival_s",
+    "travel_time_s",
     "distance_m",
     "network_distance_m",
     "connector_distance_m",
@@ -73,7 +73,7 @@ def test_agrees_with_the_cost_matrix(streets, places):
     routes = DetailedItineraries(streets, places, transport_mode="bicycle")
     costs = TravelCostMatrix(streets, places, transport_mode="bicycle")
     columns = [
-        "travel_time",
+        "travel_time_s",
         "distance_m",
         "network_distance_m",
         "connector_distance_m",

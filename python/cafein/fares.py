@@ -155,7 +155,7 @@ class FareStructure:
                 return math.nan
             total = previous_fare
             previous_route = rides[0]["route_id"]
-            previous_board = rides[0]["departure"]
+            previous_board = rides[0]["departure_s"]
             discounts = 0
             for ride in rides[1:]:
                 fare, fare_type = full_fare(ride["route_id"])
@@ -175,7 +175,7 @@ class FareStructure:
                     bool(types[fare_type]["allow_same_route_transfer"])
                     or ride["route_id"] != previous_route
                 )
-                in_time = ride["departure"] - previous_board <= allowance
+                in_time = ride["departure_s"] - previous_board <= allowance
                 if (
                     discounts < self.max_discounted_transfers
                     and pair is not None
@@ -190,7 +190,7 @@ class FareStructure:
                     total += fare
                 previous_fare, previous_type = fare, fare_type
                 previous_route = ride["route_id"]
-                previous_board = ride["departure"]
+                previous_board = ride["departure_s"]
             if math.isfinite(self.fare_cap):
                 total = min(total, self.fare_cap)
             return total
@@ -314,7 +314,7 @@ class ZoneFareStructure:
                 }
                 if None in zones:
                     return math.nan
-                needs.append((frozenset(zones), ride["departure"]))
+                needs.append((frozenset(zones), ride["departure_s"]))
 
             best = {len(needs): 0.0}
 

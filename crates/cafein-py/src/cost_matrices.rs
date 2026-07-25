@@ -1320,7 +1320,7 @@ pub(super) fn cost_rows_dict(
     let result = PyDict::new(py);
     result.set_item("from", from.into_pyarray(py))?;
     result.set_item("to", to.into_pyarray(py))?;
-    result.set_item("travel_time", travel_time.into_pyarray(py))?;
+    result.set_item("travel_time_s", travel_time.into_pyarray(py))?;
     result.set_item("rides", rides.into_pyarray(py))?;
     result.set_item("transit_distance", transit_distance.into_pyarray(py))?;
     result.set_item("walk_distance", walk_distance.into_pyarray(py))?;

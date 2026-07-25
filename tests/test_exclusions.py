@@ -179,7 +179,7 @@ def test_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
     def normalized(journeys):
         return [
             (
-                journey["arrival"],
+                journey["arrival_s"],
                 [leg["trip_id"] for leg in journey["legs"] if leg["type"] == "transit"],
             )
             for journey in journeys
@@ -200,7 +200,7 @@ def test_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
 def test_frontier_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
     from cafein import TransportNetwork, journey_frontier
 
-    columns = ["departure", "arrival", "travel_time", "rides", "frontier"]
+    columns = ["departure_s", "arrival_s", "travel_time_s", "rides", "frontier"]
     baseline = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
     excluded = sorted(used(baseline, "route_id"))[0]
     source = build_two_line_gtfs(tmp_path / "full.zip")

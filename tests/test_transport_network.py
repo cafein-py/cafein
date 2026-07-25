@@ -25,7 +25,7 @@ def test_routes_the_earliest_direct_k_train(network):
 
     direct = journeys[0]
     assert direct["rides"] == 1
-    assert direct["arrival"] == 8 * 3600 + 58 * 60
+    assert direct["arrival_s"] == 8 * 3600 + 58 * 60
 
     access, transit, egress = direct["legs"]
     assert access["type"] == "access"
@@ -34,13 +34,13 @@ def test_routes_the_earliest_direct_k_train(network):
     assert transit["route_short_name"] == "K"
     assert transit["board_stop"] == "4810551"
     assert transit["alight_stop"] == "1250551"
-    assert transit["departure"] == 8 * 3600 + 36 * 60
+    assert transit["departure_s"] == 8 * 3600 + 36 * 60
     assert egress["type"] == "egress"
 
     # Journeys form a Pareto set: more rides only when strictly earlier.
     for earlier, later in zip(journeys, journeys[1:]):
         assert later["rides"] > earlier["rides"]
-        assert later["arrival"] < earlier["arrival"]
+        assert later["arrival_s"] < earlier["arrival_s"]
 
 
 def test_transit_legs_carry_distance_and_provenance(network):
@@ -137,7 +137,7 @@ def test_a_departure_window_profiles_the_k_trains(network):
     journeys = network.route_between_stops(
         "4810551", "1250551", "2022-02-22", "08:30:00", window=1800
     )
-    direct = [(j["departure"], j["arrival"]) for j in journeys if j["rides"] == 1]
+    direct = [(j["departure_s"], j["arrival_s"]) for j in journeys if j["rides"] == 1]
     assert direct == [
         (8 * 3600 + 36 * 60, 8 * 3600 + 58 * 60),
         (8 * 3600 + 56 * 60, 9 * 3600 + 18 * 60),
@@ -284,7 +284,7 @@ def test_merged_feeds_require_qualified_stop_ids(helsinki_gtfs):
         journeys = merged.route_between_stops(
             f"{feed}:4810551", f"{feed}:1250551", "2022-02-22", "08:30:00"
         )
-        assert journeys[0]["arrival"] == 8 * 3600 + 58 * 60
+        assert journeys[0]["arrival_s"] == 8 * 3600 + 58 * 60
         transit = journeys[0]["legs"][1]
         assert transit["board_stop"] == f"{feed}:4810551"
         assert transit["alight_stop"] == f"{feed}:1250551"
@@ -313,20 +313,20 @@ def test_street_stops_are_reachable_only_over_footpaths(
     )
     first = journeys[0]
     assert first["rides"] == 1
-    assert first["arrival"] == 8 * 3600 + 39 * 60 + 20
+    assert first["arrival_s"] == 8 * 3600 + 39 * 60 + 20
 
     access, transit, transfer, egress = first["legs"]
     assert access["type"] == "access"
     assert transit["trip_id"] == "31M2_20220222_Ti_2_0817"
     assert transit["route_short_name"] == "M2"
     assert transit["board_stop"] == "1100602"
-    assert transit["departure"] == 8 * 3600 + 31 * 60
+    assert transit["departure_s"] == 8 * 3600 + 31 * 60
     assert transit["alight_stop"] == "1040602"
-    assert transit["arrival"] == 8 * 3600 + 39 * 60
+    assert transit["arrival_s"] == 8 * 3600 + 39 * 60
     assert transfer["type"] == "transfer"
     assert transfer["from_stop"] == "1040602"
     assert transfer["to_stop"] == "1040280"
-    assert transfer["arrival"] - transfer["departure"] == 20
+    assert transfer["arrival_s"] - transfer["departure_s"] == 20
     # Transfer legs carry the footpath's exact meters (1 m/s walking).
     assert 19 <= transfer["distance_m"] <= 20
     assert egress["type"] == "egress"
@@ -418,9 +418,9 @@ def test_routes_door_to_door_between_coordinates(network_with_footpaths):
     (walk_leg,) = walk_only["legs"]
     assert walk_leg["type"] == "walk"
     assert 3_000 <= walk_leg["distance_m"] <= 6_000
-    assert walk_only["arrival"] - walk_only["departure"] >= walk_leg["distance_m"]
+    assert walk_only["arrival_s"] - walk_only["departure_s"] >= walk_leg["distance_m"]
     assert first["rides"] == 1
-    assert abs(first["arrival"] - stop_journeys[0]["arrival"]) <= 2
+    assert abs(first["arrival_s"] - stop_journeys[0]["arrival_s"]) <= 2
 
     access, transit, egress = first["legs"]
     assert access["type"] == "access"
@@ -428,9 +428,9 @@ def test_routes_door_to_door_between_coordinates(network_with_footpaths):
     # Walk distances are the exact street-path meters; the leg duration
     # is the same walk rounded up to whole seconds at 1 m/s (3.6 km/h).
     assert 0 <= access["distance_m"] <= 15
-    assert access["distance_m"] <= access["arrival"] - access["departure"]
+    assert access["distance_m"] <= access["arrival_s"] - access["departure_s"]
     assert transit["trip_id"] == "31M2_20220222_Ti_2_0817"
-    assert transit["departure"] == 8 * 3600 + 31 * 60
+    assert transit["departure_s"] == 8 * 3600 + 31 * 60
     assert egress["type"] == "egress"
     assert egress["from_stop"] == "1040602"
     assert 19 <= egress["distance_m"] <= 23
@@ -448,11 +448,11 @@ def test_door_to_door_window_profiles_departures(network_with_footpaths):
     assert walk_only["rides"] == 0
     assert walk_only["legs"][0]["type"] == "walk"
     assert len(rides) >= 3
-    departures = [journey["departure"] for journey in profile]
+    departures = [journey["departure_s"] for journey in profile]
     assert departures == sorted(departures)
     for journey in rides:
-        assert journey["departure"] >= 8 * 3600 + 30 * 60
-        assert journey["arrival"] > journey["departure"]
+        assert journey["departure_s"] >= 8 * 3600 + 30 * 60
+        assert journey["arrival_s"] > journey["departure_s"]
         assert journey["rides"] >= 1
 
 
@@ -528,7 +528,7 @@ def test_a_synthetic_network_routes_door_to_door(tmp_path):
         max_walking_time=600.0,
     )
     first = journeys[0]
-    assert first["arrival"] == 8 * 3600 + 10 * 60 + 200
+    assert first["arrival_s"] == 8 * 3600 + 10 * 60 + 200
     access, transit, egress = first["legs"]
     assert access["to_stop"] == "S1"
     assert access["distance_m"] == 0.0
@@ -545,14 +545,14 @@ def test_a_synthetic_network_routes_door_to_door(tmp_path):
     (walk_leg,) = walk_only["legs"]
     assert walk_leg["type"] == "walk"
     assert walk_leg["distance_m"] == pytest.approx(50.2, abs=1.0)
-    assert walk_only["arrival"] - walk_only["departure"] in (50, 51)
+    assert walk_only["arrival_s"] - walk_only["departure_s"] in (50, 51)
 
     # A destination at the origin's own coordinate is a zero walk.
     (still,) = network.route_between_coordinates(
         (60.0, 24.0), (60.0, 24.0), "2022-02-22", "07:30:00"
     )
     assert still["rides"] == 0
-    assert still["arrival"] == still["departure"]
+    assert still["arrival_s"] == still["departure_s"]
     assert still["legs"][0]["distance_m"] == 0.0
 
     # Beyond the walking cutoff there is neither a ride nor a walk.
@@ -655,7 +655,7 @@ def test_quarantined_trips_raise_a_warning(tmp_path):
     with pytest.warns(UserWarning, match="quarantined 1 trip"):
         network = TransportNetwork.from_gtfs([str(feed)])
     journeys = network.route_between_stops("S1", "S2", "2022-02-22", "07:30:00")
-    assert journeys[0]["arrival"] == 8 * 3600 + 10 * 60
+    assert journeys[0]["arrival_s"] == 8 * 3600 + 10 * 60
 
 
 def build_timepoint_gtfs(path):
@@ -712,8 +712,8 @@ def test_timepoint_feeds_are_repaired_at_ingest(tmp_path):
     # the timepoints.
     journeys = network.route_between_stops("S2", "S3", "2022-02-22", "08:00:00")
     transit = [leg for leg in journeys[0]["legs"] if leg["type"] == "transit"]
-    assert transit[0]["departure"] == 8 * 3600 + 5 * 60
-    assert journeys[0]["arrival"] == 8 * 3600 + 10 * 60
+    assert transit[0]["departure_s"] == 8 * 3600 + 5 * 60
+    assert journeys[0]["arrival_s"] == 8 * 3600 + 10 * 60
 
 
 def test_qualified_ids_take_precedence_over_colon_raw_ids(tmp_path):
@@ -722,7 +722,7 @@ def test_qualified_ids_take_precedence_over_colon_raw_ids(tmp_path):
         merged = TransportNetwork.from_gtfs([str(feed), str(feed)])
     # "0:S1" resolves to feed 0's stop S1, not the raw stop named "0:S1".
     journeys = merged.route_between_stops("0:S1", "0:S2", "2022-02-22", "07:30:00")
-    assert journeys[0]["arrival"] == 8 * 3600 + 10 * 60
+    assert journeys[0]["arrival_s"] == 8 * 3600 + 10 * 60
     assert journeys[0]["legs"][1]["board_stop"] == "0:S1"
     # The colon-named stop stays addressable through full qualification.
     assert merged.route_between_stops("0:0:S1", "0:S2", "2022-02-22", "07:30:00") == []
@@ -767,7 +767,7 @@ def test_set_transfers_routes_over_footpaths(tmp_path):
     # Ride to S2 (arrives 08:10), walk the 120-second footpath.
     journeys = network.route_between_stops("S1", "0:S1", "2022-02-22", "07:30:00")
     first = journeys[0]
-    assert first["arrival"] == 8 * 3600 + 10 * 60 + 120
+    assert first["arrival_s"] == 8 * 3600 + 10 * 60 + 120
     types = [leg["type"] for leg in first["legs"]]
     assert types == ["access", "transit", "transfer", "egress"]
     transfer = first["legs"][2]
@@ -1032,15 +1032,15 @@ def test_previous_day_over_midnight_trip_is_reachable(tmp_path):
     access, transit, egress = journeys[0]["legs"]
     assert transit["type"] == "transit"
     assert transit["trip_id"] == "T_NIGHT"
-    assert transit["departure"] == 3600  # 01:00
-    assert transit["arrival"] == 4800  # 01:20
-    assert journeys[0]["arrival"] == 4800
+    assert transit["departure_s"] == 3600  # 01:00
+    assert transit["arrival_s"] == 4800  # 01:20
+    assert journeys[0]["arrival_s"] == 4800
 
     # On its own service day the trip is only reachable by waiting out the
     # day to its stored 25:00.
     same_day = network.route_between_stops("N1", "N2", "2022-02-21", "00:30:00")
     assert same_day
-    assert same_day[0]["arrival"] == 25 * 3600 + 20 * 60
+    assert same_day[0]["arrival_s"] == 25 * 3600 + 20 * 60
 
     # A day later there is no previous-day service to pull it in.
     assert network.route_between_stops("N1", "N2", "2022-02-23", "00:30:00") == []

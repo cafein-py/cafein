@@ -7,6 +7,7 @@ __all__ = [
     "TravelTimeMatrix",
     "DetailedItineraries",
     "travel_cost_table",
+    "to_minutes",
     "exhaustive_frontier",
     "journey_frontier",
     "journey_frontiers",
@@ -40,6 +41,10 @@ def __getattr__(name):
         from cafein.itineraries import DetailedItineraries
 
         return DetailedItineraries
+    if name == "to_minutes":
+        from cafein.units import to_minutes
+
+        return to_minutes
     if name == "travel_cost_table":
         from cafein.matrices import travel_cost_table
 

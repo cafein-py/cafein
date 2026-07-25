@@ -631,7 +631,7 @@ def test_round_trip_preserves_the_mctbtr_transfer_cache(helsinki_gtfs, tmp_path)
     loaded = TransportNetwork.load(path)
     assert loaded.has_mctbtr_transfers
     after = journey_frontier(loaded, *args, **kwargs)
-    for column in ("departure", "arrival", "rides", "emissions", "frontier"):
+    for column in ("departure_s", "arrival_s", "rides", "emissions", "frontier"):
         assert before[column].tolist() == after[column].tolist()
 
     # A network that never cached one round-trips to no cache.

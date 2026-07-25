@@ -81,7 +81,7 @@ def central_gtfs(helsinki_gtfs, tmp_path_factory):
 
 
 def _pareto(journeys):
-    return sorted({(j["arrival"], j["rides"]) for j in journeys})
+    return sorted({(j["arrival_s"], j["rides"]) for j in journeys})
 
 
 def _dominated(point, pareto):
@@ -217,16 +217,16 @@ def test_point_matrix_supersets_and_emissions_ignore(central_gtfs, kantakaupunki
             net, points, points, date=QUERY_DATE, departure=QUERY_TIME
         )
         return {
-            (row["from_id"], row["to_id"]): row["travel_time"]
+            (row["from_id"], row["to_id"]): row["travel_time_s"]
             for _, row in frame.iterrows()
-            if row["travel_time"] == row["travel_time"]  # drop NaN (unreachable)
+            if row["travel_time_s"] == row["travel_time_s"]  # drop NaN (unreachable)
         }
 
     def frontier():
         frame = journey_frontier(
             net, *frontier_pair, QUERY_DATE, QUERY_TIME, 1800, candidates="pareto"
         )
-        rows = frame[["travel_time", "emissions", "rides", "frontier"]]
+        rows = frame[["travel_time_s", "emissions", "rides", "frontier"]]
         return sorted(rows.round(3).itertuples(index=False, name=None))
 
     closure_matrix = matrix()
@@ -527,7 +527,7 @@ def test_travel_cost_matrix_agrees_with_time_matrix_under_ultra(
                 net, origins, stops, QUERY_DATE, QUERY_TIME, **walk
             )
         return {
-            (row["from_id"], row["to_id"]): int(row["travel_time"])
+            (row["from_id"], row["to_id"]): int(row["travel_time_s"])
             for _, row in frame.iterrows()
         }
 
@@ -598,7 +598,7 @@ def test_travel_cost_matrix_transit_columns_match_the_point_matrix(
         crs="EPSG:4326",
     )
     cols = [
-        "travel_time",
+        "travel_time_s",
         "transfers",
         "transit_distance_m",
         "walk_distance_m",
@@ -669,7 +669,7 @@ def test_final_walk_respects_max_walking_time(central_gtfs, kantakaupunki_pbf):
 
     def earliest(destination, cap):
         return min(
-            journey["arrival"] - journey["departure"]
+            journey["arrival_s"] - journey["departure_s"]
             for journey in net.route_between_coordinates(
                 coords[origin],
                 coords[destination],
@@ -770,7 +770,7 @@ def test_mcultra_wires_into_the_door_to_door_emissions_frontier(
             components=components,
         )
         return sorted(
-            frame[["travel_time", "emissions", "rides"]]
+            frame[["travel_time_s", "emissions", "rides"]]
             .round(3)
             .itertuples(index=False, name=None)
         )
@@ -847,7 +847,7 @@ def test_mcultra_routes_stop_pareto_queries_door_to_door(
             **walk,
         )
         return sorted(
-            frame[["travel_time", "emissions", "rides"]]
+            frame[["travel_time_s", "emissions", "rides"]]
             .round(3)
             .itertuples(index=False, name=None)
         )
@@ -1018,7 +1018,7 @@ def test_mcultra_routes_the_emissions_matrix_door_to_door(
     # rather than charging the origin's stop connector).
     diagonal = matrix_cell(origin, origin)
     assert diagonal is not None
-    assert diagonal["travel_time"] == 0
+    assert diagonal["travel_time_s"] == 0
     assert diagonal["emissions"] == pytest.approx(0.0, abs=1e-6)
 
 
@@ -1085,7 +1085,7 @@ def test_auto_router_prefers_the_mcultra_door_to_door_path(
             **extra,
         )
         return sorted(
-            frame[["from_id", "to_id", "travel_time", "emissions"]]
+            frame[["from_id", "to_id", "travel_time_s", "emissions"]]
             .round(3)
             .itertuples(index=False, name=None)
         )
