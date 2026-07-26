@@ -1578,6 +1578,8 @@ fn compile_rejects_pathological_costs_and_codes() {
     // rejected rather than silently clamped. (All speeds tiny so the max-speed
     // bound is satisfied and compilation reaches the overflowing cost.)
     let mut crawl = StreetProfileDefinition::bicycle();
+    crawl.slope_uphill = 0.0;
+    crawl.slope_downhill = 0.0;
     crawl.base_speed = 1e-9;
     crawl.dismount_speed = 1e-9;
     crawl.connector_speed = 1e-9;
@@ -1609,10 +1611,14 @@ fn builtin_profile_speeds_and_modes() {
         StreetProfileDefinition::e_scooter().mode,
         StreetMode::EScooter
     );
-    // A flat profile's max speed equals its base speed and its multiplier
+    // The bicycle's slope model is the owner's methodology, and its max
+    // speed covers the steepest clamped descent's credit; the multiplier
     // tables match the class-code counts.
     let bike = StreetProfileDefinition::bicycle();
-    assert_eq!(bike.max_speed, 4.0);
+    assert_eq!((bike.slope_uphill, bike.slope_downhill), (1.0, 0.3));
+    assert_eq!(bike.max_speed, 4.0 / (1.0 - 0.3 * MAX_SLOPE));
+    assert_eq!(StreetProfileDefinition::e_bike().slope_uphill, 0.0);
+    assert_eq!(StreetProfileDefinition::walk().slope_downhill, 0.0);
     assert_eq!(bike.highway_multipliers.len(), HIGHWAY_CODE_COUNT);
     assert_eq!(bike.surface_multipliers.len(), SURFACE_CODE_COUNT);
     assert_eq!(bike.smoothness_multipliers.len(), SMOOTHNESS_CODE_COUNT);
@@ -1661,6 +1667,8 @@ fn compile_rejects_invalid_definitions() {
     );
     // A max_speed below the greatest attainable speed is rejected.
     let mut fast = StreetProfileDefinition::bicycle();
+    fast.slope_uphill = 0.0;
+    fast.slope_downhill = 0.0;
     fast.highway_multipliers[5] = 2.0; // attainable = 8 m/s > max_speed 4
     assert_eq!(
         net.compile_profile(&fast).unwrap_err(),
@@ -1775,6 +1783,8 @@ fn profile_rounds_arc_costs_up() {
     net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
         .unwrap();
     let mut three = StreetProfileDefinition::bicycle();
+    three.slope_uphill = 0.0;
+    three.slope_downhill = 0.0;
     three.base_speed = 3.0;
     three.max_speed = 3.0;
     let compiled = net.compile_profile(&three).unwrap();
@@ -1807,6 +1817,8 @@ fn positive_length_arc_never_costs_zero() {
     net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
         .unwrap();
     let mut extreme = StreetProfileDefinition::bicycle();
+    extreme.slope_uphill = 0.0;
+    extreme.slope_downhill = 0.0;
     extreme.base_speed = 1e300;
     extreme.max_speed = 1e300;
     let compiled = net.compile_profile(&extreme).unwrap();
@@ -3106,6 +3118,154 @@ fn an_infinite_elevation_is_rejected() {
         Some(&[0.0, f32::INFINITY]),
     );
     assert_eq!(result.unwrap_err(), StreetError::InvalidAttributes);
+}
+
+// ---- Slope-aware profile compilation ----
+
+/// The permitted arc costs of a compiled profile, ascending.
+fn permitted_costs(compiled: &CompiledStreetProfile) -> Vec<u32> {
+    let mut costs: Vec<u32> = compiled
+        .arc_millis
+        .iter()
+        .copied()
+        .filter(|&cost| cost != u32::MAX)
+        .collect();
+    costs.sort_unstable();
+    costs
+}
+
+fn near(actual: u32, expected: f64) -> bool {
+    (f64::from(actual) - expected).abs() < 100.0
+}
+
+#[test]
+fn a_flat_dem_compiles_bit_identically_to_no_dem() {
+    let edges: Vec<TestEdge> = vec![
+        (0, 1, 200.0, straight((0.0, 0.0), (200.0, 0.0))),
+        (1, 2, 120.0, straight((200.0, 0.0), (200.0, 120.0))),
+    ];
+    let flat = multimodal_network(3, &edges, &plain_attrs(2)).unwrap();
+    let elevated = elevated_network(3, &edges, &plain_attrs(2), |_, _| 7.5);
+    for definition in [
+        StreetProfileDefinition::walk(),
+        StreetProfileDefinition::bicycle(),
+        StreetProfileDefinition::e_scooter(),
+    ] {
+        assert_eq!(
+            flat.compile_profile(&definition).unwrap().arc_millis,
+            elevated.compile_profile(&definition).unwrap().arc_millis,
+        );
+    }
+}
+
+#[test]
+fn a_ramp_charges_the_climb_and_credits_the_descent() {
+    // 200 m east at a 10 % grade. The flat bicycle cost is 50_000 ms; the
+    // climb multiplies by 1.1, the descent by 1 − 0.3·0.1 = 0.97.
+    let edges: Vec<TestEdge> = vec![(0, 1, 200.0, straight((0.0, 0.0), (200.0, 0.0)))];
+    let net = elevated_network(2, &edges, &plain_attrs(1), |x, _| (x / 10.0) as f32);
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let costs = permitted_costs(&bike);
+    assert_eq!(costs.len(), 2);
+    assert!(near(costs[0], 48_500.0), "downhill arc: {}", costs[0]);
+    assert!(near(costs[1], 55_000.0), "uphill arc: {}", costs[1]);
+    // The directions land the right way round: climbing east costs more.
+    let origin = lonlat(10.0, 0.0);
+    let target = lonlat(190.0, 0.0);
+    let from = net.snap(origin.1, origin.0, 50.0).unwrap();
+    let to = net.snap(target.1, target.0, 50.0).unwrap();
+    let east = net.directed_travel_time(&from, &to, &bike, 3600.0).unwrap();
+    let west = net.directed_travel_time(&to, &from, &bike, 3600.0).unwrap();
+    assert!(east > west, "east {east} (climb) vs west {west} (descent)");
+}
+
+#[test]
+fn a_hill_with_equal_endpoints_costs_both_directions_more_than_flat() {
+    // Up 10 % for 100 m, back down to the start elevation: a net endpoint
+    // slope of zero would compile flat, but each direction climbs one half
+    // and descends the other — (1.1 + 0.97) / 2 = 1.035 of flat, both ways.
+    let edges: Vec<TestEdge> = vec![(0, 1, 200.0, vec![(0.0, 0.0), (100.0, 0.0), (200.0, 0.0)])];
+    let net = elevated_network(2, &edges, &plain_attrs(1), |x, _| {
+        ((100.0 - (x - 100.0).abs()) / 10.0) as f32
+    });
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let costs = permitted_costs(&bike);
+    assert_eq!(costs.len(), 2);
+    for &cost in &costs {
+        assert!(near(cost, 51_750.0), "hill arc: {cost}");
+    }
+}
+
+#[test]
+fn nodata_elevations_and_slope_free_profiles_compile_flat() {
+    let edges: Vec<TestEdge> = vec![(0, 1, 200.0, straight((0.0, 0.0), (200.0, 0.0)))];
+    let flat = multimodal_network(2, &edges, &plain_attrs(1)).unwrap();
+    // Unavailable elevation is flat, never a penalty or a credit.
+    let nodata = elevated_network(2, &edges, &plain_attrs(1), |_, _| f32::NAN);
+    let bike = StreetProfileDefinition::bicycle();
+    assert_eq!(
+        nodata.compile_profile(&bike).unwrap().arc_millis,
+        flat.compile_profile(&bike).unwrap().arc_millis
+    );
+    // Slope-free profiles ignore even a strong ramp.
+    let ramp = elevated_network(2, &edges, &plain_attrs(1), |x, _| (x / 10.0) as f32);
+    for definition in [
+        StreetProfileDefinition::walk(),
+        StreetProfileDefinition::e_bike(),
+        StreetProfileDefinition::e_scooter(),
+    ] {
+        assert_eq!(
+            ramp.compile_profile(&definition).unwrap().arc_millis,
+            flat.compile_profile(&definition).unwrap().arc_millis
+        );
+    }
+}
+
+#[test]
+fn dem_spikes_clamp_and_extreme_credits_floor() {
+    // A 1000 % grade is a DEM artifact: it clamps to ±100 %, so the climb
+    // doubles (×2.0) and the descent credits ×0.7 — never less.
+    let edges: Vec<TestEdge> = vec![(0, 1, 200.0, straight((0.0, 0.0), (200.0, 0.0)))];
+    let net = elevated_network(2, &edges, &plain_attrs(1), |x, _| (x * 10.0) as f32);
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let costs = permitted_costs(&bike);
+    assert!(near(costs[0], 35_000.0), "clamped descent: {}", costs[0]);
+    assert!(near(costs[1], 100_000.0), "clamped climb: {}", costs[1]);
+    // A pathological downhill factor floors at MIN_SLOPE_MULTIPLIER rather
+    // than compiling a vanishing (or negative) cost.
+    let mut greedy = StreetProfileDefinition::bicycle();
+    greedy.slope_downhill = 5.0;
+    greedy.max_speed = greedy.base_speed / MIN_SLOPE_MULTIPLIER;
+    let floored = permitted_costs(&net.compile_profile(&greedy).unwrap());
+    assert!(near(floored[0], 5_000.0), "floored descent: {}", floored[0]);
+}
+
+#[test]
+fn slope_factors_validate() {
+    let mut nan = StreetProfileDefinition::bicycle();
+    nan.slope_uphill = f64::NAN;
+    assert_eq!(
+        nan.validate().unwrap_err(),
+        ProfileError::InvalidSlopeFactors
+    );
+    let mut negative = StreetProfileDefinition::bicycle();
+    negative.slope_downhill = -0.1;
+    assert_eq!(
+        negative.validate().unwrap_err(),
+        ProfileError::InvalidSlopeFactors
+    );
+    // The shipped bicycle's max_speed covers its own downhill credit...
+    assert!(StreetProfileDefinition::bicycle().validate().is_ok());
+    // ...and a bound that ignores the credit is rejected as too low.
+    let mut low = StreetProfileDefinition::bicycle();
+    low.max_speed = low.base_speed;
+    assert_eq!(low.validate().unwrap_err(), ProfileError::MaxSpeedTooLow);
 }
 
 #[test]
