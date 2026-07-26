@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Cycling is slope-aware on elevated street networks. The bicycle profile
+  compiles the owner-published cost model ``w = d · (1 + f(s))`` — ``f(s) = s``
+  uphill, ``0.3·s`` downhill (a bounded credit) — per stored sub-segment and
+  per direction, so an edge that climbs and descends is costed on both parts
+  and the reverse arc sees the negated slopes. Slopes are clamped to ±100 %
+  (DEM-spike guard) and every sub-segment multiplier is floored, so no
+  downhill can compile a vanishing cost. Unavailable elevation (NaN) stays
+  flat — a network built without ``dem=`` routes exactly as before, and walk,
+  e-bike, and e-scooter stay slope-free until sourced models exist.
+
 - Street networks can now carry elevation.
   ``StreetNetwork.from_osm(..., dem=...)`` samples a user-supplied DEM —
   a GeoTIFF path or tile paths read through the optional ``rioxarray``
@@ -14,10 +24,10 @@
   and ``elevation_metadata`` records the source, interval, nodata
   policy, sampled coverage, and inferred-structure count. The values
   ride the street artifact through ``save``/``load`` (owned and
-  mapped). Flat routing is unchanged — elevations are carried for the
-  slope-aware profiles to come, not yet costed. The conventional
-  bicycle's operational emission factor is now 21 g CO₂e per person-km
-  (dietary energy expenditure, average European diet).
+  mapped). Carrying elevations changes nothing for slope-free profiles —
+  the entry above is where they get costed. The conventional bicycle's
+  operational emission factor is now 21 g CO₂e per person-km (dietary
+  energy expenditure, average European diet).
 
 - Standalone street routing: cycling, e-scooter, e-bike, and walking as
   door-to-door modes of their own. ``cafein.StreetNetwork.from_osm``

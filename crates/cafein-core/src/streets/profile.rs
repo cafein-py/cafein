@@ -41,6 +41,14 @@ pub const HIGHWAY_CODE_COUNT: usize = 27;
 pub const SURFACE_CODE_COUNT: usize = 17;
 pub const SMOOTHNESS_CODE_COUNT: usize = 9;
 
+/// The spike clamp on a sub-segment slope: ±100 % grade. Steeper is a DEM
+/// artifact, not a street.
+pub const MAX_SLOPE: f64 = 1.0;
+
+/// The floor on a sub-segment's slope multiplier `1 + f(s)`, so no downhill
+/// factor can produce a non-positive cost.
+pub const MIN_SLOPE_MULTIPLIER: f64 = 0.1;
+
 /// The street mode a profile routes — exactly one. It maps to a single
 /// `adj_access` permission bit, so a profile can never match arcs by any-of
 /// several modes.
@@ -73,6 +81,8 @@ pub enum ProfileError {
     /// `max_speed` is below the greatest speed an arc can attain, which would
     /// make the A* heuristic that divides by it inadmissible.
     MaxSpeedTooLow,
+    /// A slope factor is not finite and non-negative.
+    InvalidSlopeFactors,
     /// A non-walk profile has no `adj_access` to route by — the network was
     /// built without the multimodal attributes.
     MissingAttributes,
@@ -90,6 +100,9 @@ impl std::fmt::Display for ProfileError {
             }
             ProfileError::InvalidMultipliers => {
                 write!(f, "a profile multiplier table is malformed")
+            }
+            ProfileError::InvalidSlopeFactors => {
+                write!(f, "a slope factor is not finite and non-negative")
             }
             ProfileError::MaxSpeedTooLow => {
                 write!(f, "max_speed is below the greatest attainable speed")
@@ -111,8 +124,9 @@ impl std::error::Error for ProfileError {}
 ///
 /// Speeds are metres per second. The per-class multipliers scale the base
 /// speed by the arc's highway class, surface, and smoothness; the built-in
-/// profiles are flat (all multipliers `1.0`), but the machinery supports
-/// user-defined slower/faster classes. `PartialEq` lets a persisted compiled
+/// profiles keep those tables neutral (all `1.0`), though the machinery
+/// supports user-defined slower/faster classes. The slope factors are
+/// separate — the built-in bicycle carries a nonzero slope model. `PartialEq` lets a persisted compiled
 /// profile bind by exact-definition equality (the `same_factors` principle),
 /// and distinguishes profiles that route identically but carry a different
 /// `vehicle_class` for later emissions.
@@ -143,6 +157,13 @@ pub struct StreetProfileDefinition {
     /// Per-smoothness speed multiplier, indexed by the smoothness code
     /// (length `SMOOTHNESS_CODE_COUNT`).
     pub smoothness_multipliers: Vec<f64>,
+    /// Cost factor on a climbing sub-segment: its multiplier is
+    /// `1 + slope_uphill·s` for slope fraction `s > 0`. Zero disables the
+    /// uphill penalty.
+    pub slope_uphill: f64,
+    /// Cost factor on a descending sub-segment: `1 + slope_downhill·s` with
+    /// `s < 0` — a bounded credit. Zero disables it.
+    pub slope_downhill: f64,
 }
 
 impl StreetProfileDefinition {
@@ -166,6 +187,8 @@ impl StreetProfileDefinition {
             highway_multipliers: vec![1.0; HIGHWAY_CODE_COUNT],
             surface_multipliers: vec![1.0; SURFACE_CODE_COUNT],
             smoothness_multipliers: vec![1.0; SMOOTHNESS_CODE_COUNT],
+            slope_uphill: 0.0,
+            slope_downhill: 0.0,
         }
     }
 
@@ -174,13 +197,23 @@ impl StreetProfileDefinition {
         StreetProfileDefinition::flat("walk", StreetMode::Walk, "walk", WALK_SPEED)
     }
 
-    /// The default bicycle profile, 14.4 km/h (R5's 4 m/s default).
+    /// The default bicycle profile, 14.4 km/h (R5's 4 m/s default), with the
+    /// slope model `w = d·(1 + f(s))`: `f(s) = s` uphill, `0.3·s` downhill.
+    /// The downhill credit can raise an arc's effective speed to
+    /// `base / (1 − 0.3·MAX_SLOPE)`, so `max_speed` covers that bound.
     pub fn bicycle() -> StreetProfileDefinition {
-        StreetProfileDefinition::flat("bicycle", StreetMode::Bicycle, "bicycle", 4.0)
+        let mut definition =
+            StreetProfileDefinition::flat("bicycle", StreetMode::Bicycle, "bicycle", 4.0);
+        definition.slope_uphill = 1.0;
+        definition.slope_downhill = 0.3;
+        definition.max_speed = definition.base_speed / (1.0 - 0.3 * MAX_SLOPE);
+        definition
     }
 
     /// The default e-bike profile: bicycle permissions and speed for now, but a
-    /// distinct vehicle class (its emissions differ).
+    /// distinct vehicle class (its emissions differ). Slope stays off — the
+    /// documented model is for the conventional bicycle, and an
+    /// assist-flattened curve would be an invented number.
     pub fn e_bike() -> StreetProfileDefinition {
         StreetProfileDefinition::flat("e_bike", StreetMode::Bicycle, "e_bike", 4.0)
     }
@@ -212,6 +245,10 @@ impl StreetProfileDefinition {
         {
             return Err(ProfileError::InvalidMultipliers);
         }
+        let factor_ok = |value: f64| value.is_finite() && value >= 0.0;
+        if !factor_ok(self.slope_uphill) || !factor_ok(self.slope_downhill) {
+            return Err(ProfileError::InvalidSlopeFactors);
+        }
         // The greatest attainable on-network speed. `multiplied` is the base
         // speed scaled by each class table's true peak (the tables are
         // validated non-empty and all-positive above, so a `0.0`-seeded max is
@@ -230,10 +267,23 @@ impl StreetProfileDefinition {
         } else {
             multiplied.max(self.dismount_speed)
         };
+        // The downhill credit shortens an arc's effective distance, raising
+        // its effective speed by up to the inverse of the smallest possible
+        // sub-segment multiplier — the A* heuristic's bound must cover it.
+        let attainable = attainable / self.min_slope_multiplier();
         if !self.max_speed.is_finite() || self.max_speed < attainable {
             return Err(ProfileError::MaxSpeedTooLow);
         }
         Ok(())
+    }
+
+    /// The smallest sub-segment multiplier this definition can produce: the
+    /// steepest clamped descent's credit, floored — or 1.0 with slope off.
+    fn min_slope_multiplier(&self) -> f64 {
+        if self.slope_uphill == 0.0 && self.slope_downhill == 0.0 {
+            return 1.0;
+        }
+        (1.0 - self.slope_downhill * MAX_SLOPE).max(MIN_SLOPE_MULTIPLIER)
     }
 }
 
@@ -259,6 +309,12 @@ impl StreetNetwork {
     /// scales the base speed by the arc edge's class multipliers, falling to
     /// the dismount speed on a `FLAG_DISMOUNT` arc.
     ///
+    /// With elevations installed and a slope-aware definition, `length` is
+    /// the arc's effective distance: the physical length scaled by the
+    /// direction's mean slope multiplier (see [`Self::slope_means`]).
+    /// Dismount arcs keep the multiplier — the same person pushes the same
+    /// bicycle up the same hill.
+    ///
     /// A graph without installed attributes carries no per-mode permissions,
     /// so only the walking profile compiles over it (every arc permitted at
     /// the base speed); a non-walk profile has nothing to route by and returns
@@ -277,6 +333,11 @@ impl StreetNetwork {
         if attributes.is_none() && definition.mode != StreetMode::Walk {
             return Err(ProfileError::MissingAttributes);
         }
+        // With elevations installed and a nonzero slope factor, every edge
+        // gets a distance-weighted mean multiplier per direction; the arc
+        // loop below scales its length by the one for its direction.
+        let slope = self.slope_means(definition);
+        let slot_reverse = slope.as_ref().map(|_| self.slot_directions());
         let mut arc_millis = vec![u32::MAX; meters.len()];
         for slot in 0..meters.len() {
             let permitted = match attributes {
@@ -285,6 +346,15 @@ impl StreetNetwork {
             };
             if !permitted {
                 continue;
+            }
+            let mut length = meters[slot];
+            if let (Some(means), Some(reverse)) = (&slope, &slot_reverse) {
+                let (forward_mean, reverse_mean) = means[edges[slot] as usize];
+                length *= if reverse[slot] {
+                    reverse_mean
+                } else {
+                    forward_mean
+                };
             }
             let mut speed = definition.base_speed;
             if let Some(attributes) = attributes {
@@ -308,7 +378,7 @@ impl StreetNetwork {
                 }
             }
             // Validated speeds keep this finite and positive.
-            let millis = (meters[slot] / speed * 1000.0).ceil();
+            let millis = (length / speed * 1000.0).ceil();
             // `u32::MAX` is the forbidden sentinel; a cost reaching it cannot be
             // stored, so a (physically implausible) definition that produces one
             // is rejected rather than silently understated.
@@ -328,6 +398,78 @@ impl StreetNetwork {
             definition: definition.clone(),
             arc_millis,
         })
+    }
+
+    /// The distance-weighted mean slope multiplier per edge and direction
+    /// (`(forward, reverse)`), integrating `1 + f(s)` over the stored
+    /// sub-segments — `None` when the network carries no elevations or the
+    /// definition's slope is off, which compiles flat.
+    ///
+    /// A sub-segment with unavailable elevation (NaN) or no length counts as
+    /// flat in both directions: unavailable data never invents a penalty or a
+    /// credit, so an elevation-less profile means multiplier 1.0 exactly and
+    /// the compiled costs are bit-identical to a flat compilation.
+    fn slope_means(&self, definition: &StreetProfileDefinition) -> Option<Vec<(f64, f64)>> {
+        if definition.slope_uphill == 0.0 && definition.slope_downhill == 0.0 {
+            return None;
+        }
+        let elevations = self.elevations()?;
+        let offsets = self.arrays().coordinate_offsets();
+        let cumulative = self.arrays().cumulative();
+        let multiplier = |slope: f64| -> f64 {
+            let f = if slope > 0.0 {
+                definition.slope_uphill * slope
+            } else {
+                definition.slope_downhill * slope
+            };
+            (1.0 + f).max(MIN_SLOPE_MULTIPLIER)
+        };
+        let mut means = Vec::with_capacity(offsets.len() - 1);
+        for edge in 0..offsets.len() - 1 {
+            let start = offsets[edge] as usize;
+            let end = offsets[edge + 1] as usize;
+            let (mut total, mut forward, mut reverse) = (0.0f64, 0.0f64, 0.0f64);
+            for point in start..end.saturating_sub(1) {
+                let length = f64::from(cumulative[point + 1]) - f64::from(cumulative[point]);
+                if length.is_nan() || length <= 0.0 {
+                    continue;
+                }
+                let rise = f64::from(elevations[point + 1]) - f64::from(elevations[point]);
+                let (up, down) = if rise.is_nan() {
+                    (1.0, 1.0)
+                } else {
+                    let slope = (rise / length).clamp(-MAX_SLOPE, MAX_SLOPE);
+                    (multiplier(slope), multiplier(-slope))
+                };
+                total += length;
+                forward += length * up;
+                reverse += length * down;
+            }
+            means.push(if total > 0.0 {
+                (forward / total, reverse / total)
+            } else {
+                (1.0, 1.0)
+            });
+        }
+        Some(means)
+    }
+
+    /// Whether each adjacency slot traverses its edge against the stored
+    /// geometry direction, from the CSR: a slot under vertex `v` over edge
+    /// `e` is forward iff `v` is the edge's stored `from` endpoint. A
+    /// self-loop reads as forward both ways — its two arcs traverse the same
+    /// profile.
+    fn slot_directions(&self) -> Vec<bool> {
+        let adjacency = self.arrays().adjacency_offsets();
+        let edges = self.arrays().adj_edges();
+        let endpoints = self.arrays().endpoints();
+        let mut reverse = vec![false; edges.len()];
+        for vertex in 0..adjacency.len() - 1 {
+            for slot in adjacency[vertex] as usize..adjacency[vertex + 1] as usize {
+                reverse[slot] = endpoints[2 * edges[slot] as usize] != vertex as u32;
+            }
+        }
+        reverse
     }
 }
 

@@ -126,20 +126,33 @@ def test_stored_elevations_match_the_ramp(elevated):
     assert error.max() < 50.0
 
 
-def test_flat_routing_is_unchanged_by_elevations(elevated, helsinki_streets):
-    # Same extract with and without the DEM: flat (slope-blind) profiles
-    # must route identically — elevations are carried, not yet costed.
+def test_routing_is_unchanged_for_slope_free_modes(elevated, helsinki_streets):
+    # Same extract with and without the DEM: profiles without a slope model
+    # must route identically — only the bicycle carries one.
     pairs = [
         (KAMPPI, HAKANIEMI),
         (HAKANIEMI, KAMPPI),
         ((60.1580, 24.9350), KAMPPI),
     ]
-    for mode in ("walk", "bicycle", "e_scooter"):
+    for mode in ("walk", "e_bike", "e_scooter"):
         for origin, destination in pairs:
             with_dem = elevated.travel_time(origin, destination, mode=mode)
             without = helsinki_streets.travel_time(origin, destination, mode=mode)
             assert with_dem == without
             assert with_dem is not None
+
+
+def test_cycling_charges_the_climb_on_an_elevated_network(elevated, helsinki_streets):
+    # The ramp climbs east, so eastbound cycling pays the slope penalty —
+    # every path east must gain at least the net elevation — and westbound
+    # earns the descent credit.
+    east = elevated.travel_time(KAMPPI, HAKANIEMI, mode="bicycle")
+    west = elevated.travel_time(HAKANIEMI, KAMPPI, mode="bicycle")
+    flat_east = helsinki_streets.travel_time(KAMPPI, HAKANIEMI, mode="bicycle")
+    flat_west = helsinki_streets.travel_time(HAKANIEMI, KAMPPI, mode="bicycle")
+    assert east > flat_east
+    assert west < flat_west
+    assert east > west
 
 
 def test_a_coarse_dem_interval_is_capped_at_the_stored_segment_limit(
