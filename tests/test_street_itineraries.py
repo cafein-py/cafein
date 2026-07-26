@@ -29,8 +29,8 @@ COLUMNS = [
 
 
 @pytest.fixture(scope="module")
-def streets(kantakaupunki_pbf):
-    return StreetNetwork.from_osm(str(kantakaupunki_pbf))
+def streets(helsinki_streets):
+    return helsinki_streets
 
 
 @pytest.fixture(scope="module")
@@ -93,9 +93,9 @@ def test_agrees_with_the_cost_matrix(streets, places):
 
 def test_absolute_times_are_absent_without_a_departure(streets, places):
     routes = DetailedItineraries(streets, places, transport_mode="bicycle")
-    assert routes.departure.isna().all()
-    assert routes.arrival.isna().all()
-    assert (routes.travel_time >= 0).all()
+    assert routes.departure_s.isna().all()
+    assert routes.arrival_s.isna().all()
+    assert (routes.travel_time_s >= 0).all()
 
 
 def test_a_departure_places_the_leg_on_a_clock(streets, places):
@@ -103,8 +103,8 @@ def test_a_departure_places_the_leg_on_a_clock(streets, places):
         streets, places, departure="08:30:00", transport_mode="bicycle"
     )
     start = 8 * 3600 + 30 * 60
-    assert (routes.departure == start).all()
-    assert (routes.arrival == start + routes.travel_time).all()
+    assert (routes.departure_s == start).all()
+    assert (routes.arrival_s == start + routes.travel_time_s).all()
 
 
 def test_geometry_runs_from_origin_to_destination(streets, places):
@@ -126,7 +126,7 @@ def test_the_diagonal_is_a_readable_zero_length_leg(streets, places):
     routes = DetailedItineraries(streets, places, transport_mode="walk")
     diagonal = routes[routes.from_id == routes.to_id]
     assert len(diagonal) == len(places)
-    assert (diagonal.travel_time == 0).all()
+    assert (diagonal.travel_time_s == 0).all()
     # Subscripted, not attribute access: `.distance_m` is geopandas' own method.
     assert (diagonal["distance_m"] == 0).all()
     coordinates = dict(zip(places["id"], zip(places.geometry.y, places.geometry.x)))
@@ -146,7 +146,7 @@ def test_geometries_false_drops_the_shapes(streets, places):
         streets, places, transport_mode="walk", geometries=False
     )
     assert routes.geometry.isna().all()
-    assert (routes.travel_time >= 0).all()
+    assert (routes.travel_time_s >= 0).all()
 
 
 def test_requires_an_explicit_mode(streets, places):
@@ -204,9 +204,9 @@ def test_the_column_dtypes_are_the_same_with_or_without_a_departure(
     routes = DetailedItineraries(
         streets, places, departure=departure, transport_mode="bicycle"
     )
-    assert routes.departure.dtype == "Int64"
-    assert routes.arrival.dtype == "Int64"
-    assert routes.travel_time.dtype == np.uint32
+    assert routes.departure_s.dtype == "Int64"
+    assert routes.arrival_s.dtype == "Int64"
+    assert routes.travel_time_s.dtype == np.uint32
     assert routes.option.dtype == np.int64
     assert routes.segment.dtype == np.int64
     for column in ("distance_m", "network_distance_m", "connector_distance_m"):

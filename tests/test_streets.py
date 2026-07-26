@@ -316,7 +316,7 @@ def test_an_empty_network_yields_an_empty_payload():
 
 
 @pytest.fixture(scope="session")
-def helsinki_streets(helsinki_gtfs, kantakaupunki_pbf):
+def helsinki_walking_streets(helsinki_gtfs, kantakaupunki_pbf):
     with (
         zipfile.ZipFile(helsinki_gtfs) as archive,
         archive.open("stops.txt") as stops_file,
@@ -334,8 +334,8 @@ def helsinki_streets(helsinki_gtfs, kantakaupunki_pbf):
 
 
 @pytest.fixture(scope="session")
-def helsinki_footpaths(helsinki_streets):
-    return helsinki_streets[0]
+def helsinki_footpaths(helsinki_walking_streets):
+    return helsinki_walking_streets[0]
 
 
 def test_helsinki_footpaths_cover_the_extract(helsinki_footpaths):
@@ -400,15 +400,15 @@ def test_helsinki_footpaths_are_symmetric(helsinki_footpaths):
     assert all(lookup.get((b, a)) == seconds for (a, b), seconds in lookup.items())
 
 
-def test_helsinki_street_network_covers_the_extract(helsinki_streets):
-    vertex_count, edge_list, offsets, lons, lats, links = helsinki_streets[1]
+def test_helsinki_street_network_covers_the_extract(helsinki_walking_streets):
+    vertex_count, edge_list, offsets, lons, lats, links = helsinki_walking_streets[1]
     assert vertex_count > 10_000
     assert len(edge_list) > 10_000
     assert len(offsets) == len(edge_list) + 1
     assert offsets[0] == 0
     assert offsets[-1] == len(lons) == len(lats)
     # Every stop with footpaths snapped, so it also carries a street link.
-    origins = {from_stop for from_stop, _, _, _ in helsinki_streets[0]}
+    origins = {from_stop for from_stop, _, _, _ in helsinki_walking_streets[0]}
     assert {link[0] for link in links} >= origins
     assert all(0 <= link[1] < len(edge_list) for link in links)
     assert all(0.0 <= link[2] <= 1.0 for link in links)

@@ -62,3 +62,5 @@ include = '(python/cafein|tests)/.*\.py$'
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Surface the slowest tests on every run.
+addopts = "--durations=25"

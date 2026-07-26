@@ -18,8 +18,8 @@ NOWHERE = (0.0, -30.0)
 
 
 @pytest.fixture(scope="module")
-def helsinki_network(kantakaupunki_pbf):
-    return StreetNetwork.from_osm(str(kantakaupunki_pbf))
+def helsinki_network(helsinki_streets):
+    return helsinki_streets
 
 
 def test_from_osm_builds_a_routable_graph(helsinki_network):

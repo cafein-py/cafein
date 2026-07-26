@@ -69,7 +69,7 @@ def test_cost_rows_pin_the_k_train(network):
     )
     row = matrix.iloc[0]
     assert (row.from_id, row.to_id) == ("4810551", "1250551")
-    assert row.travel_time == 28 * 60
+    assert row.travel_time_s == 28 * 60
     assert row.transfers == 0
     assert row.transit_distance_m == pytest.approx(16_786, abs=1)
     assert row.walk_distance_m == 0.0
@@ -88,7 +88,7 @@ def test_cost_rows_count_walks_and_transfers(network_with_footpaths):
     )
     # The 08:31 M2 to Kamppi, then the pinned 20-second footpath.
     m2 = matrix[matrix.to_id == "1040280"].iloc[0]
-    assert m2.travel_time == 9 * 60 + 20
+    assert m2.travel_time_s == 9 * 60 + 20
     assert m2.transfers == 0
     assert m2.transit_distance_m == pytest.approx(4_132, abs=1)
     assert 19 <= m2.walk_distance_m <= 20
@@ -109,12 +109,12 @@ def test_cost_matrix_matches_the_travel_time_matrix(network):
         reachable = np.nonzero(times[row_index] != np.uint32(0xFFFFFFFF))[0]
         assert len(rows) == len(reachable)
         expected = {stop_order[at]: int(times[row_index, at]) for at in reachable}
-        assert dict(zip(rows.to_id, rows.travel_time)) == expected
+        assert dict(zip(rows.to_id, rows.travel_time_s)) == expected
     # The origin reaches itself without riding.
     self_row = matrix[(matrix.from_id == "4810551") & (matrix.to_id == "4810551")].iloc[
         0
     ]
-    assert self_row.travel_time == 0
+    assert self_row.travel_time_s == 0
     assert self_row.transfers == 0
     assert self_row.transit_distance_m == 0.0
     assert self_row.emissions == 0.0
@@ -169,7 +169,7 @@ def test_point_matrices_walk_ride_and_walk(network_with_footpaths):
     m2 = matrix[
         (matrix.from_id == "kalasatama") & (matrix.to_id == "kamppi_street")
     ].iloc[0]
-    assert 558 <= m2.travel_time <= 562
+    assert 558 <= m2.travel_time_s <= 562
     assert m2.transfers == 0
     assert m2.transit_distance_m == pytest.approx(4_132, abs=1)
     assert 27 <= m2.walk_distance_m <= 31
@@ -178,7 +178,7 @@ def test_point_matrices_walk_ride_and_walk(network_with_footpaths):
     walk = matrix[
         (matrix.from_id == "kamppi_metro") & (matrix.to_id == "kamppi_street")
     ].iloc[0]
-    assert 19 <= walk.travel_time <= 21
+    assert 19 <= walk.travel_time_s <= 21
     assert walk.transfers == 0
     assert walk.transit_distance_m == 0.0
     assert 19 <= walk.walk_distance_m <= 21
@@ -190,7 +190,7 @@ def test_point_matrices_walk_ride_and_walk(network_with_footpaths):
     for row in matrix.itertuples():
         origin = list(origins["id"]).index(row.from_id)
         destination = list(destinations["id"]).index(row.to_id)
-        assert times[origin, destination] == row.travel_time
+        assert times[origin, destination] == row.travel_time_s
 
 
 def test_point_matrices_from_arbitrary_locations(network_with_footpaths):
@@ -215,7 +215,7 @@ def test_point_matrices_from_arbitrary_locations(network_with_footpaths):
     library_order = list(libraries["id"])
     for row in matrix.itertuples():
         at = building_order.index(row.from_id), library_order.index(row.to_id)
-        assert times[at] == row.travel_time
+        assert times[at] == row.travel_time_s
     # Sampled cells equal the per-pair door-to-door routing: the matrix
     # is the bulk face of route_between_coordinates.
     departure = 8 * 3600 + 30 * 60
@@ -423,7 +423,7 @@ def test_point_emission_cells_prefer_walking(network_with_footpaths):
     assert row.emissions == 0.0
     assert row.transfers == 0
     assert row.transit_distance_m == 0.0
-    assert 19 <= row.travel_time <= 21
+    assert 19 <= row.travel_time_s <= 21
     assert 19 <= row.walk_distance_m <= 21
 
 
@@ -454,7 +454,7 @@ def test_point_emission_cells_match_the_frontier(network_with_footpaths):
     )
     row = matrix.iloc[0]
     assert row.emissions == pytest.approx(oracle["emissions"])
-    assert row.travel_time == oracle["travel_time_s"]
+    assert row.travel_time_s == oracle["travel_time_s"]
     assert row.transfers == oracle["rides"] - 1
 
 
@@ -578,7 +578,7 @@ def test_point_fare_cells_prefer_walking(network_with_footpaths, helsinki_gtfs):
     assert row.fare == 0.0
     assert row.transfers == 0
     assert row.transit_distance_m == 0.0
-    assert 19 <= row.travel_time <= 21
+    assert 19 <= row.travel_time_s <= 21
 
 
 def test_fare_matrices_validate_their_options(network, helsinki_gtfs):
@@ -663,7 +663,7 @@ def test_emission_cells_never_exceed_the_fastest_journeys_emissions(network):
         optimize="emissions",
         window=600,
     ).iloc[0]
-    assert self_cell.travel_time == 0
+    assert self_cell.travel_time_s == 0
     assert self_cell.emissions == 0.0
     assert self_cell.transfers == 0
 
@@ -958,7 +958,7 @@ def test_arrow_table_matches_the_dataframe(network, tmp_path):
     assert pyarrow.types.is_dictionary(table.schema.field("from_id").type)
     assert table.column("from_id").to_pylist() == list(frame.from_id)
     assert table.column("to_id").to_pylist() == list(frame.to_id)
-    assert table.column("travel_time_s").to_pylist() == list(frame.travel_time)
+    assert table.column("travel_time_s").to_pylist() == list(frame.travel_time_s)
     assert table.column("transfers").to_pylist() == list(frame.transfers)
     assert table.column("emissions").to_pylist() == pytest.approx(list(frame.emissions))
     decoded = shapely.from_wkb(table.column("geometry").to_pylist()[0])
@@ -1003,7 +1003,7 @@ def test_travel_time_matrix_unstacks_the_wide_matrix(network):
     # Every reachable wide cell is a row; unreachable cells are absent.
     assert len(matrix) == int((wide != UNREACHABLE).sum())
     long = {
-        (row.from_id, row.to_id): int(row.travel_time) for row in matrix.itertuples()
+        (row.from_id, row.to_id): int(row.travel_time_s) for row in matrix.itertuples()
     }
     reference = {
         (origin, stops[column]): int(wide[index, column])
@@ -1014,7 +1014,7 @@ def test_travel_time_matrix_unstacks_the_wide_matrix(network):
     assert long == reference
     # The Korso -> Käpylä pair keeps its 28-minute travel time.
     korso = matrix[(matrix.from_id == "4810551") & (matrix.to_id == "1250551")]
-    assert int(korso.travel_time.iloc[0]) == 28 * 60
+    assert int(korso.travel_time_s.iloc[0]) == 28 * 60
     # Slices degrade to plain DataFrames.
     assert type(matrix.iloc[:1]) is pd.DataFrame
 
@@ -1088,7 +1088,7 @@ def test_travel_time_matrix_windowed_percentiles(network):
         column = stops.index(row.to_id)
         for offset, percentile in enumerate((10, 50, 90)):
             wide_value = wide[0, column, offset]
-            long_value = getattr(row, f"travel_time_p{percentile}")
+            long_value = getattr(row, f"travel_time_p{percentile}_s")
             if wide_value == UNREACHABLE:
                 assert np.isnan(long_value)
             else:
@@ -1161,7 +1161,7 @@ def test_travel_time_matrix_over_points(network_with_footpaths):
         departure="08:30:00",
     )
     long = {
-        (row.from_id, row.to_id): int(row.travel_time) for row in matrix.itertuples()
+        (row.from_id, row.to_id): int(row.travel_time_s) for row in matrix.itertuples()
     }
     reference = {
         ("A", destination): int(wide[0, column])

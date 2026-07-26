@@ -33,8 +33,8 @@ def scattered_points(count, seed, centre=(60.170, 24.940)):
 
 
 @pytest.fixture(scope="module")
-def streets(kantakaupunki_pbf):
-    return StreetNetwork.from_osm(str(kantakaupunki_pbf))
+def streets(helsinki_streets):
+    return helsinki_streets
 
 
 @pytest.fixture(scope="module")
@@ -60,7 +60,7 @@ def test_matrix_cells_match_single_routes(streets, origins, destinations, mode):
         streets, origins, destinations, transport_mode=mode, max_street_time=3600
     )
     cells = {
-        (row.from_id, row.to_id): int(row.travel_time)
+        (row.from_id, row.to_id): int(row.travel_time_s)
         for row in matrix.itertuples(index=False)
     }
     for from_id, origin in zip(origins["id"], coordinates(origins)):
@@ -84,7 +84,7 @@ def test_diagonal_is_zero_when_destinations_are_the_origins(streets, origins):
     matrix = TravelTimeMatrix(streets, origins, transport_mode="bicycle")
     diagonal = matrix[matrix.from_id == matrix.to_id]
     assert len(diagonal) == len(origins)
-    assert (diagonal.travel_time == 0).all()
+    assert (diagonal.travel_time_s == 0).all()
 
 
 def test_cycling_beats_walking_over_the_same_pairs(streets, origins, destinations):
@@ -94,9 +94,11 @@ def test_cycling_beats_walking_over_the_same_pairs(streets, origins, destination
     bicycle = TravelTimeMatrix(
         streets, origins, destinations, transport_mode="bicycle", max_street_time=3600
     )
-    walked = {(r.from_id, r.to_id): r.travel_time for r in walk.itertuples(index=False)}
+    walked = {
+        (r.from_id, r.to_id): r.travel_time_s for r in walk.itertuples(index=False)
+    }
     rode = {
-        (r.from_id, r.to_id): r.travel_time for r in bicycle.itertuples(index=False)
+        (r.from_id, r.to_id): r.travel_time_s for r in bicycle.itertuples(index=False)
     }
     shared = set(walked) & set(rode)
     assert shared
@@ -115,7 +117,7 @@ def test_a_tighter_cutoff_drops_cells(streets, origins, destinations):
         streets, origins, destinations, transport_mode="walk", max_street_time=120
     )
     assert len(tight) < len(generous)
-    assert (tight.travel_time <= 120).all()
+    assert (tight.travel_time_s <= 120).all()
 
 
 def test_matrix_is_deterministic(streets, origins, destinations):
@@ -187,7 +189,7 @@ def test_max_street_time_on_a_transport_network_is_rejected(network):
     "kwargs",
     [
         {"date": "2022-02-22"},
-        {"departure_s": "08:30:00"},
+        {"departure": "08:30:00"},
         {"max_transfers": 3},
         {"router": "raptor"},
         {"window": 600},
@@ -276,7 +278,7 @@ COST_COLUMNS = [
 def test_cost_matrix_columns_and_dtypes(streets, origins, destinations):
     costs = TravelCostMatrix(streets, origins, destinations, transport_mode="bicycle")
     assert list(costs.columns) == COST_COLUMNS
-    assert costs.travel_time.dtype == np.uint32
+    assert costs.travel_time_s.dtype == np.uint32
     for column in ("distance_m", "network_distance_m", "connector_distance_m"):
         assert costs[column].dtype == np.float64
     assert pd.api.types.is_string_dtype(costs.distance_provenance)
@@ -305,9 +307,11 @@ def test_cost_matrix_times_match_the_time_matrix(streets, origins, destinations)
     # The two computers run the same search; they must not disagree.
     times = TravelTimeMatrix(streets, origins, destinations, transport_mode="bicycle")
     costs = TravelCostMatrix(streets, origins, destinations, transport_mode="bicycle")
-    timed = {(r.from_id, r.to_id): r.travel_time for r in times.itertuples(index=False)}
+    timed = {
+        (r.from_id, r.to_id): r.travel_time_s for r in times.itertuples(index=False)
+    }
     costed = {
-        (r.from_id, r.to_id): r.travel_time for r in costs.itertuples(index=False)
+        (r.from_id, r.to_id): r.travel_time_s for r in costs.itertuples(index=False)
     }
     assert timed == costed
 
@@ -318,7 +322,7 @@ def test_cost_matrix_matches_single_pair_reconstruction(streets, origins, destin
     whole = TravelCostMatrix(streets, origins, destinations, transport_mode="walk")
     rows = {
         (r.from_id, r.to_id): (
-            r.travel_time,
+            r.travel_time_s,
             r.network_distance_m,
             r.connector_distance_m,
         )
@@ -338,7 +342,7 @@ def test_cost_matrix_matches_single_pair_reconstruction(streets, origins, destin
                 continue
             only = single.iloc[0]
             assert rows[(from_id, to_id)] == pytest.approx(
-                (only.travel_time, only.network_distance_m, only.connector_distance_m)
+                (only.travel_time_s, only.network_distance_m, only.connector_distance_m)
             )
 
 
@@ -464,7 +468,7 @@ def test_diagonal_geometry_is_a_valid_line(streets, origins):
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"departure_s": "08:30:00"},
+        {"departure": "08:30:00"},
         {"window": 600},
         {"within": 600},
         {"candidates": "pareto"},
