@@ -78,8 +78,8 @@ pub enum ProfileError {
     /// A multiplier table has the wrong length, or an entry is not finite and
     /// positive.
     InvalidMultipliers,
-    /// `max_speed` is below the greatest speed an arc can attain, which would
-    /// make the A* heuristic that divides by it inadmissible.
+    /// `max_speed` is below the greatest speed an arc can attain, so it
+    /// would not be the upper bound it declares itself to be.
     MaxSpeedTooLow,
     /// A slope factor is not finite and non-negative.
     InvalidSlopeFactors,
@@ -142,9 +142,11 @@ pub struct StreetProfileDefinition {
     pub base_speed: f64,
     /// Speed on off-network connectors (the snap approach), m/s.
     pub connector_speed: f64,
-    /// An upper bound on any effective on-network speed, m/s — the admissible
-    /// A* heuristic divides straight-line distance by this, so it must be at
-    /// least the greatest speed any arc can attain.
+    /// A validated upper bound on any effective on-network speed, m/s — it
+    /// must be at least the greatest speed any arc can attain (slope credit
+    /// included). The goal-directed search normally divides by the tighter
+    /// measured [`CompiledStreetProfile::max_effective_speed`]; this bound
+    /// backs the validation and serves as its fallback.
     pub max_speed: f64,
     /// Speed on a `bicycle=dismount` arc (walk speed), m/s.
     pub dismount_speed: f64,
@@ -298,7 +300,32 @@ const WALK_SPEED: f64 = 1.0;
 pub struct CompiledStreetProfile {
     pub definition: StreetProfileDefinition,
     /// One entry per directed arc (adjacency slot), aligned with `adj_meters`.
-    pub arc_millis: Vec<u32>,
+    /// Private with a read-only accessor: the cached speed bound below is
+    /// correct only for the costs it was measured over.
+    arc_millis: Vec<u32>,
+    /// The greatest *chord* speed any permitted arc attains on this network:
+    /// straight-line metres between the arc's endpoint coordinates (one
+    /// shared vertex-coordinate table) per second of compiled cost. The
+    /// goal-directed search divides by it, and because every distance in
+    /// that bound derives from the same table, the heuristic stays
+    /// admissible whatever the stored edge lengths claim — and tighter than
+    /// a length-based bound wherever edges bend. Computed lazily on the
+    /// first goal-directed query, so matrix-only workloads never pay for it
+    /// (or for the table); infinite when a permitted zero-cost arc spans a
+    /// nonzero chord, which disables the distance term entirely.
+    max_effective_speed: std::sync::OnceLock<f64>,
+}
+
+impl CompiledStreetProfile {
+    /// The per-arc millisecond costs, `u32::MAX` for a forbidden arc.
+    pub fn arc_millis(&self) -> &[u32] {
+        &self.arc_millis
+    }
+
+    /// The lazily cached chord-speed bound (see the field's documentation).
+    pub(super) fn effective_speed_cache(&self) -> &std::sync::OnceLock<f64> {
+        &self.max_effective_speed
+    }
 }
 
 impl StreetNetwork {
@@ -397,6 +424,7 @@ impl StreetNetwork {
         Ok(CompiledStreetProfile {
             definition: definition.clone(),
             arc_millis,
+            max_effective_speed: std::sync::OnceLock::new(),
         })
     }
 

@@ -72,6 +72,14 @@ impl Endpoint {
     }
 }
 
+/// The safety margin on the A* heuristic's straight-line metres: arc lengths
+/// come from the extraction's geodesic while the heuristic measures with the
+/// local-planar [`segment_length`], so the two can disagree by well under half
+/// a percent. Scaling the distance down (after subtracting a one-metre
+/// absolute guard for coordinate quantization) keeps the heuristic admissible
+/// across that disagreement at a negligible cost in pruning.
+const ASTAR_METRIC_GUARD: f64 = 0.995;
+
 /// Reusable per-thread state for the directed millisecond search, mirroring
 /// [`SearchState`](super::search::SearchState) but over `u64` milliseconds.
 /// A time query records only times; the predecessor array behind
@@ -88,6 +96,9 @@ pub(super) struct DirectedState {
     previous: Vec<(u32, u32)>,
     /// Pending `(time, vertex)` entries.
     heap: BinaryHeap<Reverse<(u64, u32)>>,
+    /// Pending `(estimate, time, vertex)` entries of a goal-directed search —
+    /// its own heap, so the Dijkstra one keeps its shape.
+    astar_heap: BinaryHeap<Reverse<(u64, u64, u32)>>,
 }
 
 impl DirectedState {
@@ -100,6 +111,14 @@ impl DirectedState {
         }
         self.touched.clear();
         self.heap.clear();
+        self.astar_heap.clear();
+    }
+
+    /// How many vertices the last search labelled — the pruning metric the
+    /// goal-directedness tests read.
+    #[cfg(test)]
+    pub(super) fn touched_count(&self) -> usize {
+        self.touched.len()
     }
 
     /// Clears and grows the predecessor array too. Only a reconstructing
@@ -148,6 +167,130 @@ fn connector_millis(connector: f64, connector_speed: f64) -> u64 {
     (connector / connector_speed * 1000.0).ceil() as u64
 }
 
+/// The A* remaining-cost bound. Any route must still reach one of the
+/// destination edge's permitted egress endpoints and pay its exact arrival
+/// offset (partial edge and connector), so the remaining cost is at least the
+/// guarded straight-line metres to the *ball* covering those endpoints —
+/// centred between them, shrunk by half their span — at the profile's
+/// greatest compiled arc speed, plus the smaller offset. One centre keeps the
+/// evaluation to a single hypot on the relaxation hot path; ending on the
+/// endpoints keeps the connector out of the bounded segment, so
+/// `connector_speed` — which validation does not bound by `max_speed` —
+/// cannot break admissibility.
+///
+/// Distances are measured in one fixed Euclidean frame whose per-degree
+/// scales are the minima over the query's reachable latitude band — a true
+/// metric (so the bound is consistent) that never exceeds the local planar
+/// distance (so it stays a lower bound). Longitude differences are plain:
+/// extracts are contiguous and never cross the antimeridian, per the street
+/// network's documented contract.
+struct AstarHeuristic {
+    /// The ball centre, degrees.
+    lon: f64,
+    lat: f64,
+    per_lon: f64,
+    per_lat: f64,
+    /// Half the endpoints' span plus the one-metre quantization guard.
+    slack: f64,
+    /// Guarded milliseconds per frame metre.
+    scale: f64,
+    /// The smaller arrival offset, milliseconds.
+    offset: u64,
+}
+
+impl AstarHeuristic {
+    fn new(
+        network: &StreetNetwork,
+        seeds: &[Endpoint],
+        arrivals: &[Endpoint],
+        max_speed: f64,
+        cutoff: u64,
+    ) -> AstarHeuristic {
+        // Targets read the vertex-coordinate table — the same metric the
+        // speed bound is measured in, so the whole admissibility argument
+        // rests on one coordinate per vertex whatever the input geometry
+        // claims elsewhere.
+        let targets: Vec<(f64, f64, u64)> = arrivals
+            .iter()
+            .map(|arrival| {
+                let (lon, lat) = network.vertex_coordinates()[arrival.vertex as usize];
+                (lon, lat, arrival.millis)
+            })
+            .collect();
+        // Every vertex the search can label is within the cutoff of a seed;
+        // 110 km per degree under-divides the true latitude scale, so the
+        // band only overshoots. The scales are minimised over the band:
+        // metres per longitude degree shrink toward the poles, metres per
+        // latitude degree toward the equator.
+        let latitudes = seeds
+            .iter()
+            .map(|seed| {
+                let (_, lat) = network.vertex_coordinates()[seed.vertex as usize];
+                if lat.is_nan() {
+                    0.0
+                } else {
+                    lat
+                }
+            })
+            .chain(targets.iter().map(|&(_, lat, _)| lat));
+        let (low, high) = latitudes.fold((90.0f64, -90.0f64), |(low, high), lat| {
+            (low.min(lat), high.max(lat))
+        });
+        let reach = cutoff as f64 / 1000.0 * max_speed / 110_000.0;
+        let low = (low - reach).max(-90.0);
+        let high = (high + reach).min(90.0);
+        let widest = low.abs().max(high.abs());
+        let flattest = if low <= 0.0 && high >= 0.0 {
+            0.0
+        } else {
+            low.abs().min(high.abs())
+        };
+        let (per_lon, _) = meters_per_degree(widest);
+        let per_lon = per_lon.max(0.0);
+        let (_, per_lat) = meters_per_degree(flattest);
+        // Collapse the (at most two) endpoints into one ball: the centre,
+        // half their frame-metre span as slack, the smaller offset.
+        let (first_lon, first_lat, first_offset) = targets[0];
+        let (lon, lat, slack, offset) = if targets.len() == 1 {
+            (first_lon, first_lat, 0.0, first_offset)
+        } else {
+            let (other_lon, other_lat, other_offset) = targets[1];
+            let dx = (first_lon - other_lon) * per_lon;
+            let dy = (first_lat - other_lat) * per_lat;
+            (
+                (first_lon + other_lon) / 2.0,
+                (first_lat + other_lat) / 2.0,
+                (dx * dx + dy * dy).sqrt() / 2.0,
+                first_offset.min(other_offset),
+            )
+        };
+        AstarHeuristic {
+            lon,
+            lat,
+            per_lon,
+            per_lat,
+            slack: slack + 1.0,
+            scale: ASTAR_METRIC_GUARD * 1000.0 / max_speed,
+            offset,
+        }
+    }
+
+    /// `h` at a vertex coordinate. Floored on conversion — rounding down
+    /// only loosens the bound; an isolated vertex's NaN coordinate collapses
+    /// the distance term to zero, which is merely a weaker bound.
+    #[inline]
+    fn bound(&self, (lon, lat): (f64, f64)) -> u64 {
+        let dx = (lon - self.lon) * self.per_lon;
+        let dy = (lat - self.lat) * self.per_lat;
+        let meters = (dx * dx + dy * dy).sqrt() - self.slack;
+        if meters <= 0.0 {
+            return self.offset;
+        }
+        // A NaN coordinate lands here and casts to zero millis.
+        ((meters * self.scale) as u64).saturating_add(self.offset)
+    }
+}
+
 impl StreetNetwork {
     /// The adjacency slot carrying edge `edge` from `from` to `to`, if any.
     fn slot_between(&self, from: u32, to: u32, edge: u32) -> Option<usize> {
@@ -187,7 +330,7 @@ impl StreetNetwork {
     ) -> (Option<usize>, Option<usize>) {
         let (forward, reverse) = self.edge_slots(snap.edge);
         let permitted =
-            |slot: Option<usize>| slot.filter(|&slot| profile.arc_millis[slot] != u32::MAX);
+            |slot: Option<usize>| slot.filter(|&slot| profile.arc_millis()[slot] != u32::MAX);
         (permitted(forward), permitted(reverse))
     }
 
@@ -197,7 +340,7 @@ impl StreetNetwork {
         [forward, reverse]
             .into_iter()
             .flatten()
-            .any(|slot| profile.arc_millis[slot] != u32::MAX)
+            .any(|slot| profile.arc_millis()[slot] != u32::MAX)
     }
 
     /// Snaps a coordinate to the nearest edge `profile` can actually use.
@@ -236,7 +379,7 @@ impl StreetNetwork {
         } else if let Some(slot) = reverse {
             seeds.push(Endpoint::new(
                 from,
-                connector.saturating_add(partial_millis(profile.arc_millis[slot], snap.fraction)),
+                connector.saturating_add(partial_millis(profile.arc_millis()[slot], snap.fraction)),
                 0.0,
             ));
         }
@@ -248,7 +391,7 @@ impl StreetNetwork {
             seeds.push(Endpoint::new(
                 to,
                 connector.saturating_add(partial_millis(
-                    profile.arc_millis[slot],
+                    profile.arc_millis()[slot],
                     1.0 - snap.fraction,
                 )),
                 1.0,
@@ -273,7 +416,7 @@ impl StreetNetwork {
         } else if let Some(slot) = forward {
             offsets.push(Endpoint::new(
                 from,
-                connector.saturating_add(partial_millis(profile.arc_millis[slot], snap.fraction)),
+                connector.saturating_add(partial_millis(profile.arc_millis()[slot], snap.fraction)),
                 0.0,
             ));
         }
@@ -285,7 +428,7 @@ impl StreetNetwork {
             offsets.push(Endpoint::new(
                 to,
                 connector.saturating_add(partial_millis(
-                    profile.arc_millis[slot],
+                    profile.arc_millis()[slot],
                     1.0 - snap.fraction,
                 )),
                 1.0,
@@ -322,7 +465,7 @@ impl StreetNetwork {
         } else {
             reverse
         };
-        slot.map(|slot| connectors.saturating_add(partial_millis(profile.arc_millis[slot], span)))
+        slot.map(|slot| connectors.saturating_add(partial_millis(profile.arc_millis()[slot], span)))
     }
 
     /// Reusable one-to-many directed search: relax each vertex's outgoing arcs
@@ -338,7 +481,7 @@ impl StreetNetwork {
         state.prepare(self.vertex_count() as usize);
         let offsets = self.arrays().adjacency_offsets();
         let targets = self.arrays().adj_targets();
-        let arc_millis = &profile.arc_millis;
+        let arc_millis = profile.arc_millis();
         for source in sources {
             let (vertex, time) = (source.vertex, source.millis);
             if time <= cutoff && time < state.time(vertex) {
@@ -384,7 +527,7 @@ impl StreetNetwork {
         let offsets = self.arrays().adjacency_offsets();
         let targets = self.arrays().adj_targets();
         let edges = self.arrays().adj_edges();
-        let arc_millis = &profile.arc_millis;
+        let arc_millis = profile.arc_millis();
         for source in sources {
             let (vertex, time) = (source.vertex, source.millis);
             if time <= cutoff && time < state.time(vertex) {
@@ -406,13 +549,303 @@ impl StreetNetwork {
                 }
                 let next = time.saturating_add(u64::from(cost));
                 let target = targets[slot];
-                if next <= cutoff && next < state.time(target) {
+                if next > cutoff {
+                    continue;
+                }
+                if next < state.time(target) {
                     state.set(target, next);
                     state.previous[target as usize] = (vertex, edges[slot]);
                     state.heap.push(Reverse((next, target)));
+                } else if next == state.time(target) && cost > 0 {
+                    // An equal-cost offer: keep the smallest (vertex, edge),
+                    // so the recorded route is a pure function of the graph
+                    // and never of relaxation order — the goal-directed
+                    // search resolves the same tie the same way. Positive
+                    // cost only: the pointer then always targets a strictly
+                    // earlier label, keeping the forest acyclic (a zero-cost
+                    // arc keeps its first-found predecessor).
+                    let candidate = (vertex, edges[slot]);
+                    if candidate < state.previous[target as usize] {
+                        state.previous[target as usize] = candidate;
+                    }
                 }
             }
         }
+    }
+
+    /// A vertex's coordinate in (longitude, latitude) degrees — a vertex is
+    /// its edge's first or last stored geometry coordinate. NaN for an
+    /// isolated vertex, which no search ever reaches.
+    fn vertex_coordinate(&self, vertex: u32) -> Option<(f64, f64)> {
+        let offsets = self.arrays().adjacency_offsets();
+        let slot = offsets[vertex as usize] as usize;
+        if slot >= offsets[vertex as usize + 1] as usize {
+            return None;
+        }
+        let edge = self.arrays().adj_edges()[slot] as usize;
+        let (from, _) = self.edge_endpoints(edge as u32);
+        let coordinates = self.arrays().coordinate_offsets();
+        let position = if from == vertex {
+            coordinates[edge] as usize
+        } else {
+            coordinates[edge + 1] as usize - 1
+        };
+        Some((
+            degrees(self.arrays().lons()[position]),
+            degrees(self.arrays().lats()[position]),
+        ))
+    }
+
+    /// The per-vertex coordinate table, built once per network on the first
+    /// goal-directed query: the heuristic's per-relaxation read becomes one
+    /// contiguous slot instead of a chase through the CSR and geometry
+    /// arrays.
+    pub(super) fn vertex_coordinates(&self) -> &[(f64, f64)] {
+        self.graph.vertex_coordinates.get_or_init(|| {
+            (0..self.vertex_count())
+                .map(|vertex| {
+                    self.vertex_coordinate(vertex)
+                        .unwrap_or((f64::NAN, f64::NAN))
+                })
+                .collect()
+        })
+    }
+
+    /// The lazily computed greatest chord speed of `profile`'s permitted
+    /// arcs, measured over the vertex-coordinate table (see
+    /// [`CompiledStreetProfile::max_effective_speed`]). A permitted zero-cost
+    /// arc spanning a nonzero chord is free spatial movement — no finite
+    /// speed bounds it, so the result is infinite and the heuristic's
+    /// distance term vanishes (the search degrades to Dijkstra ordering,
+    /// still correct).
+    fn chord_speed_bound(&self, profile: &CompiledStreetProfile) -> f64 {
+        let coordinates = self.vertex_coordinates();
+        let endpoints = self.arrays().endpoints();
+        let edges = self.arrays().adj_edges();
+        let mut fastest = 0.0f64;
+        for (slot, &millis) in profile.arc_millis().iter().enumerate() {
+            if millis == u32::MAX {
+                continue;
+            }
+            let edge = edges[slot] as usize;
+            let (from_lon, from_lat) = coordinates[endpoints[2 * edge] as usize];
+            let (to_lon, to_lat) = coordinates[endpoints[2 * edge + 1] as usize];
+            let chord = segment_length(from_lon, from_lat, to_lon, to_lat);
+            if chord.is_nan() || chord <= 0.0 {
+                continue;
+            }
+            if millis == 0 {
+                return f64::INFINITY;
+            }
+            fastest = fastest.max(chord / (f64::from(millis) / 1000.0));
+        }
+        if fastest > 0.0 {
+            fastest
+        } else {
+            profile.definition.max_speed
+        }
+    }
+
+    /// Goal-directed single-pair search: Dijkstra over the same arcs, ordered
+    /// by `g + h` where `h` lower-bounds the remaining cost to the
+    /// destination, so the frontier leans toward the target and the loop can
+    /// stop as soon as no queued label can beat the best completed total.
+    ///
+    /// `h` is the guarded straight-line metres toward the permitted egress
+    /// endpoints at the lazily measured [`Self::chord_speed_bound`], plus the
+    /// smaller exact arrival offset (see [`AstarHeuristic`]) — admissible
+    /// because every distance in both the bound and the heuristic reads the
+    /// one vertex-coordinate table, so the triangle inequality of that table
+    /// alone carries the proof, whatever the stored edge lengths claim. The
+    /// loop tolerates label reopening, so correctness needs admissibility
+    /// only, not consistency. `best0` carries the direct same-edge candidate.
+    ///
+    /// Matrix rows keep [`directed_dijkstra`](Self::directed_dijkstra): a
+    /// one-to-many search serves every target from one settled state, so a
+    /// goal bias has nothing to prune there.
+    fn directed_astar(
+        &self,
+        profile: &CompiledStreetProfile,
+        seeds: &[Endpoint],
+        to: &Snap,
+        best0: Option<u64>,
+        cutoff: u64,
+        state: &mut DirectedState,
+    ) -> Option<u64> {
+        let mut best = best0.filter(|&direct| direct <= cutoff);
+        let arrivals = self.directed_egress(to, profile);
+        if arrivals.is_empty() {
+            // No permitted way off the network at the destination: the only
+            // possible route is the direct same-edge one.
+            return best;
+        }
+        let max_speed = *profile
+            .effective_speed_cache()
+            .get_or_init(|| self.chord_speed_bound(profile));
+        let heuristic = AstarHeuristic::new(self, seeds, &arrivals, max_speed, cutoff);
+        state.prepare(self.vertex_count() as usize);
+        let coordinates = self.vertex_coordinates();
+        let offsets = self.arrays().adjacency_offsets();
+        let targets = self.arrays().adj_targets();
+        let arc_millis = profile.arc_millis();
+        for seed in seeds {
+            if seed.millis <= cutoff && seed.millis < state.time(seed.vertex) {
+                state.set(seed.vertex, seed.millis);
+                let bound = heuristic.bound(coordinates[seed.vertex as usize]);
+                state.astar_heap.push(Reverse((
+                    seed.millis.saturating_add(bound),
+                    seed.millis,
+                    seed.vertex,
+                )));
+            }
+        }
+        while let Some(Reverse((estimate, time, vertex))) = state.astar_heap.pop() {
+            // Strictly worse only: entries tying the best still settle, so a
+            // tied egress endpoint's label is final and the leg assembly
+            // resolves ties exactly as a full Dijkstra search would.
+            if best.is_some_and(|b| b < estimate) {
+                break;
+            }
+            if time > state.time(vertex) {
+                continue;
+            }
+            for arrival in &arrivals {
+                if arrival.vertex == vertex {
+                    let total = time.saturating_add(arrival.millis);
+                    if total <= cutoff && best.is_none_or(|b| total < b) {
+                        best = Some(total);
+                    }
+                }
+            }
+            let start = offsets[vertex as usize] as usize;
+            let end = offsets[vertex as usize + 1] as usize;
+            for slot in start..end {
+                let cost = arc_millis[slot];
+                if cost == u32::MAX {
+                    continue;
+                }
+                let next = time.saturating_add(u64::from(cost));
+                let target = targets[slot];
+                if next <= cutoff && next < state.time(target) {
+                    state.set(target, next);
+                    let bound = heuristic.bound(coordinates[target as usize]);
+                    state
+                        .astar_heap
+                        .push(Reverse((next.saturating_add(bound), next, target)));
+                }
+            }
+        }
+        best
+    }
+
+    /// [`directed_astar`](Self::directed_astar) additionally recording each
+    /// vertex's predecessor `(vertex, edge)` — the same time/paths split the
+    /// Dijkstra pair makes, for the same reason.
+    fn directed_astar_with_paths(
+        &self,
+        profile: &CompiledStreetProfile,
+        seeds: &[Endpoint],
+        to: &Snap,
+        best0: Option<u64>,
+        cutoff: u64,
+        state: &mut DirectedState,
+    ) -> Option<u64> {
+        let mut best = best0.filter(|&direct| direct <= cutoff);
+        let arrivals = self.directed_egress(to, profile);
+        if arrivals.is_empty() {
+            return best;
+        }
+        let max_speed = *profile
+            .effective_speed_cache()
+            .get_or_init(|| self.chord_speed_bound(profile));
+        let heuristic = AstarHeuristic::new(self, seeds, &arrivals, max_speed, cutoff);
+        state.prepare_with_previous(self.vertex_count() as usize);
+        let coordinates = self.vertex_coordinates();
+        let offsets = self.arrays().adjacency_offsets();
+        let targets = self.arrays().adj_targets();
+        let edges = self.arrays().adj_edges();
+        let arc_millis = profile.arc_millis();
+        for seed in seeds {
+            if seed.millis <= cutoff && seed.millis < state.time(seed.vertex) {
+                state.set(seed.vertex, seed.millis);
+                state.previous[seed.vertex as usize] = NO_PREVIOUS;
+                let bound = heuristic.bound(coordinates[seed.vertex as usize]);
+                state.astar_heap.push(Reverse((
+                    seed.millis.saturating_add(bound),
+                    seed.millis,
+                    seed.vertex,
+                )));
+            }
+        }
+        while let Some(Reverse((estimate, time, vertex))) = state.astar_heap.pop() {
+            // Strictly worse only: entries tying the best still settle, so a
+            // tied egress endpoint's label is final and the leg assembly
+            // resolves ties exactly as a full Dijkstra search would.
+            if best.is_some_and(|b| b < estimate) {
+                break;
+            }
+            if time > state.time(vertex) {
+                continue;
+            }
+            for arrival in &arrivals {
+                if arrival.vertex == vertex {
+                    let total = time.saturating_add(arrival.millis);
+                    if total <= cutoff && best.is_none_or(|b| total < b) {
+                        best = Some(total);
+                    }
+                }
+            }
+            let start = offsets[vertex as usize] as usize;
+            let end = offsets[vertex as usize + 1] as usize;
+            for slot in start..end {
+                let cost = arc_millis[slot];
+                if cost == u32::MAX {
+                    continue;
+                }
+                let next = time.saturating_add(u64::from(cost));
+                let target = targets[slot];
+                if next > cutoff {
+                    continue;
+                }
+                if next < state.time(target) {
+                    state.set(target, next);
+                    state.previous[target as usize] = (vertex, edges[slot]);
+                    let bound = heuristic.bound(coordinates[target as usize]);
+                    state
+                        .astar_heap
+                        .push(Reverse((next.saturating_add(bound), next, target)));
+                } else if next == state.time(target) && cost > 0 {
+                    // The same order-independent, acyclicity-preserving tie
+                    // rule as the Dijkstra path search.
+                    let candidate = (vertex, edges[slot]);
+                    if candidate < state.previous[target as usize] {
+                        state.previous[target as usize] = candidate;
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// How many vertices A* and cutoff-bounded Dijkstra each label for the
+    /// same single-pair query — the goal-directedness and benchmark metric.
+    #[cfg(test)]
+    pub(super) fn astar_versus_dijkstra_touched(
+        &self,
+        profile: &CompiledStreetProfile,
+        from: &Snap,
+        to: &Snap,
+        max_seconds: f64,
+    ) -> (usize, usize) {
+        let cutoff = (max_seconds * 1000.0).floor() as u64;
+        let seeds = self.directed_seeds(from, profile);
+        let best0 = self.same_edge_millis(from, to, profile);
+        let mut state = DirectedState::default();
+        self.directed_astar(profile, &seeds, to, best0, cutoff, &mut state);
+        let astar = state.touched_count();
+        let mut state = DirectedState::default();
+        self.directed_dijkstra(profile, &seeds, cutoff, &mut state);
+        (astar, state.touched_count())
     }
 
     /// The per-vertex times of a one-to-many directed search, for tests.
@@ -438,9 +871,10 @@ impl StreetNetwork {
 
     /// The directed travel time in whole seconds (rounded up) from `from` to
     /// `to` under `profile`, or `None` when the destination is not reachable
-    /// within `max_seconds`. Combines a forward search from the origin's
-    /// directed seeds with the destination's arrival offsets and the direct
-    /// same-edge candidate.
+    /// within `max_seconds`. A goal-directed A* search from the origin's
+    /// directed seeds toward the destination's arrival offsets, with the
+    /// direct same-edge candidate carried in — answer for answer identical to
+    /// the Dijkstra row a matrix computes, just settling less of the graph.
     pub fn directed_travel_time(
         &self,
         from: &Snap,
@@ -448,8 +882,17 @@ impl StreetNetwork {
         profile: &CompiledStreetProfile,
         max_seconds: f64,
     ) -> Option<u32> {
-        self.directed_times_to_snaps(from, std::slice::from_ref(&Some(*to)), profile, max_seconds)
-            [0]
+        if !max_seconds.is_finite() || max_seconds < 0.0 {
+            return None;
+        }
+        let cutoff = (max_seconds * 1000.0).floor() as u64;
+        let seeds = self.directed_seeds(from, profile);
+        let best0 = self.same_edge_millis(from, to, profile);
+        DIRECTED_STATE.with(|cell| {
+            let state = &mut cell.borrow_mut();
+            let millis = self.directed_astar(profile, &seeds, to, best0, cutoff, state)?;
+            Some(seconds(millis as f64 / 1000.0))
+        })
     }
 
     /// The directed travel times from `from` to each of `targets`, in whole
@@ -457,8 +900,9 @@ impl StreetNetwork {
     ///
     /// One bounded search serves the whole row: every target reads the same
     /// settled labels, so a matrix row costs one street search rather than one
-    /// per pair. Sharing [`arrival_millis`](Self::arrival_millis) with the
-    /// single route keeps the two answers identical cell for cell.
+    /// per pair. The single route runs a goal-directed search instead, over
+    /// the same seeds, egress offsets, and same-edge candidate — the equality
+    /// tests hold the two answers identical cell for cell.
     pub fn directed_times_to_snaps(
         &self,
         from: &Snap,
@@ -576,7 +1020,8 @@ impl StreetNetwork {
     }
 
     /// The reconstructed leg from `from` to `to`, or `None` when unreachable
-    /// within `max_seconds`.
+    /// within `max_seconds` — the goal-directed counterpart of one row cell,
+    /// assembling the leg from the A* predecessors.
     pub fn directed_leg(
         &self,
         from_point: (f64, f64),
@@ -586,14 +1031,28 @@ impl StreetNetwork {
         profile: &CompiledStreetProfile,
         max_seconds: f64,
     ) -> Option<StreetLeg> {
-        self.directed_legs_to_snaps(
-            from_point,
-            from,
-            &[(to_point, Some(*to))],
-            profile,
-            max_seconds,
-        )
-        .swap_remove(0)
+        if !max_seconds.is_finite() || max_seconds < 0.0 {
+            return None;
+        }
+        let cutoff = (max_seconds * 1000.0).floor() as u64;
+        let seeds = self.directed_seeds(from, profile);
+        let best0 = self.same_edge_millis(from, to, profile);
+        DIRECTED_STATE.with(|cell| {
+            let state = &mut cell.borrow_mut();
+            let millis =
+                self.directed_astar_with_paths(profile, &seeds, to, best0, cutoff, state)?;
+            let mut prefix = HashMap::new();
+            Some(self.assemble_leg(
+                from_point,
+                from,
+                to_point,
+                to,
+                profile,
+                millis,
+                state,
+                &mut prefix,
+            ))
+        })
     }
 
     /// The reconstructed legs from `from` to each of `targets`, one search
@@ -736,6 +1195,12 @@ impl StreetNetwork {
             vertices.push(previous);
             edges.push(edge);
             at = previous;
+            // The forest is acyclic by construction; a longer chain is
+            // corrupt state, and failing beats hanging.
+            assert!(
+                vertices.len() <= self.vertex_count() as usize + 1,
+                "predecessor chain exceeds the vertex count"
+            );
         }
         vertices.reverse();
         edges.reverse();
