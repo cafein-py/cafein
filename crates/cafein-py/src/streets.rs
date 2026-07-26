@@ -85,45 +85,23 @@ impl StreetNetwork {
         coordinate_elevations: Option<Vec<f32>>,
         elevation_metadata: Option<(String, f64, String, f64, u32)>,
     ) -> PyResult<StreetNetwork> {
-        if coordinate_elevations.is_some() != elevation_metadata.is_some() {
-            return Err(PyValueError::new_err(
-                "coordinate_elevations and elevation_metadata go together: \
-                 pass both or neither",
-            ));
-        }
-        let inner = CoreStreetNetwork::new_multimodal(
+        let (inner, elevation) = build_multimodal_core(
             vertex_count,
-            0,
-            &edges,
-            &coordinate_offsets,
-            &longitudes,
-            &latitudes,
-            Vec::new(),
-            EdgeAttributes {
-                highway: &edge_highway,
-                surface: &edge_surface,
-                smoothness: &edge_smoothness,
-                flags: &edge_flags,
-                access_forward: &access_forward,
-                access_reverse: &access_reverse,
-                facility_forward: &facility_forward,
-                facility_reverse: &facility_reverse,
-            },
-            coordinate_elevations.as_deref(),
-        )
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let elevation = elevation_metadata.map(
-            |(source, sampling_interval, nodata_policy, coverage, inferred_edges)| ElevationMeta {
-                source,
-                sampling_interval,
-                nodata_policy,
-                coverage,
-                inferred_edges,
-            },
-        );
-        if let Some(meta) = &elevation {
-            check_elevation_meta(meta, inner.edge_count()).map_err(PyValueError::new_err)?;
-        }
+            edges,
+            coordinate_offsets,
+            longitudes,
+            latitudes,
+            edge_highway,
+            edge_surface,
+            edge_smoothness,
+            edge_flags,
+            access_forward,
+            access_reverse,
+            facility_forward,
+            facility_reverse,
+            coordinate_elevations,
+            elevation_metadata,
+        )?;
         Ok(StreetNetwork {
             inner,
             profiles: Vec::new(),
@@ -363,16 +341,10 @@ impl StreetNetwork {
     /// network carries no elevations.
     #[getter]
     fn elevation_metadata(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
-        let Some(meta) = &self.elevation else {
-            return Ok(None);
-        };
-        let dict = PyDict::new(py);
-        dict.set_item("source", &meta.source)?;
-        dict.set_item("sampling_interval", meta.sampling_interval)?;
-        dict.set_item("nodata_policy", &meta.nodata_policy)?;
-        dict.set_item("coverage", meta.coverage)?;
-        dict.set_item("inferred_edges", meta.inferred_edges)?;
-        Ok(Some(dict.into()))
+        self.elevation
+            .as_ref()
+            .map(|meta| elevation_dict(py, meta))
+            .transpose()
     }
 
     /// The stored per-coordinate elevations, aligned with `_coordinates`.
@@ -538,10 +510,86 @@ fn parse_street_meta(
 /// Loads a street artifact into owned memory — the default path.
 type LoadedStreets = (CoreStreetNetwork, u64, Option<ElevationMeta>);
 
+/// The elevation metadata as the Python-facing dict, shared by the
+/// standalone and the transit-carried multimodal graphs.
+pub(super) fn elevation_dict(py: Python<'_>, meta: &ElevationMeta) -> PyResult<Py<PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("source", &meta.source)?;
+    dict.set_item("sampling_interval", meta.sampling_interval)?;
+    dict.set_item("nodata_policy", &meta.nodata_policy)?;
+    dict.set_item("coverage", meta.coverage)?;
+    dict.set_item("inferred_edges", meta.inferred_edges)?;
+    Ok(dict.into())
+}
+
+/// Builds the multimodal street core and its validated elevation metadata
+/// from the union extraction's flat arrays — shared by the standalone
+/// `StreetNetwork` constructor and the `TransportNetwork`'s multimodal
+/// street installer, so both enforce identical invariants.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_multimodal_core(
+    vertex_count: u32,
+    edges: Vec<(u32, u32, f64)>,
+    coordinate_offsets: Vec<u32>,
+    longitudes: Vec<f64>,
+    latitudes: Vec<f64>,
+    edge_highway: Vec<u8>,
+    edge_surface: Vec<u8>,
+    edge_smoothness: Vec<u8>,
+    edge_flags: Vec<u16>,
+    access_forward: Vec<u8>,
+    access_reverse: Vec<u8>,
+    facility_forward: Vec<u8>,
+    facility_reverse: Vec<u8>,
+    coordinate_elevations: Option<Vec<f32>>,
+    elevation_metadata: Option<(String, f64, String, f64, u32)>,
+) -> PyResult<(CoreStreetNetwork, Option<ElevationMeta>)> {
+    if coordinate_elevations.is_some() != elevation_metadata.is_some() {
+        return Err(PyValueError::new_err(
+            "coordinate_elevations and elevation_metadata go together: \
+             pass both or neither",
+        ));
+    }
+    let inner = CoreStreetNetwork::new_multimodal(
+        vertex_count,
+        0,
+        &edges,
+        &coordinate_offsets,
+        &longitudes,
+        &latitudes,
+        Vec::new(),
+        EdgeAttributes {
+            highway: &edge_highway,
+            surface: &edge_surface,
+            smoothness: &edge_smoothness,
+            flags: &edge_flags,
+            access_forward: &access_forward,
+            access_reverse: &access_reverse,
+            facility_forward: &facility_forward,
+            facility_reverse: &facility_reverse,
+        },
+        coordinate_elevations.as_deref(),
+    )
+    .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let elevation = elevation_metadata.map(
+        |(source, sampling_interval, nodata_policy, coverage, inferred_edges)| ElevationMeta {
+            source,
+            sampling_interval,
+            nodata_policy,
+            coverage,
+            inferred_edges,
+        },
+    );
+    if let Some(meta) = &elevation {
+        check_elevation_meta(meta, inner.edge_count()).map_err(PyValueError::new_err)?;
+    }
+    Ok((inner, elevation))
+}
+
 /// The metadata's declared invariants: a positive finite sampling interval,
 /// a coverage share within 0..=1, and an inferred count no larger than the
 /// edge set it describes. Shared by construction and both load paths.
-fn check_elevation_meta(meta: &ElevationMeta, edge_count: u32) -> Result<(), String> {
+pub(super) fn check_elevation_meta(meta: &ElevationMeta, edge_count: u32) -> Result<(), String> {
     if !(meta.sampling_interval.is_finite() && meta.sampling_interval > 0.0) {
         return Err("elevation sampling_interval must be positive and finite".into());
     }
@@ -561,7 +609,11 @@ fn load_street_owned(path: &str, verify: Option<bool>) -> PyResult<LoadedStreets
     let section = &bytes
         [layout.streets_offset as usize..(layout.streets_offset + layout.streets_length) as usize];
     // A street artifact carries no stops, so no link may reference one.
-    let expected_levels = validate_street_shape(path, &streets_meta, layout.streets_length, 0)?;
+    let (expected_levels, block_end) =
+        validate_street_shape(path, &streets_meta, 0, layout.streets_length, 0)?;
+    if block_end != layout.streets_length {
+        return Err(corrupted(path, "street array bounds"));
+    }
     let parts = decode_streets(path, streets_meta, section, expected_levels)?;
     let inner =
         CoreStreetNetwork::from_parts(parts).map_err(|_| corrupted(path, "street attributes"))?;
@@ -606,7 +658,10 @@ fn load_street_mapped(path: &str, verify: Option<bool>) -> PyResult<Result<Loade
     let bytes = backing.bytes();
     let (streets_meta, layout) = parse_street_meta(path, bytes, verify == Some(true))?;
     let elevation = streets_meta.elevation.clone();
-    validate_street_shape(path, &streets_meta, layout.streets_length, 0)?;
+    let (_, block_end) = validate_street_shape(path, &streets_meta, 0, layout.streets_length, 0)?;
+    if block_end != layout.streets_length {
+        return Err(corrupted(path, "street array bounds"));
+    }
     let mut streets_read = if verify == Some(true) {
         layout.streets_length
     } else {

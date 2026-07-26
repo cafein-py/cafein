@@ -20,8 +20,9 @@ impl TransportNetwork {
     /// rewrites it under live mapped readers.
     fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
         let parts = self.streets.as_ref().map(StreetNetwork::to_parts);
+        let multimodal_parts = self.multimodal.as_ref().map(StreetNetwork::to_parts);
         py.allow_threads(|| {
-            let (streets_meta, streets_bytes) = match &parts {
+            let (streets_meta, mut streets_bytes) = match &parts {
                 Some(parts) => {
                     let (descriptors, bytes) = encode_streets(parts);
                     (
@@ -29,14 +30,38 @@ impl TransportNetwork {
                             vertex_count: parts.vertex_count,
                             links: parts.links.clone(),
                             descriptors,
-                            // The transit build path is walk-only; elevations
-                            // and their metadata are the street artifact's.
+                            // The walking graph carries no elevations; they
+                            // belong to the multimodal graph below.
                             elevation: None,
                         }),
                         bytes,
                     )
                 }
                 None => (None, Vec::new()),
+            };
+            // The multimodal union graph's arrays follow the walking arrays
+            // inside the one STREETS section, starting on the array
+            // alignment; its descriptor offsets are shifted to their final
+            // section-relative positions here, so the load path reads both
+            // graphs through the same descriptor machinery.
+            let multimodal_meta = match &multimodal_parts {
+                Some(parts) => {
+                    let base =
+                        (streets_bytes.len() as u64).div_ceil(ARRAY_ALIGNMENT) * ARRAY_ALIGNMENT;
+                    streets_bytes.resize(base as usize, 0);
+                    let (mut descriptors, bytes) = encode_streets(parts);
+                    for descriptor in &mut descriptors {
+                        descriptor.offset += base;
+                    }
+                    streets_bytes.extend_from_slice(&bytes);
+                    Some(StreetsMeta {
+                        vertex_count: parts.vertex_count,
+                        links: parts.links.clone(),
+                        descriptors,
+                        elevation: self.multimodal_elevation.clone(),
+                    })
+                }
+                None => None,
             };
             let artifact = ArtifactRef {
                 feed: &self.feed,
@@ -54,6 +79,8 @@ impl TransportNetwork {
                 walking_hierarchy: self.streets.as_ref().and_then(StreetNetwork::hierarchy),
                 tbtr_time_transfers: &self.tbtr_time_transfers,
                 mctbtr_transfers: &self.mctbtr_transfers,
+                multimodal: multimodal_meta,
+                multimodal_modes: &self.multimodal_modes,
             };
             let meta = bincode::serialize(&artifact)
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -222,10 +249,12 @@ pub(super) const STREET_ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINST";
 // 2: optional elevation metadata in `StreetsMeta`, as in network format 13.
 pub(super) const STREET_ARTIFACT_FORMAT: u32 = 2;
 
-// 13: `StreetsMeta` carries optional elevation metadata (DEM source,
-// sampling interval, nodata policy, coverage) alongside the format-12
-// multimodal arrays. Earlier formats must be rebuilt.
-pub(super) const ARTIFACT_FORMAT: u32 = 13;
+// 14: the META gains an optional second `StreetsMeta` for the multimodal
+// union street graph, whose arrays follow the walking arrays inside the
+// STREETS section (descriptor offsets pre-shifted to their position).
+// 13 added optional elevation metadata to `StreetsMeta`. Earlier formats
+// must be rebuilt.
+pub(super) const ARTIFACT_FORMAT: u32 = 14;
 
 /// Section tags in the container directory.
 pub(super) const SECTION_META: u16 = 1;
@@ -276,6 +305,12 @@ pub(super) struct ArtifactRef<'a> {
     /// The cached multicriteria TBTR transfer set with its date and factor
     /// vector, when present.
     mctbtr_transfers: &'a Option<(String, Vec<f64>, cafein_core::tbtr::TransferSet)>,
+    /// The multimodal union street graph's meta, when installed. Its
+    /// descriptor offsets are already section-relative: the arrays sit after
+    /// the walking arrays inside the one STREETS section.
+    multimodal: Option<StreetsMeta>,
+    /// The pruning modes the multimodal graph was built with.
+    multimodal_modes: &'a Option<Vec<String>>,
 }
 
 /// The decoded part of the saved network, owned after reading.
@@ -296,13 +331,15 @@ pub(super) struct Artifact {
     walking_hierarchy: Option<ContractionHierarchy>,
     tbtr_time_transfers: Option<(String, cafein_core::tbtr::TransferSet)>,
     mctbtr_transfers: Option<(String, Vec<f64>, cafein_core::tbtr::TransferSet)>,
+    multimodal: Option<StreetsMeta>,
+    multimodal_modes: Option<Vec<String>>,
 }
 
 /// The street layer's decoded state: link records (endpoints
 /// denormalised, so the vertex→link index rebuilds from these alone),
 /// scalars, and the descriptor table locating every raw array inside the
 /// STREETS section.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub(super) struct StreetsMeta {
     pub(super) vertex_count: u32,
     pub(super) links: Vec<StoredLink>,
@@ -668,17 +705,20 @@ pub(super) fn expected_level_starts(leaves: usize) -> Vec<u32> {
 }
 
 /// Validates a street layer from the decoded META alone: descriptor
-/// order, sequential aligned layout inside the section, counts mutually
-/// consistent (so no query indexes out of an array), and well-formed
-/// link records. Runs on every load path without touching a single
-/// STREETS byte — which is what keeps a mapped load lazy. Returns the
-/// level-start table the index must carry.
+/// order, sequential aligned layout inside the section starting at
+/// `block_start`, counts mutually consistent (so no query indexes out of
+/// an array), and well-formed link records. Runs on every load path
+/// without touching a single STREETS byte — which is what keeps a mapped
+/// load lazy. Returns the level-start table the index must carry and the
+/// block's end byte, which the caller checks against what follows (the
+/// section end, or the next block), so trailing garbage stays rejected.
 pub(super) fn validate_street_shape(
     path: &str,
     meta: &StreetsMeta,
+    block_start: u64,
     section_length: u64,
     stop_count: u32,
-) -> PyResult<Vec<u32>> {
+) -> PyResult<(Vec<u32>, u64)> {
     // The core arrays come first, in fixed order; the optional multimodal
     // arrays follow as an order-preserving subsequence of the canonical
     // optional order (any absent, but never reordered or duplicated).
@@ -710,8 +750,8 @@ pub(super) fn validate_street_shape(
     // out: sequential, each at the next aligned position — no gaps,
     // overlaps, or aliasing. Checked arithmetic throughout, over the core
     // and any optional arrays alike.
-    let mut expected_offset = 0u64;
-    let mut last_end = 0u64;
+    let mut expected_offset = block_start;
+    let mut last_end = block_start;
     for descriptor in &meta.descriptors {
         let extent = descriptor
             .count
@@ -725,9 +765,6 @@ pub(super) fn validate_street_shape(
         }
         last_end = end;
         expected_offset = end.div_ceil(ARRAY_ALIGNMENT) * ARRAY_ALIGNMENT;
-    }
-    if last_end != section_length {
-        return Err(corrupted(path, "street array bounds"));
     }
     let count = |i: usize| meta.descriptors[i].count;
     let vertices = u64::from(meta.vertex_count);
@@ -794,7 +831,34 @@ pub(super) fn validate_street_shape(
             return Err(corrupted(path, "street link records"));
         }
     }
-    Ok(expected_levels)
+    Ok((expected_levels, last_end))
+}
+
+/// Where the multimodal block begins inside the STREETS section — its first
+/// descriptor's offset (0 for an empty table, which the shape validation
+/// then rejects).
+fn multimodal_block_start(meta: &StreetsMeta) -> u64 {
+    meta.descriptors
+        .first()
+        .map_or(0, |descriptor| descriptor.offset)
+}
+
+/// The walking block must end (aligned) exactly where the next block starts,
+/// or at the section end when nothing follows — trailing garbage stays
+/// rejected with two blocks just as it was with one.
+fn check_block_boundary(
+    path: &str,
+    block_end: u64,
+    next_block: Option<u64>,
+    section_length: u64,
+) -> PyResult<()> {
+    let target = next_block.unwrap_or(section_length);
+    let aligned = block_end.div_ceil(ARRAY_ALIGNMENT) * ARRAY_ALIGNMENT;
+    if block_end == target || (next_block.is_some() && aligned == target) {
+        Ok(())
+    } else {
+        Err(corrupted(path, "street array bounds"))
+    }
 }
 
 /// Reads the optional multimodal arrays owned, located by descriptor
@@ -1101,7 +1165,7 @@ pub(super) fn parse_container(
 
 /// A parsed artifact: the decoded META, the adopted street network, and
 /// how many STREETS-section bytes the load explicitly read.
-pub(super) type LoadedArtifact = (Artifact, Option<StreetNetwork>, u64);
+pub(super) type LoadedArtifact = (Artifact, Option<StreetNetwork>, Option<StreetNetwork>, u64);
 
 /// Validates a persisted walking hierarchy against the street graph it rides
 /// with, before its buckets are rebuilt on load: it must accompany a street
@@ -1154,10 +1218,12 @@ pub(super) fn load_owned(path: &str, verify: Option<bool>) -> PyResult<LoadedArt
         return Err(corrupted(path, "missing street section"));
     }
     let stop_count = artifact.timetable.stop_count();
+    let next_block = artifact.multimodal.as_ref().map(multimodal_block_start);
     let streets = match artifact.streets.take() {
         Some(streets_meta) => {
-            let expected_levels =
-                validate_street_shape(path, &streets_meta, layout.streets_length, stop_count)?;
+            let (expected_levels, block_end) =
+                validate_street_shape(path, &streets_meta, 0, layout.streets_length, stop_count)?;
+            check_block_boundary(path, block_end, next_block, layout.streets_length)?;
             let parts = decode_streets(path, streets_meta, section, expected_levels)?;
             Some(
                 StreetNetwork::from_parts(parts)
@@ -1166,8 +1232,50 @@ pub(super) fn load_owned(path: &str, verify: Option<bool>) -> PyResult<LoadedArt
         }
         None => None,
     };
+    let multimodal = match &artifact.multimodal {
+        Some(meta) => {
+            let start = multimodal_block_start(meta);
+            let (expected_levels, block_end) =
+                validate_street_shape(path, meta, start, layout.streets_length, 0)?;
+            check_block_boundary(path, block_end, None, layout.streets_length)?;
+            let parts = decode_streets(path, meta.clone(), section, expected_levels)?;
+            Some(adopt_multimodal(path, parts, meta)?)
+        }
+        None => None,
+    };
     validate_walking_hierarchy(path, &artifact, &streets, true)?;
-    Ok((artifact, streets, layout.streets_length))
+    Ok((artifact, streets, multimodal, layout.streets_length))
+}
+
+/// Builds the multimodal graph from decoded parts and revalidates the
+/// elevation invariants construction enforces: metadata present exactly when
+/// the elevations are, and its declared fields within bounds.
+fn adopt_multimodal(
+    path: &str,
+    parts: StreetNetworkParts,
+    meta: &StreetsMeta,
+) -> PyResult<StreetNetwork> {
+    let network = StreetNetwork::from_parts(parts)
+        .map_err(|_| corrupted(path, "multimodal street attributes"))?;
+    check_multimodal_elevation(path, &network, meta)?;
+    Ok(network)
+}
+
+/// The elevation-consistency check both load paths share.
+fn check_multimodal_elevation(
+    path: &str,
+    network: &StreetNetwork,
+    meta: &StreetsMeta,
+) -> PyResult<()> {
+    if network.elevations().is_some() != meta.elevation.is_some() {
+        return Err(corrupted(path, "multimodal elevation metadata"));
+    }
+    if let Some(elevation) = &meta.elevation {
+        if crate::streets::check_elevation_meta(elevation, network.edge_count()).is_err() {
+            return Err(corrupted(path, "multimodal elevation metadata"));
+        }
+    }
+    Ok(())
 }
 
 /// Loads an artifact with the street arrays as views into a memory map.
@@ -1225,9 +1333,12 @@ pub(super) fn load_mapped(
         return Err(corrupted(path, "missing street section"));
     }
     let stop_count = artifact.timetable.stop_count();
+    let next_block = artifact.multimodal.as_ref().map(multimodal_block_start);
     let streets = match artifact.streets.take() {
         Some(streets_meta) => {
-            validate_street_shape(path, &streets_meta, layout.streets_length, stop_count)?;
+            let (_, block_end) =
+                validate_street_shape(path, &streets_meta, 0, layout.streets_length, stop_count)?;
+            check_block_boundary(path, block_end, next_block, layout.streets_length)?;
             let ranges: Vec<(u64, u64)> = streets_meta
                 .descriptors
                 .iter()
@@ -1247,7 +1358,9 @@ pub(super) fn load_mapped(
                     .sum::<u64>();
             }
             let spec = MappedStreets {
-                backing,
+                // A clone of the Arc: the map stays borrowed for the
+                // multimodal decode below.
+                backing: backing.clone(),
                 vertex_count: streets_meta.vertex_count,
                 links: streets_meta.links,
                 adjacency_offsets: ranges[0],
@@ -1272,16 +1385,66 @@ pub(super) fn load_mapped(
         }
         None => None,
     };
+    // The multimodal union graph maps exactly as the walking one: core CSR
+    // and geometry in place, the optional attribute/elevation arrays decoded
+    // owned — the same laziness the street artifact has.
+    let multimodal = match &artifact.multimodal {
+        Some(meta) => {
+            let start = multimodal_block_start(meta);
+            let (_, block_end) =
+                validate_street_shape(path, meta, start, layout.streets_length, 0)?;
+            check_block_boundary(path, block_end, None, layout.streets_length)?;
+            let ranges: Vec<(u64, u64)> = meta
+                .descriptors
+                .iter()
+                .map(|descriptor| (layout.streets_offset + descriptor.offset, descriptor.count))
+                .collect();
+            let section = &bytes[layout.streets_offset as usize
+                ..(layout.streets_offset + layout.streets_length) as usize];
+            let (attributes, elevations) =
+                decode_optional_street_arrays(section, &meta.descriptors);
+            if verify != Some(true) {
+                streets_read += meta.descriptors[STREET_ARRAY_ORDER.len()..]
+                    .iter()
+                    .map(|descriptor| descriptor.count * descriptor.kind.size())
+                    .sum::<u64>();
+            }
+            let spec = MappedStreets {
+                backing: backing.clone(),
+                vertex_count: meta.vertex_count,
+                links: meta.links.clone(),
+                adjacency_offsets: ranges[0],
+                adj_targets: ranges[1],
+                adj_meters: ranges[2],
+                adj_edges: ranges[3],
+                endpoints: ranges[4],
+                lengths: ranges[5],
+                coordinate_offsets: ranges[6],
+                lons: ranges[7],
+                lats: ranges[8],
+                cumulative: ranges[9],
+                index_boxes: ranges[10],
+                index_payload: ranges[11],
+                attributes,
+                elevations,
+            };
+            let network = StreetNetwork::from_mapped(spec)
+                .map_err(|_| corrupted(path, "multimodal street array bounds"))?;
+            check_multimodal_elevation(path, &network, meta)?;
+            Some(network)
+        }
+        None => None,
+    };
     // Only the `verify` path has paged (and CRC-checked) the STREETS section, so
     // only there is recomputing the CSR fingerprint free of extra reads.
     validate_walking_hierarchy(path, &artifact, &streets, verify == Some(true))?;
-    Ok(Ok((artifact, streets, streets_read)))
+    Ok(Ok((artifact, streets, multimodal, streets_read)))
 }
 
 /// Assembles a network from a loaded artifact, rebuilding the derived
 /// lookup tables.
 pub(super) fn assemble(
-    (artifact, streets, streets_bytes_read): LoadedArtifact,
+    (artifact, streets, multimodal, streets_bytes_read): LoadedArtifact,
 ) -> TransportNetwork {
     let Artifact {
         feed,
@@ -1299,7 +1462,10 @@ pub(super) fn assemble(
         walking_hierarchy,
         tbtr_time_transfers,
         mctbtr_transfers,
+        multimodal: multimodal_meta,
+        multimodal_modes,
     } = artifact;
+    let multimodal_elevation = multimodal_meta.and_then(|meta| meta.elevation);
     // The contraction persisted; its buckets are derived state, rebuilt here on
     // the loading thread exactly as `install_hierarchy` builds them for a fresh
     // contraction, so a loaded network matches a freshly built one.
@@ -1329,6 +1495,9 @@ pub(super) fn assemble(
         geometry,
         leg_geometry,
         streets,
+        multimodal,
+        multimodal_elevation,
+        multimodal_modes,
         stops_by_id,
         stops_by_qualified_id,
         trips_by_public_id,

@@ -65,6 +65,9 @@ impl TransportNetwork {
             stops_by_qualified_id,
             trips_by_public_id,
             streets_bytes_read: 0,
+            multimodal: None,
+            multimodal_elevation: None,
+            multimodal_modes: None,
         })
     }
 
@@ -644,6 +647,92 @@ impl TransportNetwork {
         self.mcultra_window = None;
         self.mcultra_factors = None;
         Ok(())
+    }
+
+    /// Installs the multimodal union street graph — a second street section
+    /// with per-arc mode permissions, attributes, and optional elevations,
+    /// behind the cycling / e-scooter access and egress the PT integration
+    /// adds. The payload is the standalone ``StreetNetwork`` constructor's,
+    /// produced by the union OSM extraction. The walking graph and every
+    /// query over it are untouched.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (modes, vertex_count, edges, coordinate_offsets, longitudes, latitudes,
+                        edge_highway, edge_surface, edge_smoothness, edge_flags,
+                        access_forward, access_reverse, facility_forward, facility_reverse,
+                        coordinate_elevations = None, elevation_metadata = None))]
+    fn set_multimodal_streets(
+        &mut self,
+        modes: Vec<String>,
+        vertex_count: u32,
+        edges: Vec<(u32, u32, f64)>,
+        coordinate_offsets: Vec<u32>,
+        longitudes: Vec<f64>,
+        latitudes: Vec<f64>,
+        edge_highway: Vec<u8>,
+        edge_surface: Vec<u8>,
+        edge_smoothness: Vec<u8>,
+        edge_flags: Vec<u16>,
+        access_forward: Vec<u8>,
+        access_reverse: Vec<u8>,
+        facility_forward: Vec<u8>,
+        facility_reverse: Vec<u8>,
+        coordinate_elevations: Option<Vec<f32>>,
+        elevation_metadata: Option<(String, f64, String, f64, u32)>,
+    ) -> PyResult<()> {
+        let (inner, elevation) = crate::streets::build_multimodal_core(
+            vertex_count,
+            edges,
+            coordinate_offsets,
+            longitudes,
+            latitudes,
+            edge_highway,
+            edge_surface,
+            edge_smoothness,
+            edge_flags,
+            access_forward,
+            access_reverse,
+            facility_forward,
+            facility_reverse,
+            coordinate_elevations,
+            elevation_metadata,
+        )?;
+        self.multimodal = Some(inner);
+        self.multimodal_elevation = elevation;
+        self.multimodal_modes = Some(modes);
+        Ok(())
+    }
+
+    /// Whether the multimodal union street graph is installed.
+    #[getter]
+    fn has_multimodal_streets(&self) -> bool {
+        self.multimodal.is_some()
+    }
+
+    /// The pruning modes the multimodal graph was built with, or ``None``.
+    #[getter]
+    fn street_modes(&self) -> Option<Vec<String>> {
+        self.multimodal_modes.clone()
+    }
+
+    /// A deterministic checksum over the multimodal graph's encoded arrays —
+    /// core CSR, geometry, attributes, and elevations alike. Internal; the
+    /// round-trip tests compare it across save/load paths.
+    #[getter]
+    fn _multimodal_checksum(&self) -> Option<u32> {
+        self.multimodal.as_ref().map(|network| {
+            let (_, bytes) = crate::artifact::encode_streets(&network.to_parts());
+            crate::artifact::crc32(&bytes)
+        })
+    }
+
+    /// Provenance of the multimodal graph's sampled elevations, or ``None``
+    /// without a DEM — the dict ``StreetNetwork.elevation_metadata`` returns.
+    #[getter]
+    fn multimodal_elevation_metadata(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        self.multimodal_elevation
+            .as_ref()
+            .map(|meta| crate::streets::elevation_dict(py, meta))
+            .transpose()
     }
 
     /// Builds and installs a contraction hierarchy over the walking graph, so

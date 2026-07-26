@@ -70,6 +70,9 @@ class TransportNetwork:
         trip_distances=True,
         leg_geometries=True,
         ultra=False,
+        street_modes=None,
+        dem=None,
+        dem_interval=25.0,
     ):
         """Build a network from GTFS archives and an optional OSM extract.
 
@@ -111,6 +114,17 @@ class TransportNetwork:
             Also store the trips' polylines, so transit legs report
             their geometry; disable to save memory when geometries are
             never needed. Ignored when `trip_distances` is off.
+        street_modes : iterable of str, optional
+            Also build the multimodal union street graph from `osm_pbf`
+            (e.g. ``("walk", "bicycle", "e_scooter")``, the pruning modes
+            of ``StreetNetwork.from_osm``) and carry it with the network —
+            the second street section behind cycling / e-scooter access
+            and egress. The walking graph and every existing query are
+            untouched. Requires `osm_pbf`.
+        dem, dem_interval : optional
+            Elevation for the multimodal graph, exactly as in
+            ``StreetNetwork.from_osm``; only meaningful with
+            `street_modes`.
         ultra : bool (optional, default: False)
             Also compute the whole-day ULTRA intermediate-transfer
             shortcuts (see ``compute_ultra_shortcuts``), giving the
@@ -120,11 +134,17 @@ class TransportNetwork:
             network); ``save`` the result and reuse it. Off by default.
 
         The build reads the input files more than once (timetable,
-        distance ladder, footpaths); they must not change underneath it.
+        distance ladder, footpaths — and with `street_modes`, a second
+        pass over `osm_pbf` for the multimodal graph); they must not
+        change underneath it.
         """
         paths = _gtfs_paths(paths)
         if ultra and osm_pbf is None:
             raise ValueError("ultra=True requires an OSM extract; pass osm_pbf=")
+        if street_modes is not None and osm_pbf is None:
+            raise ValueError("street_modes requires an OSM extract; pass osm_pbf=")
+        if dem is not None and street_modes is None:
+            raise ValueError("dem applies to the multimodal graph; pass street_modes=")
         core = _TransportNetwork.from_gtfs(paths)
         if trip_distances:
             from cafein import geometry
@@ -164,9 +184,39 @@ class TransportNetwork:
                 footpaths.meters,
             )
             core.set_street_network(*street_network)
+            if street_modes is not None:
+                from cafein import street_network as _street_network
+
+                street_modes = tuple(street_modes)
+                core.set_multimodal_streets(
+                    list(street_modes),
+                    *_street_network.multimodal_payload(
+                        osm_pbf,
+                        modes=street_modes,
+                        bounding_box=bounding_box,
+                        dem=dem,
+                        dem_interval=dem_interval,
+                    ),
+                )
             if ultra:
                 core.compute_ultra_shortcuts(walking_speed_kmph)
         return cls(core)
+
+    @property
+    def has_multimodal_streets(self):
+        """Whether the multimodal union street graph is carried."""
+        return self._core.has_multimodal_streets
+
+    @property
+    def street_modes(self):
+        """The pruning modes the multimodal graph was built with, or ``None``."""
+        modes = self._core.street_modes
+        return None if modes is None else tuple(modes)
+
+    @property
+    def multimodal_elevation_metadata(self):
+        """Provenance of the multimodal graph's elevations, or ``None``."""
+        return self._core.multimodal_elevation_metadata
 
     def save(self, path):
         """Save the network as a reusable artifact.

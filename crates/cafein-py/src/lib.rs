@@ -70,6 +70,16 @@ struct TransportNetwork {
     geometry: Option<TripGeometry>,
     leg_geometry: Option<LegGeometry>,
     streets: Option<StreetNetwork>,
+    /// The optional multimodal union street graph: a second street section
+    /// with per-arc mode permissions, attributes, and elevations, for the
+    /// cycling / e-scooter access and egress the PT integration adds. Kept
+    /// apart from `streets` (the walking graph), so every walking query and
+    /// its hot loop stay exactly as they are.
+    multimodal: Option<StreetNetwork>,
+    /// What the multimodal graph's elevations mean; `None` without a DEM.
+    multimodal_elevation: Option<crate::artifact::ElevationMeta>,
+    /// The pruning modes the multimodal graph was built with.
+    multimodal_modes: Option<Vec<String>>,
     stops_by_id: HashMap<String, StopLookup>,
     stops_by_qualified_id: HashMap<String, StopIdx>,
     trips_by_public_id: HashMap<String, TripIdx>,

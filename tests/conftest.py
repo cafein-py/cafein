@@ -124,6 +124,29 @@ def network_with_footpaths(helsinki_gtfs, kantakaupunki_pbf, artifact_cache):
     return _cached_network(artifact_cache, "helsinki-footpaths", build)
 
 
+@pytest.fixture(scope="session")
+def multimodal_network(helsinki_gtfs, kantakaupunki_pbf, artifact_cache):
+    """The footpaths network also carrying the multimodal union street graph,
+    with an analytic-ramp DEM (1 m of climb per 0.001° of longitude)."""
+    pytest.importorskip("cafein._cafein")
+    import numpy as np
+    from cafein import TransportNetwork
+
+    def build():
+        def ramp(lons, lats):
+            return ((np.asarray(lons) - 24.8) * 1000.0).astype("float32")
+
+        with pytest.warns(UserWarning):
+            return TransportNetwork.from_gtfs(
+                [str(helsinki_gtfs)],
+                osm_pbf=str(kantakaupunki_pbf),
+                street_modes=("walk", "bicycle", "e_scooter"),
+                dem=ramp,
+            )
+
+    return _cached_network(artifact_cache, "helsinki-multimodal", build)
+
+
 @pytest.fixture()
 def fresh_footpaths_network(network_with_footpaths, artifact_cache):
     """A private copy of the footpaths network, for tests that mutate one.
