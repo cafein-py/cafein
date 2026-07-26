@@ -73,6 +73,10 @@ jobs:
         run: pip install -e . --no-build-isolation
       - name: Run Python tests
         shell: bash -el {0}
-        # Parallelised across the runner's cores with pytest-xdist; the heavy
-        # per-test network builds distribute well, roughly halving wall-clock.
+        # Parallelised across the runner's cores with pytest-xdist. Each
+        # worker's Rust compute is capped to two rayon threads: uncapped,
+        # every worker spawns a pool as wide as the machine, and the heavy
+        # multicriteria tests contend N-fold for the same cores.
+        env:
+          RAYON_NUM_THREADS: 2
         run: pytest -n auto --dist load --cov=cafein --cov-report=term-missing
