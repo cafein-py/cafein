@@ -2213,6 +2213,82 @@ fn astar_benchmark() {
     }
 }
 
+// --- Reverse (egress) directed search ----------------------------------------
+
+#[test]
+fn reverse_rows_match_forward_singles_cell_for_cell() {
+    // The duality oracle: one reverse search from a destination answers, for
+    // every source, exactly what the forward single route answers — one-ways,
+    // dismounts, slopes, cutoffs, and unreachable cells included.
+    let (net, coordinates) = pseudo_random_grid(9, 7, 0xE64E55);
+    for definition in [
+        StreetProfileDefinition::bicycle(),
+        StreetProfileDefinition::walk(),
+    ] {
+        let profile = net.compile_profile(&definition).unwrap();
+        let snaps = grid_snaps(&net, &coordinates, &profile, 1);
+        for max_seconds in [10_000.0, 60.0] {
+            for target in snaps.iter().flatten() {
+                let column = net.directed_times_from_snaps(&snaps, target, &profile, max_seconds);
+                for (cell, source) in column.iter().zip(&snaps) {
+                    let single = source.as_ref().and_then(|from| {
+                        net.directed_travel_time(from, target, &profile, max_seconds)
+                    });
+                    assert_eq!(single, *cell, "{} column vs single", definition.name);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_one_way_splits_access_from_egress() {
+    // A bicycle one-way east: reaching the east end is quick, coming back is
+    // not — the reverse row must see the asymmetry the forward row sees.
+    let edges: Vec<TestEdge> = vec![(0, 1, 200.0, straight((0.0, 0.0), (200.0, 0.0)))];
+    let mut attrs = plain_attrs(1);
+    attrs.access_reverse = vec![MODE_WALK];
+    let net = multimodal_network(2, &edges, &attrs).unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let west = lonlat(10.0, 0.0);
+    let east = lonlat(190.0, 0.0);
+    let from = net.snap(west.1, west.0, 50.0).unwrap();
+    let to = net.snap(east.1, east.0, 50.0).unwrap();
+    let eastbound = net.directed_times_from_snaps(&[Some(from)], &to, &bike, 3600.0)[0];
+    let westbound = net.directed_times_from_snaps(&[Some(to)], &from, &bike, 3600.0)[0];
+    assert!(eastbound.is_some());
+    // The way back has no permitted bicycle arc at all.
+    assert_eq!(westbound, None);
+}
+
+#[test]
+fn mode_bit_snapping_respects_each_bit() {
+    // A walk-only edge on the query line and a bicycle-only edge north of
+    // it: each mode bit must snap to its own permitted edge, both ways
+    // round — the stop-link builder's `foot=no` case.
+    let edges: Vec<TestEdge> = vec![
+        (0, 1, 200.0, straight((0.0, 0.0), (200.0, 0.0))),
+        (2, 3, 200.0, straight((0.0, 60.0), (200.0, 60.0))),
+    ];
+    let mut attrs = plain_attrs(2);
+    attrs.access_forward = vec![MODE_WALK, MODE_BICYCLE];
+    attrs.access_reverse = vec![MODE_WALK, MODE_BICYCLE];
+    let net = multimodal_network(4, &edges, &attrs).unwrap();
+    let (lon, lat) = lonlat(100.0, 10.0);
+    let walk = net.snap_for_mode_bit(lat, lon, 300.0, MODE_WALK).unwrap();
+    let bike = net
+        .snap_for_mode_bit(lat, lon, 300.0, MODE_BICYCLE)
+        .unwrap();
+    assert_ne!(walk.edge, bike.edge);
+    // The walk edge is the nearer one; the bicycle snap crosses to the far
+    // edge rather than landing where it may not ride.
+    assert!(walk.connector < bike.connector);
+    // No e-scooter permission anywhere: no snap at all.
+    assert_eq!(net.snap_for_mode_bit(lat, lon, 300.0, MODE_E_SCOOTER), None);
+}
+
 // --- Directed profile-aware search -------------------------------------------
 
 fn directed_slot(net: &StreetNetwork, from: u32, to: u32) -> usize {

@@ -7,6 +7,11 @@ use super::*;
 /// inspection getter returns them to Python.
 type StreetAttributeArrays = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u16>);
 
+/// One street access/egress row: public stop id, whole seconds, and the
+/// chosen link's snap identity (edge, fraction, connector meters) — the
+/// `StreetChoice` token the 12c reduction keeps beside the duration.
+type StreetRow = (String, u32, u32, f64, f64);
+
 #[pymethods]
 impl TransportNetwork {
     /// Build a network from one or several GTFS zip archives.
@@ -68,6 +73,8 @@ impl TransportNetwork {
             multimodal: None,
             multimodal_elevation: None,
             multimodal_modes: None,
+            multimodal_links: std::sync::OnceLock::new(),
+            multimodal_profiles: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -699,6 +706,8 @@ impl TransportNetwork {
         self.multimodal = Some(inner);
         self.multimodal_elevation = elevation;
         self.multimodal_modes = Some(modes);
+        self.multimodal_links = std::sync::OnceLock::new();
+        self.multimodal_profiles = std::sync::Mutex::new(Vec::new());
         Ok(())
     }
 
@@ -733,6 +742,62 @@ impl TransportNetwork {
             .as_ref()
             .map(|meta| crate::streets::elevation_dict(py, meta))
             .transpose()
+    }
+
+    /// Per-stop street access times from a coordinate over the multimodal
+    /// graph: ``(stop_id, seconds, link_edge, link_fraction,
+    /// connector_meters)`` for every stop whose mode-masked link is
+    /// reachable within ``max_seconds`` under ``mode`` — the trailing triple
+    /// is the chosen link's snap identity, the ``StreetChoice`` token. One
+    /// forward directed search serves the whole row. Internal until the 12c
+    /// policy surface; the stop links snap lazily on first use at the
+    /// walking path's 1600 m stop radius.
+    fn _street_access_seconds(
+        &self,
+        py: Python<'_>,
+        latitude: f64,
+        longitude: f64,
+        mode: &str,
+        max_seconds: f64,
+    ) -> PyResult<Vec<StreetRow>> {
+        let profile = self.multimodal_profile(mode)?;
+        let network = self.multimodal.as_ref().expect("profile lookup checked");
+        let targets = self.mode_link_targets(network, profile.definition.mode.bit());
+        let origin = network
+            .snap_for_profile(latitude, longitude, MULTIMODAL_STOP_SNAP, &profile)
+            .ok_or_else(|| {
+                PyValueError::new_err("coordinate too far from the multimodal street network")
+            })?;
+        let mut row = py.allow_threads(|| {
+            network.directed_times_to_snaps(&origin, &targets, &profile, max_seconds)
+        });
+        self.zero_coincident_stops(&mut row, &targets, latitude, longitude, max_seconds);
+        Ok(self.stop_rows(row, &targets))
+    }
+
+    /// The egress mirror of ``_street_access_seconds``: per-stop times *to*
+    /// the coordinate, one reverse directed search serving the whole column.
+    fn _street_egress_seconds(
+        &self,
+        py: Python<'_>,
+        latitude: f64,
+        longitude: f64,
+        mode: &str,
+        max_seconds: f64,
+    ) -> PyResult<Vec<StreetRow>> {
+        let profile = self.multimodal_profile(mode)?;
+        let network = self.multimodal.as_ref().expect("profile lookup checked");
+        let sources = self.mode_link_targets(network, profile.definition.mode.bit());
+        let destination = network
+            .snap_for_profile(latitude, longitude, MULTIMODAL_STOP_SNAP, &profile)
+            .ok_or_else(|| {
+                PyValueError::new_err("coordinate too far from the multimodal street network")
+            })?;
+        let mut column = py.allow_threads(|| {
+            network.directed_times_from_snaps(&sources, &destination, &profile, max_seconds)
+        });
+        self.zero_coincident_stops(&mut column, &sources, latitude, longitude, max_seconds);
+        Ok(self.stop_rows(column, &sources))
     }
 
     /// Builds and installs a contraction hierarchy over the walking graph, so
@@ -1154,5 +1219,135 @@ impl TransportNetwork {
             }
             _ => &self.transfers,
         }
+    }
+}
+
+/// The stop-link snap radius onto the multimodal graph, matching the walking
+/// path's default stop radius; the 12c policy surface may parameterize it.
+const MULTIMODAL_STOP_SNAP: f64 = 1600.0;
+
+impl TransportNetwork {
+    /// The compiled multimodal profile for `mode`, cached by exact
+    /// definition equality — the multimodal counterpart of the standalone
+    /// network's profile cache.
+    /// Any built-in mode compiles, whether or not it was in `street_modes`:
+    /// per the documented build contract, the modes select *component
+    /// pruning only* — every physical edge is kept — so a mode outside the
+    /// list routes correctly, just without its small-island pruning.
+    fn multimodal_profile(&self, mode: &str) -> PyResult<CompiledStreetProfile> {
+        let network = self.multimodal.as_ref().ok_or_else(|| {
+            PyValueError::new_err(
+                "no multimodal street graph is installed; build with street_modes=",
+            )
+        })?;
+        let definition = crate::streets::profile_definition(mode)?;
+        let mut cache = self
+            .multimodal_profiles
+            .lock()
+            .expect("profile cache poisoned");
+        if let Some((_, compiled)) = cache.iter().find(|(known, _)| known == &definition) {
+            return Ok(compiled.clone());
+        }
+        let compiled = network
+            .compile_profile(&definition)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        cache.push((definition, compiled.clone()));
+        Ok(compiled)
+    }
+
+    /// The lazily built per-stop links onto the multimodal graph: each stop
+    /// snapped per mode bit, equal snaps merged under one mask — so a stop
+    /// beside a `foot=no` cycleway links for the bicycle without granting
+    /// walking that edge, and the other way round.
+    fn multimodal_stop_links(&self, network: &StreetNetwork) -> &[Vec<(Snap, u8)>] {
+        use cafein_core::streets::{MODE_BICYCLE, MODE_E_SCOOTER, MODE_WALK};
+        self.multimodal_links.get_or_init(|| {
+            self.stops()
+                .iter()
+                .map(|(_, latitude, longitude)| {
+                    let (Some(latitude), Some(longitude)) = (latitude, longitude) else {
+                        return Vec::new();
+                    };
+                    let mut links: Vec<(Snap, u8)> = Vec::new();
+                    for bit in [MODE_WALK, MODE_BICYCLE, MODE_E_SCOOTER] {
+                        let Some(snap) = network.snap_for_mode_bit(
+                            *latitude,
+                            *longitude,
+                            MULTIMODAL_STOP_SNAP,
+                            bit,
+                        ) else {
+                            continue;
+                        };
+                        match links.iter_mut().find(|(known, _)| {
+                            known.edge == snap.edge && known.fraction == snap.fraction
+                        }) {
+                            Some((_, mask)) => *mask |= bit,
+                            None => links.push((snap, bit)),
+                        }
+                    }
+                    links
+                })
+                .collect()
+        })
+    }
+
+    /// Each stop's link snap for a mode bit, aligned with the stop indices.
+    fn mode_link_targets(&self, network: &StreetNetwork, bit: u8) -> Vec<Option<Snap>> {
+        self.multimodal_stop_links(network)
+            .iter()
+            .map(|candidates| {
+                candidates
+                    .iter()
+                    .find(|(_, mask)| mask & bit != 0)
+                    .map(|(snap, _)| *snap)
+            })
+            .collect()
+    }
+
+    /// A stop at the query's own coordinate is zero away — routing it through
+    /// the network would charge that coordinate's connector twice, exactly
+    /// the convention `directed_matrix` applies. The link (and so the snap
+    /// token) must exist and the cutoff must admit a zero-length trip.
+    fn zero_coincident_stops(
+        &self,
+        row: &mut [Option<u32>],
+        links: &[Option<Snap>],
+        latitude: f64,
+        longitude: f64,
+        max_seconds: f64,
+    ) {
+        if !max_seconds.is_finite() || max_seconds < 0.0 {
+            return;
+        }
+        for (index, (_, stop_latitude, stop_longitude)) in self.stops().iter().enumerate() {
+            if *stop_latitude == Some(latitude)
+                && *stop_longitude == Some(longitude)
+                && links[index].is_some()
+            {
+                row[index] = Some(0);
+            }
+        }
+    }
+
+    /// A row of per-stop times as `(public stop id, seconds, link edge, link
+    /// fraction, connector meters)` — the trailing triple is the chosen
+    /// link's snap identity, the `StreetChoice` token the 12c reduction
+    /// keeps beside the winning duration. `None` cells dropped.
+    fn stop_rows(&self, row: Vec<Option<u32>>, links: &[Option<Snap>]) -> Vec<StreetRow> {
+        row.into_iter()
+            .zip(links)
+            .enumerate()
+            .filter_map(|(stop, (seconds, link))| {
+                let value = seconds?;
+                let snap = link.as_ref()?;
+                Some((
+                    self.public_stop_id(StopIdx(stop as u32)),
+                    value,
+                    snap.edge,
+                    snap.fraction,
+                    snap.connector,
+                ))
+            })
+            .collect()
     }
 }
