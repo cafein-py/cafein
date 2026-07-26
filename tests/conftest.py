@@ -43,11 +43,18 @@ def fares_poa():
 def artifact_cache(tmp_path_factory):
     """The directory shared by every worker for cached network artifacts.
 
-    `getbasetemp()` is per-worker under ``pytest -n``; its parent is the one
-    directory they all share, so an artifact written there is built once for
-    the whole run rather than once per worker.
+    Under ``pytest -n`` each worker's ``getbasetemp()`` is its own
+    ``popen-gw*`` subdirectory; the parent is the run's shared directory, so
+    an artifact written there is built once for the whole run rather than
+    once per worker. Without xdist, ``getbasetemp()`` already **is** the
+    run's directory — taking its parent there would land in the persistent
+    per-user pytest directory, where a later run could silently reuse a stale
+    artifact built by older code.
     """
-    shared = tmp_path_factory.getbasetemp().parent / "cafein-networks"
+    base = tmp_path_factory.getbasetemp()
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        base = base.parent
+    shared = base / "cafein-networks"
     shared.mkdir(parents=True, exist_ok=True)
     return shared
 
