@@ -594,7 +594,7 @@ def test_pareto_candidates_route_door_to_door(network_with_footpaths):
     )
 
 
-def test_the_tbtr_pareto_router_matches_mcraptor(network_with_footpaths):
+def test_the_tbtr_pareto_router_matches_mcraptor(network_with_footpaths_mctbtr):
     from cafein import exhaustive_frontier
 
     # The full McTBTR stack — factor-aware transfer set plus segment
@@ -602,7 +602,7 @@ def test_the_tbtr_pareto_router_matches_mcraptor(network_with_footpaths):
     # oracle on the real closed Helsinki footpath network.
     origin, destination = "1100602", "1040280"
     true_set = exhaustive_frontier(
-        network_with_footpaths,
+        network_with_footpaths_mctbtr,
         origin,
         destination,
         "2022-02-22",
@@ -611,7 +611,7 @@ def test_the_tbtr_pareto_router_matches_mcraptor(network_with_footpaths):
     )
     frames = [
         journey_frontier(
-            network_with_footpaths,
+            network_with_footpaths_mctbtr,
             origin,
             destination,
             "2022-02-22",
@@ -636,7 +636,7 @@ def test_the_tbtr_pareto_router_matches_mcraptor(network_with_footpaths):
     # legitimately keep a different same-bucket representative.
     profiles = [
         journey_frontier(
-            network_with_footpaths,
+            network_with_footpaths_mctbtr,
             origin,
             destination,
             "2022-02-22",
@@ -1513,13 +1513,15 @@ def test_max_slower_bands_the_frontier_and_keeps_the_fastest(network_with_footpa
         assert row.arrival_s <= anchor + band
 
 
-def test_max_slower_is_validated(network_with_footpaths):
-    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+def test_max_slower_is_validated(network_with_footpaths_mctbtr):
+    coordinates = {
+        stop: (lat, lon) for stop, lat, lon in network_with_footpaths_mctbtr.stops
+    }
     origin, destination = coordinates["1100602"], coordinates["1040280"]
     for candidates in ("time", "relaxed", "diverse"):
         with pytest.raises(ValueError, match="candidates='pareto'"):
             journey_frontier(
-                network_with_footpaths,
+                network_with_footpaths_mctbtr,
                 origin,
                 destination,
                 "2022-02-22",
@@ -1531,7 +1533,7 @@ def test_max_slower_is_validated(network_with_footpaths):
     # max_slower rides the trip-based engine, cell-for-cell equal.
     banded = [
         journey_frontier(
-            network_with_footpaths,
+            network_with_footpaths_mctbtr,
             "1100602",
             "1040280",
             "2022-02-22",
@@ -1547,7 +1549,7 @@ def test_max_slower_is_validated(network_with_footpaths):
     assert banded[1].equals(banded[0])
     with pytest.raises(ValueError, match="non-negative"):
         journey_frontier(
-            network_with_footpaths,
+            network_with_footpaths_mctbtr,
             origin,
             destination,
             "2022-02-22",
@@ -1617,12 +1619,14 @@ def test_journey_frontiers_band_each_cell_independently(network_with_footpaths):
         )
 
 
-def test_the_tbtr_pareto_router_routes_door_to_door(network_with_footpaths):
-    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+def test_the_tbtr_pareto_router_routes_door_to_door(network_with_footpaths_mctbtr):
+    coordinates = {
+        stop: (lat, lon) for stop, lat, lon in network_with_footpaths_mctbtr.stops
+    }
     origin, destination = coordinates["1100602"], coordinates["1040280"]
     frames = [
         journey_frontier(
-            network_with_footpaths,
+            network_with_footpaths_mctbtr,
             origin,
             destination,
             "2022-02-22",
@@ -1650,13 +1654,15 @@ def test_the_tbtr_pareto_router_routes_door_to_door(network_with_footpaths):
         assert (frame["rides"] == 0).sum() == 1
 
 
-def test_journey_frontiers_tbtr_matches_raptor(network_with_footpaths):
+def test_journey_frontiers_tbtr_matches_raptor(network_with_footpaths_mctbtr):
     import geopandas as gpd
     from shapely.geometry import Point
 
     from cafein import journey_frontiers
 
-    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+    coordinates = {
+        stop: (lat, lon) for stop, lat, lon in network_with_footpaths_mctbtr.stops
+    }
     ids = ["1100602", "1040280"]
     points = gpd.GeoDataFrame(
         {"id": ids},
@@ -1666,7 +1672,7 @@ def test_journey_frontiers_tbtr_matches_raptor(network_with_footpaths):
     for origins, destinations in ((ids, ids), (points, points)):
         frames = [
             journey_frontiers(
-                network_with_footpaths,
+                network_with_footpaths_mctbtr,
                 origins,
                 destinations,
                 "2022-02-22",
@@ -1699,7 +1705,7 @@ def test_journey_frontiers_tbtr_matches_raptor(network_with_footpaths):
         )
     with pytest.raises(ValueError, match="router"):
         journey_frontiers(
-            network_with_footpaths,
+            network_with_footpaths_mctbtr,
             ids,
             ids,
             "2022-02-22",
@@ -1710,7 +1716,7 @@ def test_journey_frontiers_tbtr_matches_raptor(network_with_footpaths):
     # max_slower rides the trip-based engine on the batched form too.
     banded = [
         journey_frontiers(
-            network_with_footpaths,
+            network_with_footpaths_mctbtr,
             ids,
             ids,
             "2022-02-22",
@@ -1762,17 +1768,17 @@ def test_the_mctbtr_transfer_cache_answers_identically(tmp_path):
 
 
 def test_the_mctbtr_transfer_cache_serves_point_frontiers(
-    helsinki_gtfs, kantakaupunki_pbf
+    network_with_footpaths, network_with_footpaths_mctbtr
 ):
     import geopandas as gpd
     from shapely.geometry import Point
 
-    from cafein import TransportNetwork, journey_frontiers
+    from cafein import journey_frontiers
 
-    network = TransportNetwork.from_gtfs(
-        [str(helsinki_gtfs)], osm_pbf=str(kantakaupunki_pbf)
-    )
-    coordinates = {stop: (lat, lon) for stop, lat, lon in network.stops}
+    # The set-less shared network answers ad hoc; the session fixture carries
+    # the precomputed set. The two must agree cell for cell — the equivalence
+    # every comparison test riding the cached fixture depends on.
+    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
     ids = ["1100602", "1040280"]
     points = gpd.GeoDataFrame(
         {"id": ids},
@@ -1781,23 +1787,25 @@ def test_the_mctbtr_transfer_cache_serves_point_frontiers(
     )
     args = (points, points, "2022-02-22", "08:30:00")
     kwargs = dict(window=600, max_transfers=3, bucket=1e-6, router="tbtr")
-    adhoc = journey_frontiers(network, *args, **kwargs)
-    network.compute_mctbtr_transfers("2022-02-22")
-    assert network.has_mctbtr_transfers
-    cached = journey_frontiers(network, *args, **kwargs)
+    assert not network_with_footpaths.has_mctbtr_transfers
+    adhoc = journey_frontiers(network_with_footpaths, *args, **kwargs)
+    assert network_with_footpaths_mctbtr.has_mctbtr_transfers
+    cached = journey_frontiers(network_with_footpaths_mctbtr, *args, **kwargs)
     assert len(cached) == len(adhoc) > 0
     for column in ("from_id", "to_id", "departure_s", "arrival_s", "rides", "frontier"):
         assert cached[column].tolist() == adhoc[column].tolist()
     assert cached["emissions"].tolist() == adhoc["emissions"].tolist()
 
 
-def test_frontier_table_matches_journey_frontiers(network_with_footpaths):
+def test_frontier_table_matches_journey_frontiers(network_with_footpaths_mctbtr):
     import geopandas as gpd
     from shapely.geometry import Point
 
     from cafein import frontier_table, journey_frontiers
 
-    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+    coordinates = {
+        stop: (lat, lon) for stop, lat, lon in network_with_footpaths_mctbtr.stops
+    }
     ids = ["1100602", "1040280", "1370104"]
     points = gpd.GeoDataFrame(
         {"id": ids},
@@ -1808,8 +1816,8 @@ def test_frontier_table_matches_journey_frontiers(network_with_footpaths):
         for router in ("raptor", "tbtr"):
             kwargs = dict(window=600, max_transfers=3, bucket=1e-6, router=router)
             args = (origins, destinations, "2022-02-22", "08:30:00")
-            full = journey_frontiers(network_with_footpaths, *args, **kwargs)
-            table = frontier_table(network_with_footpaths, *args, **kwargs)
+            full = journey_frontiers(network_with_footpaths_mctbtr, *args, **kwargs)
+            table = frontier_table(network_with_footpaths_mctbtr, *args, **kwargs)
             expected = full.drop(columns=["journey"])
             assert list(table.columns) == list(expected.columns)
             assert len(table) > 0
