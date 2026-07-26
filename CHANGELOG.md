@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Single street routes are goal-directed. ``StreetNetwork.travel_time`` and
+  the single-pair leg reconstruction now run a target-directed A* search
+  with an admissible straight-line heuristic, answering exactly what the
+  Dijkstra search answers — cell-for-cell identical, enforced by tests —
+  while exploring only the route's surroundings instead of everything the
+  time cutoff reaches. Typical door-to-door queries on a city extract run
+  more than an order of magnitude faster; matrix computations keep the
+  one-to-many Dijkstra, where one search serves a whole row.
+
 - Cycling is slope-aware on elevated street networks. The bicycle profile
   compiles the owner-published cost model ``w = d · (1 + f(s))`` — ``f(s) = s``
   uphill, ``0.3·s`` downhill (a bounded credit) — per stored sub-segment and

@@ -247,6 +247,11 @@ pub(super) struct StreetGraph {
     /// extraction, so it holds, but an asymmetric graph is marked ineligible
     /// and falls back to the per-point search.
     pub(super) symmetric: std::sync::OnceLock<bool>,
+    /// Per-vertex (longitude, latitude) degrees, derived lazily from the
+    /// geometry on the first goal-directed query — the A* heuristic reads one
+    /// contiguous slot per relaxation instead of chasing the CSR. NaN marks an
+    /// isolated vertex, which no search ever reaches.
+    pub(super) vertex_coordinates: std::sync::OnceLock<Vec<(f64, f64)>>,
     /// The optional multimodal edge attributes (mode permissions, facility
     /// flags, class codes). `None` on a walk-only build; the current routing
     /// never reads them. Persisted with the artifact when present.
@@ -655,6 +660,7 @@ impl StreetNetwork {
             level_starts: index.level_starts,
             contraction: None,
             symmetric: std::sync::OnceLock::new(),
+            vertex_coordinates: std::sync::OnceLock::new(),
             attributes,
             elevations: dense_elevations,
         };
@@ -922,6 +928,7 @@ impl StreetNetwork {
                 level_starts: parts.index_level_starts,
                 contraction: None,
                 symmetric: std::sync::OnceLock::new(),
+                vertex_coordinates: std::sync::OnceLock::new(),
                 attributes: parts.attributes,
                 elevations: parts.elevations,
             },
@@ -986,6 +993,7 @@ impl StreetNetwork {
                 level_starts,
                 contraction: None,
                 symmetric: std::sync::OnceLock::new(),
+                vertex_coordinates: std::sync::OnceLock::new(),
                 attributes: spec.attributes,
                 elevations: spec.elevations,
             },

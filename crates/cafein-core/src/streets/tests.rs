@@ -1483,8 +1483,8 @@ fn profile_compiles_permitted_arc_costs() {
         .compile_profile(&StreetProfileDefinition::bicycle())
         .unwrap();
     let meters = net.arrays().adj_meters().to_vec();
-    assert_eq!(bike.arc_millis.len(), meters.len());
-    for (&length, &cost) in meters.iter().zip(&bike.arc_millis) {
+    assert_eq!(bike.arc_millis().len(), meters.len());
+    for (&length, &cost) in meters.iter().zip(bike.arc_millis()) {
         assert_eq!(cost, (length / 4.0 * 1000.0).ceil() as u32);
     }
 }
@@ -1502,8 +1502,8 @@ fn profile_forbids_arcs_missing_the_mode() {
     let bike = net
         .compile_profile(&StreetProfileDefinition::bicycle())
         .unwrap();
-    assert!(walk.arc_millis.iter().all(|&cost| cost != u32::MAX));
-    assert!(bike.arc_millis.iter().all(|&cost| cost == u32::MAX));
+    assert!(walk.arc_millis().iter().all(|&cost| cost != u32::MAX));
+    assert!(bike.arc_millis().iter().all(|&cost| cost == u32::MAX));
 }
 
 #[test]
@@ -1517,7 +1517,7 @@ fn profile_applies_class_multipliers() {
     slow.highway_multipliers[0] = 0.5;
     let compiled = net.compile_profile(&slow).unwrap();
     let meters = net.arrays().adj_meters().to_vec();
-    for (&length, &cost) in meters.iter().zip(&compiled.arc_millis) {
+    for (&length, &cost) in meters.iter().zip(compiled.arc_millis()) {
         assert_eq!(cost, (length / (4.0 * 0.5) * 1000.0).ceil() as u32);
     }
 }
@@ -1536,7 +1536,7 @@ fn profile_dismount_arc_falls_to_walk_speed() {
         .compile_profile(&StreetProfileDefinition::bicycle())
         .unwrap();
     let meters = net.arrays().adj_meters().to_vec();
-    for (&length, &cost) in meters.iter().zip(&bike.arc_millis) {
+    for (&length, &cost) in meters.iter().zip(bike.arc_millis()) {
         assert_eq!(cost, (length / 1.0 * 1000.0).ceil() as u32);
     }
 }
@@ -1551,7 +1551,7 @@ fn profile_walk_compiles_without_attributes() {
         .compile_profile(&StreetProfileDefinition::walk())
         .unwrap();
     let meters = net.arrays().adj_meters().to_vec();
-    for (&length, &walk_cost) in meters.iter().zip(&walk.arc_millis) {
+    for (&length, &walk_cost) in meters.iter().zip(walk.arc_millis()) {
         assert_eq!(walk_cost, (length * 1000.0).ceil() as u32);
     }
     assert_eq!(
@@ -1566,8 +1566,8 @@ fn compile_rejects_pathological_costs_and_codes() {
     let mut net = triangle();
     net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
         .unwrap();
-    // A dismount speed above max_speed would let on-network arcs beat the A*
-    // bound, so it is rejected by validation.
+    // A dismount speed above max_speed would break the declared upper bound
+    // on on-network speeds, so it is rejected by validation.
     let mut fast_dismount = StreetProfileDefinition::bicycle();
     fast_dismount.dismount_speed = 10.0; // > max_speed 4
     assert_eq!(
@@ -1718,7 +1718,7 @@ fn dismount_is_a_per_edge_flag_on_both_directions() {
         .unwrap();
     let meters = net.arrays().adj_meters().to_vec();
     let adj_edges = net.arrays().adj_edges().to_vec();
-    for ((&length, &edge), &cost) in meters.iter().zip(&adj_edges).zip(&bike.arc_millis) {
+    for ((&length, &edge), &cost) in meters.iter().zip(&adj_edges).zip(bike.arc_millis()) {
         let speed = if edge == 1 { 1.0 } else { 4.0 };
         assert_eq!(cost, (length / speed * 1000.0).ceil() as u32);
     }
@@ -1742,7 +1742,7 @@ fn attribute_free_walk_bound_includes_base_speed() {
     slow.max_speed = 1.0;
     let walk = net.compile_profile(&slow).unwrap();
     let meters = net.arrays().adj_meters().to_vec();
-    for (&length, &cost) in meters.iter().zip(&walk.arc_millis) {
+    for (&length, &cost) in meters.iter().zip(walk.arc_millis()) {
         assert_eq!(cost, (length / 1.0 * 1000.0).ceil() as u32);
     }
 }
@@ -1790,7 +1790,7 @@ fn profile_rounds_arc_costs_up() {
     let compiled = net.compile_profile(&three).unwrap();
     let meters = net.arrays().adj_meters().to_vec();
     let mut saw_fractional = false;
-    for (&length, &cost) in meters.iter().zip(&compiled.arc_millis) {
+    for (&length, &cost) in meters.iter().zip(compiled.arc_millis()) {
         let exact = length / 3.0 * 1000.0;
         assert_eq!(cost, exact.ceil() as u32);
         if exact.fract() != 0.0 {
@@ -1822,7 +1822,395 @@ fn positive_length_arc_never_costs_zero() {
     extreme.base_speed = 1e300;
     extreme.max_speed = 1e300;
     let compiled = net.compile_profile(&extreme).unwrap();
-    assert!(compiled.arc_millis.iter().all(|&cost| cost >= 1));
+    assert!(compiled.arc_millis().iter().all(|&cost| cost >= 1));
+}
+
+// --- Target-directed A* ------------------------------------------------------
+
+/// A deterministic pseudo-random street grid: `width × height` vertices,
+/// jittered edge lengths (always at least the straight line), bicycle one-way
+/// arcs, dismount edges, and a hilly DEM — everything the compiled costs can
+/// vary over, with no wall-clock randomness. Returns the network and each
+/// vertex's `(latitude, longitude)`.
+fn pseudo_random_grid(width: u32, height: u32, seed: u64) -> (StreetNetwork, Vec<(f64, f64)>) {
+    let mut lcg = seed;
+    let mut rng = move || {
+        lcg = lcg
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        lcg >> 33
+    };
+    let position = |i: u32, j: u32| (f64::from(i) * 130.0, f64::from(j) * 110.0);
+    let index = |i: u32, j: u32| j * width + i;
+    let both = MODE_WALK | MODE_BICYCLE;
+    let mut edges: Vec<TestEdge> = Vec::new();
+    let mut access_forward = Vec::new();
+    let mut access_reverse = Vec::new();
+    let mut flags = Vec::new();
+    let mut add = |from: (f64, f64), to: (f64, f64), a: u32, b: u32, roll: (u64, u64)| {
+        let planar = ((to.0 - from.0).powi(2) + (to.1 - from.1).powi(2)).sqrt();
+        let length = planar * (1.0 + (roll.0 % 25) as f64 / 100.0);
+        edges.push((a, b, length, straight(from, to)));
+        match roll.0 % 5 {
+            0 => {
+                access_forward.push(both);
+                access_reverse.push(MODE_WALK);
+            }
+            1 => {
+                access_forward.push(MODE_WALK);
+                access_reverse.push(both);
+            }
+            _ => {
+                access_forward.push(both);
+                access_reverse.push(both);
+            }
+        }
+        flags.push(if roll.1.is_multiple_of(7) {
+            FLAG_DISMOUNT
+        } else {
+            0
+        });
+    };
+    for j in 0..height {
+        for i in 0..width {
+            if i + 1 < width {
+                add(
+                    position(i, j),
+                    position(i + 1, j),
+                    index(i, j),
+                    index(i + 1, j),
+                    (rng(), rng()),
+                );
+            }
+            if j + 1 < height {
+                add(
+                    position(i, j),
+                    position(i, j + 1),
+                    index(i, j),
+                    index(i, j + 1),
+                    (rng(), rng()),
+                );
+            }
+        }
+    }
+    let count = edges.len();
+    let attrs = Attrs {
+        highway: vec![0; count],
+        surface: vec![0; count],
+        smoothness: vec![0; count],
+        flags,
+        access_forward,
+        access_reverse,
+        facility_forward: vec![0; count],
+        facility_reverse: vec![0; count],
+    };
+    let net = elevated_network(width * height, &edges, &attrs, |x, y| {
+        ((x / 400.0).sin() * 12.0 + (y / 700.0).cos() * 7.0) as f32
+    });
+    let coordinates = (0..height)
+        .flat_map(|j| (0..width).map(move |i| position(i, j)))
+        .map(|(x, y)| {
+            let (lon, lat) = lonlat(x, y);
+            (lat, lon)
+        })
+        .collect();
+    (net, coordinates)
+}
+
+/// Query points scattered off the grid vertices, snapped for `profile`.
+fn grid_snaps(
+    net: &StreetNetwork,
+    coordinates: &[(f64, f64)],
+    profile: &CompiledStreetProfile,
+    step: usize,
+) -> Vec<Option<Snap>> {
+    coordinates
+        .iter()
+        .step_by(step)
+        .map(|&(lat, lon)| net.snap_for_profile(lat + 0.0002, lon + 0.0004, 90.0, profile))
+        .collect()
+}
+
+#[test]
+fn astar_matches_dijkstra_cell_for_cell() {
+    // The acceptance oracle: on a grid with one-ways, dismounts, slopes, and
+    // jittered lengths, the goal-directed single route answers exactly what
+    // the Dijkstra matrix row answers — for every origin×destination pair,
+    // both profiles, and both a roomy and a tight cutoff (the tight one
+    // leaves many cells unreachable).
+    let (net, coordinates) = pseudo_random_grid(9, 7, 0xC0FFEE);
+    for definition in [
+        StreetProfileDefinition::bicycle(),
+        StreetProfileDefinition::walk(),
+    ] {
+        let profile = net.compile_profile(&definition).unwrap();
+        let snaps = grid_snaps(&net, &coordinates, &profile, 1);
+        for max_seconds in [420.0, 60.0] {
+            let mut beyond = 0usize;
+            for origin in snaps.iter().flatten() {
+                let row = net.directed_times_to_snaps(origin, &snaps, &profile, max_seconds);
+                for (cell, target) in row.iter().zip(&snaps) {
+                    let single = target
+                        .as_ref()
+                        .and_then(|to| net.directed_travel_time(origin, to, &profile, max_seconds));
+                    assert_eq!(single, *cell, "{} single vs row", definition.name);
+                    beyond += usize::from(cell.is_none());
+                }
+            }
+            // The tight cutoff really exercises the unreachable answer.
+            if max_seconds == 60.0 {
+                assert!(beyond > 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn astar_legs_match_dijkstra_legs() {
+    // The reconstructing variant: time, metres, and geometry of the A* leg
+    // are the Dijkstra row leg's, byte for byte, for both profiles — and the
+    // tight cutoff exercises identical beyond-cutoff `None` legs.
+    let (net, coordinates) = pseudo_random_grid(8, 6, 0xB1C7C1E);
+    for definition in [
+        StreetProfileDefinition::bicycle(),
+        StreetProfileDefinition::walk(),
+    ] {
+        let profile = net.compile_profile(&definition).unwrap();
+        let snaps = grid_snaps(&net, &coordinates, &profile, 2);
+        let points: Vec<(f64, f64)> = coordinates
+            .iter()
+            .step_by(2)
+            .map(|&(lat, lon)| (lat + 0.0002, lon + 0.0004))
+            .collect();
+        for max_seconds in [10_000.0, 60.0] {
+            let (mut reached, mut beyond) = (0usize, 0usize);
+            for (from_point, origin) in points.iter().zip(&snaps) {
+                let Some(from) = origin else { continue };
+                let targets: Vec<((f64, f64), Option<Snap>)> =
+                    points.iter().copied().zip(snaps.iter().copied()).collect();
+                let row =
+                    net.directed_legs_to_snaps(*from_point, from, &targets, &profile, max_seconds);
+                for ((to_point, target), row_leg) in targets.iter().zip(&row) {
+                    let single = target.as_ref().and_then(|to| {
+                        net.directed_leg(*from_point, from, *to_point, to, &profile, max_seconds)
+                    });
+                    assert_eq!(single, *row_leg, "{}", definition.name);
+                    reached += usize::from(row_leg.is_some());
+                    beyond += usize::from(row_leg.is_none());
+                }
+            }
+            if max_seconds == 60.0 {
+                assert!(beyond > 0);
+            } else {
+                assert!(reached > beyond);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_free_spatial_arc_disables_the_heuristic_but_not_correctness() {
+    // A zero-length edge whose endpoints sit apart is free spatial movement:
+    // no finite speed bounds it, so the goal bias switches off — and the
+    // answers still match Dijkstra, with the reconstruction terminating.
+    let edges: Vec<TestEdge> = vec![
+        (0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0))),
+        (1, 2, 0.0, straight((100.0, 0.0), (180.0, 0.0))),
+        (2, 3, 100.0, straight((180.0, 0.0), (280.0, 0.0))),
+    ];
+    let net = multimodal_network(4, &edges, &plain_attrs(3)).unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let origin = lonlat(20.0, 0.0);
+    let target = lonlat(260.0, 0.0);
+    let from = net.snap(origin.1, origin.0, 40.0).unwrap();
+    let to = net.snap(target.1, target.0, 40.0).unwrap();
+    let single = net.directed_travel_time(&from, &to, &bike, 3600.0);
+    let row = net.directed_times_to_snaps(&from, &[Some(to)], &bike, 3600.0)[0];
+    assert_eq!(single, row);
+    assert!(single.is_some());
+    // The measured bound is infinite — the distance term really is off.
+    assert_eq!(bike.effective_speed_cache().get(), Some(&f64::INFINITY));
+    let leg = net
+        .directed_leg(
+            (origin.1, origin.0),
+            &from,
+            (target.1, target.0),
+            &to,
+            &bike,
+            3600.0,
+        )
+        .unwrap();
+    assert_eq!(leg.seconds, single.unwrap());
+}
+
+#[test]
+fn unreachable_pairs_answer_none_from_both_searches() {
+    // A two-vertex island disconnected from a main edge: routing between
+    // them is unreachable, and both searches must say so.
+    let edges: Vec<TestEdge> = vec![
+        (0, 1, 200.0, straight((0.0, 0.0), (200.0, 0.0))),
+        (2, 3, 200.0, straight((5000.0, 0.0), (5200.0, 0.0))),
+    ];
+    let net = multimodal_network(4, &edges, &plain_attrs(2)).unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let origin = lonlat(100.0, 0.0);
+    let target = lonlat(5100.0, 0.0);
+    let from = net.snap(origin.1, origin.0, 50.0).unwrap();
+    let to = net.snap(target.1, target.0, 50.0).unwrap();
+    assert_eq!(net.directed_travel_time(&from, &to, &bike, 3600.0), None);
+    assert_eq!(
+        net.directed_times_to_snaps(&from, &[Some(to)], &bike, 3600.0)[0],
+        None
+    );
+    assert!(net
+        .directed_leg(
+            (origin.1, origin.0),
+            &from,
+            (target.1, target.0),
+            &to,
+            &bike,
+            3600.0
+        )
+        .is_none());
+}
+
+#[test]
+fn tied_routes_reconstruct_identically() {
+    // An equal-cost diamond into a destination edge snapped at its middle:
+    // the route ties between the two branches and can tie between the
+    // destination edge's ends. Both searches must resolve every tie to the
+    // same route — the order-independent predecessor rule, not pop order.
+    let edges: Vec<TestEdge> = vec![
+        // Origin edge west of the diamond.
+        (0, 1, 100.0, straight((-100.0, 0.0), (0.0, 0.0))),
+        // The two equal branches, north and south.
+        (1, 2, 100.0, straight((0.0, 0.0), (50.0, 60.0))),
+        (2, 3, 100.0, straight((50.0, 60.0), (100.0, 0.0))),
+        (1, 4, 100.0, straight((0.0, 0.0), (50.0, -60.0))),
+        (4, 3, 100.0, straight((50.0, -60.0), (100.0, 0.0))),
+        // The destination edge east of it.
+        (3, 5, 100.0, straight((100.0, 0.0), (200.0, 0.0))),
+    ];
+    let net = multimodal_network(6, &edges, &plain_attrs(6)).unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let origin = lonlat(-50.0, 0.0);
+    let target = lonlat(150.0, 0.0);
+    let from = net.snap(origin.1, origin.0, 30.0).unwrap();
+    let to = net.snap(target.1, target.0, 30.0).unwrap();
+    let single = net
+        .directed_leg(
+            (origin.1, origin.0),
+            &from,
+            (target.1, target.0),
+            &to,
+            &bike,
+            600.0,
+        )
+        .unwrap();
+    let row = net
+        .directed_legs_to_snaps(
+            (origin.1, origin.0),
+            &from,
+            &[((target.1, target.0), Some(to))],
+            &bike,
+            600.0,
+        )
+        .swap_remove(0)
+        .unwrap();
+    assert_eq!(single, row);
+}
+
+#[test]
+fn astar_labels_fewer_vertices_on_a_corridor() {
+    // A long east-west corridor with the target a few edges east of the
+    // origin: the cutoff-bounded Dijkstra floods both directions, the
+    // goal-directed search leans east and labels a fraction of that.
+    let count = 200u32;
+    let edges: Vec<TestEdge> = (0..count)
+        .map(|i| {
+            let from = (f64::from(i) * 100.0, 0.0);
+            let to = (f64::from(i + 1) * 100.0, 0.0);
+            (i, i + 1, 100.0, straight(from, to))
+        })
+        .collect();
+    let net = multimodal_network(count + 1, &edges, &plain_attrs(edges.len())).unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let origin = lonlat(10_000.0, 0.0);
+    let target = lonlat(10_450.0, 0.0);
+    let from = net.snap(origin.1, origin.0, 50.0).unwrap();
+    let to = net.snap(target.1, target.0, 50.0).unwrap();
+    let (astar, dijkstra) = net.astar_versus_dijkstra_touched(&bike, &from, &to, 3600.0);
+    assert!(
+        astar * 3 < dijkstra,
+        "A* labelled {astar} vertices to Dijkstra's {dijkstra}"
+    );
+    // And the answers still agree.
+    assert_eq!(
+        net.directed_travel_time(&from, &to, &bike, 3600.0),
+        net.directed_times_to_snaps(&from, &[Some(to)], &bike, 3600.0)[0],
+    );
+}
+
+#[test]
+#[ignore = "wall-time benchmark; run manually with -- --ignored"]
+fn astar_benchmark() {
+    // Long routes across a large grid: prints per-query settled counts and
+    // wall time for A* against the Dijkstra row, for manual comparison.
+    let width = 200usize;
+    let (net, coordinates) = pseudo_random_grid(width as u32, 160, 0x5EED);
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let at = |i: usize, j: usize| {
+        let (lat, lon) = coordinates[j * width + i];
+        net.snap_for_profile(lat + 0.0002, lon + 0.0004, 90.0, &bike)
+            .unwrap()
+    };
+    // Two route shapes at the production default cutoff (7200 s, under which
+    // a bounded Dijkstra floods the whole extract): city hops a few km long,
+    // and long crossings spanning most of the grid's width. Corner-to-corner
+    // would put every vertex on a shortest path and prune nothing — the
+    // known A* worst case, not a representative query.
+    let city_hops: Vec<(Snap, Snap)> = (0..40)
+        .map(|i| (at(60 + i, 40 + i * 2), at(90 + i, 52 + i * 2)))
+        .collect();
+    let crossings: Vec<(Snap, Snap)> = (0..40)
+        .map(|i| (at(6, 30 + i * 2), at(width - 7, 34 + i * 2)))
+        .collect();
+    for (label, pairs) in [("city hops", &city_hops), ("crossings", &crossings)] {
+        let start = std::time::Instant::now();
+        let astar: Vec<Option<u32>> = pairs
+            .iter()
+            .map(|(from, to)| net.directed_travel_time(from, to, &bike, 7200.0))
+            .collect();
+        let astar_time = start.elapsed();
+        let start = std::time::Instant::now();
+        let dijkstra: Vec<Option<u32>> = pairs
+            .iter()
+            .map(|(from, to)| net.directed_times_to_snaps(from, &[Some(*to)], &bike, 7200.0)[0])
+            .collect();
+        let dijkstra_time = start.elapsed();
+        assert_eq!(astar, dijkstra);
+        let (mut astar_labels, mut dijkstra_labels) = (0usize, 0usize);
+        for (from, to) in pairs.iter() {
+            let (a, d) = net.astar_versus_dijkstra_touched(&bike, from, to, 7200.0);
+            astar_labels += a;
+            dijkstra_labels += d;
+        }
+        println!(
+            "{} {label}: A* {astar_time:?} vs Dijkstra {dijkstra_time:?}; \
+             labels {astar_labels} vs {dijkstra_labels}",
+            pairs.len()
+        );
+    }
 }
 
 // --- Directed profile-aware search -------------------------------------------
@@ -1889,7 +2277,7 @@ fn directed_dijkstra_matches_a_plain_dijkstra() {
     let bike = net
         .compile_profile(&StreetProfileDefinition::bicycle())
         .unwrap();
-    let expected = hand_dijkstra(&net, &bike.arc_millis, 0);
+    let expected = hand_dijkstra(&net, bike.arc_millis(), 0);
     let got = net.directed_distances(&bike, &[(0, 0)], u64::MAX);
     assert_eq!(got, expected);
 }
@@ -1915,7 +2303,7 @@ fn directed_travel_time_is_the_on_edge_plus_arc_time() {
         fraction: 0.5,
         connector: 0.0,
     };
-    let arc = |a, b| bike.arc_millis[directed_slot(&net, a, b)];
+    let arc = |a, b| bike.arc_millis()[directed_slot(&net, a, b)];
     let leave = (f64::from(arc(0, 1)) * 0.75).ceil() as u64;
     let cross = u64::from(arc(1, 2));
     let arrive = (f64::from(arc(2, 3)) * 0.5).ceil() as u64;
@@ -1987,7 +2375,7 @@ fn directed_same_edge_direct_and_blocked() {
         connector: 0.0,
     };
     // near -> far runs forward (0->1) directly along the edge.
-    let arc = bike.arc_millis[directed_slot(&net, 0, 1)];
+    let arc = bike.arc_millis()[directed_slot(&net, 0, 1)];
     let direct = seconds((f64::from(arc) * 0.5).ceil() / 1000.0);
     assert_eq!(
         net.directed_travel_time(&near, &far, &bike, 1e9),
@@ -2038,17 +2426,17 @@ fn directed_search_matches_oracle_over_sources_cutoffs_and_parallels() {
     for source in 0..net.vertex_count() {
         assert_eq!(
             net.directed_distances(&bike, &[(source, 0)], u64::MAX),
-            hand_dijkstra(&net, &bike.arc_millis, source),
+            hand_dijkstra(&net, bike.arc_millis(), source),
         );
         // A bound that reaches some but not all vertices.
         let cutoff = 30_000;
         assert_eq!(
             net.directed_distances(&bike, &[(source, 0)], cutoff),
-            hand_dijkstra_bounded(&net, &bike.arc_millis, source, cutoff),
+            hand_dijkstra_bounded(&net, bike.arc_millis(), source, cutoff),
         );
     }
     // The parallel edge choice: 0 -> 1 takes the shorter of the two edges.
-    let short = bike.arc_millis[directed_slot(&net, 0, 1)];
+    let short = bike.arc_millis()[directed_slot(&net, 0, 1)];
     assert_eq!(
         net.directed_distances(&bike, &[(0, 0)], u64::MAX)[1],
         u64::from(short)
@@ -2065,8 +2453,8 @@ fn directed_search_detours_around_forbidden_arcs() {
     let bike = net
         .compile_profile(&StreetProfileDefinition::bicycle())
         .unwrap();
-    let detour = u64::from(bike.arc_millis[directed_slot(&net, 0, 2)])
-        + u64::from(bike.arc_millis[directed_slot(&net, 2, 1)]);
+    let detour = u64::from(bike.arc_millis()[directed_slot(&net, 0, 2)])
+        + u64::from(bike.arc_millis()[directed_slot(&net, 2, 1)]);
     assert_eq!(
         net.directed_distances(&bike, &[(0, 0)], u64::MAX)[1],
         detour
@@ -2074,7 +2462,7 @@ fn directed_search_detours_around_forbidden_arcs() {
     // The oracle agrees over the forbidden graph.
     assert_eq!(
         net.directed_distances(&bike, &[(0, 0)], u64::MAX),
-        hand_dijkstra(&net, &bike.arc_millis, 0),
+        hand_dijkstra(&net, bike.arc_millis(), 0),
     );
 }
 
@@ -3125,7 +3513,7 @@ fn an_infinite_elevation_is_rejected() {
 /// The permitted arc costs of a compiled profile, ascending.
 fn permitted_costs(compiled: &CompiledStreetProfile) -> Vec<u32> {
     let mut costs: Vec<u32> = compiled
-        .arc_millis
+        .arc_millis()
         .iter()
         .copied()
         .filter(|&cost| cost != u32::MAX)
@@ -3152,8 +3540,8 @@ fn a_flat_dem_compiles_bit_identically_to_no_dem() {
         StreetProfileDefinition::e_scooter(),
     ] {
         assert_eq!(
-            flat.compile_profile(&definition).unwrap().arc_millis,
-            elevated.compile_profile(&definition).unwrap().arc_millis,
+            flat.compile_profile(&definition).unwrap().arc_millis(),
+            elevated.compile_profile(&definition).unwrap().arc_millis(),
         );
     }
 }
@@ -3208,8 +3596,8 @@ fn nodata_elevations_and_slope_free_profiles_compile_flat() {
     let nodata = elevated_network(2, &edges, &plain_attrs(1), |_, _| f32::NAN);
     let bike = StreetProfileDefinition::bicycle();
     assert_eq!(
-        nodata.compile_profile(&bike).unwrap().arc_millis,
-        flat.compile_profile(&bike).unwrap().arc_millis
+        nodata.compile_profile(&bike).unwrap().arc_millis(),
+        flat.compile_profile(&bike).unwrap().arc_millis()
     );
     // Slope-free profiles ignore even a strong ramp.
     let ramp = elevated_network(2, &edges, &plain_attrs(1), |x, _| (x / 10.0) as f32);
@@ -3219,8 +3607,8 @@ fn nodata_elevations_and_slope_free_profiles_compile_flat() {
         StreetProfileDefinition::e_scooter(),
     ] {
         assert_eq!(
-            ramp.compile_profile(&definition).unwrap().arc_millis,
-            flat.compile_profile(&definition).unwrap().arc_millis
+            ramp.compile_profile(&definition).unwrap().arc_millis(),
+            flat.compile_profile(&definition).unwrap().arc_millis()
         );
     }
 }
