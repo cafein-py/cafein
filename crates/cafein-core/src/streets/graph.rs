@@ -302,6 +302,7 @@ impl StreetNetwork {
             latitudes,
             links,
             None,
+            None,
         )
     }
 
@@ -312,7 +313,10 @@ impl StreetNetwork {
     /// input order. The forward permissions land on each edge's `from → to`
     /// arc and the reverse permissions on its `to → from` arc, so directional
     /// (one-way / contraflow) access stays on the correct directed arc through
-    /// the internal reorder. Elevations, when present, are installed separately.
+    /// the internal reorder. `elevations`, when present, carries one value per
+    /// input coordinate — NaN for unavailable — and must match the coordinate
+    /// arrays' length; the values ride the reorder and the densifier into the
+    /// stored geometry.
     #[allow(clippy::too_many_arguments)]
     pub fn new_multimodal(
         vertex_count: u32,
@@ -323,6 +327,7 @@ impl StreetNetwork {
         latitudes: &[f64],
         links: Vec<StopLink>,
         attributes: EdgeAttributes,
+        elevations: Option<&[f32]>,
     ) -> Result<StreetNetwork, StreetError> {
         let edge_count = edges.len();
         if attributes.highway.len() != edge_count
@@ -336,6 +341,12 @@ impl StreetNetwork {
         {
             return Err(StreetError::InvalidAttributes);
         }
+        if let Some(elevations) = elevations {
+            if elevations.len() != longitudes.len() {
+                return Err(StreetError::InvalidAttributes);
+            }
+            check_elevations(elevations)?;
+        }
         Self::build_network(
             vertex_count,
             stop_count,
@@ -345,6 +356,7 @@ impl StreetNetwork {
             latitudes,
             links,
             Some(attributes),
+            elevations,
         )
     }
 
@@ -358,6 +370,7 @@ impl StreetNetwork {
         latitudes: &[f64],
         links: Vec<StopLink>,
         attributes: Option<EdgeAttributes>,
+        elevations: Option<&[f32]>,
     ) -> Result<StreetNetwork, StreetError> {
         if coordinate_offsets.len() != edges.len() + 1
             || coordinate_offsets.first() != Some(&0)
@@ -477,11 +490,24 @@ impl StreetNetwork {
                 )
             })
         };
+        // Elevations complete the tie-break the same way: bit patterns give a
+        // deterministic total order over f32 (NaN included) even though the
+        // order itself is arbitrary.
+        let elevation_key = |edge: u32| {
+            let start = coordinate_offsets[edge as usize] as usize;
+            let end = coordinate_offsets[edge as usize + 1] as usize;
+            elevations
+                .map(|source| &source[start..end])
+                .unwrap_or(&[])
+                .iter()
+                .map(|value| value.to_bits())
+        };
         order.sort_unstable_by(|&a, &b| {
             keys[a as usize]
                 .cmp(&keys[b as usize])
                 .then_with(|| geometry_points(a).cmp(geometry_points(b)))
                 .then_with(|| attribute_key(a).cmp(&attribute_key(b)))
+                .then_with(|| elevation_key(a).cmp(elevation_key(b)))
         });
 
         let mut edge_map = vec![0u32; edges.len()];
@@ -491,6 +517,7 @@ impl StreetNetwork {
         let mut permuted_offsets = Vec::with_capacity(edges.len() + 1);
         let mut permuted_lons = Vec::with_capacity(fixed_lons.len());
         let mut permuted_lats = Vec::with_capacity(fixed_lats.len());
+        let mut permuted_elevations = elevations.map(|_| Vec::with_capacity(fixed_lons.len()));
         permuted_offsets.push(0u32);
         for (new_edge, &old_edge) in order.iter().enumerate() {
             edge_map[old_edge as usize] = new_edge as u32;
@@ -507,6 +534,9 @@ impl StreetNetwork {
             let end = coordinate_offsets[old_edge as usize + 1] as usize;
             permuted_lons.extend_from_slice(&fixed_lons[start..end]);
             permuted_lats.extend_from_slice(&fixed_lats[start..end]);
+            if let (Some(permuted), Some(source)) = (permuted_elevations.as_mut(), elevations) {
+                permuted.extend_from_slice(&source[start..end]);
+            }
             permuted_offsets.push(permuted_lons.len() as u32);
         }
         // Vertices no edge touches keep ids after the connected ones.
@@ -533,8 +563,12 @@ impl StreetNetwork {
             })
             .collect();
 
-        let (dense_offsets, lons, lats, cumulative) =
-            densify(&permuted_offsets, &permuted_lons, &permuted_lats);
+        let (dense_offsets, lons, lats, cumulative, dense_elevations) = densify(
+            &permuted_offsets,
+            &permuted_lons,
+            &permuted_lats,
+            permuted_elevations.as_deref(),
+        );
 
         let mut adjacency_offsets = vec![0u32; vertex_count as usize + 1];
         for &(from, to, _) in &edges {
@@ -622,7 +656,7 @@ impl StreetNetwork {
             contraction: None,
             symmetric: std::sync::OnceLock::new(),
             attributes,
-            elevations: None,
+            elevations: dense_elevations,
         };
         Ok(StreetNetwork {
             graph,
@@ -674,6 +708,18 @@ impl StreetNetwork {
         self.graph.elevations.as_deref()
     }
 
+    /// The stored geometry coordinates in degrees, aligned with
+    /// [`Self::elevations`] — for diagnostics and tests.
+    pub fn coordinates(&self) -> Vec<(f64, f64)> {
+        let arrays = self.arrays();
+        arrays
+            .lons()
+            .iter()
+            .zip(arrays.lats())
+            .map(|(&lon, &lat)| (degrees(lon), degrees(lat)))
+            .collect()
+    }
+
     /// Attaches multimodal edge attributes to the graph, replacing any
     /// installed set. Every array must match the graph's shape: the two
     /// adjacency-slot arrays span `2·edges`, the four per-edge arrays span
@@ -697,6 +743,7 @@ impl StreetNetwork {
         if elevations.len() != self.arrays().lons().len() {
             return Err(StreetError::InvalidAttributes);
         }
+        check_elevations(&elevations)?;
         self.graph.elevations = Some(elevations);
         Ok(())
     }
@@ -845,6 +892,12 @@ impl StreetNetwork {
         if let Some(attributes) = &parts.attributes {
             check_street_attributes(attributes, parts.lengths.len())?;
         }
+        if let Some(elevations) = &parts.elevations {
+            if elevations.len() != parts.lons.len() {
+                return Err(StreetError::InvalidAttributes);
+            }
+            check_elevations(elevations)?;
+        }
         let vertex_links = build_vertex_links(&parts.links);
         Ok(StreetNetwork {
             graph: StreetGraph {
@@ -920,6 +973,12 @@ impl StreetNetwork {
         if let Some(attributes) = &spec.attributes {
             check_street_attributes(attributes, arrays.lengths.len)?;
         }
+        if let Some(elevations) = &spec.elevations {
+            if elevations.len() != arrays.lons.len {
+                return Err(StreetError::InvalidAttributes);
+            }
+            check_elevations(elevations)?;
+        }
         let vertex_links = build_vertex_links(&spec.links);
         Ok(StreetNetwork {
             graph: StreetGraph {
@@ -967,6 +1026,15 @@ pub struct StreetNetworkParts {
     pub attributes: Option<StreetAttributes>,
     /// The optional per-coordinate elevations, present when elevation is on.
     pub elevations: Option<Vec<f32>>,
+}
+
+/// Elevations are finite metres or NaN for unavailable; an infinity would
+/// poison every slope computed over it, so it is refused at the boundary.
+pub(super) fn check_elevations(elevations: &[f32]) -> Result<(), StreetError> {
+    if elevations.iter().any(|value| value.is_infinite()) {
+        return Err(StreetError::InvalidAttributes);
+    }
+    Ok(())
 }
 
 /// Validates a multimodal attribute set against a graph of `edges` edges: the

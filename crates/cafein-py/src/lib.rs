@@ -130,6 +130,10 @@ fn _cafein(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TransportNetwork>()?;
     m.add_class::<streets::StreetNetwork>()?;
     m.add(
+        "STREET_MAX_SEGMENT_METERS",
+        cafein_core::streets::MAX_SEGMENT_METERS,
+    )?;
+    m.add(
         "STREET_DISTANCE_PROVENANCE",
         cafein_core::streets::STREET_DISTANCE_PROVENANCE,
     )?;

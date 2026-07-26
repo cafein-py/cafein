@@ -75,16 +75,22 @@ pub(super) fn segment_length(lon_a: f64, lat_a: f64, lon_b: f64, lat_b: f64) -> 
 /// Splits every segment longer than `MAX_SEGMENT_METERS` into equal colinear
 /// pieces, returning the densified coordinate offsets, geographic coordinates,
 /// and per-coordinate cumulative distance from each edge's first point.
+/// The densified geometry: offsets, fixed-point coordinates, cumulative
+/// metres, and — when input elevations were given — interpolated elevations.
+pub(super) type Densified = (Vec<u32>, Vec<i32>, Vec<i32>, Vec<f32>, Option<Vec<f32>>);
+
 pub(super) fn densify(
     coordinate_offsets: &[u32],
     longitudes: &[i32],
     latitudes: &[i32],
-) -> (Vec<u32>, Vec<i32>, Vec<i32>, Vec<f32>) {
+    elevations: Option<&[f32]>,
+) -> Densified {
     let edge_count = coordinate_offsets.len().saturating_sub(1);
     let mut offsets = Vec::with_capacity(coordinate_offsets.len());
     let mut lons = Vec::new();
     let mut lats = Vec::new();
     let mut cumulative = Vec::new();
+    let mut dense_elevations = elevations.map(|_| Vec::new());
     // Inserted points re-quantize onto the grid (≤ ~0.8 cm each), so the
     // split targets a hair under the maximum and no sub-segment exceeds it.
     let target = MAX_SEGMENT_METERS - QUANTIZATION_GUARD_METERS;
@@ -95,6 +101,9 @@ pub(super) fn densify(
         lons.push(longitudes[start]);
         lats.push(latitudes[start]);
         cumulative.push(0.0f32);
+        if let (Some(dense), Some(source)) = (dense_elevations.as_mut(), elevations) {
+            dense.push(source[start]);
+        }
         let mut running = 0.0f64;
         for point in start..end - 1 {
             let (lon_a, lat_a) = (degrees(longitudes[point]), degrees(latitudes[point]));
@@ -137,11 +146,22 @@ pub(super) fn densify(
                 lons.push(lon);
                 lats.push(lat);
                 cumulative.push(running as f32);
+                if let (Some(dense), Some(source)) = (dense_elevations.as_mut(), elevations) {
+                    // Interpolates alongside longitude and latitude; a NaN
+                    // endpoint makes the inserted points NaN — unavailable
+                    // elevation is not invented between known values.
+                    let (ele_a, ele_b) = (source[point], source[point + 1]);
+                    dense.push(if k == pieces {
+                        ele_b
+                    } else {
+                        (f64::from(ele_a) + t * (f64::from(ele_b) - f64::from(ele_a))) as f32
+                    });
+                }
             }
         }
         offsets.push(lons.len() as u32);
     }
-    (offsets, lons, lats, cumulative)
+    (offsets, lons, lats, cumulative, dense_elevations)
 }
 
 /// Local meters per degree of (longitude, latitude) on the WGS84 spheroid.

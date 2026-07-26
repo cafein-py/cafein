@@ -3,7 +3,7 @@
 /// Longest stored segment, in meters. Segments are densified below this so a
 /// single centre-latitude scale represents each one to well under a
 /// millimetre even at high latitude.
-pub(super) const MAX_SEGMENT_METERS: f64 = 100.0;
+pub const MAX_SEGMENT_METERS: f64 = 100.0;
 
 /// Headroom the densifier leaves under `MAX_SEGMENT_METERS`, so re-quantizing
 /// the inserted points (≤ ~0.8 cm each) never pushes a segment over the

@@ -2292,6 +2292,7 @@ fn multimodal_network(
             facility_forward: &attrs.facility_forward,
             facility_reverse: &attrs.facility_reverse,
         },
+        None,
     )
 }
 
@@ -2923,4 +2924,274 @@ fn the_row_form_matches_leg_by_leg() {
         );
         assert_eq!(row[index], expected);
     }
+}
+
+// ---- Elevation intake ----
+
+/// Builds a multimodal network with a per-input-coordinate elevation
+/// callback, laying out geometry exactly as [`multimodal_network`] does.
+fn elevated_network(
+    vertex_count: u32,
+    edges: &[TestEdge],
+    attrs: &Attrs,
+    elevation: impl Fn(f64, f64) -> f32,
+) -> StreetNetwork {
+    let mut offsets = vec![0u32];
+    let mut longitudes = Vec::new();
+    let mut latitudes = Vec::new();
+    let mut elevations = Vec::new();
+    for (_, _, _, path) in edges {
+        for &(x, y) in path {
+            let (lon, lat) = lonlat(x, y);
+            longitudes.push(lon);
+            latitudes.push(lat);
+            elevations.push(elevation(x, y));
+        }
+        offsets.push(longitudes.len() as u32);
+    }
+    let flat: Vec<(u32, u32, f64)> = edges
+        .iter()
+        .map(|&(from, to, meters, _)| (from, to, meters))
+        .collect();
+    StreetNetwork::new_multimodal(
+        vertex_count,
+        0,
+        &flat,
+        &offsets,
+        &longitudes,
+        &latitudes,
+        vec![],
+        EdgeAttributes {
+            highway: &attrs.highway,
+            surface: &attrs.surface,
+            smoothness: &attrs.smoothness,
+            flags: &attrs.flags,
+            access_forward: &attrs.access_forward,
+            access_reverse: &attrs.access_reverse,
+            facility_forward: &attrs.facility_forward,
+            facility_reverse: &attrs.facility_reverse,
+        },
+        Some(&elevations),
+    )
+    .unwrap()
+}
+
+fn plain_attrs(count: usize) -> Attrs {
+    let both = MODE_WALK | MODE_BICYCLE;
+    Attrs {
+        highway: vec![0; count],
+        surface: vec![0; count],
+        smoothness: vec![0; count],
+        flags: vec![0; count],
+        access_forward: vec![both; count],
+        access_reverse: vec![both; count],
+        facility_forward: vec![0; count],
+        facility_reverse: vec![0; count],
+    }
+}
+
+#[test]
+fn elevations_ride_the_reorder_and_the_densifier() {
+    // A 500 m ramp climbing 1 m per 10 m of easting, given as edges out of
+    // spatial order so the reorder permutes them. Every stored coordinate —
+    // including the ones the densifier inserts — must carry the elevation of
+    // its own longitude, which pins both the permutation and the
+    // interpolation.
+    let edges: Vec<TestEdge> = vec![
+        (2, 3, 100.0, straight((200.0, 0.0), (300.0, 0.0))),
+        (0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0))),
+        (4, 5, 100.0, straight((400.0, 0.0), (500.0, 0.0))),
+        (1, 2, 100.0, straight((100.0, 0.0), (200.0, 0.0))),
+        (3, 4, 100.0, straight((300.0, 0.0), (400.0, 0.0))),
+    ];
+    let net = elevated_network(6, &edges, &plain_attrs(5), |x, _| (x / 10.0) as f32);
+    let elevations = net.elevations().expect("elevations installed");
+    let lons = net.arrays().lons();
+    assert_eq!(elevations.len(), lons.len());
+    // The densifier split the 100 m edges (segments cap under 100 m), so
+    // there are more stored coordinates than the 10 input ones.
+    assert!(elevations.len() > 10);
+    let origin_lon = lonlat(0.0, 0.0).0;
+    let per_lon = meters_per_degree(60.0).0;
+    for (&lon, &elevation) in lons.iter().zip(elevations) {
+        let x = (degrees(lon) - origin_lon) * per_lon;
+        assert!(
+            (f64::from(elevation) - x / 10.0).abs() < 0.05,
+            "coordinate at x={x:.1} carries {elevation}"
+        );
+    }
+}
+
+#[test]
+fn unavailable_elevation_stays_unavailable_through_densification() {
+    // The second input coordinate has no elevation; the densifier must mark
+    // every point it inserts against that endpoint as NaN rather than invent
+    // values between a known and an unknown.
+    let edges: Vec<TestEdge> = vec![(0, 1, 200.0, straight((0.0, 0.0), (200.0, 0.0)))];
+    let net = elevated_network(2, &edges, &plain_attrs(1), |x, _| {
+        if x > 100.0 {
+            f32::NAN
+        } else {
+            10.0
+        }
+    });
+    let elevations = net.elevations().unwrap();
+    assert!(elevations.len() > 2);
+    // The first stored coordinate keeps its sampled value; everything
+    // interpolated toward the NaN endpoint, and the endpoint itself, is NaN.
+    assert_eq!(elevations[0], 10.0);
+    assert!(elevations[1..].iter().all(|value| value.is_nan()));
+}
+
+#[test]
+fn a_build_without_elevations_installs_none() {
+    let edges: Vec<TestEdge> = vec![(0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0)))];
+    let net = multimodal_network(2, &edges, &plain_attrs(1)).unwrap();
+    assert!(net.elevations().is_none());
+}
+
+#[test]
+fn a_misshaped_elevation_array_is_rejected() {
+    let (lon_a, lat_a) = lonlat(0.0, 0.0);
+    let (lon_b, lat_b) = lonlat(100.0, 0.0);
+    let attrs = plain_attrs(1);
+    let result = StreetNetwork::new_multimodal(
+        2,
+        0,
+        &[(0, 1, 100.0)],
+        &[0, 2],
+        &[lon_a, lon_b],
+        &[lat_a, lat_b],
+        vec![],
+        EdgeAttributes {
+            highway: &attrs.highway,
+            surface: &attrs.surface,
+            smoothness: &attrs.smoothness,
+            flags: &attrs.flags,
+            access_forward: &attrs.access_forward,
+            access_reverse: &attrs.access_reverse,
+            facility_forward: &attrs.facility_forward,
+            facility_reverse: &attrs.facility_reverse,
+        },
+        Some(&[1.0]),
+    );
+    assert_eq!(result.unwrap_err(), StreetError::InvalidAttributes);
+}
+
+#[test]
+fn an_infinite_elevation_is_rejected() {
+    // The contract is finite metres or NaN; an infinity would poison every
+    // slope computed over it, so construction refuses it.
+    let (lon_a, lat_a) = lonlat(0.0, 0.0);
+    let (lon_b, lat_b) = lonlat(100.0, 0.0);
+    let attrs = plain_attrs(1);
+    let result = StreetNetwork::new_multimodal(
+        2,
+        0,
+        &[(0, 1, 100.0)],
+        &[0, 2],
+        &[lon_a, lon_b],
+        &[lat_a, lat_b],
+        vec![],
+        EdgeAttributes {
+            highway: &attrs.highway,
+            surface: &attrs.surface,
+            smoothness: &attrs.smoothness,
+            flags: &attrs.flags,
+            access_forward: &attrs.access_forward,
+            access_reverse: &attrs.access_reverse,
+            facility_forward: &attrs.facility_forward,
+            facility_reverse: &attrs.facility_reverse,
+        },
+        Some(&[0.0, f32::INFINITY]),
+    );
+    assert_eq!(result.unwrap_err(), StreetError::InvalidAttributes);
+}
+
+#[test]
+fn adoption_rejects_misshaped_or_infinite_persisted_elevations() {
+    // Both adoption paths validate elevations like attributes: a wrong-length
+    // or infinite array is refused rather than indexed out of alignment. The
+    // owned path is exercised through the public parts round-trip; the mapped
+    // path runs the same checks.
+    let edges: Vec<TestEdge> = vec![(0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0)))];
+    let net = elevated_network(2, &edges, &plain_attrs(1), |_, _| 5.0);
+    assert!(StreetNetwork::from_parts(net.to_parts()).is_ok());
+    let mut wrong_len = net.to_parts();
+    wrong_len.elevations.as_mut().unwrap().pop();
+    assert_eq!(
+        StreetNetwork::from_parts(wrong_len).unwrap_err(),
+        StreetError::InvalidAttributes
+    );
+    let mut infinite = net.to_parts();
+    infinite.elevations.as_mut().unwrap()[0] = f32::INFINITY;
+    assert_eq!(
+        StreetNetwork::from_parts(infinite).unwrap_err(),
+        StreetError::InvalidAttributes
+    );
+    // The install path refuses an infinity the same way.
+    let mut plain = multimodal_network(2, &edges, &plain_attrs(1)).unwrap();
+    let count = plain.arrays().lons().len();
+    assert_eq!(
+        plain
+            .install_elevations(vec![f32::INFINITY; count])
+            .unwrap_err(),
+        StreetError::InvalidAttributes
+    );
+}
+
+#[test]
+fn coincident_edges_differing_only_in_elevation_order_deterministically() {
+    // Two edges identical in geometry and attributes but not in their
+    // elevation profiles — one of them holding a NaN — must lay out the same
+    // way whatever order they arrive in, so the stored profile stays a pure
+    // function of the edge set.
+    let path = straight((0.0, 0.0), (200.0, 0.0));
+    let build = |profiles: [[f32; 2]; 2]| {
+        let mut offsets = vec![0u32];
+        let mut longitudes = Vec::new();
+        let mut latitudes = Vec::new();
+        let mut elevations = Vec::new();
+        for profile in &profiles {
+            for (&(x, y), &elevation) in path.iter().zip(profile) {
+                let (lon, lat) = lonlat(x, y);
+                longitudes.push(lon);
+                latitudes.push(lat);
+                elevations.push(elevation);
+            }
+            offsets.push(longitudes.len() as u32);
+        }
+        let attrs = plain_attrs(2);
+        StreetNetwork::new_multimodal(
+            2,
+            0,
+            &[(0, 1, 200.0), (0, 1, 200.0)],
+            &offsets,
+            &longitudes,
+            &latitudes,
+            vec![],
+            EdgeAttributes {
+                highway: &attrs.highway,
+                surface: &attrs.surface,
+                smoothness: &attrs.smoothness,
+                flags: &attrs.flags,
+                access_forward: &attrs.access_forward,
+                access_reverse: &attrs.access_reverse,
+                facility_forward: &attrs.facility_forward,
+                facility_reverse: &attrs.facility_reverse,
+            },
+            Some(&elevations),
+        )
+        .unwrap()
+    };
+    let bits = |net: &StreetNetwork| {
+        net.elevations()
+            .unwrap()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    };
+    let ab = build([[0.0, 20.0], [f32::NAN, 5.0]]);
+    let ba = build([[f32::NAN, 5.0], [0.0, 20.0]]);
+    assert_eq!(bits(&ab), bits(&ba));
 }

@@ -177,6 +177,7 @@ pub use directed::{StreetLeg, STREET_DISTANCE_PROVENANCE};
 mod geo;
 mod graph;
 mod index;
+pub use index::MAX_SEGMENT_METERS;
 mod paths;
 mod profile;
 mod search;
