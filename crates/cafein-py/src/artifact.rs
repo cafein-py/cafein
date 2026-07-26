@@ -29,6 +29,9 @@ impl TransportNetwork {
                             vertex_count: parts.vertex_count,
                             links: parts.links.clone(),
                             descriptors,
+                            // The transit build path is walk-only; elevations
+                            // and their metadata are the street artifact's.
+                            elevation: None,
                         }),
                         bytes,
                     )
@@ -216,12 +219,13 @@ pub(super) const ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINET";
 /// failing later in a checksum or a decode.
 pub(super) const STREET_ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINST";
 
-pub(super) const STREET_ARTIFACT_FORMAT: u32 = 1;
+// 2: optional elevation metadata in `StreetsMeta`, as in network format 13.
+pub(super) const STREET_ARTIFACT_FORMAT: u32 = 2;
 
-// 12: the STREETS section may carry the optional multimodal arrays
-// (directional permissions, edge attributes, elevations) after the core
-// graph; walk-only artifacts omit them. Earlier formats must be rebuilt.
-pub(super) const ARTIFACT_FORMAT: u32 = 12;
+// 13: `StreetsMeta` carries optional elevation metadata (DEM source,
+// sampling interval, nodata policy, coverage) alongside the format-12
+// multimodal arrays. Earlier formats must be rebuilt.
+pub(super) const ARTIFACT_FORMAT: u32 = 13;
 
 /// Section tags in the container directory.
 pub(super) const SECTION_META: u16 = 1;
@@ -303,6 +307,25 @@ pub(super) struct StreetsMeta {
     pub(super) vertex_count: u32,
     pub(super) links: Vec<StoredLink>,
     pub(super) descriptors: Vec<ArrayDescriptor>,
+    /// What the persisted per-coordinate elevations mean; `None` when the
+    /// network carries no elevations.
+    pub(super) elevation: Option<ElevationMeta>,
+}
+
+/// Provenance of the sampled elevations: enough to know what the numbers
+/// mean without re-reading the DEM.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub(super) struct ElevationMeta {
+    /// The DEM the coordinates were sampled from, as given to the build.
+    pub(super) source: String,
+    /// The along-edge sampling interval in meters.
+    pub(super) sampling_interval: f64,
+    /// How missing raster values were treated.
+    pub(super) nodata_policy: String,
+    /// The finite share of sampled coordinates, 0..=1.
+    pub(super) coverage: f64,
+    /// Bridge/tunnel edges whose interior was endpoint-interpolated.
+    pub(super) inferred_edges: u32,
 }
 
 /// One raw array inside the STREETS section. Offsets are relative to the

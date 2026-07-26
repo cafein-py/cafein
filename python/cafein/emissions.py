@@ -92,9 +92,12 @@ def vehicle_class_factors():
 def street_factors():
     """The shipped street-mode factor table, in g CO₂e per person-km.
 
-    Walking and the conventional bicycle have zero direct operational
-    emissions, so their ``fuel`` and ``operations`` components are zero. Every
-    other value is deliberately **unresolved** (NA), not zero: a bicycle's
+    Walking has zero direct operational emissions, so its ``fuel`` and
+    ``operations`` components are zero. The conventional bicycle's ``fuel``
+    is the dietary energy-expenditure factor of 21 g CO₂e per km — the
+    additional food intake compensating cycling caloric expenditure under
+    average European dietary patterns — with zero ``operations``. Every other
+    value is deliberately **unresolved** (NA), not zero: a bicycle's
     manufacturing footprint is not nothing, and no e-bike or e-scooter number
     ships without a documented source and lifetime allocation. A
     full-life-cycle request therefore reports NA emissions until sourced rows
@@ -117,7 +120,8 @@ def street_factors():
             "vehicle_class": "conventional",
             "service_model": "private",
             "vehicle": nan,
-            "fuel": 0.0,
+            # Dietary energy expenditure, average European diet: 21 g/km.
+            "fuel": 21.0,
             "infrastructure": nan,
             "operations": 0.0,
         },

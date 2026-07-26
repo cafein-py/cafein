@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Street networks can now carry elevation.
+  ``StreetNetwork.from_osm(..., dem=...)`` samples a user-supplied DEM —
+  a GeoTIFF path or tile paths read through the optional ``rioxarray``
+  dependency (``pip install cafein[dem]``), or a
+  ``(lons, lats) -> elevations`` callable — at every geometry
+  coordinate, densified to ``dem_interval`` metres (default 25) so the
+  profile between OSM nodes is captured. Missing data is ``NaN``, never
+  invented; bridge and tunnel interiors interpolate between their
+  endpoint elevations instead of tracking the terrain below or above;
+  and ``elevation_metadata`` records the source, interval, nodata
+  policy, sampled coverage, and inferred-structure count. The values
+  ride the street artifact through ``save``/``load`` (owned and
+  mapped). Flat routing is unchanged — elevations are carried for the
+  slope-aware profiles to come, not yet costed. The conventional
+  bicycle's operational emission factor is now 21 g CO₂e per person-km
+  (dietary energy expenditure, average European diet).
+
 - Standalone street routing: cycling, e-scooter, e-bike, and walking as
   door-to-door modes of their own. ``cafein.StreetNetwork.from_osm``
   builds a directional multimodal street graph from an OpenStreetMap

@@ -557,17 +557,20 @@ def test_default_full_lca_is_unresolved_not_zero(streets, origins, mode):
 
 
 @pytest.mark.parametrize(
-    ("mode", "expected_zero"),
-    [("walk", True), ("bicycle", True), ("e_bike", False), ("e_scooter", False)],
+    ("mode", "per_km"),
+    [("walk", 0.0), ("bicycle", 21.0), ("e_bike", None), ("e_scooter", None)],
 )
 def test_operational_components_resolve_the_human_powered_modes(
-    streets, origins, mode, expected_zero
+    streets, origins, mode, per_km
 ):
-    if expected_zero:
+    # Walking is free; the conventional bicycle carries the shipped dietary
+    # energy factor of 21 g/km; the battery modes stay unresolved.
+    if per_km is not None:
         costs = TravelCostMatrix(
             streets, origins, transport_mode=mode, components=["fuel", "operations"]
         )
-        assert (costs.emissions == 0).all()
+        expected = costs.network_distance_m / 1000.0 * per_km
+        assert np.allclose(costs.emissions, expected)
     else:
         with pytest.warns(UserWarning, match="unresolved"):
             costs = TravelCostMatrix(

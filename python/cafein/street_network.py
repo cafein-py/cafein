@@ -1,11 +1,13 @@
 """The standalone street network: build from OSM, route between coordinates."""
 
+import math
 import os
 
 import numpy as np
 import shapely
 
-from . import _osm, streets
+from . import _osm, elevation, streets
+from ._cafein import STREET_MAX_SEGMENT_METERS
 from ._cafein import StreetNetwork as _CoreStreetNetwork
 
 MODES = ("walk", "bicycle", "e_scooter")
@@ -35,7 +37,9 @@ class StreetNetwork:
         self._core = core
 
     @classmethod
-    def from_osm(cls, osm_pbf, *, modes=MODES, bounding_box=None):
+    def from_osm(
+        cls, osm_pbf, *, modes=MODES, bounding_box=None, dem=None, dem_interval=25.0
+    ):
         """Build a street network from an OSM PBF extract.
 
         Parameters
@@ -49,6 +53,20 @@ class StreetNetwork:
             later, just without its small-component pruning.
         bounding_box : sequence of float, optional
             ``(min_lon, min_lat, max_lon, max_lat)`` to clip the extract.
+        dem : path, sequence of paths, or callable, optional
+            An elevation source: a GeoTIFF path or tile paths sampled through
+            the optional rioxarray dependency, or a callable
+            ``(lons, lats) -> elevations``. Every geometry coordinate gets an
+            elevation (NaN where the DEM has none); bridge and tunnel edges
+            interpolate between their endpoints instead of tracking terrain,
+            and ``elevation_metadata`` records the provenance. Without it the
+            network carries no elevations, as before.
+        dem_interval : float
+            The along-edge sampling interval in meters (default 25): edge
+            geometry is densified to it before sampling so the profile
+            between OSM nodes is captured. Capped just under the stored
+            geometry's own ~100 m segment limit; ``elevation_metadata``
+            records the interval actually used.
         """
         modes = tuple(modes)
         nodes, edges = _osm.union_network(osm_pbf, bounding_box=bounding_box)
@@ -67,10 +85,65 @@ class StreetNetwork:
 
         lengths = edges["length"].to_numpy(dtype=float)
         geometry = edges.geometry.to_numpy()
+        if dem is not None:
+            if not (math.isfinite(dem_interval) and dem_interval > 0):
+                raise ValueError("dem_interval must be a positive, finite number")
+            # The Rust densifier splits stored segments under its own cap
+            # regardless, so sampling coarser than that would let it insert
+            # interpolated interiors after structure inference has already
+            # counted; capping (with headroom) keeps every stored coordinate
+            # in existence — and sampled — before inference runs.
+            dem_interval = min(float(dem_interval), STREET_MAX_SEGMENT_METERS - 1.0)
+            # Densify to the sampling interval before extracting coordinates,
+            # so the elevation profile between OSM nodes is captured.
+            # segmentize measures Euclidean degrees, and a degree of latitude
+            # is the longest degree there is — 111,694 m at the poles — so
+            # dividing by that ceiling bounds every direction: no segment
+            # exceeds the interval, and east-west ones oversample (harmless).
+            # Extracts are contiguous and never cross the antimeridian, per
+            # the street network's documented contract.
+            geometry = shapely.segmentize(geometry, dem_interval / 111_700.0)
         offsets = np.concatenate(
             [[0], np.cumsum(shapely.get_num_coordinates(geometry))]
         )
         coordinates = shapely.get_coordinates(geometry)
+
+        elevations = None
+        metadata = None
+        if dem is not None:
+            # Snapshot path inputs up front: they are consumed for sampling
+            # and again for the source identifier, so a one-shot iterable or
+            # a stateful PathLike must not make the two disagree.
+            if not callable(dem):
+                dem = (
+                    os.fspath(dem)
+                    if isinstance(dem, (str, os.PathLike))
+                    else tuple(os.fspath(tile) for tile in dem)
+                )
+            values = elevation.sample_dem(coordinates[:, 0], coordinates[:, 1], dem)
+            # The promised finite share of DEM samples — taken before
+            # structure inference rewrites bridge and tunnel interiors.
+            sampled_coverage = elevation.coverage(values)
+            structures = np.nonzero(
+                (flags & (_osm.FLAG_BRIDGE | _osm.FLAG_TUNNEL)).astype(bool)
+            )[0]
+            inferred = elevation.infer_structures(
+                offsets, coordinates[:, 0], coordinates[:, 1], values, structures
+            )
+            if callable(dem):
+                source = "callable"
+            elif isinstance(dem, (str, os.PathLike)):
+                source = os.fspath(dem)
+            else:
+                source = ";".join(dem)
+            elevations = values.tolist()
+            metadata = (
+                source,
+                float(dem_interval),
+                elevation.NODATA_POLICY,
+                sampled_coverage,
+                int(inferred),
+            )
         # `adj_facility` is reserved: no profile reads it yet (the compiler
         # routes on the access bits and the per-edge flags).
         facility = np.zeros(len(edges), dtype=np.uint8)
@@ -89,8 +162,31 @@ class StreetNetwork:
                 access_reverse.tolist(),
                 facility.tolist(),
                 facility.tolist(),
+                elevations,
+                metadata,
             )
         )
+
+    @property
+    def elevation_metadata(self):
+        """Provenance of the sampled elevations, or ``None`` without a DEM.
+
+        A dict of ``source``, ``sampling_interval`` (meters),
+        ``nodata_policy``, ``coverage`` (the finite share of sampled
+        coordinates), and ``inferred_edges`` (bridges and tunnels whose
+        interior was endpoint-interpolated). Persisted with the artifact.
+        """
+        return self._core.elevation_metadata
+
+    @property
+    def _coordinate_elevations(self):
+        """The stored per-coordinate elevations; internal, for the tests."""
+        return self._core._coordinate_elevations
+
+    @property
+    def _coordinates(self):
+        """The stored ``(longitude, latitude)`` degrees; internal."""
+        return self._core._coordinates
 
     def save(self, path):
         """Save the network as a reusable artifact.

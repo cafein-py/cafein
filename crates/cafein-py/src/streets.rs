@@ -20,8 +20,8 @@ use cafein_core::streets::{
 
 use crate::artifact::{
     corrupted, crc32, decode_optional_street_arrays, decode_streets, encode_streets, io_error,
-    parse_container, validate_street_shape, write_container, MappedArtifact, MmapMode, StreetsMeta,
-    STREET_ARRAY_ORDER, STREET_ARTIFACT_FORMAT, STREET_ARTIFACT_MAGIC,
+    parse_container, validate_street_shape, write_container, ElevationMeta, MappedArtifact,
+    MmapMode, StreetsMeta, STREET_ARRAY_ORDER, STREET_ARTIFACT_FORMAT, STREET_ARTIFACT_MAGIC,
 };
 
 /// The street-mode names accepted by the public API, with the shipped profile
@@ -52,6 +52,8 @@ pub struct StreetNetwork {
     /// owned load, and just the owned optional arrays for a lazy mapped one.
     /// Zero only for a network built from arrays rather than loaded.
     streets_bytes_read: u64,
+    /// What the installed elevations mean; `None` without elevations.
+    elevation: Option<ElevationMeta>,
 }
 
 #[pymethods]
@@ -62,6 +64,10 @@ impl StreetNetwork {
     /// order as `edges`.
     #[new]
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (vertex_count, edges, coordinate_offsets, longitudes, latitudes,
+                        edge_highway, edge_surface, edge_smoothness, edge_flags,
+                        access_forward, access_reverse, facility_forward, facility_reverse,
+                        coordinate_elevations = None, elevation_metadata = None))]
     fn new(
         vertex_count: u32,
         edges: Vec<(u32, u32, f64)>,
@@ -76,7 +82,15 @@ impl StreetNetwork {
         access_reverse: Vec<u8>,
         facility_forward: Vec<u8>,
         facility_reverse: Vec<u8>,
+        coordinate_elevations: Option<Vec<f32>>,
+        elevation_metadata: Option<(String, f64, String, f64, u32)>,
     ) -> PyResult<StreetNetwork> {
+        if coordinate_elevations.is_some() != elevation_metadata.is_some() {
+            return Err(PyValueError::new_err(
+                "coordinate_elevations and elevation_metadata go together: \
+                 pass both or neither",
+            ));
+        }
         let inner = CoreStreetNetwork::new_multimodal(
             vertex_count,
             0,
@@ -95,12 +109,26 @@ impl StreetNetwork {
                 facility_forward: &facility_forward,
                 facility_reverse: &facility_reverse,
             },
+            coordinate_elevations.as_deref(),
         )
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let elevation = elevation_metadata.map(
+            |(source, sampling_interval, nodata_policy, coverage, inferred_edges)| ElevationMeta {
+                source,
+                sampling_interval,
+                nodata_policy,
+                coverage,
+                inferred_edges,
+            },
+        );
+        if let Some(meta) = &elevation {
+            check_elevation_meta(meta, inner.edge_count()).map_err(PyValueError::new_err)?;
+        }
         Ok(StreetNetwork {
             inner,
             profiles: Vec::new(),
             streets_bytes_read: 0,
+            elevation,
         })
     }
 
@@ -123,6 +151,7 @@ impl StreetNetwork {
                 vertex_count: parts.vertex_count,
                 links: parts.links.clone(),
                 descriptors,
+                elevation: self.elevation.clone(),
             })
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
             write_container(
@@ -164,7 +193,9 @@ impl StreetNetwork {
         };
         if mode != MmapMode::Off {
             match py.allow_threads(|| load_street_mapped(path, verify))? {
-                Ok((inner, bytes_read)) => return Ok(StreetNetwork::adopt(inner, bytes_read)),
+                Ok((inner, bytes_read, elevation)) => {
+                    return Ok(StreetNetwork::adopt(inner, bytes_read, elevation))
+                }
                 Err(reason) if mode == MmapMode::Require => {
                     return Err(PyValueError::new_err(format!(
                         "'{path}' cannot be memory-mapped ({reason}) and \
@@ -174,8 +205,9 @@ impl StreetNetwork {
                 Err(_) => {}
             }
         }
-        let (inner, bytes_read) = py.allow_threads(|| load_street_owned(path, verify))?;
-        Ok(StreetNetwork::adopt(inner, bytes_read))
+        let (inner, bytes_read, elevation) =
+            py.allow_threads(|| load_street_owned(path, verify))?;
+        Ok(StreetNetwork::adopt(inner, bytes_read, elevation))
     }
 
     /// The origins × destinations travel-time matrix under `mode`, in whole
@@ -327,6 +359,36 @@ impl StreetNetwork {
         Ok(table.into())
     }
 
+    /// What the installed elevations mean, as a dict, or `None` when the
+    /// network carries no elevations.
+    #[getter]
+    fn elevation_metadata(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        let Some(meta) = &self.elevation else {
+            return Ok(None);
+        };
+        let dict = PyDict::new(py);
+        dict.set_item("source", &meta.source)?;
+        dict.set_item("sampling_interval", meta.sampling_interval)?;
+        dict.set_item("nodata_policy", &meta.nodata_policy)?;
+        dict.set_item("coverage", meta.coverage)?;
+        dict.set_item("inferred_edges", meta.inferred_edges)?;
+        Ok(Some(dict.into()))
+    }
+
+    /// The stored per-coordinate elevations, aligned with `_coordinates`.
+    /// Internal; the elevation intake tests assert on the stored values.
+    #[getter]
+    fn _coordinate_elevations(&self) -> Option<Vec<f32>> {
+        self.inner.elevations().map(<[f32]>::to_vec)
+    }
+
+    /// The stored geometry coordinates as `(longitude, latitude)` degrees.
+    /// Internal; pairs with `_coordinate_elevations` in tests.
+    #[getter]
+    fn _coordinates(&self) -> Vec<(f64, f64)> {
+        self.inner.coordinates()
+    }
+
     /// Whether the street arrays are memory-mapped views of the artifact.
     #[getter]
     fn mapped(&self) -> bool {
@@ -391,11 +453,16 @@ impl StreetNetwork {
 impl StreetNetwork {
     /// Wraps a loaded core network. Profiles are compiled on first query, so a
     /// loaded network starts with an empty cache.
-    fn adopt(inner: CoreStreetNetwork, streets_bytes_read: u64) -> StreetNetwork {
+    fn adopt(
+        inner: CoreStreetNetwork,
+        streets_bytes_read: u64,
+        elevation: Option<ElevationMeta>,
+    ) -> StreetNetwork {
         StreetNetwork {
             inner,
             profiles: Vec::new(),
             streets_bytes_read,
+            elevation,
         }
     }
 
@@ -469,9 +536,28 @@ fn parse_street_meta(
 }
 
 /// Loads a street artifact into owned memory — the default path.
-fn load_street_owned(path: &str, verify: Option<bool>) -> PyResult<(CoreStreetNetwork, u64)> {
+type LoadedStreets = (CoreStreetNetwork, u64, Option<ElevationMeta>);
+
+/// The metadata's declared invariants: a positive finite sampling interval,
+/// a coverage share within 0..=1, and an inferred count no larger than the
+/// edge set it describes. Shared by construction and both load paths.
+fn check_elevation_meta(meta: &ElevationMeta, edge_count: u32) -> Result<(), String> {
+    if !(meta.sampling_interval.is_finite() && meta.sampling_interval > 0.0) {
+        return Err("elevation sampling_interval must be positive and finite".into());
+    }
+    if !(meta.coverage.is_finite() && (0.0..=1.0).contains(&meta.coverage)) {
+        return Err("elevation coverage must be a share within 0..=1".into());
+    }
+    if meta.inferred_edges > edge_count {
+        return Err("elevation inferred_edges exceeds the edge count".into());
+    }
+    Ok(())
+}
+
+fn load_street_owned(path: &str, verify: Option<bool>) -> PyResult<LoadedStreets> {
     let bytes = std::fs::read(path).map_err(io_error)?;
     let (streets_meta, layout) = parse_street_meta(path, &bytes, verify.unwrap_or(true))?;
+    let elevation = streets_meta.elevation.clone();
     let section = &bytes
         [layout.streets_offset as usize..(layout.streets_offset + layout.streets_length) as usize];
     // A street artifact carries no stops, so no link may reference one.
@@ -479,17 +565,24 @@ fn load_street_owned(path: &str, verify: Option<bool>) -> PyResult<(CoreStreetNe
     let parts = decode_streets(path, streets_meta, section, expected_levels)?;
     let inner =
         CoreStreetNetwork::from_parts(parts).map_err(|_| corrupted(path, "street attributes"))?;
-    Ok((inner, layout.streets_length))
+    // Metadata is absent exactly when the elevations are, and its fields
+    // must hold their declared invariants.
+    if inner.elevations().is_some() != elevation.is_some() {
+        return Err(corrupted(path, "elevation metadata"));
+    }
+    if let Some(meta) = &elevation {
+        if check_elevation_meta(meta, inner.edge_count()).is_err() {
+            return Err(corrupted(path, "elevation metadata"));
+        }
+    }
+    Ok((inner, layout.streets_length, elevation))
 }
 
 /// Loads a street artifact with the core arrays as views into a memory map.
 /// `Ok(Err(reason))` means mapping is environmentally unavailable and the
 /// caller decides between fallback and error; artifact problems are hard
 /// errors on every path.
-fn load_street_mapped(
-    path: &str,
-    verify: Option<bool>,
-) -> PyResult<Result<(CoreStreetNetwork, u64), String>> {
+fn load_street_mapped(path: &str, verify: Option<bool>) -> PyResult<Result<LoadedStreets, String>> {
     // Mapped arrays reinterpret the stored little-endian bytes in place.
     if cfg!(target_endian = "big") {
         return Ok(Err("mapped street arrays need a little-endian host".into()));
@@ -512,6 +605,7 @@ fn load_street_mapped(
     let backing = std::sync::Arc::new(MappedArtifact(map));
     let bytes = backing.bytes();
     let (streets_meta, layout) = parse_street_meta(path, bytes, verify == Some(true))?;
+    let elevation = streets_meta.elevation.clone();
     validate_street_shape(path, &streets_meta, layout.streets_length, 0)?;
     let mut streets_read = if verify == Some(true) {
         layout.streets_length
@@ -556,5 +650,15 @@ fn load_street_mapped(
     };
     let inner =
         CoreStreetNetwork::from_mapped(spec).map_err(|_| corrupted(path, "street array bounds"))?;
-    Ok(Ok((inner, streets_read)))
+    // Metadata is absent exactly when the elevations are, and its fields
+    // must hold their declared invariants.
+    if inner.elevations().is_some() != elevation.is_some() {
+        return Err(corrupted(path, "elevation metadata"));
+    }
+    if let Some(meta) = &elevation {
+        if check_elevation_meta(meta, inner.edge_count()).is_err() {
+            return Err(corrupted(path, "elevation metadata"));
+        }
+    }
+    Ok(Ok((inner, streets_read, elevation)))
 }
