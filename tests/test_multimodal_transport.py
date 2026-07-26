@@ -118,3 +118,126 @@ def test_dem_requires_street_modes(helsinki_gtfs, kantakaupunki_pbf):
             osm_pbf=str(kantakaupunki_pbf),
             dem=lambda lons, lats: lons,
         )
+
+
+def test_street_access_and_egress_rows(multimodal_network):
+    # One directed search per row over the multimodal graph, mode-masked
+    # stop links: cycling reaches far more stops than walking in the same
+    # budget and is at least as fast to nearly all shared ones (slope and
+    # one-ways explain the rest); the reverse row sees the asymmetry.
+    core = multimodal_network._core
+    times = lambda rows: {stop: seconds for stop, seconds, *_ in rows}  # noqa: E731
+    bike_rows = core._street_access_seconds(60.1690, 24.9320, "bicycle", 900.0)
+    bike = times(bike_rows)
+    walk = times(core._street_access_seconds(60.1690, 24.9320, "walk", 900.0))
+    assert len(bike) > 2 * len(walk) > 0
+    shared = set(bike) & set(walk)
+    faster = sum(bike[stop] <= walk[stop] for stop in shared)
+    assert faster > 0.9 * len(shared)
+    egress = times(core._street_egress_seconds(60.1690, 24.9320, "bicycle", 900.0))
+    assert len(set(bike) & set(egress)) > 0.8 * len(bike)
+    # Every row carries its chosen link's snap identity — the 12c token.
+    for _, seconds, edge, fraction, connector in bike_rows:
+        assert seconds >= 0 and edge >= 0
+        assert 0.0 <= fraction <= 1.0
+        assert connector >= 0.0
+
+
+def test_street_rows_need_the_multimodal_graph(network_with_footpaths):
+    with pytest.raises(ValueError, match="street_modes"):
+        network_with_footpaths._core._street_access_seconds(
+            60.169, 24.932, "bicycle", 900.0
+        )
+
+
+def test_synthetic_links_keep_modes_apart_and_merge_equal_snaps(
+    fresh_footpaths_network,
+):
+    # A walk+e-scooter edge south of a real stop and a bicycle-only edge
+    # north of it, installed directly: the stop's walk and e-scooter links
+    # coincide (one merged mask), the bicycle link is the other edge, and
+    # both access and egress rows resolve through the right link.
+    network = fresh_footpaths_network
+    stop, lat, lon = next((s, la, lo) for s, la, lo in network.stops if la is not None)
+    south, north = lat - 0.0005, lat + 0.0011
+    zeros = [0, 0]
+    network._core.set_multimodal_streets(
+        ["walk", "bicycle", "e_scooter"],
+        4,
+        [(0, 1, 200.0), (2, 3, 200.0)],
+        [0, 2, 4],
+        [lon - 0.001, lon + 0.001, lon - 0.001, lon + 0.001],
+        [south, south, north, north],
+        zeros,
+        zeros,
+        zeros,
+        zeros,
+        [1 | 4, 2],  # south: walk + e_scooter; north: bicycle only
+        [1 | 4, 2],
+        zeros,
+        zeros,
+    )
+    rows = {
+        mode: {
+            row[0]: row
+            for row in network._core._street_access_seconds(south, lon, mode, 600.0)
+        }
+        for mode in ("walk", "bicycle", "e_scooter")
+    }
+    assert stop in rows["walk"] and stop in rows["bicycle"]
+    assert stop in rows["e_scooter"]
+    walk_edge = rows["walk"][stop][2]
+    # The merged mask: walking and the e-scooter share one link snap...
+    assert rows["e_scooter"][stop][2] == walk_edge
+    # ...while the bicycle links through the other, permitted edge.
+    assert rows["bicycle"][stop][2] != walk_edge
+    egress = {
+        row[0]: row
+        for row in network._core._street_egress_seconds(south, lon, "bicycle", 600.0)
+    }
+    assert egress[stop][2] == rows["bicycle"][stop][2]
+
+
+def test_multimodal_walk_rows_agree_with_the_walking_graph(multimodal_network):
+    # The same coordinate through the multimodal walk profile and through
+    # the legacy walking access path: two different extractions of the same
+    # streets, so agreement is near, not bit-for-bit — most stops shared,
+    # and the shared times close.
+    import statistics
+
+    legacy = multimodal_network.access_stops(60.1690, 24.9320)
+    rows = multimodal_network._core._street_access_seconds(
+        60.1690, 24.9320, "walk", 900.0
+    )
+    multimodal = {stop: seconds for stop, seconds, *_ in rows}
+    within = {stop: s for stop, s in legacy.items() if s <= 900}
+    shared = set(within) & set(multimodal)
+    assert len(shared) > 0.5 * len(within)
+    differences = [abs(multimodal[stop] - within[stop]) for stop in shared]
+    assert statistics.median(differences) <= 30
+
+
+def test_a_query_at_a_stops_coordinate_is_zero_away(multimodal_network):
+    # Routing a stop's own coordinate through the network would charge its
+    # connector twice; the rows apply the matrix convention instead.
+    probe = multimodal_network._core._street_access_seconds(
+        60.1690, 24.9320, "bicycle", 900.0
+    )
+    coordinates = {s: (la, lo) for s, la, lo in multimodal_network.stops}
+    stop, seconds, *_ = probe[0]
+    assert seconds > 0
+    lat, lon = coordinates[stop]
+    rows = {
+        r[0]: r
+        for r in multimodal_network._core._street_access_seconds(
+            lat, lon, "bicycle", 900.0
+        )
+    }
+    assert rows[stop][1] == 0
+    egress = {
+        r[0]: r
+        for r in multimodal_network._core._street_egress_seconds(
+            lat, lon, "bicycle", 900.0
+        )
+    }
+    assert egress[stop][1] == 0

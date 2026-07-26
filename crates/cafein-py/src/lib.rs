@@ -19,8 +19,8 @@ use cafein_core::mcultra::compute_mcultra_shortcuts;
 use cafein_core::raptor::{CostInputs, CostRow, Objective, Raptor};
 use cafein_core::router::{factor_fingerprint, same_factors, Exclusions, Request, TransitRouter};
 use cafein_core::streets::{
-    Backing, MappedStreets, Snap, StopLink, StoredLink, StreetAttributes, StreetNetwork,
-    StreetNetworkParts, WalkedStop,
+    Backing, CompiledStreetProfile, MappedStreets, Snap, StopLink, StoredLink, StreetAttributes,
+    StreetNetwork, StreetNetworkParts, StreetProfileDefinition, WalkedStop,
 };
 use cafein_core::tbtr::{DayView, TbtrEngine};
 use cafein_core::timetable::{StopIdx, Timetable, TripIdx};
@@ -80,6 +80,14 @@ struct TransportNetwork {
     multimodal_elevation: Option<crate::artifact::ElevationMeta>,
     /// The pruning modes the multimodal graph was built with.
     multimodal_modes: Option<Vec<String>>,
+    /// Per-stop links onto the multimodal graph, mode-masked and lazily
+    /// built on the first access/egress row (never persisted — one R*-tree
+    /// pass recomputes them per load).
+    multimodal_links: std::sync::OnceLock<Vec<Vec<(Snap, u8)>>>,
+    /// Compiled profiles for the multimodal graph, keyed by exact
+    /// definition equality — the 12a-planned cache, arriving with its first
+    /// consumers.
+    multimodal_profiles: std::sync::Mutex<Vec<(StreetProfileDefinition, CompiledStreetProfile)>>,
     stops_by_id: HashMap<String, StopLookup>,
     stops_by_qualified_id: HashMap<String, StopIdx>,
     trips_by_public_id: HashMap<String, TripIdx>,

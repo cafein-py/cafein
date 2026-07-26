@@ -8,11 +8,12 @@
 //! routes, time matrices, and the distance/geometry reconstruction behind the
 //! cost outputs. The walking loop is untouched.
 //!
-//! Only the **forward** search is implemented here — a door-to-door route and
-//! an origins×destinations matrix are forward searches from each origin,
-//! reading the label at the destination's snap. The reverse search (for
-//! stops that can *reach* a destination) is a PT-egress concern for a later
-//! bike-and-ride PR.
+//! Door-to-door routes and origins×destinations matrices are **forward**
+//! searches from each origin, reading the label at the destination's snap.
+//! The **reverse** search serves the PT-egress side: one search from a
+//! destination's arrival offsets over the transposed adjacency labels every
+//! vertex with its cost *to* the destination, so a whole column of sources —
+//! each stop that can reach it — reads from one settled state.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -341,6 +342,26 @@ impl StreetNetwork {
             .into_iter()
             .flatten()
             .any(|slot| profile.arc_millis()[slot] != u32::MAX)
+    }
+
+    /// Snaps a coordinate to the nearest edge whose `adj_access` carries
+    /// `bit` in either direction — the stop-link builder's mode-aware snap,
+    /// needing no compiled profile. `None` on a graph without attributes.
+    pub fn snap_for_mode_bit(
+        &self,
+        latitude: f64,
+        longitude: f64,
+        max_snap_distance: f64,
+        bit: u8,
+    ) -> Option<Snap> {
+        let attributes = self.street_attributes()?;
+        self.snap_filtered(latitude, longitude, max_snap_distance, |edge| {
+            let (forward, reverse) = self.edge_slots(edge);
+            [forward, reverse]
+                .into_iter()
+                .flatten()
+                .any(|slot| attributes.adj_access[slot] & bit != 0)
+        })
     }
 
     /// Snaps a coordinate to the nearest edge `profile` can actually use.
@@ -846,6 +867,121 @@ impl StreetNetwork {
         let mut state = DirectedState::default();
         self.directed_dijkstra(profile, &seeds, cutoff, &mut state);
         (astar, state.touched_count())
+    }
+
+    /// The lazily built transpose of the adjacency CSR: `(offsets, sources,
+    /// slots)`, where vertex `v`'s incoming arcs are
+    /// `offsets[v]..offsets[v + 1]`, each arriving from `sources[i]` over
+    /// adjacency slot `slots[i]`.
+    fn reverse_adjacency(&self) -> &(Vec<u32>, Vec<u32>, Vec<u32>) {
+        self.graph.reverse_adjacency.get_or_init(|| {
+            let offsets = self.arrays().adjacency_offsets();
+            let targets = self.arrays().adj_targets();
+            let vertices = self.vertex_count() as usize;
+            let mut counts = vec![0u32; vertices + 1];
+            for &target in targets {
+                counts[target as usize + 1] += 1;
+            }
+            for vertex in 0..vertices {
+                counts[vertex + 1] += counts[vertex];
+            }
+            let mut sources = vec![0u32; targets.len()];
+            let mut slots = vec![0u32; targets.len()];
+            let mut cursor: Vec<u32> = counts.clone();
+            for vertex in 0..vertices {
+                for slot in offsets[vertex] as usize..offsets[vertex + 1] as usize {
+                    let position = cursor[targets[slot] as usize] as usize;
+                    sources[position] = vertex as u32;
+                    slots[position] = slot as u32;
+                    cursor[targets[slot] as usize] += 1;
+                }
+            }
+            (counts, sources, slots)
+        })
+    }
+
+    /// The reverse counterpart of [`directed_dijkstra`](Self::directed_dijkstra):
+    /// relaxes *incoming* arcs over the transposed view, so a settled label is
+    /// the millisecond cost **from** that vertex **to** the destination whose
+    /// egress endpoints seeded the search. Same cutoff and sentinel semantics.
+    pub(super) fn directed_dijkstra_reverse(
+        &self,
+        profile: &CompiledStreetProfile,
+        seeds: &[Endpoint],
+        cutoff: u64,
+        state: &mut DirectedState,
+    ) {
+        state.prepare(self.vertex_count() as usize);
+        let (offsets, sources, slots) = self.reverse_adjacency();
+        let arc_millis = profile.arc_millis();
+        for seed in seeds {
+            if seed.millis <= cutoff && seed.millis < state.time(seed.vertex) {
+                state.set(seed.vertex, seed.millis);
+                state.heap.push(Reverse((seed.millis, seed.vertex)));
+            }
+        }
+        while let Some(Reverse((time, vertex))) = state.heap.pop() {
+            if time > state.time(vertex) {
+                continue;
+            }
+            let start = offsets[vertex as usize] as usize;
+            let end = offsets[vertex as usize + 1] as usize;
+            for incoming in start..end {
+                let cost = arc_millis[slots[incoming] as usize];
+                if cost == u32::MAX {
+                    continue;
+                }
+                let next = time.saturating_add(u64::from(cost));
+                let target = sources[incoming];
+                if next <= cutoff && next < state.time(target) {
+                    state.set(target, next);
+                    state.heap.push(Reverse((next, target)));
+                }
+            }
+        }
+    }
+
+    /// The directed travel times from each of `sources` to `to`, in whole
+    /// seconds — the egress mirror of
+    /// [`directed_times_to_snaps`](Self::directed_times_to_snaps): one reverse
+    /// search from the destination's arrival offsets serves the whole column,
+    /// and each source reads its own departure seeds against the settled
+    /// labels plus the direct same-edge candidate.
+    pub fn directed_times_from_snaps(
+        &self,
+        sources: &[Option<Snap>],
+        to: &Snap,
+        profile: &CompiledStreetProfile,
+        max_seconds: f64,
+    ) -> Vec<Option<u32>> {
+        if !max_seconds.is_finite() || max_seconds < 0.0 {
+            return vec![None; sources.len()];
+        }
+        let cutoff = (max_seconds * 1000.0).floor() as u64;
+        let seeds = self.directed_egress(to, profile);
+        DIRECTED_STATE.with(|cell| {
+            let state = &mut cell.borrow_mut();
+            self.directed_dijkstra_reverse(profile, &seeds, cutoff, state);
+            sources
+                .iter()
+                .map(|source| {
+                    let from = source.as_ref()?;
+                    let mut best = self
+                        .same_edge_millis(from, to, profile)
+                        .filter(|&direct| direct <= cutoff);
+                    for departure in self.directed_seeds(from, profile) {
+                        let reached = state.time(departure.vertex);
+                        if reached != u64::MAX {
+                            let total = reached.saturating_add(departure.millis);
+                            if total <= cutoff {
+                                best = Some(best.map_or(total, |b| b.min(total)));
+                            }
+                        }
+                    }
+                    Some(seconds(best? as f64 / 1000.0))
+                })
+                .collect()
+        })
     }
 
     /// The per-vertex times of a one-to-many directed search, for tests.

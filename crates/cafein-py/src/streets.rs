@@ -26,7 +26,7 @@ use crate::artifact::{
 
 /// The street-mode names accepted by the public API, with the shipped profile
 /// definition each resolves to.
-fn profile_definition(mode: &str) -> PyResult<StreetProfileDefinition> {
+pub(super) fn profile_definition(mode: &str) -> PyResult<StreetProfileDefinition> {
     match mode {
         "walk" => Ok(StreetProfileDefinition::walk()),
         "bicycle" => Ok(StreetProfileDefinition::bicycle()),

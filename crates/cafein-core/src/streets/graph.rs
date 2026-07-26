@@ -252,9 +252,15 @@ pub(super) struct StreetGraph {
     /// contiguous slot per relaxation instead of chasing the CSR. NaN marks an
     /// isolated vertex, which no search ever reaches.
     pub(super) vertex_coordinates: std::sync::OnceLock<Vec<(f64, f64)>>,
+    /// The CSR's transpose, derived lazily on the first reverse (egress)
+    /// search: per vertex, its incoming `(source, slot)` pairs. Topology
+    /// only — costs always come from a profile's `arc_millis[slot]` — so one
+    /// view serves every compiled profile.
+    pub(super) reverse_adjacency: std::sync::OnceLock<(Vec<u32>, Vec<u32>, Vec<u32>)>,
     /// The optional multimodal edge attributes (mode permissions, facility
-    /// flags, class codes). `None` on a walk-only build; the current routing
-    /// never reads them. Persisted with the artifact when present.
+    /// flags, class codes). `None` on a walk-only build. The legacy walking
+    /// search stays mode-blind and never reads them; profile compilation and
+    /// the mode-aware snaps do. Persisted with the artifact when present.
     pub(super) attributes: Option<StreetAttributes>,
     /// The optional per-coordinate elevations, aligned one-to-one with the
     /// geometry `lons`/`lats`/`cumulative`. `None` unless elevation was
@@ -661,6 +667,7 @@ impl StreetNetwork {
             contraction: None,
             symmetric: std::sync::OnceLock::new(),
             vertex_coordinates: std::sync::OnceLock::new(),
+            reverse_adjacency: std::sync::OnceLock::new(),
             attributes,
             elevations: dense_elevations,
         };
@@ -929,6 +936,7 @@ impl StreetNetwork {
                 contraction: None,
                 symmetric: std::sync::OnceLock::new(),
                 vertex_coordinates: std::sync::OnceLock::new(),
+                reverse_adjacency: std::sync::OnceLock::new(),
                 attributes: parts.attributes,
                 elevations: parts.elevations,
             },
@@ -994,6 +1002,7 @@ impl StreetNetwork {
                 contraction: None,
                 symmetric: std::sync::OnceLock::new(),
                 vertex_coordinates: std::sync::OnceLock::new(),
+                reverse_adjacency: std::sync::OnceLock::new(),
                 attributes: spec.attributes,
                 elevations: spec.elevations,
             },
