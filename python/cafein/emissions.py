@@ -25,6 +25,18 @@ import pandas as pd
 KEY_COLUMNS = ["trip_id", "route_id", "agency_id", "route_type"]
 COMPONENT_COLUMNS = ["vehicle", "fuel", "infrastructure", "operations"]
 
+STREET_KEY_COLUMNS = ["street_mode", "vehicle_class", "service_model"]
+
+# The public street modes' factor identities (design §8.1): the e-bike is a
+# bicycle-mode vehicle class, not a mode of its own, exactly as it rides the
+# bicycle permissions in routing.
+STREET_MODE_IDENTITIES = {
+    "walk": ("walk", "on_foot", "private"),
+    "bicycle": ("bicycle", "conventional", "private"),
+    "e_bike": ("bicycle", "e_bike", "private"),
+    "e_scooter": ("e_scooter", "battery", "private"),
+}
+
 
 def default_factors():
     """The shipped factor table, in g CO₂e per passenger-km.
@@ -75,6 +87,210 @@ def vehicle_class_factors():
     frame = pd.DataFrame.from_dict(rows, orient="index", columns=COMPONENT_COLUMNS)
     frame.index.name = "vehicle_class"
     return frame
+
+
+def street_factors():
+    """The shipped street-mode factor table, in g CO₂e per person-km.
+
+    Walking and the conventional bicycle have zero direct operational
+    emissions, so their ``fuel`` and ``operations`` components are zero. Every
+    other value is deliberately **unresolved** (NA), not zero: a bicycle's
+    manufacturing footprint is not nothing, and no e-bike or e-scooter number
+    ships without a documented source and lifetime allocation. A
+    full-life-cycle request therefore reports NA emissions until sourced rows
+    are layered over these through ``factors=`` — see ``load_street_factors``
+    for the expected columns.
+    """
+    nan = float("nan")
+    rows = [
+        {
+            "street_mode": "walk",
+            "vehicle_class": "on_foot",
+            "service_model": "private",
+            "vehicle": nan,
+            "fuel": 0.0,
+            "infrastructure": nan,
+            "operations": 0.0,
+        },
+        {
+            "street_mode": "bicycle",
+            "vehicle_class": "conventional",
+            "service_model": "private",
+            "vehicle": nan,
+            "fuel": 0.0,
+            "infrastructure": nan,
+            "operations": 0.0,
+        },
+        {
+            "street_mode": "bicycle",
+            "vehicle_class": "e_bike",
+            "service_model": "private",
+            "vehicle": nan,
+            "fuel": nan,
+            "infrastructure": nan,
+            "operations": nan,
+        },
+        {
+            "street_mode": "e_scooter",
+            "vehicle_class": "battery",
+            "service_model": "private",
+            "vehicle": nan,
+            "fuel": nan,
+            "infrastructure": nan,
+            "operations": nan,
+        },
+    ]
+    return pd.DataFrame(rows).reindex(columns=STREET_KEY_COLUMNS + COMPONENT_COLUMNS)
+
+
+def load_street_factors(source):
+    """Load and validate a street-mode factor table.
+
+    Parameters
+    ----------
+    source : DataFrame or path
+        A long-format table: any of the key columns ``street_mode``,
+        ``vehicle_class``, ``service_model`` (empty where not applicable)
+        plus one or more component columns ``vehicle``, ``fuel``,
+        ``infrastructure``, ``operations`` in g CO₂e per person-km
+        (occupancy 1 for private micromobility). Paths may point to CSV,
+        JSON, or YAML as in ``load_factors``.
+
+    Returns
+    -------
+    DataFrame
+        The normalized table. Unlike the transit loader, rows with NA
+        components are allowed: NA marks a component as unresolved rather
+        than zero, which is how the shipped table refuses to invent
+        micromobility numbers.
+    """
+    if isinstance(source, pd.DataFrame):
+        frame = source.copy()
+    elif isinstance(source, (str, os.PathLike)):
+        frame = _read_factor_file(pathlib.Path(source))
+    else:
+        raise TypeError(f"cannot load emission factors from {type(source).__name__}")
+    unknown = set(frame.columns) - set(STREET_KEY_COLUMNS + COMPONENT_COLUMNS)
+    if unknown:
+        raise ValueError(
+            f"unknown street factor-table column(s): {', '.join(sorted(unknown))}"
+        )
+    components = [column for column in COMPONENT_COLUMNS if column in frame.columns]
+    if not components:
+        raise ValueError(
+            "a factor table needs at least one component column "
+            f"({', '.join(COMPONENT_COLUMNS)})"
+        )
+    frame = frame.reindex(columns=STREET_KEY_COLUMNS + COMPONENT_COLUMNS)
+    for column in frame.columns:
+        frame[column] = frame[column].map(_blank_to_na)
+    for column in COMPONENT_COLUMNS:
+        frame[column] = pd.to_numeric(frame[column], errors="raise")
+        if (frame[column] < 0).any():
+            raise ValueError(f"negative values in factor component '{column}'")
+    for column in STREET_KEY_COLUMNS:
+        frame[column] = frame[column].map(_key_string, na_action="ignore")
+    # The resolver matches three shapes — mode, mode + class, or the exact
+    # triple — so any other combination could never resolve. A silently
+    # ignored row is worse than an error: the ladder would fall through to
+    # the shipped placeholders and report their values instead of the user's.
+    missing_mode = frame["street_mode"].isna()
+    if missing_mode.any():
+        raise ValueError(
+            f"{int(missing_mode.sum())} street factor row(s) have no street_mode"
+        )
+    dangling = frame["service_model"].notna() & frame["vehicle_class"].isna()
+    if dangling.any():
+        raise ValueError(
+            f"{int(dangling.sum())} street factor row(s) set service_model "
+            "without vehicle_class; the resolver never matches that shape"
+        )
+    return frame
+
+
+def street_factor(transport_mode, factors=None, components=None):
+    """The resolved g CO₂e per person-km factor for one street mode.
+
+    Resolution is most-specific-wins over the mode's identity
+    (``STREET_MODE_IDENTITIES``): the exact ``(street_mode, vehicle_class,
+    service_model)`` triple, then ``(street_mode, vehicle_class)``, then
+    ``street_mode`` alone. The user's table is consulted first at every
+    specificity — a sourced user row at any rung beats the shipped
+    placeholders, which resolve only when the user supplies nothing for the
+    mode. The factor is the sum of the selected `components` (default: all
+    four); an NA in any selected component leaves the whole factor NA —
+    unresolved, never silently zero — with a warning naming the components.
+    """
+    if transport_mode not in STREET_MODE_IDENTITIES:
+        raise ValueError(
+            f"unknown street mode {transport_mode!r}; expected one of "
+            f"{', '.join(sorted(STREET_MODE_IDENTITIES))}"
+        )
+    if components is None:
+        selected = COMPONENT_COLUMNS
+    else:
+        chosen = set(components)
+        unknown = chosen - set(COMPONENT_COLUMNS)
+        if unknown:
+            raise ValueError(
+                f"unknown emission component(s): {', '.join(sorted(unknown))}"
+            )
+        selected = [column for column in COMPONENT_COLUMNS if column in chosen]
+        if not selected:
+            raise ValueError(
+                "components selects nothing; an empty selection would report "
+                "zero emissions rather than unresolved ones"
+            )
+    mode, vehicle_class, service_model = STREET_MODE_IDENTITIES[transport_mode]
+    ladder = [
+        (mode, vehicle_class, service_model),
+        (mode, vehicle_class, None),
+        (mode, None, None),
+    ]
+
+    def resolve(table):
+        for step_mode, step_class, step_service in ladder:
+            match = table["street_mode"] == step_mode
+            match &= (
+                table["vehicle_class"].isna()
+                if step_class is None
+                else table["vehicle_class"] == step_class
+            )
+            match &= (
+                table["service_model"].isna()
+                if step_service is None
+                else table["service_model"] == step_service
+            )
+            rows = table[match]
+            if not rows.empty:
+                return rows.iloc[-1]
+        return None
+
+    # The user's table first at every specificity: a sourced row at any rung
+    # must beat the shipped placeholders, which are fallbacks, not answers.
+    row = None
+    if factors is not None:
+        row = resolve(load_street_factors(factors))
+    if row is None:
+        row = resolve(street_factors())
+    if row is None:
+        warnings.warn(
+            f"no emission factor matches street mode '{transport_mode}'; "
+            "emissions stay unresolved",
+            stacklevel=3,
+        )
+        return float("nan")
+    value = row[selected].sum(skipna=False)
+    if pd.isna(value):
+        unresolved = [column for column in selected if pd.isna(row[column])]
+        warnings.warn(
+            f"emission component(s) {', '.join(unresolved)} are unresolved "
+            f"for street mode '{transport_mode}'; supply factors= rows or "
+            "narrow components= to resolve emissions",
+            stacklevel=3,
+        )
+        return float("nan")
+    return float(value)
 
 
 def load_factors(source):

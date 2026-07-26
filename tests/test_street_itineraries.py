@@ -24,6 +24,7 @@ COLUMNS = [
     "network_distance_m",
     "connector_distance_m",
     "distance_provenance",
+    "emissions",
     "geometry",
 ]
 
@@ -162,8 +163,6 @@ def test_requires_an_explicit_mode(streets, places):
         {"router": "raptor"},
         {"candidates": "pareto"},
         {"bucket": 50.0},
-        {"factors": object()},
-        {"components": ["vehicle"]},
         {"slack_seconds": 300},
         {"max_options": 3},
         {"diversity": "spread"},

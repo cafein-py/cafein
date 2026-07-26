@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- Standalone street routing: cycling, e-scooter, e-bike, and walking as
+  door-to-door modes of their own. ``cafein.StreetNetwork.from_osm``
+  builds a directional multimodal street graph from an OpenStreetMap
+  extract in one pass — per-arc mode permissions with one-way and
+  contraflow handling, highway/surface/smoothness classes, and per-mode
+  connectivity pruning — and ``save``/``load`` round-trip it through its
+  own versioned artifact (mappable, like the network artifact).
+  ``travel_time`` routes a pair; ``TravelTimeMatrix``,
+  ``TravelCostMatrix``, and ``DetailedItineraries`` accept a
+  ``StreetNetwork`` with ``transport_mode=`` for matrices and leg-level
+  itineraries — times, exact street distances split into network and
+  connector metres with their provenance, route geometry, and emissions.
+  Profiles compile once per mode and are cached on the network; snapping
+  is profile-aware, so a bicycle query never starts on a footway it may
+  not ride. Street emissions resolve over a
+  ``street_mode``/``vehicle_class``/``service_model`` ladder
+  (``cafein.emissions.street_factors``) at grams CO₂e per person-km over
+  network metres only; walking and the conventional bicycle ship with
+  zero operational components, while manufacturing and infrastructure —
+  and every battery-mode component — stay deliberately unresolved (NA,
+  with a warning) until sourced rows are supplied through ``factors=``:
+  no invented numbers, and never a silent zero.
+  ([#164](https://github.com/cafein-py/cafein/pull/164),
+  [#166](https://github.com/cafein-py/cafein/pull/166),
+  [#167](https://github.com/cafein-py/cafein/pull/167),
+  [#168](https://github.com/cafein-py/cafein/pull/168),
+  [#172](https://github.com/cafein-py/cafein/pull/172),
+  [#173](https://github.com/cafein-py/cafein/pull/173),
+  [#174](https://github.com/cafein-py/cafein/pull/174),
+  [#175](https://github.com/cafein-py/cafein/pull/175))
+
 - **Breaking:** every time column now carries its unit in its name too.
   ``travel_time`` becomes ``travel_time_s``, the departure-window
   percentiles become ``travel_time_p<p>_s``, and the journey and leg

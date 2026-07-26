@@ -1,6 +1,7 @@
 """Standalone travel-time matrices over a StreetNetwork."""
 
 import math
+import warnings
 
 import geopandas as gpd
 import numpy as np
@@ -272,6 +273,7 @@ COST_COLUMNS = [
     "network_distance_m",
     "connector_distance_m",
     "distance_provenance",
+    "emissions",
 ]
 
 
@@ -421,8 +423,6 @@ def test_cost_matrix_rejects_a_street_mode_on_a_transport_network(network):
     [
         {"date": "2022-02-22"},
         {"optimize": "emissions"},
-        {"factors": object()},
-        {"components": ["vehicle"]},
         {"router": "raptor"},
         {"max_transfers": 3},
     ],
@@ -496,3 +496,205 @@ def test_cost_matrix_warns_on_unsnappable_origins(streets, destinations):
     with pytest.warns(UserWarning, match="atlantic"):
         costs = TravelCostMatrix(streets, far, destinations, transport_mode="bicycle")
     assert len(costs) == 0
+
+
+# ---- Emissions ----
+
+BICYCLE_ROW = {
+    "street_mode": "bicycle",
+    "vehicle_class": "conventional",
+    "service_model": "private",
+    "vehicle": 5.0,
+    "fuel": 0.0,
+    "infrastructure": 15.0,
+    "operations": 0.0,
+}
+
+
+def test_emissions_are_network_kilometres_at_the_resolved_factor(
+    streets, origins, destinations
+):
+    # The hand-calculated example: 20 g/pkm across the four components, so
+    # each cell's grams are its network metres — connectors excluded — at 20.
+    factors = pd.DataFrame([BICYCLE_ROW])
+    costs = TravelCostMatrix(
+        streets, origins, destinations, transport_mode="bicycle", factors=factors
+    )
+    assert len(costs) > 0
+    expected = costs.network_distance_m / 1000.0 * 20.0
+    assert np.allclose(costs.emissions, expected)
+    # Connectors are excluded: pairs with real connectors would differ if the
+    # total distance were used instead.
+    off = costs[costs.connector_distance_m > 1.0]
+    assert len(off) > 0
+    assert not np.allclose(off.emissions, off.distance_m / 1000.0 * 20.0)
+
+
+def test_emission_components_select_a_subset(streets, origins):
+    factors = pd.DataFrame([BICYCLE_ROW])
+    full = TravelCostMatrix(streets, origins, transport_mode="bicycle", factors=factors)
+    vehicle_only = TravelCostMatrix(
+        streets,
+        origins,
+        transport_mode="bicycle",
+        factors=factors,
+        components=["vehicle"],
+    )
+    off = full.from_id != full.to_id
+    assert np.allclose(vehicle_only.emissions[off], full.emissions[off] * (5.0 / 20.0))
+
+
+@pytest.mark.parametrize("mode", ["walk", "bicycle", "e_bike", "e_scooter"])
+def test_default_full_lca_is_unresolved_not_zero(streets, origins, mode):
+    # No micromobility number ships without a source: the default full-LCA
+    # request warns exactly once and reports NA, never a silent zero.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        costs = TravelCostMatrix(streets, origins, transport_mode=mode)
+    unresolved = [w for w in caught if "unresolved" in str(w.message)]
+    assert len(unresolved) == 1
+    assert costs.emissions.isna().all()
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_zero"),
+    [("walk", True), ("bicycle", True), ("e_bike", False), ("e_scooter", False)],
+)
+def test_operational_components_resolve_the_human_powered_modes(
+    streets, origins, mode, expected_zero
+):
+    if expected_zero:
+        costs = TravelCostMatrix(
+            streets, origins, transport_mode=mode, components=["fuel", "operations"]
+        )
+        assert (costs.emissions == 0).all()
+    else:
+        with pytest.warns(UserWarning, match="unresolved"):
+            costs = TravelCostMatrix(
+                streets,
+                origins,
+                transport_mode=mode,
+                components=["fuel", "operations"],
+            )
+        assert costs.emissions.isna().all()
+
+
+def test_a_user_row_with_a_missing_selected_component_stays_unresolved(
+    streets, origins
+):
+    # A user row resolves the ladder, but an NA in a selected component still
+    # reports NA — a partial row must not quietly sum its known parts.
+    partial = dict(BICYCLE_ROW)
+    partial["fuel"] = float("nan")
+    with pytest.warns(UserWarning, match="fuel"):
+        costs = TravelCostMatrix(
+            streets,
+            origins,
+            transport_mode="bicycle",
+            factors=pd.DataFrame([partial]),
+            components=["vehicle", "fuel"],
+        )
+    assert costs.emissions.isna().all()
+
+
+def test_a_mode_level_user_row_beats_the_shipped_placeholder(streets, origins):
+    # The shipped table carries an exact-triple placeholder for every mode; a
+    # sourced user row at bare street_mode specificity must still win it.
+    factors = pd.DataFrame(
+        [
+            {
+                "street_mode": "bicycle",
+                "vehicle": 10.0,
+                "fuel": 0.0,
+                "infrastructure": 10.0,
+                "operations": 0.0,
+            }
+        ]
+    )
+    costs = TravelCostMatrix(
+        streets, origins, transport_mode="bicycle", factors=factors
+    )
+    off = costs[costs.from_id != costs.to_id]
+    assert len(off) > 0
+    assert np.allclose(off.emissions, off.network_distance_m / 1000.0 * 20.0)
+
+
+def test_empty_components_are_rejected(streets, origins):
+    with pytest.raises(ValueError, match="selects nothing"):
+        TravelCostMatrix(streets, origins, transport_mode="bicycle", components=[])
+
+
+def test_the_street_ladder_prefers_the_specific_row(streets, origins):
+    # A mode-level row is shadowed by the class-level pair — the middle rung,
+    # with no service_model — which the exact triple shadows in turn.
+    mode_row = {
+        "street_mode": "bicycle",
+        "vehicle": 100.0,
+        "fuel": 0.0,
+        "infrastructure": 0.0,
+        "operations": 0.0,
+    }
+    pair_row = {
+        "street_mode": "bicycle",
+        "vehicle_class": "conventional",
+        "vehicle": 30.0,
+        "fuel": 0.0,
+        "infrastructure": 10.0,
+        "operations": 0.0,
+    }
+    pair = TravelCostMatrix(
+        streets,
+        origins,
+        transport_mode="bicycle",
+        factors=pd.DataFrame([mode_row, pair_row]),
+    )
+    off = pair[pair.from_id != pair.to_id]
+    assert len(off) > 0
+    assert np.allclose(off.emissions, off.network_distance_m / 1000.0 * 40.0)
+
+    triple = TravelCostMatrix(
+        streets,
+        origins,
+        transport_mode="bicycle",
+        factors=pd.DataFrame([mode_row, pair_row, BICYCLE_ROW]),
+    )
+    off = triple[triple.from_id != triple.to_id]
+    assert np.allclose(off.emissions, off.network_distance_m / 1000.0 * 20.0)
+
+
+def test_unmatchable_factor_rows_are_rejected(streets, origins):
+    # A row shape the resolver can never match must error, not be silently
+    # ignored — the ladder would otherwise fall through to the shipped
+    # placeholders and answer with their values instead of the user's.
+    no_mode = pd.DataFrame(
+        [{"vehicle_class": "conventional", "vehicle": 5.0, "fuel": 0.0}]
+    )
+    with pytest.raises(ValueError, match="no street_mode"):
+        TravelCostMatrix(streets, origins, transport_mode="bicycle", factors=no_mode)
+    dangling = pd.DataFrame(
+        [
+            {
+                "street_mode": "bicycle",
+                "service_model": "private",
+                "vehicle": 5.0,
+                "fuel": 0.0,
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="without vehicle_class"):
+        TravelCostMatrix(streets, origins, transport_mode="bicycle", factors=dangling)
+
+
+def test_itineraries_agree_with_the_cost_matrix_on_emissions(streets, origins):
+    from cafein import DetailedItineraries
+
+    factors = pd.DataFrame([BICYCLE_ROW])
+    costs = TravelCostMatrix(
+        streets, origins, transport_mode="bicycle", factors=factors
+    )
+    legs = DetailedItineraries(
+        streets, origins, transport_mode="bicycle", factors=factors
+    )
+    by_pair = {(r.from_id, r.to_id): r.emissions for r in costs.itertuples(index=False)}
+    for row in legs.itertuples(index=False):
+        assert row.emissions == pytest.approx(by_pair[(row.from_id, row.to_id)])
