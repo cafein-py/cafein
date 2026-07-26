@@ -9,24 +9,13 @@ QUERY_DATE, QUERY_TIME = "2022-02-22", "08:30:00"
 # routing). The routing tests use a centrally-cropped feed, because routing
 # only relaxes a whole-day set and a whole-day compute over the region-wide
 # feed's 195k trips takes minutes; cropped to the centre it takes seconds.
-CUTOFF = 300.0
-WINDOW = {"min_departure": 28800, "max_departure": 29400}  # 08:00–08:10
+from conftest import ULTRA_CUTOFF as CUTOFF  # noqa: E402
+from conftest import ULTRA_WINDOW as WINDOW  # noqa: E402
+
 CENTRAL_BBOX = (60.14, 24.88, 60.20, 25.00)  # (min_lat, min_lon, max_lat, max_lon)
 # A short access/egress radius makes journeys rely on transit and the
 # intermediate transfers ULTRA widens, rather than walking the ends.
 ACCESS = 200.0
-
-
-@pytest.fixture(scope="module")
-def ultra_network(helsinki_gtfs, kantakaupunki_pbf):
-    """A Helsinki network with a bounded-window ULTRA set computed."""
-    pytest.importorskip("cafein._cafein")
-    with pytest.warns(UserWarning):
-        network = TransportNetwork.from_gtfs(
-            [str(helsinki_gtfs)], osm_pbf=str(kantakaupunki_pbf)
-        )
-    network.compute_ultra_shortcuts(max_transfer_time=CUTOFF, **WINDOW)
-    return network
 
 
 @pytest.fixture(scope="module")

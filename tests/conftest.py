@@ -124,6 +124,93 @@ def network_with_footpaths(helsinki_gtfs, kantakaupunki_pbf, artifact_cache):
     return _cached_network(artifact_cache, "helsinki-footpaths", build)
 
 
+@pytest.fixture()
+def fresh_footpaths_network(network_with_footpaths, artifact_cache):
+    """A private copy of the footpaths network, for tests that mutate one.
+
+    Loading the cached artifact costs ~1 s; mutating the shared session
+    object would flip ``router="auto"`` resolution for every later test on
+    the same worker. `network_with_footpaths` is requested first so the
+    artifact exists before this loads it.
+    """
+    from cafein import TransportNetwork
+
+    return TransportNetwork.load(artifact_cache / "helsinki-footpaths.cafein")
+
+
+ULTRA_CUTOFF = 300.0
+ULTRA_WINDOW = {"min_departure": 28800, "max_departure": 29400}  # 08:00-08:10
+
+
+@pytest.fixture(scope="session")
+def network_with_tbtr(helsinki_gtfs, artifact_cache):
+    """The Helsinki network carrying a whole-day time TBTR transfer set.
+
+    Computing the set costs minutes and several tests only need a network
+    that *has* one — the round trips, the cache-reuse queries — so it is
+    built once and cached like the plain networks. Tests exercising the
+    computation itself still compute their own.
+    """
+    pytest.importorskip("cafein._cafein")
+    from cafein import TransportNetwork
+
+    def build():
+        # Composes on the cached plain artifact, so the GTFS parse is paid
+        # once per run however many set variants are built.
+        network = _cached_network(
+            artifact_cache,
+            "helsinki",
+            lambda: TransportNetwork.from_gtfs([str(helsinki_gtfs)]),
+        )
+        network.compute_tbtr_transfers("2022-02-22")
+        return network
+
+    return _cached_network(artifact_cache, "helsinki-tbtr", build)
+
+
+@pytest.fixture(scope="session")
+def network_with_mctbtr(helsinki_gtfs, artifact_cache):
+    """The Helsinki network carrying a whole-day multicriteria TBTR set."""
+    pytest.importorskip("cafein._cafein")
+    from cafein import TransportNetwork
+
+    def build():
+        network = _cached_network(
+            artifact_cache,
+            "helsinki",
+            lambda: TransportNetwork.from_gtfs([str(helsinki_gtfs)]),
+        )
+        network.compute_mctbtr_transfers("2022-02-22")
+        return network
+
+    return _cached_network(artifact_cache, "helsinki-mctbtr", build)
+
+
+@pytest.fixture(scope="session")
+def ultra_network(helsinki_gtfs, kantakaupunki_pbf, artifact_cache):
+    """A Helsinki network with a bounded-window ULTRA set computed.
+
+    Session-scoped and artifact-cached: as a module fixture this was
+    rebuilt by every xdist worker that received an ULTRA test, computing
+    the shortcut set each time.
+    """
+    pytest.importorskip("cafein._cafein")
+    from cafein import TransportNetwork
+
+    def build():
+        def base():
+            with pytest.warns(UserWarning):
+                return TransportNetwork.from_gtfs(
+                    [str(helsinki_gtfs)], osm_pbf=str(kantakaupunki_pbf)
+                )
+
+        network = _cached_network(artifact_cache, "helsinki-footpaths", base)
+        network.compute_ultra_shortcuts(max_transfer_time=ULTRA_CUTOFF, **ULTRA_WINDOW)
+        return network
+
+    return _cached_network(artifact_cache, "helsinki-ultra", build)
+
+
 @pytest.fixture(scope="session")
 def helsinki_streets(kantakaupunki_pbf):
     """The standalone street network of the OSM extract, built once.

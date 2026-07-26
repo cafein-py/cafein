@@ -1028,30 +1028,30 @@ def test_travel_time_matrix_accepts_the_tbtr_router(network):
     assert raptor.equals(tbtr)
 
 
-def test_tbtr_transfer_cache_reuse_matches_ad_hoc(helsinki_gtfs):
+def test_tbtr_transfer_cache_reuse_matches_ad_hoc(network, network_with_tbtr):
     # compute_tbtr_transfers precomputes the transfer set once; a router="tbtr"
     # time matrix on that date reuses it (build once, query many) and returns
-    # the same cells as the ad-hoc build. A fresh network keeps the mutation off
-    # the shared fixture.
-    from cafein import TransportNetwork
-
-    network = TransportNetwork.from_gtfs([str(helsinki_gtfs)])
+    # the same cells as the ad-hoc build. The set-less shared network answers
+    # ad hoc; the session fixture carries the expensive precomputed set.
     origins = ["4810551", "1040602", "1250551"]
     common = dict(date="2022-02-22", departure="08:30:00")
+    assert not network.has_tbtr_transfers
     ad_hoc = TravelTimeMatrix(network, origins, router="tbtr", **common)
 
-    assert not network.has_tbtr_transfers
-    network.compute_tbtr_transfers("2022-02-22")
-    assert network.has_tbtr_transfers
-    cached = TravelTimeMatrix(network, origins, router="tbtr", **common)
+    assert network_with_tbtr.has_tbtr_transfers
+    cached = TravelTimeMatrix(network_with_tbtr, origins, router="tbtr", **common)
     assert cached.equals(ad_hoc)
 
     # A query on a different date ignores the cache (ad-hoc build), still correct.
     other = TravelTimeMatrix(
-        network, origins, date="2022-02-23", departure="08:30:00", router="tbtr"
+        network_with_tbtr,
+        origins,
+        date="2022-02-23",
+        departure="08:30:00",
+        router="tbtr",
     )
     other_raptor = TravelTimeMatrix(
-        network, origins, date="2022-02-23", departure="08:30:00"
+        network_with_tbtr, origins, date="2022-02-23", departure="08:30:00"
     )
     assert other.equals(other_raptor)
 
@@ -1099,12 +1099,11 @@ def test_travel_time_matrix_windowed_percentiles(network):
     assert (reachable.travel_time_p50_s <= reachable.travel_time_p90_s).all()
 
 
-def test_windowed_tbtr_matches_raptor_and_reuses_cache(helsinki_gtfs):
+def test_windowed_tbtr_matches_raptor_and_reuses_cache(network, network_with_tbtr):
     # A windowed router="tbtr" stop matrix returns the same percentile cells
-    # as RAPTOR, ad hoc and off the compute_tbtr_transfers cache alike.
-    from cafein import TransportNetwork
-
-    network = TransportNetwork.from_gtfs([str(helsinki_gtfs)])
+    # as RAPTOR, ad hoc and off the compute_tbtr_transfers cache alike. The
+    # set-less shared network answers ad hoc; the session fixture carries the
+    # expensive precomputed set.
     origins = ["4810551", "1040602", "1250551"]
     common = dict(
         date="2022-02-22", departure="08:00:00", window=1800, percentiles=[10, 50, 90]
@@ -1112,36 +1111,35 @@ def test_windowed_tbtr_matches_raptor_and_reuses_cache(helsinki_gtfs):
     raptor = TravelTimeMatrix(network, origins, **common)
     ad_hoc = TravelTimeMatrix(network, origins, router="tbtr", **common)
     assert ad_hoc.equals(raptor)
-    network.compute_tbtr_transfers("2022-02-22")
-    cached = TravelTimeMatrix(network, origins, router="tbtr", **common)
+    cached = TravelTimeMatrix(network_with_tbtr, origins, router="tbtr", **common)
     assert cached.equals(ad_hoc)
 
 
-def test_tbtr_point_matrices_match_raptor(network_with_footpaths):
+def test_tbtr_point_matrices_match_raptor(fresh_footpaths_network):
     # Door-to-door coordinate matrices agree cell for cell between the two
     # engines — single departure and windowed percentiles, ad-hoc and cached
     # transfer set alike.
-    origins = point_frame(network_with_footpaths, [("A", "1100602"), ("B", "1250551")])
+    origins = point_frame(fresh_footpaths_network, [("A", "1100602"), ("B", "1250551")])
     destinations = point_frame(
-        network_with_footpaths, [("C", "1040280"), ("D", "4810551"), ("E", "1100602")]
+        fresh_footpaths_network, [("C", "1040280"), ("D", "4810551"), ("E", "1100602")]
     )
     single = dict(date="2022-02-22", departure="08:30:00")
     windowed = dict(single, window=600, percentiles=[10, 50, 90])
     for common in (single, windowed):
         raptor = TravelTimeMatrix(
-            network_with_footpaths, origins, destinations, **common
+            fresh_footpaths_network, origins, destinations, **common
         )
         ad_hoc = TravelTimeMatrix(
-            network_with_footpaths, origins, destinations, router="tbtr", **common
+            fresh_footpaths_network, origins, destinations, router="tbtr", **common
         )
         assert ad_hoc.equals(raptor)
-    network_with_footpaths.compute_tbtr_transfers("2022-02-22")
+    fresh_footpaths_network.compute_tbtr_transfers("2022-02-22")
     for common in (single, windowed):
         cached = TravelTimeMatrix(
-            network_with_footpaths, origins, destinations, router="tbtr", **common
+            fresh_footpaths_network, origins, destinations, router="tbtr", **common
         )
         assert cached.equals(
-            TravelTimeMatrix(network_with_footpaths, origins, destinations, **common)
+            TravelTimeMatrix(fresh_footpaths_network, origins, destinations, **common)
         )
 
 

@@ -329,29 +329,30 @@ def test_install_street_attributes_rejects_wrong_shape(artifact_path):
         net._core._install_elevations([0.0] * (coordinates + 1))
 
 
-def test_round_trip_preserves_the_tbtr_transfer_cache(helsinki_gtfs, tmp_path):
+def test_round_trip_preserves_the_tbtr_transfer_cache(
+    network_with_tbtr, network, tmp_path
+):
     # A cached time-only TBTR transfer set persists through save/load, so a
     # loaded network reuses it (build once, ship the artifact, query many) and
-    # its router="tbtr" matrices reproduce cell for cell.
-    network = TransportNetwork.from_gtfs([str(helsinki_gtfs)])
+    # its router="tbtr" matrices reproduce cell for cell. The set is expensive,
+    # so the session fixture carries it; this test owns the round trip, not
+    # the computation.
     origins = ["4810551", "1040602", "1250551"]
-    network.compute_tbtr_transfers("2022-02-22")
-    assert network.has_tbtr_transfers
-    before = network.travel_time_matrix(
+    assert network_with_tbtr.has_tbtr_transfers
+    before = network_with_tbtr.travel_time_matrix(
         origins, "2022-02-22", "08:30:00", router="tbtr"
     )
 
     path = tmp_path / "tbtr.cafein"
-    network.save(path)
+    network_with_tbtr.save(path)
     loaded = TransportNetwork.load(path)
     assert loaded.has_tbtr_transfers
     after = loaded.travel_time_matrix(origins, "2022-02-22", "08:30:00", router="tbtr")
     assert np.array_equal(before, after)
 
     # A network that never cached one round-trips to no cache.
-    plain = TransportNetwork.from_gtfs([str(helsinki_gtfs)])
     plain_path = tmp_path / "plain.cafein"
-    plain.save(plain_path)
+    network.save(plain_path)
     assert not TransportNetwork.load(plain_path).has_tbtr_transfers
 
 
@@ -612,22 +613,24 @@ def test_mapped_artifacts_serve_concurrent_processes(
     assert results == [expected, expected]
 
 
-def test_round_trip_preserves_the_mctbtr_transfer_cache(helsinki_gtfs, tmp_path):
+def test_round_trip_preserves_the_mctbtr_transfer_cache(
+    network_with_mctbtr, network, tmp_path
+):
     # A cached multicriteria TBTR transfer set persists through save/load,
     # so a loaded network answers router="tbtr" frontier queries without
-    # rebuilding the dominance-aware precompute.
+    # rebuilding the dominance-aware precompute. The set is expensive, so the
+    # session fixture carries it; this test owns the round trip, not the
+    # computation.
     from cafein.frontier import journey_frontier
 
-    network = TransportNetwork.from_gtfs([str(helsinki_gtfs)])
-    network.compute_mctbtr_transfers("2022-02-22")
-    assert network.has_mctbtr_transfers
+    assert network_with_mctbtr.has_mctbtr_transfers
     args = ("1370104", "4960238", "2022-02-22", "08:30:00")
     kwargs = dict(window=600, candidates="pareto", router="tbtr", bucket=1e-6)
-    before = journey_frontier(network, *args, **kwargs)
+    before = journey_frontier(network_with_mctbtr, *args, **kwargs)
     assert len(before) > 0
 
     path = tmp_path / "mctbtr.cafein"
-    network.save(path)
+    network_with_mctbtr.save(path)
     loaded = TransportNetwork.load(path)
     assert loaded.has_mctbtr_transfers
     after = journey_frontier(loaded, *args, **kwargs)
@@ -635,7 +638,6 @@ def test_round_trip_preserves_the_mctbtr_transfer_cache(helsinki_gtfs, tmp_path)
         assert before[column].tolist() == after[column].tolist()
 
     # A network that never cached one round-trips to no cache.
-    plain = TransportNetwork.from_gtfs([str(helsinki_gtfs)])
     plain_path = tmp_path / "plain_mc.cafein"
-    plain.save(plain_path)
+    network.save(plain_path)
     assert not TransportNetwork.load(plain_path).has_mctbtr_transfers

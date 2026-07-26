@@ -190,11 +190,11 @@ def test_mmap_require_errors_when_mapping_is_disabled(artifact, monkeypatch):
     assert not StreetNetwork.load(artifact, mmap=True).mapped
 
 
-def test_rejects_an_artifact_of_the_wrong_kind(artifact, helsinki_gtfs, tmp_path):
+def test_rejects_an_artifact_of_the_wrong_kind(artifact, network, tmp_path):
     from cafein import TransportNetwork
 
     network_path = tmp_path / "network.cafein"
-    TransportNetwork.from_gtfs([str(helsinki_gtfs)]).save(network_path)
+    network.save(network_path)
     with pytest.raises(ValueError, match="not a cafein street artifact"):
         StreetNetwork.load(network_path)
     with pytest.raises(ValueError, match="not a cafein network artifact"):
