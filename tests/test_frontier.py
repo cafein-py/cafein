@@ -359,7 +359,7 @@ def test_exhaustive_frontier_finds_points_the_interim_misses(network):
     # true frontier point (the oracle covers everything reachable).
     for row in resolved.itertuples():
         assert any(
-            point.arrival <= row.arrival and point.emissions <= row.emissions + 1e-6
+            point.arrival_s <= row.arrival_s and point.emissions <= row.emissions + 1e-6
             for point in true_set.itertuples()
         )
     # Incompleteness of the interim: a true point no interim candidate
@@ -368,7 +368,7 @@ def test_exhaustive_frontier_finds_points_the_interim_misses(network):
         point
         for point in true_set.itertuples()
         if not any(
-            row.arrival <= point.arrival and row.emissions <= point.emissions + 1e-6
+            row.arrival_s <= point.arrival_s and row.emissions <= point.emissions + 1e-6
             for row in resolved.itertuples()
         )
     ]
@@ -540,8 +540,8 @@ def test_pareto_candidates_match_the_oracle_over_footpaths(network_with_footpath
     )
     for row in interim[interim["emissions"].notna()].itertuples():
         assert any(
-            candidate.departure >= row.departure
-            and candidate.arrival <= row.arrival
+            candidate.departure_s >= row.departure_s
+            and candidate.arrival_s <= row.arrival_s
             and candidate.emissions <= row.emissions + 1e-6
             for candidate in pareto.itertuples()
         )
@@ -584,8 +584,8 @@ def test_pareto_candidates_route_door_to_door(network_with_footpaths):
     )
     for row in interim[interim["emissions"].notna()].itertuples():
         assert any(
-            candidate.departure >= row.departure
-            and candidate.arrival <= row.arrival
+            candidate.departure_s >= row.departure_s
+            and candidate.arrival_s <= row.arrival_s
             and candidate.emissions <= row.emissions + 1e-6
             for candidate in frame.itertuples()
         )
@@ -704,8 +704,8 @@ def test_pareto_candidate_options_are_validated(tmp_path):
 def _frontier_tuples(frame):
     return sorted(
         (
-            int(row.departure),
-            int(row.arrival),
+            int(row.departure_s),
+            int(row.arrival_s),
             int(row.rides),
             round(float(row.emissions), 3),
         )
@@ -1509,8 +1509,8 @@ def test_max_slower_bands_the_frontier_and_keeps_the_fastest(network_with_footpa
     # than `band` behind the fastest unrestricted arrival of the same
     # departure.
     for row in banded_transit.itertuples():
-        anchor = transit[transit["departure_s"] == row.departure]["arrival_s"].min()
-        assert row.arrival <= anchor + band
+        anchor = transit[transit["departure_s"] == row.departure_s]["arrival_s"].min()
+        assert row.arrival_s <= anchor + band
 
 
 def test_max_slower_is_validated(network_with_footpaths):
@@ -1601,10 +1601,10 @@ def test_journey_frontiers_band_each_cell_independently(network_with_footpaths):
             # row sits within the cell's own per-pass band.
             assert transit["arrival_s"].min() in banded_transit["arrival_s"].tolist()
             for row in banded_transit.itertuples():
-                anchor = transit[transit["departure_s"] == row.departure][
+                anchor = transit[transit["departure_s"] == row.departure_s][
                     "arrival_s"
                 ].min()
-                assert row.arrival <= anchor + band
+                assert row.arrival_s <= anchor + band
     with pytest.raises(ValueError, match="non-negative"):
         journey_frontiers(
             network_with_footpaths,
