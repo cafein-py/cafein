@@ -68,102 +68,15 @@ class StreetNetwork:
             geometry's own ~100 m segment limit; ``elevation_metadata``
             records the interval actually used.
         """
-        modes = tuple(modes)
-        nodes, edges = _osm.union_network(osm_pbf, bounding_box=bounding_box)
-        if edges.empty:
-            raise ValueError(f"no routable ways in '{osm_pbf}'")
-        nodes = nodes.reset_index(drop=True)
-        edges = edges.reset_index(drop=True)
-
-        u, v = streets._vertex_endpoints(nodes, edges)
-        highway, surface, smoothness, class_flags = _osm.normalise_codes(edges)
-        access_forward, access_reverse, access_flags, _ = _osm.edge_permissions(edges)
-        flags = class_flags | access_flags
-        access_forward, access_reverse = _osm.prune_components_per_profile(
-            u, v, len(nodes), access_forward, access_reverse, modes=modes
-        )
-
-        lengths = edges["length"].to_numpy(dtype=float)
-        geometry = edges.geometry.to_numpy()
-        if dem is not None:
-            if not (math.isfinite(dem_interval) and dem_interval > 0):
-                raise ValueError("dem_interval must be a positive, finite number")
-            # The Rust densifier splits stored segments under its own cap
-            # regardless, so sampling coarser than that would let it insert
-            # interpolated interiors after structure inference has already
-            # counted; capping (with headroom) keeps every stored coordinate
-            # in existence — and sampled — before inference runs.
-            dem_interval = min(float(dem_interval), STREET_MAX_SEGMENT_METERS - 1.0)
-            # Densify to the sampling interval before extracting coordinates,
-            # so the elevation profile between OSM nodes is captured.
-            # segmentize measures Euclidean degrees, and a degree of latitude
-            # is the longest degree there is — 111,694 m at the poles — so
-            # dividing by that ceiling bounds every direction: no segment
-            # exceeds the interval, and east-west ones oversample (harmless).
-            # Extracts are contiguous and never cross the antimeridian, per
-            # the street network's documented contract.
-            geometry = shapely.segmentize(geometry, dem_interval / 111_700.0)
-        offsets = np.concatenate(
-            [[0], np.cumsum(shapely.get_num_coordinates(geometry))]
-        )
-        coordinates = shapely.get_coordinates(geometry)
-
-        elevations = None
-        metadata = None
-        if dem is not None:
-            # Snapshot path inputs up front: they are consumed for sampling
-            # and again for the source identifier, so a one-shot iterable or
-            # a stateful PathLike must not make the two disagree.
-            if not callable(dem):
-                dem = (
-                    os.fspath(dem)
-                    if isinstance(dem, (str, os.PathLike))
-                    else tuple(os.fspath(tile) for tile in dem)
-                )
-            values = elevation.sample_dem(coordinates[:, 0], coordinates[:, 1], dem)
-            # The promised finite share of DEM samples — taken before
-            # structure inference rewrites bridge and tunnel interiors.
-            sampled_coverage = elevation.coverage(values)
-            structures = np.nonzero(
-                (flags & (_osm.FLAG_BRIDGE | _osm.FLAG_TUNNEL)).astype(bool)
-            )[0]
-            inferred = elevation.infer_structures(
-                offsets, coordinates[:, 0], coordinates[:, 1], values, structures
-            )
-            if callable(dem):
-                source = "callable"
-            elif isinstance(dem, (str, os.PathLike)):
-                source = os.fspath(dem)
-            else:
-                source = ";".join(dem)
-            elevations = values.tolist()
-            metadata = (
-                source,
-                float(dem_interval),
-                elevation.NODATA_POLICY,
-                sampled_coverage,
-                int(inferred),
-            )
-        # `adj_facility` is reserved: no profile reads it yet (the compiler
-        # routes on the access bits and the per-edge flags).
-        facility = np.zeros(len(edges), dtype=np.uint8)
         return cls(
             _CoreStreetNetwork(
-                len(nodes),
-                list(zip(u.tolist(), v.tolist(), lengths.tolist())),
-                offsets.tolist(),
-                coordinates[:, 0].tolist(),
-                coordinates[:, 1].tolist(),
-                highway.tolist(),
-                surface.tolist(),
-                smoothness.tolist(),
-                flags.tolist(),
-                access_forward.tolist(),
-                access_reverse.tolist(),
-                facility.tolist(),
-                facility.tolist(),
-                elevations,
-                metadata,
+                *multimodal_payload(
+                    osm_pbf,
+                    modes=modes,
+                    bounding_box=bounding_box,
+                    dem=dem,
+                    dem_interval=dem_interval,
+                )
             )
         )
 
@@ -274,3 +187,107 @@ class StreetNetwork:
 
     def __repr__(self):
         return f"StreetNetwork({self.vertex_count} vertices, {self.edge_count} edges)"
+
+
+def multimodal_payload(
+    osm_pbf, *, modes=MODES, bounding_box=None, dem=None, dem_interval=25.0
+):
+    """The union extraction as the core constructor's argument tuple.
+
+    Shared by ``StreetNetwork.from_osm`` and the ``TransportNetwork`` build,
+    so both install the identical multimodal graph from the same inputs.
+    """
+    modes = tuple(modes)
+    nodes, edges = _osm.union_network(osm_pbf, bounding_box=bounding_box)
+    if edges.empty:
+        raise ValueError(f"no routable ways in '{osm_pbf}'")
+    nodes = nodes.reset_index(drop=True)
+    edges = edges.reset_index(drop=True)
+
+    u, v = streets._vertex_endpoints(nodes, edges)
+    highway, surface, smoothness, class_flags = _osm.normalise_codes(edges)
+    access_forward, access_reverse, access_flags, _ = _osm.edge_permissions(edges)
+    flags = class_flags | access_flags
+    access_forward, access_reverse = _osm.prune_components_per_profile(
+        u, v, len(nodes), access_forward, access_reverse, modes=modes
+    )
+
+    lengths = edges["length"].to_numpy(dtype=float)
+    geometry = edges.geometry.to_numpy()
+    if dem is not None:
+        if not (math.isfinite(dem_interval) and dem_interval > 0):
+            raise ValueError("dem_interval must be a positive, finite number")
+        # The Rust densifier splits stored segments under its own cap
+        # regardless, so sampling coarser than that would let it insert
+        # interpolated interiors after structure inference has already
+        # counted; capping (with headroom) keeps every stored coordinate
+        # in existence — and sampled — before inference runs.
+        dem_interval = min(float(dem_interval), STREET_MAX_SEGMENT_METERS - 1.0)
+        # Densify to the sampling interval before extracting coordinates,
+        # so the elevation profile between OSM nodes is captured.
+        # segmentize measures Euclidean degrees, and a degree of latitude
+        # is the longest degree there is — 111,694 m at the poles — so
+        # dividing by that ceiling bounds every direction: no segment
+        # exceeds the interval, and east-west ones oversample (harmless).
+        # Extracts are contiguous and never cross the antimeridian, per
+        # the street network's documented contract.
+        geometry = shapely.segmentize(geometry, dem_interval / 111_700.0)
+    offsets = np.concatenate([[0], np.cumsum(shapely.get_num_coordinates(geometry))])
+    coordinates = shapely.get_coordinates(geometry)
+
+    elevations = None
+    metadata = None
+    if dem is not None:
+        # Snapshot path inputs up front: they are consumed for sampling
+        # and again for the source identifier, so a one-shot iterable or
+        # a stateful PathLike must not make the two disagree.
+        if not callable(dem):
+            dem = (
+                os.fspath(dem)
+                if isinstance(dem, (str, os.PathLike))
+                else tuple(os.fspath(tile) for tile in dem)
+            )
+        values = elevation.sample_dem(coordinates[:, 0], coordinates[:, 1], dem)
+        # The promised finite share of DEM samples — taken before
+        # structure inference rewrites bridge and tunnel interiors.
+        sampled_coverage = elevation.coverage(values)
+        structures = np.nonzero(
+            (flags & (_osm.FLAG_BRIDGE | _osm.FLAG_TUNNEL)).astype(bool)
+        )[0]
+        inferred = elevation.infer_structures(
+            offsets, coordinates[:, 0], coordinates[:, 1], values, structures
+        )
+        if callable(dem):
+            source = "callable"
+        elif isinstance(dem, str):
+            source = dem
+        else:
+            source = ";".join(dem)
+        elevations = values.tolist()
+        metadata = (
+            source,
+            float(dem_interval),
+            elevation.NODATA_POLICY,
+            sampled_coverage,
+            int(inferred),
+        )
+    # `adj_facility` is reserved: no profile reads it yet (the compiler
+    # routes on the access bits and the per-edge flags).
+    facility = np.zeros(len(edges), dtype=np.uint8)
+    return (
+        len(nodes),
+        list(zip(u.tolist(), v.tolist(), lengths.tolist())),
+        offsets.tolist(),
+        coordinates[:, 0].tolist(),
+        coordinates[:, 1].tolist(),
+        highway.tolist(),
+        surface.tolist(),
+        smoothness.tolist(),
+        flags.tolist(),
+        access_forward.tolist(),
+        access_reverse.tolist(),
+        facility.tolist(),
+        facility.tolist(),
+        elevations,
+        metadata,
+    )

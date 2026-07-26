@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- A ``TransportNetwork`` can now carry the multimodal union street graph.
+  ``from_gtfs(..., street_modes=("walk", "bicycle", "e_scooter"), dem=...)``
+  builds the same directional multimodal graph a standalone
+  ``StreetNetwork.from_osm`` builds — per-arc mode permissions, street
+  attributes, optional slope-ready elevations — from the same OSM extract,
+  and persists it as a second street graph in the artifact's street
+  section (format 14;
+  owned and mapped loads restore it). It is groundwork for cycling and
+  e-scooter access and egress in PT routing: the walking graph, its
+  footpaths, and every existing query stay untouched — walking results are
+  bit-for-bit identical with and without it, enforced by tests. Exposed as
+  ``has_multimodal_streets`` and ``multimodal_elevation_metadata``.
+
 - Single street routes are goal-directed. ``StreetNetwork.travel_time`` and
   the single-pair leg reconstruction now run a target-directed A* search
   with an admissible straight-line heuristic, answering exactly what the
