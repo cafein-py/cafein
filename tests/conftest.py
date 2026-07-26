@@ -187,6 +187,34 @@ def network_with_mctbtr(helsinki_gtfs, artifact_cache):
 
 
 @pytest.fixture(scope="session")
+def network_with_footpaths_mctbtr(helsinki_gtfs, kantakaupunki_pbf, artifact_cache):
+    """The footpaths network carrying a whole-day multicriteria TBTR set.
+
+    The frontier comparison tests' subject is engine equality — tbtr versus
+    raptor, table versus frames — not ad-hoc set building: every
+    ``router="tbtr"`` call on a set-less network builds and discards a
+    whole-feed set, which multiplied into the suite's largest cost. Cached
+    and ad-hoc sets answer identically (pinned by the cache-serving test),
+    so the comparisons ride one cached set per run.
+    """
+    pytest.importorskip("cafein._cafein")
+    from cafein import TransportNetwork
+
+    def build():
+        def base():
+            with pytest.warns(UserWarning):
+                return TransportNetwork.from_gtfs(
+                    [str(helsinki_gtfs)], osm_pbf=str(kantakaupunki_pbf)
+                )
+
+        network = _cached_network(artifact_cache, "helsinki-footpaths", base)
+        network.compute_mctbtr_transfers("2022-02-22")
+        return network
+
+    return _cached_network(artifact_cache, "helsinki-footpaths-mctbtr", build)
+
+
+@pytest.fixture(scope="session")
 def ultra_network(helsinki_gtfs, kantakaupunki_pbf, artifact_cache):
     """A Helsinki network with a bounded-window ULTRA set computed.
 
