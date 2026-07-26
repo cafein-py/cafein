@@ -46,17 +46,19 @@ class TravelCostMatrix(pd.DataFrame):
     computation over the compiled profile of ``transport_mode``, bounded
     by ``max_street_time``. Its columns are ``from_id``, ``to_id``,
     ``travel_time``, ``distance_m``, ``network_distance_m``,
-    ``connector_distance_m``, ``distance_provenance``, and — with
-    ``geometries=True`` — the route as a shapely LineString. The
+    ``connector_distance_m``, ``distance_provenance``, ``emissions``,
+    and — with ``geometries=True`` — the route as a shapely LineString. The
     distances carry their unit in the name: ``network_distance_m`` sums
     the stored edge lengths the route traversed and
     ``connector_distance_m`` the straight lines from each coordinate to
     its snap point, and ``distance_m`` is their sum, reported alongside
     rather than instead of them because the two are measured
-    differently. Street emissions are
-    not computed yet, so there is no ``emissions`` column and the
-    arguments configuring it are rejected, as are ``date``,
-    ``departure``, and the other timetable-only ones.
+    differently. ``emissions`` is the ride's
+    grams CO₂e — ``network_distance_m`` at the mode's resolved factor
+    (see ``cafein.emissions.street_factors``; connectors are excluded,
+    and an unresolved factor reports NA rather than a silent zero).
+    ``date``, ``departure``, and the other timetable-only arguments are
+    rejected; ``factors=`` and ``components=`` configure the factor.
 
     Parameters
     ----------
@@ -126,7 +128,9 @@ class TravelCostMatrix(pd.DataFrame):
         factors, mirroring ``journey_frontier``.
     factors : DataFrame or path (optional)
         Extra emission-factor rows layered over the shipped defaults;
-        see ``cafein.emissions.load_factors``.
+        see ``cafein.emissions.load_factors`` — or, for a
+        ``StreetNetwork``, street-mode rows for
+        ``cafein.emissions.load_street_factors``.
     components : list of str (optional)
         The life-cycle components to include (default: all four); see
         ``cafein.emissions.annotate``.
@@ -199,6 +203,8 @@ class TravelCostMatrix(pd.DataFrame):
                 max_snap_distance=max_snap_distance,
                 chunk=chunk,
                 geometries=geometries,
+                factors=factors,
+                components=components,
                 transit_only={
                     "date": date,
                     "departure": departure,
@@ -207,10 +213,6 @@ class TravelCostMatrix(pd.DataFrame):
                     "fares": fares,
                     "walking_speed_kmph": walking_speed_kmph,
                     "max_walking_time": max_walking_time,
-                    # Emissions configuration: street emissions are not
-                    # computed yet, so accepting these would imply they were.
-                    "factors": factors,
-                    "components": components,
                     "max_transfers": None if max_transfers == 7 else max_transfers,
                     "optimize": None if optimize == "time" else optimize,
                     "candidates": None if candidates == "time" else candidates,
@@ -568,8 +570,11 @@ def _street_cost_columns(
     chunk,
     geometries,
     transit_only,
+    factors=None,
+    components=None,
 ):
     """The reachable cells of a street cost matrix, in long format."""
+    from cafein import emissions
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
 
     query = _street_query(
@@ -606,6 +611,11 @@ def _street_cost_columns(
         "distance_provenance": np.full(
             len(network_distance), STREET_DISTANCE_PROVENANCE, dtype=object
         ),
+        # One mode per matrix, so the factor resolves once; connectors are the
+        # walk to the vehicle, not vehicle-kilometres, so network metres only.
+        "emissions": network_distance
+        / 1000.0
+        * emissions.street_factor(transport_mode, factors, components),
     }
     if geometries:
         data["geometry"] = shapely.from_wkb(np.array(table["geometry"], dtype=object))

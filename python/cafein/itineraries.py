@@ -84,8 +84,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
     ``distance_provenance``. A street
     network has no timetable, so ``departure`` and ``arrival`` are null
     unless ``departure`` is given purely to place the leg on a clock, and
-    ``date`` and the timetable-only arguments are rejected. Street
-    emissions are not computed yet, so there is no ``emissions`` column.
+    ``date`` and the timetable-only arguments are rejected, while
+    ``factors=`` and ``components=`` configure the mode's emission factor
+    (``emissions`` is NA where it is unresolved, never a silent zero).
 
     Parameters
     ----------
@@ -106,7 +107,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
         Maximum number of transfers between rides.
     factors : DataFrame or path (optional)
         Extra emission-factor rows layered over the shipped defaults;
-        see ``cafein.emissions.load_factors``.
+        see ``cafein.emissions.load_factors`` — or, for a
+        ``StreetNetwork``, street-mode rows for
+        ``cafein.emissions.load_street_factors``.
     components : list of str (optional)
         The life-cycle components to include (default: all four); see
         ``cafein.emissions.annotate``.
@@ -240,10 +243,10 @@ class DetailedItineraries(gpd.GeoDataFrame):
                     max_street_time=max_street_time,
                     max_snap_distance=max_snap_distance,
                     geometries=geometries,
+                    factors=factors,
+                    components=components,
                     transit_only={
                         "date": date,
-                        "factors": factors,
-                        "components": components,
                         "slack_seconds": slack_seconds,
                         "max_options": max_options,
                         "walking_speed_kmph": walking_speed_kmph,
@@ -689,6 +692,7 @@ STREET_COLUMNS = [
     "network_distance_m",
     "connector_distance_m",
     "distance_provenance",
+    "emissions",
     "geometry",
 ]
 
@@ -704,8 +708,11 @@ def _street_itineraries_frame(
     max_snap_distance,
     geometries,
     transit_only,
+    factors=None,
+    components=None,
 ):
     """Street routes as one leg per reachable pair."""
+    from cafein import emissions
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
 
     query = _street_query(
@@ -764,6 +771,11 @@ def _street_itineraries_frame(
             "distance_provenance": np.full(
                 rows, STREET_DISTANCE_PROVENANCE, dtype=object
             ),
+            # Post-reconstruction annotation: network metres only — the
+            # connectors are the walk to the vehicle, not vehicle-kilometres.
+            "emissions": network_distance
+            / 1000.0
+            * emissions.street_factor(transport_mode, factors, components),
         },
         columns=[column for column in STREET_COLUMNS if column != "geometry"],
     )
