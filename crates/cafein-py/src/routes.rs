@@ -376,6 +376,62 @@ impl TransportNetwork {
         Ok(matrix)
     }
 
+    /// The Pareto journeys from pre-reduced street access and egress
+    /// offsets — the street-policy reconstruction path. The offsets arrive
+    /// from the time-only reduction (`_reduced_street_offsets`); the run
+    /// relaxes the full transfer closure like every policy query, and the
+    /// journeys come back as ``route_between_stops``-shaped dicts whose
+    /// access and egress legs carry no distances — Python rebuilds them
+    /// from the kept `StreetChoice` tokens. Internal until the policy
+    /// surface stabilises.
+    #[pyo3(signature = (access, egress, date, departure, max_transfers,
+                        exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![],
+                        geometries = true))]
+    #[allow(clippy::too_many_arguments)]
+    fn _route_with_access(
+        &self,
+        py: Python<'_>,
+        access: Vec<(String, u32)>,
+        egress: Vec<(String, u32)>,
+        date: &str,
+        departure: &str,
+        max_transfers: u8,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
+        geometries: bool,
+    ) -> PyResult<Py<PyList>> {
+        let resolve = |offsets: &[(String, u32)]| {
+            offsets
+                .iter()
+                .map(|(stop, seconds)| Ok((self.resolve_stop(stop)?, *seconds)))
+                .collect::<PyResult<Vec<_>>>()
+        };
+        let request = Request {
+            departure: parse_time(departure)?,
+            access: resolve(&access)?,
+            egress: resolve(&egress)?,
+            active_services: self.active_services(date)?,
+            active_services_previous: self.active_services_previous(date)?,
+            max_transfers,
+            exclusions: self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?,
+        };
+        let journeys =
+            py.allow_threads(|| Raptor.route(&self.build.timetable, &self.transfers, &request));
+        let result = PyList::empty(py);
+        for journey in &journeys {
+            result.append(self.journey_to_dict(
+                py,
+                journey,
+                None,
+                None,
+                geometries,
+                &self.transfers,
+            )?)?;
+        }
+        Ok(result.unbind())
+    }
+
     /// Earliest arrivals from pre-reduced street access offsets — the
     /// street-policy path. The offsets arrive from the time-only reduction
     /// (`_reduced_street_offsets`), and the run relaxes the full transfer

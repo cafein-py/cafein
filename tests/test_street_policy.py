@@ -565,3 +565,388 @@ def test_the_direct_walk_survives_a_walkless_access_policy(multimodal_network):
     # The same coordinate is a zero-length direct walk whatever the
     # access modes.
     assert int(frame.travel_time_s.iloc[0]) == 0
+
+
+DEST = (60.2043, 24.9615)
+
+
+def _bike_walk_policy():
+    return StreetLegPolicy(
+        access={"walk": 900, "bicycle": 900},
+        egress={"walk": 900},
+        vehicles={"bicycle": own()},
+    )
+
+
+def test_policy_journeys_rebuild_the_street_legs(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein._cafein import STREET_DISTANCE_PROVENANCE
+    from cafein.policy import reduction_modes
+
+    core = multimodal_network._core
+    policy = _bike_walk_policy()
+    journeys = multimodal_network.route_between_coordinates(
+        ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=policy
+    )
+    assert journeys
+    access_tokens = {
+        row[0]: row[1:]
+        for row in core._reduced_street_offsets(
+            *ORIGIN, False, reduction_modes(policy, "access", 7200.0)
+        )
+    }
+    egress_tokens = {
+        row[0]: row[1:]
+        for row in core._reduced_street_offsets(
+            *DEST, True, reduction_modes(policy, "egress", 7200.0)
+        )
+    }
+    for journey in journeys:
+        legs = journey["legs"]
+        assert legs[0]["departure_s"] == journey["departure_s"]
+        assert legs[-1]["arrival_s"] == journey["arrival_s"]
+        for before, after in zip(legs, legs[1:]):
+            assert before["arrival_s"] <= after["departure_s"]
+        for leg in legs:
+            if leg["type"] == "transit":
+                assert leg["mode"] is None
+                continue
+            assert leg["mode"] in ("walk", "bicycle")
+            if leg["type"] in ("access", "egress", "walk"):
+                assert leg["distance_m"] > 0.0
+                assert leg["distance_m"] == pytest.approx(
+                    leg["network_distance_m"] + leg["connector_distance_m"]
+                )
+                assert leg["distance_provenance"] == STREET_DISTANCE_PROVENANCE
+                assert leg["geometry"] is not None
+        # A direct (non-via) end leg's duration is exactly its token's
+        # reduced seconds, and its mode is the token's winning mode.
+        if legs[0]["type"] == "access":
+            token = access_tokens[legs[0]["to_stop"]]
+            if token[5] is None:
+                assert legs[0]["arrival_s"] - legs[0]["departure_s"] == token[0]
+                assert legs[0]["mode"] == token[1]
+        if legs[-1]["type"] == "egress":
+            token = egress_tokens[legs[-1]["from_stop"]]
+            if token[5] is None:
+                assert legs[-1]["arrival_s"] - legs[-1]["departure_s"] == token[0]
+                assert legs[-1]["mode"] == token[1]
+
+
+def test_a_walking_only_policy_routes_the_legacy_journeys(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+
+    legacy = multimodal_network.route_between_coordinates(
+        ORIGIN, DEST, "2022-02-22", "08:30:00"
+    )
+    policied = multimodal_network.route_between_coordinates(
+        ORIGIN,
+        DEST,
+        "2022-02-22",
+        "08:30:00",
+        street_policy=StreetLegPolicy(access={"walk": 7200}, egress={"walk": 7200}),
+    )
+    assert policied == legacy
+
+
+def test_a_via_choice_splits_into_the_vehicle_and_the_walk(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein.network import _policy_street_legs
+
+    core = multimodal_network._core
+    unrestricted = core._reduced_street_offsets(
+        *ORIGIN, False, [("bicycle", 900.0, False, None)]
+    )
+    hub = min(unrestricted, key=lambda row: row[1])
+    assert hub[6] is None
+    rows = core._reduced_street_offsets(
+        *ORIGIN, False, [("bicycle", 900.0, False, [hub[0]])]
+    )
+    carried = [row for row in rows if row[6] is not None]
+    assert carried, "parking at one stop must spread through the closure"
+    transfers = {(frm, to): seconds for frm, to, seconds in core._transfer_edges()}
+    # Every carried choice names the hub as its seed, keeps the hub's own
+    # link snap, and costs the hub's direct time plus exactly one
+    # installed transfer - the vehicle only ever reaches the hub, and the
+    # closure never composes edges.
+    for row in carried:
+        assert row[6] == hub[0]
+        assert row[3:6] == hub[3:6]
+        assert row[1] == hub[1] + transfers[(hub[0], row[0])]
+    tokens = {row[0]: row[1:] for row in rows}
+    stop, seconds = carried[0][0], carried[0][1]
+    departure = 30600
+    legs = _policy_street_legs(
+        core,
+        {
+            "type": "access",
+            "to_stop": stop,
+            "departure_s": departure,
+            "arrival_s": departure + seconds,
+        },
+        ORIGIN,
+        tokens,
+        {"bicycle": 900.0},
+        False,
+        True,
+    )
+    assert len(legs) == 2
+    vehicle, walked = legs
+    assert vehicle["type"] == "access" and vehicle["to_stop"] == hub[0]
+    assert vehicle["mode"] == "bicycle"
+    assert walked["type"] == "transfer" and walked["mode"] == "walk"
+    assert walked["from_stop"] == hub[0] and walked["to_stop"] == stop
+    assert vehicle["departure_s"] == departure
+    assert vehicle["arrival_s"] == walked["departure_s"]
+    assert walked["arrival_s"] == departure + seconds
+    # The rebuilt vehicle leg is exactly the hub's own reduced time, and
+    # the walked remainder is exactly the installed transfer.
+    assert vehicle["arrival_s"] - vehicle["departure_s"] == hub[1]
+    assert walked["arrival_s"] - walked["departure_s"] == transfers[(hub[0], stop)]
+    assert vehicle["distance_m"] > 0.0 and vehicle["geometry"] is not None
+
+
+def test_policy_itineraries_carry_modes_and_street_emissions(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries
+
+    policy = _bike_walk_policy()
+    factors = pd.DataFrame(
+        {
+            "street_mode": ["bicycle"],
+            "vehicle": [5.0],
+            "fuel": [0.0],
+            "infrastructure": [10.0],
+            "operations": [6.0],
+        }
+    )
+    frame = DetailedItineraries(
+        multimodal_network,
+        _points_frame([ORIGIN]),
+        _points_frame([DEST]),
+        "2022-02-22",
+        "08:30:00",
+        street_policy=policy,
+        factors=factors,
+    )
+    assert list(frame.columns[:6]) == [
+        "from_id",
+        "to_id",
+        "option",
+        "segment",
+        "leg_type",
+        "mode",
+    ]
+    transit = frame[frame["leg_type"] == "transit"]
+    assert not transit.empty and transit["mode"].isna().all()
+    assert (transit["emissions"] > 0.0).all()
+    assert transit["network_distance_m"].isna().all()
+    assert transit["connector_distance_m"].isna().all()
+    street = frame[frame["leg_type"].isin(["access", "egress", "walk"])]
+    assert not street.empty and street["mode"].isin(["walk", "bicycle"]).all()
+    # The rebuilt legs expose their exact distance parts beside the total.
+    assert street["network_distance_m"].notna().all()
+    assert list(
+        street["network_distance_m"] + street["connector_distance_m"]
+    ) == pytest.approx(list(street["distance_m"]))
+    assert (street.loc[street["mode"] == "walk", "emissions"] == 0.0).all()
+    bicycle = street[street["mode"] == "bicycle"]
+    assert not bicycle.empty
+    journeys = multimodal_network.route_between_coordinates(
+        ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=policy
+    )
+    expected = sorted(
+        leg["network_distance_m"] / 1000.0 * 21.0
+        for journey in journeys
+        for leg in journey["legs"]
+        if leg.get("mode") == "bicycle"
+    )
+    assert sorted(bicycle["emissions"]) == pytest.approx(expected)
+
+
+def test_policy_itineraries_reject_incompatible_knobs(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries
+
+    policy = _bike_walk_policy()
+    points = (_points_frame([ORIGIN]), _points_frame([DEST]))
+    for kwargs, message in [
+        ({"candidates": "pareto"}, "candidates='time'"),
+        ({"router": "raptor"}, "router= does not apply"),
+        ({"max_walking_time": 900}, "carries its own budgets"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            DetailedItineraries(
+                multimodal_network,
+                *points,
+                "2022-02-22",
+                "08:30:00",
+                street_policy=policy,
+                **kwargs,
+            )
+    with pytest.raises(ValueError, match="point origins and destinations"):
+        DetailedItineraries(
+            multimodal_network,
+            ["1130446"],
+            ["1140447"],
+            "2022-02-22",
+            "08:30:00",
+            street_policy=policy,
+        )
+    with pytest.raises(ValueError, match="departure window"):
+        multimodal_network.route_between_coordinates(
+            ORIGIN,
+            DEST,
+            "2022-02-22",
+            "08:30:00",
+            window=600,
+            street_policy=policy,
+        )
+
+
+def test_the_direct_walk_dominates_the_policy_journeys(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+
+    journeys = multimodal_network.route_between_coordinates(
+        ORIGIN, ORIGIN, "2022-02-22", "08:30:00", street_policy=_bike_walk_policy()
+    )
+    assert len(journeys) == 1
+    walk = journeys[0]
+    assert walk["rides"] == 0 and walk["arrival_s"] == walk["departure_s"]
+    assert walk["legs"][0]["type"] == "walk"
+    assert walk["legs"][0]["mode"] == "walk"
+    assert walk["legs"][0]["distance_m"] == 0.0
+
+
+def test_policy_journeys_honour_exclusions(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+
+    policy = _bike_walk_policy()
+    journeys = multimodal_network.route_between_coordinates(
+        ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=policy
+    )
+    boarded = next(
+        leg["board_stop"]
+        for journey in journeys
+        for leg in journey["legs"]
+        if leg["type"] == "transit"
+    )
+    excluded = multimodal_network.route_between_coordinates(
+        ORIGIN,
+        DEST,
+        "2022-02-22",
+        "08:30:00",
+        street_policy=policy,
+        exclude_stops=[boarded],
+    )
+    for journey in excluded:
+        for leg in journey["legs"]:
+            for key in ("board_stop", "alight_stop", "from_stop", "to_stop"):
+                assert leg.get(key) != boarded
+
+
+def test_policy_itineraries_reconcile_with_the_time_matrix(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries, TravelTimeMatrix
+
+    policy = _bike_walk_policy()
+    itineraries = DetailedItineraries(
+        multimodal_network,
+        _points_frame([ORIGIN]),
+        _points_frame([DEST]),
+        "2022-02-22",
+        "08:30:00",
+        street_policy=policy,
+        geometries=False,
+    )
+    per_option = itineraries.groupby("option").agg(
+        departure=("departure_s", "min"), arrival=("arrival_s", "max")
+    )
+    fastest = int((per_option["arrival"] - per_option["departure"]).min())
+    matrix = TravelTimeMatrix(
+        multimodal_network,
+        _points_frame([ORIGIN]),
+        _points_frame([DEST]),
+        "2022-02-22",
+        "08:30:00",
+        street_policy=policy,
+    )
+    assert int(matrix["travel_time_s"].iloc[0]) == fastest
+
+
+def test_an_egress_via_choice_walks_the_forward_transfer(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein.network import _policy_street_legs
+
+    core = multimodal_network._core
+    unrestricted = core._reduced_street_offsets(
+        *DEST, True, [("bicycle", 900.0, False, None)]
+    )
+    hub = min(unrestricted, key=lambda row: row[1])
+    assert hub[6] is None
+    rows = core._reduced_street_offsets(
+        *DEST, True, [("bicycle", 900.0, False, [hub[0]])]
+    )
+    carried = [row for row in rows if row[6] is not None]
+    assert carried
+    transfers = {(frm, to): seconds for frm, to, seconds in core._transfer_edges()}
+    # The egress mirror of the closure shape: each carried choice walks
+    # exactly one installed forward stop-to-seed edge, then rides.
+    for row in carried:
+        assert row[6] == hub[0]
+        assert row[1] == hub[1] + transfers[(row[0], hub[0])]
+    tokens = {row[0]: row[1:] for row in rows}
+    stop, seconds = carried[0][0], carried[0][1]
+    arrival = 34200
+    legs = _policy_street_legs(
+        core,
+        {
+            "type": "egress",
+            "from_stop": stop,
+            "departure_s": arrival - seconds,
+            "arrival_s": arrival,
+        },
+        DEST,
+        tokens,
+        {"bicycle": 900.0},
+        True,
+        True,
+    )
+    assert len(legs) == 2
+    walked, vehicle = legs
+    # The traveller walks the closure's forward stop-to-seed edge first,
+    # then rides the vehicle from the seed's link to the destination.
+    assert walked["type"] == "transfer" and walked["mode"] == "walk"
+    assert walked["from_stop"] == stop and walked["to_stop"] == hub[0]
+    assert vehicle["type"] == "egress" and vehicle["from_stop"] == hub[0]
+    assert vehicle["mode"] == "bicycle"
+    assert walked["departure_s"] == arrival - seconds
+    assert walked["arrival_s"] == vehicle["departure_s"]
+    assert vehicle["arrival_s"] == arrival
+    assert vehicle["arrival_s"] - vehicle["departure_s"] == hub[1]
+    assert walked["arrival_s"] - walked["departure_s"] == transfers[(stop, hub[0])]
+    # The walked meters come from that same forward edge.
+    forward = core._transfer_leg(stop, hub[0], False)
+    assert forward is not None and walked["distance_m"] == forward[1]
+
+
+OFFSHORE = (60.05, 24.60)
+
+
+def test_an_unsnapped_policy_side_degrades_to_the_direct_walk(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+
+    policy = _bike_walk_policy()
+    journeys = multimodal_network.route_between_coordinates(
+        OFFSHORE, OFFSHORE, "2022-02-22", "08:30:00", street_policy=policy
+    )
+    # No policy mode snaps offshore, but the zero walk to the same
+    # coordinate needs no network at all - the query degrades to it
+    # instead of failing, as the policy matrix path does.
+    assert len(journeys) == 1
+    assert journeys[0]["rides"] == 0
+    assert journeys[0]["legs"][0]["type"] == "walk"
+    with pytest.raises(ValueError, match="too far from the multimodal"):
+        multimodal_network.route_between_coordinates(
+            OFFSHORE, DEST, "2022-02-22", "08:30:00", street_policy=policy
+        )

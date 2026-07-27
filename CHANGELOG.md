@@ -18,6 +18,15 @@
   the same reduction per point-set origin and destination through the
   engine's parallel fan-out, egress folded per destination and the direct
   walking alternative over the same graph folded in.
+  ``route_between_coordinates(street_policy=...)`` and
+  ``DetailedItineraries(street_policy=...)`` reconstruct the full
+  journeys: every access and egress leg rebuilds from its winning street
+  choice with the mode, the exact network and connector distances and
+  shape over the multimodal graph, the street distance provenance, and —
+  in the itineraries frame, which gains a ``mode`` column beside
+  ``leg_type`` — the mode's street emissions over its network meters. A
+  choice carried through the transfer closure splits into the vehicle leg
+  to its seed stop plus the walked transfer, so no leg blends two modes.
 
 - A ``TransportNetwork`` can now carry the multimodal union street graph.
   ``from_gtfs(..., street_modes=("walk", "bicycle", "e_scooter"), dem=...)``
