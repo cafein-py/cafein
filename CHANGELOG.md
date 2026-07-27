@@ -37,6 +37,16 @@
   also compose the zero-ride alternative — ride the street to a stop and
   leave on foot without boarding — which the engine never emits and
   which only walking-only queries could safely omit.
+  With ``candidates="pareto"`` or ``"relaxed"``, street-leg emissions
+  now enter the McRAPTOR dominance itself: each journey end reduces to
+  its (seconds, grams) Pareto frontier over the policy's modes, the
+  engine seeds and drains those label sets — zero-ride street
+  compositions included — and the options genuinely trade street
+  emissions against time (an e-scooter access can be the fast, dirtier
+  alternative beside the slower, cleaner walk). Granted vehicle modes
+  then require resolved emission factors; unresolved ones are rejected,
+  never silently zeroed. A walking-only policy rides the legacy
+  multicriteria path bit for bit.
 
 - A ``TransportNetwork`` can now carry the multimodal union street graph.
   ``from_gtfs(..., street_modes=("walk", "bicycle", "e_scooter"), dem=...)``

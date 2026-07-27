@@ -351,6 +351,160 @@ def _policy_journeys(
     return [walk] + kept
 
 
+def _policy_mc_journeys(
+    core,
+    origin,
+    destination,
+    date,
+    departure,
+    max_transfers,
+    policy,
+    exclusions,
+    geometries,
+    trip_factors,
+    street_factors,
+    components,
+    bucket,
+    slack,
+    max_options,
+):
+    """Door-to-door multicriteria journeys under a street-leg policy.
+
+    Each side reduces to its ``(seconds, grams)`` Pareto frontier, the
+    McRAPTOR search seeds and drains those label sets with the street
+    grams inside its (arrival, emissions bucket) dominance — zero-ride
+    street compositions included, the engine drains the seeds itself —
+    and the street legs rebuild from the kept tokens by
+    ``(stop, seconds)``. The direct walking alternative applies the
+    multicriteria rule exactly as ``mc_route_between_coordinates`` does:
+    journeys must beat it strictly, and it leads the list as the
+    zero-emission, zero-ride baseline.
+    """
+    from cafein import streets as _streets
+    from cafein._cafein import STREET_DISTANCE_PROVENANCE
+    from cafein.policy import pareto_reduction_modes
+
+    exclude_routes = tuple(str(route) for route in exclusions[0])
+    exclude_trips = tuple(str(trip) for trip in exclusions[1])
+    exclude_stops = tuple(str(stop) for stop in exclusions[2])
+    access_modes = pareto_reduction_modes(
+        policy, "access", _streets.MAX_ACCESS_EGRESS_TIME, street_factors, components
+    )
+    egress_modes = pareto_reduction_modes(
+        policy, "egress", _streets.MAX_ACCESS_EGRESS_TIME, street_factors, components
+    )
+    origin = tuple(origin)
+    destination = tuple(destination)
+
+    def frontier(point, egress_side, modes):
+        # A side none of whose modes snap is empty rather than fatal, as
+        # on every policy path; the error is kept for the no-walk case.
+        try:
+            rows = core._pareto_street_rows(
+                point[0], point[1], egress_side, modes, list(exclude_stops)
+            )
+        except ValueError as error:
+            if "too far from the multimodal street network" not in str(error):
+                raise
+            return [], {}, error
+        labels = [(row[0], row[1], row[2]) for row in rows]
+        tokens = {
+            (row[0], row[1]): (row[1], row[3], row[4], row[5], row[6], row[10])
+            for row in rows
+        }
+        return labels, tokens, None
+
+    access, access_tokens, access_error = frontier(origin, False, access_modes)
+    egress, egress_tokens, egress_error = frontier(destination, True, egress_modes)
+    journeys = core._mc_route_with_access(
+        access,
+        egress,
+        date,
+        departure,
+        trip_factors,
+        max_transfers,
+        bucket,
+        float(slack),
+        max_options,
+        list(exclude_routes),
+        list(exclude_trips),
+        list(exclude_stops),
+        geometries,
+    )
+    access_budgets = {mode: seconds for mode, seconds, *_ in access_modes}
+    egress_budgets = {mode: seconds for mode, seconds, *_ in egress_modes}
+    for journey in journeys:
+        legs = []
+        for leg in journey["legs"]:
+            if leg["type"] == "access":
+                span = leg["arrival_s"] - leg["departure_s"]
+                token = access_tokens[(leg["to_stop"], span)]
+                legs.extend(
+                    _policy_street_legs(
+                        core,
+                        leg,
+                        origin,
+                        {leg["to_stop"]: token},
+                        access_budgets,
+                        False,
+                        geometries,
+                    )
+                )
+            elif leg["type"] == "egress":
+                span = leg["arrival_s"] - leg["departure_s"]
+                token = egress_tokens[(leg["from_stop"], span)]
+                legs.extend(
+                    _policy_street_legs(
+                        core,
+                        leg,
+                        destination,
+                        {leg["from_stop"]: token},
+                        egress_budgets,
+                        True,
+                        geometries,
+                    )
+                )
+            else:
+                leg["mode"] = "walk" if leg["type"] == "transfer" else None
+                legs.append(leg)
+        journey["legs"] = legs
+    walk_budget = access_budgets.get("walk", _streets.MAX_ACCESS_EGRESS_TIME)
+    direct = core._multimodal_direct_leg(
+        origin, destination, "walk", walk_budget, geometries
+    )
+    if direct is None:
+        unsnapped = access_error or egress_error
+        if unsnapped is not None:
+            raise unsnapped
+        return journeys
+    walk_seconds, network_m, connector_m, shape = direct
+    kept = [
+        journey
+        for journey in journeys
+        if journey["arrival_s"] - journey["departure_s"] < walk_seconds
+    ]
+    departed = _departure_seconds(departure)
+    walk = {
+        "departure_s": departed,
+        "arrival_s": departed + walk_seconds,
+        "rides": 0,
+        "legs": [
+            {
+                "type": "walk",
+                "mode": "walk",
+                "departure_s": departed,
+                "arrival_s": departed + walk_seconds,
+                "distance_m": network_m + connector_m,
+                "network_distance_m": network_m,
+                "connector_distance_m": connector_m,
+                "distance_provenance": STREET_DISTANCE_PROVENANCE,
+                "geometry": shape,
+            }
+        ],
+    }
+    return [walk] + kept
+
+
 class TransportNetwork:
     """A routable public-transport network.
 

@@ -210,7 +210,16 @@ class DetailedItineraries(gpd.GeoDataFrame):
     street_policy : StreetLegPolicy (optional)
         Which street modes may serve the access and egress, on what
         vehicle terms (``cafein.StreetLegPolicy``); point origins and
-        destinations only, with ``candidates="time"``. The frame gains a
+        destinations only, with ``candidates="time"``, ``"pareto"``, or
+        ``"relaxed"`` (``"diverse"`` arrives with a later stage). Under
+        the multicriteria candidates each journey end reduces to its
+        (seconds, grams) Pareto frontier and the street grams enter the
+        McRAPTOR dominance itself, so the options genuinely trade street
+        emissions against time — including zero-ride street
+        compositions on the frontier. Every granted vehicle mode then
+        needs a resolved emission factor (``factors=`` rows keyed by
+        ``street_mode``); an unresolved factor is rejected, never
+        silently zeroed. The frame gains a
         ``mode`` column beside ``leg_type`` — the street mode of every
         rebuilt access/egress/transfer/walk leg, ``None`` on transit
         legs — and the rebuilt street legs carry their exact distances
@@ -393,14 +402,15 @@ def _itineraries_frame(
     if street_policy is not None:
         if kind != "points":
             raise ValueError("street_policy applies to point origins and destinations")
-        if candidates != "time":
+        if candidates == "diverse":
             raise ValueError(
-                "street_policy supports candidates='time' for now; the "
-                "emissions-aware alternative sets arrive with a later stage"
+                "street_policy does not support candidates='diverse' yet; "
+                "the penalization rounds arrive with a later stage"
             )
-        if router != "auto":
+        if router == "tbtr":
             raise ValueError(
-                "street_policy resolves its own engine; router= does not apply"
+                "street_policy queries run the RAPTOR engines; "
+                "router='tbtr' arrives with a later stage"
             )
         if any(option is not None for option in walk):
             raise ValueError(
@@ -419,14 +429,16 @@ def _itineraries_frame(
     )
     exclusions = _exclusion_lists(exclude_routes, exclude_trips, exclude_stops)
     multicriteria = candidates in ("pareto", "relaxed", "diverse")
-    # The multicriteria (McRAPTOR) candidates need the per-trip factor vector;
-    # the time candidates get their emissions from the post-hoc annotation only.
-    trip_factors = (
-        emissions.trip_factors(network, factors, components) if multicriteria else None
-    )
     transit_factors, street_factors = factors, None
     if street_policy is not None:
         transit_factors, street_factors = _factor_tables(factors)
+    # The multicriteria (McRAPTOR) candidates need the per-trip factor vector;
+    # the time candidates get their emissions from the post-hoc annotation only.
+    trip_factors = (
+        emissions.trip_factors(network, transit_factors, components)
+        if multicriteria
+        else None
+    )
 
     records = []
     for origin_id, origin_key in zip(origin_ids, origin_keys):
@@ -472,6 +484,8 @@ def _itineraries_frame(
                     trip_factors,
                     exclusions,
                     street_policy,
+                    street_factors,
+                    components,
                 )
             if not journeys:
                 continue
@@ -527,6 +541,8 @@ def _route(
     trip_factors,
     exclusions,
     street_policy=None,
+    street_factors=None,
+    components=None,
 ):
     """The Pareto-optimal journeys of one OD pair — the time-optimal
     (arrival, rides) set, or the (arrival, emissions) McRAPTOR set with
@@ -548,6 +564,9 @@ def _route(
             options,
             trip_factors,
             exclusions,
+            street_policy,
+            street_factors,
+            components,
         )
     if kind == "points":
         walking_speed_kmph, max_walking_time, max_snap_distance = walk
@@ -595,13 +614,40 @@ def _route_pareto(
     options,
     trip_factors,
     exclusions,
+    street_policy=None,
+    street_factors=None,
+    components=None,
 ):
     """The (arrival, emissions) McRAPTOR journeys of one OD pair — the
     cleaner-but-slower alternatives the time-optimal set misses, widened by
     a ``slack``-second slack in the per-stop dominance. Single
     departure (``window=None``)."""
-    from cafein.network import _walk_options
+    from cafein.matrices import _walking_only_policy
+    from cafein.network import _policy_mc_journeys, _walk_options
 
+    if street_policy is not None:
+        walk_only, walk_budget = _walking_only_policy(street_policy)
+        if not walk_only:
+            return _policy_mc_journeys(
+                network._core,
+                origin_key,
+                dest_key,
+                date,
+                departure,
+                max_transfers,
+                street_policy,
+                exclusions,
+                geometries,
+                trip_factors,
+                street_factors,
+                components,
+                bucket,
+                slack or 0.0,
+                options,
+            )
+        # A walking-only policy IS the legacy multicriteria walking path,
+        # at the policy's one walking budget.
+        walk = (None, walk_budget, None)
     if kind == "points":
         return network._core.mc_route_between_coordinates(
             origin_key,

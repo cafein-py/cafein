@@ -375,6 +375,10 @@ pub(super) struct Search<'a> {
     /// The edge-major footpath batch (strict searches only); general
     /// searches keep the label-major loop.
     pub(super) batch: Option<FootpathBatch>,
+    /// Street-policy label sets: when set, they seed and drain the
+    /// search instead of the request's walking offsets, each point
+    /// carrying its street grams into the dominance.
+    pub(super) policy: Option<&'a PolicyLabels>,
 }
 
 impl<'a> Search<'a> {
@@ -411,6 +415,7 @@ impl<'a> Search<'a> {
             stats: Box::default(),
             ops: std::env::var_os("CAFEIN_MCRAPTOR_PROF_OPS").is_some(),
             batch: None,
+            policy: None,
         };
         if search.strict_bags {
             search.batch = Some(FootpathBatch::new(timetable.stop_count() as usize));
@@ -483,46 +488,121 @@ impl<'a> Search<'a> {
         // Single-target pruning is sound only for the one-pair query: a
         // fold serves many destination cells, and a pruned label may be
         // another cell's winner.
-        self.prune_target = !request.egress.is_empty() && fold.is_none() && frontier.is_none();
+        self.prune_target = (!request.egress.is_empty()
+            || self.policy.is_some_and(|policy| !policy.egress.is_empty()))
+            && fold.is_none()
+            && frontier.is_none();
         self.stats.departure_passes += 1;
         let mut fresh: Vec<u32> = Vec::new();
         let phase = std::time::Instant::now();
-        for &(stop, seconds) in &request.access {
-            let arrival = departure.saturating_add(seconds);
-            let label = self.arena.len() as u32;
-            let key = self.key(0.0);
-            self.stats.access_offers += 1;
-            if self.stop_excluded(stop)
-                || self.beyond_cutoff(stop, arrival)
-                || self.target_pruned(departure, arrival, key, 0.0)
-            {
-                continue;
-            }
-            if self.bags[stop.0 as usize].insert_label(
-                self.strict_bags,
-                arrival,
-                0,
-                0.0,
-                key,
-                0,
-                self.slack,
-            ) {
-                self.stats.access_admissions += 1;
-                self.arena.push(Label {
-                    arrival,
-                    grams: 0.0,
-                    stop,
-                    departure,
-                    penalty: 0,
-                    origin: Origin::Access,
-                });
-                if let Some(fold) = fold {
-                    fold.fold(&self.arena[label as usize], label);
+        // Policy label sets seed with their own street grams; the walking
+        // arm below stays byte-for-byte the pre-policy loop — no
+        // per-pass allocation, zero grams.
+        if let Some(policy) = self.policy {
+            for &(stop, seconds, grams) in &policy.access {
+                let arrival = departure.saturating_add(seconds);
+                let label = self.arena.len() as u32;
+                let key = self.key(grams);
+                self.stats.access_offers += 1;
+                if self.stop_excluded(stop)
+                    || self.beyond_cutoff(stop, arrival)
+                    || self.target_pruned(departure, arrival, key, grams)
+                {
+                    continue;
                 }
-                fresh.push(label);
+                if self.bags[stop.0 as usize].insert_label(
+                    self.strict_bags,
+                    arrival,
+                    0,
+                    grams,
+                    key,
+                    0,
+                    self.slack,
+                ) {
+                    self.stats.access_admissions += 1;
+                    self.arena.push(Label {
+                        arrival,
+                        grams,
+                        stop,
+                        departure,
+                        penalty: 0,
+                        origin: Origin::Access,
+                    });
+                    if let Some(fold) = fold {
+                        fold.fold(&self.arena[label as usize], label);
+                    }
+                    fresh.push(label);
+                }
+            }
+        } else {
+            for &(stop, seconds) in &request.access {
+                let arrival = departure.saturating_add(seconds);
+                let label = self.arena.len() as u32;
+                let key = self.key(0.0);
+                self.stats.access_offers += 1;
+                if self.stop_excluded(stop)
+                    || self.beyond_cutoff(stop, arrival)
+                    || self.target_pruned(departure, arrival, key, 0.0)
+                {
+                    continue;
+                }
+                if self.bags[stop.0 as usize].insert_label(
+                    self.strict_bags,
+                    arrival,
+                    0,
+                    0.0,
+                    key,
+                    0,
+                    self.slack,
+                ) {
+                    self.stats.access_admissions += 1;
+                    self.arena.push(Label {
+                        arrival,
+                        grams: 0.0,
+                        stop,
+                        departure,
+                        penalty: 0,
+                        origin: Origin::Access,
+                    });
+                    if let Some(fold) = fold {
+                        fold.fold(&self.arena[label as usize], label);
+                    }
+                    fresh.push(label);
+                }
             }
         }
         self.stats.access_ns += phase.elapsed().as_nanos() as u64;
+        // Drain the access seeds against the policy egress offsets: a
+        // street ride to a stop and a street leg out of it is a real
+        // zero-ride alternative whose (arrival, grams) belongs in the
+        // destination dominance. The walking arm never drains seeds —
+        // its composition is always dominated by the direct walk over
+        // the same graph, so its behaviour stays untouched.
+        if let Some(policy) = self.policy {
+            for &label in &fresh {
+                let reached = self.arena[label as usize];
+                for &(stop, seconds, grams) in &policy.egress {
+                    if self.stop_excluded(stop) {
+                        continue;
+                    }
+                    if stop == reached.stop {
+                        let arrival = reached.arrival.saturating_add(seconds);
+                        let total = reached.grams + grams;
+                        self.destination.insert(
+                            Arrived {
+                                departure,
+                                arrival,
+                                penalty: reached.penalty,
+                                key: self.key(total),
+                                grams: total,
+                                label,
+                            },
+                            self.slack,
+                        );
+                    }
+                }
+            }
+        }
         // The bags store ride counts as `u8`, so 255 rides (254
         // transfers) is the representable cap; beyond it the count would
         // wrap and evict labels as zero-ride candidates.
@@ -606,23 +686,48 @@ impl<'a> Search<'a> {
                         self.slack,
                     );
                 }
-                for &(stop, seconds) in &request.egress {
-                    if self.stop_excluded(stop) {
-                        continue;
+                if let Some(policy) = self.policy {
+                    // Policy egress offsets add their street grams to the
+                    // journey's before the destination dominance.
+                    for &(stop, seconds, grams) in &policy.egress {
+                        if self.stop_excluded(stop) {
+                            continue;
+                        }
+                        if stop == reached.stop {
+                            let arrival = reached.arrival.saturating_add(seconds);
+                            let total = reached.grams + grams;
+                            self.destination.insert(
+                                Arrived {
+                                    departure,
+                                    arrival,
+                                    penalty: reached.penalty,
+                                    key: self.key(total),
+                                    grams: total,
+                                    label,
+                                },
+                                self.slack,
+                            );
+                        }
                     }
-                    if stop == reached.stop {
-                        let arrival = reached.arrival.saturating_add(seconds);
-                        self.destination.insert(
-                            Arrived {
-                                departure,
-                                arrival,
-                                penalty: reached.penalty,
-                                key: self.key(reached.grams),
-                                grams: reached.grams,
-                                label,
-                            },
-                            self.slack,
-                        );
+                } else {
+                    for &(stop, seconds) in &request.egress {
+                        if self.stop_excluded(stop) {
+                            continue;
+                        }
+                        if stop == reached.stop {
+                            let arrival = reached.arrival.saturating_add(seconds);
+                            self.destination.insert(
+                                Arrived {
+                                    departure,
+                                    arrival,
+                                    penalty: reached.penalty,
+                                    key: self.key(reached.grams),
+                                    grams: reached.grams,
+                                    label,
+                                },
+                                self.slack,
+                            );
+                        }
                     }
                 }
             }

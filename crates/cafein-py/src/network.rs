@@ -45,6 +45,36 @@ type MeterCell = (u32, f64, f64);
 /// A mode's per-stop meter cells beside the mode-masked links they used.
 type MeterRow = (Vec<Option<MeterCell>>, Vec<Option<Snap>>);
 
+/// One Pareto street choice: stop, seconds, grams, winning mode, its
+/// link snap identity (edge, fraction, connector meters — the
+/// ``StreetChoice`` token the leg rebuild consumes), the vehicle's
+/// network and connector meters, the walked meters, and — for a
+/// closure-carried choice — the seed stop. The multicriteria engines
+/// seed one label per row; ``(stop, seconds)`` identifies the row at
+/// reconstruction (equal seconds at different grams cannot coexist on
+/// one frontier).
+type ParetoRow = (
+    String,
+    u32,
+    f64,
+    String,
+    u32,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    Option<String>,
+);
+
+/// A frontier point of the Pareto street reduction: the winner's shape
+/// plus its street grams (NaN = the mode's factor is unresolved).
+#[derive(Clone, Copy)]
+struct ParetoChoice {
+    winner: Winner,
+    grams: f64,
+}
+
 /// The reduction's running winner per stop. The meter fields ride along
 /// only when a meters-carrying reduction asked for them; the times-only
 /// reduction leaves them zero and never reads them.
@@ -1052,6 +1082,164 @@ impl TransportNetwork {
             .collect())
     }
 
+    /// The Pareto street reduction (design §7.2/§9, stage 14a): per stop,
+    /// the ``(seconds, grams)`` frontier over the policy's modes instead
+    /// of the time-only winner — the access label sets the multicriteria
+    /// engines seed. ``modes`` arrive in declared order as ``(mode,
+    /// max_seconds, paid_rental, eligible_stops, factor)`` with the
+    /// mode's resolved g CO₂e per passenger-km; grams are the choice's
+    /// vehicle network meters times that factor, walking rides free, and
+    /// a NaN factor poisons its choices' grams (they survive only where
+    /// strictly fastest, surfacing as unresolved journeys — never a
+    /// silent zero). Exact ``(seconds, grams)`` ties resolve to fewer
+    /// paid rentals, then the declared order. The transfer closure
+    /// extends every direct frontier point by one installed edge
+    /// (+duration, grams unchanged) from a snapshot, then re-Paretos.
+    /// With every factor zero the frontier degenerates to the time-only
+    /// winner, row for row. Returns ``(stop_id, seconds, grams, mode,
+    /// link_edge, link_fraction, connector_meters, vehicle_network_m,
+    /// vehicle_connector_m, walk_m, via_stop)`` per kept point, per-stop
+    /// points sorted by seconds. Internal.
+    #[pyo3(signature = (latitude, longitude, egress, modes, exclude_stops = vec![]))]
+    #[allow(clippy::type_complexity)]
+    fn _pareto_street_rows(
+        &self,
+        py: Python<'_>,
+        latitude: f64,
+        longitude: f64,
+        egress: bool,
+        modes: Vec<(String, f64, bool, Option<Vec<String>>, f64)>,
+        exclude_stops: Vec<String>,
+    ) -> PyResult<Vec<ParetoRow>> {
+        let stop_count = self.build.timetable.stop_count() as usize;
+        let mut frontiers: Vec<Vec<ParetoChoice>> = vec![Vec::new(); stop_count];
+        let mut snapped = false;
+        for (order, (mode, max_seconds, rental, eligible, factor)) in modes.iter().enumerate() {
+            let mask = match eligible {
+                Some(stops) => {
+                    let mut mask = vec![false; stop_count];
+                    for stop in stops {
+                        mask[self.resolve_stop(stop)?.0 as usize] = true;
+                    }
+                    Some(mask)
+                }
+                None => None,
+            };
+            let Some((cells, links)) =
+                self.try_street_meters_row(py, latitude, longitude, mode, *max_seconds, egress)?
+            else {
+                continue;
+            };
+            snapped = true;
+            for (stop, cell) in cells.into_iter().enumerate() {
+                let Some((seconds, network_m, total_m)) = cell else {
+                    continue;
+                };
+                if mask.as_ref().is_some_and(|mask| !mask[stop]) {
+                    continue;
+                }
+                let Some(snap) = links[stop] else { continue };
+                // Zero meters ridden are zero grams whatever the factor —
+                // the zero-coincident convention stays exact even when
+                // the factor is unresolved.
+                let grams = if mode == "walk" || network_m <= 0.0 {
+                    0.0
+                } else {
+                    network_m / 1000.0 * factor
+                };
+                pareto_insert(
+                    &mut frontiers[stop],
+                    ParetoChoice {
+                        winner: Winner {
+                            seconds,
+                            rental: *rental,
+                            order,
+                            snap,
+                            via: None,
+                            network_m,
+                            total_m,
+                            walk_transfer_m: 0.0,
+                        },
+                        grams,
+                    },
+                );
+            }
+        }
+        if !snapped {
+            return Err(PyValueError::new_err(
+                "coordinate too far from the multimodal street network for \
+                 every policy mode",
+            ));
+        }
+        // Exclusions and the one-edge closure, exactly as the time-only
+        // reduction applies them — here every direct frontier point
+        // extends, not just the winner.
+        let mut excluded = vec![false; stop_count];
+        for stop in &exclude_stops {
+            let index = self.resolve_stop(stop)?.0 as usize;
+            frontiers[index].clear();
+            excluded[index] = true;
+        }
+        let seeds = frontiers.clone();
+        for stop in 0..stop_count {
+            for transfer in self.transfers.from_stop(StopIdx(stop as u32)) {
+                let to = transfer.to.0 as usize;
+                let (source, target) = if egress { (to, stop) } else { (stop, to) };
+                if excluded[target] {
+                    continue;
+                }
+                for point in &seeds[source] {
+                    let Some(seconds) = point.winner.seconds.checked_add(transfer.duration) else {
+                        continue;
+                    };
+                    pareto_insert(
+                        &mut frontiers[target],
+                        ParetoChoice {
+                            winner: Winner {
+                                seconds,
+                                via: Some(StopIdx(source as u32)),
+                                walk_transfer_m: transfer.meters,
+                                ..point.winner
+                            },
+                            grams: point.grams,
+                        },
+                    );
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        for (stop, frontier) in frontiers.iter_mut().enumerate() {
+            frontier.sort_unstable_by_key(|point| point.winner.seconds);
+            for point in frontier.iter() {
+                let winner = &point.winner;
+                let mode = modes[winner.order].0.clone();
+                let (vehicle_network, vehicle_connector, walk) = if mode == "walk" {
+                    (0.0, 0.0, winner.total_m + winner.walk_transfer_m)
+                } else {
+                    (
+                        winner.network_m,
+                        winner.total_m - winner.network_m,
+                        winner.walk_transfer_m,
+                    )
+                };
+                rows.push((
+                    self.public_stop_id(StopIdx(stop as u32)),
+                    winner.seconds,
+                    point.grams,
+                    mode,
+                    winner.snap.edge,
+                    winner.snap.fraction,
+                    winner.snap.connector,
+                    vehicle_network,
+                    vehicle_connector,
+                    walk,
+                    winner.via.map(|via| self.public_stop_id(via)),
+                ));
+            }
+        }
+        Ok(rows)
+    }
+
     /// The meters-carrying form of ``_reduced_street_offsets``: the same
     /// reduction over meters-tracking searches, returning ``(stop_id,
     /// seconds, winning_mode, vehicle_network_m, vehicle_connector_m,
@@ -1941,4 +2129,35 @@ fn leg_parts(
         leg.connector_meters,
         geometry,
     )
+}
+
+/// Inserts a candidate into a per-stop Pareto frontier over
+/// `(seconds, grams)`, NaN grams reading as infinitely dirty so an
+/// unresolved choice survives only where strictly fastest. Exact ties on
+/// both criteria resolve to fewer paid rentals, then the declared mode
+/// order — the frontier is a pure function of its inputs, whatever the
+/// insertion order.
+fn pareto_insert(frontier: &mut Vec<ParetoChoice>, candidate: ParetoChoice) {
+    let key = |grams: f64| if grams.is_nan() { f64::INFINITY } else { grams };
+    let rank = |choice: &ParetoChoice| (usize::from(choice.winner.rental), choice.winner.order);
+    for held in frontier.iter() {
+        let no_worse = held.winner.seconds <= candidate.winner.seconds
+            && key(held.grams) <= key(candidate.grams);
+        if no_worse
+            && (held.winner.seconds < candidate.winner.seconds
+                || key(held.grams) < key(candidate.grams)
+                || rank(held) <= rank(&candidate))
+        {
+            return;
+        }
+    }
+    frontier.retain(|held| {
+        let no_worse = candidate.winner.seconds <= held.winner.seconds
+            && key(candidate.grams) <= key(held.grams);
+        !(no_worse
+            && (candidate.winner.seconds < held.winner.seconds
+                || key(candidate.grams) < key(held.grams)
+                || rank(&candidate) < rank(held)))
+    });
+    frontier.push(candidate);
 }

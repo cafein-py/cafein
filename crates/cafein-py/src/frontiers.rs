@@ -578,6 +578,119 @@ impl TransportNetwork {
         Ok(result.unbind())
     }
 
+    /// The multicriteria Pareto journeys from pre-reduced street label
+    /// sets — the street-policy McRAPTOR path (stage 14b). The sets
+    /// arrive from the Pareto reduction (``_pareto_street_rows``), each
+    /// ``(stop, seconds, grams)`` point seeding or draining the search
+    /// with its street grams inside the (arrival, emissions bucket)
+    /// dominance. The run relaxes the full transfer closure — McULTRA
+    /// gating by exact policy and factor definitions arrives with 14c —
+    /// and the journeys come back as ``route_between_stops``-shaped
+    /// dicts whose access and egress legs carry no distances: Python
+    /// rebuilds them from the kept tokens by ``(stop, seconds)``.
+    /// Internal until the policy surface stabilises.
+    #[pyo3(signature = (access, egress, date, departure, trip_factors, max_transfers, bucket,
+                        slack = 0.0, max_options = None,
+                        exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![],
+                        geometries = true))]
+    #[allow(clippy::too_many_arguments)]
+    fn _mc_route_with_access(
+        &self,
+        py: Python<'_>,
+        access: Vec<(String, u32, f64)>,
+        egress: Vec<(String, u32, f64)>,
+        date: &str,
+        departure: &str,
+        trip_factors: Vec<(String, f64)>,
+        max_transfers: u8,
+        bucket: f64,
+        slack: f64,
+        max_options: Option<usize>,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
+        geometries: bool,
+    ) -> PyResult<Py<PyList>> {
+        if !bucket.is_finite() || bucket <= 0.0 {
+            return Err(PyValueError::new_err(
+                "bucket must be a positive number of grams",
+            ));
+        }
+        if !slack.is_finite() || slack < 0.0 {
+            return Err(PyValueError::new_err(
+                "slack must be a non-negative number of seconds",
+            ));
+        }
+        if matches!(max_options, Some(0)) {
+            return Err(PyValueError::new_err(
+                "max_options must be a positive integer",
+            ));
+        }
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        let Some(geometry) = &self.geometry else {
+            return Err(PyValueError::new_err(
+                "no trip distances installed; build the network with trip distances enabled",
+            ));
+        };
+        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
+        for (trip_id, factor) in &trip_factors {
+            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
+                per_trip[trip.0 as usize] = *factor;
+            }
+        }
+        let resolve = |rows: &[(String, u32, f64)]| -> PyResult<Vec<(StopIdx, u32, f64)>> {
+            rows.iter()
+                .map(|(stop, seconds, grams)| Ok((self.resolve_stop(stop)?, *seconds, *grams)))
+                .collect()
+        };
+        let labels = mcraptor::PolicyLabels {
+            access: resolve(&access)?,
+            egress: resolve(&egress)?,
+        };
+        let request = Request {
+            departure: parse_time(departure)?,
+            access: Vec::new(),
+            egress: Vec::new(),
+            active_services: self.active_services(date)?,
+            active_services_previous: self.active_services_previous(date)?,
+            max_transfers,
+            exclusions,
+        };
+        let slack = slack.round() as u32;
+        let journeys = py.allow_threads(|| {
+            let view = DayView::for_date(
+                &self.build.timetable,
+                &request.active_services,
+                &request.active_services_previous,
+            );
+            mcraptor::route_with_policy(
+                &view,
+                &self.build.timetable,
+                &self.transfers,
+                geometry,
+                &per_trip,
+                &request,
+                &labels,
+                bucket,
+                slack,
+                max_options,
+                &[],
+            )
+        });
+        let result = PyList::empty(py);
+        for journey in &journeys {
+            result.append(self.journey_to_dict(
+                py,
+                journey,
+                None,
+                None,
+                geometries,
+                &self.transfers,
+            )?)?;
+        }
+        Ok(result.unbind())
+    }
+
     /// Batched multicriteria Pareto frontiers between stops: per
     /// (origin, destination) cell, the journeys of
     /// ``mc_route_between_stops`` with strict pareto candidates, from

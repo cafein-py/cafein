@@ -41,10 +41,24 @@ mod stats;
 pub(crate) use super::mc_bounds::resolved_bounds;
 use bag::*;
 pub(crate) use bag::{Bag, InsertProbes};
-pub use products::{frontier_matrix, least_emissions_matrix, route, route_range};
+pub use products::{
+    frontier_matrix, least_emissions_matrix, route, route_range, route_with_policy,
+};
 use search::*;
 pub(crate) use stats::McRaptorStats;
 use stats::*;
 
 #[cfg(test)]
 mod tests;
+
+/// Street-policy label sets for the multicriteria search (design §7.2):
+/// per-stop access seeds and egress offsets carrying the street grams of
+/// the Pareto reduction's frontier points. `None` keeps the walking
+/// behaviour — the request's offsets at zero grams. `(stop, seconds)`
+/// identifies a frontier point at reconstruction: within one frontier,
+/// equal seconds at different grams cannot coexist.
+#[derive(Debug, Clone, Default)]
+pub struct PolicyLabels {
+    pub access: Vec<(StopIdx, u32, f64)>,
+    pub egress: Vec<(StopIdx, u32, f64)>,
+}

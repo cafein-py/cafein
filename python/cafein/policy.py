@@ -215,3 +215,36 @@ def reduction_modes(policy, side, walking_budget):
         eligible = None if terms.facilities == "any_stop" else list(terms.facilities)
         modes.append((mode, seconds, terms.source == "shared", eligible))
     return modes
+
+
+def pareto_reduction_modes(policy, side, walking_budget, factors=None, components=None):
+    """The Pareto reduction's mode list for one journey side.
+
+    The time-only list of :func:`reduction_modes` with each mode's
+    resolved emission factor appended — the shape the ``(seconds,
+    grams)`` frontier reduction consumes. The multicriteria search ranks
+    street grams, so an unresolved vehicle factor is rejected here
+    rather than silently zeroed or left unrankable; ``factors`` takes
+    street-mode rows (see ``cafein.emissions.load_street_factors``).
+    """
+    import pandas as pd
+
+    from cafein import emissions
+
+    modes = []
+    for mode, seconds, rental, eligible in reduction_modes(
+        policy, side, walking_budget
+    ):
+        if mode == "walk":
+            modes.append((mode, seconds, rental, eligible, 0.0))
+            continue
+        value = emissions.street_factor(mode, factors, components)
+        if pd.isna(value):
+            raise ValueError(
+                f"the {mode} emission factor is unresolved; the "
+                "multicriteria search ranks street emissions, so pass "
+                "factors= rows resolving it (see "
+                "cafein.emissions.load_street_factors)"
+            )
+        modes.append((mode, seconds, rental, eligible, float(value)))
+    return modes
