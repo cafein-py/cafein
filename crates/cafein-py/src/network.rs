@@ -18,6 +18,14 @@ type ModeRow = (Vec<Option<u32>>, Vec<Option<Snap>>);
 /// A direct street matrix beside its unsnapped origin/destination indices.
 type DirectMatrix = (Vec<Vec<Option<u32>>>, Vec<u32>, Vec<u32>);
 
+/// A reconstructed street leg's parts: whole seconds, network meters,
+/// connector meters, and the WKB shape when geometries were asked for.
+type StreetLegParts = (u32, f64, f64, Option<Py<PyBytes>>);
+
+/// An installed transfer's parts: whole seconds, meters, and the walked
+/// path when geometries were asked for.
+type TransferLegParts = (u32, f64, Option<Py<PyBytes>>);
+
 /// One reduced street choice: stop, seconds, winning mode, its link snap
 /// identity (edge, fraction, connector meters), and — when the transfer
 /// closure carried it — the seed stop the vehicle actually reached. The
@@ -841,15 +849,148 @@ impl TransportNetwork {
         }))
     }
 
+    /// The reconstructed street leg between a coordinate and a stop's kept
+    /// link snap — the reconstruction stage's counterpart of one reduced
+    /// choice. The ``(edge, fraction, connector)`` triple is the
+    /// ``StreetChoice`` token; the coordinate re-snaps for ``mode``, and the
+    /// leg runs coordinate → link for access, link → coordinate for egress.
+    /// ``None`` when the link is beyond ``max_seconds``. A stop at the
+    /// coordinate itself is a zero leg, matching the reduction's
+    /// zero-coincident convention. Internal.
+    #[pyo3(signature = (latitude, longitude, mode, stop, edge, fraction, connector,
+                        egress, max_seconds, geometries))]
+    #[allow(clippy::too_many_arguments)]
+    fn _multimodal_leg(
+        &self,
+        py: Python<'_>,
+        latitude: f64,
+        longitude: f64,
+        mode: &str,
+        stop: &str,
+        edge: u32,
+        fraction: f64,
+        connector: f64,
+        egress: bool,
+        max_seconds: f64,
+        geometries: bool,
+    ) -> PyResult<Option<StreetLegParts>> {
+        let profile = self.multimodal_profile(mode)?;
+        let network = self.multimodal.as_ref().expect("profile lookup checked");
+        let stop = self.resolve_stop(stop)?;
+        let feed_stop = &self.feed.stops[stop.0 as usize];
+        let (Some(stop_latitude), Some(stop_longitude)) = (feed_stop.latitude, feed_stop.longitude)
+        else {
+            return Err(PyValueError::new_err(
+                "the stop has no coordinates to rebuild the street leg from",
+            ));
+        };
+        if stop_latitude == latitude && stop_longitude == longitude {
+            return Ok(Some(zero_leg(py, latitude, longitude, geometries)));
+        }
+        let link = Snap {
+            edge,
+            fraction,
+            connector,
+        };
+        let Some(snap) =
+            network.snap_for_profile(latitude, longitude, MULTIMODAL_STOP_SNAP, &profile)
+        else {
+            return Err(PyValueError::new_err(
+                "coordinate too far from the multimodal street network",
+            ));
+        };
+        let coordinate = (latitude, longitude);
+        let stop_point = (stop_latitude, stop_longitude);
+        let ((from_point, from), (to_point, to)) = if egress {
+            ((stop_point, link), (coordinate, snap))
+        } else {
+            ((coordinate, snap), (stop_point, link))
+        };
+        let leg = py.allow_threads(|| {
+            network.directed_leg(from_point, &from, to_point, &to, &profile, max_seconds)
+        });
+        Ok(leg.map(|leg| leg_parts(py, leg, geometries)))
+    }
+
+    /// The reconstructed direct street leg between two coordinates over the
+    /// multimodal graph — the policy path's door-to-door alternative.
+    /// ``None`` when either coordinate has no snap for the mode or the pair
+    /// is beyond ``max_seconds``; equal coordinates are a zero leg. Internal.
+    fn _multimodal_direct_leg(
+        &self,
+        py: Python<'_>,
+        origin: (f64, f64),
+        destination: (f64, f64),
+        mode: &str,
+        max_seconds: f64,
+        geometries: bool,
+    ) -> PyResult<Option<StreetLegParts>> {
+        let profile = self.multimodal_profile(mode)?;
+        let network = self.multimodal.as_ref().expect("profile lookup checked");
+        if origin == destination {
+            return Ok(Some(zero_leg(py, origin.0, origin.1, geometries)));
+        }
+        let snaps = (
+            network.snap_for_profile(origin.0, origin.1, MULTIMODAL_STOP_SNAP, &profile),
+            network.snap_for_profile(destination.0, destination.1, MULTIMODAL_STOP_SNAP, &profile),
+        );
+        let (Some(from), Some(to)) = snaps else {
+            return Ok(None);
+        };
+        let leg = py.allow_threads(|| {
+            network.directed_leg(origin, &from, destination, &to, &profile, max_seconds)
+        });
+        Ok(leg.map(|leg| leg_parts(py, leg, geometries)))
+    }
+
+    /// The installed transfer between two stops as ``(seconds, meters,
+    /// walked path)``, or ``None`` when the closure holds no such edge — the
+    /// via leg of a closure-carried street choice. The path draws over the
+    /// walking street network, like every transfer leg. Internal.
+    fn _transfer_leg(
+        &self,
+        py: Python<'_>,
+        from_stop: &str,
+        to_stop: &str,
+        geometries: bool,
+    ) -> PyResult<Option<TransferLegParts>> {
+        let from = self.resolve_stop(from_stop)?;
+        let to = self.resolve_stop(to_stop)?;
+        // Transfers are deduplicated per stop pair at construction
+        // (`Transfers::from_edges` keeps the minimum-duration edge), so
+        // the one edge found is the one the reduction relaxed.
+        let Some(edge) = self
+            .transfers
+            .from_stop(from)
+            .iter()
+            .find(|transfer| transfer.to == to)
+        else {
+            return Ok(None);
+        };
+        let geometry = geometries
+            .then(|| {
+                let (from_point, from_snap) = self.stop_walk_endpoint(from)?;
+                let (to_point, to_snap) = self.stop_walk_endpoint(to)?;
+                self.walk_wkb(py, from_point, &from_snap, to_point, &to_snap)
+            })
+            .flatten()
+            .map(Bound::unbind);
+        Ok(Some((edge.duration, edge.meters, geometry)))
+    }
+
     /// The time-only street reduction (design §7.2): per stop, the fastest
     /// permitted choice across the policy's modes over the multimodal graph.
     /// ``modes`` arrive in declared order as ``(mode, max_seconds,
     /// paid_rental, eligible_stops)`` — ``eligible_stops=None`` leaves the
     /// mode unmasked (walking is never masked). Exact-time ties resolve to
     /// fewer paid rentals, then the declared order. Returns
-    /// ``(stop_id, seconds, winning_mode)`` per reachable stop — the
-    /// ``(stop, seconds)`` array the time engines consume, plus the mode the
-    /// reconstruction sidecar keeps. Internal until the policy surface.
+    /// ``(stop_id, seconds, winning_mode, link_edge, link_fraction,
+    /// connector_meters, via_stop)`` per reachable stop — the
+    /// ``(stop, seconds)`` array the time engines consume plus the
+    /// ``StreetChoice`` token the reconstruction rebuilds the leg from:
+    /// the winning mode, its link snap identity, and, for a
+    /// closure-carried choice, the seed stop the vehicle actually
+    /// reached (``None`` when direct). Internal until the policy surface.
     #[pyo3(signature = (latitude, longitude, egress, modes, exclude_stops = vec![]))]
     #[allow(clippy::type_complexity)]
     fn _reduced_street_offsets(
@@ -934,11 +1075,16 @@ impl TransportNetwork {
         // construction — so a reduced array must be too, or "ride to one
         // platform, walk to the neighbouring one" would go missing and a
         // better seed could only prune the transit label that used to feed
-        // that footpath. The installed set is a closure, so one pass
-        // suffices; the winner keeps its street mode. Direction follows the
-        // labels: access labels propagate along a transfer (reach the seed,
-        // then walk it), egress labels against it (walk it first, then
-        // leave from the seed) — asymmetric footpaths stay honest.
+        // that footpath. Direction follows the labels: access labels
+        // propagate along a transfer (reach the seed, then walk it), egress
+        // labels against it (walk it first, then leave from the seed) —
+        // asymmetric footpaths stay honest. The pass relaxes a snapshot of
+        // the direct winners, never its own output: the installed set is
+        // transitively closed within its own walking cutoff, so composing
+        // two installed edges would walk beyond that cutoff. Every carried
+        // choice is thus its seed's direct time plus exactly one installed
+        // transfer, whatever the stop order.
+        let seeds = best.clone();
         for stop in 0..stop_count {
             for transfer in self.transfers.from_stop(StopIdx(stop as u32)) {
                 let to = transfer.to.0 as usize;
@@ -946,7 +1092,7 @@ impl TransportNetwork {
                 if excluded[target] {
                     continue;
                 }
-                let Some(winner) = best[source] else {
+                let Some(winner) = seeds[source] else {
                     continue;
                 };
                 let Some(candidate) = winner.seconds.checked_add(transfer.duration) else {
@@ -963,7 +1109,9 @@ impl TransportNetwork {
                 };
                 if wins {
                     // The choice token stays the seed's — the vehicle serves
-                    // its own snap and the transfer is walked via `via`.
+                    // its own snap and the transfer is walked via `via`; a
+                    // snapshot source is always a direct winner, so `via`
+                    // names the stop whose link the token snap belongs to.
                     best[target] = Some(Winner {
                         seconds: candidate,
                         via: Some(StopIdx(source as u32)),
@@ -1590,4 +1738,27 @@ impl TransportNetwork {
             })
             .collect()
     }
+}
+
+/// A degenerate zero-length leg at a coordinate — the reconstruction of the
+/// zero-coincident convention: no travel, no meters, a point-pair shape.
+fn zero_leg(py: Python<'_>, latitude: f64, longitude: f64, geometries: bool) -> StreetLegParts {
+    let at = (longitude, latitude);
+    let geometry = geometries.then(|| wkb_line_string(py, &[at, at]).unbind());
+    (0, 0.0, 0.0, geometry)
+}
+
+/// A reconstructed [`StreetLeg`] as the flat parts Python consumes.
+fn leg_parts(
+    py: Python<'_>,
+    leg: cafein_core::streets::StreetLeg,
+    geometries: bool,
+) -> StreetLegParts {
+    let geometry = geometries.then(|| wkb_line_string(py, &leg.geometry).unbind());
+    (
+        leg.seconds,
+        leg.network_meters,
+        leg.connector_meters,
+        geometry,
+    )
 }

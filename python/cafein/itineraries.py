@@ -35,6 +35,16 @@ _COLUMNS = [
     "geometry",
 ]
 
+# A street-policy frame adds the leg's street mode beside its structural
+# position and the rebuilt legs' distance parts beside the total; the
+# legacy schema is otherwise unchanged.
+_POLICY_COLUMNS = list(_COLUMNS)
+_POLICY_COLUMNS.insert(_POLICY_COLUMNS.index("departure_s"), "mode")
+_POLICY_COLUMNS.insert(_POLICY_COLUMNS.index("distance_m") + 1, "network_distance_m")
+_POLICY_COLUMNS.insert(
+    _POLICY_COLUMNS.index("network_distance_m") + 1, "connector_distance_m"
+)
+
 
 class DetailedItineraries(gpd.GeoDataFrame):
     """Full journeys between origins and destinations, one row per leg.
@@ -196,6 +206,29 @@ class DetailedItineraries(gpd.GeoDataFrame):
         Cutoff in seconds for a ``StreetNetwork``, beyond which a
         destination counts as unreachable (default:
         ``cafein.street_network.MAX_STREET_TIME``, 7200).
+    street_policy : StreetLegPolicy (optional)
+        Which street modes may serve the access and egress, on what
+        vehicle terms (``cafein.StreetLegPolicy``); point origins and
+        destinations only, with ``candidates="time"``. The frame gains a
+        ``mode`` column beside ``leg_type`` — the street mode of every
+        rebuilt access/egress/transfer/walk leg, ``None`` on transit
+        legs — and the rebuilt street legs carry their exact distances
+        (the ``network_distance_m`` and ``connector_distance_m`` parts
+        beside the ``distance_m`` total; null on other legs), the street
+        distance provenance, their shapes, and the mode's
+        street emissions over its network meters (a ``factors=`` table
+        keyed by ``street_mode`` configures the street ladder — see
+        ``cafein.emissions.load_street_factors`` — while any other table
+        layers over the transit ladder as always; NA where unresolved).
+        A choice the transfer closure carried splits into the vehicle
+        leg to its seed stop
+        plus the walked transfer, so no row blends two modes. A
+        walking-only policy at one shared budget rides the legacy
+        walking path, and the direct door-to-door alternative stays the
+        walking one — direct vehicle journeys ride the standalone street
+        products until the vehicle-terms fold arrives. Conflicts with
+        the walking options, which are rejected rather than silently
+        ignored.
     """
 
     @property
@@ -229,10 +262,17 @@ class DetailedItineraries(gpd.GeoDataFrame):
         max_snap_distance=None,
         transport_mode=None,
         max_street_time=None,
+        street_policy=None,
     ):
         # Before the reconstruction guard below: a StreetNetwork has no
         # `route_between_stops` either, so it would be mistaken for frame data.
         if _is_street_network(network):
+            if street_policy is not None:
+                raise ValueError(
+                    "street_policy shapes a TransportNetwork's access and "
+                    "egress; a StreetNetwork routes one mode directly — pass "
+                    "transport_mode instead"
+                )
             super().__init__(
                 _street_itineraries_frame(
                     network,
@@ -301,6 +341,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
+            street_policy=street_policy,
         )
         super().__init__(frame, geometry="geometry", crs="EPSG:4326")
 
@@ -329,6 +370,7 @@ def _itineraries_frame(
     walking_speed_kmph,
     max_walking_time,
     max_snap_distance,
+    street_policy=None,
 ):
     from cafein import emissions
     from cafein.frontier import _alternative_options, _exclusion_lists
@@ -347,6 +389,24 @@ def _itineraries_frame(
         raise ValueError("candidates must be 'time', 'pareto', 'relaxed', or 'diverse'")
     if router not in ("auto", "raptor", "tbtr"):
         raise ValueError("router must be 'auto', 'raptor', or 'tbtr'")
+    if street_policy is not None:
+        if kind != "points":
+            raise ValueError("street_policy applies to point origins and destinations")
+        if candidates != "time":
+            raise ValueError(
+                "street_policy supports candidates='time' for now; the "
+                "emissions-aware alternative sets arrive with a later stage"
+            )
+        if router != "auto":
+            raise ValueError(
+                "street_policy resolves its own engine; router= does not apply"
+            )
+        if any(option is not None for option in walk):
+            raise ValueError(
+                "street_policy carries its own budgets; passing "
+                "walking_speed_kmph, max_walking_time, or max_snap_distance "
+                "beside it is a conflict"
+            )
     if router == "tbtr" and candidates != "pareto":
         raise ValueError("router='tbtr' requires candidates='pareto'")
     if router == "auto" and candidates in ("relaxed", "diverse"):
@@ -363,6 +423,9 @@ def _itineraries_frame(
     trip_factors = (
         emissions.trip_factors(network, factors, components) if multicriteria else None
     )
+    transit_factors, street_factors = factors, None
+    if street_policy is not None:
+        transit_factors, street_factors = _factor_tables(factors)
 
     records = []
     for origin_id, origin_key in zip(origin_ids, origin_keys):
@@ -407,16 +470,27 @@ def _itineraries_frame(
                     options,
                     trip_factors,
                     exclusions,
+                    street_policy,
                 )
             if not journeys:
                 continue
-            network.annotate_emissions(journeys, factors, components)
+            network.annotate_emissions(journeys, transit_factors, components)
+            if street_policy is not None:
+                _street_leg_emissions(journeys, street_factors, components)
             for option, journey in enumerate(journeys):
                 for segment, leg in enumerate(journey["legs"]):
                     records.append(
-                        _leg_record(origin_id, dest_id, option, segment, leg)
+                        _leg_record(
+                            origin_id,
+                            dest_id,
+                            option,
+                            segment,
+                            leg,
+                            mode=street_policy is not None,
+                        )
                     )
-    return _to_geodataframe(records)
+    columns = _COLUMNS if street_policy is None else _POLICY_COLUMNS
+    return _to_geodataframe(records, columns)
 
 
 def _endpoints(value, role):
@@ -451,6 +525,7 @@ def _route(
     options,
     trip_factors,
     exclusions,
+    street_policy=None,
 ):
     """The Pareto-optimal journeys of one OD pair — the time-optimal
     (arrival, rides) set, or the (arrival, emissions) McRAPTOR set with
@@ -488,6 +563,7 @@ def _route(
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
             geometries=geometries,
+            street_policy=street_policy,
         )
     return network.route_between_stops(
         origin_key,
@@ -642,7 +718,7 @@ def _route_diverse(
     return _diverse_rounds(search, annotate, k, diversity, penalty)
 
 
-def _leg_record(from_id, to_id, option, segment, leg):
+def _leg_record(from_id, to_id, option, segment, leg, mode=False):
     """One leg as a flat record, with its endpoints normalised."""
     leg_type = leg["type"]
     if leg_type == "transit":
@@ -657,7 +733,7 @@ def _leg_record(from_id, to_id, option, segment, leg):
     else:
         from_stop, to_stop = leg["from_stop"], leg["to_stop"]
     wkb = leg.get("geometry")
-    return {
+    record = {
         "from_id": from_id,
         "to_id": to_id,
         "option": option,
@@ -676,6 +752,15 @@ def _leg_record(from_id, to_id, option, segment, leg):
         "emissions": leg.get("emissions"),
         "geometry": shapely.from_wkb(wkb) if wkb is not None else None,
     }
+    if mode:
+        # Rebuilt street legs name their mode; a walking-only policy rides
+        # the legacy path whose walked legs carry none, so the structural
+        # type resolves it there. The distance parts exist on rebuilt
+        # street legs only — legacy and transit legs carry nulls.
+        record["mode"] = leg.get("mode", None if leg_type == "transit" else "walk")
+        record["network_distance_m"] = leg.get("network_distance_m")
+        record["connector_distance_m"] = leg.get("connector_distance_m")
+    return record
 
 
 STREET_COLUMNS = [
@@ -788,9 +873,54 @@ def _street_itineraries_frame(
     return gpd.GeoDataFrame(frame, geometry=geometry, crs="EPSG:4326")
 
 
-def _to_geodataframe(records):
+def _factor_tables(factors):
+    """``factors=`` split by schema for the policy frame: a table keyed by
+    ``street_mode`` configures the street ladder and leaves the transit
+    legs on the shipped defaults; anything else layers over the transit
+    ladder as always."""
+    import pathlib
+
+    from cafein import emissions
+
+    if factors is None:
+        return None, None
+    frame = (
+        factors
+        if isinstance(factors, pd.DataFrame)
+        else emissions._read_factor_file(pathlib.Path(factors))
+    )
+    if "street_mode" in frame.columns:
+        return None, frame
+    return factors, None
+
+
+def _street_leg_emissions(journeys, factors, components):
+    """Street emissions on the rebuilt vehicle legs, in place.
+
+    Network meters times the mode's resolved per-km factor — the
+    connectors are the walk to the vehicle, not vehicle-kilometres.
+    Walking legs keep the annotation's zero; an unresolved factor leaves
+    NA, never a silent zero. Journey totals grow accordingly.
+    """
+    from cafein import emissions
+
+    resolved = {}
+    for journey in journeys:
+        for leg in journey["legs"]:
+            mode = leg.get("mode")
+            if mode in (None, "walk"):
+                continue
+            if mode not in resolved:
+                resolved[mode] = emissions.street_factor(mode, factors, components)
+            leg["emissions"] = leg["network_distance_m"] / 1000.0 * resolved[mode]
+            total = journey.get("emissions")
+            if total is not None:
+                journey["emissions"] = total + leg["emissions"]
+
+
+def _to_geodataframe(records, columns=None):
     """The leg records as a GeoDataFrame with a set geometry and CRS."""
-    frame = pd.DataFrame(records, columns=_COLUMNS)
+    frame = pd.DataFrame(records, columns=_COLUMNS if columns is None else columns)
     geometry = gpd.GeoSeries(
         frame["geometry"].to_list(), index=frame.index, crs="EPSG:4326"
     )
