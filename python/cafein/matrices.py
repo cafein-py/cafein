@@ -160,8 +160,9 @@ class TravelCostMatrix(pd.DataFrame):
         ``cafein.street_network.MAX_STREET_TIME``, 7200).
 
     ``street_policy=`` is accepted for signature parity but rejected: the
-    cost matrix gains policy support with the street-leg reconstruction
-    stage.
+    cost matrix aggregates whole rebuilt journeys per pair, so its policy
+    support arrives with a policy cost fan-out of its own
+    (``DetailedItineraries`` reconstructs policy journeys today).
     """
 
     @property
@@ -240,8 +241,9 @@ class TravelCostMatrix(pd.DataFrame):
             raise ValueError("max_street_time applies to a StreetNetwork matrix")
         if street_policy is not None:
             raise ValueError(
-                "street_policy is not wired into the cost matrix yet; it "
-                "arrives with the street-leg reconstruction stage"
+                "street_policy is not wired into the cost matrix yet; "
+                "DetailedItineraries reconstructs policy journeys, and the "
+                "cost aggregation arrives with its own fan-out"
             )
         table, from_ids, to_ids = _cost_columns(
             network,

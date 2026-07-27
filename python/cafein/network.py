@@ -47,6 +47,255 @@ def _walk_options(walking_speed_kmph, max_walking_time, max_snap_distance):
     return walking_speed_kmph, max_walking_time, max_snap_distance
 
 
+def _departure_seconds(departure):
+    """``HH:MM:SS`` as seconds past the service day's start."""
+    hours, minutes, seconds = str(departure).split(":")
+    return int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+
+
+def _policy_reduced(core, point, egress, modes, exclude_stops):
+    """One side's reduction: the ``(stop, seconds)`` offsets the engine
+    seeds, and the per-stop ``StreetChoice`` tokens the reconstruction
+    rebuilds the street legs from."""
+    rows = core._reduced_street_offsets(
+        point[0], point[1], egress, modes, [str(stop) for stop in exclude_stops]
+    )
+    offsets = [(stop, seconds) for stop, seconds, *_ in rows]
+    tokens = {row[0]: row[1:] for row in rows}
+    return offsets, tokens
+
+
+def _policy_street_legs(core, leg, point, tokens, budgets, egress, geometries):
+    """The reconstructed street leg(s) behind one access or egress row.
+
+    The kept token names the winning mode and the stop link it reached;
+    the leg rebuilds between the coordinate and that link over the
+    multimodal graph. A closure-carried choice (``via``) splits into the
+    vehicle leg serving its seed stop plus the walked transfer between
+    the seed and the boarded stop, so no leg blends two modes.
+    """
+    from cafein._cafein import STREET_DISTANCE_PROVENANCE
+
+    stop = leg["from_stop"] if egress else leg["to_stop"]
+    # The token's seconds equal the leg's own span — the engine was
+    # seeded with them — so the leg times below stand in for them.
+    _, mode, edge, fraction, connector, via = tokens[stop]
+    seed = via if via is not None and via != stop else stop
+    parts = core._multimodal_leg(
+        point[0],
+        point[1],
+        mode,
+        seed,
+        edge,
+        fraction,
+        connector,
+        egress,
+        budgets[mode],
+        geometries,
+    )
+    if parts is None:
+        # The reduction proved this link reachable within the budget; a
+        # missing rebuild means the two searches drifted apart.
+        raise RuntimeError(
+            f"the {mode} street leg serving stop {seed!r} could not be "
+            "rebuilt from its reduced choice"
+        )
+    leg_seconds, network_m, connector_m, shape = parts
+    street = {
+        "type": leg["type"],
+        "mode": mode,
+        "distance_m": network_m + connector_m,
+        "network_distance_m": network_m,
+        "connector_distance_m": connector_m,
+        "distance_provenance": STREET_DISTANCE_PROVENANCE,
+        "geometry": shape,
+    }
+    if seed == stop:
+        street["departure_s"] = leg["departure_s"]
+        street["arrival_s"] = leg["arrival_s"]
+        end = ("from_stop", seed) if egress else ("to_stop", seed)
+        street[end[0]] = end[1]
+        return [street]
+    # The walked edge follows the closure's direction: access walks from
+    # the seed the vehicle reached, egress walks *to* the seed it leaves
+    # from — asymmetric footpaths stay honest. The reduction carried the
+    # choice over exactly this installed edge, so it exists; the guard
+    # below is defensive, and the times derive from the reduced total
+    # either way.
+    ends = (stop, seed) if egress else (seed, stop)
+    walked = core._transfer_leg(*ends, geometries)
+    transfer = {
+        "type": "transfer",
+        "mode": "walk",
+        "distance_m": walked[1] if walked is not None else None,
+        "distance_provenance": None,
+        "geometry": walked[2] if walked is not None else None,
+    }
+    if egress:
+        # The traveller walks the transfer first, then the vehicle leaves
+        # from the seed's link.
+        boundary = max(leg["arrival_s"] - leg_seconds, leg["departure_s"])
+        transfer.update(
+            from_stop=stop,
+            to_stop=seed,
+            departure_s=leg["departure_s"],
+            arrival_s=boundary,
+        )
+        street.update(from_stop=seed, departure_s=boundary, arrival_s=leg["arrival_s"])
+        return [transfer, street]
+    # Access: the vehicle reaches the seed's link, then the transfer is
+    # walked to the boarded stop.
+    boundary = min(leg["departure_s"] + leg_seconds, leg["arrival_s"])
+    street.update(to_stop=seed, departure_s=leg["departure_s"], arrival_s=boundary)
+    transfer.update(
+        from_stop=seed,
+        to_stop=stop,
+        departure_s=boundary,
+        arrival_s=leg["arrival_s"],
+    )
+    return [street, transfer]
+
+
+def _policy_journeys(
+    core,
+    origin,
+    destination,
+    date,
+    departure,
+    max_transfers,
+    policy,
+    exclusions,
+    geometries,
+):
+    """Door-to-door journeys under a street-leg policy.
+
+    Each side reduces over the multimodal graph, the engine routes from
+    the reduced offsets, the street legs rebuild from the kept tokens,
+    and the direct walking alternative folds in exactly as the legacy
+    walking path folds it: a journey is dropped when walking out at its
+    own departure would arrive no later, and a walking-only journey
+    leads the list unless a kept journey already rides nothing.
+    """
+    from cafein import streets as _streets
+    from cafein._cafein import STREET_DISTANCE_PROVENANCE
+    from cafein.policy import reduction_modes
+
+    # One immutable snapshot of the caller's exclusions, reused across
+    # every search below — a one-shot iterable or a list mutated between
+    # the GIL-releasing calls must not shift the exclusion set mid-query.
+    exclude_routes = tuple(str(route) for route in exclusions[0])
+    exclude_trips = tuple(str(trip) for trip in exclusions[1])
+    exclude_stops = tuple(str(stop) for stop in exclusions[2])
+    access_modes = reduction_modes(policy, "access", _streets.MAX_ACCESS_EGRESS_TIME)
+    egress_modes = reduction_modes(policy, "egress", _streets.MAX_ACCESS_EGRESS_TIME)
+    origin = tuple(origin)
+    destination = tuple(destination)
+
+    def reduced(point, egress_side, modes):
+        # A side none of whose modes snap is empty rather than fatal —
+        # the direct walking alternative below may still stand, as it
+        # does on the policy matrix path. The error is kept: with no
+        # walk either, it is the honest answer.
+        try:
+            offsets, tokens = _policy_reduced(
+                core, point, egress_side, modes, exclude_stops
+            )
+        except ValueError as error:
+            if "too far from the multimodal street network" not in str(error):
+                raise
+            return [], {}, error
+        return offsets, tokens, None
+
+    access, access_tokens, access_error = reduced(origin, False, access_modes)
+    egress, egress_tokens, egress_error = reduced(destination, True, egress_modes)
+    journeys = core._route_with_access(
+        access,
+        egress,
+        date,
+        departure,
+        max_transfers,
+        list(exclude_routes),
+        list(exclude_trips),
+        list(exclude_stops),
+        geometries,
+    )
+    access_budgets = {mode: seconds for mode, seconds, *_ in access_modes}
+    egress_budgets = {mode: seconds for mode, seconds, *_ in egress_modes}
+    for journey in journeys:
+        legs = []
+        for leg in journey["legs"]:
+            if leg["type"] == "access":
+                legs.extend(
+                    _policy_street_legs(
+                        core,
+                        leg,
+                        origin,
+                        access_tokens,
+                        access_budgets,
+                        False,
+                        geometries,
+                    )
+                )
+            elif leg["type"] == "egress":
+                legs.extend(
+                    _policy_street_legs(
+                        core,
+                        leg,
+                        destination,
+                        egress_tokens,
+                        egress_budgets,
+                        True,
+                        geometries,
+                    )
+                )
+            else:
+                leg["mode"] = "walk" if leg["type"] == "transfer" else None
+                legs.append(leg)
+        journey["legs"] = legs
+    # The direct walking alternative rides nothing and needs no stop, so
+    # it stands whatever the policy grants; its budget is the policy's
+    # walking access budget when walking is granted, else the usual one.
+    walk_budget = access_budgets.get("walk", _streets.MAX_ACCESS_EGRESS_TIME)
+    direct = core._multimodal_direct_leg(
+        origin, destination, "walk", walk_budget, geometries
+    )
+    if direct is None:
+        unsnapped = access_error or egress_error
+        if unsnapped is not None:
+            # No policy mode snapped on that side and no walk stands in
+            # either: the coordinate really is off the street network.
+            raise unsnapped
+        return journeys
+    walk_seconds, network_m, connector_m, shape = direct
+    kept = [
+        journey
+        for journey in journeys
+        if journey["arrival_s"] - journey["departure_s"] < walk_seconds
+    ]
+    if any(journey["rides"] == 0 for journey in kept):
+        return kept
+    departed = _departure_seconds(departure)
+    walk = {
+        "departure_s": departed,
+        "arrival_s": departed + walk_seconds,
+        "rides": 0,
+        "legs": [
+            {
+                "type": "walk",
+                "mode": "walk",
+                "departure_s": departed,
+                "arrival_s": departed + walk_seconds,
+                "distance_m": network_m + connector_m,
+                "network_distance_m": network_m,
+                "connector_distance_m": connector_m,
+                "distance_provenance": STREET_DISTANCE_PROVENANCE,
+                "geometry": shape,
+            }
+        ],
+    }
+    return [walk] + kept
+
+
 class TransportNetwork:
     """A routable public-transport network.
 
@@ -728,6 +977,7 @@ class TransportNetwork:
         max_walking_time=None,
         max_snap_distance=None,
         geometries=True,
+        street_policy=None,
     ):
         """Route door-to-door between two coordinates.
 
@@ -772,6 +1022,25 @@ class TransportNetwork:
             transfers, and access/egress, but vehicles still ride
             through it; an excluded origin or destination yields no
             journeys. Unknown route and trip ids are ignored.
+        street_policy : StreetLegPolicy, optional
+            Which street modes may serve the access and egress, on what
+            vehicle terms (``cafein.StreetLegPolicy``). A walking-only
+            policy at one shared budget is the current walking path at
+            that budget; anything else runs the per-stop time-only
+            reduction over the multimodal graph (build with
+            ``street_modes=``) and rebuilds the street legs from the
+            winning choices — each such leg carries an additional
+            ``mode`` beside its exact distances (``network_distance_m``
+            and ``connector_distance_m`` parts included), the street
+            distance provenance, and its shape, and a choice carried
+            through the transfer closure splits into the vehicle leg to
+            its seed stop plus the walked transfer. The direct
+            door-to-door alternative stays the walking one: whether a
+            policy's vehicle may serve a stop-less journey depends on
+            its terms, so that fold arrives with a later stage and the
+            standalone street products answer direct street routing
+            today. Conflicts with the walking knobs above and with
+            ``window``, which are rejected rather than silently ignored.
 
         Returns
         -------
@@ -779,6 +1048,55 @@ class TransportNetwork:
             Journeys as in ``route_between_stops``; arrivals include
             the egress walk.
         """
+        if street_policy is not None:
+            from cafein.matrices import _walking_only_policy
+
+            if any(
+                option is not None
+                for option in (walking_speed_kmph, max_walking_time, max_snap_distance)
+            ):
+                raise ValueError(
+                    "street_policy carries its own budgets; passing "
+                    "walking_speed_kmph, max_walking_time, or "
+                    "max_snap_distance beside it is a conflict"
+                )
+            if window is not None:
+                raise ValueError(
+                    "street_policy does not combine with a departure window yet"
+                )
+            walk_only, walk_budget = _walking_only_policy(street_policy)
+            if walk_only:
+                # A walking-only policy IS the current walking path, at the
+                # policy's walking budget.
+                return self._core.route_between_coordinates(
+                    tuple(origin),
+                    tuple(destination),
+                    date,
+                    departure,
+                    max_transfers,
+                    None,
+                    [str(route) for route in exclude_routes],
+                    [str(trip) for trip in exclude_trips],
+                    [str(stop) for stop in exclude_stops],
+                    *_walk_options(None, walk_budget, None),
+                    geometries,
+                )
+            if not self._core.has_multimodal_streets:
+                raise ValueError(
+                    "street_policy needs the multimodal street graph; build "
+                    "with street_modes="
+                )
+            return _policy_journeys(
+                self._core,
+                origin,
+                destination,
+                date,
+                departure,
+                max_transfers,
+                street_policy,
+                (exclude_routes, exclude_trips, exclude_stops),
+                geometries,
+            )
         return self._core.route_between_coordinates(
             tuple(origin),
             tuple(destination),
