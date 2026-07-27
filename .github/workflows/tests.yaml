@@ -76,7 +76,14 @@ jobs:
         # Parallelised across the runner's cores with pytest-xdist. Each
         # worker's Rust compute is capped to two rayon threads: uncapped,
         # every worker spawns a pool as wide as the machine, and the heavy
-        # multicriteria tests contend N-fold for the same cores.
+        # multicriteria tests contend N-fold for the same cores. Linux
+        # runners cap at three workers: with four, the workers' session
+        # network fixtures together exceed the 7 GB runner near the end
+        # of the suite and the OOM reaper stops the runner service —
+        # the job dies with "runner received a shutdown signal", not a
+        # test failure.
         env:
           RAYON_NUM_THREADS: 2
-        run: pytest -n auto --dist load --cov=cafein --cov-report=term-missing
+        run: >-
+          pytest -n ${{ runner.os == 'Linux' && '3' || 'auto' }}
+          --dist load --cov=cafein --cov-report=term-missing
