@@ -260,6 +260,7 @@ impl<'a> McTbtrEngine<'a> {
         let mut rides = 0u32;
         let mut transit_meters = 0.0;
         let mut walk_meters = 0.0;
+        let mut access_stop = to.0;
         let mut legs: Vec<(TripIdx, u16, u16)> = Vec::new();
         let mut fare_legs: Vec<FareLeg> = Vec::new();
         if winner.leaf != ACCESS_LEAF {
@@ -303,7 +304,10 @@ impl<'a> McTbtrEngine<'a> {
                     .pattern_stops(self.view.line_pattern(self.view.line_of(trip)))
                     [segment.board as usize];
                 match segment.origin {
-                    SegOrigin::Access { .. } => break,
+                    SegOrigin::Access { stop, .. } => {
+                        access_stop = stop.0;
+                        break;
+                    }
                     SegOrigin::Transfer { parent, alight: at }
                     | SegOrigin::Walked {
                         parent, alight: at, ..
@@ -349,6 +353,8 @@ impl<'a> McTbtrEngine<'a> {
         };
         CostRow {
             to: to.0,
+            access_stop,
+            egress_stop: to.0,
             seconds: winner.seconds,
             rides,
             transit_meters,

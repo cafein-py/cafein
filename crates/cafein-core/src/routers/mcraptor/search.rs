@@ -1208,6 +1208,7 @@ impl<'a> Search<'a> {
         access_meters: &[(StopIdx, f64)],
     ) -> CostRow {
         let (grams, seconds, mut at, egress_meters) = winner;
+        let alighted = self.arena[at as usize].stop;
         let mut rides = 0u32;
         let mut transit_meters = 0.0;
         // The final walk to the destination (zero when the label alights there).
@@ -1285,6 +1286,8 @@ impl<'a> Search<'a> {
         };
         CostRow {
             to,
+            access_stop: access_stop.0,
+            egress_stop: alighted.0,
             seconds,
             rides,
             transit_meters,

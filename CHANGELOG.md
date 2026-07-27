@@ -27,6 +27,16 @@
   ``leg_type`` — the mode's street emissions over its network meters. A
   choice carried through the transfer closure splits into the vehicle leg
   to its seed stop plus the walked transfer, so no leg blends two modes.
+  ``TravelCostMatrix(street_policy=...)`` completes the policy products:
+  the frame gains ``street_distance_m`` beside the transit and walking
+  distances — the vehicle legs' network meters plus their connectors at
+  the journey ends — and ``emissions`` adds each vehicle mode's street
+  emissions over its network meters only (NaN where the factor is unresolved, never a silent
+  zero), attributed per pair from the winning journey's access and
+  egress choices outside the routing engine. The policy journey products
+  also compose the zero-ride alternative — ride the street to a stop and
+  leave on foot without boarding — which the engine never emits and
+  which only walking-only queries could safely omit.
 
 - A ``TransportNetwork`` can now carry the multimodal union street graph.
   ``from_gtfs(..., street_modes=("walk", "bicycle", "e_scooter"), dem=...)``

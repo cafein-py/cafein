@@ -65,6 +65,7 @@ impl<'a> TbtrEngine<'a> {
                 }
                 return self.finish_cost_row(
                     stop.0,
+                    stop.0,
                     rides,
                     transit_meters,
                     walk_meters,
@@ -91,7 +92,9 @@ impl<'a> TbtrEngine<'a> {
                 (segment, alight, from)
             }
         };
-        loop {
+        // The chain always roots at its access segment, whose stop the
+        // loop yields.
+        let access_stop = loop {
             let entry = &state.arena[segment as usize];
             let backing = self.view.backing(entry.trip);
             let offset = self.view.day_offset(entry.trip);
@@ -136,7 +139,7 @@ impl<'a> TbtrEngine<'a> {
                     if let Some(access) = access_meters {
                         walk_meters += access.get(&origin).copied().unwrap_or(0.0);
                     }
-                    break;
+                    break origin.0;
                 }
                 SegmentOrigin::Transfer { parent, alight } => {
                     let parent_entry = &state.arena[parent as usize];
@@ -159,9 +162,10 @@ impl<'a> TbtrEngine<'a> {
                     segment = parent;
                 }
             }
-        }
+        };
         self.finish_cost_row(
             stop.0,
+            access_stop,
             rides,
             transit_meters,
             walk_meters,
@@ -180,6 +184,7 @@ impl<'a> TbtrEngine<'a> {
     fn finish_cost_row(
         &self,
         to: u32,
+        access_stop: u32,
         rides: u32,
         transit_meters: f64,
         walk_meters: f64,
@@ -209,6 +214,8 @@ impl<'a> TbtrEngine<'a> {
         };
         CostRow {
             to,
+            access_stop,
+            egress_stop: NO_STOP,
             seconds: 0,
             rides,
             transit_meters,
@@ -416,6 +423,7 @@ impl<'a> TbtrEngine<'a> {
         let (arrival, stop, egress_meters) = chosen?;
         let mut row = self.matrix_costs_to(state, stop, departure, inputs, Some(access_meters))?;
         row.to = point;
+        row.egress_stop = stop.0;
         row.seconds = arrival - departure;
         row.walk_meters += egress_meters;
         Some(row)
@@ -520,6 +528,7 @@ impl<'a> TbtrEngine<'a> {
                 }
                 let mut row = self.matrix_cost_row(state, stop, round, inputs, Some(access_meters));
                 row.to = point as u32;
+                row.egress_stop = stop.0;
                 row.seconds = seconds;
                 row.walk_meters += egress_meters;
                 crate::raptor::fold_better(&mut best[point], row, objective);
