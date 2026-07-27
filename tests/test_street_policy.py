@@ -771,8 +771,8 @@ def test_policy_itineraries_reject_incompatible_knobs(multimodal_network):
     policy = _bike_walk_policy()
     points = (_points_frame([ORIGIN]), _points_frame([DEST]))
     for kwargs, message in [
-        ({"candidates": "pareto"}, "candidates='time'"),
-        ({"router": "raptor"}, "router= does not apply"),
+        ({"candidates": "diverse"}, "candidates='diverse'"),
+        ({"router": "tbtr"}, "router='tbtr'"),
         ({"max_walking_time": 900}, "carries its own budgets"),
     ]:
         with pytest.raises(ValueError, match=message):
@@ -1213,3 +1213,273 @@ def test_the_composition_coexists_with_faster_transit(multimodal_network):
     zero = [j for j in journeys if j["rides"] == 0]
     assert ridden and zero
     assert min(j["arrival_s"] for j in ridden) < min(j["arrival_s"] for j in zero)
+
+
+def test_the_pareto_reduction_degenerates_without_factors(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+
+    core = multimodal_network._core
+    modes = [("walk", 900.0, False, None), ("bicycle", 900.0, False, None)]
+    winners = {
+        (stop, seconds)
+        for stop, seconds, *_ in core._reduced_street_offsets(*ORIGIN, False, modes)
+    }
+    rows = core._pareto_street_rows(
+        *ORIGIN,
+        False,
+        [
+            (mode, cutoff, rental, eligible, 0.0)
+            for mode, cutoff, rental, eligible in modes
+        ],
+    )
+    # Every factor zero: the frontier is exactly the time-only winner,
+    # one point per stop, riding free.
+    assert {(row[0], row[1]) for row in rows} == winners
+    assert len(rows) == len(winners)
+    assert all(row[2] == 0.0 for row in rows)
+
+
+def test_the_pareto_frontier_keeps_the_cleaner_slower_choice(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+
+    core = multimodal_network._core
+    rows = core._pareto_street_rows(
+        *ORIGIN,
+        False,
+        [("walk", 900.0, False, None, 0.0), ("e_scooter", 900.0, False, None, 100.0)],
+    )
+    by_stop = {}
+    for row in rows:
+        by_stop.setdefault(row[0], []).append(row)
+    doubles = {stop: points for stop, points in by_stop.items() if len(points) > 1}
+    assert doubles, "somewhere the scooter must be faster and dirtier than walking"
+    for points in doubles.values():
+        fast, slow = points[0], points[-1]
+        assert fast[1] < slow[1] and fast[2] > slow[2]
+        assert fast[3] == "e_scooter" and slow[3] == "walk"
+        assert fast[2] == pytest.approx(fast[7] / 1000.0 * 100.0)
+        assert slow[2] == 0.0
+    # And per-stop points are sorted by seconds with strictly improving
+    # grams — a true frontier.
+    for points in by_stop.values():
+        seconds = [p[1] for p in points]
+        grams = [p[2] for p in points]
+        assert seconds == sorted(seconds)
+        assert grams == sorted(grams, reverse=True)
+
+
+def test_an_unresolved_factor_survives_only_where_fastest(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    import math
+
+    core = multimodal_network._core
+    rows = core._pareto_street_rows(
+        *ORIGIN,
+        False,
+        [
+            ("walk", 900.0, False, None, 0.0),
+            ("bicycle", 900.0, False, None, float("nan")),
+        ],
+    )
+    walk_seconds = {row[0]: row[1] for row in rows if row[3] == "walk"}
+    bicycle = [row for row in rows if row[3] == "bicycle"]
+    assert bicycle, "the bicycle is strictly fastest somewhere"
+    for row in bicycle:
+        assert math.isnan(row[2])
+        # NaN grams read as infinitely dirty: the choice survives only
+        # where strictly fastest, never as an equal-time alternative.
+        if row[0] in walk_seconds:
+            assert row[1] < walk_seconds[row[0]]
+
+
+def test_the_pareto_closure_extends_whole_frontiers(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+
+    core = multimodal_network._core
+    unrestricted = core._reduced_street_offsets(
+        *ORIGIN, False, [("bicycle", 900.0, False, None)]
+    )
+    hub = min(unrestricted, key=lambda row: row[1])
+    rows = core._pareto_street_rows(
+        *ORIGIN,
+        False,
+        [("bicycle", 900.0, False, [hub[0]], 50.0)],
+    )
+    transfers = {(frm, to): seconds for frm, to, seconds in core._transfer_edges()}
+    hub_rows = [row for row in rows if row[0] == hub[0]]
+    assert len(hub_rows) == 1 and hub_rows[0][10] is None
+    carried = [row for row in rows if row[10] is not None]
+    assert carried
+    for row in carried:
+        assert row[10] == hub[0]
+        assert row[1] == hub_rows[0][1] + transfers[(hub[0], row[0])]
+        # The vehicle leg is the hub's, so its grams carry unchanged.
+        assert row[2] == pytest.approx(hub_rows[0][2])
+
+
+def _scooter_policy():
+    return StreetLegPolicy(
+        access={"walk": 900, "e_scooter": 900},
+        egress={"walk": 900},
+        vehicles={"e_scooter": shared()},
+    )
+
+
+def _scooter_factor_rows():
+    return pd.DataFrame(
+        {
+            "street_mode": ["e_scooter"],
+            "vehicle": [10.0],
+            "fuel": [1.0],
+            "infrastructure": [5.0],
+            "operations": [5.0],
+        }
+    )
+
+
+def test_mc_policy_options_form_a_true_frontier(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries
+
+    frame = DetailedItineraries(
+        multimodal_network,
+        _points_frame([ORIGIN]),
+        _points_frame([DEST]),
+        "2022-02-22",
+        "08:30:00",
+        candidates="pareto",
+        street_policy=_scooter_policy(),
+        factors=_scooter_factor_rows(),
+        geometries=False,
+    )
+    options = frame.groupby("option").agg(
+        departure=("departure_s", "min"),
+        arrival=("arrival_s", "max"),
+        grams=("emissions", "sum"),
+    )
+    durations = (options["arrival"] - options["departure"]).tolist()
+    grams = options["grams"].tolist()
+    # The cleaner-but-slower alternatives the time-only set misses: more
+    # than one option, sorted into a genuine (duration, grams) frontier.
+    assert len(durations) > 1
+    assert durations == sorted(durations)
+    assert grams == sorted(grams, reverse=True)
+    # Street emissions ride the scooter's network meters at 21 g/pkm.
+    scooter = frame[frame["mode"] == "e_scooter"]
+    assert not scooter.empty
+    assert scooter["emissions"].equals(scooter["network_distance_m"] / 1000.0 * 21.0)
+
+
+def test_mc_policy_surfaces_zero_ride_street_compositions(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries
+
+    frame = DetailedItineraries(
+        multimodal_network,
+        _points_frame([ORIGIN]),
+        _points_frame([DEST]),
+        "2022-02-22",
+        "08:30:00",
+        candidates="pareto",
+        street_policy=_scooter_policy(),
+        factors=_scooter_factor_rows(),
+        geometries=False,
+    )
+    # The engine drains its access seeds: at least one Pareto option
+    # rides no transit at all yet uses the scooter — the zero-ride
+    # street composition on the emissions frontier.
+    zero_ride = [
+        option
+        for option, legs in frame.groupby("option")
+        if not (legs["leg_type"] == "transit").any()
+        and (legs["mode"] == "e_scooter").any()
+    ]
+    assert zero_ride
+
+
+def test_a_walking_only_policy_rides_the_legacy_pareto_path(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries
+
+    legacy = DetailedItineraries(
+        multimodal_network,
+        _points_frame([ORIGIN]),
+        _points_frame([DEST]),
+        "2022-02-22",
+        "08:30:00",
+        candidates="pareto",
+        max_walking_time=1200,
+        geometries=False,
+    )
+    policied = DetailedItineraries(
+        multimodal_network,
+        _points_frame([ORIGIN]),
+        _points_frame([DEST]),
+        "2022-02-22",
+        "08:30:00",
+        candidates="pareto",
+        street_policy=StreetLegPolicy(access={"walk": 1200}, egress={"walk": 1200}),
+        geometries=False,
+    )
+    additive = ["mode", "network_distance_m", "connector_distance_m"]
+    pd.testing.assert_frame_equal(
+        pd.DataFrame(policied.drop(columns=additive)).reset_index(drop=True),
+        pd.DataFrame(legacy).reset_index(drop=True),
+    )
+
+
+def test_mc_policy_rejects_unresolved_street_factors(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries
+
+    with pytest.raises(ValueError, match="unresolved"):
+        DetailedItineraries(
+            multimodal_network,
+            _points_frame([ORIGIN]),
+            _points_frame([DEST]),
+            "2022-02-22",
+            "08:30:00",
+            candidates="pareto",
+            street_policy=_scooter_policy(),
+            geometries=False,
+        )
+    with pytest.raises(ValueError, match="diverse"):
+        DetailedItineraries(
+            multimodal_network,
+            _points_frame([ORIGIN]),
+            _points_frame([DEST]),
+            "2022-02-22",
+            "08:30:00",
+            candidates="diverse",
+            street_policy=_scooter_policy(),
+            factors=_scooter_factor_rows(),
+            geometries=False,
+        )
+
+
+def test_relaxed_policy_candidates_widen_the_frontier(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries
+
+    shared_kwargs = dict(
+        date="2022-02-22",
+        departure="08:30:00",
+        street_policy=_scooter_policy(),
+        factors=_scooter_factor_rows(),
+        geometries=False,
+    )
+    pareto = DetailedItineraries(
+        multimodal_network,
+        _points_frame([ORIGIN]),
+        _points_frame([DEST]),
+        candidates="pareto",
+        **shared_kwargs,
+    )
+    relaxed = DetailedItineraries(
+        multimodal_network,
+        _points_frame([ORIGIN]),
+        _points_frame([DEST]),
+        candidates="relaxed",
+        **shared_kwargs,
+    )
+    assert relaxed["option"].nunique() >= pareto["option"].nunique()

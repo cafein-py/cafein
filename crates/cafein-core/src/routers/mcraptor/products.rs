@@ -34,6 +34,44 @@ pub fn route(
         max_options,
         route_penalties,
         max_slower,
+        None,
+    )
+}
+
+/// The multicriteria journeys for a single departure under a street
+/// policy (stage 14b): the request's access and egress stay empty and
+/// the policy label sets seed and drain the search instead, each
+/// frontier point carrying its street grams into the (arrival,
+/// emissions bucket) dominance. `max_slower` is unsupported beside a
+/// policy — its resolved-trip bounds read the request's walking offsets.
+#[allow(clippy::too_many_arguments)]
+pub fn route_with_policy(
+    view: &DayView,
+    timetable: &Timetable,
+    footpaths: &Transfers,
+    geometry: &TripGeometry,
+    factors: &[f64],
+    request: &Request,
+    labels: &PolicyLabels,
+    bucket: f64,
+    slack: u32,
+    max_options: Option<usize>,
+    route_penalties: &[u32],
+) -> Vec<Journey> {
+    profile(
+        view,
+        timetable,
+        footpaths,
+        geometry,
+        factors,
+        request,
+        &[request.departure],
+        bucket,
+        slack,
+        max_options,
+        route_penalties,
+        None,
+        Some(labels),
     )
 }
 
@@ -69,6 +107,7 @@ pub fn route_range(
         max_options,
         route_penalties,
         max_slower,
+        None,
     )
 }
 
@@ -433,10 +472,15 @@ pub(super) fn profile(
     max_options: Option<usize>,
     route_penalties: &[u32],
     max_slower: Option<u32>,
+    policy: Option<&PolicyLabels>,
 ) -> Vec<Journey> {
     assert!(
         bucket.is_finite() && bucket > 0.0,
         "the emissions bucket must be positive"
+    );
+    assert!(
+        policy.is_none() || max_slower.is_none(),
+        "max_slower is unsupported beside a street policy"
     );
     // The `max_slower` restriction: per pass, the resolved-trip bounds
     // anchor the per-stop band and the destination bound floors it (so
@@ -468,6 +512,7 @@ pub(super) fn profile(
         route_penalties,
         request.exclusions.as_deref(),
     );
+    search.policy = policy;
     for (index, &departure) in departures.iter().enumerate() {
         if let Some((band, bounds, floors)) = &restricted {
             search.set_cutoff(&bounds[index], floors[index], *band);
