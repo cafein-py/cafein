@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Cycling and e-scooter **access to public transport**, behind an explicit
+  policy. ``cafein.StreetLegPolicy`` names which street modes may serve a
+  journey's access and egress, each with its own time budget, and
+  ``cafein.VehiclePolicy`` states the vehicle terms — an own vehicle serves
+  one declared side and names where it may be left or picked up
+  (``bicycle_parking`` stops, a user list, or the explicit ``any_stop``
+  assumption; never silently assumed), a shared vehicle states its
+  availability. ``travel_times_from_coordinate(street_policy=...)`` then
+  reduces, per stop, the fastest permitted street choice over the carried
+  multimodal graph — closed under the stop-to-stop transfers, ties to
+  fewer paid rentals then declared order — and feeds the same
+  earliest-arrival engine as today. A walking-only policy is the current
+  walking path, bit for bit.
+
 - A ``TransportNetwork`` can now carry the multimodal union street graph.
   ``from_gtfs(..., street_modes=("walk", "bicycle", "e_scooter"), dem=...)``
   builds the same directional multimodal graph a standalone

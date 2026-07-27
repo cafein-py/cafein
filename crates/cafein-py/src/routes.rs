@@ -297,6 +297,60 @@ impl TransportNetwork {
         Ok(result.unbind())
     }
 
+    /// Earliest arrivals from pre-reduced street access offsets — the
+    /// street-policy path. The offsets arrive from the time-only reduction
+    /// (`_reduced_street_offsets`), and the run relaxes the full transfer
+    /// closure: the ULTRA shortcut set models *walking* egress, so policy
+    /// queries stay off it until multimodal ULTRA arrives. Internal until
+    /// the policy surface stabilises.
+    #[pyo3(signature = (access, date, departure, max_transfers, router = "raptor"))]
+    fn _travel_times_with_access(
+        &self,
+        py: Python<'_>,
+        access: Vec<(String, u32)>,
+        date: &str,
+        departure: &str,
+        max_transfers: u8,
+        router: &str,
+    ) -> PyResult<Py<PyDict>> {
+        let departure = parse_time(departure)?;
+        let offsets = access
+            .iter()
+            .map(|(stop, seconds)| Ok((self.resolve_stop(stop)?, *seconds)))
+            .collect::<PyResult<Vec<_>>>()?;
+        let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
+        let arrivals = match router {
+            "raptor" => {
+                let request = Request {
+                    departure,
+                    access: offsets,
+                    egress: Vec::new(),
+                    active_services,
+                    active_services_previous,
+                    max_transfers,
+                    exclusions: None,
+                };
+                py.allow_threads(|| {
+                    Raptor.one_to_all(&self.build.timetable, &self.transfers, &request)
+                })
+            }
+            // The engine-neutrality arm: the same reduced array through the
+            // trip-based engine, for the RAPTOR/TBTR equality tests.
+            "tbtr" => py.allow_threads(|| {
+                self.tbtr_engine(
+                    &self.transfers,
+                    date,
+                    &active_services,
+                    &active_services_previous,
+                )
+                .one_to_all(departure, &offsets, max_transfers)
+            }),
+            other => return Err(invalid_router(other)),
+        };
+        self.arrivals_dict(py, &arrivals, departure)
+    }
+
     /// Earliest arrival at every reachable stop from a coordinate.
     ///
     /// The counterpart of ``travel_times_from_stop`` for a coordinate

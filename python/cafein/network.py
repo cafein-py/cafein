@@ -806,6 +806,7 @@ class TransportNetwork:
         walking_speed_kmph=None,
         max_walking_time=None,
         max_snap_distance=None,
+        street_policy=None,
     ):
         """Earliest arrival at every reachable stop from a coordinate.
 
@@ -834,6 +835,15 @@ class TransportNetwork:
         max_snap_distance : float (optional, default: 1600)
             Maximum straight-line distance in meters from the
             coordinate to the walking network.
+        street_policy : StreetLegPolicy, optional
+            Which street modes may serve the access, on what vehicle
+            terms (``cafein.StreetLegPolicy``). A walking-only policy is
+            the current walking path at the policy's budget; an omitted
+            side means walking at the usual 7200 s budget. Non-walking
+            modes need the multimodal graph (build with
+            ``street_modes=``) and run the per-stop time-only reduction
+            over it. Conflicts with the walking knobs above and with
+            exclusions, which are rejected rather than silently ignored.
 
         Returns
         -------
@@ -841,6 +851,52 @@ class TransportNetwork:
             Travel time in seconds to every reachable stop, keyed by
             stop_id; unreachable stops are absent.
         """
+        if street_policy is not None:
+            from cafein import streets as _streets
+            from cafein.policy import reduction_modes
+
+            if any(
+                option is not None
+                for option in (walking_speed_kmph, max_walking_time, max_snap_distance)
+            ):
+                raise ValueError(
+                    "street_policy carries its own budgets; passing "
+                    "walking_speed_kmph, max_walking_time, or "
+                    "max_snap_distance beside it is a conflict"
+                )
+            if any((exclude_routes, exclude_trips, exclude_stops)):
+                raise ValueError("street_policy does not combine with exclusions yet")
+            modes = reduction_modes(
+                street_policy, "access", _streets.MAX_ACCESS_EGRESS_TIME
+            )
+            if all(mode == "walk" for mode, *_ in modes):
+                # A walking-only policy IS the current walking path, at the
+                # policy's walking budget.
+                walk_budget = next(s for mode, s, *_ in modes if mode == "walk")
+                return self._core.travel_times_from_coordinate(
+                    tuple(origin),
+                    date,
+                    departure,
+                    max_transfers,
+                    [],
+                    [],
+                    [],
+                    *_walk_options(walking_speed_kmph, walk_budget, max_snap_distance),
+                )
+            if not self._core.has_multimodal_streets:
+                raise ValueError(
+                    "street_policy needs the multimodal street graph; build "
+                    "with street_modes="
+                )
+            access = [
+                (stop, seconds)
+                for stop, seconds, *_ in self._core._reduced_street_offsets(
+                    *tuple(origin), False, modes
+                )
+            ]
+            return self._core._travel_times_with_access(
+                access, date, departure, max_transfers
+            )
         return self._core.travel_times_from_coordinate(
             tuple(origin),
             date,
