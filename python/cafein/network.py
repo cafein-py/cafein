@@ -221,6 +221,62 @@ def _policy_journeys(
     )
     access_budgets = {mode: seconds for mode, seconds, *_ in access_modes}
     egress_budgets = {mode: seconds for mode, seconds, *_ in egress_modes}
+    departed = _departure_seconds(departure)
+    # The zero-ride composition: ride the street to a stop and leave it
+    # on foot without ever boarding. The engine never emits it — its
+    # walking ancestor was always dominated by the direct walk, by the
+    # triangle inequality on the one walking graph — but a vehicle
+    # access can genuinely beat both the walk and every ridden
+    # alternative. Both arrays are closed under the installed transfers,
+    # so the same-stop minimum covers every through-a-transfer variant.
+    egress_seconds = dict(egress)
+    composed = None
+    for stop, seconds in access:
+        other = egress_seconds.get(stop)
+        if other is None:
+            continue
+        total = seconds + other
+        if composed is None or total < composed[0]:
+            composed = (total, stop, seconds)
+    if composed is not None:
+        total, stop, access_seconds = composed
+        arrival = departed + total
+        boundary = departed + access_seconds
+        # The Pareto contract over (arrival, rides): the composition
+        # rides nothing, so only an equal-or-earlier zero-ride journey
+        # dominates it — an earlier *ridden* journey coexists with it,
+        # exactly as the walking journey always has. It in turn drops
+        # whatever arrives no earlier while riding.
+        dominated = any(
+            journey["rides"] == 0 and journey["arrival_s"] <= arrival
+            for journey in journeys
+        )
+        if not dominated:
+            journeys = [
+                journey for journey in journeys if journey["arrival_s"] < arrival
+            ]
+            journeys.insert(
+                0,
+                {
+                    "departure_s": departed,
+                    "arrival_s": arrival,
+                    "rides": 0,
+                    "legs": [
+                        {
+                            "type": "access",
+                            "to_stop": stop,
+                            "departure_s": departed,
+                            "arrival_s": boundary,
+                        },
+                        {
+                            "type": "egress",
+                            "from_stop": stop,
+                            "departure_s": boundary,
+                            "arrival_s": arrival,
+                        },
+                    ],
+                },
+            )
     for journey in journeys:
         legs = []
         for leg in journey["legs"]:
@@ -274,7 +330,6 @@ def _policy_journeys(
     ]
     if any(journey["rides"] == 0 for journey in kept):
         return kept
-    departed = _departure_seconds(departure)
     walk = {
         "departure_s": departed,
         "arrival_s": departed + walk_seconds,

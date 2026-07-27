@@ -8,6 +8,7 @@ import pandas as pd
 import shapely
 
 from cafein.matrices import (
+    _factor_tables,
     _is_point_frame,
     _is_street_network,
     _point_list,
@@ -871,27 +872,6 @@ def _street_itineraries_frame(
         shapes = [None] * rows
     geometry = gpd.GeoSeries(shapes, index=frame.index, crs="EPSG:4326")
     return gpd.GeoDataFrame(frame, geometry=geometry, crs="EPSG:4326")
-
-
-def _factor_tables(factors):
-    """``factors=`` split by schema for the policy frame: a table keyed by
-    ``street_mode`` configures the street ladder and leaves the transit
-    legs on the shipped defaults; anything else layers over the transit
-    ladder as always."""
-    import pathlib
-
-    from cafein import emissions
-
-    if factors is None:
-        return None, None
-    frame = (
-        factors
-        if isinstance(factors, pd.DataFrame)
-        else emissions._read_factor_file(pathlib.Path(factors))
-    )
-    if "street_mode" in frame.columns:
-        return None, frame
-    return factors, None
 
 
 def _street_leg_emissions(journeys, factors, components):

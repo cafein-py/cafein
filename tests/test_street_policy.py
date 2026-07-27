@@ -950,3 +950,266 @@ def test_an_unsnapped_policy_side_degrades_to_the_direct_walk(multimodal_network
         multimodal_network.route_between_coordinates(
             OFFSHORE, DEST, "2022-02-22", "08:30:00", street_policy=policy
         )
+
+
+def _street_factor_rows():
+    return pd.DataFrame(
+        {
+            "street_mode": ["bicycle"],
+            "vehicle": [5.0],
+            "fuel": [0.0],
+            "infrastructure": [10.0],
+            "operations": [6.0],
+        }
+    )
+
+
+def test_policy_cost_matrix_reconciles_with_the_itineraries(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries, TravelCostMatrix
+
+    policy = _bike_walk_policy()
+    factors = _street_factor_rows()
+    origins = _points_frame([ORIGIN, MATRIX_POINTS[1]])
+    destinations = _points_frame([DEST, MATRIX_POINTS[2]])
+    matrix = TravelCostMatrix(
+        multimodal_network,
+        origins,
+        destinations,
+        "2022-02-22",
+        "08:30:00",
+        street_policy=policy,
+        factors=factors,
+    )
+    assert set(matrix.columns) >= {
+        "travel_time_s",
+        "transfers",
+        "transit_distance_m",
+        "walk_distance_m",
+        "street_distance_m",
+        "emissions",
+    }
+    assert (matrix["street_distance_m"] > 0.0).any()
+    for (from_id, to_id), cell in matrix.groupby(["from_id", "to_id"]):
+        assert len(cell) == 1
+        cell = cell.iloc[0]
+        itineraries = DetailedItineraries(
+            multimodal_network,
+            origins[origins["id"] == from_id],
+            destinations[destinations["id"] == to_id],
+            "2022-02-22",
+            "08:30:00",
+            street_policy=policy,
+            factors=factors,
+            geometries=False,
+        )
+        options = itineraries.groupby("option").agg(
+            departure=("departure_s", "min"),
+            arrival=("arrival_s", "max"),
+            emissions=("emissions", "sum"),
+            distance=("distance_m", "sum"),
+        )
+        durations = options["arrival"] - options["departure"]
+        assert int(cell["travel_time_s"]) == int(durations.min())
+        # Where one option alone attains the fastest time, the matrix
+        # aggregated exactly that journey: its distances and emissions
+        # match the legs' sums.
+        fastest = options[durations == durations.min()]
+        if len(fastest) == 1:
+            assert cell["emissions"] == pytest.approx(
+                float(fastest["emissions"].iloc[0]), rel=1e-9
+            )
+            total = (
+                cell["transit_distance_m"]
+                + cell["walk_distance_m"]
+                + cell["street_distance_m"]
+            )
+            assert total == pytest.approx(float(fastest["distance"].iloc[0]), rel=1e-9)
+
+
+def test_a_walking_only_policy_cost_matrix_is_the_legacy_matrix(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelCostMatrix
+
+    origins = _points_frame(MATRIX_POINTS[:2])
+    destinations = _points_frame(MATRIX_POINTS[1:])
+    legacy = TravelCostMatrix(
+        multimodal_network, origins, destinations, "2022-02-22", "08:30:00"
+    )
+    policied = TravelCostMatrix(
+        multimodal_network,
+        origins,
+        destinations,
+        "2022-02-22",
+        "08:30:00",
+        street_policy=StreetLegPolicy(access={"walk": 7200}, egress={"walk": 7200}),
+    )
+    assert (policied["street_distance_m"] == 0.0).all()
+    pd.testing.assert_frame_equal(
+        policied.drop(columns="street_distance_m").reset_index(drop=True),
+        pd.DataFrame(legacy).reset_index(drop=True),
+    )
+
+
+def test_policy_cost_matrix_rejects_incompatible_knobs(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelCostMatrix
+
+    policy = _bike_walk_policy()
+    points = (_points_frame([ORIGIN]), _points_frame([DEST]))
+    for kwargs in [
+        {"optimize": "emissions", "window": 3600},
+        {"router": "tbtr"},
+        {"max_walking_time": 900},
+        {"candidates": "pareto"},
+    ]:
+        with pytest.raises(ValueError, match="does not combine"):
+            TravelCostMatrix(
+                multimodal_network,
+                *points,
+                "2022-02-22",
+                "08:30:00",
+                street_policy=policy,
+                **kwargs,
+            )
+
+
+def test_policy_cost_matrix_street_emissions_never_zero_silently(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelCostMatrix
+
+    policy = StreetLegPolicy(
+        access={"bicycle": 900},
+        egress={"walk": 900},
+        vehicles={"bicycle": own()},
+    )
+    origins = _points_frame([ORIGIN])
+    destinations = _points_frame([DEST])
+    with pytest.warns(UserWarning, match="unresolved for street mode 'bicycle'"):
+        bare = TravelCostMatrix(
+            multimodal_network,
+            origins,
+            destinations,
+            "2022-02-22",
+            "08:30:00",
+            street_policy=policy,
+        )
+    ridden_bicycle = bare[(bare["street_distance_m"] > 0.0)]
+    assert not ridden_bicycle.empty
+    # Without factor rows the bicycle factor is unresolved: its rows'
+    # emissions poison to NaN, never a silent zero.
+    assert ridden_bicycle["emissions"].isna().all()
+    priced = TravelCostMatrix(
+        multimodal_network,
+        origins,
+        destinations,
+        "2022-02-22",
+        "08:30:00",
+        street_policy=policy,
+        factors=_street_factor_rows(),
+    )
+    ridden_bicycle = priced[(priced["street_distance_m"] > 0.0)]
+    assert not ridden_bicycle.empty
+    assert ridden_bicycle["emissions"].notna().all()
+
+
+def test_the_policy_cost_matrix_zero_walk_is_free(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelCostMatrix
+
+    frame = TravelCostMatrix(
+        multimodal_network,
+        _points_frame([ORIGIN]),
+        _points_frame([ORIGIN]),
+        "2022-02-22",
+        "08:30:00",
+        street_policy=_bike_walk_policy(),
+    )
+    cell = frame.iloc[0]
+    assert int(cell["travel_time_s"]) == 0
+    assert cell["walk_distance_m"] == 0.0
+    assert cell["street_distance_m"] == 0.0
+    assert cell["emissions"] == 0.0
+
+
+def test_a_zero_ride_street_composition_is_a_journey(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+
+    # Ride the bicycle to a stop and walk away without boarding: the
+    # engine never emits this journey (walking compositions are always
+    # dominated by the direct walk on one graph), so the policy path
+    # composes it from the closed reduced arrays. The pair below is one
+    # where it beats every ridden alternative and the direct walk.
+    journeys = multimodal_network.route_between_coordinates(
+        ORIGIN,
+        MATRIX_POINTS[2],
+        "2022-02-22",
+        "08:30:00",
+        street_policy=_bike_walk_policy(),
+    )
+    assert journeys
+    fastest = min(journeys, key=lambda j: j["arrival_s"] - j["departure_s"])
+    assert fastest["rides"] == 0
+    modes = [leg["mode"] for leg in fastest["legs"]]
+    assert "bicycle" in modes
+    types = [leg["type"] for leg in fastest["legs"]]
+    assert types[0] == "access" and types[-1] == "egress"
+    for before, after in zip(fastest["legs"], fastest["legs"][1:]):
+        assert before["arrival_s"] <= after["departure_s"]
+
+
+def test_an_unsnapped_coincident_pair_yields_no_cost_rows(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelCostMatrix
+
+    # Coincident but off the street network: the zero-walk convention
+    # never outranks the unsnapped-row contract - the pair is warned and
+    # omitted, exactly as in the time matrix.
+    with pytest.warns(UserWarning, match="off the walking network"):
+        frame = TravelCostMatrix(
+            multimodal_network,
+            _points_frame([OFFSHORE]),
+            _points_frame([OFFSHORE]),
+            "2022-02-22",
+            "08:30:00",
+            street_policy=_bike_walk_policy(),
+        )
+    assert frame.empty
+
+
+def test_a_walking_only_policy_accepts_street_factor_rows(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelCostMatrix
+
+    # A street-mode factor table configures street vehicles only; the
+    # walking-only fast path must not feed it to the transit resolver.
+    frame = TravelCostMatrix(
+        multimodal_network,
+        _points_frame([ORIGIN]),
+        _points_frame([DEST]),
+        "2022-02-22",
+        "08:30:00",
+        street_policy=StreetLegPolicy(access={"walk": 7200}, egress={"walk": 7200}),
+        factors=_street_factor_rows(),
+    )
+    assert not frame.empty
+    # Transit legs keep the shipped defaults, so ridden rows still carry
+    # resolved emissions.
+    ridden = frame[frame["transfers"] >= 0]
+    assert (ridden["emissions"].notna()).any()
+
+
+def test_the_composition_coexists_with_faster_transit(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+
+    # The (arrival, rides) Pareto contract: an earlier *ridden* journey
+    # never dominates the zero-ride composition — they coexist, exactly
+    # as the walking journey always has. Here transit is fastest, the
+    # bicycle composition beats walking, and both are returned.
+    journeys = multimodal_network.route_between_coordinates(
+        ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=_bike_walk_policy()
+    )
+    ridden = [j for j in journeys if j["rides"] > 0]
+    zero = [j for j in journeys if j["rides"] == 0]
+    assert ridden and zero
+    assert min(j["arrival_s"] for j in ridden) < min(j["arrival_s"] for j in zero)

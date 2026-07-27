@@ -201,6 +201,7 @@ impl<'a> Search<'a> {
         let (arrival, stop, egress_meters) = chosen?;
         let mut row = self.costs_to(stop, departure, inputs, Some(access_meters))?;
         row.to = point;
+        row.egress_stop = stop.0;
         row.seconds = arrival - departure;
         row.walk_meters += egress_meters;
         Some(row)
@@ -254,7 +255,9 @@ impl<'a> Search<'a> {
         let mut resolved = true;
         let mut legs: Vec<(TripIdx, u16, u16)> = Vec::new();
         let mut fare_legs: Vec<FareLeg> = Vec::new();
-        loop {
+        // The chain always ends at its access label, whose stop the
+        // loop yields.
+        let access_stop = loop {
             match self.labels[round][at.0 as usize] {
                 Label::Transit {
                     trip,
@@ -311,11 +314,11 @@ impl<'a> Search<'a> {
                     if let Some(access) = access_meters {
                         walk_meters += access.get(&at).copied().unwrap_or(0.0);
                     }
-                    break;
+                    break at.0;
                 }
                 Label::Unreached => unreachable!("cost reconstruction hit an unreached label"),
             }
-        }
+        };
         let geometry = match (inputs.with_geometry, inputs.leg_geometry) {
             (true, Some(shapes)) => {
                 let parts: Vec<Vec<(f64, f64)>> = legs
@@ -338,6 +341,8 @@ impl<'a> Search<'a> {
         };
         CostRow {
             to: stop.0,
+            access_stop,
+            egress_stop: NO_STOP,
             seconds: 0,
             rides,
             transit_meters,
@@ -454,6 +459,7 @@ impl<'a> Search<'a> {
                 }
                 let mut row = self.walk_costs(stop, round, inputs, Some(access_meters));
                 row.to = point as u32;
+                row.egress_stop = stop.0;
                 row.seconds = seconds;
                 row.walk_meters += egress_meters;
                 fold_better(&mut best[point], row, objective);

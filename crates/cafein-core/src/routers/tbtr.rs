@@ -29,7 +29,7 @@ use rayon::prelude::*;
 
 use crate::journey::{Journey, Leg};
 use crate::path_key::{challenger_wins, PathToken};
-use crate::raptor::{CostInputs, CostRow};
+use crate::raptor::{CostInputs, CostRow, NO_STOP};
 use crate::router::{Request, TransitRouter};
 use crate::timetable::{PatternIdx, StopIdx, StopTime, Timetable, TripIdx};
 use crate::transfers::Transfers;

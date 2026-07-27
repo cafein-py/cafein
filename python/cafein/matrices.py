@@ -159,10 +159,26 @@ class TravelCostMatrix(pd.DataFrame):
         Cutoff in seconds for a ``StreetNetwork`` matrix (default:
         ``cafein.street_network.MAX_STREET_TIME``, 7200).
 
-    ``street_policy=`` is accepted for signature parity but rejected: the
-    cost matrix aggregates whole rebuilt journeys per pair, so its policy
-    support arrives with a policy cost fan-out of its own
-    (``DetailedItineraries`` reconstructs policy journeys today).
+    ``street_policy=`` (a ``cafein.StreetLegPolicy``) opens the access
+    and egress to the policy's street modes over the multimodal graph
+    (build with ``street_modes=``); point origins and destinations only.
+    The frame gains ``street_distance_m`` beside the transit and walking
+    distances — the meters ridden on street vehicles at the journey
+    ends, connectors included — and ``emissions`` adds each vehicle
+    mode's street emissions over its network meters (a ``factors=``
+    table keyed by ``street_mode`` configures the street ladder, as in
+    ``DetailedItineraries``; NaN where unresolved, never a silent
+    zero). ``walk_distance_m`` keeps genuine walking: walk-mode ends,
+    carried transfer walks, and the mid-journey transfers. Row geometry
+    stays the ridden transit legs', as in the legacy matrix — per-leg
+    street shapes ride ``DetailedItineraries``. The direct
+    walking alternative folds in at the policy's walking access budget,
+    and a walking-only policy at one shared budget rides the legacy
+    cost matrix bit for bit (its ``street_distance_m`` is identically
+    zero). Policy cost matrices run the time-fastest engine arm and do
+    not price fares; ``optimize``, ``window``, ``within``, ``fares``,
+    ``candidates``, ``router``, and the walking knobs are rejected
+    beside a policy rather than silently ignored.
     """
 
     @property
@@ -240,11 +256,99 @@ class TravelCostMatrix(pd.DataFrame):
         if max_street_time is not None:
             raise ValueError("max_street_time applies to a StreetNetwork matrix")
         if street_policy is not None:
-            raise ValueError(
-                "street_policy is not wired into the cost matrix yet; "
-                "DetailedItineraries reconstructs policy journeys, and the "
-                "cost aggregation arrives with its own fan-out"
+            offending = next(
+                (
+                    name
+                    for name, value in (
+                        ("optimize", None if optimize == "time" else optimize),
+                        ("window", window),
+                        ("within", within),
+                        ("fares", fares),
+                        ("candidates", None if candidates == "time" else candidates),
+                        ("router", None if router == "auto" else router),
+                        ("walking_speed_kmph", walking_speed_kmph),
+                        ("max_walking_time", max_walking_time),
+                        ("max_snap_distance", max_snap_distance),
+                    )
+                    if value is not None
+                ),
+                None,
             )
+            if offending is not None:
+                raise ValueError(
+                    f"street_policy does not combine with {offending}; the "
+                    "policy carries its own budgets and the policy cost "
+                    "matrix runs the time-fastest engine arm, unpriced"
+                )
+            walk_only, walk_budget = _walking_only_policy(street_policy)
+            if walk_only:
+                # A walking-only policy IS the legacy cost matrix, at the
+                # policy's one walking budget. A street-mode factor table
+                # configures street vehicles only, so it never reaches the
+                # transit resolver — and walking rides none of them.
+                transit_factors, _ = _factor_tables(factors)
+                table, from_ids, to_ids = _cost_columns(
+                    network,
+                    origins,
+                    destinations,
+                    date,
+                    departure,
+                    max_transfers=max_transfers,
+                    optimize="time",
+                    window=None,
+                    within=None,
+                    factors=transit_factors,
+                    components=components,
+                    fares=None,
+                    candidates="time",
+                    bucket=bucket,
+                    router="auto",
+                    exclude_routes=exclude_routes,
+                    exclude_trips=exclude_trips,
+                    exclude_stops=exclude_stops,
+                    geometries=geometries,
+                    chunk=chunk,
+                    walking_speed_kmph=None,
+                    max_walking_time=walk_budget,
+                    max_snap_distance=None,
+                )
+            else:
+                table, from_ids, to_ids = _policy_cost_columns(
+                    network,
+                    origins,
+                    destinations,
+                    date,
+                    departure,
+                    street_policy,
+                    max_transfers=max_transfers,
+                    factors=factors,
+                    components=components,
+                    geometries=geometries,
+                    chunk=chunk,
+                    exclude_routes=exclude_routes,
+                    exclude_trips=exclude_trips,
+                    exclude_stops=exclude_stops,
+                )
+            data = {
+                "from_id": np.array(from_ids, dtype=object)[table["from"]],
+                "to_id": np.array(to_ids, dtype=object)[table["to"]],
+                "travel_time_s": table["travel_time_s"],
+                "transfers": np.maximum(table["rides"], 1) - 1,
+                "transit_distance_m": table["transit_distance"],
+                "walk_distance_m": table["walk_distance"],
+                # The legacy fast path has no street vehicles, so its
+                # street meters are identically zero.
+                "street_distance_m": table.get(
+                    "street_distance", np.zeros(len(table["travel_time_s"]))
+                ),
+                "emissions": table["emissions"],
+            }
+            if geometries:
+                data["geometry"] = shapely.from_wkb(
+                    np.array(table["geometry"], dtype=object)
+                )
+            super().__init__(pd.DataFrame(data))
+            return
         table, from_ids, to_ids = _cost_columns(
             network,
             origins,
@@ -1244,3 +1348,156 @@ def _policy_time_columns(
             data["to_id"].append(to_id)
             data["travel_time_s"].append(best)
     return data
+
+
+def _factor_tables(factors):
+    """``factors=`` split by schema for the policy products: a table keyed
+    by ``street_mode`` configures the street ladder and leaves the transit
+    legs on the shipped defaults; anything else layers over the transit
+    ladder as always."""
+    import pathlib
+
+    from cafein import emissions
+
+    if factors is None:
+        return None, None
+    frame = (
+        factors
+        if isinstance(factors, pd.DataFrame)
+        else emissions._read_factor_file(pathlib.Path(factors))
+    )
+    if "street_mode" in frame.columns:
+        return None, frame
+    return factors, None
+
+
+def _policy_cost_columns(
+    network,
+    origins,
+    destinations,
+    date,
+    departure,
+    policy,
+    *,
+    max_transfers,
+    factors,
+    components,
+    geometries,
+    chunk,
+    exclude_routes=(),
+    exclude_trips=(),
+    exclude_stops=(),
+):
+    """The street-policy cost matrix columns: per-point meters-carrying
+    reductions through the engine fan-out, street distances and emissions
+    attributed per row from the winning choices, and the direct walking
+    alternative folded in over the same multimodal graph."""
+    from cafein import emissions
+    from cafein import streets as _streets
+    from cafein.policy import reduction_modes
+
+    core = network._core
+    if not core.has_multimodal_streets:
+        raise ValueError(
+            "street_policy needs the multimodal street graph; build with "
+            "street_modes="
+        )
+    if not _is_point_frame(origins):
+        raise ValueError(
+            "street_policy matrices take point-set origins and destinations"
+        )
+    # Materialised once: a one-shot iterable must not exhaust between the
+    # per-point reductions, and later mutation must not desynchronise them.
+    exclude_routes = tuple(str(route) for route in exclude_routes)
+    exclude_trips = tuple(str(trip) for trip in exclude_trips)
+    exclude_stops = tuple(str(stop) for stop in exclude_stops)
+    from_ids, origin_points = _point_list(origins, "origins")
+    if destinations is None:
+        to_ids, destination_points = from_ids, origin_points
+    else:
+        to_ids, destination_points = _point_list(destinations, "destinations")
+    rows_slice = _chunk_slice(len(from_ids), chunk)
+    from_ids = from_ids[rows_slice]
+    origin_points = origin_points[rows_slice]
+    access_modes = reduction_modes(policy, "access", _streets.MAX_ACCESS_EGRESS_TIME)
+    egress_modes = reduction_modes(policy, "egress", _streets.MAX_ACCESS_EGRESS_TIME)
+    transit_factors, street_factors = _factor_tables(factors)
+    trip_factors = emissions.trip_factors(network, transit_factors, components)
+    # One resolved per-km factor per granted vehicle mode; NaN keeps an
+    # unresolved factor poisoning rather than zeroing its rows. Walking
+    # rides no vehicle, so its factor is never read.
+    mode_factors = {"walk": 0.0}
+    for mode, *_ in access_modes + egress_modes:
+        if mode in mode_factors:
+            continue
+        value = emissions.street_factor(mode, street_factors, components)
+        mode_factors[mode] = float("nan") if pd.isna(value) else float(value)
+
+    def reduced(points, egress, modes):
+        rows, unsnapped = [], []
+        for index, (lat, lon) in enumerate(points):
+            try:
+                cells = core._reduced_street_rows(
+                    lat, lon, egress, modes, exclude_stops=list(exclude_stops)
+                )
+            except ValueError as error:
+                if "too far from the multimodal street network" not in str(error):
+                    raise
+                # An unsnapped point reaches nothing; its cells are omitted.
+                rows.append([])
+                unsnapped.append(index)
+                continue
+            rows.append(
+                [
+                    (stop, seconds, network_m, connector_m, walk_m, mode_factors[mode])
+                    for stop, seconds, mode, network_m, connector_m, walk_m in cells
+                ]
+            )
+        return rows, unsnapped
+
+    access_rows, unsnapped_origins = reduced(origin_points, False, access_modes)
+    egress_rows, unsnapped_destinations = reduced(
+        destination_points, True, egress_modes
+    )
+    # The direct walking alternative always applies — walking needs no
+    # vehicle — at the policy's walking access budget when it names one,
+    # else the usual door-to-door cutoff.
+    access_budgets = (
+        policy.access
+        if policy.access is not None
+        else {"walk": _streets.MAX_ACCESS_EGRESS_TIME}
+    )
+    walk_budget = access_budgets.get("walk", _streets.MAX_ACCESS_EGRESS_TIME)
+    table = core._cost_matrix_with_access(
+        access_rows,
+        egress_rows,
+        list(origin_points),
+        list(destination_points),
+        date,
+        departure,
+        trip_factors,
+        float(walk_budget),
+        max_transfers,
+        exclude_routes=list(exclude_routes),
+        exclude_trips=list(exclude_trips),
+        exclude_stops=list(exclude_stops),
+        geometries=bool(geometries),
+    )
+    # A point is unsnapped only when neither the policy's modes nor the
+    # direct walking alternative can snap it — a snap fact from both
+    # searches, never inferred from reachability.
+    _warn_unsnapped(
+        {
+            "unsnapped_from": sorted(
+                set(map(int, unsnapped_origins))
+                & set(map(int, table["unsnapped_from"]))
+            ),
+            "unsnapped_to": sorted(
+                set(map(int, unsnapped_destinations))
+                & set(map(int, table["unsnapped_to"]))
+            ),
+        },
+        from_ids,
+        to_ids,
+    )
+    return table, from_ids, to_ids
