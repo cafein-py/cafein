@@ -73,17 +73,16 @@ jobs:
         run: pip install -e . --no-build-isolation
       - name: Run Python tests
         shell: bash -el {0}
-        # Parallelised across the runner's cores with pytest-xdist. Each
-        # worker's Rust compute is capped to two rayon threads: uncapped,
-        # every worker spawns a pool as wide as the machine, and the heavy
-        # multicriteria tests contend N-fold for the same cores. Linux
-        # runners cap at three workers: with four, the workers' session
-        # network fixtures together exceed the 7 GB runner near the end
-        # of the suite and the OOM reaper stops the runner service —
-        # the job dies with "runner received a shutdown signal", not a
-        # test failure.
+        # Parallelised with pytest-xdist at three workers on every OS.
+        # Each worker's Rust compute is capped to two rayon threads:
+        # uncapped, every worker spawns a pool as wide as the machine,
+        # and the heavy multicriteria tests contend N-fold for the same
+        # cores. Three workers beat `-n auto` on the hosted runners —
+        # a fourth oversubscribes the four-core machines against the
+        # rayon pools and duplicates the session network fixtures, which
+        # on Linux pushed past the 7 GB runner and had the OOM reaper
+        # stop the runner service mid-suite ("runner received a shutdown
+        # signal", not a test failure).
         env:
           RAYON_NUM_THREADS: 2
-        run: >-
-          pytest -n ${{ runner.os == 'Linux' && '3' || 'auto' }}
-          --dist load --cov=cafein --cov-report=term-missing
+        run: pytest -n 3 --dist load --cov=cafein --cov-report=term-missing
