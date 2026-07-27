@@ -15,6 +15,11 @@ pub struct McTbtrEngine<'a> {
     pub(super) view: DayView,
     pub(super) set: std::borrow::Cow<'a, TransferSet>,
     pub(super) chains: CleanerChains,
+    /// Street-policy label sets: when set, they seed and drain the
+    /// search instead of the request's walking offsets, each point
+    /// carrying its street grams into the dominance — the McTBTR mirror
+    /// of the McRAPTOR field.
+    pub policy: Option<&'a PolicyLabels>,
 }
 
 impl<'a> McTbtrEngine<'a> {
@@ -59,6 +64,7 @@ impl<'a> McTbtrEngine<'a> {
             view,
             set: std::borrow::Cow::Owned(set),
             chains,
+            policy: None,
         }
     }
 
@@ -87,6 +93,7 @@ impl<'a> McTbtrEngine<'a> {
             view,
             set: std::borrow::Cow::Borrowed(set),
             chains,
+            policy: None,
         }
     }
 
@@ -154,6 +161,10 @@ impl<'a> McTbtrEngine<'a> {
         max_slower: Option<u32>,
         fold: &mut Option<MatrixSink<'_>>,
     ) -> Vec<Journey> {
+        assert!(
+            self.policy.is_none() || max_slower.is_none(),
+            "max_slower is unsupported beside a street policy"
+        );
         let mut stats = SearchStats::default();
         let restriction =
             max_slower.map(|band| self.max_slower_restriction(request, departures, band));
@@ -214,44 +225,108 @@ impl<'a> McTbtrEngine<'a> {
         let mut destination: Vec<Arrived> = Vec::new();
         for (pass, &departure) in departures.iter().enumerate() {
             let cutoff = cutoffs.map(|cutoffs| cutoffs[pass].as_slice());
-            // Seed: board from every access stop.
-            for &(stop, seconds) in &request.access {
-                let ready = departure.saturating_add(seconds);
-                if beyond_cutoff(cutoff, stop, ready) {
-                    continue;
-                }
-                // rides = 0: the access seed precedes every ride, so
-                // it ranks below all round-ranked arrivals — see
-                // mcraptor::Bag::insert.
-                let admitted = stop_bags[stop.0 as usize].insert(ready, 0.0, key(0.0), 0);
-                if !admitted {
-                    continue;
-                }
-                if let Some(sink) = fold {
-                    // The zero-ride floor of the origin's own cell.
-                    sink.fold(
+            // Seed: board from every access stop. The policy arm seeds
+            // its label sets with their street grams; the walking arm
+            // below stays byte-for-byte the pre-policy loop.
+            if let Some(policy) = self.policy {
+                for &(stop, seconds, grams) in &policy.access {
+                    let ready = departure.saturating_add(seconds);
+                    if beyond_cutoff(cutoff, stop, ready) {
+                        continue;
+                    }
+                    let admitted = stop_bags[stop.0 as usize].insert(ready, grams, key(grams), 0);
+                    if !admitted {
+                        continue;
+                    }
+                    if let Some(sink) = fold {
+                        sink.fold(
+                            stop,
+                            ready.saturating_sub(departure),
+                            grams,
+                            ACCESS_LEAF,
+                            0,
+                            false,
+                        );
+                    }
+                    self.board(
                         stop,
-                        ready.saturating_sub(departure),
-                        0.0,
-                        ACCESS_LEAF,
+                        ready,
+                        grams,
+                        departure,
+                        |_, _| SegOrigin::Access { stop, seconds },
                         0,
-                        false,
+                        key,
+                        &mut arena,
+                        &mut segment_states,
+                        &mut trip_bags,
+                        &mut queue[1],
+                        stats,
                     );
                 }
-                self.board(
-                    stop,
-                    ready,
-                    0.0,
-                    departure,
-                    |_, _| SegOrigin::Access { stop, seconds },
-                    0,
-                    key,
-                    &mut arena,
-                    &mut segment_states,
-                    &mut trip_bags,
-                    &mut queue[1],
-                    stats,
-                );
+                // Drain the seeds against the policy egress offsets: the
+                // zero-ride street composition belongs in the destination
+                // dominance, exactly as on the McRAPTOR arm. The seed's
+                // stop and access seconds ride in the `walk` slot, which
+                // no access-floor entry uses otherwise.
+                for &(stop, seconds, grams) in &policy.access {
+                    let ready = departure.saturating_add(seconds);
+                    if beyond_cutoff(cutoff, stop, ready) {
+                        continue;
+                    }
+                    for &(egress, egress_seconds, egress_grams) in &policy.egress {
+                        if egress == stop {
+                            self.join(
+                                &mut destination,
+                                key,
+                                departure,
+                                ready.saturating_add(egress_seconds),
+                                grams + egress_grams,
+                                ACCESS_LEAF,
+                                0,
+                                Some((stop, seconds)),
+                            );
+                        }
+                    }
+                }
+            } else {
+                for &(stop, seconds) in &request.access {
+                    let ready = departure.saturating_add(seconds);
+                    if beyond_cutoff(cutoff, stop, ready) {
+                        continue;
+                    }
+                    // rides = 0: the access seed precedes every ride, so
+                    // it ranks below all round-ranked arrivals — see
+                    // mcraptor::Bag::insert.
+                    let admitted = stop_bags[stop.0 as usize].insert(ready, 0.0, key(0.0), 0);
+                    if !admitted {
+                        continue;
+                    }
+                    if let Some(sink) = fold {
+                        // The zero-ride floor of the origin's own cell.
+                        sink.fold(
+                            stop,
+                            ready.saturating_sub(departure),
+                            0.0,
+                            ACCESS_LEAF,
+                            0,
+                            false,
+                        );
+                    }
+                    self.board(
+                        stop,
+                        ready,
+                        0.0,
+                        departure,
+                        |_, _| SegOrigin::Access { stop, seconds },
+                        0,
+                        key,
+                        &mut arena,
+                        &mut segment_states,
+                        &mut trip_bags,
+                        &mut queue[1],
+                        stats,
+                    );
+                }
             }
             for round in 1..=rounds {
                 let queued = std::mem::take(&mut queue[round]);
@@ -375,7 +450,12 @@ impl<'a> McTbtrEngine<'a> {
         #[cfg(debug_assertions)]
         for arrived in &destination {
             // A cancelled segment was never scanned, so it can be
-            // neither a destination leaf nor any chain parent.
+            // neither a destination leaf nor any chain parent. A policy
+            // zero-ride composition has no chain at all — its leaf is
+            // the `ACCESS_LEAF` sentinel, not an arena index.
+            if arrived.leaf == ACCESS_LEAF {
+                continue;
+            }
             let mut cursor = arrived.leaf;
             loop {
                 debug_assert!(
@@ -558,18 +638,37 @@ impl<'a> McTbtrEngine<'a> {
         fold: &mut Option<MatrixSink<'_>>,
         frontier: &mut Option<FrontierSink<'_>>,
     ) {
-        for &(egress, seconds) in &request.egress {
-            if egress == stop {
-                self.join(
-                    destination,
-                    key,
-                    departure,
-                    arrival.saturating_add(seconds),
-                    grams,
-                    index,
-                    alight,
-                    None,
-                );
+        if let Some(policy) = self.policy {
+            // Policy egress offsets add their street grams before the
+            // destination dominance.
+            for &(egress, seconds, egress_grams) in &policy.egress {
+                if egress == stop {
+                    self.join(
+                        destination,
+                        key,
+                        departure,
+                        arrival.saturating_add(seconds),
+                        grams + egress_grams,
+                        index,
+                        alight,
+                        None,
+                    );
+                }
+            }
+        } else {
+            for &(egress, seconds) in &request.egress {
+                if egress == stop {
+                    self.join(
+                        destination,
+                        key,
+                        departure,
+                        arrival.saturating_add(seconds),
+                        grams,
+                        index,
+                        alight,
+                        None,
+                    );
+                }
             }
         }
         if let Some(sink) = frontier {
@@ -686,18 +785,35 @@ impl<'a> McTbtrEngine<'a> {
                             true,
                         );
                     }
-                    for &(egress, seconds) in &request.egress {
-                        if egress == to {
-                            self.join(
-                                destination,
-                                key,
-                                departure,
-                                reached.saturating_add(seconds),
-                                point.grams,
-                                point.segment,
-                                point.alight,
-                                Some((to, duration)),
-                            );
+                    if let Some(policy) = self.policy {
+                        for &(egress, seconds, egress_grams) in &policy.egress {
+                            if egress == to {
+                                self.join(
+                                    destination,
+                                    key,
+                                    departure,
+                                    reached.saturating_add(seconds),
+                                    point.grams + egress_grams,
+                                    point.segment,
+                                    point.alight,
+                                    Some((to, duration)),
+                                );
+                            }
+                        }
+                    } else {
+                        for &(egress, seconds) in &request.egress {
+                            if egress == to {
+                                self.join(
+                                    destination,
+                                    key,
+                                    departure,
+                                    reached.saturating_add(seconds),
+                                    point.grams,
+                                    point.segment,
+                                    point.alight,
+                                    Some((to, duration)),
+                                );
+                            }
                         }
                     }
                     if let Some(sink) = frontier {

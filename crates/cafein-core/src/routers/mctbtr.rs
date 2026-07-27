@@ -33,7 +33,7 @@ use crate::exhaustive::quantized;
 use crate::fares::FareLeg;
 use crate::geometry::{wkb_multi_line_string, TripGeometry};
 use crate::journey::{Journey, Leg};
-use crate::mcraptor::{Bag, InsertProbes};
+use crate::mcraptor::{Bag, InsertProbes, PolicyLabels};
 use crate::raptor::{departure_candidates, CostInputs, CostRow};
 use crate::router::Request;
 use crate::tbtr::{

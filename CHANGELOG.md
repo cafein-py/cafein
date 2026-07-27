@@ -46,7 +46,12 @@
   alternative beside the slower, cleaner walk). Granted vehicle modes
   then require resolved emission factors; unresolved ones are rejected,
   never silently zeroed. A walking-only policy rides the legacy
-  multicriteria path bit for bit.
+  multicriteria path bit for bit. Both multicriteria engines serve the
+  policy: ``router="auto"`` resolves to McTBTR when the cached
+  multicriteria transfer set (``compute_mctbtr_transfers``) matches the
+  query, answering exactly what McRAPTOR answers; policy queries always
+  relax the full transfer closure — the McULTRA shortcut set never
+  serves them.
 
 - A ``TransportNetwork`` can now carry the multimodal union street graph.
   ``from_gtfs(..., street_modes=("walk", "bicycle", "e_scooter"), dem=...)``

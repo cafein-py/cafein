@@ -583,14 +583,20 @@ impl TransportNetwork {
     /// arrive from the Pareto reduction (``_pareto_street_rows``), each
     /// ``(stop, seconds, grams)`` point seeding or draining the search
     /// with its street grams inside the (arrival, emissions bucket)
-    /// dominance. The run relaxes the full transfer closure — McULTRA
-    /// gating by exact policy and factor definitions arrives with 14c —
-    /// and the journeys come back as ``route_between_stops``-shaped
+    /// dominance, on either multicriteria engine: ``router="auto"``
+    /// resolves to McTBTR when the cached multicriteria transfer set
+    /// matches the query's date and factors, else McRAPTOR — the set
+    /// concerns trips and intermediate transfers only, so the policy
+    /// seeds never enter its precompute. Both arms relax the full
+    /// transfer closure: the McULTRA shortcut set's witness pruning
+    /// runs under bucket arithmetic at zero access grams, which a
+    /// policy's grams offsets can re-split, so it never serves a policy
+    /// query. Journeys come back as ``route_between_stops``-shaped
     /// dicts whose access and egress legs carry no distances: Python
     /// rebuilds them from the kept tokens by ``(stop, seconds)``.
     /// Internal until the policy surface stabilises.
     #[pyo3(signature = (access, egress, date, departure, trip_factors, max_transfers, bucket,
-                        slack = 0.0, max_options = None,
+                        slack = 0.0, max_options = None, router = "auto",
                         exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![],
                         geometries = true))]
     #[allow(clippy::too_many_arguments)]
@@ -606,6 +612,7 @@ impl TransportNetwork {
         bucket: f64,
         slack: f64,
         max_options: Option<usize>,
+        router: &str,
         exclude_routes: Vec<String>,
         exclude_trips: Vec<String>,
         exclude_stops: Vec<String>,
@@ -615,6 +622,9 @@ impl TransportNetwork {
             return Err(PyValueError::new_err(
                 "bucket must be a positive number of grams",
             ));
+        }
+        if !matches!(router, "auto" | "raptor" | "tbtr") {
+            return Err(invalid_router(router));
         }
         if !slack.is_finite() || slack < 0.0 {
             return Err(PyValueError::new_err(
@@ -626,7 +636,17 @@ impl TransportNetwork {
                 "max_options must be a positive integer",
             ));
         }
+        if router == "tbtr" && slack > 0.0 {
+            return Err(PyValueError::new_err(
+                "route slacks require router='raptor'",
+            ));
+        }
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        if exclusions.is_some() && router == "tbtr" {
+            return Err(PyValueError::new_err(
+                "route/trip/stop exclusions require router='raptor'",
+            ));
+        }
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
                 "no trip distances installed; build the network with trip distances enabled",
@@ -656,8 +676,26 @@ impl TransportNetwork {
             max_transfers,
             exclusions,
         };
+        let router = self.resolve_mc_router(
+            router,
+            date,
+            &per_trip,
+            slack > 0.0 || request.exclusions.is_some(),
+        )?;
         let slack = slack.round() as u32;
         let journeys = py.allow_threads(|| {
+            if router == "tbtr" {
+                let mut engine = self.mctbtr_engine(
+                    &self.transfers,
+                    geometry,
+                    &per_trip,
+                    date,
+                    &request.active_services,
+                    &request.active_services_previous,
+                );
+                engine.policy = Some(&labels);
+                return engine.route(&request, bucket, None);
+            }
             let view = DayView::for_date(
                 &self.build.timetable,
                 &request.active_services,
