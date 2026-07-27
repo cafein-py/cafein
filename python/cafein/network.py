@@ -367,15 +367,17 @@ def _policy_mc_journeys(
     bucket,
     slack,
     max_options,
+    router="auto",
 ):
     """Door-to-door multicriteria journeys under a street-leg policy.
 
-    Each side reduces to its ``(seconds, grams)`` Pareto frontier, the
-    McRAPTOR search seeds and drains those label sets with the street
-    grams inside its (arrival, emissions bucket) dominance — zero-ride
-    street compositions included, the engine drains the seeds itself —
-    and the street legs rebuild from the kept tokens by
-    ``(stop, seconds)``. The direct walking alternative applies the
+    Each side reduces to its ``(seconds, grams)`` Pareto frontier, and
+    the resolved multicriteria engine — McRAPTOR, or McTBTR when the
+    cached transfer set serves the query — seeds and drains those label
+    sets with the street grams inside its (arrival, emissions bucket)
+    dominance — zero-ride street compositions included, the engines
+    drain the seeds themselves — and the street legs rebuild from the
+    kept tokens by ``(stop, seconds)``. The direct walking alternative applies the
     multicriteria rule exactly as ``mc_route_between_coordinates`` does:
     journeys must beat it strictly, and it leads the list as the
     zero-emission, zero-ride baseline.
@@ -426,6 +428,7 @@ def _policy_mc_journeys(
         bucket,
         float(slack),
         max_options,
+        router,
         list(exclude_routes),
         list(exclude_trips),
         list(exclude_stops),

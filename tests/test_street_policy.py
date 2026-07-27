@@ -1483,3 +1483,38 @@ def test_relaxed_policy_candidates_widen_the_frontier(multimodal_network):
         **shared_kwargs,
     )
     assert relaxed["option"].nunique() >= pareto["option"].nunique()
+
+
+def test_mc_policy_engines_answer_identically(multimodal_mctbtr_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries
+
+    frames = {}
+    for router in ("raptor", "tbtr", "auto"):
+        frames[router] = DetailedItineraries(
+            multimodal_mctbtr_network,
+            _points_frame([ORIGIN]),
+            _points_frame([DEST]),
+            "2022-02-22",
+            "08:30:00",
+            candidates="pareto",
+            router=router,
+            street_policy=_scooter_policy(),
+            factors=_scooter_factor_rows(),
+            geometries=False,
+        )
+    # Engine neutrality with policy label sets: McTBTR (the cached set
+    # serves both the explicit and the auto-resolved arm) answers exactly
+    # what McRAPTOR answers, zero-ride street compositions included.
+    for router in ("tbtr", "auto"):
+        pd.testing.assert_frame_equal(
+            pd.DataFrame(frames[router]).reset_index(drop=True),
+            pd.DataFrame(frames["raptor"]).reset_index(drop=True),
+        )
+    zero_ride = [
+        option
+        for option, legs in frames["tbtr"].groupby("option")
+        if not (legs["leg_type"] == "transit").any()
+        and (legs["mode"] == "e_scooter").any()
+    ]
+    assert zero_ride

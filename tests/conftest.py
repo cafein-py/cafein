@@ -147,6 +147,35 @@ def multimodal_network(helsinki_gtfs, kantakaupunki_pbf, artifact_cache):
     return _cached_network(artifact_cache, "helsinki-multimodal", build)
 
 
+@pytest.fixture(scope="session")
+def multimodal_mctbtr_network(helsinki_gtfs, kantakaupunki_pbf, artifact_cache):
+    """The multimodal network carrying a whole-day multicriteria TBTR set,
+    for the policy engine-equality comparisons — one cached set per run,
+    as with the other mctbtr fixtures."""
+    pytest.importorskip("cafein._cafein")
+    import numpy as np
+    from cafein import TransportNetwork
+
+    def build():
+        def ramp(lons, lats):
+            return ((np.asarray(lons) - 24.8) * 1000.0).astype("float32")
+
+        def base():
+            with pytest.warns(UserWarning):
+                return TransportNetwork.from_gtfs(
+                    [str(helsinki_gtfs)],
+                    osm_pbf=str(kantakaupunki_pbf),
+                    street_modes=("walk", "bicycle", "e_scooter"),
+                    dem=ramp,
+                )
+
+        network = _cached_network(artifact_cache, "helsinki-multimodal", base)
+        network.compute_mctbtr_transfers("2022-02-22")
+        return network
+
+    return _cached_network(artifact_cache, "helsinki-multimodal-mctbtr", build)
+
+
 @pytest.fixture()
 def fresh_footpaths_network(network_with_footpaths, artifact_cache):
     """A private copy of the footpaths network, for tests that mutate one.

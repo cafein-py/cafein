@@ -367,6 +367,31 @@ impl<'a> McTbtrEngine<'a> {
 
     /// Walks a winning segment chain back into the journey contract.
     pub(super) fn assemble(&self, arrived: &Arrived, arena: &[Segment]) -> Journey {
+        if arrived.leaf == ACCESS_LEAF {
+            // The zero-ride street composition: the seed's stop and its
+            // access seconds ride in `walk`, which no access-floor entry
+            // uses otherwise.
+            let (stop, seconds) = arrived
+                .walk
+                .expect("an access-floor arrival carries its seed in `walk`");
+            let boundary = arrived.departure.saturating_add(seconds);
+            return Journey {
+                legs: vec![
+                    Leg::Access {
+                        to_stop: stop,
+                        departure: arrived.departure,
+                        arrival: boundary,
+                    },
+                    Leg::Egress {
+                        from_stop: stop,
+                        departure: boundary,
+                        arrival: arrived.arrival,
+                    },
+                ],
+                departure: arrived.departure,
+                arrival: arrived.arrival,
+            };
+        }
         let mut legs = Vec::new();
         let mut segment = &arena[arrived.leaf as usize];
         let mut alight = arrived.alight;

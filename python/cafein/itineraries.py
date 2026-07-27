@@ -407,10 +407,10 @@ def _itineraries_frame(
                 "street_policy does not support candidates='diverse' yet; "
                 "the penalization rounds arrive with a later stage"
             )
-        if router == "tbtr":
+        if candidates == "time" and router == "tbtr":
             raise ValueError(
-                "street_policy queries run the RAPTOR engines; "
-                "router='tbtr' arrives with a later stage"
+                "street_policy time queries run the RAPTOR arm; "
+                "router='tbtr' serves candidates='pareto'"
             )
         if any(option is not None for option in walk):
             raise ValueError(
@@ -644,6 +644,7 @@ def _route_pareto(
                 bucket,
                 slack or 0.0,
                 options,
+                router,
             )
         # A walking-only policy IS the legacy multicriteria walking path,
         # at the policy's one walking budget.
