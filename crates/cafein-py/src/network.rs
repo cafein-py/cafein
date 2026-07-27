@@ -32,7 +32,22 @@ type TransferLegParts = (u32, f64, Option<Py<PyBytes>>);
 /// `StreetChoice` sidecar the reconstruction stage consumes.
 type ReducedChoice = (String, u32, String, u32, f64, f64, Option<String>);
 
-/// The reduction's running winner per stop.
+/// One reduced street choice with its meters: stop, seconds, winning
+/// mode, the vehicle's network and connector meters, and the walked
+/// transfer meters of a closure-carried choice — the per-stop street
+/// distances the policy cost matrix attributes.
+type ReducedRow = (String, u32, String, f64, f64, f64);
+
+/// One meters-row cell: whole seconds, network meters, and total street
+/// meters (both connectors included).
+type MeterCell = (u32, f64, f64);
+
+/// A mode's per-stop meter cells beside the mode-masked links they used.
+type MeterRow = (Vec<Option<MeterCell>>, Vec<Option<Snap>>);
+
+/// The reduction's running winner per stop. The meter fields ride along
+/// only when a meters-carrying reduction asked for them; the times-only
+/// reduction leaves them zero and never reads them.
 #[derive(Clone, Copy)]
 struct Winner {
     seconds: u32,
@@ -40,6 +55,13 @@ struct Winner {
     order: usize,
     snap: Snap,
     via: Option<StopIdx>,
+    /// The winning route's ridden network meters to the link.
+    network_m: f64,
+    /// Network meters plus both connectors — the choice's total street
+    /// meters before any carried transfer walk.
+    total_m: f64,
+    /// The carried transfer edge's walked meters; zero when direct.
+    walk_transfer_m: f64,
 }
 
 #[pymethods]
@@ -1002,124 +1024,15 @@ impl TransportNetwork {
         modes: Vec<(String, f64, bool, Option<Vec<String>>)>,
         exclude_stops: Vec<String>,
     ) -> PyResult<Vec<ReducedChoice>> {
-        let stop_count = self.build.timetable.stop_count() as usize;
-        let mut best: Vec<Option<Winner>> = vec![None; stop_count];
-        let mut snapped = false;
-        for (order, (mode, max_seconds, rental, eligible)) in modes.iter().enumerate() {
-            let mask = match eligible {
-                Some(stops) => {
-                    let mut mask = vec![false; stop_count];
-                    for stop in stops {
-                        mask[self.resolve_stop(stop)?.0 as usize] = true;
-                    }
-                    Some(mask)
-                }
-                None => None,
-            };
-            let Some((row, links)) =
-                self.try_street_row(py, latitude, longitude, mode, *max_seconds, egress)?
-            else {
-                continue;
-            };
-            snapped = true;
-            for (stop, seconds) in row.into_iter().enumerate() {
-                let Some(seconds) = seconds else { continue };
-                if mask.as_ref().is_some_and(|mask| !mask[stop]) {
-                    continue;
-                }
-                let Some(snap) = links[stop] else { continue };
-                let candidate = Winner {
-                    seconds,
-                    rental: *rental,
-                    order,
-                    snap,
-                    via: None,
-                };
-                // Faster wins; a tie falls to fewer paid rentals, then the
-                // declared mode order — deterministic whatever the input.
-                let wins = match &best[stop] {
-                    None => true,
-                    Some(held) => {
-                        candidate.seconds < held.seconds
-                            || (candidate.seconds == held.seconds
-                                && (usize::from(candidate.rental), candidate.order)
-                                    < (usize::from(held.rental), held.order))
-                    }
-                };
-                if wins {
-                    best[stop] = Some(candidate);
-                }
-            }
-        }
-        if !snapped {
-            return Err(PyValueError::new_err(
-                "coordinate too far from the multimodal street network for \
-                 every policy mode",
-            ));
-        }
-        // A query-excluded stop takes no part: it neither keeps a choice nor
-        // feeds one through the transfer closure below — the engines drop
-        // direct seeds at excluded stops themselves, but a closure-derived
-        // seed would smuggle travel through one back in. The mask also
-        // guards the closure's targets, so a transfer cannot repopulate an
-        // excluded stop mid-pass and propagate onward from it.
-        let mut excluded = vec![false; stop_count];
-        for stop in &exclude_stops {
-            let index = self.resolve_stop(stop)?.0 as usize;
-            best[index] = None;
-            excluded[index] = true;
-        }
-        // Close the reduction under the installed stop-to-stop transfers:
-        // the engines never relax footpaths out of access-seeded stops,
-        // because the walking access array is footpath-closed by
-        // construction — so a reduced array must be too, or "ride to one
-        // platform, walk to the neighbouring one" would go missing and a
-        // better seed could only prune the transit label that used to feed
-        // that footpath. Direction follows the labels: access labels
-        // propagate along a transfer (reach the seed, then walk it), egress
-        // labels against it (walk it first, then leave from the seed) —
-        // asymmetric footpaths stay honest. The pass relaxes a snapshot of
-        // the direct winners, never its own output: the installed set is
-        // transitively closed within its own walking cutoff, so composing
-        // two installed edges would walk beyond that cutoff. Every carried
-        // choice is thus its seed's direct time plus exactly one installed
-        // transfer, whatever the stop order.
-        let seeds = best.clone();
-        for stop in 0..stop_count {
-            for transfer in self.transfers.from_stop(StopIdx(stop as u32)) {
-                let to = transfer.to.0 as usize;
-                let (source, target) = if egress { (to, stop) } else { (stop, to) };
-                if excluded[target] {
-                    continue;
-                }
-                let Some(winner) = seeds[source] else {
-                    continue;
-                };
-                let Some(candidate) = winner.seconds.checked_add(transfer.duration) else {
-                    continue;
-                };
-                let wins = match &best[target] {
-                    None => true,
-                    Some(held) => {
-                        candidate < held.seconds
-                            || (candidate == held.seconds
-                                && (usize::from(winner.rental), winner.order)
-                                    < (usize::from(held.rental), held.order))
-                    }
-                };
-                if wins {
-                    // The choice token stays the seed's — the vehicle serves
-                    // its own snap and the transfer is walked via `via`; a
-                    // snapshot source is always a direct winner, so `via`
-                    // names the stop whose link the token snap belongs to.
-                    best[target] = Some(Winner {
-                        seconds: candidate,
-                        via: Some(StopIdx(source as u32)),
-                        ..winner
-                    });
-                }
-            }
-        }
+        let best = self.reduce_street_choices(
+            py,
+            latitude,
+            longitude,
+            egress,
+            &modes,
+            &exclude_stops,
+            false,
+        )?;
         Ok(best
             .into_iter()
             .enumerate()
@@ -1133,6 +1046,63 @@ impl TransportNetwork {
                         winner.snap.fraction,
                         winner.snap.connector,
                         winner.via.map(|via| self.public_stop_id(via)),
+                    )
+                })
+            })
+            .collect())
+    }
+
+    /// The meters-carrying form of ``_reduced_street_offsets``: the same
+    /// reduction over meters-tracking searches, returning ``(stop_id,
+    /// seconds, winning_mode, vehicle_network_m, vehicle_connector_m,
+    /// walk_m)`` per reachable stop — the street distances the policy
+    /// cost matrix attributes. A walking choice carries its whole
+    /// distance in ``walk_m`` (vehicle columns zero); a vehicle choice
+    /// splits network and connector meters, and a closure-carried choice
+    /// adds the walked transfer edge to ``walk_m``. Seconds are
+    /// identical to ``_reduced_street_offsets`` cell for cell. Internal.
+    #[pyo3(signature = (latitude, longitude, egress, modes, exclude_stops = vec![]))]
+    #[allow(clippy::type_complexity)]
+    fn _reduced_street_rows(
+        &self,
+        py: Python<'_>,
+        latitude: f64,
+        longitude: f64,
+        egress: bool,
+        modes: Vec<(String, f64, bool, Option<Vec<String>>)>,
+        exclude_stops: Vec<String>,
+    ) -> PyResult<Vec<ReducedRow>> {
+        let best = self.reduce_street_choices(
+            py,
+            latitude,
+            longitude,
+            egress,
+            &modes,
+            &exclude_stops,
+            true,
+        )?;
+        Ok(best
+            .into_iter()
+            .enumerate()
+            .filter_map(|(stop, winner)| {
+                winner.map(|winner| {
+                    let mode = modes[winner.order].0.clone();
+                    let (vehicle_network, vehicle_connector, walk) = if mode == "walk" {
+                        (0.0, 0.0, winner.total_m + winner.walk_transfer_m)
+                    } else {
+                        (
+                            winner.network_m,
+                            winner.total_m - winner.network_m,
+                            winner.walk_transfer_m,
+                        )
+                    };
+                    (
+                        self.public_stop_id(StopIdx(stop as u32)),
+                        winner.seconds,
+                        mode,
+                        vehicle_network,
+                        vehicle_connector,
+                        walk,
                     )
                 })
             })
@@ -1563,7 +1533,7 @@ impl TransportNetwork {
 
 /// The stop-link snap radius onto the multimodal graph, matching the walking
 /// path's default stop radius; the 12c policy surface may parameterize it.
-const MULTIMODAL_STOP_SNAP: f64 = 1600.0;
+pub(super) const MULTIMODAL_STOP_SNAP: f64 = 1600.0;
 
 impl TransportNetwork {
     /// The compiled multimodal profile for `mode`, cached by exact
@@ -1573,7 +1543,7 @@ impl TransportNetwork {
     /// per the documented build contract, the modes select *component
     /// pruning only* — every physical edge is kept — so a mode outside the
     /// list routes correctly, just without its small-island pruning.
-    fn multimodal_profile(&self, mode: &str) -> PyResult<CompiledStreetProfile> {
+    pub(super) fn multimodal_profile(&self, mode: &str) -> PyResult<CompiledStreetProfile> {
         let network = self.multimodal.as_ref().ok_or_else(|| {
             PyValueError::new_err(
                 "no multimodal street graph is installed; build with street_modes=",
@@ -1659,6 +1629,216 @@ impl TransportNetwork {
             .ok_or_else(|| {
                 PyValueError::new_err("coordinate too far from the multimodal street network")
             })
+    }
+
+    /// The shared street reduction behind `_reduced_street_offsets` and
+    /// `_reduced_street_rows` (design §7.2): per stop, the fastest
+    /// permitted choice across the policy's modes, closed under the
+    /// installed transfers. With `with_meters` the per-mode rows track
+    /// the winning routes' meters (identical seconds, path-tracking
+    /// searches); without it they stay times-only and the winners' meter
+    /// fields are zero.
+    #[allow(clippy::too_many_arguments)]
+    fn reduce_street_choices(
+        &self,
+        py: Python<'_>,
+        latitude: f64,
+        longitude: f64,
+        egress: bool,
+        modes: &[(String, f64, bool, Option<Vec<String>>)],
+        exclude_stops: &[String],
+        with_meters: bool,
+    ) -> PyResult<Vec<Option<Winner>>> {
+        let stop_count = self.build.timetable.stop_count() as usize;
+        let mut best: Vec<Option<Winner>> = vec![None; stop_count];
+        let mut snapped = false;
+        for (order, (mode, max_seconds, rental, eligible)) in modes.iter().enumerate() {
+            let mask = match eligible {
+                Some(stops) => {
+                    let mut mask = vec![false; stop_count];
+                    for stop in stops {
+                        mask[self.resolve_stop(stop)?.0 as usize] = true;
+                    }
+                    Some(mask)
+                }
+                None => None,
+            };
+            let row = if with_meters {
+                self.try_street_meters_row(py, latitude, longitude, mode, *max_seconds, egress)?
+            } else {
+                self.try_street_row(py, latitude, longitude, mode, *max_seconds, egress)?
+                    .map(|(row, links)| {
+                        let cells = row
+                            .into_iter()
+                            .map(|seconds| seconds.map(|seconds| (seconds, 0.0, 0.0)))
+                            .collect();
+                        (cells, links)
+                    })
+            };
+            let Some((cells, links)) = row else {
+                continue;
+            };
+            snapped = true;
+            for (stop, cell) in cells.into_iter().enumerate() {
+                let Some((seconds, network_m, total_m)) = cell else {
+                    continue;
+                };
+                if mask.as_ref().is_some_and(|mask| !mask[stop]) {
+                    continue;
+                }
+                let Some(snap) = links[stop] else { continue };
+                let candidate = Winner {
+                    seconds,
+                    rental: *rental,
+                    order,
+                    snap,
+                    via: None,
+                    network_m,
+                    total_m,
+                    walk_transfer_m: 0.0,
+                };
+                // Faster wins; a tie falls to fewer paid rentals, then the
+                // declared mode order — deterministic whatever the input.
+                let wins = match &best[stop] {
+                    None => true,
+                    Some(held) => {
+                        candidate.seconds < held.seconds
+                            || (candidate.seconds == held.seconds
+                                && (usize::from(candidate.rental), candidate.order)
+                                    < (usize::from(held.rental), held.order))
+                    }
+                };
+                if wins {
+                    best[stop] = Some(candidate);
+                }
+            }
+        }
+        if !snapped {
+            return Err(PyValueError::new_err(
+                "coordinate too far from the multimodal street network for \
+                 every policy mode",
+            ));
+        }
+        // A query-excluded stop takes no part: it neither keeps a choice nor
+        // feeds one through the transfer closure below — the engines drop
+        // direct seeds at excluded stops themselves, but a closure-derived
+        // seed would smuggle travel through one back in. The mask also
+        // guards the closure's targets, so a transfer cannot repopulate an
+        // excluded stop mid-pass and propagate onward from it.
+        let mut excluded = vec![false; stop_count];
+        for stop in exclude_stops {
+            let index = self.resolve_stop(stop)?.0 as usize;
+            best[index] = None;
+            excluded[index] = true;
+        }
+        // Close the reduction under the installed stop-to-stop transfers:
+        // the engines never relax footpaths out of access-seeded stops,
+        // because the walking access array is footpath-closed by
+        // construction — so a reduced array must be too, or "ride to one
+        // platform, walk to the neighbouring one" would go missing and a
+        // better seed could only prune the transit label that used to feed
+        // that footpath. Direction follows the labels: access labels
+        // propagate along a transfer (reach the seed, then walk it), egress
+        // labels against it (walk it first, then leave from the seed) —
+        // asymmetric footpaths stay honest. The pass relaxes a snapshot of
+        // the direct winners, never its own output: the installed set is
+        // transitively closed within its own walking cutoff, so composing
+        // two installed edges would walk beyond that cutoff. Every carried
+        // choice is thus its seed's direct time plus exactly one installed
+        // transfer, whatever the stop order.
+        let seeds = best.clone();
+        for stop in 0..stop_count {
+            for transfer in self.transfers.from_stop(StopIdx(stop as u32)) {
+                let to = transfer.to.0 as usize;
+                let (source, target) = if egress { (to, stop) } else { (stop, to) };
+                if excluded[target] {
+                    continue;
+                }
+                let Some(winner) = seeds[source] else {
+                    continue;
+                };
+                let Some(candidate) = winner.seconds.checked_add(transfer.duration) else {
+                    continue;
+                };
+                let wins = match &best[target] {
+                    None => true,
+                    Some(held) => {
+                        candidate < held.seconds
+                            || (candidate == held.seconds
+                                && (usize::from(winner.rental), winner.order)
+                                    < (usize::from(held.rental), held.order))
+                    }
+                };
+                if wins {
+                    // The choice token stays the seed's — the vehicle serves
+                    // its own snap and the transfer is walked via `via`; a
+                    // snapshot source is always a direct winner, so `via`
+                    // names the stop whose link the token snap belongs to.
+                    best[target] = Some(Winner {
+                        seconds: candidate,
+                        via: Some(StopIdx(source as u32)),
+                        walk_transfer_m: transfer.meters,
+                        ..winner
+                    });
+                }
+            }
+        }
+        Ok(best)
+    }
+
+    /// One mode's per-stop meter cells over the multimodal graph —
+    /// `try_street_row`'s meters-tracking counterpart, with the same
+    /// zero-coincident convention (a stop at the query's own coordinate
+    /// is zero away with zero meters) and `None` when the coordinate has
+    /// no snap for this mode.
+    fn try_street_meters_row(
+        &self,
+        py: Python<'_>,
+        latitude: f64,
+        longitude: f64,
+        mode: &str,
+        max_seconds: f64,
+        egress: bool,
+    ) -> PyResult<Option<MeterRow>> {
+        let profile = self.multimodal_profile(mode)?;
+        let network = self.multimodal.as_ref().expect("profile lookup checked");
+        let links = self.mode_link_targets(network, profile.definition.mode.bit());
+        let Some(snap) =
+            network.snap_for_profile(latitude, longitude, MULTIMODAL_STOP_SNAP, &profile)
+        else {
+            return Ok(None);
+        };
+        let raw = py.allow_threads(|| {
+            if egress {
+                network.directed_meters_from_snaps(&links, &snap, &profile, max_seconds)
+            } else {
+                network.directed_meters_to_snaps(&snap, &links, &profile, max_seconds)
+            }
+        });
+        let mut cells: Vec<Option<MeterCell>> = raw
+            .into_iter()
+            .zip(&links)
+            .map(|(cell, link)| {
+                let (seconds, network_m) = cell?;
+                let link = link.as_ref()?;
+                Some((
+                    seconds,
+                    network_m,
+                    network_m + snap.connector + link.connector,
+                ))
+            })
+            .collect();
+        if max_seconds.is_finite() && max_seconds >= 0.0 {
+            for (index, (_, stop_latitude, stop_longitude)) in self.stops().iter().enumerate() {
+                if *stop_latitude == Some(latitude)
+                    && *stop_longitude == Some(longitude)
+                    && links[index].is_some()
+                {
+                    cells[index] = Some((0, 0.0, 0.0));
+                }
+            }
+        }
+        Ok(Some((cells, links)))
     }
 
     /// [`street_row`](Self::street_row), answering `None` when the

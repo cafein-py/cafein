@@ -16,7 +16,7 @@ use cafein_core::journey::{Journey, Leg};
 use cafein_core::mcraptor;
 use cafein_core::mctbtr::McTbtrEngine;
 use cafein_core::mcultra::compute_mcultra_shortcuts;
-use cafein_core::raptor::{CostInputs, CostRow, Objective, Raptor};
+use cafein_core::raptor::{CostInputs, CostRow, Objective, Raptor, NO_STOP};
 use cafein_core::router::{factor_fingerprint, same_factors, Exclusions, Request, TransitRouter};
 use cafein_core::streets::{
     Backing, CompiledStreetProfile, MappedStreets, Snap, StopLink, StoredLink, StreetAttributes,
@@ -81,8 +81,8 @@ struct TransportNetwork {
     /// The pruning modes the multimodal graph was built with.
     multimodal_modes: Option<Vec<String>>,
     /// Per-stop links onto the multimodal graph, mode-masked and lazily
-    /// built on the first access/egress row (never persisted — one R*-tree
-    /// pass recomputes them per load).
+    /// built on the first access/egress row (never persisted — one
+    /// spatial-index pass recomputes them per load).
     multimodal_links: std::sync::OnceLock<Vec<Vec<(Snap, u8)>>>,
     /// Compiled profiles for the multimodal graph, keyed by exact
     /// definition equality — the 12a-planned cache, arriving with its first

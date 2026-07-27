@@ -73,6 +73,20 @@ impl Endpoint {
     }
 }
 
+/// The route behind a settled cost, as the reconstruction reads it: the
+/// direct ride along the shared snap edge, or the predecessor chain with
+/// the partial-edge fractions where the route enters and leaves the snap
+/// edges. Meters and geometry both derive from it.
+enum WinningRoute {
+    SameEdge,
+    Chain {
+        vertices: Vec<u32>,
+        edges: Vec<u32>,
+        entry_fraction: f64,
+        exit_fraction: f64,
+    },
+}
+
 /// The safety margin on the A* heuristic's straight-line metres: arc lengths
 /// come from the extraction's geodesic while the heuristic measures with the
 /// local-planar [`segment_length`], so the two can disagree by well under half
@@ -941,6 +955,181 @@ impl StreetNetwork {
         }
     }
 
+    /// [`directed_dijkstra_reverse`](Self::directed_dijkstra_reverse)
+    /// additionally recording each settled vertex's next hop
+    /// `(vertex, edge)` toward the destination — the reverse counterpart
+    /// of [`directed_dijkstra_with_paths`](Self::directed_dijkstra_with_paths),
+    /// with the same order-independent, acyclicity-preserving tie rule.
+    pub(super) fn directed_dijkstra_reverse_with_paths(
+        &self,
+        profile: &CompiledStreetProfile,
+        seeds: &[Endpoint],
+        cutoff: u64,
+        state: &mut DirectedState,
+    ) {
+        state.prepare_with_previous(self.vertex_count() as usize);
+        let (offsets, sources, slots) = self.reverse_adjacency();
+        let edges = self.arrays().adj_edges();
+        let arc_millis = profile.arc_millis();
+        for seed in seeds {
+            if seed.millis <= cutoff && seed.millis < state.time(seed.vertex) {
+                state.set(seed.vertex, seed.millis);
+                state.previous[seed.vertex as usize] = NO_PREVIOUS;
+                state.heap.push(Reverse((seed.millis, seed.vertex)));
+            }
+        }
+        while let Some(Reverse((time, vertex))) = state.heap.pop() {
+            if time > state.time(vertex) {
+                continue;
+            }
+            let start = offsets[vertex as usize] as usize;
+            let end = offsets[vertex as usize + 1] as usize;
+            for incoming in start..end {
+                let slot = slots[incoming] as usize;
+                let cost = arc_millis[slot];
+                if cost == u32::MAX {
+                    continue;
+                }
+                let next = time.saturating_add(u64::from(cost));
+                let target = sources[incoming];
+                if next > cutoff {
+                    continue;
+                }
+                if next < state.time(target) {
+                    state.set(target, next);
+                    state.previous[target as usize] = (vertex, edges[slot]);
+                    state.heap.push(Reverse((next, target)));
+                } else if next == state.time(target) && cost > 0 {
+                    let candidate = (vertex, edges[slot]);
+                    if candidate < state.previous[target as usize] {
+                        state.previous[target as usize] = candidate;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The directed times and network meters from each of `sources` to
+    /// `to` — the egress mirror of
+    /// [`directed_meters_to_snaps`](Self::directed_meters_to_snaps): one
+    /// path-tracking reverse search serves the whole column, chains
+    /// toward the destination memoise across sources, and seconds are
+    /// identical to [`directed_times_from_snaps`](Self::directed_times_from_snaps)
+    /// cell for cell (the direct same-edge candidate wins exact ties, as
+    /// the forward reconstruction resolves them). The meters are the
+    /// meters of an optimal route: on an exact integer-millisecond tie
+    /// between physically different routes, the reverse tree may keep a
+    /// different — equally optimal — one than a forward reconstruction
+    /// of the same pair, its per-direction choice deterministic either
+    /// way. Canonicalising across directions would cost the
+    /// one-search-per-column shape, and the time contract is unaffected.
+    pub fn directed_meters_from_snaps(
+        &self,
+        sources: &[Option<Snap>],
+        to: &Snap,
+        profile: &CompiledStreetProfile,
+        max_seconds: f64,
+    ) -> Vec<Option<(u32, f64)>> {
+        if !max_seconds.is_finite() || max_seconds < 0.0 {
+            return vec![None; sources.len()];
+        }
+        let cutoff = (max_seconds * 1000.0).floor() as u64;
+        let seeds = self.directed_egress(to, profile);
+        DIRECTED_STATE.with(|cell| {
+            let state = &mut cell.borrow_mut();
+            self.directed_dijkstra_reverse_with_paths(profile, &seeds, cutoff, state);
+            let lengths = self.arrays().lengths();
+            let mut suffix: HashMap<u32, (f64, f64)> = HashMap::new();
+            sources
+                .iter()
+                .map(|source| {
+                    let from = source.as_ref()?;
+                    // The times column's fold, remembering which candidate
+                    // produced the winning total.
+                    let mut best: Option<(u64, Option<Endpoint>)> = self
+                        .same_edge_millis(from, to, profile)
+                        .filter(|&direct| direct <= cutoff)
+                        .map(|direct| (direct, None));
+                    for departure in self.directed_seeds(from, profile) {
+                        let reached = state.time(departure.vertex);
+                        if reached == u64::MAX {
+                            continue;
+                        }
+                        let total = reached.saturating_add(departure.millis);
+                        if total > cutoff {
+                            continue;
+                        }
+                        let better = match &best {
+                            None => true,
+                            Some((held, _)) => total < *held,
+                        };
+                        if better {
+                            best = Some((total, Some(departure)));
+                        }
+                    }
+                    let (millis, winner) = best?;
+                    let meters = match winner {
+                        None => (to.fraction - from.fraction).abs() * lengths[from.edge as usize],
+                        Some(departure) => {
+                            let (chain, exit_fraction) =
+                                self.suffix_meters(departure.vertex, &seeds, state, &mut suffix);
+                            chain
+                                + (from.fraction - departure.fraction).abs()
+                                    * lengths[from.edge as usize]
+                                + (to.fraction - exit_fraction).abs() * lengths[to.edge as usize]
+                        }
+                    };
+                    Some((seconds(millis as f64 / 1000.0), meters))
+                })
+                .collect()
+        })
+    }
+
+    /// Meters from a settled vertex along its recorded chain to the
+    /// destination root, and the root's exit fraction — memoised per
+    /// vertex so sources sharing a suffix walk it once.
+    fn suffix_meters(
+        &self,
+        start: u32,
+        seeds: &[Endpoint],
+        state: &DirectedState,
+        suffix: &mut HashMap<u32, (f64, f64)>,
+    ) -> (f64, f64) {
+        let lengths = self.arrays().lengths();
+        let mut walk: Vec<(u32, u32)> = Vec::new();
+        let mut at = start;
+        let (base, exit_fraction) = loop {
+            if let Some(&memo) = suffix.get(&at) {
+                break memo;
+            }
+            let (next, edge) = state.previous[at as usize];
+            if (next, edge) == NO_PREVIOUS {
+                // The chain roots at a seeded arrival offset; its label
+                // says which end of the destination edge it is.
+                let fraction = seeds
+                    .iter()
+                    .find(|seed| seed.vertex == at && seed.millis == state.time(at))
+                    .map(|seed| seed.fraction)
+                    .expect("the chain roots at one of the destination's arrival offsets");
+                break (0.0, fraction);
+            }
+            walk.push((at, edge));
+            at = next;
+            // The forest is acyclic by construction; a longer chain is
+            // corrupt state, and failing beats hanging.
+            assert!(
+                walk.len() <= self.vertex_count() as usize + 1,
+                "predecessor chain exceeds the vertex count"
+            );
+        };
+        let mut total = base;
+        for &(vertex, edge) in walk.iter().rev() {
+            total += lengths[edge as usize];
+            suffix.insert(vertex, (total, exit_fraction));
+        }
+        (total, exit_fraction)
+    }
+
     /// The directed travel times from each of `sources` to `to`, in whole
     /// seconds — the egress mirror of
     /// [`directed_times_to_snaps`](Self::directed_times_to_snaps): one reverse
@@ -1233,6 +1422,55 @@ impl StreetNetwork {
         })
     }
 
+    /// The directed times and network meters from `from` to each of
+    /// `targets` — the row [`directed_times_to_snaps`](Self::directed_times_to_snaps)
+    /// computes, each reachable cell additionally carrying the winning
+    /// route's ridden meters (partial snap edges included, connectors
+    /// not). One path-tracking search serves the whole row and the chain
+    /// meters memoise across targets; no geometry is assembled. Seconds
+    /// are identical to the times-only row cell for cell.
+    pub fn directed_meters_to_snaps(
+        &self,
+        from: &Snap,
+        targets: &[Option<Snap>],
+        profile: &CompiledStreetProfile,
+        max_seconds: f64,
+    ) -> Vec<Option<(u32, f64)>> {
+        if !max_seconds.is_finite() || max_seconds < 0.0 {
+            return vec![None; targets.len()];
+        }
+        let cutoff = (max_seconds * 1000.0).floor() as u64;
+        let seeds = self.directed_seeds(from, profile);
+        DIRECTED_STATE.with(|cell| {
+            let state = &mut cell.borrow_mut();
+            self.directed_dijkstra_with_paths(profile, &seeds, cutoff, state);
+            let mut prefix = HashMap::new();
+            targets
+                .iter()
+                .map(|target| {
+                    let to = target.as_ref()?;
+                    let millis = self.arrival_millis(from, to, profile, cutoff, state)?;
+                    let meters = match &self.winning_route(from, to, profile, millis, state) {
+                        WinningRoute::SameEdge => {
+                            let length = self.arrays().lengths()[from.edge as usize];
+                            (to.fraction - from.fraction).abs() * length
+                        }
+                        WinningRoute::Chain {
+                            vertices,
+                            edges,
+                            entry_fraction,
+                            exit_fraction,
+                        } => {
+                            self.chain_meters(vertices, edges, &mut prefix)
+                                + self.partial_meters(from, to, *entry_fraction, *exit_fraction)
+                        }
+                    };
+                    Some((seconds(millis as f64 / 1000.0), meters))
+                })
+                .collect()
+        })
+    }
+
     /// Builds the leg for a destination the search has already reached, whose
     /// best cost is `millis`.
     #[allow(clippy::too_many_arguments)]
@@ -1248,66 +1486,43 @@ impl StreetNetwork {
         prefix: &mut HashMap<u32, f64>,
     ) -> StreetLeg {
         let connector_meters = from.connector + to.connector;
-        let same_edge = self
-            .same_edge_millis(from, to, profile)
-            .is_some_and(|direct| direct == millis);
-        // The winning route is the direct one along the shared edge when that
-        // candidate is what produced the best time; otherwise it entered the
-        // network and left it at one of the destination edge's endpoints.
-        let (network_meters, path) = if same_edge {
-            let length = self.arrays().lengths()[from.edge as usize];
-            let mut path = vec![
-                (from_point.1, from_point.0),
-                self.point_at(from.edge, from.fraction),
-            ];
-            path.extend(self.edge_slice(from.edge, from.fraction, to.fraction));
-            path.push(self.point_at(to.edge, to.fraction));
-            path.push((to_point.1, to_point.0));
-            ((to.fraction - from.fraction).abs() * length, path)
-        } else {
-            // Take the arrival that produced the winning time, and with it the
-            // end of the destination edge it came in at — the vertex alone
-            // would not say which end of a self-loop that is.
-            let arrival = self
-                .directed_egress(to, profile)
-                .into_iter()
-                .find(|end| {
-                    let reached = state.time(end.vertex);
-                    reached != u64::MAX && reached.saturating_add(end.millis) == millis
-                })
-                .expect("the winning arrival is one of the destination's endpoints");
-            let exit = arrival.vertex;
-            let (vertices, edges) = self.predecessor_chain(exit, state);
-            let entry = vertices[0];
-            let meters = self.chain_meters(&vertices, &edges, prefix);
-            let from_length = self.arrays().lengths()[from.edge as usize];
-            let to_length = self.arrays().lengths()[to.edge as usize];
-            // The chain roots at a seed, so the seed whose cost is the entry's
-            // settled label is the one the winning path left from.
-            let entry_fraction = self
-                .directed_seeds(from, profile)
-                .into_iter()
-                .find(|seed| seed.vertex == entry && seed.millis == state.time(entry))
-                .map(|seed| seed.fraction)
-                .expect("the winning path roots at one of the origin's seeds");
-            let exit_fraction = arrival.fraction;
-            let partial = (from.fraction - entry_fraction).abs() * from_length
-                + (to.fraction - exit_fraction).abs() * to_length;
-            let mut path = vec![
-                (from_point.1, from_point.0),
-                self.point_at(from.edge, from.fraction),
-            ];
-            path.extend(self.edge_slice(from.edge, from.fraction, entry_fraction));
-            for (step, &edge) in edges.iter().enumerate() {
-                let (u, _) = self.edge_endpoints(edge);
-                let forward = vertices[step] == u;
-                let (start, end) = if forward { (0.0, 1.0) } else { (1.0, 0.0) };
-                path.extend(self.edge_slice(edge, start, end));
+        let route = self.winning_route(from, to, profile, millis, state);
+        let (network_meters, path) = match &route {
+            WinningRoute::SameEdge => {
+                let length = self.arrays().lengths()[from.edge as usize];
+                let mut path = vec![
+                    (from_point.1, from_point.0),
+                    self.point_at(from.edge, from.fraction),
+                ];
+                path.extend(self.edge_slice(from.edge, from.fraction, to.fraction));
+                path.push(self.point_at(to.edge, to.fraction));
+                path.push((to_point.1, to_point.0));
+                ((to.fraction - from.fraction).abs() * length, path)
             }
-            path.extend(self.edge_slice(to.edge, exit_fraction, to.fraction));
-            path.push(self.point_at(to.edge, to.fraction));
-            path.push((to_point.1, to_point.0));
-            (meters + partial, path)
+            WinningRoute::Chain {
+                vertices,
+                edges,
+                entry_fraction,
+                exit_fraction,
+            } => {
+                let meters = self.chain_meters(vertices, edges, prefix)
+                    + self.partial_meters(from, to, *entry_fraction, *exit_fraction);
+                let mut path = vec![
+                    (from_point.1, from_point.0),
+                    self.point_at(from.edge, from.fraction),
+                ];
+                path.extend(self.edge_slice(from.edge, from.fraction, *entry_fraction));
+                for (step, &edge) in edges.iter().enumerate() {
+                    let (u, _) = self.edge_endpoints(edge);
+                    let forward = vertices[step] == u;
+                    let (start, end) = if forward { (0.0, 1.0) } else { (1.0, 0.0) };
+                    path.extend(self.edge_slice(edge, start, end));
+                }
+                path.extend(self.edge_slice(to.edge, *exit_fraction, to.fraction));
+                path.push(self.point_at(to.edge, to.fraction));
+                path.push((to_point.1, to_point.0));
+                (meters, path)
+            }
         };
         StreetLeg {
             seconds: seconds(millis as f64 / 1000.0),
@@ -1315,6 +1530,65 @@ impl StreetNetwork {
             connector_meters,
             geometry: dedup_consecutive(path),
         }
+    }
+
+    /// The winning route behind a settled forward-search cost: the direct
+    /// same-edge candidate when that is what produced it, else the
+    /// predecessor chain with the partial-edge fractions at both ends.
+    fn winning_route(
+        &self,
+        from: &Snap,
+        to: &Snap,
+        profile: &CompiledStreetProfile,
+        millis: u64,
+        state: &DirectedState,
+    ) -> WinningRoute {
+        let same_edge = self
+            .same_edge_millis(from, to, profile)
+            .is_some_and(|direct| direct == millis);
+        if same_edge {
+            return WinningRoute::SameEdge;
+        }
+        // Take the arrival that produced the winning time, and with it the
+        // end of the destination edge it came in at — the vertex alone
+        // would not say which end of a self-loop that is.
+        let arrival = self
+            .directed_egress(to, profile)
+            .into_iter()
+            .find(|end| {
+                let reached = state.time(end.vertex);
+                reached != u64::MAX && reached.saturating_add(end.millis) == millis
+            })
+            .expect("the winning arrival is one of the destination's endpoints");
+        let (vertices, edges) = self.predecessor_chain(arrival.vertex, state);
+        let entry = vertices[0];
+        // The chain roots at a seed, so the seed whose cost is the entry's
+        // settled label is the one the winning path left from.
+        let entry_fraction = self
+            .directed_seeds(from, profile)
+            .into_iter()
+            .find(|seed| seed.vertex == entry && seed.millis == state.time(entry))
+            .map(|seed| seed.fraction)
+            .expect("the winning path roots at one of the origin's seeds");
+        WinningRoute::Chain {
+            vertices,
+            edges,
+            entry_fraction,
+            exit_fraction: arrival.fraction,
+        }
+    }
+
+    /// The partial lengths ridden on the snap edges at both route ends.
+    fn partial_meters(
+        &self,
+        from: &Snap,
+        to: &Snap,
+        entry_fraction: f64,
+        exit_fraction: f64,
+    ) -> f64 {
+        let lengths = self.arrays().lengths();
+        (from.fraction - entry_fraction).abs() * lengths[from.edge as usize]
+            + (to.fraction - exit_fraction).abs() * lengths[to.edge as usize]
     }
 
     /// The predecessor chain back to the seed, as `(vertices, edges)` in

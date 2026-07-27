@@ -2009,6 +2009,79 @@ fn astar_legs_match_dijkstra_legs() {
 }
 
 #[test]
+fn meters_rows_match_the_reconstructed_legs() {
+    // The meters rows are the reconstructed legs minus the geometry: the
+    // forward row equals `directed_legs_to_snaps` in seconds and network
+    // metres cell for cell, and the reverse column equals the forward
+    // single legs the same way, its seconds also identical to the
+    // times-only column. Both profiles; the tight cutoff exercises
+    // identical beyond-cutoff `None` cells.
+    let (net, coordinates) = pseudo_random_grid(8, 6, 0xB1C7C1E);
+    for definition in [
+        StreetProfileDefinition::bicycle(),
+        StreetProfileDefinition::walk(),
+    ] {
+        let profile = net.compile_profile(&definition).unwrap();
+        let snaps = grid_snaps(&net, &coordinates, &profile, 2);
+        let points: Vec<(f64, f64)> = coordinates
+            .iter()
+            .step_by(2)
+            .map(|&(lat, lon)| (lat + 0.0002, lon + 0.0004))
+            .collect();
+        for max_seconds in [10_000.0, 60.0] {
+            for (from_point, origin) in points.iter().zip(&snaps) {
+                let Some(from) = origin else { continue };
+                let row = net.directed_meters_to_snaps(from, &snaps, &profile, max_seconds);
+                let targets: Vec<((f64, f64), Option<Snap>)> =
+                    points.iter().copied().zip(snaps.iter().copied()).collect();
+                let legs =
+                    net.directed_legs_to_snaps(*from_point, from, &targets, &profile, max_seconds);
+                for (cell, leg) in row.iter().zip(&legs) {
+                    match (cell, leg) {
+                        (Some((seconds, meters)), Some(leg)) => {
+                            assert_eq!(*seconds, leg.seconds, "{}", definition.name);
+                            assert_eq!(*meters, leg.network_meters, "{}", definition.name);
+                        }
+                        (None, None) => {}
+                        other => panic!("row/leg reachability diverged: {other:?}"),
+                    }
+                }
+            }
+            for (to_point, target) in points.iter().zip(&snaps) {
+                let Some(to) = target else { continue };
+                let column = net.directed_meters_from_snaps(&snaps, to, &profile, max_seconds);
+                let times = net.directed_times_from_snaps(&snaps, to, &profile, max_seconds);
+                for ((source_point, source), (cell, time)) in
+                    points.iter().zip(&snaps).zip(column.iter().zip(&times))
+                {
+                    assert_eq!(cell.map(|(s, _)| s), *time, "{}", definition.name);
+                    let Some(from) = source else { continue };
+                    let leg =
+                        net.directed_leg(*source_point, from, *to_point, to, &profile, max_seconds);
+                    match (cell, leg) {
+                        (Some((seconds, meters)), Some(leg)) => {
+                            assert_eq!(*seconds, leg.seconds, "{}", definition.name);
+                            // The same route, summed from the destination
+                            // side instead of the seed's: bit equality is
+                            // lost to the accumulation order, nothing else.
+                            let tolerance = 1e-9 * leg.network_meters.max(1.0);
+                            assert!(
+                                (*meters - leg.network_meters).abs() <= tolerance,
+                                "{}: {meters} vs {}",
+                                definition.name,
+                                leg.network_meters
+                            );
+                        }
+                        (None, None) => {}
+                        other => panic!("column/leg reachability diverged: {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn a_free_spatial_arc_disables_the_heuristic_but_not_correctness() {
     // A zero-length edge whose endpoints sit apart is free spatial movement:
     // no finite speed bounds it, so the goal bias switches off — and the

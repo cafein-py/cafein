@@ -3,12 +3,24 @@
 
 use super::*;
 
+/// The sentinel for a cost row's absent stop identity: a walking-direct
+/// cell never enters transit, and only pointset rows leave over an
+/// egress link.
+pub const NO_STOP: u32 = u32::MAX;
+
 /// Aggregated costs of the fastest journey to one destination.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CostRow {
     /// The destination's index: a stop index for stop matrices, a
     /// destination-point index for pointset matrices.
     pub to: u32,
+    /// The access stop the winning journey was seeded at; [`NO_STOP`]
+    /// for a cell that never entered transit.
+    pub access_stop: u32,
+    /// The stop the winning journey left the transit system at — the
+    /// chosen egress link's stop for pointset rows, the alighting stop
+    /// where known otherwise; [`NO_STOP`] when there is none.
+    pub egress_stop: u32,
     /// Travel time in seconds from the requested departure.
     pub seconds: u32,
     /// Number of transit legs; 0 for a destination reached on foot.
