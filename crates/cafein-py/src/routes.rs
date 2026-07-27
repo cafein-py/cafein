@@ -297,6 +297,85 @@ impl TransportNetwork {
         Ok(result.unbind())
     }
 
+    /// The street-policy time matrix core: per-origin pre-reduced access
+    /// arrays and per-destination pre-reduced egress arrays in, the flat
+    /// origins-major seconds out (`None` = unreachable). One `Request` per
+    /// origin through the rayon fan-out, then the egress fold per
+    /// destination — the points-matrix shape minus the walking machinery,
+    /// which the policy path replaces with its reductions. Stays on the
+    /// full transfer closure like every policy query. Internal until the
+    /// policy surface stabilises.
+    #[pyo3(signature = (access_rows, egress_rows, date, departure, max_transfers,
+                        exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![]))]
+    #[allow(clippy::too_many_arguments)]
+    fn _time_matrix_with_access(
+        &self,
+        py: Python<'_>,
+        access_rows: Vec<Vec<(String, u32)>>,
+        egress_rows: Vec<Vec<(String, u32)>>,
+        date: &str,
+        departure: &str,
+        max_transfers: u8,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
+    ) -> PyResult<Vec<Vec<Option<u32>>>> {
+        let departure = parse_time(departure)?;
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
+        let mut requests = Vec::with_capacity(access_rows.len());
+        for row in &access_rows {
+            let offsets = row
+                .iter()
+                .map(|(stop, seconds)| Ok((self.resolve_stop(stop)?, *seconds)))
+                .collect::<PyResult<Vec<_>>>()?;
+            requests.push(Request {
+                departure,
+                access: offsets,
+                egress: Vec::new(),
+                active_services: active_services.clone(),
+                active_services_previous: active_services_previous.clone(),
+                max_transfers,
+                exclusions: exclusions.clone(),
+            });
+        }
+        let mut egress = Vec::with_capacity(egress_rows.len());
+        for row in &egress_rows {
+            egress.push(
+                row.iter()
+                    .map(|(stop, seconds)| Ok((self.resolve_stop(stop)?, *seconds)))
+                    .collect::<PyResult<Vec<_>>>()?,
+            );
+        }
+        let matrix = py.allow_threads(|| {
+            let rows = Raptor.one_to_all_many(&self.build.timetable, &self.transfers, &requests);
+            rows.iter()
+                .map(|arrivals| {
+                    egress
+                        .iter()
+                        .map(|links| {
+                            let mut best = u32::MAX;
+                            for &(stop, seconds) in links {
+                                let Some(at_stop) = arrivals[stop.0 as usize] else {
+                                    continue;
+                                };
+                                let Some(arrival) =
+                                    at_stop.checked_add(seconds).filter(|&at| at != u32::MAX)
+                                else {
+                                    continue;
+                                };
+                                best = best.min(arrival);
+                            }
+                            (best != u32::MAX).then(|| best - departure)
+                        })
+                        .collect()
+                })
+                .collect()
+        });
+        Ok(matrix)
+    }
+
     /// Earliest arrivals from pre-reduced street access offsets — the
     /// street-policy path. The offsets arrive from the time-only reduction
     /// (`_reduced_street_offsets`), and the run relaxes the full transfer

@@ -1,5 +1,6 @@
 """StreetLegPolicy/VehiclePolicy validation and the time-only reduction."""
 
+import pandas as pd
 import pytest
 
 from cafein import StreetLegPolicy, VehiclePolicy
@@ -370,3 +371,197 @@ def test_the_public_policy_path_matches_a_hand_built_reduction(multimodal_networ
         ORIGIN, "2022-02-22", "08:30:00", street_policy=policy
     )
     assert public == seeded
+
+
+# --- The street-policy travel-time matrix ------------------------------------
+
+
+def _points_frame(coordinates):
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    return gpd.GeoDataFrame(
+        {"id": [f"p{i}" for i in range(len(coordinates))]},
+        geometry=[Point(lon, lat) for lat, lon in coordinates],
+        crs="EPSG:4326",
+    )
+
+
+MATRIX_POINTS = [(60.1690, 24.9320), (60.1795, 24.9520), (60.1580, 24.9350)]
+
+
+def test_policy_matrix_cells_reconcile_with_single_queries(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelTimeMatrix
+    from cafein import streets as _streets
+    from cafein.policy import reduction_modes
+
+    policy = StreetLegPolicy(
+        access={"walk": 1200, "bicycle": 900},
+        egress={"walk": 1200},
+        vehicles={
+            "bicycle": VehiclePolicy(source="own", side="origin", facilities="any_stop")
+        },
+    )
+    frame = TravelTimeMatrix(
+        multimodal_network,
+        _points_frame(MATRIX_POINTS),
+        _points_frame(MATRIX_POINTS),
+        "2022-02-22",
+        "08:30:00",
+        street_policy=policy,
+    )
+    core = multimodal_network._core
+    egress_modes = reduction_modes(policy, "egress", _streets.MAX_ACCESS_EGRESS_TIME)
+    cells = {(row.from_id, row.to_id): row.travel_time_s for row in frame.itertuples()}
+    for i, origin in enumerate(MATRIX_POINTS):
+        arrivals = multimodal_network.travel_times_from_coordinate(
+            origin, "2022-02-22", "08:30:00", street_policy=policy
+        )
+        for j, destination in enumerate(MATRIX_POINTS):
+            egress = {
+                stop: seconds
+                for stop, seconds, *_ in core._reduced_street_offsets(
+                    *destination, True, egress_modes
+                )
+            }
+            best = min(
+                (
+                    arrivals[stop] + seconds
+                    for stop, seconds in egress.items()
+                    if stop in arrivals
+                ),
+                default=None,
+            )
+            direct = core._multimodal_direct_matrix(
+                [origin], [destination], "walk", 1200.0
+            )[0][0][0]
+            if direct is not None:
+                best = direct if best is None else min(best, direct)
+            cell = cells[(f"p{i}", f"p{j}")]
+            assert (pd.isna(cell) and best is None) or cell == best
+
+
+def test_a_walking_only_policy_matrix_is_the_legacy_matrix(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelTimeMatrix
+
+    policy_frame = TravelTimeMatrix(
+        multimodal_network,
+        _points_frame(MATRIX_POINTS),
+        _points_frame(MATRIX_POINTS),
+        "2022-02-22",
+        "08:30:00",
+        street_policy=StreetLegPolicy(access={"walk": 1200}, egress={"walk": 1200}),
+    )
+    legacy_frame = TravelTimeMatrix(
+        multimodal_network,
+        _points_frame(MATRIX_POINTS),
+        _points_frame(MATRIX_POINTS),
+        "2022-02-22",
+        "08:30:00",
+        max_walking_time=1200,
+    )
+    key = ["from_id", "to_id"]
+    assert (
+        policy_frame.sort_values(key)
+        .reset_index(drop=True)
+        .equals(legacy_frame.sort_values(key).reset_index(drop=True))
+    )
+    # And the diagonal is a zero-length trip.
+    diagonal = policy_frame[policy_frame.from_id == policy_frame.to_id]
+    assert (diagonal.travel_time_s == 0).all()
+
+
+def test_policy_matrix_honours_exclusions(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelTimeMatrix
+
+    policy = StreetLegPolicy(
+        access={"walk": 900, "bicycle": 900},
+        egress={"walk": 900},
+        vehicles={
+            "bicycle": VehiclePolicy(source="own", side="origin", facilities="any_stop")
+        },
+    )
+    build = lambda **extra: TravelTimeMatrix(  # noqa: E731
+        multimodal_network,
+        _points_frame(MATRIX_POINTS[:1]),
+        _points_frame(MATRIX_POINTS[1:2]),
+        "2022-02-22",
+        "08:30:00",
+        street_policy=policy,
+        **extra,
+    )
+    unrestricted = build()
+    # Excluding a rich set of routes must not improve any cell.
+    routes = [str(route) for route in range(1, 120)]
+    restricted = build(exclude_routes=routes)
+    if len(restricted) and len(unrestricted):
+        assert restricted.travel_time_s.iloc[0] >= unrestricted.travel_time_s.iloc[0]
+
+
+def test_policy_matrix_rejects_incompatible_knobs(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelTimeMatrix
+
+    with pytest.raises(ValueError, match="does not combine"):
+        TravelTimeMatrix(
+            multimodal_network,
+            _points_frame(MATRIX_POINTS),
+            _points_frame(MATRIX_POINTS),
+            "2022-02-22",
+            "08:30:00",
+            street_policy=StreetLegPolicy(access={"walk": 1200}),
+            max_walking_time=900,
+        )
+
+
+def test_an_unsnapped_matrix_point_warns_and_yields_no_rows(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelTimeMatrix
+
+    points = MATRIX_POINTS + [(63.0, 28.0)]  # far outside the extract
+    policy = StreetLegPolicy(
+        access={"walk": 900, "bicycle": 900},
+        egress={"walk": 900},
+        vehicles={
+            "bicycle": VehiclePolicy(source="own", side="origin", facilities="any_stop")
+        },
+    )
+    with pytest.warns(UserWarning, match="origin"):
+        frame = TravelTimeMatrix(
+            multimodal_network,
+            _points_frame(points),
+            _points_frame(MATRIX_POINTS),
+            "2022-02-22",
+            "08:30:00",
+            street_policy=policy,
+        )
+    assert "p3" not in set(frame.from_id)
+    assert set(frame.from_id) >= {"p0", "p1", "p2"}
+
+
+def test_the_direct_walk_survives_a_walkless_access_policy(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelTimeMatrix
+
+    frame = TravelTimeMatrix(
+        multimodal_network,
+        _points_frame(MATRIX_POINTS[:1]),
+        _points_frame(MATRIX_POINTS[:1]),
+        "2022-02-22",
+        "08:30:00",
+        street_policy=StreetLegPolicy(
+            access={"bicycle": 900},
+            egress={"walk": 900},
+            vehicles={
+                "bicycle": VehiclePolicy(
+                    source="own", side="origin", facilities="any_stop"
+                )
+            },
+        ),
+    )
+    # The same coordinate is a zero-length direct walk whatever the
+    # access modes.
+    assert int(frame.travel_time_s.iloc[0]) == 0
