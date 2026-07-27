@@ -14,7 +14,10 @@
   multimodal graph — closed under the stop-to-stop transfers, ties to
   fewer paid rentals then declared order — and feeds the same
   earliest-arrival engine as today. A walking-only policy is the current
-  walking path, bit for bit.
+  walking path, bit for bit. ``TravelTimeMatrix(street_policy=...)`` runs
+  the same reduction per point-set origin and destination through the
+  engine's parallel fan-out, egress folded per destination and the direct
+  walking alternative over the same graph folded in.
 
 - A ``TransportNetwork`` can now carry the multimodal union street graph.
   ``from_gtfs(..., street_modes=("walk", "bicycle", "e_scooter"), dem=...)``

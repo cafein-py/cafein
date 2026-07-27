@@ -15,6 +15,9 @@ type StreetRow = (String, u32, u32, f64, f64);
 /// A mode's raw per-stop times beside the mode-masked links they used.
 type ModeRow = (Vec<Option<u32>>, Vec<Option<Snap>>);
 
+/// A direct street matrix beside its unsnapped origin/destination indices.
+type DirectMatrix = (Vec<Vec<Option<u32>>>, Vec<u32>, Vec<u32>);
+
 /// One reduced street choice: stop, seconds, winning mode, its link snap
 /// identity (edge, fraction, connector meters), and — when the transfer
 /// closure carried it — the seed stop the vehicle actually reached. The
@@ -812,6 +815,32 @@ impl TransportNetwork {
         edges
     }
 
+    /// The direct street times over the multimodal graph, for the policy
+    /// matrices' door-to-door walking alternative: origins × destinations
+    /// whole seconds under ``mode`` (``None`` beyond ``max_seconds``), plus
+    /// the unsnapped origin and destination indices — snap facts, not
+    /// reachability inferences. Internal.
+    fn _multimodal_direct_matrix(
+        &self,
+        py: Python<'_>,
+        origins: Vec<(f64, f64)>,
+        destinations: Vec<(f64, f64)>,
+        mode: &str,
+        max_seconds: f64,
+    ) -> PyResult<DirectMatrix> {
+        let profile = self.multimodal_profile(mode)?;
+        let network = self.multimodal.as_ref().expect("profile lookup checked");
+        Ok(py.allow_threads(|| {
+            network.directed_matrix(
+                &origins,
+                &destinations,
+                &profile,
+                max_seconds,
+                MULTIMODAL_STOP_SNAP,
+            )
+        }))
+    }
+
     /// The time-only street reduction (design §7.2): per stop, the fastest
     /// permitted choice across the policy's modes over the multimodal graph.
     /// ``modes`` arrive in declared order as ``(mode, max_seconds,
@@ -821,6 +850,7 @@ impl TransportNetwork {
     /// ``(stop_id, seconds, winning_mode)`` per reachable stop — the
     /// ``(stop, seconds)`` array the time engines consume, plus the mode the
     /// reconstruction sidecar keeps. Internal until the policy surface.
+    #[pyo3(signature = (latitude, longitude, egress, modes, exclude_stops = vec![]))]
     #[allow(clippy::type_complexity)]
     fn _reduced_street_offsets(
         &self,
@@ -829,6 +859,7 @@ impl TransportNetwork {
         longitude: f64,
         egress: bool,
         modes: Vec<(String, f64, bool, Option<Vec<String>>)>,
+        exclude_stops: Vec<String>,
     ) -> PyResult<Vec<ReducedChoice>> {
         let stop_count = self.build.timetable.stop_count() as usize;
         let mut best: Vec<Option<Winner>> = vec![None; stop_count];
@@ -885,6 +916,18 @@ impl TransportNetwork {
                  every policy mode",
             ));
         }
+        // A query-excluded stop takes no part: it neither keeps a choice nor
+        // feeds one through the transfer closure below — the engines drop
+        // direct seeds at excluded stops themselves, but a closure-derived
+        // seed would smuggle travel through one back in. The mask also
+        // guards the closure's targets, so a transfer cannot repopulate an
+        // excluded stop mid-pass and propagate onward from it.
+        let mut excluded = vec![false; stop_count];
+        for stop in &exclude_stops {
+            let index = self.resolve_stop(stop)?.0 as usize;
+            best[index] = None;
+            excluded[index] = true;
+        }
         // Close the reduction under the installed stop-to-stop transfers:
         // the engines never relax footpaths out of access-seeded stops,
         // because the walking access array is footpath-closed by
@@ -900,6 +943,9 @@ impl TransportNetwork {
             for transfer in self.transfers.from_stop(StopIdx(stop as u32)) {
                 let to = transfer.to.0 as usize;
                 let (source, target) = if egress { (to, stop) } else { (stop, to) };
+                if excluded[target] {
+                    continue;
+                }
                 let Some(winner) = best[source] else {
                     continue;
                 };
