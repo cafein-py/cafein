@@ -307,7 +307,7 @@ impl TransportNetwork {
     /// policy surface stabilises.
     #[pyo3(signature = (access_rows, egress_rows, date, departure, max_transfers,
                         exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![],
-                        transfer_mode = None))]
+                        transfer_mode = None, router = "auto"))]
     #[allow(clippy::too_many_arguments)]
     fn _time_matrix_with_access(
         &self,
@@ -321,6 +321,7 @@ impl TransportNetwork {
         exclude_trips: Vec<String>,
         exclude_stops: Vec<String>,
         transfer_mode: Option<(String, f64)>,
+        router: &str,
     ) -> PyResult<Vec<Vec<Option<u32>>>> {
         if transfer_mode.is_some() && !exclude_stops.is_empty() {
             // A rental-bearing merged edge hides its pickup and drop
@@ -361,8 +362,19 @@ impl TransportNetwork {
             );
         }
         let relaxed = self.policy_transfers(transfer_mode.as_ref())?;
+        let router = self.resolve_time_router(router, date, exclusions.is_some())?;
         let matrix = py.allow_threads(|| {
-            let rows = Raptor.one_to_all_many(&self.build.timetable, relaxed, &requests);
+            let rows = if router == "tbtr" {
+                let engine =
+                    self.tbtr_engine(relaxed, date, &active_services, &active_services_previous);
+                let accesses: Vec<Vec<(StopIdx, u32)>> = requests
+                    .iter()
+                    .map(|request| request.access.clone())
+                    .collect();
+                engine.one_to_all_many(departure, &accesses, max_transfers)
+            } else {
+                Raptor.one_to_all_many(&self.build.timetable, relaxed, &requests)
+            };
             rows.iter()
                 .map(|arrivals| {
                     egress
@@ -455,7 +467,7 @@ impl TransportNetwork {
     /// closure: the ULTRA shortcut set models *walking* egress, so policy
     /// queries stay off it until multimodal ULTRA arrives. Internal until
     /// the policy surface stabilises.
-    #[pyo3(signature = (access, date, departure, max_transfers, router = "raptor", transfer_mode = None))]
+    #[pyo3(signature = (access, date, departure, max_transfers, router = "auto", transfer_mode = None))]
     #[allow(clippy::too_many_arguments)]
     fn _travel_times_with_access(
         &self,
@@ -474,6 +486,9 @@ impl TransportNetwork {
             .collect::<PyResult<Vec<_>>>()?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
+        // The cached whole-day set is timetable-only, so it serves the
+        // merged transfer binding as-is.
+        let router = self.resolve_time_router(router, date, false)?;
         let arrivals = match router {
             "raptor" => {
                 let request = Request {
