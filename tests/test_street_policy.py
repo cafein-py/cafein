@@ -2056,3 +2056,75 @@ def test_merged_sets_are_engine_neutral(multimodal_transfers_network):
         access, "2022-02-22", "08:30:00", 7, router="tbtr", transfer_mode=binding
     )
     assert raptor == tbtr
+
+
+def test_policy_time_queries_auto_ride_the_cached_tbtr_set(
+    multimodal_network, artifact_cache
+):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TransportNetwork
+    from cafein import streets as _streets
+    from cafein.policy import reduction_modes
+
+    # A private copy: computing the caches mutates network state.
+    network = TransportNetwork.load(artifact_cache / "helsinki-multimodal.cafein")
+    network.compute_mode_transfers("e_scooter", 600)
+    core = network._core
+    modes = reduction_modes(
+        _transfer_policy(), "access", _streets.MAX_ACCESS_EGRESS_TIME
+    )
+    access = [
+        (stop, seconds)
+        for stop, seconds, *_ in core._reduced_street_offsets(*ORIGIN, False, modes)
+    ]
+    binding = ("e_scooter", 600.0)
+    args = (access, "2022-02-22", "08:30:00", 7)
+    before = core._travel_times_with_access(*args, transfer_mode=binding)
+    from cafein import TravelTimeMatrix
+
+    def public_frame():
+        return TravelTimeMatrix(
+            network,
+            _points_frame([ORIGIN]),
+            _points_frame([DEST]),
+            "2022-02-22",
+            "08:30:00",
+            street_policy=_transfer_policy(),
+        )
+
+    frame_before = public_frame()
+    # With the whole-day set cached, auto rides the trip-based engine —
+    # the merged binding included, answering identically.
+    core.compute_tbtr_transfers("2022-02-22")
+    assert core._travel_times_with_access(*args, transfer_mode=binding) == before
+    explicit = core._travel_times_with_access(
+        *args, router="raptor", transfer_mode=binding
+    )
+    assert explicit == before
+    rows = core._time_matrix_with_access(
+        [access], [[("1391124", 0)]], "2022-02-22", "08:30:00", 7, transfer_mode=binding
+    )
+    raptor_rows = core._time_matrix_with_access(
+        [access],
+        [[("1391124", 0)]],
+        "2022-02-22",
+        "08:30:00",
+        7,
+        transfer_mode=binding,
+        router="raptor",
+    )
+    assert rows == raptor_rows
+    # The public surface: an explicit router beside street_policy stays
+    # rejected — auto resolution is internal, never a user knob here —
+    # and the cached set leaves the public matrix's answers untouched.
+    with pytest.raises(ValueError, match="router"):
+        TravelTimeMatrix(
+            network,
+            _points_frame([ORIGIN]),
+            _points_frame([DEST]),
+            "2022-02-22",
+            "08:30:00",
+            street_policy=_transfer_policy(),
+            router="raptor",
+        )
+    assert public_frame().equals(frame_before)

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Street-policy **time queries auto-ride the cached trip-based set**:
+  with a whole-day TBTR cache (``compute_tbtr_transfers``) matching the
+  query's date, ``travel_times_from_coordinate(street_policy=...)`` and
+  the policy ``TravelTimeMatrix`` run on the trip-based engine — the
+  merged ``transfers=`` binding included, since the cache is
+  timetable-only and both engines now relax unclosed sets exactly.
+  Answers are engine-identical (pinned by tests); on the Helsinki
+  fixture the trip-based arm is ~1.1× faster on walking closures and
+  ~1.3× on merged sets per one-to-all. Exclusion queries keep RAPTOR,
+  as on the legacy paths.
+
 - The **trip-based engine serves merged transfer sets exactly**: its
   query-time footpath joins relaxed only from label-improving transit
   arrivals — the closure assumption the merged set cannot honor — so a
