@@ -45,6 +45,29 @@ pub(super) fn chain_tokens_into(
                 });
                 at = from_stop.0 as usize;
             }
+            Label::TransferFromRide {
+                from_stop,
+                duration,
+                trip,
+                board_position,
+                alight_position,
+                day_offset,
+            } => {
+                out.push(PathToken::Walk {
+                    from: from_stop.0,
+                    to: at as u32,
+                    duration,
+                });
+                out.push(PathToken::Ride {
+                    trip: trip.0,
+                    day_offset,
+                    board: board_position,
+                    alight: alight_position,
+                });
+                let pattern = timetable.trip_pattern(trip);
+                at = timetable.pattern_stops(pattern)[board_position as usize].0 as usize;
+                r -= 1;
+            }
             Label::Access {
                 departure,
                 duration,
@@ -89,6 +112,18 @@ pub(super) enum Label {
         from_stop: StopIdx,
         duration: u32,
     },
+    /// Walked from a transit arrival the exact phase relaxed (unclosed
+    /// transfer sets only). The ride rides along because `from_stop`'s
+    /// own label slot may hold a better earlier-transfer arrival that
+    /// shadows this ride — reconstruction cannot recover it from there.
+    TransferFromRide {
+        from_stop: StopIdx,
+        duration: u32,
+        trip: TripIdx,
+        board_position: u16,
+        alight_position: u16,
+        day_offset: u32,
+    },
 }
 
 /// RAPTOR state shared by the passes of one query.
@@ -115,6 +150,18 @@ pub(crate) struct Search<'a> {
     /// Reusable scratch for canonical-key comparisons on exact ties.
     key_scratch_a: Vec<PathToken>,
     key_scratch_b: Vec<PathToken>,
+    /// Whether the transfer set declared itself unclosed, switching the
+    /// transfer phase to relax from every transit arrival of the round
+    /// rather than only label-improving ones — a transfer-improved label
+    /// must not shadow a transit arrival's own walk extensions when the
+    /// closure contract cannot cover the composite.
+    exact_transfers: bool,
+    /// Exact-phase sidecar, `UNREACHED` when untouched this round: the
+    /// best transit arrival per stop and the ride behind it, kept even
+    /// when a better earlier-transfer label swallowed the label update.
+    transit_arrival: Vec<u32>,
+    transit_ride: Vec<(TripIdx, u16, u16, u32)>,
+    transit_touched: Vec<StopIdx>,
 }
 
 impl<'a> Search<'a> {
@@ -125,6 +172,8 @@ impl<'a> Search<'a> {
     ) -> Self {
         let stop_count = timetable.stop_count() as usize;
         let rounds = request.max_transfers as usize + 1;
+        let exact_transfers = !transfers.closed();
+        let sidecar = if exact_transfers { stop_count } else { 0 };
         Search {
             timetable,
             transfers,
@@ -139,6 +188,10 @@ impl<'a> Search<'a> {
             queued_patterns: Vec::new(),
             key_scratch_a: Vec::new(),
             key_scratch_b: Vec::new(),
+            exact_transfers,
+            transit_arrival: vec![UNREACHED; sidecar],
+            transit_ride: vec![(TripIdx(0), 0, 0, 0); sidecar],
+            transit_touched: Vec::new(),
         }
     }
 
@@ -159,6 +212,8 @@ impl<'a> Search<'a> {
         }
         self.marked.clear();
         self.is_marked.fill(false);
+        self.transit_arrival.fill(UNREACHED);
+        self.transit_touched.clear();
         // `queue_position` needs no reset: every pass restores it to
         // u16::MAX as patterns are dequeued.
     }
@@ -309,6 +364,12 @@ impl<'a> Search<'a> {
                         .map(|transfer| transfer.meters)
                         .unwrap_or(0.0);
                     at = from_stop;
+                }
+                Label::TransferFromRide { .. } => {
+                    // Exact-phase labels exist only under an unclosed
+                    // (merged mode-transfer) set, and every cost surface
+                    // rejects those until rental attribution lands.
+                    unreachable!("cost reconstruction walked an exact-phase transfer label")
                 }
                 Label::Access { .. } => {
                     if let Some(access) = access_meters {
@@ -506,6 +567,16 @@ impl<'a> Search<'a> {
         let arrival = timetable.trip_stop_times(trip)[position]
             .arrival
             .saturating_sub(day_offset);
+        if self.exact_transfers && arrival < self.transit_arrival[stop] {
+            // The sidecar keeps the round's best transit arrival even
+            // when a better label swallows the update below: the exact
+            // transfer phase relaxes walks from it regardless.
+            if self.transit_arrival[stop] == UNREACHED {
+                self.transit_touched.push(stops[position]);
+            }
+            self.transit_arrival[stop] = arrival;
+            self.transit_ride[stop] = (trip, board_position, position as u16, day_offset);
+        }
         if arrival < self.best[round][stop] {
             self.tau[round][stop] = arrival;
             for best in &mut self.best[round..] {
@@ -744,13 +815,40 @@ impl<'a> Search<'a> {
             // Relax one footpath hop from every stop improved by transit,
             // leaving from the transit arrivals as they stand now — a
             // transfer improving a marked stop must not chain into that
-            // stop's own outgoing transfers within the round.
-            let transit_marked: Vec<(StopIdx, u32)> = self
-                .marked
-                .iter()
-                .map(|&stop| (stop, self.tau[round][stop.0 as usize]))
-                .collect();
-            for (stop, departure_at_stop) in transit_marked {
+            // stop's own outgoing transfers within the round. An unclosed
+            // set relaxes from every transit arrival of the round instead:
+            // with no closure row covering the composite, a better
+            // earlier-transfer label must not shadow a transit arrival's
+            // own walk extensions. Such relaxations carry their ride in
+            // the label, and settle exact-tie challenges toward the
+            // incumbent.
+            type Ride = (TripIdx, u16, u16, u32);
+            let transit_marked: Vec<(StopIdx, u32, Option<Ride>)> = if self.exact_transfers {
+                let touched = std::mem::take(&mut self.transit_touched);
+                let rows = touched
+                    .iter()
+                    .map(|&stop| {
+                        let index = stop.0 as usize;
+                        (
+                            stop,
+                            self.transit_arrival[index],
+                            Some(self.transit_ride[index]),
+                        )
+                    })
+                    .collect();
+                for &stop in &touched {
+                    self.transit_arrival[stop.0 as usize] = UNREACHED;
+                }
+                self.transit_touched = touched;
+                self.transit_touched.clear();
+                rows
+            } else {
+                self.marked
+                    .iter()
+                    .map(|&stop| (stop, self.tau[round][stop.0 as usize], None))
+                    .collect()
+            };
+            for (stop, departure_at_stop, ride) in transit_marked {
                 for transfer in self.transfers.from_stop(stop) {
                     if self.stop_excluded(transfer.to) {
                         continue;
@@ -767,15 +865,30 @@ impl<'a> Search<'a> {
                         for best in &mut self.best[round..] {
                             best[to] = best[to].min(arrival);
                         }
-                        self.labels[round][to] = Label::Transfer {
-                            from_stop: stop,
-                            duration: transfer.duration,
+                        self.labels[round][to] = match ride {
+                            None => Label::Transfer {
+                                from_stop: stop,
+                                duration: transfer.duration,
+                            },
+                            Some((trip, board_position, alight_position, day_offset)) => {
+                                Label::TransferFromRide {
+                                    from_stop: stop,
+                                    duration: transfer.duration,
+                                    trip,
+                                    board_position,
+                                    alight_position,
+                                    day_offset,
+                                }
+                            }
                         };
                         if !self.is_marked[to] {
                             self.is_marked[to] = true;
                             self.marked.push(transfer.to);
                         }
-                    } else if arrival == self.tau[round][to] && arrival != UNREACHED {
+                    } else if ride.is_none()
+                        && arrival == self.tau[round][to]
+                        && arrival != UNREACHED
+                    {
                         let mut challenger = std::mem::take(&mut self.key_scratch_a);
                         let mut incumbent = std::mem::take(&mut self.key_scratch_b);
                         challenger.clear();
@@ -914,6 +1027,43 @@ impl<'a> Search<'a> {
                         arrival,
                     });
                     stop = from_stop;
+                }
+                Label::TransferFromRide {
+                    from_stop,
+                    duration,
+                    trip,
+                    board_position,
+                    alight_position,
+                    day_offset,
+                } => {
+                    // The walk leaves the carried ride's arrival, not
+                    // `from_stop`'s (possibly better) label.
+                    let arrival = self.tau[current_round][stop.0 as usize];
+                    legs.push(Leg::Transfer {
+                        from_stop,
+                        to_stop: stop,
+                        departure: arrival - duration,
+                        arrival,
+                    });
+                    let pattern = timetable.trip_pattern(trip);
+                    let pattern_stops = timetable.pattern_stops(pattern);
+                    let times = timetable.trip_stop_times(trip);
+                    let board_stop = pattern_stops[board_position as usize];
+                    legs.push(Leg::Transit {
+                        trip,
+                        board_stop,
+                        alight_stop: from_stop,
+                        board_position,
+                        alight_position,
+                        board_time: times[board_position as usize]
+                            .departure
+                            .saturating_sub(day_offset),
+                        alight_time: times[alight_position as usize]
+                            .arrival
+                            .saturating_sub(day_offset),
+                    });
+                    stop = board_stop;
+                    current_round -= 1;
                 }
                 Label::Access { .. } => {
                     legs.push(Leg::Access {

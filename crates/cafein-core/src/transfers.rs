@@ -16,12 +16,25 @@ pub struct Transfer {
 ///
 /// The input edge list must already be transitively closed (the footpath
 /// precompute's responsibility): routing relaxes one transfer hop per
-/// round and does not chain transfers.
+/// round and does not chain transfers. A set that cannot honor that
+/// contract — the budget-bounded merged mode-transfer set — declares
+/// itself with `mark_unclosed`, and RAPTOR switches to its exact
+/// transfer phase for it.
 #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Transfers {
     /// CSR offsets into `edges`, one entry per stop plus a tail.
     offsets: Vec<u32>,
     edges: Vec<Transfer>,
+    /// Whether the set satisfies the transitive-closure contract. Not
+    /// persisted: unclosed sets are runtime-only, so a loaded set is
+    /// always a closure.
+    #[serde(skip, default = "closed_default")]
+    closed: bool,
+}
+
+/// A deserialized transfer set is always a walking closure.
+fn closed_default() -> bool {
+    true
 }
 
 impl Transfers {
@@ -30,6 +43,7 @@ impl Transfers {
         Transfers {
             offsets: vec![0; stop_count as usize + 1],
             edges: Vec::new(),
+            closed: true,
         }
     }
 
@@ -88,7 +102,19 @@ impl Transfers {
         Ok(Transfers {
             offsets,
             edges: sorted,
+            closed: true,
         })
+    }
+
+    /// Declares that this set does not satisfy the transitive-closure
+    /// contract, switching RAPTOR to its exact transfer phase.
+    pub fn mark_unclosed(&mut self) {
+        self.closed = false;
+    }
+
+    /// Whether the set satisfies the transitive-closure contract.
+    pub fn closed(&self) -> bool {
+        self.closed
     }
 
     /// Number of transfer edges.

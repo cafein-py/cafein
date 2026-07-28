@@ -74,10 +74,10 @@ def test_shared_vehicles_state_their_availability():
     assert policy.vehicles["e_scooter"].availability == "unconstrained"
 
 
-def test_carrying_aboard_and_non_walk_transfers_are_not_yet():
+def test_carrying_aboard_and_own_vehicle_transfers_are_not_yet():
     with pytest.raises(ValueError, match="take_aboard"):
         own(take_aboard=True)
-    with pytest.raises(ValueError, match="not consumed yet"):
+    with pytest.raises(ValueError, match="possession state"):
         StreetLegPolicy(transfers={"bicycle": 900}, vehicles={"bicycle": own()})
 
 
@@ -312,8 +312,8 @@ def test_policy_and_legacy_walk_knobs_conflict(multimodal_network):
         )
 
 
-def test_transfers_and_string_selectors_are_not_yet():
-    with pytest.raises(ValueError, match="not consumed yet"):
+def test_walking_transfers_and_string_selectors_are_rejected():
+    with pytest.raises(ValueError, match="walking transfers"):
         StreetLegPolicy(transfers={"walk": 900})
     with pytest.raises(ValueError, match="not a known selector"):
         VehiclePolicy(source="own", side="origin", facilities="bicycle_parking")
@@ -1576,3 +1576,251 @@ def test_the_shipped_street_factors_resolve_by_service_model():
     assert emissions.street_factor(
         "e_scooter", service_model="private"
     ) == pytest.approx(36.0)
+
+
+def _transfer_policy(budget=600):
+    return StreetLegPolicy(
+        access={"walk": 900},
+        egress={"walk": 900},
+        transfers={"e_scooter": budget},
+        vehicles={"e_scooter": shared()},
+    )
+
+
+def test_transfer_policies_take_shared_modes_only():
+    with pytest.raises(ValueError, match="walking transfers"):
+        StreetLegPolicy(transfers={"walk": 600})
+    with pytest.raises(ValueError, match="possession state"):
+        StreetLegPolicy(
+            transfers={"bicycle": 600},
+            vehicles={"bicycle": own()},
+        )
+    with pytest.raises(ValueError, match="vehicle terms"):
+        StreetLegPolicy(transfers={"e_scooter": 600})
+    with pytest.raises(ValueError, match="one shared transfer mode"):
+        StreetLegPolicy(
+            transfers={"e_scooter": 600, "bicycle": 500},
+            vehicles={"e_scooter": shared(), "bicycle": shared()},
+        )
+    with pytest.raises(ValueError, match="any_stop"):
+        StreetLegPolicy(
+            transfers={"e_scooter": 600},
+            vehicles={
+                "e_scooter": VehiclePolicy(
+                    source="shared",
+                    facilities=("1230109",),
+                    availability="unconstrained",
+                )
+            },
+        )
+    policy = _transfer_policy()
+    assert policy.transfers == {"e_scooter": 600.0}
+    assert "transfers={'e_scooter': 600.0}" in repr(policy)
+
+
+def test_transfers_need_the_matching_merged_set(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+
+    with pytest.raises(ValueError, match="compute_mode_transfers"):
+        multimodal_network.route_between_coordinates(
+            ORIGIN,
+            DEST,
+            "2022-02-22",
+            "08:30:00",
+            street_policy=_transfer_policy(),
+        )
+
+
+def test_a_mismatched_transfer_binding_is_rejected(multimodal_transfers_network):
+    pytest.importorskip("cafein._cafein")
+
+    with pytest.raises(ValueError, match="bound to"):
+        multimodal_transfers_network.route_between_coordinates(
+            ORIGIN,
+            DEST,
+            "2022-02-22",
+            "08:30:00",
+            street_policy=_transfer_policy(budget=500),
+        )
+
+
+def test_the_merged_set_preserves_the_walking_closure(multimodal_transfers_network):
+    pytest.importorskip("cafein._cafein")
+
+    core = multimodal_transfers_network._core
+    mode, budget, edges, rented = core._mode_transfer_binding
+    assert (mode, budget) == ("e_scooter", 600.0)
+    walking = len(core._transfer_edges())
+    # Never weaker than the set it extends: every walking pair survives,
+    # rentals only add or improve.
+    assert edges >= walking
+    assert 0 < rented < edges
+
+
+def test_rented_transfers_improve_arrivals_everywhere(multimodal_transfers_network):
+    pytest.importorskip("cafein._cafein")
+
+    from cafein import streets as _streets
+    from cafein.policy import reduction_modes
+
+    core = multimodal_transfers_network._core
+    modes = reduction_modes(
+        _transfer_policy(), "access", _streets.MAX_ACCESS_EGRESS_TIME
+    )
+    access = [
+        (stop, seconds)
+        for stop, seconds, *_ in core._reduced_street_offsets(*ORIGIN, False, modes)
+    ]
+    walking = core._travel_times_with_access(access, "2022-02-22", "08:30:00", 7)
+    rented = core._travel_times_with_access(
+        access, "2022-02-22", "08:30:00", 7, transfer_mode=("e_scooter", 600.0)
+    )
+    # Identical access seeds, one relaxed set swapped for the other: the
+    # merged set is a superset of the walking closure, so arrivals are
+    # monotone — never later, somewhere strictly earlier.
+    assert set(walking) <= set(rented)
+    assert all(rented[stop] <= seconds for stop, seconds in walking.items())
+    assert any(rented[stop] < seconds for stop, seconds in walking.items())
+
+
+def test_rented_transfer_legs_split_from_their_tokens(multimodal_transfers_network):
+    pytest.importorskip("cafein._cafein")
+
+    journeys = multimodal_transfers_network.route_between_coordinates(
+        ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=_transfer_policy()
+    )
+    scooter = [
+        leg
+        for journey in journeys
+        for leg in journey["legs"]
+        if leg["type"] == "transfer" and leg.get("mode") == "e_scooter"
+    ]
+    assert scooter, "somewhere the rental beats walking a transfer"
+    for leg in scooter:
+        assert leg["arrival_s"] > leg["departure_s"]
+        assert leg["distance_m"] == pytest.approx(
+            leg["network_distance_m"] + leg["connector_distance_m"]
+        )
+    matched = 0
+    for journey in journeys:
+        runs, run = [], []
+        for leg in journey["legs"]:
+            if leg["type"] == "transfer":
+                run.append(leg)
+            elif run:
+                runs.append(run)
+                run = []
+        if run:
+            runs.append(run)
+        for run in runs:
+            rides = [leg for leg in run if leg.get("mode") == "e_scooter"]
+            if len(rides) != 1:
+                # A zero-ride composition can put the access-side and
+                # egress-side transfer splits back to back; the outer
+                # stop pairs are not recoverable from such a run.
+                continue
+            # The ride leg spans exactly the token's pickup-to-drop
+            # stretch with the token's own distances; the token is keyed
+            # by the relaxed edge's outer stop pair.
+            (ride,) = rides
+            token = multimodal_transfers_network._core._mode_transfer_token(
+                run[0]["from_stop"], run[-1]["to_stop"]
+            )
+            pickup, drop, ride_seconds, ride_network, ride_total = token[:5]
+            assert (ride["from_stop"], ride["to_stop"]) == (pickup, drop)
+            assert ride["arrival_s"] - ride["departure_s"] == ride_seconds
+            assert ride["distance_m"] == pytest.approx(ride_total)
+            assert ride["network_distance_m"] == pytest.approx(ride_network)
+            matched += 1
+        for before, after in zip(journey["legs"], journey["legs"][1:]):
+            assert before["arrival_s"] <= after["departure_s"]
+    assert matched, "at least one mid-journey rental transfer verifies its token"
+
+
+def test_the_transfer_matrix_reconciles_with_single_queries(
+    multimodal_transfers_network,
+):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelTimeMatrix
+
+    policy = _transfer_policy()
+    matrix = TravelTimeMatrix(
+        multimodal_transfers_network,
+        _points_frame([ORIGIN]),
+        _points_frame([DEST]),
+        "2022-02-22",
+        "08:30:00",
+        street_policy=policy,
+    )
+    journeys = multimodal_transfers_network.route_between_coordinates(
+        ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=policy
+    )
+    fastest = min(j["arrival_s"] - j["departure_s"] for j in journeys)
+    assert int(matrix["travel_time_s"].iloc[0]) == fastest
+
+
+def test_transfers_are_rejected_on_the_mc_and_cost_paths(multimodal_transfers_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries, TravelCostMatrix
+
+    with pytest.raises(ValueError, match="emissions-aware transfer stage"):
+        DetailedItineraries(
+            multimodal_transfers_network,
+            _points_frame([ORIGIN]),
+            _points_frame([DEST]),
+            "2022-02-22",
+            "08:30:00",
+            candidates="pareto",
+            street_policy=_transfer_policy(),
+            geometries=False,
+        )
+    with pytest.raises(ValueError, match="cost matrix"):
+        TravelCostMatrix(
+            multimodal_transfers_network,
+            _points_frame([ORIGIN]),
+            _points_frame([DEST]),
+            "2022-02-22",
+            "08:30:00",
+            street_policy=_transfer_policy(),
+        )
+
+
+def test_stop_exclusions_do_not_combine_with_transfers(multimodal_transfers_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelTimeMatrix
+
+    with pytest.raises(ValueError, match="exclusion-aware"):
+        multimodal_transfers_network.route_between_coordinates(
+            ORIGIN,
+            DEST,
+            "2022-02-22",
+            "08:30:00",
+            street_policy=_transfer_policy(),
+            exclude_stops=["1230109"],
+        )
+    with pytest.raises(ValueError, match="exclusion-aware"):
+        TravelTimeMatrix(
+            multimodal_transfers_network,
+            _points_frame([ORIGIN]),
+            _points_frame([DEST]),
+            "2022-02-22",
+            "08:30:00",
+            street_policy=_transfer_policy(),
+            exclude_stops=["1230109"],
+        )
+
+
+def test_replacing_the_closure_drops_the_merged_set(multimodal_network, artifact_cache):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TransportNetwork
+
+    network = TransportNetwork.load(artifact_cache / "helsinki-multimodal.cafein")
+    network.compute_mode_transfers("e_scooter", 600)
+    assert network._core._mode_transfer_binding is not None
+    # The merged set folded the replaced closure; it must not survive.
+    network._core.set_transfers([])
+    assert network._core._mode_transfer_binding is None
+    with pytest.raises(ValueError, match="compute_mode_transfers"):
+        network.route_between_coordinates(
+            ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=_transfer_policy()
+        )

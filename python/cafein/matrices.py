@@ -492,9 +492,12 @@ class TravelTimeMatrix(pd.DataFrame):
     ``street_policy=`` (a ``cafein.StreetLegPolicy``) opens the access
     and egress to the policy's street modes over the carried multimodal
     graph: point-set origins and destinations only, exclusions honoured,
-    a walking-only policy identical to the legacy walking matrix. It
-    conflicts with the walking knobs, ``router``, and the departure-window
-    parameters, which are rejected rather than silently ignored.
+    a walking-only policy identical to the legacy walking matrix. With
+    ``transfers={mode: budget}`` the matrix relaxes the merged
+    mode-transfer set of ``TransportNetwork.compute_mode_transfers``,
+    which must be computed with exactly that binding. It conflicts with
+    the walking knobs, ``router``, and the departure-window parameters,
+    which are rejected rather than silently ignored.
     """
 
     @property
@@ -1209,6 +1212,10 @@ def _walking_only_policy(policy):
     egress walking budgets run over the multimodal graph instead."""
     from cafein import streets as _streets
 
+    if policy.transfers:
+        # Shared intermediate transfers change the relaxed transfer set;
+        # no walking-only fast path applies.
+        return False, None
     sides = [
         side if side is not None else {"walk": _streets.MAX_ACCESS_EGRESS_TIME}
         for side in (policy.access, policy.egress)
@@ -1239,6 +1246,7 @@ def _policy_time_columns(
     """The street-policy travel-time matrix columns: per-point reductions
     through the engine fan-out, the direct walking alternative folded in."""
     from cafein import streets as _streets
+    from cafein.network import _policy_transfer_mode
     from cafein.policy import reduction_modes
 
     core = network._core
@@ -1266,6 +1274,7 @@ def _policy_time_columns(
     origin_points = origin_points[rows_slice]
     access_modes = reduction_modes(policy, "access", _streets.MAX_ACCESS_EGRESS_TIME)
     egress_modes = reduction_modes(policy, "egress", _streets.MAX_ACCESS_EGRESS_TIME)
+    transfer_mode = _policy_transfer_mode(policy)
 
     def reduced(points, egress, modes):
         rows, unsnapped = [], []
@@ -1280,6 +1289,7 @@ def _policy_time_columns(
                             egress,
                             modes,
                             exclude_stops=list(exclude_stops),
+                            transfer_mode=transfer_mode,
                         )
                     ]
                 )
@@ -1304,6 +1314,7 @@ def _policy_time_columns(
         exclude_routes=list(exclude_routes),
         exclude_trips=list(exclude_trips),
         exclude_stops=list(exclude_stops),
+        transfer_mode=transfer_mode,
     )
     # Walking directly can beat riding, exactly as in the walking matrix;
     # the alternative runs over the same multimodal graph at the policy's
@@ -1395,6 +1406,13 @@ def _policy_cost_columns(
     from cafein import emissions
     from cafein import streets as _streets
     from cafein.policy import reduction_modes
+
+    if policy.transfers:
+        raise ValueError(
+            "street_policy transfers= is not wired into the cost matrix "
+            "yet; its per-pair rental attribution arrives with the "
+            "emissions-aware transfer stage"
+        )
 
     core = network._core
     if not core.has_multimodal_streets:

@@ -26,6 +26,10 @@ type StreetLegParts = (u32, f64, f64, Option<Py<PyBytes>>);
 /// path when geometries were asked for.
 type TransferLegParts = (u32, f64, Option<Py<PyBytes>>);
 
+/// A rental transfer token's parts: pickup and drop stops, the ride's
+/// seconds and meters, and the walking split around it.
+type RentalTokenParts = (String, String, u32, f64, f64, u32, u32);
+
 /// One reduced street choice: stop, seconds, winning mode, its link snap
 /// identity (edge, fraction, connector meters), and — when the transfer
 /// closure carried it — the seed stop the vehicle actually reached. The
@@ -157,6 +161,7 @@ impl TransportNetwork {
             multimodal_modes: None,
             multimodal_links: std::sync::OnceLock::new(),
             multimodal_profiles: std::sync::Mutex::new(Vec::new()),
+            mode_transfers: None,
         })
     }
 
@@ -540,6 +545,8 @@ impl TransportNetwork {
         }
         self.transfers = Transfers::from_edges(self.build.timetable.stop_count(), &edges)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        // The merged mode-transfer set folded the old closure; recompute.
+        self.mode_transfers = None;
         Ok(())
     }
 
@@ -599,6 +606,8 @@ impl TransportNetwork {
         }
         self.transfers = Transfers::from_edges(self.build.timetable.stop_count(), &edges)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        // The merged mode-transfer set folded the old closure; recompute.
+        self.mode_transfers = None;
         Ok(())
     }
 
@@ -789,6 +798,8 @@ impl TransportNetwork {
         self.multimodal_elevation = elevation;
         self.multimodal_modes = Some(modes);
         self.multimodal_links = std::sync::OnceLock::new();
+        // The merged mode-transfer set rode the old graph; recompute.
+        self.mode_transfers = None;
         self.multimodal_profiles = std::sync::Mutex::new(Vec::new());
         Ok(())
     }
@@ -999,20 +1010,22 @@ impl TransportNetwork {
     /// walked path)``, or ``None`` when the closure holds no such edge — the
     /// via leg of a closure-carried street choice. The path draws over the
     /// walking street network, like every transfer leg. Internal.
+    #[pyo3(signature = (from_stop, to_stop, geometries, transfer_mode = None))]
     fn _transfer_leg(
         &self,
         py: Python<'_>,
         from_stop: &str,
         to_stop: &str,
         geometries: bool,
+        transfer_mode: Option<(String, f64)>,
     ) -> PyResult<Option<TransferLegParts>> {
         let from = self.resolve_stop(from_stop)?;
         let to = self.resolve_stop(to_stop)?;
         // Transfers are deduplicated per stop pair at construction
         // (`Transfers::from_edges` keeps the minimum-duration edge), so
         // the one edge found is the one the reduction relaxed.
-        let Some(edge) = self
-            .transfers
+        let set = self.policy_transfers(transfer_mode.as_ref())?;
+        let Some(edge) = set
             .from_stop(from)
             .iter()
             .find(|transfer| transfer.to == to)
@@ -1030,6 +1043,33 @@ impl TransportNetwork {
         Ok(Some((edge.duration, edge.meters, geometry)))
     }
 
+    /// The rental leg behind a merged transfer edge, or ``None`` for a
+    /// pure walking edge: ``(pickup_stop, drop_stop, ride_seconds,
+    /// ride_network_m, ride_total_m, pre_walk_seconds,
+    /// post_walk_seconds)`` — the reconstruction splits such a transfer
+    /// into its walk–ride–walk legs. Internal.
+    fn _mode_transfer_token(
+        &self,
+        from_stop: &str,
+        to_stop: &str,
+    ) -> PyResult<Option<RentalTokenParts>> {
+        let from = self.resolve_stop(from_stop)?;
+        let to = self.resolve_stop(to_stop)?;
+        Ok(self.mode_transfers.as_ref().and_then(|held| {
+            held.tokens.get(&(from.0, to.0)).map(|token| {
+                (
+                    self.public_stop_id(token.pickup),
+                    self.public_stop_id(token.drop),
+                    token.ride_seconds,
+                    token.ride_network_meters,
+                    token.ride_total_meters,
+                    token.pre_seconds,
+                    token.post_seconds,
+                )
+            })
+        }))
+    }
+
     /// The time-only street reduction (design §7.2): per stop, the fastest
     /// permitted choice across the policy's modes over the multimodal graph.
     /// ``modes`` arrive in declared order as ``(mode, max_seconds,
@@ -1043,8 +1083,9 @@ impl TransportNetwork {
     /// the winning mode, its link snap identity, and, for a
     /// closure-carried choice, the seed stop the vehicle actually
     /// reached (``None`` when direct). Internal until the policy surface.
-    #[pyo3(signature = (latitude, longitude, egress, modes, exclude_stops = vec![]))]
+    #[pyo3(signature = (latitude, longitude, egress, modes, exclude_stops = vec![], transfer_mode = None))]
     #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments)]
     fn _reduced_street_offsets(
         &self,
         py: Python<'_>,
@@ -1053,6 +1094,7 @@ impl TransportNetwork {
         egress: bool,
         modes: Vec<(String, f64, bool, Option<Vec<String>>)>,
         exclude_stops: Vec<String>,
+        transfer_mode: Option<(String, f64)>,
     ) -> PyResult<Vec<ReducedChoice>> {
         let best = self.reduce_street_choices(
             py,
@@ -1062,6 +1104,7 @@ impl TransportNetwork {
             &modes,
             &exclude_stops,
             false,
+            transfer_mode.as_ref(),
         )?;
         Ok(best
             .into_iter()
@@ -1100,8 +1143,9 @@ impl TransportNetwork {
     /// link_edge, link_fraction, connector_meters, vehicle_network_m,
     /// vehicle_connector_m, walk_m, via_stop)`` per kept point, per-stop
     /// points sorted by seconds. Internal.
-    #[pyo3(signature = (latitude, longitude, egress, modes, exclude_stops = vec![]))]
+    #[pyo3(signature = (latitude, longitude, egress, modes, exclude_stops = vec![], transfer_mode = None))]
     #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments)]
     fn _pareto_street_rows(
         &self,
         py: Python<'_>,
@@ -1110,6 +1154,7 @@ impl TransportNetwork {
         egress: bool,
         modes: Vec<(String, f64, bool, Option<Vec<String>>, f64)>,
         exclude_stops: Vec<String>,
+        transfer_mode: Option<(String, f64)>,
     ) -> PyResult<Vec<ParetoRow>> {
         let stop_count = self.build.timetable.stop_count() as usize;
         let mut frontiers: Vec<Vec<ParetoChoice>> = vec![Vec::new(); stop_count];
@@ -1180,9 +1225,10 @@ impl TransportNetwork {
             frontiers[index].clear();
             excluded[index] = true;
         }
+        let closure = self.policy_transfers(transfer_mode.as_ref())?;
         let seeds = frontiers.clone();
         for stop in 0..stop_count {
-            for transfer in self.transfers.from_stop(StopIdx(stop as u32)) {
+            for transfer in closure.from_stop(StopIdx(stop as u32)) {
                 let to = transfer.to.0 as usize;
                 let (source, target) = if egress { (to, stop) } else { (stop, to) };
                 if excluded[target] {
@@ -1249,8 +1295,9 @@ impl TransportNetwork {
     /// splits network and connector meters, and a closure-carried choice
     /// adds the walked transfer edge to ``walk_m``. Seconds are
     /// identical to ``_reduced_street_offsets`` cell for cell. Internal.
-    #[pyo3(signature = (latitude, longitude, egress, modes, exclude_stops = vec![]))]
+    #[pyo3(signature = (latitude, longitude, egress, modes, exclude_stops = vec![], transfer_mode = None))]
     #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments)]
     fn _reduced_street_rows(
         &self,
         py: Python<'_>,
@@ -1259,6 +1306,7 @@ impl TransportNetwork {
         egress: bool,
         modes: Vec<(String, f64, bool, Option<Vec<String>>)>,
         exclude_stops: Vec<String>,
+        transfer_mode: Option<(String, f64)>,
     ) -> PyResult<Vec<ReducedRow>> {
         let best = self.reduce_street_choices(
             py,
@@ -1268,6 +1316,7 @@ impl TransportNetwork {
             &modes,
             &exclude_stops,
             true,
+            transfer_mode.as_ref(),
         )?;
         Ok(best
             .into_iter()
@@ -1295,6 +1344,104 @@ impl TransportNetwork {
                 })
             })
             .collect())
+    }
+
+    /// Computes and installs the merged shared-vehicle transfer set
+    /// (stage 15a): per stop with a street link for ``mode``, one
+    /// meters-tracking directed search over the multimodal graph yields
+    /// the rental candidate edges to every other link within
+    /// ``max_seconds``; the core merge folds them into the walking
+    /// closure and re-closes under the one-rental-per-transfer contract
+    /// (`merge_mode_transfers`), the whole movement bounded by
+    /// ``max_seconds``. The set is runtime state bound to the exact
+    /// mode and budget — a policy query only relaxes it when its
+    /// ``transfers=`` matches, and it is not persisted yet. Heavy
+    /// precompute (one directed search per linked stop). Internal until
+    /// the 15b surface.
+    fn _compute_mode_transfers(
+        &mut self,
+        py: Python<'_>,
+        mode: &str,
+        max_seconds: f64,
+    ) -> PyResult<(usize, usize)> {
+        if mode == "walk" {
+            return Err(PyValueError::new_err(
+                "walking transfers are the installed set; mode transfers \
+                 take a shared vehicle mode",
+            ));
+        }
+        if !max_seconds.is_finite() || max_seconds <= 0.0 {
+            return Err(PyValueError::new_err(
+                "max_seconds must be a positive, finite transfer budget",
+            ));
+        }
+        let profile = self.multimodal_profile(mode)?;
+        let network = self.multimodal.as_ref().expect("profile lookup checked");
+        let links = self.mode_link_targets(network, profile.definition.mode.bit());
+        let stop_count = self.build.timetable.stop_count();
+        let (edges, tokens) = py.allow_threads(|| {
+            use rayon::prelude::*;
+            let rentals: Vec<Vec<cafein_core::mode_transfers::RentalEdge>> = (0..stop_count
+                as usize)
+                .into_par_iter()
+                .map(|stop| {
+                    let Some(from) = links[stop].as_ref() else {
+                        return Vec::new();
+                    };
+                    network
+                        .directed_meters_to_snaps(from, &links, &profile, max_seconds)
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(target, cell)| {
+                            if target == stop {
+                                return None;
+                            }
+                            let (seconds, network_meters) = cell?;
+                            let link = links[target].as_ref()?;
+                            Some(cafein_core::mode_transfers::RentalEdge {
+                                to: target as u32,
+                                seconds,
+                                network_meters,
+                                total_meters: network_meters + from.connector + link.connector,
+                            })
+                        })
+                        .collect()
+                })
+                .collect();
+            cafein_core::mode_transfers::merge_mode_transfers(
+                &self.transfers,
+                &rentals,
+                stop_count,
+                max_seconds.floor() as u32,
+            )
+        });
+        let mut set = Transfers::from_edges(stop_count, &edges)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        // Budget-bounded rental rows cannot close over walks past the
+        // budget; RAPTOR runs its exact transfer phase for this set.
+        set.mark_unclosed();
+        let counts = (set.edge_count(), tokens.len());
+        self.mode_transfers = Some(ModeTransferSet {
+            mode: mode.to_owned(),
+            budget: max_seconds,
+            set,
+            tokens,
+        });
+        Ok(counts)
+    }
+
+    /// The installed mode-transfer binding as ``(mode, budget,
+    /// edge_count, rental_token_count)``, or ``None``. Internal.
+    #[getter]
+    fn _mode_transfer_binding(&self) -> Option<(String, f64, usize, usize)> {
+        self.mode_transfers.as_ref().map(|held| {
+            (
+                held.mode.clone(),
+                held.budget,
+                held.set.edge_count(),
+                held.tokens.len(),
+            )
+        })
     }
 
     /// Builds and installs a contraction hierarchy over the walking graph, so
@@ -1819,6 +1966,29 @@ impl TransportNetwork {
             })
     }
 
+    /// The transfer set a policy query relaxes: the installed walking
+    /// closure, or — under a matching ``transfers=`` binding — the
+    /// merged mode-transfer set. A mismatched or missing merged set is
+    /// an error, never a silent walking fallback.
+    pub(super) fn policy_transfers(
+        &self,
+        transfer_mode: Option<&(String, f64)>,
+    ) -> PyResult<&Transfers> {
+        let Some((mode, budget)) = transfer_mode else {
+            return Ok(&self.transfers);
+        };
+        match &self.mode_transfers {
+            Some(held) if held.mode == *mode && held.budget == *budget => Ok(&held.set),
+            Some(held) => Err(PyValueError::new_err(format!(
+                "the computed mode-transfer set is bound to ('{}', {} s), not                  ('{mode}', {budget} s); recompute with compute_mode_transfers",
+                held.mode, held.budget
+            ))),
+            None => Err(PyValueError::new_err(
+                "street_policy transfers= needs the merged transfer set;                  compute it with compute_mode_transfers(mode, budget)",
+            )),
+        }
+    }
+
     /// The shared street reduction behind `_reduced_street_offsets` and
     /// `_reduced_street_rows` (design §7.2): per stop, the fastest
     /// permitted choice across the policy's modes, closed under the
@@ -1836,6 +2006,7 @@ impl TransportNetwork {
         modes: &[(String, f64, bool, Option<Vec<String>>)],
         exclude_stops: &[String],
         with_meters: bool,
+        transfer_mode: Option<&(String, f64)>,
     ) -> PyResult<Vec<Option<Winner>>> {
         let stop_count = self.build.timetable.stop_count() as usize;
         let mut best: Vec<Option<Winner>> = vec![None; stop_count];
@@ -1934,9 +2105,10 @@ impl TransportNetwork {
         // two installed edges would walk beyond that cutoff. Every carried
         // choice is thus its seed's direct time plus exactly one installed
         // transfer, whatever the stop order.
+        let closure = self.policy_transfers(transfer_mode)?;
         let seeds = best.clone();
         for stop in 0..stop_count {
-            for transfer in self.transfers.from_stop(StopIdx(stop as u32)) {
+            for transfer in closure.from_stop(StopIdx(stop as u32)) {
                 let to = transfer.to.0 as usize;
                 let (source, target) = if egress { (to, stop) } else { (stop, to) };
                 if excluded[target] {

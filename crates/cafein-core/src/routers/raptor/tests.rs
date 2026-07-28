@@ -980,3 +980,72 @@ fn range_profiles_previous_day_over_midnight_trips() {
         .collect();
     assert_eq!(profile, vec![(3_600, 4_200, 1)]);
 }
+
+/// An unclosed set must not let a better transfer label shadow a transit
+/// arrival's own walk extensions. Stop 2 is reached faster by a round-1
+/// transfer row (arr 25), yet the round-2 ride into it (arr 60) still
+/// extends over the walking row to stop 3 — no closure row covers that
+/// composite, so under the closure contract stop 3 stays unreached.
+#[test]
+fn unclosed_sets_relax_walks_from_shadowed_transit_arrivals() {
+    let mut builder = TimetableBuilder::new(4);
+    let first = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let second = builder.add_pattern(&[StopIdx(1), StopIdx(2)], 1).unwrap();
+    builder
+        .add_trip(first, vec![time(10), time(20)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(second, vec![time(26), time(60)], 1, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let edges = [
+        (StopIdx(1), StopIdx(2), 5, 5.0),
+        (StopIdx(2), StopIdx(3), 100, 100.0),
+    ];
+    let closed = Transfers::from_edges(4, &edges).unwrap();
+    let mut unclosed = Transfers::from_edges(4, &edges).unwrap();
+    unclosed.mark_unclosed();
+    let request = Request {
+        departure: 0,
+        access: vec![(StopIdx(0), 0)],
+        egress: vec![(StopIdx(3), 0)],
+        active_services: vec![true],
+        active_services_previous: Vec::new(),
+        max_transfers: 3,
+        exclusions: None,
+    };
+    assert_eq!(Raptor.one_to_all(&timetable, &closed, &request)[3], None);
+    assert_eq!(
+        Raptor.one_to_all(&timetable, &unclosed, &request)[3],
+        Some(160)
+    );
+    let journeys = Raptor.route(&timetable, &unclosed, &request);
+    let journey = journeys
+        .iter()
+        .find(|journey| journey.arrival == 160)
+        .unwrap();
+    assert_eq!(journey.rides(), 2);
+    // The walk leaves the shadowed ride's arrival at 60, not the faster
+    // transfer label's 25.
+    assert_eq!(
+        journey.legs[3],
+        Leg::Transfer {
+            from_stop: StopIdx(2),
+            to_stop: StopIdx(3),
+            departure: 60,
+            arrival: 160,
+        }
+    );
+    assert_eq!(
+        journey.legs[2],
+        Leg::Transit {
+            trip: TripIdx(1),
+            board_stop: StopIdx(1),
+            alight_stop: StopIdx(2),
+            board_position: 0,
+            alight_position: 1,
+            board_time: 26,
+            alight_time: 60,
+        }
+    );
+}
