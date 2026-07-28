@@ -544,42 +544,34 @@ def test_emission_components_select_a_subset(streets, origins):
     assert np.allclose(vehicle_only.emissions[off], full.emissions[off] * (5.0 / 20.0))
 
 
-@pytest.mark.parametrize("mode", ["walk", "bicycle", "e_bike", "e_scooter"])
-def test_default_full_lca_is_unresolved_not_zero(streets, origins, mode):
-    # No micromobility number ships without a source: the default full-LCA
-    # request warns exactly once and reports NA, never a silent zero.
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        costs = TravelCostMatrix(streets, origins, transport_mode=mode)
-    unresolved = [w for w in caught if "unresolved" in str(w.message)]
-    assert len(unresolved) == 1
-    assert costs.emissions.isna().all()
+@pytest.mark.parametrize(
+    ("mode", "per_km"),
+    # The shipped sourced defaults: ITF "Good to Go?" components on the
+    # Finland 2020 mix (via cafein-lca), the conventional bicycle's
+    # dietary 21 g/km on top, walking the zero baseline.
+    [("walk", 0.0), ("bicycle", 37.0), ("e_bike", 25.0), ("e_scooter", 36.0)],
+)
+def test_default_full_lca_resolves_with_the_shipped_sources(
+    streets, origins, mode, per_km
+):
+    costs = TravelCostMatrix(streets, origins, transport_mode=mode)
+    expected = costs.network_distance_m / 1000.0 * per_km
+    assert np.allclose(costs.emissions, expected)
 
 
 @pytest.mark.parametrize(
     ("mode", "per_km"),
-    [("walk", 0.0), ("bicycle", 21.0), ("e_bike", None), ("e_scooter", None)],
+    [("walk", 0.0), ("bicycle", 21.0), ("e_bike", 3.0), ("e_scooter", 1.0)],
 )
-def test_operational_components_resolve_the_human_powered_modes(
-    streets, origins, mode, per_km
-):
+def test_operational_components_narrow_to_use_phase(streets, origins, mode, per_km):
     # Walking is free; the conventional bicycle carries the shipped dietary
-    # energy factor of 21 g/km; the battery modes stay unresolved.
-    if per_km is not None:
-        costs = TravelCostMatrix(
-            streets, origins, transport_mode=mode, components=["fuel", "operations"]
-        )
-        expected = costs.network_distance_m / 1000.0 * per_km
-        assert np.allclose(costs.emissions, expected)
-    else:
-        with pytest.warns(UserWarning, match="unresolved"):
-            costs = TravelCostMatrix(
-                streets,
-                origins,
-                transport_mode=mode,
-                components=["fuel", "operations"],
-            )
-        assert costs.emissions.isna().all()
+    # energy factor of 21 g/km; the battery modes their Finnish-mix
+    # charging electricity.
+    costs = TravelCostMatrix(
+        streets, origins, transport_mode=mode, components=["fuel", "operations"]
+    )
+    expected = costs.network_distance_m / 1000.0 * per_km
+    assert np.allclose(costs.emissions, expected)
 
 
 def test_a_user_row_with_a_missing_selected_component_stays_unresolved(
@@ -600,8 +592,8 @@ def test_a_user_row_with_a_missing_selected_component_stays_unresolved(
     assert costs.emissions.isna().all()
 
 
-def test_a_mode_level_user_row_beats_the_shipped_placeholder(streets, origins):
-    # The shipped table carries an exact-triple placeholder for every mode; a
+def test_a_mode_level_user_row_beats_the_shipped_default(streets, origins):
+    # The shipped table carries an exact-triple sourced row for every mode; a
     # sourced user row at bare street_mode specificity must still win it.
     factors = pd.DataFrame(
         [
@@ -668,7 +660,7 @@ def test_the_street_ladder_prefers_the_specific_row(streets, origins):
 def test_unmatchable_factor_rows_are_rejected(streets, origins):
     # A row shape the resolver can never match must error, not be silently
     # ignored — the ladder would otherwise fall through to the shipped
-    # placeholders and answer with their values instead of the user's.
+    # defaults and answer with their values instead of the user's.
     no_mode = pd.DataFrame(
         [{"vehicle_class": "conventional", "vehicle": 5.0, "fuel": 0.0}]
     )

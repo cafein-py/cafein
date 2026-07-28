@@ -92,56 +92,79 @@ def vehicle_class_factors():
 def street_factors():
     """The shipped street-mode factor table, in g CO₂e per person-km.
 
-    Walking has zero direct operational emissions, so its ``fuel`` and
-    ``operations`` components are zero. The conventional bicycle's ``fuel``
-    is the dietary energy-expenditure factor of 21 g CO₂e per km — the
-    additional food intake compensating cycling caloric expenditure under
-    average European dietary patterns — with zero ``operations``. Every other
-    value is deliberately **unresolved** (NA), not zero: a bicycle's
-    manufacturing footprint is not nothing, and no e-bike or e-scooter number
-    ships without a documented source and lifetime allocation. A
-    full-life-cycle request therefore reports NA emissions until sourced rows
-    are layered over these through ``factors=`` — see ``load_street_factors``
-    for the expected columns.
+    The micromobility life-cycle components come from the ITF "Good to
+    Go?" LCA model (Cazzola & Crist 2020) computed with the Finland 2020
+    electricity mix through its ``cafein-lca`` reimplementation — the
+    same calibration as the transit defaults — except the shared
+    e-scooter, whose values follow the Helsinki fleet study of Judl,
+    Horn, Mosoni & Suomalainen (2026, doi:10.1007/s11367-026-02685-2):
+    the current-generation (2GEN) scenario's gross impacts, without
+    end-of-life recycling credits, split by the paper's contribution
+    shares — plus the ITF infrastructure component, which that study's
+    system boundary excludes, grafted on so every micromobility row
+    shares one boundary. Assumptions ride the sources: ITF private
+    micromobility lifetimes (bicycle and e-bike 6 y, e-scooter 3 y) and
+    the Judl 5-year, 5,000 km shared-scooter lifetime.
+
+    Walking is the model's zero baseline by convention — no vehicle, no
+    fuel, and its infrastructure is not allocated. The conventional
+    bicycle's ``fuel`` keeps the dietary energy-expenditure factor of
+    21 g CO₂e per km — the additional food intake compensating cycling
+    caloric expenditure under average European dietary patterns — which
+    the ITF model does not count; the e-bike carries its charging
+    electricity instead. Sourced user rows layered through ``factors=``
+    beat all of these — see ``load_street_factors``.
     """
-    nan = float("nan")
     rows = [
         {
             "street_mode": "walk",
             "vehicle_class": "on_foot",
             "service_model": "private",
-            "vehicle": nan,
+            "vehicle": 0.0,
             "fuel": 0.0,
-            "infrastructure": nan,
+            "infrastructure": 0.0,
             "operations": 0.0,
         },
         {
             "street_mode": "bicycle",
             "vehicle_class": "conventional",
             "service_model": "private",
-            "vehicle": nan,
+            "vehicle": 7.0,
             # Dietary energy expenditure, average European diet: 21 g/km.
             "fuel": 21.0,
-            "infrastructure": nan,
+            "infrastructure": 9.0,
             "operations": 0.0,
         },
         {
             "street_mode": "bicycle",
             "vehicle_class": "e_bike",
             "service_model": "private",
-            "vehicle": nan,
-            "fuel": nan,
-            "infrastructure": nan,
-            "operations": nan,
+            "vehicle": 13.0,
+            "fuel": 3.0,
+            "infrastructure": 9.0,
+            "operations": 0.0,
         },
         {
             "street_mode": "e_scooter",
             "vehicle_class": "battery",
             "service_model": "private",
-            "vehicle": nan,
-            "fuel": nan,
-            "infrastructure": nan,
-            "operations": nan,
+            "vehicle": 26.0,
+            "fuel": 1.0,
+            "infrastructure": 9.0,
+            "operations": 0.0,
+        },
+        {
+            # Judl et al. (2026) 2GEN gross 99.2 g/pkm split by its §4.1
+            # shares (electricity < 4 %, balancing logistics 7 %, the
+            # manufacture-dominated remainder), plus the ITF
+            # infrastructure graft.
+            "street_mode": "e_scooter",
+            "vehicle_class": "battery",
+            "service_model": "shared",
+            "vehicle": 88.8,
+            "fuel": 3.5,
+            "infrastructure": 9.0,
+            "operations": 6.9,
         },
     ]
     return pd.DataFrame(rows).reindex(columns=STREET_KEY_COLUMNS + COMPONENT_COLUMNS)
@@ -164,9 +187,10 @@ def load_street_factors(source):
     -------
     DataFrame
         The normalized table. Unlike the transit loader, rows with NA
-        components are allowed: NA marks a component as unresolved rather
-        than zero, which is how the shipped table refuses to invent
-        micromobility numbers.
+        components are allowed: NA marks a component as unresolved
+        rather than zero, so a user row can deliberately withhold a
+        component it has no source for — the resolver then reports NA,
+        never a silent zero.
     """
     if isinstance(source, pd.DataFrame):
         frame = source.copy()
@@ -212,18 +236,21 @@ def load_street_factors(source):
     return frame
 
 
-def street_factor(transport_mode, factors=None, components=None):
+def street_factor(transport_mode, factors=None, components=None, service_model=None):
     """The resolved g CO₂e per person-km factor for one street mode.
 
     Resolution is most-specific-wins over the mode's identity
     (``STREET_MODE_IDENTITIES``): the exact ``(street_mode, vehicle_class,
     service_model)`` triple, then ``(street_mode, vehicle_class)``, then
-    ``street_mode`` alone. The user's table is consulted first at every
+    ``street_mode`` alone. ``service_model=`` overrides the identity's
+    third element — ``"shared"`` resolves a rental's fleet factors (its
+    collection and rebalancing operations) where the identity defaults
+    to the private vehicle. The user's table is consulted first at every
     specificity — a sourced user row at any rung beats the shipped
-    placeholders, which resolve only when the user supplies nothing for the
-    mode. The factor is the sum of the selected `components` (default: all
-    four); an NA in any selected component leaves the whole factor NA —
-    unresolved, never silently zero — with a warning naming the components.
+    defaults. The factor is the sum of the selected `components`
+    (default: all four); an NA in any selected component leaves the
+    whole factor NA — unresolved, never silently zero — with a warning
+    naming the components.
     """
     if transport_mode not in STREET_MODE_IDENTITIES:
         raise ValueError(
@@ -245,7 +272,8 @@ def street_factor(transport_mode, factors=None, components=None):
                 "components selects nothing; an empty selection would report "
                 "zero emissions rather than unresolved ones"
             )
-    mode, vehicle_class, service_model = STREET_MODE_IDENTITIES[transport_mode]
+    mode, vehicle_class, identity_service = STREET_MODE_IDENTITIES[transport_mode]
+    service_model = identity_service if service_model is None else service_model
     ladder = [
         (mode, vehicle_class, service_model),
         (mode, vehicle_class, None),
@@ -270,8 +298,9 @@ def street_factor(transport_mode, factors=None, components=None):
                 return rows.iloc[-1]
         return None
 
-    # The user's table first at every specificity: a sourced row at any rung
-    # must beat the shipped placeholders, which are fallbacks, not answers.
+    # The user's table first at every specificity: a user row at any rung
+    # must beat the shipped defaults, which are fallbacks the user never
+    # asked to override piecemeal.
     row = None
     if factors is not None:
         row = resolve(load_street_factors(factors))
