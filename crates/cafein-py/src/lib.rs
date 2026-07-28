@@ -108,7 +108,8 @@ struct TransportNetwork {
     /// The merged shared-vehicle transfer set (stage 15a): the walking
     /// closure with one mode's rental edges folded in and re-closed,
     /// beside its reconstruction tokens and the exact binding it was
-    /// computed under. Runtime state, not persisted yet.
+    /// computed under. Persisted with the artifact and restored on
+    /// load, unclosed marking re-applied.
     mode_transfers: Option<ModeTransferSet>,
     stops_by_id: HashMap<String, StopLookup>,
     stops_by_qualified_id: HashMap<String, StopIdx>,
