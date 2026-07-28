@@ -2030,3 +2030,29 @@ def test_rental_ride_legs_draw_their_shape(multimodal_transfers_network):
         shape = wkb.loads(bytes(leg["geometry"]))
         assert shape.geom_type == "LineString"
         assert len(shape.coords) > 1
+
+
+def test_merged_sets_are_engine_neutral(multimodal_transfers_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import streets as _streets
+    from cafein.policy import reduction_modes
+
+    # The same reduced access array under the merged set through RAPTOR
+    # and the trip-based engine: identical arrivals at every stop — both
+    # relax shadowed transit arrivals exactly.
+    core = multimodal_transfers_network._core
+    modes = reduction_modes(
+        _transfer_policy(), "access", _streets.MAX_ACCESS_EGRESS_TIME
+    )
+    access = [
+        (stop, seconds)
+        for stop, seconds, *_ in core._reduced_street_offsets(*ORIGIN, False, modes)
+    ]
+    binding = ("e_scooter", 600.0)
+    raptor = core._travel_times_with_access(
+        access, "2022-02-22", "08:30:00", 7, transfer_mode=binding
+    )
+    tbtr = core._travel_times_with_access(
+        access, "2022-02-22", "08:30:00", 7, router="tbtr", transfer_mode=binding
+    )
+    assert raptor == tbtr

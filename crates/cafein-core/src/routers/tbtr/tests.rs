@@ -1783,3 +1783,126 @@ fn a_previous_day_overtaker_is_not_missed() {
     );
     assert_eq!((tbtr.seconds, tbtr.rides), (raptor.seconds, raptor.rides));
 }
+
+/// The unclosed-set shadowing corner on the trip-based engine, exactly
+/// as RAPTOR's: stop 2 is reached faster by a round-1 rental row
+/// (arr 25), and the round-2 ride into it (arr 60) — dominated on the
+/// stop label — still relaxes the walking row to stop 3, the only
+/// journey there. Under the closure contract the ride never extends.
+#[test]
+fn unclosed_sets_relax_walks_from_shadowed_arrivals() {
+    let mut builder = TimetableBuilder::new(4);
+    let first = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let second = builder.add_pattern(&[StopIdx(1), StopIdx(2)], 1).unwrap();
+    builder
+        .add_trip(first, vec![time(10), time(20)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(second, vec![time(26), time(60)], 1, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let edges = [
+        (StopIdx(1), StopIdx(2), 5, 5.0),
+        (StopIdx(2), StopIdx(3), 100, 100.0),
+    ];
+    let closed = Transfers::from_edges(4, &edges).unwrap();
+    let mut unclosed = Transfers::from_edges(4, &edges).unwrap();
+    unclosed.mark_unclosed();
+    let request = request(3, StopIdx(0), StopIdx(3), 0);
+    let closed_engine = TbtrEngine::for_date(
+        &timetable,
+        &closed,
+        &request.active_services,
+        &request.active_services_previous,
+    );
+    assert_eq!(
+        closed_engine.one_to_all(0, &request.access, 3)[3],
+        None,
+        "the closure contract assumes the composite is covered"
+    );
+    let engine = TbtrEngine::for_date(
+        &timetable,
+        &unclosed,
+        &request.active_services,
+        &request.active_services_previous,
+    );
+    assert_eq!(engine.one_to_all(0, &request.access, 3)[3], Some(160));
+    // The profile scan takes the same walk through its via-join.
+    let journeys = engine.route_range(&request, 1);
+    assert!(journeys.iter().any(|journey| journey.arrival == 160));
+}
+
+/// The profile and window scans agree with RAPTOR on the unclosed
+/// shadow fixture: the multi-departure profile emits the same
+/// (departure, arrival, rides) set, and every window mark's travel
+/// times match `one_to_all` for that departure — pinning the exact
+/// gates of all three scans against the reference engine.
+#[test]
+fn unclosed_profiles_and_windows_match_raptor() {
+    use crate::raptor::Raptor;
+
+    let mut builder = TimetableBuilder::new(4);
+    let first = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let second = builder.add_pattern(&[StopIdx(1), StopIdx(2)], 1).unwrap();
+    builder
+        .add_trip(first, vec![time(10), time(20)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(first, vec![time(40), time(50)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(second, vec![time(26), time(60)], 2, 0)
+        .unwrap();
+    builder
+        .add_trip(second, vec![time(56), time(90)], 3, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let mut merged = Transfers::from_edges(
+        4,
+        &[
+            (StopIdx(1), StopIdx(2), 5, 5.0),
+            (StopIdx(2), StopIdx(3), 100, 100.0),
+        ],
+    )
+    .unwrap();
+    merged.mark_unclosed();
+    let request = request(4, StopIdx(0), StopIdx(3), 0);
+    let engine = TbtrEngine::for_date(
+        &timetable,
+        &merged,
+        &request.active_services,
+        &request.active_services_previous,
+    );
+    let window = 60;
+    let raptor = Raptor.route_range(&timetable, &merged, &request, window);
+    let tbtr = engine.route_range(&request, window);
+    let triples = |journeys: &[Journey]| {
+        let mut triples: Vec<(u32, u32, usize)> = journeys
+            .iter()
+            .map(|journey| (journey.departure, journey.arrival, journey.rides()))
+            .collect();
+        triples.sort_unstable();
+        triples
+    };
+    assert_eq!(triples(&tbtr), triples(&raptor));
+    assert!(tbtr.iter().any(|journey| journey.arrival == 160));
+    // Window samples: each mark equals `one_to_all` for its departure
+    // with the access floor applied, shadowed relaxations included.
+    for (mark, labels) in engine.window_samples(&request, window) {
+        let direct = engine.one_to_all(mark, &request.access, request.max_transfers);
+        for (stop, label) in labels.iter().enumerate() {
+            let floored = request
+                .access
+                .iter()
+                .find(|&&(access_stop, _)| access_stop.0 as usize == stop)
+                .map(|&(_, seconds)| mark.saturating_add(seconds));
+            let expected = match (direct[stop], floored) {
+                (Some(arrival), Some(floor)) => Some(arrival.min(floor)),
+                (Some(arrival), None) => Some(arrival),
+                (None, floored) => floored,
+            };
+            let label = (*label != u32::MAX).then_some(*label);
+            assert_eq!(label, expected, "stop {stop} at mark {mark}");
+        }
+    }
+}
