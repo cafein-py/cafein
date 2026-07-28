@@ -46,6 +46,21 @@ pub(super) struct Entry {
     pub(super) key: i64,
     pub(super) grams: f64,
     pub(super) rides: u8,
+    /// Whether the entry was admitted through a rental-bearing merged
+    /// edge: such a point cannot legally extend by a further walk, so
+    /// its dominance does not cover a newcomer's walk extensions —
+    /// only merged-set queries ever set it.
+    pub(super) sealed: bool,
+}
+
+/// A transit arrival's fate under a merged (unclosed) transfer set:
+/// admitted, plainly dominated, or dominated only by sealed points —
+/// still owed its footpath relaxations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TransitAdmission {
+    Admitted,
+    Rejected,
+    Shadowed,
 }
 
 /// A per-stop label bag under bucketed dominance, cumulative across
@@ -124,6 +139,7 @@ impl Bag {
             key,
             grams,
             rides,
+            sealed: false,
         });
         let last = self.entries.len() - 1;
         if last != 0 {
@@ -190,6 +206,7 @@ impl Bag {
             key,
             grams,
             rides,
+            sealed: false,
         });
         true
     }
@@ -238,6 +255,7 @@ impl Bag {
             key,
             grams,
             rides,
+            sealed: false,
         });
         let last = self.entries.len() - 1;
         if last != 0 {
@@ -260,6 +278,7 @@ impl Bag {
                     key,
                     grams,
                     rides,
+                    sealed: false,
                 })
                 .collect(),
         }
@@ -323,6 +342,7 @@ impl Bag {
             key,
             grams,
             rides,
+            sealed: false,
         });
         true
     }
@@ -372,6 +392,114 @@ impl Bag {
         } else {
             self.insert_slack_probed(arrival, penalty, grams, key, rides, slack, probes)
         }
+    }
+
+    /// A transit arrival's admission under a merged (unclosed)
+    /// transfer set: as `insert_label`, except a rejection reports
+    /// whether **every** rejecting witness is sealed — a rental-origin
+    /// point cannot legally take the newcomer's walk extensions, so a
+    /// transit arrival rejected exclusively by sealed points must still
+    /// relax footpaths (`Shadowed`); its boarding and egress
+    /// continuations stay covered by the witnesses. The scan skips the
+    /// strict path's self-organising swaps (entry order has no
+    /// semantic consumer).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn insert_transit(
+        &mut self,
+        strict: bool,
+        arrival: u32,
+        penalty: u32,
+        grams: f64,
+        key: i64,
+        rides: u8,
+        slack: u32,
+    ) -> TransitAdmission {
+        let effective = arrival.saturating_add(penalty);
+        let mut rejected = false;
+        let mut sealed_only = true;
+        for entry in &self.entries {
+            let rejects = if strict {
+                rejects_strict(entry, arrival, grams, key, rides)
+            } else if entry.key <= key && entry.rides <= rides && entry.arrival <= arrival {
+                if entry.arrival == arrival
+                    && entry.penalty == penalty
+                    && entry.key == key
+                    && entry.rides == rides
+                {
+                    grams >= entry.grams
+                } else {
+                    entry
+                        .arrival
+                        .saturating_add(entry.penalty)
+                        .saturating_add(slack)
+                        <= effective
+                }
+            } else {
+                false
+            };
+            if rejects {
+                rejected = true;
+                if !entry.sealed {
+                    sealed_only = false;
+                    break;
+                }
+            }
+        }
+        if rejected {
+            return if sealed_only {
+                TransitAdmission::Shadowed
+            } else {
+                TransitAdmission::Rejected
+            };
+        }
+        self.entries.retain(|entry| {
+            let entry_effective = entry.arrival.saturating_add(entry.penalty);
+            !((key <= entry.key
+                && rides <= entry.rides
+                && arrival <= entry.arrival
+                && effective.saturating_add(slack) <= entry_effective)
+                || (entry.arrival == arrival
+                    && entry.penalty == penalty
+                    && entry.key == key
+                    && entry.rides == rides
+                    && grams < entry.grams))
+        });
+        self.entries.push(Entry {
+            arrival,
+            penalty,
+            key,
+            grams,
+            rides,
+            sealed: false,
+        });
+        TransitAdmission::Admitted
+    }
+
+    /// A walked admission under a merged transfer set: as
+    /// `insert_label`, except the pushed entry records whether the edge
+    /// bore a rental (`sealed`). A rejected walk needs no shadow — its
+    /// boarding, egress, and output continuations are all covered by
+    /// whichever witness rejected it.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn insert_walk(
+        &mut self,
+        strict: bool,
+        arrival: u32,
+        penalty: u32,
+        grams: f64,
+        key: i64,
+        rides: u8,
+        slack: u32,
+        sealed: bool,
+    ) -> bool {
+        let admitted = self.insert_label(strict, arrival, penalty, grams, key, rides, slack);
+        if admitted && sealed {
+            // Both insert paths leave the newcomer's entry reachable:
+            // strict swaps it to slot 0, slack pushes it last.
+            let slot = if strict { 0 } else { self.entries.len() - 1 };
+            self.entries[slot].sealed = true;
+        }
+        admitted
     }
 
     /// The number of retained entries, for diagnostic bag censuses.

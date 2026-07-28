@@ -598,12 +598,12 @@ impl TransportNetwork {
     #[pyo3(signature = (access, egress, date, departure, trip_factors, max_transfers, bucket,
                         slack = 0.0, max_options = None, router = "auto",
                         exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![],
-                        geometries = true))]
+                        geometries = true, transfer_mode = None))]
     #[allow(clippy::too_many_arguments)]
     fn _mc_route_with_access(
         &self,
         py: Python<'_>,
-        access: Vec<(String, u32, f64)>,
+        access: Vec<(String, u32, f64, bool)>,
         egress: Vec<(String, u32, f64)>,
         date: &str,
         departure: &str,
@@ -617,6 +617,7 @@ impl TransportNetwork {
         exclude_trips: Vec<String>,
         exclude_stops: Vec<String>,
         geometries: bool,
+        transfer_mode: Option<(String, f64, f64)>,
     ) -> PyResult<Py<PyList>> {
         if !bucket.is_finite() || bucket <= 0.0 {
             return Err(PyValueError::new_err(
@@ -647,6 +648,23 @@ impl TransportNetwork {
                 "route/trip/stop exclusions require router='raptor'",
             ));
         }
+        // The merged mode-transfer set runs on McRAPTOR only (the
+        // trip-based precompute assumes a closed footpath set), and a
+        // rental token's interior stops are not exclusion-aware.
+        if transfer_mode.is_some() {
+            if router == "tbtr" {
+                return Err(PyValueError::new_err(
+                    "street_policy transfers= multicriteria queries run on McRAPTOR",
+                ));
+            }
+            if !exclude_stops.is_empty() {
+                return Err(PyValueError::new_err(
+                    "stop exclusions do not combine with street_policy \
+                     transfers= yet; a rental transfer's interior stops are \
+                     not exclusion-aware",
+                ));
+            }
+        }
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
                 "no trip distances installed; build the network with trip distances enabled",
@@ -658,14 +676,17 @@ impl TransportNetwork {
                 per_trip[trip.0 as usize] = *factor;
             }
         }
-        let resolve = |rows: &[(String, u32, f64)]| -> PyResult<Vec<(StopIdx, u32, f64)>> {
-            rows.iter()
-                .map(|(stop, seconds, grams)| Ok((self.resolve_stop(stop)?, *seconds, *grams)))
-                .collect()
-        };
         let labels = mcraptor::PolicyLabels {
-            access: resolve(&access)?,
-            egress: resolve(&egress)?,
+            access: access
+                .iter()
+                .map(|(stop, seconds, grams, sealed)| {
+                    Ok((self.resolve_stop(stop)?, *seconds, *grams, *sealed))
+                })
+                .collect::<PyResult<Vec<_>>>()?,
+            egress: egress
+                .iter()
+                .map(|(stop, seconds, grams)| Ok((self.resolve_stop(stop)?, *seconds, *grams)))
+                .collect::<PyResult<Vec<_>>>()?,
         };
         let request = Request {
             departure: parse_time(departure)?,
@@ -676,17 +697,35 @@ impl TransportNetwork {
             max_transfers,
             exclusions,
         };
-        let router = self.resolve_mc_router(
-            router,
-            date,
-            &per_trip,
-            slack > 0.0 || request.exclusions.is_some(),
-        )?;
+        let router = if transfer_mode.is_some() {
+            "raptor"
+        } else {
+            self.resolve_mc_router(
+                router,
+                date,
+                &per_trip,
+                slack > 0.0 || request.exclusions.is_some(),
+            )?
+        };
+        let binding = transfer_mode
+            .as_ref()
+            .map(|(mode, budget, _)| (mode.clone(), *budget));
+        let relaxed = self.policy_transfers(binding.as_ref())?;
+        // The binding was just validated, so the held set is the one
+        // `policy_transfers` returned.
+        let rental = transfer_mode.as_ref().map(|&(_, _, grams_per_meter)| {
+            let held = self.mode_transfers.as_ref().expect("binding validated");
+            (
+                held.rental_network_meters.as_slice(),
+                held.rental_edge.as_slice(),
+                grams_per_meter,
+            )
+        });
         let slack = slack.round() as u32;
         let journeys = py.allow_threads(|| {
             if router == "tbtr" {
                 let mut engine = self.mctbtr_engine(
-                    &self.transfers,
+                    relaxed,
                     geometry,
                     &per_trip,
                     date,
@@ -704,7 +743,7 @@ impl TransportNetwork {
             mcraptor::route_with_policy(
                 &view,
                 &self.build.timetable,
-                &self.transfers,
+                relaxed,
                 geometry,
                 &per_trip,
                 &request,
@@ -713,18 +752,12 @@ impl TransportNetwork {
                 slack,
                 max_options,
                 &[],
+                rental,
             )
         });
         let result = PyList::empty(py);
         for journey in &journeys {
-            result.append(self.journey_to_dict(
-                py,
-                journey,
-                None,
-                None,
-                geometries,
-                &self.transfers,
-            )?)?;
+            result.append(self.journey_to_dict(py, journey, None, None, geometries, relaxed)?)?;
         }
         Ok(result.unbind())
     }

@@ -69,6 +69,7 @@ type ParetoRow = (
     f64,
     f64,
     Option<String>,
+    bool,
 );
 
 /// A frontier point of the Pareto street reduction: the winner's shape
@@ -85,7 +86,14 @@ struct ParetoChoice {
 #[derive(Clone, Copy)]
 struct Winner {
     seconds: u32,
-    rental: bool,
+    /// Paid rentals along the choice — the vehicle's own (0 or 1) plus
+    /// any rental-bearing merged transfer edge the closure folded in;
+    /// ties fall to fewer.
+    rentals: u8,
+    /// Whether a rental-bearing merged transfer edge is part of the
+    /// choice: such a point cannot legally extend by further walking,
+    /// so its access seed enters the stop bags sealed.
+    transfer_rental: bool,
     order: usize,
     snap: Snap,
     via: Option<StopIdx>,
@@ -1137,7 +1145,8 @@ impl TransportNetwork {
     /// silent zero). Exact ``(seconds, grams)`` ties resolve to fewer
     /// paid rentals, then the declared order. The transfer closure
     /// extends every direct frontier point by one installed edge
-    /// (+duration, grams unchanged) from a snapshot, then re-Paretos.
+    /// (+duration; a rental-bearing merged edge adds its ride grams)
+    /// from a snapshot, then re-Paretos.
     /// With every factor zero the frontier degenerates to the time-only
     /// winner, row for row. Returns ``(stop_id, seconds, grams, mode,
     /// link_edge, link_fraction, connector_meters, vehicle_network_m,
@@ -1154,7 +1163,7 @@ impl TransportNetwork {
         egress: bool,
         modes: Vec<(String, f64, bool, Option<Vec<String>>, f64)>,
         exclude_stops: Vec<String>,
-        transfer_mode: Option<(String, f64)>,
+        transfer_mode: Option<(String, f64, f64)>,
     ) -> PyResult<Vec<ParetoRow>> {
         let stop_count = self.build.timetable.stop_count() as usize;
         let mut frontiers: Vec<Vec<ParetoChoice>> = vec![Vec::new(); stop_count];
@@ -1197,7 +1206,8 @@ impl TransportNetwork {
                     ParetoChoice {
                         winner: Winner {
                             seconds,
-                            rental: *rental,
+                            rentals: u8::from(*rental),
+                            transfer_rental: false,
                             order,
                             snap,
                             via: None,
@@ -1225,10 +1235,34 @@ impl TransportNetwork {
             frontiers[index].clear();
             excluded[index] = true;
         }
-        let closure = self.policy_transfers(transfer_mode.as_ref())?;
+        let binding = transfer_mode
+            .as_ref()
+            .map(|(mode, budget, _)| (mode.clone(), *budget));
+        let closure = self.policy_transfers(binding.as_ref())?;
+        // A rental-bearing merged edge folds its ride grams into the
+        // extended point (by the edge's rental identity — meters and
+        // factor may both be zero) — the dominance ranks them, the
+        // count breaks ties, and the seal rides to the access seeds.
+        let rental = transfer_mode.as_ref().map(|&(_, _, grams_per_meter)| {
+            let held = self.mode_transfers.as_ref().expect("binding validated");
+            (
+                held.rental_network_meters.as_slice(),
+                held.rental_edge.as_slice(),
+                grams_per_meter,
+            )
+        });
         let seeds = frontiers.clone();
         for stop in 0..stop_count {
-            for transfer in closure.from_stop(StopIdx(stop as u32)) {
+            let range = closure.edge_range(StopIdx(stop as u32));
+            for (index, transfer) in closure.from_stop(StopIdx(stop as u32)).iter().enumerate() {
+                let rented_edge =
+                    matches!(rental, Some((_, flags, _)) if flags[range.start + index]);
+                let ride_grams = match rental {
+                    Some((meters, _, per_meter)) if rented_edge => {
+                        meters[range.start + index] * per_meter
+                    }
+                    _ => 0.0,
+                };
                 let to = transfer.to.0 as usize;
                 let (source, target) = if egress { (to, stop) } else { (stop, to) };
                 if excluded[target] {
@@ -1243,11 +1277,13 @@ impl TransportNetwork {
                         ParetoChoice {
                             winner: Winner {
                                 seconds,
+                                rentals: point.winner.rentals + u8::from(rented_edge),
+                                transfer_rental: point.winner.transfer_rental || rented_edge,
                                 via: Some(StopIdx(source as u32)),
                                 walk_transfer_m: transfer.meters,
                                 ..point.winner
                             },
-                            grams: point.grams,
+                            grams: point.grams + ride_grams,
                         },
                     );
                 }
@@ -1280,6 +1316,7 @@ impl TransportNetwork {
                     vehicle_connector,
                     walk,
                     winner.via.map(|via| self.public_stop_id(via)),
+                    winner.transfer_rental,
                 ));
             }
         }
@@ -1421,11 +1458,26 @@ impl TransportNetwork {
         // budget; RAPTOR runs its exact transfer phase for this set.
         set.mark_unclosed();
         let counts = (set.edge_count(), tokens.len());
+        // Ridden network meters per CSR edge, aligned for the
+        // multicriteria relax; walking rows stay zero.
+        let mut rental_network_meters = vec![0.0; set.edge_count()];
+        let mut rental_edge = vec![false; set.edge_count()];
+        for stop in 0..stop_count {
+            let range = set.edge_range(StopIdx(stop));
+            for (edge, slot) in set.from_stop(StopIdx(stop)).iter().zip(range) {
+                if let Some(token) = tokens.get(&(stop, edge.to.0)) {
+                    rental_network_meters[slot] = token.ride_network_meters;
+                    rental_edge[slot] = true;
+                }
+            }
+        }
         self.mode_transfers = Some(ModeTransferSet {
             mode: mode.to_owned(),
             budget: max_seconds,
             set,
             tokens,
+            rental_network_meters,
+            rental_edge,
         });
         Ok(counts)
     }
@@ -2048,7 +2100,8 @@ impl TransportNetwork {
                 let Some(snap) = links[stop] else { continue };
                 let candidate = Winner {
                     seconds,
-                    rental: *rental,
+                    rentals: u8::from(*rental),
+                    transfer_rental: false,
                     order,
                     snap,
                     via: None,
@@ -2063,8 +2116,8 @@ impl TransportNetwork {
                     Some(held) => {
                         candidate.seconds < held.seconds
                             || (candidate.seconds == held.seconds
-                                && (usize::from(candidate.rental), candidate.order)
-                                    < (usize::from(held.rental), held.order))
+                                && (usize::from(candidate.rentals), candidate.order)
+                                    < (usize::from(held.rentals), held.order))
                     }
                 };
                 if wins {
@@ -2106,9 +2159,15 @@ impl TransportNetwork {
         // choice is thus its seed's direct time plus exactly one installed
         // transfer, whatever the stop order.
         let closure = self.policy_transfers(transfer_mode)?;
+        let rental_flags = transfer_mode.map(|_| {
+            let held = self.mode_transfers.as_ref().expect("binding validated");
+            held.rental_edge.as_slice()
+        });
         let seeds = best.clone();
         for stop in 0..stop_count {
-            for transfer in closure.from_stop(StopIdx(stop as u32)) {
+            let range = closure.edge_range(StopIdx(stop as u32));
+            for (index, transfer) in closure.from_stop(StopIdx(stop as u32)).iter().enumerate() {
+                let rented_edge = rental_flags.is_some_and(|flags| flags[range.start + index]);
                 let to = transfer.to.0 as usize;
                 let (source, target) = if egress { (to, stop) } else { (stop, to) };
                 if excluded[target] {
@@ -2120,13 +2179,14 @@ impl TransportNetwork {
                 let Some(candidate) = winner.seconds.checked_add(transfer.duration) else {
                     continue;
                 };
+                let rentals = winner.rentals + u8::from(rented_edge);
                 let wins = match &best[target] {
                     None => true,
                     Some(held) => {
                         candidate < held.seconds
                             || (candidate == held.seconds
-                                && (usize::from(winner.rental), winner.order)
-                                    < (usize::from(held.rental), held.order))
+                                && (usize::from(rentals), winner.order)
+                                    < (usize::from(held.rentals), held.order))
                     }
                 };
                 if wins {
@@ -2136,6 +2196,8 @@ impl TransportNetwork {
                     // names the stop whose link the token snap belongs to.
                     best[target] = Some(Winner {
                         seconds: candidate,
+                        rentals,
+                        transfer_rental: winner.transfer_rental || rented_edge,
                         via: Some(StopIdx(source as u32)),
                         walk_transfer_m: transfer.meters,
                         ..winner
@@ -2311,7 +2373,7 @@ fn leg_parts(
 /// insertion order.
 fn pareto_insert(frontier: &mut Vec<ParetoChoice>, candidate: ParetoChoice) {
     let key = |grams: f64| if grams.is_nan() { f64::INFINITY } else { grams };
-    let rank = |choice: &ParetoChoice| (usize::from(choice.winner.rental), choice.winner.order);
+    let rank = |choice: &ParetoChoice| (usize::from(choice.winner.rentals), choice.winner.order);
     for held in frontier.iter() {
         let no_worse = held.winner.seconds <= candidate.winner.seconds
             && key(held.grams) <= key(candidate.grams);

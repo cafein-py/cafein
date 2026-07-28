@@ -1759,21 +1759,10 @@ def test_the_transfer_matrix_reconciles_with_single_queries(
     assert int(matrix["travel_time_s"].iloc[0]) == fastest
 
 
-def test_transfers_are_rejected_on_the_mc_and_cost_paths(multimodal_transfers_network):
+def test_transfers_are_rejected_on_the_cost_path(multimodal_transfers_network):
     pytest.importorskip("cafein._cafein")
-    from cafein import DetailedItineraries, TravelCostMatrix
+    from cafein import TravelCostMatrix
 
-    with pytest.raises(ValueError, match="emissions-aware transfer stage"):
-        DetailedItineraries(
-            multimodal_transfers_network,
-            _points_frame([ORIGIN]),
-            _points_frame([DEST]),
-            "2022-02-22",
-            "08:30:00",
-            candidates="pareto",
-            street_policy=_transfer_policy(),
-            geometries=False,
-        )
     with pytest.raises(ValueError, match="cost matrix"):
         TravelCostMatrix(
             multimodal_transfers_network,
@@ -1823,4 +1812,112 @@ def test_replacing_the_closure_drops_the_merged_set(multimodal_network, artifact
     with pytest.raises(ValueError, match="compute_mode_transfers"):
         network.route_between_coordinates(
             ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=_transfer_policy()
+        )
+
+
+def test_mc_transfers_join_the_frontier(multimodal_transfers_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries
+
+    def frame(policy):
+        return DetailedItineraries(
+            multimodal_transfers_network,
+            _points_frame([ORIGIN]),
+            _points_frame([DEST]),
+            "2022-02-22",
+            "08:30:00",
+            candidates="pareto",
+            street_policy=policy,
+            factors=_scooter_factor_rows(),
+            geometries=False,
+        )
+
+    walking = frame(StreetLegPolicy(access={"walk": 900}, egress={"walk": 900}))
+    rented = frame(_transfer_policy())
+    scooter = rented[
+        (rented["leg_type"] == "transfer") & (rented["mode"] == "e_scooter")
+    ]
+    assert not scooter.empty
+    # The ride legs carry the shared fleet's grams over their ridden
+    # network meters, exactly as the dominance ranked them.
+    assert scooter["emissions"].equals(scooter["network_distance_m"] / 1000.0 * 21.0)
+    options = rented.groupby("option").agg(
+        departure=("departure_s", "min"),
+        arrival=("arrival_s", "max"),
+        grams=("emissions", "sum"),
+    )
+    durations = (options["arrival"] - options["departure"]).tolist()
+    grams = options["grams"].tolist()
+    assert durations == sorted(durations)
+    assert grams == sorted(grams, reverse=True)
+    # More than one option with a rental beside cleaner slower ones —
+    # the frontier genuinely trades time against rental grams. (The
+    # option count may shrink against the walking frontier: a rental
+    # option can evict a same-bucket slower walking one.)
+    assert len(options) > 1
+    best = lambda f: (f.groupby("option")["arrival_s"].max()).min()  # noqa: E731
+    assert best(rented) <= best(walking)
+
+
+def test_mc_relaxed_candidates_take_transfers(multimodal_transfers_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries
+
+    frame = DetailedItineraries(
+        multimodal_transfers_network,
+        _points_frame([ORIGIN]),
+        _points_frame([DEST]),
+        "2022-02-22",
+        "08:30:00",
+        candidates="relaxed",
+        slack_seconds=120,
+        street_policy=_transfer_policy(),
+        factors=_scooter_factor_rows(),
+        geometries=False,
+    )
+    scooter = frame[(frame["leg_type"] == "transfer") & (frame["mode"] == "e_scooter")]
+    assert not scooter.empty
+
+
+def test_mc_transfer_bindings_are_checked(
+    multimodal_network, multimodal_transfers_network
+):
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries
+
+    def query(network, policy, **kwargs):
+        return DetailedItineraries(
+            network,
+            _points_frame([ORIGIN]),
+            _points_frame([DEST]),
+            "2022-02-22",
+            "08:30:00",
+            candidates="pareto",
+            street_policy=policy,
+            factors=_scooter_factor_rows(),
+            geometries=False,
+            **kwargs,
+        )
+
+    with pytest.raises(ValueError, match="compute_mode_transfers"):
+        query(multimodal_network, _transfer_policy())
+    with pytest.raises(ValueError, match="bound to"):
+        query(multimodal_transfers_network, _transfer_policy(budget=500))
+    with pytest.raises(ValueError, match="exclusion-aware"):
+        query(
+            multimodal_transfers_network,
+            _transfer_policy(),
+            exclude_stops=["1230109"],
+        )
+    with pytest.raises(ValueError, match="McRAPTOR"):
+        multimodal_transfers_network._core._mc_route_with_access(
+            [("1230109", 0, 0.0, False)],
+            [("1391124", 0, 0.0)],
+            "2022-02-22",
+            "08:30:00",
+            [],
+            7,
+            25.0,
+            router="tbtr",
+            transfer_mode=("e_scooter", 600.0, 0.021),
         )

@@ -128,6 +128,13 @@ impl Transfers {
         let end = self.offsets[stop.0 as usize + 1] as usize;
         &self.edges[start..end]
     }
+
+    /// The `from_stop` slice's index range into the edge-major order,
+    /// for arrays aligned with the CSR edges (the merged set's per-edge
+    /// rental meters).
+    pub fn edge_range(&self, stop: StopIdx) -> std::ops::Range<usize> {
+        self.offsets[stop.0 as usize] as usize..self.offsets[stop.0 as usize + 1] as usize
+    }
 }
 
 #[cfg(test)]
