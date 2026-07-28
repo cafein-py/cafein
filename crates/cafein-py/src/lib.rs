@@ -28,6 +28,16 @@ use cafein_core::transfers::Transfers;
 use cafein_core::ultra::{compute_shortcuts, Shortcut};
 use cafein_gtfs::{build_timetable, Feed, RouteType, ServiceCalendar, TimetableBuild};
 
+/// A computed merged transfer set and the query binding that made it:
+/// serving a policy requires the exact same mode and budget, never a
+/// silently mismatched set.
+struct ModeTransferSet {
+    mode: String,
+    budget: f64,
+    set: Transfers,
+    tokens: std::collections::HashMap<(u32, u32), cafein_core::mode_transfers::RentalToken>,
+}
+
 /// A routable public-transport network built from GTFS data.
 #[pyclass]
 struct TransportNetwork {
@@ -88,6 +98,11 @@ struct TransportNetwork {
     /// definition equality — the 12a-planned cache, arriving with its first
     /// consumers.
     multimodal_profiles: std::sync::Mutex<Vec<(StreetProfileDefinition, CompiledStreetProfile)>>,
+    /// The merged shared-vehicle transfer set (stage 15a): the walking
+    /// closure with one mode's rental edges folded in and re-closed,
+    /// beside its reconstruction tokens and the exact binding it was
+    /// computed under. Runtime state, not persisted yet.
+    mode_transfers: Option<ModeTransferSet>,
     stops_by_id: HashMap<String, StopLookup>,
     stops_by_qualified_id: HashMap<String, StopIdx>,
     trips_by_public_id: HashMap<String, TripIdx>,

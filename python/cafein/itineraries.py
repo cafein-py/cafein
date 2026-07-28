@@ -211,7 +211,11 @@ class DetailedItineraries(gpd.GeoDataFrame):
         Which street modes may serve the access and egress, on what
         vehicle terms (``cafein.StreetLegPolicy``); point origins and
         destinations only, with ``candidates="time"``, ``"pareto"``, or
-        ``"relaxed"`` (``"diverse"`` arrives with a later stage). Under
+        ``"relaxed"`` (``"diverse"`` arrives with a later stage). A
+        ``transfers={mode: budget}`` grant rides the merged mode-transfer
+        set of ``TransportNetwork.compute_mode_transfers`` — time
+        candidates only for now — and a transfer whose edge rode a
+        rental splits into its walk--ride--walk legs. Under
         the multicriteria candidates each journey end reduces to its
         (seconds, grams) Pareto frontier and the street grams enter the
         McRAPTOR dominance itself, so the options genuinely trade street

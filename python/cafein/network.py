@@ -53,19 +53,122 @@ def _departure_seconds(departure):
     return int(hours) * 3600 + int(minutes) * 60 + int(seconds)
 
 
-def _policy_reduced(core, point, egress, modes, exclude_stops):
+def _policy_transfer_mode(policy):
+    """The policy's transfer binding as a ``(mode, seconds)`` tuple, or
+    ``None`` for the installed walking set."""
+    if not policy.transfers:
+        return None
+    ((mode, seconds),) = policy.transfers.items()
+    return (mode, float(seconds))
+
+
+def _policy_reduced(core, point, egress, modes, exclude_stops, transfer_mode=None):
     """One side's reduction: the ``(stop, seconds)`` offsets the engine
     seeds, and the per-stop ``StreetChoice`` tokens the reconstruction
     rebuilds the street legs from."""
     rows = core._reduced_street_offsets(
-        point[0], point[1], egress, modes, [str(stop) for stop in exclude_stops]
+        point[0],
+        point[1],
+        egress,
+        modes,
+        [str(stop) for stop in exclude_stops],
+        transfer_mode=transfer_mode,
     )
     offsets = [(stop, seconds) for stop, seconds, *_ in rows]
     tokens = {row[0]: row[1:] for row in rows}
     return offsets, tokens
 
 
-def _policy_street_legs(core, leg, point, tokens, budgets, egress, geometries):
+def _transfer_leg_dicts(
+    core, from_stop, to_stop, departure_s, arrival_s, geometries, transfer_mode
+):
+    """The leg dicts of one relaxed transfer edge: a single walking leg,
+    or — when the merged set's edge rode a rental — the walk-ride-walk
+    split from its token, the ride's distances from the token itself
+    (its street path is not drawn yet). Times split by the token's
+    walking seconds; the edge's total stays authoritative."""
+    token = (
+        core._mode_transfer_token(from_stop, to_stop)
+        if transfer_mode is not None
+        else None
+    )
+    if token is None:
+        walked = core._transfer_leg(
+            from_stop, to_stop, geometries, transfer_mode=transfer_mode
+        )
+        return [
+            {
+                "type": "transfer",
+                "mode": "walk",
+                "from_stop": from_stop,
+                "to_stop": to_stop,
+                "departure_s": departure_s,
+                "arrival_s": arrival_s,
+                "distance_m": walked[1] if walked is not None else None,
+                "distance_provenance": None,
+                "geometry": walked[2] if walked is not None else None,
+            }
+        ]
+    pickup, drop, ride_seconds, ride_network, ride_total, pre_seconds, post_seconds = (
+        token
+    )
+    legs = []
+    at = departure_s
+    if pre_seconds > 0 or pickup != from_stop:
+        walked = core._transfer_leg(from_stop, pickup, geometries)
+        legs.append(
+            {
+                "type": "transfer",
+                "mode": "walk",
+                "from_stop": from_stop,
+                "to_stop": pickup,
+                "departure_s": at,
+                "arrival_s": at + pre_seconds,
+                "distance_m": walked[1] if walked is not None else None,
+                "distance_provenance": None,
+                "geometry": walked[2] if walked is not None else None,
+            }
+        )
+        at += pre_seconds
+    legs.append(
+        {
+            "type": "transfer",
+            "mode": transfer_mode[0],
+            "from_stop": pickup,
+            "to_stop": drop,
+            "departure_s": at,
+            "arrival_s": at + ride_seconds,
+            "distance_m": ride_total,
+            "network_distance_m": ride_network,
+            "connector_distance_m": ride_total - ride_network,
+            "distance_provenance": None,
+            "geometry": None,
+        }
+    )
+    at += ride_seconds
+    if post_seconds > 0 or drop != to_stop:
+        walked = core._transfer_leg(drop, to_stop, geometries)
+        legs.append(
+            {
+                "type": "transfer",
+                "mode": "walk",
+                "from_stop": drop,
+                "to_stop": to_stop,
+                "departure_s": at,
+                "arrival_s": arrival_s,
+                "distance_m": walked[1] if walked is not None else None,
+                "distance_provenance": None,
+                "geometry": walked[2] if walked is not None else None,
+            }
+        )
+    else:
+        legs[-1]["arrival_s"] = arrival_s
+    return legs
+
+
+def _policy_street_legs(
+    core, leg, point, tokens, budgets, egress, geometries, transfer_mode=None
+):
     """The reconstructed street leg(s) behind one access or egress row.
 
     The kept token names the winning mode and the stop link it reached;
@@ -116,44 +219,27 @@ def _policy_street_legs(core, leg, point, tokens, budgets, egress, geometries):
         end = ("from_stop", seed) if egress else ("to_stop", seed)
         street[end[0]] = end[1]
         return [street]
-    # The walked edge follows the closure's direction: access walks from
-    # the seed the vehicle reached, egress walks *to* the seed it leaves
-    # from — asymmetric footpaths stay honest. The reduction carried the
-    # choice over exactly this installed edge, so it exists; the guard
-    # below is defensive, and the times derive from the reduced total
-    # either way.
-    ends = (stop, seed) if egress else (seed, stop)
-    walked = core._transfer_leg(*ends, geometries)
-    transfer = {
-        "type": "transfer",
-        "mode": "walk",
-        "distance_m": walked[1] if walked is not None else None,
-        "distance_provenance": None,
-        "geometry": walked[2] if walked is not None else None,
-    }
+    # The relaxed edge follows the closure's direction: access moves from
+    # the seed the vehicle reached, egress moves *to* the seed it leaves
+    # from — asymmetric edges stay honest. Under a merged set the edge
+    # itself may ride a rental, so the shared splitter emits its legs.
     if egress:
-        # The traveller walks the transfer first, then the vehicle leaves
-        # from the seed's link.
+        # The traveller crosses the transfer first, then the vehicle
+        # leaves from the seed's link.
         boundary = max(leg["arrival_s"] - leg_seconds, leg["departure_s"])
-        transfer.update(
-            from_stop=stop,
-            to_stop=seed,
-            departure_s=leg["departure_s"],
-            arrival_s=boundary,
+        transfer_legs = _transfer_leg_dicts(
+            core, stop, seed, leg["departure_s"], boundary, geometries, transfer_mode
         )
         street.update(from_stop=seed, departure_s=boundary, arrival_s=leg["arrival_s"])
-        return [transfer, street]
-    # Access: the vehicle reaches the seed's link, then the transfer is
-    # walked to the boarded stop.
+        return transfer_legs + [street]
+    # Access: the vehicle reaches the seed's link, then the transfer
+    # crosses to the boarded stop.
     boundary = min(leg["departure_s"] + leg_seconds, leg["arrival_s"])
     street.update(to_stop=seed, departure_s=leg["departure_s"], arrival_s=boundary)
-    transfer.update(
-        from_stop=seed,
-        to_stop=stop,
-        departure_s=boundary,
-        arrival_s=leg["arrival_s"],
+    transfer_legs = _transfer_leg_dicts(
+        core, seed, stop, boundary, leg["arrival_s"], geometries, transfer_mode
     )
-    return [street, transfer]
+    return [street] + transfer_legs
 
 
 def _policy_journeys(
@@ -188,6 +274,7 @@ def _policy_journeys(
     exclude_stops = tuple(str(stop) for stop in exclusions[2])
     access_modes = reduction_modes(policy, "access", _streets.MAX_ACCESS_EGRESS_TIME)
     egress_modes = reduction_modes(policy, "egress", _streets.MAX_ACCESS_EGRESS_TIME)
+    transfer_mode = _policy_transfer_mode(policy)
     origin = tuple(origin)
     destination = tuple(destination)
 
@@ -198,7 +285,7 @@ def _policy_journeys(
         # walk either, it is the honest answer.
         try:
             offsets, tokens = _policy_reduced(
-                core, point, egress_side, modes, exclude_stops
+                core, point, egress_side, modes, exclude_stops, transfer_mode
             )
         except ValueError as error:
             if "too far from the multimodal street network" not in str(error):
@@ -218,6 +305,7 @@ def _policy_journeys(
         list(exclude_trips),
         list(exclude_stops),
         geometries,
+        transfer_mode=transfer_mode,
     )
     access_budgets = {mode: seconds for mode, seconds, *_ in access_modes}
     egress_budgets = {mode: seconds for mode, seconds, *_ in egress_modes}
@@ -290,6 +378,7 @@ def _policy_journeys(
                         access_budgets,
                         False,
                         geometries,
+                        transfer_mode,
                     )
                 )
             elif leg["type"] == "egress":
@@ -302,6 +391,22 @@ def _policy_journeys(
                         egress_budgets,
                         True,
                         geometries,
+                        transfer_mode,
+                    )
+                )
+            elif leg["type"] == "transfer" and transfer_mode is not None:
+                # A merged-set edge may ride a rental; the splitter
+                # emits its walk-ride-walk legs from the token. Pure
+                # walking transfers keep the engine's own leg below.
+                legs.extend(
+                    _transfer_leg_dicts(
+                        core,
+                        leg["from_stop"],
+                        leg["to_stop"],
+                        leg["departure_s"],
+                        leg["arrival_s"],
+                        geometries,
+                        transfer_mode,
                     )
                 )
             else:
@@ -386,6 +491,13 @@ def _policy_mc_journeys(
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
     from cafein.policy import pareto_reduction_modes
 
+    if policy.transfers:
+        raise ValueError(
+            "street_policy transfers= is not available on the "
+            "multicriteria candidates yet: a rental transfer adds grams "
+            "the dominance must see, which arrives with the "
+            "emissions-aware transfer stage"
+        )
     exclude_routes = tuple(str(route) for route in exclusions[0])
     exclude_trips = tuple(str(trip) for trip in exclusions[1])
     exclude_stops = tuple(str(stop) for stop in exclusions[2])
@@ -1246,7 +1358,11 @@ class TransportNetwork:
             and ``connector_distance_m`` parts included), the street
             distance provenance, and its shape, and a choice carried
             through the transfer closure splits into the vehicle leg to
-            its seed stop plus the walked transfer. The direct
+            its seed stop plus the walked transfer. With
+            ``transfers={mode: budget}`` (one shared mode; compute the
+            set first with :meth:`compute_mode_transfers`) the run
+            relaxes the merged mode-transfer set, and a transfer whose
+            edge rode a rental splits into its walk--ride--walk legs. The direct
             door-to-door alternative stays the walking one: whether a
             policy's vehicle may serve a stop-less journey depends on
             its terms, so that fold arrives with a later stage and the
@@ -1323,6 +1439,30 @@ class TransportNetwork:
             geometries,
         )
 
+    def compute_mode_transfers(self, mode, max_seconds):
+        """Compute the merged shared-vehicle transfer set for ``mode``.
+
+        Per stop with a street link for `mode`, one directed search over
+        the multimodal graph collects the rental rides to every other
+        link within `max_seconds`; they merge into the installed walking
+        closure under the one-rental-per-transfer contract — the budget
+        bounds a rental-bearing transfer's whole movement (pre-walk,
+        ride, post-walk), while pure walking transfers keep the
+        installed set's own budget, so the merged set is never weaker
+        than the walking one. Queries with
+        ``StreetLegPolicy(transfers={mode: max_seconds})`` then relax
+        this set; a missing or differently bound set is rejected, never
+        silently substituted. Heavy precompute; runtime state, not yet
+        persisted by ``save``.
+
+        Returns
+        -------
+        (int, int)
+            The merged set's edge count and how many edges ride a
+            rental.
+        """
+        return self._core._compute_mode_transfers(mode, float(max_seconds))
+
     def travel_times_from_coordinate(
         self,
         origin,
@@ -1372,8 +1512,12 @@ class TransportNetwork:
             side means walking at the usual 7200 s budget. Non-walking
             modes need the multimodal graph (build with
             ``street_modes=``) and run the per-stop time-only reduction
-            over it. Conflicts with the walking knobs above and with
-            exclusions, which are rejected rather than silently ignored.
+            over it. With ``transfers={mode: budget}`` the run relaxes
+            the merged mode-transfer set of
+            :meth:`compute_mode_transfers`, which must be computed with
+            exactly that binding. Conflicts with the walking knobs above
+            and with exclusions, which are rejected rather than
+            silently ignored.
 
         Returns
         -------
@@ -1396,12 +1540,16 @@ class TransportNetwork:
                 )
             if any((exclude_routes, exclude_trips, exclude_stops)):
                 raise ValueError("street_policy does not combine with exclusions yet")
+            from cafein.network import _policy_transfer_mode
+
             modes = reduction_modes(
                 street_policy, "access", _streets.MAX_ACCESS_EGRESS_TIME
             )
-            if all(mode == "walk" for mode, *_ in modes):
+            transfer_mode = _policy_transfer_mode(street_policy)
+            if transfer_mode is None and all(mode == "walk" for mode, *_ in modes):
                 # A walking-only policy IS the current walking path, at the
-                # policy's walking budget.
+                # policy's walking budget; a transfers= binding changes the
+                # relaxed set, so it never takes this shortcut.
                 walk_budget = next(s for mode, s, *_ in modes if mode == "walk")
                 return self._core.travel_times_from_coordinate(
                     tuple(origin),
@@ -1421,11 +1569,11 @@ class TransportNetwork:
             access = [
                 (stop, seconds)
                 for stop, seconds, *_ in self._core._reduced_street_offsets(
-                    *tuple(origin), False, modes
+                    *tuple(origin), False, modes, transfer_mode=transfer_mode
                 )
             ]
             return self._core._travel_times_with_access(
-                access, date, departure, max_transfers
+                access, date, departure, max_transfers, transfer_mode=transfer_mode
             )
         return self._core.travel_times_from_coordinate(
             tuple(origin),

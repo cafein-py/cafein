@@ -1,10 +1,12 @@
 """Street-leg policies for public-transport queries.
 
 A :class:`StreetLegPolicy` says which street modes may serve a journey's
-access and egress (and, later, its intermediate transfers), each with its
-own time budget, and under which vehicle terms. It is one structured
-object rather than a growing collection of loosely related mode arguments,
-and it is deliberately explicit: an own vehicle names the one side it
+access and egress and — for shared vehicles, over the merged set of
+``TransportNetwork.compute_mode_transfers`` — its intermediate
+transfers, each with its own time budget, and under which vehicle
+terms. It is one structured object rather than a growing collection of
+loosely related mode arguments, and it is deliberately explicit: an own
+vehicle names the one side it
 serves and where it may be left or picked up, and a shared vehicle names
 its availability — nothing is silently assumed.
 """
@@ -121,9 +123,15 @@ class StreetLegPolicy:
         ``e_bike``, and ``e_scooter``. An omitted dict means walking at
         the query's usual walking budget.
     transfers : dict, optional
-        Not consumed yet — rejected if passed. Intermediate transfers ride
-        the installed walking transfer set until shared intermediate legs
-        arrive (a later stage).
+        ``{mode: seconds}`` for stop-to-stop transfers mid-journey, one
+        **shared** mode at a time: each such transfer is a complete
+        pickup-travel-drop-off rental, so it needs no possession state
+        (own-vehicle transfers arrive with the carriage stage). The
+        budget bounds a rental-bearing transfer's whole movement —
+        pre-walk, ride, and post-walk; pure walking transfers keep the
+        installed set's own budget. Queries require the matching merged
+        set precomputed with
+        ``TransportNetwork.compute_mode_transfers``.
     vehicles : dict, optional
         ``{mode: VehiclePolicy}`` for every non-walking mode used. A
         non-walking mode without vehicle terms is rejected — whose bicycle
@@ -137,12 +145,18 @@ class StreetLegPolicy:
         self.access = None if access is None else _validated_budgets("access", access)
         self.egress = None if egress is None else _validated_budgets("egress", egress)
         if transfers is not None:
-            raise ValueError(
-                "transfers= is not consumed yet: intermediate transfers ride "
-                "the installed walking transfer set; per-mode transfer "
-                "budgets arrive with shared intermediate legs"
-            )
-        self.transfers = None
+            transfers = _validated_budgets("transfers", transfers)
+            if "walk" in transfers:
+                raise ValueError(
+                    "walking transfers are the installed transfer set; "
+                    "transfers= names shared vehicle modes"
+                )
+            if len(transfers) > 1:
+                raise ValueError(
+                    "one shared transfer mode at a time for now; the "
+                    "merged transfer set is computed per mode"
+                )
+        self.transfers = transfers
         vehicles = dict(vehicles or {})
         for mode, policy in vehicles.items():
             if mode not in STREET_POLICY_MODES or mode == "walk":
@@ -167,12 +181,32 @@ class StreetLegPolicy:
                             f"(side={policy.side!r}), so it cannot be an "
                             f"{side_name} mode"
                         )
+        for mode in self.transfers or {}:
+            policy = vehicles.get(mode)
+            if policy is None:
+                raise ValueError(
+                    f"transfer mode {mode!r} needs vehicle terms; pass "
+                    f"vehicles={{{mode!r}: VehiclePolicy(...)}}"
+                )
+            if policy.source != "shared":
+                raise ValueError(
+                    "own-vehicle transfers need possession state (the "
+                    "carriage stage); transfers= takes shared modes — "
+                    "each transfer is a complete pickup-travel-drop-off "
+                    "rental"
+                )
+            if policy.facilities != "any_stop":
+                raise ValueError(
+                    f"the merged transfer set rents {mode!r} at every "
+                    "linked stop; a facility-masked set is not computed "
+                    "yet, so transfer vehicles need facilities='any_stop'"
+                )
         self.vehicles = vehicles
 
     def __repr__(self):
         return (
             f"StreetLegPolicy(access={self.access!r}, egress={self.egress!r}, "
-            f"vehicles={self.vehicles!r})"
+            f"transfers={self.transfers!r}, vehicles={self.vehicles!r})"
         )
 
 

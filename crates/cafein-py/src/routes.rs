@@ -306,7 +306,8 @@ impl TransportNetwork {
     /// full transfer closure like every policy query. Internal until the
     /// policy surface stabilises.
     #[pyo3(signature = (access_rows, egress_rows, date, departure, max_transfers,
-                        exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![]))]
+                        exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![],
+                        transfer_mode = None))]
     #[allow(clippy::too_many_arguments)]
     fn _time_matrix_with_access(
         &self,
@@ -319,7 +320,18 @@ impl TransportNetwork {
         exclude_routes: Vec<String>,
         exclude_trips: Vec<String>,
         exclude_stops: Vec<String>,
+        transfer_mode: Option<(String, f64)>,
     ) -> PyResult<Vec<Vec<Option<u32>>>> {
+        if transfer_mode.is_some() && !exclude_stops.is_empty() {
+            // A rental-bearing merged edge hides its pickup and drop
+            // stops inside the token; the engine's exclusion checks see
+            // only the edge's endpoints.
+            return Err(PyValueError::new_err(
+                "stop exclusions do not combine with street_policy \
+                 transfers= yet; a rental transfer's interior stops are \
+                 not exclusion-aware",
+            ));
+        }
         let departure = parse_time(departure)?;
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         let active_services = self.active_services(date)?;
@@ -348,8 +360,9 @@ impl TransportNetwork {
                     .collect::<PyResult<Vec<_>>>()?,
             );
         }
+        let relaxed = self.policy_transfers(transfer_mode.as_ref())?;
         let matrix = py.allow_threads(|| {
-            let rows = Raptor.one_to_all_many(&self.build.timetable, &self.transfers, &requests);
+            let rows = Raptor.one_to_all_many(&self.build.timetable, relaxed, &requests);
             rows.iter()
                 .map(|arrivals| {
                     egress
@@ -386,7 +399,7 @@ impl TransportNetwork {
     /// surface stabilises.
     #[pyo3(signature = (access, egress, date, departure, max_transfers,
                         exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![],
-                        geometries = true))]
+                        geometries = true, transfer_mode = None))]
     #[allow(clippy::too_many_arguments)]
     fn _route_with_access(
         &self,
@@ -400,7 +413,18 @@ impl TransportNetwork {
         exclude_trips: Vec<String>,
         exclude_stops: Vec<String>,
         geometries: bool,
+        transfer_mode: Option<(String, f64)>,
     ) -> PyResult<Py<PyList>> {
+        if transfer_mode.is_some() && !exclude_stops.is_empty() {
+            // A rental-bearing merged edge hides its pickup and drop
+            // stops inside the token; the engine's exclusion checks see
+            // only the edge's endpoints.
+            return Err(PyValueError::new_err(
+                "stop exclusions do not combine with street_policy \
+                 transfers= yet; a rental transfer's interior stops are \
+                 not exclusion-aware",
+            ));
+        }
         let resolve = |offsets: &[(String, u32)]| {
             offsets
                 .iter()
@@ -416,18 +440,11 @@ impl TransportNetwork {
             max_transfers,
             exclusions: self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?,
         };
-        let journeys =
-            py.allow_threads(|| Raptor.route(&self.build.timetable, &self.transfers, &request));
+        let relaxed = self.policy_transfers(transfer_mode.as_ref())?;
+        let journeys = py.allow_threads(|| Raptor.route(&self.build.timetable, relaxed, &request));
         let result = PyList::empty(py);
         for journey in &journeys {
-            result.append(self.journey_to_dict(
-                py,
-                journey,
-                None,
-                None,
-                geometries,
-                &self.transfers,
-            )?)?;
+            result.append(self.journey_to_dict(py, journey, None, None, geometries, relaxed)?)?;
         }
         Ok(result.unbind())
     }
@@ -438,7 +455,8 @@ impl TransportNetwork {
     /// closure: the ULTRA shortcut set models *walking* egress, so policy
     /// queries stay off it until multimodal ULTRA arrives. Internal until
     /// the policy surface stabilises.
-    #[pyo3(signature = (access, date, departure, max_transfers, router = "raptor"))]
+    #[pyo3(signature = (access, date, departure, max_transfers, router = "raptor", transfer_mode = None))]
+    #[allow(clippy::too_many_arguments)]
     fn _travel_times_with_access(
         &self,
         py: Python<'_>,
@@ -447,6 +465,7 @@ impl TransportNetwork {
         departure: &str,
         max_transfers: u8,
         router: &str,
+        transfer_mode: Option<(String, f64)>,
     ) -> PyResult<Py<PyDict>> {
         let departure = parse_time(departure)?;
         let offsets = access
@@ -466,21 +485,27 @@ impl TransportNetwork {
                     max_transfers,
                     exclusions: None,
                 };
-                py.allow_threads(|| {
-                    Raptor.one_to_all(&self.build.timetable, &self.transfers, &request)
-                })
+                let relaxed = self.policy_transfers(transfer_mode.as_ref())?;
+                py.allow_threads(|| Raptor.one_to_all(&self.build.timetable, relaxed, &request))
             }
             // The engine-neutrality arm: the same reduced array through the
             // trip-based engine, for the RAPTOR/TBTR equality tests.
-            "tbtr" => py.allow_threads(|| {
-                self.tbtr_engine(
-                    &self.transfers,
-                    date,
-                    &active_services,
-                    &active_services_previous,
-                )
-                .one_to_all(departure, &offsets, max_transfers)
-            }),
+            "tbtr" => {
+                if transfer_mode.is_some() {
+                    // The trip-based engine still assumes a transitively
+                    // closed footpath set; the merged mode-transfer set
+                    // runs on RAPTOR's exact transfer phase only.
+                    return Err(PyValueError::new_err(
+                        "the trip-based arm serves the walking closure; \
+                         street_policy transfers= queries run on RAPTOR",
+                    ));
+                }
+                let relaxed = self.policy_transfers(transfer_mode.as_ref())?;
+                py.allow_threads(|| {
+                    self.tbtr_engine(relaxed, date, &active_services, &active_services_previous)
+                        .one_to_all(departure, &offsets, max_transfers)
+                })
+            }
             other => return Err(invalid_router(other)),
         };
         self.arrivals_dict(py, &arrivals, departure)

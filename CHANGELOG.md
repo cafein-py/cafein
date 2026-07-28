@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- Shared vehicles may now serve the **transfers between rides**, behind
+  the same policy. ``TransportNetwork.compute_mode_transfers(mode,
+  max_seconds)`` builds a merged transfer set beside the walking
+  closure: per stop pair the walking row survives untouched unless one
+  walk--ride--walk movement on the shared mode is strictly faster
+  within the budget — at most one rental per transfer, the walks each
+  one closure row, ties to walking.
+  ``StreetLegPolicy(transfers={mode: budget})`` then relaxes that set
+  on the time-only paths (``route_between_coordinates``,
+  ``travel_times_from_coordinate``, ``TravelTimeMatrix``, and
+  ``DetailedItineraries`` with ``candidates="time"``); the binding is
+  checked exactly — a missing or differently parameterised set is an
+  error, never a silent walking fallback — and reconstructed journeys
+  split a rental-bearing transfer into its walk--ride--walk legs, the
+  ride carrying the mode and its exact distances. Because a
+  budget-bounded rental row cannot close over walks past its budget,
+  the merged set declares itself outside the engines'
+  transitive-closure contract and RAPTOR runs an exact transfer phase
+  for it, relaxing walks from every transit arrival of a round rather
+  than only label-improving ones. The trip-based engines and the
+  multicriteria and cost surfaces decline the binding until their
+  stages land.
+
 - **Sourced street-mode emission factors ship by default.** The
   micromobility rows of ``cafein.emissions.street_factors()`` now
   resolve out of the box: ITF *Good to Go?* (Cazzola & Crist 2020)

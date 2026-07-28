@@ -176,6 +176,20 @@ def multimodal_mctbtr_network(helsinki_gtfs, kantakaupunki_pbf, artifact_cache):
     return _cached_network(artifact_cache, "helsinki-multimodal-mctbtr", build)
 
 
+@pytest.fixture(scope="session")
+def multimodal_transfers_network(multimodal_network, artifact_cache):
+    """A private multimodal copy carrying the merged e-scooter transfer
+    set (600 s budget). Computing the set mutates network state, so the
+    shared multimodal fixture is never touched; the artifact load plus
+    the 0.6 s merge stay cheap enough for a session fixture.
+    `multimodal_network` is requested first so the artifact exists."""
+    from cafein import TransportNetwork
+
+    network = TransportNetwork.load(artifact_cache / "helsinki-multimodal.cafein")
+    network.compute_mode_transfers("e_scooter", 600)
+    return network
+
+
 @pytest.fixture()
 def fresh_footpaths_network(network_with_footpaths, artifact_cache):
     """A private copy of the footpaths network, for tests that mutate one.

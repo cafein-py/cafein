@@ -1500,6 +1500,7 @@ pub(super) fn assemble(
         multimodal_modes,
         multimodal_links: std::sync::OnceLock::new(),
         multimodal_profiles: std::sync::Mutex::new(Vec::new()),
+        mode_transfers: None,
         stops_by_id,
         stops_by_qualified_id,
         trips_by_public_id,
