@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 — 2026-07-28
 
 - Street-policy **time queries auto-ride the cached trip-based set**:
   with a whole-day TBTR cache (``compute_tbtr_transfers``) matching the
