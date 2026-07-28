@@ -85,8 +85,9 @@ def _transfer_leg_dicts(
     """The leg dicts of one relaxed transfer edge: a single walking leg,
     or — when the merged set's edge rode a rental — the walk-ride-walk
     split from its token, the ride's distances from the token itself
-    (its street path is not drawn yet). Times split by the token's
-    walking seconds; the edge's total stays authoritative."""
+    and its shape drawn under the transfer mode's profile. Times split
+    by the token's walking seconds; the edge's total stays
+    authoritative."""
     token = (
         core._mode_transfer_token(from_stop, to_stop)
         if transfer_mode is not None
@@ -112,6 +113,11 @@ def _transfer_leg_dicts(
     pickup, drop, ride_seconds, ride_network, ride_total, pre_seconds, post_seconds = (
         token
     )
+    ride_shape = None
+    if geometries:
+        drawn = core._mode_transfer_ride_leg(from_stop, to_stop)
+        if drawn is not None:
+            ride_shape = drawn[3]
     legs = []
     at = departure_s
     if pre_seconds > 0 or pickup != from_stop:
@@ -142,7 +148,7 @@ def _transfer_leg_dicts(
             "network_distance_m": ride_network,
             "connector_distance_m": ride_total - ride_network,
             "distance_provenance": None,
-            "geometry": None,
+            "geometry": ride_shape,
         }
     )
     at += ride_seconds
@@ -1490,8 +1496,8 @@ class TransportNetwork:
         than the walking one. Queries with
         ``StreetLegPolicy(transfers={mode: max_seconds})`` then relax
         this set; a missing or differently bound set is rejected, never
-        silently substituted. Heavy precompute; runtime state, not yet
-        persisted by ``save``.
+        silently substituted. Heavy precompute; persisted by ``save``
+        and restored by ``load`` with its exact binding.
 
         Returns
         -------

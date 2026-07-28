@@ -81,6 +81,22 @@ impl TransportNetwork {
                 mctbtr_transfers: &self.mctbtr_transfers,
                 multimodal: multimodal_meta,
                 multimodal_modes: &self.multimodal_modes,
+                mode_transfers: self.mode_transfers.as_ref().map(|held| {
+                    let mut tokens: Vec<_> = held
+                        .tokens
+                        .iter()
+                        .map(|(&pair, &token)| (pair, token))
+                        .collect();
+                    tokens.sort_unstable_by_key(|&(pair, _)| pair);
+                    PersistedModeTransfersRef {
+                        mode: &held.mode,
+                        budget: held.budget,
+                        set: &held.set,
+                        tokens,
+                        rental_network_meters: &held.rental_network_meters,
+                        rental_edge: &held.rental_edge,
+                    }
+                }),
             };
             let meta = bincode::serialize(&artifact)
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -249,12 +265,14 @@ pub(super) const STREET_ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINST";
 // 2: optional elevation metadata in `StreetsMeta`, as in network format 13.
 pub(super) const STREET_ARTIFACT_FORMAT: u32 = 2;
 
-// 14: the META gains an optional second `StreetsMeta` for the multimodal
-// union street graph, whose arrays follow the walking arrays inside the
+// 15: the META gains the optional merged mode-transfer set with its
+// tokens, per-edge rental arrays, and exact binding.
+// 14 added an optional second `StreetsMeta` for the multimodal union
+// street graph, whose arrays follow the walking arrays inside the
 // STREETS section (descriptor offsets pre-shifted to their position).
 // 13 added optional elevation metadata to `StreetsMeta`. Earlier formats
 // must be rebuilt.
-pub(super) const ARTIFACT_FORMAT: u32 = 14;
+pub(super) const ARTIFACT_FORMAT: u32 = 15;
 
 /// Section tags in the container directory.
 pub(super) const SECTION_META: u16 = 1;
@@ -311,6 +329,34 @@ pub(super) struct ArtifactRef<'a> {
     multimodal: Option<StreetsMeta>,
     /// The pruning modes the multimodal graph was built with.
     multimodal_modes: &'a Option<Vec<String>>,
+    /// The merged shared-vehicle transfer set with its exact binding,
+    /// when computed; restored so the heavy merge need not be repeated.
+    mode_transfers: Option<PersistedModeTransfersRef<'a>>,
+}
+
+/// The merged mode-transfer set as persisted: the token map flattened
+/// into key-sorted pairs so a re-save stays byte-identical, the
+/// unclosed marking re-applied on load (a persisted merged set is
+/// never a closure). The borrowed twin serializes to the same bytes
+/// the owned form deserializes from.
+#[derive(serde::Serialize)]
+struct PersistedModeTransfersRef<'a> {
+    mode: &'a str,
+    budget: f64,
+    set: &'a Transfers,
+    tokens: Vec<((u32, u32), cafein_core::mode_transfers::RentalToken)>,
+    rental_network_meters: &'a [f64],
+    rental_edge: &'a [bool],
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct PersistedModeTransfers {
+    mode: String,
+    budget: f64,
+    set: Transfers,
+    tokens: Vec<((u32, u32), cafein_core::mode_transfers::RentalToken)>,
+    rental_network_meters: Vec<f64>,
+    rental_edge: Vec<bool>,
 }
 
 /// The decoded part of the saved network, owned after reading.
@@ -333,6 +379,7 @@ pub(super) struct Artifact {
     mctbtr_transfers: Option<(String, Vec<f64>, cafein_core::tbtr::TransferSet)>,
     multimodal: Option<StreetsMeta>,
     multimodal_modes: Option<Vec<String>>,
+    mode_transfers: Option<PersistedModeTransfers>,
 }
 
 /// The street layer's decoded state: link records (endpoints
@@ -1464,7 +1511,29 @@ pub(super) fn assemble(
         mctbtr_transfers,
         multimodal: multimodal_meta,
         multimodal_modes,
+        mode_transfers,
     } = artifact;
+    let mode_transfers = mode_transfers.map(|persisted| {
+        let PersistedModeTransfers {
+            mode,
+            budget,
+            mut set,
+            tokens,
+            rental_network_meters,
+            rental_edge,
+        } = persisted;
+        // A persisted merged set is never a closure; the skip-serialized
+        // marking must not default it back to one.
+        set.mark_unclosed();
+        crate::ModeTransferSet {
+            mode,
+            budget,
+            set,
+            tokens: tokens.into_iter().collect(),
+            rental_network_meters,
+            rental_edge,
+        }
+    });
     let multimodal_elevation = multimodal_meta.and_then(|meta| meta.elevation);
     // The contraction persisted; its buckets are derived state, rebuilt here on
     // the loading thread exactly as `install_hierarchy` builds them for a fresh
@@ -1500,7 +1569,7 @@ pub(super) fn assemble(
         multimodal_modes,
         multimodal_links: std::sync::OnceLock::new(),
         multimodal_profiles: std::sync::Mutex::new(Vec::new()),
-        mode_transfers: None,
+        mode_transfers,
         stops_by_id,
         stops_by_qualified_id,
         trips_by_public_id,

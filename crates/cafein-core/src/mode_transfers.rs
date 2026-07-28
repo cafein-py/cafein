@@ -37,7 +37,7 @@ pub struct RentalEdge {
 /// the reconstruction token. The walking legs on either side derive
 /// from the closure (`pre_seconds` walking before the pickup,
 /// `post_seconds` after the drop).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RentalToken {
     pub pickup: StopIdx,
     pub drop: StopIdx,

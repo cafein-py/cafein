@@ -1078,6 +1078,59 @@ impl TransportNetwork {
         }))
     }
 
+    /// The drawn street path of a rental transfer's ride — the merged
+    /// edge's pickup-to-drop stretch under the transfer mode's profile.
+    /// The leg's authoritative times and meters stay the token's; the
+    /// drawn path is an optimal one under the same profile, as with
+    /// walked transfer shapes. ``None`` without a binding, a token for
+    /// the pair, or a pair of mode links. Internal.
+    fn _mode_transfer_ride_leg(
+        &self,
+        py: Python<'_>,
+        from_stop: &str,
+        to_stop: &str,
+    ) -> PyResult<Option<StreetLegParts>> {
+        let from = self.resolve_stop(from_stop)?;
+        let to = self.resolve_stop(to_stop)?;
+        let Some(held) = &self.mode_transfers else {
+            return Ok(None);
+        };
+        let Some(token) = held.tokens.get(&(from.0, to.0)).copied() else {
+            return Ok(None);
+        };
+        let profile = self.multimodal_profile(&held.mode)?;
+        let network = self.multimodal.as_ref().expect("profile lookup checked");
+        let links = self.mode_link_targets(network, profile.definition.mode.bit());
+        let (Some(pickup_link), Some(drop_link)) =
+            (links[token.pickup.0 as usize], links[token.drop.0 as usize])
+        else {
+            return Ok(None);
+        };
+        let point = |stop: StopIdx| {
+            let feed_stop = &self.feed.stops[stop.0 as usize];
+            match (feed_stop.latitude, feed_stop.longitude) {
+                (Some(latitude), Some(longitude)) => Some((latitude, longitude)),
+                _ => None,
+            }
+        };
+        let (Some(pickup_point), Some(drop_point)) = (point(token.pickup), point(token.drop))
+        else {
+            return Ok(None);
+        };
+        let budget = held.budget;
+        let leg = py.allow_threads(|| {
+            network.directed_leg(
+                pickup_point,
+                &pickup_link,
+                drop_point,
+                &drop_link,
+                &profile,
+                budget,
+            )
+        });
+        Ok(leg.map(|leg| leg_parts(py, leg, true)))
+    }
+
     /// The time-only street reduction (design §7.2): per stop, the fastest
     /// permitted choice across the policy's modes over the multimodal graph.
     /// ``modes`` arrive in declared order as ``(mode, max_seconds,
@@ -1392,9 +1445,9 @@ impl TransportNetwork {
     /// (`merge_mode_transfers`), the whole movement bounded by
     /// ``max_seconds``. The set is runtime state bound to the exact
     /// mode and budget — a policy query only relaxes it when its
-    /// ``transfers=`` matches, and it is not persisted yet. Heavy
-    /// precompute (one directed search per linked stop). Internal until
-    /// the 15b surface.
+    /// ``transfers=`` matches; persisted with the artifact and
+    /// restored on load. Heavy precompute (one directed search per
+    /// linked stop). Internal behind the 15b surface.
     fn _compute_mode_transfers(
         &mut self,
         py: Python<'_>,

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- The merged shared-vehicle transfer set is now **persisted** with the
+  network artifact (format 15): ``save`` writes the set, its
+  reconstruction tokens, and the exact ``(mode, budget)`` binding —
+  token order canonicalised so a re-save stays byte-identical — and
+  ``load`` restores it with the unclosed marking re-applied, so a
+  loaded network answers ``transfers=`` queries without repeating the
+  merge and with the exact transfer phase intact. Rental transfer legs
+  also gain their **drawn street path**: the ride's pickup-to-drop
+  shape under the transfer mode's profile as a WKB LineString (the
+  leg's times and meters stay the token's, as with walked transfer
+  shapes).
+
 - Shared **transfer rentals enter the multicriteria dominance**. The
   ``transfers={mode: budget}`` policy grant now works with
   ``DetailedItineraries``' ``"pareto"`` and ``"relaxed"`` candidates:

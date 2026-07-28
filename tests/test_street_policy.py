@@ -1921,3 +1921,81 @@ def test_mc_transfer_bindings_are_checked(
             router="tbtr",
             transfer_mode=("e_scooter", 600.0, 0.021),
         )
+
+
+def test_the_merged_set_survives_the_artifact(multimodal_transfers_network, tmp_path):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TransportNetwork
+    from cafein import streets as _streets
+    from cafein.policy import reduction_modes
+
+    path = tmp_path / "with-transfers.cafein"
+    multimodal_transfers_network.save(path)
+    loaded = TransportNetwork.load(path)
+    # Double-saving the loaded network stays byte-identical: its token
+    # map lands in a freshly seeded HashMap, so this exercises the
+    # key-sorted canonicalisation rather than one map's repeated
+    # iteration order. (Byte identity across the load cycle itself has
+    # never been a feed guarantee.)
+    once = tmp_path / "again.cafein"
+    twice = tmp_path / "and-again.cafein"
+    loaded.save(once)
+    loaded.save(twice)
+    assert once.read_bytes() == twice.read_bytes()
+
+    assert (
+        loaded._core._mode_transfer_binding
+        == multimodal_transfers_network._core._mode_transfer_binding
+    )
+    # The loaded set keeps the unclosed marking: identical access seeds,
+    # arrivals monotone against the walking closure — never later,
+    # somewhere strictly earlier (a set silently loaded as a closure
+    # would lose shadowed walk extensions and fail this).
+    core = loaded._core
+    modes = reduction_modes(
+        _transfer_policy(), "access", _streets.MAX_ACCESS_EGRESS_TIME
+    )
+    access = [
+        (stop, seconds)
+        for stop, seconds, *_ in core._reduced_street_offsets(*ORIGIN, False, modes)
+    ]
+    walking = core._travel_times_with_access(access, "2022-02-22", "08:30:00", 7)
+    rented = core._travel_times_with_access(
+        access, "2022-02-22", "08:30:00", 7, transfer_mode=("e_scooter", 600.0)
+    )
+    assert all(rented[stop] <= seconds for stop, seconds in walking.items())
+    assert any(rented[stop] < seconds for stop, seconds in walking.items())
+    # And the journeys match the saving network's, tokens intact.
+    before = multimodal_transfers_network.route_between_coordinates(
+        ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=_transfer_policy()
+    )
+    after = loaded.route_between_coordinates(
+        ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=_transfer_policy()
+    )
+    assert before == after
+
+
+def test_rental_ride_legs_draw_their_shape(multimodal_transfers_network):
+    pytest.importorskip("cafein._cafein")
+    from shapely import wkb
+
+    journeys = multimodal_transfers_network.route_between_coordinates(
+        ORIGIN,
+        DEST,
+        "2022-02-22",
+        "08:30:00",
+        street_policy=_transfer_policy(),
+        geometries=True,
+    )
+    rides = [
+        leg
+        for journey in journeys
+        for leg in journey["legs"]
+        if leg["type"] == "transfer" and leg.get("mode") == "e_scooter"
+    ]
+    assert rides
+    for leg in rides:
+        assert leg["geometry"] is not None
+        shape = wkb.loads(bytes(leg["geometry"]))
+        assert shape.geom_type == "LineString"
+        assert len(shape.coords) > 1
