@@ -33,7 +33,7 @@ mod search;
 
 pub(crate) use costs::fold_better;
 use costs::*;
-pub use costs::{CostInputs, CostRow, Objective, NO_STOP};
+pub use costs::{CostInputs, CostRow, Objective, RentalCostView, NO_STOP};
 pub(crate) use matrices::{
     access_floor, departure_candidates, nearest_rank, propagate_point_percentiles, travel_time,
 };

@@ -7,16 +7,21 @@ use crate::network::MULTIMODAL_STOP_SNAP;
 
 /// One reduced stop's data as the policy cost fan-out consumes it:
 /// stop id, seconds, the vehicle's network and connector meters, the
-/// walked meters, and the winning mode's emission factor in g CO₂e per
+/// walked meters, the winning mode's emission factor in g CO₂e per
 /// passenger-km (NaN when unresolved; irrelevant when the vehicle
-/// meters are zero).
-type PolicyStopData = (String, u32, f64, f64, f64, f64);
+/// meters are zero), a carried rental transfer's ride meters (network
+/// and street-total), and whether the end used any street vehicle at
+/// all — the walking tie-break's identity, meters aside.
+type PolicyStopData = (String, u32, f64, f64, f64, f64, f64, f64, bool);
 
 /// A policy cost row: the engine's mode-blind row beside the street
 /// meters the attribution added.
 struct PolicyCostRow {
     row: CostRow,
     street_meters: f64,
+    /// Whether the journey used any street vehicle — the end shares'
+    /// identity plus the row's rental transfers; meters may be zero.
+    street_used: bool,
 }
 
 /// The street attribution of one journey end, keyed by stop index.
@@ -26,6 +31,13 @@ struct StreetShare {
     vehicle_connector: f64,
     walk: f64,
     factor: f64,
+    /// A rental-bearing carried transfer's ride meters (network and
+    /// street-total), priced at the query's transfer-mode factor.
+    transfer_network: f64,
+    transfer_total: f64,
+    /// Whether the end used any street vehicle at all (its own or a
+    /// carried rental); the walking tie-break reads this, not meters.
+    street_used: bool,
 }
 
 #[pymethods]
@@ -150,6 +162,7 @@ impl TransportNetwork {
             leg_geometry: self.leg_geometry.as_ref(),
             with_geometry: geometries,
             fares: tables.as_ref(),
+            rental: None,
         };
         // Under a whole-day set, snappable origins route door-to-door (the stop
         // cost matrix as a point cost matrix over the stops' coordinates);
@@ -327,6 +340,7 @@ impl TransportNetwork {
             leg_geometry: self.leg_geometry.as_ref(),
             with_geometry: geometries,
             fares: tables.as_ref(),
+            rental: None,
         };
         let (rows, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
             // One stop-search pass links both the origins (access) and the
@@ -446,6 +460,8 @@ impl TransportNetwork {
                             rides: 0,
                             transit_meters: 0.0,
                             walk_meters: *meters,
+                            street_meters: 0.0,
+                            rental_transfers: 0,
                             emission_grams: 0.0,
                             fare: walk_fare,
                             geometry: walk_geometry(origin, point),
@@ -490,7 +506,7 @@ impl TransportNetwork {
     #[pyo3(signature = (access_rows, egress_rows, origins, destinations, date, departure,
                         factors, walk_budget, max_transfers,
                         exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![],
-                        geometries = false))]
+                        geometries = false, transfer_mode = None))]
     #[allow(clippy::too_many_arguments)]
     fn _cost_matrix_with_access(
         &self,
@@ -508,10 +524,20 @@ impl TransportNetwork {
         exclude_trips: Vec<String>,
         exclude_stops: Vec<String>,
         geometries: bool,
+        transfer_mode: Option<(String, f64, f64)>,
     ) -> PyResult<Py<PyDict>> {
         if access_rows.len() != origins.len() || egress_rows.len() != destinations.len() {
             return Err(PyValueError::new_err(
                 "reduced rows and coordinates must align",
+            ));
+        }
+        if transfer_mode.is_some() && !exclude_stops.is_empty() {
+            // A rental token's interior stops are invisible to the
+            // engine's exclusion checks.
+            return Err(PyValueError::new_err(
+                "stop exclusions do not combine with street_policy \
+                 transfers= yet; a rental transfer's interior stops are \
+                 not exclusion-aware",
             ));
         }
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
@@ -542,7 +568,9 @@ impl TransportNetwork {
         for row in &access_rows {
             let mut offsets = Vec::with_capacity(row.len());
             let mut shares = HashMap::with_capacity(row.len());
-            for (stop, seconds, vehicle_network, vehicle_connector, walk, factor) in row {
+            for (stop, seconds, vehicle_network, vehicle_connector, walk, factor, tn, tt, used) in
+                row
+            {
                 let stop = self.resolve_stop(stop)?;
                 offsets.push((stop, *seconds));
                 shares.insert(
@@ -552,6 +580,9 @@ impl TransportNetwork {
                         vehicle_connector: *vehicle_connector,
                         walk: *walk,
                         factor: *factor,
+                        transfer_network: *tn,
+                        transfer_total: *tt,
+                        street_used: *used,
                     },
                 );
             }
@@ -573,7 +604,9 @@ impl TransportNetwork {
         for row in &egress_rows {
             let mut links = Vec::with_capacity(row.len());
             let mut shares = HashMap::with_capacity(row.len());
-            for (stop, seconds, vehicle_network, vehicle_connector, walk, factor) in row {
+            for (stop, seconds, vehicle_network, vehicle_connector, walk, factor, tn, tt, used) in
+                row
+            {
                 let stop = self.resolve_stop(stop)?;
                 links.push((stop, *seconds, 0.0));
                 shares.insert(
@@ -583,18 +616,37 @@ impl TransportNetwork {
                         vehicle_connector: *vehicle_connector,
                         walk: *walk,
                         factor: *factor,
+                        transfer_network: *tn,
+                        transfer_total: *tt,
+                        street_used: *used,
                     },
                 );
             }
             egress_links.push(links);
             egress_shares.push(shares);
         }
+        let binding = transfer_mode
+            .as_ref()
+            .map(|(mode, budget, _)| (mode.clone(), *budget));
+        let relaxed = self.policy_transfers(binding.as_ref())?;
+        let rental = transfer_mode.as_ref().map(|&(_, _, grams_per_meter)| {
+            let held = self.mode_transfers.as_ref().expect("binding validated");
+            RentalCostView {
+                tokens: &held.tokens,
+                grams_per_meter,
+            }
+        });
+        let transfer_grams_per_meter = transfer_mode
+            .as_ref()
+            .map(|&(_, _, grams_per_meter)| grams_per_meter)
+            .unwrap_or(0.0);
         let inputs = CostInputs {
             geometry,
             factors: &per_trip,
             leg_geometry: self.leg_geometry.as_ref(),
             with_geometry: geometries,
             fares: None,
+            rental,
         };
         let walk_profile = self.multimodal_profile("walk")?;
         let multimodal = self.multimodal.as_ref().ok_or_else(|| {
@@ -605,7 +657,7 @@ impl TransportNetwork {
         let (rows, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
             let engine_rows = Raptor.cost_matrix_to_points(
                 &self.build.timetable,
-                &self.transfers,
+                relaxed,
                 &inputs,
                 &requests,
                 &zero_meters,
@@ -618,40 +670,47 @@ impl TransportNetwork {
                     origin_rows
                         .into_iter()
                         .map(|mut row| {
-                            let mut street = 0.0;
+                            // Mid-journey rental street meters arrive on
+                            // the row itself; the shares add the ends'.
+                            let mut street = row.street_meters;
                             // The branch keeps a NaN factor from poisoning a
                             // walking or zero-vehicle end; a ridden vehicle
                             // end with an unresolved factor poisons the row,
                             // never silently zeroes it.
                             let mut vehicle_grams = 0.0;
+                            let mut street_used = row.rental_transfers > 0;
+                            let mut fold = |share: &StreetShare| {
+                                street_used |= share.street_used;
+                                row.walk_meters += share.walk;
+                                street += share.vehicle_network + share.vehicle_connector;
+                                if share.vehicle_network > 0.0 {
+                                    vehicle_grams += share.vehicle_network / 1000.0 * share.factor;
+                                }
+                                street += share.transfer_total;
+                                if share.transfer_network > 0.0 {
+                                    vehicle_grams +=
+                                        share.transfer_network * transfer_grams_per_meter;
+                                }
+                            };
                             if row.access_stop != NO_STOP {
                                 if let Some(share) =
                                     access_shares[origin].get(&StopIdx(row.access_stop))
                                 {
-                                    row.walk_meters += share.walk;
-                                    street += share.vehicle_network + share.vehicle_connector;
-                                    if share.vehicle_network > 0.0 {
-                                        vehicle_grams +=
-                                            share.vehicle_network / 1000.0 * share.factor;
-                                    }
+                                    fold(share);
                                 }
                             }
                             if row.egress_stop != NO_STOP {
                                 if let Some(share) =
                                     egress_shares[row.to as usize].get(&StopIdx(row.egress_stop))
                                 {
-                                    row.walk_meters += share.walk;
-                                    street += share.vehicle_network + share.vehicle_connector;
-                                    if share.vehicle_network > 0.0 {
-                                        vehicle_grams +=
-                                            share.vehicle_network / 1000.0 * share.factor;
-                                    }
+                                    fold(share);
                                 }
                             }
                             row.emission_grams += vehicle_grams;
                             PolicyCostRow {
                                 row,
                                 street_meters: street,
+                                street_used,
                             }
                         })
                         .collect()
@@ -732,7 +791,7 @@ impl TransportNetwork {
                         // ridden row — transit and street vehicles alike.
                         if walk_seconds < policy_row.row.seconds
                             || (walk_seconds == policy_row.row.seconds
-                                && (policy_row.row.rides > 0 || policy_row.street_meters > 0.0))
+                                && (policy_row.row.rides > 0 || policy_row.street_used))
                         {
                             policy_row.row = CostRow {
                                 to: point as u32,
@@ -742,11 +801,14 @@ impl TransportNetwork {
                                 rides: 0,
                                 transit_meters: 0.0,
                                 walk_meters: meters,
+                                street_meters: 0.0,
+                                rental_transfers: 0,
                                 emission_grams: 0.0,
                                 fare: f64::NAN,
                                 geometry: walk_geometry(point),
                             };
                             policy_row.street_meters = 0.0;
+                            policy_row.street_used = false;
                         }
                     }
                 }
@@ -764,11 +826,14 @@ impl TransportNetwork {
                                 rides: 0,
                                 transit_meters: 0.0,
                                 walk_meters: meters,
+                                street_meters: 0.0,
+                                rental_transfers: 0,
                                 emission_grams: 0.0,
                                 fare: f64::NAN,
                                 geometry: walk_geometry(point),
                             },
                             street_meters: 0.0,
+                            street_used: false,
                         });
                     }
                 }
@@ -1020,6 +1085,7 @@ impl TransportNetwork {
             leg_geometry: self.leg_geometry.as_ref(),
             with_geometry: geometries,
             fares: tables.as_ref(),
+            rental: None,
         };
         let rows = py.allow_threads(|| {
             if candidates == "pareto" && router == "tbtr" {
@@ -1241,6 +1307,7 @@ impl TransportNetwork {
             leg_geometry: self.leg_geometry.as_ref(),
             with_geometry: geometries,
             fares: tables.as_ref(),
+            rental: None,
         };
         let (rows, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
             // One stop-search pass links both the origins (access) and the
@@ -1377,6 +1444,8 @@ impl TransportNetwork {
                             rides: 0,
                             transit_meters: 0.0,
                             walk_meters: *meters,
+                            street_meters: 0.0,
+                            rental_transfers: 0,
                             emission_grams: 0.0,
                             fare: walk_fare,
                             geometry: walk_geometry(origin, point),
@@ -1768,6 +1837,8 @@ pub(super) fn merge_direct_walk_cells(
             rides: 0,
             transit_meters: 0.0,
             walk_meters: meters,
+            street_meters: 0.0,
+            rental_transfers: 0,
             emission_grams: 0.0,
             fare: if priced { 0.0 } else { f64::NAN },
             geometry: None,

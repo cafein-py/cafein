@@ -1759,18 +1759,49 @@ def test_the_transfer_matrix_reconciles_with_single_queries(
     assert int(matrix["travel_time_s"].iloc[0]) == fastest
 
 
-def test_transfers_are_rejected_on_the_cost_path(multimodal_transfers_network):
+def test_the_cost_matrix_attributes_rental_transfers(multimodal_transfers_network):
     pytest.importorskip("cafein._cafein")
-    from cafein import TravelCostMatrix
+    from cafein import DetailedItineraries, TravelCostMatrix, TravelTimeMatrix
 
-    with pytest.raises(ValueError, match="cost matrix"):
+    args = (
+        multimodal_transfers_network,
+        _points_frame([ORIGIN]),
+        _points_frame([DEST]),
+        "2022-02-22",
+        "08:30:00",
+    )
+    cost = TravelCostMatrix(*args, street_policy=_transfer_policy())
+    time = TravelTimeMatrix(*args, street_policy=_transfer_policy())
+    walking = TravelCostMatrix(
+        *args, street_policy=StreetLegPolicy(access={"walk": 900}, egress={"walk": 900})
+    )
+    row = cost.iloc[0]
+    # The same engine and set as the time matrix, cell for cell.
+    assert row["travel_time_s"] == time.iloc[0]["travel_time_s"]
+    assert row["travel_time_s"] < walking.iloc[0]["travel_time_s"]
+    # The winning journey rides rental transfers: their street meters
+    # and grams are attributed, never silently walked.
+    assert row["street_distance_m"] > 0.0
+    itinerary = DetailedItineraries(
+        *args,
+        street_policy=_transfer_policy(),
+        geometries=False,
+    )
+    fastest = min(
+        (legs for _, legs in itinerary.groupby("option")),
+        key=lambda legs: legs["arrival_s"].max(),
+    )
+    scooter = fastest[fastest["mode"] == "e_scooter"]
+    assert not scooter.empty
+    assert row["emissions"] == pytest.approx(fastest["emissions"].sum(), rel=1e-6)
+    assert row["street_distance_m"] == pytest.approx(
+        scooter["distance_m"].sum(), rel=1e-6
+    )
+    with pytest.raises(ValueError, match="exclusion-aware"):
         TravelCostMatrix(
-            multimodal_transfers_network,
-            _points_frame([ORIGIN]),
-            _points_frame([DEST]),
-            "2022-02-22",
-            "08:30:00",
+            *args,
             street_policy=_transfer_policy(),
+            exclude_stops=["1230109"],
         )
 
 

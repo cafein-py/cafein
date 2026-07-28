@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- The **cost matrix attributes rental transfers**, completing the
+  ``transfers=`` surface: ``TravelCostMatrix(street_policy=...)``
+  accepts the binding, the winning journey's rental-bearing transfers
+  add their ride meters to ``street_distance_m`` (connectors included)
+  and their ride grams — the shared-fleet factor over ridden network
+  meters — to ``emissions``, with the movement's walking rest in
+  ``walk_distance_m``; access and egress ends composed through a
+  rental edge split the same way. Cells reconcile exactly with the
+  fastest ``DetailedItineraries`` option's per-leg sums. The transfer
+  mode's factor must resolve, and stop exclusions keep rejecting the
+  binding.
+
 - The merged shared-vehicle transfer set is now **persisted** with the
   network artifact (format 15): ``save`` writes the set, its
   reconstruction tokens, and the exact ``(mode, budget)`` binding —
@@ -28,8 +40,8 @@
   transit arrival dominated only by rental-origin points still relaxes
   its walks, because a rental point cannot legally extend by a further
   walk. Merged-set multicriteria queries run on McRAPTOR (the
-  trip-based engines still assume a closed footpath set), and the cost
-  matrix keeps declining the binding until its attribution stage.
+  trip-based engines still assume a closed footpath set); the cost
+  matrix takes the binding too — see above.
 
 - Shared vehicles may now serve the **transfers between rides**, behind
   the same policy. ``TransportNetwork.compute_mode_transfers(mode,
@@ -50,9 +62,9 @@
   the merged set declares itself outside the engines'
   transitive-closure contract and RAPTOR runs an exact transfer phase
   for it, relaxing walks from every transit arrival of a round rather
-  than only label-improving ones. The trip-based engines and the cost
-  surfaces decline the binding until their stages land (the
-  multicriteria candidates take it — see above).
+  than only label-improving ones. The trip-based engines decline the
+  binding until their stage lands (the multicriteria candidates and
+  the cost matrix take it — see above).
 
 - **Sourced street-mode emission factors ship by default.** The
   micromobility rows of ``cafein.emissions.street_factors()`` now
