@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- The **trip-based engine serves merged transfer sets exactly**: its
+  query-time footpath joins relaxed only from label-improving transit
+  arrivals — the closure assumption the merged set cannot honor — so a
+  faster rental-transfer label could shadow a transit arrival's legal
+  walk extension, exactly as in pre-fix RAPTOR. All three TBTR scans
+  (one-to-all, the profile's via-joins and walks, and the window
+  samples) now relax shadowed arrivals from a per-round transit-best
+  sidecar when the set declares itself unclosed; closed sets keep the
+  current gates bit for bit, and the segment DAG already reconstructs
+  shadow-free. RAPTOR and TBTR answer merged-set queries identically,
+  pinned by an engine-neutrality test over the reduced arrays.
+
 - The **cost matrix attributes rental transfers**, completing the
   ``transfers=`` surface: ``TravelCostMatrix(street_policy=...)``
   accepts the binding, the winning journey's rental-bearing transfers

@@ -489,17 +489,10 @@ impl TransportNetwork {
                 py.allow_threads(|| Raptor.one_to_all(&self.build.timetable, relaxed, &request))
             }
             // The engine-neutrality arm: the same reduced array through the
-            // trip-based engine, for the RAPTOR/TBTR equality tests.
+            // trip-based engine, for the RAPTOR/TBTR equality tests —
+            // merged (unclosed) sets included, whose shadowed arrivals
+            // both engines now relax exactly.
             "tbtr" => {
-                if transfer_mode.is_some() {
-                    // The trip-based engine still assumes a transitively
-                    // closed footpath set; the merged mode-transfer set
-                    // runs on RAPTOR's exact transfer phase only.
-                    return Err(PyValueError::new_err(
-                        "the trip-based arm serves the walking closure; \
-                         street_policy transfers= queries run on RAPTOR",
-                    ));
-                }
                 let relaxed = self.policy_transfers(transfer_mode.as_ref())?;
                 py.allow_threads(|| {
                     self.tbtr_engine(relaxed, date, &active_services, &active_services_previous)

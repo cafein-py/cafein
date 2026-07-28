@@ -338,6 +338,11 @@ impl<'a> TbtrEngine<'a> {
         // not dominated.
         let stop_count = self.timetable.stop_count() as usize;
         let mut labels = vec![UNREACHED; stop_count * rounds];
+        // Unclosed sets: shadowed transit arrivals still relax their
+        // walks (and joins) — RAPTOR's exact transfer phase, inline.
+        let exact = !self.footpaths.closed();
+        let mut transit_best = vec![UNREACHED; stop_count];
+        let mut transit_touched: Vec<u32> = Vec::new();
         // The label suffix is non-increasing across rounds (each slot is the
         // min over rounds up to it), so a time that does not beat the first
         // slot beats none, and the write loop can stop at the first
@@ -381,6 +386,10 @@ impl<'a> TbtrEngine<'a> {
                 let mut round_best: Option<(u32, u32, u16, &Target)> = None;
                 let segments = std::mem::take(&mut queues[round]);
                 walked.clear();
+                for &stop in &transit_touched {
+                    transit_best[stop as usize] = UNREACHED;
+                }
+                transit_touched.clear();
                 for &(segment, end) in &segments {
                     let trip = arena[segment as usize].trip;
                     let board = arena[segment as usize].board;
@@ -432,7 +441,15 @@ impl<'a> TbtrEngine<'a> {
                         // marked-stop transfer relaxation. An arrival a
                         // ride looping back cannot beat never improves.
                         let improved = improve(&mut labels, stop, arrival, round);
-                        if improved {
+                        let shadowed =
+                            exact && !improved && arrival < transit_best[stop.0 as usize];
+                        if exact && arrival < transit_best[stop.0 as usize] {
+                            if transit_best[stop.0 as usize] == UNREACHED {
+                                transit_touched.push(stop.0);
+                            }
+                            transit_best[stop.0 as usize] = arrival;
+                        }
+                        if improved || shadowed {
                             if let Some(line_targets) = targets.get(&line) {
                                 for target in line_targets {
                                     if target.via.is_none() || target.position != alight {
@@ -579,6 +596,13 @@ impl<'a> TbtrEngine<'a> {
         let mut arena: Vec<Segment> = Vec::new();
         let mut queues: Vec<Vec<(u32, u16)>> = vec![Vec::new(); rounds];
         let mut walked = WalkedScratch::new(self.timetable.stop_count() as usize);
+        // An unclosed (merged mode-transfer) set: a stop's label may be
+        // a rental-walk that cannot legally walk again, so the round's
+        // best transit arrivals relax their walks even when the label
+        // does not improve — RAPTOR's exact transfer phase, inline.
+        let exact = !self.footpaths.closed();
+        let mut transit_best = vec![UNREACHED; self.timetable.stop_count() as usize];
+        let mut transit_touched: Vec<u32> = Vec::new();
         self.seed(
             departure,
             access,
@@ -593,6 +617,10 @@ impl<'a> TbtrEngine<'a> {
             }
             let segments = std::mem::take(&mut queues[round]);
             walked.clear();
+            for &stop in &transit_touched {
+                transit_best[stop as usize] = UNREACHED;
+            }
+            transit_touched.clear();
             for &(segment, end) in &segments {
                 let trip = arena[segment as usize].trip;
                 let board = arena[segment as usize].board;
@@ -607,9 +635,21 @@ impl<'a> TbtrEngine<'a> {
                     // Walks relax only from arrivals that improve the
                     // stop — RAPTOR's marked-stop semantics; a ride
                     // looping back to a better-known stop goes nowhere.
+                    // Under an unclosed set a shadowed transit arrival
+                    // still relaxes when it beats the round's transit
+                    // best; its boardings stay covered by the shadower.
                     let improved = arrival < best[stop.0 as usize];
                     if improved {
                         best[stop.0 as usize] = arrival;
+                    }
+                    let shadowed = exact && !improved && arrival < transit_best[stop.0 as usize];
+                    if exact && arrival < transit_best[stop.0 as usize] {
+                        if transit_best[stop.0 as usize] == UNREACHED {
+                            transit_touched.push(stop.0);
+                        }
+                        transit_best[stop.0 as usize] = arrival;
+                    }
+                    if improved || shadowed {
                         for footpath in self.footpaths.from_stop(stop) {
                             let walked_at = arrival.saturating_add(footpath.duration);
                             let slot = &mut best[footpath.to.0 as usize];
@@ -762,6 +802,11 @@ impl<'a> TbtrEngine<'a> {
         // departures; the last-round slot is the earliest arrival over all
         // rounds, so it is what each mark snapshots.
         let mut labels = vec![UNREACHED; stop_count * rounds];
+        // Unclosed sets: shadowed transit arrivals still relax their
+        // walks (and joins) — RAPTOR's exact transfer phase, inline.
+        let exact = !self.footpaths.closed();
+        let mut transit_best = vec![UNREACHED; stop_count];
+        let mut transit_touched: Vec<u32> = Vec::new();
         // The label suffix is non-increasing across rounds (each slot is the
         // min over rounds up to it), so a time that does not beat the first
         // slot beats none, and the write loop can stop at the first
@@ -813,6 +858,10 @@ impl<'a> TbtrEngine<'a> {
                     }
                     let segments = std::mem::take(&mut queues[round]);
                     walked.clear();
+                    for &stop in &transit_touched {
+                        transit_best[stop as usize] = UNREACHED;
+                    }
+                    transit_touched.clear();
                     for &(segment, end) in &segments {
                         let trip = arena[segment as usize].trip;
                         let board = arena[segment as usize].board;
@@ -829,7 +878,16 @@ impl<'a> TbtrEngine<'a> {
                             // Unlike `profile` this relaxes at the last round
                             // too, so a stop reachable only by a final walk is
                             // captured, matching `one_to_all`.
-                            if improve(&mut labels, stop, arrival, round) {
+                            let improved = improve(&mut labels, stop, arrival, round);
+                            let shadowed =
+                                exact && !improved && arrival < transit_best[stop.0 as usize];
+                            if exact && arrival < transit_best[stop.0 as usize] {
+                                if transit_best[stop.0 as usize] == UNREACHED {
+                                    transit_touched.push(stop.0);
+                                }
+                                transit_best[stop.0 as usize] = arrival;
+                            }
+                            if improved || shadowed {
                                 for footpath in self.footpaths.from_stop(stop) {
                                     let walked_at = arrival.saturating_add(footpath.duration);
                                     if improve(&mut labels, footpath.to, walked_at, round) {
