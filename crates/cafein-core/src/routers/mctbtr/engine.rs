@@ -229,7 +229,7 @@ impl<'a> McTbtrEngine<'a> {
             // its label sets with their street grams; the walking arm
             // below stays byte-for-byte the pre-policy loop.
             if let Some(policy) = self.policy {
-                for &(stop, seconds, grams) in &policy.access {
+                for &(stop, seconds, grams, _) in &policy.access {
                     let ready = departure.saturating_add(seconds);
                     if beyond_cutoff(cutoff, stop, ready) {
                         continue;
@@ -268,7 +268,7 @@ impl<'a> McTbtrEngine<'a> {
                 // dominance, exactly as on the McRAPTOR arm. The seed's
                 // stop and access seconds ride in the `walk` slot, which
                 // no access-floor entry uses otherwise.
-                for &(stop, seconds, grams) in &policy.access {
+                for &(stop, seconds, grams, _) in &policy.access {
                     let ready = departure.saturating_add(seconds);
                     if beyond_cutoff(cutoff, stop, ready) {
                         continue;

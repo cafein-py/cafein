@@ -379,6 +379,14 @@ pub(super) struct Search<'a> {
     /// search instead of the request's walking offsets, each point
     /// carrying its street grams into the dominance.
     pub(super) policy: Option<&'a PolicyLabels>,
+    /// The merged set's per-CSR-edge ridden network meters and
+    /// rental-identity flags beside the transfer mode's grams per meter
+    /// — Some only when `footpaths` is the merged mode-transfer set.
+    /// Rental-bearing relaxations (by the flag: meters and factor may
+    /// both legitimately be zero) add their ride grams (re-bucketing
+    /// the key) and seal the admitted entry; transit arrivals dominated
+    /// only by sealed entries still relax footpaths.
+    pub(super) rental: Option<(&'a [f64], &'a [bool], f64)>,
 }
 
 impl<'a> Search<'a> {
@@ -416,6 +424,7 @@ impl<'a> Search<'a> {
             ops: std::env::var_os("CAFEIN_MCRAPTOR_PROF_OPS").is_some(),
             batch: None,
             policy: None,
+            rental: None,
         };
         if search.strict_bags {
             search.batch = Some(FootpathBatch::new(timetable.stop_count() as usize));
@@ -499,7 +508,7 @@ impl<'a> Search<'a> {
         // arm below stays byte-for-byte the pre-policy loop — no
         // per-pass allocation, zero grams.
         if let Some(policy) = self.policy {
-            for &(stop, seconds, grams) in &policy.access {
+            for &(stop, seconds, grams, sealed) in &policy.access {
                 let arrival = departure.saturating_add(seconds);
                 let label = self.arena.len() as u32;
                 let key = self.key(grams);
@@ -510,7 +519,9 @@ impl<'a> Search<'a> {
                 {
                     continue;
                 }
-                if self.bags[stop.0 as usize].insert_label(
+                // A rental-composed seed enters sealed: it must not
+                // shadow a transit arrival's walk extensions.
+                if self.bags[stop.0 as usize].insert_walk(
                     self.strict_bags,
                     arrival,
                     0,
@@ -518,6 +529,7 @@ impl<'a> Search<'a> {
                     key,
                     0,
                     self.slack,
+                    sealed,
                 ) {
                     self.stats.access_admissions += 1;
                     self.arena.push(Label {
@@ -642,10 +654,11 @@ impl<'a> Search<'a> {
             self.stats.queue_collect_ns += phase.elapsed().as_nanos() as u64;
             let phase = std::time::Instant::now();
             let mut rode: Vec<u32> = Vec::new();
+            let mut shadow: Vec<u32> = Vec::new();
             let touched = std::mem::take(&mut self.touched);
             self.stats.lines_touched += touched.len() as u64;
             for &line in &touched {
-                self.scan_line(line, rides, &mut rode);
+                self.scan_line(line, rides, &mut rode, &mut shadow);
             }
             self.stats.route_scan_ns += phase.elapsed().as_nanos() as u64;
             self.stats.rode_labels += rode.len() as u64;
@@ -653,22 +666,31 @@ impl<'a> Search<'a> {
                 self.audit_rode(&rode, rides);
             }
             // One footpath hop from the improving ride labels; the
-            // closed transfer contract makes chains redundant.
+            // closed transfer contract makes chains redundant. Shadowed
+            // arrivals join the relax sources but never `next` — their
+            // boarding and egress continuations are covered.
             let phase = std::time::Instant::now();
             let mut next = rode.clone();
+            let sources = if shadow.is_empty() {
+                rode
+            } else {
+                let mut sources = rode;
+                sources.append(&mut shadow);
+                sources
+            };
             if let Some(mut batch) = self.batch.take() {
                 if self.ops {
                     self.relax_footpaths_batched_probed(
-                        &mut batch, &rode, rides, departure, &mut next,
+                        &mut batch, &sources, rides, departure, &mut next,
                     );
                 } else {
-                    self.relax_footpaths_batched(&mut batch, &rode, rides, departure, &mut next);
+                    self.relax_footpaths_batched(&mut batch, &sources, rides, departure, &mut next);
                 }
                 self.batch = Some(batch);
             } else if self.ops {
-                self.relax_footpaths_probed(&rode, rides, &mut next);
+                self.relax_footpaths_probed(&sources, rides, &mut next);
             } else {
-                self.relax_footpaths(&rode, rides, &mut next);
+                self.relax_footpaths(&sources, rides, &mut next);
             }
             self.stats.footpath_ns += phase.elapsed().as_nanos() as u64;
             let phase = std::time::Instant::now();
@@ -816,31 +838,62 @@ impl<'a> Search<'a> {
             }
             self.stats.batch_points_live += batch.active.len() as u64;
             let slice = self.footpaths.from_stop(source);
+            let range = self.footpaths.edge_range(source);
             let mut cutoff_pruned = 0u64;
             let mut target_pruned = 0u64;
             let mut admissions = 0u64;
-            for footpath in slice {
+            for (index, footpath) in slice.iter().enumerate() {
+                // A rental-bearing merged edge adds its ride grams and
+                // re-buckets; walking rows keep the points' exactly.
+                let sealed =
+                    matches!(self.rental, Some((_, flags, _)) if flags[range.start + index]);
+                let ride_grams = match self.rental {
+                    Some((meters, _, per_meter)) if sealed => {
+                        meters[range.start + index] * per_meter
+                    }
+                    _ => 0.0,
+                };
                 for point in &batch.active {
+                    let (walk_grams, walk_key) = if sealed {
+                        let grams = quantized(point.grams + ride_grams);
+                        (grams, self.key(grams))
+                    } else {
+                        (point.grams, point.key)
+                    };
                     let arrival = point.arrival.saturating_add(footpath.duration);
                     let walked = self.arena.len() as u32;
                     if self.stop_excluded(footpath.to) || self.beyond_cutoff(footpath.to, arrival) {
                         cutoff_pruned += 1;
                         continue;
                     }
-                    if self.target_pruned(departure, arrival, point.key, point.grams) {
+                    if self.target_pruned(departure, arrival, walk_key, walk_grams) {
                         target_pruned += 1;
                         continue;
                     }
-                    if self.bags[footpath.to.0 as usize].insert(
-                        arrival,
-                        point.grams,
-                        point.key,
-                        rides,
-                    ) {
+                    let admitted = if self.rental.is_some() {
+                        self.bags[footpath.to.0 as usize].insert_walk(
+                            self.strict_bags,
+                            arrival,
+                            0,
+                            walk_grams,
+                            walk_key,
+                            rides,
+                            self.slack,
+                            sealed,
+                        )
+                    } else {
+                        self.bags[footpath.to.0 as usize].insert(
+                            arrival,
+                            point.grams,
+                            point.key,
+                            rides,
+                        )
+                    };
+                    if admitted {
                         admissions += 1;
                         self.arena.push(Label {
                             arrival,
-                            grams: point.grams,
+                            grams: walk_grams,
                             stop: footpath.to,
                             departure,
                             penalty: 0,
@@ -879,6 +932,11 @@ impl<'a> Search<'a> {
         departure: u32,
         next: &mut Vec<u32>,
     ) {
+        if self.rental.is_some() {
+            // Merged-set relaxations take the production path; the
+            // probe histograms stay walking-only.
+            return self.relax_footpaths_batched(batch, rode, rides, departure, next);
+        }
         for &label in rode {
             let from = self.arena[label as usize];
             if self.footpaths.from_stop(from.stop).is_empty() {
@@ -978,10 +1036,27 @@ impl<'a> Search<'a> {
             let from = self.arena[label as usize];
             let key = self.key(from.grams);
             let slice = self.footpaths.from_stop(from.stop);
+            let range = self.footpaths.edge_range(from.stop);
             let mut cutoff_pruned = 0u64;
             let mut target_pruned = 0u64;
             let mut admissions = 0u64;
-            for footpath in slice {
+            for (index, footpath) in slice.iter().enumerate() {
+                // A rental-bearing merged edge adds its ride grams and
+                // re-buckets; walking rows keep the chain's exactly.
+                let sealed =
+                    matches!(self.rental, Some((_, flags, _)) if flags[range.start + index]);
+                let ride_grams = match self.rental {
+                    Some((meters, _, per_meter)) if sealed => {
+                        meters[range.start + index] * per_meter
+                    }
+                    _ => 0.0,
+                };
+                let (walk_grams, walk_key) = if sealed {
+                    let grams = quantized(from.grams + ride_grams);
+                    (grams, self.key(grams))
+                } else {
+                    (from.grams, key)
+                };
                 let arrival = from.arrival.saturating_add(footpath.duration);
                 let walked = self.arena.len() as u32;
                 if self.stop_excluded(footpath.to) || self.beyond_cutoff(footpath.to, arrival) {
@@ -991,26 +1066,40 @@ impl<'a> Search<'a> {
                 if self.target_pruned(
                     from.departure,
                     arrival.saturating_add(from.penalty),
-                    key,
-                    from.grams,
+                    walk_key,
+                    walk_grams,
                 ) {
                     target_pruned += 1;
                     continue;
                 }
                 // A footpath adds no route penalty; it inherits the chain's.
-                if self.bags[footpath.to.0 as usize].insert_label(
-                    self.strict_bags,
-                    arrival,
-                    from.penalty,
-                    from.grams,
-                    key,
-                    rides,
-                    self.slack,
-                ) {
+                let admitted = if self.rental.is_some() {
+                    self.bags[footpath.to.0 as usize].insert_walk(
+                        self.strict_bags,
+                        arrival,
+                        from.penalty,
+                        walk_grams,
+                        walk_key,
+                        rides,
+                        self.slack,
+                        sealed,
+                    )
+                } else {
+                    self.bags[footpath.to.0 as usize].insert_label(
+                        self.strict_bags,
+                        arrival,
+                        from.penalty,
+                        from.grams,
+                        key,
+                        rides,
+                        self.slack,
+                    )
+                };
+                if admitted {
                     admissions += 1;
                     self.arena.push(Label {
                         arrival,
-                        grams: from.grams,
+                        grams: walk_grams,
                         stop: footpath.to,
                         departure: from.departure,
                         penalty: from.penalty,
@@ -1037,6 +1126,11 @@ impl<'a> Search<'a> {
     /// through the probed insert, plus the probe-depth histograms.
     /// Runs only under the ops flag.
     fn relax_footpaths_probed(&mut self, rode: &[u32], rides: u8, next: &mut Vec<u32>) {
+        if self.rental.is_some() {
+            // Merged-set relaxations take the production path; the
+            // probe histograms stay walking-only.
+            return self.relax_footpaths(rode, rides, next);
+        }
         for &label in rode {
             let from = self.arena[label as usize];
             let key = self.key(from.grams);
@@ -1116,7 +1210,7 @@ impl<'a> Search<'a> {
             .is_some_and(|excluded| excluded.excludes_stop(stop))
     }
 
-    fn scan_line(&mut self, line: u32, rides: u8, rode: &mut Vec<u32>) {
+    fn scan_line(&mut self, line: u32, rides: u8, rode: &mut Vec<u32>, shadow: &mut Vec<u32>) {
         let mut entries = std::mem::take(&mut self.queue[line as usize]);
         let pattern = self.view.line_pattern(line);
         let line_penalty = self
@@ -1175,7 +1269,17 @@ impl<'a> Search<'a> {
                 {
                     continue;
                 }
-                let admitted = self.bags[stops[position].0 as usize].insert_label(
+                let admission = if self.rental.is_some() {
+                    self.bags[stops[position].0 as usize].insert_transit(
+                        self.strict_bags,
+                        arrival,
+                        penalty,
+                        grams,
+                        key,
+                        rides,
+                        self.slack,
+                    )
+                } else if self.bags[stops[position].0 as usize].insert_label(
                     self.strict_bags,
                     arrival,
                     penalty,
@@ -1183,12 +1287,18 @@ impl<'a> Search<'a> {
                     key,
                     rides,
                     self.slack,
-                );
+                ) {
+                    TransitAdmission::Admitted
+                } else {
+                    TransitAdmission::Rejected
+                };
                 bag_calls += 1;
-                if !admitted {
+                if admission == TransitAdmission::Rejected {
                     continue;
                 }
-                admissions += 1;
+                if admission == TransitAdmission::Admitted {
+                    admissions += 1;
+                }
                 {
                     self.arena.push(Label {
                         arrival,
@@ -1203,7 +1313,14 @@ impl<'a> Search<'a> {
                             alight: position as u16,
                         },
                     });
-                    rode.push(label);
+                    // A shadowed arrival owes only its footpath
+                    // relaxations; the sealed witnesses cover its
+                    // boarding and egress continuations.
+                    if admission == TransitAdmission::Admitted {
+                        rode.push(label);
+                    } else {
+                        shadow.push(label);
+                    }
                 }
             }
             while queued < entries.len() && entries[queued].0 as usize == position {

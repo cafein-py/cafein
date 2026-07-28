@@ -487,17 +487,31 @@ def _policy_mc_journeys(
     journeys must beat it strictly, and it leads the list as the
     zero-emission, zero-ride baseline.
     """
+    import pandas as pd
+
+    from cafein import emissions
     from cafein import streets as _streets
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
     from cafein.policy import pareto_reduction_modes
 
-    if policy.transfers:
-        raise ValueError(
-            "street_policy transfers= is not available on the "
-            "multicriteria candidates yet: a rental transfer adds grams "
-            "the dominance must see, which arrives with the "
-            "emissions-aware transfer stage"
+    transfer_mode = _policy_transfer_mode(policy)
+    transfer_arg = None
+    if transfer_mode is not None:
+        mode, budget = transfer_mode
+        # The rental's ride grams enter the dominance, so the transfer
+        # mode's shared-fleet factor must resolve, exactly as a granted
+        # access mode's must.
+        value = emissions.street_factor(
+            mode, street_factors, components, service_model="shared"
         )
+        if pd.isna(value):
+            raise ValueError(
+                f"the {mode} emission factor is unresolved; the "
+                "multicriteria search ranks street emissions, so pass "
+                "factors= rows resolving it (see "
+                "cafein.emissions.load_street_factors)"
+            )
+        transfer_arg = (mode, budget, float(value) / 1000.0)
     exclude_routes = tuple(str(route) for route in exclusions[0])
     exclude_trips = tuple(str(trip) for trip in exclusions[1])
     exclude_stops = tuple(str(stop) for stop in exclusions[2])
@@ -515,13 +529,22 @@ def _policy_mc_journeys(
         # on every policy path; the error is kept for the no-walk case.
         try:
             rows = core._pareto_street_rows(
-                point[0], point[1], egress_side, modes, list(exclude_stops)
+                point[0],
+                point[1],
+                egress_side,
+                modes,
+                list(exclude_stops),
+                transfer_mode=transfer_arg,
             )
         except ValueError as error:
             if "too far from the multimodal street network" not in str(error):
                 raise
             return [], {}, error
-        labels = [(row[0], row[1], row[2]) for row in rows]
+        labels = (
+            [(row[0], row[1], row[2], row[11]) for row in rows]
+            if not egress_side
+            else [(row[0], row[1], row[2]) for row in rows]
+        )
         tokens = {
             (row[0], row[1]): (row[1], row[3], row[4], row[5], row[6], row[10])
             for row in rows
@@ -545,6 +568,7 @@ def _policy_mc_journeys(
         list(exclude_trips),
         list(exclude_stops),
         geometries,
+        transfer_mode=transfer_arg,
     )
     access_budgets = {mode: seconds for mode, seconds, *_ in access_modes}
     egress_budgets = {mode: seconds for mode, seconds, *_ in egress_modes}
@@ -563,6 +587,7 @@ def _policy_mc_journeys(
                         access_budgets,
                         False,
                         geometries,
+                        transfer_mode,
                     )
                 )
             elif leg["type"] == "egress":
@@ -577,6 +602,19 @@ def _policy_mc_journeys(
                         egress_budgets,
                         True,
                         geometries,
+                        transfer_mode,
+                    )
+                )
+            elif leg["type"] == "transfer" and transfer_mode is not None:
+                legs.extend(
+                    _transfer_leg_dicts(
+                        core,
+                        leg["from_stop"],
+                        leg["to_stop"],
+                        leg["departure_s"],
+                        leg["arrival_s"],
+                        geometries,
+                        transfer_mode,
                     )
                 )
             else:

@@ -2215,3 +2215,214 @@ fn exclusions_compose_with_route_penalties() {
         .collect();
     assert_eq!(triples, vec![(400, 1)]);
 }
+
+/// The bag-domain shadowing corner of the merged (unclosed) transfer
+/// set: stop 2 is reached by a round-1 rental row at (25, 100 g,
+/// sealed); the round-2 ride into it lands at (60, 150 g), dominated
+/// on both axes by the sealed point alone — yet its walk to stop 3 is
+/// the only legal journey there, because the rental point cannot take
+/// a further walk. The walk must leave the shadowed ride's arrival.
+#[test]
+fn sealed_points_do_not_shadow_transit_walk_extensions() {
+    let mut builder = TimetableBuilder::new(4);
+    let first = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let second = builder.add_pattern(&[StopIdx(1), StopIdx(2)], 1).unwrap();
+    builder
+        .add_trip(first, vec![time(10), time(20)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(second, vec![time(26), time(60)], 1, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let factors = [0.0, 150.0];
+    let mut merged = Transfers::from_edges(
+        4,
+        &[
+            (StopIdx(1), StopIdx(2), 5, 105.0),
+            (StopIdx(2), StopIdx(3), 100, 100.0),
+        ],
+    )
+    .unwrap();
+    merged.mark_unclosed();
+    // CSR edge order by source stop: (1→2) bears the rental.
+    let rental_meters = [100.0, 0.0];
+    let rental_flags = [true, false];
+    let view = DayView::universal(&timetable);
+    let labels = PolicyLabels {
+        access: vec![(StopIdx(0), 0, 0.0, false)],
+        egress: vec![(StopIdx(3), 0, 0.0)],
+    };
+    let request = Request {
+        departure: 0,
+        access: Vec::new(),
+        egress: Vec::new(),
+        active_services: Vec::new(),
+        active_services_previous: Vec::new(),
+        max_transfers: 3,
+        exclusions: None,
+    };
+    let journeys = route_with_policy(
+        &view,
+        &timetable,
+        &merged,
+        &geometry,
+        &factors,
+        &request,
+        &labels,
+        1e-6,
+        0,
+        None,
+        &[],
+        Some((&rental_meters, &rental_flags, 1.0)),
+    );
+    assert_eq!(journeys.len(), 1);
+    let journey = &journeys[0];
+    assert_eq!(journey.arrival, 160);
+    assert_eq!(journey.rides(), 2);
+    assert_eq!(grams_of(journey, &geometry, &factors), 150.0);
+    // The walk leaves the shadowed ride's arrival at 60, not the
+    // faster sealed point's 25.
+    assert!(journey.legs.iter().any(|leg| matches!(
+        leg,
+        Leg::Transfer {
+            from_stop: StopIdx(2),
+            to_stop: StopIdx(3),
+            departure: 60,
+            arrival: 160,
+        }
+    )));
+}
+
+/// The seal derives from the edge's rental identity, not its grams: a
+/// zero-emission fleet (factor 0) still cannot extend a rental point
+/// by a further walk, so the shadowed transit arrival keeps its walk
+/// extension exactly as under a paying fleet.
+#[test]
+fn zero_factor_rentals_still_seal() {
+    let mut builder = TimetableBuilder::new(4);
+    let first = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let second = builder.add_pattern(&[StopIdx(1), StopIdx(2)], 1).unwrap();
+    builder
+        .add_trip(first, vec![time(10), time(20)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(second, vec![time(26), time(60)], 1, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    // Both trips clean: the rental point (25, 0 g) dominates the ride
+    // into stop 2 (60, 0 g) on time alone within the zero bucket.
+    let factors = [0.0, 0.0];
+    let mut merged = Transfers::from_edges(
+        4,
+        &[
+            (StopIdx(1), StopIdx(2), 5, 105.0),
+            (StopIdx(2), StopIdx(3), 100, 100.0),
+        ],
+    )
+    .unwrap();
+    merged.mark_unclosed();
+    let rental_meters = [100.0, 0.0];
+    let rental_flags = [true, false];
+    let view = DayView::universal(&timetable);
+    let labels = PolicyLabels {
+        access: vec![(StopIdx(0), 0, 0.0, false)],
+        egress: vec![(StopIdx(3), 0, 0.0)],
+    };
+    let request = Request {
+        departure: 0,
+        access: Vec::new(),
+        egress: Vec::new(),
+        active_services: Vec::new(),
+        active_services_previous: Vec::new(),
+        max_transfers: 3,
+        exclusions: None,
+    };
+    let journeys = route_with_policy(
+        &view,
+        &timetable,
+        &merged,
+        &geometry,
+        &factors,
+        &request,
+        &labels,
+        1e-6,
+        0,
+        None,
+        &[],
+        Some((&rental_meters, &rental_flags, 0.0)),
+    );
+    assert!(journeys.iter().any(|journey| journey.arrival == 160));
+}
+
+/// A sealed access seed must not shadow a transit arrival's walk
+/// extension either: the rental-composed zero-emission seed reaches
+/// stop 1 at (5, 0 g); the ride into stop 1 (20, 0 g) is dominated by
+/// it on time alone, yet its walk to stop 2 is the only journey there
+/// — the seed's composition already rode a rental and cannot walk
+/// further.
+#[test]
+fn sealed_access_seeds_do_not_shadow_transit_walk_extensions() {
+    let mut builder = TimetableBuilder::new(3);
+    let first = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    builder
+        .add_trip(first, vec![time(10), time(20)], 0, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![(TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly)],
+    )
+    .unwrap();
+    let factors = [0.0];
+    let mut merged = Transfers::from_edges(3, &[(StopIdx(1), StopIdx(2), 100, 100.0)]).unwrap();
+    merged.mark_unclosed();
+    let rental_meters = [0.0];
+    let rental_flags = [false];
+    let view = DayView::universal(&timetable);
+    let labels = PolicyLabels {
+        access: vec![(StopIdx(0), 0, 0.0, false), (StopIdx(1), 5, 0.0, true)],
+        egress: vec![(StopIdx(2), 0, 0.0)],
+    };
+    let request = Request {
+        departure: 0,
+        access: Vec::new(),
+        egress: Vec::new(),
+        active_services: Vec::new(),
+        active_services_previous: Vec::new(),
+        max_transfers: 3,
+        exclusions: None,
+    };
+    let journeys = route_with_policy(
+        &view,
+        &timetable,
+        &merged,
+        &geometry,
+        &factors,
+        &request,
+        &labels,
+        1e-6,
+        0,
+        None,
+        &[],
+        Some((&rental_meters, &rental_flags, 1.0)),
+    );
+    // The ride's walk extension survives the sealed seed's dominance:
+    // stop 2 is reached at 120 over the ride into stop 1 at 20.
+    assert!(journeys.iter().any(|journey| journey.arrival == 120));
+}

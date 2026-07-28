@@ -59,6 +59,9 @@ mod tests;
 /// equal seconds at different grams cannot coexist.
 #[derive(Debug, Clone, Default)]
 pub struct PolicyLabels {
-    pub access: Vec<(StopIdx, u32, f64)>,
+    /// ``(stop, seconds, grams, sealed)`` — sealed when the point's
+    /// composition rode a rental-bearing merged transfer edge, so its
+    /// bag entry must not shadow a transit arrival's walk extensions.
+    pub access: Vec<(StopIdx, u32, f64, bool)>,
     pub egress: Vec<(StopIdx, u32, f64)>,
 }

@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Shared **transfer rentals enter the multicriteria dominance**. The
+  ``transfers={mode: budget}`` policy grant now works with
+  ``DetailedItineraries``' ``"pareto"`` and ``"relaxed"`` candidates:
+  a rental-bearing merged transfer edge adds its ride grams — the
+  shared-fleet factor over the ridden network meters — inside the
+  (arrival, emissions bucket) dominance, so faster-but-dirtier rental
+  options join the frontier beside cleaner walking-transfer options
+  rather than replacing them, and reconstructed rental transfer legs
+  carry their mode, distances, and emissions. The transfer mode's
+  factor must resolve (as any granted vehicle mode's must), and the
+  exactness rule of the time-only stage carries over in bag form: a
+  transit arrival dominated only by rental-origin points still relaxes
+  its walks, because a rental point cannot legally extend by a further
+  walk. Merged-set multicriteria queries run on McRAPTOR (the
+  trip-based engines still assume a closed footpath set), and the cost
+  matrix keeps declining the binding until its attribution stage.
+
 - Shared vehicles may now serve the **transfers between rides**, behind
   the same policy. ``TransportNetwork.compute_mode_transfers(mode,
   max_seconds)`` builds a merged transfer set beside the walking
@@ -21,9 +38,9 @@
   the merged set declares itself outside the engines'
   transitive-closure contract and RAPTOR runs an exact transfer phase
   for it, relaxing walks from every transit arrival of a round rather
-  than only label-improving ones. The trip-based engines and the
-  multicriteria and cost surfaces decline the binding until their
-  stages land.
+  than only label-improving ones. The trip-based engines and the cost
+  surfaces decline the binding until their stages land (the
+  multicriteria candidates take it — see above).
 
 - **Sourced street-mode emission factors ship by default.** The
   micromobility rows of ``cafein.emissions.street_factors()`` now

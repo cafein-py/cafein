@@ -35,6 +35,7 @@ pub fn route(
         route_penalties,
         max_slower,
         None,
+        None,
     )
 }
 
@@ -57,6 +58,7 @@ pub fn route_with_policy(
     slack: u32,
     max_options: Option<usize>,
     route_penalties: &[u32],
+    rental: Option<(&[f64], &[bool], f64)>,
 ) -> Vec<Journey> {
     profile(
         view,
@@ -72,6 +74,7 @@ pub fn route_with_policy(
         route_penalties,
         None,
         Some(labels),
+        rental,
     )
 }
 
@@ -107,6 +110,7 @@ pub fn route_range(
         max_options,
         route_penalties,
         max_slower,
+        None,
         None,
     )
 }
@@ -473,6 +477,7 @@ pub(super) fn profile(
     route_penalties: &[u32],
     max_slower: Option<u32>,
     policy: Option<&PolicyLabels>,
+    rental: Option<(&[f64], &[bool], f64)>,
 ) -> Vec<Journey> {
     assert!(
         bucket.is_finite() && bucket > 0.0,
@@ -481,6 +486,10 @@ pub(super) fn profile(
     assert!(
         policy.is_none() || max_slower.is_none(),
         "max_slower is unsupported beside a street policy"
+    );
+    assert!(
+        rental.is_none() || policy.is_some(),
+        "a merged transfer set rides only policy queries"
     );
     // The `max_slower` restriction: per pass, the resolved-trip bounds
     // anchor the per-stop band and the destination bound floors it (so
@@ -513,6 +522,7 @@ pub(super) fn profile(
         request.exclusions.as_deref(),
     );
     search.policy = policy;
+    search.rental = rental;
     for (index, &departure) in departures.iter().enumerate() {
         if let Some((band, bounds, floors)) = &restricted {
             search.set_cutoff(&bounds[index], floors[index], *band);

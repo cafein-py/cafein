@@ -36,6 +36,13 @@ struct ModeTransferSet {
     budget: f64,
     set: Transfers,
     tokens: std::collections::HashMap<(u32, u32), cafein_core::mode_transfers::RentalToken>,
+    /// Ridden network meters per CSR edge of `set` (0 for walking
+    /// rows), for the multicriteria relax's per-edge grams.
+    rental_network_meters: Vec<f64>,
+    /// Whether each CSR edge bears a rental — the identity the sealed
+    /// bit and the tie-breaks derive from; meters and factors may both
+    /// legitimately be zero.
+    rental_edge: Vec<bool>,
 }
 
 /// A routable public-transport network built from GTFS data.
