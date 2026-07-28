@@ -1427,10 +1427,15 @@ def _policy_cost_columns(
     # unresolved factor poisoning rather than zeroing its rows. Walking
     # rides no vehicle, so its factor is never read.
     mode_factors = {"walk": 0.0}
-    for mode, *_ in access_modes + egress_modes:
+    for mode, _, rental, *_ in access_modes + egress_modes:
         if mode in mode_factors:
             continue
-        value = emissions.street_factor(mode, street_factors, components)
+        value = emissions.street_factor(
+            mode,
+            street_factors,
+            components,
+            service_model="shared" if rental else None,
+        )
         mode_factors[mode] = float("nan") if pd.isna(value) else float(value)
 
     def reduced(points, egress, modes):

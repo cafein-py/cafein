@@ -1085,6 +1085,19 @@ def test_policy_cost_matrix_street_emissions_never_zero_silently(multimodal_netw
     )
     origins = _points_frame([ORIGIN])
     destinations = _points_frame([DEST])
+    # A winning user row may carry NA components; the factor then stays
+    # unresolved and its rows' emissions poison to NaN, never a silent
+    # zero — the shipped sourced defaults resolve only when the user
+    # supplies nothing for the mode.
+    unresolved_rows = pd.DataFrame(
+        {
+            "street_mode": ["bicycle"],
+            "vehicle": [float("nan")],
+            "fuel": [0.0],
+            "infrastructure": [0.0],
+            "operations": [0.0],
+        }
+    )
     with pytest.warns(UserWarning, match="unresolved for street mode 'bicycle'"):
         bare = TravelCostMatrix(
             multimodal_network,
@@ -1093,11 +1106,10 @@ def test_policy_cost_matrix_street_emissions_never_zero_silently(multimodal_netw
             "2022-02-22",
             "08:30:00",
             street_policy=policy,
+            factors=unresolved_rows,
         )
     ridden_bicycle = bare[(bare["street_distance_m"] > 0.0)]
     assert not ridden_bicycle.empty
-    # Without factor rows the bicycle factor is unresolved: its rows'
-    # emissions poison to NaN, never a silent zero.
     assert ridden_bicycle["emissions"].isna().all()
     priced = TravelCostMatrix(
         multimodal_network,
@@ -1432,6 +1444,15 @@ def test_mc_policy_rejects_unresolved_street_factors(multimodal_network):
     pytest.importorskip("cafein._cafein")
     from cafein import DetailedItineraries
 
+    unresolved_rows = pd.DataFrame(
+        {
+            "street_mode": ["e_scooter"],
+            "vehicle": [float("nan")],
+            "fuel": [0.0],
+            "infrastructure": [0.0],
+            "operations": [0.0],
+        }
+    )
     with pytest.raises(ValueError, match="unresolved"):
         DetailedItineraries(
             multimodal_network,
@@ -1441,8 +1462,24 @@ def test_mc_policy_rejects_unresolved_street_factors(multimodal_network):
             "08:30:00",
             candidates="pareto",
             street_policy=_scooter_policy(),
+            factors=unresolved_rows,
             geometries=False,
         )
+    # Without factors= the shipped sourced defaults resolve the shared
+    # scooter out of the box, at its fleet (not private) rate.
+    frame = DetailedItineraries(
+        multimodal_network,
+        _points_frame([ORIGIN]),
+        _points_frame([DEST]),
+        "2022-02-22",
+        "08:30:00",
+        candidates="pareto",
+        street_policy=_scooter_policy(),
+        geometries=False,
+    )
+    scooter = frame[frame["mode"] == "e_scooter"]
+    assert not scooter.empty
+    assert scooter["emissions"].equals(scooter["network_distance_m"] / 1000.0 * 108.2)
     with pytest.raises(ValueError, match="diverse"):
         DetailedItineraries(
             multimodal_network,
@@ -1518,3 +1555,24 @@ def test_mc_policy_engines_answer_identically(multimodal_mctbtr_network):
         and (legs["mode"] == "e_scooter").any()
     ]
     assert zero_ride
+
+
+def test_the_shipped_street_factors_resolve_by_service_model():
+    pytest.importorskip("cafein._cafein")
+    from cafein import emissions
+
+    # ITF "Good to Go?" components on the Finland 2020 mix (cafein-lca),
+    # the conventional bicycle's dietary 21 g/km on top; the shared
+    # e-scooter follows Judl et al. (2026) 2GEN gross plus the ITF
+    # infrastructure graft.
+    assert emissions.street_factor("walk") == 0.0
+    assert emissions.street_factor("bicycle") == pytest.approx(37.0)
+    assert emissions.street_factor("e_bike") == pytest.approx(25.0)
+    assert emissions.street_factor("e_scooter") == pytest.approx(36.0)
+    assert emissions.street_factor(
+        "e_scooter", service_model="shared"
+    ) == pytest.approx(108.2)
+    # The identity's own service model is the default.
+    assert emissions.street_factor(
+        "e_scooter", service_model="private"
+    ) == pytest.approx(36.0)

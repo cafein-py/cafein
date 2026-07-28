@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Sourced street-mode emission factors ship by default.** The
+  micromobility rows of ``cafein.emissions.street_factors()`` now
+  resolve out of the box: ITF *Good to Go?* (Cazzola & Crist 2020)
+  life-cycle components computed on the Finland 2020 electricity mix
+  through the ``cafein-lca`` reimplementation — bicycle 7/21*/9/0,
+  e-bike 13/3/9/0, private e-scooter 26/1/9/0 g CO₂e per person-km over
+  (vehicle/fuel/infrastructure/operations; *the bicycle's dietary
+  energy factor stays) — and a shared e-scooter row from the Helsinki
+  fleet study of Judl et al. (2026, doi:10.1007/s11367-026-02685-2):
+  the current-generation scenario's gross impacts split by its
+  contribution shares, plus the ITF infrastructure component grafted on
+  for one boundary across rows. ``street_factor()`` gains a
+  ``service_model=`` override, and the street-policy products resolve a
+  rental mode's shared-fleet factors automatically — an emissions-aware
+  policy query now works without user factor rows. Walking is the
+  explicit zero baseline. User ``factors=`` rows still beat everything.
+
 - Cycling and e-scooter **access to public transport**, behind an explicit
   policy. ``cafein.StreetLegPolicy`` names which street modes may serve a
   journey's access and egress, each with its own time budget, and
@@ -120,10 +137,9 @@
   ``street_mode``/``vehicle_class``/``service_model`` ladder
   (``cafein.emissions.street_factors``) at grams CO₂e per person-km over
   network metres only; walking and the conventional bicycle ship with
-  zero operational components, while manufacturing and infrastructure —
-  and every battery-mode component — stay deliberately unresolved (NA,
-  with a warning) until sourced rows are supplied through ``factors=``:
-  no invented numbers, and never a silent zero.
+  zero operational components. (The remaining components initially
+  shipped unresolved; the sourced defaults above supersede that within
+  this release — never a silent zero either way.)
   ([#164](https://github.com/cafein-py/cafein/pull/164),
   [#166](https://github.com/cafein-py/cafein/pull/166),
   [#167](https://github.com/cafein-py/cafein/pull/167),

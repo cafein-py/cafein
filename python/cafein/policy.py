@@ -238,7 +238,12 @@ def pareto_reduction_modes(policy, side, walking_budget, factors=None, component
         if mode == "walk":
             modes.append((mode, seconds, rental, eligible, 0.0))
             continue
-        value = emissions.street_factor(mode, factors, components)
+        value = emissions.street_factor(
+            mode,
+            factors,
+            components,
+            service_model="shared" if rental else None,
+        )
         if pd.isna(value):
             raise ValueError(
                 f"the {mode} emission factor is unresolved; the "

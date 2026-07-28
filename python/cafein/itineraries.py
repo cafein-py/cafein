@@ -491,7 +491,9 @@ def _itineraries_frame(
                 continue
             network.annotate_emissions(journeys, transit_factors, components)
             if street_policy is not None:
-                _street_leg_emissions(journeys, street_factors, components)
+                _street_leg_emissions(
+                    journeys, street_factors, components, street_policy
+                )
             for option, journey in enumerate(journeys):
                 for segment, leg in enumerate(journey["legs"]):
                     records.append(
@@ -921,13 +923,14 @@ def _street_itineraries_frame(
     return gpd.GeoDataFrame(frame, geometry=geometry, crs="EPSG:4326")
 
 
-def _street_leg_emissions(journeys, factors, components):
+def _street_leg_emissions(journeys, factors, components, policy=None):
     """Street emissions on the rebuilt vehicle legs, in place.
 
-    Network meters times the mode's resolved per-km factor — the
-    connectors are the walk to the vehicle, not vehicle-kilometres.
-    Walking legs keep the annotation's zero; an unresolved factor leaves
-    NA, never a silent zero. Journey totals grow accordingly.
+    Network meters times the mode's resolved per-km factor — a rental
+    mode resolves its shared-fleet factors — and the connectors are the
+    walk to the vehicle, not vehicle-kilometres. Walking legs keep the
+    annotation's zero; an unresolved factor leaves NA, never a silent
+    zero. Journey totals grow accordingly.
     """
     from cafein import emissions
 
@@ -938,7 +941,14 @@ def _street_leg_emissions(journeys, factors, components):
             if mode in (None, "walk"):
                 continue
             if mode not in resolved:
-                resolved[mode] = emissions.street_factor(mode, factors, components)
+                terms = None if policy is None else policy.vehicles.get(mode)
+                shared = terms is not None and terms.source == "shared"
+                resolved[mode] = emissions.street_factor(
+                    mode,
+                    factors,
+                    components,
+                    service_model="shared" if shared else None,
+                )
             leg["emissions"] = leg["network_distance_m"] / 1000.0 * resolved[mode]
             total = journey.get("emissions")
             if total is not None:
