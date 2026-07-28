@@ -176,6 +176,7 @@ fn cost_rows_aggregate_the_fastest_journey() {
         leg_geometry: None,
         with_geometry: false,
         fares: None,
+        rental: None,
     };
     let mut request = request(StopIdx(0), StopIdx(3), 0);
     request.egress = Vec::new();
@@ -247,6 +248,7 @@ fn point_rows_join_over_egress_links() {
         leg_geometry: None,
         with_geometry: false,
         fares: None,
+        rental: None,
     };
     let mut request = request(StopIdx(0), StopIdx(3), 0);
     request.egress = Vec::new();
@@ -325,6 +327,7 @@ fn cost_rows_carry_fares() {
             leg_geometry: None,
             with_geometry: false,
             fares: Some(tables),
+            rental: None,
         };
         Raptor.cost_matrix(
             &timetable,
@@ -362,6 +365,7 @@ fn cost_rows_carry_fares() {
         leg_geometry: None,
         with_geometry: false,
         fares: Some(&rules(200.0)),
+        rental: None,
     };
     let rows = Raptor.least_cost_matrix(
         &timetable,

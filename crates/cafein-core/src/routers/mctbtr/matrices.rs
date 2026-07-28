@@ -359,6 +359,8 @@ impl<'a> McTbtrEngine<'a> {
             rides,
             transit_meters,
             walk_meters,
+            street_meters: 0.0,
+            rental_transfers: 0,
             emission_grams: winner.grams,
             fare,
             geometry,

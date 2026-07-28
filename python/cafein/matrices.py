@@ -162,6 +162,12 @@ class TravelCostMatrix(pd.DataFrame):
     ``street_policy=`` (a ``cafein.StreetLegPolicy``) opens the access
     and egress to the policy's street modes over the multimodal graph
     (build with ``street_modes=``); point origins and destinations only.
+    With ``transfers={mode: budget}`` the matrix relaxes the merged
+    mode-transfer set of ``TransportNetwork.compute_mode_transfers``
+    (computed with exactly that binding), and the winning journey's
+    rental transfers join the attribution: ride meters in
+    ``street_distance_m``, ride grams in ``emissions``, the walking
+    rest in ``walk_distance_m``.
     The frame gains ``street_distance_m`` beside the transit and walking
     distances — the meters ridden on street vehicles at the journey
     ends, connectors included — and ``emissions`` adds each vehicle
@@ -1407,12 +1413,9 @@ def _policy_cost_columns(
     from cafein import streets as _streets
     from cafein.policy import reduction_modes
 
-    if policy.transfers:
-        raise ValueError(
-            "street_policy transfers= is not wired into the cost matrix "
-            "yet; its per-pair rental attribution arrives with the "
-            "emissions-aware transfer stage"
-        )
+    from cafein.network import _policy_transfer_mode
+
+    transfer_mode = _policy_transfer_mode(policy)
 
     core = network._core
     if not core.has_multimodal_streets:
@@ -1441,6 +1444,22 @@ def _policy_cost_columns(
     egress_modes = reduction_modes(policy, "egress", _streets.MAX_ACCESS_EGRESS_TIME)
     transit_factors, street_factors = _factor_tables(factors)
     trip_factors = emissions.trip_factors(network, transit_factors, components)
+    transfer_arg = None
+    if transfer_mode is not None:
+        # The rental's ride grams join the emissions column, so the
+        # transfer mode's shared-fleet factor must resolve.
+        mode, budget = transfer_mode
+        value = emissions.street_factor(
+            mode, street_factors, components, service_model="shared"
+        )
+        if pd.isna(value):
+            raise ValueError(
+                f"the {mode} emission factor is unresolved; the cost "
+                "matrix attributes rental transfer emissions, so pass "
+                "factors= rows resolving it (see "
+                "cafein.emissions.load_street_factors)"
+            )
+        transfer_arg = (mode, budget, float(value) / 1000.0)
     # One resolved per-km factor per granted vehicle mode; NaN keeps an
     # unresolved factor poisoning rather than zeroing its rows. Walking
     # rides no vehicle, so its factor is never read.
@@ -1461,7 +1480,12 @@ def _policy_cost_columns(
         for index, (lat, lon) in enumerate(points):
             try:
                 cells = core._reduced_street_rows(
-                    lat, lon, egress, modes, exclude_stops=list(exclude_stops)
+                    lat,
+                    lon,
+                    egress,
+                    modes,
+                    exclude_stops=list(exclude_stops),
+                    transfer_mode=transfer_mode,
                 )
             except ValueError as error:
                 if "too far from the multimodal street network" not in str(error):
@@ -1472,8 +1496,28 @@ def _policy_cost_columns(
                 continue
             rows.append(
                 [
-                    (stop, seconds, network_m, connector_m, walk_m, mode_factors[mode])
-                    for stop, seconds, mode, network_m, connector_m, walk_m in cells
+                    (
+                        stop,
+                        seconds,
+                        network_m,
+                        connector_m,
+                        walk_m,
+                        mode_factors[mode],
+                        transfer_network_m,
+                        transfer_total_m,
+                        mode != "walk" or transfer_rental,
+                    )
+                    for (
+                        stop,
+                        seconds,
+                        mode,
+                        network_m,
+                        connector_m,
+                        walk_m,
+                        transfer_network_m,
+                        transfer_total_m,
+                        transfer_rental,
+                    ) in cells
                 ]
             )
         return rows, unsnapped
@@ -1505,6 +1549,7 @@ def _policy_cost_columns(
         exclude_trips=list(exclude_trips),
         exclude_stops=list(exclude_stops),
         geometries=bool(geometries),
+        transfer_mode=transfer_arg,
     )
     # A point is unsnapped only when neither the policy's modes nor the
     # direct walking alternative can snap it — a snap fact from both

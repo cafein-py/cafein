@@ -306,6 +306,8 @@ impl<'a> Search<'a> {
         let mut rides = 0u32;
         let mut transit_meters = 0.0;
         let mut walk_meters = 0.0;
+        let mut street_meters = 0.0;
+        let mut rental_transfers = 0u32;
         let mut grams = 0.0;
         let mut resolved = true;
         let mut legs: Vec<(TripIdx, u16, u16)> = Vec::new();
@@ -365,11 +367,68 @@ impl<'a> Search<'a> {
                         .unwrap_or(0.0);
                     at = from_stop;
                 }
-                Label::TransferFromRide { .. } => {
-                    // Exact-phase labels exist only under an unclosed
-                    // (merged mode-transfer) set, and every cost surface
-                    // rejects those until rental attribution lands.
-                    unreachable!("cost reconstruction walked an exact-phase transfer label")
+                Label::TransferFromRide {
+                    from_stop,
+                    duration: _,
+                    trip,
+                    board_position,
+                    alight_position,
+                    day_offset,
+                } => {
+                    // The relaxed merged edge's total meters, split by
+                    // its token: the ride's street meters (connectors
+                    // included) beside the movement's walking rest, the
+                    // ride grams over its network meters. A walking row
+                    // of the merged set has no token and stays a walk.
+                    let edge_meters = self
+                        .transfers
+                        .from_stop(from_stop)
+                        .iter()
+                        .find(|transfer| transfer.to == at)
+                        .map(|transfer| transfer.meters)
+                        .unwrap_or(0.0);
+                    let rental = inputs
+                        .rental
+                        .expect("merged-set cost chains carry the rental view");
+                    match rental.tokens.get(&(from_stop.0, at.0)) {
+                        Some(token) => {
+                            walk_meters += (edge_meters - token.ride_total_meters).max(0.0);
+                            street_meters += token.ride_total_meters;
+                            rental_transfers += 1;
+                            grams += token.ride_network_meters * rental.grams_per_meter;
+                        }
+                        None => walk_meters += edge_meters,
+                    }
+                    // The carried ride, exactly as a `Transit` label's.
+                    rides += 1;
+                    let meters = inputs
+                        .geometry
+                        .leg_distance(trip, board_position, alight_position)
+                        as f64;
+                    transit_meters += meters;
+                    let factor = inputs.factors[trip.0 as usize];
+                    if factor.is_finite() {
+                        grams += meters / 1000.0 * factor;
+                    } else {
+                        resolved = false;
+                    }
+                    if inputs.with_geometry {
+                        legs.push((trip, board_position, alight_position));
+                    }
+                    let pattern = timetable.trip_pattern(trip);
+                    let board_stop = timetable.pattern_stops(pattern)[board_position as usize];
+                    if inputs.fares.is_some() {
+                        fare_legs.push(FareLeg {
+                            route: timetable.pattern_route(pattern),
+                            board_stop: board_stop.0,
+                            alight_stop: from_stop.0,
+                            board_time: timetable.trip_stop_times(trip)[board_position as usize]
+                                .departure
+                                .saturating_sub(day_offset),
+                        });
+                    }
+                    at = board_stop;
+                    round -= 1;
                 }
                 Label::Access { .. } => {
                     if let Some(access) = access_meters {
@@ -408,6 +467,8 @@ impl<'a> Search<'a> {
             rides,
             transit_meters,
             walk_meters,
+            street_meters,
+            rental_transfers,
             emission_grams: if resolved { grams } else { f64::NAN },
             fare,
             geometry,

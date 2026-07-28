@@ -37,10 +37,12 @@ type RentalTokenParts = (String, String, u32, f64, f64, u32, u32);
 type ReducedChoice = (String, u32, String, u32, f64, f64, Option<String>);
 
 /// One reduced street choice with its meters: stop, seconds, winning
-/// mode, the vehicle's network and connector meters, and the walked
-/// transfer meters of a closure-carried choice — the per-stop street
-/// distances the policy cost matrix attributes.
-type ReducedRow = (String, u32, String, f64, f64, f64);
+/// mode, the vehicle's network and connector meters, the walked
+/// transfer meters of a closure-carried choice, a carried rental
+/// transfer's ride meters (network and street-total), and whether the
+/// carried edge bore a rental — the per-stop street distances and
+/// identities the policy cost matrix attributes.
+type ReducedRow = (String, u32, String, f64, f64, f64, f64, f64, bool);
 
 /// One meters-row cell: whole seconds, network meters, and total street
 /// meters (both connectors included).
@@ -1414,7 +1416,7 @@ impl TransportNetwork {
             .filter_map(|(stop, winner)| {
                 winner.map(|winner| {
                     let mode = modes[winner.order].0.clone();
-                    let (vehicle_network, vehicle_connector, walk) = if mode == "walk" {
+                    let (vehicle_network, vehicle_connector, mut walk) = if mode == "walk" {
                         (0.0, 0.0, winner.total_m + winner.walk_transfer_m)
                     } else {
                         (
@@ -1423,6 +1425,30 @@ impl TransportNetwork {
                             winner.walk_transfer_m,
                         )
                     };
+                    // A rental-bearing carried transfer: the folded
+                    // edge's meters split into the ride's street meters
+                    // and the walking rest by its token.
+                    let (transfer_network, transfer_total) = match (
+                        winner.transfer_rental,
+                        winner.via,
+                        self.mode_transfers.as_ref(),
+                    ) {
+                        (true, Some(via), Some(held)) => {
+                            let pair = if egress {
+                                (stop as u32, via.0)
+                            } else {
+                                (via.0, stop as u32)
+                            };
+                            match held.tokens.get(&pair) {
+                                Some(token) => {
+                                    walk = (walk - token.ride_total_meters).max(0.0);
+                                    (token.ride_network_meters, token.ride_total_meters)
+                                }
+                                None => (0.0, 0.0),
+                            }
+                        }
+                        _ => (0.0, 0.0),
+                    };
                     (
                         self.public_stop_id(StopIdx(stop as u32)),
                         winner.seconds,
@@ -1430,6 +1456,9 @@ impl TransportNetwork {
                         vehicle_network,
                         vehicle_connector,
                         walk,
+                        transfer_network,
+                        transfer_total,
+                        winner.transfer_rental,
                     )
                 })
             })

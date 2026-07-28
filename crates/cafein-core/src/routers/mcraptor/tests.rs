@@ -831,6 +831,7 @@ fn the_emissions_matrix_sees_past_the_time_candidates() {
         leg_geometry: None,
         with_geometry: false,
         fares: None,
+        rental: None,
     };
     let requests = vec![Request {
         departure: 0,
@@ -893,6 +894,7 @@ fn a_budget_caps_the_matrix_travel_time() {
         leg_geometry: None,
         with_geometry: false,
         fares: None,
+        rental: None,
     };
     let requests = vec![Request {
         departure: 0,
@@ -969,6 +971,7 @@ fn matrix_rows_carry_their_transfer_walks() {
         leg_geometry: None,
         with_geometry: false,
         fares: None,
+        rental: None,
     };
     let requests = vec![Request {
         departure: 0,
@@ -1793,6 +1796,7 @@ fn repeated_destination_stops_keep_every_matrix_cell() {
         leg_geometry: None,
         with_geometry: false,
         fares: None,
+        rental: None,
     };
     let requests = vec![Request {
         departure: 0,
@@ -1870,6 +1874,7 @@ fn a_matrix_request_with_egress_is_not_target_pruned() {
         leg_geometry: None,
         with_geometry: false,
         fares: None,
+        rental: None,
     };
     let request = |egress: Vec<(StopIdx, u32)>| {
         vec![Request {
@@ -1936,6 +1941,7 @@ fn the_transfer_cap_saturates_at_the_ride_count_limit() {
         leg_geometry: None,
         with_geometry: false,
         fares: None,
+        rental: None,
     };
     let request = |max_transfers: u8| {
         vec![Request {

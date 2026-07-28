@@ -29,6 +29,13 @@ pub struct CostRow {
     pub transit_meters: f64,
     /// Distance walked on transfers and access links, in meters.
     pub walk_meters: f64,
+    /// Street-vehicle meters of the journey's rental-bearing transfers
+    /// (ride network meters plus their connectors); 0 outside
+    /// merged-set policy queries.
+    pub street_meters: f64,
+    /// How many rental-bearing transfers the journey rode — the street
+    /// identity the tie-breaks read (meters may legitimately be zero).
+    pub rental_transfers: u32,
     /// Grams CO₂e over the ridden legs; NaN when a ridden trip has no
     /// emission factor.
     pub emission_grams: f64,
@@ -54,6 +61,19 @@ pub struct CostInputs<'a> {
     /// Fare tables to price each row's journey with; `None` leaves
     /// fares NaN.
     pub fares: Option<&'a FareTables>,
+    /// The merged mode-transfer set's reconstruction view — the rental
+    /// tokens and the transfer mode's grams per meter — `Some` only
+    /// when the relaxed set is a merged one, whose chains carry
+    /// exact-phase transfer labels.
+    pub rental: Option<RentalCostView<'a>>,
+}
+
+/// The cost walker's view of a merged set's rentals: token lookups by
+/// the relaxed edge's stop pair, and the resolved shared-fleet factor.
+#[derive(Clone, Copy)]
+pub struct RentalCostView<'a> {
+    pub tokens: &'a std::collections::HashMap<(u32, u32), crate::mode_transfers::RentalToken>,
+    pub grams_per_meter: f64,
 }
 
 pub(super) const UNREACHED: u32 = u32::MAX;
