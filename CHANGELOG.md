@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- The **possession-state carriage engine** (17b, first slice):
+  ``travel_times_from_coordinate`` routes carriage policies. The
+  search runs two label planes — Carrying (the bicycle rides along)
+  and Free (parked, or left at the origin: carriage is optional, so
+  every no-bicycle journey stays available) — with carried boardings
+  masked by the GTFS tri-state under the policy's ``unknown_bike_trips``
+  rule, the park transition crossing the planes within its round at
+  facility-eligible stops, the (unclosed) carriage set relaxed under
+  the exact-phase rule when the own ``transfers=`` grant is bound, and
+  the reported time the cross-plane minimum. On the Helsinki fixture a
+  carried bicycle with the transfers grant improves 1674 stops over
+  the no-carriage baseline and worsens none — the pure-option-value
+  contract, pinned by tests together with the forbid-default equality
+  and the parking-restriction monotonicity. Route reconstruction, the
+  itineraries surface, and the matrices reject carriage until the next
+  slice.
+
 - Groundwork for **own-bicycle carriage aboard PT** (the carriage
   stage, 17a of the street-policy arc): the GTFS per-trip
   ``bikes_allowed`` tri-state is ingested (trip field only — the
@@ -15,9 +32,9 @@
   pair the faster of the walking row and the own vehicle's direct
   ride, each row a single mode, unclosed by construction with the
   exact ``(mode, budget)`` binding (internal until the engine).
-  Routing with ``take_aboard`` still rejects: the possession-state
-  engine and the public precompute wrapper arrive with the next
-  slice.
+  ``travel_times_from_coordinate`` routes carriage since the engine
+  slice above; the remaining surfaces and the public precompute
+  wrapper arrive with the following one.
 
 ## 0.7.0 — 2026-07-28
 

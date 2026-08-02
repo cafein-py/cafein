@@ -286,6 +286,9 @@ class TravelCostMatrix(pd.DataFrame):
                     "policy carries its own budgets and the policy cost "
                     "matrix runs the time-fastest engine arm, unpriced"
                 )
+            from cafein.policy import reject_carriage as _reject_carriage
+
+            _reject_carriage(street_policy, "matrix computation")
             walk_only, walk_budget = _walking_only_policy(street_policy)
             if walk_only:
                 # A walking-only policy IS the legacy cost matrix, at the
@@ -586,6 +589,9 @@ class TravelTimeMatrix(pd.DataFrame):
                     "policy carries its own budgets and runs the "
                     "earliest-arrival engine"
                 )
+            from cafein.policy import reject_carriage as _reject_carriage
+
+            _reject_carriage(street_policy, "matrix computation")
             walk_only, walk_budget = _walking_only_policy(street_policy)
             if walk_only:
                 # A walking-only policy IS the legacy walking matrix, at the
@@ -1253,8 +1259,9 @@ def _policy_time_columns(
     through the engine fan-out, the direct walking alternative folded in."""
     from cafein import streets as _streets
     from cafein.network import _policy_transfer_mode
-    from cafein.policy import reduction_modes
+    from cafein.policy import reduction_modes, reject_carriage
 
+    reject_carriage(policy, "the travel time matrix")
     core = network._core
     if not core.has_multimodal_streets:
         raise ValueError(
@@ -1414,7 +1421,9 @@ def _policy_cost_columns(
     from cafein.policy import reduction_modes
 
     from cafein.network import _policy_transfer_mode
+    from cafein.policy import reject_carriage
 
+    reject_carriage(policy, "the cost matrix")
     transfer_mode = _policy_transfer_mode(policy)
 
     core = network._core

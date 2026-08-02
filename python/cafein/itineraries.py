@@ -632,6 +632,9 @@ def _route_pareto(
     from cafein.network import _policy_mc_journeys, _walk_options
 
     if street_policy is not None:
+        from cafein.policy import reject_carriage as _reject_carriage
+
+        _reject_carriage(street_policy, "itinerary reconstruction")
         walk_only, walk_budget = _walking_only_policy(street_policy)
         if not walk_only:
             return _policy_mc_journeys(

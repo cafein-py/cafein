@@ -75,8 +75,6 @@ def test_shared_vehicles_state_their_availability():
 
 
 def test_carriage_terms_validate_and_routing_awaits_the_engine():
-    from cafein.policy import reduction_modes
-
     # The carriage validation matrix: own + origin only, the unknown
     # rule explicit, shared never carries.
     carried = own(take_aboard=True)
@@ -101,13 +99,13 @@ def test_carriage_terms_validate_and_routing_awaits_the_engine():
     # with it — and every query rejects until the carriage engine.
     with pytest.raises(ValueError, match="possession state"):
         StreetLegPolicy(transfers={"bicycle": 900}, vehicles={"bicycle": own()})
-    policy = StreetLegPolicy(
+    # The terms build; the unwired surfaces reject them loudly (see
+    # test_carriage_rejects_the_unwired_surfaces).
+    StreetLegPolicy(
         access={"bicycle": 600},
         transfers={"bicycle": 900},
         vehicles={"bicycle": carried},
     )
-    with pytest.raises(ValueError, match="carriage engine"):
-        reduction_modes(policy, "access", 7200)
     # A carried bicycle may serve both ends; an uncarried one cannot.
     StreetLegPolicy(
         access={"bicycle": 600},
@@ -2238,3 +2236,150 @@ def test_the_carriage_set_builds_binds_and_persists(
     # Replacing the closure drops the set, as with the merged set.
     core.set_transfers([])
     assert core._carriage_transfer_binding is None
+
+
+def _carried(**terms):
+    return VehiclePolicy(
+        source="own",
+        side="origin",
+        facilities="any_stop",
+        take_aboard=True,
+        **terms,
+    )
+
+
+def _carriage_policy(vehicle, transfers=None, egress=None):
+    kwargs = dict(
+        access={"bicycle": 600, "walk": 900},
+        egress=egress or {"walk": 900},
+        vehicles={"bicycle": vehicle},
+    )
+    if transfers:
+        kwargs["transfers"] = transfers
+    return StreetLegPolicy(**kwargs)
+
+
+def test_carriage_travel_times_are_pure_option_value(
+    multimodal_network, artifact_cache
+):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TransportNetwork
+
+    network = TransportNetwork.load(artifact_cache / "helsinki-multimodal.cafein")
+    baseline_policy = StreetLegPolicy(
+        access={"bicycle": 600, "walk": 900},
+        egress={"walk": 900},
+        vehicles={
+            "bicycle": VehiclePolicy(source="own", side="origin", facilities="any_stop")
+        },
+    )
+    args = (ORIGIN, "2022-02-22", "08:30:00")
+    baseline = network.travel_times_from_coordinate(
+        *args, street_policy=baseline_policy
+    )
+    # The conservative default on an all-unknown feed: carrying can
+    # never board, so carriage equals the no-carriage baseline exactly.
+    forbid = network.travel_times_from_coordinate(
+        *args, street_policy=_carriage_policy(_carried())
+    )
+    assert forbid == baseline
+    # With the carriage set and the own-transfers grant under
+    # unknown='allow', the carried bicycle rides between stops: never
+    # worse anywhere, strictly better somewhere.
+    network._core._compute_carriage_transfers("bicycle", 900)
+    granted = network.travel_times_from_coordinate(
+        *args,
+        street_policy=_carriage_policy(
+            _carried(unknown_bike_trips="allow"), transfers={"bicycle": 900}
+        ),
+    )
+    assert all(granted[stop] <= seconds for stop, seconds in baseline.items())
+    assert any(granted[stop] < seconds for stop, seconds in baseline.items())
+    # Restricting the parking facilities only removes Free options.
+    restricted = network.travel_times_from_coordinate(
+        *args,
+        street_policy=_carriage_policy(
+            VehiclePolicy(
+                source="own",
+                side="origin",
+                facilities=("1230109",),
+                take_aboard=True,
+                unknown_bike_trips="allow",
+            ),
+            transfers={"bicycle": 900},
+        ),
+    )
+    assert all(
+        restricted.get(stop, 1 << 30) >= seconds for stop, seconds in granted.items()
+    )
+    # Facilities govern parking only: the carried access still ends at
+    # any stop, so the restricted policy still beats the baseline
+    # somewhere through carried movement.
+    assert any(
+        restricted.get(stop, 1 << 30) < seconds for stop, seconds in baseline.items()
+    )
+    # Binding discipline: the transfers grant needs the exact set.
+    with pytest.raises(ValueError, match="bound to"):
+        network.travel_times_from_coordinate(
+            *args,
+            street_policy=_carriage_policy(
+                _carried(unknown_bike_trips="allow"), transfers={"bicycle": 600}
+            ),
+        )
+
+
+def test_carriage_rejects_the_unwired_surfaces(multimodal_transfers_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries, TravelCostMatrix, TravelTimeMatrix
+
+    policy = _carriage_policy(_carried())
+    # A walking-only carriage policy must not slip through the legacy
+    # fast paths either.
+    walk_only = StreetLegPolicy(
+        access={"walk": 900},
+        egress={"walk": 900},
+        vehicles={"bicycle": _carried()},
+    )
+    with pytest.raises(ValueError, match="not wired into matrix computation"):
+        TravelTimeMatrix(
+            multimodal_transfers_network,
+            _points_frame([ORIGIN]),
+            _points_frame([DEST]),
+            "2022-02-22",
+            "08:30:00",
+            street_policy=walk_only,
+        )
+    with pytest.raises(ValueError, match="not wired into route reconstruction"):
+        multimodal_transfers_network.route_between_coordinates(
+            ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=policy
+        )
+    with pytest.raises(ValueError, match="not wired into matrix computation"):
+        TravelTimeMatrix(
+            multimodal_transfers_network,
+            _points_frame([ORIGIN]),
+            _points_frame([DEST]),
+            "2022-02-22",
+            "08:30:00",
+            street_policy=policy,
+        )
+    with pytest.raises(ValueError, match="not wired into matrix computation"):
+        TravelCostMatrix(
+            multimodal_transfers_network,
+            _points_frame([ORIGIN]),
+            _points_frame([DEST]),
+            "2022-02-22",
+            "08:30:00",
+            street_policy=policy,
+        )
+    with pytest.raises(ValueError, match="not wired into itinerary reconstruction"):
+        DetailedItineraries(
+            multimodal_transfers_network,
+            _points_frame([ORIGIN]),
+            _points_frame([DEST]),
+            "2022-02-22",
+            "08:30:00",
+            candidates="pareto",
+            street_policy=policy,
+            factors=_scooter_factor_rows(),
+            geometries=False,
+        )

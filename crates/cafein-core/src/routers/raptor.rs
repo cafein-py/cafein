@@ -37,6 +37,7 @@ pub use costs::{CostInputs, CostRow, Objective, RentalCostView, NO_STOP};
 pub(crate) use matrices::{
     access_floor, departure_candidates, nearest_rank, propagate_point_percentiles, travel_time,
 };
+pub(crate) use search::earliest_active_trip;
 pub(crate) use search::Search;
 use search::*;
 
