@@ -325,6 +325,35 @@ def carriage_terms(policy):
     return None
 
 
+def carriage_plane_modes(policy, side, default_walk):
+    """One side's per-plane reduction mode lists for a carriage query.
+
+    Carrying takes the policy's granted modes with the carried mode
+    unmasked (facilities govern parking, never its access) and always
+    walks — pushing the vehicle — at the walking budget; Free is the
+    walking-only reduction at that budget (carriage is optional, so the
+    no-vehicle journeys stay available). Reads the policy completely,
+    so callers snapshot by calling this before any GIL-releasing
+    search.
+    """
+    mode, _ = carriage_terms(policy)
+    modes = reduction_modes(policy, side, default_walk)
+    carrying = [
+        (
+            (name, seconds, rental, None)
+            if name == mode
+            else (name, seconds, rental, eligible)
+        )
+        for name, seconds, rental, eligible in modes
+    ]
+    budgets = (policy.access if side == "access" else policy.egress) or {}
+    walk_budget = float(budgets.get("walk", default_walk))
+    free = [("walk", walk_budget, False, None)]
+    if all(name != "walk" for name, *_ in carrying):
+        carrying.append(("walk", walk_budget, False, None))
+    return carrying, free
+
+
 def reject_carriage(policy, surface):
     """Loudly rejects a carriage policy on a surface that cannot route
     possession states yet."""

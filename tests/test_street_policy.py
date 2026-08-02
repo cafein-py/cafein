@@ -2352,7 +2352,7 @@ def test_carriage_travel_times_are_pure_option_value(
 
 def test_carriage_rejects_the_matrix_surfaces(multimodal_transfers_network):
     pytest.importorskip("cafein._cafein")
-    from cafein import DetailedItineraries, TravelCostMatrix, TravelTimeMatrix
+    from cafein import DetailedItineraries, TravelCostMatrix
 
     policy = _carriage_policy(_carried())
     # A walking-only carriage policy must not slip through the legacy
@@ -2365,9 +2365,7 @@ def test_carriage_rejects_the_matrix_surfaces(multimodal_transfers_network):
     frames = (_points_frame([ORIGIN]), _points_frame([DEST]))
     args = (*frames, "2022-02-22", "08:30:00")
     with pytest.raises(ValueError, match="not wired into matrix computation"):
-        TravelTimeMatrix(multimodal_transfers_network, *args, street_policy=walk_only)
-    with pytest.raises(ValueError, match="not wired into matrix computation"):
-        TravelTimeMatrix(multimodal_transfers_network, *args, street_policy=policy)
+        TravelCostMatrix(multimodal_transfers_network, *args, street_policy=walk_only)
     with pytest.raises(ValueError, match="not wired into matrix computation"):
         TravelCostMatrix(multimodal_transfers_network, *args, street_policy=policy)
     with pytest.raises(ValueError, match="the multicriteria candidates"):
@@ -2497,3 +2495,91 @@ def test_carriage_itineraries_render_the_frame(multimodal_network, artifact_cach
     assert (park["from_stop"] == park["to_stop"]).all()
     assert park["mode"].isna().all()
     assert (park["travel_time_s"] == 0).all()
+
+
+def test_carriage_time_matrix_matches_the_route_surface(
+    multimodal_network, artifact_cache
+):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TransportNetwork, TravelTimeMatrix
+
+    network = TransportNetwork.load(artifact_cache / "helsinki-multimodal.cafein")
+    network.compute_carriage_transfers("bicycle", 900)
+    policy = _carriage_policy(
+        _carried(unknown_bike_trips="allow"),
+        transfers={"bicycle": 900},
+        egress={"bicycle": 600, "walk": 900},
+    )
+    frames = (_points_frame([ORIGIN]), _points_frame([DEST, PARK_DEST]))
+    args = (*frames, "2022-02-22", "08:30:00")
+    matrix = TravelTimeMatrix(network, *args, street_policy=policy)
+    departed = 8 * 3600 + 30 * 60
+    # Every cell is the route surface's best arrival, door to door.
+    for index, destination in enumerate([DEST, PARK_DEST]):
+        best = (
+            min(
+                journey["arrival_s"]
+                for journey in network.route_between_coordinates(
+                    ORIGIN,
+                    destination,
+                    "2022-02-22",
+                    "08:30:00",
+                    street_policy=policy,
+                )
+            )
+            - departed
+        )
+        cell = matrix.loc[matrix["to_id"] == f"p{index}", "travel_time_s"]
+        assert int(cell.iloc[0]) == best
+    # Pure option value at the matrix level: the forbid default equals
+    # the no-carriage baseline exactly.
+    baseline_policy = StreetLegPolicy(
+        access={"bicycle": 600, "walk": 900},
+        egress={"walk": 900},
+        vehicles={
+            "bicycle": VehiclePolicy(source="own", side="origin", facilities="any_stop")
+        },
+    )
+    forbid = TravelTimeMatrix(
+        network, *args, street_policy=_carriage_policy(_carried())
+    )
+    baseline = TravelTimeMatrix(network, *args, street_policy=baseline_policy)
+    pd.testing.assert_frame_equal(pd.DataFrame(forbid), pd.DataFrame(baseline))
+    # A walking-only carriage policy rides the carriage engine while
+    # the plain one keeps the legacy fast path (which snaps on the
+    # walking graph): every pair the legacy matrix reaches must agree
+    # exactly, and the carriage cells cover at least that set — the
+    # multimodal snap reaches PARK_DEST where the walking graph
+    # cannot.
+    walk_only_carriage = StreetLegPolicy(
+        access={"walk": 900},
+        egress={"walk": 900},
+        vehicles={"bicycle": _carried()},
+    )
+    walk_only = StreetLegPolicy(access={"walk": 900}, egress={"walk": 900})
+    wide = (
+        _points_frame([ORIGIN, (60.1699, 24.9384)]),
+        _points_frame([DEST, PARK_DEST, (60.1866, 24.9600)]),
+    )
+    carriage_cells = TravelTimeMatrix(
+        network, *wide, "2022-02-22", "08:30:00", street_policy=walk_only_carriage
+    )
+    plain_cells = TravelTimeMatrix(
+        network, *wide, "2022-02-22", "08:30:00", street_policy=walk_only
+    )
+    merged = plain_cells.merge(
+        carriage_cells, on=["from_id", "to_id"], suffixes=("_plain", "_carriage")
+    )
+    assert len(merged) == len(plain_cells)
+    assert (merged["travel_time_s_plain"] == merged["travel_time_s_carriage"]).all()
+    assert len(carriage_cells) > len(plain_cells)
+    # Exclusions are rejected rather than silently dropped.
+    with pytest.raises(ValueError, match="does not combine with exclusions"):
+        TravelTimeMatrix(
+            network, *args, street_policy=policy, exclude_stops=["1230109"]
+        )
+    # A cached trip-based set never claims the carriage query: the
+    # cells are identical with and without it.
+    network._core.compute_tbtr_transfers("2022-02-22")
+    cached = TravelTimeMatrix(network, *args, street_policy=policy)
+    pd.testing.assert_frame_equal(pd.DataFrame(cached), pd.DataFrame(matrix))

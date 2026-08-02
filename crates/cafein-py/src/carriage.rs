@@ -366,3 +366,106 @@ impl TransportNetwork {
         Ok(journeys.unbind())
     }
 }
+
+#[pymethods]
+impl TransportNetwork {
+    /// The carriage time matrix core: per-origin pre-reduced plane
+    /// seeds and per-destination pre-reduced plane egress offsets in,
+    /// the flat origins-major seconds out (``None`` = unreachable).
+    /// One possession-state search per origin through the rayon
+    /// fan-out, then the per-plane egress fold per destination — a
+    /// carried egress folds from the Carrying plane only (a parked
+    /// chain lives in Free), a walking egress from Free. Internal.
+    #[pyo3(signature = (carrying_rows, free_rows, carrying_egress_rows, free_egress_rows,
+                        date, departure, max_transfers, unknown_rule,
+                        park_stops = None, transfer_mode = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn _carriage_time_matrix(
+        &self,
+        py: Python<'_>,
+        carrying_rows: Vec<Vec<(String, u32)>>,
+        free_rows: Vec<Vec<(String, u32)>>,
+        carrying_egress_rows: Vec<Vec<(String, u32)>>,
+        free_egress_rows: Vec<Vec<(String, u32)>>,
+        date: &str,
+        departure: &str,
+        max_transfers: u8,
+        unknown_rule: &str,
+        park_stops: Option<Vec<String>>,
+        transfer_mode: Option<(String, f64)>,
+    ) -> PyResult<Vec<Vec<Option<u32>>>> {
+        if carrying_rows.len() != free_rows.len()
+            || carrying_egress_rows.len() != free_egress_rows.len()
+        {
+            return Err(PyValueError::new_err(
+                "the per-plane row lists must pair up per point",
+            ));
+        }
+        let departure = parse_time(departure)?;
+        let resolve = |offsets: &[(String, u32)]| {
+            offsets
+                .iter()
+                .map(|(stop, seconds)| Ok((self.resolve_stop(stop)?, *seconds)))
+                .collect::<PyResult<Vec<_>>>()
+        };
+        let mut requests = Vec::with_capacity(carrying_rows.len());
+        for (carrying, free) in carrying_rows.iter().zip(&free_rows) {
+            requests.push(CarriageRequest {
+                departure,
+                carrying_access: resolve(carrying)?,
+                free_access: resolve(free)?,
+                max_transfers,
+            });
+        }
+        let mut egress: Vec<[Vec<(StopIdx, u32)>; 2]> =
+            Vec::with_capacity(carrying_egress_rows.len());
+        for (carrying, free) in carrying_egress_rows.iter().zip(&free_egress_rows) {
+            egress.push([resolve(carrying)?, resolve(free)?]);
+        }
+        let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
+        let mut empty_flags = Vec::new();
+        let (mut inputs, carrying_mask, park_mask) = self.carriage_query(
+            transfer_mode.as_ref(),
+            unknown_rule,
+            park_stops.as_deref(),
+            &mut empty_flags,
+        )?;
+        inputs.carrying_mask = &carrying_mask;
+        inputs.park_mask = &park_mask;
+        inputs.active_services = &active_services;
+        inputs.active_services_previous = &active_services_previous;
+        let matrix = py.allow_threads(|| {
+            use rayon::prelude::*;
+
+            requests
+                .par_iter()
+                .map(|request| {
+                    let result = search(&inputs, request);
+                    let arrivals = [result.arrivals(CARRYING), result.arrivals(FREE)];
+                    egress
+                        .iter()
+                        .map(|links| {
+                            let mut best = u32::MAX;
+                            for plane in [CARRYING, FREE] {
+                                for &(stop, seconds) in &links[plane] {
+                                    let Some(at_stop) = arrivals[plane][stop.0 as usize] else {
+                                        continue;
+                                    };
+                                    let Some(arrival) =
+                                        at_stop.checked_add(seconds).filter(|&at| at != u32::MAX)
+                                    else {
+                                        continue;
+                                    };
+                                    best = best.min(arrival);
+                                }
+                            }
+                            (best != u32::MAX).then(|| best - departure)
+                        })
+                        .collect()
+                })
+                .collect()
+        });
+        Ok(matrix)
+    }
+}

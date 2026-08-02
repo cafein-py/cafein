@@ -471,7 +471,7 @@ def _carriage_journeys(
     events and ``bike_aboard`` flags passed through."""
     from cafein import streets as _streets
     from cafein.network import _policy_transfer_mode
-    from cafein.policy import carriage_terms, reduction_modes
+    from cafein.policy import carriage_plane_modes, carriage_terms
 
     mode, vehicle = carriage_terms(policy)
     origin = tuple(origin)
@@ -490,29 +490,13 @@ def _carriage_journeys(
     )
     transfer_mode = _policy_transfer_mode(policy)
 
-    def plane_modes(side):
-        modes = reduction_modes(policy, side, _streets.MAX_ACCESS_EGRESS_TIME)
-        carrying = [
-            (
-                (name, seconds, rental, None)
-                if name == mode
-                else (name, seconds, rental, eligible)
-            )
-            for name, seconds, rental, eligible in modes
-        ]
-        budgets = (policy.access if side == "access" else policy.egress) or {}
-        walk_budget = budgets.get("walk", _streets.MAX_ACCESS_EGRESS_TIME)
-        free = [("walk", float(walk_budget), False, None)]
-        if all(name != "walk" for name, *_ in carrying):
-            # Carrying may always walk (pushing the vehicle) at the
-            # walking budget: walking is both planes' base movement.
-            carrying.append(("walk", float(walk_budget), False, None))
-        return carrying, free
-
     # The mode lists complete the snapshot: after this the policy is
     # never read again, so the GIL-releasing searches below cannot mix
     # policy versions.
-    side_specs = {side: plane_modes(side) for side in ("access", "egress")}
+    side_specs = {
+        side: carriage_plane_modes(policy, side, _streets.MAX_ACCESS_EGRESS_TIME)
+        for side in ("access", "egress")
+    }
 
     def reduced(point, egress, modes):
         try:
@@ -1866,10 +1850,6 @@ class TransportNetwork:
                     )
                 # Snapshot every policy term before the GIL-releasing
                 # street searches; the query reads the policy once.
-                access_budgets = street_policy.access or {}
-                walk_budget = access_budgets.get(
-                    "walk", _streets.MAX_ACCESS_EGRESS_TIME
-                )
                 unknown_rule = vehicle.unknown_bike_trips
                 park = (
                     None
@@ -1881,19 +1861,11 @@ class TransportNetwork:
                 # along), so the reduction runs unmasked for it. A side
                 # that snaps for neither plane is fatal; one plane may
                 # snap alone (the other seeds empty).
-                carrying_modes = [
-                    (
-                        (name, seconds, rental, None)
-                        if name == mode
-                        else (name, seconds, rental, eligible)
-                    )
-                    for name, seconds, rental, eligible in modes
-                ]
-                free_modes = [("walk", float(walk_budget), False, None)]
-                if all(name != "walk" for name, *_ in carrying_modes):
-                    # Carrying may always walk (pushing the vehicle) at
-                    # the walking budget, as on the route surface.
-                    carrying_modes.append(("walk", float(walk_budget), False, None))
+                from cafein.policy import carriage_plane_modes
+
+                carrying_modes, free_modes = carriage_plane_modes(
+                    street_policy, "access", _streets.MAX_ACCESS_EGRESS_TIME
+                )
 
                 def reduced(plane_modes):
                     try:
