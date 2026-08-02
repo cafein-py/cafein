@@ -45,6 +45,7 @@ _POLICY_COLUMNS.insert(_POLICY_COLUMNS.index("distance_m") + 1, "network_distanc
 _POLICY_COLUMNS.insert(
     _POLICY_COLUMNS.index("network_distance_m") + 1, "connector_distance_m"
 )
+_POLICY_COLUMNS.insert(_POLICY_COLUMNS.index("emissions") + 1, "bike_aboard")
 
 
 class DetailedItineraries(gpd.GeoDataFrame):
@@ -59,7 +60,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
     (the OD pair), ``option`` (the journey alternative, numbered per OD
     pair), ``segment`` (the leg's position in that journey), and the leg
     itself — ``leg_type`` (``access``, ``transit``, ``transfer``,
-    ``egress``, or ``walk`` for a walking-only door-to-door journey),
+    ``egress``, ``walk`` for a walking-only door-to-door journey, or
+    ``park`` for a carried vehicle left at a stop — a zero-length
+    event under a carriage street policy),
     ``departure`` and ``arrival`` and ``travel_time`` in
     seconds, ``from_stop`` and ``to_stop`` (the boarding and alighting
     stops; ``None`` at the walked ends of a door-to-door journey),
@@ -236,7 +239,11 @@ class DetailedItineraries(gpd.GeoDataFrame):
         layers over the transit ladder as always; NA where unresolved).
         A choice the transfer closure carried splits into the vehicle
         leg to its seed stop
-        plus the walked transfer, so no row blends two modes. A
+        plus the walked transfer, so no row blends two modes. A carried
+        vehicle (``take_aboard=True``, time candidates) additionally
+        adds a ``bike_aboard`` column — ``True`` on the transit rows
+        the bicycle rode along — and ``park`` rows where it was left at
+        a stop; carriage-set ride transfers render as bicycle legs. A
         walking-only policy at one shared budget rides the legacy
         walking path, and the direct door-to-door alternative stays the
         walking one — direct vehicle journeys ride the standalone street
@@ -434,8 +441,20 @@ def _itineraries_frame(
     exclusions = _exclusion_lists(exclude_routes, exclude_trips, exclude_stops)
     multicriteria = candidates in ("pareto", "relaxed", "diverse")
     transit_factors, street_factors = factors, None
+    shared_modes = frozenset()
     if street_policy is not None:
+        import copy
+
+        # One frozen policy for the whole frame: every OD pair routes,
+        # decorates, and prices emissions under the same version, even
+        # if the caller mutates theirs mid-build.
+        street_policy = copy.deepcopy(street_policy)
         transit_factors, street_factors = _factor_tables(factors)
+        shared_modes = frozenset(
+            name
+            for name, terms in (street_policy.vehicles or {}).items()
+            if terms.source == "shared"
+        )
     # The multicriteria (McRAPTOR) candidates need the per-trip factor vector;
     # the time candidates get their emissions from the post-hoc annotation only.
     trip_factors = (
@@ -496,7 +515,7 @@ def _itineraries_frame(
             network.annotate_emissions(journeys, transit_factors, components)
             if street_policy is not None:
                 _street_leg_emissions(
-                    journeys, street_factors, components, street_policy
+                    journeys, street_factors, components, shared_modes
                 )
             for option, journey in enumerate(journeys):
                 for segment, leg in enumerate(journey["legs"]):
@@ -632,9 +651,9 @@ def _route_pareto(
     from cafein.network import _policy_mc_journeys, _walk_options
 
     if street_policy is not None:
-        from cafein.policy import reject_carriage as _reject_carriage
+        from cafein.policy import reject_carriage
 
-        _reject_carriage(street_policy, "itinerary reconstruction")
+        reject_carriage(street_policy, "the multicriteria candidates")
         walk_only, walk_budget = _walking_only_policy(street_policy)
         if not walk_only:
             return _policy_mc_journeys(
@@ -787,6 +806,9 @@ def _leg_record(from_id, to_id, option, segment, leg, mode=False):
     elif leg_type == "walk":
         # A door-to-door walking journey never touches a stop.
         from_stop, to_stop = None, None
+    elif leg_type == "park":
+        # The carried vehicle stays here; a zero-length event.
+        from_stop = to_stop = leg["stop"]
     else:
         from_stop, to_stop = leg["from_stop"], leg["to_stop"]
     wkb = leg.get("geometry")
@@ -815,8 +837,11 @@ def _leg_record(from_id, to_id, option, segment, leg, mode=False):
         # type resolves it there. The distance parts exist on rebuilt
         # street legs only — legacy and transit legs carry nulls.
         record["mode"] = leg.get("mode", None if leg_type == "transit" else "walk")
+        if leg_type == "park":
+            record["mode"] = None
         record["network_distance_m"] = leg.get("network_distance_m")
         record["connector_distance_m"] = leg.get("connector_distance_m")
+        record["bike_aboard"] = bool(leg.get("bike_aboard", False))
     return record
 
 
@@ -930,12 +955,13 @@ def _street_itineraries_frame(
     return gpd.GeoDataFrame(frame, geometry=geometry, crs="EPSG:4326")
 
 
-def _street_leg_emissions(journeys, factors, components, policy=None):
+def _street_leg_emissions(journeys, factors, components, shared_modes=frozenset()):
     """Street emissions on the rebuilt vehicle legs, in place.
 
-    Network meters times the mode's resolved per-km factor — a rental
-    mode resolves its shared-fleet factors — and the connectors are the
-    walk to the vehicle, not vehicle-kilometres. Walking legs keep the
+    Network meters times the mode's resolved per-km factor — a mode in
+    ``shared_modes`` (snapshotted from the policy before routing)
+    resolves its shared-fleet factors — and the connectors are the walk
+    to the vehicle, not vehicle-kilometres. Walking legs keep the
     annotation's zero; an unresolved factor leaves NA, never a silent
     zero. Journey totals grow accordingly.
     """
@@ -948,8 +974,7 @@ def _street_leg_emissions(journeys, factors, components, policy=None):
             if mode in (None, "walk"):
                 continue
             if mode not in resolved:
-                terms = None if policy is None else policy.vehicles.get(mode)
-                shared = terms is not None and terms.source == "shared"
+                shared = mode in shared_modes
                 resolved[mode] = emissions.street_factor(
                     mode,
                     factors,

@@ -331,7 +331,7 @@ def reject_carriage(policy, surface):
     if carriage_terms(policy) is not None:
         raise ValueError(
             f"take_aboard=True is not wired into {surface} yet; "
-            "travel_times_from_coordinate carries first"
+            "the time-candidate surfaces carry first"
         )
 
 

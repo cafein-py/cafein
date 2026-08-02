@@ -78,6 +78,10 @@ pub enum CarriageLabel {
         duration: u32,
         ride: bool,
         via_transit: Option<(TripIdx, u16, u16, u32)>,
+        /// The walk left a park whose Free label may since have been
+        /// overwritten: the park travels inline (the uniform-carry
+        /// rule), so reconstruction crosses planes here.
+        via_park: bool,
     },
     /// Parked at this stop: entered Free from Carrying's same-stop
     /// label this round.
@@ -169,6 +173,28 @@ impl CarriageSearch {
         let arrival = self.planes[plane].tau[round][stop.0 as usize];
         (arrival != UNREACHED).then_some(arrival)
     }
+
+    /// The best arrival within `round` rounds at (plane, stop).
+    pub fn prefix_arrival(&self, plane: usize, round: usize, stop: StopIdx) -> Option<u32> {
+        let arrival = self.planes[plane].best[round][stop.0 as usize];
+        (arrival != UNREACHED).then_some(arrival)
+    }
+
+    /// The first round at or under `round` whose write equals the
+    /// prefix best at (plane, stop) — the reconstruction entry for the
+    /// (arrival, rides) frontier.
+    pub fn achieving_round(&self, plane: usize, round: usize, stop: StopIdx) -> Option<usize> {
+        let target = self.planes[plane].best[round][stop.0 as usize];
+        if target == UNREACHED {
+            return None;
+        }
+        (0..=round).find(|&r| self.planes[plane].tau[r][stop.0 as usize] == target)
+    }
+
+    /// The search's round count (`max_transfers + 1`).
+    pub fn rounds(&self) -> usize {
+        self.rounds
+    }
 }
 
 /// Runs one carriage search to completion.
@@ -204,6 +230,7 @@ pub fn search(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Carriag
         };
         planes[FREE].improve(0, stop, arrival, CarriageLabel::Access);
     }
+    let mut parked_seeds: Vec<(StopIdx, u32)> = Vec::new();
     for index in 0..stop_count {
         if !inputs.park_mask[index] {
             continue;
@@ -211,58 +238,65 @@ pub fn search(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Carriag
         let arrival = planes[CARRYING].tau[0][index];
         if arrival != UNREACHED {
             planes[FREE].improve(0, StopIdx(index as u32), arrival, CarriageLabel::Park);
+            parked_seeds.push((StopIdx(index as u32), arrival));
         }
     }
 
     // The parked seeds are not walking-closed (the Free access rows
-    // are, by their reduction): relax the closed walking set over the
-    // round-zero Free labels so a park-then-walk boarding stop is
-    // seeded before the first transit round. Walk targets mark
-    // themselves; marks stay for round one's scan.
-    let free_seeds: Vec<StopIdx> = planes[FREE].marked.clone();
-    for source in free_seeds {
-        let departure_at = planes[FREE].tau[0][source.0 as usize];
-        if departure_at == UNREACHED {
-            continue;
-        }
-        let walks: Vec<(StopIdx, u32)> = inputs
-            .walking
-            .from_stop(source)
-            .iter()
-            .filter_map(|edge| {
-                departure_at
-                    .checked_add(edge.duration)
-                    .filter(|&at| at != UNREACHED)
-                    .map(|arrival| (edge.to, arrival))
-            })
-            .collect();
-        for (stop, arrival) in walks {
-            planes[FREE].improve(
-                0,
-                stop,
+    // are, by their reduction — walking again from them would compose
+    // closure rows past the budget): relax the closed walking set over
+    // every parking candidate, shadowed or not — a better Free label
+    // may itself be closure-derived and barred from walking again,
+    // while the park walks fresh (the exact rule; the park travels
+    // inline for reconstruction). Walk targets mark themselves; marks
+    // stay for round one's scan.
+    let mut seed_walks: Vec<(StopIdx, u32, CarriageLabel)> = Vec::new();
+    for &(source, departure_at) in &parked_seeds {
+        for edge in inputs.walking.from_stop(source) {
+            let Some(arrival) = departure_at
+                .checked_add(edge.duration)
+                .filter(|&at| at != UNREACHED)
+            else {
+                continue;
+            };
+            seed_walks.push((
+                edge.to,
                 arrival,
                 CarriageLabel::Transfer {
                     from_stop: source,
-                    duration: arrival - departure_at,
+                    duration: edge.duration,
                     ride: false,
                     via_transit: None,
+                    via_park: true,
                 },
-            );
+            ));
         }
     }
+    for (stop, arrival, label) in seed_walks {
+        planes[FREE].improve(0, stop, arrival, label);
+    }
 
-    // Exact-phase sidecar for the Carrying plane's unclosed set.
-    let mut transit_arrival = vec![UNREACHED; stop_count];
-    let mut transit_ride: Vec<(TripIdx, u16, u16, u32)> = vec![(TripIdx(0), 0, 0, 0); stop_count];
-    let mut transit_touched: Vec<u32> = Vec::new();
+    // Exact-phase sidecars, per plane: the round's best transit
+    // arrivals with their rides, shadowed or not — Carrying's feed the
+    // unclosed carriage set, Free's the walking phase (a fresh ride
+    // resets the one-transfer allowance even when an older
+    // closure-derived label shadows it).
+    let mut transit_arrival = [vec![UNREACHED; stop_count], vec![UNREACHED; stop_count]];
+    let mut transit_ride: [Vec<(TripIdx, u16, u16, u32)>; 2] = [
+        vec![(TripIdx(0), 0, 0, 0); stop_count],
+        vec![(TripIdx(0), 0, 0, 0); stop_count],
+    ];
+    let mut transit_touched: [Vec<u32>; 2] = [Vec::new(), Vec::new()];
 
     for round in 1..=rounds {
         // Transit phase, per plane. The Carrying scan filters trips by
-        // the carrying mask; the sidecar records its transit arrivals.
-        for &stop in &transit_touched {
-            transit_arrival[stop as usize] = UNREACHED;
+        // the carrying mask; the sidecars record the transit arrivals.
+        for plane_index in [CARRYING, FREE] {
+            for &stop in &transit_touched[plane_index] {
+                transit_arrival[plane_index][stop as usize] = UNREACHED;
+            }
+            transit_touched[plane_index].clear();
         }
-        transit_touched.clear();
         for plane_index in [CARRYING, FREE] {
             let marked = std::mem::take(&mut planes[plane_index].marked);
             for &stop in &marked {
@@ -279,11 +313,11 @@ pub fn search(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Carriag
                 &mut writes,
             );
             for (stop, arrival, label) in writes {
-                if plane_index == CARRYING && arrival < transit_arrival[stop.0 as usize] {
-                    if transit_arrival[stop.0 as usize] == UNREACHED {
-                        transit_touched.push(stop.0);
+                if arrival < transit_arrival[plane_index][stop.0 as usize] {
+                    if transit_arrival[plane_index][stop.0 as usize] == UNREACHED {
+                        transit_touched[plane_index].push(stop.0);
                     }
-                    transit_arrival[stop.0 as usize] = arrival;
+                    transit_arrival[plane_index][stop.0 as usize] = arrival;
                     if let CarriageLabel::Transit {
                         trip,
                         board_position,
@@ -291,7 +325,7 @@ pub fn search(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Carriag
                         day_offset,
                     } = label
                     {
-                        transit_ride[stop.0 as usize] =
+                        transit_ride[plane_index][stop.0 as usize] =
                             (trip, board_position, alight_position, day_offset);
                     }
                 }
@@ -302,10 +336,10 @@ pub fn search(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Carriag
         // Carrying transfer phase: the unclosed carriage set relaxes
         // from every transit arrival of the round (the exact rule).
         let mut relaxations: Vec<(StopIdx, u32, CarriageLabel)> = Vec::new();
-        for &source in &transit_touched {
+        for &source in &transit_touched[CARRYING] {
             let source_stop = StopIdx(source);
-            let departure_at = transit_arrival[source as usize];
-            let ride = transit_ride[source as usize];
+            let departure_at = transit_arrival[CARRYING][source as usize];
+            let ride = transit_ride[CARRYING][source as usize];
             let range = inputs.carriage.edge_range(source_stop);
             for (offset, edge) in inputs.carriage.from_stop(source_stop).iter().enumerate() {
                 let Some(arrival) = departure_at
@@ -326,6 +360,7 @@ pub fn search(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Carriag
                         duration: edge.duration,
                         ride: inputs.ride_edge[range.start + offset],
                         via_transit: Some(ride),
+                        via_park: false,
                     },
                 ));
             }
@@ -335,29 +370,53 @@ pub fn search(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Carriag
         }
 
         // Park phase: every Carrying label the round produced may park
-        // at an eligible stop, entering Free the same round.
+        // at an eligible stop, entering Free the same round. The full
+        // candidate list stays as a sidecar — a shadowed park still
+        // walks below, since its shadower may be closure-derived and
+        // barred from walking again (the exact rule).
         let carrying_round: Vec<(usize, u32)> = (0..stop_count)
             .filter(|&index| inputs.park_mask[index])
             .map(|index| (index, planes[CARRYING].tau[round][index]))
             .filter(|&(_, arrival)| arrival != UNREACHED)
             .collect();
-        let mut parked: Vec<StopIdx> = Vec::new();
-        for (index, arrival) in carrying_round {
-            if planes[FREE].improve(round, StopIdx(index as u32), arrival, CarriageLabel::Park) {
-                parked.push(StopIdx(index as u32));
-            }
+        for &(index, arrival) in &carrying_round {
+            planes[FREE].improve(round, StopIdx(index as u32), arrival, CarriageLabel::Park);
         }
 
         // Free walking phase: the closed walking closure relaxes from
-        // the round's Free transit arrivals and the freshly parked —
-        // exactly the marked-stop gate, the closure being closed.
-        let sources: Vec<StopIdx> = planes[FREE].marked.to_vec();
+        // the sidecar of the round's Free transit arrivals (shadowed
+        // ones included — the fresh ride resets the one-transfer
+        // allowance) and from every parking candidate, each walk
+        // inline-carrying its predecessor (the uniform-carry rule):
+        // reconstruction must never chain closure rows through a
+        // mutable or missing label.
         let mut walks: Vec<(StopIdx, u32, CarriageLabel)> = Vec::new();
-        for &source in &sources {
-            let departure_at = planes[FREE].tau[round][source.0 as usize];
-            if departure_at == UNREACHED {
-                continue;
+        for &source in &transit_touched[FREE] {
+            let source_stop = StopIdx(source);
+            let departure_at = transit_arrival[FREE][source as usize];
+            let ride = Some(transit_ride[FREE][source as usize]);
+            for edge in inputs.walking.from_stop(source_stop) {
+                let Some(arrival) = departure_at
+                    .checked_add(edge.duration)
+                    .filter(|&at| at != UNREACHED)
+                else {
+                    continue;
+                };
+                walks.push((
+                    edge.to,
+                    arrival,
+                    CarriageLabel::Transfer {
+                        from_stop: source_stop,
+                        duration: edge.duration,
+                        ride: false,
+                        via_transit: ride,
+                        via_park: false,
+                    },
+                ));
             }
+        }
+        for &(index, departure_at) in &carrying_round {
+            let source = StopIdx(index as u32);
             for edge in inputs.walking.from_stop(source) {
                 let Some(arrival) = departure_at
                     .checked_add(edge.duration)
@@ -373,11 +432,11 @@ pub fn search(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Carriag
                         duration: edge.duration,
                         ride: false,
                         via_transit: None,
+                        via_park: true,
                     },
                 ));
             }
         }
-        let _ = parked;
         for (stop, arrival, label) in walks {
             planes[FREE].improve(round, stop, arrival, label);
         }
@@ -624,6 +683,7 @@ impl CarriageSearch {
                     duration,
                     ride,
                     via_transit,
+                    via_park,
                 } => {
                     legs.push(CarriageLeg::Transfer {
                         from_stop,
@@ -632,6 +692,18 @@ impl CarriageSearch {
                         arrival,
                         ride,
                     });
+                    if via_park {
+                        // The park travels inline: its Free label may
+                        // have been overwritten by a cheaper walk, but
+                        // the Carrying seed below it is immutable.
+                        legs.push(CarriageLeg::Park {
+                            stop: from_stop,
+                            at: arrival - duration,
+                        });
+                        plane_index = CARRYING;
+                        at = from_stop;
+                        continue;
+                    }
                     match via_transit {
                         Some((trip, board_position, alight_position, day_offset)) => {
                             let pattern = timetable.trip_pattern(trip);
