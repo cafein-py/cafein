@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- Groundwork for **own-bicycle carriage aboard PT** (the carriage
+  stage, 17a of the street-policy arc): the GTFS per-trip
+  ``bikes_allowed`` tri-state is ingested (trip field only — the
+  standard defines no route fallback); ``VehiclePolicy`` accepts
+  ``take_aboard=True`` for own vehicles on ``side="origin"`` with an
+  explicit ``unknown_bike_trips`` rule (``"forbid"`` default /
+  ``"allow"`` — never silently assumed), and an own-vehicle
+  ``transfers=`` grant becomes legal vehicle terms beside it; the
+  carriage transfer-set precompute builds and persists (artifact
+  format 16) the carriage set — per stop
+  pair the faster of the walking row and the own vehicle's direct
+  ride, each row a single mode, unclosed by construction with the
+  exact ``(mode, budget)`` binding (internal until the engine).
+  Routing with ``take_aboard`` still rejects: the possession-state
+  engine and the public precompute wrapper arrive with the next
+  slice.
+
 ## 0.7.0 — 2026-07-28
 
 - Street-policy **time queries auto-ride the cached trip-based set**:

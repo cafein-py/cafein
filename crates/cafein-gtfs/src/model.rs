@@ -75,6 +75,9 @@ pub struct Trip {
     pub direction_id: Option<u8>,
     pub shape_id: Option<String>,
     pub headsign: Option<String>,
+    /// GTFS ``bikes_allowed``: ``Some(true)`` = bicycles allowed,
+    /// ``Some(false)`` = forbidden, ``None`` = the feed says nothing.
+    pub bikes_allowed: Option<bool>,
     pub stop_times: Vec<StopTime>,
 }
 

@@ -172,6 +172,7 @@ impl TransportNetwork {
             multimodal_links: std::sync::OnceLock::new(),
             multimodal_profiles: std::sync::Mutex::new(Vec::new()),
             mode_transfers: None,
+            carriage_transfers: None,
         })
     }
 
@@ -555,8 +556,10 @@ impl TransportNetwork {
         }
         self.transfers = Transfers::from_edges(self.build.timetable.stop_count(), &edges)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        // The merged mode-transfer set folded the old closure; recompute.
+        // The merged mode-transfer and carriage sets folded the old
+        // closure; recompute.
         self.mode_transfers = None;
+        self.carriage_transfers = None;
         Ok(())
     }
 
@@ -616,8 +619,10 @@ impl TransportNetwork {
         }
         self.transfers = Transfers::from_edges(self.build.timetable.stop_count(), &edges)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        // The merged mode-transfer set folded the old closure; recompute.
+        // The merged mode-transfer and carriage sets folded the old
+        // closure; recompute.
         self.mode_transfers = None;
+        self.carriage_transfers = None;
         Ok(())
     }
 
@@ -808,8 +813,10 @@ impl TransportNetwork {
         self.multimodal_elevation = elevation;
         self.multimodal_modes = Some(modes);
         self.multimodal_links = std::sync::OnceLock::new();
-        // The merged mode-transfer set rode the old graph; recompute.
+        // The merged mode-transfer and carriage sets rode the old
+        // graph; recompute.
         self.mode_transfers = None;
+        self.carriage_transfers = None;
         self.multimodal_profiles = std::sync::Mutex::new(Vec::new());
         Ok(())
     }
@@ -1562,6 +1569,123 @@ impl TransportNetwork {
             rental_edge,
         });
         Ok(counts)
+    }
+
+    /// Computes and installs the carriage transfer set (stage 17a):
+    /// per stop with a street link for ``mode``, one meters-tracking
+    /// directed search yields the own vehicle's ride edges within
+    /// ``max_seconds``; per ordered pair the faster of the walking row
+    /// and the direct ride wins (ties to walking), each row one mode.
+    /// The set is unclosed by construction — the budget bounds each
+    /// ride as one movement — and bound to the exact ``(mode,
+    /// budget)``; a query under any other binding is an error. The
+    /// carriage engine (17b) consumes it; persisted with the artifact.
+    /// Internal behind the 17b surface.
+    fn _compute_carriage_transfers(
+        &mut self,
+        py: Python<'_>,
+        mode: &str,
+        max_seconds: f64,
+    ) -> PyResult<(usize, usize)> {
+        if mode == "walk" {
+            return Err(PyValueError::new_err(
+                "walking needs no carriage; the carriage set takes the \
+                 carried vehicle's mode",
+            ));
+        }
+        if !max_seconds.is_finite() || max_seconds <= 0.0 {
+            return Err(PyValueError::new_err(
+                "max_seconds must be a positive, finite transfer budget",
+            ));
+        }
+        let profile = self.multimodal_profile(mode)?;
+        let network = self.multimodal.as_ref().expect("profile lookup checked");
+        let links = self.mode_link_targets(network, profile.definition.mode.bit());
+        let stop_count = self.build.timetable.stop_count();
+        let (edges, winners) = py.allow_threads(|| {
+            use rayon::prelude::*;
+            let rides: Vec<Vec<cafein_core::mode_transfers::RentalEdge>> = (0..stop_count as usize)
+                .into_par_iter()
+                .map(|stop| {
+                    let Some(from) = links[stop].as_ref() else {
+                        return Vec::new();
+                    };
+                    network
+                        .directed_meters_to_snaps(from, &links, &profile, max_seconds)
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(target, cell)| {
+                            if target == stop {
+                                return None;
+                            }
+                            let (seconds, network_meters) = cell?;
+                            let link = links[target].as_ref()?;
+                            Some(cafein_core::mode_transfers::RentalEdge {
+                                to: target as u32,
+                                seconds,
+                                network_meters,
+                                total_meters: network_meters + from.connector + link.connector,
+                            })
+                        })
+                        .collect()
+                })
+                .collect();
+            cafein_core::mode_transfers::merge_carriage_transfers(
+                &self.transfers,
+                &rides,
+                stop_count,
+            )
+        });
+        let mut set = Transfers::from_edges(stop_count, &edges)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        // Budget-bounded ride rows cannot close over composites past
+        // the budget; the carriage engine runs the exact phase.
+        set.mark_unclosed();
+        let mut ride_edge = vec![false; set.edge_count()];
+        let mut ride_network_meters = vec![0.0; set.edge_count()];
+        for stop in 0..stop_count {
+            let range = set.edge_range(StopIdx(stop));
+            for (edge, slot) in set.from_stop(StopIdx(stop)).iter().zip(range) {
+                if let Some(&meters) = winners.get(&(stop, edge.to.0)) {
+                    ride_edge[slot] = true;
+                    ride_network_meters[slot] = meters;
+                }
+            }
+        }
+        let counts = (set.edge_count(), winners.len());
+        self.carriage_transfers = Some(CarriageTransferSet {
+            mode: mode.to_owned(),
+            budget: max_seconds,
+            set,
+            ride_edge,
+            ride_network_meters,
+        });
+        Ok(counts)
+    }
+
+    /// The installed carriage binding as ``(mode, budget, edge_count,
+    /// ride_edge_count)``, or ``None``. Internal.
+    #[getter]
+    fn _carriage_transfer_binding(&self) -> Option<(String, f64, usize, usize)> {
+        self.carriage_transfers.as_ref().map(|held| {
+            (
+                held.mode.clone(),
+                held.budget,
+                held.set.edge_count(),
+                held.ride_edge.iter().filter(|&&flag| flag).count(),
+            )
+        })
+    }
+
+    /// Per-trip GTFS ``bikes_allowed`` tri-state by trip index:
+    /// ``True``/``False``/``None`` (unknown). Internal.
+    fn _trip_bikes_allowed(&self) -> Vec<Option<bool>> {
+        (0..self.build.timetable.trip_count())
+            .map(|trip| {
+                let source = self.build.timetable.trip_source(TripIdx(trip));
+                self.feed.trips[source as usize].bikes_allowed
+            })
+            .collect()
     }
 
     /// The installed mode-transfer binding as ``(mode, budget,

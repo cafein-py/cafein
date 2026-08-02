@@ -97,6 +97,15 @@ impl TransportNetwork {
                         rental_edge: &held.rental_edge,
                     }
                 }),
+                carriage_transfers: self.carriage_transfers.as_ref().map(|held| {
+                    PersistedCarriageRef {
+                        mode: &held.mode,
+                        budget: held.budget,
+                        set: &held.set,
+                        ride_edge: &held.ride_edge,
+                        ride_network_meters: &held.ride_network_meters,
+                    }
+                }),
             };
             let meta = bincode::serialize(&artifact)
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -265,14 +274,17 @@ pub(super) const STREET_ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINST";
 // 2: optional elevation metadata in `StreetsMeta`, as in network format 13.
 pub(super) const STREET_ARTIFACT_FORMAT: u32 = 2;
 
-// 15: the META gains the optional merged mode-transfer set with its
-// tokens, per-edge rental arrays, and exact binding.
+// 16: the META gains the optional carriage transfer set with its
+// per-edge ride arrays and exact binding, and the feed's trips carry
+// the GTFS `bikes_allowed` tri-state.
+// 15 added the optional merged mode-transfer set with its tokens,
+// per-edge rental arrays, and exact binding.
 // 14 added an optional second `StreetsMeta` for the multimodal union
 // street graph, whose arrays follow the walking arrays inside the
 // STREETS section (descriptor offsets pre-shifted to their position).
 // 13 added optional elevation metadata to `StreetsMeta`. Earlier formats
 // must be rebuilt.
-pub(super) const ARTIFACT_FORMAT: u32 = 15;
+pub(super) const ARTIFACT_FORMAT: u32 = 16;
 
 /// Section tags in the container directory.
 pub(super) const SECTION_META: u16 = 1;
@@ -332,6 +344,28 @@ pub(super) struct ArtifactRef<'a> {
     /// The merged shared-vehicle transfer set with its exact binding,
     /// when computed; restored so the heavy merge need not be repeated.
     mode_transfers: Option<PersistedModeTransfersRef<'a>>,
+    /// The carriage transfer set with its exact binding, when computed.
+    carriage_transfers: Option<PersistedCarriageRef<'a>>,
+}
+
+/// The carriage set as persisted: rows, per-edge ride identity and
+/// meters, and the binding; the unclosed marking is re-applied on load.
+#[derive(serde::Serialize)]
+struct PersistedCarriageRef<'a> {
+    mode: &'a str,
+    budget: f64,
+    set: &'a Transfers,
+    ride_edge: &'a [bool],
+    ride_network_meters: &'a [f64],
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct PersistedCarriage {
+    mode: String,
+    budget: f64,
+    set: Transfers,
+    ride_edge: Vec<bool>,
+    ride_network_meters: Vec<f64>,
 }
 
 /// The merged mode-transfer set as persisted: the token map flattened
@@ -380,6 +414,7 @@ pub(super) struct Artifact {
     multimodal: Option<StreetsMeta>,
     multimodal_modes: Option<Vec<String>>,
     mode_transfers: Option<PersistedModeTransfers>,
+    carriage_transfers: Option<PersistedCarriage>,
 }
 
 /// The street layer's decoded state: link records (endpoints
@@ -1512,7 +1547,26 @@ pub(super) fn assemble(
         multimodal: multimodal_meta,
         multimodal_modes,
         mode_transfers,
+        carriage_transfers,
     } = artifact;
+    let carriage_transfers = carriage_transfers.map(|persisted| {
+        let PersistedCarriage {
+            mode,
+            budget,
+            mut set,
+            ride_edge,
+            ride_network_meters,
+        } = persisted;
+        // A persisted carriage set is never a closure.
+        set.mark_unclosed();
+        crate::CarriageTransferSet {
+            mode,
+            budget,
+            set,
+            ride_edge,
+            ride_network_meters,
+        }
+    });
     let mode_transfers = mode_transfers.map(|persisted| {
         let PersistedModeTransfers {
             mode,
@@ -1570,6 +1624,7 @@ pub(super) fn assemble(
         multimodal_links: std::sync::OnceLock::new(),
         multimodal_profiles: std::sync::Mutex::new(Vec::new()),
         mode_transfers,
+        carriage_transfers,
         stops_by_id,
         stops_by_qualified_id,
         trips_by_public_id,

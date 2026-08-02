@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read as _, Write as _};
 use std::path::Path;
 
-use gtfs_structures::{DirectionType, Gtfs, GtfsReader};
+use gtfs_structures::{BikesAllowedType, DirectionType, Gtfs, GtfsReader};
 
 use crate::model::{
     Agency, Calendar, CalendarDate, Feed, FeedIndex, FeedInfo, Route, RouteIndex, Stop, StopIndex,
@@ -215,6 +215,12 @@ fn append_gtfs(feed: &mut Feed, feed_index: FeedIndex, gtfs: Gtfs) -> Result<(),
             }),
             shape_id: trip.shape_id,
             headsign: trip.trip_headsign,
+            bikes_allowed: match trip.bikes_allowed {
+                BikesAllowedType::AtLeastOneBike => Some(true),
+                BikesAllowedType::NoBikesAllowed => Some(false),
+                // No information and out-of-spec values stay unknown.
+                _ => None,
+            },
             stop_times,
         });
     }

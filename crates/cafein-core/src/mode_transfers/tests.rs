@@ -142,3 +142,51 @@ fn walks_never_chain_past_the_closure() {
     assert_eq!(ride.2, 150);
     assert_eq!(tokens[&(1, 3)].pre_seconds, 100);
 }
+
+/// The carriage merge: a strictly faster ride replaces the walking row
+/// and is flagged as a winner; an equal-time ride loses to walking; a
+/// ride-only pair is added. Rows never mix modes.
+#[test]
+fn carriage_rides_win_strictly_and_tie_to_walking() {
+    let walking = Transfers::from_edges(
+        4,
+        &[
+            (StopIdx(0), StopIdx(1), 100, 100.0),
+            (StopIdx(0), StopIdx(2), 200, 200.0),
+        ],
+    )
+    .unwrap();
+    let mut rides = vec![Vec::new(); 4];
+    rides[0].push(RentalEdge {
+        to: 1,
+        seconds: 100,
+        network_meters: 300.0,
+        total_meters: 320.0,
+    });
+    rides[0].push(RentalEdge {
+        to: 2,
+        seconds: 150,
+        network_meters: 500.0,
+        total_meters: 520.0,
+    });
+    rides[0].push(RentalEdge {
+        to: 3,
+        seconds: 400,
+        network_meters: 1500.0,
+        total_meters: 1520.0,
+    });
+    let (edges, winners) = merge_carriage_transfers(&walking, &rides, 4);
+    let mut edges = edges;
+    edges.sort_unstable_by_key(|&(from, to, _, _)| (from, to));
+    assert_eq!(
+        edges,
+        vec![
+            (StopIdx(0), StopIdx(1), 100, 100.0),
+            (StopIdx(0), StopIdx(2), 150, 520.0),
+            (StopIdx(0), StopIdx(3), 400, 1520.0),
+        ]
+    );
+    assert_eq!(winners.len(), 2);
+    assert_eq!(winners[&(0, 2)], 500.0);
+    assert_eq!(winners[&(0, 3)], 1500.0);
+}

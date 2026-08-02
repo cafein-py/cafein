@@ -45,6 +45,19 @@ struct ModeTransferSet {
     rental_edge: Vec<bool>,
 }
 
+/// The carriage transfer set (stage 17a): per pair the faster of the
+/// walking row and the own vehicle's direct ride, each row one mode,
+/// beside the ride winners' identity flags and network meters aligned
+/// with the CSR edges. Unclosed by construction (the budget bounds
+/// each ride as one movement); bound to its exact mode and budget.
+struct CarriageTransferSet {
+    mode: String,
+    budget: f64,
+    set: Transfers,
+    ride_edge: Vec<bool>,
+    ride_network_meters: Vec<f64>,
+}
+
 /// A routable public-transport network built from GTFS data.
 #[pyclass]
 struct TransportNetwork {
@@ -111,6 +124,9 @@ struct TransportNetwork {
     /// computed under. Persisted with the artifact and restored on
     /// load, unclosed marking re-applied.
     mode_transfers: Option<ModeTransferSet>,
+    /// The carriage transfer set (stage 17a), the same binding and
+    /// invalidation contract as `mode_transfers`.
+    carriage_transfers: Option<CarriageTransferSet>,
     stops_by_id: HashMap<String, StopLookup>,
     stops_by_qualified_id: HashMap<String, StopIdx>,
     trips_by_public_id: HashMap<String, TripIdx>,
