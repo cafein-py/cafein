@@ -30,8 +30,8 @@ class VehiclePolicy:
         Own vehicles only: the one end the vehicle serves. ``"origin"``
         means it is available at the origin, used for access, and left at
         an eligible stop; ``"destination"`` means it is pre-positioned at
-        an eligible stop and used for egress. The same own vehicle cannot
-        serve both ends.
+        an eligible stop and used for egress. The same own vehicle
+        serves both ends only when carried (``take_aboard=True``).
     facilities : iterable of str, or "any_stop"
         The eligible stops: where an own vehicle may be left (``side=
         "origin"``) or picked up (``side="destination"``), or where a
@@ -43,8 +43,16 @@ class VehiclePolicy:
         that a vehicle is always available at every eligible stop. (An
         availability snapshot arrives with a later stage.)
     take_aboard : bool
-        Must be ``False``: carrying a vehicle aboard changes the routing
-        state space and arrives with a later stage.
+        Own vehicles on ``side="origin"`` only: carry the vehicle
+        aboard bike-permitted trips (the carriage stage). The routing
+        state space gains possession states; see
+        ``unknown_bike_trips`` for trips whose GTFS ``bikes_allowed``
+        says nothing.
+    unknown_bike_trips : str, optional
+        With ``take_aboard=True`` only: how trips without a GTFS
+        ``bikes_allowed`` value board while carrying —
+        ``"forbid"`` (the conservative default) or ``"allow"`` (the
+        explicit modelling assumption). Never silently assumed.
     """
 
     def __init__(
@@ -55,13 +63,34 @@ class VehiclePolicy:
         facilities=None,
         availability=None,
         take_aboard=False,
+        unknown_bike_trips=None,
     ):
         if source not in ("own", "shared"):
             raise ValueError(f"source must be 'own' or 'shared', not {source!r}")
         if take_aboard:
+            if source != "own":
+                raise ValueError(
+                    "take_aboard applies to own vehicles; a shared rental "
+                    "is picked up and dropped per leg, never carried"
+                )
+            if side != "origin":
+                raise ValueError(
+                    "a carried vehicle starts with the traveller; "
+                    "take_aboard=True requires side='origin' "
+                    "(destination pre-positioning contradicts carriage)"
+                )
+            if unknown_bike_trips is None:
+                unknown_bike_trips = "forbid"
+            if unknown_bike_trips not in ("forbid", "allow"):
+                raise ValueError(
+                    "unknown_bike_trips must be 'forbid' or 'allow' — how "
+                    "trips without a GTFS bikes_allowed value board while "
+                    "carrying is never silently assumed"
+                )
+        elif unknown_bike_trips is not None:
             raise ValueError(
-                "take_aboard=True (carrying the vehicle aboard) is not yet "
-                "supported; it changes the routing state space"
+                "unknown_bike_trips applies to carried vehicles only; pass "
+                "take_aboard=True"
             )
         if source == "own":
             if side not in _OWN_SIDES:
@@ -104,7 +133,8 @@ class VehiclePolicy:
         self.side = side
         self.facilities = facilities
         self.availability = availability
-        self.take_aboard = False
+        self.take_aboard = bool(take_aboard)
+        self.unknown_bike_trips = unknown_bike_trips
 
     def __repr__(self):
         terms = f"source={self.source!r}"
@@ -124,14 +154,17 @@ class StreetLegPolicy:
         the query's usual walking budget.
     transfers : dict, optional
         ``{mode: seconds}`` for stop-to-stop transfers mid-journey, one
-        **shared** mode at a time: each such transfer is a complete
-        pickup-travel-drop-off rental, so it needs no possession state
-        (own-vehicle transfers arrive with the carriage stage). The
+        mode at a time: a **shared** mode (each transfer a complete
+        pickup-travel-drop-off rental, no possession state needed), or
+        the **carried own vehicle** (``take_aboard=True``), whose
+        possession the carriage engine tracks. The
         budget bounds a rental-bearing transfer's whole movement —
-        pre-walk, ride, and post-walk; pure walking transfers keep the
-        installed set's own budget. Queries require the matching merged
-        set precomputed with
-        ``TransportNetwork.compute_mode_transfers``.
+        pre-walk, ride, and post-walk — or a carried vehicle's ride as
+        one movement; pure walking transfers keep the installed set's
+        own budget. Shared queries require the matching merged set
+        precomputed with ``TransportNetwork.compute_mode_transfers``;
+        the carried vehicle's set has its own precompute, arriving
+        publicly with the carriage engine.
     vehicles : dict, optional
         ``{mode: VehiclePolicy}`` for every non-walking mode used. A
         non-walking mode without vehicle terms is rejected — whose bicycle
@@ -149,12 +182,13 @@ class StreetLegPolicy:
             if "walk" in transfers:
                 raise ValueError(
                     "walking transfers are the installed transfer set; "
-                    "transfers= names shared vehicle modes"
+                    "transfers= names a shared vehicle mode or the "
+                    "carried own vehicle"
                 )
             if len(transfers) > 1:
                 raise ValueError(
-                    "one shared transfer mode at a time for now; the "
-                    "merged transfer set is computed per mode"
+                    "one transfer mode at a time for now; each transfer "
+                    "set is computed per mode"
                 )
         self.transfers = transfers
         vehicles = dict(vehicles or {})
@@ -173,13 +207,17 @@ class StreetLegPolicy:
                         f"{side_name} mode {mode!r} needs vehicle terms; pass "
                         f"vehicles={{{mode!r}: VehiclePolicy(...)}}"
                     )
-                if policy.source == "own":
+                if policy.source == "own" and not policy.take_aboard:
+                    # A carried vehicle may serve both ends — carriage
+                    # is what transports it; an uncarried own vehicle
+                    # keeps its one declared side.
                     served = "access" if policy.side == "origin" else "egress"
                     if side_name != served:
                         raise ValueError(
                             f"the own {mode} serves {served} only "
-                            f"(side={policy.side!r}), so it cannot be an "
-                            f"{side_name} mode"
+                            f"(side={policy.side!r}) without carriage; "
+                            f"take_aboard=True lets it serve {side_name} "
+                            "too"
                         )
         for mode in self.transfers or {}:
             policy = vehicles.get(mode)
@@ -188,18 +226,46 @@ class StreetLegPolicy:
                     f"transfer mode {mode!r} needs vehicle terms; pass "
                     f"vehicles={{{mode!r}: VehiclePolicy(...)}}"
                 )
-            if policy.source != "shared":
+            if policy.source != "shared" and not policy.take_aboard:
                 raise ValueError(
-                    "own-vehicle transfers need possession state (the "
-                    "carriage stage); transfers= takes shared modes — "
-                    "each transfer is a complete pickup-travel-drop-off "
-                    "rental"
+                    "own-vehicle transfers need possession state; carry "
+                    "the vehicle with take_aboard=True, or grant a shared "
+                    "mode — a shared transfer is a complete "
+                    "pickup-travel-drop-off rental"
                 )
-            if policy.facilities != "any_stop":
+            if policy.source == "shared" and policy.facilities != "any_stop":
                 raise ValueError(
                     f"the merged transfer set rents {mode!r} at every "
                     "linked stop; a facility-masked set is not computed "
-                    "yet, so transfer vehicles need facilities='any_stop'"
+                    "yet, so shared transfer vehicles need "
+                    "facilities='any_stop'"
+                )
+        carried = [mode for mode, vehicle in vehicles.items() if vehicle.take_aboard]
+        if len(carried) > 1:
+            raise ValueError(
+                "one carried vehicle per policy; "
+                f"{', '.join(sorted(carried))} all declare take_aboard=True"
+            )
+        if carried:
+            mode = carried[0]
+            if mode != "bicycle":
+                raise ValueError(
+                    "carriage is modelled for bicycles (GTFS bikes_allowed "
+                    f"governs the boardings); a carried {mode} arrives once "
+                    "its own carriage rules are modelled"
+                )
+            granted = {
+                granted_mode
+                for budgets in (self.access, self.egress, self.transfers)
+                for granted_mode in (budgets or {})
+                if granted_mode != "walk"
+            }
+            if granted - {mode}:
+                extra = ", ".join(sorted(granted - {mode}))
+                raise ValueError(
+                    "a carriage policy grants the carried bicycle and "
+                    f"walking only; mixing {extra} with a carried vehicle "
+                    "arrives later"
                 )
         self.vehicles = vehicles
 
@@ -235,6 +301,11 @@ def reduction_modes(policy, side, walking_budget):
     omitted resolves to walking at `walking_budget`, the query's usual
     walking cutoff.
     """
+    if any(vehicle.take_aboard for vehicle in policy.vehicles.values()):
+        raise ValueError(
+            "take_aboard=True routing arrives with the carriage engine; "
+            "the policy terms are accepted, the queries are not wired yet"
+        )
     budgets = policy.access if side == "access" else policy.egress
     if budgets is None:
         budgets = {"walk": float(walking_budget)}

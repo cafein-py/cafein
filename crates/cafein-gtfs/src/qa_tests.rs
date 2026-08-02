@@ -32,6 +32,7 @@ fn flags_coordinate_less_stops_and_never_running_trips() {
             direction_id: None,
             shape_id: None,
             headsign: None,
+            bikes_allowed: None,
             stop_times: Vec::new(),
         }],
         ..Feed::default()

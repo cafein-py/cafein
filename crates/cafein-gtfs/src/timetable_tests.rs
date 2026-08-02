@@ -22,6 +22,7 @@ fn trip(id: &str, stop_times: Vec<crate::StopTime>) -> Trip {
         direction_id: None,
         shape_id: None,
         headsign: None,
+        bikes_allowed: None,
         stop_times,
     }
 }

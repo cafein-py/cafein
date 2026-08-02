@@ -225,5 +225,54 @@ fn close_from(
     reached
 }
 
+/// Builds the carriage transfer set from the walking closure and
+/// per-stop own-vehicle ride edges: per ordered pair
+/// **min(walking row, direct ride row)** — each row one mode, never a
+/// mixed chain, so reconstruction is a single leg under the row's own
+/// profile. Walking rows survive untouched unless the ride is strictly
+/// faster (ties fall to walking); ride-only pairs are added. The budget
+/// bounds each ride as one whole movement (the search cutoff), so the
+/// set is deliberately not transitively closed — the caller marks it
+/// unclosed and the engines' exact phase covers the composite corner.
+/// Returns the edges beside the ride winners keyed by pair (network
+/// meters, for the post-CSR identity and meters alignment).
+pub fn merge_carriage_transfers(
+    walking: &Transfers,
+    rides: &[Vec<RentalEdge>],
+    stop_count: u32,
+) -> (Vec<MergedEdge>, HashMap<(u32, u32), f64>) {
+    let stops = stop_count as usize;
+    assert_eq!(rides.len(), stops, "ride rows must cover every stop");
+    let mut edges = Vec::new();
+    let mut winners = HashMap::new();
+    for source in 0..stop_count {
+        let mut ride_best: HashMap<u32, (u32, f64, f64)> = HashMap::new();
+        for ride in &rides[source as usize] {
+            let slot = ride_best.entry(ride.to).or_insert((
+                ride.seconds,
+                ride.network_meters,
+                ride.total_meters,
+            ));
+            if ride.seconds < slot.0 {
+                *slot = (ride.seconds, ride.network_meters, ride.total_meters);
+            }
+        }
+        for edge in walking.from_stop(StopIdx(source)) {
+            match ride_best.get(&edge.to.0) {
+                Some(&(seconds, _, _)) if seconds < edge.duration => {}
+                _ => {
+                    ride_best.remove(&edge.to.0);
+                    edges.push((StopIdx(source), edge.to, edge.duration, edge.meters));
+                }
+            }
+        }
+        for (target, (seconds, network_meters, total_meters)) in ride_best {
+            edges.push((StopIdx(source), StopIdx(target), seconds, total_meters));
+            winners.insert((source, target), network_meters);
+        }
+    }
+    (edges, winners)
+}
+
 #[cfg(test)]
 mod tests;

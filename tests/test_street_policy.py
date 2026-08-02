@@ -41,7 +41,7 @@ def test_an_own_vehicle_serves_exactly_one_declared_side():
     with pytest.raises(ValueError, match="one declared side"):
         VehiclePolicy(source="own", facilities="any_stop")
     # side='origin' serves access only.
-    with pytest.raises(ValueError, match="cannot be an egress"):
+    with pytest.raises(ValueError, match="serves access only"):
         StreetLegPolicy(egress={"bicycle": 1800}, vehicles={"bicycle": own()})
     policy = StreetLegPolicy(access={"bicycle": 1800}, vehicles={"bicycle": own()})
     assert policy.vehicles["bicycle"].side == "origin"
@@ -74,11 +74,89 @@ def test_shared_vehicles_state_their_availability():
     assert policy.vehicles["e_scooter"].availability == "unconstrained"
 
 
-def test_carrying_aboard_and_own_vehicle_transfers_are_not_yet():
-    with pytest.raises(ValueError, match="take_aboard"):
-        own(take_aboard=True)
+def test_carriage_terms_validate_and_routing_awaits_the_engine():
+    from cafein.policy import reduction_modes
+
+    # The carriage validation matrix: own + origin only, the unknown
+    # rule explicit, shared never carries.
+    carried = own(take_aboard=True)
+    assert carried.take_aboard and carried.unknown_bike_trips == "forbid"
+    assert own(take_aboard=True, unknown_bike_trips="allow").unknown_bike_trips == (
+        "allow"
+    )
+    with pytest.raises(ValueError, match="never carried"):
+        VehiclePolicy(
+            source="shared",
+            facilities="any_stop",
+            availability="unconstrained",
+            take_aboard=True,
+        )
+    with pytest.raises(ValueError, match="side='origin'"):
+        own(side="destination", take_aboard=True)
+    with pytest.raises(ValueError, match="unknown_bike_trips"):
+        own(take_aboard=True, unknown_bike_trips="maybe")
+    with pytest.raises(ValueError, match="take_aboard=True"):
+        own(unknown_bike_trips="forbid")
+    # Own transfers stay rejected without carriage, become legal terms
+    # with it — and every query rejects until the carriage engine.
     with pytest.raises(ValueError, match="possession state"):
         StreetLegPolicy(transfers={"bicycle": 900}, vehicles={"bicycle": own()})
+    policy = StreetLegPolicy(
+        access={"bicycle": 600},
+        transfers={"bicycle": 900},
+        vehicles={"bicycle": carried},
+    )
+    with pytest.raises(ValueError, match="carriage engine"):
+        reduction_modes(policy, "access", 7200)
+    # A carried bicycle may serve both ends; an uncarried one cannot.
+    StreetLegPolicy(
+        access={"bicycle": 600},
+        egress={"bicycle": 600},
+        vehicles={"bicycle": carried},
+    )
+    with pytest.raises(ValueError, match="take_aboard=True lets it"):
+        StreetLegPolicy(
+            access={"bicycle": 600},
+            egress={"bicycle": 600},
+            vehicles={"bicycle": own()},
+        )
+    with pytest.raises(ValueError, match="carriage is modelled for bicycles"):
+        StreetLegPolicy(
+            access={"e_scooter": 300},
+            vehicles={
+                "e_scooter": VehiclePolicy(
+                    source="own",
+                    side="origin",
+                    facilities="any_stop",
+                    take_aboard=True,
+                )
+            },
+        )
+    with pytest.raises(ValueError, match="carried bicycle and walking only"):
+        StreetLegPolicy(
+            access={"bicycle": 600, "e_scooter": 300},
+            vehicles={
+                "bicycle": carried,
+                "e_scooter": VehiclePolicy(
+                    source="shared",
+                    facilities="any_stop",
+                    availability="unconstrained",
+                ),
+            },
+        )
+    with pytest.raises(ValueError, match="one carried vehicle"):
+        StreetLegPolicy(
+            access={"bicycle": 600, "e_scooter": 300},
+            vehicles={
+                "bicycle": carried,
+                "e_scooter": VehiclePolicy(
+                    source="own",
+                    side="origin",
+                    facilities="any_stop",
+                    take_aboard=True,
+                ),
+            },
+        )
 
 
 # --- The time-only reduction over the multimodal graph -----------------------
@@ -1597,7 +1675,7 @@ def test_transfer_policies_take_shared_modes_only():
         )
     with pytest.raises(ValueError, match="vehicle terms"):
         StreetLegPolicy(transfers={"e_scooter": 600})
-    with pytest.raises(ValueError, match="one shared transfer mode"):
+    with pytest.raises(ValueError, match="one transfer mode at a time"):
         StreetLegPolicy(
             transfers={"e_scooter": 600, "bicycle": 500},
             vehicles={"e_scooter": shared(), "bicycle": shared()},
@@ -2128,3 +2206,35 @@ def test_policy_time_queries_auto_ride_the_cached_tbtr_set(
             router="raptor",
         )
     assert public_frame().equals(frame_before)
+
+
+def test_the_carriage_set_builds_binds_and_persists(
+    multimodal_network, artifact_cache, tmp_path
+):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TransportNetwork
+
+    network = TransportNetwork.load(artifact_cache / "helsinki-multimodal.cafein")
+    core = network._core
+    tri = core._trip_bikes_allowed()
+    assert len(tri) > 0
+    assert set(map(type, tri)) <= {bool, type(None)}
+    edges, rides = core._compute_carriage_transfers("bicycle", 600)
+    assert core._carriage_transfer_binding == ("bicycle", 600.0, edges, rides)
+    walking = len(core._transfer_edges())
+    # Rides only replace strictly faster pairs or add new ones.
+    assert edges >= walking
+    assert 0 < rides <= edges
+    # Persistence: the binding and arrays survive the artifact.
+    path = tmp_path / "with-carriage.cafein"
+    network.save(path)
+    loaded = TransportNetwork.load(path)
+    assert loaded._core._carriage_transfer_binding == (
+        "bicycle",
+        600.0,
+        edges,
+        rides,
+    )
+    # Replacing the closure drops the set, as with the merged set.
+    core.set_transfers([])
+    assert core._carriage_transfer_binding is None
