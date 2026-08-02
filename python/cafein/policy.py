@@ -301,11 +301,6 @@ def reduction_modes(policy, side, walking_budget):
     omitted resolves to walking at `walking_budget`, the query's usual
     walking cutoff.
     """
-    if any(vehicle.take_aboard for vehicle in policy.vehicles.values()):
-        raise ValueError(
-            "take_aboard=True routing arrives with the carriage engine; "
-            "the policy terms are accepted, the queries are not wired yet"
-        )
     budgets = policy.access if side == "access" else policy.egress
     if budgets is None:
         budgets = {"walk": float(walking_budget)}
@@ -320,6 +315,24 @@ def reduction_modes(policy, side, walking_budget):
         eligible = None if terms.facilities == "any_stop" else list(terms.facilities)
         modes.append((mode, seconds, terms.source == "shared", eligible))
     return modes
+
+
+def carriage_terms(policy):
+    """The carried vehicle's ``(mode, VehiclePolicy)``, or ``None``."""
+    for mode, vehicle in policy.vehicles.items():
+        if vehicle.take_aboard:
+            return mode, vehicle
+    return None
+
+
+def reject_carriage(policy, surface):
+    """Loudly rejects a carriage policy on a surface that cannot route
+    possession states yet."""
+    if carriage_terms(policy) is not None:
+        raise ValueError(
+            f"take_aboard=True is not wired into {surface} yet; "
+            "travel_times_from_coordinate carries first"
+        )
 
 
 def pareto_reduction_modes(policy, side, walking_budget, factors=None, components=None):

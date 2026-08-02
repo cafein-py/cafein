@@ -167,6 +167,7 @@ impl Backing for MappedArtifact {
 }
 
 mod artifact;
+mod carriage;
 mod cost_matrices;
 mod frontiers;
 mod network;

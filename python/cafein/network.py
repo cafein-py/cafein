@@ -500,6 +500,9 @@ def _policy_mc_journeys(
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
     from cafein.policy import pareto_reduction_modes
 
+    from cafein.policy import reject_carriage
+
+    reject_carriage(policy, "the multicriteria candidates")
     transfer_mode = _policy_transfer_mode(policy)
     transfer_arg = None
     if transfer_mode is not None:
@@ -1436,6 +1439,9 @@ class TransportNetwork:
                 raise ValueError(
                     "street_policy does not combine with a departure window yet"
                 )
+            from cafein.policy import reject_carriage
+
+            reject_carriage(street_policy, "route reconstruction")
             walk_only, walk_budget = _walking_only_policy(street_policy)
             if walk_only:
                 # A walking-only policy IS the current walking path, at the
@@ -1585,11 +1591,86 @@ class TransportNetwork:
             if any((exclude_routes, exclude_trips, exclude_stops)):
                 raise ValueError("street_policy does not combine with exclusions yet")
             from cafein.network import _policy_transfer_mode
+            from cafein.policy import carriage_terms
 
             modes = reduction_modes(
                 street_policy, "access", _streets.MAX_ACCESS_EGRESS_TIME
             )
             transfer_mode = _policy_transfer_mode(street_policy)
+            carriage = carriage_terms(street_policy)
+            if carriage is not None:
+                # The possession-state search: Carrying seeds from the
+                # policy reduction, Free seeds from the walking-only
+                # reduction — carriage is optional, so every journey
+                # without the vehicle stays available.
+                mode, vehicle = carriage
+                origin = tuple(origin)
+                if not self._core.has_multimodal_streets:
+                    raise ValueError(
+                        "street_policy needs the multimodal street graph; "
+                        "build with street_modes="
+                    )
+                # Snapshot every policy term before the GIL-releasing
+                # street searches; the query reads the policy once.
+                access_budgets = street_policy.access or {}
+                walk_budget = access_budgets.get(
+                    "walk", _streets.MAX_ACCESS_EGRESS_TIME
+                )
+                unknown_rule = vehicle.unknown_bike_trips
+                park = (
+                    None
+                    if vehicle.facilities == "any_stop"
+                    else [str(stop) for stop in vehicle.facilities]
+                )
+                # A carried vehicle's facilities govern parking only:
+                # its access may end at any stop (the bicycle boards
+                # along), so the reduction runs unmasked for it. A side
+                # that snaps for neither plane is fatal; one plane may
+                # snap alone (the other seeds empty).
+                carrying_modes = [
+                    (
+                        (name, seconds, rental, None)
+                        if name == mode
+                        else (name, seconds, rental, eligible)
+                    )
+                    for name, seconds, rental, eligible in modes
+                ]
+                free_modes = [("walk", float(walk_budget), False, None)]
+
+                def reduced(plane_modes):
+                    try:
+                        return [
+                            (stop, seconds)
+                            for stop, seconds, *_ in (
+                                self._core._reduced_street_offsets(
+                                    *origin, False, plane_modes
+                                )
+                            )
+                        ]
+                    except ValueError as error:
+                        if "too far from the multimodal street network" not in str(
+                            error
+                        ):
+                            raise
+                        return None
+
+                carrying = reduced(carrying_modes)
+                free = reduced(free_modes)
+                if carrying is None and free is None:
+                    raise ValueError(
+                        "coordinate too far from the multimodal street "
+                        "network for every policy mode"
+                    )
+                return self._core._carriage_travel_times(
+                    carrying or [],
+                    free or [],
+                    date,
+                    departure,
+                    max_transfers,
+                    unknown_rule,
+                    park_stops=park,
+                    transfer_mode=transfer_mode,
+                )
             if transfer_mode is None and all(mode == "walk" for mode, *_ in modes):
                 # A walking-only policy IS the current walking path, at the
                 # policy's walking budget; a transfers= binding changes the

@@ -1150,7 +1150,7 @@ impl<'a> Search<'a> {
 /// The earliest trip of `pattern` departing `position` at or after `reached`
 /// whose service is `active`. Valid because departures at every position are
 /// sorted within a FIFO pattern.
-pub(super) fn earliest_active_trip(
+pub(crate) fn earliest_active_trip(
     timetable: &Timetable,
     active: &[bool],
     exclusions: Option<&Exclusions>,
