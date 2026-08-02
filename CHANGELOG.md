@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 — 2026-08-02
 
 - **The carriage `TravelTimeMatrix`** (17c, closing the carriage
   stage): a street policy with a carried bicycle runs the
