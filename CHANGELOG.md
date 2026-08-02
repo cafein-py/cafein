@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Carriage journeys on the route and itinerary surfaces** (17b,
+  second slice): ``route_between_coordinates`` and time-candidate
+  ``DetailedItineraries`` reconstruct carriage journeys on the
+  ``(arrival, rides)`` frontier, with the direct walking alternative
+  folded in exactly as on the policy route (exclusions are rejected
+  rather than silently dropped). Transit legs carry a ``bike_aboard``
+  flag, their distances, and — with ``geometries`` — their shapes; the
+  park event appears as a zero-length ``park`` leg at its stop,
+  carriage-set ride transfers decorate as bicycle legs with
+  network/connector distances and drawn shapes, and access/egress
+  rebuild from the per-plane policy reductions (a carried side keeps
+  the vehicle to the door). The
+  itineraries frame gains a ``bike_aboard`` column under a street
+  policy, ``compute_carriage_transfers`` becomes the public precompute
+  wrapper, and the engine is pinned against an exhaustive brute-force
+  possession-state oracle across park/permission-mask sweeps. The
+  matrix surfaces and multicriteria candidates still reject carriage
+  until the next slice.
+
 - The **possession-state carriage engine** (17b, first slice):
   ``travel_times_from_coordinate`` routes carriage policies. The
   search runs two label planes — Carrying (the bicycle rides along)
@@ -15,9 +34,7 @@
   carried bicycle with the transfers grant improves 1674 stops over
   the no-carriage baseline and worsens none — the pure-option-value
   contract, pinned by tests together with the forbid-default equality
-  and the parking-restriction monotonicity. Route reconstruction, the
-  itineraries surface, and the matrices reject carriage until the next
-  slice.
+  and the parking-restriction monotonicity.
 
 - Groundwork for **own-bicycle carriage aboard PT** (the carriage
   stage, 17a of the street-policy arc): the GTFS per-trip
@@ -32,9 +49,9 @@
   pair the faster of the walking row and the own vehicle's direct
   ride, each row a single mode, unclosed by construction with the
   exact ``(mode, budget)`` binding (internal until the engine).
-  ``travel_times_from_coordinate`` routes carriage since the engine
-  slice above; the remaining surfaces and the public precompute
-  wrapper arrive with the following one.
+  ``travel_times_from_coordinate``, ``route_between_coordinates``,
+  and ``DetailedItineraries`` route carriage since the engine slices
+  above.
 
 ## 0.7.0 — 2026-07-28
 

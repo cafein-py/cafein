@@ -462,6 +462,219 @@ def _policy_journeys(
     return [walk] + kept
 
 
+def _carriage_journeys(
+    core, origin, destination, date, departure, max_transfers, policy, geometries
+):
+    """Door-to-door carriage journeys: the possession-state search per
+    plane-reduced side, the winning chain decorated — street legs from
+    the planes' tokens, ride transfers under the carried mode, park
+    events and ``bike_aboard`` flags passed through."""
+    from cafein import streets as _streets
+    from cafein.network import _policy_transfer_mode
+    from cafein.policy import carriage_terms, reduction_modes
+
+    mode, vehicle = carriage_terms(policy)
+    origin = tuple(origin)
+    destination = tuple(destination)
+    if not core.has_multimodal_streets:
+        raise ValueError(
+            "street_policy needs the multimodal street graph; build with "
+            "street_modes="
+        )
+    # Snapshot every policy term before the GIL-releasing searches.
+    unknown_rule = vehicle.unknown_bike_trips
+    park = (
+        None
+        if vehicle.facilities == "any_stop"
+        else [str(stop) for stop in vehicle.facilities]
+    )
+    transfer_mode = _policy_transfer_mode(policy)
+
+    def plane_modes(side):
+        modes = reduction_modes(policy, side, _streets.MAX_ACCESS_EGRESS_TIME)
+        carrying = [
+            (
+                (name, seconds, rental, None)
+                if name == mode
+                else (name, seconds, rental, eligible)
+            )
+            for name, seconds, rental, eligible in modes
+        ]
+        budgets = (policy.access if side == "access" else policy.egress) or {}
+        walk_budget = budgets.get("walk", _streets.MAX_ACCESS_EGRESS_TIME)
+        free = [("walk", float(walk_budget), False, None)]
+        if all(name != "walk" for name, *_ in carrying):
+            # Carrying may always walk (pushing the vehicle) at the
+            # walking budget: walking is both planes' base movement.
+            carrying.append(("walk", float(walk_budget), False, None))
+        return carrying, free
+
+    # The mode lists complete the snapshot: after this the policy is
+    # never read again, so the GIL-releasing searches below cannot mix
+    # policy versions.
+    side_specs = {side: plane_modes(side) for side in ("access", "egress")}
+
+    def reduced(point, egress, modes):
+        try:
+            return _policy_reduced(core, point, egress, modes, ())
+        except ValueError as error:
+            if "too far from the multimodal street network" not in str(error):
+                raise
+            return None
+
+    sides = {}
+    unsnapped = None
+    for side_name, point, egress in (
+        ("access", origin, False),
+        ("egress", destination, True),
+    ):
+        carrying_modes, free_modes = side_specs[side_name]
+        carrying = reduced(point, egress, carrying_modes)
+        free = reduced(point, egress, free_modes)
+        if carrying is None and free is None and unsnapped is None:
+            # Kept rather than raised: the direct walking alternative
+            # below may still stand, exactly as on the policy route.
+            unsnapped = ValueError(
+                "coordinate too far from the multimodal street network for "
+                "every policy mode"
+            )
+        sides[side_name] = (carrying, free, carrying_modes)
+    carr_acc, free_acc, acc_modes = sides["access"]
+    carr_egr, free_egr, egr_modes = sides["egress"]
+    journeys = core._carriage_route(
+        (carr_acc or ([], {}))[0],
+        (free_acc or ([], {}))[0],
+        (carr_egr or ([], {}))[0],
+        (free_egr or ([], {}))[0],
+        date,
+        departure,
+        max_transfers,
+        unknown_rule,
+        geometries,
+        park_stops=park,
+        transfer_mode=transfer_mode,
+    )
+    acc_budgets = {name: seconds for name, seconds, *_ in acc_modes}
+    egr_budgets = {name: seconds for name, seconds, *_ in egr_modes}
+    walk_budgets_acc = {
+        "walk": acc_budgets.get("walk", _streets.MAX_ACCESS_EGRESS_TIME)
+    }
+    walk_budgets_egr = {
+        "walk": egr_budgets.get("walk", _streets.MAX_ACCESS_EGRESS_TIME)
+    }
+    for journey in journeys:
+        legs = []
+        for leg in journey["legs"]:
+            if leg["type"] == "access":
+                tokens = (carr_acc if leg["carrying"] else free_acc)[1]
+                budgets = acc_budgets if leg["carrying"] else walk_budgets_acc
+                legs.extend(
+                    _policy_street_legs(
+                        core,
+                        leg,
+                        origin,
+                        {leg["to_stop"]: tokens[leg["to_stop"]]},
+                        budgets,
+                        False,
+                        geometries,
+                    )
+                )
+            elif leg["type"] == "egress":
+                tokens = (carr_egr if leg["carrying"] else free_egr)[1]
+                budgets = egr_budgets if leg["carrying"] else walk_budgets_egr
+                legs.extend(
+                    _policy_street_legs(
+                        core,
+                        leg,
+                        destination,
+                        {leg["from_stop"]: tokens[leg["from_stop"]]},
+                        budgets,
+                        True,
+                        geometries,
+                    )
+                )
+            elif leg["type"] == "transfer" and leg.pop("ride", False):
+                drawn = core._carriage_ride_leg(
+                    leg["from_stop"], leg["to_stop"], geometries
+                )
+                network_m = drawn[1] if drawn is not None else None
+                connector_m = drawn[2] if drawn is not None else None
+                legs.append(
+                    {
+                        **leg,
+                        "mode": mode,
+                        "distance_m": (
+                            None if drawn is None else network_m + connector_m
+                        ),
+                        "network_distance_m": network_m,
+                        "connector_distance_m": connector_m,
+                        "distance_provenance": None,
+                        "geometry": drawn[3] if drawn is not None else None,
+                    }
+                )
+            elif leg["type"] == "transfer":
+                walked = core._transfer_leg(
+                    leg["from_stop"], leg["to_stop"], geometries
+                )
+                legs.append(
+                    {
+                        **leg,
+                        "mode": "walk",
+                        "distance_m": walked[1] if walked is not None else None,
+                        "distance_provenance": None,
+                        "geometry": walked[2] if walked is not None else None,
+                    }
+                )
+            else:
+                # Transit legs keep their bike_aboard flag; park events
+                # pass through with no mode.
+                leg.setdefault("mode", None)
+                legs.append(leg)
+        journey["legs"] = legs
+    # The direct walking alternative folds in exactly as on the policy
+    # route: a journey stands only when strictly faster than walking
+    # out, and the walk leads unless a kept journey already rides
+    # nothing. The carried vehicle's own direct ride stays with the
+    # standalone street products, as on every policy surface.
+    from cafein._cafein import STREET_DISTANCE_PROVENANCE
+
+    departed = _departure_seconds(departure)
+    direct = core._multimodal_direct_leg(
+        origin, destination, "walk", walk_budgets_acc["walk"], geometries
+    )
+    if direct is None:
+        if unsnapped is not None and not journeys:
+            raise unsnapped
+        return journeys
+    walk_seconds, network_m, connector_m, shape = direct
+    kept = [
+        journey
+        for journey in journeys
+        if journey["arrival_s"] - journey["departure_s"] < walk_seconds
+    ]
+    if any(journey["rides"] == 0 for journey in kept):
+        return kept
+    walk = {
+        "departure_s": departed,
+        "arrival_s": departed + walk_seconds,
+        "rides": 0,
+        "legs": [
+            {
+                "type": "walk",
+                "mode": "walk",
+                "departure_s": departed,
+                "arrival_s": departed + walk_seconds,
+                "distance_m": network_m + connector_m,
+                "network_distance_m": network_m,
+                "connector_distance_m": connector_m,
+                "distance_provenance": STREET_DISTANCE_PROVENANCE,
+                "geometry": shape,
+            }
+        ],
+    }
+    return [walk] + kept
+
+
 def _policy_mc_journeys(
     core,
     origin,
@@ -1439,9 +1652,23 @@ class TransportNetwork:
                 raise ValueError(
                     "street_policy does not combine with a departure window yet"
                 )
-            from cafein.policy import reject_carriage
+            from cafein.policy import carriage_terms
 
-            reject_carriage(street_policy, "route reconstruction")
+            if carriage_terms(street_policy) is not None:
+                if any((exclude_routes, exclude_trips, exclude_stops)):
+                    raise ValueError(
+                        "take_aboard=True does not combine with exclusions yet"
+                    )
+                return _carriage_journeys(
+                    self._core,
+                    origin,
+                    destination,
+                    date,
+                    departure,
+                    max_transfers,
+                    street_policy,
+                    geometries,
+                )
             walk_only, walk_budget = _walking_only_policy(street_policy)
             if walk_only:
                 # A walking-only policy IS the current walking path, at the
@@ -1488,6 +1715,33 @@ class TransportNetwork:
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
             geometries,
         )
+
+    def compute_carriage_transfers(self, mode, max_seconds):
+        """Compute the carriage transfer set for a carried ``mode``.
+
+        Per stop pair the faster of the walking closure row and the own
+        vehicle's direct ride (ties to walking; ride-only pairs are
+        added), each row a single mode. The budget bounds each ride as
+        one movement, and queries granting ``transfers={mode:
+        max_seconds}`` beside a carried vehicle relax exactly this set
+        — a missing or differently parameterised set is an error, never
+        a silent fallback. Heavy precompute; persisted by ``save`` and
+        restored by ``load`` with its exact binding, and dropped when
+        the walking closure or the multimodal graph is replaced.
+
+        Parameters
+        ----------
+        mode : str
+            The carried vehicle's street mode (``"bicycle"``).
+        max_seconds : float
+            The per-movement ride budget in seconds.
+
+        Returns
+        -------
+        (int, int)
+            Total edges in the merged set, and how many are rides.
+        """
+        return self._core._compute_carriage_transfers(mode, float(max_seconds))
 
     def compute_mode_transfers(self, mode, max_seconds):
         """Compute the merged shared-vehicle transfer set for ``mode``.
@@ -1636,6 +1890,10 @@ class TransportNetwork:
                     for name, seconds, rental, eligible in modes
                 ]
                 free_modes = [("walk", float(walk_budget), False, None)]
+                if all(name != "walk" for name, *_ in carrying_modes):
+                    # Carrying may always walk (pushing the vehicle) at
+                    # the walking budget, as on the route surface.
+                    carrying_modes.append(("walk", float(walk_budget), False, None))
 
                 def reduced(plane_modes):
                     try:

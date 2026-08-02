@@ -1688,6 +1688,70 @@ impl TransportNetwork {
             .collect()
     }
 
+    /// A carriage ride transfer's parts — whole seconds, ridden
+    /// network meters, connector meters, and (with ``geometries``) the
+    /// drawn shape under the carried mode's profile — for the relaxed
+    /// carriage edge between two stops; ``None`` without a binding or
+    /// a ride row for the pair. Times and meters stay the set's; the
+    /// drawn path is an optimal one under the same profile. Internal.
+    fn _carriage_ride_leg(
+        &self,
+        py: Python<'_>,
+        from_stop: &str,
+        to_stop: &str,
+        geometries: bool,
+    ) -> PyResult<Option<StreetLegParts>> {
+        let from = self.resolve_stop(from_stop)?;
+        let to = self.resolve_stop(to_stop)?;
+        let Some(held) = &self.carriage_transfers else {
+            return Ok(None);
+        };
+        let range = held.set.edge_range(from);
+        let Some((edge, slot)) = held
+            .set
+            .from_stop(from)
+            .iter()
+            .zip(range)
+            .find(|(edge, slot)| edge.to == to && held.ride_edge[*slot])
+        else {
+            return Ok(None);
+        };
+        let network_meters = held.ride_network_meters[slot];
+        let connector_meters = edge.meters - network_meters;
+        let seconds = edge.duration;
+        if !geometries {
+            return Ok(Some((seconds, network_meters, connector_meters, None)));
+        }
+        let profile = self.multimodal_profile(&held.mode)?;
+        let network = self.multimodal.as_ref().expect("profile lookup checked");
+        let links = self.mode_link_targets(network, profile.definition.mode.bit());
+        let shape = match (links[from.0 as usize], links[to.0 as usize]) {
+            (Some(from_link), Some(to_link)) => {
+                let point = |stop: StopIdx| {
+                    let feed_stop = &self.feed.stops[stop.0 as usize];
+                    match (feed_stop.latitude, feed_stop.longitude) {
+                        (Some(latitude), Some(longitude)) => Some((latitude, longitude)),
+                        _ => None,
+                    }
+                };
+                match (point(from), point(to)) {
+                    (Some(from_point), Some(to_point)) => {
+                        let budget = held.budget;
+                        py.allow_threads(|| {
+                            network.directed_leg(
+                                from_point, &from_link, to_point, &to_link, &profile, budget,
+                            )
+                        })
+                        .and_then(|leg| leg_parts(py, leg, true).3)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        Ok(Some((seconds, network_meters, connector_meters, shape)))
+    }
+
     /// The installed mode-transfer binding as ``(mode, budget,
     /// edge_count, rental_token_count)``, or ``None``. Internal.
     #[getter]

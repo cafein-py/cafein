@@ -160,14 +160,16 @@ impl TransportNetwork {
         Ok(dict.unbind())
     }
 
-    /// The best carriage journey per egress side: per plane the labels
-    /// fold that plane's egress offsets (Carrying may cycle out, Free
-    /// walks), the cross-plane minimum wins, and the winning chain
-    /// reconstructs into ``route_between_stops``-shaped legs plus the
-    /// carriage extras (``bike_aboard`` transit flags, ``park``
-    /// events, ``ride`` transfers in the carried mode). Internal.
+    /// The carriage journeys on the ``(arrival, rides)`` frontier: per
+    /// round the planes fold their egress offsets (Carrying may cycle
+    /// out, Free walks), a round joins the frontier when its cross-
+    /// plane best strictly beats every earlier round, and each kept
+    /// chain reconstructs into ``route_between_stops``-shaped legs
+    /// plus the carriage extras (``bike_aboard`` transit flags,
+    /// ``park`` events, ``ride`` transfers in the carried mode).
+    /// Internal.
     #[pyo3(signature = (carrying_access, free_access, carrying_egress, free_egress,
-                        date, departure, max_transfers, unknown_rule,
+                        date, departure, max_transfers, unknown_rule, geometries,
                         park_stops = None, transfer_mode = None))]
     #[allow(clippy::too_many_arguments)]
     fn _carriage_route(
@@ -181,6 +183,7 @@ impl TransportNetwork {
         departure: &str,
         max_transfers: u8,
         unknown_rule: &str,
+        geometries: bool,
         park_stops: Option<Vec<String>>,
         transfer_mode: Option<(String, f64)>,
     ) -> PyResult<Py<PyList>> {
@@ -212,99 +215,154 @@ impl TransportNetwork {
         inputs.active_services = &active_services;
         inputs.active_services_previous = &active_services_previous;
         let result = py.allow_threads(|| search(&inputs, &request));
-        // The cross-plane best (arrival, plane, round, stop, egress s).
-        let mut best: Option<(u32, usize, usize, StopIdx, u32)> = None;
-        for plane in [CARRYING, FREE] {
-            for &(stop, seconds) in &egress[plane] {
-                let Some((round, at_stop)) = result.best_round(plane, stop) else {
-                    continue;
-                };
-                let Some(arrival) = at_stop.checked_add(seconds).filter(|&at| at != u32::MAX)
-                else {
-                    continue;
-                };
-                if best.is_none_or(|(current, ..)| arrival < current) {
-                    best = Some((arrival, plane, round, stop, seconds));
+        // The (arrival, rides) frontier by round: a round is kept when
+        // its cross-plane egress best strictly beats every earlier
+        // round's, and reconstructs at the round its label was set.
+        let mut frontier: Vec<(u32, usize, usize, StopIdx, u32)> = Vec::new();
+        let mut previous = u32::MAX;
+        for round in 0..=result.rounds() {
+            let mut candidate: Option<(u32, usize, StopIdx, u32)> = None;
+            for plane in [CARRYING, FREE] {
+                for &(stop, seconds) in &egress[plane] {
+                    let Some(at_stop) = result.prefix_arrival(plane, round, stop) else {
+                        continue;
+                    };
+                    let Some(arrival) = at_stop.checked_add(seconds).filter(|&at| at != u32::MAX)
+                    else {
+                        continue;
+                    };
+                    if candidate.is_none_or(|(current, ..)| arrival < current) {
+                        candidate = Some((arrival, plane, stop, seconds));
+                    }
                 }
             }
+            let Some((arrival, plane, stop, seconds)) = candidate else {
+                continue;
+            };
+            if arrival >= previous {
+                continue;
+            }
+            previous = arrival;
+            let achieved = result
+                .achieving_round(plane, round, stop)
+                .expect("a prefix arrival always has an achieving round");
+            frontier.push((arrival, plane, achieved, stop, seconds));
         }
         let journeys = PyList::empty(py);
-        let Some((arrival, plane, round, stop, egress_seconds)) = best else {
-            return Ok(journeys.unbind());
-        };
-        let legs = result.reconstruct(&self.build.timetable, plane, round, stop);
-        let out = PyList::empty(py);
-        let mut rides = 0u32;
-        for leg in &legs {
-            let item = PyDict::new(py);
-            match *leg {
-                CarriageLeg::Access {
-                    plane: leg_plane,
-                    to_stop,
-                    arrival,
-                } => {
-                    item.set_item("type", "access")?;
-                    item.set_item("carrying", leg_plane == CARRYING)?;
-                    item.set_item("to_stop", self.public_stop_id(to_stop))?;
-                    item.set_item("departure_s", departure)?;
-                    item.set_item("arrival_s", arrival)?;
+        for (arrival, plane, round, stop, egress_seconds) in frontier {
+            let legs = result.reconstruct(&self.build.timetable, plane, round, stop);
+            let out = PyList::empty(py);
+            let mut rides = 0u32;
+            for leg in &legs {
+                let item = PyDict::new(py);
+                match *leg {
+                    CarriageLeg::Access {
+                        plane: leg_plane,
+                        to_stop,
+                        arrival,
+                    } => {
+                        item.set_item("type", "access")?;
+                        item.set_item("carrying", leg_plane == CARRYING)?;
+                        item.set_item("to_stop", self.public_stop_id(to_stop))?;
+                        item.set_item("departure_s", departure)?;
+                        item.set_item("arrival_s", arrival)?;
+                    }
+                    CarriageLeg::Park { stop, at } => {
+                        item.set_item("type", "park")?;
+                        item.set_item("stop", self.public_stop_id(stop))?;
+                        item.set_item("departure_s", at)?;
+                        item.set_item("arrival_s", at)?;
+                    }
+                    CarriageLeg::Transit {
+                        trip,
+                        board_stop,
+                        alight_stop,
+                        board_position,
+                        alight_position,
+                        board_time,
+                        alight_time,
+                        bike_aboard,
+                    } => {
+                        rides += 1;
+                        let source_trip =
+                            &self.feed.trips[self.build.timetable.trip_source(trip) as usize];
+                        item.set_item("type", "transit")?;
+                        item.set_item(
+                            "trip_id",
+                            self.public_id(source_trip.feed, &source_trip.id),
+                        )?;
+                        let route = &self.feed.routes[source_trip.route as usize];
+                        item.set_item("route_id", self.public_id(route.feed, &route.id))?;
+                        item.set_item("route_short_name", route.short_name.as_deref())?;
+                        item.set_item("board_stop", self.public_stop_id(board_stop))?;
+                        item.set_item("alight_stop", self.public_stop_id(alight_stop))?;
+                        item.set_item("departure_s", board_time)?;
+                        item.set_item("arrival_s", alight_time)?;
+                        item.set_item("bike_aboard", bike_aboard)?;
+                        match &self.geometry {
+                            Some(geometry) => {
+                                item.set_item(
+                                    "distance_m",
+                                    geometry.leg_distance(trip, board_position, alight_position)
+                                        as f64,
+                                )?;
+                                item.set_item(
+                                    "distance_provenance",
+                                    provenance_name(geometry.provenance(trip)),
+                                )?;
+                            }
+                            None => {
+                                item.set_item("distance_m", py.None())?;
+                                item.set_item("distance_provenance", py.None())?;
+                            }
+                        }
+                        let geometry =
+                            self.leg_geometry
+                                .as_ref()
+                                .filter(|_| geometries)
+                                .map(|geometry| {
+                                    wkb_line_string(
+                                        py,
+                                        &geometry.leg_coordinates(
+                                            trip,
+                                            board_position,
+                                            alight_position,
+                                        ),
+                                    )
+                                });
+                        item.set_item("geometry", geometry)?;
+                    }
+                    CarriageLeg::Transfer {
+                        from_stop,
+                        to_stop,
+                        departure,
+                        arrival,
+                        ride,
+                    } => {
+                        item.set_item("type", "transfer")?;
+                        item.set_item("ride", ride)?;
+                        item.set_item("from_stop", self.public_stop_id(from_stop))?;
+                        item.set_item("to_stop", self.public_stop_id(to_stop))?;
+                        item.set_item("departure_s", departure)?;
+                        item.set_item("arrival_s", arrival)?;
+                    }
                 }
-                CarriageLeg::Park { stop, at } => {
-                    item.set_item("type", "park")?;
-                    item.set_item("stop", self.public_stop_id(stop))?;
-                    item.set_item("departure_s", at)?;
-                    item.set_item("arrival_s", at)?;
-                }
-                CarriageLeg::Transit {
-                    trip,
-                    board_stop,
-                    alight_stop,
-                    board_time,
-                    alight_time,
-                    bike_aboard,
-                    ..
-                } => {
-                    rides += 1;
-                    let source_trip =
-                        &self.feed.trips[self.build.timetable.trip_source(trip) as usize];
-                    item.set_item("type", "transit")?;
-                    item.set_item("trip_id", self.public_id(source_trip.feed, &source_trip.id))?;
-                    item.set_item("from_stop", self.public_stop_id(board_stop))?;
-                    item.set_item("to_stop", self.public_stop_id(alight_stop))?;
-                    item.set_item("departure_s", board_time)?;
-                    item.set_item("arrival_s", alight_time)?;
-                    item.set_item("bike_aboard", bike_aboard)?;
-                }
-                CarriageLeg::Transfer {
-                    from_stop,
-                    to_stop,
-                    departure,
-                    arrival,
-                    ride,
-                } => {
-                    item.set_item("type", "transfer")?;
-                    item.set_item("ride", ride)?;
-                    item.set_item("from_stop", self.public_stop_id(from_stop))?;
-                    item.set_item("to_stop", self.public_stop_id(to_stop))?;
-                    item.set_item("departure_s", departure)?;
-                    item.set_item("arrival_s", arrival)?;
-                }
+                out.append(item)?;
             }
-            out.append(item)?;
+            let egress_leg = PyDict::new(py);
+            egress_leg.set_item("type", "egress")?;
+            egress_leg.set_item("carrying", plane == CARRYING)?;
+            egress_leg.set_item("from_stop", self.public_stop_id(stop))?;
+            egress_leg.set_item("departure_s", arrival - egress_seconds)?;
+            egress_leg.set_item("arrival_s", arrival)?;
+            out.append(egress_leg)?;
+            let journey = PyDict::new(py);
+            journey.set_item("departure_s", departure)?;
+            journey.set_item("arrival_s", arrival)?;
+            journey.set_item("rides", rides)?;
+            journey.set_item("legs", out)?;
+            journeys.append(journey)?;
         }
-        let egress_leg = PyDict::new(py);
-        egress_leg.set_item("type", "egress")?;
-        egress_leg.set_item("carrying", plane == CARRYING)?;
-        egress_leg.set_item("from_stop", self.public_stop_id(stop))?;
-        egress_leg.set_item("departure_s", arrival - egress_seconds)?;
-        egress_leg.set_item("arrival_s", arrival)?;
-        out.append(egress_leg)?;
-        let journey = PyDict::new(py);
-        journey.set_item("departure_s", departure)?;
-        journey.set_item("arrival_s", arrival)?;
-        journey.set_item("rides", rides)?;
-        journey.set_item("legs", out)?;
-        journeys.append(journey)?;
         Ok(journeys.unbind())
     }
 }
