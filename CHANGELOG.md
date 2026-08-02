@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **The carriage `TravelTimeMatrix`** (17c, closing the carriage
+  stage): a street policy with a carried bicycle runs the
+  possession-state search per origin through the rayon fan-out — per
+  cell the cross-plane earliest arrival over the per-plane egress
+  offsets (a carried egress folds from the Carrying plane only, since
+  a parked chain lives in Free), with the direct walking alternative
+  folded in over the same multimodal graph. Every cell equals the
+  route surface's best arrival; the forbid default equals the
+  no-carriage baseline exactly (pure option value at matrix level); a
+  walking-only carriage policy matches the plain walking-only cells; a
+  cached trip-based set never claims the query; and exclusions are
+  rejected rather than silently dropped. The cost matrix and the
+  multicriteria candidates still reject carriage.
+
 - **Carriage journeys on the route and itinerary surfaces** (17b,
   second slice): ``route_between_coordinates`` and time-candidate
   ``DetailedItineraries`` reconstruct carriage journeys on the

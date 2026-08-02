@@ -504,7 +504,13 @@ class TravelTimeMatrix(pd.DataFrame):
     a walking-only policy identical to the legacy walking matrix. With
     ``transfers={mode: budget}`` the matrix relaxes the merged
     mode-transfer set of ``TransportNetwork.compute_mode_transfers``,
-    which must be computed with exactly that binding. It conflicts with
+    which must be computed with exactly that binding. A carried vehicle
+    (``take_aboard=True``, with the carriage set of
+    ``TransportNetwork.compute_carriage_transfers`` under an own
+    ``transfers=`` grant) runs the possession-state search per origin:
+    the bicycle rides along where trips permit, parks at the policy's
+    facilities, and every cell is the cross-plane earliest arrival —
+    exclusions are rejected beside a carried vehicle. It conflicts with
     the walking knobs, ``router``, and the departure-window parameters,
     which are rejected rather than silently ignored.
     """
@@ -589,9 +595,24 @@ class TravelTimeMatrix(pd.DataFrame):
                     "policy carries its own budgets and runs the "
                     "earliest-arrival engine"
                 )
-            from cafein.policy import reject_carriage as _reject_carriage
+            from cafein.policy import carriage_terms as _carriage_terms
 
-            _reject_carriage(street_policy, "matrix computation")
+            if _carriage_terms(street_policy) is not None:
+                data = _carriage_time_columns(
+                    network,
+                    origins,
+                    destinations,
+                    date,
+                    departure,
+                    street_policy,
+                    max_transfers,
+                    chunk,
+                    exclude_routes,
+                    exclude_trips,
+                    exclude_stops,
+                )
+                super().__init__(pd.DataFrame(data))
+                return
             walk_only, walk_budget = _walking_only_policy(street_policy)
             if walk_only:
                 # A walking-only policy IS the legacy walking matrix, at the
@@ -1367,6 +1388,140 @@ def _policy_time_columns(
                 best = direct[i][j] if best is None else min(best, direct[i][j])
             if best is None:
                 # The matrix omits unreachable pairs, as it always has.
+                continue
+            data["from_id"].append(from_id)
+            data["to_id"].append(to_id)
+            data["travel_time_s"].append(best)
+    return data
+
+
+def _carriage_time_columns(
+    network,
+    origins,
+    destinations,
+    date,
+    departure,
+    policy,
+    max_transfers,
+    chunk,
+    exclude_routes=(),
+    exclude_trips=(),
+    exclude_stops=(),
+):
+    """The carriage time-matrix columns: per-point per-plane reductions
+    through the possession-state fan-out, the cross-plane egress fold
+    per cell, and the direct walking alternative folded in over the
+    same multimodal graph."""
+    from cafein import streets as _streets
+    from cafein.network import _policy_transfer_mode
+    from cafein.policy import carriage_plane_modes, carriage_terms
+
+    if any((exclude_routes, exclude_trips, exclude_stops)):
+        raise ValueError("take_aboard=True does not combine with exclusions yet")
+    core = network._core
+    if not core.has_multimodal_streets:
+        raise ValueError(
+            "street_policy needs the multimodal street graph; build with "
+            "street_modes="
+        )
+    if not _is_point_frame(origins):
+        raise ValueError(
+            "street_policy matrices take point-set origins and destinations"
+        )
+    # Snapshot every policy term before the GIL-releasing searches.
+    _, vehicle = carriage_terms(policy)
+    unknown_rule = vehicle.unknown_bike_trips
+    park = (
+        None
+        if vehicle.facilities == "any_stop"
+        else [str(stop) for stop in vehicle.facilities]
+    )
+    transfer_mode = _policy_transfer_mode(policy)
+    access_planes = carriage_plane_modes(
+        policy, "access", _streets.MAX_ACCESS_EGRESS_TIME
+    )
+    egress_planes = carriage_plane_modes(
+        policy, "egress", _streets.MAX_ACCESS_EGRESS_TIME
+    )
+    walk_budget = (policy.access or {}).get("walk", _streets.MAX_ACCESS_EGRESS_TIME)
+    from_ids, origin_points = _point_list(origins, "origins")
+    if destinations is None:
+        to_ids, destination_points = from_ids, origin_points
+    else:
+        to_ids, destination_points = _point_list(destinations, "destinations")
+    rows_slice = _chunk_slice(len(from_ids), chunk)
+    from_ids = from_ids[rows_slice]
+    origin_points = origin_points[rows_slice]
+
+    def reduced(points, egress, planes):
+        carrying_rows, free_rows, unsnapped = [], [], []
+        for index, (lat, lon) in enumerate(points):
+            rows = []
+            for plane_modes in planes:
+                try:
+                    rows.append(
+                        [
+                            (stop, seconds)
+                            for stop, seconds, *_ in core._reduced_street_offsets(
+                                lat, lon, egress, plane_modes
+                            )
+                        ]
+                    )
+                except ValueError as error:
+                    if "too far from the multimodal street network" not in str(error):
+                        raise
+                    rows.append([])
+            if not any(rows):
+                # Neither plane snapped; the point's cells are omitted
+                # unless the direct walk below still stands.
+                unsnapped.append(index)
+            carrying_rows.append(rows[0])
+            free_rows.append(rows[1])
+        return carrying_rows, free_rows, unsnapped
+
+    carrying_rows, free_rows, unsnapped_origins = reduced(
+        origin_points, False, access_planes
+    )
+    carrying_egress_rows, free_egress_rows, unsnapped_destinations = reduced(
+        destination_points, True, egress_planes
+    )
+    matrix = core._carriage_time_matrix(
+        carrying_rows,
+        free_rows,
+        carrying_egress_rows,
+        free_egress_rows,
+        date,
+        departure,
+        max_transfers,
+        unknown_rule,
+        park_stops=park,
+        transfer_mode=transfer_mode,
+    )
+    # The direct walking alternative always applies — walking needs no
+    # vehicle — at the policy's walking access budget when it names one,
+    # else the usual door-to-door cutoff.
+    direct, walk_unsnapped_from, walk_unsnapped_to = core._multimodal_direct_matrix(
+        list(origin_points), list(destination_points), "walk", float(walk_budget)
+    )
+    _warn_unsnapped(
+        {
+            "unsnapped_from": sorted(
+                set(map(int, unsnapped_origins)) & set(map(int, walk_unsnapped_from))
+            ),
+            "unsnapped_to": sorted(
+                set(map(int, unsnapped_destinations)) & set(map(int, walk_unsnapped_to))
+            ),
+        },
+        from_ids,
+        to_ids,
+    )
+    data = {"from_id": [], "to_id": [], "travel_time_s": []}
+    for i, from_id in enumerate(from_ids):
+        for j, to_id in enumerate(to_ids):
+            best = matrix[i][j]
+            if direct is not None and direct[i][j] is not None:
+                best = direct[i][j] if best is None else min(best, direct[i][j])
+            if best is None:
                 continue
             data["from_id"].append(from_id)
             data["to_id"].append(to_id)
