@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- The zone fare model **prices the rule shapes it previously
+  ignored**: a product's restriction dimensions are now alternative
+  grants — the zone-set cover, a **route grant** (route-only
+  ``fare_rules`` rows; a set, so one ticket covers a transfer between
+  its routes), and **origin/destination clauses** (endpoint zones of
+  the covered stretch, a named route binding to its clause) — any one
+  of which validates a stretch, matching real tariffs (HSL's ``D``
+  ticket carries all three shapes at once and still covers plain
+  D-zone trips). Agency scope (``fare_attributes.agency_id`` resolved
+  through ``routes.txt``) bounds every grant, and a multi-agency feed
+  whose fares omit it is rejected. A fare without any rule rows is
+  unrestricted, the spec's reading. ``zone_fare_structure`` gains
+  ``rules="zones"`` for the pre-grant zone-only reading; the compiled
+  matrix fare path prices that model only and rejects grant-bearing
+  or unrestricted structures loudly rather than silently diverging
+  from ``annotate_fares``.
+
 - **Street rental pricing** joins the fare models: ``FareStructure``
   and ``ZoneFareStructure`` accept a ``street`` tariff — per rental
   mode, an ``unlock`` price plus a ``per_minute`` price billed per

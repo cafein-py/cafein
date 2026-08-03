@@ -232,7 +232,7 @@ def test_cost_routers_agree_with_geometry_and_fares(network, helsinki_gtfs):
     from cafein import TravelCostMatrix
     from cafein import fares as fare_module
 
-    hsl = fare_module.zone_fare_structure(helsinki_gtfs)
+    hsl = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
     args = (network, ["4810551", "1040602"], ["1250551"], "2022-02-22", "08:30:00")
     kwargs = dict(geometries=True, fares=hsl)
     # The HSL ferries have no shipped factor; the warning is part of the
@@ -260,7 +260,8 @@ def test_point_cost_matrices_accept_tbtr(network_with_footpaths, helsinki_gtfs):
     args = (network_with_footpaths, origins, destinations, DATE, "08:30:00")
     # The full payload — geometry and fare columns included.
     payload = dict(
-        geometries=True, fares=fare_module.zone_fare_structure(helsinki_gtfs)
+        geometries=True,
+        fares=fare_module.zone_fare_structure(helsinki_gtfs, rules="zones"),
     )
     with pytest.warns(UserWarning, match="route_type"):
         fastest_raptor = TravelCostMatrix(*args, router="raptor", **payload)

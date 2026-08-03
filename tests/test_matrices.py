@@ -497,7 +497,7 @@ def test_least_fare_cells_match_the_frontier(tmp_path):
 def test_fare_columns_price_the_reported_journeys(network, helsinki_gtfs):
     from cafein import fares as fare_module
 
-    hsl = fare_module.zone_fare_structure(helsinki_gtfs)
+    hsl = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
     matrix = cost_matrix(
         network,
         origins=["4810551"],
@@ -534,7 +534,7 @@ def test_fare_columns_price_the_reported_journeys(network, helsinki_gtfs):
 def test_fare_cells_survive_unresolved_emissions(network, helsinki_gtfs):
     from cafein import fares as fare_module
 
-    hsl = fare_module.zone_fare_structure(helsinki_gtfs)
+    hsl = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
     # Each objective qualifies by its own key: the factorless ferry to
     # Suomenlinna prices at the zone ticket under the fare objective,
     # while the emissions objective has no qualifying candidate.
@@ -564,7 +564,7 @@ def test_fare_cells_survive_unresolved_emissions(network, helsinki_gtfs):
 def test_point_fare_cells_prefer_walking(network_with_footpaths, helsinki_gtfs):
     from cafein import fares as fare_module
 
-    hsl = fare_module.zone_fare_structure(helsinki_gtfs)
+    hsl = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
     matrix = cost_matrix(
         network_with_footpaths,
         origins=point_frame(network_with_footpaths, [("metro", "1040602")]),
@@ -600,7 +600,7 @@ def test_fare_matrices_validate_their_options(network, helsinki_gtfs):
             date="2022-02-22",
             departure="08:30:00",
             optimize="fare",
-            fares=fare_module.zone_fare_structure(helsinki_gtfs),
+            fares=fare_module.zone_fare_structure(helsinki_gtfs, rules="zones"),
         )
     # Without a fare structure no fare column appears.
     plain = cost_matrix(
