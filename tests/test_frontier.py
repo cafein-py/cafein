@@ -1877,3 +1877,66 @@ def test_frontier_table_matches_on_the_two_line_fixture(tmp_path):
         "emissions",
         "frontier",
     ]
+
+
+def test_fare_frontier_prunes_at_the_cutoffs(network):
+    from cafein import fare_frontier, fares, frontier_table
+
+    structure = fares.setup_fare_structure(network, base_fare=3.0)
+    args = (["4810551"], ["1250551"], "2022-02-22", "08:30:00", 600)
+    # Unbounded by money, the frontier's travel time is the window's
+    # time-optimal one — the shipped frontier product's best row.
+    unbounded = fare_frontier(network, *args, structure, cutoffs=[1e9], max_transfers=4)
+    assert len(unbounded) == 1
+    reference = frontier_table(
+        network,
+        ["4810551"],
+        ["1250551"],
+        "2022-02-22",
+        "08:30:00",
+        window=600,
+        max_transfers=4,
+    )
+    assert unbounded["travel_time_s"].iloc[0] == reference["travel_time_s"].min()
+    # Every reported fare fits its cutoff, and relaxing the cutoff
+    # never slows the winner.
+    rows = fare_frontier(
+        network,
+        *args,
+        structure,
+        cutoffs=[3.0, 6.0, 1e9],
+        max_transfers=4,
+    )
+    assert (rows["fare"] <= rows["cutoff"] + 1e-9).all()
+    assert (rows.sort_values("cutoff")["travel_time_s"].diff().dropna() <= 0).all()
+    # A duration cap below the fastest journey empties the cell.
+    fastest = int(unbounded["travel_time_s"].iloc[0])
+    capped = fare_frontier(
+        network,
+        *args,
+        structure,
+        cutoffs=[1e9],
+        max_transfers=4,
+        max_duration=fastest - 1,
+    )
+    assert capped.empty
+
+
+def test_fare_frontier_rejects_the_unpriceable(network, helsinki_gtfs):
+    from cafein import fare_frontier, fares
+
+    structure = fares.setup_fare_structure(network, base_fare=3.0)
+    args = (["4810551"], ["1250551"], "2022-02-22", "08:30:00", 600)
+    with pytest.raises(ValueError, match="rule-based structures only"):
+        fare_frontier(
+            network,
+            *args,
+            fares.zone_fare_structure(helsinki_gtfs),
+            cutoffs=[3.0],
+        )
+    with pytest.raises(ValueError, match="FareStructure"):
+        fare_frontier(network, *args, object(), cutoffs=[3.0])
+    with pytest.raises(ValueError, match="ascending"):
+        fare_frontier(network, *args, structure, cutoffs=[])
+    with pytest.raises(ValueError, match="ascending"):
+        fare_frontier(network, *args, structure, cutoffs=[5.0, 3.0])

@@ -14,6 +14,7 @@ __all__ = [
     "journey_frontier",
     "journey_frontiers",
     "frontier_table",
+    "fare_frontier",
     "least_emissions",
     "least_fare",
     "__version__",
@@ -71,6 +72,10 @@ def __getattr__(name):
         from cafein.frontier import frontier_table
 
         return frontier_table
+    if name == "fare_frontier":
+        from cafein.frontier import fare_frontier
+
+        return fare_frontier
     if name == "least_emissions":
         from cafein.frontier import least_emissions
 

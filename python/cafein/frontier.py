@@ -1135,3 +1135,103 @@ def _frontier_mask(times, grams, fares=None):
         )
         mask.append(not dominated)
     return mask
+
+
+def fare_frontier(
+    network,
+    origins,
+    destinations,
+    date,
+    departure,
+    window,
+    fares,
+    *,
+    cutoffs,
+    max_transfers=7,
+    max_duration=None,
+):
+    """The cutoff-pruned (time, fare) frontier over a departure window.
+
+    Per origin-destination pair and per fare cutoff: the minimum
+    travel time among journeys whose fare fits the cutoff, reported
+    with that journey's exact fare and rides — r5r's
+    ``pareto_frontier`` shape. Fare enters the engine's dominance
+    (labels carry the rule-based calculator's exact state), so a
+    slower-but-cheaper journey survives to win its cutoff — no fold
+    over the fare-blind products can reproduce this. Ties on travel
+    time resolve to the cheapest, then simplest, journey.
+
+    Parameters
+    ----------
+    network : TransportNetwork
+        The network to route on.
+    origins, destinations : list of str
+        Stop ids; each origin boards at its stop, exactly as
+        ``route_between_stops`` does, and the direct walk between the
+        stops joins each cell as the zero-fare candidate. The
+        point-to-point form arrives with the scale slice.
+    date, departure, window
+        The service date, the window's start (``HH:MM:SS``), and its
+        length in seconds.
+    fares : FareStructure
+        The rule-based fare model (``cafein.fares``). A zone
+        structure's journeys price through ``journey_frontiers`` and
+        ``annotate_fares`` instead — zone fares are journey-level and
+        do not enter routing yet.
+    cutoffs : list of float
+        Required: the ascending monetary cutoffs to prune and report
+        at.
+    max_transfers : int (optional, default: 7)
+        Maximum transfers between rides.
+    max_duration : int (optional)
+        A bound on a journey's duration in seconds (r5r caps at 90
+        minutes); ``None`` leaves it unbounded.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Columns ``from_id``, ``to_id``, ``cutoff``, ``travel_time_s``,
+        ``fare``, and ``rides``; a (pair, cutoff) whose cutoff no
+        journey fits is absent.
+    """
+    import pandas as pd
+
+    from cafein import fares as fares_module
+
+    if isinstance(fares, fares_module.ZoneFareStructure):
+        raise ValueError(
+            "the fare frontier prices rule-based structures only; a zone "
+            "structure's journeys price through journey_frontiers and "
+            "annotate_fares"
+        )
+    if not isinstance(fares, fares_module.FareStructure):
+        raise ValueError("fares must be a cafein.fares.FareStructure")
+    from_ids = _frontier_ids(origins, "origins")
+    to_ids = _frontier_ids(destinations, "destinations")
+    if from_ids is None or to_ids is None:
+        raise ValueError(
+            "the fare frontier takes stop ids; the point-to-point form "
+            "arrives with the scale slice"
+        )
+    data = network._core._fare_frontier_table(
+        from_ids,
+        to_ids,
+        date,
+        departure,
+        window,
+        fares._flat_tables(network),
+        [float(cutoff) for cutoff in cutoffs],
+        max_transfers=max_transfers,
+        max_duration=max_duration,
+    )
+    frame = pd.DataFrame(
+        {
+            "from_id": [from_ids[i] for i in data["from_index"]],
+            "to_id": [to_ids[j] for j in data["to_index"]],
+            "cutoff": data["cutoff"],
+            "travel_time_s": data["travel_time_s"],
+            "fare": data["fare"],
+            "rides": data["rides"],
+        }
+    )
+    return frame
