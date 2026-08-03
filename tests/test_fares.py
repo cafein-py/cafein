@@ -241,3 +241,85 @@ def test_frontier_carries_fares(network, hsl):
     assert frame["fare"].tolist() == pytest.approx([4.1] * len(frame))
     assert frame["frontier"].any()
     assert least_emissions(frame) is not None
+
+
+def street_leg(mode, departure, seconds):
+    """A rebuilt street leg with just the fields pricing consumes."""
+    return {
+        "type": "access",
+        "mode": mode,
+        "departure_s": departure,
+        "arrival_s": departure + seconds,
+    }
+
+
+def test_street_rentals_price_beside_the_transit_fare(hsl):
+    scooter = fares.ZoneFareStructure(
+        hsl.fares,
+        hsl.fare_zones,
+        hsl.stop_zones,
+        street={"e_scooter": {"unlock": 1.0, "per_minute": 0.25}},
+    )
+    # A 90-second rental bills two started minutes: 1.00 + 2 × 0.25.
+    trip = journey(
+        street_leg("e_scooter", 0, 90), ride("any", 120, "1040602", "1040280")
+    )
+    priced = fares.annotate_fares([trip], scooter, shared_modes=("e_scooter",))
+    assert priced[0]["fare"] == pytest.approx(2.8 + 1.5)
+    # The minute boundary is exact: 60 s is one minute, 61 s is two.
+    exact = journey(street_leg("e_scooter", 0, 60))
+    over = journey(street_leg("e_scooter", 0, 61))
+    fares.annotate_fares([exact, over], scooter, shared_modes=("e_scooter",))
+    assert exact["fare"] == pytest.approx(1.25)
+    assert over["fare"] == pytest.approx(1.5)
+    # Own vehicles and walking are free: a fare is what is paid —
+    # walking even when mistakenly marked shared.
+    own = journey(
+        street_leg("bicycle", 0, 90),
+        street_leg("walk", 100, 200),
+        ride("any", 400, "1040602", "1040280"),
+    )
+    fares.annotate_fares([own], scooter, shared_modes=("e_scooter", "walk"))
+    assert own["fare"] == pytest.approx(2.8)
+    # Without shared_modes the scooter leg is treated as owned.
+    unmarked = journey(street_leg("e_scooter", 0, 90))
+    fares.annotate_fares([unmarked], scooter)
+    assert unmarked["fare"] == 0.0
+
+
+def test_unpriced_rental_modes_are_nan(hsl):
+    # A ridden rental mode without a tariff prices NaN, never zero.
+    trip = journey(street_leg("e_bike", 0, 90), ride("any", 120, "1040602", "1040280"))
+    fares.annotate_fares([trip], hsl, shared_modes=("e_bike",))
+    assert math.isnan(trip["fare"])
+
+
+def test_rule_structures_price_street_rentals_too(poa):
+    priced = fares.FareStructure(
+        fares_per_type=poa.fares_per_type,
+        fares_per_transfer=poa.fares_per_transfer,
+        fares_per_route=poa.fares_per_route,
+        street={"e_scooter": {"unlock": 2.0, "per_minute": 0.5}},
+    )
+    scoot = journey(street_leg("e_scooter", 0, 300))
+    fares.annotate_fares([scoot], priced, shared_modes=("e_scooter",))
+    assert scoot["fare"] == pytest.approx(2.0 + 5 * 0.5)
+
+
+def test_negative_street_tariffs_are_rejected(hsl):
+    with pytest.raises(ValueError, match="must not be negative"):
+        fares.ZoneFareStructure(
+            hsl.fares,
+            hsl.fare_zones,
+            hsl.stop_zones,
+            street={"e_scooter": {"unlock": -1.0, "per_minute": 0.25}},
+        )
+    # Both components are stated explicitly; a partial entry could
+    # silently undercharge.
+    with pytest.raises(ValueError, match="missing"):
+        fares.ZoneFareStructure(
+            hsl.fares,
+            hsl.fare_zones,
+            hsl.stop_zones,
+            street={"e_scooter": {"unlock": 1.0}},
+        )

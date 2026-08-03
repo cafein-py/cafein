@@ -17,6 +17,12 @@ Two fare models are supported:
   edit, and `load_fare_structure` reads a structure saved by r5r (or by
   `save_fare_structure`) so the two tools can share fare definitions.
   Pricing follows r5r's rule-based calculator exactly.
+- **Street rentals** price beside either model: a ``street`` tariff
+  (per rental mode: an ``unlock`` price plus a ``per_minute`` price,
+  billed per started minute) covers the shared-vehicle legs a street
+  policy reconstructs. `annotate_fares` names which modes rode rentals
+  (``shared_modes`` — own vehicles and walking are free), and a rental
+  leg whose mode has no tariff prices NaN, never a silent zero.
 - **Zone-based** (`ZoneFareStructure`) prices journeys from GTFS
   ``fare_attributes.txt``/``fare_rules.txt`` with ``contains_id`` zone
   sets — the model Helsinki Region Transport ships: a ticket is the
@@ -103,6 +109,7 @@ class FareStructure:
         fares_per_type=None,
         fares_per_transfer=None,
         fares_per_route=None,
+        street=None,
     ):
         self.max_discounted_transfers = int(max_discounted_transfers)
         self.transfer_time_allowance = float(transfer_time_allowance)
@@ -110,6 +117,7 @@ class FareStructure:
         self.fares_per_type = _framed(fares_per_type, _TYPE_COLUMNS)
         self.fares_per_transfer = _framed(fares_per_transfer, _TRANSFER_COLUMNS)
         self.fares_per_route = _framed(fares_per_route, _ROUTE_COLUMNS)
+        self.street = _street_tariffs(street)
 
     def price(self, journey):
         """The journey's fare, mirroring r5r's rule-based calculator.
@@ -267,10 +275,11 @@ class ZoneFareStructure:
         ``stop_id`` → zone.
     """
 
-    def __init__(self, fares, fare_zones, stop_zones):
+    def __init__(self, fares, fare_zones, stop_zones, street=None):
         self.fares = fares
         self.fare_zones = {fare: frozenset(zones) for fare, zones in fare_zones.items()}
         self.stop_zones = dict(stop_zones)
+        self.street = _street_tariffs(street)
 
     def price(self, journey):
         """The journey's fare: the cheapest chain of zone tickets.
@@ -550,7 +559,7 @@ def zone_fare_structure(gtfs_path):
     return ZoneFareStructure(attributes, fare_zones, stop_zones)
 
 
-def annotate_fares(journeys, structure):
+def annotate_fares(journeys, structure, shared_modes=()):
     """Attach ``fare`` to journeys, in place, and return them.
 
     Parameters
@@ -559,11 +568,58 @@ def annotate_fares(journeys, structure):
         Journeys as returned by the routing calls.
     structure : FareStructure or ZoneFareStructure
         The fare model to price with.
+    shared_modes : iterable of str (optional)
+        The street modes ridden as rentals under the journeys' street
+        policy (the policy's ``source="shared"`` modes). Their legs
+        price from the structure's ``street`` tariff — an unlock plus
+        started minutes per leg — while own-vehicle and walking legs
+        stay free; a rental mode without a tariff prices ``NaN``,
+        never a silent zero.
     """
     priced = structure._pricer()
+    shared = frozenset(str(mode) for mode in shared_modes)
     for journey in journeys:
-        journey["fare"] = priced(journey)
+        journey["fare"] = priced(journey) + _street_cost(
+            journey, structure.street, shared
+        )
     return journeys
+
+
+def _street_tariffs(street):
+    """``street`` normalized to ``mode -> (unlock, per_minute)`` floats."""
+    tariffs = {}
+    for mode, entry in (street or {}).items():
+        missing = {"unlock", "per_minute"} - set(entry)
+        if missing:
+            raise ValueError(
+                f"street tariff for {mode!r} is missing {sorted(missing)}; "
+                "state a zero component explicitly"
+            )
+        unlock = float(entry["unlock"])
+        per_minute = float(entry["per_minute"])
+        if unlock < 0 or per_minute < 0:
+            raise ValueError(f"street tariff for {mode!r} must not be negative")
+        tariffs[str(mode)] = (unlock, per_minute)
+    return tariffs
+
+
+def _street_cost(journey, street, shared_modes):
+    """The journey's rental cost: per shared-mode leg, its mode's unlock
+    plus started minutes; ``NaN`` when a ridden rental mode has no
+    tariff. Own-vehicle and walking legs are free — a fare is what is
+    paid, never an imputed cost."""
+    total = 0.0
+    for leg in journey["legs"]:
+        mode = leg.get("mode")
+        if mode is None or mode == "walk" or mode not in shared_modes:
+            continue
+        tariff = street.get(mode)
+        if tariff is None:
+            return math.nan
+        unlock, per_minute = tariff
+        minutes = math.ceil((leg["arrival_s"] - leg["departure_s"]) / 60.0)
+        total += unlock + minutes * per_minute
+    return total
 
 
 def _framed(frame, columns):
