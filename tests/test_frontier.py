@@ -1940,3 +1940,89 @@ def test_fare_frontier_rejects_the_unpriceable(network, helsinki_gtfs):
         fare_frontier(network, *args, structure, cutoffs=[])
     with pytest.raises(ValueError, match="ascending"):
         fare_frontier(network, *args, structure, cutoffs=[5.0, 3.0])
+
+
+def test_fare_frontier_routes_points_door_to_door(multimodal_network):
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    from cafein import fare_frontier, fares
+
+    structure = fares.setup_fare_structure(multimodal_network, base_fare=3.0)
+    frame_o = gpd.GeoDataFrame(
+        {"id": ["o"]}, geometry=[Point(24.9320, 60.1690)], crs="EPSG:4326"
+    )
+    frame_d = gpd.GeoDataFrame(
+        {"id": ["d"]}, geometry=[Point(24.9615, 60.2043)], crs="EPSG:4326"
+    )
+    rows = fare_frontier(
+        multimodal_network,
+        frame_o,
+        frame_d,
+        "2022-02-22",
+        "08:30:00",
+        600,
+        structure,
+        cutoffs=[3.0, 9.0],
+        max_transfers=4,
+        max_duration=5_400,
+        exact=False,
+    )
+    assert not rows.empty
+    # The flat tariff is integration-free, so the fast discipline is
+    # exact: the two modes agree cell for cell at the bounded cap.
+    bounded = dict(cutoffs=[3.0, 9.0], max_transfers=4, max_duration=1_800)
+    exact_rows = fare_frontier(
+        multimodal_network,
+        frame_o,
+        frame_d,
+        "2022-02-22",
+        "08:30:00",
+        600,
+        structure,
+        **bounded,
+    )
+    fast_rows = fare_frontier(
+        multimodal_network,
+        frame_o,
+        frame_d,
+        "2022-02-22",
+        "08:30:00",
+        600,
+        structure,
+        exact=False,
+        **bounded,
+    )
+    import pandas as pd
+
+    key = ["from_id", "to_id", "cutoff"]
+    pd.testing.assert_frame_equal(
+        exact_rows.sort_values(key).reset_index(drop=True),
+        fast_rows.sort_values(key).reset_index(drop=True),
+    )
+    assert (rows["fare"] <= rows["cutoff"] + 1e-9).all()
+    assert set(rows["from_id"]) == {"o"} and set(rows["to_id"]) == {"d"}
+    # Mixing stop ids with the walking options is a conflict.
+    with pytest.raises(ValueError, match="board at their stops"):
+        fare_frontier(
+            multimodal_network,
+            ["4810551"],
+            ["1250551"],
+            "2022-02-22",
+            "08:30:00",
+            600,
+            structure,
+            cutoffs=[3.0],
+            max_walking_time=900,
+        )
+    with pytest.raises(ValueError, match="both"):
+        fare_frontier(
+            multimodal_network,
+            frame_o,
+            ["1250551"],
+            "2022-02-22",
+            "08:30:00",
+            600,
+            structure,
+            cutoffs=[3.0],
+        )
