@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **The fare frontier goes point-to-point**: ``fare_frontier`` gains the
+  point-to-point form (walking access and egress over the street
+  network with the walking-time bound clamped to ``max_duration``,
+  the direct walk joining each cell at fare zero, unsnapped points
+  warned), a rayon fan-out over origins, and an ``exact=`` mode
+  switch. ``exact=True`` (the default) keeps the exhaustively
+  verified state bags — every journey the tariff's fine structure
+  distinguishes, with runtimes growing steeply in ``max_duration``;
+  ``exact=False`` runs the r5r-style per-class discipline — exact
+  for well-behaved tariffs, every reported fare real, a cheaper
+  journey possibly missed where a scarce discount budget meets
+  transfer windows — for large analyses. The exact engine also
+  gains sound structural pruning (a duration-cap horizon
+  everywhere, discount-exhausted state collapse, the R5-style
+  transfer-allowance bound as a second dominance rule, and
+  insert-time result folding).
+
 - **The cutoff-pruned (time, fare) frontier** ships as
   ``fare_frontier``: per origin-destination pair and fare cutoff, the
   minimum travel time over a departure window — r5r's
@@ -15,9 +32,8 @@
   fare-blind oracle pins the engine cell for cell across cutoff and
   duration-cap sweeps. Stop-to-stop and rule-based structures only
   for now (a zone structure's journeys keep pricing through
-  ``journey_frontiers`` and ``annotate_fares``); the point-to-point
-  form, the origin fan-out, and the benchmark arrive with the scale
-  slice.
+  ``journey_frontiers`` and ``annotate_fares``); the scale slice
+  above adds the point-to-point form and the origin fan-out.
 
 - Groundwork for the **cutoff-pruned (time, fare) frontier**: the
   rule-based fare calculator gains its incremental form — a

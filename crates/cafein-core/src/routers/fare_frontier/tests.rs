@@ -63,12 +63,13 @@ fn cheaper_but_slower_journeys_survive_to_their_cutoff() {
         fares: &fares,
         cutoffs: &[3.0, 6.0],
         max_duration: None,
+        exact: true,
     };
     let request = request(vec![(StopIdx(0), 0)]);
-    let mut search = FareFrontierSearch::new(&inputs, &request, 1);
-    search.pass(0, &[vec![(StopIdx(1), 0)]]);
-    let arrivals = search.into_arrivals();
-    let rows = fold_cutoffs(&arrivals[0], &[3.0, 6.0]);
+    let destinations = [vec![(StopIdx(1), 0)]];
+    let mut search = FareFrontierSearch::new(&inputs, &request, &destinations);
+    search.pass(0);
+    let rows = search.into_rows().swap_remove(0);
     // Under 3.0 only the slow cheap line fits (arrives 900); under
     // 6.0 the fast expensive one wins (arrives 400).
     let low = rows[0].expect("the cheap journey fits the low cutoff");
@@ -91,12 +92,13 @@ fn walking_chains_price_zero() {
         fares: &fares,
         cutoffs: &[3.0],
         max_duration: None,
+        exact: true,
     };
     let request = request(vec![(StopIdx(1), 30), (StopIdx(2), 90)]);
-    let mut search = FareFrontierSearch::new(&inputs, &request, 1);
-    search.pass(0, &[vec![(StopIdx(2), 0)]]);
-    let arrivals = search.into_arrivals();
-    let rows = fold_cutoffs(&arrivals[0], &[3.0]);
+    let destinations = [vec![(StopIdx(2), 0)]];
+    let mut search = FareFrontierSearch::new(&inputs, &request, &destinations);
+    search.pass(0);
+    let rows = search.into_rows().swap_remove(0);
     let row = rows[0].expect("walking fits every cutoff");
     assert_eq!(row.travel_time, 90);
     assert_eq!(row.fare, 0.0);
@@ -112,16 +114,21 @@ fn the_duration_cap_bounds_journeys() {
         timetable: &timetable,
         transfers: &transfers,
         fares: &fares,
-        cutoffs: &[6.0],
+        cutoffs: &[3.0, 6.0],
         max_duration: Some(500),
+        exact: true,
     };
     let request = request(vec![(StopIdx(0), 0)]);
-    let mut search = FareFrontierSearch::new(&inputs, &request, 1);
-    search.pass(0, &[vec![(StopIdx(1), 0)]]);
-    let arrivals = search.into_arrivals();
-    // Only the fast journey (400) fits the 500-second cap.
-    assert_eq!(arrivals[0].len(), 1);
-    assert_eq!(arrivals[0][0].arrival, 400);
+    let destinations = [vec![(StopIdx(1), 0)]];
+    let mut search = FareFrontierSearch::new(&inputs, &request, &destinations);
+    search.pass(0);
+    let rows = search.into_rows().swap_remove(0);
+    // The cheap slow journey (900) exceeds the cap, so the low
+    // cutoff empties; the fast journey (400) fits the high one.
+    assert!(rows[0].is_none());
+    let row = rows[1].expect("the fast journey fits the cap");
+    assert_eq!(row.travel_time, 400);
+    assert!((row.fare - 5.0).abs() < 1e-9);
 }
 
 /// A brute-force reference with **no fare-aware dominance at all**:
@@ -331,16 +338,92 @@ fn gated_fixture(harmful: bool) -> (Timetable, Transfers, RuleFares) {
     (timetable, transfers, fares)
 }
 
+/// An unlimited-transfer tariff: cheap buses (3.0), an expensive rail
+/// type (6.0) whose further rail rides are free. The dearer rail
+/// label at the junction is the low-cutoff winner two legs on — the
+/// allowance bound must never prune it (its free rides are not
+/// discounts).
+fn unlimited_fixture() -> (Timetable, Transfers, RuleFares) {
+    let mut builder = TimetableBuilder::new(3);
+    let bus = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let rail_a = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 1).unwrap();
+    let rail_b = builder.add_pattern(&[StopIdx(1), StopIdx(2)], 1).unwrap();
+    builder
+        .add_trip(bus, vec![time(100), time(300)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(rail_a, vec![time(150), time(400)], 1, 0)
+        .unwrap();
+    builder
+        .add_trip(rail_b, vec![time(500), time(700)], 2, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let transfers = Transfers::from_edges(3, &[]).unwrap();
+    let fares = RuleFares {
+        route_type: vec![0, 1],
+        route_fare: vec![3.0, 6.0],
+        unlimited_transfers: vec![false, true],
+        allow_same_route: vec![false, false],
+        pair_fare: vec![f64::NAN; 4],
+        max_discounted_transfers: 1,
+        transfer_allowance: 3_600.0,
+        fare_cap: f64::INFINITY,
+    };
+    (timetable, transfers, fares)
+}
+
+/// An all-harmful tariff: the only pair (bus 4.0 → shuttle 4.0)
+/// integrates at 12.0, so the margin — a savings bound — is zero and
+/// an ungated transfer-allowance relation would prune the dearer
+/// parallel rail label (6.0, pairless) whose suffix stays cheap while
+/// the bus label is forced through the surcharge.
+fn harmful_allowance_fixture() -> (Timetable, Transfers, RuleFares) {
+    let mut builder = TimetableBuilder::new(3);
+    let bus = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let rail = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 1).unwrap();
+    let shuttle = builder.add_pattern(&[StopIdx(1), StopIdx(2)], 2).unwrap();
+    builder
+        .add_trip(bus, vec![time(100), time(400)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(rail, vec![time(100), time(400)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(shuttle, vec![time(500), time(800)], 0, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let transfers = Transfers::from_edges(3, &[]).unwrap();
+    let fares = RuleFares {
+        route_type: vec![0, 1, 2],
+        route_fare: vec![4.0, 6.0, 4.0],
+        unlimited_transfers: vec![false, false, false],
+        allow_same_route: vec![false, false, false],
+        pair_fare: {
+            let mut pairs = vec![f64::NAN; 9];
+            pairs[2] = 12.0;
+            pairs
+        },
+        max_discounted_transfers: 2,
+        transfer_allowance: 2_000.0,
+        fare_cap: f64::INFINITY,
+    };
+    (timetable, transfers, fares)
+}
+
 /// The engine matches the fare-blind exhaustive oracle cell for cell
 /// across cutoff sets, duration caps, and window departures — on the
-/// transfer-rich tariff and on both gated ones, where later trips'
-/// fresher windows, scarce discounts, and harmful pairs all bite.
+/// transfer-rich tariff, on both gated ones, where later trips'
+/// fresher windows, scarce discounts, and harmful pairs all bite, and
+/// on the all-harmful tariff whose zero margin would otherwise let
+/// the allowance relation prune across the surcharge.
 #[test]
 fn engine_matches_the_exhaustive_oracle() {
     for (timetable, transfers, fares) in [
         transfer_fixture(),
         gated_fixture(false),
         gated_fixture(true),
+        unlimited_fixture(),
+        harmful_allowance_fixture(),
     ] {
         sweep(&timetable, &transfers, &fares);
     }
@@ -372,18 +455,15 @@ fn sweep(timetable: &Timetable, transfers: &Transfers, fares: &RuleFares) {
                 fares,
                 cutoffs: &cutoffs,
                 max_duration,
+                exact: true,
             };
             let departures =
                 crate::routers::raptor::departure_candidates(timetable, &request, 2_000);
-            let mut search = FareFrontierSearch::new(&inputs, &request, destinations.len());
+            let mut search = FareFrontierSearch::new(&inputs, &request, &destinations);
             for &departure in &departures {
-                search.pass(departure, &destinations);
+                search.pass(departure);
             }
-            let engine: Vec<Vec<Option<FrontierRow>>> = search
-                .into_arrivals()
-                .iter()
-                .map(|arrivals| fold_cutoffs(arrivals, &cutoffs))
-                .collect();
+            let engine: Vec<Vec<Option<FrontierRow>>> = search.into_rows();
             let reference = oracle(
                 timetable,
                 transfers,
@@ -398,6 +478,74 @@ fn sweep(timetable: &Timetable, transfers: &Transfers, fares: &RuleFares) {
                 engine, reference,
                 "cutoffs {cutoffs:?}, cap {max_duration:?}"
             );
+        }
+    }
+}
+
+/// The fast discipline never beats the exact mode (its rows' fares
+/// are always real), and on the well-behaved transfer tariff the two
+/// modes agree cell for cell.
+#[test]
+fn the_fast_mode_is_honest_and_agrees_when_well_behaved() {
+    for (index, (timetable, transfers, fares)) in [
+        transfer_fixture(),
+        gated_fixture(false),
+        gated_fixture(true),
+        unlimited_fixture(),
+        harmful_allowance_fixture(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let service_count = {
+            let mut top = 0;
+            for trip in 0..timetable.trip_count() {
+                top = top.max(timetable.trip_service(TripIdx(trip)) as usize + 1);
+            }
+            top
+        };
+        let request = Request {
+            departure: 0,
+            access: vec![(StopIdx(0), 0)],
+            egress: Vec::new(),
+            active_services: vec![true; service_count],
+            active_services_previous: Vec::new(),
+            max_transfers: 3,
+            exclusions: None,
+        };
+        let destinations = vec![vec![(StopIdx(1), 0)], vec![(StopIdx(2), 0)]];
+        let cutoffs = vec![3.0, 5.0, 8.0, 12.5];
+        let departures = crate::routers::raptor::departure_candidates(&timetable, &request, 2_000);
+        let mut cells: Vec<Vec<Vec<Option<FrontierRow>>>> = Vec::new();
+        for exact in [true, false] {
+            let inputs = FareFrontierInputs {
+                timetable: &timetable,
+                transfers: &transfers,
+                fares: &fares,
+                cutoffs: &cutoffs,
+                max_duration: None,
+                exact,
+            };
+            let mut search = FareFrontierSearch::new(&inputs, &request, &destinations);
+            for &departure in &departures {
+                search.pass(departure);
+            }
+            cells.push(search.into_rows());
+        }
+        let (exact_cells, fast_cells) = (&cells[0], &cells[1]);
+        for (slot, rows) in fast_cells.iter().enumerate() {
+            for (cut, fast) in rows.iter().enumerate() {
+                let exact = &exact_cells[slot][cut];
+                if let Some(fast) = fast {
+                    assert!(fast.fare <= fast.cutoff + 1e-9);
+                    let exact = exact.expect("a fast row implies an exact one");
+                    assert!(fast.travel_time >= exact.travel_time);
+                }
+            }
+        }
+        if index == 0 {
+            // The transfer tariff is well-behaved: full agreement.
+            assert_eq!(exact_cells, fast_cells);
         }
     }
 }

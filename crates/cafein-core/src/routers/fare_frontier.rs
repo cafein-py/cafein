@@ -8,7 +8,8 @@
 //! with [`state_dominates`], gated per query by the tables'
 //! monotonicity checks. The cutoff list trims at two sound points
 //! only: labels whose best continuation cannot fit the top cutoff are
-//! pruned, and the per-cutoff fold happens at result assembly.
+//! pruned, and the per-cutoff fold runs as admitted labels reach
+//! destination-linked stops, never inside dominance.
 //!
 //! The product is reconstruction-free — per (pair, cutoff) the
 //! minimum travel time with its exact fare and rides — so labels are
@@ -38,6 +39,14 @@ pub struct FareFrontierInputs<'a> {
     pub cutoffs: &'a [f64],
     /// A bound on `arrival − departure`, seconds; `None` unbounded.
     pub max_duration: Option<u32>,
+    /// `true`: the oracle-exact state bags. `false`: the fast
+    /// discipline — the state relation with its gates assumed
+    /// monotone, and only the earliest boardable trip explored, the
+    /// r5r trade. A kept row's fare is always its real fare; a
+    /// cheaper journey may be missed where discounts and transfer
+    /// windows interact (tariffs without integrations are exact
+    /// either way).
+    pub exact: bool,
 }
 
 /// One journey candidate at a destination: everything the per-cutoff
@@ -88,11 +97,106 @@ struct Entry {
 struct Gates {
     discounts_monotone: bool,
     freshness_monotone: bool,
+    /// The tables' largest single-integration saving: the transfer
+    /// allowance bound of the conservative relation below.
+    margin: f64,
+    max_discounts: u32,
+    exact: bool,
+    /// Whether any fare type rides free after the first boarding.
+    unlimited_types: bool,
+    /// Bit `t` set: type `t` rides free after the first boarding.
+    /// Types past 128 are conservatively treated as unlimited.
+    unlimited_mask: u128,
+}
+
+fn gates_unlimited(gates: Gates, kind: u32) -> bool {
+    kind >= 128 || (gates.unlimited_mask >> kind) & 1 == 1
+}
+
+/// A discount-exhausted state's window, route, and previous full fare
+/// can never matter again — no integration remains to read them — so
+/// they collapse to canonical sentinels and the state niches merge.
+/// The unlimited-transfers branch still reads the previous type, which
+/// stays.
+fn canonicalize(fares: &RuleFares, state: FareState) -> FareState {
+    if state.discounts < fares.max_discounted_transfers {
+        return state;
+    }
+    FareState {
+        previous_route: u32::MAX,
+        previous_board: u32::MAX,
+        previous_fare: f64::INFINITY,
+        ..state
+    }
+}
+
+/// A state's remaining discount budget.
+fn remaining(entry: &Entry, max_discounts: u32) -> u32 {
+    match &entry.side {
+        FareSide::Unboarded => max_discounts,
+        FareSide::Boarded(state) => max_discounts.saturating_sub(state.discounts),
+    }
+}
+
+fn total(entry: &Entry) -> f64 {
+    match &entry.side {
+        FareSide::Unboarded => 0.0,
+        FareSide::Boarded(state) => state.total,
+    }
+}
+
+/// The R5-style transfer-allowance relation: `b`'s continuation can
+/// undercut `a`'s by at most one margin per remaining discount (an
+/// earlier label can replicate any suffix), so `a` dominates whenever
+/// its total clears `b`'s by that bound. The bound is blind to
+/// unlimited-transfer types — their free rides are not discounts and
+/// are unbounded in count — so when `b`'s previous type rides free,
+/// only an equal previous type may use this rule. Pricing `a`'s
+/// suffix at full fare at worst also needs monotone tables — a
+/// harmful pair's forced integration is a surcharge the savings-only
+/// margin cannot bound — so non-monotone tariffs skip the rule.
+/// Sound beside the exact relation; this is what keeps real-feed
+/// bags small.
+fn conservatively_dominates(a: &Entry, b: &Entry, gates: Gates) -> bool {
+    if !gates.discounts_monotone {
+        return false;
+    }
+    if let FareSide::Boarded(state) = &b.side {
+        if gates.unlimited_types
+            && gates_unlimited(gates, state.previous_type)
+            && !matches!(&a.side, FareSide::Boarded(other)
+                if other.previous_type == state.previous_type)
+        {
+            return false;
+        }
+    }
+    a.arrival <= b.arrival
+        && a.rides <= b.rides
+        && total(a) <= total(b) - gates.margin * remaining(b, gates.max_discounts) as f64
 }
 
 fn dominates(a: &Entry, b: &Entry, gates: Gates) -> bool {
+    if conservatively_dominates(a, b, gates) {
+        return true;
+    }
     if a.arrival > b.arrival || a.rides > b.rides {
         return false;
+    }
+    if !gates.exact {
+        // The fast discipline: the state gates are assumed monotone,
+        // so far fewer niches survive. Every kept row's fare is real,
+        // but a cheaper journey can be missed where discounts and
+        // windows interact — the r5r trade, stated in the docs.
+        return match (&a.side, &b.side) {
+            (FareSide::Unboarded, FareSide::Unboarded) => true,
+            (FareSide::Boarded(a), FareSide::Boarded(b)) => {
+                a.previous_type == b.previous_type
+                    && a.total <= b.total
+                    && a.discounts <= b.discounts
+                    && a.previous_board >= b.previous_board
+            }
+            _ => false,
+        };
     }
     match (&a.side, &b.side) {
         (FareSide::Unboarded, FareSide::Unboarded) => true,
@@ -147,15 +251,19 @@ pub struct FareFrontierSearch<'a> {
     bags: Vec<Bag>,
     marked: Vec<StopIdx>,
     is_marked: Vec<bool>,
-    /// Per destination slot: the nondominated arrivals.
-    arrivals: Vec<Vec<Arrived>>,
+    /// Per stop: the destination slots it serves, with egress seconds
+    /// — the fold runs at insert time, only over admitted entries.
+    destination_map: Vec<Vec<(u32, u32)>>,
+    /// Per destination slot × cutoff: the current winner — only the
+    /// per-cutoff minimum ever matters, so no arrival set is kept.
+    rows: Vec<Vec<Option<FrontierRow>>>,
 }
 
 impl<'a> FareFrontierSearch<'a> {
     pub fn new(
         inputs: &'a FareFrontierInputs<'a>,
         request: &'a Request,
-        destination_count: usize,
+        destinations: &[Vec<(StopIdx, u32)>],
     ) -> FareFrontierSearch<'a> {
         assert!(
             inputs.transfers.closed(),
@@ -173,13 +281,82 @@ impl<'a> FareFrontierSearch<'a> {
             gates: Gates {
                 discounts_monotone,
                 freshness_monotone,
+                margin: inputs.fares.max_discount_margin(),
+                max_discounts: inputs.fares.max_discounted_transfers,
+                exact: inputs.exact,
+                unlimited_types: inputs.fares.unlimited_transfers.iter().any(|&on| on),
+                unlimited_mask: inputs
+                    .fares
+                    .unlimited_transfers
+                    .iter()
+                    .take(128)
+                    .enumerate()
+                    .fold(
+                        0u128,
+                        |mask, (kind, &on)| {
+                            if on {
+                                mask | (1 << kind)
+                            } else {
+                                mask
+                            }
+                        },
+                    ),
             },
             margin: inputs.fares.max_discount_margin(),
             top_cutoff: inputs.cutoffs.last().copied().unwrap_or(f64::INFINITY),
             bags: vec![Bag::default(); stop_count],
             marked: Vec::new(),
             is_marked: vec![false; stop_count],
-            arrivals: vec![Vec::new(); destination_count],
+            destination_map: {
+                let mut map: Vec<Vec<(u32, u32)>> = vec![Vec::new(); stop_count];
+                for (slot, egress) in destinations.iter().enumerate() {
+                    for &(stop, seconds) in egress {
+                        map[stop.0 as usize].push((slot as u32, seconds));
+                    }
+                }
+                map
+            },
+            rows: vec![vec![None; inputs.cutoffs.len()]; destinations.len()],
+        }
+    }
+
+    /// Folds one just-admitted entry into the per-cutoff winners of
+    /// the destination slots its stop serves.
+    fn collect(&mut self, stop: StopIdx, entry: &Entry, departure: u32) {
+        if self.destination_map[stop.0 as usize].is_empty() {
+            return;
+        }
+        let fare = match &entry.side {
+            FareSide::Unboarded => 0.0,
+            FareSide::Boarded(state) => self.inputs.fares.capped_total(state),
+        };
+        if fare.is_nan() || fare > self.top_cutoff + MONEY_EPSILON {
+            return;
+        }
+        for index in 0..self.destination_map[stop.0 as usize].len() {
+            let (slot, seconds) = self.destination_map[stop.0 as usize][index];
+            let Some(arrival) = entry
+                .arrival
+                .checked_add(seconds)
+                .filter(|&at| at != UNREACHED)
+            else {
+                continue;
+            };
+            if let Some(cap) = self.inputs.max_duration {
+                if arrival.saturating_sub(departure) > cap {
+                    continue;
+                }
+            }
+            fold_candidate(
+                &mut self.rows[slot as usize],
+                self.inputs.cutoffs,
+                Arrived {
+                    departure,
+                    arrival,
+                    rides: entry.rides,
+                    fare,
+                },
+            );
         }
     }
 
@@ -211,11 +388,22 @@ impl<'a> FareFrontierSearch<'a> {
     /// semantics — the stop-to-stop product deliberately boards at
     /// the origin only, while a caller wanting walk-first boardings
     /// supplies closure-composed access rows.
-    pub fn pass(&mut self, departure: u32, destinations: &[Vec<(StopIdx, u32)>]) {
+    pub fn pass(&mut self, departure: u32) {
+        // The pass's arrival horizon: an intermediate arrival past the
+        // duration cap already exceeds it for every continuation, so
+        // such labels prune everywhere below.
+        let horizon = self
+            .inputs
+            .max_duration
+            .and_then(|cap| departure.checked_add(cap))
+            .unwrap_or(UNREACHED);
         // Access seeding: unboarded labels, fare zero.
         let mut seeds: Vec<(StopIdx, Entry)> = Vec::new();
         for &(stop, seconds) in &self.request.access {
-            let Some(arrival) = departure.checked_add(seconds).filter(|&at| at != UNREACHED) else {
+            let Some(arrival) = departure
+                .checked_add(seconds)
+                .filter(|&at| at != UNREACHED && at <= horizon)
+            else {
                 continue;
             };
             seeds.push((
@@ -230,9 +418,9 @@ impl<'a> FareFrontierSearch<'a> {
         for (stop, entry) in seeds {
             if self.bags[stop.0 as usize].insert(entry, self.gates) {
                 self.mark(stop);
+                self.collect(stop, &entry, departure);
             }
         }
-        self.fold(departure, destinations, 0);
 
         // `rides` is a u8: the 255th transfer would be the 256th ride,
         // so the budget clamps at 254 exactly as McRAPTOR's does.
@@ -269,13 +457,14 @@ impl<'a> FareFrontierSearch<'a> {
                     crate::timetable::PatternIdx(pattern),
                     start_position as usize,
                     round,
-                    departure,
+                    horizon,
                     &mut writes,
                 );
             }
             for (stop, entry) in writes {
                 if self.bags[stop.0 as usize].insert(entry, self.gates) {
                     self.mark(stop);
+                    self.collect(stop, &entry, departure);
                 }
             }
 
@@ -294,7 +483,7 @@ impl<'a> FareFrontierSearch<'a> {
                         let Some(arrival) = entry
                             .arrival
                             .checked_add(edge.duration)
-                            .filter(|&at| at != UNREACHED)
+                            .filter(|&at| at != UNREACHED && at <= horizon)
                         else {
                             continue;
                         };
@@ -312,10 +501,9 @@ impl<'a> FareFrontierSearch<'a> {
             for (stop, entry) in walks {
                 if self.bags[stop.0 as usize].insert(entry, self.gates) {
                     self.mark(stop);
+                    self.collect(stop, &entry, departure);
                 }
             }
-
-            self.fold(departure, destinations, round);
         }
     }
 
@@ -326,7 +514,7 @@ impl<'a> FareFrontierSearch<'a> {
         pattern: crate::timetable::PatternIdx,
         start_position: usize,
         round: usize,
-        departure: u32,
+        horizon: u32,
         writes: &mut Vec<(StopIdx, Entry)>,
     ) {
         let timetable = self.inputs.timetable;
@@ -339,10 +527,8 @@ impl<'a> FareFrontierSearch<'a> {
             for run in &riding {
                 let times = timetable.trip_stop_times(run.trip);
                 let arrival = times[position].arrival.saturating_sub(run.day_offset);
-                if let Some(cap) = self.inputs.max_duration {
-                    if arrival.saturating_sub(departure) > cap {
-                        continue;
-                    }
+                if arrival > horizon {
+                    continue;
                 }
                 writes.push((
                     stop,
@@ -391,11 +577,32 @@ impl<'a> FareFrontierSearch<'a> {
                         continue;
                     };
                     // Boarding time is fare state: a later trip keeps
-                    // a fresher window that can win a cutoff, so every
-                    // boardable trip is a candidate, not just the
-                    // earliest — the bags prune the incomparable rest.
-                    for trip in first.0..trip_range.end {
+                    // a fresher window that can win a cutoff — but only
+                    // while a discount remains to exploit it, so an
+                    // exhausted label boards the earliest trip alone.
+                    // The horizon cuts trips departing past the
+                    // duration cap.
+                    let explores_later = self.inputs.exact
+                        && match &entry.side {
+                            FareSide::Unboarded => self.inputs.fares.max_discounted_transfers > 0,
+                            FareSide::Boarded(state) => {
+                                state.discounts < self.inputs.fares.max_discounted_transfers
+                            }
+                        };
+                    let last = if explores_later {
+                        trip_range.end
+                    } else {
+                        first.0 + 1
+                    };
+                    for trip in first.0..last {
                         let trip = TripIdx(trip);
+                        if timetable.trip_stop_times(trip)[position]
+                            .departure
+                            .saturating_sub(day_offset)
+                            > horizon
+                        {
+                            break;
+                        }
                         if !active
                             .get(timetable.trip_service(trip) as usize)
                             .copied()
@@ -437,7 +644,10 @@ impl<'a> FareFrontierSearch<'a> {
         };
         // An unpriceable or cutoff-dead label is dropped: it can never
         // win any cell.
-        let Some(state) = state.filter(|state| self.alive(state)) else {
+        let Some(state) = state
+            .map(|state| canonicalize(self.inputs.fares, state))
+            .filter(|state| self.alive(state))
+        else {
             return;
         };
         let run = Riding {
@@ -475,61 +685,47 @@ impl<'a> FareFrontierSearch<'a> {
         }
     }
 
-    /// Folds the round's labels at the destination stops into the
-    /// per-slot arrival sets.
-    fn fold(&mut self, departure: u32, destinations: &[Vec<(StopIdx, u32)>], round: usize) {
-        for (slot, egress) in destinations.iter().enumerate() {
-            for &(stop, seconds) in egress {
-                let candidates: Vec<Arrived> = self.bags[stop.0 as usize]
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.rides as usize == round)
-                    .filter_map(|entry| {
-                        let arrival = entry
-                            .arrival
-                            .checked_add(seconds)
-                            .filter(|&at| at != UNREACHED)?;
-                        if let Some(cap) = self.inputs.max_duration {
-                            if arrival.saturating_sub(departure) > cap {
-                                return None;
-                            }
-                        }
-                        let fare = match &entry.side {
-                            FareSide::Unboarded => 0.0,
-                            FareSide::Boarded(state) => self.inputs.fares.capped_total(state),
-                        };
-                        if fare.is_nan() || fare > self.top_cutoff + MONEY_EPSILON {
-                            return None;
-                        }
-                        Some(Arrived {
-                            departure,
-                            arrival,
-                            rides: entry.rides,
-                            fare,
-                        })
-                    })
-                    .collect();
-                for candidate in candidates {
-                    insert_arrival(&mut self.arrivals[slot], candidate);
-                }
-            }
-        }
+    /// The folded product: per slot, the per-cutoff winners.
+    pub fn into_rows(self) -> Vec<Vec<Option<FrontierRow>>> {
+        self.rows
     }
+}
 
-    /// The per-slot arrival sets, for the cutoff fold.
-    pub fn into_arrivals(self) -> Vec<Vec<Arrived>> {
-        self.arrivals
+/// Offers one candidate to every cutoff it fits, keeping the
+/// lexicographic (travel time, fare, rides) minimum per cutoff.
+pub fn fold_candidate(rows: &mut [Option<FrontierRow>], cutoffs: &[f64], candidate: Arrived) {
+    for (slot, &cutoff) in cutoffs.iter().enumerate() {
+        if candidate.fare > cutoff + MONEY_EPSILON {
+            continue;
+        }
+        let row = FrontierRow {
+            cutoff,
+            travel_time: candidate.travel_time(),
+            fare: candidate.fare,
+            rides: candidate.rides,
+        };
+        let better = match &rows[slot] {
+            None => true,
+            Some(current) => {
+                (row.travel_time, row.fare, row.rides)
+                    < (current.travel_time, current.fare, current.rides)
+            }
+        };
+        if better {
+            rows[slot] = Some(row);
+        }
     }
 }
 
 /// Injects the direct walking alternative into a cell's arrivals: a
 /// zero-fare, zero-ride candidate at the walk's duration.
-pub fn push_walk(set: &mut Vec<Arrived>, departure: u32, seconds: u32) {
+pub fn push_walk(rows: &mut [Option<FrontierRow>], cutoffs: &[f64], departure: u32, seconds: u32) {
     let Some(arrival) = departure.checked_add(seconds).filter(|&at| at != UNREACHED) else {
         return;
     };
-    insert_arrival(
-        set,
+    fold_candidate(
+        rows,
+        cutoffs,
         Arrived {
             departure,
             arrival,
@@ -539,27 +735,10 @@ pub fn push_walk(set: &mut Vec<Arrived>, departure: u32, seconds: u32) {
     );
 }
 
-/// Keeps `set` nondominated over (travel time, fare, rides).
-fn insert_arrival(set: &mut Vec<Arrived>, candidate: Arrived) {
-    for entry in set.iter() {
-        if entry.travel_time() <= candidate.travel_time()
-            && entry.fare <= candidate.fare
-            && entry.rides <= candidate.rides
-        {
-            return;
-        }
-    }
-    set.retain(|entry| {
-        !(candidate.travel_time() <= entry.travel_time()
-            && candidate.fare <= entry.fare
-            && candidate.rides <= entry.rides)
-    });
-    set.push(candidate);
-}
-
 /// Folds one cell's arrivals per cutoff: the minimum travel time with
 /// fare within the cutoff, ties to the lexicographic minimum of
 /// (travel time, fare, rides); `None` where nothing fits.
+/// `fold_candidate` applies the same rule incrementally.
 pub fn fold_cutoffs(arrivals: &[Arrived], cutoffs: &[f64]) -> Vec<Option<FrontierRow>> {
     cutoffs
         .iter()
@@ -602,12 +781,12 @@ pub fn frontier(
     request: &Request,
     destinations: &[Vec<(StopIdx, u32)>],
     window: u32,
-) -> Vec<Vec<Arrived>> {
+) -> Vec<Vec<Option<FrontierRow>>> {
     let departures =
         crate::routers::raptor::departure_candidates(inputs.timetable, request, window);
-    let mut search = FareFrontierSearch::new(inputs, request, destinations.len());
+    let mut search = FareFrontierSearch::new(inputs, request, destinations);
     for &departure in &departures {
-        search.pass(departure, destinations);
+        search.pass(departure);
     }
-    search.into_arrivals()
+    search.into_rows()
 }

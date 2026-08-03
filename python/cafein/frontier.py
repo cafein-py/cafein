@@ -1149,6 +1149,10 @@ def fare_frontier(
     cutoffs,
     max_transfers=7,
     max_duration=None,
+    exact=True,
+    walking_speed_kmph=None,
+    max_walking_time=None,
+    max_snap_distance=None,
 ):
     """The cutoff-pruned (time, fare) frontier over a departure window.
 
@@ -1165,11 +1169,12 @@ def fare_frontier(
     ----------
     network : TransportNetwork
         The network to route on.
-    origins, destinations : list of str
-        Stop ids; each origin boards at its stop, exactly as
-        ``route_between_stops`` does, and the direct walk between the
-        stops joins each cell as the zero-fare candidate. The
-        point-to-point form arrives with the scale slice.
+    origins, destinations : list of str, or GeoDataFrames
+        Stop ids (each origin boards at its stop, exactly as
+        ``route_between_stops`` does), or point GeoDataFrames with an
+        ``id`` column routing door-to-door over the street network —
+        both the same kind. Either way the direct walk joins each
+        cell as the zero-fare candidate.
     date, departure, window
         The service date, the window's start (``HH:MM:SS``), and its
         length in seconds.
@@ -1186,6 +1191,20 @@ def fare_frontier(
     max_duration : int (optional)
         A bound on a journey's duration in seconds (r5r caps at 90
         minutes); ``None`` leaves it unbounded.
+    exact : bool (optional, default: True)
+        ``True`` keeps every journey the tariff's fine structure can
+        distinguish — the exhaustively verified mode; runtimes grow
+        steeply with ``max_duration``. ``False`` runs the r5r-style
+        discipline (earliest arrival per fare class): exact for
+        well-behaved tariffs — every reported fare is real — but a
+        cheaper journey can be missed where a scarce discount budget
+        interacts with transfer windows; large analyses want this
+        mode, as r5r's own frontier does.
+    walking_speed_kmph, max_walking_time, max_snap_distance : float
+        Street-search options for the point form, as in
+        ``route_between_coordinates``; rejected beside stop ids. The
+        walking-time bound is clamped to ``max_duration`` — a longer
+        walk cannot join a journey that fits the cap.
 
     Returns
     -------
@@ -1208,22 +1227,63 @@ def fare_frontier(
         raise ValueError("fares must be a cafein.fares.FareStructure")
     from_ids = _frontier_ids(origins, "origins")
     to_ids = _frontier_ids(destinations, "destinations")
-    if from_ids is None or to_ids is None:
+    if (from_ids is None) != (to_ids is None):
         raise ValueError(
-            "the fare frontier takes stop ids; the point-to-point form "
-            "arrives with the scale slice"
+            "origins and destinations must both be stop ids or both be " "point frames"
         )
-    data = network._core._fare_frontier_table(
-        from_ids,
-        to_ids,
-        date,
-        departure,
-        window,
-        fares._flat_tables(network),
-        [float(cutoff) for cutoff in cutoffs],
-        max_transfers=max_transfers,
-        max_duration=max_duration,
-    )
+    if from_ids is not None and any(
+        option is not None
+        for option in (walking_speed_kmph, max_walking_time, max_snap_distance)
+    ):
+        raise ValueError(
+            "the walking options shape the point form's street search; "
+            "stop-id queries board at their stops"
+        )
+    if from_ids is None:
+        from cafein.matrices import _point_list, _warn_unsnapped
+        from cafein.network import _walk_options
+
+        from_ids, from_points = _point_list(origins, "origins")
+        to_ids, to_points = _point_list(destinations, "destinations")
+        walk = _walk_options(walking_speed_kmph, max_walking_time, max_snap_distance)
+        if max_duration is not None:
+            walk = (walk[0], min(walk[1], max_duration), walk[2])
+        data = network._core._fare_frontier_table_from_points(
+            from_points,
+            to_points,
+            date,
+            departure,
+            window,
+            fares._flat_tables(network),
+            [float(cutoff) for cutoff in cutoffs],
+            max_transfers=max_transfers,
+            max_duration=max_duration,
+            exact=exact,
+            **dict(
+                zip(
+                    (
+                        "walking_speed_kmph",
+                        "max_walking_time",
+                        "max_snap_distance",
+                    ),
+                    walk,
+                )
+            ),
+        )
+        _warn_unsnapped(data, from_ids, to_ids)
+    else:
+        data = network._core._fare_frontier_table(
+            from_ids,
+            to_ids,
+            date,
+            departure,
+            window,
+            fares._flat_tables(network),
+            [float(cutoff) for cutoff in cutoffs],
+            max_transfers=max_transfers,
+            max_duration=max_duration,
+            exact=exact,
+        )
     frame = pd.DataFrame(
         {
             "from_id": [from_ids[i] for i in data["from_index"]],
