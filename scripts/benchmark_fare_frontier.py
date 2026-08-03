@@ -150,6 +150,27 @@ def main():
         f"in {points_seconds:.1f} s"
     )
 
+    events_start = time.time()
+    points_events = fare_frontier(
+        network,
+        frame(origins),
+        frame(stop_ids),
+        DATE,
+        DEPARTURE,
+        WINDOW,
+        structure,
+        cutoffs=CUTOFFS,
+        max_transfers=MAX_TRANSFERS,
+        max_duration=MAX_DURATION,
+        exact=False,
+        departure_step=None,
+    )
+    events_seconds = time.time() - events_start
+    print(
+        f"cafein fast mode, points, event profile: "
+        f"{len(points_events)} rows in {events_seconds:.1f} s"
+    )
+
     exact_start = time.time()
     exact = fare_frontier(
         network,

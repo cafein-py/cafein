@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- ``fare_frontier`` **samples the departure window**:
+  ``departure_step`` (default 60 seconds) rasterises the window
+  exactly as R5 does — every reported journey is real and waits from
+  its sampled departure, so travel times are measured against the
+  grid — and ``departure_step=None`` searches every exact
+  (trip departure − access walk) event instead: the shipped frontier
+  products' wait-free event semantics, at far more search passes on
+  point origins.
+
 - **The fare frontier goes point-to-point**: ``fare_frontier`` gains the
   point-to-point form (walking access and egress over the street
   network with the walking-time bound clamped to ``max_duration``,

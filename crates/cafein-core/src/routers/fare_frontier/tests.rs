@@ -63,6 +63,7 @@ fn cheaper_but_slower_journeys_survive_to_their_cutoff() {
         fares: &fares,
         cutoffs: &[3.0, 6.0],
         max_duration: None,
+        departure_step: None,
         exact: true,
     };
     let request = request(vec![(StopIdx(0), 0)]);
@@ -92,6 +93,7 @@ fn walking_chains_price_zero() {
         fares: &fares,
         cutoffs: &[3.0],
         max_duration: None,
+        departure_step: None,
         exact: true,
     };
     let request = request(vec![(StopIdx(1), 30), (StopIdx(2), 90)]);
@@ -116,6 +118,7 @@ fn the_duration_cap_bounds_journeys() {
         fares: &fares,
         cutoffs: &[3.0, 6.0],
         max_duration: Some(500),
+        departure_step: None,
         exact: true,
     };
     let request = request(vec![(StopIdx(0), 0)]);
@@ -455,6 +458,7 @@ fn sweep(timetable: &Timetable, transfers: &Transfers, fares: &RuleFares) {
                 fares,
                 cutoffs: &cutoffs,
                 max_duration,
+                departure_step: None,
                 exact: true,
             };
             let departures =
@@ -524,6 +528,7 @@ fn the_fast_mode_is_honest_and_agrees_when_well_behaved() {
                 fares: &fares,
                 cutoffs: &cutoffs,
                 max_duration: None,
+                departure_step: None,
                 exact,
             };
             let mut search = FareFrontierSearch::new(&inputs, &request, &destinations);
@@ -548,4 +553,95 @@ fn the_fast_mode_is_honest_and_agrees_when_well_behaved() {
             assert_eq!(exact_cells, fast_cells);
         }
     }
+}
+
+/// `sampled_departures` rasterises the half-open window, descending.
+#[test]
+fn sampled_departures_rasterise_the_window() {
+    let grid = sampled_departures(100, 600, 60);
+    assert_eq!(grid.len(), 10);
+    assert_eq!(grid[0], 640);
+    assert_eq!(grid[9], 100);
+    assert_eq!(sampled_departures(100, 600, 700), vec![100]);
+    assert!(sampled_departures(100, 0, 60).is_empty());
+    // Samples past `u32` stop rather than wrapping, and the
+    // `UNREACHED` sentinel itself is never a sample.
+    let clipped = sampled_departures(u32::MAX - 100, 1_000, 60);
+    assert_eq!(clipped, vec![u32::MAX - 40, u32::MAX - 100]);
+    let sentinel = sampled_departures(u32::MAX - 60, 1_000, 60);
+    assert_eq!(sentinel, vec![u32::MAX - 60]);
+}
+
+/// The rasterised grid matches the oracle on the same grid cell for
+/// cell. On this fixture every boarding has an in-window event, so
+/// each sampled journey is an event journey waited for from its grid
+/// departure and never beats it — at a window's edge the wait-free
+/// event profile can instead exclude a journey the grid catches, so
+/// the relation is pinned per fixture, not universally.
+#[test]
+fn the_sampled_grid_matches_the_oracle_and_never_beats_the_events() {
+    let (timetable, transfers, fares) = transfer_fixture();
+    let service_count = {
+        let mut top = 0;
+        for trip in 0..timetable.trip_count() {
+            top = top.max(timetable.trip_service(TripIdx(trip)) as usize + 1);
+        }
+        top
+    };
+    let request = Request {
+        departure: 0,
+        access: vec![(StopIdx(0), 0)],
+        egress: Vec::new(),
+        active_services: vec![true; service_count],
+        active_services_previous: Vec::new(),
+        max_transfers: 3,
+        exclusions: None,
+    };
+    let destinations = vec![vec![(StopIdx(1), 0)], vec![(StopIdx(2), 0)]];
+    let cutoffs = vec![3.0, 5.0, 8.0, 12.5];
+    let window = 2_000;
+    let sampled_inputs = FareFrontierInputs {
+        timetable: &timetable,
+        transfers: &transfers,
+        fares: &fares,
+        cutoffs: &cutoffs,
+        max_duration: None,
+        departure_step: Some(240),
+        exact: true,
+    };
+    let sampled = frontier(&sampled_inputs, &request, &destinations, window);
+    let grid = sampled_departures(request.departure, window, 240);
+    assert_eq!(grid.first().copied(), Some(1_920));
+    let reference = oracle(
+        &timetable,
+        &transfers,
+        &fares,
+        &request,
+        &destinations,
+        &grid,
+        &cutoffs,
+        None,
+    );
+    assert_eq!(sampled, reference);
+    let event_inputs = FareFrontierInputs {
+        timetable: &timetable,
+        transfers: &transfers,
+        fares: &fares,
+        cutoffs: &cutoffs,
+        max_duration: None,
+        departure_step: None,
+        exact: true,
+    };
+    let events = frontier(&event_inputs, &request, &destinations, window);
+    let mut populated = 0;
+    for (slot, rows) in sampled.iter().enumerate() {
+        for (cut, row) in rows.iter().enumerate() {
+            if let Some(row) = row {
+                let event = events[slot][cut].expect("a sampled row implies an event row");
+                assert!(row.travel_time >= event.travel_time);
+                populated += 1;
+            }
+        }
+    }
+    assert!(populated > 0);
 }

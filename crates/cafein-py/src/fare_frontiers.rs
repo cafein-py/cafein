@@ -8,6 +8,26 @@ use rayon::prelude::*;
 use crate::cost_matrices::fare_tables;
 use crate::points::{request_offsets, unsnapped};
 
+/// Rejects a zero step or a grid too fine for its window — an
+/// unbounded sample list would materialise before routing.
+fn validated_step(window: u32, departure_step: Option<u32>) -> PyResult<()> {
+    let Some(step) = departure_step else {
+        return Ok(());
+    };
+    if step == 0 {
+        return Err(PyValueError::new_err(
+            "departure_step must be a positive number of seconds",
+        ));
+    }
+    if (window as u64).div_ceil(step as u64) > 100_000 {
+        return Err(PyValueError::new_err(
+            "window / departure_step samples the window more than \
+             100000 times; widen the step or narrow the window",
+        ));
+    }
+    Ok(())
+}
+
 fn validated_cutoffs(cutoffs: &[f64]) -> PyResult<()> {
     if cutoffs.is_empty()
         || cutoffs
@@ -63,7 +83,8 @@ impl TransportNetwork {
     /// each origin boards at its stop, and the direct walk joins each
     /// cell as the zero-fare candidate. Internal.
     #[pyo3(signature = (from_stops, to_stops, date, departure, window, fares, cutoffs,
-                        max_transfers = 7, max_duration = None, exact = true))]
+                        max_transfers = 7, max_duration = None, exact = true,
+                        departure_step = None))]
     #[allow(clippy::too_many_arguments)]
     fn _fare_frontier_table(
         &self,
@@ -78,12 +99,14 @@ impl TransportNetwork {
         max_transfers: u8,
         max_duration: Option<u32>,
         exact: bool,
+        departure_step: Option<u32>,
     ) -> PyResult<Py<PyDict>> {
         if window == 0 {
             return Err(PyValueError::new_err(
                 "window must be a positive number of seconds",
             ));
         }
+        validated_step(window, departure_step)?;
         validated_cutoffs(&cutoffs)?;
         let tables = fare_tables(
             &fares,
@@ -106,6 +129,12 @@ impl TransportNetwork {
             .map(|stop| Ok(vec![(self.resolve_stop(stop)?, 0u32)]))
             .collect::<PyResult<Vec<_>>>()?;
         let departure = parse_time(departure)?;
+        if departure as u64 + window as u64 > u32::MAX as u64 {
+            return Err(PyValueError::new_err(
+                "departure + window overflows the router clock; narrow \
+                 the window",
+            ));
+        }
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
         let inputs = FareFrontierInputs {
@@ -114,6 +143,7 @@ impl TransportNetwork {
             fares: rules,
             cutoffs: &cutoffs,
             max_duration,
+            departure_step,
             exact,
         };
         let cells: Vec<Vec<Vec<Option<_>>>> = py.allow_threads(|| {
@@ -165,6 +195,7 @@ impl TransportNetwork {
     /// Internal.
     #[pyo3(signature = (origins, destinations, date, departure, window, fares, cutoffs,
                         max_transfers = 7, max_duration = None, exact = true,
+                        departure_step = None,
                         walking_speed_kmph = 3.6, max_walking_time = 7200.0,
                         max_snap_distance = 1600.0))]
     #[allow(clippy::too_many_arguments)]
@@ -181,6 +212,7 @@ impl TransportNetwork {
         max_transfers: u8,
         max_duration: Option<u32>,
         exact: bool,
+        departure_step: Option<u32>,
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
@@ -190,6 +222,7 @@ impl TransportNetwork {
                 "window must be a positive number of seconds",
             ));
         }
+        validated_step(window, departure_step)?;
         validated_cutoffs(&cutoffs)?;
         let tables = fare_tables(
             &fares,
@@ -209,6 +242,12 @@ impl TransportNetwork {
         validate_points(&origins)?;
         validate_points(&destinations)?;
         let departure = parse_time(departure)?;
+        if departure as u64 + window as u64 > u32::MAX as u64 {
+            return Err(PyValueError::new_err(
+                "departure + window overflows the router clock; narrow \
+                 the window",
+            ));
+        }
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
         let inputs = FareFrontierInputs {
@@ -217,6 +256,7 @@ impl TransportNetwork {
             fares: rules,
             cutoffs: &cutoffs,
             max_duration,
+            departure_step,
             exact,
         };
         let (cells, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
