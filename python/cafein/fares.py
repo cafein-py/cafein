@@ -24,14 +24,16 @@ Two fare models are supported:
   (``shared_modes`` — own vehicles and walking are free), and a rental
   leg whose mode has no tariff prices NaN, never a silent zero.
 - **Zone-based** (`ZoneFareStructure`) prices journeys from GTFS
-  ``fare_attributes.txt``/``fare_rules.txt`` with ``contains_id`` zone
-  sets — the model Helsinki Region Transport ships: a ticket is the
-  cheapest fare whose zone set covers the zones a stretch of the journey
-  touches, valid for unlimited boardings within its transfer window, and
-  a long journey chains tickets. Legs contribute their boarding and
-  alighting stops' zones (with contiguous zone products, as in
-  ring-shaped systems, that equals the traversed span). Fare rules keyed
-  by route or origin/destination zone pairs are not modelled.
+  ``fare_attributes.txt``/``fare_rules.txt`` — the model Helsinki
+  Region Transport ships: a ticket is the cheapest fare valid for a
+  stretch of boardings within its transfer window, and a long journey
+  chains tickets. A fare's rule rows become alternative **grants** —
+  its ``contains_id`` zone set (covering the stretch's boarding and
+  alighting zones; with contiguous zone products, as in ring-shaped
+  systems, that equals the traversed span), its route set (route-only
+  rows), and its origin/destination clauses — any one of which
+  validates a stretch, with agency scope bounding them all and a fare
+  without rules valid network-wide.
 """
 
 import math
@@ -262,6 +264,13 @@ class FareStructure:
 class ZoneFareStructure:
     """Zone-set fares from GTFS ``fare_attributes``/``fare_rules``.
 
+    A product's restriction dimensions are **alternative grants** — any
+    one validates a covered stretch, because that is what real v1 data
+    means (HSL's ``D`` ticket carries a zone row, a route-only row, and
+    origin/destination rows at once, and plainly covers ordinary
+    D-zone trips). A product with no grants is unrestricted. Agency
+    scope is the one conjunct, bounding every grant.
+
     Attributes
     ----------
     fares : pandas.DataFrame
@@ -270,34 +279,88 @@ class ZoneFareStructure:
         window), ``transfer_duration`` (seconds of validity from the
         first boarding).
     fare_zones : dict
-        ``fare_id`` → frozenset of the zones the product covers.
+        ``fare_id`` → frozenset of zones: the **zone grant** — a
+        stretch whose traversed zones are a subset is covered.
+    fare_routes : dict
+        ``fare_id`` → frozenset of routes: the **route grant** — a
+        stretch whose every leg rides one of them is covered.
+    fare_od : dict
+        ``fare_id`` → tuple of ``(origin, destination, route)``
+        **OD clauses** (each field optional, ``None`` when absent):
+        the origin constrains the stretch's first boarding zone, the
+        destination its last alighting zone, and a named route binds
+        to its clause — every covered leg must ride it.
+    agency_routes : dict
+        ``fare_id`` → frozenset of the fare's agency's routes — the
+        conjunct: when present, every covered leg must ride one,
+        whatever grant applies.
     stop_zones : dict
         ``stop_id`` → zone.
     """
 
-    def __init__(self, fares, fare_zones, stop_zones, street=None):
+    def __init__(
+        self,
+        fares,
+        fare_zones,
+        stop_zones,
+        street=None,
+        fare_routes=None,
+        fare_od=None,
+        agency_routes=None,
+    ):
         self.fares = fares
-        self.fare_zones = {fare: frozenset(zones) for fare, zones in fare_zones.items()}
+        # Keys normalize to the strings the pricer looks up: a numeric
+        # fare id must not silently drop its restrictions and turn the
+        # fare unrestricted.
+        self.fare_zones = {
+            str(fare): frozenset(zones) for fare, zones in fare_zones.items()
+        }
         self.stop_zones = dict(stop_zones)
         self.street = _street_tariffs(street)
+        self.fare_routes = {
+            str(fare): frozenset(routes) for fare, routes in (fare_routes or {}).items()
+        }
+        self.fare_od = {
+            str(fare): tuple(
+                (origin, destination, route) for origin, destination, route in clauses
+            )
+            for fare, clauses in (fare_od or {}).items()
+        }
+        self.agency_routes = {
+            str(fare): frozenset(routes)
+            for fare, routes in (agency_routes or {}).items()
+        }
+
+    @property
+    def _has_rule_grants(self):
+        return bool(self.fare_routes or self.fare_od or self.agency_routes)
 
     def price(self, journey):
-        """The journey's fare: the cheapest chain of zone tickets.
+        """The journey's fare: the cheapest chain of tickets.
 
-        Each ticket must cover the zones of every leg it spans (a leg
-        contributes its boarding and alighting stops' zones) and every
-        boarding it covers must fall within its transfer window; a
-        journey longer than one window chains tickets. Returns NaN when
-        a leg's zones are outside every product or a stop has no zone.
+        A ticket covers a stretch of boardings within its transfer
+        window when one of its grants validates it — its zone set
+        covers the stretch's boarding and alighting zones, its route
+        set covers every leg's route, or an origin/destination clause
+        matches the stretch's endpoints — under its agency scope; a
+        grant-free ticket is valid network-wide, and a journey longer
+        than one window chains tickets. Returns NaN when some leg no
+        ticket can cover (an unknown stop zone fails the zone grant
+        and any OD endpoint that must match it, never the route
+        grant).
         """
         return self._pricer()(journey)
 
     def _pricer(self):
         products = []
         for _, row in self.fares.iterrows():
-            zones = self.fare_zones.get(str(row["fare_id"]))
-            if zones is None:
-                continue
+            fare_id = str(row["fare_id"])
+            zones = self.fare_zones.get(fare_id)
+            routes = self.fare_routes.get(fare_id)
+            clauses = self.fare_od.get(fare_id, ())
+            # A product no rule row restricts is unrestricted — the
+            # spec's reading of a fare without fare_rules — and covers
+            # any stretch within its window.
             # `transfers` and `transfer_duration` are optional columns:
             # absent means unlimited boardings without a time limit.
             duration = row.get("transfer_duration")
@@ -306,10 +369,51 @@ class ZoneFareStructure:
                 (
                     float(row["price"]),
                     zones,
+                    routes,
+                    clauses,
+                    self.agency_routes.get(fare_id),
                     math.inf if pd.isna(duration) else float(duration),
                     math.inf if pd.isna(transfers) else int(transfers),
                 )
             )
+
+        def covers(product, needs, start, end):
+            """Whether the product's grants validate legs start..end."""
+            _, zones, routes, clauses, agency, _, _ = product
+            stretch = needs[start : end + 1]
+            if agency is not None and any(
+                leg_route not in agency for _, _, _, leg_route in stretch
+            ):
+                return False
+            if zones is None and routes is None and not clauses:
+                return True
+            if zones is not None:
+                union = set()
+                known = True
+                for leg_zones, _, _, _ in stretch:
+                    if leg_zones is None:
+                        known = False
+                        break
+                    union |= leg_zones
+                if known and union <= zones:
+                    return True
+            if routes is not None and all(
+                leg_route in routes for _, _, _, leg_route in stretch
+            ):
+                return True
+            first_board = stretch[0][2][0]
+            last_alight = stretch[-1][2][1]
+            for origin, destination, route in clauses:
+                if origin is not None and first_board != origin:
+                    continue
+                if destination is not None and last_alight != destination:
+                    continue
+                if route is not None and any(
+                    leg_route != route for _, _, _, leg_route in stretch
+                ):
+                    continue
+                return True
+            return False
 
         def priced(journey):
             rides = [leg for leg in journey["legs"] if leg["type"] == "transit"]
@@ -317,13 +421,21 @@ class ZoneFareStructure:
                 return 0.0
             needs = []
             for ride in rides:
-                zones = {
-                    self.stop_zones.get(ride["board_stop"]),
-                    self.stop_zones.get(ride["alight_stop"]),
-                }
-                if None in zones:
-                    return math.nan
-                needs.append((frozenset(zones), ride["departure_s"]))
+                board = self.stop_zones.get(ride["board_stop"])
+                alight = self.stop_zones.get(ride["alight_stop"])
+                zones = (
+                    None
+                    if board is None or alight is None
+                    else frozenset((board, alight))
+                )
+                needs.append(
+                    (
+                        zones,
+                        ride["departure_s"],
+                        (board, alight),
+                        ride.get("route_id"),
+                    )
+                )
 
             best = {len(needs): 0.0}
 
@@ -331,24 +443,29 @@ class ZoneFareStructure:
                 if at in best:
                     return best[at]
                 cheapest = math.nan
-                for price, zones, duration, transfers in products:
-                    if not needs[at][0] <= zones:
-                        continue
-                    # The ticket covers boardings within its window (and
-                    # its transfer count), as far as the zones allow.
+                for product in products:
+                    price, _, _, _, _, duration, transfers = product
+                    # Every stretch end within the window and transfer
+                    # count is tried — an OD-restricted product may
+                    # need the next ticket to start mid-window.
                     end = at
-                    while (
-                        end + 1 < len(needs)
-                        and needs[end + 1][0] <= zones
-                        and needs[end + 1][1] - needs[at][1] <= duration
-                        and (end + 1 - at) <= transfers
-                    ):
+                    while True:
+                        if (
+                            needs[end][1] - needs[at][1] <= duration
+                            and (end - at) <= transfers
+                            and covers(product, needs, at, end)
+                        ):
+                            rest = cost(end + 1)
+                            candidate = price + rest
+                            if math.isnan(cheapest) or candidate < cheapest:
+                                cheapest = candidate
+                        if (
+                            end + 1 >= len(needs)
+                            or needs[end + 1][1] - needs[at][1] > duration
+                            or (end + 1 - at) > transfers
+                        ):
+                            break
                         end += 1
-                    for split in range(at, end + 1):
-                        rest = cost(split + 1)
-                        candidate = price + rest
-                        if math.isnan(cheapest) or candidate < cheapest:
-                            cheapest = candidate
                 best[at] = cheapest
                 return cheapest
 
@@ -362,8 +479,29 @@ class ZoneFareStructure:
         Zones become bit positions: ``stop_zone`` maps each stop (in
         ``network.stops`` order) to its zone index, and each product is
         ``(price, zone bitmask, window seconds, boardings after the
-        first)`` with sentinels for "no zone" and "unlimited".
+        first)`` with sentinels for "no zone" and "unlimited". The
+        compiled pricer carries the zone model only: a structure with
+        route, OD, or agency grants is rejected rather than silently
+        priced differently from ``annotate_fares``.
         """
+        if self._has_rule_grants:
+            raise ValueError(
+                "matrix fare pricing does not carry route, "
+                "origin/destination, or agency fare rules yet; load "
+                "with zone_fare_structure(..., rules='zones') for the "
+                "zone-only model, or price journeys with annotate_fares"
+            )
+        unrestricted = sorted(
+            str(row["fare_id"])
+            for _, row in self.fares.iterrows()
+            if str(row["fare_id"]) not in self.fare_zones
+        )
+        if unrestricted:
+            raise ValueError(
+                "matrix fare pricing does not carry unrestricted "
+                f"products yet ({unrestricted}); price journeys with "
+                "annotate_fares"
+            )
         zones = sorted(
             {zone for covered in self.fare_zones.values() for zone in covered}
             | set(self.stop_zones.values())
@@ -522,41 +660,149 @@ def save_fare_structure(structure, path):
             archive.writestr(name, frame.to_csv(index=False))
 
 
-def zone_fare_structure(gtfs_path):
+def zone_fare_structure(gtfs_path, rules="model"):
     """A zone-based fare structure from a GTFS feed's fare files.
 
-    Reads ``fare_attributes.txt``, the ``contains_id`` rows of
-    ``fare_rules.txt``, and the stops' ``zone_id`` column. Fare rules
-    keyed by route or origin/destination zones are ignored (fares built
-    purely from such rules get no zone set and never price a journey).
+    Reads ``fare_attributes.txt``, ``fare_rules.txt``, and the stops'
+    ``zone_id`` column. Every rule row shape becomes a grant:
+    ``contains_id`` values aggregate into the fare's zone set whatever
+    else their row carries, a row whose only other field is
+    ``route_id`` joins the route grant, and a row with either
+    endpoint becomes one origin/destination clause holding exactly
+    its present fields. Agency scope — ``fare_attributes.agency_id``
+    resolved through ``routes.txt`` — compiles into the conjunctive
+    agency-route set, and a multi-agency feed whose fares omit
+    ``agency_id`` is rejected (the spec requires it). Pass
+    ``rules="zones"`` for the pre-grant zone-only reading (route, OD,
+    and agency rules ignored) — the model the compiled matrix fare
+    path still prices.
     """
+    if rules not in ("model", "zones"):
+        raise ValueError(f"rules must be 'model' or 'zones', not {rules!r}")
+
+    # Everything reads as verbatim strings: numeric-looking ids must
+    # not become numbers (a numeric agency_id would look absent), and
+    # pandas' default NA tokens must not eat legal ids like "NA" — a
+    # lost restriction would make a product look unrestricted.
+    def read(handle):
+        return pd.read_csv(handle, dtype=str, keep_default_na=False)
+
     with zipfile.ZipFile(gtfs_path) as archive:
         names = set(archive.namelist())
-        if not {"fare_attributes.txt", "fare_rules.txt"} <= names:
+        if "fare_attributes.txt" not in names:
             raise ValueError(f"'{gtfs_path}' carries no GTFS fare files")
-        attributes = pd.read_csv(
-            archive.open("fare_attributes.txt"), dtype={"fare_id": str}
+        attributes = read(archive.open("fare_attributes.txt"))
+        # fare_rules.txt is optional: a feed with attributes alone
+        # sells unrestricted, network-wide products.
+        rule_rows = (
+            read(archive.open("fare_rules.txt"))
+            if "fare_rules.txt" in names
+            else pd.DataFrame(columns=["fare_id"])
         )
-        rules = pd.read_csv(archive.open("fare_rules.txt"), dtype=str)
-        stops = pd.read_csv(archive.open("stops.txt"), dtype=str)
-    # `contains_id` and `zone_id` are optional columns: a feed whose
-    # fare rules are purely route- or origin/destination-keyed yields no
-    # zone products, and prices nothing.
+        stops = read(archive.open("stops.txt"))
+        routes_table = (
+            read(archive.open("routes.txt")) if "routes.txt" in names else None
+        )
+        agency_table = (
+            read(archive.open("agency.txt")) if "agency.txt" in names else None
+        )
+    # The optional numeric columns come back as text; an empty cell is
+    # absent, exactly as the NaN the pricer already handles.
+    for column in ("transfers", "transfer_duration"):
+        if column in attributes.columns:
+            attributes[column] = attributes[column].map(
+                lambda value: math.nan if not str(value).strip() else value
+            )
+
+    def cell(row, column):
+        value = getattr(row, column, None)
+        return value if isinstance(value, str) and value.strip() else None
+
     fare_zones = {}
-    if "contains_id" in rules.columns:
-        contains = rules[rules["contains_id"].notna()]
-        fare_zones = {
-            fare: set(group["contains_id"])
-            for fare, group in contains.groupby("fare_id")
-        }
+    fare_routes = {}
+    fare_od = {}
+    for row in rule_rows.itertuples():
+        fare = cell(row, "fare_id")
+        if fare is None:
+            continue
+        contains = cell(row, "contains_id")
+        if contains is not None:
+            fare_zones.setdefault(fare, set()).add(contains)
+        origin = cell(row, "origin_id")
+        destination = cell(row, "destination_id")
+        route = cell(row, "route_id")
+        if origin is not None or destination is not None:
+            fare_od.setdefault(fare, []).append((origin, destination, route))
+        elif route is not None and contains is None:
+            # Only a row whose sole field is the route joins the route
+            # grant; a contains-bearing row contributes its zone alone,
+            # or the fare would turn valid on that route outside its
+            # covered zones.
+            fare_routes.setdefault(fare, set()).add(route)
     stop_zones = {}
     if "zone_id" in stops.columns:
         stop_zones = {
             row.stop_id: row.zone_id
             for row in stops.itertuples()
-            if isinstance(row.zone_id, str)
+            if isinstance(row.zone_id, str) and row.zone_id.strip()
         }
-    return ZoneFareStructure(attributes, fare_zones, stop_zones)
+    if rules == "zones":
+        # The zone-only reading must not turn a fare whose (dropped)
+        # rules were route- or OD-keyed into an unrestricted one:
+        # fares with rule rows but no contains rows stay out entirely,
+        # exactly the pre-grant behaviour.
+        ruled = {
+            cell(row, "fare_id")
+            for row in rule_rows.itertuples()
+            if cell(row, "fare_id") is not None
+        }
+        keep = attributes["fare_id"].map(
+            lambda fare: str(fare) in fare_zones or str(fare) not in ruled
+        )
+        return ZoneFareStructure(attributes[keep], fare_zones, stop_zones)
+    agency_of_route = {}
+    if routes_table is not None:
+        for row in routes_table.itertuples():
+            route = cell(row, "route_id")
+            if route is not None:
+                agency_of_route[route] = cell(row, "agency_id")
+    agencies = set()
+    if agency_table is not None:
+        for row in agency_table.itertuples():
+            agencies.add(cell(row, "agency_id"))
+    agency_routes = {}
+    if "agency_id" in attributes.columns or len(agencies) > 1:
+        # In a single-agency feed, routes may omit agency_id yet
+        # belong to the one agency; without routes.txt the scope
+        # cannot be resolved and the fare stays unscoped.
+        sole_agency = next(iter(agencies)) if len(agencies) == 1 else None
+        for row in attributes.itertuples():
+            fare = str(row.fare_id)
+            agency = cell(row, "agency_id")
+            if agency is None:
+                if len(agencies) > 1:
+                    raise ValueError(
+                        f"fare {fare!r} names no agency_id in a "
+                        "multi-agency feed; the spec requires it — fix "
+                        "the feed or load with rules='zones'"
+                    )
+                continue
+            # Kept even when empty: an agency with no resolvable
+            # routes surfaces as an unpriceable fare, never as one
+            # valid everywhere.
+            agency_routes[fare] = {
+                route
+                for route, owner in agency_of_route.items()
+                if (owner or sole_agency) == agency
+            }
+    return ZoneFareStructure(
+        attributes,
+        fare_zones,
+        stop_zones,
+        fare_routes=fare_routes,
+        fare_od=fare_od,
+        agency_routes=agency_routes,
+    )
 
 
 def annotate_fares(journeys, structure, shared_modes=()):

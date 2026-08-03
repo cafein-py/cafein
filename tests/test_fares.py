@@ -132,6 +132,11 @@ def test_setup_seeds_a_structure_from_the_network(network):
 
 
 @pytest.fixture(scope="module")
+def hsl_zones(helsinki_gtfs):
+    return fares.zone_fare_structure(helsinki_gtfs, rules="zones")
+
+
+@pytest.fixture(scope="module")
 def hsl(helsinki_gtfs):
     return fares.zone_fare_structure(helsinki_gtfs)
 
@@ -172,7 +177,9 @@ def test_zone_structure_tolerates_missing_fare_columns(tmp_path):
     import zipfile as zf
 
     # A feed whose fare rules are route-keyed only (no contains_id
-    # column) and whose stops carry no zone_id: loadable, prices nothing.
+    # column) and whose stops carry no zone_id: the route rows become
+    # the route grant, so riding that route prices — and other routes
+    # still cannot.
     path = tmp_path / "route_fares.zip"
     with zf.ZipFile(path, "w") as archive:
         archive.writestr(
@@ -183,7 +190,13 @@ def test_zone_structure_tolerates_missing_fare_columns(tmp_path):
         archive.writestr("stops.txt", "stop_id,stop_name\nS1,One\n")
     structure = fares.zone_fare_structure(path)
     assert structure.fare_zones == {}
-    assert math.isnan(structure.price(journey(ride("R1", 0, "S1", "S1"))))
+    assert structure.fare_routes == {"F1": frozenset({"R1"})}
+    assert structure.price(journey(ride("R1", 0, "S1", "S1"))) == pytest.approx(2.0)
+    assert math.isnan(structure.price(journey(ride("R2", 0, "S1", "S1"))))
+    # The pre-grant zone-only reading stays available for the compiled
+    # matrix path.
+    zones_only = fares.zone_fare_structure(path, rules="zones")
+    assert math.isnan(zones_only.price(journey(ride("R1", 0, "S1", "S1"))))
     # Without the optional transfers/transfer_duration columns a zone
     # product is simply valid without limits.
     minimal = tmp_path / "minimal.zip"
@@ -205,7 +218,7 @@ def test_zone_structure_tolerates_missing_fare_columns(tmp_path):
         fares.zone_fare_structure(bare)
 
 
-def test_flat_tables_align_with_the_network(network, hsl):
+def test_flat_tables_align_with_the_network(network, hsl, hsl_zones):
     seeded = fares.setup_fare_structure(network, base_fare=3.0)
     flat = seeded._flat_tables(network)
     assert len(flat["route_type"]) == len(network.routes) == len(flat["route_fare"])
@@ -214,11 +227,15 @@ def test_flat_tables_align_with_the_network(network, hsl):
     assert len(flat["pair_fare"]) == count * count
     assert all(kind < count for kind in flat["route_type"])
     assert flat["transfer_allowance"] == seeded.transfer_time_allowance * 60.0
-    zones = hsl._flat_tables(network)
+    # The compiled pricer carries the zone model only: a structure
+    # with rule grants is rejected, never silently priced differently.
+    with pytest.raises(ValueError, match="matrix fare pricing"):
+        hsl._flat_tables(network)
+    zones = hsl_zones._flat_tables(network)
     assert len(zones["stop_zone"]) == len(network.stops)
-    assert len(zones["products"]) == len(hsl.fares)
+    assert len(zones["products"]) == len(hsl_zones.fares)
     # The ABCD product covers all four zone bits.
-    named = dict(zip(hsl.fares["fare_id"], zones["products"]))
+    named = dict(zip(hsl_zones.fares["fare_id"], zones["products"]))
     assert bin(named["ABCD"][1]).count("1") == 4
 
 
@@ -323,3 +340,184 @@ def test_negative_street_tariffs_are_rejected(hsl):
             hsl.stop_zones,
             street={"e_scooter": {"unlock": 1.0}},
         )
+
+
+def test_rule_grants_price_the_fixtures_restricted_fares(hsl):
+    # The loader models every rule shape of the real HSL tables.
+    assert hsl.fare_routes["BC"] == frozenset({"2550"})
+    assert hsl.fare_routes["BCD"] == frozenset({"2550"})
+    assert ("Ei HSL", "D", "9665A") in hsl.fare_od["D"]
+    assert hsl.fare_routes["D"] == frozenset({"9987"})
+    assert ("D", "Ei HSL", "9665A") in hsl.fare_od["D"]
+    # Ticket D still covers a plain D-zone trip beside its route-only
+    # row — the dimensions are alternative grants, never conjuncts.
+    d_stop = next(s for s, z in hsl.stop_zones.items() if z == "D")
+    assert hsl.price(journey(ride("any", 0, d_stop, d_stop))) == pytest.approx(2.8)
+    # The 9665A feeder prices D↔"Ei HSL" trips through its OD clause.
+    outside = next(s for s, z in hsl.stop_zones.items() if z == "Ei HSL")
+    od_trip = journey(ride("9665A", 0, d_stop, outside))
+    assert hsl.price(od_trip) == pytest.approx(2.8)
+    reverse = journey(ride("9665A", 0, outside, d_stop))
+    assert hsl.price(reverse) == pytest.approx(2.8)
+    # The same trip off the named route stays unpriceable.
+    assert math.isnan(hsl.price(journey(ride("other", 0, d_stop, outside))))
+    # Route 9987 rides on ticket D wherever it goes.
+    assert hsl.price(journey(ride("9987", 0, "1040602", "1040280"))) == (
+        pytest.approx(2.8)
+    )
+    # Route 2550's tickets: its route grant sells BC (2.80) even where
+    # the stop zones are outside every zone set, and the same trip off
+    # the route stays unpriceable.
+    fringe = [s for s, z in hsl.stop_zones.items() if z == "Ei HSL"]
+    trip_2550 = journey(ride("2550", 0, fringe[0], fringe[1]))
+    assert hsl.price(trip_2550) == pytest.approx(2.8)
+    assert math.isnan(hsl.price(journey(ride("other", 0, fringe[0], fringe[1]))))
+
+
+def test_route_grants_cover_transfers_and_od_endpoints_are_terminal(tmp_path):
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        [
+            {
+                "fare_id": "R",
+                "price": 3.0,
+                "currency_type": "EUR",
+                "transfers": math.nan,
+                "transfer_duration": 3600,
+            },
+            {
+                "fare_id": "OD",
+                "price": 1.0,
+                "currency_type": "EUR",
+                "transfers": math.nan,
+                "transfer_duration": 3600,
+            },
+        ]
+    )
+    route_only = fares.ZoneFareStructure(
+        frame[frame["fare_id"] == "R"],
+        {},
+        {"S1": "A", "S2": "B", "S3": "C"},
+        fare_routes={"R": {"X", "Y"}},
+    )
+    # One route-granted ticket covers a transfer between two of its
+    # routes; a leg outside the set breaks the stretch.
+    two_routes = journey(ride("X", 0, "S1", "S2"), ride("Y", 600, "S2", "S3"))
+    assert route_only.price(two_routes) == pytest.approx(3.0)
+    outside = journey(ride("X", 0, "S1", "S2"), ride("Z", 600, "S2", "S3"))
+    assert math.isnan(route_only.price(outside))
+    # The OD clause reads the stretch's endpoints, not each leg: A→B→C
+    # prices as one A→C ticket though no leg is A→C itself.
+    od_only = fares.ZoneFareStructure(
+        frame[frame["fare_id"] == "OD"],
+        {},
+        {"S1": "A", "S2": "B", "S3": "C"},
+        fare_od={"OD": [("A", "C", None)]},
+    )
+    chained = journey(ride("X", 0, "S1", "S2"), ride("Y", 600, "S2", "S3"))
+    assert od_only.price(chained) == pytest.approx(1.0)
+    # An intermediate endpoint alone never satisfies the clause.
+    assert math.isnan(od_only.price(journey(ride("X", 0, "S1", "S2"))))
+
+
+def test_mixed_rule_rows_and_bare_route_owners_normalize(tmp_path):
+    import zipfile as zf
+
+    # A row carrying both contains_id and route_id contributes its
+    # zone alone — no route grant, or the fare would turn valid on
+    # that route outside its covered zones. And in a single-agency
+    # feed whose routes omit agency_id, an agency-scoped fare still
+    # resolves to that agency's routes rather than an empty scope.
+    path = tmp_path / "mixed.zip"
+    with zf.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "agency.txt",
+            "agency_id,agency_name,agency_url,agency_timezone\n"
+            "A1,One,https://one,Europe/Helsinki\n",
+        )
+        archive.writestr(
+            "routes.txt",
+            "route_id,route_short_name,route_type\nR1,r1,3\n",
+        )
+        archive.writestr(
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method,transfers,agency_id\n"
+            "F1,2.0,EUR,0,,A1\n",
+        )
+        archive.writestr("fare_rules.txt", "fare_id,route_id,contains_id\nF1,R1,Z\n")
+        archive.writestr("stops.txt", "stop_id,stop_name,zone_id\nS1,One,Z\nS2,Two,\n")
+    structure = fares.zone_fare_structure(path)
+    assert structure.fare_routes == {}
+    assert structure.fare_zones == {"F1": frozenset({"Z"})}
+    assert structure.agency_routes == {"F1": frozenset({"R1"})}
+    # A fare with no rule rows at all is unrestricted — the spec's
+    # reading of a fare without fare_rules — and prices any stretch.
+    flat = tmp_path / "flat.zip"
+    import zipfile as zf2
+
+    with zf2.ZipFile(path) as source, zf2.ZipFile(flat, "w") as target:
+        for name in source.namelist():
+            if name == "fare_attributes.txt":
+                target.writestr(
+                    name,
+                    "fare_id,price,currency_type,payment_method,transfers\n"
+                    "ANY,1.5,EUR,0,\n",
+                )
+            elif name == "fare_rules.txt":
+                target.writestr(name, "fare_id,route_id\n")
+            else:
+                target.writestr(name, source.read(name))
+    unrestricted = fares.zone_fare_structure(flat)
+    assert unrestricted.price(journey(ride("R9", 0, "S1", "S2"))) == (
+        pytest.approx(1.5)
+    )
+    # The zone grant prices within Z on the agency's route; the same
+    # route outside the covered zone stays unpriceable.
+    assert structure.price(journey(ride("R1", 0, "S1", "S1"))) == pytest.approx(2.0)
+    assert math.isnan(structure.price(journey(ride("R1", 0, "S1", "S2"))))
+
+
+def test_agency_scope_bounds_every_grant(tmp_path):
+    import zipfile as zf
+
+    path = tmp_path / "two_agencies.zip"
+    with zf.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "agency.txt",
+            "agency_id,agency_name,agency_url,agency_timezone\n"
+            "A1,One,https://one,Europe/Helsinki\n"
+            "A2,Two,https://two,Europe/Helsinki\n",
+        )
+        archive.writestr(
+            "routes.txt",
+            "route_id,agency_id,route_short_name,route_type\n"
+            "R1,A1,r1,3\nR2,A2,r2,3\n",
+        )
+        archive.writestr(
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method,transfers,agency_id\n"
+            "F1,2.0,EUR,0,,A1\n",
+        )
+        archive.writestr("fare_rules.txt", "fare_id,contains_id\nF1,Z\n")
+        archive.writestr("stops.txt", "stop_id,stop_name,zone_id\nS1,One,Z\nS2,Two,Z\n")
+    structure = fares.zone_fare_structure(path)
+    # The zone grant holds, but only on the fare's own agency's routes.
+    assert structure.price(journey(ride("R1", 0, "S1", "S2"))) == pytest.approx(2.0)
+    assert math.isnan(structure.price(journey(ride("R2", 0, "S1", "S2"))))
+    # A multi-agency feed whose fares omit agency_id is rejected.
+    unscoped = tmp_path / "unscoped.zip"
+    with zf.ZipFile(path) as source, zf.ZipFile(unscoped, "w") as target:
+        for name in source.namelist():
+            if name == "fare_attributes.txt":
+                target.writestr(
+                    name,
+                    "fare_id,price,currency_type,payment_method,transfers\n"
+                    "F1,2.0,EUR,0,\n",
+                )
+            else:
+                target.writestr(name, source.read(name))
+    with pytest.raises(ValueError, match="multi-agency"):
+        fares.zone_fare_structure(unscoped)
+    # The zones-only reading still loads such feeds.
+    fares.zone_fare_structure(unscoped, rules="zones")
