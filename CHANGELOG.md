@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **The cutoff-pruned (time, fare) frontier** ships as
+  ``fare_frontier``: per origin-destination pair and fare cutoff, the
+  minimum travel time over a departure window — r5r's
+  ``pareto_frontier`` shape — reported with the winning journey's
+  exact fare and rides, ties to the cheapest-then-simplest journey.
+  Fare enters routing as a dominance axis: labels carry the
+  rule-based calculator's exact continuation state in per-stop bags
+  under the groundwork slice's gated relation, so a
+  slower-but-cheaper journey survives to win its cutoff — no fold
+  over the fare-blind products can reproduce this — and an exhaustive
+  fare-blind oracle pins the engine cell for cell across cutoff and
+  duration-cap sweeps. Stop-to-stop and rule-based structures only
+  for now (a zone structure's journeys keep pricing through
+  ``journey_frontiers`` and ``annotate_fares``); the point-to-point
+  form, the origin fan-out, and the benchmark arrive with the scale
+  slice.
+
 - Groundwork for the **cutoff-pruned (time, fare) frontier**: the
   rule-based fare calculator gains its incremental form — a
   per-boarding ``FareState`` step machine pinned equal to the journey
