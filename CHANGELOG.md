@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **Street rental pricing** joins the fare models: ``FareStructure``
+  and ``ZoneFareStructure`` accept a ``street`` tariff — per rental
+  mode, an ``unlock`` price plus a ``per_minute`` price billed per
+  started minute — and ``annotate_fares`` gains ``shared_modes``, the
+  street modes the journeys rode as rentals under their street
+  policy. Each rental leg prices its unlock plus started minutes
+  beside the transit fare; own-vehicle and walking legs stay free —
+  a fare is what is paid, never an imputed cost — and a ridden
+  rental mode without a tariff prices ``NaN``, never a silent zero.
+  The r5r fare-structure zip format is unchanged (street tariffs do
+  not round-trip it).
+
 ## 0.8.0 — 2026-08-02
 
 - **The carriage `TravelTimeMatrix`** (17c, closing the carriage
