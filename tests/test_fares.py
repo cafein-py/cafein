@@ -521,3 +521,43 @@ def test_agency_scope_bounds_every_grant(tmp_path):
         fares.zone_fare_structure(unscoped)
     # The zones-only reading still loads such feeds.
     fares.zone_fare_structure(unscoped, rules="zones")
+
+
+def test_compiled_pricer_matches_python_over_random_sequences(network):
+    import random
+
+    rng = random.Random(0x5EED)
+    structure = fares.setup_fare_structure(network, base_fare=3.0)
+    # Diversify the tables: random per-route fares, mixed route-fare
+    # use, some unlimited-transfer types, random pair totals, a short
+    # window — every calculator branch gets exercised.
+    structure.fares_per_route["route_fare"] = [
+        round(rng.uniform(1.0, 6.0), 2) for _ in range(len(structure.fares_per_route))
+    ]
+    structure.fares_per_type["use_route_fare"] = [
+        rng.random() < 0.5 for _ in range(len(structure.fares_per_type))
+    ]
+    structure.fares_per_type["unlimited_transfers"] = [
+        rng.random() < 0.3 for _ in range(len(structure.fares_per_type))
+    ]
+    structure.fares_per_transfer["fare"] = [
+        round(rng.uniform(2.0, 8.0), 2)
+        for _ in range(len(structure.fares_per_transfer))
+    ]
+    structure.transfer_time_allowance = 45.0
+    route_ids = [route_id for route_id, _, _ in network.routes]
+    for cap in (math.inf, 7.5):
+        structure.fare_cap = cap
+        flat = structure._flat_tables(network)
+        for _ in range(300):
+            time, legs, positions = 0, [], []
+            for _ in range(rng.randint(1, 5)):
+                time += rng.randint(0, 3000)
+                position = rng.randrange(len(route_ids))
+                positions.append((position, time))
+                legs.append(ride(route_ids[position], time))
+            expected = structure.price(journey(*legs))
+            probed = network._core._fare_probe(flat, positions)
+            assert (math.isnan(expected) and math.isnan(probed)) or (
+                expected == pytest.approx(probed)
+            )

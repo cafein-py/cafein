@@ -129,6 +129,203 @@ impl RuleFares {
     }
 }
 
+/// The continuation state of a partially priced journey under the
+/// rule-based model: everything the calculator's future increments
+/// read, plus the running (uncapped) total. The frontier engine's
+/// labels carry one of these; `fare_cap` applies at result time,
+/// never mid-search.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FareState {
+    /// The running total, uncapped; NaN once any boarding was
+    /// unpriceable by amount (a fare row without a price).
+    pub total: f64,
+    pub previous_type: u32,
+    pub previous_route: u32,
+    pub previous_fare: f64,
+    pub previous_board: u32,
+    pub discounts: u32,
+}
+
+impl RuleFares {
+    /// The state after a journey's first boarding; `None` when the
+    /// route has no fare row.
+    pub fn board_first(&self, route: u32, board_time: u32) -> Option<FareState> {
+        let kind = self.route_type[route as usize];
+        if kind == NO_FARE {
+            return None;
+        }
+        let fare = self.route_fare[route as usize];
+        Some(FareState {
+            total: fare,
+            previous_type: kind,
+            previous_route: route,
+            previous_fare: fare,
+            previous_board: board_time,
+            discounts: 0,
+        })
+    }
+
+    /// The state after one further boarding — the incremental form of
+    /// [`RuleFares::price`], branch for branch; `None` when the route
+    /// has no fare row.
+    pub fn board_next(&self, state: &FareState, route: u32, board_time: u32) -> Option<FareState> {
+        let kind = self.route_type[route as usize];
+        if kind == NO_FARE {
+            return None;
+        }
+        let fare = self.route_fare[route as usize];
+        let mut next = *state;
+        // Rides within an unlimited-transfers type are free and spend
+        // neither a discount nor the transfer clock; a later
+        // integration prices off this ride's route.
+        if kind == state.previous_type && self.unlimited_transfers[kind as usize] {
+            next.previous_route = route;
+            next.previous_fare = fare;
+            return Some(next);
+        }
+        let count = self.unlimited_transfers.len();
+        let pair = self.pair_fare[state.previous_type as usize * count + kind as usize];
+        let allowed = kind != state.previous_type
+            || self.allow_same_route[kind as usize]
+            || route != state.previous_route;
+        let in_time = board_time as f64 - state.previous_board as f64 <= self.transfer_allowance;
+        if state.discounts < self.max_discounted_transfers && !pair.is_nan() && allowed && in_time {
+            next.total += pair - state.previous_fare;
+            next.discounts += 1;
+        } else {
+            next.total += fare;
+        }
+        next.previous_fare = fare;
+        next.previous_type = kind;
+        next.previous_route = route;
+        next.previous_board = board_time;
+        Some(next)
+    }
+
+    /// The journey total a state reports: the cap applied, NaN kept.
+    pub fn capped_total(&self, state: &FareState) -> f64 {
+        if state.total.is_nan() {
+            return f64::NAN;
+        }
+        state.total.min(self.fare_cap)
+    }
+
+    /// The largest single integration saving the tables allow — the
+    /// sound per-remaining-discount pruning margin: a label may still
+    /// save at most `margin × remaining discounts` off its running
+    /// total.
+    pub fn max_discount_margin(&self) -> f64 {
+        let count = self.unlimited_transfers.len();
+        let mut margin: f64 = 0.0;
+        for first in 0..count {
+            for second in 0..count {
+                let pair = self.pair_fare[first * count + second];
+                if pair.is_nan() {
+                    continue;
+                }
+                // The increment `pair − previous_fare` replaces the
+                // full fare `fare`; the saving against paying in full
+                // is `fare + previous_fare − pair`, maximised over the
+                // full fares the types can carry.
+                let best_first = self.best_full_fare(first as u32);
+                let best_second = self.best_full_fare(second as u32);
+                margin = margin.max((best_first + best_second - pair).max(0.0));
+            }
+        }
+        margin
+    }
+
+    fn best_full_fare(&self, kind: u32) -> f64 {
+        let mut best: f64 = 0.0;
+        for (route, &route_kind) in self.route_type.iter().enumerate() {
+            if route_kind == kind && !self.route_fare[route].is_nan() {
+                best = best.max(self.route_fare[route]);
+            }
+        }
+        best
+    }
+
+    fn cheapest_full_fare(&self, kind: u32) -> f64 {
+        let mut cheapest = f64::INFINITY;
+        for (route, &route_kind) in self.route_type.iter().enumerate() {
+            if route_kind == kind && !self.route_fare[route].is_nan() {
+                cheapest = cheapest.min(self.route_fare[route]);
+            }
+        }
+        cheapest
+    }
+
+    /// Whether spending a discount can never cost more than paying in
+    /// full — the calculator *forces* the integration branch, so a
+    /// pair total above the cheapest full fares it replaces makes
+    /// unspent discount capacity a liability, and `discounts ≤` stops
+    /// being a safe dominance axis. Computed once per query.
+    pub fn discounts_are_monotone(&self) -> bool {
+        let count = self.unlimited_transfers.len();
+        for first in 0..count {
+            for second in 0..count {
+                let pair = self.pair_fare[first * count + second];
+                if pair.is_nan() {
+                    continue;
+                }
+                let floor =
+                    self.cheapest_full_fare(first as u32) + self.cheapest_full_fare(second as u32);
+                if pair > floor {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// The fare-state half of the frontier dominance relation: `a` prices
+/// every continuation at most as high as `b`. Continuation cost reads
+/// only the fields compared here — equal previous type and route keep
+/// the branch structure identical, a lower total and fewer spent
+/// discounts never price worse, a later previous boarding keeps a
+/// fresher window, and a higher previous full fare only shrinks the
+/// integration increment `pair − previous_fare`. The caller conjoins
+/// arrival ≤. Because the calculator *forces* the integration branch,
+/// two axes need table-dependent gates:
+/// `discounts_monotone` is [`RuleFares::discounts_are_monotone`] —
+/// when the tables guarantee an integration never costs more than
+/// paying full, fewer spent discounts is a safe ≤ axis; otherwise
+/// only **equal** spent discounts compare. `freshness_monotone` may
+/// only be true when `discounts_monotone` holds **and** the discount
+/// budget covers every boarding the query can make
+/// (`max_discounted_transfers ≥` the ride bound) — then a fresher
+/// window's forced integrations are pointwise no dearer; with a
+/// scarce budget a fresher window can squander the last discount on a
+/// weak integration a staler label saves for a larger one, so only
+/// **equal** previous boarding times compare. NaN totals neither
+/// dominate nor are dominated — a NaN running total never recovers,
+/// so the engine drops such labels at creation rather than relying on
+/// dominance.
+pub fn state_dominates(
+    a: &FareState,
+    b: &FareState,
+    discounts_monotone: bool,
+    freshness_monotone: bool,
+) -> bool {
+    let discounts_ok = if discounts_monotone {
+        a.discounts <= b.discounts
+    } else {
+        a.discounts == b.discounts
+    };
+    let freshness_ok = if freshness_monotone {
+        a.previous_board >= b.previous_board
+    } else {
+        a.previous_board == b.previous_board
+    };
+    a.previous_type == b.previous_type
+        && a.previous_route == b.previous_route
+        && a.total <= b.total
+        && discounts_ok
+        && freshness_ok
+        && a.previous_fare >= b.previous_fare
+}
+
 /// A zone ticket: a price valid for the zones in the bitmask, for
 /// `transfers` further boardings within `duration` seconds of the
 /// first.
