@@ -39,6 +39,18 @@ pub struct FareFrontierInputs<'a> {
     pub cutoffs: &'a [f64],
     /// A bound on `arrival − departure`, seconds; `None` unbounded.
     pub max_duration: Option<u32>,
+    /// `Some(step)`: rasterise the departure window every `step`
+    /// seconds, R5's discipline — every reported journey is real and
+    /// waits from its sampled departure, so travel times are measured
+    /// against the grid, not the exact event. `None`: one pass per
+    /// exact (trip departure − access walk) event — wait-free
+    /// departures, the shipped frontier products' event semantics,
+    /// far more passes on street-linked origins. A journey catchable
+    /// only by waiting past the last in-window event belongs to the
+    /// grid, so neither mode's travel times bound the other's at a
+    /// window's edge. The caller bounds `window / step`; the bindings
+    /// reject more than 100,000 samples.
+    pub departure_step: Option<u32>,
     /// `true`: the oracle-exact state bags. `false`: the fast
     /// discipline — the state relation with its gates assumed
     /// monotone, and only the earliest boardable trip explored, the
@@ -774,16 +786,41 @@ pub fn fold_cutoffs(arrivals: &[Arrived], cutoffs: &[f64]) -> Vec<Option<Frontie
 #[path = "fare_frontier/tests.rs"]
 mod tests;
 
-/// One origin's frontier over the departure window: the engines'
-/// shared candidate enumeration, one pass per departure, descending.
+/// The rasterised window: departures every `step` seconds within
+/// `[departure, departure + window)`, descending — the same half-open
+/// window the event enumeration searches.
+pub fn sampled_departures(departure: u32, window: u32, step: u32) -> Vec<u32> {
+    let step = step.max(1) as u64;
+    let mut departures = Vec::new();
+    let mut offset = 0u64;
+    while offset < window as u64 {
+        // Samples stop below the `UNREACHED` sentinel; the bindings
+        // reject windows crossing the clock outright.
+        let Some(at) = u32::try_from(departure as u64 + offset)
+            .ok()
+            .filter(|&at| at != UNREACHED)
+        else {
+            break;
+        };
+        departures.push(at);
+        offset += step;
+    }
+    departures.reverse();
+    departures
+}
+
+/// One origin's frontier over the departure window: one pass per
+/// sampled or event departure, descending.
 pub fn frontier(
     inputs: &FareFrontierInputs<'_>,
     request: &Request,
     destinations: &[Vec<(StopIdx, u32)>],
     window: u32,
 ) -> Vec<Vec<Option<FrontierRow>>> {
-    let departures =
-        crate::routers::raptor::departure_candidates(inputs.timetable, request, window);
+    let departures = match inputs.departure_step {
+        Some(step) => sampled_departures(request.departure, window, step),
+        None => crate::routers::raptor::departure_candidates(inputs.timetable, request, window),
+    };
     let mut search = FareFrontierSearch::new(inputs, request, destinations);
     for &departure in &departures {
         search.pass(departure);

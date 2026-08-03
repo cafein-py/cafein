@@ -1884,9 +1884,12 @@ def test_fare_frontier_prunes_at_the_cutoffs(network):
 
     structure = fares.setup_fare_structure(network, base_fare=3.0)
     args = (["4810551"], ["1250551"], "2022-02-22", "08:30:00", 600)
-    # Unbounded by money, the frontier's travel time is the window's
-    # time-optimal one — the shipped frontier product's best row.
-    unbounded = fare_frontier(network, *args, structure, cutoffs=[1e9], max_transfers=4)
+    # Unbounded by money, the event profile's travel time is the
+    # window's time-optimal one — the shipped frontier product's best
+    # row.
+    unbounded = fare_frontier(
+        network, *args, structure, cutoffs=[1e9], max_transfers=4, departure_step=None
+    )
     assert len(unbounded) == 1
     reference = frontier_table(
         network,
@@ -1898,6 +1901,42 @@ def test_fare_frontier_prunes_at_the_cutoffs(network):
         max_transfers=4,
     )
     assert unbounded["travel_time_s"].iloc[0] == reference["travel_time_s"].min()
+    # The default rasterised window reports real journeys too: on
+    # this window its winner waits from its sampled departure and
+    # never beats the event profile's travel time (the wait-free
+    # event semantics can differ at a window's edge).
+    sampled = fare_frontier(network, *args, structure, cutoffs=[1e9], max_transfers=4)
+    assert len(sampled) == 1
+    assert sampled["travel_time_s"].iloc[0] >= unbounded["travel_time_s"].iloc[0]
+    with pytest.raises(ValueError, match="departure_step"):
+        fare_frontier(network, *args, structure, cutoffs=[1e9], departure_step=0)
+    # A grid too fine for its window is rejected before it
+    # materialises, and a window past the router clock is rejected
+    # rather than silently truncated.
+    with pytest.raises(ValueError, match="samples the window"):
+        fare_frontier(
+            network,
+            ["4810551"],
+            ["1250551"],
+            "2022-02-22",
+            "08:30:00",
+            600_000_000,
+            structure,
+            cutoffs=[1e9],
+            departure_step=1,
+        )
+    with pytest.raises(ValueError, match="router clock"):
+        fare_frontier(
+            network,
+            ["4810551"],
+            ["1250551"],
+            "2022-02-22",
+            "08:30:00",
+            4_294_967_295,
+            structure,
+            cutoffs=[1e9],
+            departure_step=60_000,
+        )
     # Every reported fare fits its cutoff, and relaxing the cutoff
     # never slows the winner.
     rows = fare_frontier(

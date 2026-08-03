@@ -1150,6 +1150,7 @@ def fare_frontier(
     max_transfers=7,
     max_duration=None,
     exact=True,
+    departure_step=60,
     walking_speed_kmph=None,
     max_walking_time=None,
     max_snap_distance=None,
@@ -1200,6 +1201,17 @@ def fare_frontier(
         cheaper journey can be missed where a scarce discount budget
         interacts with transfer windows; large analyses want this
         mode, as r5r's own frontier does.
+    departure_step : int (optional, default: 60)
+        Seconds between the window's sampled departures — R5's
+        per-minute rasterisation. Every reported journey is real and
+        waits from its sampled departure, so travel times are
+        measured against the grid. ``None`` searches every exact
+        (trip departure - access walk) event instead — the wait-free
+        event profile the shipped frontier products enumerate, at far
+        more search passes on point origins. A journey catchable only
+        by waiting past the last in-window event belongs to the grid,
+        so neither mode's travel times bound the other's at a
+        window's edge.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         Street-search options for the point form, as in
         ``route_between_coordinates``; rejected beside stop ids. The
@@ -1217,6 +1229,14 @@ def fare_frontier(
 
     from cafein import fares as fares_module
 
+    if departure_step is not None:
+        step = int(departure_step)
+        if step <= 0 or step != departure_step:
+            raise ValueError(
+                "departure_step must be a positive whole number of "
+                "seconds, or None for every departure event"
+            )
+        departure_step = step
     if isinstance(fares, fares_module.ZoneFareStructure):
         raise ValueError(
             "the fare frontier prices rule-based structures only; a zone "
@@ -1259,6 +1279,7 @@ def fare_frontier(
             max_transfers=max_transfers,
             max_duration=max_duration,
             exact=exact,
+            departure_step=departure_step,
             **dict(
                 zip(
                     (
@@ -1283,6 +1304,7 @@ def fare_frontier(
             max_transfers=max_transfers,
             max_duration=max_duration,
             exact=exact,
+            departure_step=departure_step,
         )
     frame = pd.DataFrame(
         {
