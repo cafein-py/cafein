@@ -1620,6 +1620,43 @@ impl TransportNetwork {
     }
 }
 
+#[pymethods]
+impl TransportNetwork {
+    /// Prices one boarding sequence — ``(route position, board time)``
+    /// pairs in ride order — through the compiled fare calculator, for
+    /// the Python-parity property tests. Internal.
+    fn _fare_probe(&self, fares: Bound<'_, PyDict>, legs: Vec<(u32, u32)>) -> PyResult<f64> {
+        let tables = fare_tables(
+            &fares,
+            self.feed.routes.len(),
+            self.build.timetable.stop_count() as usize,
+        )?;
+        // The rule-based model folds the incremental state machine —
+        // the parity property must exercise the step form, not the
+        // monolithic pricer it mirrors.
+        if let cafein_core::fares::FareTables::RuleBased(rules) = &tables {
+            let Some((first, rest)) = legs.split_first() else {
+                return Ok(0.0);
+            };
+            let mut state = rules.board_first(first.0, first.1);
+            for &(route, board_time) in rest {
+                state = state.and_then(|state| rules.board_next(&state, route, board_time));
+            }
+            return Ok(state.map_or(f64::NAN, |state| rules.capped_total(&state)));
+        }
+        let legs: Vec<cafein_core::fares::FareLeg> = legs
+            .into_iter()
+            .map(|(route, board_time)| cafein_core::fares::FareLeg {
+                route,
+                board_stop: 0,
+                alight_stop: 0,
+                board_time,
+            })
+            .collect();
+        Ok(tables.price(&legs))
+    }
+}
+
 /// Parses the flat fare tables `cafein.fares` produces, validating the
 /// arrays against the network's route and stop counts.
 pub(super) fn fare_tables(

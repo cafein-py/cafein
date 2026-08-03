@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Groundwork for the **cutoff-pruned (time, fare) frontier**: the
+  rule-based fare calculator gains its incremental form — a
+  per-boarding ``FareState`` step machine pinned equal to the journey
+  pricer over randomized sequences on both the Rust and the Python
+  side, the continuation-state dominance relation the coming frontier
+  engine's label bags will use — equal previous type and route, fare
+  ≤ and previous full fare ≥ always; spent discounts ≤ and window
+  freshness ≥ only under per-query table gates (monotone integration
+  pairs, and a discount budget covering every boarding), equality
+  otherwise — and the sound cutoff-pruning discount margin. Internal
+  until the product lands.
+
 - The zone fare model **prices the rule shapes it previously
   ignored**: a product's restriction dimensions are now alternative
   grants — the zone-set cover, a **route grant** (route-only
