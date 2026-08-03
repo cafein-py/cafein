@@ -5,14 +5,14 @@ import pytest
 
 from cafein import _osm
 
-W, B, S = _osm.WALK, _osm.BICYCLE, _osm.E_SCOOTER
+W, B, S, C = _osm.WALK, _osm.BICYCLE, _osm.E_SCOOTER, _osm.CAR
 
 
 def test_mode_and_flag_bits_match_the_rust_abi():
     # These integer values cross to the Rust profile compiler (streets/profile.rs)
     # as the raw u8/u16 attribute arrays, so a change here is a breaking ABI
     # change and must be mirrored on the Rust side (and vice versa).
-    assert (_osm.WALK, _osm.BICYCLE, _osm.E_SCOOTER) == (1, 2, 4)
+    assert (_osm.WALK, _osm.BICYCLE, _osm.E_SCOOTER, _osm.CAR) == (1, 2, 4, 8)
     assert (
         _osm.FLAG_DISMOUNT,
         _osm.FLAG_BRIDGE,
@@ -47,10 +47,20 @@ def _perm(**tags):
         (dict(highway="pedestrian"), W, W, 0),
         (dict(highway="steps"), W, W, 0),
         (dict(highway="cycleway"), B | S, B | S, 0),
-        (dict(highway="residential"), W | B | S, W | B | S, 0),
-        (dict(highway="track"), W | B | S, W | B | S, 0),
+        (dict(highway="residential"), W | B | S | C, W | B | S | C, 0),
+        (dict(highway="track"), W | B | S | C, W | B | S | C, 0),
         (dict(highway="platform"), W, W, 0),
-        # An unrecognised highway value denies both modes by default (only an
+        (dict(highway="trunk"), C, C, 0),
+        # A motorway carriageway is implicitly one-way; an explicit false
+        # oneway opens it, and links follow their explicit tags only.
+        (dict(highway="motorway"), C, 0, 0),
+        (dict(highway="motorway", oneway="no"), C, C, 0),
+        (dict(highway="motorway_link"), C, C, 0),
+        (dict(highway="motorway_link", oneway="yes"), C, 0, 0),
+        # The implied one-way is shared state: an explicitly permitted
+        # bicycle on a motorway is directional too.
+        (dict(highway="motorway", bicycle="yes"), B | S | C, 0, 0),
+        # An unrecognised highway value denies every mode by default (only an
         # explicit mode tag opens it) — see the unknown-highway test below.
         (dict(highway="something_new"), 0, 0, 0),
         (dict(highway="something_new", bicycle="yes"), B | S, B | S, 0),
@@ -61,7 +71,7 @@ def _perm(**tags):
         (dict(highway="footway", access="destination"), W, W, 0),
         (dict(highway="footway", access="yes"), W, W, 0),
         # Mode-specific tags override the general access.
-        (dict(highway="residential", foot="no"), B | S, B | S, 0),
+        (dict(highway="residential", foot="no"), B | S | C, B | S | C, 0),
         (dict(highway="footway", bicycle="yes"), W | B | S, W | B | S, 0),
         (dict(highway="cycleway", bicycle="no"), 0, 0, 0),
         (dict(highway="cycleway", foot="yes"), W | B | S, W | B | S, 0),
@@ -72,38 +82,59 @@ def _perm(**tags):
             W | B | S,
             _osm.FLAG_DISMOUNT,
         ),
-        # use_sidepath denies the bicycle on this way.
-        (dict(highway="primary", bicycle="use_sidepath"), W, W, 0),
+        # use_sidepath denies the bicycle on this way; the car is untouched.
+        (dict(highway="primary", bicycle="use_sidepath"), W | C, W | C, 0),
         # vehicle sits between access and bicycle in the hierarchy: vehicle=no
-        # denies the bike, vehicle=yes re-grants a bike-permitting way that a
-        # general access=no closed, but never grants a type-denied mode.
+        # denies bike and car, vehicle=yes re-grants what the type permits,
+        # but never grants a type-denied mode.
         (dict(highway="service", vehicle="no"), W, W, 0),
-        (dict(highway="service", vehicle="no", bicycle="yes"), W | B | S, W | B | S, 0),
-        # access=no denies pedestrians (foot has no vehicle re-grant), while
-        # vehicle=yes re-opens the bike on this bike-permitting way.
-        (dict(highway="service", access="no", vehicle="yes"), B | S, B | S, 0),
-        (dict(highway="footway", vehicle="yes"), W, W, 0),
-        # Directionality: oneway blocks the reverse bicycle; foot is unaffected.
-        (dict(highway="residential", oneway="yes"), W | B | S, W, 0),
-        (dict(highway="residential", oneway="-1"), W, W | B | S, 0),
-        (dict(highway="residential", junction="roundabout"), W | B | S, W, 0),
-        # An explicit oneway=no overrides a roundabout's implicit direction.
         (
-            dict(highway="residential", junction="roundabout", oneway="no"),
+            dict(highway="service", vehicle="no", bicycle="yes"),
             W | B | S,
             W | B | S,
             0,
         ),
-        # Cycling exceptions re-open the direction the base oneway blocked.
+        # access=no denies pedestrians (foot has no vehicle re-grant), while
+        # vehicle=yes re-opens bike and car on this permitting way.
+        (dict(highway="service", access="no", vehicle="yes"), B | S | C, B | S | C, 0),
+        (dict(highway="footway", vehicle="yes"), W, W, 0),
+        # The car chain continues below vehicle: motor_vehicle / motorcar.
+        (dict(highway="residential", motor_vehicle="no"), W | B | S, W | B | S, 0),
+        (dict(highway="residential", motorcar="no"), W | B | S, W | B | S, 0),
+        (
+            dict(highway="residential", motor_vehicle="no", motorcar="yes"),
+            W | B | S | C,
+            W | B | S | C,
+            0,
+        ),
+        (dict(highway="residential", vehicle="no", motorcar="yes"), W | C, W | C, 0),
+        (dict(highway="residential", access="no", motorcar="yes"), C, C, 0),
+        # The most-specific motorcar= overrides freely, like bicycle= does.
+        (dict(highway="footway", motorcar="yes"), W | C, W | C, 0),
+        (dict(highway="cycleway", motorcar="yes"), B | S | C, B | S | C, 0),
+        # Directionality: oneway blocks the reverse bicycle and car; foot is
+        # unaffected.
+        (dict(highway="residential", oneway="yes"), W | B | S | C, W, 0),
+        (dict(highway="residential", oneway="-1"), W, W | B | S | C, 0),
+        (dict(highway="residential", junction="roundabout"), W | B | S | C, W, 0),
+        # An explicit oneway=no overrides a roundabout's implicit direction.
+        (
+            dict(highway="residential", junction="roundabout", oneway="no"),
+            W | B | S | C,
+            W | B | S | C,
+            0,
+        ),
+        # Cycling exceptions re-open the blocked direction for the bicycle
+        # only — the car has no contraflow grants of any kind.
         (
             {"highway": "residential", "oneway": "yes", "oneway:bicycle": "no"},
-            W | B | S,
+            W | B | S | C,
             W | B | S,
             0,
         ),
         (
             dict(highway="residential", oneway="yes", cycleway="opposite_lane"),
-            W | B | S,
+            W | B | S | C,
             W | B | S,
             0,
         ),
@@ -113,7 +144,7 @@ def _perm(**tags):
                 "oneway": "yes",
                 "cycleway:left": "opposite_track",
             },
-            W | B | S,
+            W | B | S | C,
             W | B | S,
             0,
         ),
@@ -121,19 +152,19 @@ def _perm(**tags):
         (
             dict(highway="residential", oneway="-1", cycleway="opposite_lane"),
             W | B | S,
-            W | B | S,
+            W | B | S | C,
             0,
         ),
         # `oneway:bicycle` honours the boolean aliases, not just "no".
         (
             {"highway": "residential", "oneway": "yes", "oneway:bicycle": "false"},
-            W | B | S,
+            W | B | S | C,
             W | B | S,
             0,
         ),
         (
             {"highway": "residential", "oneway": "yes", "oneway:bicycle": "0"},
-            W | B | S,
+            W | B | S | C,
             W | B | S,
             0,
         ),
@@ -146,7 +177,7 @@ def _perm(**tags):
                 "cycleway:left": "lane",
                 "cycleway:left:oneway": "-1",
             },
-            W | B | S,
+            W | B | S | C,
             W | B | S,
             0,
         ),
@@ -157,7 +188,7 @@ def _perm(**tags):
                 "cycleway:right": "track",
                 "cycleway:right:oneway": "no",
             },
-            W | B | S,
+            W | B | S | C,
             W | B | S,
             0,
         ),
@@ -170,7 +201,7 @@ def _perm(**tags):
                 "cycleway:right": "separate",
                 "cycleway:right:oneway": "no",
             },
-            W | B | S,
+            W | B | S | C,
             W,
             0,
         ),
@@ -180,7 +211,7 @@ def _perm(**tags):
                 "oneway": "yes",
                 "cycleway:left:oneway": "-1",
             },
-            W | B | S,
+            W | B | S | C,
             W,
             0,
         ),
@@ -188,18 +219,24 @@ def _perm(**tags):
         (dict(highway="service", access="delivery"), 0, 0, 0),
         (dict(highway="track", access="agricultural"), 0, 0, 0),
         (dict(highway="track", access="forestry", foot="yes"), W, W, 0),
-        # A dismounted cyclist is pedestrian-like and ignores the oneway.
+        # A dismounted cyclist is pedestrian-like and ignores the oneway; the
+        # car still follows it.
         (
             dict(highway="residential", oneway="yes", bicycle="dismount"),
-            W | B | S,
+            W | B | S | C,
             W | B | S,
             _osm.FLAG_DISMOUNT,
         ),
         # junction=circular is not implicitly one-way (unlike roundabout).
-        (dict(highway="residential", junction="circular"), W | B | S, W | B | S, 0),
+        (
+            dict(highway="residential", junction="circular"),
+            W | B | S | C,
+            W | B | S | C,
+            0,
+        ),
         (
             dict(highway="residential", junction="circular", oneway="yes"),
-            W | B | S,
+            W | B | S | C,
             W,
             0,
         ),
@@ -213,7 +250,7 @@ def _perm(**tags):
                 "cycleway:left:oneway": "yes",
             },
             W | B | S,
-            W | B | S,
+            W | B | S | C,
             0,
         ),
         # …while a reverse-running lane on a reverse base just follows it — the
@@ -226,7 +263,7 @@ def _perm(**tags):
                 "cycleway:left:oneway": "-1",
             },
             W,
-            W | B | S,
+            W | B | S | C,
             0,
         ),
     ],
@@ -242,7 +279,7 @@ def test_unknown_access_is_conservative_and_counted():
     # An unrecognised access value neither newly permits nor denies — the
     # highway default stands — and it is reported for diagnostics.
     forward, reverse, _, unknown_access, _ = _perm(highway="residential", access="wat")
-    assert forward == reverse == W | B | S
+    assert forward == reverse == W | B | S | C
     assert unknown_access
     forward, _, _, unknown_access, _ = _perm(highway="footway", access="wat")
     assert forward == W
@@ -452,3 +489,187 @@ def test_pruning_rejects_an_unknown_mode(union_extract):
         _osm.prune_components_per_profile(
             u, v, len(nodes), forward, reverse, modes=["hovercraft"]
         )
+
+
+# --- Car speeds ---------------------------------------------------------------
+
+
+def test_parse_maxspeed_table():
+    mph = 1.609344
+    cases = [
+        ("50", 50.0),
+        ("50.5", 50.5),
+        ("30 mph", 30 * mph),
+        ("30mph", 30 * mph),
+        ("none", None),
+        ("signals", None),
+        ("walk", None),
+        ("DE:zone30", None),
+        ("-5", None),
+        ("0", None),
+        ("", None),
+        (None, None),
+    ]
+    for raw, expected in cases:
+        got = _osm.parse_maxspeed(raw)
+        if expected is None:
+            assert got is None, raw
+        else:
+            assert got == pytest.approx(expected), raw
+
+
+def test_car_speeds_resolve_tags_then_country_defaults():
+    import pandas as pd
+
+    edges = pd.DataFrame(
+        {
+            "highway": ["residential", "motorway", "primary", "wat", "living_street"],
+            "maxspeed": [None, "100", "30 mph", None, None],
+            "maxspeed:backward": ["40", None, None, None, None],
+        }
+    )
+    # A tagged maxspeed wins; a directional tag overrides its direction
+    # only; untagged ways take the country row's class default, unknown
+    # classes the other_* fallback.
+    forward, reverse = _osm.car_speeds(edges, country="FI")
+    assert list(forward) == pytest.approx([50.0, 100.0, 30 * 1.609344, 50.0, 20.0])
+    assert list(reverse) == pytest.approx([40.0, 100.0, 30 * 1.609344, 50.0, 20.0])
+    # The rural values apply outside urban polygons; a subdivision row
+    # selects state law (US-CA residential 25 mph = 40 km/h), and an
+    # unknown subdivision falls back to the country's generic row.
+    rural = [False] * len(edges)
+    forward, _ = _osm.car_speeds(edges, country="US-CA", urban=rural)
+    assert forward[0] == pytest.approx(40.0)
+    forward, _ = _osm.car_speeds(edges, country="US-TX", urban=rural)
+    generic_us, _ = _osm.car_speeds(edges, country="US", urban=rural)
+    assert forward[0] == pytest.approx(generic_us[0])
+    with pytest.raises(ValueError, match="ISO 3166"):
+        _osm.car_speeds(edges, country="bogus!")
+    # An urban-areas polygon frame resolves membership by spatial join.
+    import geopandas as gpd
+    from shapely.geometry import LineString, Polygon
+
+    geo = gpd.GeoDataFrame(
+        {"highway": ["residential", "residential"]},
+        geometry=[LineString([(0, 0), (1, 0)]), LineString([(5, 5), (6, 5)])],
+        crs="EPSG:4326",
+    )
+    urban_areas = gpd.GeoDataFrame(
+        geometry=[Polygon([(-1, -1), (2, -1), (2, 2), (-1, 2)])], crs="EPSG:4326"
+    )
+    forward, _ = _osm.car_speeds(geo, country="FI", urban=urban_areas)
+    assert list(forward) == pytest.approx([50.0, 80.0])
+    # The join reprojects mismatched polygon CRSs onto the edges' own.
+    projected = urban_areas.to_crs("EPSG:3067")
+    forward, _ = _osm.car_speeds(geo, country="FI", urban=projected)
+    assert list(forward) == pytest.approx([50.0, 80.0])
+    with pytest.raises(ValueError, match="CRS"):
+        _osm.car_speeds(
+            geo, country="FI", urban=urban_areas.set_crs(None, allow_override=True)
+        )
+    # Untagged tracks take the low product default, area-invariant —
+    # never the ordinary-road fallback — and `speed_limits=` overrides
+    # any class of the resolved row.
+    track = pd.DataFrame({"highway": ["track", "track"]})
+    forward, _ = _osm.car_speeds(track, country="FI", urban=[True, False])
+    assert list(forward) == pytest.approx([20.0, 20.0])
+    forward, _ = _osm.car_speeds(track, country="FI", speed_limits={"track": 30})
+    assert list(forward) == pytest.approx([30.0, 30.0])
+    forward, _ = _osm.car_speeds(
+        edges, country="FI", speed_limits={"residential_inside": 35}
+    )
+    assert forward[0] == pytest.approx(35.0)
+    # Overrides are validated: unknown classes and non-positive or
+    # non-finite speeds are rejected loudly.
+    with pytest.raises(ValueError, match="unknown speed_limits"):
+        _osm.car_speeds(edges, country="FI", speed_limits={"residental": 30})
+    with pytest.raises(ValueError, match="positive km/h"):
+        _osm.car_speeds(edges, country="FI", speed_limits={"track": 0})
+    with pytest.raises(ValueError, match="positive km/h"):
+        _osm.car_speeds(edges, country="FI", speed_limits={"track": float("nan")})
+    with pytest.raises(ValueError, match="per edge"):
+        _osm.car_speeds(edges, country="FI", urban=[True])
+    with pytest.warns(UserWarning, match="no country="):
+        _osm.car_speeds(edges)
+    with pytest.warns(UserWarning, match="Generic row"):
+        _osm.car_speeds(edges, country="XX")
+
+
+def test_speed_limit_table_is_the_vendored_prototype():
+    # Pins the vendored table: a known country row, the Generic fallback,
+    # a subdivision row, and that every row prices the fallback classes.
+    from cafein._speed_limits import SPEED_LIMITS
+
+    assert SPEED_LIMITS["FI"]["motorway_outside"] == 120
+    assert SPEED_LIMITS["FI"]["residential_inside"] == 50
+    assert SPEED_LIMITS["GB"]["motorway_outside"] == 113  # 70 mph, stored km/h
+    assert SPEED_LIMITS["US-CA"]["motorway_outside"] == 105  # 65 mph
+    assert SPEED_LIMITS[""]["residential_inside"] == 50
+    # 48 ISO-addressable countries, 22 subdivision rows, one Generic;
+    # the source's Northern Cyprus row shares Turkey's code and is
+    # deliberately not vendored — TR carries Turkey's own values.
+    countries = [key for key in SPEED_LIMITS if len(key) == 2]
+    subdivisions = [key for key in SPEED_LIMITS if "-" in key]
+    assert (len(countries), len(subdivisions)) == (48, 22)
+    assert SPEED_LIMITS["TR"]["motorway_outside"] == 120
+    for key, row in SPEED_LIMITS.items():
+        assert "other_inside" in row and "other_outside" in row, key
+
+
+# --- Junction delay classes ---------------------------------------------------
+
+
+def _junctions(tags_by_vertex, u, v, ways, masks, vertices):
+    import numpy as np
+
+    tags = [tags_by_vertex.get(i) for i in range(vertices)]
+    forward = np.array(masks, dtype=np.uint8)
+    return _osm.junction_delay_classes(tags, u, v, ways, forward, forward, vertices)
+
+
+def test_junction_classes_by_degree_and_control():
+    # Way 10 runs 0→1→2; way 20 crosses it at vertex 1 (3→1→4).
+    u, v = [0, 1, 3, 1], [1, 2, 1, 4]
+    ways = [10, 10, 20, 20]
+    car = [_osm.CAR] * 4
+    # Untagged: four drivable approaches meet at 1 — a plain junction.
+    fwd, rev = _junctions({}, u, v, ways, car, 5)
+    assert list(fwd) == [_osm.JUNCTION_UNCONTROLLED, 0, _osm.JUNCTION_UNCONTROLLED, 0]
+    assert list(rev) == [0, _osm.JUNCTION_UNCONTROLLED, 0, _osm.JUNCTION_UNCONTROLLED]
+    # Signals charge every approach.
+    fwd, rev = _junctions({1: {"highway": "traffic_signals"}}, u, v, ways, car, 5)
+    assert list(fwd) == [_osm.JUNCTION_SIGNALS, 0, _osm.JUNCTION_SIGNALS, 0]
+    assert list(rev) == [0, _osm.JUNCTION_SIGNALS, 0, _osm.JUNCTION_SIGNALS]
+    # A stop mapped onto the shared junction vertex is ambiguous — every
+    # approach is charged, the conservative reading.
+    fwd, rev = _junctions({1: {"highway": "stop"}}, u, v, ways, car, 5)
+    assert list(fwd) == [_osm.JUNCTION_PRIORITY, 0, _osm.JUNCTION_PRIORITY, 0]
+    assert list(rev) == [0, _osm.JUNCTION_PRIORITY, 0, _osm.JUNCTION_PRIORITY]
+    # A vertex two footways join is no junction for the car.
+    fwd, rev = _junctions({}, u, v, ways, [_osm.CAR, _osm.CAR, _osm.WALK, _osm.WALK], 5)
+    assert list(fwd) == [0, 0, 0, 0]
+    assert list(rev) == [0, 0, 0, 0]
+
+
+def test_priority_nodes_charge_their_own_way_only():
+    # A give-way sign at vertex 1, mid-way on way 10 (0→1→2) — vertex 3
+    # joins by way 20 only at vertex 2, so vertex 1 lies on one way.
+    u, v = [0, 1, 2], [1, 2, 3]
+    ways = [10, 10, 20]
+    car = [_osm.CAR] * 3
+    fwd, rev = _junctions({1: {"highway": "give_way"}}, u, v, ways, car, 4)
+    # Both approaches along way 10 are charged; way 20 never touches 1.
+    assert list(fwd) == [_osm.JUNCTION_PRIORITY, 0, 0]
+    assert list(rev) == [0, _osm.JUNCTION_PRIORITY, 0]
+    # direction=forward charges only the approach running with the way.
+    fwd, rev = _junctions(
+        {1: {"highway": "stop", "direction": "forward"}}, u, v, ways, car, 4
+    )
+    assert list(fwd) == [_osm.JUNCTION_PRIORITY, 0, 0]
+    assert list(rev) == [0, 0, 0]
+    # direction=backward charges only the against-the-way approach.
+    fwd, rev = _junctions(
+        {1: {"highway": "stop", "direction": "backward"}}, u, v, ways, car, 4
+    )
+    assert list(fwd) == [0, 0, 0]
+    assert list(rev) == [0, _osm.JUNCTION_PRIORITY, 0]

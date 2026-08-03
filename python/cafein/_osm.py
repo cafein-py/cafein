@@ -8,6 +8,10 @@ separately for each mode. `StreetNetwork.from_osm` consumes that output as the
 multimodal edge data the format-12 arrays carry.
 """
 
+import math
+import re
+import warnings
+
 import numpy as np
 import pyrosm
 from scipy import sparse
@@ -20,8 +24,9 @@ from .streets import MIN_ISLAND_VERTICES
 WALK = 1 << 0
 BICYCLE = 1 << 1
 E_SCOOTER = 1 << 2
+CAR = 1 << 3
 
-MODES = {"walk": WALK, "bicycle": BICYCLE, "e_scooter": E_SCOOTER}
+MODES = {"walk": WALK, "bicycle": BICYCLE, "e_scooter": E_SCOOTER, "car": CAR}
 """The street modes and their permission bits. An e-bike reuses the bicycle
 bit (same permissions, different speed); the e-scooter has its own bit,
 "bicycle_like" by default."""
@@ -109,41 +114,43 @@ SMOOTHNESS_CODES = {
 
 # --- Permission model --------------------------------------------------------
 
-# Default (foot, bicycle) permission per highway class, before any explicit
+# Default (foot, bicycle, car) permission per highway class, before any explicit
 # access tags, following the OSM wiki defaults and R5's foot/bike traversal
 # conventions. A way that passed the exclusion filter but carries an
 # unrecognised highway value falls back to `_DEFAULT_HIGHWAY_PERMISSION`.
 HIGHWAY_DEFAULTS = {
-    "footway": (True, False),
-    "pedestrian": (True, False),
-    "steps": (True, False),
-    "corridor": (True, False),
-    "platform": (True, False),
-    "path": (True, True),
-    "cycleway": (False, True),
-    "bridleway": (True, False),
-    "track": (True, True),
-    "living_street": (True, True),
-    "residential": (True, True),
-    "service": (True, True),
-    "unclassified": (True, True),
-    "tertiary": (True, True),
-    "tertiary_link": (True, True),
-    "secondary": (True, True),
-    "secondary_link": (True, True),
-    "primary": (True, True),
-    "primary_link": (True, True),
-    "trunk": (False, False),
-    "trunk_link": (False, False),
-    "elevator": (True, True),
-    "road": (True, True),
-    "busway": (False, False),
+    "footway": (True, False, False),
+    "pedestrian": (True, False, False),
+    "steps": (True, False, False),
+    "corridor": (True, False, False),
+    "platform": (True, False, False),
+    "path": (True, True, False),
+    "cycleway": (False, True, False),
+    "bridleway": (True, False, False),
+    "track": (True, True, True),
+    "living_street": (True, True, True),
+    "residential": (True, True, True),
+    "service": (True, True, True),
+    "unclassified": (True, True, True),
+    "tertiary": (True, True, True),
+    "tertiary_link": (True, True, True),
+    "secondary": (True, True, True),
+    "secondary_link": (True, True, True),
+    "primary": (True, True, True),
+    "primary_link": (True, True, True),
+    "trunk": (False, False, True),
+    "trunk_link": (False, False, True),
+    "elevator": (True, True, False),
+    "road": (True, True, True),
+    "busway": (False, False, False),
+    "motorway": (False, False, True),
+    "motorway_link": (False, False, True),
 }
-_DEFAULT_HIGHWAY_PERMISSION = (False, False)
+_DEFAULT_HIGHWAY_PERMISSION = (False, False, False)
 """A retained way with an unrecognised highway value (a typo, a lifecycle
-value, or a type cafein does not model yet) denies both modes by default —
-only an explicit `foot=`/`bicycle=` tag opens it — and the value is reported,
-so routing never silently traverses an unmodelled way."""
+value, or a type cafein does not model yet) denies every mode by default —
+only an explicit `foot=`/`bicycle=`/`motorcar=` tag opens it — and the value
+is reported, so routing never silently traverses an unmodelled way."""
 
 _ALLOWED_ACCESS = frozenset(
     {"yes", "designated", "permissive", "destination", "customers", "official"}
@@ -289,6 +296,37 @@ def _bicycle_permission(bike_default, access, vehicle, bicycle):
     return allowed, dismount, unknown
 
 
+def _car_permission(car_default, access, vehicle, motor_vehicle, motorcar):
+    """Car permission resolved down the OSM access hierarchy
+    (type default → `access` → `vehicle` → `motor_vehicle` → `motorcar`),
+    and whether an unknown value was seen.
+
+    The same precedence semantics as the bicycle chain: a less-specific
+    *allow* never grants a mode the highway type denies, a deny at any
+    level propagates until a more-specific key re-grants, and the
+    most-specific `motorcar=` overrides freely.
+    """
+    allowed = car_default
+    unknown = False
+    for value in (access, vehicle, motor_vehicle):
+        if value is None:
+            continue
+        if value in _DENIED_ACCESS:
+            allowed = False
+        elif value in _ALLOWED_ACCESS:
+            allowed = car_default
+        else:
+            unknown = True
+    if motorcar is not None:
+        if motorcar in _ALLOWED_ACCESS:
+            allowed = True
+        elif motorcar in _DENIED_ACCESS:
+            allowed = False
+        else:
+            unknown = True
+    return allowed, unknown
+
+
 def _row_permissions(row):
     """(forward_mask, reverse_mask, flags, unknown_access, unknown_highway).
 
@@ -301,7 +339,7 @@ def _row_permissions(row):
     """
     highway = row.get("highway")
     unknown_highway = highway is not None and highway not in HIGHWAY_DEFAULTS
-    foot_default, bike_default = HIGHWAY_DEFAULTS.get(
+    foot_default, bike_default, car_default = HIGHWAY_DEFAULTS.get(
         highway, _DEFAULT_HIGHWAY_PERMISSION
     )
     access = row.get("access")
@@ -310,16 +348,38 @@ def _row_permissions(row):
     bike_ok, dismount, bike_unknown = _bicycle_permission(
         bike_default, access, row.get("vehicle"), row.get("bicycle")
     )
+    car_ok, car_unknown = _car_permission(
+        car_default,
+        access,
+        row.get("vehicle"),
+        row.get("motor_vehicle"),
+        row.get("motorcar"),
+    )
 
-    # Directionality (bicycle/e-scooter only). A roundabout is implicitly
+    # Directionality (bicycle, e-scooter, and the car). A roundabout is
+    # implicitly
     # one-way unless an explicit false `oneway` overrides it; `junction=circular`
     # is not implicitly directional and follows its explicit `oneway`. A
     # dismounted cyclist is pedestrian-like and, like walking, ignores oneway.
     oneway = row.get("oneway")
     junction = row.get("junction")
-    forced_oneway = junction == "roundabout" and oneway not in _FALSE_ONEWAY
+    # Roundabouts and motorway carriageways are implicitly one-way; only
+    # an explicit false `oneway` opens them.
+    forced_oneway = (
+        junction == "roundabout" or highway == "motorway"
+    ) and oneway not in _FALSE_ONEWAY
     reversed_oneway = oneway == "-1"
     is_oneway = oneway in ("yes", "true", "1") or reversed_oneway or forced_oneway
+    # Cars follow the base one-way strictly — no contraflow grants of
+    # any kind.
+    car_oneway = is_oneway
+    car_forward = car_ok
+    car_reverse = car_ok
+    if car_oneway:
+        if reversed_oneway:
+            car_forward = False
+        else:
+            car_reverse = False
 
     bike_forward = bike_ok
     bike_reverse = bike_ok
@@ -349,14 +409,17 @@ def _row_permissions(row):
         (WALK if foot_ok else 0)
         | (BICYCLE if bike_forward else 0)
         | (E_SCOOTER if bike_forward else 0)
+        | (CAR if car_forward else 0)
     )
     reverse = (
         (WALK if foot_ok else 0)
         | (BICYCLE if bike_reverse else 0)
         | (E_SCOOTER if bike_reverse else 0)
+        | (CAR if car_reverse else 0)
     )
     flags = FLAG_DISMOUNT if dismount else 0
-    return forward, reverse, flags, (foot_unknown or bike_unknown), unknown_highway
+    unknown = foot_unknown or bike_unknown or car_unknown
+    return forward, reverse, flags, unknown, unknown_highway
 
 
 def edge_permissions(edges):
@@ -368,7 +431,8 @@ def edge_permissions(edges):
     e-scooter follow oneway and its cycling exceptions. Returns
     ``(access_forward, access_reverse, flags, diagnostics)`` where `diagnostics`
     counts edge rows carrying an unrecognised access-hierarchy value —
-    ``access``/``foot``/``vehicle``/``bicycle`` (`unknown_access`) — and rows
+    ``access``/``foot``/``vehicle``/``bicycle``/``motor_vehicle``/
+    ``motorcar`` (`unknown_access`) — and rows
     with an unmodelled ``highway`` value (`unknown_highway`); `flags`
     OR-combines with `normalise_codes`' class flags.
     """
@@ -380,6 +444,8 @@ def edge_permissions(edges):
             "foot",
             "bicycle",
             "vehicle",
+            "motor_vehicle",
+            "motorcar",
             "oneway",
             "oneway:bicycle",
             "junction",
@@ -413,28 +479,295 @@ def edge_permissions(edges):
     return forward, reverse, flags, diagnostics
 
 
+# --- Car speeds ---------------------------------------------------------------
+
+_MPH_TO_KMH = 1.609344
+
+_AREA_INVARIANT_SPEED = frozenset({"living_street", "service"})
+"""Classes whose legal default does not vary between urban and rural."""
+
+_EXTRA_CLASS_SPEEDS = {"track": 20}
+"""Low-speed classes the vendored table does not carry: product defaults
+in km/h, area-invariant, overridable through ``speed_limits=``."""
+
+
+def parse_maxspeed(value):
+    """km/h from a ``maxspeed`` tag value, or ``None`` where no numeric
+    limit is stated.
+
+    A bare number is km/h; ``NN mph`` converts. Everything else —
+    ``none``, ``signals``, ``walk``, zone names, garbage — yields ``None``
+    so the class default applies, never infinity.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text.endswith("mph"):
+        text, factor = text[:-3].strip(), _MPH_TO_KMH
+    else:
+        factor = 1.0
+    try:
+        parsed = float(text)
+    except ValueError:
+        return None
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed * factor
+
+
+def speed_limit_row(country=None):
+    """The legal-default speed row for a `country` selector.
+
+    `country` is ISO 3166-1 alpha-2 (``"FI"``) or, where the vendored
+    table carries subdivision rows, ISO 3166-2 (``"US-CA"``). The
+    fallback chain is subdivision row → the country's generic row → the
+    table's Generic row; ``None`` selects Generic with a warning naming
+    the option, and a code the table does not carry warns as it falls
+    back.
+    """
+    from cafein._speed_limits import SPEED_LIMITS
+
+    if country is None:
+        warnings.warn(
+            "no country= given; using the Generic legal default speed "
+            "limits for untagged ways",
+            UserWarning,
+            stacklevel=3,
+        )
+        return SPEED_LIMITS[""]
+    code = str(country).strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}(-[A-Z0-9]{1,3})?", code):
+        raise ValueError(
+            f"country must be an ISO 3166-1 alpha-2 or ISO 3166-2 code, "
+            f"not {country!r}"
+        )
+    for key in (code, code.split("-")[0]):
+        if key in SPEED_LIMITS:
+            return SPEED_LIMITS[key]
+    warnings.warn(
+        f"no legal default speed limits for '{code}'; using the Generic row",
+        UserWarning,
+        stacklevel=3,
+    )
+    return SPEED_LIMITS[""]
+
+
+def _class_speed(row, highway, inside):
+    """The row's km/h default for a highway class, urban or rural."""
+    if highway in _AREA_INVARIANT_SPEED or highway in _EXTRA_CLASS_SPEEDS:
+        value = row.get(highway)
+        if value is None:
+            value = _EXTRA_CLASS_SPEEDS.get(highway)
+        if value is not None:
+            return value
+    elif highway is not None and highway.endswith("_link"):
+        value = row.get(highway)
+        if value is not None:
+            return value
+        highway = highway[:-5]
+    suffix = "_inside" if inside else "_outside"
+    value = row.get(f"{highway}{suffix}") if highway is not None else None
+    if value is not None:
+        return value
+    return row[f"other{suffix}"]
+
+
+def _inside_urban_areas(edges, urban_areas):
+    """Per-edge urban membership by spatial join against area polygons."""
+    import geopandas as gpd
+
+    crs = getattr(edges.geometry, "crs", None) or "EPSG:4326"
+    if urban_areas.crs is None:
+        raise ValueError("urban_areas must carry a CRS")
+    frame = gpd.GeoDataFrame(geometry=edges.geometry.reset_index(drop=True), crs=crs)
+    joined = frame.sjoin(urban_areas[["geometry"]].to_crs(crs), how="left")
+    inside = joined.groupby(level=0)["index_right"].first().notna()
+    return inside.reindex(range(len(frame)), fill_value=False).to_numpy()
+
+
+def _validated_speed_limits(speed_limits):
+    """The override mapping checked against the known class columns."""
+    from cafein._speed_limits import SPEED_LIMITS
+
+    known = set(_EXTRA_CLASS_SPEEDS)
+    for row in SPEED_LIMITS.values():
+        known.update(row)
+    overrides = dict(speed_limits)
+    unknown = sorted(set(overrides) - known)
+    if unknown:
+        raise ValueError(
+            "unknown speed_limits classes: " + ", ".join(map(str, unknown))
+        )
+    for key, value in overrides.items():
+        if (
+            not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"speed_limits[{key!r}] must be a positive km/h number")
+    return overrides
+
+
+def car_speeds(edges, country=None, urban=None, speed_limits=None):
+    """Per-edge (forward_kmh, reverse_kmh) car speeds.
+
+    Per direction: the parsed ``maxspeed:forward``/``:backward``, else the
+    parsed ``maxspeed``, else the legal default for the way's class from
+    the `country` row. `urban` picks the urban or rural default: a
+    polygon GeoDataFrame resolves per edge by spatial join, a per-edge
+    boolean array is taken as given, and ``None`` treats every way as
+    urban — the conservative default for city-scale extracts, as the
+    docs state. `speed_limits` layers user overrides (class column →
+    km/h) over the resolved country row.
+    """
+    row = speed_limit_row(country)
+    if speed_limits is not None:
+        row = {**row, **_validated_speed_limits(speed_limits)}
+    highway = _column(edges, "highway")
+    base = _column(edges, "maxspeed")
+    forward_tag = _column(edges, "maxspeed:forward")
+    backward_tag = _column(edges, "maxspeed:backward")
+    n = len(edges)
+    if urban is None:
+        inside = np.ones(n, dtype=bool)
+    elif hasattr(urban, "geometry"):
+        inside = _inside_urban_areas(edges, urban)
+    else:
+        inside = np.asarray(urban, dtype=bool)
+        if inside.shape != (n,):
+            raise ValueError("urban must be a boolean value per edge")
+    forward = np.empty(n, dtype=np.float64)
+    reverse = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        tagged = parse_maxspeed(base[i])
+        default = None
+        for target, directional in ((forward, forward_tag), (reverse, backward_tag)):
+            speed = parse_maxspeed(directional[i])
+            if speed is None:
+                speed = tagged
+            if speed is None:
+                if default is None:
+                    default = float(_class_speed(row, highway[i], bool(inside[i])))
+                speed = default
+            target[i] = speed
+    return forward, reverse
+
+
+# --- Junction delay classes ---------------------------------------------------
+
+JUNCTION_UNCONTROLLED = 1
+JUNCTION_PRIORITY = 2
+JUNCTION_SIGNALS = 3
+"""The car delay table's junction classes (0 = no crossing delay):
+signalized (`highway=traffic_signals`), priority-controlled
+(`highway=stop`/`give_way`), and plain intersections of drivable ways."""
+
+_PRIORITY_NODE = frozenset({"stop", "give_way"})
+
+
+def junction_delay_classes(
+    node_tags, u, v, way_ids, access_forward, access_reverse, vertex_count
+):
+    """Per-edge (forward_head, reverse_head) junction classes, u8.
+
+    ``forward_head[e]`` is the class charged when a car traverses edge
+    ``e`` along its stored geometry and crosses the junction at its head
+    (``v[e]``); ``reverse_head[e]`` covers the opposite traversal into
+    ``u[e]``. Signals charge every approach; a plain intersection —
+    three or more distinct drivable approaches, no control tag — does
+    too. `stop`/`give_way` associate by way membership: a node lying on
+    exactly one drivable way charges that way's approaches only,
+    honouring the node's ``direction=forward/backward`` (relative to
+    that way's stored geometry); a node shared by several ways charges
+    every approach — the conservative reading of ambiguous mapping.
+    Whether a traversal is charged at all (trip endpoints never are) is
+    the routing engine's rule; these arrays only say which crossings
+    carry which class.
+    """
+    u = np.asarray(u)
+    v = np.asarray(v)
+    way_ids = np.asarray(way_ids)
+    car = ((np.asarray(access_forward) | np.asarray(access_reverse)) & CAR) != 0
+    degree = np.zeros(vertex_count, dtype=np.int64)
+    np.add.at(degree, u[car], 1)
+    np.add.at(degree, v[car], 1)
+
+    node_class = np.zeros(vertex_count, dtype=np.uint8)
+    node_class[degree >= 3] = JUNCTION_UNCONTROLLED
+    priority = {}
+    for index, tags in enumerate(node_tags):
+        if not isinstance(tags, dict):
+            continue
+        kind = tags.get("highway")
+        if kind == "traffic_signals":
+            node_class[index] = JUNCTION_SIGNALS
+        elif kind in _PRIORITY_NODE:
+            node_class[index] = JUNCTION_PRIORITY
+            priority[index] = tags
+
+    forward_head = node_class[v].copy()
+    reverse_head = node_class[u].copy()
+    if not priority:
+        return forward_head, reverse_head
+    # One pass builds the priority nodes' incident approaches, so each
+    # node reads its own edges rather than scanning them all.
+    heads = {node: [] for node in priority}
+    tails = {node: [] for node in priority}
+    for e in range(len(u)):
+        into = heads.get(int(v[e]))
+        if into is not None:
+            into.append(e)
+        out = tails.get(int(u[e]))
+        if out is not None:
+            out.append(e)
+    for node, tags in priority.items():
+        drivable = {int(way_ids[e]) for e in heads[node] + tails[node] if car[e]}
+        if len(drivable) != 1:
+            # Shared by several ways (or carless): every approach stays
+            # charged, the conservative reading of ambiguous mapping.
+            continue
+        (way,) = drivable
+        direction = {"forward": 1, "backward": -1}.get(tags.get("direction"), 0)
+        for e in heads[node]:
+            if way_ids[e] != way or direction == -1:
+                forward_head[e] = 0
+        for e in tails[node]:
+            if way_ids[e] != way or direction == 1:
+                reverse_head[e] = 0
+    return forward_head, reverse_head
+
+
 # --- Union extraction filter -------------------------------------------------
 
 _EXCLUDED_HIGHWAY = [
     "abandoned",
     "construction",
     "motor",
-    "motorway",
-    "motorway_link",
     "proposed",
     "raceway",
 ]
-"""Highway values no street mode we model may use: motor-only and unbuilt."""
+"""Highway values no street mode may use: unbuilt or unmodelled ways."""
 
-_UNION_FILTER = {
-    "area": ["yes", "true", "1"],
-    "highway": _EXCLUDED_HIGHWAY,
-    "service": ["private"],
-}
-"""The broad exclusion filter: motor-only or unbuilt ways, ways mapped as
-areas, and private service ways. Everything else — stairs, footways, paths,
-pedestrian streets, platforms, cycleways, tracks, ordinary roads — is retained,
-and the per-mode permission compiler decides who may use each."""
+_MOTOR_ONLY_HIGHWAY = ["motorway", "motorway_link"]
+"""Highway values only the car mode may use: excluded from the extraction
+unless a car build asks for them."""
+
+
+def union_filter(car=False):
+    """The broad exclusion filter: unbuilt ways, ways mapped as areas, and
+    private service ways — plus the motor-only classes unless a car build
+    keeps them. Everything else — stairs, footways, paths, pedestrian
+    streets, platforms, cycleways, tracks, ordinary roads — is retained, and
+    the per-mode permission compiler decides who may use each."""
+    excluded = list(_EXCLUDED_HIGHWAY)
+    if not car:
+        excluded += _MOTOR_ONLY_HIGHWAY
+    return {
+        "area": ["yes", "true", "1"],
+        "highway": excluded,
+        "service": ["private"],
+    }
+
 
 _EXTRA_ATTRIBUTES = [
     "vehicle",
@@ -453,18 +786,25 @@ _EXTRA_ATTRIBUTES = [
     "oneway:bicycle",
     "junction",
     "segregated",
+    # The car chain and its speeds.
+    "motor_vehicle",
+    "motorcar",
+    "maxspeed",
+    "maxspeed:forward",
+    "maxspeed:backward",
 ]
 """Tags cafein needs kept on the extracted ways; the first block is not in
 pyrosm's default highway columns, the second is requested defensively."""
 
 
-def union_network(osm_pbf, bounding_box=None):
+def union_network(osm_pbf, bounding_box=None, car=False):
     """The union street network of a PBF extract, as (nodes, edges).
 
     One `pyrosm` pass over the broadly-filtered network with the multimodal
     tags retained. Unlike `streets._walking_network`, no mode is filtered out
     here; connectivity is pruned per mode afterwards by
-    `prune_components_per_profile`.
+    `prune_components_per_profile`. A car build (`car=True`) keeps the
+    motor-only highway classes in the extraction.
     """
     osm = pyrosm.OSM(
         str(osm_pbf),
@@ -474,7 +814,7 @@ def union_network(osm_pbf, bounding_box=None):
     )
     network = osm.get_network(
         network_type="all",
-        custom_filter=_UNION_FILTER,
+        custom_filter=union_filter(car=car),
         filter_type="exclude",
         extra_attributes=_EXTRA_ATTRIBUTES,
         nodes=True,

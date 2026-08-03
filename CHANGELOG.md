@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Groundwork for **realistic car routing** (the car arc's driving
+  graph): the OSM permission compiler gains the ``car`` mode —
+  resolved down the ``access → vehicle → motor_vehicle → motorcar``
+  hierarchy with the house deny-unknown semantics, strict one-way
+  (roundabouts and motorway carriageways implied, no contraflow
+  grants), and the motor-only highway classes entering the
+  extraction only when a car build requests them. Beside it: a
+  ``maxspeed`` parser (numeric km/h, ``mph``, anything else falls to
+  the class default, never infinity), world-covering per-country
+  legal default speed limits for untagged ways (the prototype's
+  OSM-wiki compilation — 48 ISO-addressable countries with BE/CA/US
+  subdivision rows, urban and rural values per class, a Generic
+  fallback —
+  selected by an ISO ``country=`` code with a pinned fallback chain,
+  urban membership by polygon spatial join), and the junction delay
+  classes for the coming crossing-delay model (signalized,
+  priority-controlled with way-and-direction association, plain
+  intersections). Compiler-level only; the car routing engine and
+  its matrices land in the next slices.
+
 - ``fare_frontier`` **samples the departure window**:
   ``departure_step`` (default 60 seconds) rasterises the window
   exactly as R5 does — every reported journey is real and waits from

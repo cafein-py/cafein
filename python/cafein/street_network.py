@@ -48,9 +48,11 @@ class StreetNetwork:
             Path to an ``.osm.pbf`` extract.
         modes : iterable of str
             The modes to prune connectivity for, from ``walk``, ``bicycle``,
-            and ``e_scooter``. This selects pruning only — every physical edge
-            is kept whatever is listed — so a mode left out can still be routed
-            later, just without its small-component pruning.
+            ``e_scooter``, and ``car``. Listing ``car`` also keeps the
+            motor-only highway classes (motorways) in the extraction;
+            otherwise the selection changes pruning only — every physical
+            edge is kept whatever is listed, so a mode left out can still
+            be routed later, just without its small-component pruning.
         bounding_box : sequence of float, optional
             ``(min_lon, min_lat, max_lon, max_lat)`` to clip the extract.
         dem : path, sequence of paths, or callable, optional
@@ -198,7 +200,9 @@ def multimodal_payload(
     so both install the identical multimodal graph from the same inputs.
     """
     modes = tuple(modes)
-    nodes, edges = _osm.union_network(osm_pbf, bounding_box=bounding_box)
+    nodes, edges = _osm.union_network(
+        osm_pbf, bounding_box=bounding_box, car="car" in modes
+    )
     if edges.empty:
         raise ValueError(f"no routable ways in '{osm_pbf}'")
     nodes = nodes.reset_index(drop=True)
