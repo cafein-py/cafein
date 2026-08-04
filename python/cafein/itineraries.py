@@ -217,6 +217,13 @@ class DetailedItineraries(gpd.GeoDataFrame):
         model under ``profile=`` (``"rush"``, ``"midday"`` — the
         default — or ``"day-average"``) with ``delay_model=`` partial
         overrides, as in ``StreetNetwork.travel_time``.
+    parking : optional
+        Car legs only, off by default. The parking search ending each
+        leg (``True`` → 300 s / 0 m, a number → seconds, a
+        ``(seconds, metres)`` pair, or a per-area polygon GeoDataFrame),
+        as in ``StreetNetwork.travel_time``: the seconds join the leg's
+        travel time and arrival, the metres its driven distance and
+        emissions basis; the leg geometry never shows the search loop.
     street_policy : StreetLegPolicy (optional)
         Which street modes may serve the access and egress, on what
         vehicle terms (``cafein.StreetLegPolicy``); point origins and
@@ -294,6 +301,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         intersection_delays=False,
         profile=None,
         delay_model=None,
+        parking=None,
     ):
         # Before the reconstruction guard below: a StreetNetwork has no
         # `route_between_stops` either, so it would be mistaken for frame data.
@@ -319,6 +327,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
                     intersection_delays=intersection_delays,
                     profile=profile,
                     delay_model=delay_model,
+                    parking=parking,
                     transit_only={
                         "date": date,
                         "slack_seconds": slack_seconds,
@@ -352,10 +361,15 @@ class DetailedItineraries(gpd.GeoDataFrame):
             )
         if max_street_time is not None:
             raise ValueError("max_street_time applies to a StreetNetwork")
-        if intersection_delays or profile is not None or delay_model is not None:
+        if (
+            intersection_delays
+            or profile is not None
+            or delay_model is not None
+            or parking is not None
+        ):
             raise ValueError(
-                "intersection_delays, profile, and delay_model apply to a "
-                "StreetNetwork car query"
+                "intersection_delays, profile, delay_model, and parking "
+                "apply to a StreetNetwork car query"
             )
         frame = _itineraries_frame(
             network,
@@ -898,12 +912,14 @@ def _street_itineraries_frame(
     intersection_delays=False,
     profile=None,
     delay_model=None,
+    parking=None,
 ):
     """Street routes as one leg per reachable pair."""
-    from cafein import emissions
+    from cafein import _parking, emissions
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
     from cafein.street_network import _resolved_delays
 
+    resolved_parking = _parking.resolve(parking, transport_mode)
     query = _street_query(
         origins,
         destinations,
@@ -924,10 +940,26 @@ def _street_itineraries_frame(
             transport_mode, intersection_delays, profile, delay_model
         ),
     )
-    _warn_unsnapped(table, query.from_ids, query.to_ids)
+    _warn_unsnapped(
+        table,
+        query.from_ids,
+        query.to_ids,
+        network=f"the streets the {transport_mode} profile can use",
+    )
     from_ids = np.asarray(query.from_ids, dtype=object)
     to_ids = np.asarray(query.to_ids, dtype=object)
     travel_time = table["travel_time_s"]
+    network_distance = table["network_distance"]
+    if resolved_parking is not None:
+        # The parking search ends each leg: seconds join the travel time
+        # (and through it the arrival), metres the driven distance and the
+        # emissions basis; the leg geometry never shows the search loop.
+        seconds, metres = _parking.destination_costs(
+            resolved_parking, query.destination_points
+        )
+        to_index = np.asarray(table["to"])
+        travel_time = travel_time + np.rint(seconds[to_index]).astype(np.int64)
+        network_distance = network_distance + metres[to_index]
     rows = len(travel_time)
     # A street network has no timetable, so absolute times exist only when a
     # departure is supplied to place the leg on a clock.
@@ -941,7 +973,6 @@ def _street_itineraries_frame(
         arrivals = pd.array(
             np.asarray(travel_time, dtype=np.int64) + start, dtype="Int64"
         )
-    network_distance = table["network_distance"]
     connector_distance = table["connector_distance"]
     frame = pd.DataFrame(
         {

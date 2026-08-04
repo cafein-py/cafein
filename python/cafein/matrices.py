@@ -168,6 +168,18 @@ class TravelCostMatrix(pd.DataFrame):
         ``"day-average"``), with ``delay_model=`` merging partial
         overrides over the shipped values, as in
         ``StreetNetwork.travel_time``.
+    parking : optional
+        Car matrices only, off by default. The parking search ending
+        each reachable trip, per destination cell: ``True`` → the
+        shipped constant (300 s, 0 m), a number → seconds, a
+        ``(seconds, metres)`` pair, or a polygon GeoDataFrame with a
+        ``seconds`` column (optional ``metres``) resolved by
+        point-in-polygon (largest seconds, ties by largest metres then
+        lowest row; outside every polygon the shipped constant). The
+        seconds join ``travel_time_s`` and the metres join the driven
+        network distance and the emissions basis; geometry never shows
+        the search loop, and ``max_street_time`` bounds the driving
+        alone.
 
     ``street_policy=`` (a ``cafein.StreetLegPolicy``) opens the access
     and egress to the policy's street modes over the multimodal graph
@@ -233,6 +245,7 @@ class TravelCostMatrix(pd.DataFrame):
         intersection_delays=False,
         profile=None,
         delay_model=None,
+        parking=None,
     ):
         if _is_street_network(network):
             data = _street_cost_columns(
@@ -249,6 +262,7 @@ class TravelCostMatrix(pd.DataFrame):
                 intersection_delays=intersection_delays,
                 profile=profile,
                 delay_model=delay_model,
+                parking=parking,
                 transit_only={
                     "date": date,
                     "departure": departure,
@@ -277,10 +291,15 @@ class TravelCostMatrix(pd.DataFrame):
             )
         if max_street_time is not None:
             raise ValueError("max_street_time applies to a StreetNetwork matrix")
-        if intersection_delays or profile is not None or delay_model is not None:
+        if (
+            intersection_delays
+            or profile is not None
+            or delay_model is not None
+            or parking is not None
+        ):
             raise ValueError(
-                "intersection_delays, profile, and delay_model apply to a "
-                "StreetNetwork car matrix"
+                "intersection_delays, profile, delay_model, and parking "
+                "apply to a StreetNetwork car matrix"
             )
         if street_policy is not None:
             offending = next(
@@ -457,7 +476,8 @@ class TravelTimeMatrix(pd.DataFrame):
     ``"e_scooter"``, or ``"car"``), bounded by ``max_street_time``. Car
     cells are free-flow by default; ``intersection_delays=True`` with
     ``profile=`` and ``delay_model=`` applies the intersection-delay
-    model, as in ``StreetNetwork.travel_time``. It needs no
+    model, and ``parking=`` adds each destination's parking search
+    seconds, as in ``StreetNetwork.travel_time``. It needs no
     timetable, so ``date`` and ``departure`` do not apply, and the
     arguments that only mean something to a timetable — ``max_transfers``,
     ``router``, the departure-window percentiles, the transit exclusions,
@@ -569,6 +589,7 @@ class TravelTimeMatrix(pd.DataFrame):
         intersection_delays=False,
         profile=None,
         delay_model=None,
+        parking=None,
     ):
         if _is_street_network(network):
             data = _street_time_columns(
@@ -582,6 +603,7 @@ class TravelTimeMatrix(pd.DataFrame):
                 intersection_delays=intersection_delays,
                 profile=profile,
                 delay_model=delay_model,
+                parking=parking,
                 transit_only={
                     "date": date,
                     "departure": departure,
@@ -608,10 +630,15 @@ class TravelTimeMatrix(pd.DataFrame):
             )
         if max_street_time is not None:
             raise ValueError("max_street_time applies to a StreetNetwork matrix")
-        if intersection_delays or profile is not None or delay_model is not None:
+        if (
+            intersection_delays
+            or profile is not None
+            or delay_model is not None
+            or parking is not None
+        ):
             raise ValueError(
-                "intersection_delays, profile, and delay_model apply to a "
-                "StreetNetwork car matrix"
+                "intersection_delays, profile, delay_model, and parking "
+                "apply to a StreetNetwork car matrix"
             )
         if street_policy is not None:
             rejected = {
@@ -829,12 +856,14 @@ def _street_cost_columns(
     intersection_delays=False,
     profile=None,
     delay_model=None,
+    parking=None,
 ):
     """The reachable cells of a street cost matrix, in long format."""
-    from cafein import emissions
+    from cafein import _parking, emissions
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
     from cafein.street_network import _resolved_delays
 
+    resolved_parking = _parking.resolve(parking, transport_mode)
     query = _street_query(
         origins,
         destinations,
@@ -855,15 +884,31 @@ def _street_cost_columns(
             transport_mode, intersection_delays, profile, delay_model
         ),
     )
-    _warn_unsnapped(table, query.from_ids, query.to_ids)
+    _warn_unsnapped(
+        table,
+        query.from_ids,
+        query.to_ids,
+        network=f"the streets the {transport_mode} profile can use",
+    )
     from_ids = np.asarray(query.from_ids, dtype=object)
     to_ids = np.asarray(query.to_ids, dtype=object)
     network_distance = table["network_distance"]
     connector_distance = table["connector_distance"]
+    travel_time_s = table["travel_time_s"]
+    if resolved_parking is not None:
+        # The parking search ends each reachable trip: its seconds join the
+        # travel time and its metres the driven network distance (and with
+        # it the emissions basis); the geometry never shows the search loop.
+        seconds, metres = _parking.destination_costs(
+            resolved_parking, query.destination_points
+        )
+        to_index = np.asarray(table["to"])
+        travel_time_s = travel_time_s + np.rint(seconds[to_index]).astype(np.int64)
+        network_distance = network_distance + metres[to_index]
     data = {
         "from_id": from_ids[table["from"]],
         "to_id": to_ids[table["to"]],
-        "travel_time_s": table["travel_time_s"],
+        "travel_time_s": travel_time_s,
         # Reported alongside its parts, not instead of them: the two are
         # measured differently (stored edge lengths versus straight connectors).
         "distance_m": network_distance + connector_distance,
@@ -896,10 +941,13 @@ def _street_time_columns(
     intersection_delays=False,
     profile=None,
     delay_model=None,
+    parking=None,
 ):
     """The reachable cells of a street travel-time matrix, in long format."""
+    from cafein import _parking
     from cafein.street_network import _resolved_delays
 
+    resolved_parking = _parking.resolve(parking, transport_mode)
     query = _street_query(
         origins,
         destinations,
@@ -920,15 +968,27 @@ def _street_time_columns(
             transport_mode, intersection_delays, profile, delay_model
         ),
     )
-    _warn_unsnapped(table, from_ids, to_ids)
+    _warn_unsnapped(
+        table,
+        from_ids,
+        to_ids,
+        network=f"the streets the {transport_mode} profile can use",
+    )
     matrix = table["matrix"]
     from_ids = np.asarray(from_ids, dtype=object)
     to_ids = np.asarray(to_ids, dtype=object)
     rows, columns = np.nonzero(matrix != np.iinfo(np.uint32).max)
+    travel_time_s = matrix[rows, columns]
+    if resolved_parking is not None:
+        # Parking seconds join every reachable cell by its destination.
+        seconds, _ = _parking.destination_costs(
+            resolved_parking, query.destination_points
+        )
+        travel_time_s = travel_time_s + np.rint(seconds[columns]).astype(np.int64)
     return {
         "from_id": from_ids[rows],
         "to_id": to_ids[columns],
-        "travel_time_s": matrix[rows, columns],
+        "travel_time_s": travel_time_s,
     }
 
 
@@ -1271,8 +1331,14 @@ def _point_list(frame, role):
     return ids, list(zip(geometry.y, geometry.x))
 
 
-def _warn_unsnapped(table, from_ids, to_ids):
-    """Warn about points off the walking network, naming the first few."""
+def _warn_unsnapped(table, from_ids, to_ids, network="the walking network"):
+    """Warn about points the routed profile cannot snap, naming a few.
+
+    Snapping is profile-specific — the same coordinate can be on the
+    walking network yet off the streets the routed mode may use — so the
+    street matrices name the routed mode's network instead of the
+    walking default the transit paths keep.
+    """
     for key, ids, side in (
         ("unsnapped_from", from_ids, "origin"),
         ("unsnapped_to", to_ids, "destination"),
@@ -1283,7 +1349,7 @@ def _warn_unsnapped(table, from_ids, to_ids):
         named = ", ".join(str(ids[index]) for index in missed[:5])
         suffix = ", …" if len(missed) > 5 else ""
         warnings.warn(
-            f"{len(missed)} {side} point(s) are off the walking network "
+            f"{len(missed)} {side} point(s) are off {network} "
             f"and unreachable ({named}{suffix})",
             stacklevel=3,
         )

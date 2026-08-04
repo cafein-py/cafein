@@ -193,6 +193,7 @@ class StreetNetwork:
         intersection_delays=False,
         profile=None,
         delay_model=None,
+        parking=None,
     ):
         """Travel time in whole seconds from `origin` to `destination`.
 
@@ -220,6 +221,17 @@ class StreetNetwork:
             ``groups``, ``ramp_multipliers``, ``congestion_multipliers``,
             ``ramp_shares``), merged over them entry by entry. Requires
             ``intersection_delays=True``.
+        parking : optional
+            Car only, off by default. The parking search ending a car trip,
+            costed as time (and, in the richer forms, extra driving
+            metres): ``True`` → the shipped constant (300 s, 0 m), a
+            number → that many seconds, a ``(seconds, metres)`` pair, or a
+            polygon GeoDataFrame with a ``seconds`` column (optional
+            ``metres``) resolved per destination by point-in-polygon — a
+            destination inside several polygons takes the largest seconds
+            (ties: largest metres, then lowest row), outside every polygon
+            the shipped constant. Parking adds after the driving search:
+            `max_time` bounds the driving alone.
 
         Returns
         -------
@@ -227,14 +239,24 @@ class StreetNetwork:
             Seconds, or ``None`` when the destination is not reachable within
             `max_time`.
         """
-        return self._core.travel_time(
-            tuple(origin),
-            tuple(destination),
+        from . import _parking
+
+        resolved = _parking.resolve(parking, mode)
+        # Materialized once: the routed pair and the parking lookup must see
+        # the same coordinates even if a mutable input changes mid-call.
+        origin, destination = tuple(origin), tuple(destination)
+        seconds = self._core.travel_time(
+            origin,
+            destination,
             mode,
             float(max_time),
             float(max_snap_distance),
             car_model=_resolved_delays(mode, intersection_delays, profile, delay_model),
         )
+        if seconds is None or resolved is None:
+            return seconds
+        extra, _ = _parking.destination_costs(resolved, [destination])
+        return int(seconds + round(float(extra[0])))
 
     def __repr__(self):
         return f"StreetNetwork({self.vertex_count} vertices, {self.edge_count} edges)"
