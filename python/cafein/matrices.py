@@ -155,8 +155,9 @@ class TravelCostMatrix(pd.DataFrame):
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
         one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
-        ``"car"`` (a car build; emissions resolve through ``factors=``
-        rows or stay NaN until the shipped car factors land).
+        ``"car"`` (a car build; the shipped per-powertrain factors price
+        emissions with ICE as the default class, and ``factors=`` rows
+        still win).
     max_street_time : float (optional)
         Cutoff in seconds for a ``StreetNetwork`` matrix (default:
         ``cafein.street_network.MAX_STREET_TIME``, 7200).
@@ -180,6 +181,14 @@ class TravelCostMatrix(pd.DataFrame):
         network distance and the emissions basis; geometry never shows
         the search loop, and ``max_street_time`` bounds the driving
         alone.
+    occupancy, vehicle_class : optional
+        Car matrices only. The shipped car factors are per
+        vehicle-kilometre by powertrain (GEMMAT Table 4, Finland's
+        energy mix; the default class is ``"ICE"``): ``vehicle_class=``
+        selects ``"HEV"``, ``"PHEV"``, ``"BEV"``, ``"FCEV"``, or a user
+        row's class, and ``occupancy=`` (at least 1, default 1) divides
+        the per-vehicle emissions across the persons carried — the
+        factors themselves are never rescaled.
 
     ``street_policy=`` (a ``cafein.StreetLegPolicy``) opens the access
     and egress to the policy's street modes over the multimodal graph
@@ -246,6 +255,8 @@ class TravelCostMatrix(pd.DataFrame):
         profile=None,
         delay_model=None,
         parking=None,
+        occupancy=None,
+        vehicle_class=None,
     ):
         if _is_street_network(network):
             data = _street_cost_columns(
@@ -263,6 +274,8 @@ class TravelCostMatrix(pd.DataFrame):
                 profile=profile,
                 delay_model=delay_model,
                 parking=parking,
+                occupancy=occupancy,
+                vehicle_class=vehicle_class,
                 transit_only={
                     "date": date,
                     "departure": departure,
@@ -296,10 +309,13 @@ class TravelCostMatrix(pd.DataFrame):
             or profile is not None
             or delay_model is not None
             or parking is not None
+            or occupancy is not None
+            or vehicle_class is not None
         ):
             raise ValueError(
-                "intersection_delays, profile, delay_model, and parking "
-                "apply to a StreetNetwork car matrix"
+                "intersection_delays, profile, delay_model, parking, "
+                "occupancy, and vehicle_class apply to a StreetNetwork "
+                "car matrix"
             )
         if street_policy is not None:
             offending = next(
@@ -857,6 +873,8 @@ def _street_cost_columns(
     profile=None,
     delay_model=None,
     parking=None,
+    occupancy=None,
+    vehicle_class=None,
 ):
     """The reachable cells of a street cost matrix, in long format."""
     from cafein import _parking, emissions
@@ -864,6 +882,9 @@ def _street_cost_columns(
     from cafein.street_network import _resolved_delays
 
     resolved_parking = _parking.resolve(parking, transport_mode)
+    occupancy, vehicle_class = emissions._car_query_options(
+        transport_mode, occupancy, vehicle_class
+    )
     query = _street_query(
         origins,
         destinations,
@@ -872,6 +893,13 @@ def _street_cost_columns(
         max_snap_distance=max_snap_distance,
         chunk=chunk,
         transit_only=transit_only,
+    )
+    # Resolved after the argument validation but before the routing call:
+    # the factor the query started with is the one applied, whatever
+    # happens to a mutable `factors` frame while the search holds no GIL
+    # — and a bad table fails before the search pays for it.
+    factor = emissions.street_factor(
+        transport_mode, factors, components, vehicle_class=vehicle_class
     )
     table = network._core.cost_matrix(
         query.origin_points,
@@ -917,11 +945,11 @@ def _street_cost_columns(
         "distance_provenance": np.full(
             len(network_distance), STREET_DISTANCE_PROVENANCE, dtype=object
         ),
-        # One mode per matrix, so the factor resolves once; connectors are the
-        # walk to the vehicle, not vehicle-kilometres, so network metres only.
-        "emissions": network_distance
-        / 1000.0
-        * emissions.street_factor(transport_mode, factors, components),
+        # One mode per matrix, so the factor resolved once, above; the
+        # connectors are the walk to the vehicle, not vehicle-kilometres,
+        # so network metres only. The car's per-vehicle factor divides
+        # across the persons carried.
+        "emissions": network_distance / 1000.0 * factor / occupancy,
     }
     if geometries:
         data["geometry"] = shapely.from_wkb(np.array(table["geometry"], dtype=object))

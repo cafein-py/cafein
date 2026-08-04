@@ -238,29 +238,88 @@ def test_car_matrices_take_the_delay_options(car_network, origins, destinations)
         )
 
 
-def test_car_cost_matrix_reports_unresolved_emissions(
+def test_the_shipped_car_factors_are_gemmat_table_4():
+    from cafein import emissions
+
+    table = emissions.street_factors()
+    cars = table[table.street_mode == "car"].set_index("vehicle_class")
+    assert (cars.service_model == "private").all()
+    # GEMMAT Table 4 per vehicle-km: (vehicle, fuel, infrastructure) with
+    # zero operational services, and the published totals.
+    expected = {
+        "ICE": (24.0, 126.0, 12.0),
+        "HEV": (26.0, 94.0, 13.0),
+        "PHEV": (32.0, 43.0, 13.0),
+        "BEV": (42.0, 16.0, 12.0),
+        "FCEV": (38.0, 83.0, 13.0),
+    }
+    assert set(cars.index) == set(expected)
+    for vehicle_class, (vehicle, fuel, infrastructure) in expected.items():
+        row = cars.loc[vehicle_class]
+        assert (row.vehicle, row.fuel, row.infrastructure, row.operations) == (
+            vehicle,
+            fuel,
+            infrastructure,
+            0.0,
+        )
+    totals = {"ICE": 162.0, "HEV": 133.0, "PHEV": 88.0, "BEV": 70.0, "FCEV": 134.0}
+    for vehicle_class, total in totals.items():
+        assert emissions.street_factor("car", vehicle_class=vehicle_class) == total
+    # The default class is ICE.
+    assert emissions.street_factor("car") == 162.0
+
+
+def test_car_cost_matrix_resolves_emissions_by_class_and_occupancy(
     car_network, origins, destinations
 ):
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        matrix = TravelCostMatrix(
-            car_network, origins, destinations, transport_mode="car"
-        )
+    matrix = TravelCostMatrix(car_network, origins, destinations, transport_mode="car")
     assert len(matrix) > 0
     assert (matrix.distance_m > 0).all()
-    # No shipped car emission factor yet: unresolved, never silently zero.
-    assert matrix.emissions.isna().all()
-    assert any("emission" in str(warning.message) for warning in caught)
-    # A user-supplied factor row resolves it.
+    # The default powertrain is ICE at the driver-only occupancy.
+    assert np.allclose(matrix.emissions, matrix.network_distance_m / 1000.0 * 162.0)
+    bev = TravelCostMatrix(
+        car_network,
+        origins,
+        destinations,
+        transport_mode="car",
+        vehicle_class="BEV",
+    )
+    assert np.allclose(bev.emissions, bev.network_distance_m / 1000.0 * 70.0)
+    # Occupancy divides the per-vehicle emissions, never the factors.
+    for occupancy in (1.0, 1.6, 2.0, 4.0):
+        shared = TravelCostMatrix(
+            car_network,
+            origins,
+            destinations,
+            transport_mode="car",
+            occupancy=occupancy,
+        )
+        assert np.allclose(
+            shared.emissions,
+            shared.network_distance_m / 1000.0 * 162.0 / occupancy,
+        )
+    # Parking-search metres join the emissions basis before the division.
+    parked = TravelCostMatrix(
+        car_network,
+        origins,
+        destinations,
+        transport_mode="car",
+        parking=(60, 400.0),
+        occupancy=2.0,
+    )
+    assert np.allclose(
+        parked.emissions, parked.network_distance_m / 1000.0 * 162.0 / 2.0
+    )
+    # A user-supplied row still beats the shipped defaults.
     factors = pd.DataFrame(
         [
             {
                 "street_mode": "car",
                 "vehicle_class": "ICE",
                 "service_model": "private",
-                "vehicle": 30.0,
-                "fuel": 120.0,
-                "infrastructure": 10.0,
+                "vehicle": 10.0,
+                "fuel": 80.0,
+                "infrastructure": 8.0,
                 "operations": 2.0,
             }
         ]
@@ -268,8 +327,63 @@ def test_car_cost_matrix_reports_unresolved_emissions(
     priced = TravelCostMatrix(
         car_network, origins, destinations, transport_mode="car", factors=factors
     )
-    expected = priced.network_distance_m / 1000.0 * 162.0
-    assert np.allclose(priced.emissions, expected)
+    assert np.allclose(priced.emissions, priced.network_distance_m / 1000.0 * 100.0)
+
+
+def test_factor_validation_precedes_routing(
+    car_network, origins, destinations, monkeypatch
+):
+    # The emission configuration is resolved before the search runs, so a
+    # bad table fails fast and a mutable one cannot change mid-query.
+    class NoRouting:
+        def __getattr__(self, name):
+            raise AssertionError("routing ran before factor validation")
+
+    monkeypatch.setattr(car_network, "_core", NoRouting())
+    with pytest.raises(ValueError, match="component"):
+        TravelCostMatrix(
+            car_network,
+            origins,
+            destinations,
+            transport_mode="car",
+            components=["bogus"],
+        )
+
+
+def test_car_emission_options_are_guarded(car_network, origins, destinations):
+    for bad in ({"occupancy": 0}, {"occupancy": -1.0}, {"occupancy": float("nan")}):
+        with pytest.raises(ValueError, match="occupancy"):
+            TravelCostMatrix(
+                car_network, origins, destinations, transport_mode="car", **bad
+            )
+    with pytest.raises(ValueError, match="transport_mode='car'"):
+        TravelCostMatrix(
+            car_network,
+            origins,
+            destinations,
+            transport_mode="bicycle",
+            occupancy=2.0,
+        )
+    with pytest.raises(ValueError, match="transport_mode='car'"):
+        TravelCostMatrix(
+            car_network,
+            origins,
+            destinations,
+            transport_mode="walk",
+            vehicle_class="BEV",
+        )
+    # An unknown powertrain resolves nothing: unresolved, never zero.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        unknown = TravelCostMatrix(
+            car_network,
+            origins,
+            destinations,
+            transport_mode="car",
+            vehicle_class="DIESEL",
+        )
+    assert unknown.emissions.isna().all()
+    assert any("emission" in str(warning.message) for warning in caught)
 
 
 def test_car_itineraries_carry_geometry(car_network, origins, destinations):
@@ -283,6 +397,19 @@ def test_car_itineraries_carry_geometry(car_network, origins, destinations):
     assert len(legs) > 0
     assert (legs["mode"] == "car").all()
     assert legs.geometry.notna().all()
+    # The emission options ride the leg surface too.
+    shared_bev = DetailedItineraries(
+        car_network,
+        origins.head(2),
+        destinations.head(2),
+        transport_mode="car",
+        vehicle_class="BEV",
+        occupancy=2.0,
+    )
+    assert np.allclose(
+        shared_bev.emissions,
+        shared_bev.network_distance_m / 1000.0 * 70.0 / 2.0,
+    )
 
 
 def test_parking_is_off_by_default_and_adds_per_form(car_network):

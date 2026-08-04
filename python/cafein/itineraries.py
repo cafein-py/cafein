@@ -224,6 +224,12 @@ class DetailedItineraries(gpd.GeoDataFrame):
         as in ``StreetNetwork.travel_time``: the seconds join the leg's
         travel time and arrival, the metres its driven distance and
         emissions basis; the leg geometry never shows the search loop.
+    occupancy, vehicle_class : optional
+        Car legs only. ``vehicle_class=`` selects the powertrain of the
+        shipped per-vehicle-km car factors (GEMMAT Table 4; default
+        ``"ICE"``) and ``occupancy=`` (at least 1, default 1) divides
+        the per-vehicle emissions across the persons carried, as in
+        ``TravelCostMatrix``.
     street_policy : StreetLegPolicy (optional)
         Which street modes may serve the access and egress, on what
         vehicle terms (``cafein.StreetLegPolicy``); point origins and
@@ -302,6 +308,8 @@ class DetailedItineraries(gpd.GeoDataFrame):
         profile=None,
         delay_model=None,
         parking=None,
+        occupancy=None,
+        vehicle_class=None,
     ):
         # Before the reconstruction guard below: a StreetNetwork has no
         # `route_between_stops` either, so it would be mistaken for frame data.
@@ -328,6 +336,8 @@ class DetailedItineraries(gpd.GeoDataFrame):
                     profile=profile,
                     delay_model=delay_model,
                     parking=parking,
+                    occupancy=occupancy,
+                    vehicle_class=vehicle_class,
                     transit_only={
                         "date": date,
                         "slack_seconds": slack_seconds,
@@ -366,10 +376,13 @@ class DetailedItineraries(gpd.GeoDataFrame):
             or profile is not None
             or delay_model is not None
             or parking is not None
+            or occupancy is not None
+            or vehicle_class is not None
         ):
             raise ValueError(
-                "intersection_delays, profile, delay_model, and parking "
-                "apply to a StreetNetwork car query"
+                "intersection_delays, profile, delay_model, parking, "
+                "occupancy, and vehicle_class apply to a StreetNetwork "
+                "car query"
             )
         frame = _itineraries_frame(
             network,
@@ -913,6 +926,8 @@ def _street_itineraries_frame(
     profile=None,
     delay_model=None,
     parking=None,
+    occupancy=None,
+    vehicle_class=None,
 ):
     """Street routes as one leg per reachable pair."""
     from cafein import _parking, emissions
@@ -920,6 +935,9 @@ def _street_itineraries_frame(
     from cafein.street_network import _resolved_delays
 
     resolved_parking = _parking.resolve(parking, transport_mode)
+    occupancy, vehicle_class = emissions._car_query_options(
+        transport_mode, occupancy, vehicle_class
+    )
     query = _street_query(
         origins,
         destinations,
@@ -928,6 +946,11 @@ def _street_itineraries_frame(
         max_snap_distance=max_snap_distance,
         chunk=None,
         transit_only=transit_only,
+    )
+    # Resolved after the argument validation but before the routing call,
+    # exactly as the cost matrix does.
+    factor = emissions.street_factor(
+        transport_mode, factors, components, vehicle_class=vehicle_class
     )
     table = network._core.cost_matrix(
         query.origin_points,
@@ -996,9 +1019,9 @@ def _street_itineraries_frame(
             ),
             # Post-reconstruction annotation: network metres only — the
             # connectors are the walk to the vehicle, not vehicle-kilometres.
-            "emissions": network_distance
-            / 1000.0
-            * emissions.street_factor(transport_mode, factors, components),
+            # The car's per-vehicle factor (resolved above) divides
+            # across the persons carried.
+            "emissions": network_distance / 1000.0 * factor / occupancy,
         },
         columns=[column for column in STREET_COLUMNS if column != "geometry"],
     )

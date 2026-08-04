@@ -93,3 +93,32 @@ def test_mctbtr_window_profile_keeps_cleaner_earlier_journeys(network_with_footp
     transit = frontier[frontier["frontier"] & (frontier["rides"] >= 1)]
 
     assert transit["emissions"].min() == pytest.approx(cleanest, abs=1e-3)
+
+
+def test_factor_loaders_reject_infinities():
+    # Both factor loaders accepted +inf component values, which priced
+    # infinite emissions instead of failing loudly; NA stays the marker
+    # for an unresolved component.
+    import pandas as pd
+    import pytest
+
+    from cafein import emissions
+
+    street = pd.DataFrame(
+        [
+            {
+                "street_mode": "car",
+                "vehicle_class": "ICE",
+                "service_model": "private",
+                "vehicle": float("inf"),
+                "fuel": 0.0,
+                "infrastructure": 0.0,
+                "operations": 0.0,
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="non-finite"):
+        emissions.load_street_factors(street)
+    transit = pd.DataFrame([{"route_type": 3, "vehicle": float("inf")}])
+    with pytest.raises(ValueError, match="non-finite"):
+        emissions.load_factors(transit)
