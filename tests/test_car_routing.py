@@ -656,3 +656,27 @@ def test_transit_matrices_reject_the_delay_options(network):
 def test_the_car_never_serves_transit_access(multimodal_network):
     with pytest.raises(ValueError, match="street-only"):
         multimodal_network._core._street_access_seconds(60.1690, 24.9320, "car", 900.0)
+
+
+def test_parking_metres_join_the_cost_basis(car_network, origins, destinations):
+    plain = TravelCostMatrix(
+        car_network,
+        origins,
+        destinations,
+        transport_mode="car",
+        perspectives="private",
+    )
+    parked = TravelCostMatrix(
+        car_network,
+        origins,
+        destinations,
+        transport_mode="car",
+        perspectives="private",
+        parking=(60, 400.0),
+    )
+    merged = pd.merge(plain, parked, on=["from_id", "to_id"], suffixes=("", "_p"))
+    assert len(merged) == len(plain)
+    assert np.allclose(
+        merged.cost_private_p, merged.network_distance_m_p / 1000.0 * 0.250
+    )
+    assert np.allclose(merged.cost_private_p - merged.cost_private, 0.4 * 0.250)

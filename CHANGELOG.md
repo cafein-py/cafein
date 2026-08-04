@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **The monetary cost account** (``cafein.costs``): street matrices and
+  itineraries price the driven kilometres under two selectable
+  perspectives — a **separate account from fares, never summed with
+  them**. ``perspectives=`` adds ``cost_private`` (the
+  vehicle-operation bundle) and/or ``cost_societal`` (the external
+  cost) columns from the shipped Gössling et al. (2019, Table 2)
+  values: car 0.250 / +0.108, bicycle 0.047 / −0.184, walking
+  0.041 / −0.370 per km in 2017 euros, the car's societal account
+  fully component-resolved (climate through accidents, summing to
+  0.108) and the active-mode health benefits **reported signed, never
+  clamped**. Totals are always derived from components:
+  ``cost_components=`` (one perspective at a time) restricts the sum
+  and adds per-component columns, ``costs=`` layers a user table by
+  (perspective, street_mode, component) key with loud validation
+  (street-only rows, finite values, no duplicates), and ``currency=``
+  (default ``"EUR2017"``) is a declared label carried beside the
+  outputs, never a conversion. The basis is the driven network
+  distance including parking-search metres; the e-bike rides the
+  bicycle rows; a mode without a row (the e-scooter has none) prices
+  NaN with a warning, and transit surfaces reject the account loudly —
+  transit perspective costs are a recorded follow-up.
+
 - **Car emission factors ship**: the street factor table gains the five
   car powertrains of GEMMAT's Table 4 (Dey, Marín-Flores & Tenkanen
   2026 — the ITF LCA tool calibrated to Finland's energy mix) —
