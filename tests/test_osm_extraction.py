@@ -21,12 +21,32 @@ def test_mode_and_flag_bits_match_the_rust_abi():
         _osm.FLAG_STEPS,
         _osm.FLAG_SEGREGATED,
         _osm.FLAG_LIT,
-    ) == (1, 2, 4, 8, 16, 32, 64)
+        _osm.FLAG_ROUNDABOUT,
+    ) == (1, 2, 4, 8, 16, 32, 64, 128)
+    assert (
+        _osm.JUNCTION_TOPOLOGICAL,
+        _osm.JUNCTION_PRIORITY,
+        _osm.JUNCTION_SIGNALS,
+        _osm.JUNCTION_RAMP,
+    ) == (1, 2, 3, 4)
     assert (
         len(_osm.HIGHWAY_CODES),
         len(_osm.SURFACE_CODES),
         len(_osm.SMOOTHNESS_CODES),
     ) == (27, 17, 9)
+
+
+def test_normalise_codes_sets_the_roundabout_flag():
+    import pandas as pd
+
+    edges = pd.DataFrame(
+        {
+            "highway": ["residential", "residential", "residential"],
+            "junction": ["roundabout", "circular", None],
+        }
+    )
+    _, _, _, flags = _osm.normalise_codes(edges)
+    assert list(flags & _osm.FLAG_ROUNDABOUT) == [_osm.FLAG_ROUNDABOUT, 0, 0]
 
 
 def _perm(**tags):
@@ -550,19 +570,25 @@ def test_car_speeds_resolve_tags_then_country_defaults():
     from shapely.geometry import LineString, Polygon
 
     geo = gpd.GeoDataFrame(
-        {"highway": ["residential", "residential"]},
-        geometry=[LineString([(0, 0), (1, 0)]), LineString([(5, 5), (6, 5)])],
+        {"highway": ["residential", "residential", "residential"]},
+        geometry=[
+            LineString([(0, 0), (1, 0)]),
+            LineString([(5, 5), (6, 5)]),
+            # Crosses the polygon boundary: any intersection makes the
+            # whole edge urban.
+            LineString([(1, 1), (5, 1)]),
+        ],
         crs="EPSG:4326",
     )
     urban_areas = gpd.GeoDataFrame(
         geometry=[Polygon([(-1, -1), (2, -1), (2, 2), (-1, 2)])], crs="EPSG:4326"
     )
     forward, _ = _osm.car_speeds(geo, country="FI", urban=urban_areas)
-    assert list(forward) == pytest.approx([50.0, 80.0])
+    assert list(forward) == pytest.approx([50.0, 80.0, 50.0])
     # The join reprojects mismatched polygon CRSs onto the edges' own.
     projected = urban_areas.to_crs("EPSG:3067")
     forward, _ = _osm.car_speeds(geo, country="FI", urban=projected)
-    assert list(forward) == pytest.approx([50.0, 80.0])
+    assert list(forward) == pytest.approx([50.0, 80.0, 50.0])
     with pytest.raises(ValueError, match="CRS"):
         _osm.car_speeds(
             geo, country="FI", urban=urban_areas.set_crs(None, allow_override=True)
@@ -619,12 +645,16 @@ def test_speed_limit_table_is_the_vendored_prototype():
 # --- Junction delay classes ---------------------------------------------------
 
 
-def _junctions(tags_by_vertex, u, v, ways, masks, vertices):
+def _junctions(tags_by_vertex, u, v, ways, masks, vertices, highway=None):
     import numpy as np
 
     tags = [tags_by_vertex.get(i) for i in range(vertices)]
     forward = np.array(masks, dtype=np.uint8)
-    return _osm.junction_delay_classes(tags, u, v, ways, forward, forward, vertices)
+    if highway is None:
+        highway = ["residential"] * len(u)
+    return _osm.junction_delay_classes(
+        tags, u, v, ways, highway, forward, forward, vertices
+    )
 
 
 def test_junction_classes_by_degree_and_control():
@@ -632,42 +662,68 @@ def test_junction_classes_by_degree_and_control():
     u, v = [0, 1, 3, 1], [1, 2, 1, 4]
     ways = [10, 10, 20, 20]
     car = [_osm.CAR] * 4
-    # Untagged: four drivable approaches meet at 1 — a plain junction.
+    # Untagged: four drivable approaches meet at 1 — a topological junction.
     fwd, rev = _junctions({}, u, v, ways, car, 5)
-    assert list(fwd) == [_osm.JUNCTION_UNCONTROLLED, 0, _osm.JUNCTION_UNCONTROLLED, 0]
-    assert list(rev) == [0, _osm.JUNCTION_UNCONTROLLED, 0, _osm.JUNCTION_UNCONTROLLED]
-    # Signals charge every approach.
+    assert list(fwd) == [_osm.JUNCTION_TOPOLOGICAL, 0, _osm.JUNCTION_TOPOLOGICAL, 0]
+    assert list(rev) == [0, _osm.JUNCTION_TOPOLOGICAL, 0, _osm.JUNCTION_TOPOLOGICAL]
+    # Signals mark every approach and sit atop the hierarchy.
     fwd, rev = _junctions({1: {"highway": "traffic_signals"}}, u, v, ways, car, 5)
     assert list(fwd) == [_osm.JUNCTION_SIGNALS, 0, _osm.JUNCTION_SIGNALS, 0]
     assert list(rev) == [0, _osm.JUNCTION_SIGNALS, 0, _osm.JUNCTION_SIGNALS]
-    # A stop mapped onto the shared junction vertex is ambiguous — every
-    # approach is charged, the conservative reading.
+    # A stop mapped onto a real junction is subsumed by it: the junction
+    # alone charges, the sign adds nothing (the advance-sign rule).
     fwd, rev = _junctions({1: {"highway": "stop"}}, u, v, ways, car, 5)
-    assert list(fwd) == [_osm.JUNCTION_PRIORITY, 0, _osm.JUNCTION_PRIORITY, 0]
-    assert list(rev) == [0, _osm.JUNCTION_PRIORITY, 0, _osm.JUNCTION_PRIORITY]
+    assert list(fwd) == [_osm.JUNCTION_TOPOLOGICAL, 0, _osm.JUNCTION_TOPOLOGICAL, 0]
+    assert list(rev) == [0, _osm.JUNCTION_TOPOLOGICAL, 0, _osm.JUNCTION_TOPOLOGICAL]
     # A vertex two footways join is no junction for the car.
     fwd, rev = _junctions({}, u, v, ways, [_osm.CAR, _osm.CAR, _osm.WALK, _osm.WALK], 5)
     assert list(fwd) == [0, 0, 0, 0]
     assert list(rev) == [0, 0, 0, 0]
 
 
-def test_priority_nodes_charge_their_own_way_only():
+def test_ramp_junctions_outrank_topology_and_yield_to_signals():
+    # Ramp way 20 (motorway_link) leaves road 10 at vertex 1; a second
+    # road edge keeps vertex 1 at four approaches.
+    u, v = [0, 1, 1], [1, 2, 3]
+    ways = [10, 10, 20]
+    highway = ["primary", "primary", "motorway_link"]
+    car = [_osm.CAR] * 3
+    fwd, rev = _junctions({}, u, v, ways, car, 4, highway=highway)
+    # Vertex 1 is where the link meets non-link elements: a ramp junction
+    # for every approach, outranking the topological class.
+    assert list(fwd) == [_osm.JUNCTION_RAMP, 0, 0]
+    assert list(rev) == [0, _osm.JUNCTION_RAMP, _osm.JUNCTION_RAMP]
+    # Signals on the same vertex win the hierarchy.
+    fwd, rev = _junctions(
+        {1: {"highway": "traffic_signals"}}, u, v, ways, car, 4, highway=highway
+    )
+    assert list(fwd) == [_osm.JUNCTION_SIGNALS, 0, 0]
+    assert list(rev) == [0, _osm.JUNCTION_SIGNALS, _osm.JUNCTION_SIGNALS]
+    # Two links meeting each other only is no ramp junction.
+    fwd, rev = _junctions(
+        {}, [0, 1], [1, 2], [10, 20], car[:2], 3, highway=["motorway_link"] * 2
+    )
+    assert list(fwd) == [0, 0]
+    assert list(rev) == [0, 0]
+
+
+def test_priority_nodes_mark_their_own_way_only():
     # A give-way sign at vertex 1, mid-way on way 10 (0→1→2) — vertex 3
     # joins by way 20 only at vertex 2, so vertex 1 lies on one way.
     u, v = [0, 1, 2], [1, 2, 3]
     ways = [10, 10, 20]
     car = [_osm.CAR] * 3
     fwd, rev = _junctions({1: {"highway": "give_way"}}, u, v, ways, car, 4)
-    # Both approaches along way 10 are charged; way 20 never touches 1.
+    # Both approaches along way 10 are marked; way 20 never touches 1.
     assert list(fwd) == [_osm.JUNCTION_PRIORITY, 0, 0]
     assert list(rev) == [0, _osm.JUNCTION_PRIORITY, 0]
-    # direction=forward charges only the approach running with the way.
+    # direction=forward marks only the approach running with the way.
     fwd, rev = _junctions(
         {1: {"highway": "stop", "direction": "forward"}}, u, v, ways, car, 4
     )
     assert list(fwd) == [_osm.JUNCTION_PRIORITY, 0, 0]
     assert list(rev) == [0, 0, 0]
-    # direction=backward charges only the against-the-way approach.
+    # direction=backward marks only the against-the-way approach.
     fwd, rev = _junctions(
         {1: {"highway": "stop", "direction": "backward"}}, u, v, ways, car, 4
     )

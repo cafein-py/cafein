@@ -1,13 +1,16 @@
 """Union OpenStreetMap extraction for multimodal street routing.
 
 The walking build (`streets._walking_network`) stays the default; this module
-adds the union extraction the cycling / e-scooter modes need: one `pyrosm`
-pass over the broadly-filtered network, its tags normalised into flat per-edge
-codes and per-direction mode-permission masks, with connectivity pruned
-separately for each mode. `StreetNetwork.from_osm` consumes that output as the
-multimodal edge data the format-12 arrays carry.
+adds the union extraction the cycling / e-scooter / car modes need: one
+`pyrosm` pass over the broadly-filtered network, its tags normalised into
+flat per-edge codes and per-direction mode-permission masks — plus, on a car
+build, per-direction driving speeds and junction head classes — with
+connectivity pruned separately for each mode. `StreetNetwork.from_osm`
+consumes that output as the multimodal edge data the persisted street
+arrays carry.
 """
 
+import json
 import math
 import re
 import warnings
@@ -42,6 +45,9 @@ FLAG_INDOOR = 1 << 3
 FLAG_STEPS = 1 << 4
 FLAG_SEGREGATED = 1 << 5
 FLAG_LIT = 1 << 6
+FLAG_ROUNDABOUT = 1 << 7
+"""A roundabout interior (`junction=roundabout`); the car delay model
+charges it `b/4` in place of endpoint shares."""
 
 
 # --- Normalised class codes (the edge_highway / edge_surface / … arrays) ------
@@ -655,45 +661,110 @@ def car_speeds(edges, country=None, urban=None, speed_limits=None):
 
 # --- Junction delay classes ---------------------------------------------------
 
-JUNCTION_UNCONTROLLED = 1
+JUNCTION_TOPOLOGICAL = 1
 JUNCTION_PRIORITY = 2
 JUNCTION_SIGNALS = 3
-"""The car delay table's junction classes (0 = no crossing delay):
-signalized (`highway=traffic_signals`), priority-controlled
-(`highway=stop`/`give_way`), and plain intersections of drivable ways."""
+JUNCTION_RAMP = 4
+"""The persisted junction head classes (0 = no junction): a topological
+junction (three or more drivable approaches), a priority sign
+(`highway=stop`/`give_way` — recorded, never charged by the delay
+engine), signals (`highway=traffic_signals`), and a ramp junction
+(an unsignalized endpoint where a `*_link` element meets non-link
+drivable elements). Overlaps store one class by the calibration's own
+hierarchy: signalized > ramp junction > topological > priority."""
 
 _PRIORITY_NODE = frozenset({"stop", "give_way"})
 
 
+def node_delay_tags(nodes):
+    """Per-node tag dicts for `junction_delay_classes`.
+
+    Reads the union extraction's nodes frame: the ``highway`` control tag
+    and its optional ``direction``, from dedicated columns when pyrosm
+    split them out, with the free-form ``tags`` mapping (a dict, or its
+    JSON string form) as the fallback. Nodes carrying no control tag map
+    to ``None``.
+    """
+    n = len(nodes)
+
+    def column(name):
+        if name not in nodes.columns:
+            return np.full(n, None, dtype=object)
+        return nodes[name].to_numpy(dtype=object)
+
+    def clean(value):
+        if value is None or value == "" or value == "nan":
+            return None
+        if isinstance(value, float) and value != value:
+            return None
+        return value
+
+    highway = column("highway")
+    direction = column("direction")
+    tags = column("tags")
+    out = []
+    for i in range(n):
+        h = clean(highway[i])
+        d = clean(direction[i])
+        t = tags[i]
+        if isinstance(t, str):
+            try:
+                t = json.loads(t)
+            except ValueError:
+                t = None
+        if isinstance(t, dict):
+            if h is None:
+                h = clean(t.get("highway"))
+            if d is None:
+                d = clean(t.get("direction"))
+        out.append(None if h is None else {"highway": h, "direction": d})
+    return out
+
+
 def junction_delay_classes(
-    node_tags, u, v, way_ids, access_forward, access_reverse, vertex_count
+    node_tags, u, v, way_ids, highway, access_forward, access_reverse, vertex_count
 ):
     """Per-edge (forward_head, reverse_head) junction classes, u8.
 
-    ``forward_head[e]`` is the class charged when a car traverses edge
-    ``e`` along its stored geometry and crosses the junction at its head
-    (``v[e]``); ``reverse_head[e]`` covers the opposite traversal into
-    ``u[e]``. Signals charge every approach; a plain intersection —
-    three or more distinct drivable approaches, no control tag — does
-    too. `stop`/`give_way` associate by way membership: a node lying on
-    exactly one drivable way charges that way's approaches only,
-    honouring the node's ``direction=forward/backward`` (relative to
-    that way's stored geometry); a node shared by several ways charges
-    every approach — the conservative reading of ambiguous mapping.
-    Whether a traversal is charged at all (trip endpoints never are) is
-    the routing engine's rule; these arrays only say which crossings
-    carry which class.
+    ``forward_head[e]`` is the class stored for the junction a car crosses
+    traversing edge ``e`` along its stored geometry (at ``v[e]``);
+    ``reverse_head[e]`` covers the opposite traversal into ``u[e]``.
+    Signals, ramp junctions, and topological junctions are node
+    properties marking every approach; overlaps resolve by the
+    signalized > ramp junction > topological hierarchy. `stop`/`give_way`
+    survive only where no higher class applies (an advance sign on an
+    interior node): they associate by way membership — a node lying on
+    exactly one drivable way marks that way's approaches only, honouring
+    the node's ``direction=forward/backward`` (relative to that way's
+    stored geometry); a node shared by several ways marks every
+    approach — the conservative reading of ambiguous mapping. What each
+    class costs (priority signs cost nothing; trip endpoints never
+    charge) is the routing engine's rule; these arrays only say which
+    crossings carry which class.
     """
     u = np.asarray(u)
     v = np.asarray(v)
     way_ids = np.asarray(way_ids)
+    highway = np.asarray(highway, dtype=object)
     car = ((np.asarray(access_forward) | np.asarray(access_reverse)) & CAR) != 0
     degree = np.zeros(vertex_count, dtype=np.int64)
     np.add.at(degree, u[car], 1)
     np.add.at(degree, v[car], 1)
 
+    ramp_edge = car & np.array(
+        [isinstance(h, str) and h.endswith("_link") for h in highway], dtype=bool
+    )
+    has_ramp = np.zeros(vertex_count, dtype=bool)
+    has_ramp[u[ramp_edge]] = True
+    has_ramp[v[ramp_edge]] = True
+    nonramp_edge = car & ~ramp_edge
+    has_nonramp = np.zeros(vertex_count, dtype=bool)
+    has_nonramp[u[nonramp_edge]] = True
+    has_nonramp[v[nonramp_edge]] = True
+
     node_class = np.zeros(vertex_count, dtype=np.uint8)
-    node_class[degree >= 3] = JUNCTION_UNCONTROLLED
+    node_class[degree >= 3] = JUNCTION_TOPOLOGICAL
+    node_class[has_ramp & has_nonramp] = JUNCTION_RAMP
     priority = {}
     for index, tags in enumerate(node_tags):
         if not isinstance(tags, dict):
@@ -701,8 +772,7 @@ def junction_delay_classes(
         kind = tags.get("highway")
         if kind == "traffic_signals":
             node_class[index] = JUNCTION_SIGNALS
-        elif kind in _PRIORITY_NODE:
-            node_class[index] = JUNCTION_PRIORITY
+        elif kind in _PRIORITY_NODE and node_class[index] == 0:
             priority[index] = tags
 
     forward_head = node_class[v].copy()
@@ -722,18 +792,16 @@ def junction_delay_classes(
             out.append(e)
     for node, tags in priority.items():
         drivable = {int(way_ids[e]) for e in heads[node] + tails[node] if car[e]}
-        if len(drivable) != 1:
-            # Shared by several ways (or carless): every approach stays
-            # charged, the conservative reading of ambiguous mapping.
-            continue
-        (way,) = drivable
+        # Shared by several ways (or carless): every approach is marked,
+        # the conservative reading of ambiguous mapping.
+        way = drivable.pop() if len(drivable) == 1 else None
         direction = {"forward": 1, "backward": -1}.get(tags.get("direction"), 0)
         for e in heads[node]:
-            if way_ids[e] != way or direction == -1:
-                forward_head[e] = 0
+            if way is None or (way_ids[e] == way and direction != -1):
+                forward_head[e] = JUNCTION_PRIORITY
         for e in tails[node]:
-            if way_ids[e] != way or direction == 1:
-                reverse_head[e] = 0
+            if way is None or (way_ids[e] == way and direction != 1):
+                reverse_head[e] = JUNCTION_PRIORITY
     return forward_head, reverse_head
 
 
@@ -880,6 +948,8 @@ def normalise_codes(edges):
             dtype=bool,
         )
         flags |= np.where(present, bit, 0).astype(np.uint16)
+    junction = _column(edges, "junction")
+    flags |= np.where(junction == "roundabout", FLAG_ROUNDABOUT, 0).astype(np.uint16)
     return edge_highway, edge_surface, edge_smoothness, flags
 
 

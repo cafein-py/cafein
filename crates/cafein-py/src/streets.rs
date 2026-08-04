@@ -14,8 +14,8 @@ use rayon::prelude::*;
 
 use cafein_core::geometry::wkb_line_string;
 use cafein_core::streets::{
-    Backing, CompiledStreetProfile, EdgeAttributes, MappedStreets, Snap, StreetLeg,
-    StreetNetwork as CoreStreetNetwork, StreetProfileDefinition,
+    Backing, CarCostModel, CarEdgeAttributes, CompiledStreetProfile, EdgeAttributes, MappedStreets,
+    Snap, StreetLeg, StreetNetwork as CoreStreetNetwork, StreetProfileDefinition,
 };
 
 use crate::artifact::{
@@ -25,18 +25,42 @@ use crate::artifact::{
 };
 
 /// The street-mode names accepted by the public API, with the shipped profile
-/// definition each resolves to.
+/// definition each resolves to. The car resolves to its free-flow default;
+/// a resolved delay model arrives separately (see [`car_cost_model`]).
 pub(super) fn profile_definition(mode: &str) -> PyResult<StreetProfileDefinition> {
     match mode {
         "walk" => Ok(StreetProfileDefinition::walk()),
         "bicycle" => Ok(StreetProfileDefinition::bicycle()),
         "e_bike" => Ok(StreetProfileDefinition::e_bike()),
         "e_scooter" => Ok(StreetProfileDefinition::e_scooter()),
+        "car" => Ok(StreetProfileDefinition::car(None)),
         other => Err(PyValueError::new_err(format!(
             "unknown street mode '{other}'; expected one of \
-             'walk', 'bicycle', 'e_bike', 'e_scooter'"
+             'walk', 'bicycle', 'e_bike', 'e_scooter', 'car'"
         ))),
     }
+}
+
+/// The resolved car delay model as the Python layer passes it: one period's
+/// flat numbers — `(group_seconds, groups, ramp_share_high, ramp_share_low,
+/// ramp_multiplier, congestion_multiplier)`. Python resolves the period and
+/// merges any `delay_model=` override; the numbers validate in
+/// `StreetProfileDefinition::validate`.
+pub(super) type CarModelPayload = (Vec<f64>, Vec<u8>, f64, f64, f64, f64);
+
+fn car_cost_model(payload: &CarModelPayload) -> PyResult<CarCostModel> {
+    let (seconds, groups, share_high, share_low, ramp_multiplier, congestion_multiplier) = payload;
+    let group_seconds: [f64; 3] = seconds.as_slice().try_into().map_err(|_| {
+        PyValueError::new_err("the car delay model carries one value per road-class group (3)")
+    })?;
+    Ok(CarCostModel {
+        group_seconds,
+        groups: groups.clone(),
+        ramp_share_high: *share_high,
+        ramp_share_low: *share_low,
+        ramp_multiplier: *ramp_multiplier,
+        congestion_multiplier: *congestion_multiplier,
+    })
 }
 
 /// A routable street network built from an OpenStreetMap extract.
@@ -67,7 +91,8 @@ impl StreetNetwork {
     #[pyo3(signature = (vertex_count, edges, coordinate_offsets, longitudes, latitudes,
                         edge_highway, edge_surface, edge_smoothness, edge_flags,
                         access_forward, access_reverse, facility_forward, facility_reverse,
-                        coordinate_elevations = None, elevation_metadata = None))]
+                        coordinate_elevations = None, elevation_metadata = None,
+                        car_attributes = None))]
     fn new(
         vertex_count: u32,
         edges: Vec<(u32, u32, f64)>,
@@ -84,6 +109,7 @@ impl StreetNetwork {
         facility_reverse: Vec<u8>,
         coordinate_elevations: Option<Vec<f32>>,
         elevation_metadata: Option<(String, f64, String, f64, u32)>,
+        car_attributes: Option<CarPayload>,
     ) -> PyResult<StreetNetwork> {
         let (inner, elevation) = build_multimodal_core(
             vertex_count,
@@ -101,6 +127,7 @@ impl StreetNetwork {
             facility_reverse,
             coordinate_elevations,
             elevation_metadata,
+            car_attributes,
         )?;
         Ok(StreetNetwork {
             inner,
@@ -194,6 +221,9 @@ impl StreetNetwork {
     /// Returns `matrix` alongside the index lists of the coordinates that did
     /// not snap, matching the dict the transit point matrices return.
     /// Coordinates are `(latitude, longitude)` in EPSG:4326.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (origins, destinations, mode, max_seconds, max_snap_distance,
+                        car_model = None))]
     fn travel_time_matrix(
         &mut self,
         py: Python<'_>,
@@ -202,8 +232,9 @@ impl StreetNetwork {
         mode: &str,
         max_seconds: f64,
         max_snap_distance: f64,
+        car_model: Option<CarModelPayload>,
     ) -> PyResult<Py<PyDict>> {
-        let index = self.compiled(mode)?;
+        let index = self.compiled(mode, car_model.as_ref())?;
         let (_, profile) = &self.profiles[index];
         let destination_count = destinations.len();
         let (rows, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
@@ -237,6 +268,8 @@ impl StreetNetwork {
     /// are `(latitude, longitude)`; `geometries` attaches each row's shape as
     /// WKB.
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (origins, destinations, mode, max_seconds, max_snap_distance,
+                        geometries, car_model = None))]
     fn cost_matrix(
         &mut self,
         py: Python<'_>,
@@ -246,8 +279,9 @@ impl StreetNetwork {
         max_seconds: f64,
         max_snap_distance: f64,
         geometries: bool,
+        car_model: Option<CarModelPayload>,
     ) -> PyResult<Py<PyDict>> {
-        let index = self.compiled(mode)?;
+        let index = self.compiled(mode, car_model.as_ref())?;
         let (_, profile) = &self.profiles[index];
         let rows = py.allow_threads(|| {
             let snap = |&(latitude, longitude): &(f64, f64)| {
@@ -361,6 +395,15 @@ impl StreetNetwork {
         self.inner.coordinates()
     }
 
+    /// The stored per-slot car arrays as `(speeds, junctions)`, or `None`
+    /// without a car build. Internal; the round-trip tests assert on them.
+    #[getter]
+    fn _car_attributes(&self) -> Option<(Vec<f32>, Vec<u8>)> {
+        self.inner
+            .car_attributes()
+            .map(|car| (car.adj_car_speed.clone(), car.adj_junction.clone()))
+    }
+
     /// Whether the street arrays are memory-mapped views of the artifact.
     #[getter]
     fn mapped(&self) -> bool {
@@ -394,6 +437,8 @@ impl StreetNetwork {
     /// Coordinates are `(latitude, longitude)` in EPSG:4326. A coordinate that
     /// does not snap to the network raises `ValueError` — unreachable and
     /// unsnappable are different answers.
+    #[pyo3(signature = (origin, destination, mode, max_seconds, max_snap_distance,
+                        car_model = None))]
     fn travel_time(
         &mut self,
         origin: (f64, f64),
@@ -401,10 +446,11 @@ impl StreetNetwork {
         mode: &str,
         max_seconds: f64,
         max_snap_distance: f64,
+        car_model: Option<CarModelPayload>,
     ) -> PyResult<Option<u32>> {
         // Compile first: snapping is profile-aware, so that a bicycle query
         // does not land on a footway it may not enter.
-        let index = self.compiled(mode)?;
+        let index = self.compiled(mode, car_model.as_ref())?;
         let (_, profile) = &self.profiles[index];
         let from = self.snap_endpoint(origin, max_snap_distance, "origin", profile)?;
         let to = self.snap_endpoint(destination, max_snap_distance, "destination", profile)?;
@@ -460,9 +506,18 @@ impl StreetNetwork {
 
     /// The position of `mode`'s compiled profile, compiling and caching it on
     /// first use. Returns an index rather than a reference so the cache can be
-    /// extended while the network stays borrowed.
-    fn compiled(&mut self, mode: &str) -> PyResult<usize> {
-        let definition = profile_definition(mode)?;
+    /// extended while the network stays borrowed. A resolved car delay model
+    /// joins the definition, so each model caches separately by equality.
+    fn compiled(&mut self, mode: &str, car_model: Option<&CarModelPayload>) -> PyResult<usize> {
+        let mut definition = profile_definition(mode)?;
+        if let Some(payload) = car_model {
+            if mode != "car" {
+                return Err(PyValueError::new_err(
+                    "the intersection-delay model applies to mode='car' only",
+                ));
+            }
+            definition.car = Some(car_cost_model(payload)?);
+        }
         if let Some(index) = self
             .profiles
             .iter()
@@ -522,6 +577,11 @@ pub(super) fn elevation_dict(py: Python<'_>, meta: &ElevationMeta) -> PyResult<P
     Ok(dict.into())
 }
 
+/// The car payload as the Python surface passes it: per-edge
+/// `(speed_forward, speed_reverse, junction_forward, junction_reverse)`,
+/// all four together or the group absent.
+pub(super) type CarPayload = (Vec<f32>, Vec<f32>, Vec<u8>, Vec<u8>);
+
 /// Builds the multimodal street core and its validated elevation metadata
 /// from the union extraction's flat arrays — shared by the standalone
 /// `StreetNetwork` constructor and the `TransportNetwork`'s multimodal
@@ -543,6 +603,7 @@ pub(super) fn build_multimodal_core(
     facility_reverse: Vec<u8>,
     coordinate_elevations: Option<Vec<f32>>,
     elevation_metadata: Option<(String, f64, String, f64, u32)>,
+    car_attributes: Option<CarPayload>,
 ) -> PyResult<(CoreStreetNetwork, Option<ElevationMeta>)> {
     if coordinate_elevations.is_some() != elevation_metadata.is_some() {
         return Err(PyValueError::new_err(
@@ -567,6 +628,16 @@ pub(super) fn build_multimodal_core(
             access_reverse: &access_reverse,
             facility_forward: &facility_forward,
             facility_reverse: &facility_reverse,
+            car: car_attributes.as_ref().map(
+                |(speed_forward, speed_reverse, junction_forward, junction_reverse)| {
+                    CarEdgeAttributes {
+                        speed_forward,
+                        speed_reverse,
+                        junction_forward,
+                        junction_reverse,
+                    }
+                },
+            ),
         },
         coordinate_elevations.as_deref(),
     )
@@ -676,7 +747,7 @@ fn load_street_mapped(path: &str, verify: Option<bool>) -> PyResult<Result<Loade
     // are decoded owned, paging in only their bytes.
     let section = &bytes
         [layout.streets_offset as usize..(layout.streets_offset + layout.streets_length) as usize];
-    let (attributes, elevations) =
+    let (attributes, car, elevations) =
         decode_optional_street_arrays(section, &streets_meta.descriptors);
     if verify != Some(true) {
         streets_read += streets_meta.descriptors[STREET_ARRAY_ORDER.len()..]
@@ -701,6 +772,7 @@ fn load_street_mapped(path: &str, verify: Option<bool>) -> PyResult<Result<Loade
         index_boxes: ranges[10],
         index_payload: ranges[11],
         attributes,
+        car,
         elevations,
     };
     let inner =

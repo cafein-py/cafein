@@ -185,13 +185,16 @@ mod snap;
 
 use geo::*;
 pub use graph::{
-    Backing, EdgeAttributes, MappedStreets, StreetAttributes, StreetNetwork, StreetNetworkParts,
+    Backing, CarAttributes, CarEdgeAttributes, EdgeAttributes, MappedStreets, StreetAttributes,
+    StreetNetwork, StreetNetworkParts, JUNCTION_CLASS_COUNT,
 };
 use index::*;
 pub use profile::{
-    CompiledStreetProfile, ProfileError, StreetMode, StreetProfileDefinition, FLAG_BRIDGE,
-    FLAG_DISMOUNT, FLAG_INDOOR, FLAG_LIT, FLAG_SEGREGATED, FLAG_STEPS, FLAG_TUNNEL,
-    HIGHWAY_CODE_COUNT, MAX_SLOPE, MIN_SLOPE_MULTIPLIER, MODE_BICYCLE, MODE_E_SCOOTER, MODE_WALK,
+    CarCostModel, CompiledStreetProfile, ProfileError, StreetMode, StreetProfileDefinition,
+    CAR_HIGH_SPEED_KMH, CAR_SPEED_CEILING_KMH, FLAG_BRIDGE, FLAG_DISMOUNT, FLAG_INDOOR, FLAG_LIT,
+    FLAG_ROUNDABOUT, FLAG_SEGREGATED, FLAG_STEPS, FLAG_TUNNEL, HIGHWAY_CODE_COUNT,
+    JUNCTION_PRIORITY, JUNCTION_RAMP, JUNCTION_SIGNALS, JUNCTION_TOPOLOGICAL, MAX_SLOPE,
+    MIN_SLOPE_MULTIPLIER, MODE_BICYCLE, MODE_CAR, MODE_E_SCOOTER, MODE_WALK, RAMP_HIGHWAY,
     SMOOTHNESS_CODE_COUNT, SURFACE_CODE_COUNT,
 };
 use search::*;

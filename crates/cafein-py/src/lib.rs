@@ -19,8 +19,8 @@ use cafein_core::mcultra::compute_mcultra_shortcuts;
 use cafein_core::raptor::{CostInputs, CostRow, Objective, Raptor, RentalCostView, NO_STOP};
 use cafein_core::router::{factor_fingerprint, same_factors, Exclusions, Request, TransitRouter};
 use cafein_core::streets::{
-    Backing, CompiledStreetProfile, MappedStreets, Snap, StopLink, StoredLink, StreetAttributes,
-    StreetNetwork, StreetNetworkParts, StreetProfileDefinition, WalkedStop,
+    Backing, CarAttributes, CompiledStreetProfile, MappedStreets, Snap, StopLink, StoredLink,
+    StreetAttributes, StreetNetwork, StreetNetworkParts, StreetProfileDefinition, WalkedStop,
 };
 use cafein_core::tbtr::{DayView, TbtrEngine};
 use cafein_core::timetable::{StopIdx, Timetable, TripIdx};

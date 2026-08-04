@@ -154,10 +154,20 @@ class TravelCostMatrix(pd.DataFrame):
         ``StreetNetwork``, whose speeds come from the mode's profile.
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
-        one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``.
+        one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
+        ``"car"`` (a car build; emissions resolve through ``factors=``
+        rows or stay NaN until the shipped car factors land).
     max_street_time : float (optional)
         Cutoff in seconds for a ``StreetNetwork`` matrix (default:
         ``cafein.street_network.MAX_STREET_TIME``, 7200).
+    intersection_delays, profile, delay_model : optional
+        Car matrices only. By default car cells are free-flow,
+        speed-limit travel times; ``intersection_delays=True`` applies
+        the empirical intersection-delay model under ``profile=``
+        (``"rush"``, ``"midday"`` — the default — or
+        ``"day-average"``), with ``delay_model=`` merging partial
+        overrides over the shipped values, as in
+        ``StreetNetwork.travel_time``.
 
     ``street_policy=`` (a ``cafein.StreetLegPolicy``) opens the access
     and egress to the policy's street modes over the multimodal graph
@@ -220,6 +230,9 @@ class TravelCostMatrix(pd.DataFrame):
         transport_mode=None,
         max_street_time=None,
         street_policy=None,
+        intersection_delays=False,
+        profile=None,
+        delay_model=None,
     ):
         if _is_street_network(network):
             data = _street_cost_columns(
@@ -233,6 +246,9 @@ class TravelCostMatrix(pd.DataFrame):
                 geometries=geometries,
                 factors=factors,
                 components=components,
+                intersection_delays=intersection_delays,
+                profile=profile,
+                delay_model=delay_model,
                 transit_only={
                     "date": date,
                     "departure": departure,
@@ -261,6 +277,11 @@ class TravelCostMatrix(pd.DataFrame):
             )
         if max_street_time is not None:
             raise ValueError("max_street_time applies to a StreetNetwork matrix")
+        if intersection_delays or profile is not None or delay_model is not None:
+            raise ValueError(
+                "intersection_delays, profile, and delay_model apply to a "
+                "StreetNetwork car matrix"
+            )
         if street_policy is not None:
             offending = next(
                 (
@@ -432,8 +453,11 @@ class TravelTimeMatrix(pd.DataFrame):
 
     Given a ``StreetNetwork`` instead, the matrix is a standalone street
     computation: one bounded search per origin over the compiled profile
-    of ``transport_mode`` (``"walk"``, ``"bicycle"``, ``"e_bike"``, or
-    ``"e_scooter"``), bounded by ``max_street_time``. It needs no
+    of ``transport_mode`` (``"walk"``, ``"bicycle"``, ``"e_bike"``,
+    ``"e_scooter"``, or ``"car"``), bounded by ``max_street_time``. Car
+    cells are free-flow by default; ``intersection_delays=True`` with
+    ``profile=`` and ``delay_model=`` applies the intersection-delay
+    model, as in ``StreetNetwork.travel_time``. It needs no
     timetable, so ``date`` and ``departure`` do not apply, and the
     arguments that only mean something to a timetable — ``max_transfers``,
     ``router``, the departure-window percentiles, the transit exclusions,
@@ -490,9 +514,9 @@ class TravelTimeMatrix(pd.DataFrame):
         ``StreetNetwork``, whose speeds come from the mode's profile.
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
-        one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``;
-        for a ``TransportNetwork`` only ``"public_transport"`` (the
-        default meaning) applies.
+        one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
+        ``"car"``; for a ``TransportNetwork`` only ``"public_transport"``
+        (the default meaning) applies.
     max_street_time : float (optional)
         Cutoff in seconds for a ``StreetNetwork`` matrix, beyond which a
         destination counts as unreachable (default:
@@ -542,6 +566,9 @@ class TravelTimeMatrix(pd.DataFrame):
         transport_mode=None,
         max_street_time=None,
         street_policy=None,
+        intersection_delays=False,
+        profile=None,
+        delay_model=None,
     ):
         if _is_street_network(network):
             data = _street_time_columns(
@@ -552,6 +579,9 @@ class TravelTimeMatrix(pd.DataFrame):
                 max_street_time=max_street_time,
                 max_snap_distance=max_snap_distance,
                 chunk=chunk,
+                intersection_delays=intersection_delays,
+                profile=profile,
+                delay_model=delay_model,
                 transit_only={
                     "date": date,
                     "departure": departure,
@@ -578,6 +608,11 @@ class TravelTimeMatrix(pd.DataFrame):
             )
         if max_street_time is not None:
             raise ValueError("max_street_time applies to a StreetNetwork matrix")
+        if intersection_delays or profile is not None or delay_model is not None:
+            raise ValueError(
+                "intersection_delays, profile, and delay_model apply to a "
+                "StreetNetwork car matrix"
+            )
         if street_policy is not None:
             rejected = {
                 "window": window,
@@ -791,10 +826,14 @@ def _street_cost_columns(
     transit_only,
     factors=None,
     components=None,
+    intersection_delays=False,
+    profile=None,
+    delay_model=None,
 ):
     """The reachable cells of a street cost matrix, in long format."""
     from cafein import emissions
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
+    from cafein.street_network import _resolved_delays
 
     query = _street_query(
         origins,
@@ -812,6 +851,9 @@ def _street_cost_columns(
         query.max_seconds,
         query.max_snap_distance,
         bool(geometries),
+        car_model=_resolved_delays(
+            transport_mode, intersection_delays, profile, delay_model
+        ),
     )
     _warn_unsnapped(table, query.from_ids, query.to_ids)
     from_ids = np.asarray(query.from_ids, dtype=object)
@@ -851,8 +893,13 @@ def _street_time_columns(
     max_snap_distance,
     chunk,
     transit_only,
+    intersection_delays=False,
+    profile=None,
+    delay_model=None,
 ):
     """The reachable cells of a street travel-time matrix, in long format."""
+    from cafein.street_network import _resolved_delays
+
     query = _street_query(
         origins,
         destinations,
@@ -869,6 +916,9 @@ def _street_time_columns(
         transport_mode,
         query.max_seconds,
         query.max_snap_distance,
+        car_model=_resolved_delays(
+            transport_mode, intersection_delays, profile, delay_model
+        ),
     )
     _warn_unsnapped(table, from_ids, to_ids)
     matrix = table["matrix"]

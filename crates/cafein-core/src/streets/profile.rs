@@ -18,6 +18,7 @@ use super::*;
 pub const MODE_WALK: u8 = 1 << 0;
 pub const MODE_BICYCLE: u8 = 1 << 1;
 pub const MODE_E_SCOOTER: u8 = 1 << 2;
+pub const MODE_CAR: u8 = 1 << 3;
 
 // The per-edge `edge_flags` bits, mirroring `_osm.py` exactly. `FLAG_DISMOUNT`
 // is the only one the profile compiler reads today (it lowers the bicycle to
@@ -33,6 +34,7 @@ pub const FLAG_INDOOR: u16 = 1 << 3;
 pub const FLAG_STEPS: u16 = 1 << 4;
 pub const FLAG_SEGREGATED: u16 = 1 << 5;
 pub const FLAG_LIT: u16 = 1 << 6;
+pub const FLAG_ROUNDABOUT: u16 = 1 << 7;
 
 /// The class-code table sizes, mirroring `_osm.py`'s `HIGHWAY_CODES`,
 /// `SURFACE_CODES`, and `SMOOTHNESS_CODES`. A profile carries one multiplier
@@ -40,6 +42,36 @@ pub const FLAG_LIT: u16 = 1 << 6;
 pub const HIGHWAY_CODE_COUNT: usize = 27;
 pub const SURFACE_CODE_COUNT: usize = 17;
 pub const SMOOTHNESS_CODE_COUNT: usize = 9;
+
+/// Which highway codes are the ramp category (`*_link`), by `edge_highway`
+/// code — mirroring `_osm.py`'s `HIGHWAY_CODES` order: motorway_link (2),
+/// trunk_link (4), primary_link (6), secondary_link (8), tertiary_link (10).
+pub const RAMP_HIGHWAY: [bool; HIGHWAY_CODE_COUNT] = {
+    let mut ramps = [false; HIGHWAY_CODE_COUNT];
+    ramps[2] = true;
+    ramps[4] = true;
+    ramps[6] = true;
+    ramps[8] = true;
+    ramps[10] = true;
+    ramps
+};
+
+/// The speed bound splitting the delay model's high- and low-speed branches
+/// (ramp shares and the junction-free multipliers), km/h.
+pub const CAR_HIGH_SPEED_KMH: f64 = 70.0;
+
+/// The default car profile's `max_speed`, km/h. Compiled arc speeds are the
+/// persisted values exactly — the goal-directed bound is measured from the
+/// compiled costs — so this only backs that bound's degenerate fallback and
+/// the definition validation.
+pub const CAR_SPEED_CEILING_KMH: f64 = 250.0;
+
+/// The junction head classes the car delay model reads, mirroring
+/// `_osm.py`'s `JUNCTION_*` values.
+pub const JUNCTION_TOPOLOGICAL: u8 = 1;
+pub const JUNCTION_PRIORITY: u8 = 2;
+pub const JUNCTION_SIGNALS: u8 = 3;
+pub const JUNCTION_RAMP: u8 = 4;
 
 /// The spike clamp on a sub-segment slope: ±100 % grade. Steeper is a DEM
 /// artifact, not a street.
@@ -57,6 +89,7 @@ pub enum StreetMode {
     Walk,
     Bicycle,
     EScooter,
+    Car,
 }
 
 impl StreetMode {
@@ -66,6 +99,7 @@ impl StreetMode {
             StreetMode::Walk => MODE_WALK,
             StreetMode::Bicycle => MODE_BICYCLE,
             StreetMode::EScooter => MODE_E_SCOOTER,
+            StreetMode::Car => MODE_CAR,
         }
     }
 }
@@ -86,6 +120,10 @@ pub enum ProfileError {
     /// A non-walk profile has no `adj_access` to route by — the network was
     /// built without the multimodal attributes.
     MissingAttributes,
+    /// The car delay model is malformed (wrong table lengths, out-of-range
+    /// group indexes, or non-finite/negative numbers), or a non-car profile
+    /// carries one.
+    InvalidCarModel,
     /// A validated definition produced an arc cost at or above the forbidden
     /// sentinel (`u32::MAX`), which cannot be represented; the definition is
     /// physically implausible (an extreme speed or multiplier).
@@ -109,6 +147,9 @@ impl std::fmt::Display for ProfileError {
             }
             ProfileError::MissingAttributes => {
                 write!(f, "a non-walk profile needs installed street attributes")
+            }
+            ProfileError::InvalidCarModel => {
+                write!(f, "the car delay model is malformed")
             }
             ProfileError::ArcCostOverflow => {
                 write!(f, "a profile produced an unrepresentable arc cost")
@@ -166,6 +207,36 @@ pub struct StreetProfileDefinition {
     /// Cost factor on a descending sub-segment: `1 + slope_downhill·s` with
     /// `s < 0` — a bounded credit. Zero disables it.
     pub slope_downhill: f64,
+    /// The car delay model, resolved to one period's flat numbers. `None`
+    /// compiles free-flow — the default regime; only a car profile may carry
+    /// `Some`. The car mode reads the per-arc driving speeds either way; this
+    /// controls the junction penalties and multipliers alone.
+    pub car: Option<CarCostModel>,
+}
+
+/// The intersection-delay model's numbers for one period, resolved flat by
+/// the Python layer (the shipped Jaakkola 2013 values merged with any
+/// `delay_model=` override). Everything an arc's delay needs is here plus
+/// the arc's own persisted attributes, so compilation stays edge-local.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CarCostModel {
+    /// Crossing penalty `b` in seconds by road-class group
+    /// (`[groups 1–2, group 3, groups 4–6]`) for the resolved period.
+    pub group_seconds: [f64; 3],
+    /// Highway code → index into `group_seconds`, length
+    /// `HIGHWAY_CODE_COUNT`.
+    pub groups: Vec<u8>,
+    /// The share of its own `b` a ramp element charges per junction
+    /// endpoint at or above [`CAR_HIGH_SPEED_KMH`].
+    pub ramp_share_high: f64,
+    /// The below-threshold ramp share (the calibration's ½, every period).
+    pub ramp_share_low: f64,
+    /// The multiplier on a junction-free ramp element at or above the
+    /// threshold.
+    pub ramp_multiplier: f64,
+    /// The multiplier on a junction-free non-ramp element at or above the
+    /// threshold (1.0 in the midday period).
+    pub congestion_multiplier: f64,
 }
 
 impl StreetProfileDefinition {
@@ -191,6 +262,7 @@ impl StreetProfileDefinition {
             smoothness_multipliers: vec![1.0; SMOOTHNESS_CODE_COUNT],
             slope_uphill: 0.0,
             slope_downhill: 0.0,
+            car: None,
         }
     }
 
@@ -226,6 +298,19 @@ impl StreetProfileDefinition {
         StreetProfileDefinition::flat("e_scooter", StreetMode::EScooter, "e_scooter", 15.0 / 3.6)
     }
 
+    /// The default car profile: free-flow (no delay model), each arc at
+    /// exactly its own persisted driving speed — `base_speed` and the class
+    /// tables are unused, and no ceiling alters a tagged speed. The
+    /// goal-directed bound is measured from the compiled costs themselves;
+    /// `max_speed` only backs its degenerate fallback and the validation.
+    /// The connector stays at walking speed: you walk to the car.
+    pub fn car(model: Option<CarCostModel>) -> StreetProfileDefinition {
+        let mut definition = StreetProfileDefinition::flat("car", StreetMode::Car, "ICE", 1.0);
+        definition.max_speed = CAR_SPEED_CEILING_KMH / 3.6;
+        definition.car = model;
+        definition
+    }
+
     /// Checks the numeric invariants the compiler and the later A* heuristic
     /// rely on: finite positive speeds, correctly sized multiplier tables with
     /// finite positive entries, and a `max_speed` at least the greatest
@@ -237,6 +322,33 @@ impl StreetProfileDefinition {
             || !positive(self.dismount_speed)
         {
             return Err(ProfileError::NonPositiveSpeed);
+        }
+        if self.car.is_some() && self.mode != StreetMode::Car {
+            return Err(ProfileError::InvalidCarModel);
+        }
+        if let Some(model) = &self.car {
+            let factor = |value: f64| value.is_finite() && value >= 0.0;
+            let numbers_ok = model.group_seconds.iter().all(|&b| factor(b))
+                && factor(model.ramp_share_high)
+                && factor(model.ramp_share_low)
+                && factor(model.ramp_multiplier)
+                && factor(model.congestion_multiplier);
+            let groups_ok = model.groups.len() == HIGHWAY_CODE_COUNT
+                && model.groups.iter().all(|&group| (group as usize) < 3);
+            if !numbers_ok || !groups_ok {
+                return Err(ProfileError::InvalidCarModel);
+            }
+        }
+        if self.mode == StreetMode::Car {
+            // The car routes on the per-arc persisted speeds; the base speed
+            // and the class tables are unused, and `max_speed` is the clamp
+            // the compiler applies to every arc speed, so it only needs to be
+            // a positive finite ceiling.
+            return if positive(self.max_speed) {
+                Ok(())
+            } else {
+                Err(ProfileError::MaxSpeedTooLow)
+            };
         }
         let table_ok = |table: &[f64], len: usize| {
             table.len() == len && table.iter().all(|&value| positive(value))
@@ -303,6 +415,13 @@ pub struct CompiledStreetProfile {
     /// Private with a read-only accessor: the cached speed bound below is
     /// correct only for the costs it was measured over.
     arc_millis: Vec<u32>,
+    /// The car delay model's per-slot cost split, present only when a delay
+    /// model compiled: the distance-proportional base and the two junction
+    /// endpoint delays, with `base + head + tail == arc_millis` per permitted
+    /// slot. Partial (snapped) traversals prorate the base alone and add only
+    /// the endpoint delay of a junction actually crossed; full relaxations
+    /// keep reading `arc_millis`.
+    car_partials: Option<CarPartials>,
     /// The greatest *chord* speed any permitted arc attains on this network:
     /// straight-line metres between the arc's endpoint coordinates (one
     /// shared vertex-coordinate table) per second of compiled cost. The
@@ -316,10 +435,92 @@ pub struct CompiledStreetProfile {
     max_effective_speed: std::sync::OnceLock<f64>,
 }
 
+/// The car cost split behind [`CompiledStreetProfile::car_partials`]: per
+/// slot, the distance-proportional base cost and the junction delay charged
+/// at each end of the traversal — `head` at the slot's target vertex, `tail`
+/// at its source.
+#[derive(Debug, Clone)]
+struct CarPartials {
+    base: Vec<u32>,
+    head: Vec<u32>,
+    tail: Vec<u32>,
+}
+
+/// The on-network millisecond cost of traversing `fraction` of an arc whose
+/// full cost is `arc`.
+pub(super) fn partial_millis(arc: u32, fraction: f64) -> u64 {
+    (f64::from(arc) * fraction).ceil() as u64
+}
+
 impl CompiledStreetProfile {
     /// The per-arc millisecond costs, `u32::MAX` for a forbidden arc.
     pub fn arc_millis(&self) -> &[u32] {
         &self.arc_millis
+    }
+
+    /// The cost of leaving a mid-edge snap toward the slot's head over the
+    /// given fraction: the head junction is crossed, the one behind the snap
+    /// is not — unless the fraction is the whole edge, where the snap sits
+    /// exactly on the tail vertex and that junction is crossed too (the full
+    /// arc cost, agreeing with the graph relaxation for the same trip).
+    /// Without a cost split this is the plain proration.
+    pub(super) fn departing_partial(&self, slot: usize, fraction: f64) -> u64 {
+        match &self.car_partials {
+            Some(partials) => partial_millis(partials.base[slot], fraction)
+                .saturating_add(u64::from(partials.head[slot]))
+                .saturating_add(if fraction >= 1.0 {
+                    u64::from(partials.tail[slot])
+                } else {
+                    0
+                }),
+            None => partial_millis(self.arc_millis[slot], fraction),
+        }
+    }
+
+    /// The cost of entering the slot at its tail and stopping at a mid-edge
+    /// snap over the given fraction: the tail junction is crossed, the head
+    /// is never reached — unless the fraction is the whole edge, where the
+    /// snap sits exactly on the head vertex and that junction is crossed too.
+    pub(super) fn arriving_partial(&self, slot: usize, fraction: f64) -> u64 {
+        match &self.car_partials {
+            Some(partials) => partial_millis(partials.base[slot], fraction)
+                .saturating_add(u64::from(partials.tail[slot]))
+                .saturating_add(if fraction >= 1.0 {
+                    u64::from(partials.head[slot])
+                } else {
+                    0
+                }),
+            None => partial_millis(self.arc_millis[slot], fraction),
+        }
+    }
+
+    /// The cost of a same-edge trip over `fraction` of the slot: two interior
+    /// snaps cross no junction, but a trip that starts exactly at the
+    /// traversal's tail vertex enters the element through that junction, and
+    /// one that ends exactly at its head vertex crosses that one — matching
+    /// what the seed/egress path charges for the identical trip, so the
+    /// same-edge fast path can never undercut the graph route.
+    pub(super) fn same_edge_partial(
+        &self,
+        slot: usize,
+        fraction: f64,
+        enters_at_tail: bool,
+        exits_at_head: bool,
+    ) -> u64 {
+        match &self.car_partials {
+            Some(partials) => partial_millis(partials.base[slot], fraction)
+                .saturating_add(if enters_at_tail {
+                    u64::from(partials.tail[slot])
+                } else {
+                    0
+                })
+                .saturating_add(if exits_at_head {
+                    u64::from(partials.head[slot])
+                } else {
+                    0
+                }),
+            None => partial_millis(self.arc_millis[slot], fraction),
+        }
     }
 
     /// The lazily cached chord-speed bound (see the field's documentation).
@@ -351,6 +552,9 @@ impl StreetNetwork {
         definition: &StreetProfileDefinition,
     ) -> Result<CompiledStreetProfile, ProfileError> {
         definition.validate()?;
+        if definition.mode == StreetMode::Car {
+            return self.compile_car(definition);
+        }
         let mode = definition.mode.bit();
         let meters = self.arrays().adj_meters();
         let edges = self.arrays().adj_edges();
@@ -424,6 +628,135 @@ impl StreetNetwork {
         Ok(CompiledStreetProfile {
             definition: definition.clone(),
             arc_millis,
+            car_partials: None,
+            max_effective_speed: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Compiles a car profile: each permitted arc at its own persisted
+    /// driving speed, plus — with a delay model — the element's
+    /// attribute-derived delay under the Jaakkola calibration, exactly
+    /// edge-separable. Without a model (`car: None`, the default regime)
+    /// every arc is its free-flow seconds.
+    ///
+    /// With a model, an element's cost is exclusive between multipliers and
+    /// penalties: a roundabout interior charges `b/4` in place of endpoint
+    /// shares; otherwise a junction-affected element — one with a
+    /// topological, signalized, or ramp-junction endpoint, a property of the
+    /// classes, never of the numeric share values — sums each junction
+    /// endpoint's share: `½·b` at a topological or signalized endpoint, at a
+    /// ramp-junction endpoint `¼·b` for a non-ramp element and the period's
+    /// ramp share of `b` for a ramp element (the low-speed branch below
+    /// [`CAR_HIGH_SPEED_KMH`]); only a junction-free element scales by a
+    /// multiplier instead: the ramp multiplier on a fast ramp, the
+    /// congestion multiplier on a fast non-ramp element, free-flow below
+    /// the threshold. `b` always comes from the element's own group.
+    ///
+    /// The compiled profile also carries the per-slot cost split (base and
+    /// endpoint delays) the partial-traversal costs read, with
+    /// `base + head + tail == arc_millis` on every permitted slot.
+    fn compile_car(
+        &self,
+        definition: &StreetProfileDefinition,
+    ) -> Result<CompiledStreetProfile, ProfileError> {
+        let meters = self.arrays().adj_meters();
+        let edges = self.arrays().adj_edges();
+        let (Some(attributes), Some(car)) = (self.street_attributes(), self.car_attributes())
+        else {
+            return Err(ProfileError::MissingAttributes);
+        };
+        // Each slot stores the class at its own head; its tail class is the
+        // sibling slot's head. Pairing the two slots of every edge makes both
+        // available per traversal direction.
+        let mut tail_classes = vec![0u8; meters.len()];
+        let mut first_slot = vec![usize::MAX; self.edge_count() as usize];
+        for (slot, &edge) in edges.iter().enumerate() {
+            let edge = edge as usize;
+            if first_slot[edge] == usize::MAX {
+                first_slot[edge] = slot;
+            } else {
+                let sibling = first_slot[edge];
+                tail_classes[slot] = car.adj_junction[sibling];
+                tail_classes[sibling] = car.adj_junction[slot];
+            }
+        }
+        let mut arc_millis = vec![u32::MAX; meters.len()];
+        let mut partials = definition.car.as_ref().map(|_| CarPartials {
+            base: vec![0; meters.len()],
+            head: vec![0; meters.len()],
+            tail: vec![0; meters.len()],
+        });
+        for slot in 0..meters.len() {
+            if attributes.adj_access[slot] & MODE_CAR == 0 {
+                continue;
+            }
+            let speed_kmh = f64::from(car.adj_car_speed[slot]);
+            let mut base = meters[slot] / (speed_kmh / 3.6);
+            let (mut head, mut tail) = (0.0f64, 0.0f64);
+            if let Some(model) = &definition.car {
+                let edge = edges[slot] as usize;
+                let code = attributes.edge_highway[edge] as usize;
+                let b = model.group_seconds[model.groups[code] as usize];
+                let is_ramp = RAMP_HIGHWAY[code];
+                let fast = speed_kmh >= CAR_HIGH_SPEED_KMH;
+                let junction = |class: u8| {
+                    matches!(
+                        class,
+                        JUNCTION_TOPOLOGICAL | JUNCTION_SIGNALS | JUNCTION_RAMP
+                    )
+                };
+                let share = |class: u8| match class {
+                    JUNCTION_TOPOLOGICAL | JUNCTION_SIGNALS => 0.5,
+                    JUNCTION_RAMP if is_ramp => {
+                        if fast {
+                            model.ramp_share_high
+                        } else {
+                            model.ramp_share_low
+                        }
+                    }
+                    JUNCTION_RAMP => 0.25,
+                    _ => 0.0,
+                };
+                let (head_class, tail_class) = (car.adj_junction[slot], tail_classes[slot]);
+                if attributes.edge_flags[edge] & FLAG_ROUNDABOUT != 0 {
+                    // The interior charge is circulating delay, spread over
+                    // the element like distance rather than pinned to an end.
+                    base += b / 4.0;
+                } else if junction(head_class) || junction(tail_class) {
+                    head = b * share(head_class);
+                    tail = b * share(tail_class);
+                } else if fast {
+                    base *= if is_ramp {
+                        model.ramp_multiplier
+                    } else {
+                        model.congestion_multiplier
+                    };
+                }
+            }
+            let millis = ((base + head + tail) * 1000.0).ceil();
+            if millis >= u32::MAX as f64 {
+                return Err(ProfileError::ArcCostOverflow);
+            }
+            let total = if meters[slot] > 0.0 {
+                (millis as u32).max(1)
+            } else {
+                millis as u32
+            };
+            arc_millis[slot] = total;
+            if let Some(partials) = &mut partials {
+                // The endpoint components round to the nearest millisecond;
+                // the base absorbs the ceil so the three sum to the total.
+                let head = ((head * 1000.0).round() as u32).min(total);
+                let tail = ((tail * 1000.0).round() as u32).min(total - head);
+                partials.head[slot] = head;
+                partials.tail[slot] = tail;
+                partials.base[slot] = total - head - tail;
+            }
+        }
+        Ok(CompiledStreetProfile {
+            definition: definition.clone(),
+            arc_millis,
+            car_partials: partials,
             max_effective_speed: std::sync::OnceLock::new(),
         })
     }

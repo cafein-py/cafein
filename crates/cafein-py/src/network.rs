@@ -772,7 +772,8 @@ impl TransportNetwork {
     #[pyo3(signature = (modes, vertex_count, edges, coordinate_offsets, longitudes, latitudes,
                         edge_highway, edge_surface, edge_smoothness, edge_flags,
                         access_forward, access_reverse, facility_forward, facility_reverse,
-                        coordinate_elevations = None, elevation_metadata = None))]
+                        coordinate_elevations = None, elevation_metadata = None,
+                        car_attributes = None))]
     fn set_multimodal_streets(
         &mut self,
         modes: Vec<String>,
@@ -791,6 +792,7 @@ impl TransportNetwork {
         facility_reverse: Vec<u8>,
         coordinate_elevations: Option<Vec<f32>>,
         elevation_metadata: Option<(String, f64, String, f64, u32)>,
+        car_attributes: Option<crate::streets::CarPayload>,
     ) -> PyResult<()> {
         let (inner, elevation) = crate::streets::build_multimodal_core(
             vertex_count,
@@ -808,6 +810,7 @@ impl TransportNetwork {
             facility_reverse,
             coordinate_elevations,
             elevation_metadata,
+            car_attributes,
         )?;
         self.multimodal = Some(inner);
         self.multimodal_elevation = elevation;
@@ -842,6 +845,17 @@ impl TransportNetwork {
             let (_, bytes) = crate::artifact::encode_streets(&network.to_parts());
             crate::artifact::crc32(&bytes)
         })
+    }
+
+    /// The multimodal graph's per-slot car arrays as `(speeds, junctions)`,
+    /// or ``None`` without a car build. Internal; the round-trip tests
+    /// assert on them.
+    #[getter]
+    fn _multimodal_car_attributes(&self) -> Option<(Vec<f32>, Vec<u8>)> {
+        self.multimodal
+            .as_ref()
+            .and_then(|network| network.car_attributes())
+            .map(|car| (car.adj_car_speed.clone(), car.adj_junction.clone()))
     }
 
     /// Provenance of the multimodal graph's sampled elevations, or ``None``
@@ -1861,7 +1875,8 @@ impl TransportNetwork {
     }
 
     /// The number of street-array descriptors this network would save: the 13
-    /// core arrays, plus six for an attribute group and one for elevations.
+    /// core arrays, plus six for an attribute group, one for elevations, and
+    /// two for a car group.
     /// Internal surface for the walk-only-vs-multimodal descriptor red-check.
     fn _street_descriptor_count(&self) -> Option<usize> {
         let streets = self.streets.as_ref()?;
@@ -1870,7 +1885,12 @@ impl TransportNetwork {
                 6
             } else {
                 0
-            } + usize::from(streets.elevations().is_some()),
+            } + usize::from(streets.elevations().is_some())
+                + if streets.car_attributes().is_some() {
+                    2
+                } else {
+                    0
+                },
         )
     }
 
@@ -2206,6 +2226,13 @@ impl TransportNetwork {
                 "no multimodal street graph is installed; build with street_modes=",
             )
         })?;
+        // Car legs never join transit journeys (park-and-ride is out of
+        // scope); the car routes through the standalone street queries.
+        if mode == "car" {
+            return Err(PyValueError::new_err(
+                "the car is a street-only mode; it cannot serve transit access or egress",
+            ));
+        }
         let definition = crate::streets::profile_definition(mode)?;
         let mut cache = self
             .multimodal_profiles
