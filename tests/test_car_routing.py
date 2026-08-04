@@ -285,6 +285,228 @@ def test_car_itineraries_carry_geometry(car_network, origins, destinations):
     assert legs.geometry.notna().all()
 
 
+def test_parking_is_off_by_default_and_adds_per_form(car_network):
+    base = car_network.travel_time(KAMPPI, ARABIA, mode="car")
+    assert car_network.travel_time(KAMPPI, ARABIA, mode="car", parking=False) == base
+    assert (
+        car_network.travel_time(KAMPPI, ARABIA, mode="car", parking=True) == base + 300
+    )
+    assert (
+        car_network.travel_time(KAMPPI, ARABIA, mode="car", parking=120) == base + 120
+    )
+    assert (
+        car_network.travel_time(KAMPPI, ARABIA, mode="car", parking=(60, 400.0))
+        == base + 60
+    )
+    # Parking composes with the delay model.
+    midday = car_network.travel_time(
+        KAMPPI, ARABIA, mode="car", intersection_delays=True
+    )
+    assert (
+        car_network.travel_time(
+            KAMPPI, ARABIA, mode="car", intersection_delays=True, parking=True
+        )
+        == midday + 300
+    )
+
+
+def test_parking_rejects_bad_values_and_other_modes(car_network):
+    for bad in (
+        -1,
+        float("nan"),
+        (60, -5),
+        (float("inf"), 0),
+        "lot",
+        (1, 2, 3),
+        1e12,  # beyond the loud ceiling
+    ):
+        with pytest.raises(ValueError, match="parking"):
+            car_network.travel_time(KAMPPI, ARABIA, mode="car", parking=bad)
+    with pytest.raises(ValueError, match="mode='car'"):
+        car_network.travel_time(KAMPPI, ARABIA, mode="walk", parking=True)
+    # NumPy scalars are numbers too.
+    base = car_network.travel_time(KAMPPI, ARABIA, mode="car")
+    assert (
+        car_network.travel_time(KAMPPI, ARABIA, mode="car", parking=np.int64(120))
+        == base + 120
+    )
+    frame = gpd.GeoDataFrame(
+        {"metres": [10.0]},
+        geometry=[ARABIA_SQUARE],
+        crs="EPSG:4326",
+    )
+    with pytest.raises(ValueError, match="seconds"):
+        car_network.travel_time(KAMPPI, ARABIA, mode="car", parking=frame)
+    missing_crs = gpd.GeoDataFrame({"seconds": [60.0]}, geometry=[ARABIA_SQUARE])
+    with pytest.raises(ValueError, match="CRS"):
+        car_network.travel_time(KAMPPI, ARABIA, mode="car", parking=missing_crs)
+    from shapely.geometry import LineString
+
+    lines = gpd.GeoDataFrame(
+        {"seconds": [60.0]},
+        geometry=[LineString([(24.9, 60.1), (25.0, 60.2)])],
+        crs="EPSG:4326",
+    )
+    with pytest.raises(ValueError, match="Polygon"):
+        car_network.travel_time(KAMPPI, ARABIA, mode="car", parking=lines)
+    # The snapshot taken at resolve time is immune to later mutation.
+    from cafein import _parking
+
+    areas = gpd.GeoDataFrame(
+        {"seconds": [60.0]}, geometry=[ARABIA_SQUARE], crs="EPSG:4326"
+    )
+    resolved = _parking.resolve(areas, "car")
+    areas.loc[0, "seconds"] = 9999.0
+    seconds, _ = _parking.destination_costs(resolved, [ARABIA])
+    assert seconds[0] == 60.0
+
+
+def _square(latitude, longitude, half=0.004):
+    from shapely.geometry import Polygon
+
+    return Polygon(
+        [
+            (longitude - half, latitude - half),
+            (longitude + half, latitude - half),
+            (longitude + half, latitude + half),
+            (longitude - half, latitude + half),
+        ]
+    )
+
+
+ARABIA_SQUARE = _square(*ARABIA)
+
+
+def test_parking_areas_resolve_by_polygon_with_the_settled_tie_break(car_network):
+    base = car_network.travel_time(KAMPPI, ARABIA, mode="car")
+    # Two overlapping polygons over Arabia: the largest seconds wins; with
+    # equal seconds the largest metres; with both equal the lowest row.
+    overlapping = gpd.GeoDataFrame(
+        {"seconds": [90.0, 240.0], "metres": [500.0, 100.0]},
+        geometry=[ARABIA_SQUARE, _square(*ARABIA, half=0.008)],
+        crs="EPSG:4326",
+    )
+    assert (
+        car_network.travel_time(KAMPPI, ARABIA, mode="car", parking=overlapping)
+        == base + 240
+    )
+    equal_seconds = gpd.GeoDataFrame(
+        {"seconds": [240.0, 240.0], "metres": [100.0, 900.0]},
+        geometry=[ARABIA_SQUARE, _square(*ARABIA, half=0.008)],
+        crs="EPSG:4326",
+    )
+    from cafein import _parking
+
+    seconds, metres = _parking.destination_costs(
+        _parking.resolve(equal_seconds, "car"), [ARABIA]
+    )
+    assert (seconds[0], metres[0]) == (240.0, 900.0)
+    full_tie = gpd.GeoDataFrame(
+        {"seconds": [240.0, 240.0], "metres": [900.0, 900.0]},
+        geometry=[_square(*ARABIA, half=0.008), ARABIA_SQUARE],
+        crs="EPSG:4326",
+    )
+    seconds, metres = _parking.destination_costs(
+        _parking.resolve(full_tie, "car"), [ARABIA]
+    )
+    assert (seconds[0], metres[0]) == (240.0, 900.0)
+    # Outside every polygon the shipped constant applies, and a projected
+    # frame reprojects onto the points' CRS.
+    away = gpd.GeoDataFrame(
+        {"seconds": [90.0]}, geometry=[_square(60.9, 24.0)], crs="EPSG:4326"
+    )
+    assert (
+        car_network.travel_time(KAMPPI, ARABIA, mode="car", parking=away) == base + 300
+    )
+    projected = overlapping.to_crs("EPSG:3067")
+    assert (
+        car_network.travel_time(KAMPPI, ARABIA, mode="car", parking=projected)
+        == base + 240
+    )
+    # Point-in-polygon is strict: a destination exactly on a polygon
+    # boundary is outside and takes the fallback.
+    from shapely.geometry import Polygon
+
+    latitude, longitude = ARABIA
+    touching = gpd.GeoDataFrame(
+        {"seconds": [90.0]},
+        geometry=[
+            Polygon(
+                [
+                    (longitude - 0.004, latitude),
+                    (longitude + 0.004, latitude),
+                    (longitude + 0.004, latitude + 0.008),
+                    (longitude - 0.004, latitude + 0.008),
+                ]
+            )
+        ],
+        crs="EPSG:4326",
+    )
+    from cafein import _parking
+
+    seconds, _ = _parking.destination_costs(_parking.resolve(touching, "car"), [ARABIA])
+    assert seconds[0] == 300.0
+
+
+def test_parking_metres_join_distance_and_emissions(car_network, origins, destinations):
+    factors = pd.DataFrame(
+        [
+            {
+                "street_mode": "car",
+                "vehicle_class": "ICE",
+                "service_model": "private",
+                "vehicle": 30.0,
+                "fuel": 120.0,
+                "infrastructure": 10.0,
+                "operations": 2.0,
+            }
+        ]
+    )
+    plain = TravelCostMatrix(
+        car_network, origins, destinations, transport_mode="car", factors=factors
+    )
+    parked = TravelCostMatrix(
+        car_network,
+        origins,
+        destinations,
+        transport_mode="car",
+        factors=factors,
+        parking=(60, 400.0),
+    )
+    merged = pd.merge(plain, parked, on=["from_id", "to_id"], suffixes=("", "_p"))
+    assert len(merged) == len(plain) == len(parked)
+    assert (merged.travel_time_s_p == merged.travel_time_s + 60).all()
+    assert np.allclose(merged.network_distance_m_p, merged.network_distance_m + 400.0)
+    assert np.allclose(merged.distance_m_p, merged.distance_m + 400.0)
+    # The extra metres are driven: they join the emissions basis.
+    assert np.allclose(merged.emissions_p, merged.network_distance_m_p / 1000.0 * 162.0)
+    # The time matrix gains the same seconds per cell.
+    times = TravelTimeMatrix(
+        car_network, origins, destinations, transport_mode="car", parking=(60, 400.0)
+    )
+    with_base = pd.merge(plain, times, on=["from_id", "to_id"], suffixes=("", "_t"))
+    assert (with_base.travel_time_s_t == with_base.travel_time_s + 60).all()
+    # Itineraries shift arrivals and keep the geometry free of the search.
+    legs = DetailedItineraries(
+        car_network,
+        origins.head(1),
+        destinations.head(1),
+        departure="08:00:00",
+        transport_mode="car",
+        parking=(60, 400.0),
+    )
+    bare = DetailedItineraries(
+        car_network,
+        origins.head(1),
+        destinations.head(1),
+        departure="08:00:00",
+        transport_mode="car",
+    )
+    assert (legs.travel_time_s.to_numpy() == bare.travel_time_s.to_numpy() + 60).all()
+    assert (legs.arrival_s.to_numpy() == bare.arrival_s.to_numpy() + 60).all()
+    assert legs.geometry.iloc[0].equals(bare.geometry.iloc[0])
+
+
 def test_transit_matrices_reject_the_delay_options(network):
     with pytest.raises(ValueError, match="StreetNetwork car matrix"):
         TravelTimeMatrix(
@@ -293,6 +515,14 @@ def test_transit_matrices_reject_the_delay_options(network):
             date="2022-02-22",
             departure="08:30:00",
             intersection_delays=True,
+        )
+    with pytest.raises(ValueError, match="StreetNetwork car matrix"):
+        TravelTimeMatrix(
+            network,
+            ["1030423"],
+            date="2022-02-22",
+            departure="08:30:00",
+            parking=True,
         )
 
 

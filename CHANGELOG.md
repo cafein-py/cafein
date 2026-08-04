@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **The car parking search model**: car queries gain ``parking=`` on
+  ``StreetNetwork.travel_time``, ``TravelTimeMatrix``,
+  ``TravelCostMatrix``, and ``DetailedItineraries`` — the search that
+  ends a car trip, costed as time and extra driving distance (GEMMAT's
+  model; Fink et al. 2024), never as a walking leg. Off by default;
+  ``parking=True`` applies the shipped constant (300 s, 0 m — inside
+  Jaakkola's 245–322 s Helsinki-region estimates), a number sets the
+  seconds, a ``(seconds, metres)`` pair both constants, and a polygon
+  GeoDataFrame with a ``seconds`` column (optional ``metres``) resolves
+  per destination by point-in-polygon — overlaps take the largest
+  seconds (ties: largest metres, then lowest row), destinations outside
+  every polygon the shipped constant. The seconds join the travel time
+  (and arrivals), the metres join the driven network distance and with
+  it the emissions basis; path geometry never shows the search loop,
+  the driving cutoff bounds the driving alone, and negative or NaN
+  values, non-car modes, and transit surfaces reject the option loudly.
+
 - **Car routing lands**: building with ``"car"`` in the street modes
   computes and persists per-arc driving speeds (tagged ``maxspeed``
   with the world speed-limit defaults filling untagged ways, selected
