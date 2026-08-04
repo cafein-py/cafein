@@ -204,12 +204,19 @@ class DetailedItineraries(gpd.GeoDataFrame):
         whose speeds come from the mode's profile.
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
-        one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``.
-        A ``TransportNetwork`` routes public transport and takes none.
+        one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
+        ``"car"`` (a car build). A ``TransportNetwork`` routes public
+        transport and takes none.
     max_street_time : float (optional)
         Cutoff in seconds for a ``StreetNetwork``, beyond which a
         destination counts as unreachable (default:
         ``cafein.street_network.MAX_STREET_TIME``, 7200).
+    intersection_delays, profile, delay_model : optional
+        Car legs only. Free-flow by default;
+        ``intersection_delays=True`` applies the intersection-delay
+        model under ``profile=`` (``"rush"``, ``"midday"`` — the
+        default — or ``"day-average"``) with ``delay_model=`` partial
+        overrides, as in ``StreetNetwork.travel_time``.
     street_policy : StreetLegPolicy (optional)
         Which street modes may serve the access and egress, on what
         vehicle terms (``cafein.StreetLegPolicy``); point origins and
@@ -284,6 +291,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
         transport_mode=None,
         max_street_time=None,
         street_policy=None,
+        intersection_delays=False,
+        profile=None,
+        delay_model=None,
     ):
         # Before the reconstruction guard below: a StreetNetwork has no
         # `route_between_stops` either, so it would be mistaken for frame data.
@@ -306,6 +316,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
                     geometries=geometries,
                     factors=factors,
                     components=components,
+                    intersection_delays=intersection_delays,
+                    profile=profile,
+                    delay_model=delay_model,
                     transit_only={
                         "date": date,
                         "slack_seconds": slack_seconds,
@@ -339,6 +352,11 @@ class DetailedItineraries(gpd.GeoDataFrame):
             )
         if max_street_time is not None:
             raise ValueError("max_street_time applies to a StreetNetwork")
+        if intersection_delays or profile is not None or delay_model is not None:
+            raise ValueError(
+                "intersection_delays, profile, and delay_model apply to a "
+                "StreetNetwork car query"
+            )
         frame = _itineraries_frame(
             network,
             origins,
@@ -877,10 +895,14 @@ def _street_itineraries_frame(
     transit_only,
     factors=None,
     components=None,
+    intersection_delays=False,
+    profile=None,
+    delay_model=None,
 ):
     """Street routes as one leg per reachable pair."""
     from cafein import emissions
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
+    from cafein.street_network import _resolved_delays
 
     query = _street_query(
         origins,
@@ -898,6 +920,9 @@ def _street_itineraries_frame(
         query.max_seconds,
         query.max_snap_distance,
         bool(geometries),
+        car_model=_resolved_delays(
+            transport_mode, intersection_delays, profile, delay_model
+        ),
     )
     _warn_unsnapped(table, query.from_ids, query.to_ids)
     from_ids = np.asarray(query.from_ids, dtype=object)

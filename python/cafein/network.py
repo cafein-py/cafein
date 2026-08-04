@@ -890,6 +890,9 @@ class TransportNetwork:
         street_modes=None,
         dem=None,
         dem_interval=25.0,
+        country=None,
+        urban_areas=None,
+        speed_limits=None,
     ):
         """Build a network from GTFS archives and an optional OSM extract.
 
@@ -942,6 +945,10 @@ class TransportNetwork:
             Elevation for the multimodal graph, exactly as in
             ``StreetNetwork.from_osm``; only meaningful with
             `street_modes`.
+        country, urban_areas, speed_limits : optional
+            Car speed configuration, exactly as in
+            ``StreetNetwork.from_osm``; only meaningful with ``"car"``
+            in `street_modes`.
         ultra : bool (optional, default: False)
             Also compute the whole-day ULTRA intermediate-transfer
             shortcuts (see ``compute_ultra_shortcuts``), giving the
@@ -962,6 +969,13 @@ class TransportNetwork:
             raise ValueError("street_modes requires an OSM extract; pass osm_pbf=")
         if dem is not None and street_modes is None:
             raise ValueError("dem applies to the multimodal graph; pass street_modes=")
+        if street_modes is None and any(
+            option is not None for option in (country, urban_areas, speed_limits)
+        ):
+            raise ValueError(
+                "country, urban_areas, and speed_limits configure car speeds; "
+                "pass street_modes= including 'car'"
+            )
         core = _TransportNetwork.from_gtfs(paths)
         if trip_distances:
             from cafein import geometry
@@ -1013,6 +1027,9 @@ class TransportNetwork:
                         bounding_box=bounding_box,
                         dem=dem,
                         dem_interval=dem_interval,
+                        country=country,
+                        urban_areas=urban_areas,
+                        speed_limits=speed_limits,
                     ),
                 )
             if ultra:

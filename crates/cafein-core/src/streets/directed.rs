@@ -171,12 +171,6 @@ thread_local! {
         std::cell::RefCell::new(DirectedState::default());
 }
 
-/// The on-network millisecond cost of traversing `fraction` of an arc whose
-/// whole-edge cost is `arc`, rounded up. `arc` is finite (the arc is permitted).
-fn partial_millis(arc: u32, fraction: f64) -> u64 {
-    (f64::from(arc) * fraction).ceil() as u64
-}
-
 /// The connector's millisecond cost at the profile's connector speed.
 fn connector_millis(connector: f64, connector_speed: f64) -> u64 {
     (connector / connector_speed * 1000.0).ceil() as u64
@@ -409,12 +403,14 @@ impl StreetNetwork {
         let mut seeds = Vec::with_capacity(2);
         // Reach `from`: at fraction 0 the snap is already there (no arc needed);
         // otherwise travel the leading fraction against the edge (reverse arc).
+        // A departing partial charges the junction at the endpoint reached
+        // (the slot's head) and never the one behind the snap.
         if snap.fraction == 0.0 {
             seeds.push(Endpoint::new(from, connector, 0.0));
         } else if let Some(slot) = reverse {
             seeds.push(Endpoint::new(
                 from,
-                connector.saturating_add(partial_millis(profile.arc_millis()[slot], snap.fraction)),
+                connector.saturating_add(profile.departing_partial(slot, snap.fraction)),
                 0.0,
             ));
         }
@@ -425,10 +421,7 @@ impl StreetNetwork {
         } else if let Some(slot) = forward {
             seeds.push(Endpoint::new(
                 to,
-                connector.saturating_add(partial_millis(
-                    profile.arc_millis()[slot],
-                    1.0 - snap.fraction,
-                )),
+                connector.saturating_add(profile.departing_partial(slot, 1.0 - snap.fraction)),
                 1.0,
             ));
         }
@@ -446,12 +439,14 @@ impl StreetNetwork {
         let mut offsets = Vec::with_capacity(2);
         // Arrive at the snap from `from`: at fraction 0 the snap is at `from`;
         // otherwise travel the leading fraction along the edge (forward arc).
+        // An arriving partial enters the edge through the junction at the
+        // slot's tail and stops mid-edge, so only that endpoint charges.
         if snap.fraction == 0.0 {
             offsets.push(Endpoint::new(from, connector, 0.0));
         } else if let Some(slot) = forward {
             offsets.push(Endpoint::new(
                 from,
-                connector.saturating_add(partial_millis(profile.arc_millis()[slot], snap.fraction)),
+                connector.saturating_add(profile.arriving_partial(slot, snap.fraction)),
                 0.0,
             ));
         }
@@ -462,10 +457,7 @@ impl StreetNetwork {
         } else if let Some(slot) = reverse {
             offsets.push(Endpoint::new(
                 to,
-                connector.saturating_add(partial_millis(
-                    profile.arc_millis()[slot],
-                    1.0 - snap.fraction,
-                )),
+                connector.saturating_add(profile.arriving_partial(slot, 1.0 - snap.fraction)),
                 1.0,
             ));
         }
@@ -493,14 +485,24 @@ impl StreetNetwork {
         if span == 0.0 {
             return Some(connectors);
         }
-        // The destination is ahead along the edge (forward) or behind (reverse).
+        // The destination is ahead along the edge (forward) or behind
+        // (reverse). Interior snaps cross no junction; a trip starting
+        // exactly at the traversal's tail vertex or ending exactly at its
+        // head vertex charges that endpoint, as the graph path would.
         let (forward, reverse) = self.snap_arcs(from, profile);
-        let slot = if to.fraction > from.fraction {
-            forward
+        let (slot, enters_at_tail, exits_at_head) = if to.fraction > from.fraction {
+            (forward, from.fraction == 0.0, to.fraction == 1.0)
         } else {
-            reverse
+            (reverse, from.fraction == 1.0, to.fraction == 0.0)
         };
-        slot.map(|slot| connectors.saturating_add(partial_millis(profile.arc_millis()[slot], span)))
+        slot.map(|slot| {
+            connectors.saturating_add(profile.same_edge_partial(
+                slot,
+                span,
+                enters_at_tail,
+                exits_at_head,
+            ))
+        })
     }
 
     /// Reusable one-to-many directed search: relax each vertex's outgoing arcs

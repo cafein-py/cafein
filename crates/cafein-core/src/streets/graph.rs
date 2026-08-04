@@ -161,6 +161,30 @@ pub struct StreetAttributes {
     pub edge_flags: Vec<u16>,
 }
 
+/// The optional car attribute group: per-adjacency-slot driving speeds
+/// and junction head classes. Present only on car builds, always beside
+/// the multimodal attribute group, and owned like it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CarAttributes {
+    /// Driving speed in km/h per adjacency slot (`2·edges`).
+    pub adj_car_speed: Vec<f32>,
+    /// Junction class at the slot's head vertex (`2·edges`): 0 none,
+    /// 1 topological, 2 priority-controlled (reserved), 3 signalized,
+    /// 4 ramp junction. Signalized > ramp junction > topological when a
+    /// vertex qualifies as more than one.
+    pub adj_junction: Vec<u8>,
+}
+
+/// The car inputs of [`EdgeAttributes`]: directional driving speeds and
+/// junction head classes, one entry per physical edge, all four present
+/// together.
+pub struct CarEdgeAttributes<'a> {
+    pub speed_forward: &'a [f32],
+    pub speed_reverse: &'a [f32],
+    pub junction_forward: &'a [u8],
+    pub junction_reverse: &'a [u8],
+}
+
 /// Per-edge directional attributes handed to [`StreetNetwork::new_multimodal`],
 /// one entry per physical edge in the caller's input edge order (the same order
 /// as `edges`). The `*_forward` slices describe the stored geometry direction
@@ -175,6 +199,8 @@ pub struct EdgeAttributes<'a> {
     pub access_reverse: &'a [u8],
     pub facility_forward: &'a [u8],
     pub facility_reverse: &'a [u8],
+    /// The car group, present on car builds only.
+    pub car: Option<CarEdgeAttributes<'a>>,
 }
 
 /// Where each street array lives inside a mapped artifact: byte offsets
@@ -203,6 +229,8 @@ pub struct MappedStreets {
     /// The optional multimodal attributes, decoded owned by the loader when
     /// the artifact carries them, else `None` (a walk-only artifact).
     pub attributes: Option<StreetAttributes>,
+    /// The optional car attribute group, decoded owned, else `None`.
+    pub car: Option<CarAttributes>,
     /// The optional per-coordinate elevations, decoded owned, else `None`.
     pub elevations: Option<Vec<f32>>,
 }
@@ -262,6 +290,10 @@ pub(super) struct StreetGraph {
     /// search stays mode-blind and never reads them; profile compilation and
     /// the mode-aware snaps do. Persisted with the artifact when present.
     pub(super) attributes: Option<StreetAttributes>,
+    /// The optional car attribute group (driving speeds, junction head
+    /// classes). Present only on car builds, always beside `attributes`;
+    /// persisted with the artifact when present.
+    pub(super) car: Option<CarAttributes>,
     /// The optional per-coordinate elevations, aligned one-to-one with the
     /// geometry `lons`/`lats`/`cumulative`. `None` unless elevation was
     /// enabled; persisted with the artifact when present.
@@ -351,6 +383,25 @@ impl StreetNetwork {
             || attributes.facility_reverse.len() != edge_count
         {
             return Err(StreetError::InvalidAttributes);
+        }
+        if let Some(car) = &attributes.car {
+            if car.speed_forward.len() != edge_count
+                || car.speed_reverse.len() != edge_count
+                || car.junction_forward.len() != edge_count
+                || car.junction_reverse.len() != edge_count
+            {
+                return Err(StreetError::InvalidAttributes);
+            }
+            for speed in car.speed_forward.iter().chain(car.speed_reverse) {
+                if !speed.is_finite() || *speed <= 0.0 {
+                    return Err(StreetError::InvalidAttributes);
+                }
+            }
+            for junction in car.junction_forward.iter().chain(car.junction_reverse) {
+                if *junction as usize >= JUNCTION_CLASS_COUNT {
+                    return Err(StreetError::InvalidAttributes);
+                }
+            }
         }
         if let Some(elevations) = elevations {
             if elevations.len() != longitudes.len() {
@@ -498,6 +549,14 @@ impl StreetNetwork {
                     a.access_reverse[edge],
                     a.facility_forward[edge],
                     a.facility_reverse[edge],
+                    a.car.as_ref().map(|car| {
+                        (
+                            car.speed_forward[edge].to_bits(),
+                            car.speed_reverse[edge].to_bits(),
+                            car.junction_forward[edge],
+                            car.junction_reverse[edge],
+                        )
+                    }),
                 )
             })
         };
@@ -602,6 +661,13 @@ impl StreetNetwork {
         };
         let mut adj_access = vec![0u8; slots];
         let mut adj_facility = vec![0u8; slots];
+        let car_slots = if attributes.as_ref().is_some_and(|a| a.car.is_some()) {
+            slots
+        } else {
+            0
+        };
+        let mut adj_car_speed = vec![0f32; car_slots];
+        let mut adj_junction = vec![0u8; car_slots];
         let mut cursor = adjacency_offsets.clone();
         for (index, &(from, to, meters)) in edges.iter().enumerate() {
             let source = order[index] as usize;
@@ -618,6 +684,15 @@ impl StreetNetwork {
                     };
                     adj_access[slot] = access;
                     adj_facility[slot] = facility;
+                    if let Some(car) = &attrs.car {
+                        let (speed, junction) = if direction == 0 {
+                            (car.speed_forward[source], car.junction_forward[source])
+                        } else {
+                            (car.speed_reverse[source], car.junction_reverse[source])
+                        };
+                        adj_car_speed[slot] = speed;
+                        adj_junction[slot] = junction;
+                    }
                 }
                 cursor[a as usize] += 1;
             }
@@ -629,6 +704,13 @@ impl StreetNetwork {
 
         // The per-edge codes arrive in input order; permute them into internal
         // edge order (`order[new] == old`) and validate the assembled group.
+        let car_attributes = attributes
+            .as_ref()
+            .and_then(|attrs| attrs.car.as_ref())
+            .map(|_| CarAttributes {
+                adj_car_speed,
+                adj_junction,
+            });
         let attributes = match attributes {
             Some(attrs) => {
                 let permute = |src: &[u8]| -> Vec<u8> {
@@ -669,6 +751,7 @@ impl StreetNetwork {
             vertex_coordinates: std::sync::OnceLock::new(),
             reverse_adjacency: std::sync::OnceLock::new(),
             attributes,
+            car: car_attributes,
             elevations: dense_elevations,
         };
         Ok(StreetNetwork {
@@ -714,6 +797,11 @@ impl StreetNetwork {
     /// The installed multimodal edge attributes, when present.
     pub fn street_attributes(&self) -> Option<&StreetAttributes> {
         self.graph.attributes.as_ref()
+    }
+
+    /// The installed car attribute group, when present.
+    pub fn car_attributes(&self) -> Option<&CarAttributes> {
+        self.graph.car.as_ref()
     }
 
     /// The installed per-coordinate elevations, when present.
@@ -891,6 +979,7 @@ impl StreetNetwork {
             index_level_starts: self.graph.level_starts.clone(),
             links: self.stop_links.links.clone(),
             attributes: self.graph.attributes.clone(),
+            car: self.graph.car.clone(),
             elevations: self.graph.elevations.clone(),
         }
     }
@@ -904,6 +993,12 @@ impl StreetNetwork {
     pub fn from_parts(parts: StreetNetworkParts) -> Result<StreetNetwork, StreetError> {
         if let Some(attributes) = &parts.attributes {
             check_street_attributes(attributes, parts.lengths.len())?;
+        }
+        if let Some(car) = &parts.car {
+            if parts.attributes.is_none() {
+                return Err(StreetError::InvalidAttributes);
+            }
+            check_car_attributes(car, parts.lengths.len())?;
         }
         if let Some(elevations) = &parts.elevations {
             if elevations.len() != parts.lons.len() {
@@ -938,6 +1033,7 @@ impl StreetNetwork {
                 vertex_coordinates: std::sync::OnceLock::new(),
                 reverse_adjacency: std::sync::OnceLock::new(),
                 attributes: parts.attributes,
+                car: parts.car,
                 elevations: parts.elevations,
             },
             stop_links: StopLinks {
@@ -988,6 +1084,12 @@ impl StreetNetwork {
         if let Some(attributes) = &spec.attributes {
             check_street_attributes(attributes, arrays.lengths.len)?;
         }
+        if let Some(car) = &spec.car {
+            if spec.attributes.is_none() {
+                return Err(StreetError::InvalidAttributes);
+            }
+            check_car_attributes(car, arrays.lengths.len)?;
+        }
         if let Some(elevations) = &spec.elevations {
             if elevations.len() != arrays.lons.len {
                 return Err(StreetError::InvalidAttributes);
@@ -1004,6 +1106,7 @@ impl StreetNetwork {
                 vertex_coordinates: std::sync::OnceLock::new(),
                 reverse_adjacency: std::sync::OnceLock::new(),
                 attributes: spec.attributes,
+                car: spec.car,
                 elevations: spec.elevations,
             },
             stop_links: StopLinks {
@@ -1041,6 +1144,8 @@ pub struct StreetNetworkParts {
     pub links: Vec<StoredLink>,
     /// The optional multimodal edge attributes, present on a multimodal build.
     pub attributes: Option<StreetAttributes>,
+    /// The optional car attribute group, present on a car build.
+    pub car: Option<CarAttributes>,
     /// The optional per-coordinate elevations, present when elevation is on.
     pub elevations: Option<Vec<f32>>,
 }
@@ -1078,6 +1183,36 @@ pub(super) fn check_street_attributes(
     if !in_range(&attributes.edge_highway, HIGHWAY_CODE_COUNT)
         || !in_range(&attributes.edge_surface, SURFACE_CODE_COUNT)
         || !in_range(&attributes.edge_smoothness, SMOOTHNESS_CODE_COUNT)
+    {
+        return Err(StreetError::InvalidAttributes);
+    }
+    Ok(())
+}
+
+/// The junction head classes: 0 none, 1 topological, 2 priority-controlled
+/// (reserved), 3 signalized, 4 ramp junction.
+pub const JUNCTION_CLASS_COUNT: usize = 5;
+
+/// Validates a car attribute group against a graph of `edges` edges: both
+/// adjacency-slot arrays span `2·edges`, every speed is positive and finite,
+/// and every junction class is within the vocabulary. Shared by installation
+/// and both load paths, like [`check_street_attributes`].
+pub(super) fn check_car_attributes(car: &CarAttributes, edges: usize) -> Result<(), StreetError> {
+    let slots = 2 * edges;
+    if car.adj_car_speed.len() != slots || car.adj_junction.len() != slots {
+        return Err(StreetError::InvalidAttributes);
+    }
+    if !car
+        .adj_car_speed
+        .iter()
+        .all(|speed| speed.is_finite() && *speed > 0.0)
+    {
+        return Err(StreetError::InvalidAttributes);
+    }
+    if !car
+        .adj_junction
+        .iter()
+        .all(|&class| (class as usize) < JUNCTION_CLASS_COUNT)
     {
         return Err(StreetError::InvalidAttributes);
     }

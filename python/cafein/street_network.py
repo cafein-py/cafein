@@ -13,10 +13,11 @@ from ._cafein import StreetNetwork as _CoreStreetNetwork
 MODES = ("walk", "bicycle", "e_scooter")
 """The modes built by default — those with their own permission bit."""
 
-STREET_MODES = ("walk", "bicycle", "e_bike", "e_scooter")
+STREET_MODES = ("walk", "bicycle", "e_bike", "e_scooter", "car")
 """The modes that can be routed. `e_bike` has no permission bit of its own — it
 rides the bicycle permissions with its own speed profile — so it is routable
-without being a separate build mode."""
+without being a separate build mode. `car` requires a build with ``"car"`` in
+`modes` (the persisted driving speeds and junction classes)."""
 
 MAX_STREET_TIME = 7200.0
 """Default routing cutoff in seconds, matching the street-time ceiling the
@@ -38,7 +39,16 @@ class StreetNetwork:
 
     @classmethod
     def from_osm(
-        cls, osm_pbf, *, modes=MODES, bounding_box=None, dem=None, dem_interval=25.0
+        cls,
+        osm_pbf,
+        *,
+        modes=MODES,
+        bounding_box=None,
+        dem=None,
+        dem_interval=25.0,
+        country=None,
+        urban_areas=None,
+        speed_limits=None,
     ):
         """Build a street network from an OSM PBF extract.
 
@@ -48,11 +58,14 @@ class StreetNetwork:
             Path to an ``.osm.pbf`` extract.
         modes : iterable of str
             The modes to prune connectivity for, from ``walk``, ``bicycle``,
-            ``e_scooter``, and ``car``. Listing ``car`` also keeps the
-            motor-only highway classes (motorways) in the extraction;
-            otherwise the selection changes pruning only — every physical
-            edge is kept whatever is listed, so a mode left out can still
-            be routed later, just without its small-component pruning.
+            ``e_scooter``, and ``car``. For the non-car modes the selection
+            changes pruning only — every physical edge is kept whatever is
+            listed, so a mode left out can still be routed later, just
+            without its small-component pruning. ``car`` is the exception:
+            listing it keeps the motor-only highway classes (motorways) in
+            the extraction and computes the persisted driving speeds and
+            junction classes, so car routing requires a build with ``car``
+            in `modes`.
         bounding_box : sequence of float, optional
             ``(min_lon, min_lat, max_lon, max_lat)`` to clip the extract.
         dem : path, sequence of paths, or callable, optional
@@ -69,6 +82,22 @@ class StreetNetwork:
             between OSM nodes is captured. Capped just under the stored
             geometry's own ~100 m segment limit; ``elevation_metadata``
             records the interval actually used.
+        country : str, optional
+            ISO 3166-1 alpha-2 code (or 3166-2 subdivision, e.g.
+            ``"US-CA"``) selecting the legal default speed limits that fill
+            ways with no ``maxspeed`` tag. A subdivision falls back to its
+            country, an unknown or omitted code to the generic row, each
+            fallback with a warning. Car builds only.
+        urban_areas : geopandas.GeoDataFrame or array of bool, optional
+            Where the urban (inside built-up area) speed defaults apply: a
+            polygon layer resolved per edge by intersection, or a
+            precomputed per-edge boolean. Omitted, every way counts as
+            urban — the conservative default for city extracts. Car builds
+            only.
+        speed_limits : mapping, optional
+            Per-class km/h overrides layered over the resolved country row
+            (e.g. ``{"residential_inside": 30}``); unknown classes and
+            non-positive values are rejected. Car builds only.
         """
         return cls(
             _CoreStreetNetwork(
@@ -78,6 +107,9 @@ class StreetNetwork:
                     bounding_box=bounding_box,
                     dem=dem,
                     dem_interval=dem_interval,
+                    country=country,
+                    urban_areas=urban_areas,
+                    speed_limits=speed_limits,
                 )
             )
         )
@@ -158,6 +190,9 @@ class StreetNetwork:
         mode,
         max_time=MAX_STREET_TIME,
         max_snap_distance=streets.MAX_SNAP_DISTANCE,
+        intersection_delays=False,
+        profile=None,
+        delay_model=None,
     ):
         """Travel time in whole seconds from `origin` to `destination`.
 
@@ -167,11 +202,24 @@ class StreetNetwork:
             ``(lat, lon)`` coordinates in EPSG:4326. A coordinate farther than
             `max_snap_distance` from the network raises ``ValueError``.
         mode : str
-            ``walk``, ``bicycle``, ``e_bike``, or ``e_scooter``.
+            ``walk``, ``bicycle``, ``e_bike``, ``e_scooter``, or ``car``.
         max_time : float
             Cutoff in seconds; beyond it the destination counts as unreachable.
         max_snap_distance : float
             How far a coordinate may be from the network, in meters.
+        intersection_delays : bool
+            Car only. ``False`` (the default) computes free-flow,
+            speed-limit-based times; ``True`` applies the empirical
+            intersection-delay model (Jaakkola 2013, the calibration behind
+            GEMMAT) under the selected `profile`.
+        profile : str, optional
+            The delay period — ``"rush"``, ``"midday"`` (the default), or
+            ``"day-average"``. Requires ``intersection_delays=True``.
+        delay_model : mapping, optional
+            Partial override of the shipped delay values (keys ``values``,
+            ``groups``, ``ramp_multipliers``, ``congestion_multipliers``,
+            ``ramp_shares``), merged over them entry by entry. Requires
+            ``intersection_delays=True``.
 
         Returns
         -------
@@ -185,14 +233,40 @@ class StreetNetwork:
             mode,
             float(max_time),
             float(max_snap_distance),
+            car_model=_resolved_delays(mode, intersection_delays, profile, delay_model),
         )
 
     def __repr__(self):
         return f"StreetNetwork({self.vertex_count} vertices, {self.edge_count} edges)"
 
 
+def _resolved_delays(mode, intersection_delays, profile, delay_model):
+    """The core's ``car_model`` payload for a query, or ``None``.
+
+    The delay options belong to the car: any of them set under another mode
+    raises rather than being silently ignored.
+    """
+    from . import _delays
+
+    if mode != "car" and (
+        intersection_delays or profile is not None or delay_model is not None
+    ):
+        raise ValueError(
+            "intersection_delays, profile, and delay_model apply to mode='car'"
+        )
+    return _delays.resolve(intersection_delays, profile, delay_model)
+
+
 def multimodal_payload(
-    osm_pbf, *, modes=MODES, bounding_box=None, dem=None, dem_interval=25.0
+    osm_pbf,
+    *,
+    modes=MODES,
+    bounding_box=None,
+    dem=None,
+    dem_interval=25.0,
+    country=None,
+    urban_areas=None,
+    speed_limits=None,
 ):
     """The union extraction as the core constructor's argument tuple.
 
@@ -200,6 +274,13 @@ def multimodal_payload(
     so both install the identical multimodal graph from the same inputs.
     """
     modes = tuple(modes)
+    if "car" not in modes and any(
+        option is not None for option in (country, urban_areas, speed_limits)
+    ):
+        raise ValueError(
+            "country, urban_areas, and speed_limits configure car speeds; "
+            "add 'car' to modes to use them"
+        )
     nodes, edges = _osm.union_network(
         osm_pbf, bounding_box=bounding_box, car="car" in modes
     )
@@ -275,6 +356,29 @@ def multimodal_payload(
             sampled_coverage,
             int(inferred),
         )
+    car_attributes = None
+    if "car" in modes:
+        # Speeds and junction classes read the pruned permissions: the
+        # drivable graph the routing engine will actually see.
+        speed_forward, speed_reverse = _osm.car_speeds(
+            edges, country=country, urban=urban_areas, speed_limits=speed_limits
+        )
+        junction_forward, junction_reverse = _osm.junction_delay_classes(
+            _osm.node_delay_tags(nodes),
+            u,
+            v,
+            edges["id"].to_numpy(),
+            _osm._column(edges, "highway"),
+            access_forward,
+            access_reverse,
+            len(nodes),
+        )
+        car_attributes = (
+            speed_forward.tolist(),
+            speed_reverse.tolist(),
+            junction_forward.tolist(),
+            junction_reverse.tolist(),
+        )
     # `adj_facility` is reserved: no profile reads it yet (the compiler
     # routes on the access bits and the per-edge flags).
     facility = np.zeros(len(edges), dtype=np.uint8)
@@ -294,4 +398,5 @@ def multimodal_payload(
         facility.tolist(),
         elevations,
         metadata,
+        car_attributes,
     )

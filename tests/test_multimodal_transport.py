@@ -198,6 +198,78 @@ def test_synthetic_links_keep_modes_apart_and_merge_equal_snaps(
     assert egress[stop][2] == rows["bicycle"][stop][2]
 
 
+def test_car_attributes_round_trip_through_the_artifact(
+    fresh_footpaths_network, tmp_path
+):
+    # A tiny drivable graph installed with the car group: per-edge driving
+    # speeds and junction head classes survive save/load on both load paths,
+    # stored beside the multimodal attributes.
+    network = fresh_footpaths_network
+    _, lat, lon = next((s, la, lo) for s, la, lo in network.stops if la is not None)
+    zeros = [0, 0]
+    network._core.set_multimodal_streets(
+        ["walk", "car"],
+        4,
+        [(0, 1, 200.0), (2, 3, 200.0)],
+        [0, 2, 4],
+        [lon - 0.001, lon + 0.001, lon - 0.001, lon + 0.001],
+        [lat - 0.0005, lat - 0.0005, lat + 0.0011, lat + 0.0011],
+        zeros,
+        zeros,
+        zeros,
+        zeros,
+        [1 | 8, 8],
+        [1, 0],
+        zeros,
+        zeros,
+        car_attributes=([50.0, 40.0], [30.0, 20.0], [3, 1], [0, 4]),
+    )
+    stored = network._core._multimodal_car_attributes
+    assert stored is not None
+    speeds, junctions = stored
+    assert sorted(speeds) == [20.0, 30.0, 40.0, 50.0]
+    assert sorted(junctions) == [0, 1, 3, 4]
+    checksum = network._core._multimodal_checksum
+    path = tmp_path / "car.cafein"
+    network.save(path)
+    for mmap in (False, True):
+        loaded = TransportNetwork.load(path, mmap=mmap)
+        assert loaded._core._multimodal_car_attributes == stored
+        assert loaded._core._multimodal_checksum == checksum
+
+
+def test_malformed_car_payloads_are_refused(fresh_footpaths_network):
+    # A zero speed, a junction class outside the vocabulary, and a length
+    # mismatch are each refused at installation.
+    network = fresh_footpaths_network
+    _, lat, lon = next((s, la, lo) for s, la, lo in network.stops if la is not None)
+    zeros = [0, 0]
+    cases = [
+        ([0.0, 40.0], [30.0, 20.0], [0, 0], [0, 0]),
+        ([50.0, 40.0], [30.0, 20.0], [5, 0], [0, 0]),
+        ([50.0], [30.0, 20.0], [0, 0], [0, 0]),
+    ]
+    for car in cases:
+        with pytest.raises(ValueError):
+            network._core.set_multimodal_streets(
+                ["walk", "car"],
+                4,
+                [(0, 1, 200.0), (2, 3, 200.0)],
+                [0, 2, 4],
+                [lon - 0.001, lon + 0.001, lon - 0.001, lon + 0.001],
+                [lat - 0.0005, lat - 0.0005, lat + 0.0011, lat + 0.0011],
+                zeros,
+                zeros,
+                zeros,
+                zeros,
+                [1 | 8, 8],
+                [1, 0],
+                zeros,
+                zeros,
+                car_attributes=car,
+            )
+
+
 def test_multimodal_walk_rows_agree_with_the_walking_graph(multimodal_network):
     # The same coordinate through the multimodal walk profile and through
     # the legacy walking access path: two different extractions of the same

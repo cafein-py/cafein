@@ -35,6 +35,11 @@ STREET_MODE_IDENTITIES = {
     "bicycle": ("bicycle", "conventional", "private"),
     "e_bike": ("bicycle", "e_bike", "private"),
     "e_scooter": ("e_scooter", "battery", "private"),
+    # No shipped car factor row yet: a car matrix resolves through
+    # ``factors=`` rows or reports unresolved (NaN) emissions. The
+    # powertrain classes are the documented uppercase acronyms
+    # (ICE/HEV/PHEV/BEV/FCEV); the default car is ICE.
+    "car": ("car", "ICE", "private"),
 }
 
 

@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- **Car routing lands**: building with ``"car"`` in the street modes
+  computes and persists per-arc driving speeds (tagged ``maxspeed``
+  with the world speed-limit defaults filling untagged ways, selected
+  by ``country=`` / ``urban_areas=`` / ``speed_limits=`` on
+  ``StreetNetwork.from_osm`` and ``TransportNetwork.from_gtfs``) and
+  junction head classes (topological / signalized / ramp-junction by
+  the calibration's own hierarchy, priority signs recorded but never
+  charged), plus a roundabout edge flag — carried through
+  save/load as two new optional street arrays (artifact format 17;
+  earlier artifacts must be rebuilt). ``mode="car"`` /
+  ``transport_mode="car"`` then routes door-to-door and through the
+  matrix and itinerary computers on the standalone street network.
+  **By default car queries are free-flow** — speed-limit travel
+  times, no delay model; passing ``intersection_delays=True`` applies
+  the empirical intersection-delay model (Jaakkola 2013, the
+  calibration behind MetropAccess-Digiroad and GEMMAT) in an exactly
+  edge-separable form — per-endpoint crossing shares, ramp period
+  shares with the low-speed branch, junction-free ramp and congestion
+  multipliers, ``b/4`` roundabout interiors — under a ``profile=``
+  period (``rush``, ``midday`` — the default — or ``day-average``)
+  with ``delay_model=`` partial overrides of every shipped number.
+  ``profile=`` or ``delay_model=`` without the gate raise. Car legs
+  never serve transit access or egress (no park-and-ride), and a car
+  cost matrix reports unresolved (NaN) emissions until factor rows
+  are supplied — the shipped car factors come in a later slice.
+
 - Groundwork for **realistic car routing** (the car arc's driving
   graph): the OSM permission compiler gains the ``car`` mode —
   resolved down the ``access → vehicle → motor_vehicle → motorcar``

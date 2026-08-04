@@ -1365,6 +1365,7 @@ fn mapped_from(owned: &StreetNetwork) -> StreetNetwork {
         index_boxes,
         index_payload,
         attributes: None,
+        car: None,
         elevations: None,
     })
     .unwrap()
@@ -1436,6 +1437,7 @@ fn mapped_adoption_refuses_misaligned_or_truncated_ranges() {
         index_boxes: (0, 4),
         index_payload: (0, 2),
         attributes: None,
+        car: None,
         elevations: None,
     };
     // An f64 array at a 4-byte offset is misaligned; one past the
@@ -1752,7 +1754,10 @@ fn profile_abi_constants_mirror_the_python_contract() {
     // These must match python/cafein/_osm.py exactly — the raw u8/u16 attribute
     // arrays cross the language boundary as these integers, so a change on
     // either side is a breaking ABI change that must be made on both.
-    assert_eq!((MODE_WALK, MODE_BICYCLE, MODE_E_SCOOTER), (1, 2, 4));
+    assert_eq!(
+        (MODE_WALK, MODE_BICYCLE, MODE_E_SCOOTER, MODE_CAR),
+        (1, 2, 4, 8)
+    );
     assert_eq!(
         (
             FLAG_DISMOUNT,
@@ -1762,8 +1767,20 @@ fn profile_abi_constants_mirror_the_python_contract() {
             FLAG_STEPS,
             FLAG_SEGREGATED,
             FLAG_LIT,
+            FLAG_ROUNDABOUT,
         ),
-        (1, 2, 4, 8, 16, 32, 64)
+        (1, 2, 4, 8, 16, 32, 64, 128)
+    );
+    // The persisted junction head-class vocabulary (`_osm.py`'s JUNCTION_*).
+    assert_eq!(
+        (
+            JUNCTION_TOPOLOGICAL,
+            JUNCTION_PRIORITY,
+            JUNCTION_SIGNALS,
+            JUNCTION_RAMP,
+            JUNCTION_CLASS_COUNT,
+        ),
+        (1, 2, 3, 4, 5)
     );
     assert_eq!(
         (
@@ -2840,6 +2857,7 @@ fn multimodal_network(
             access_reverse: &attrs.access_reverse,
             facility_forward: &attrs.facility_forward,
             facility_reverse: &attrs.facility_reverse,
+            car: None,
         },
         None,
     )
@@ -2932,6 +2950,564 @@ fn new_multimodal_aligns_attributes_through_the_reorder() {
             }
         );
     }
+}
+
+/// Per-edge car attributes for a car test build, one entry per input edge.
+struct CarAttrs {
+    speed_forward: Vec<f32>,
+    speed_reverse: Vec<f32>,
+    junction_forward: Vec<u8>,
+    junction_reverse: Vec<u8>,
+}
+
+/// Builds a network through `new_multimodal` with the car group installed.
+fn car_network(
+    vertex_count: u32,
+    edges: &[TestEdge],
+    attrs: &Attrs,
+    car: &CarAttrs,
+) -> Result<StreetNetwork, StreetError> {
+    let mut offsets = vec![0u32];
+    let mut longitudes = Vec::new();
+    let mut latitudes = Vec::new();
+    for (_, _, _, path) in edges {
+        for &(x, y) in path {
+            let (lon, lat) = lonlat(x, y);
+            longitudes.push(lon);
+            latitudes.push(lat);
+        }
+        offsets.push(longitudes.len() as u32);
+    }
+    let flat: Vec<(u32, u32, f64)> = edges
+        .iter()
+        .map(|&(from, to, meters, _)| (from, to, meters))
+        .collect();
+    StreetNetwork::new_multimodal(
+        vertex_count,
+        0,
+        &flat,
+        &offsets,
+        &longitudes,
+        &latitudes,
+        vec![],
+        EdgeAttributes {
+            highway: &attrs.highway,
+            surface: &attrs.surface,
+            smoothness: &attrs.smoothness,
+            flags: &attrs.flags,
+            access_forward: &attrs.access_forward,
+            access_reverse: &attrs.access_reverse,
+            facility_forward: &attrs.facility_forward,
+            facility_reverse: &attrs.facility_reverse,
+            car: Some(CarEdgeAttributes {
+                speed_forward: &car.speed_forward,
+                speed_reverse: &car.speed_reverse,
+                junction_forward: &car.junction_forward,
+                junction_reverse: &car.junction_reverse,
+            }),
+        },
+        None,
+    )
+}
+
+#[test]
+fn new_multimodal_aligns_car_attributes_through_the_reorder() {
+    // The same out-of-spatial-order edges as the attribute alignment test;
+    // each input edge carries direction-tagged speeds and junction classes,
+    // so every directed arc traces back to its input edge and direction.
+    let edges: Vec<TestEdge> = vec![
+        (2, 3, 100.0, straight((200.0, 0.0), (300.0, 0.0))),
+        (0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0))),
+        (4, 5, 100.0, straight((400.0, 0.0), (500.0, 0.0))),
+        (1, 2, 100.0, straight((100.0, 0.0), (200.0, 0.0))),
+        (3, 4, 100.0, straight((300.0, 0.0), (400.0, 0.0))),
+    ];
+    let n = edges.len();
+    let car = CarAttrs {
+        speed_forward: (0..n).map(|i| 10.0 * i as f32 + 1.0).collect(),
+        speed_reverse: (0..n).map(|i| 10.0 * i as f32 + 2.0).collect(),
+        junction_forward: (0..n as u8).map(|i| i % 5).collect(),
+        junction_reverse: (0..n as u8).map(|i| (i + 1) % 5).collect(),
+    };
+    let net = car_network(6, &edges, &plain_attrs(n), &car).unwrap();
+    let built = net.car_attributes().unwrap();
+
+    // The geometry oracle from the attribute alignment test: an internal
+    // edge's first stored coordinate identifies the input edge it came from.
+    let lons = net.arrays().lons();
+    let lats = net.arrays().lats();
+    let offsets = net.arrays().coordinate_offsets();
+    let first_keys: Vec<(i32, i32)> = edges
+        .iter()
+        .map(|(_, _, _, path)| {
+            let (lon, lat) = lonlat(path[0].0, path[0].1);
+            (quantize(lon), quantize(lat))
+        })
+        .collect();
+    let source_edge = |internal: usize| -> usize {
+        let start = offsets[internal] as usize;
+        first_keys
+            .iter()
+            .position(|&key| key == (lons[start], lats[start]))
+            .unwrap()
+    };
+    assert!((0..n).any(|e| source_edge(e) != e));
+
+    let targets = net.arrays().adj_targets();
+    let arc_edges = net.arrays().adj_edges();
+    for slot in 0..2 * n {
+        let e = arc_edges[slot] as usize;
+        let i = source_edge(e);
+        let (from, to) = net.edge_endpoints(e as u32);
+        assert_ne!(from, to);
+        let forward = targets[slot] == to;
+        let (speed, junction) = if forward {
+            (car.speed_forward[i], car.junction_forward[i])
+        } else {
+            (car.speed_reverse[i], car.junction_reverse[i])
+        };
+        assert_eq!(built.adj_car_speed[slot], speed);
+        assert_eq!(built.adj_junction[slot], junction);
+    }
+}
+
+#[test]
+fn car_attributes_round_trip_through_parts() {
+    let edges: Vec<TestEdge> = vec![
+        (0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0))),
+        (1, 2, 100.0, straight((100.0, 0.0), (200.0, 0.0))),
+    ];
+    let n = edges.len();
+    let car = CarAttrs {
+        speed_forward: vec![50.0; n],
+        speed_reverse: vec![30.0; n],
+        junction_forward: vec![3; n],
+        junction_reverse: vec![1; n],
+    };
+    let net = car_network(3, &edges, &plain_attrs(n), &car).unwrap();
+    let parts = net.to_parts();
+    assert!(parts.car.is_some());
+    let rebuilt = StreetNetwork::from_parts(parts).unwrap();
+    assert_eq!(rebuilt.car_attributes(), net.car_attributes());
+    assert_eq!(rebuilt.to_parts(), net.to_parts());
+}
+
+#[test]
+fn from_parts_rejects_malformed_car_groups() {
+    let edges: Vec<TestEdge> = vec![(0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0)))];
+    let car = CarAttrs {
+        speed_forward: vec![50.0],
+        speed_reverse: vec![30.0],
+        junction_forward: vec![0],
+        junction_reverse: vec![0],
+    };
+    let net = car_network(2, &edges, &plain_attrs(1), &car).unwrap();
+    let corrupt = |mutate: &dyn Fn(&mut StreetNetworkParts)| {
+        let mut parts = net.to_parts();
+        mutate(&mut parts);
+        StreetNetwork::from_parts(parts).unwrap_err()
+    };
+    // A car group without the attribute group is refused.
+    assert_eq!(
+        corrupt(&|parts| parts.attributes = None),
+        StreetError::InvalidAttributes
+    );
+    // Truncated arrays, non-positive and non-finite speeds, and junction
+    // classes outside the vocabulary are refused.
+    let cases: Vec<&dyn Fn(&mut StreetNetworkParts)> = vec![
+        &|parts| {
+            parts.car.as_mut().unwrap().adj_car_speed.pop();
+        },
+        &|parts| {
+            parts.car.as_mut().unwrap().adj_junction.pop();
+        },
+        &|parts| parts.car.as_mut().unwrap().adj_car_speed[0] = 0.0,
+        &|parts| parts.car.as_mut().unwrap().adj_car_speed[0] = f32::NAN,
+        &|parts| parts.car.as_mut().unwrap().adj_car_speed[0] = f32::INFINITY,
+        &|parts| parts.car.as_mut().unwrap().adj_junction[0] = JUNCTION_CLASS_COUNT as u8,
+    ];
+    for mutate in cases {
+        assert_eq!(corrupt(mutate), StreetError::InvalidAttributes);
+    }
+}
+
+#[test]
+fn new_multimodal_rejects_invalid_car_inputs() {
+    let edges: Vec<TestEdge> = vec![(0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0)))];
+    let build = |car: CarAttrs| car_network(2, &edges, &plain_attrs(1), &car).unwrap_err();
+    // A zero speed, a junction class outside the vocabulary, and a length
+    // mismatch are each refused at construction.
+    assert_eq!(
+        build(CarAttrs {
+            speed_forward: vec![0.0],
+            speed_reverse: vec![30.0],
+            junction_forward: vec![0],
+            junction_reverse: vec![0],
+        }),
+        StreetError::InvalidAttributes
+    );
+    assert_eq!(
+        build(CarAttrs {
+            speed_forward: vec![50.0],
+            speed_reverse: vec![30.0],
+            junction_forward: vec![JUNCTION_CLASS_COUNT as u8],
+            junction_reverse: vec![0],
+        }),
+        StreetError::InvalidAttributes
+    );
+    assert_eq!(
+        build(CarAttrs {
+            speed_forward: vec![50.0, 60.0],
+            speed_reverse: vec![30.0],
+            junction_forward: vec![0],
+            junction_reverse: vec![0],
+        }),
+        StreetError::InvalidAttributes
+    );
+}
+
+// ---- The car profile and its delay model ----
+
+/// The default highway-code → group mapping (motorway/trunk/primary → 1–2,
+/// secondary/tertiary → 3, everything else → 4–6).
+fn default_groups() -> Vec<u8> {
+    let mut groups = vec![2u8; HIGHWAY_CODE_COUNT];
+    for code in [1, 3, 5] {
+        groups[code] = 0;
+    }
+    for code in [7, 9] {
+        groups[code] = 1;
+    }
+    groups
+}
+
+/// A delay model with distinct per-group values so a group swap cannot pass.
+fn test_delay_model() -> CarCostModel {
+    CarCostModel {
+        group_seconds: [12.0, 8.0, 6.0],
+        groups: default_groups(),
+        ramp_share_high: 0.75,
+        ramp_share_low: 0.5,
+        ramp_multiplier: 1.5,
+        congestion_multiplier: 1.2,
+    }
+}
+
+/// The compiled cost of the directed arc `from → to`, from the CSR.
+fn arc_between(net: &StreetNetwork, profile: &CompiledStreetProfile, from: u32, to: u32) -> u32 {
+    let adjacency = net.arrays().adjacency_offsets();
+    let targets = net.arrays().adj_targets();
+    let slot = (adjacency[from as usize] as usize..adjacency[from as usize + 1] as usize)
+        .find(|&slot| targets[slot] == to)
+        .unwrap_or_else(|| panic!("no arc {from}->{to}"));
+    profile.arc_millis()[slot]
+}
+
+/// A chain of `edges.len()` 100 m elements with per-edge highway codes,
+/// speeds, junction head classes, and flags — the car oracle fixture.
+/// `junctions[i]` is `(at_from, at_to)` for edge `i`.
+#[allow(clippy::type_complexity)]
+fn car_oracle_network(
+    edges: &[(u32, u32)],
+    codes: &[u8],
+    speeds: &[f32],
+    junctions: &[(u8, u8)],
+    flags: &[u16],
+) -> StreetNetwork {
+    let n = edges.len();
+    let test_edges: Vec<TestEdge> = edges
+        .iter()
+        .enumerate()
+        .map(|(i, &(from, to))| {
+            let x = 100.0 * i as f64;
+            (from, to, 100.0, straight((x, 0.0), (x + 100.0, 0.0)))
+        })
+        .collect();
+    let mut attrs = plain_attrs(n);
+    attrs.highway = codes.to_vec();
+    for mask in attrs
+        .access_forward
+        .iter_mut()
+        .chain(attrs.access_reverse.iter_mut())
+    {
+        *mask |= MODE_CAR;
+    }
+    let vertex_count = edges.iter().map(|&(a, b)| a.max(b)).max().unwrap() + 1;
+    let car = CarAttrs {
+        speed_forward: speeds.to_vec(),
+        speed_reverse: speeds.to_vec(),
+        junction_forward: junctions.iter().map(|&(_, at_to)| at_to).collect(),
+        junction_reverse: junctions.iter().map(|&(at_from, _)| at_from).collect(),
+    };
+    attrs.flags = flags.to_vec();
+    car_network(vertex_count, &test_edges, &attrs, &car).unwrap()
+}
+
+#[test]
+fn car_free_flow_is_the_persisted_speeds_alone() {
+    // Two elements, 36 and 72 km/h, both endpoints junctions — the default
+    // regime (no model) charges nothing anywhere: 100 m at 36 km/h is 10 s,
+    // at 72 km/h 5 s, junction classes and flags notwithstanding.
+    let net = car_oracle_network(
+        &[(0, 1), (1, 2)],
+        &[12, 12],
+        &[36.0, 72.0],
+        &[(1, 1), (1, 3)],
+        &[0, FLAG_ROUNDABOUT],
+    );
+    let profile = net
+        .compile_profile(&StreetProfileDefinition::car(None))
+        .unwrap();
+    assert_eq!(arc_between(&net, &profile, 0, 1), 10_000);
+    assert_eq!(arc_between(&net, &profile, 1, 0), 10_000);
+    assert_eq!(arc_between(&net, &profile, 1, 2), 5_000);
+}
+
+#[test]
+fn car_delay_crossing_total_and_terminal_element() {
+    // Three residential elements (group 4–6, b = 6) meeting at vertex 1 — a
+    // topological junction. Each element charges ½·b for that endpoint and
+    // nothing at its dead end, so a path over two of them pays the full
+    // crossing b (3 + 3), and each terminal element alone carries just its
+    // own share.
+    let net = car_oracle_network(
+        &[(0, 1), (1, 2), (1, 3)],
+        &[12, 12, 12],
+        &[36.0, 36.0, 36.0],
+        &[(0, 1), (1, 0), (1, 0)],
+        &[0, 0, 0],
+    );
+    let profile = net
+        .compile_profile(&StreetProfileDefinition::car(Some(test_delay_model())))
+        .unwrap();
+    // 10 s free-flow + ½·6 = 13 s, in both directions of every element.
+    for (from, to) in [(0, 1), (1, 0), (1, 2), (2, 1), (1, 3), (3, 1)] {
+        assert_eq!(arc_between(&net, &profile, from, to), 13_000);
+    }
+}
+
+#[test]
+fn car_delay_mixed_endpoints_charge_each_elements_own_group() {
+    // A primary element (b = 12) and a residential one (b = 6), each between
+    // a ramp junction (¼·b) and a topological junction (½·b): the shares sum
+    // per endpoint and each element reads its own group's b.
+    let net = car_oracle_network(
+        &[(0, 1), (2, 3)],
+        &[5, 12],
+        &[36.0, 36.0],
+        &[(4, 1), (4, 1)],
+        &[0, 0],
+    );
+    let profile = net
+        .compile_profile(&StreetProfileDefinition::car(Some(test_delay_model())))
+        .unwrap();
+    // Primary: 10 + ¼·12 + ½·12 = 19 s; residential: 10 + 1.5 + 3 = 14.5 s.
+    assert_eq!(arc_between(&net, &profile, 0, 1), 19_000);
+    assert_eq!(arc_between(&net, &profile, 2, 3), 14_500);
+}
+
+#[test]
+fn car_delay_ramp_shares_and_the_signalized_ramp_junction() {
+    // Ramp elements (motorway_link, group 4–6, b = 6) with one junction
+    // endpoint each: at a ramp junction the period share applies — ¾ fast
+    // (72 km/h), ½ slow (36 km/h) — while a signalized endpoint gives the
+    // ordinary ½ share even to a ramp element (the calibration's hierarchy).
+    let net = car_oracle_network(
+        &[(0, 1), (2, 3), (4, 5)],
+        &[2, 2, 2],
+        &[72.0, 36.0, 72.0],
+        &[(4, 0), (4, 0), (3, 0)],
+        &[0, 0, 0],
+    );
+    let profile = net
+        .compile_profile(&StreetProfileDefinition::car(Some(test_delay_model())))
+        .unwrap();
+    // Fast ramp at its ramp junction: 5 + 0.75·6 = 9.5 s.
+    assert_eq!(arc_between(&net, &profile, 0, 1), 9_500);
+    // Slow ramp: 10 + 0.5·6 = 13 s (the low-speed branch).
+    assert_eq!(arc_between(&net, &profile, 2, 3), 13_000);
+    // Signalized ramp junction: 5 + ½·6 = 8 s.
+    assert_eq!(arc_between(&net, &profile, 4, 5), 8_000);
+}
+
+#[test]
+fn car_delay_multiplier_branches_are_junction_free_only() {
+    // Junction-free elements (endpoint classes 0 and priority 2 — an advance
+    // sign never charges): the fast ramp takes ×1.5, the fast primary ×1.2,
+    // and both slow elements stay at free-flow.
+    let net = car_oracle_network(
+        &[(0, 1), (2, 3), (4, 5), (6, 7)],
+        &[2, 5, 2, 12],
+        &[72.0, 72.0, 36.0, 36.0],
+        &[(0, 2), (2, 0), (0, 0), (0, 2)],
+        &[0, 0, 0, 0],
+    );
+    let profile = net
+        .compile_profile(&StreetProfileDefinition::car(Some(test_delay_model())))
+        .unwrap();
+    // Fast ramp: 5 × 1.5 = 7.5 s; fast primary: 5 × 1.2 = 6 s.
+    assert_eq!(arc_between(&net, &profile, 0, 1), 7_500);
+    assert_eq!(arc_between(&net, &profile, 2, 3), 6_000);
+    // Slow elements: free-flow, whatever their class.
+    assert_eq!(arc_between(&net, &profile, 4, 5), 10_000);
+    assert_eq!(arc_between(&net, &profile, 6, 7), 10_000);
+}
+
+#[test]
+fn car_zero_valued_shares_stay_on_the_penalty_branch() {
+    // Junction incidence is a property of the endpoint classes, never of the
+    // numeric share values: a zeroed ramp share (or a zeroed b) must yield a
+    // zero penalty, not a fall-through onto the multiplier branch.
+    let net = car_oracle_network(
+        &[(0, 1), (2, 3)],
+        &[2, 5],
+        &[72.0, 72.0],
+        &[(4, 0), (1, 0)],
+        &[0, 0],
+    );
+    let mut zero_share = test_delay_model();
+    zero_share.ramp_share_high = 0.0;
+    let profile = net
+        .compile_profile(&StreetProfileDefinition::car(Some(zero_share)))
+        .unwrap();
+    // The fast ramp at its ramp junction: free-flow exactly, no ×1.5.
+    assert_eq!(arc_between(&net, &profile, 0, 1), 5_000);
+    let mut zero_b = test_delay_model();
+    zero_b.group_seconds = [0.0, 0.0, 0.0];
+    let profile = net
+        .compile_profile(&StreetProfileDefinition::car(Some(zero_b)))
+        .unwrap();
+    // The fast primary at its topological junction: free-flow, no ×1.2.
+    assert_eq!(arc_between(&net, &profile, 2, 3), 5_000);
+}
+
+#[test]
+fn car_partial_traversals_charge_only_crossed_junctions() {
+    // Two residential elements (b = 6) joined at vertex 1, both charging
+    // ½·b there: full arcs are 10 + 3 = 13 s. Snapped queries must charge a
+    // junction exactly when the route crosses it.
+    let net = car_oracle_network(
+        &[(0, 1), (1, 2)],
+        &[12, 12],
+        &[36.0, 36.0],
+        &[(0, 1), (1, 0)],
+        &[0, 0],
+    );
+    let profile = net
+        .compile_profile(&StreetProfileDefinition::car(Some(test_delay_model())))
+        .unwrap();
+    let snap = |edge: u32, fraction: f64| Snap {
+        edge,
+        fraction,
+        connector: 0.0,
+    };
+    // Identify the internal edges by their endpoints.
+    let edge_at = |from: u32, to: u32| {
+        (0..net.edge_count())
+            .find(|&edge| {
+                let (a, b) = net.edge_endpoints(edge);
+                (a, b) == (from, to) || (a, b) == (to, from)
+            })
+            .unwrap()
+    };
+    let (e0, e1) = (edge_at(0, 1), edge_at(1, 2));
+    // Between two interior points of one element no junction is crossed:
+    // half the element at free-flow is 5 s, not half of 13.
+    assert_eq!(
+        net.directed_travel_time(&snap(e0, 0.25), &snap(e0, 0.75), &profile, 3600.0),
+        Some(5)
+    );
+    // Mid-element to mid-element across vertex 1: each element pays its own
+    // ½·b for the one junction crossed — (5 + 3) + (3 + 5) = 16 s, where
+    // whole-arc proration would misprice the uncrossed endpoints.
+    assert_eq!(
+        net.directed_travel_time(&snap(e0, 0.5), &snap(e1, 0.5), &profile, 3600.0),
+        Some(16)
+    );
+    // A same-edge trip whose end sits exactly on the junction vertex crosses
+    // it: interior → vertex 1 on e0 is 5 + 3 s (whichever endpoints the
+    // stored direction puts at fraction 0 and 1, exactly one end of this
+    // edge is its junction), matching what the seed/egress path charges.
+    let (_, stored_to) = net.edge_endpoints(e0);
+    let junction_fraction = if stored_to == 1 { 1.0 } else { 0.0 };
+    assert_eq!(
+        net.directed_travel_time(
+            &snap(e0, 0.5),
+            &snap(e0, junction_fraction),
+            &profile,
+            3600.0
+        ),
+        Some(8)
+    );
+    // The dead-end vertex charges nothing.
+    assert_eq!(
+        net.directed_travel_time(
+            &snap(e0, 0.5),
+            &snap(e0, 1.0 - junction_fraction),
+            &profile,
+            3600.0
+        ),
+        Some(5)
+    );
+    // The full 0 → 1 same-edge traversal equals the whole arc: the free-flow
+    // base plus the one junction endpoint this edge has — 10 + 3 = 13 s.
+    assert_eq!(
+        net.directed_travel_time(&snap(e0, 0.0), &snap(e0, 1.0), &profile, 3600.0),
+        Some(13)
+    );
+}
+
+#[test]
+fn car_delay_roundabout_interior_replaces_shares() {
+    // A roundabout-interior residential element between two topological
+    // junctions charges b/4 in place of its 2 × ½·b endpoint shares.
+    let net = car_oracle_network(&[(0, 1)], &[12], &[36.0], &[(1, 1)], &[FLAG_ROUNDABOUT]);
+    let profile = net
+        .compile_profile(&StreetProfileDefinition::car(Some(test_delay_model())))
+        .unwrap();
+    // 10 + 6/4 = 11.5 s.
+    assert_eq!(arc_between(&net, &profile, 0, 1), 11_500);
+}
+
+#[test]
+fn car_speeds_above_the_default_bound_compile_exactly() {
+    // A persisted speed is the edge speed, whatever the profile's fallback
+    // bound says: 100 m at a 300 km/h tag compiles unclamped (the
+    // goal-directed bound is measured from the compiled costs, so no clamp
+    // is needed) — ~1.2 s, not the 1.44 s a 250 km/h ceiling would give.
+    let net = car_oracle_network(&[(0, 1)], &[1], &[300.0], &[(0, 0)], &[0]);
+    let profile = net
+        .compile_profile(&StreetProfileDefinition::car(None))
+        .unwrap();
+    let unclamped = ((100.0f64 / (300.0 / 3.6)) * 1000.0).ceil() as u32;
+    assert_eq!(arc_between(&net, &profile, 0, 1), unclamped);
+    assert!(unclamped < 1_440);
+}
+
+#[test]
+fn car_profiles_reject_bad_models_and_carless_networks() {
+    // A malformed model (wrong groups length), a model on a non-car mode,
+    // and a car compile over a network without the car group are each
+    // refused.
+    let mut bad = test_delay_model();
+    bad.groups.pop();
+    assert_eq!(
+        StreetProfileDefinition::car(Some(bad))
+            .validate()
+            .unwrap_err(),
+        ProfileError::InvalidCarModel
+    );
+    let mut walk = StreetProfileDefinition::walk();
+    walk.car = Some(test_delay_model());
+    assert_eq!(walk.validate().unwrap_err(), ProfileError::InvalidCarModel);
+    let edges: Vec<TestEdge> = vec![(0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0)))];
+    let carless = multimodal_network(2, &edges, &plain_attrs(1)).unwrap();
+    assert_eq!(
+        carless
+            .compile_profile(&StreetProfileDefinition::car(None))
+            .unwrap_err(),
+        ProfileError::MissingAttributes
+    );
 }
 
 #[test]
@@ -3519,6 +4095,7 @@ fn elevated_network(
             access_reverse: &attrs.access_reverse,
             facility_forward: &attrs.facility_forward,
             facility_reverse: &attrs.facility_reverse,
+            car: None,
         },
         Some(&elevations),
     )
@@ -3621,6 +4198,7 @@ fn a_misshaped_elevation_array_is_rejected() {
             access_reverse: &attrs.access_reverse,
             facility_forward: &attrs.facility_forward,
             facility_reverse: &attrs.facility_reverse,
+            car: None,
         },
         Some(&[1.0]),
     );
@@ -3651,6 +4229,7 @@ fn an_infinite_elevation_is_rejected() {
             access_reverse: &attrs.access_reverse,
             facility_forward: &attrs.facility_forward,
             facility_reverse: &attrs.facility_reverse,
+            car: None,
         },
         Some(&[0.0, f32::INFINITY]),
     );
@@ -3876,6 +4455,7 @@ fn coincident_edges_differing_only_in_elevation_order_deterministically() {
                 access_reverse: &attrs.access_reverse,
                 facility_forward: &attrs.facility_forward,
                 facility_reverse: &attrs.facility_reverse,
+                car: None,
             },
             Some(&elevations),
         )
