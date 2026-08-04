@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 — 2026-08-04
 
 - **The car benchmark harness** (``scripts/benchmark_car_vs_r5py.py``,
   run manually): a parity run comparing cafein's default free-flow car
