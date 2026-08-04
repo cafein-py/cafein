@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Car emission factors ship**: the street factor table gains the five
+  car powertrains of GEMMAT's Table 4 (Dey, Marín-Flores & Tenkanen
+  2026 — the ITF LCA tool calibrated to Finland's energy mix) —
+  ``vehicle_class`` ∈ ICE (162), HEV (133), PHEV (88), BEV (70), FCEV
+  (134 g CO₂ per **vehicle**-kilometre, driver-only basis), split into
+  the four life-cycle component columns, each row
+  ``service_model="private"`` and resolved most-specific-wins under the
+  existing ladder (user ``factors=`` rows still win). Car cost matrices
+  and itineraries therefore price emissions out of the box: the default
+  powertrain is ICE, ``vehicle_class=`` selects another, and a new
+  ``occupancy=`` option (at least 1, default 1) divides the per-vehicle
+  emissions across the persons carried without ever rescaling the
+  factors; the basis stays the driven network distance including any
+  parking-search metres. Both options are car-only and rejected loudly
+  elsewhere; an unknown powertrain reports unresolved (NaN) emissions
+  with a warning, never a silent zero.
+
 - **The car parking search model**: car queries gain ``parking=`` on
   ``StreetNetwork.travel_time``, ``TravelTimeMatrix``,
   ``TravelCostMatrix``, and ``DetailedItineraries`` — the search that
@@ -41,9 +58,8 @@
   period (``rush``, ``midday`` — the default — or ``day-average``)
   with ``delay_model=`` partial overrides of every shipped number.
   ``profile=`` or ``delay_model=`` without the gate raise. Car legs
-  never serve transit access or egress (no park-and-ride), and a car
-  cost matrix reports unresolved (NaN) emissions until factor rows
-  are supplied — the shipped car factors come in a later slice.
+  never serve transit access or egress (no park-and-ride); the car
+  emission factors ship in the entry above, ICE by default.
 
 - Groundwork for **realistic car routing** (the car arc's driving
   graph): the OSM permission compiler gains the ``car`` mode —

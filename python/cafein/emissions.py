@@ -16,10 +16,13 @@ from the same table by selecting components.
 """
 
 import json
+import math
+import numbers
 import os
 import pathlib
 import warnings
 
+import numpy as np
 import pandas as pd
 
 KEY_COLUMNS = ["trip_id", "route_id", "agency_id", "route_type"]
@@ -35,10 +38,9 @@ STREET_MODE_IDENTITIES = {
     "bicycle": ("bicycle", "conventional", "private"),
     "e_bike": ("bicycle", "e_bike", "private"),
     "e_scooter": ("e_scooter", "battery", "private"),
-    # No shipped car factor row yet: a car matrix resolves through
-    # ``factors=`` rows or reports unresolved (NaN) emissions. The
-    # powertrain classes are the documented uppercase acronyms
-    # (ICE/HEV/PHEV/BEV/FCEV); the default car is ICE.
+    # The powertrain classes are the documented uppercase acronyms
+    # (ICE/HEV/PHEV/BEV/FCEV); the default car is ICE, selectable per
+    # query with ``vehicle_class=``.
     "car": ("car", "ICE", "private"),
 }
 
@@ -67,14 +69,16 @@ def default_factors():
 
 
 def vehicle_class_factors():
-    """Life-cycle factors per vehicle class, in g CO₂e per passenger-km.
+    """Life-cycle factors per vehicle class, in g CO₂e per kilometre.
 
-    The International Transport Forum's LCA components calibrated to the
+    The transit classes are per passenger-km (occupancy baked in); the
+    ``car-*`` classes are per **vehicle**-km on the driver-only basis,
+    exactly as the shipped car street factors apply them. The
+    International Transport Forum's LCA components calibrated to the
     Finnish electricity mix, from Dey, Marín-Flores & Tenkanen (2026,
     Tables 4-5, doi:10.1016/j.scs.2026.107226). Use these to author
     route- or trip-level factor rows — e.g. give a city's electrified
-    bus lines the ``bus-BEV`` values, the GEMMAT approach — and, for the
-    private-vehicle classes, future direct-mode tables.
+    bus lines the ``bus-BEV`` values, the GEMMAT approach.
     """
     rows = {
         "bus-ICE": (8.0, 72.0, 4.0, 8.0),
@@ -95,7 +99,12 @@ def vehicle_class_factors():
 
 
 def street_factors():
-    """The shipped street-mode factor table, in g CO₂e per person-km.
+    """The shipped street-mode factor table, in g CO₂e per kilometre.
+
+    The unit is conditional by mode: the walking and micromobility rows
+    are per person-km (occupancy 1 baked in), while the car rows are per
+    **vehicle**-km on the driver-only basis — the query surfaces divide
+    them by ``occupancy=``.
 
     The micromobility life-cycle components come from the ITF "Good to
     Go?" LCA model (Cazzola & Crist 2020) computed with the Finland 2020
@@ -172,6 +181,29 @@ def street_factors():
             "operations": 6.9,
         },
     ]
+    # The car powertrains: GEMMAT Table 4 (Dey, Marín-Flores & Tenkanen
+    # 2026 — the ITF LCA tool calibrated to Finland's energy mix), in
+    # g CO₂ per VEHICLE-kilometre on the paper's driver-only basis
+    # (occupancy 1); a query's `occupancy=` divides these across the
+    # persons carried, never rescaling the rows.
+    for vehicle_class, vehicle, fuel, infrastructure in (
+        ("ICE", 24.0, 126.0, 12.0),
+        ("HEV", 26.0, 94.0, 13.0),
+        ("PHEV", 32.0, 43.0, 13.0),
+        ("BEV", 42.0, 16.0, 12.0),
+        ("FCEV", 38.0, 83.0, 13.0),
+    ):
+        rows.append(
+            {
+                "street_mode": "car",
+                "vehicle_class": vehicle_class,
+                "service_model": "private",
+                "vehicle": vehicle,
+                "fuel": fuel,
+                "infrastructure": infrastructure,
+                "operations": 0.0,
+            }
+        )
     return pd.DataFrame(rows).reindex(columns=STREET_KEY_COLUMNS + COMPONENT_COLUMNS)
 
 
@@ -185,7 +217,9 @@ def load_street_factors(source):
         ``vehicle_class``, ``service_model`` (empty where not applicable)
         plus one or more component columns ``vehicle``, ``fuel``,
         ``infrastructure``, ``operations`` in g CO₂e per person-km
-        (occupancy 1 for private micromobility). Paths may point to CSV,
+        (occupancy 1 for private micromobility) — or per vehicle-km for
+        ``street_mode="car"`` rows, which queries divide by
+        ``occupancy=``. Paths may point to CSV,
         JSON, or YAML as in ``load_factors``.
 
     Returns
@@ -221,6 +255,9 @@ def load_street_factors(source):
         frame[column] = pd.to_numeric(frame[column], errors="raise")
         if (frame[column] < 0).any():
             raise ValueError(f"negative values in factor component '{column}'")
+        # NA marks an unresolved component; an infinity is data corruption.
+        if np.isinf(frame[column].to_numpy(dtype=float)).any():
+            raise ValueError(f"non-finite values in factor component '{column}'")
     for column in STREET_KEY_COLUMNS:
         frame[column] = frame[column].map(_key_string, na_action="ignore")
     # The resolver matches three shapes — mode, mode + class, or the exact
@@ -241,8 +278,41 @@ def load_street_factors(source):
     return frame
 
 
-def street_factor(transport_mode, factors=None, components=None, service_model=None):
-    """The resolved g CO₂e per person-km factor for one street mode.
+def _car_query_options(transport_mode, occupancy, vehicle_class):
+    """Validated ``(occupancy, vehicle_class)`` for a street query.
+
+    Both options belong to the car — its shipped factors are per
+    vehicle-kilometre on the driver-only basis, so ``occupancy`` divides
+    the per-vehicle emissions across the persons carried (at least the
+    driver, so at least 1) and ``vehicle_class`` picks the powertrain.
+    The person-km rows of the other modes take neither.
+    """
+    if transport_mode != "car" and (occupancy is not None or vehicle_class is not None):
+        raise ValueError("occupancy and vehicle_class apply to transport_mode='car'")
+    if occupancy is None:
+        effective = 1.0
+    else:
+        if isinstance(occupancy, bool) or not isinstance(occupancy, numbers.Real):
+            raise ValueError("occupancy must be a number")
+        effective = float(occupancy)
+        if not math.isfinite(effective) or effective < 1.0:
+            raise ValueError("occupancy must be a finite number of at least 1")
+    if vehicle_class is not None and not isinstance(vehicle_class, str):
+        raise ValueError("vehicle_class must be a string")
+    return effective, vehicle_class
+
+
+def street_factor(
+    transport_mode,
+    factors=None,
+    components=None,
+    service_model=None,
+    vehicle_class=None,
+):
+    """The resolved g CO₂e per-kilometre factor for one street mode.
+
+    Person-km for walking and micromobility; **vehicle**-km for the car,
+    whose query surfaces divide by ``occupancy=`` afterwards.
 
     Resolution is most-specific-wins over the mode's identity
     (``STREET_MODE_IDENTITIES``): the exact ``(street_mode, vehicle_class,
@@ -250,9 +320,11 @@ def street_factor(transport_mode, factors=None, components=None, service_model=N
     ``street_mode`` alone. ``service_model=`` overrides the identity's
     third element — ``"shared"`` resolves a rental's fleet factors (its
     collection and rebalancing operations) where the identity defaults
-    to the private vehicle. The user's table is consulted first at every
-    specificity — a sourced user row at any rung beats the shipped
-    defaults. The factor is the sum of the selected `components`
+    to the private vehicle — and ``vehicle_class=`` its second, so a car
+    query selects a powertrain (``"HEV"``, ``"BEV"``, …) where the
+    identity defaults to ``"ICE"``. The user's table is consulted first
+    at every specificity — a sourced user row at any rung beats the
+    shipped defaults. The factor is the sum of the selected `components`
     (default: all four); an NA in any selected component leaves the
     whole factor NA — unresolved, never silently zero — with a warning
     naming the components.
@@ -277,7 +349,8 @@ def street_factor(transport_mode, factors=None, components=None, service_model=N
                 "components selects nothing; an empty selection would report "
                 "zero emissions rather than unresolved ones"
             )
-    mode, vehicle_class, identity_service = STREET_MODE_IDENTITIES[transport_mode]
+    mode, identity_class, identity_service = STREET_MODE_IDENTITIES[transport_mode]
+    vehicle_class = identity_class if vehicle_class is None else vehicle_class
     service_model = identity_service if service_model is None else service_model
     ladder = [
         (mode, vehicle_class, service_model),
@@ -379,6 +452,9 @@ def load_factors(source):
         frame[column] = pd.to_numeric(frame[column], errors="raise")
         if (frame[column] < 0).any():
             raise ValueError(f"negative values in factor component '{column}'")
+        # NA marks an unresolved component; an infinity is data corruption.
+        if np.isinf(frame[column].to_numpy(dtype=float)).any():
+            raise ValueError(f"non-finite values in factor component '{column}'")
     # A keyed row with no component values would resolve as zero
     # emissions and shadow broader rows.
     empty = frame[COMPONENT_COLUMNS].isna().all(axis=1)
