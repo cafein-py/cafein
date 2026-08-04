@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **The car benchmark harness** (``scripts/benchmark_car_vs_r5py.py``,
+  run manually): a parity run comparing cafein's default free-flow car
+  regime against r5py's CAR mode door-to-door — both engines fed the
+  same restriction-free PBF, written with pyrosm alone
+  (``write_pbf(delete=…)`` over every ``type=restriction`` relation)
+  and cafein's untagged-way defaults aligned to R5's documented
+  per-class speeds for the run — reporting coverage, agreement within
+  ±60 s, difference quantiles, bias, and build/matrix times; and a
+  cafein-only realism run reporting the rush-vs-free-flow travel time
+  ratio distribution of the intersection-delay model. Requires r5py
+  (≥ 1.0) and a Java runtime for the parity side only.
+
 - **The monetary cost account** (``cafein.costs``): street matrices and
   itineraries price the driven kilometres under two selectable
   perspectives — a **separate account from fares, never summed with
