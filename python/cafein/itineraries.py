@@ -230,6 +230,13 @@ class DetailedItineraries(gpd.GeoDataFrame):
         ``"ICE"``) and ``occupancy=`` (at least 1, default 1) divides
         the per-vehicle emissions across the persons carried, as in
         ``TravelCostMatrix``.
+    perspectives, costs, currency, cost_components : optional
+        The monetary cost account of the street legs, exactly as in
+        ``TravelCostMatrix``: off by default, ``cost_<perspective>``
+        columns over the driven kilometres from the Gössling et al.
+        (2019) defaults with ``costs=`` overrides, per-component
+        columns via ``cost_components=`` (one perspective), and the
+        declared ``currency`` label column.
     street_policy : StreetLegPolicy (optional)
         Which street modes may serve the access and egress, on what
         vehicle terms (``cafein.StreetLegPolicy``); point origins and
@@ -310,6 +317,10 @@ class DetailedItineraries(gpd.GeoDataFrame):
         parking=None,
         occupancy=None,
         vehicle_class=None,
+        perspectives=None,
+        costs=None,
+        currency=None,
+        cost_components=None,
     ):
         # Before the reconstruction guard below: a StreetNetwork has no
         # `route_between_stops` either, so it would be mistaken for frame data.
@@ -338,6 +349,10 @@ class DetailedItineraries(gpd.GeoDataFrame):
                     parking=parking,
                     occupancy=occupancy,
                     vehicle_class=vehicle_class,
+                    perspectives=perspectives,
+                    costs=costs,
+                    currency=currency,
+                    cost_components=cost_components,
                     transit_only={
                         "date": date,
                         "slack_seconds": slack_seconds,
@@ -383,6 +398,17 @@ class DetailedItineraries(gpd.GeoDataFrame):
                 "intersection_delays, profile, delay_model, parking, "
                 "occupancy, and vehicle_class apply to a StreetNetwork "
                 "car query"
+            )
+        if (
+            perspectives is not None
+            or costs is not None
+            or currency is not None
+            or cost_components is not None
+        ):
+            raise ValueError(
+                "perspectives, costs, currency, and cost_components price "
+                "street kilometres and apply to a StreetNetwork query "
+                "(transit perspective costs are not supported)"
             )
         frame = _itineraries_frame(
             network,
@@ -928,9 +954,13 @@ def _street_itineraries_frame(
     parking=None,
     occupancy=None,
     vehicle_class=None,
+    perspectives=None,
+    costs=None,
+    currency=None,
+    cost_components=None,
 ):
     """Street routes as one leg per reachable pair."""
-    from cafein import _parking, emissions
+    from cafein import _parking, costs as _costs, emissions
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
     from cafein.street_network import _resolved_delays
 
@@ -951,6 +981,9 @@ def _street_itineraries_frame(
     # exactly as the cost matrix does.
     factor = emissions.street_factor(
         transport_mode, factors, components, vehicle_class=vehicle_class
+    )
+    account = _costs.resolve_query(
+        transport_mode, perspectives, costs, currency, cost_components
     )
     table = network._core.cost_matrix(
         query.origin_points,
@@ -1025,6 +1058,16 @@ def _street_itineraries_frame(
         },
         columns=[column for column in STREET_COLUMNS if column != "geometry"],
     )
+    if account is not None:
+        # Appended after the fixed leg schema: costs ride the same driven
+        # kilometres as the emissions, and a missing row's NaN propagates.
+        totals, breakdown, label = account
+        kilometres = network_distance / 1000.0
+        for perspective, per_km in totals.items():
+            frame[f"cost_{perspective}"] = kilometres * per_km
+        for (perspective, component), per_km in breakdown.items():
+            frame[f"cost_{perspective}_{component}"] = kilometres * per_km
+        frame["currency"] = label
     if geometries:
         shapes = list(shapely.from_wkb(np.array(table["geometry"], dtype=object)))
     else:

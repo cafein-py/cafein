@@ -11,7 +11,7 @@ class TravelCostMatrix(pd.DataFrame):
     """The fastest journey's aggregated costs per OD pair, long format.
 
     A pandas DataFrame with one row per reachable OD pair: ``from_id``
-    and ``to_id``, ``travel_time`` (seconds), ``transfers``,
+    and ``to_id``, ``travel_time_s`` (seconds), ``transfers``,
     ``transit_distance_m`` and ``walk_distance_m`` (meters), and
     ``emissions`` (grams CO₂e over the ridden legs; NaN where a ridden
     trip has no matching factor row). With ``geometries=True`` each row
@@ -45,7 +45,7 @@ class TravelCostMatrix(pd.DataFrame):
     Given a ``StreetNetwork`` instead, the matrix is a standalone street
     computation over the compiled profile of ``transport_mode``, bounded
     by ``max_street_time``. Its columns are ``from_id``, ``to_id``,
-    ``travel_time``, ``distance_m``, ``network_distance_m``,
+    ``travel_time_s``, ``distance_m``, ``network_distance_m``,
     ``connector_distance_m``, ``distance_provenance``, ``emissions``,
     and — with ``geometries=True`` — the route as a shapely LineString. The
     distances carry their unit in the name: ``network_distance_m`` sums
@@ -189,6 +189,20 @@ class TravelCostMatrix(pd.DataFrame):
         row's class, and ``occupancy=`` (at least 1, default 1) divides
         the per-vehicle emissions across the persons carried — the
         factors themselves are never rescaled.
+    perspectives, costs, currency, cost_components : optional
+        The monetary cost account of a street matrix — a separate
+        account from fares, off by default. ``perspectives=`` selects
+        ``"private"`` (the vehicle-operation bundle), ``"societal"``
+        (the external cost, negatives are benefits), or both, adding a
+        ``cost_<perspective>`` column per selection over the driven
+        kilometres (parking metres included) from the shipped Gössling
+        et al. (2019) Table 2 values — see ``cafein.costs``. ``costs=``
+        layers a user table by (perspective, street_mode, component)
+        key; ``cost_components=`` (one perspective only) restricts the
+        derived total to named components and adds their columns; and
+        ``currency=`` (default ``"EUR2017"``) is a declared label
+        carried in a ``currency`` column, never a conversion. A mode
+        without a matching row prices NaN, never zero.
 
     ``street_policy=`` (a ``cafein.StreetLegPolicy``) opens the access
     and egress to the policy's street modes over the multimodal graph
@@ -257,6 +271,10 @@ class TravelCostMatrix(pd.DataFrame):
         parking=None,
         occupancy=None,
         vehicle_class=None,
+        perspectives=None,
+        costs=None,
+        currency=None,
+        cost_components=None,
     ):
         if _is_street_network(network):
             data = _street_cost_columns(
@@ -276,6 +294,10 @@ class TravelCostMatrix(pd.DataFrame):
                 parking=parking,
                 occupancy=occupancy,
                 vehicle_class=vehicle_class,
+                perspectives=perspectives,
+                costs=costs,
+                currency=currency,
+                cost_components=cost_components,
                 transit_only={
                     "date": date,
                     "departure": departure,
@@ -316,6 +338,17 @@ class TravelCostMatrix(pd.DataFrame):
                 "intersection_delays, profile, delay_model, parking, "
                 "occupancy, and vehicle_class apply to a StreetNetwork "
                 "car matrix"
+            )
+        if (
+            perspectives is not None
+            or costs is not None
+            or currency is not None
+            or cost_components is not None
+        ):
+            raise ValueError(
+                "perspectives, costs, currency, and cost_components price "
+                "street kilometres and apply to a StreetNetwork matrix "
+                "(transit perspective costs are not supported)"
             )
         if street_policy is not None:
             offending = next(
@@ -461,7 +494,7 @@ class TravelTimeMatrix(pd.DataFrame):
     """Travel times per OD pair, long format — the lean r5py-style mode.
 
     A pandas DataFrame with one row per reachable OD pair: ``from_id``,
-    ``to_id``, and ``travel_time`` in seconds. It is the long-format face
+    ``to_id``, and ``travel_time_s`` in seconds. It is the long-format face
     of ``TransportNetwork.travel_time_matrix``: one RAPTOR run serves
     each origin, fanned out over all cores, and the reachable cells of
     the resulting wide matrix are unstacked into rows. Unreachable pairs
@@ -471,7 +504,7 @@ class TravelTimeMatrix(pd.DataFrame):
     emissions.
 
     With ``window``, every minute mark within ``[departure, departure +
-    window)`` is profiled and the ``travel_time`` column is replaced by
+    window)`` is profiled and the ``travel_time_s`` column is replaced by
     one ``travel_time_p<p>`` column per requested percentile (the median
     by default, or ``confidence`` for the symmetric interval plus the
     median), in seconds and floating-point so an unreachable percentile
@@ -875,9 +908,13 @@ def _street_cost_columns(
     parking=None,
     occupancy=None,
     vehicle_class=None,
+    perspectives=None,
+    costs=None,
+    currency=None,
+    cost_components=None,
 ):
     """The reachable cells of a street cost matrix, in long format."""
-    from cafein import _parking, emissions
+    from cafein import _parking, costs as _costs, emissions
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
     from cafein.street_network import _resolved_delays
 
@@ -895,11 +932,14 @@ def _street_cost_columns(
         transit_only=transit_only,
     )
     # Resolved after the argument validation but before the routing call:
-    # the factor the query started with is the one applied, whatever
-    # happens to a mutable `factors` frame while the search holds no GIL
-    # — and a bad table fails before the search pays for it.
+    # the factor and cost account the query started with are the ones
+    # applied, whatever happens to a mutable table while the search holds
+    # no GIL — and a bad table fails before the search pays for it.
     factor = emissions.street_factor(
         transport_mode, factors, components, vehicle_class=vehicle_class
+    )
+    account = _costs.resolve_query(
+        transport_mode, perspectives, costs, currency, cost_components
     )
     table = network._core.cost_matrix(
         query.origin_points,
@@ -951,6 +991,17 @@ def _street_cost_columns(
         # across the persons carried.
         "emissions": network_distance / 1000.0 * factor / occupancy,
     }
+    if account is not None:
+        # Costs ride the same driven kilometres as the emissions —
+        # parking-search metres included, connectors excluded — and a
+        # missing row's NaN propagates, never a silent zero.
+        totals, breakdown, label = account
+        kilometres = network_distance / 1000.0
+        for perspective, per_km in totals.items():
+            data[f"cost_{perspective}"] = kilometres * per_km
+        for (perspective, component), per_km in breakdown.items():
+            data[f"cost_{perspective}_{component}"] = kilometres * per_km
+        data["currency"] = np.full(len(network_distance), label, dtype=object)
     if geometries:
         data["geometry"] = shapely.from_wkb(np.array(table["geometry"], dtype=object))
     return data
