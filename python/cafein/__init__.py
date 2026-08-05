@@ -9,6 +9,7 @@ __all__ = [
     "TravelTimeMatrix",
     "DetailedItineraries",
     "travel_cost_table",
+    "StreamingResult",
     "to_minutes",
     "exhaustive_frontier",
     "journey_frontier",
@@ -56,6 +57,10 @@ def __getattr__(name):
         from cafein.matrices import travel_cost_table
 
         return travel_cost_table
+    if name == "StreamingResult":
+        from cafein._streaming import StreamingResult
+
+        return StreamingResult
     if name == "exhaustive_frontier":
         from cafein.frontier import exhaustive_frontier
 
