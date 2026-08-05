@@ -61,6 +61,14 @@ struct CarriageTransferSet {
 /// A routable public-transport network built from GTFS data.
 #[pyclass]
 struct TransportNetwork {
+    /// The artifact file this network was loaded from (canonicalized),
+    /// with the header CRCs read at load time — the streaming
+    /// fingerprint's stable cross-process identity. `None` for
+    /// in-memory builds, and cleared pessimistically at the START of
+    /// every mutating method: a mutation attempt that fails also drops
+    /// the file identity (the network then digests by content —
+    /// conservative, never a false match).
+    source: Option<(String, u32, u32)>,
     feed: Feed,
     build: TimetableBuild,
     transfers: Transfers,

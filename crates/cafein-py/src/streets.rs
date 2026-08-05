@@ -76,6 +76,10 @@ pub struct StreetNetwork {
     /// owned load, and just the owned optional arrays for a lazy mapped one.
     /// Zero only for a network built from arrays rather than loaded.
     streets_bytes_read: u64,
+    /// The artifact file this network was loaded from, with the header
+    /// CRCs read at load time — the streaming fingerprint's stable
+    /// cross-process identity; `None` for in-memory builds.
+    source: Option<(String, u32, u32)>,
     /// What the installed elevations mean; `None` without elevations.
     elevation: Option<ElevationMeta>,
 }
@@ -134,6 +138,7 @@ impl StreetNetwork {
             profiles: Vec::new(),
             streets_bytes_read: 0,
             elevation,
+            source: None,
         })
     }
 
@@ -169,6 +174,42 @@ impl StreetNetwork {
         })
     }
 
+    /// A deterministic content digest over everything `save` would
+    /// persist — the artifact identity without writing a file, as a
+    /// SHA-256 hex string. Serializes the payload on demand (the
+    /// street arrays encode into one transient section buffer); the
+    /// streaming fingerprint calls it once per run.
+    fn _artifact_checksum(&self, py: Python<'_>) -> PyResult<String> {
+        use sha2::{Digest, Sha256};
+
+        if let Some((path, meta_crc, streets_crc)) = &self.source {
+            if let Some(digest) =
+                py.allow_threads(|| crate::artifact::file_digest(path, *meta_crc, *streets_crc))
+            {
+                return Ok(digest);
+            }
+        }
+        py.allow_threads(|| {
+            let parts = self.inner.to_parts();
+            let (descriptors, streets_bytes) = encode_streets(&parts);
+            let meta = StreetsMeta {
+                vertex_count: parts.vertex_count,
+                links: parts.links.clone(),
+                descriptors,
+                elevation: self.elevation.clone(),
+            };
+            let mut hasher = Sha256::new();
+            hasher.update(STREET_ARTIFACT_MAGIC);
+            hasher.update(STREET_ARTIFACT_FORMAT.to_le_bytes());
+            bincode::serialize_into(crate::artifact::HashWriter(&mut hasher), &meta)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            hasher.update(b"\0STREETS");
+            hasher.update((streets_bytes.len() as u64).to_le_bytes());
+            hasher.update(&streets_bytes);
+            Ok(crate::artifact::hex_digest(hasher))
+        })
+    }
+
     /// Load a street network saved with ``save``.
     ///
     /// ``mmap='auto'`` maps the file and uses the street arrays in place,
@@ -196,10 +237,12 @@ impl StreetNetwork {
                 )))
             }
         };
+        let source =
+            crate::artifact::read_source(path, STREET_ARTIFACT_MAGIC, STREET_ARTIFACT_FORMAT);
         if mode != MmapMode::Off {
             match py.allow_threads(|| load_street_mapped(path, verify))? {
                 Ok((inner, bytes_read, elevation)) => {
-                    return Ok(StreetNetwork::adopt(inner, bytes_read, elevation))
+                    return Ok(StreetNetwork::adopt(inner, bytes_read, elevation, source))
                 }
                 Err(reason) if mode == MmapMode::Require => {
                     return Err(PyValueError::new_err(format!(
@@ -212,7 +255,7 @@ impl StreetNetwork {
         }
         let (inner, bytes_read, elevation) =
             py.allow_threads(|| load_street_owned(path, verify))?;
-        Ok(StreetNetwork::adopt(inner, bytes_read, elevation))
+        Ok(StreetNetwork::adopt(inner, bytes_read, elevation, source))
     }
 
     /// The origins × destinations travel-time matrix under `mode`, in whole
@@ -483,12 +526,14 @@ impl StreetNetwork {
         inner: CoreStreetNetwork,
         streets_bytes_read: u64,
         elevation: Option<ElevationMeta>,
+        source: Option<(String, u32, u32)>,
     ) -> StreetNetwork {
         StreetNetwork {
             inner,
             profiles: Vec::new(),
             streets_bytes_read,
             elevation,
+            source,
         }
     }
 

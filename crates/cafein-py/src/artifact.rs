@@ -22,95 +22,27 @@ impl TransportNetwork {
         let parts = self.streets.as_ref().map(StreetNetwork::to_parts);
         let multimodal_parts = self.multimodal.as_ref().map(StreetNetwork::to_parts);
         py.allow_threads(|| {
-            let (streets_meta, mut streets_bytes) = match &parts {
-                Some(parts) => {
-                    let (descriptors, bytes) = encode_streets(parts);
-                    (
-                        Some(StreetsMeta {
-                            vertex_count: parts.vertex_count,
-                            links: parts.links.clone(),
-                            descriptors,
-                            // The walking graph carries no elevations; they
-                            // belong to the multimodal graph below.
-                            elevation: None,
-                        }),
-                        bytes,
-                    )
-                }
-                None => (None, Vec::new()),
-            };
-            // The multimodal union graph's arrays follow the walking arrays
-            // inside the one STREETS section, starting on the array
-            // alignment; its descriptor offsets are shifted to their final
-            // section-relative positions here, so the load path reads both
-            // graphs through the same descriptor machinery.
-            let multimodal_meta = match &multimodal_parts {
-                Some(parts) => {
-                    let base =
-                        (streets_bytes.len() as u64).div_ceil(ARRAY_ALIGNMENT) * ARRAY_ALIGNMENT;
-                    streets_bytes.resize(base as usize, 0);
-                    let (mut descriptors, bytes) = encode_streets(parts);
-                    for descriptor in &mut descriptors {
-                        descriptor.offset += base;
-                    }
-                    streets_bytes.extend_from_slice(&bytes);
-                    Some(StreetsMeta {
-                        vertex_count: parts.vertex_count,
-                        links: parts.links.clone(),
-                        descriptors,
-                        elevation: self.multimodal_elevation.clone(),
-                    })
-                }
-                None => None,
-            };
-            let artifact = ArtifactRef {
-                feed: &self.feed,
-                timetable: &self.build.timetable,
-                services: &self.build.services,
-                transfers: &self.transfers,
-                geometry: &self.geometry,
-                leg_geometry: &self.leg_geometry,
-                streets: streets_meta,
-                ultra_transfers: &self.ultra_transfers,
-                ultra_window: self.ultra_window,
-                mcultra_transfers: &self.mcultra_transfers,
-                mcultra_window: self.mcultra_window,
-                mcultra_factors: &self.mcultra_factors,
-                walking_hierarchy: self.streets.as_ref().and_then(StreetNetwork::hierarchy),
-                tbtr_time_transfers: &self.tbtr_time_transfers,
-                mctbtr_transfers: &self.mctbtr_transfers,
-                multimodal: multimodal_meta,
-                multimodal_modes: &self.multimodal_modes,
-                mode_transfers: self.mode_transfers.as_ref().map(|held| {
-                    let mut tokens: Vec<_> = held
-                        .tokens
-                        .iter()
-                        .map(|(&pair, &token)| (pair, token))
-                        .collect();
-                    tokens.sort_unstable_by_key(|&(pair, _)| pair);
-                    PersistedModeTransfersRef {
-                        mode: &held.mode,
-                        budget: held.budget,
-                        set: &held.set,
-                        tokens,
-                        rental_network_meters: &held.rental_network_meters,
-                        rental_edge: &held.rental_edge,
-                    }
-                }),
-                carriage_transfers: self.carriage_transfers.as_ref().map(|held| {
-                    PersistedCarriageRef {
-                        mode: &held.mode,
-                        budget: held.budget,
-                        set: &held.set,
-                        ride_edge: &held.ride_edge,
-                        ride_network_meters: &held.ride_network_meters,
-                    }
-                }),
-            };
-            let meta = bincode::serialize(&artifact)
-                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            let (meta, streets_bytes) = self.encode_artifact(&parts, &multimodal_parts)?;
             write_container(path, ARTIFACT_MAGIC, ARTIFACT_FORMAT, &meta, &streets_bytes)
         })
+    }
+
+    /// The network's identity for the streaming fingerprint, as a
+    /// SHA-256 hex string. A network loaded from an artifact hashes the
+    /// **file** (streamed, bound to the load-time header CRCs) — stable
+    /// across processes, the cross-process resume identity. An
+    /// in-memory build, or one mutated since loading, digests the
+    /// content it would save instead — strong but process-local, since
+    /// the serialization is not canonical across processes.
+    fn _artifact_checksum(&self, py: Python<'_>) -> PyResult<String> {
+        if let Some((path, meta_crc, streets_crc)) = &self.source {
+            if let Some(digest) = py.allow_threads(|| file_digest(path, *meta_crc, *streets_crc)) {
+                return Ok(digest);
+            }
+        }
+        let parts = self.streets.as_ref().map(StreetNetwork::to_parts);
+        let multimodal_parts = self.multimodal.as_ref().map(StreetNetwork::to_parts);
+        py.allow_threads(|| self.content_digest(&parts, &multimodal_parts))
     }
 
     /// Load a network saved with ``save``.
@@ -175,6 +107,157 @@ impl TransportNetwork {
     #[getter]
     fn _streets_bytes_read(&self) -> u64 {
         self.streets_bytes_read
+    }
+}
+
+impl TransportNetwork {
+    /// The bincode META payload and STREETS bytes `save` writes — shared
+    /// with `_artifact_checksum` so the checksum is exactly the saved
+    /// content's.
+    fn encode_artifact(
+        &self,
+        parts: &Option<cafein_core::streets::StreetNetworkParts>,
+        multimodal_parts: &Option<cafein_core::streets::StreetNetworkParts>,
+    ) -> PyResult<(Vec<u8>, Vec<u8>)> {
+        let (streets_meta, multimodal_meta, streets_bytes) =
+            self.encode_street_sections(parts, multimodal_parts);
+        let artifact = self.artifact_ref(streets_meta, multimodal_meta);
+        let meta = bincode::serialize(&artifact)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        Ok((meta, streets_bytes))
+    }
+
+    /// The strong artifact identity: a SHA-256 over the artifact kind and
+    /// format, the streamed META serialization, and the STREETS section
+    /// with its length — domain-separated, computed without buffering the
+    /// META payload (the street arrays still encode into one section
+    /// buffer, the run's one network-sized transient).
+    fn content_digest(
+        &self,
+        parts: &Option<cafein_core::streets::StreetNetworkParts>,
+        multimodal_parts: &Option<cafein_core::streets::StreetNetworkParts>,
+    ) -> PyResult<String> {
+        use sha2::{Digest, Sha256};
+
+        let (streets_meta, multimodal_meta, streets_bytes) =
+            self.encode_street_sections(parts, multimodal_parts);
+        let artifact = self.artifact_ref(streets_meta, multimodal_meta);
+        let mut hasher = Sha256::new();
+        hasher.update(ARTIFACT_MAGIC);
+        hasher.update(ARTIFACT_FORMAT.to_le_bytes());
+        bincode::serialize_into(HashWriter(&mut hasher), &artifact)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        hasher.update(b"\0STREETS");
+        hasher.update((streets_bytes.len() as u64).to_le_bytes());
+        hasher.update(&streets_bytes);
+        Ok(hex_digest(hasher))
+    }
+
+    /// The STREETS section (walking + multimodal graphs) as `save`
+    /// lays it out, with both graphs' metadata.
+    fn encode_street_sections(
+        &self,
+        parts: &Option<cafein_core::streets::StreetNetworkParts>,
+        multimodal_parts: &Option<cafein_core::streets::StreetNetworkParts>,
+    ) -> (Option<StreetsMeta>, Option<StreetsMeta>, Vec<u8>) {
+        {
+            let (streets_meta, mut streets_bytes) = match &parts {
+                Some(parts) => {
+                    let (descriptors, bytes) = encode_streets(parts);
+                    (
+                        Some(StreetsMeta {
+                            vertex_count: parts.vertex_count,
+                            links: parts.links.clone(),
+                            descriptors,
+                            // The walking graph carries no elevations; they
+                            // belong to the multimodal graph below.
+                            elevation: None,
+                        }),
+                        bytes,
+                    )
+                }
+                None => (None, Vec::new()),
+            };
+            // The multimodal union graph's arrays follow the walking arrays
+            // inside the one STREETS section, starting on the array
+            // alignment; its descriptor offsets are shifted to their final
+            // section-relative positions here, so the load path reads both
+            // graphs through the same descriptor machinery.
+            let multimodal_meta = match &multimodal_parts {
+                Some(parts) => {
+                    let base =
+                        (streets_bytes.len() as u64).div_ceil(ARRAY_ALIGNMENT) * ARRAY_ALIGNMENT;
+                    streets_bytes.resize(base as usize, 0);
+                    let (mut descriptors, bytes) = encode_streets(parts);
+                    for descriptor in &mut descriptors {
+                        descriptor.offset += base;
+                    }
+                    streets_bytes.extend_from_slice(&bytes);
+                    Some(StreetsMeta {
+                        vertex_count: parts.vertex_count,
+                        links: parts.links.clone(),
+                        descriptors,
+                        elevation: self.multimodal_elevation.clone(),
+                    })
+                }
+                None => None,
+            };
+            (streets_meta, multimodal_meta, streets_bytes)
+        }
+    }
+
+    /// The bincode-serializable view of everything `save` persists.
+    fn artifact_ref<'a>(
+        &'a self,
+        streets_meta: Option<StreetsMeta>,
+        multimodal_meta: Option<StreetsMeta>,
+    ) -> ArtifactRef<'a> {
+        {
+            ArtifactRef {
+                feed: &self.feed,
+                timetable: &self.build.timetable,
+                services: &self.build.services,
+                transfers: &self.transfers,
+                geometry: &self.geometry,
+                leg_geometry: &self.leg_geometry,
+                streets: streets_meta,
+                ultra_transfers: &self.ultra_transfers,
+                ultra_window: self.ultra_window,
+                mcultra_transfers: &self.mcultra_transfers,
+                mcultra_window: self.mcultra_window,
+                mcultra_factors: &self.mcultra_factors,
+                walking_hierarchy: self.streets.as_ref().and_then(StreetNetwork::hierarchy),
+                tbtr_time_transfers: &self.tbtr_time_transfers,
+                mctbtr_transfers: &self.mctbtr_transfers,
+                multimodal: multimodal_meta,
+                multimodal_modes: &self.multimodal_modes,
+                mode_transfers: self.mode_transfers.as_ref().map(|held| {
+                    let mut tokens: Vec<_> = held
+                        .tokens
+                        .iter()
+                        .map(|(&pair, &token)| (pair, token))
+                        .collect();
+                    tokens.sort_unstable_by_key(|&(pair, _)| pair);
+                    PersistedModeTransfersRef {
+                        mode: &held.mode,
+                        budget: held.budget,
+                        set: &held.set,
+                        tokens,
+                        rental_network_meters: &held.rental_network_meters,
+                        rental_edge: &held.rental_edge,
+                    }
+                }),
+                carriage_transfers: self.carriage_transfers.as_ref().map(|held| {
+                    PersistedCarriageRef {
+                        mode: &held.mode,
+                        budget: held.budget,
+                        set: &held.set,
+                        ride_edge: &held.ride_edge,
+                        ride_network_meters: &held.ride_network_meters,
+                    }
+                }),
+            }
+        }
     }
 }
 
@@ -627,33 +710,170 @@ pub(super) fn io_error(error: std::io::Error) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
 
+/// Streams `bincode` output straight into a SHA-256 — the META payload
+/// hashes without ever being buffered.
+pub(super) struct HashWriter<'a>(pub(super) &'a mut sha2::Sha256);
+
+impl std::io::Write for HashWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        sha2::Digest::update(self.0, buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The loaded artifact file's streamed SHA-256, bound to the header
+/// CRCs recorded at load time: a file replaced since then fails the
+/// binding and the caller falls back to the content digest.
+pub(super) fn file_digest(path: &str, meta_crc: u32, streets_crc: u32) -> Option<String> {
+    use sha2::Digest;
+    use std::io::Read;
+
+    let total = std::fs::metadata(path).ok()?.len();
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut head = vec![0u8; 4096.min(total as usize)];
+    file.read_exact(&mut head).ok()?;
+    let layout = parse_header(path, &head, total, ARTIFACT_MAGIC, ARTIFACT_FORMAT)
+        .or_else(|_| {
+            parse_header(
+                path,
+                &head,
+                total,
+                STREET_ARTIFACT_MAGIC,
+                STREET_ARTIFACT_FORMAT,
+            )
+        })
+        .ok()?;
+    if layout.meta_crc != meta_crc || layout.streets_crc != streets_crc {
+        return None;
+    }
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"FILE\0");
+    let mut meta_state = Crc32::new();
+    let mut streets_state = Crc32::new();
+    let mut position = 0u64;
+    let mut feed = |bytes: &[u8], position: &mut u64| {
+        hasher.update(bytes);
+        for (range, state) in [
+            (
+                layout.meta_offset..layout.meta_offset + layout.meta_length,
+                &mut meta_state,
+            ),
+            (
+                layout.streets_offset..layout.streets_offset + layout.streets_length,
+                &mut streets_state,
+            ),
+        ] {
+            let start = range
+                .start
+                .max(*position)
+                .min(*position + bytes.len() as u64);
+            let end = range.end.max(*position).min(*position + bytes.len() as u64);
+            if start < end {
+                state.update(&bytes[(start - *position) as usize..(end - *position) as usize]);
+            }
+        }
+        *position += bytes.len() as u64;
+    };
+    feed(&head, &mut position);
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        feed(&buffer[..read], &mut position);
+    }
+    if meta_state.finish() != meta_crc || streets_state.finish() != streets_crc {
+        return None;
+    }
+    Some(hex_digest(hasher))
+}
+
+/// The `(path, meta_crc, streets_crc)` source binding of an artifact
+/// file, read from its header alone.
+pub(super) fn read_source(path: &str, magic: &[u8; 8], format: u32) -> Option<(String, u32, u32)> {
+    use std::io::Read;
+
+    let total = std::fs::metadata(path).ok()?.len();
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut head = vec![0u8; 4096.min(total as usize)];
+    file.read_exact(&mut head).ok()?;
+    let layout = parse_header(path, &head, total, magic, format).ok()?;
+    Some((
+        canonical_source_path(path),
+        layout.meta_crc,
+        layout.streets_crc,
+    ))
+}
+
+/// The absolute form a source path is remembered in, so a later
+/// working-directory change cannot re-point the identity.
+pub(super) fn canonical_source_path(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|canonical| canonical.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// A SHA-256 state as its lowercase hex digest.
+pub(super) fn hex_digest(hasher: sha2::Sha256) -> String {
+    use sha2::Digest;
+
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// CRC-32 (IEEE) over the artifact payload.
 pub(super) fn crc32(bytes: &[u8]) -> u32 {
-    const TABLE: [u32; 256] = {
-        let mut table = [0u32; 256];
-        let mut index = 0;
-        while index < 256 {
-            let mut value = index as u32;
-            let mut bit = 0;
-            while bit < 8 {
-                value = if value & 1 != 0 {
-                    0xEDB8_8320 ^ (value >> 1)
-                } else {
-                    value >> 1
-                };
-                bit += 1;
-            }
-            table[index] = value;
-            index += 1;
-        }
-        table
-    };
-    let mut crc = u32::MAX;
-    for &byte in bytes {
-        crc = TABLE[((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8);
-    }
-    !crc
+    let mut state = Crc32::new();
+    state.update(bytes);
+    state.finish()
 }
+
+/// The container CRC as an incremental state, for streamed reads.
+pub(super) struct Crc32(u32);
+
+impl Crc32 {
+    pub(super) fn new() -> Crc32 {
+        Crc32(u32::MAX)
+    }
+
+    pub(super) fn update(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = CRC_TABLE[((self.0 ^ byte as u32) & 0xFF) as usize] ^ (self.0 >> 8);
+        }
+    }
+
+    pub(super) fn finish(&self) -> u32 {
+        !self.0
+    }
+}
+
+const CRC_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut index = 0;
+    while index < 256 {
+        let mut value = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            value = if value & 1 != 0 {
+                0xEDB8_8320 ^ (value >> 1)
+            } else {
+                value >> 1
+            };
+            bit += 1;
+        }
+        table[index] = value;
+        index += 1;
+    }
+    table
+};
 
 /// A corrupted-artifact error with the standard rebuild advice.
 pub(super) fn corrupted(path: &str, what: &str) -> PyErr {
@@ -1216,7 +1436,18 @@ pub(super) fn parse_container(
     magic: &[u8; 8],
     expected_format: u32,
 ) -> PyResult<ContainerLayout> {
-    let total = bytes.len() as u64;
+    parse_header(path, bytes, bytes.len() as u64, magic, expected_format)
+}
+
+/// `parse_container` over a head slice of a file whose full length is
+/// known separately — the light path that never reads the sections.
+pub(super) fn parse_header(
+    path: &str,
+    bytes: &[u8],
+    total: u64,
+    magic: &[u8; 8],
+    expected_format: u32,
+) -> PyResult<ContainerLayout> {
     let take = |offset: usize, length: usize| -> PyResult<&[u8]> {
         offset
             .checked_add(length)
@@ -1292,7 +1523,13 @@ pub(super) fn parse_container(
 
 /// A parsed artifact: the decoded META, the adopted street network, and
 /// how many STREETS-section bytes the load explicitly read.
-pub(super) type LoadedArtifact = (Artifact, Option<StreetNetwork>, Option<StreetNetwork>, u64);
+pub(super) type LoadedArtifact = (
+    Artifact,
+    Option<StreetNetwork>,
+    Option<StreetNetwork>,
+    u64,
+    (String, u32, u32),
+);
 
 /// Validates a persisted walking hierarchy against the street graph it rides
 /// with, before its buckets are rebuilt on load: it must accompany a street
@@ -1371,7 +1608,17 @@ pub(super) fn load_owned(path: &str, verify: Option<bool>) -> PyResult<LoadedArt
         None => None,
     };
     validate_walking_hierarchy(path, &artifact, &streets, true)?;
-    Ok((artifact, streets, multimodal, layout.streets_length))
+    Ok((
+        artifact,
+        streets,
+        multimodal,
+        layout.streets_length,
+        (
+            canonical_source_path(path),
+            layout.meta_crc,
+            layout.streets_crc,
+        ),
+    ))
 }
 
 /// Builds the multimodal graph from decoded parts and revalidates the
@@ -1567,13 +1814,23 @@ pub(super) fn load_mapped(
     // Only the `verify` path has paged (and CRC-checked) the STREETS section, so
     // only there is recomputing the CSR fingerprint free of extra reads.
     validate_walking_hierarchy(path, &artifact, &streets, verify == Some(true))?;
-    Ok(Ok((artifact, streets, multimodal, streets_read)))
+    Ok(Ok((
+        artifact,
+        streets,
+        multimodal,
+        streets_read,
+        (
+            canonical_source_path(path),
+            layout.meta_crc,
+            layout.streets_crc,
+        ),
+    )))
 }
 
 /// Assembles a network from a loaded artifact, rebuilding the derived
 /// lookup tables.
 pub(super) fn assemble(
-    (artifact, streets, multimodal, streets_bytes_read): LoadedArtifact,
+    (artifact, streets, multimodal, streets_bytes_read, source): LoadedArtifact,
 ) -> TransportNetwork {
     let Artifact {
         feed,
@@ -1676,5 +1933,6 @@ pub(super) fn assemble(
         stops_by_qualified_id,
         trips_by_public_id,
         streets_bytes_read,
+        source: Some(source),
     }
 }

@@ -535,7 +535,8 @@ class TravelCostMatrix(pd.DataFrame):
         ``from_id``/``to_id`` are dictionary-encoded over the shared id
         domains; a street matrix's geometry streams as plain WKB
         binary. ``street_policy`` matrices do not stream yet and are
-        rejected. ``resume=`` is reserved and raises.
+        rejected. ``resume=True`` continues a matching partial
+        directory run exactly as ``travel_cost_table`` does.
         """
         import pyarrow
 
@@ -596,6 +597,7 @@ class TravelCostMatrix(pd.DataFrame):
                 output,
                 size,
                 pyarrow,
+                resume=resume,
             )
         _reject_cost_street_args(
             transport_mode,
@@ -639,6 +641,7 @@ class TravelCostMatrix(pd.DataFrame):
             output=output,
             size=size,
             pyarrow=pyarrow,
+            resume=resume,
         )
 
 
@@ -974,7 +977,8 @@ class TravelTimeMatrix(pd.DataFrame):
         ``from_id``/``to_id`` are dictionary-encoded over the shared id
         domains; a windowed matrix streams its percentile columns.
         ``street_policy`` matrices do not stream yet and are rejected.
-        ``resume=`` is reserved and raises.
+        ``resume=True`` continues a matching partial directory run
+        exactly as ``travel_cost_table`` does.
         """
         import pyarrow
 
@@ -1022,6 +1026,7 @@ class TravelTimeMatrix(pd.DataFrame):
                 output,
                 size,
                 pyarrow,
+                resume=resume,
             )
         _reject_time_street_args(
             transport_mode,
@@ -1053,6 +1058,7 @@ class TravelTimeMatrix(pd.DataFrame):
             output=output,
             size=size,
             pyarrow=pyarrow,
+            resume=resume,
         )
 
 
@@ -1679,8 +1685,14 @@ def travel_cost_table(
     the destination count — a huge destination set splits across jobs.
     ``chunk=`` and ``output=`` compose: a chunked HPC job can itself
     stream its slice. An explicit ``batch_size`` or ``resume=True``
-    without ``output=`` is rejected (``resume=False`` is inert);
-    ``resume=True`` itself is not implemented yet and raises.
+    without ``output=`` is rejected (``resume=False`` is inert).
+    ``resume=True`` — directory form only — continues a matching
+    partial run: completed shards are skipped untouched (never
+    recomputed), a shard from a run killed between its rename and its
+    manifest marker is rewritten, and the manifest fingerprint must
+    match the query exactly — same network, inputs, parameters,
+    ``chunk``, and ``batch_size`` — else the directory is refused,
+    never overwritten.
     """
     try:
         import pyarrow
@@ -1755,6 +1767,7 @@ def travel_cost_table(
         output=output,
         size=size,
         pyarrow=pyarrow,
+        resume=resume,
     )
 
 
@@ -1787,6 +1800,7 @@ def _stream_transit_cost(
     output,
     size,
     pyarrow,
+    resume=False,
 ):
     """The transit cost matrix streamed in origin batches — shared by
     ``travel_cost_table`` and ``TravelCostMatrix.to_parquet``."""
@@ -1834,7 +1848,9 @@ def _stream_transit_cost(
         "optimize": optimize,
         "window": window,
         "within": within,
-        "factors": trip_factors,
+        # Sorted for the hash only: the resolver's order is not
+        # canonical across processes, the (trip, factor) SET is.
+        "factors": sorted(trip_factors),
         "fares": fare_tables,
         "geometries": bool(geometries),
         "chunk": None if chunk is None else list(chunk),
@@ -1904,6 +1920,7 @@ def _stream_transit_cost(
         size,
         make_batch,
         pyarrow,
+        resume=resume,
     )
 
 
@@ -1919,13 +1936,17 @@ def _stream_run(
     size,
     make_batch,
     pyarrow,
+    resume=False,
 ):
     """The shared streaming driver: fingerprint, claim, batch, write.
 
     ``make_batch(rows, shared_from, shared_to)`` returns one batch's
     Arrow table for the origin slice ``rows`` — inputs must already be
     frozen by the caller. Used by ``travel_cost_table`` and the matrix
-    computers' ``to_parquet`` classmethods identically.
+    computers' ``to_parquet`` classmethods identically. With
+    ``resume=True`` (directory form) the completed shards of a matching
+    partial run are skipped — their batches never compute — and only
+    the remainder routes.
     """
     from cafein import _streaming
 
@@ -1942,10 +1963,16 @@ def _stream_run(
         to_ids,
         points,
     )
-    mode, path = _streaming.resolve_output(output)
+    mode, path = _streaming.resolve_output(output, resume)
+    manifest = None
+    completed = frozenset()
+    if resume:
+        manifest, completed = _streaming.prepare_resume(path, fingerprint, size, count)
 
     def produce():
         for index in range(batches):
+            if index in completed:
+                continue
             rows = slice(index * size, min((index + 1) * size, count))
             arrow = make_batch(rows, shared_from, shared_to)
             yield index, rows.start, rows.stop, arrow
@@ -1966,11 +1993,12 @@ def _stream_run(
         produce(),
         manifest_seed,
         {"from_id": shared_from, "to_id": shared_to},
+        manifest=manifest,
     )
 
 
 def _stream_street_cost(
-    operation, network, resolved, geometries, chunk, output, size, pa
+    operation, network, resolved, geometries, chunk, output, size, pa, resume=False
 ):
     """The street cost matrix streamed in origin batches over a frozen
     resolution — `TravelCostMatrix.to_parquet`'s street arm."""
@@ -2059,10 +2087,13 @@ def _stream_street_cost(
         size,
         make_batch,
         pa,
+        resume=resume,
     )
 
 
-def _stream_street_time(operation, network, resolved, chunk, output, size, pa):
+def _stream_street_time(
+    operation, network, resolved, chunk, output, size, pa, resume=False
+):
     """The street time matrix streamed in origin batches over a frozen
     resolution — `TravelTimeMatrix.to_parquet`'s street arm."""
     query = resolved["query"]
@@ -2112,6 +2143,7 @@ def _stream_street_time(operation, network, resolved, chunk, output, size, pa):
         size,
         make_batch,
         pa,
+        resume=resume,
     )
 
 
@@ -2138,6 +2170,7 @@ def _stream_transit_time(
     output,
     size,
     pyarrow,
+    resume=False,
 ):
     """The transit time matrix streamed in origin batches —
     `TravelTimeMatrix.to_parquet`'s transit arm."""
@@ -2253,6 +2286,7 @@ def _stream_transit_time(
         size,
         make_batch,
         pyarrow,
+        resume=resume,
     )
 
 
@@ -2272,15 +2306,9 @@ def _point_frame(ids, coordinates):
 
 
 def _stream_size(batch_size, resume):
-    """The validated batch size of a streaming call (resume is
-    reserved until the resumability release)."""
+    """The validated batch size of a streaming call."""
     from cafein import _streaming
 
-    if resume:
-        raise NotImplementedError(
-            "resume=True is not implemented yet; it arrives with the "
-            "resumability release"
-        )
     if batch_size is None:
         return _streaming.DEFAULT_BATCH_SIZE
     size = operator.index(batch_size)
