@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **OD zone surfaces** (``cafein.zones``): ``square_grid(area,
+  cell_size, crs=None)`` lays lattice-snapped square cells of
+  ``cell_size`` metres over an area (ids ``"{column}_{row}"`` on the
+  generation CRS's fixed lattice, so overlapping areas share cells and
+  ids), and ``h3_grid(area, resolution)`` covers it with canonical H3
+  cells (requires the new ``cafein[h3]`` extra). Both accept a
+  ``(west, south, east, north)`` bbox, a polygon frame, or a built
+  ``StreetNetwork``/``TransportNetwork`` (its street extent), and
+  return EPSG:4326 polygon frames with explicit
+  ``centroid_lat``/``centroid_lon`` routing coordinates. The matrix
+  and itinerary computers now accept polygon frames as origins and
+  destinations, routed by centroid — those columns when present,
+  local-UTM centroids otherwise.
+
 ## 0.9.0 — 2026-08-04
 
 - **The car benchmark harness** (``scripts/benchmark_car_vs_r5py.py``,

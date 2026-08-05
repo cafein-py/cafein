@@ -43,6 +43,7 @@ dependencies = [
 [project.optional-dependencies]
 arrow = ["pyarrow"]
 dem = ["rioxarray"]
+h3 = ["h3>=4"]
 yaml = ["pyyaml"]
 
 [project.urls]

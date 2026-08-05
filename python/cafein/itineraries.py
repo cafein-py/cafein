@@ -74,8 +74,12 @@ class DetailedItineraries(gpd.GeoDataFrame):
     none. Group by ``["from_id", "to_id", "option"]`` to recover whole
     journeys.
 
-    Origins and destinations are either stop identifiers or point
-    GeoDataFrames with an ``id`` column, and both must be the same kind.
+    Origins and destinations are either stop identifiers or
+    GeoDataFrames with an ``id`` column — point frames, or polygon
+    frames routed from their centroids
+    (``centroid_lat``/``centroid_lon`` columns when present — the
+    ``cafein.zones`` protocol — otherwise local-UTM centroids) — and
+    both must be the same kind.
     Stops route with :meth:`TransportNetwork.route_between_stops`;
     points route door-to-door with
     :meth:`TransportNetwork.route_between_coordinates` and need a network
@@ -109,7 +113,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
         street path and requires ``transport_mode``.
     origins : list of str, or GeoDataFrame
         Origin stop_ids, or points with an ``id`` column. A street
-        network needs points.
+        network needs points. Polygon frames route from their centroids
+        (``centroid_lat``/``centroid_lon`` columns when present — the
+        ``cafein.zones`` protocol — otherwise local-UTM centroids).
     destinations : list of str, or GeoDataFrame
         Destination stop_ids, or points with an ``id`` column; the same
         kind as `origins`.

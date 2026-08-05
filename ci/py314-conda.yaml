@@ -12,5 +12,6 @@ dependencies:
   - pytest
   - pytest-cov
   - pytest-xdist
+  - h3-py
   - pyarrow
   - pyyaml

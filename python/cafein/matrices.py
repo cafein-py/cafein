@@ -19,8 +19,12 @@ class TravelCostMatrix(pd.DataFrame):
     EPSG:4326 — convert with
     ``geopandas.GeoDataFrame(matrix, crs="EPSG:4326")``.
 
-    Origins and destinations are either stop identifiers or point
-    GeoDataFrames with an ``id`` column. Points are linked once against
+    Origins and destinations are either stop identifiers or
+    GeoDataFrames with an ``id`` column — point frames, or polygon
+    frames routed from their centroids
+    (``centroid_lat``/``centroid_lon`` columns when present — the
+    ``cafein.zones`` protocol — otherwise local-UTM centroids). Points
+    are linked once against
     the street network (requires ``osm_pbf=`` at build time): a point's
     travel time is its fastest walk–ride–walk chain or the direct street
     walk (within ``max_walking_time``), whichever is faster — a
@@ -67,7 +71,10 @@ class TravelCostMatrix(pd.DataFrame):
         standalone street path and requires ``transport_mode``.
     origins : list of str, or GeoDataFrame (optional)
         Origin stop_ids (every stop when omitted), or points with an
-        ``id`` column. A street matrix needs points.
+        ``id`` column. A street matrix needs points. Polygon frames
+        (``cafein.zones`` surfaces or your own) route from their
+        centroids — the ``centroid_lat``/``centroid_lon`` columns when
+        present, local-UTM centroids otherwise.
     destinations : list of str, or GeoDataFrame (optional)
         Destination stop_ids (every stop when omitted), or points; with
         point origins the destinations default to the origins.
@@ -516,8 +523,10 @@ class TravelTimeMatrix(pd.DataFrame):
     origins always span every stop (the ``stops`` order). Points are
     linked once against the street network (requires ``osm_pbf=`` at
     build time); points off the walking network are reported with a
-    warning and stay unreachable. Slices and copies degrade to plain
-    DataFrames.
+    warning and stay unreachable. Polygon frames route from their
+    centroids (``centroid_lat``/``centroid_lon`` columns when present —
+    the ``cafein.zones`` protocol — otherwise local-UTM centroids).
+    Slices and copies degrade to plain DataFrames.
 
     Given a ``StreetNetwork`` instead, the matrix is a standalone street
     computation: one bounded search per origin over the compiled profile
@@ -1396,18 +1405,50 @@ def _is_point_frame(value):
 
 
 def _point_list(frame, role):
-    """A point GeoDataFrame's ids and ``(lat, lon)`` pairs, in EPSG:4326."""
+    """A GeoDataFrame's ids and ``(lat, lon)`` pairs, in EPSG:4326.
+
+    Point frames route from their point geometry. Polygon and
+    multipolygon frames route from their centroids: the explicit
+    ``centroid_lat``/``centroid_lon`` columns when present (the
+    ``cafein.zones`` protocol — always EPSG:4326), otherwise centroids
+    computed in the frame's local UTM zone. Mixed geometry is rejected.
+    """
     if not _is_point_frame(frame):
         raise TypeError(f"{role} must be a point GeoDataFrame when points are used")
     if "id" not in frame.columns:
         raise ValueError(f"the {role} GeoDataFrame needs an 'id' column")
-    if frame.crs is not None:
-        frame = frame.to_crs("EPSG:4326")
-    geometry = frame.geometry
-    if not (geometry.geom_type == "Point").all():
-        raise ValueError(f"the {role} GeoDataFrame must contain points")
     ids = [str(identifier) for identifier in frame["id"]]
-    return ids, list(zip(geometry.y, geometry.x))
+    kinds = set(frame.geometry.geom_type)
+    if kinds <= {"Point"}:
+        if frame.crs is not None:
+            frame = frame.to_crs("EPSG:4326")
+        geometry = frame.geometry
+        return ids, list(zip(geometry.y, geometry.x))
+    if kinds <= {"Polygon", "MultiPolygon"}:
+        return ids, _zone_centroids(frame, role)
+    raise ValueError(
+        f"the {role} GeoDataFrame must contain only points or only "
+        "polygon/multipolygon geometries"
+    )
+
+
+def _zone_centroids(frame, role):
+    """A polygon frame's routing coordinates as ``(lat, lon)`` pairs."""
+    if {"centroid_lat", "centroid_lon"} <= set(frame.columns):
+        return list(
+            zip(
+                (float(value) for value in frame["centroid_lat"]),
+                (float(value) for value in frame["centroid_lon"]),
+            )
+        )
+    if frame.crs is None:
+        raise ValueError(
+            f"the polygon {role} GeoDataFrame needs a CRS (or explicit "
+            "centroid_lat/centroid_lon columns) to compute centroids"
+        )
+    projected = frame.to_crs(frame.estimate_utm_crs())
+    centroids = projected.geometry.centroid.to_crs("EPSG:4326")
+    return list(zip(centroids.y, centroids.x))
 
 
 def _warn_unsnapped(table, from_ids, to_ids, network="the walking network"):
