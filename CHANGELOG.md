@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+- Groundwork for the distance ladder's **OSM tiers** (§18): route
+  relations extract through pyrosm (``complete_relations=True``) with
+  ordered members, roles, member-way geometries, and the way tags the
+  stitcher will consume — boundary-crossing members resolve to ``None``
+  geometry rather than guessing — plus the rail-family way extraction
+  (``railway=`` tram/light_rail/subway/rail, service ways excluded)
+  that will feed the map-matching graphs. The test data ships in two
+  layers: a **committed transit-only fixture**
+  (``tests/data/helsinki-transit.osm.pbf``, ~3.7 MB — every
+  Helsinki-region PT route relation with members, produced by a
+  relation-preserving pyrosm subset) with two committed defect
+  variants (a deleted member way; a deleted relation), so the
+  extraction contract tests run everywhere including CI; and the full
+  ~100 MB metropolitan clip, reproducibly regenerated locally by
+  ``scripts/generate_osm_tier_fixtures.py`` from the pinned
+  ``finland-220101`` Geofabrik snapshot (GTFS-derived bounds,
+  per-mode counts pinned, staged atomic publication), for the
+  street-graph and calibration work — tests needing it skip when it
+  is absent. The central-Helsinki fixture carries no route relations
+  or railway ways (its producing pipeline stripped them), which the
+  no-data paths now pin.
+
 ## 0.10.0 — 2026-08-05
 
 - **Resumable streaming runs**: ``resume=True`` on
