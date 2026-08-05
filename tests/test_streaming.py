@@ -9,13 +9,51 @@ import pytest
 pyarrow = pytest.importorskip("pyarrow")
 import pyarrow.parquet as parquet  # noqa: E402
 
-from cafein import _streaming, travel_cost_table  # noqa: E402
+from cafein import (  # noqa: E402
+    _streaming,
+    travel_cost_table,
+    TravelCostMatrix,
+    TravelTimeMatrix,
+)
 
 QUERY = {"date": "2022-02-22", "departure": "08:30:00"}
 
 
 def _origin_stops(network, count):
     return [stop for stop, _, _ in network.stops][:count]
+
+
+def _read_aligned(path, frame):
+    """The streamed output as a frame, dictionary and constant columns
+    cast back to the constructor frame's dtypes for exact comparison."""
+    import pandas as pd
+
+    read = parquet.read_table(path).to_pandas()
+    for name in ("from_id", "to_id", "distance_provenance", "currency"):
+        if name in read.columns:
+            read[name] = read[name].astype(frame[name].dtype)
+    return read, pd.DataFrame(frame)
+
+
+@pytest.fixture(scope="module")
+def car_streets(kantakaupunki_pbf):
+    from cafein import StreetNetwork
+
+    return StreetNetwork.from_osm(str(kantakaupunki_pbf), modes=("walk", "car"))
+
+
+@pytest.fixture(scope="module")
+def street_points():
+    import geopandas
+
+    return geopandas.GeoDataFrame(
+        {"id": ["a", "b", "c", "d", "e"]},
+        geometry=geopandas.points_from_xy(
+            [24.9384, 24.9241, 24.9600, 24.9450, 24.9300],
+            [60.1699, 60.1587, 60.1870, 60.1750, 60.1650],
+        ),
+        crs="EPSG:4326",
+    )
 
 
 def test_streamed_file_equals_unstreamed(network, tmp_path):
@@ -405,6 +443,222 @@ def test_writer_rejects_deviating_batches(tmp_path):
         )
 
 
+def test_cost_to_parquet_transit_equals_constructor(network, tmp_path):
+    import pandas as pd
+
+    stops = _origin_stops(network, 80)
+    frame = TravelCostMatrix(network, origins=stops, **QUERY)
+    result = TravelCostMatrix.to_parquet(
+        network, origins=stops, **QUERY, output=tmp_path / "tcm.parquet", batch_size=30
+    )
+    assert isinstance(result, _streaming.StreamingResult)
+    assert result.batches == 3
+    read, expected = _read_aligned(tmp_path / "tcm.parquet", frame)
+    pd.testing.assert_frame_equal(read, expected)
+
+
+def test_time_to_parquet_transit_equals_constructor(network, tmp_path):
+    import pandas as pd
+
+    stops = _origin_stops(network, 80)
+    frame = TravelTimeMatrix(network, origins=stops, **QUERY)
+    TravelTimeMatrix.to_parquet(
+        network, origins=stops, **QUERY, output=tmp_path / "ttm.parquet", batch_size=30
+    )
+    read, expected = _read_aligned(tmp_path / "ttm.parquet", frame)
+    pd.testing.assert_frame_equal(read, expected)
+    windowed = TravelTimeMatrix(
+        network, origins=stops[:20], **QUERY, window=600, confidence=0.8
+    )
+    TravelTimeMatrix.to_parquet(
+        network,
+        origins=stops[:20],
+        **QUERY,
+        window=600,
+        confidence=0.8,
+        output=tmp_path / "windowed.parquet",
+        batch_size=8,
+    )
+    read, expected = _read_aligned(tmp_path / "windowed.parquet", windowed)
+    pd.testing.assert_frame_equal(read, expected)
+
+
+def test_time_to_parquet_points_default_destinations(network_with_footpaths, tmp_path):
+    # destinations=None means every origin — including origins outside
+    # the routed batch, which must never narrow the destination set.
+    import geopandas
+    import pandas as pd
+
+    coordinates = [(24.9384, 60.1699), (24.9241, 60.1587), (24.9600, 60.1870)]
+    points = geopandas.GeoDataFrame(
+        {"id": ["a", "b", "c"]},
+        geometry=geopandas.points_from_xy(*zip(*coordinates)),
+        crs="EPSG:4326",
+    )
+    frame = TravelTimeMatrix(network_with_footpaths, origins=points, **QUERY)
+    result = TravelTimeMatrix.to_parquet(
+        network_with_footpaths,
+        origins=points,
+        **QUERY,
+        output=tmp_path / "points.parquet",
+        batch_size=1,
+    )
+    assert result.batches == 3
+    read, expected = _read_aligned(tmp_path / "points.parquet", frame)
+    pd.testing.assert_frame_equal(read, expected)
+
+
+def test_cost_to_parquet_street_car_equals_constructor(
+    car_streets, street_points, tmp_path
+):
+    import pandas as pd
+    import shapely
+
+    options = dict(
+        transport_mode="car",
+        intersection_delays=True,
+        profile="rush",
+        parking=True,
+        occupancy=2,
+        vehicle_class="BEV",
+        perspectives=["private", "societal"],
+        geometries=True,
+    )
+    frame = TravelCostMatrix(car_streets, origins=street_points, **options)
+    result = TravelCostMatrix.to_parquet(
+        car_streets,
+        origins=street_points,
+        **options,
+        output=tmp_path / "car.parquet",
+        batch_size=2,
+    )
+    assert result.batches == 3
+    read, expected = _read_aligned(tmp_path / "car.parquet", frame)
+    # Geometry streams as plain WKB binary, deliberately without
+    # GeoParquet footer metadata.
+    expected["geometry"] = shapely.to_wkb(expected["geometry"].values)
+    pd.testing.assert_frame_equal(read, expected)
+    metadata = parquet.ParquetFile(tmp_path / "car.parquet").metadata.metadata
+    assert not metadata or b"geo" not in metadata
+
+
+def test_time_to_parquet_street_car_equals_constructor(
+    car_streets, street_points, tmp_path
+):
+    import pandas as pd
+
+    options = dict(
+        transport_mode="car", intersection_delays=True, profile="rush", parking=True
+    )
+    frame = TravelTimeMatrix(car_streets, origins=street_points, **options)
+    TravelTimeMatrix.to_parquet(
+        car_streets,
+        origins=street_points,
+        **options,
+        output=tmp_path / "cartime.parquet",
+        batch_size=2,
+    )
+    read, expected = _read_aligned(tmp_path / "cartime.parquet", frame)
+    pd.testing.assert_frame_equal(read, expected)
+
+
+def test_to_parquet_refusals(network, car_streets, street_points, tmp_path):
+    stops = _origin_stops(network, 4)
+    with pytest.raises(NotImplementedError, match="street_policy"):
+        TravelCostMatrix.to_parquet(
+            network,
+            origins=stops,
+            **QUERY,
+            street_policy=object(),
+            output=tmp_path / "a.parquet",
+        )
+    with pytest.raises(NotImplementedError, match="resume"):
+        TravelTimeMatrix.to_parquet(
+            network, origins=stops, **QUERY, output=tmp_path / "b.parquet", resume=True
+        )
+    with pytest.raises(ValueError, match="batch_size"):
+        TravelCostMatrix.to_parquet(
+            network, origins=stops, **QUERY, output=tmp_path / "c.parquet", batch_size=0
+        )
+    with pytest.raises(ValueError, match="StreetNetwork car matrix"):
+        TravelCostMatrix.to_parquet(
+            network, origins=stops, **QUERY, parking=True, output=tmp_path / "d.parquet"
+        )
+    with pytest.raises(ValueError, match="no meaning for a street matrix"):
+        TravelCostMatrix.to_parquet(
+            car_streets,
+            origins=street_points,
+            transport_mode="walk",
+            date="2022-02-22",
+            output=tmp_path / "e.parquet",
+        )
+    with pytest.raises(ValueError, match="destinations apply to point origins"):
+        TravelTimeMatrix.to_parquet(
+            network,
+            origins=stops,
+            destinations=stops[:2],
+            **QUERY,
+            output=tmp_path / "f.parquet",
+        )
+    # Failed validation never leaves claimed outputs behind.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_invalid_queries_never_claim_outputs(network, tmp_path):
+    # Deterministic validation runs before the output is claimed — the
+    # directory form must not publish a manifest for a doomed query.
+    stops = _origin_stops(network, 4)
+    with pytest.raises(ValueError, match="pareto"):
+        TravelCostMatrix.to_parquet(
+            network,
+            origins=stops,
+            **QUERY,
+            candidates="pareto",
+            output=tmp_path / "pareto-shards",
+        )
+    with pytest.raises(ValueError, match="router"):
+        TravelTimeMatrix.to_parquet(
+            network,
+            origins=stops,
+            **QUERY,
+            router="warp",
+            output=tmp_path / "router-shards",
+        )
+    assert not (tmp_path / "pareto-shards" / "manifest.json").exists()
+    assert not (tmp_path / "router-shards" / "manifest.json").exists()
+
+
+def test_percentile_iterable_freezes_once(network, tmp_path):
+    import pandas as pd
+
+    stops = _origin_stops(network, 12)
+    frame = TravelTimeMatrix(
+        network, origins=stops, **QUERY, window=600, percentiles=[25.0, 75.0]
+    )
+    TravelTimeMatrix.to_parquet(
+        network,
+        origins=stops,
+        **QUERY,
+        window=600,
+        percentiles=iter([25.0, 75.0]),
+        output=tmp_path / "generator.parquet",
+        batch_size=5,
+    )
+    read, expected = _read_aligned(tmp_path / "generator.parquet", frame)
+    pd.testing.assert_frame_equal(read, expected)
+
+
+def test_operation_distinguishes_fingerprints(network, tmp_path):
+    stops = _origin_stops(network, 10)
+    table = travel_cost_table(
+        network, origins=stops, **QUERY, output=tmp_path / "table", batch_size=5
+    )
+    method = TravelCostMatrix.to_parquet(
+        network, origins=stops, **QUERY, output=tmp_path / "method", batch_size=5
+    )
+    assert table.manifest["fingerprint"] != method.manifest["fingerprint"]
+
+
 RSS_SCRIPT = textwrap.dedent("""
     import resource
     import sys
@@ -413,13 +667,24 @@ RSS_SCRIPT = textwrap.dedent("""
     warnings.filterwarnings("ignore")
     from cafein import TransportNetwork, travel_cost_table
 
-    artifact, output, count = sys.argv[1], sys.argv[2], int(sys.argv[3])
+    artifact, output, count, entry = (
+        sys.argv[1],
+        sys.argv[2],
+        int(sys.argv[3]),
+        sys.argv[4],
+    )
     network = TransportNetwork.load(artifact)
     # The same 250 origins cycled: every batch computes identical rows,
     # so peak memory is comparable across origin counts.
     base = [stop for stop, _, _ in network.stops][:250]
     origins = (base * ((count + 249) // 250))[:count]
-    result = travel_cost_table(
+    if entry == "classmethod":
+        from cafein import TravelCostMatrix
+
+        stream = TravelCostMatrix.to_parquet
+    else:
+        stream = travel_cost_table
+    result = stream(
         network,
         origins=origins,
         date="2022-02-22",
@@ -437,10 +702,14 @@ RSS_SCRIPT = textwrap.dedent("""
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="resource module is Unix-only")
-def test_streaming_peak_rss_is_flat_in_origins(network, tmp_path):
+@pytest.mark.parametrize("entry", ["table", "classmethod"])
+def test_streaming_peak_rss_is_flat_in_origins(network, tmp_path, entry):
     """The subprocess RSS guard: growing origins at fixed destinations
     and batch_size must not grow peak memory like the materialised
-    table would (pyarrow pool counters print alongside for diagnosis)."""
+    table would (pyarrow pool counters print alongside for diagnosis).
+    Runs against both ``travel_cost_table`` and the classmethod, so an
+    implementation that materialises the constructor result and shards
+    it afterwards cannot pass."""
     artifact = tmp_path / "network.cafein"
     network.save(artifact)
 
@@ -453,6 +722,7 @@ def test_streaming_peak_rss_is_flat_in_origins(network, tmp_path):
                 str(artifact),
                 str(tmp_path / name),
                 str(count),
+                entry,
             ],
             capture_output=True,
             text=True,

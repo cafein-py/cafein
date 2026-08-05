@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Streaming matrix classmethods**: ``TravelCostMatrix.to_parquet``
+  and ``TravelTimeMatrix.to_parquet`` stream the matrix computers'
+  results to disk with the constructors' semantics — transit and
+  street branches alike, the car matrices with their delay, parking,
+  emission, and cost options included, and the windowed time matrix
+  with its percentile columns — through the same batch writer, output
+  forms, and manifest as ``travel_cost_table(output=...)``, returning
+  ``cafein.StreamingResult``. Peak memory holds one batch, never the
+  whole constructor frame; street geometries stream as plain WKB
+  binary. The constructors are unchanged; ``street_policy`` matrices
+  do not stream yet and are rejected. The recorded fingerprint version
+  is now 2 (the producing operation and enlarged parameter sets join
+  the hashed material).
+
 - **Streaming `travel_cost_table`**: ``output=`` streams the matrix to
   disk in origin batches (``batch_size=``, default 500) instead of
   materialising it — a ``.parquet`` path becomes one file written one

@@ -327,37 +327,20 @@ class TravelCostMatrix(pd.DataFrame):
             )
             super().__init__(pd.DataFrame(data))
             return
-        if transport_mode is not None and transport_mode != "public_transport":
-            raise ValueError(
-                f"transport_mode={transport_mode!r} is a street mode; pass a "
-                "StreetNetwork to route on it"
-            )
-        if max_street_time is not None:
-            raise ValueError("max_street_time applies to a StreetNetwork matrix")
-        if (
-            intersection_delays
-            or profile is not None
-            or delay_model is not None
-            or parking is not None
-            or occupancy is not None
-            or vehicle_class is not None
-        ):
-            raise ValueError(
-                "intersection_delays, profile, delay_model, parking, "
-                "occupancy, and vehicle_class apply to a StreetNetwork "
-                "car matrix"
-            )
-        if (
-            perspectives is not None
-            or costs is not None
-            or currency is not None
-            or cost_components is not None
-        ):
-            raise ValueError(
-                "perspectives, costs, currency, and cost_components price "
-                "street kilometres and apply to a StreetNetwork matrix "
-                "(transit perspective costs are not supported)"
-            )
+        _reject_cost_street_args(
+            transport_mode,
+            max_street_time,
+            intersection_delays,
+            profile,
+            delay_model,
+            parking,
+            occupancy,
+            vehicle_class,
+            perspectives,
+            costs,
+            currency,
+            cost_components,
+        )
         if street_policy is not None:
             offending = next(
                 (
@@ -497,6 +480,167 @@ class TravelCostMatrix(pd.DataFrame):
             )
         super().__init__(pd.DataFrame(data))
 
+    @classmethod
+    def to_parquet(
+        cls,
+        network,
+        origins=None,
+        destinations=None,
+        date=None,
+        departure=None,
+        *,
+        output,
+        batch_size=None,
+        resume=False,
+        max_transfers=7,
+        optimize="time",
+        window=None,
+        within=None,
+        factors=None,
+        components=None,
+        fares=None,
+        candidates="time",
+        bucket=25.0,
+        router="auto",
+        exclude_routes=(),
+        exclude_trips=(),
+        exclude_stops=(),
+        geometries=False,
+        chunk=None,
+        walking_speed_kmph=None,
+        max_walking_time=None,
+        max_snap_distance=None,
+        transport_mode=None,
+        max_street_time=None,
+        street_policy=None,
+        intersection_delays=False,
+        profile=None,
+        delay_model=None,
+        parking=None,
+        occupancy=None,
+        vehicle_class=None,
+        perspectives=None,
+        costs=None,
+        currency=None,
+        cost_components=None,
+    ):
+        """The cost matrix streamed to Parquet — the constructor's
+        semantics with `travel_cost_table`'s ``output=`` behavior.
+
+        Origins are processed in ``batch_size`` slices (default 500)
+        and each batch is written as it completes, so peak memory holds
+        one batch — never the whole constructor result. ``output=``
+        selects the form by suffix exactly as ``travel_cost_table``
+        does and the return value is a :class:`cafein.StreamingResult`.
+        ``from_id``/``to_id`` are dictionary-encoded over the shared id
+        domains; a street matrix's geometry streams as plain WKB
+        binary. ``street_policy`` matrices do not stream yet and are
+        rejected. ``resume=`` is reserved and raises.
+        """
+        import pyarrow
+
+        size = _stream_size(batch_size, resume)
+        if street_policy is not None:
+            raise NotImplementedError(
+                "street_policy matrices do not stream yet; compute the "
+                "frame with the constructor instead"
+            )
+        if chunk is not None:
+            chunk = tuple(int(part) for part in chunk)
+        if _is_street_network(network):
+            resolved = _street_cost_resolution(
+                network,
+                origins,
+                destinations,
+                transport_mode=transport_mode,
+                max_street_time=max_street_time,
+                max_snap_distance=max_snap_distance,
+                chunk=chunk,
+                transit_only={
+                    "date": date,
+                    "departure": departure,
+                    "window": window,
+                    "within": within,
+                    "fares": fares,
+                    "walking_speed_kmph": walking_speed_kmph,
+                    "max_walking_time": max_walking_time,
+                    "max_transfers": None if max_transfers == 7 else max_transfers,
+                    "optimize": None if optimize == "time" else optimize,
+                    "candidates": None if candidates == "time" else candidates,
+                    "bucket": None if bucket == 25.0 else bucket,
+                    "router": None if router == "auto" else router,
+                    "exclude_routes": tuple(exclude_routes) or None,
+                    "exclude_trips": tuple(exclude_trips) or None,
+                    "exclude_stops": tuple(exclude_stops) or None,
+                    "street_policy": None,
+                },
+                factors=factors,
+                components=components,
+                intersection_delays=intersection_delays,
+                profile=profile,
+                delay_model=delay_model,
+                parking=parking,
+                occupancy=occupancy,
+                vehicle_class=vehicle_class,
+                perspectives=perspectives,
+                costs=costs,
+                currency=currency,
+                cost_components=cost_components,
+            )
+            return _stream_street_cost(
+                "TravelCostMatrix.to_parquet",
+                network,
+                resolved,
+                geometries,
+                chunk,
+                output,
+                size,
+                pyarrow,
+            )
+        _reject_cost_street_args(
+            transport_mode,
+            max_street_time,
+            intersection_delays,
+            profile,
+            delay_model,
+            parking,
+            occupancy,
+            vehicle_class,
+            perspectives,
+            costs,
+            currency,
+            cost_components,
+        )
+        return _stream_transit_cost(
+            "TravelCostMatrix.to_parquet",
+            network,
+            origins,
+            destinations,
+            date,
+            departure,
+            max_transfers=max_transfers,
+            optimize=optimize,
+            window=window,
+            within=within,
+            factors=factors,
+            components=components,
+            fares=fares,
+            candidates=candidates,
+            bucket=bucket,
+            router=router,
+            exclude_routes=exclude_routes,
+            exclude_trips=exclude_trips,
+            exclude_stops=exclude_stops,
+            geometries=geometries,
+            chunk=chunk,
+            walking_speed_kmph=walking_speed_kmph,
+            max_walking_time=max_walking_time,
+            max_snap_distance=max_snap_distance,
+            output=output,
+            size=size,
+            pyarrow=pyarrow,
+        )
+
 
 class TravelTimeMatrix(pd.DataFrame):
     """Travel times per OD pair, long format — the lean r5py-style mode.
@@ -541,7 +685,8 @@ class TravelTimeMatrix(pd.DataFrame):
     arguments that only mean something to a timetable — ``max_transfers``,
     ``router``, the departure-window percentiles, the transit exclusions,
     and the walking-speed options, whose speeds come from the profile —
-    are rejected. Origins and destinations are point GeoDataFrames;
+    are rejected. Origins and destinations are point GeoDataFrames (or
+    polygon frames routed by centroid, as on the transit side);
     a point routes to itself in zero seconds.
 
     Parameters
@@ -681,24 +826,14 @@ class TravelTimeMatrix(pd.DataFrame):
             )
             super().__init__(pd.DataFrame(data))
             return
-        if transport_mode is not None and transport_mode != "public_transport":
-            raise ValueError(
-                f"transport_mode={transport_mode!r} is a street mode; pass a "
-                "StreetNetwork to route on it (street legs within a "
-                "public-transport journey are a separate feature)"
-            )
-        if max_street_time is not None:
-            raise ValueError("max_street_time applies to a StreetNetwork matrix")
-        if (
-            intersection_delays
-            or profile is not None
-            or delay_model is not None
-            or parking is not None
-        ):
-            raise ValueError(
-                "intersection_delays, profile, delay_model, and parking "
-                "apply to a StreetNetwork car matrix"
-            )
+        _reject_time_street_args(
+            transport_mode,
+            max_street_time,
+            intersection_delays,
+            profile,
+            delay_model,
+            parking,
+        )
         if street_policy is not None:
             rejected = {
                 "window": window,
@@ -795,12 +930,216 @@ class TravelTimeMatrix(pd.DataFrame):
         )
         super().__init__(pd.DataFrame(data))
 
+    @classmethod
+    def to_parquet(
+        cls,
+        network,
+        origins=None,
+        destinations=None,
+        date=None,
+        departure=None,
+        *,
+        output,
+        batch_size=None,
+        resume=False,
+        max_transfers=7,
+        window=None,
+        percentiles=None,
+        confidence=None,
+        chunk=None,
+        router="auto",
+        exclude_routes=(),
+        exclude_trips=(),
+        exclude_stops=(),
+        walking_speed_kmph=None,
+        max_walking_time=None,
+        max_snap_distance=None,
+        transport_mode=None,
+        max_street_time=None,
+        street_policy=None,
+        intersection_delays=False,
+        profile=None,
+        delay_model=None,
+        parking=None,
+    ):
+        """The travel-time matrix streamed to Parquet — the
+        constructor's semantics with ``travel_cost_table``'s
+        ``output=`` behavior.
+
+        Origins are processed in ``batch_size`` slices (default 500)
+        and each batch is written as it completes, so peak memory holds
+        one batch — never the whole constructor result. ``output=``
+        selects the form by suffix exactly as ``travel_cost_table``
+        does and the return value is a :class:`cafein.StreamingResult`.
+        ``from_id``/``to_id`` are dictionary-encoded over the shared id
+        domains; a windowed matrix streams its percentile columns.
+        ``street_policy`` matrices do not stream yet and are rejected.
+        ``resume=`` is reserved and raises.
+        """
+        import pyarrow
+
+        size = _stream_size(batch_size, resume)
+        if street_policy is not None:
+            raise NotImplementedError(
+                "street_policy matrices do not stream yet; compute the "
+                "frame with the constructor instead"
+            )
+        if chunk is not None:
+            chunk = tuple(int(part) for part in chunk)
+        if _is_street_network(network):
+            resolved = _street_time_resolution(
+                origins,
+                destinations,
+                transport_mode=transport_mode,
+                max_street_time=max_street_time,
+                max_snap_distance=max_snap_distance,
+                chunk=chunk,
+                transit_only={
+                    "date": date,
+                    "departure": departure,
+                    "window": window,
+                    "percentiles": percentiles,
+                    "confidence": confidence,
+                    "walking_speed_kmph": walking_speed_kmph,
+                    "max_walking_time": max_walking_time,
+                    "max_transfers": None if max_transfers == 7 else max_transfers,
+                    "router": None if router == "auto" else router,
+                    "exclude_routes": tuple(exclude_routes) or None,
+                    "exclude_trips": tuple(exclude_trips) or None,
+                    "exclude_stops": tuple(exclude_stops) or None,
+                    "street_policy": None,
+                },
+                intersection_delays=intersection_delays,
+                profile=profile,
+                delay_model=delay_model,
+                parking=parking,
+            )
+            return _stream_street_time(
+                "TravelTimeMatrix.to_parquet",
+                network,
+                resolved,
+                chunk,
+                output,
+                size,
+                pyarrow,
+            )
+        _reject_time_street_args(
+            transport_mode,
+            max_street_time,
+            intersection_delays,
+            profile,
+            delay_model,
+            parking,
+        )
+        return _stream_transit_time(
+            "TravelTimeMatrix.to_parquet",
+            network,
+            origins,
+            destinations,
+            date,
+            departure,
+            max_transfers=max_transfers,
+            window=window,
+            percentiles=percentiles,
+            confidence=confidence,
+            chunk=chunk,
+            router=router,
+            exclude_routes=exclude_routes,
+            exclude_trips=exclude_trips,
+            exclude_stops=exclude_stops,
+            walking_speed_kmph=walking_speed_kmph,
+            max_walking_time=max_walking_time,
+            max_snap_distance=max_snap_distance,
+            output=output,
+            size=size,
+            pyarrow=pyarrow,
+        )
+
 
 def _is_street_network(network):
     """Whether `network` is a standalone street network rather than a transit one."""
     from cafein.street_network import StreetNetwork
 
     return isinstance(network, StreetNetwork)
+
+
+def _reject_cost_street_args(
+    transport_mode,
+    max_street_time,
+    intersection_delays,
+    profile,
+    delay_model,
+    parking,
+    occupancy,
+    vehicle_class,
+    perspectives,
+    costs,
+    currency,
+    cost_components,
+):
+    """The cost matrix's street-only arguments, rejected on a transit
+    network — shared by the constructor and ``to_parquet``."""
+    if transport_mode is not None and transport_mode != "public_transport":
+        raise ValueError(
+            f"transport_mode={transport_mode!r} is a street mode; pass a "
+            "StreetNetwork to route on it"
+        )
+    if max_street_time is not None:
+        raise ValueError("max_street_time applies to a StreetNetwork matrix")
+    if (
+        intersection_delays
+        or profile is not None
+        or delay_model is not None
+        or parking is not None
+        or occupancy is not None
+        or vehicle_class is not None
+    ):
+        raise ValueError(
+            "intersection_delays, profile, delay_model, parking, "
+            "occupancy, and vehicle_class apply to a StreetNetwork "
+            "car matrix"
+        )
+    if (
+        perspectives is not None
+        or costs is not None
+        or currency is not None
+        or cost_components is not None
+    ):
+        raise ValueError(
+            "perspectives, costs, currency, and cost_components price "
+            "street kilometres and apply to a StreetNetwork matrix "
+            "(transit perspective costs are not supported)"
+        )
+
+
+def _reject_time_street_args(
+    transport_mode,
+    max_street_time,
+    intersection_delays,
+    profile,
+    delay_model,
+    parking,
+):
+    """The time matrix's street-only arguments, rejected on a transit
+    network — shared by the constructor and ``to_parquet``."""
+    if transport_mode is not None and transport_mode != "public_transport":
+        raise ValueError(
+            f"transport_mode={transport_mode!r} is a street mode; pass a "
+            "StreetNetwork to route on it (street legs within a "
+            "public-transport journey are a separate feature)"
+        )
+    if max_street_time is not None:
+        raise ValueError("max_street_time applies to a StreetNetwork matrix")
+    if (
+        intersection_delays
+        or profile is not None
+        or delay_model is not None
+        or parking is not None
+    ):
+        raise ValueError(
+            "intersection_delays, profile, delay_model, and parking "
+            "apply to a StreetNetwork car matrix"
+        )
 
 
 class _StreetQuery:
@@ -866,15 +1205,17 @@ def _street_query(
         )
     if not _is_point_frame(origins):
         raise TypeError(
-            "a street matrix needs origins as a GeoDataFrame of points; stop "
-            "ids belong to a TransportNetwork"
+            "a street matrix needs origins as a GeoDataFrame of points (or "
+            "polygons routed by centroid); stop ids belong to a "
+            "TransportNetwork"
         )
     from_ids, origin_points = _point_list(origins, "origins")
     if destinations is None:
         to_ids, destination_points = list(from_ids), list(origin_points)
     elif not _is_point_frame(destinations):
         raise TypeError(
-            "a street matrix needs destinations as a GeoDataFrame of points"
+            "a street matrix needs destinations as a GeoDataFrame of points "
+            "(or polygons routed by centroid)"
         )
     else:
         to_ids, destination_points = _point_list(destinations, "destinations")
@@ -924,8 +1265,81 @@ def _street_cost_columns(
     cost_components=None,
 ):
     """The reachable cells of a street cost matrix, in long format."""
-    from cafein import _parking, costs as _costs, emissions
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
+
+    resolved = _street_cost_resolution(
+        network,
+        origins,
+        destinations,
+        transport_mode=transport_mode,
+        max_street_time=max_street_time,
+        max_snap_distance=max_snap_distance,
+        chunk=chunk,
+        transit_only=transit_only,
+        factors=factors,
+        components=components,
+        intersection_delays=intersection_delays,
+        profile=profile,
+        delay_model=delay_model,
+        parking=parking,
+        occupancy=occupancy,
+        vehicle_class=vehicle_class,
+        perspectives=perspectives,
+        costs=costs,
+        currency=currency,
+        cost_components=cost_components,
+    )
+    query = resolved["query"]
+    from_index, to_index, numeric, wkb = _street_cost_cells(
+        network, query, geometries=geometries, resolved=resolved
+    )
+    from_ids = np.asarray(query.from_ids, dtype=object)
+    to_ids = np.asarray(query.to_ids, dtype=object)
+    data = {"from_id": from_ids[from_index], "to_id": to_ids[to_index]}
+    data.update(numeric)
+    count = len(from_index)
+    data["distance_provenance"] = np.full(
+        count, STREET_DISTANCE_PROVENANCE, dtype=object
+    )
+    if resolved["account"] is not None:
+        data["currency"] = np.full(count, resolved["account"][2], dtype=object)
+    if geometries:
+        data["geometry"] = shapely.from_wkb(np.array(wkb, dtype=object))
+    # The frame orders provenance before the cost block, as documented.
+    order = ["from_id", "to_id", "travel_time_s", "distance_m"]
+    order += ["network_distance_m", "connector_distance_m", "distance_provenance"]
+    order += ["emissions"]
+    order += [name for name in data if name not in order]
+    return {name: data[name] for name in order}
+
+
+def _street_cost_resolution(
+    network,
+    origins,
+    destinations,
+    *,
+    transport_mode,
+    max_street_time,
+    max_snap_distance,
+    chunk,
+    transit_only,
+    factors,
+    components,
+    intersection_delays,
+    profile,
+    delay_model,
+    parking,
+    occupancy,
+    vehicle_class,
+    perspectives,
+    costs,
+    currency,
+    cost_components,
+):
+    """Every result-affecting street-cost input resolved exactly once —
+    validation first, then the frozen snapshot the cells (and the
+    streaming form's batches) compute from."""
+    from cafein import _parking, costs as _costs, emissions
     from cafein.street_network import _resolved_delays
 
     resolved_parking = _parking.resolve(parking, transport_mode)
@@ -951,6 +1365,28 @@ def _street_cost_columns(
     account = _costs.resolve_query(
         transport_mode, perspectives, costs, currency, cost_components
     )
+    parking_costs = (
+        None
+        if resolved_parking is None
+        else _parking.destination_costs(resolved_parking, query.destination_points)
+    )
+    return {
+        "transport_mode": transport_mode,
+        "query": query,
+        "car_model": _resolved_delays(
+            transport_mode, intersection_delays, profile, delay_model
+        ),
+        "parking_costs": parking_costs,
+        "occupancy": occupancy,
+        "factor": factor,
+        "account": account,
+    }
+
+
+def _street_cost_cells(network, query, *, geometries, resolved):
+    """One street-cost batch: origin/destination indices, the numeric
+    columns, and the WKB geometries (``None`` without ``geometries``)."""
+    transport_mode = resolved["transport_mode"]
     table = network._core.cost_matrix(
         query.origin_points,
         query.destination_points,
@@ -958,9 +1394,7 @@ def _street_cost_columns(
         query.max_seconds,
         query.max_snap_distance,
         bool(geometries),
-        car_model=_resolved_delays(
-            transport_mode, intersection_delays, profile, delay_model
-        ),
+        car_model=resolved["car_model"],
     )
     _warn_unsnapped(
         table,
@@ -968,53 +1402,45 @@ def _street_cost_columns(
         query.to_ids,
         network=f"the streets the {transport_mode} profile can use",
     )
-    from_ids = np.asarray(query.from_ids, dtype=object)
-    to_ids = np.asarray(query.to_ids, dtype=object)
     network_distance = table["network_distance"]
     connector_distance = table["connector_distance"]
     travel_time_s = table["travel_time_s"]
-    if resolved_parking is not None:
+    if resolved["parking_costs"] is not None:
         # The parking search ends each reachable trip: its seconds join the
         # travel time and its metres the driven network distance (and with
         # it the emissions basis); the geometry never shows the search loop.
-        seconds, metres = _parking.destination_costs(
-            resolved_parking, query.destination_points
-        )
+        seconds, metres = resolved["parking_costs"]
         to_index = np.asarray(table["to"])
         travel_time_s = travel_time_s + np.rint(seconds[to_index]).astype(np.int64)
         network_distance = network_distance + metres[to_index]
-    data = {
-        "from_id": from_ids[table["from"]],
-        "to_id": to_ids[table["to"]],
+    numeric = {
         "travel_time_s": travel_time_s,
         # Reported alongside its parts, not instead of them: the two are
         # measured differently (stored edge lengths versus straight connectors).
         "distance_m": network_distance + connector_distance,
         "network_distance_m": network_distance,
         "connector_distance_m": connector_distance,
-        "distance_provenance": np.full(
-            len(network_distance), STREET_DISTANCE_PROVENANCE, dtype=object
-        ),
-        # One mode per matrix, so the factor resolved once, above; the
+        # One mode per matrix, so the factor resolved once; the
         # connectors are the walk to the vehicle, not vehicle-kilometres,
         # so network metres only. The car's per-vehicle factor divides
         # across the persons carried.
-        "emissions": network_distance / 1000.0 * factor / occupancy,
+        "emissions": network_distance
+        / 1000.0
+        * resolved["factor"]
+        / resolved["occupancy"],
     }
-    if account is not None:
+    if resolved["account"] is not None:
         # Costs ride the same driven kilometres as the emissions —
         # parking-search metres included, connectors excluded — and a
         # missing row's NaN propagates, never a silent zero.
-        totals, breakdown, label = account
+        totals, breakdown, _ = resolved["account"]
         kilometres = network_distance / 1000.0
         for perspective, per_km in totals.items():
-            data[f"cost_{perspective}"] = kilometres * per_km
+            numeric[f"cost_{perspective}"] = kilometres * per_km
         for (perspective, component), per_km in breakdown.items():
-            data[f"cost_{perspective}_{component}"] = kilometres * per_km
-        data["currency"] = np.full(len(network_distance), label, dtype=object)
-    if geometries:
-        data["geometry"] = shapely.from_wkb(np.array(table["geometry"], dtype=object))
-    return data
+            numeric[f"cost_{perspective}_{component}"] = kilometres * per_km
+    geometry = table["geometry"] if geometries else None
+    return table["from"], table["to"], numeric, geometry
 
 
 def _street_time_columns(
@@ -1033,6 +1459,45 @@ def _street_time_columns(
     parking=None,
 ):
     """The reachable cells of a street travel-time matrix, in long format."""
+    resolved = _street_time_resolution(
+        origins,
+        destinations,
+        transport_mode=transport_mode,
+        max_street_time=max_street_time,
+        max_snap_distance=max_snap_distance,
+        chunk=chunk,
+        transit_only=transit_only,
+        intersection_delays=intersection_delays,
+        profile=profile,
+        delay_model=delay_model,
+        parking=parking,
+    )
+    query = resolved["query"]
+    rows, columns, travel_time_s = _street_time_cells(network, query, resolved)
+    from_ids = np.asarray(query.from_ids, dtype=object)
+    to_ids = np.asarray(query.to_ids, dtype=object)
+    return {
+        "from_id": from_ids[rows],
+        "to_id": to_ids[columns],
+        "travel_time_s": travel_time_s,
+    }
+
+
+def _street_time_resolution(
+    origins,
+    destinations,
+    *,
+    transport_mode,
+    max_street_time,
+    max_snap_distance,
+    chunk,
+    transit_only,
+    intersection_delays,
+    profile,
+    delay_model,
+    parking,
+):
+    """Every result-affecting street-time input resolved exactly once."""
     from cafein import _parking
     from cafein.street_network import _resolved_delays
 
@@ -1046,39 +1511,46 @@ def _street_time_columns(
         chunk=chunk,
         transit_only=transit_only,
     )
-    from_ids, to_ids = query.from_ids, query.to_ids
+    parking_seconds = (
+        None
+        if resolved_parking is None
+        else _parking.destination_costs(resolved_parking, query.destination_points)[0]
+    )
+    return {
+        "transport_mode": transport_mode,
+        "query": query,
+        "car_model": _resolved_delays(
+            transport_mode, intersection_delays, profile, delay_model
+        ),
+        "parking_seconds": parking_seconds,
+    }
+
+
+def _street_time_cells(network, query, resolved):
+    """One street-time batch: cell indices and their travel times."""
+    transport_mode = resolved["transport_mode"]
     table = network._core.travel_time_matrix(
         query.origin_points,
         query.destination_points,
         transport_mode,
         query.max_seconds,
         query.max_snap_distance,
-        car_model=_resolved_delays(
-            transport_mode, intersection_delays, profile, delay_model
-        ),
+        car_model=resolved["car_model"],
     )
     _warn_unsnapped(
         table,
-        from_ids,
-        to_ids,
+        query.from_ids,
+        query.to_ids,
         network=f"the streets the {transport_mode} profile can use",
     )
     matrix = table["matrix"]
-    from_ids = np.asarray(from_ids, dtype=object)
-    to_ids = np.asarray(to_ids, dtype=object)
     rows, columns = np.nonzero(matrix != np.iinfo(np.uint32).max)
     travel_time_s = matrix[rows, columns]
-    if resolved_parking is not None:
+    if resolved["parking_seconds"] is not None:
         # Parking seconds join every reachable cell by its destination.
-        seconds, _ = _parking.destination_costs(
-            resolved_parking, query.destination_points
-        )
+        seconds = resolved["parking_seconds"]
         travel_time_s = travel_time_s + np.rint(seconds[columns]).astype(np.int64)
-    return {
-        "from_id": from_ids[rows],
-        "to_id": to_ids[columns],
-        "travel_time_s": travel_time_s,
-    }
+    return rows, columns, travel_time_s
 
 
 def _time_columns(
@@ -1254,24 +1726,77 @@ def travel_cost_table(
             geometries,
             pyarrow,
         )
-    from cafein import _streaming
+    size = _stream_size(batch_size, resume)
+    return _stream_transit_cost(
+        "travel_cost_table",
+        network,
+        origins,
+        destinations,
+        date,
+        departure,
+        max_transfers=max_transfers,
+        optimize=optimize,
+        window=window,
+        within=within,
+        factors=factors,
+        components=components,
+        fares=fares,
+        candidates="time",
+        bucket=25.0,
+        router=router,
+        exclude_routes=exclude_routes,
+        exclude_trips=exclude_trips,
+        exclude_stops=exclude_stops,
+        geometries=geometries,
+        chunk=chunk,
+        walking_speed_kmph=walking_speed_kmph,
+        max_walking_time=max_walking_time,
+        max_snap_distance=max_snap_distance,
+        output=output,
+        size=size,
+        pyarrow=pyarrow,
+    )
 
-    if resume:
-        raise NotImplementedError(
-            "resume=True is not implemented yet; it arrives with the "
-            "resumability release"
-        )
-    if batch_size is None:
-        size = _streaming.DEFAULT_BATCH_SIZE
-    else:
-        size = operator.index(batch_size)
-        if size < 1:
-            raise ValueError("batch_size must be >= 1")
+
+def _stream_transit_cost(
+    operation,
+    network,
+    origins,
+    destinations,
+    date,
+    departure,
+    *,
+    max_transfers,
+    optimize,
+    window,
+    within,
+    factors,
+    components,
+    fares,
+    candidates,
+    bucket,
+    router,
+    exclude_routes,
+    exclude_trips,
+    exclude_stops,
+    geometries,
+    chunk,
+    walking_speed_kmph,
+    max_walking_time,
+    max_snap_distance,
+    output,
+    size,
+    pyarrow,
+):
+    """The transit cost matrix streamed in origin batches — shared by
+    ``travel_cost_table`` and ``TravelCostMatrix.to_parquet``."""
     # Everything result-affecting resolves and freezes ONCE, before the
     # output is claimed: one-shot iterables drain here, later mutation of
     # the input frames cannot desynchronise batches from the fingerprint,
     # and an invalid query never leaves an empty claimed output behind.
     _validate_cost_query(date, departure, optimize, window, within, fares, router)
+    if candidates not in ("time", "pareto"):
+        raise ValueError("candidates must be 'time' or 'pareto'")
     exclude_routes = [str(route) for route in exclude_routes]
     exclude_trips = [str(trip) for trip in exclude_trips]
     exclude_stops = [str(stop) for stop in exclude_stops]
@@ -1280,14 +1805,15 @@ def travel_cost_table(
     from_ids, to_ids, points, to_stops = _cost_endpoints(
         network, origins, destinations, chunk
     )
+    if candidates == "pareto":
+        if optimize != "emissions":
+            raise ValueError("candidates='pareto' requires optimize='emissions'")
+        if points is not None:
+            raise ValueError("pareto candidates require stop origins and destinations")
     from cafein import emissions
 
     trip_factors = emissions.trip_factors(network, factors, components)
     fare_tables = None if fares is None else fares._flat_tables(network)
-    shared_from = pyarrow.array(from_ids, type=pyarrow.string())
-    shared_to = pyarrow.array(to_ids, type=pyarrow.string())
-    count = len(from_ids)
-    batches = max(1, -(-count // size))
     columns = [
         "from_id",
         "to_id",
@@ -1312,7 +1838,8 @@ def travel_cost_table(
         "fares": fare_tables,
         "geometries": bool(geometries),
         "chunk": None if chunk is None else list(chunk),
-        "batch_size": size,
+        "candidates": candidates,
+        "bucket": bucket,
         "router": router,
         "destinations": to_stops,
         "exclude_routes": exclude_routes,
@@ -1322,11 +1849,95 @@ def travel_cost_table(
         "max_walking_time": max_walking_time,
         "max_snap_distance": max_snap_distance,
     }
+
+    def make_batch(rows, shared_from, shared_to):
+        if points is None:
+            endpoints = ("stops", from_ids[rows], to_stops)
+        else:
+            origin_points, destination_points = points
+            endpoints = (
+                "points",
+                from_ids[rows],
+                origin_points[rows],
+                to_ids,
+                destination_points,
+            )
+        table, _, _ = _cost_columns(
+            network,
+            origins,
+            destinations,
+            date,
+            departure,
+            max_transfers=max_transfers,
+            optimize=optimize,
+            window=window,
+            within=within,
+            factors=factors,
+            components=components,
+            fares=fares,
+            candidates=candidates,
+            bucket=bucket,
+            geometries=geometries,
+            chunk=chunk,
+            router=router,
+            exclude_routes=exclude_routes,
+            exclude_trips=exclude_trips,
+            exclude_stops=exclude_stops,
+            walking_speed_kmph=walking_speed_kmph,
+            max_walking_time=max_walking_time,
+            max_snap_distance=max_snap_distance,
+            _resolved=(trip_factors, fare_tables, endpoints),
+        )
+        return _arrow_table(
+            table, shared_from, shared_to, rows.start, fares, geometries, pyarrow
+        )
+
+    return _stream_run(
+        operation,
+        network,
+        columns,
+        parameters,
+        from_ids,
+        to_ids,
+        points,
+        output,
+        size,
+        make_batch,
+        pyarrow,
+    )
+
+
+def _stream_run(
+    operation,
+    network,
+    columns,
+    parameters,
+    from_ids,
+    to_ids,
+    points,
+    output,
+    size,
+    make_batch,
+    pyarrow,
+):
+    """The shared streaming driver: fingerprint, claim, batch, write.
+
+    ``make_batch(rows, shared_from, shared_to)`` returns one batch's
+    Arrow table for the origin slice ``rows`` — inputs must already be
+    frozen by the caller. Used by ``travel_cost_table`` and the matrix
+    computers' ``to_parquet`` classmethods identically.
+    """
+    from cafein import _streaming
+
+    shared_from = pyarrow.array(from_ids, type=pyarrow.string())
+    shared_to = pyarrow.array(to_ids, type=pyarrow.string())
+    count = len(from_ids)
+    batches = max(1, -(-count // size))
     fingerprint = _streaming.fingerprint(
-        "travel_cost_table",
+        operation,
         columns,
         _streaming.network_digest(network),
-        parameters,
+        dict(parameters, batch_size=size),
         from_ids,
         to_ids,
         points,
@@ -1336,52 +1947,14 @@ def travel_cost_table(
     def produce():
         for index in range(batches):
             rows = slice(index * size, min((index + 1) * size, count))
-            if points is None:
-                endpoints = ("stops", from_ids[rows], to_stops)
-            else:
-                origin_points, destination_points = points
-                endpoints = (
-                    "points",
-                    from_ids[rows],
-                    origin_points[rows],
-                    to_ids,
-                    destination_points,
-                )
-            table, _, _ = _cost_columns(
-                network,
-                origins,
-                destinations,
-                date,
-                departure,
-                max_transfers=max_transfers,
-                optimize=optimize,
-                window=window,
-                within=within,
-                factors=factors,
-                components=components,
-                fares=fares,
-                geometries=geometries,
-                chunk=chunk,
-                router=router,
-                exclude_routes=exclude_routes,
-                exclude_trips=exclude_trips,
-                exclude_stops=exclude_stops,
-                walking_speed_kmph=walking_speed_kmph,
-                max_walking_time=max_walking_time,
-                max_snap_distance=max_snap_distance,
-                _resolved=(trip_factors, fare_tables, endpoints),
-            )
-            arrow = _arrow_table(
-                table, shared_from, shared_to, rows.start, fares, geometries, pyarrow
-            )
+            arrow = make_batch(rows, shared_from, shared_to)
+            yield index, rows.start, rows.stop, arrow
             # Release this batch before the next one computes: the
             # working set holds one batch, not two.
-            del table
-            yield index, rows.start, min(rows.stop, count), arrow
             del arrow
 
     manifest_seed = {
-        "operation": "travel_cost_table",
+        "operation": operation,
         "fingerprint": fingerprint,
         "fingerprint_version": _streaming.FINGERPRINT_VERSION,
         "batch_size": size,
@@ -1394,6 +1967,326 @@ def travel_cost_table(
         manifest_seed,
         {"from_id": shared_from, "to_id": shared_to},
     )
+
+
+def _stream_street_cost(
+    operation, network, resolved, geometries, chunk, output, size, pa
+):
+    """The street cost matrix streamed in origin batches over a frozen
+    resolution — `TravelCostMatrix.to_parquet`'s street arm."""
+    from cafein._cafein import STREET_DISTANCE_PROVENANCE
+
+    query = resolved["query"]
+    account = resolved["account"]
+    columns = [
+        "from_id",
+        "to_id",
+        "travel_time_s",
+        "distance_m",
+        "network_distance_m",
+        "connector_distance_m",
+        "distance_provenance",
+        "emissions",
+    ]
+    if account is not None:
+        totals, breakdown, label = account
+        columns += [f"cost_{perspective}" for perspective in totals]
+        columns += [
+            f"cost_{perspective}_{component}" for perspective, component in breakdown
+        ]
+        columns.append("currency")
+    if geometries:
+        columns.append("geometry")
+    parameters = {
+        "transport_mode": resolved["transport_mode"],
+        "max_street_time": query.max_seconds,
+        "max_snap_distance": query.max_snap_distance,
+        "geometries": bool(geometries),
+        "chunk": None if chunk is None else list(chunk),
+        "car_model": resolved["car_model"],
+        "parking_costs": resolved["parking_costs"],
+        "occupancy": resolved["occupancy"],
+        "factor": resolved["factor"],
+        "account": None if account is None else [totals, breakdown, label],
+    }
+
+    def make_batch(rows, shared_from, shared_to):
+        batch = _StreetQuery(
+            query.from_ids[rows],
+            query.to_ids,
+            query.origin_points[rows],
+            query.destination_points,
+            query.max_seconds,
+            query.max_snap_distance,
+        )
+        from_index, to_index, numeric, wkb = _street_cost_cells(
+            network, batch, geometries=geometries, resolved=resolved
+        )
+        count = len(from_index)
+        data = {
+            "from_id": pa.DictionaryArray.from_arrays(
+                pa.array(from_index + rows.start if rows.start else from_index),
+                shared_from,
+            ),
+            "to_id": pa.DictionaryArray.from_arrays(pa.array(to_index), shared_to),
+            "travel_time_s": pa.array(numeric["travel_time_s"]),
+            "distance_m": pa.array(numeric["distance_m"]),
+            "network_distance_m": pa.array(numeric["network_distance_m"]),
+            "connector_distance_m": pa.array(numeric["connector_distance_m"]),
+            "distance_provenance": pa.array(
+                [STREET_DISTANCE_PROVENANCE] * count, type=pa.string()
+            ),
+            "emissions": pa.array(numeric["emissions"]),
+        }
+        for name, values in numeric.items():
+            if name.startswith("cost_"):
+                data[name] = pa.array(values)
+        if account is not None:
+            data["currency"] = pa.array([label] * count, type=pa.string())
+        if geometries:
+            data["geometry"] = pa.array(list(wkb), type=pa.binary())
+        return pa.table(data)
+
+    return _stream_run(
+        operation,
+        network,
+        columns,
+        parameters,
+        list(query.from_ids),
+        list(query.to_ids),
+        (query.origin_points, query.destination_points),
+        output,
+        size,
+        make_batch,
+        pa,
+    )
+
+
+def _stream_street_time(operation, network, resolved, chunk, output, size, pa):
+    """The street time matrix streamed in origin batches over a frozen
+    resolution — `TravelTimeMatrix.to_parquet`'s street arm."""
+    query = resolved["query"]
+    parameters = {
+        "transport_mode": resolved["transport_mode"],
+        "max_street_time": query.max_seconds,
+        "max_snap_distance": query.max_snap_distance,
+        "chunk": None if chunk is None else list(chunk),
+        "car_model": resolved["car_model"],
+        "parking_seconds": resolved["parking_seconds"],
+    }
+
+    def make_batch(rows, shared_from, shared_to):
+        batch = _StreetQuery(
+            query.from_ids[rows],
+            query.to_ids,
+            query.origin_points[rows],
+            query.destination_points,
+            query.max_seconds,
+            query.max_snap_distance,
+        )
+        cell_rows, cell_columns, travel_time_s = _street_time_cells(
+            network, batch, resolved
+        )
+        return pa.table(
+            {
+                "from_id": pa.DictionaryArray.from_arrays(
+                    pa.array(cell_rows + rows.start if rows.start else cell_rows),
+                    shared_from,
+                ),
+                "to_id": pa.DictionaryArray.from_arrays(
+                    pa.array(cell_columns), shared_to
+                ),
+                "travel_time_s": pa.array(travel_time_s),
+            }
+        )
+
+    return _stream_run(
+        operation,
+        network,
+        ["from_id", "to_id", "travel_time_s"],
+        parameters,
+        list(query.from_ids),
+        list(query.to_ids),
+        (query.origin_points, query.destination_points),
+        output,
+        size,
+        make_batch,
+        pa,
+    )
+
+
+def _stream_transit_time(
+    operation,
+    network,
+    origins,
+    destinations,
+    date,
+    departure,
+    *,
+    max_transfers,
+    window,
+    percentiles,
+    confidence,
+    chunk,
+    router,
+    exclude_routes,
+    exclude_trips,
+    exclude_stops,
+    walking_speed_kmph,
+    max_walking_time,
+    max_snap_distance,
+    output,
+    size,
+    pyarrow,
+):
+    """The transit time matrix streamed in origin batches —
+    `TravelTimeMatrix.to_parquet`'s transit arm."""
+    from cafein.network import _window_percentiles
+
+    if date is None or departure is None:
+        raise TypeError("TravelTimeMatrix requires date and departure")
+    if router not in ("auto", "raptor", "tbtr"):
+        raise ValueError(f"router must be 'auto', 'raptor', or 'tbtr', not {router!r}")
+    # Frozen once: a one-shot percentile iterable drains here, and every
+    # batch routes the resolved list, not the caller's mutable value.
+    resolved_percentiles = _window_percentiles(window, percentiles, confidence)
+    exclude_routes = [str(route) for route in exclude_routes]
+    exclude_trips = [str(trip) for trip in exclude_trips]
+    exclude_stops = [str(stop) for stop in exclude_stops]
+    if chunk is not None:
+        chunk = tuple(int(part) for part in chunk)
+    from_ids, to_ids, points, _ = _cost_endpoints(network, origins, destinations, chunk)
+    if points is None and destinations is not None:
+        raise ValueError("destinations apply to point origins")
+    if points is None:
+        destination_frame = None
+    else:
+        _, destination_points = points
+        destination_frame = _point_frame(to_ids, destination_points)
+    if resolved_percentiles is None:
+        columns = ["from_id", "to_id", "travel_time_s"]
+    else:
+        columns = ["from_id", "to_id"] + [
+            f"travel_time_p{percentile:g}_s" for percentile in resolved_percentiles
+        ]
+    parameters = {
+        "date": date,
+        "departure": departure,
+        "max_transfers": max_transfers,
+        "window": window,
+        "percentiles": resolved_percentiles,
+        "chunk": None if chunk is None else list(chunk),
+        "router": router,
+        "exclude_routes": exclude_routes,
+        "exclude_trips": exclude_trips,
+        "exclude_stops": exclude_stops,
+        "walking_speed_kmph": walking_speed_kmph,
+        "max_walking_time": max_walking_time,
+        "max_snap_distance": max_snap_distance,
+    }
+
+    def make_batch(rows, shared_from, shared_to):
+        if points is None:
+            origins_batch = list(from_ids[rows])
+            destinations_batch = None
+        else:
+            origin_points, _ = points
+            origins_batch = _point_frame(from_ids[rows], origin_points[rows])
+            destinations_batch = destination_frame
+        matrix, _, _, batch_percentiles = network._time_matrix_with_ids(
+            origins_batch,
+            date,
+            departure,
+            max_transfers,
+            destinations=destinations_batch,
+            window=window,
+            percentiles=resolved_percentiles,
+            confidence=None,
+            chunk=None,
+            router=router,
+            exclude_routes=exclude_routes,
+            exclude_trips=exclude_trips,
+            exclude_stops=exclude_stops,
+            walking_speed_kmph=walking_speed_kmph,
+            max_walking_time=max_walking_time,
+            max_snap_distance=max_snap_distance,
+        )
+        if batch_percentiles != resolved_percentiles:
+            raise ValueError(
+                "a batch resolved different percentiles than the frozen "
+                "query; the stream never re-resolves"
+            )
+        unreachable = np.iinfo(np.uint32).max
+        if resolved_percentiles is None:
+            cell_rows, cell_columns = np.nonzero(matrix != unreachable)
+            values = {"travel_time_s": pyarrow.array(matrix[cell_rows, cell_columns])}
+        else:
+            cell_rows, cell_columns = np.nonzero((matrix != unreachable).any(axis=2))
+            spread = matrix[cell_rows, cell_columns, :].astype(float)
+            spread[spread == unreachable] = np.nan
+            values = {
+                f"travel_time_p{percentile:g}_s": pyarrow.array(spread[:, index])
+                for index, percentile in enumerate(resolved_percentiles)
+            }
+        return pyarrow.table(
+            {
+                "from_id": pyarrow.DictionaryArray.from_arrays(
+                    pyarrow.array(cell_rows + rows.start if rows.start else cell_rows),
+                    shared_from,
+                ),
+                "to_id": pyarrow.DictionaryArray.from_arrays(
+                    pyarrow.array(cell_columns), shared_to
+                ),
+                **values,
+            }
+        )
+
+    return _stream_run(
+        operation,
+        network,
+        columns,
+        parameters,
+        from_ids,
+        to_ids,
+        points,
+        output,
+        size,
+        make_batch,
+        pyarrow,
+    )
+
+
+def _point_frame(ids, coordinates):
+    """A frozen point GeoDataFrame rebuilt from resolved ``(lat, lon)``
+    pairs — per-batch inputs the caller's mutable frames cannot touch."""
+    import geopandas
+
+    return geopandas.GeoDataFrame(
+        {"id": list(ids)},
+        geometry=geopandas.points_from_xy(
+            [longitude for _, longitude in coordinates],
+            [latitude for latitude, _ in coordinates],
+        ),
+        crs="EPSG:4326",
+    )
+
+
+def _stream_size(batch_size, resume):
+    """The validated batch size of a streaming call (resume is
+    reserved until the resumability release)."""
+    from cafein import _streaming
+
+    if resume:
+        raise NotImplementedError(
+            "resume=True is not implemented yet; it arrives with the "
+            "resumability release"
+        )
+    if batch_size is None:
+        return _streaming.DEFAULT_BATCH_SIZE
+    size = operator.index(batch_size)
+    if size < 1:
+        raise ValueError("batch_size must be >= 1")
+    return size
 
 
 def _arrow_table(table, from_dictionary, to_dictionary, offset, fares, geometries, pa):

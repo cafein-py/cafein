@@ -24,7 +24,9 @@ if False:  # noqa: SIM108 — typing-only import; pyarrow stays optional
 
 #: Bumped whenever the hashed material or the result semantics change,
 #: so fingerprints from other implementation versions can never match.
-FINGERPRINT_VERSION = 1
+#: 2: candidates/bucket join the transit parameters; the matrix
+#: classmethods' operations and street/time parameter sets arrive.
+FINGERPRINT_VERSION = 2
 MANIFEST_FORMAT = 1
 MANIFEST_NAME = "manifest.json"
 DEFAULT_BATCH_SIZE = 500
@@ -116,6 +118,16 @@ def network_digest(network):
     the common mixups (different feeds, different extracts).
     """
     state = hashlib.sha256()
+    if not hasattr(network, "stops"):
+        # A standalone street network: counts, extent, and elevation
+        # provenance stand in the same heuristic way.
+        state.update(b"street")
+        core = getattr(network, "_core", None)
+        for name in ("vertex_count", "edge_count"):
+            state.update(repr(getattr(network, name, None)).encode())
+        state.update(repr(getattr(core, "_coordinate_bounds", None)).encode())
+        state.update(repr(getattr(network, "elevation_metadata", None)).encode())
+        return state.hexdigest()
     for stop, latitude, longitude in network.stops:
         state.update(repr((stop, latitude, longitude)).encode())
     for route in network.routes:
