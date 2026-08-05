@@ -1,5 +1,6 @@
 """Matrix computers over a transport network."""
 
+import operator
 import warnings
 
 import numpy as np
@@ -1163,6 +1164,9 @@ def travel_cost_table(
     walking_speed_kmph=None,
     max_walking_time=None,
     max_snap_distance=None,
+    output=None,
+    batch_size=None,
+    resume=False,
 ):
     """The travel-cost matrix as a pyarrow Table — the shard-writing form.
 
@@ -1183,6 +1187,28 @@ def travel_cost_table(
 
     Shards concatenate trivially. Requires pyarrow (install
     ``cafein[arrow]``).
+
+    With ``output=`` the matrix **streams to disk** instead of
+    materialising: origins are processed in ``batch_size`` slices
+    (default 500) and the return value is a
+    :class:`cafein.StreamingResult`, not a table. The form is chosen by
+    suffix — a path whose final component ends in ``.parquet``
+    (case-insensitive) is a single Parquet file written one row group
+    per batch through one writer (splitting only past Parquet's 64 Mi
+    rows-per-group cap), any other path is a directory of
+    per-batch shards (``part-00000.parquet``, …) beside a
+    ``manifest.json`` recording the query fingerprint and each shard's
+    origin slice, row count, and completion marker. Existing targets
+    are refused, never overwritten. The streamed output concatenates
+    bit-for-bit to the unstreamed table (batch-major, the same origin
+    order), with ``from_id``/``to_id`` dictionary-encoded over the same
+    shared domains in every batch. Peak memory holds one batch's rows
+    (plus the id domains): flat in the total origin count, linear in
+    the destination count — a huge destination set splits across jobs.
+    ``chunk=`` and ``output=`` compose: a chunked HPC job can itself
+    stream its slice. An explicit ``batch_size`` or ``resume=True``
+    without ``output=`` is rejected (``resume=False`` is inert);
+    ``resume=True`` itself is not implemented yet and raises.
     """
     try:
         import pyarrow
@@ -1191,51 +1217,230 @@ def travel_cost_table(
             "Arrow tables need the optional pyarrow dependency; install "
             "cafein[arrow] or pyarrow"
         ) from error
-    table, from_ids, to_ids = _cost_columns(
-        network,
-        origins,
-        destinations,
-        date,
-        departure,
-        max_transfers=max_transfers,
-        optimize=optimize,
-        window=window,
-        within=within,
-        factors=factors,
-        components=components,
-        fares=fares,
-        geometries=geometries,
-        chunk=chunk,
-        router=router,
-        exclude_routes=exclude_routes,
-        exclude_trips=exclude_trips,
-        exclude_stops=exclude_stops,
-        walking_speed_kmph=walking_speed_kmph,
-        max_walking_time=max_walking_time,
-        max_snap_distance=max_snap_distance,
-    )
-    columns = {
-        "from_id": pyarrow.DictionaryArray.from_arrays(
-            pyarrow.array(table["from"]),
+    if output is None:
+        if batch_size is not None:
+            raise ValueError("batch_size requires output=")
+        if resume:
+            raise ValueError("resume=True requires output=")
+        table, from_ids, to_ids = _cost_columns(
+            network,
+            origins,
+            destinations,
+            date,
+            departure,
+            max_transfers=max_transfers,
+            optimize=optimize,
+            window=window,
+            within=within,
+            factors=factors,
+            components=components,
+            fares=fares,
+            geometries=geometries,
+            chunk=chunk,
+            router=router,
+            exclude_routes=exclude_routes,
+            exclude_trips=exclude_trips,
+            exclude_stops=exclude_stops,
+            walking_speed_kmph=walking_speed_kmph,
+            max_walking_time=max_walking_time,
+            max_snap_distance=max_snap_distance,
+        )
+        return _arrow_table(
+            table,
             pyarrow.array(from_ids, type=pyarrow.string()),
-        ),
-        "to_id": pyarrow.DictionaryArray.from_arrays(
-            pyarrow.array(table["to"]),
             pyarrow.array(to_ids, type=pyarrow.string()),
+            0,
+            fares,
+            geometries,
+            pyarrow,
+        )
+    from cafein import _streaming
+
+    if resume:
+        raise NotImplementedError(
+            "resume=True is not implemented yet; it arrives with the "
+            "resumability release"
+        )
+    if batch_size is None:
+        size = _streaming.DEFAULT_BATCH_SIZE
+    else:
+        size = operator.index(batch_size)
+        if size < 1:
+            raise ValueError("batch_size must be >= 1")
+    # Everything result-affecting resolves and freezes ONCE, before the
+    # output is claimed: one-shot iterables drain here, later mutation of
+    # the input frames cannot desynchronise batches from the fingerprint,
+    # and an invalid query never leaves an empty claimed output behind.
+    _validate_cost_query(date, departure, optimize, window, within, fares, router)
+    exclude_routes = [str(route) for route in exclude_routes]
+    exclude_trips = [str(trip) for trip in exclude_trips]
+    exclude_stops = [str(stop) for stop in exclude_stops]
+    if chunk is not None:
+        chunk = tuple(int(part) for part in chunk)
+    from_ids, to_ids, points, to_stops = _cost_endpoints(
+        network, origins, destinations, chunk
+    )
+    from cafein import emissions
+
+    trip_factors = emissions.trip_factors(network, factors, components)
+    fare_tables = None if fares is None else fares._flat_tables(network)
+    shared_from = pyarrow.array(from_ids, type=pyarrow.string())
+    shared_to = pyarrow.array(to_ids, type=pyarrow.string())
+    count = len(from_ids)
+    batches = max(1, -(-count // size))
+    columns = [
+        "from_id",
+        "to_id",
+        "travel_time_s",
+        "transfers",
+        "transit_distance_m",
+        "walk_distance_m",
+        "emissions",
+    ]
+    if fares is not None:
+        columns.append("fare")
+    if geometries:
+        columns.append("geometry")
+    parameters = {
+        "date": date,
+        "departure": departure,
+        "max_transfers": max_transfers,
+        "optimize": optimize,
+        "window": window,
+        "within": within,
+        "factors": trip_factors,
+        "fares": fare_tables,
+        "geometries": bool(geometries),
+        "chunk": None if chunk is None else list(chunk),
+        "batch_size": size,
+        "router": router,
+        "destinations": to_stops,
+        "exclude_routes": exclude_routes,
+        "exclude_trips": exclude_trips,
+        "exclude_stops": exclude_stops,
+        "walking_speed_kmph": walking_speed_kmph,
+        "max_walking_time": max_walking_time,
+        "max_snap_distance": max_snap_distance,
+    }
+    fingerprint = _streaming.fingerprint(
+        "travel_cost_table",
+        columns,
+        _streaming.network_digest(network),
+        parameters,
+        from_ids,
+        to_ids,
+        points,
+    )
+    mode, path = _streaming.resolve_output(output)
+
+    def produce():
+        for index in range(batches):
+            rows = slice(index * size, min((index + 1) * size, count))
+            if points is None:
+                endpoints = ("stops", from_ids[rows], to_stops)
+            else:
+                origin_points, destination_points = points
+                endpoints = (
+                    "points",
+                    from_ids[rows],
+                    origin_points[rows],
+                    to_ids,
+                    destination_points,
+                )
+            table, _, _ = _cost_columns(
+                network,
+                origins,
+                destinations,
+                date,
+                departure,
+                max_transfers=max_transfers,
+                optimize=optimize,
+                window=window,
+                within=within,
+                factors=factors,
+                components=components,
+                fares=fares,
+                geometries=geometries,
+                chunk=chunk,
+                router=router,
+                exclude_routes=exclude_routes,
+                exclude_trips=exclude_trips,
+                exclude_stops=exclude_stops,
+                walking_speed_kmph=walking_speed_kmph,
+                max_walking_time=max_walking_time,
+                max_snap_distance=max_snap_distance,
+                _resolved=(trip_factors, fare_tables, endpoints),
+            )
+            arrow = _arrow_table(
+                table, shared_from, shared_to, rows.start, fares, geometries, pyarrow
+            )
+            # Release this batch before the next one computes: the
+            # working set holds one batch, not two.
+            del table
+            yield index, rows.start, min(rows.stop, count), arrow
+            del arrow
+
+    manifest_seed = {
+        "operation": "travel_cost_table",
+        "fingerprint": fingerprint,
+        "fingerprint_version": _streaming.FINGERPRINT_VERSION,
+        "batch_size": size,
+        "origin_count": count,
+    }
+    return _streaming.write_stream(
+        mode,
+        path,
+        produce(),
+        manifest_seed,
+        {"from_id": shared_from, "to_id": shared_to},
+    )
+
+
+def _arrow_table(table, from_dictionary, to_dictionary, offset, fares, geometries, pa):
+    """One batch's Arrow table over the shared id dictionary domains.
+
+    ``offset`` shifts the batch-relative origin indices into the shared
+    ``from_dictionary`` domain; destination indices already span theirs.
+    """
+    origin_indices = table["from"] if not offset else table["from"] + offset
+    columns = {
+        "from_id": pa.DictionaryArray.from_arrays(
+            pa.array(origin_indices), from_dictionary
         ),
-        "travel_time_s": pyarrow.array(table["travel_time_s"]),
-        "transfers": pyarrow.array(np.maximum(table["rides"], 1) - 1),
-        "transit_distance_m": pyarrow.array(table["transit_distance"]),
-        "walk_distance_m": pyarrow.array(table["walk_distance"]),
-        "emissions": pyarrow.array(table["emissions"]),
+        "to_id": pa.DictionaryArray.from_arrays(pa.array(table["to"]), to_dictionary),
+        "travel_time_s": pa.array(table["travel_time_s"]),
+        "transfers": pa.array(np.maximum(table["rides"], 1) - 1),
+        "transit_distance_m": pa.array(table["transit_distance"]),
+        "walk_distance_m": pa.array(table["walk_distance"]),
+        "emissions": pa.array(table["emissions"]),
     }
     if fares is not None:
-        columns["fare"] = pyarrow.array(table["fare"])
+        columns["fare"] = pa.array(table["fare"])
     if geometries:
-        columns["geometry"] = pyarrow.array(
-            list(table["geometry"]), type=pyarrow.binary()
-        )
-    return pyarrow.table(columns)
+        columns["geometry"] = pa.array(list(table["geometry"]), type=pa.binary())
+    return pa.table(columns)
+
+
+def _cost_endpoints(network, origins, destinations, chunk):
+    """The resolved routing inputs, snapshotted once for streaming:
+    ``(from_ids, to_ids, points, to_stops)`` — the ``chunk``-sliced
+    origin ids, the full destination id domain, the
+    ``(origin_points, destination_points)`` pair on point queries
+    (``None`` on stop queries), and the stop path's ordered destination
+    selection (``None`` on point queries or when every stop applies).
+    Mirrors `_cost_columns`'s own resolution and must stay in step."""
+    if _is_point_frame(origins) or _is_point_frame(destinations):
+        from_ids, origin_points = _point_list(origins, "origins")
+        if destinations is None:
+            to_ids, destination_points = from_ids, origin_points
+        else:
+            to_ids, destination_points = _point_list(destinations, "destinations")
+        rows = _chunk_slice(len(from_ids), chunk)
+        return from_ids[rows], to_ids, (origin_points[rows], destination_points), None
+    stop_ids = [stop for stop, _, _ in network.stops]
+    from_ids = list(stop_ids) if origins is None else [str(o) for o in origins]
+    to_stops = None if destinations is None else [str(d) for d in destinations]
+    return from_ids[_chunk_slice(len(from_ids), chunk)], stop_ids, None, to_stops
 
 
 def _cost_columns(
@@ -1263,8 +1468,16 @@ def _cost_columns(
     exclude_routes=(),
     exclude_trips=(),
     exclude_stops=(),
+    _resolved=None,
 ):
-    """The core's cost arrays plus the origin and destination ids."""
+    """The core's cost arrays plus the origin and destination ids.
+
+    ``_resolved`` is the streaming form's frozen snapshot: a
+    ``(trip_factors, fare_tables, endpoints)`` triple whose endpoints
+    are one origin batch — ``("points", from_ids, origin_points,
+    to_ids, destination_points)`` or ``("stops", from_ids, to_stops)``
+    — replacing the resolution below so mutable inputs are only ever
+    read once (`_cost_endpoints` mirrors it and must stay in step)."""
     exclusions = (
         [str(route) for route in exclude_routes],
         [str(trip) for trip in exclude_trips],
@@ -1273,38 +1486,37 @@ def _cost_columns(
     from cafein import emissions
     from cafein.network import _walk_options
 
-    if date is None or departure is None:
-        raise TypeError("TravelCostMatrix requires date and departure")
-    if optimize not in ("time", "emissions", "fare"):
-        raise ValueError(
-            f"optimize must be 'time', 'emissions', or 'fare', not {optimize!r}"
-        )
-    if optimize != "time" and window is None:
-        raise ValueError(f"optimize={optimize!r} requires a departure window")
-    if optimize == "time" and not (window is None and within is None):
-        raise ValueError("window and within require optimize='emissions' or 'fare'")
-    if optimize == "fare" and fares is None:
-        raise ValueError("optimize='fare' requires a fare structure (fares=)")
+    _validate_cost_query(date, departure, optimize, window, within, fares, router)
     if candidates not in ("time", "pareto"):
         raise ValueError("candidates must be 'time' or 'pareto'")
-    if router not in ("auto", "raptor", "tbtr"):
-        raise ValueError("router must be 'auto', 'raptor', or 'tbtr'")
     if candidates == "pareto":
         if optimize != "emissions":
             raise ValueError("candidates='pareto' requires optimize='emissions'")
         if _is_point_frame(origins) or _is_point_frame(destinations):
             raise ValueError("pareto candidates require stop origins and destinations")
-    fare_tables = None if fares is None else fares._flat_tables(network)
-    trip_factors = emissions.trip_factors(network, factors, components)
-    if _is_point_frame(origins) or _is_point_frame(destinations):
-        from_ids, origin_points = _point_list(origins, "origins")
-        if destinations is None:
-            to_ids, destination_points = from_ids, origin_points
+    if _resolved is not None:
+        trip_factors, fare_tables, endpoints = _resolved
+    else:
+        fare_tables = None if fares is None else fares._flat_tables(network)
+        trip_factors = emissions.trip_factors(network, factors, components)
+        endpoints = None
+    point_query = (
+        endpoints[0] == "points"
+        if endpoints is not None
+        else _is_point_frame(origins) or _is_point_frame(destinations)
+    )
+    if point_query:
+        if endpoints is not None:
+            _, from_ids, origin_points, to_ids, destination_points = endpoints
         else:
-            to_ids, destination_points = _point_list(destinations, "destinations")
-        rows = _chunk_slice(len(from_ids), chunk)
-        from_ids = from_ids[rows]
-        origin_points = origin_points[rows]
+            from_ids, origin_points = _point_list(origins, "origins")
+            if destinations is None:
+                to_ids, destination_points = from_ids, origin_points
+            else:
+                to_ids, destination_points = _point_list(destinations, "destinations")
+            rows = _chunk_slice(len(from_ids), chunk)
+            from_ids = from_ids[rows]
+            origin_points = origin_points[rows]
         walk = _walk_options(walking_speed_kmph, max_walking_time, max_snap_distance)
         if optimize != "time":
             table = network._core.least_cost_matrix_from_points(
@@ -1340,9 +1552,12 @@ def _cost_columns(
         _warn_unsnapped(table, from_ids, to_ids)
     else:
         stop_ids = [stop for stop, _, _ in network.stops]
-        from_ids = list(stop_ids) if origins is None else [str(o) for o in origins]
-        from_ids = from_ids[_chunk_slice(len(from_ids), chunk)]
-        to_stops = None if destinations is None else [str(d) for d in destinations]
+        if endpoints is not None:
+            _, from_ids, to_stops = endpoints
+        else:
+            from_ids = list(stop_ids) if origins is None else [str(o) for o in origins]
+            from_ids = from_ids[_chunk_slice(len(from_ids), chunk)]
+            to_stops = None if destinations is None else [str(d) for d in destinations]
         if optimize != "time":
             # The emissions (McRAPTOR) stop matrix relaxes a matching whole-day
             # McULTRA set for the pareto objective, routing door-to-door with
@@ -1384,6 +1599,25 @@ def _cost_columns(
             )
         to_ids = stop_ids
     return table, from_ids, to_ids
+
+
+def _validate_cost_query(date, departure, optimize, window, within, fares, router):
+    """The cost-matrix argument contract, shared by `_cost_columns` and
+    the streaming path (which must validate before claiming outputs)."""
+    if date is None or departure is None:
+        raise TypeError("TravelCostMatrix requires date and departure")
+    if optimize not in ("time", "emissions", "fare"):
+        raise ValueError(
+            f"optimize must be 'time', 'emissions', or 'fare', not {optimize!r}"
+        )
+    if optimize != "time" and window is None:
+        raise ValueError(f"optimize={optimize!r} requires a departure window")
+    if optimize == "time" and not (window is None and within is None):
+        raise ValueError("window and within require optimize='emissions' or 'fare'")
+    if optimize == "fare" and fares is None:
+        raise ValueError("optimize='fare' requires a fare structure (fares=)")
+    if router not in ("auto", "raptor", "tbtr"):
+        raise ValueError("router must be 'auto', 'raptor', or 'tbtr'")
 
 
 def _chunk_slice(count, chunk):

@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Streaming `travel_cost_table`**: ``output=`` streams the matrix to
+  disk in origin batches (``batch_size=``, default 500) instead of
+  materialising it — a ``.parquet`` path becomes one file written one
+  row group per batch (up to Parquet's 64 Mi rows-per-group cap), any
+  other path a directory of per-batch shards
+  beside a ``manifest.json`` carrying the query fingerprint and
+  per-shard completion markers (temp-write + rename throughout). The
+  streamed output concatenates bit-for-bit to the unstreamed table,
+  with ``from_id``/``to_id`` dictionary-encoded over shared domains in
+  every batch; peak memory holds one batch. Returns the new
+  ``cafein.StreamingResult`` record. ``chunk=`` composes with
+  ``output=``; ``resume=`` is reserved (rejected until the
+  resumability release).
+
 - **OD zone surfaces** (``cafein.zones``): ``square_grid(area,
   cell_size, crs=None)`` lays lattice-snapped square cells of
   ``cell_size`` metres over an area (ids ``"{column}_{row}"`` on the
