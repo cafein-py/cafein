@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 — 2026-08-05
 
 - **Resumable streaming runs**: ``resume=True`` on
   ``travel_cost_table`` and the matrix ``to_parquet`` classmethods
