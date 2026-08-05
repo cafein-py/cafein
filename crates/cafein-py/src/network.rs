@@ -1803,6 +1803,16 @@ impl TransportNetwork {
             .is_some_and(StreetNetwork::has_hierarchy)
     }
 
+    /// The installed street network's coordinate bounding box as
+    /// `(west, south, east, north)` degrees, or `None` without streets.
+    /// Internal; the zone generators take a network's extent from it.
+    #[getter]
+    fn _street_coordinate_bounds(&self) -> Option<(f64, f64, f64, f64)> {
+        self.streets
+            .as_ref()
+            .and_then(StreetNetwork::coordinate_bounds)
+    }
+
     /// Attaches synthetic multimodal edge attributes to the installed street
     /// network, for exercising the format-12 round-trip before the real
     /// producers (OSM extraction, profile compiler) exist. Internal surface;

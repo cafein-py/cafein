@@ -395,6 +395,14 @@ impl StreetNetwork {
         self.inner.coordinates()
     }
 
+    /// The stored coordinates' bounding box as `(west, south, east, north)`
+    /// degrees, or `None` for an empty geometry section. Internal; the zone
+    /// generators take a network's extent from it.
+    #[getter]
+    fn _coordinate_bounds(&self) -> Option<(f64, f64, f64, f64)> {
+        self.inner.coordinate_bounds()
+    }
+
     /// The stored per-slot car arrays as `(speeds, junctions)`, or `None`
     /// without a car build. Internal; the round-trip tests assert on them.
     #[getter]

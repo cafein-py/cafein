@@ -821,6 +821,30 @@ impl StreetNetwork {
             .collect()
     }
 
+    /// The bounding box of the stored coordinates as `(west, south, east,
+    /// north)` degrees, or `None` for an empty geometry section.
+    pub fn coordinate_bounds(&self) -> Option<(f64, f64, f64, f64)> {
+        let arrays = self.arrays();
+        let (lons, lats) = (arrays.lons(), arrays.lats());
+        if lons.is_empty() {
+            return None;
+        }
+        let mut bounds = (
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        );
+        for (&lon, &lat) in lons.iter().zip(lats) {
+            let (lon, lat) = (degrees(lon), degrees(lat));
+            bounds.0 = bounds.0.min(lon);
+            bounds.1 = bounds.1.min(lat);
+            bounds.2 = bounds.2.max(lon);
+            bounds.3 = bounds.3.max(lat);
+        }
+        Some(bounds)
+    }
+
     /// Attaches multimodal edge attributes to the graph, replacing any
     /// installed set. Every array must match the graph's shape: the two
     /// adjacency-slot arrays span `2·edges`, the four per-edge arrays span

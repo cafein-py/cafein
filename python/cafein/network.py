@@ -2073,7 +2073,10 @@ class TransportNetwork:
             column. Points are linked once against the street network
             (requires ``osm_pbf=`` at build time); points off the
             walking network are reported with a warning and stay
-            unreachable. Point cells hold the faster of transit and
+            unreachable. Polygon frames route from their centroids
+            (``centroid_lat``/``centroid_lon`` columns when present —
+            the ``cafein.zones`` protocol — otherwise local-UTM
+            centroids). Point cells hold the faster of transit and
             walking directly (within ``max_walking_time``), so a pair
             best covered on foot reports its walking time.
         date : str
