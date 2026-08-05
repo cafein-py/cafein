@@ -162,6 +162,7 @@ impl TransportNetwork {
             geometry: None,
             leg_geometry: None,
             streets: None,
+            source: None,
             stops_by_id,
             stops_by_qualified_id,
             trips_by_public_id,
@@ -271,6 +272,7 @@ impl TransportNetwork {
     /// different date rebuilds ad hoc. The cached set is persisted with the
     /// artifact (`save`/`load`); recomputing for a new date replaces it.
     fn compute_tbtr_transfers(&mut self, py: Python<'_>, date: &str) -> PyResult<()> {
+        self.source = None;
         let active = self.active_services(date)?;
         let previous = self.active_services_previous(date)?;
         let timetable = &self.build.timetable;
@@ -310,6 +312,7 @@ impl TransportNetwork {
         date: &str,
         factors: Vec<(String, f64)>,
     ) -> PyResult<()> {
+        self.source = None;
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
                 "no trip distances installed; build the network with trip distances enabled",
@@ -383,6 +386,7 @@ impl TransportNetwork {
         min_departure: u32,
         max_departure: u32,
     ) -> PyResult<usize> {
+        self.source = None;
         if !walking_speed_kmph.is_finite() || walking_speed_kmph <= 0.0 {
             return Err(PyValueError::new_err(
                 "walking_speed_kmph must be a positive, finite number",
@@ -448,6 +452,7 @@ impl TransportNetwork {
         min_departure: u32,
         max_departure: u32,
     ) -> PyResult<usize> {
+        self.source = None;
         if !walking_speed_kmph.is_finite() || walking_speed_kmph <= 0.0 {
             return Err(PyValueError::new_err(
                 "walking_speed_kmph must be a positive, finite number",
@@ -540,6 +545,7 @@ impl TransportNetwork {
     ///     per round; ``cafein.streets.walking_footpaths`` produces such
     ///     lists.
     fn set_transfers(&mut self, footpaths: Vec<(String, String, u32, f64)>) -> PyResult<()> {
+        self.source = None;
         let mut edges = Vec::with_capacity(footpaths.len());
         for (index, (from, to, duration, meters)) in footpaths.iter().enumerate() {
             if !meters.is_finite() || *meters < 0.0 {
@@ -579,6 +585,7 @@ impl TransportNetwork {
         seconds: PyReadonlyArray1<'_, u32>,
         meters: PyReadonlyArray1<'_, f64>,
     ) -> PyResult<()> {
+        self.source = None;
         let resolved: Vec<StopIdx> = stop_ids
             .iter()
             .map(|stop| self.resolve_stop(stop))
@@ -641,6 +648,7 @@ impl TransportNetwork {
     ///     timetable trip must be covered.
     ///     ``cafein.geometry.trip_distances`` produces such lists.
     fn set_trip_distances(&mut self, distances: Vec<(String, Vec<f64>, String)>) -> PyResult<()> {
+        self.source = None;
         let mut entries = Vec::with_capacity(distances.len());
         for (trip_id, cumulative, provenance) in &distances {
             let Some(&trip) = self.trips_by_public_id.get(trip_id) else {
@@ -686,6 +694,7 @@ impl TransportNetwork {
         polylines: Vec<(Vec<f64>, Vec<f64>, Vec<f64>)>,
         trips: Vec<(String, u32, Vec<f64>)>,
     ) -> PyResult<()> {
+        self.source = None;
         let mut entries = Vec::with_capacity(trips.len());
         for (trip_id, polyline, positions) in trips {
             let Some(&trip) = self.trips_by_public_id.get(&trip_id) else {
@@ -731,6 +740,7 @@ impl TransportNetwork {
         latitudes: Vec<f64>,
         stop_links: Vec<(String, u32, f64, f64)>,
     ) -> PyResult<()> {
+        self.source = None;
         let mut links = Vec::with_capacity(stop_links.len());
         for (stop_id, edge, fraction, connector) in &stop_links {
             links.push(StopLink {
@@ -794,6 +804,7 @@ impl TransportNetwork {
         elevation_metadata: Option<(String, f64, String, f64, u32)>,
         car_attributes: Option<crate::streets::CarPayload>,
     ) -> PyResult<()> {
+        self.source = None;
         let (inner, elevation) = crate::streets::build_multimodal_core(
             vertex_count,
             edges,
@@ -1504,6 +1515,7 @@ impl TransportNetwork {
         mode: &str,
         max_seconds: f64,
     ) -> PyResult<(usize, usize)> {
+        self.source = None;
         if mode == "walk" {
             return Err(PyValueError::new_err(
                 "walking transfers are the installed set; mode transfers \
@@ -1601,6 +1613,7 @@ impl TransportNetwork {
         mode: &str,
         max_seconds: f64,
     ) -> PyResult<(usize, usize)> {
+        self.source = None;
         if mode == "walk" {
             return Err(PyValueError::new_err(
                 "walking needs no carriage; the carriage set takes the \
@@ -1787,6 +1800,7 @@ impl TransportNetwork {
     /// Requires an installed street network. Persisted by `save` and restored by
     /// `load` (the buckets are rebuilt on load), so it need not be run again.
     fn install_walking_hierarchy(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.source = None;
         let streets = self
             .streets
             .as_mut()
@@ -1826,6 +1840,7 @@ impl TransportNetwork {
         edge_smoothness: Vec<u8>,
         edge_flags: Vec<u16>,
     ) -> PyResult<()> {
+        self.source = None;
         let streets = self
             .streets
             .as_mut()
@@ -1844,6 +1859,7 @@ impl TransportNetwork {
 
     /// Attaches synthetic per-coordinate elevations. Internal surface.
     fn _install_elevations(&mut self, elevations: Vec<f32>) -> PyResult<()> {
+        self.source = None;
         let streets = self
             .streets
             .as_mut()

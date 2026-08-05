@@ -276,7 +276,7 @@ def test_streaming_validation(network, tmp_path):
         travel_cost_table(
             network, origins=stops, **QUERY, output=tmp_path / "x.parquet", batch_size=0
         )
-    with pytest.raises(NotImplementedError, match="resume"):
+    with pytest.raises(ValueError, match="directory form"):
         travel_cost_table(
             network, origins=stops, **QUERY, output=tmp_path / "y.parquet", resume=True
         )
@@ -572,7 +572,7 @@ def test_to_parquet_refusals(network, car_streets, street_points, tmp_path):
             street_policy=object(),
             output=tmp_path / "a.parquet",
         )
-    with pytest.raises(NotImplementedError, match="resume"):
+    with pytest.raises(ValueError, match="directory form"):
         TravelTimeMatrix.to_parquet(
             network, origins=stops, **QUERY, output=tmp_path / "b.parquet", resume=True
         )
@@ -657,6 +657,455 @@ def test_operation_distinguishes_fingerprints(network, tmp_path):
         network, origins=stops, **QUERY, output=tmp_path / "method", batch_size=5
     )
     assert table.manifest["fingerprint"] != method.manifest["fingerprint"]
+
+
+def _interrupt(monkeypatch, at_call):
+    """Patch `_cost_columns` to crash on its ``at_call``-th invocation
+    and count every one, returning the counter."""
+    from cafein import matrices
+
+    calls = {"n": 0}
+    real = matrices._cost_columns
+
+    def wrapped(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == at_call:
+            raise RuntimeError("injected crash")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(matrices, "_cost_columns", wrapped)
+    return calls
+
+
+def test_resume_completes_an_interrupted_run(network, tmp_path, monkeypatch):
+    stops = _origin_stops(network, 100)
+    plain = travel_cost_table(network, origins=stops, **QUERY)
+    target = tmp_path / "run"
+    calls = _interrupt(monkeypatch, at_call=3)
+    with pytest.raises(RuntimeError, match="injected"):
+        travel_cost_table(network, origins=stops, **QUERY, output=target, batch_size=25)
+    import json
+
+    partial = json.loads((target / "manifest.json").read_text())
+    assert [shard["index"] for shard in partial["shards"]] == [0, 1]
+    before = {
+        part.name: (part.stat().st_mtime_ns, part.stat().st_size)
+        for part in target.glob("part-*.parquet")
+    }
+    calls["n"] = 10_000  # count on, never crash again
+    result = travel_cost_table(
+        network, origins=stops, **QUERY, output=target, batch_size=25, resume=True
+    )
+    # Skipped, not recomputed: only the two remaining batches routed,
+    # and the completed shards' file identity is untouched.
+    assert calls["n"] == 10_002
+    after = {
+        part.name: (part.stat().st_mtime_ns, part.stat().st_size)
+        for part in target.glob("part-*.parquet")
+    }
+    assert all(after[name] == before[name] for name in before)
+    assert (result.batches, result.rows) == (4, plain.num_rows)
+    assert [shard["index"] for shard in result.manifest["shards"]] == [0, 1, 2, 3]
+    joined = pyarrow.concat_tables(
+        parquet.read_table(part) for part in sorted(target.glob("part-*.parquet"))
+    )
+    assert joined.equals(plain)
+    # A completed run resumes as a no-op — nothing routes at all.
+    calls["n"] = 20_000
+    again = travel_cost_table(
+        network, origins=stops, **QUERY, output=target, batch_size=25, resume=True
+    )
+    assert calls["n"] == 20_000
+    assert (again.batches, again.rows) == (4, plain.num_rows)
+    assert again.schema == plain.schema
+
+
+def test_resume_refuses_mismatched_queries(network, tmp_path, monkeypatch):
+    stops = _origin_stops(network, 50)
+    target = tmp_path / "run"
+    _interrupt(monkeypatch, at_call=2)
+    with pytest.raises(RuntimeError, match="injected"):
+        travel_cost_table(network, origins=stops, **QUERY, output=target, batch_size=25)
+    with pytest.raises(ValueError, match="fingerprint"):
+        travel_cost_table(
+            network, origins=stops, **QUERY, output=target, batch_size=10, resume=True
+        )
+    with pytest.raises(ValueError, match="fingerprint"):
+        travel_cost_table(
+            network,
+            origins=stops,
+            **QUERY,
+            output=target,
+            batch_size=25,
+            chunk=(0, 2),
+            resume=True,
+        )
+    with pytest.raises(ValueError, match="fingerprint"):
+        travel_cost_table(
+            network,
+            origins=stops[:40],
+            **QUERY,
+            output=target,
+            batch_size=25,
+            resume=True,
+        )
+    import json
+
+    manifest = json.loads((target / "manifest.json").read_text())
+    manifest["schema_digest"] = "0" * 64
+    _streaming.write_manifest(target, manifest)
+    with pytest.raises(ValueError, match="schema"):
+        travel_cost_table(
+            network, origins=stops, **QUERY, output=target, batch_size=25, resume=True
+        )
+
+
+def test_resume_refuses_a_moved_coordinate(
+    network_with_footpaths, tmp_path, monkeypatch
+):
+    import geopandas
+
+    def frame(coordinates):
+        return geopandas.GeoDataFrame(
+            {"id": ["a", "b", "c"]},
+            geometry=geopandas.points_from_xy(*zip(*coordinates)),
+            crs="EPSG:4326",
+        )
+
+    base = [(24.9384, 60.1699), (24.9241, 60.1587), (24.9600, 60.1870)]
+    target = tmp_path / "points"
+    _interrupt(monkeypatch, at_call=2)
+    with pytest.raises(RuntimeError, match="injected"):
+        travel_cost_table(
+            network_with_footpaths,
+            origins=frame(base),
+            **QUERY,
+            output=target,
+            batch_size=2,
+        )
+    moved = [base[0], base[1], (24.9600, 60.1871)]
+    with pytest.raises(ValueError, match="fingerprint"):
+        travel_cost_table(
+            network_with_footpaths,
+            origins=frame(moved),
+            **QUERY,
+            output=target,
+            batch_size=2,
+            resume=True,
+        )
+
+
+def test_resume_validation(network, tmp_path):
+    stops = _origin_stops(network, 4)
+    with pytest.raises(ValueError, match="nothing to resume"):
+        travel_cost_table(
+            network, origins=stops, **QUERY, output=tmp_path / "missing", resume=True
+        )
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(ValueError, match="no manifest.json"):
+        travel_cost_table(network, origins=stops, **QUERY, output=empty, resume=True)
+    corrupt = tmp_path / "corrupt"
+    corrupt.mkdir()
+    (corrupt / "manifest.json").write_text("{ truncated")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        travel_cost_table(network, origins=stops, **QUERY, output=corrupt, resume=True)
+    # Without resume, a non-empty directory names the way forward.
+    with pytest.raises(ValueError, match="resume=True"):
+        travel_cost_table(network, origins=stops, **QUERY, output=corrupt)
+
+
+def test_resume_claim_is_exclusive(network, tmp_path, monkeypatch):
+    stops = _origin_stops(network, 50)
+    target = tmp_path / "run"
+    _interrupt(monkeypatch, at_call=2)
+    with pytest.raises(RuntimeError, match="injected"):
+        travel_cost_table(network, origins=stops, **QUERY, output=target, batch_size=25)
+    (target / "run.claim").write_bytes(b"")
+    with pytest.raises(FileExistsError, match="run.claim"):
+        travel_cost_table(
+            network, origins=stops, **QUERY, output=target, batch_size=25, resume=True
+        )
+    (target / "run.claim").unlink()
+    result = travel_cost_table(
+        network, origins=stops, **QUERY, output=target, batch_size=25, resume=True
+    )
+    # The claim releases on completion.
+    assert not (target / "run.claim").exists()
+    assert result.batches == 2
+
+
+def test_crashed_shard_without_marker_is_rewritten(network, tmp_path, monkeypatch):
+    stops = _origin_stops(network, 75)
+    plain = travel_cost_table(network, origins=stops, **QUERY)
+    target = tmp_path / "run"
+    _interrupt(monkeypatch, at_call=3)
+    with pytest.raises(RuntimeError, match="injected"):
+        travel_cost_table(network, origins=stops, **QUERY, output=target, batch_size=25)
+    # The window between a shard's rename and its manifest marker: the
+    # part file exists, the manifest does not know it.
+    (target / "part-00002.parquet").write_bytes(b"junk from a killed run")
+    result = travel_cost_table(
+        network, origins=stops, **QUERY, output=target, batch_size=25, resume=True
+    )
+    assert result.batches == 3
+    joined = pyarrow.concat_tables(
+        parquet.read_table(part) for part in sorted(target.glob("part-*.parquet"))
+    )
+    assert joined.equals(plain)
+
+
+def test_failure_mid_manifest_publication_resumes(network, tmp_path, monkeypatch):
+    stops = _origin_stops(network, 75)
+    plain = travel_cost_table(network, origins=stops, **QUERY)
+    target = tmp_path / "run"
+    real = _streaming.write_manifest
+    updates = {"n": 0}
+
+    def failing(directory, manifest, claim=False):
+        if not claim:
+            updates["n"] += 1
+            if updates["n"] == 2:
+                raise OSError("injected manifest failure")
+        return real(directory, manifest, claim=claim)
+
+    monkeypatch.setattr(_streaming, "write_manifest", failing)
+    with pytest.raises(OSError, match="injected manifest"):
+        travel_cost_table(network, origins=stops, **QUERY, output=target, batch_size=25)
+    monkeypatch.setattr(_streaming, "write_manifest", real)
+    # Shard 1 was renamed but never marked: the manifest holds one
+    # completed shard and the orphan part recomputes on resume.
+    import json
+
+    manifest = json.loads((target / "manifest.json").read_text())
+    assert [shard["index"] for shard in manifest["shards"]] == [0]
+    assert (target / "part-00001.parquet").exists()
+    result = travel_cost_table(
+        network, origins=stops, **QUERY, output=target, batch_size=25, resume=True
+    )
+    assert result.batches == 3
+    joined = pyarrow.concat_tables(
+        parquet.read_table(part) for part in sorted(target.glob("part-*.parquet"))
+    )
+    assert joined.equals(plain)
+
+
+def test_failure_mid_manifest_replace_resumes(network, tmp_path, monkeypatch):
+    """The other atomic window: the manifest temporary is fully written
+    but the process dies before ``os.replace`` publishes it."""
+    import os as _os
+
+    stops = _origin_stops(network, 75)
+    plain = travel_cost_table(network, origins=stops, **QUERY)
+    target = tmp_path / "run"
+    real_replace = _os.replace
+    state = {"manifest_replaces": 0}
+
+    def failing(source, destination, *args, **kwargs):
+        if str(destination).endswith("manifest.json"):
+            state["manifest_replaces"] += 1
+            if state["manifest_replaces"] == 2:
+                raise OSError("injected replace failure")
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(_streaming.os, "replace", failing)
+    with pytest.raises(OSError, match="injected replace"):
+        travel_cost_table(network, origins=stops, **QUERY, output=target, batch_size=25)
+    monkeypatch.setattr(_streaming.os, "replace", real_replace)
+    # The published manifest is still the previous valid one, the
+    # written-but-unpublished temporary remains for resume to sweep.
+    import json
+
+    manifest = json.loads((target / "manifest.json").read_text())
+    assert [shard["index"] for shard in manifest["shards"]] == [0]
+    assert list(target.glob("*.tmp"))
+    result = travel_cost_table(
+        network, origins=stops, **QUERY, output=target, batch_size=25, resume=True
+    )
+    assert result.batches == 3
+    assert not list(target.glob("*.tmp"))
+    joined = pyarrow.concat_tables(
+        parquet.read_table(part) for part in sorted(target.glob("part-*.parquet"))
+    )
+    assert joined.equals(plain)
+
+
+def test_classmethod_resume(network, tmp_path, monkeypatch):
+    import pandas as pd
+
+    stops = _origin_stops(network, 50)
+    frame = TravelTimeMatrix(network, origins=stops, **QUERY)
+    target = tmp_path / "ttm-run"
+    real = _streaming.write_manifest
+    updates = {"n": 0}
+
+    def failing(directory, manifest, claim=False):
+        if not claim:
+            updates["n"] += 1
+            if updates["n"] == 1:
+                raise OSError("injected manifest failure")
+        return real(directory, manifest, claim=claim)
+
+    monkeypatch.setattr(_streaming, "write_manifest", failing)
+    with pytest.raises(OSError, match="injected manifest"):
+        TravelTimeMatrix.to_parquet(
+            network, origins=stops, **QUERY, output=target, batch_size=25
+        )
+    monkeypatch.setattr(_streaming, "write_manifest", real)
+    result = TravelTimeMatrix.to_parquet(
+        network, origins=stops, **QUERY, output=target, batch_size=25, resume=True
+    )
+    assert result.batches == 2
+    joined = pyarrow.concat_tables(
+        parquet.read_table(part) for part in sorted(target.glob("part-*.parquet"))
+    ).to_pandas()
+    for name in ("from_id", "to_id"):
+        joined[name] = joined[name].astype(frame[name].dtype)
+    pd.testing.assert_frame_equal(joined, pd.DataFrame(frame))
+
+
+def test_resume_refuses_tampered_manifests(network, tmp_path, monkeypatch):
+    import json
+
+    stops = _origin_stops(network, 75)
+    target = tmp_path / "run"
+    _interrupt(monkeypatch, at_call=3)
+    with pytest.raises(RuntimeError, match="injected"):
+        travel_cost_table(network, origins=stops, **QUERY, output=target, batch_size=25)
+    pristine = json.loads((target / "manifest.json").read_text())
+
+    def tampered(mutate):
+        manifest = json.loads(json.dumps(pristine))
+        mutate(manifest)
+        _streaming.write_manifest(target, manifest)
+
+    def resume():
+        return travel_cost_table(
+            network, origins=stops, **QUERY, output=target, batch_size=25, resume=True
+        )
+
+    tampered(lambda m: m["shards"][0].__setitem__("file", "../escape.parquet"))
+    with pytest.raises(ValueError, match="names shard"):
+        resume()
+    tampered(lambda m: m["shards"][0].__setitem__("rows", 1))
+    with pytest.raises(ValueError, match="different rows"):
+        resume()
+    tampered(lambda m: m["shards"][0].__setitem__("origin_start", 7))
+    with pytest.raises(ValueError, match="origin slice"):
+        resume()
+    tampered(lambda m: m["shards"][0].__setitem__("index", 40))
+    with pytest.raises(ValueError, match="batch plan"):
+        resume()
+    # A same-shaped shard with different values: rows and schema agree,
+    # the content hash does not.
+    original = parquet.read_table(target / "part-00000.parquet")
+    swapped = original.set_column(
+        original.schema.get_field_index("travel_time_s"),
+        "travel_time_s",
+        pyarrow.array(
+            [value + 1 for value in original["travel_time_s"].to_pylist()],
+            type=original.schema.field("travel_time_s").type,
+        ),
+    )
+    _streaming.write_manifest(target, pristine)
+    parquet.write_table(swapped, target / "part-00000.parquet")
+    with pytest.raises(ValueError, match="different content"):
+        resume()
+    _streaming.write_manifest(target, pristine)
+    (target / "part-00000.parquet").unlink()
+    with pytest.raises(ValueError, match="missing or not a regular file"):
+        resume()
+
+
+def test_sigkilled_run_resumes(network, tmp_path):
+    """A real process death — no exception handling, no cleanup — must
+    leave a directory a plain resume completes from."""
+    import time
+
+    from cafein import TransportNetwork
+
+    artifact = tmp_path / "network.cafein"
+    network.save(artifact)
+    # Both processes route the SAME artifact file: its hash is the
+    # cross-process network identity the fingerprints must share.
+    loaded = TransportNetwork.load(artifact)
+    stops = _origin_stops(loaded, 100)
+    plain = travel_cost_table(loaded, origins=stops, **QUERY)
+    target = tmp_path / "run"
+    script = textwrap.dedent("""
+        import sys, warnings
+        warnings.filterwarnings("ignore")
+        from cafein import TransportNetwork, travel_cost_table
+
+        network = TransportNetwork.load(sys.argv[1])
+        stops = [stop for stop, _, _ in network.stops][:100]
+        travel_cost_table(
+            network,
+            origins=stops,
+            date="2022-02-22",
+            departure="08:30:00",
+            output=sys.argv[2],
+            batch_size=25,
+        )
+        """)
+    child = subprocess.Popen(
+        [sys.executable, "-c", script, str(artifact), str(target)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        if (target / "part-00000.parquet").exists():
+            break
+        if child.poll() is not None:
+            raise AssertionError("the child finished before it could be killed")
+        time.sleep(0.02)
+    child.kill()
+    child.wait()
+    # The kill lands at an arbitrary point: a claim and partial state
+    # remain. Confirmed dead, the stale claim is removed and the run
+    # resumes to the exact uninterrupted result.
+    (target / "run.claim").unlink(missing_ok=True)
+    result = travel_cost_table(
+        loaded, origins=stops, **QUERY, output=target, batch_size=25, resume=True
+    )
+    assert result.rows == plain.num_rows
+    joined = pyarrow.concat_tables(
+        parquet.read_table(part) for part in sorted(target.glob("part-*.parquet"))
+    )
+    assert joined.equals(plain)
+
+
+def test_network_digest_is_the_artifact_checksum(
+    network, network_with_footpaths, tmp_path
+):
+    # Same feed, same stops, routes, and trip count — only the street
+    # section differs. The content checksum tells them apart where the
+    # old structural heuristics collided.
+    assert network._core._artifact_checksum() == network._core._artifact_checksum()
+    assert _streaming.network_digest(network) != _streaming.network_digest(
+        network_with_footpaths
+    )
+    # A loaded artifact's identity is its file hash: stable across
+    # processes (in-memory serialization is not canonical between
+    # processes, so unsaved networks digest process-locally).
+    from cafein import TransportNetwork
+
+    artifact = tmp_path / "network.cafein"
+    network.save(artifact)
+    parent = TransportNetwork.load(artifact)._core._artifact_checksum()
+    script = (
+        "import sys, warnings; warnings.filterwarnings('ignore');"
+        "from cafein import TransportNetwork;"
+        "print(TransportNetwork.load(sys.argv[1])._core._artifact_checksum())"
+    )
+    child = subprocess.run(
+        [sys.executable, "-c", script, str(artifact)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert child.stdout.split()[-1] == parent
 
 
 RSS_SCRIPT = textwrap.dedent("""

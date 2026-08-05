@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Resumable streaming runs**: ``resume=True`` on
+  ``travel_cost_table`` and the matrix ``to_parquet`` classmethods
+  continues an interrupted directory-form run — completed shards are
+  skipped untouched (their batches never recompute), a shard from a
+  run killed between its rename and its manifest marker is rewritten,
+  and stale temporaries are cleaned up. The manifest's query
+  fingerprint must match exactly — same network content, inputs,
+  parameters, ``chunk``, and ``batch_size`` — and the schema digest
+  must agree, else the directory is refused rather than overwritten;
+  concurrent resumes of one directory are excluded by a claim. The
+  fingerprint's network identity is now the **artifact content
+  checksum** (the CRCs over exactly what ``save`` persists, computed
+  on demand), so networks differing in any persisted state — 
+  timetables, transfers, street data — never share a fingerprint
+  (fingerprint version 3). A refused non-empty output directory now
+  names ``resume=True`` as the way to continue a matching partial run.
+
 - **Streaming matrix classmethods**: ``TravelCostMatrix.to_parquet``
   and ``TravelTimeMatrix.to_parquet`` stream the matrix computers'
   results to disk with the constructors' semantics — transit and
@@ -13,8 +30,9 @@
   whole constructor frame; street geometries stream as plain WKB
   binary. The constructors are unchanged; ``street_policy`` matrices
   do not stream yet and are rejected. The recorded fingerprint version
-  is now 2 (the producing operation and enlarged parameter sets join
-  the hashed material).
+  rose to 2 with this change (the producing operation and enlarged
+  parameter sets join the hashed material); the resumability entry
+  above supersedes it with version 3.
 
 - **Streaming `travel_cost_table`**: ``output=`` streams the matrix to
   disk in origin batches (``batch_size=``, default 500) instead of
@@ -27,8 +45,8 @@
   with ``from_id``/``to_id`` dictionary-encoded over shared domains in
   every batch; peak memory holds one batch. Returns the new
   ``cafein.StreamingResult`` record. ``chunk=`` composes with
-  ``output=``; ``resume=`` is reserved (rejected until the
-  resumability release).
+  ``output=``; ``resume=True`` continues an interrupted directory run
+  (the entry above).
 
 - **OD zone surfaces** (``cafein.zones``): ``square_grid(area,
   cell_size, crs=None)`` lays lattice-snapped square cells of

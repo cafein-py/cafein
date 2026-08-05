@@ -26,8 +26,9 @@ if False:  # noqa: SIM108 — typing-only import; pyarrow stays optional
 #: so fingerprints from other implementation versions can never match.
 #: 2: candidates/bucket join the transit parameters; the matrix
 #: classmethods' operations and street/time parameter sets arrive.
-FINGERPRINT_VERSION = 2
-MANIFEST_FORMAT = 1
+#: 3: the network digest becomes the artifact content checksum.
+FINGERPRINT_VERSION = 3
+MANIFEST_FORMAT = 2
 MANIFEST_NAME = "manifest.json"
 DEFAULT_BATCH_SIZE = 500
 
@@ -62,16 +63,23 @@ class StreamingResult:
     manifest: dict | None
 
 
-def resolve_output(output):
+def resolve_output(output, resume=False):
     """The ``(mode, path)`` a streaming run writes to, by the suffix rule.
 
     A path whose final component ends in ``.parquet``
     (case-insensitive) is the single-file form, any other path the
-    directory form. Existing targets are refused — a single file is
-    never overwritten, and a directory must be empty.
+    directory form. Fresh targets are refused when occupied — a single
+    file is never overwritten, and a directory must be empty. With
+    ``resume=True`` (directory form only) the directory must exist and
+    hold a run to continue; `prepare_resume` validates it.
     """
     path = pathlib.Path(output)
     if path.name.lower().endswith(".parquet"):
+        if resume:
+            raise ValueError(
+                "resume=True applies to the directory form; a single "
+                ".parquet file carries no manifest to continue from"
+            )
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
             raise FileExistsError(
@@ -91,6 +99,13 @@ def resolve_output(output):
             ) from None
         os.close(fd)
         return "file", path
+    if resume:
+        if not path.is_dir():
+            raise ValueError(
+                f"nothing to resume at {path}: the output directory of a "
+                "partial run must exist"
+            )
+        return "directory", path
     if path.exists():
         if not path.is_dir():
             raise ValueError(
@@ -100,7 +115,8 @@ def resolve_output(output):
         if any(path.iterdir()):
             raise ValueError(
                 f"output directory {path} is not empty; refusing to write "
-                "beside existing contents"
+                "beside existing contents (a matching partial run "
+                "continues with resume=True)"
             )
     else:
         path.mkdir(parents=True)
@@ -108,16 +124,23 @@ def resolve_output(output):
 
 
 def network_digest(network):
-    """A deterministic identity proxy for the routed network.
+    """A deterministic identity for the routed network.
 
-    Hashes the public stop and route tables and the trip count. This is
-    an identity heuristic, not a content checksum: the artifact
-    container's checksum is not exposed for in-memory builds, so two
-    networks differing only in state outside these tables (timetables,
-    transfers, street data) hash alike — the fingerprint still refuses
-    the common mixups (different feeds, different extracts).
+    The core exposes ``_artifact_checksum``: a network loaded from an
+    artifact hashes the **file** (stable across processes — the
+    identity that lets one HPC job resume another's run over a shared
+    artifact), while an in-memory build or a mutated network digests
+    the content it would save (strong, but process-local: resume such
+    a run from the process that started it, or save and load the
+    artifact). The structural summaries below remain as a fallback for
+    cores without the getter.
     """
     state = hashlib.sha256()
+    core = getattr(network, "_core", None)
+    checksum = getattr(core, "_artifact_checksum", None)
+    if checksum is not None:
+        state.update(repr(("artifact", checksum())).encode())
+        return state.hexdigest()
     if not hasattr(network, "stops"):
         # A standalone street network: counts, extent, and elevation
         # provenance stand in the same heuristic way.
@@ -133,7 +156,6 @@ def network_digest(network):
     for route in network.routes:
         state.update(repr(route).encode())
     state.update(repr(network.trip_count).encode())
-    core = getattr(network, "_core", None)
     for extra in ("_multimodal_checksum", "has_walking_hierarchy"):
         state.update(repr(getattr(core, extra, None)).encode())
     return state.hexdigest()
@@ -191,6 +213,157 @@ def _canonical(value):
     raise TypeError(f"cannot fingerprint a {type(value).__name__}")
 
 
+def prepare_resume(path, fingerprint, size, count):
+    """The stored manifest and completed batch indices of the run to
+    continue — validated against the resuming query, never trusted
+    blindly.
+
+    The manifest fingerprint must match the query's exactly (``resume``
+    and the output location are outside it; everything result-affecting
+    including ``chunk`` and ``batch_size`` is inside). The directory is
+    claimed exclusively for the resume, stale temporaries are removed,
+    and a part file without a completion marker — a run killed between
+    the shard rename and its manifest update — is dropped so its batch
+    recomputes.
+    """
+    target = path / MANIFEST_NAME
+    # The exclusive claim comes before anything is read: a validation
+    # snapshot taken outside the claim could otherwise be acted on
+    # after another resume already finished, destroying its shards.
+    claim_run(path)
+    try:
+        return _validate_resume(path, target, fingerprint, size, count)
+    except BaseException:
+        _cleanup(path / "run.claim")
+        raise
+
+
+def _validate_resume(path, target, fingerprint, size, count):
+    if not target.exists():
+        raise ValueError(
+            f"nothing to resume at {path}: no manifest.json (only "
+            "directory-form streaming runs can be resumed)"
+        )
+    try:
+        manifest = json.loads(target.read_text())
+    except ValueError:
+        raise ValueError(
+            f"the manifest at {target} is not valid JSON; the run cannot "
+            "be resumed — remove the directory and rerun"
+        ) from None
+    if manifest.get("fingerprint_version") != FINGERPRINT_VERSION:
+        raise ValueError(
+            "the manifest was written by fingerprint version "
+            f"{manifest.get('fingerprint_version')}, this cafein uses "
+            f"{FINGERPRINT_VERSION}; rerun instead of resuming"
+        )
+    if manifest.get("fingerprint") != fingerprint:
+        raise ValueError(
+            f"the manifest at {target} records a different query "
+            "fingerprint; resuming requires the exact original inputs "
+            "and parameters (including chunk and batch_size)"
+        )
+    if manifest.get("format") != MANIFEST_FORMAT:
+        raise ValueError(
+            f"the manifest at {target} has format "
+            f"{manifest.get('format')}, this cafein writes "
+            f"{MANIFEST_FORMAT}; rerun instead of resuming"
+        )
+    # Completed shard descriptors are validated, never trusted: the
+    # canonical name pins each entry inside the directory, the origin
+    # slice must match the current batch plan, and the published file
+    # must exist with exactly the recorded rows.
+    import pyarrow.parquet
+
+    batches = max(1, -(-count // size))
+    shards = [shard for shard in manifest["shards"] if shard["completed"]]
+    seen = set()
+    for shard in shards:
+        index = shard["index"]
+        if not isinstance(index, int) or not 0 <= index < batches or index in seen:
+            raise ValueError(
+                f"the manifest at {target} records shard index {index!r} "
+                "outside the query's batch plan; the run cannot be resumed"
+            )
+        seen.add(index)
+        expected_name = f"part-{index:05d}.parquet"
+        if shard["file"] != expected_name:
+            raise ValueError(
+                f"the manifest at {target} names shard {index} "
+                f"{shard['file']!r} instead of {expected_name!r}; the run "
+                "cannot be resumed"
+            )
+        if shard["origin_start"] != index * size or shard["origin_stop"] != min(
+            (index + 1) * size, count
+        ):
+            raise ValueError(
+                f"the manifest at {target} records an origin slice for "
+                f"shard {index} that does not match the batch plan; the "
+                "run cannot be resumed"
+            )
+        part = path / expected_name
+        if part.is_symlink() or not part.is_file():
+            raise ValueError(
+                f"completed shard {expected_name} is missing or not a "
+                f"regular file in {path}; the run cannot be resumed"
+            )
+        published = pyarrow.parquet.ParquetFile(part)
+        if published.metadata.num_rows != shard["rows"]:
+            raise ValueError(
+                f"completed shard {expected_name} holds different rows "
+                "than the manifest records; the run cannot be resumed"
+            )
+        digest = hashlib.sha256(
+            published.schema_arrow.serialize().to_pybytes()
+        ).hexdigest()
+        if digest != manifest.get("schema_digest"):
+            raise ValueError(
+                f"completed shard {expected_name} holds a different schema "
+                "than the manifest records; the run cannot be resumed"
+            )
+        if _file_sha256(part) != shard.get("sha256"):
+            raise ValueError(
+                f"completed shard {expected_name} holds different content "
+                "than the manifest records; the run cannot be resumed"
+            )
+    for stray in path.glob("*.tmp"):
+        _cleanup(stray)
+    manifest["shards"] = shards
+    known = {shard["file"] for shard in shards}
+    # Only a canonical name for an in-plan incomplete batch can be a
+    # crash leftover; anything else in the directory is not this run's
+    # to delete.
+    expected = {f"part-{index:05d}.parquet" for index in range(batches)}
+    for part in path.glob("part-*.parquet"):
+        if part.name in known:
+            continue
+        if part.name in expected:
+            _cleanup(part)
+        else:
+            raise ValueError(
+                f"unexpected file {part.name} in the output directory; "
+                "refusing to resume beside contents this run did not write"
+            )
+    return manifest, seen
+
+
+def claim_run(path):
+    """The one directory-wide exclusive claim every run — fresh or
+    resumed — holds from before its first write until its last: two
+    jobs can never interleave shards or manifests. A run killed while
+    holding it leaves the claim behind; the error names the file so a
+    stale claim can be removed after the death is confirmed."""
+    try:
+        fd = os.open(path / "run.claim", os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise FileExistsError(
+            f"{path} is claimed by another running job (run.claim "
+            "exists); wait for it, or remove the stale claim of a dead "
+            "one"
+        ) from None
+    os.close(fd)
+
+
 def write_manifest(directory, manifest, claim=False):
     """Atomically publish ``manifest.json``.
 
@@ -218,13 +391,15 @@ def write_manifest(directory, manifest, claim=False):
     os.replace(temporary, target)
 
 
-def write_stream(mode, path, batches, manifest_seed, dictionaries):
+def write_stream(mode, path, batches, manifest_seed, dictionaries, manifest=None):
     """Drain ``batches`` into ``path`` and return the `StreamingResult`.
 
     ``batches`` yields ``(index, origin_start, origin_stop, table)``;
     the writer holds one table at a time. ``dictionaries`` maps
     dictionary column names to their shared domain arrays — every batch
-    must carry exactly those domains.
+    must carry exactly those domains. A ``manifest`` from
+    `prepare_resume` continues that run (directory form): its completed
+    shards stay untouched and only the remaining batches arrive here.
     """
     import pyarrow.parquet
 
@@ -270,39 +445,80 @@ def write_stream(mode, path, batches, manifest_seed, dictionaries):
             raise
         _cleanup(temporary, claim_path(path))
         return StreamingResult(path, "file", rows, batches_written, schema, None)
-    manifest = dict(manifest_seed)
-    manifest["format"] = MANIFEST_FORMAT
-    manifest["shards"] = []
-    write_manifest(path, manifest, claim=True)
-    for index, start, stop, table in batches:
-        if schema is None:
-            schema = table.schema
-            manifest["schema_digest"] = hashlib.sha256(
-                schema.serialize().to_pybytes()
-            ).hexdigest()
-        _check_batch(table, schema, dictionaries)
-        shard = f"part-{index:05d}.parquet"
-        descriptor, temporary = tempfile.mkstemp(dir=path, suffix=".tmp")
-        with os.fdopen(descriptor, "wb") as stream:
-            pyarrow.parquet.write_table(
-                table, stream, row_group_size=max(table.num_rows, 1)
+    if manifest is None:
+        claim_run(path)
+        try:
+            manifest = dict(manifest_seed)
+            manifest["format"] = MANIFEST_FORMAT
+            manifest["shards"] = []
+            write_manifest(path, manifest, claim=True)
+        except BaseException:
+            _cleanup(path / "run.claim")
+            raise
+    try:
+        # The claim holds through the LAST write: schema recovery, the
+        # final sort, and the closing manifest publication included.
+        for index, start, stop, table in batches:
+            if schema is None:
+                schema = table.schema
+                digest = hashlib.sha256(schema.serialize().to_pybytes()).hexdigest()
+                if manifest.get("schema_digest", digest) != digest:
+                    raise ValueError(
+                        "the resumed run's schema differs from the "
+                        "manifest's schema digest; resuming requires the "
+                        "exact original query"
+                    )
+                manifest["schema_digest"] = digest
+            _check_batch(table, schema, dictionaries)
+            shard = f"part-{index:05d}.parquet"
+            descriptor, temporary = tempfile.mkstemp(dir=path, suffix=".tmp")
+            with os.fdopen(descriptor, "wb") as stream:
+                pyarrow.parquet.write_table(
+                    table, stream, row_group_size=max(table.num_rows, 1)
+                )
+            os.replace(temporary, path / shard)
+            manifest["shards"].append(
+                {
+                    "index": index,
+                    "file": shard,
+                    "origin_start": start,
+                    "origin_stop": stop,
+                    "rows": table.num_rows,
+                    # The published bytes, hashed so a resume can prove a
+                    # completed shard is still this run's exact output.
+                    "sha256": _file_sha256(path / shard),
+                    "completed": True,
+                }
             )
-        os.replace(temporary, path / shard)
-        manifest["shards"].append(
-            {
-                "index": index,
-                "file": shard,
-                "origin_start": start,
-                "origin_stop": stop,
-                "rows": table.num_rows,
-                "completed": True,
-            }
-        )
+            write_manifest(path, manifest)
+            table = None
+        if schema is None and manifest["shards"]:
+            # Every batch was already complete: the schema comes from the
+            # published shards — and must still match the recorded digest.
+            schema = pyarrow.parquet.read_schema(path / manifest["shards"][0]["file"])
+            digest = hashlib.sha256(schema.serialize().to_pybytes()).hexdigest()
+            if manifest.get("schema_digest", digest) != digest:
+                raise ValueError(
+                    "the completed shards' schema differs from the manifest's "
+                    "schema digest; the output cannot be trusted as this "
+                    "query's"
+                )
+        manifest["shards"].sort(key=lambda shard: shard["index"])
         write_manifest(path, manifest)
-        rows += table.num_rows
-        batches_written += 1
-        table = None
+    finally:
+        _cleanup(path / "run.claim")
+    rows = sum(shard["rows"] for shard in manifest["shards"])
+    batches_written = len(manifest["shards"])
     return StreamingResult(path, "directory", rows, batches_written, schema, manifest)
+
+
+def _file_sha256(path):
+    """A published file's streamed content hash."""
+    state = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            state.update(chunk)
+    return state.hexdigest()
 
 
 def claim_path(path):
