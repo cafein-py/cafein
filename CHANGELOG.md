@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- The distance ladder's **member-way stitcher** (`cafein._stitch`,
+  tier-3 groundwork): a route relation's way members become one
+  LineString — relation order leads, adjacency disambiguates shuffles
+  (continuing only on a unique candidate), reversed segments and
+  sub-tolerance stubs orient automatically, and closed rings splice in
+  under the verified-direction rule (``junction=roundabout/circular``
+  or ``oneway=yes``; stored-vertex-order arcs between the entry and
+  exit touch points). Anything ambiguous or broken refuses with a
+  reason code (``gap``, ``branching``, ``ring-direction``,
+  ``ring-touch``, ``unresolved-member``) instead of repairing — the
+  ladder's fallthrough handles it. On the committed transit fixture,
+  20 of Helsinki's 22 tram relations stitch; the two refusals are
+  honest gaps, and the gap defect fixture refuses as designed.
+
 - Groundwork for the distance ladder's **OSM tiers** (§18): route
   relations extract through pyrosm (``complete_relations=True``) with
   ordered members, roles, member-way geometries, and the way tags the
