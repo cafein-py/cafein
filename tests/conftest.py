@@ -34,6 +34,23 @@ def kantakaupunki_pbf():
 
 
 @pytest.fixture(scope="session")
+def helsinki_metro_pbf():
+    """The Helsinki metropolitan OSM clip (route relations included).
+
+    Generated locally by ``scripts/generate_osm_tier_fixtures.py`` from
+    the pinned Geofabrik snapshot; not fetched or hosted, so tests that
+    need it skip when it is absent.
+    """
+    path = pathlib.Path(__file__).parent / "data" / "helsinki-metro.osm.pbf"
+    if not path.exists():
+        pytest.skip(
+            "helsinki-metro.osm.pbf not generated "
+            "(scripts/generate_osm_tier_fixtures.py)"
+        )
+    return path
+
+
+@pytest.fixture(scope="session")
 def fares_poa():
     """Path to r5r's saved Porto Alegre fare structure."""
     return _data_file("fares_poa.zip")
