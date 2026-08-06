@@ -28,6 +28,31 @@ GAP_TOLERANCE_METERS = 10.0
 #: Ring ways with these tag values travel in stored-vertex order.
 _RING_DIRECTED = {"junction": ("roundabout", "circular"), "oneway": ("yes",)}
 
+#: Highway values that imply ``oneway=yes`` when untagged.
+_IMPLIED_ONEWAY_HIGHWAYS = ("motorway", "motorway_link")
+
+
+def effective_direction(tags):
+    """A way's legal travel direction from its tags: ``1`` stored
+    order only, ``-1`` reversed order only, ``0`` both, ``None`` for
+    an unrecognised ``oneway`` value. Covers explicit ``oneway``,
+    roundabout/circular junctions, and OSM's implied one-way motorway
+    semantics."""
+    oneway = tags.get("oneway")
+    if oneway in ("no", "false", "0"):
+        return 0
+    if oneway in ("yes", "true", "1"):
+        return 1
+    if oneway in ("-1", "reverse"):
+        return -1
+    if oneway is None:
+        if tags.get("junction") in _RING_DIRECTED["junction"]:
+            return 1
+        if tags.get("highway") in _IMPLIED_ONEWAY_HIGHWAYS:
+            return 1
+        return 0
+    return None
+
 
 class StitchRefusal(ValueError):
     """The relation cannot be stitched; ``reason`` says why.
@@ -38,7 +63,8 @@ class StitchRefusal(ValueError):
     continuation within tolerance), ``branching`` (more than one
     continuation candidate), ``ring-direction`` (a closed ring without
     verified one-way travel), ``ring-touch`` (a ring whose entry or
-    exit cannot be placed).
+    exit cannot be placed), ``member-direction`` (the chain traverses
+    a one-way member against its legal direction).
     """
 
     def __init__(self, reason, detail=""):
@@ -85,7 +111,10 @@ def stitch(members, gap_tolerance=GAP_TOLERANCE_METERS):
             )
         segments.append(
             _Segment(
-                coordinates[:-1] if closed else coordinates, dict(member.tags), closed
+                coordinates[:-1] if closed else coordinates,
+                dict(member.tags),
+                closed,
+                getattr(member, "id", None),
             )
         )
     if not segments:
@@ -95,12 +124,13 @@ def stitch(members, gap_tolerance=GAP_TOLERANCE_METERS):
 
 
 class _Segment:
-    __slots__ = ("coordinates", "tags", "ring")
+    __slots__ = ("coordinates", "tags", "ring", "id")
 
-    def __init__(self, coordinates, tags, ring):
+    def __init__(self, coordinates, tags, ring, identifier=None):
         self.coordinates = coordinates
         self.tags = tags
         self.ring = ring
+        self.id = identifier
 
 
 def _walk(segments, tolerance):
@@ -120,6 +150,7 @@ def _walk(segments, tolerance):
     used = {first}
     remaining = [index for index in order if index != first]
     coordinates = list(seed.coordinates)
+    seed_reversed = False
     if remaining:
         # Orient the seed against the NEXT relation member when that
         # decides a unique direction (relation order is the travel
@@ -129,13 +160,19 @@ def _walk(segments, tolerance):
         backward = _connectable(coordinates[0], ordered_next, tolerance)
         if backward and not forward:
             coordinates.reverse()
+            seed_reversed = True
         elif not forward and not backward:
             others = [segments[index] for index in remaining]
             if not _connectable(coordinates[-1], others, tolerance) and _connectable(
                 coordinates[0], others, tolerance
             ):
                 coordinates.reverse()
+                seed_reversed = True
     parts = [coordinates]
+    # Per-part traversal record: (segment, reversed). Ring arcs enter
+    # in verified direction (reversed=False); a later global flip may
+    # still reverse them, which direction validation refuses.
+    traversal = [(seed, seed_reversed)]
     end = coordinates[-1]
     flipped = False
     while remaining:
@@ -146,15 +183,53 @@ def _walk(segments, tolerance):
                 # the chain's other terminus before calling it a gap.
                 flipped = True
                 parts = [list(reversed(part)) for part in reversed(parts)]
+                traversal = [
+                    (segment, not was_reversed)
+                    for segment, was_reversed in reversed(traversal)
+                ]
                 end = parts[-1][-1]
                 continue
             raise StitchRefusal("gap", "no continuation within tolerance")
-        index, part, new_end = step
+        index, part, new_end, reversed_part = step
         parts.append(part)
+        traversal.append(
+            (segments[index], False if reversed_part is None else reversed_part)
+        )
         used.add(index)
         remaining.remove(index)
         end = new_end
+    _check_directions(traversal)
     return parts
+
+
+def _check_directions(traversal):
+    """Refuse a chain that traverses any one-way member against its
+    legal direction (``junction=roundabout/circular`` implies stored
+    order; ``oneway=-1``/``reverse`` demands the reverse). A ring arc
+    entered the chain in its verified direction — it only violates
+    when the interior-seed flip reversed it afterwards."""
+    for segment, was_reversed in traversal:
+        if segment.ring:
+            if was_reversed:
+                raise StitchRefusal(
+                    "ring-direction",
+                    f"chain growth reversed the ring arc of way {segment.id}",
+                )
+            continue
+        direction = effective_direction(segment.tags)
+        if direction == 0:
+            continue
+        if direction is None:
+            raise StitchRefusal(
+                "member-direction",
+                "unrecognised oneway "
+                f"{segment.tags.get('oneway')!r} on way {segment.id}",
+            )
+        if (direction == 1) == bool(was_reversed):
+            raise StitchRefusal(
+                "member-direction",
+                f"way {segment.id} traversed against its oneway",
+            )
 
 
 def _next_step(end, segments, remaining, tolerance):
@@ -177,7 +252,10 @@ def _next_step(end, segments, remaining, tolerance):
 
 
 def _connect(end, segment, segments, remaining, tolerance):
-    """``(part, new_end)`` when ``segment`` continues from ``end``."""
+    """``(part, new_end, reversed)`` when ``segment`` continues from
+    ``end`` — ``reversed`` tells whether the part runs against the
+    stored coordinates, with ``None`` marking a ring arc (its
+    direction is verified by the ring rule)."""
     if segment.ring:
         return _connect_ring(end, segment, segments, remaining, tolerance)
     from_start = _meters(end, segment.coordinates[0])
@@ -188,22 +266,22 @@ def _connect(end, segment, segments, remaining, tolerance):
     # (crossover track pieces): the closer end wins — a mis-orientation
     # there distorts by less than the tolerance itself.
     if from_start <= from_end:
-        return segment.coordinates, segment.coordinates[-1]
+        return segment.coordinates, segment.coordinates[-1], False
     reversed_part = list(reversed(segment.coordinates))
-    return reversed_part, reversed_part[-1]
+    return reversed_part, reversed_part[-1], True
 
 
 def _connect_ring(end, segment, segments, remaining, tolerance):
     """The ring rule: verified direction, entry at the chain end, exit
     toward the next connectable neighbour, arc in stored order."""
     oneway = segment.tags.get("oneway")
-    junction = segment.tags.get("junction") in _RING_DIRECTED["junction"]
     if oneway in ("no", "false", "0"):
         raise StitchRefusal("ring-direction", "explicitly bidirectional ring")
-    if oneway in ("-1", "reverse"):
+    direction = effective_direction(segment.tags)
+    if direction == -1:
         # Legal reversed one-way: travel runs against stored order.
         ring = list(reversed(segment.coordinates))
-    elif oneway in ("yes", "true", "1") or (oneway is None and junction):
+    elif direction == 1:
         ring = segment.coordinates
     else:
         raise StitchRefusal(
@@ -244,7 +322,7 @@ def _connect_ring(end, segment, segments, remaining, tolerance):
         )
     exit_ = exits[0]
     arc = _arc(ring, entry, exit_)
-    return arc, arc[-1]
+    return arc, arc[-1], None
 
 
 def _arc(ring, start, stop):
