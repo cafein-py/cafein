@@ -198,6 +198,15 @@ def test_missing_variant_drops_the_relation(transit_relations):
     assert len(remaining) == len(transit_relations) - 1
 
 
+def test_rail_ways_carry_node_identities():
+    ways = _relations.rail_ways(str(TRANSIT))
+    assert len(ways) > 100
+    for refs, lons, lats, railway, _oneway in ways[:50]:
+        assert railway in ("tram", "light_rail", "subway", "rail")
+        assert len(refs) == len(lons) == len(lats) >= 2
+        assert refs.dtype.kind == "i"
+
+
 def test_rail_network_extraction():
     rails = _relations.rail_network(str(TRANSIT))
     assert len(rails)
@@ -236,6 +245,12 @@ def test_service_exclusion_actually_filters():
     filtered = _relations._service_filtered(frame)
     assert list(filtered["id"]) == [2, 3]
     assert "service" in filtered.columns and "oneway" in filtered.columns
+
+
+def test_rail_ways_on_railless_extract(kantakaupunki_pbf):
+    # An extract with streets but no rails (and no PT relations): the
+    # node-identity reader returns empty without touching relations.
+    assert _relations.rail_ways(str(kantakaupunki_pbf)) == []
 
 
 def test_rail_network_on_railless_extract(kantakaupunki_pbf):

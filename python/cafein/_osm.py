@@ -485,6 +485,188 @@ def edge_permissions(edges):
     return forward, reverse, flags, diagnostics
 
 
+# --- Bus permissions (tier-4 preprocessing surface) ---------------------------
+
+# The bus-drivable graph is preprocessing-only: it feeds the distance
+# ladder's map-matching tier, never a routable street mode. Bus
+# permissions resolve per candidate way down the full PSV hierarchy —
+# never as a union with the car set: buses gain car-forbidden ways
+# (bus-only streets, busways, guided busways) and lose car-drivable
+# ways tagged ``bus=no``/``psv=no``.
+
+_BUS_HIGHWAYS = frozenset({"busway", "bus_guideway"})
+"""Highway classes that are bus-drivable by definition."""
+
+_UNBUSABLE_FILTER = {
+    "area": ["yes", "true", "1"],
+    "highway": [
+        "abandoned",
+        "construction",
+        "no",
+        "planned",
+        "platform",
+        "proposed",
+        "raceway",
+        "razed",
+        "rest_area",
+        "services",
+        "bridleway",
+        "corridor",
+        "cycleway",
+        "elevator",
+        "escalator",
+        "steps",
+    ],
+}
+"""The exclusion filter for the bus-graph extraction: pyrosm's
+driving+service highway exclusions with ``bus_guideway`` retained,
+WITHOUT pyrosm's access/motor_vehicle exclusions (an
+``access=no`` + ``bus=yes`` street must reach the permission
+resolver, not vanish at extraction), and WITHOUT the
+footway/pedestrian/path/track classes — pedestrianised transit
+streets carry explicit ``bus=``/``psv=`` grants that only the
+permission chain can honour; untagged ways of those classes are
+denied there instead."""
+
+
+def _bus_permission(bus_default, access, vehicle, motor_vehicle, psv, bus):
+    """Bus permission resolved down the OSM access hierarchy
+    (type default → ``access`` → ``vehicle`` → ``motor_vehicle`` →
+    ``psv`` → ``bus``), and whether an unknown value was seen.
+
+    The same precedence semantics as the car chain, with two
+    bus-specific twists: ``psv`` and ``bus`` are MORE specific than the
+    motor-vehicle chain and may grant ways the highway type denies to
+    general traffic (the bus-only street: ``access=no`` + ``bus=yes``),
+    and the most-specific ``bus=`` overrides freely.
+    """
+    allowed = bus_default
+    unknown = False
+    for value in (access, vehicle, motor_vehicle):
+        if value is None:
+            continue
+        if value in _DENIED_ACCESS:
+            allowed = False
+        elif value in _ALLOWED_ACCESS:
+            allowed = bus_default
+        else:
+            unknown = True
+    for value in (psv, bus):
+        if value is None:
+            continue
+        if value in _ALLOWED_ACCESS:
+            allowed = True
+        elif value in _DENIED_ACCESS:
+            allowed = False
+        else:
+            unknown = True
+    return allowed, unknown
+
+
+def bus_permissions(edges):
+    """Per-edge ``(forward, reverse)`` bus drivability, and diagnostics.
+
+    ``edges`` is a pyrosm network frame (tags as columns). The forward
+    direction runs along the stored geometry. Buses follow the base
+    ``oneway`` strictly, with only the explicit ``oneway:bus=`` /
+    ``oneway:psv=`` exemptions honoured — contraflow bus-lane
+    inference from ``busway:*`` tags is deliberately out of scope, so
+    a missing exemption merely costs a detour, never legality.
+    """
+    columns = {
+        tag: _column(edges, tag)
+        for tag in (
+            "highway",
+            "access",
+            "vehicle",
+            "motor_vehicle",
+            "psv",
+            "bus",
+            "oneway",
+            "oneway:bus",
+            "oneway:psv",
+            "junction",
+        )
+    }
+    n = len(edges)
+    forward = np.zeros(n, dtype=bool)
+    reverse = np.zeros(n, dtype=bool)
+    unknown_access = 0
+    unknown_highway = 0
+    for i in range(n):
+        highway = columns["highway"][i]
+        if highway in _BUS_HIGHWAYS:
+            bus_default = True
+        elif highway == "track":
+            # Cars default onto tracks; buses never do without an
+            # explicit grant.
+            bus_default = False
+        elif highway in HIGHWAY_DEFAULTS:
+            bus_default = HIGHWAY_DEFAULTS[highway][2]
+        else:
+            bus_default = False
+            unknown_highway += int(highway is not None)
+        allowed, unknown = _bus_permission(
+            bus_default,
+            columns["access"][i],
+            columns["vehicle"][i],
+            columns["motor_vehicle"][i],
+            columns["psv"][i],
+            columns["bus"][i],
+        )
+        unknown_access += int(unknown)
+        if not allowed:
+            continue
+        oneway = columns["oneway"][i]
+        forced = (
+            columns["junction"][i] == "roundabout" or highway == "motorway"
+        ) and oneway not in _FALSE_ONEWAY
+        reversed_oneway = oneway == "-1"
+        is_oneway = oneway in ("yes", "true", "1") or reversed_oneway or forced
+        forward[i] = not (is_oneway and reversed_oneway)
+        reverse[i] = not (is_oneway and not reversed_oneway)
+        exemption = columns["oneway:bus"][i]
+        if exemption is None:
+            exemption = columns["oneway:psv"][i]
+        if exemption in _FALSE_ONEWAY:
+            forward[i] = reverse[i] = True
+        elif exemption in ("yes", "true", "1"):
+            forward[i], reverse[i] = True, False
+        elif exemption == "-1":
+            forward[i], reverse[i] = False, True
+    diagnostics = {
+        "unknown_access": unknown_access,
+        "unknown_highway": unknown_highway,
+    }
+    return forward, reverse, diagnostics
+
+
+_BARRIER_MOTOR_PERVIOUS = frozenset(
+    {"cattle_grid", "toll_booth", "border_control", "entrance"}
+)
+"""Barrier types motor traffic passes freely by default. Everything
+else — gates, bollards, and every unrecognised type — blocks unless an
+explicit allow opens it: over-blocking only drops a pattern to the
+next ladder tier, while under-blocking would legalise a wrong path."""
+
+
+def bus_barrier_blocks(barrier, tags):
+    """Whether a barrier node splits the bus graph.
+
+    The most specific present access value among ``bus`` → ``psv`` →
+    ``motor_vehicle`` → ``vehicle`` → ``access`` decides: an explicit
+    allow opens the barrier, anything else (including an explicit
+    deny) blocks; with no access tags, only the motor-pervious barrier
+    types pass.
+    """
+    for key in ("bus", "psv", "motor_vehicle", "vehicle", "access"):
+        value = tags.get(key)
+        if value is None:
+            continue
+        return value not in _ALLOWED_ACCESS
+    return barrier not in _BARRIER_MOTOR_PERVIOUS
+
+
 # --- Car speeds ---------------------------------------------------------------
 
 _MPH_TO_KMH = 1.609344

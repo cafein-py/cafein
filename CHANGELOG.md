@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- The distance ladder's **`map_matched` tier (tier 4)**: patterns the
+  relation tier cannot resolve fall through to stop-to-stop shortest
+  paths on a dedicated mode graph, under the same `osm_tiers=` opt-in
+  (off by default). Rail families (tram, subway, train) route over
+  directed track graphs from the rail-way extraction; buses and
+  trolleybuses over a **bus-drivable street graph** resolved per way
+  through the full PSV access hierarchy
+  (`access → vehicle → motor_vehicle → psv → bus`) — never the car
+  set: bus-only streets (`access=no` + `bus=yes`), `highway=busway`,
+  and guided busways come in, `bus=no`/`psv=no` ways drop out, and
+  the graph is **split conservatively at every barrier node** (gates,
+  bollards, unknown types) whose bus access is not an explicit allow.
+  Matching snaps each stop to its nearby candidate vertices and picks
+  one consistent vertex chain minimising total path length (parallel
+  per-direction tracks make the single nearest vertex wrong for
+  roughly half the stops), with Dijkstra runs grouped by source,
+  search balls bounded by the detour limit, and per-segment gates —
+  provisional 1.5× (rail) / 2.0× (bus) of the segment crow-fly,
+  calibrated by the validation sweep. Ferries structurally skip
+  tier 4 (open water has no meaningful graph; their tier-3 miss falls
+  to crow-fly) — and **so do buses and trolleybuses for now**: the
+  bus pass measured in an isolated process against the plan's budget
+  on the Helsinki metropolitan extract
+  (``scripts/measure_bus_tier4.py``, the ``finland-220101`` clip) —
+  street read + PSV graph build (1.32 M vertices, 2.59 M directed
+  edges) + path resolution for all 873 deduplicated bus patterns,
+  resolving 568 — took **111 s (budget 600 s) but 4.14 GiB added peak
+  RSS against the 2 GiB gate** (the pyrosm street-network
+  materialisation dominates the peak), so bus patterns keep tier 3
+  and the ladder's fallthrough. The bus graph machinery and its tests land regardless,
+  and the gate reruns with the calibrated detour bound in the sweep. On the Helsinki fixture with shapes withheld and
+  trams opted in, the OSM tiers together resolve tram patterns at
+  ~1% (tier 3) and ~1.7% (tier 4) median length error against the
+  withheld ground truth.
+
 - The distance ladder's **`osm_relation` tier (tier 3)**: matched OSM
   route relations now produce per-trip distances and geometries when a
   feed's own shapes cannot. `cafein.geometry.trip_distances` gains

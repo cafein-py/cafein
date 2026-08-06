@@ -1,14 +1,12 @@
-"""Tier-3 resolution — matched OSM route relations as distance source.
+"""The OSM distance tiers — relation matching and map matching.
 
-`RelationLadder` owns the per-build OSM state: relations loaded once
-from the extract, stitched lines and canonical boarding positions
-cached per relation, and per-pattern match results with their
-diagnostics. `resolve` returns validated cumulative distances for one
-pattern or ``None`` — the caller falls through the ladder either way.
-Every accepted geometry passed the same gates as a tier-2 shape:
-denser than the stop sequence, every stop within snap tolerance,
-monotone linear referencing, and total length inside the plausibility
-band of the pattern's crow-fly length.
+`OsmLadder` owns the per-build OSM state: relations, stitched lines,
+canonical boarding positions, mode graphs, and per-pattern results
+with their diagnostics. `resolve` runs tier 3 (a matched route
+relation, validated with the same gates as a tier-2 shape) and falls
+through to tier 4 (stop-to-stop shortest paths on the mode graph,
+gated per segment by the detour bound; ferries have no graph and skip
+it) — or returns ``None`` and the caller drops to crow-fly.
 """
 
 import geopandas as gpd
@@ -16,16 +14,18 @@ import numpy as np
 import pyproj
 import shapely
 
-from cafein import _matching, _relations, _stitch
-from cafein.geometry import _locate_on_shape, _measures
+from cafein import _map_match, _matching, _relations, _stitch
+from cafein.geometry import MAP_MATCHED, OSM_RELATION, _locate_on_shape, _measures
 
 #: Stitched-length plausibility band against the pattern's crow-fly
 #: length — tier 1's band, applied to the linear-referenced total.
 LENGTH_RATIO = (0.8, 5.0)
 
+_UNSET = object()
 
-class RelationLadder:
-    """The tier-3 context for one `trip_distances` call.
+
+class OsmLadder:
+    """The OSM-tier context for one `trip_distances` call.
 
     Each pattern is projected in the UTM CRS estimated from its own
     stops (feeds and patterns need not share a zone); projected caches
@@ -45,6 +45,10 @@ class RelationLadder:
         self._canonical = {}
         self._lines = {}
         self._resolved = {}
+        self._rail_ways = None
+        self._street_network = _UNSET
+        self._graphs = {}
+        self._matched = 0
         self.diagnostics = {}
 
     def begin_feed(self, feed):
@@ -53,26 +57,29 @@ class RelationLadder:
         self._feed = feed
 
     def resolve(self, route, route_type, stop_ids, latlon, crow_total):
-        """Validated tier-3 distances for one pattern, or ``None``.
+        """Validated OSM-tier distances for one pattern, or ``None``.
 
         ``route`` is ``(route_id, short_name, long_name, agency)``;
-        a hit returns ``(cumulative, relation_id, along)`` with the
-        stops' absolute positions along the stitched line in meters.
+        a hit returns ``(cumulative, identity, along, tier)`` with the
+        stops' absolute positions along the tier's line in meters and
+        ``tier`` the provenance (``osm_relation`` or ``map_matched``).
         """
         mode = _matching.mode_of(route_type)
         if mode is None or mode not in self._modes:
             return None
         key = (self._feed, route[0], tuple(stop_ids))
         if key not in self._resolved:
-            self._resolved[key] = self._resolve(
-                route, mode, stop_ids, latlon, crow_total
-            )
+            result = self._resolve(route, mode, stop_ids, latlon, crow_total)
+            if result is None:
+                result = self._map_matched(mode, stop_ids, latlon)
+            self._resolved[key] = result
         return self._resolved[key]
 
     def polyline(self, identity):
         """The ``(lons, lats, measures)`` payload of an accepted line;
-        ``identity`` is the ``(crs, relation_id, reversed)`` key a
-        resolution returned."""
+        ``identity`` is the opaque key a resolution returned — a
+        ``(crs, relation_id, reversed)`` triple for tier 3, a
+        ``("match", n)`` pair for tier 4."""
         projected, lons, lats = self._lines[identity]
         return lons, lats, _measures(projected)
 
@@ -115,6 +122,80 @@ class RelationLadder:
                 return result
         return None
 
+    def _map_matched(self, mode, stop_ids, latlon):
+        """Tier 4: consecutive-stop shortest paths on the mode graph.
+
+        Every stop must snap to candidate graph vertices and every
+        segment of the chosen chain stay inside the detour bound of
+        its crow-fly; the accepted segment paths concatenate into the
+        pattern geometry.
+        """
+        if not self._set_projection(latlon):
+            return None
+        graph = self._graph(mode)
+        if graph is None:
+            return None
+        stop_xy = self._project(latlon[:, 1], latlon[:, 0])
+        segments = _map_match.match_chain(graph, stop_xy)
+        if segments is None:
+            return None
+        chained = graph.chain([path for _, path in segments])
+        if chained is None:
+            return None
+        along = np.concatenate([[0.0], np.cumsum([length for length, _ in segments])])
+        identity = ("match", self._matched)
+        self._matched += 1
+        self._lines[identity] = chained
+        return along.tolist(), identity, along.tolist(), MAP_MATCHED
+
+    def _graph(self, mode):
+        """The mode's graph in the current CRS — ``None`` when the mode
+        has no tier-4 graph.
+
+        Ferries never have one (open water). Buses and trolleybuses
+        are **structurally excluded for now**: the measured bus pass
+        exceeds the plan's memory budget on the metro fixture
+        (4.14 GiB added peak RSS against the 2 GiB gate, timing well
+        inside its bound — ``scripts/measure_bus_tier4.py``), so bus
+        patterns keep tier 3 and the ladder's fallthrough; the gate
+        reruns with the calibrated detour bound in the validation
+        sweep.
+        """
+        if mode not in _map_match.RAIL_VALUES:
+            return None
+        key = ("rail", _map_match.RAIL_VALUES[mode], self._crs)
+        if key not in self._graphs:
+            if self._rail_ways is None:
+                self._rail_ways = _relations.rail_ways(self._pbf)
+            self._graphs[key] = _map_match.rail_graph(
+                self._rail_ways, self._project, key[1]
+            )
+        return self._graphs[key]
+
+    def _streets(self):
+        """The bus-candidate street network (nodes, edges), read once."""
+        if self._street_network is _UNSET:
+            import pyrosm
+
+            from cafein import _osm
+
+            osm = pyrosm.OSM(self._pbf, engine="out_of_core", workers="auto")
+            self._street_network = osm.get_network(
+                network_type="driving+service",
+                custom_filter=_osm._UNBUSABLE_FILTER,
+                filter_type="exclude",
+                nodes=True,
+                extra_attributes=[
+                    "psv",
+                    "bus",
+                    "vehicle",
+                    "motor_vehicle",
+                    "oneway:bus",
+                    "oneway:psv",
+                ],
+            )
+        return self._street_network
+
     def _validated(self, relation, reversed_, latlon, crow_total):
         """The tier-2-style gates over one oriented line: density,
         stop snap, monotonicity, length plausibility."""
@@ -133,7 +214,7 @@ class RelationLadder:
         if not LENGTH_RATIO[0] <= total / crow_total <= LENGTH_RATIO[1]:
             return None
         identity = (self._crs, relation.id, reversed_)
-        return (along - along[0]).tolist(), identity, along.tolist()
+        return (along - along[0]).tolist(), identity, along.tolist(), OSM_RELATION
 
     def _mode_relations(self, mode):
         if self._relations is None:

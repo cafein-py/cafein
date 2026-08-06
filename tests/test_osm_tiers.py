@@ -87,12 +87,18 @@ def tier3_run(withheld_feed, pattern_trips):
     return results, polylines, trip_rows
 
 
-def test_tram_patterns_resolve_at_tier_3(tier3_run, pattern_trips):
+def test_tram_patterns_resolve_at_the_osm_tiers(tier3_run, pattern_trips):
     results, _, _ = tier3_run
     tiers = {tier for _, _, tier in results}
-    assert tiers <= {geometry.OSM_RELATION, geometry.CROW_FLY}
+    assert tiers <= {
+        geometry.OSM_RELATION,
+        geometry.MAP_MATCHED,
+        geometry.CROW_FLY,
+    }
     resolved = [row for row in results if row[2] == geometry.OSM_RELATION]
     assert len(resolved) >= 10
+    matched = [row for row in results if row[2] == geometry.MAP_MATCHED]
+    assert len(matched) >= 10  # tier 4 catches tier-3 fallthroughs
     _, bus_trip = pattern_trips
     bus_tier = next(tier for trip, _, tier in results if trip == bus_trip)
     assert bus_tier == geometry.CROW_FLY  # tram-only enablement
@@ -176,8 +182,12 @@ def build_ladder(
         network=None,
         members=tuple(platforms + ways),
     )
-    ladder = _osm_tiers.RelationLadder("unused.osm.pbf", frozenset(modes))
+    ladder = _osm_tiers.OsmLadder("unused.osm.pbf", frozenset(modes))
     ladder._relations = [relation, *more]
+    # No tier-4 graph in the synthetic ladders: the injected empty
+    # way list keeps the fixture path from ever being read.
+    ladder._rail_ways = []
+    ladder._street_network = None
     return ladder
 
 
@@ -211,7 +221,8 @@ def test_reversed_relation_resolves_in_pattern_direction():
     latlon = np.asarray([[60.1, 24.930 - i * 0.010] for i in range(4)])
     resolved = resolve(ladder, latlon)
     assert resolved is not None
-    cumulative, identity, along = resolved
+    cumulative, identity, along, tier = resolved
+    assert tier == geometry.OSM_RELATION
     assert identity[1:] == (77, True)
     assert (np.diff(cumulative) > 0).all()
     lons, lats, measures = ladder.polyline(identity)
@@ -258,7 +269,7 @@ def test_bidirectional_way_stored_against_boarding_order_resolves():
     latlon = np.asarray([[60.1, 24.930 - i * 0.010] for i in range(4)])
     resolved = resolve(ladder, latlon)
     assert resolved is not None
-    cumulative, identity, along = resolved
+    cumulative, identity, along, tier = resolved
     assert identity[1:] == (77, True)
     assert (np.diff(cumulative) > 0).all()
 
@@ -357,6 +368,18 @@ def test_implausible_length_fails_the_ratio_gate():
     ladder = build_ladder(way_lines, platforms)
     latlon = np.asarray([[60.1, 24.900], [60.102, 24.900]])
     assert resolve(ladder, latlon, stop_ids=("a", "b")) is None
+
+
+def test_bus_and_ferry_skip_tier_4_structurally():
+    from cafein import _osm_tiers
+
+    ladder = _osm_tiers.OsmLadder(
+        "unused.osm.pbf", frozenset({"bus", "trolleybus", "ferry"})
+    )
+    ladder._crs = 32635
+    assert ladder._graph("bus") is None
+    assert ladder._graph("trolleybus") is None
+    assert ladder._graph("ferry") is None
 
 
 def test_disabled_tiers_change_nothing(withheld_feed, pattern_trips):
