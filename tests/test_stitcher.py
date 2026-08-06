@@ -303,6 +303,120 @@ def test_endpoint_touching_two_ring_arcs_refuses():
     assert refusal([close_approach, hairpin, far_exit]) == "ring-touch"
 
 
+def test_oneway_member_flipped_refuses():
+    # The middle member is stored against travel and tagged
+    # oneway=yes: orienting it into the chain would traverse it
+    # illegally — refuse, never repair.
+    flipped_oneway = [
+        CHAIN[0],
+        member(
+            list(reversed([P(2, 0), P(3, 0)])),
+            tags={"oneway": "yes"},
+            identifier=2,
+        ),
+        CHAIN[2],
+    ]
+    assert refusal(flipped_oneway) == "member-direction"
+
+
+def test_oneway_member_forward_stitches():
+    correct_oneway = [
+        CHAIN[0],
+        member([P(2, 0), P(3, 0)], tags={"oneway": "yes"}, identifier=2),
+        CHAIN[2],
+    ]
+    line = _stitch.stitch(correct_oneway)
+    assert line.coords[-1] == P(5, 0)
+
+
+def test_reverse_oneway_member_forward_refuses():
+    # oneway=-1 legally runs against stored order: traversing it in
+    # stored order is the violation.
+    forward_minus_one = [
+        CHAIN[0],
+        member([P(2, 0), P(3, 0)], tags={"oneway": "-1"}, identifier=2),
+        CHAIN[2],
+    ]
+    assert refusal(forward_minus_one) == "member-direction"
+    reversed_minus_one = [
+        CHAIN[0],
+        member(
+            list(reversed([P(2, 0), P(3, 0)])),
+            tags={"oneway": "-1"},
+            identifier=2,
+        ),
+        CHAIN[2],
+    ]
+    line = _stitch.stitch(reversed_minus_one)
+    assert line.coords[-1] == P(5, 0)
+
+
+def test_split_roundabout_arc_flipped_refuses():
+    # An open way tagged junction=roundabout (a split roundabout arc)
+    # implies stored-order travel.
+    flipped_arc = [
+        CHAIN[0],
+        member(
+            list(reversed([P(2, 0), P(3, 0)])),
+            tags={"junction": "roundabout"},
+            identifier=2,
+        ),
+        CHAIN[2],
+    ]
+    assert refusal(flipped_arc) == "member-direction"
+
+
+def test_unrecognised_oneway_open_member_refuses():
+    alternating = [
+        CHAIN[0],
+        member([P(2, 0), P(3, 0)], tags={"oneway": "alternating"}, identifier=2),
+        CHAIN[2],
+    ]
+    assert refusal(alternating) == "member-direction"
+
+
+def test_implied_motorway_oneway_refuses_flip():
+    # highway=motorway implies oneway=yes: a chain needing the member
+    # reversed refuses, while the forward traversal stitches; an
+    # explicit oneway=no override restores reversibility.
+    def motorway(tags):
+        return [
+            CHAIN[0],
+            member(list(reversed([P(2, 0), P(3, 0)])), tags=tags, identifier=2),
+            CHAIN[2],
+        ]
+
+    assert refusal(motorway({"highway": "motorway"})) == "member-direction"
+    assert refusal(motorway({"highway": "motorway_link"})) == "member-direction"
+    line = _stitch.stitch(motorway({"highway": "motorway", "oneway": "no"}))
+    assert line.coords[-1] == P(5, 0)
+    forward = [
+        CHAIN[0],
+        member([P(2, 0), P(3, 0)], tags={"highway": "motorway"}, identifier=2),
+        CHAIN[2],
+    ]
+    assert _stitch.stitch(forward).coords[-1] == P(5, 0)
+
+
+def test_flip_reversing_a_ring_arc_refuses():
+    # An interior seed grows through the roundabout first, dead-ends,
+    # and flips to grow the other side: the flip would reverse the
+    # verified ring arc — refuse.
+    ring = member(
+        [P(6, 0), P(7, 1), P(8, 0), P(7, -1), P(6, 0)],
+        tags={"junction": "roundabout"},
+        identifier=30,
+    )
+    shuffled = [
+        member([P(2, 0), P(4, 0)], identifier=31),  # interior seed
+        member([P(4, 0), P(6, 0)], identifier=32),
+        ring,
+        member([P(8, 0), P(10, 0)], identifier=33),
+        member([P(0, 0), P(2, 0)], identifier=34),  # the flipped-to side
+    ]
+    assert refusal(shuffled) == "ring-direction"
+
+
 def test_lone_ring_refuses():
     assert refusal([ring_member({"junction": "roundabout"})]) == "ring-touch"
 

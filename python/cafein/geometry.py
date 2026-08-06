@@ -1,12 +1,13 @@
 """Per-trip travel distances from GTFS data — the fallback ladder.
 
-Tiers 1, 2, and 5 of the distance ladder, applied per trip at
-preprocessing time: validated ``shape_dist_traveled`` values straight
-from the feed (``shape_dist``), stops linear-referenced onto the feed's
-shape geometry (``shape_linref``), and great-circle distances scaled by a
-mode detour coefficient (``crow_fly``). Any validation failing drops the
-trip to the next tier. The OSM tiers (route-relation matching, map
-matching) arrive with the OSM preprocessing.
+The distance ladder, applied per trip at preprocessing time: validated
+``shape_dist_traveled`` values straight from the feed (``shape_dist``),
+stops linear-referenced onto the feed's shape geometry
+(``shape_linref``), matched OSM route relations (``osm_relation``,
+opt-in via ``osm_tiers=``), and great-circle distances scaled by a mode
+detour coefficient (``crow_fly``). Any validation failing drops the
+trip to the next tier. The map-matching tier arrives with the OSM mode
+graphs.
 """
 
 import os
@@ -22,6 +23,7 @@ import shapely
 
 SHAPE_DIST = "shape_dist"
 SHAPE_LINREF = "shape_linref"
+OSM_RELATION = "osm_relation"
 CROW_FLY = "crow_fly"
 
 SNAP_TOLERANCE = 100.0
@@ -30,7 +32,9 @@ SNAP_TOLERANCE = 100.0
 EARTH_RADIUS = 6_371_000.0
 
 
-def trip_distances(gtfs_paths, include=None, geometries=False):
+def trip_distances(
+    gtfs_paths, include=None, geometries=False, osm_pbf=None, osm_tiers=None
+):
     """Compute cumulative travel distances for the feeds' trips.
 
     Parameters
@@ -45,6 +49,17 @@ def trip_distances(gtfs_paths, include=None, geometries=False):
     geometries : bool (optional, default: False)
         Also produce the per-trip leg-geometry payload from the same
         pass over the feeds.
+    osm_pbf : path (optional)
+        An OSM extract covering the feeds' area; makes the OSM
+        distance tiers available.
+    osm_tiers : bool or iterable of str (optional)
+        Opt-in to the OSM tiers. ``None`` (the default) applies the
+        shipped per-mode defaults — currently every mode off, so a
+        default build behaves exactly as without OSM — ``True`` opts
+        every mode in, ``False`` disables the tiers, and an iterable
+        of mode families (from ``bus``, ``trolleybus``, ``tram``,
+        ``subway``, ``train``, ``ferry``) opts exactly those in.
+        Unknown names raise; enabling anything requires `osm_pbf`.
 
     Returns
     -------
@@ -53,20 +68,28 @@ def trip_distances(gtfs_paths, include=None, geometries=False):
         provenance)`` rows suitable for
         ``TransportNetwork.set_trip_distances``: one cumulative distance
         per stop of the trip, and the ladder tier of the estimate
-        (``shape_dist``, ``shape_linref``, or ``crow_fly``). Trip
-        identifiers are feed-qualified when several feeds are given.
+        (``shape_dist``, ``shape_linref``, ``osm_relation``, or
+        ``crow_fly``). Trip identifiers are feed-qualified when several
+        feeds are given.
 
         With `geometries`, a ``(distances, geometry)`` pair where
         ``geometry`` is the argument tuple of
         ``TransportNetwork.set_leg_geometries``: deduplicated
         ``polylines`` as ``(longitudes, latitudes, measures)`` triples —
-        the shape when the trip has one that its stops lie along,
+        the shape when the trip has one that its stops lie along, the
+        matched relation line when tier 3 produced the distances,
         otherwise the straight stop chain — and ``trips`` as
         ``(trip_id, polyline, stop_positions)`` rows locating each stop
         of the trip on its polyline, in the polyline's measure.
     """
     if isinstance(gtfs_paths, (str, os.PathLike)):
         gtfs_paths = [gtfs_paths]
+    modes = _osm_modes(osm_tiers, osm_pbf)
+    osm = None
+    if modes:
+        from cafein import _osm_tiers as osm_tiers_module
+
+        osm = osm_tiers_module.RelationLadder(osm_pbf, modes)
     qualify = len(gtfs_paths) > 1
     results = []
     polylines = []
@@ -79,7 +102,11 @@ def trip_distances(gtfs_paths, include=None, geometries=False):
             local = {t[len(prefix) :] for t in include if t.startswith(prefix)}
         else:
             local = set(include)
-        rows, feed_polylines, feed_trips = _feed_trip_distances(path, local, geometries)
+        if osm is not None:
+            osm.begin_feed(feed)
+        rows, feed_polylines, feed_trips = _feed_trip_distances(
+            path, local, geometries, osm
+        )
         base = len(polylines)
         polylines.extend(feed_polylines)
         for trip_id, cumulative, tier in rows:
@@ -91,6 +118,25 @@ def trip_distances(gtfs_paths, include=None, geometries=False):
     if geometries:
         return results, (polylines, trips)
     return results
+
+
+def _osm_modes(osm_tiers, osm_pbf):
+    """The mode families the OSM tiers run for — empty when inactive."""
+    if osm_tiers is None or osm_tiers is False:
+        return frozenset()
+    from cafein import _matching
+
+    if osm_tiers is True:
+        modes = frozenset(_matching.MODE_ROUTES)
+    else:
+        requested = tuple(osm_tiers)
+        unknown = sorted(set(requested) - set(_matching.MODE_ROUTES))
+        if unknown:
+            raise ValueError("unknown osm_tiers mode name(s): " + ", ".join(unknown))
+        modes = frozenset(requested)
+    if modes and osm_pbf is None:
+        raise ValueError("osm_tiers enables OSM tiers but no osm_pbf was given")
+    return modes
 
 
 def _detour(route_type):
@@ -119,7 +165,7 @@ def _read_table(path, name, **kwargs):
             return pd.read_csv(member, **kwargs)
 
 
-def _feed_trip_distances(path, include=None, geometries=False):
+def _feed_trip_distances(path, include=None, geometries=False, osm=None):
     """The ladder over one feed: one distance row per included trip, plus
     the feed's deduplicated leg-geometry payload when requested."""
     stop_times = _read_table(
@@ -137,8 +183,9 @@ def _feed_trip_distances(path, include=None, geometries=False):
         stop_times["shape_dist_traveled"], errors="coerce"
     )
     trips = _read_table(path, "trips.txt", dtype=str).set_index("trip_id")
-    routes = _read_table(path, "routes.txt", dtype={"route_id": str})
+    routes = _read_table(path, "routes.txt", dtype=str)
     route_types = routes.set_index("route_id")["route_type"].astype(int)
+    route_meta = _route_metadata(path, routes) if osm is not None else {}
     stops = _read_table(path, "stops.txt", dtype={"stop_id": str})
     coordinates = (
         stops.drop_duplicates("stop_id")
@@ -181,9 +228,14 @@ def _feed_trip_distances(path, include=None, geometries=False):
         shape_id = shape_of.get(trip_id)
         if pd.isna(shape_id):
             shape_id = None
-        route_type = int(route_types[route_of[trip_id]])
+        route_id = route_of[trip_id]
+        route_type = int(route_types[route_id])
         stop_ids = tuple(stop_arrays[index])
         key = (shape_id, route_type, stop_ids, dist_arrays[index].tobytes())
+        if osm is not None:
+            # Tier 3 matches on route metadata too, so identical stop
+            # sequences of different routes are separate units.
+            key = key + (route_id,)
         if key not in cache:
             cache[key] = _ladder(
                 shape_id,
@@ -193,6 +245,8 @@ def _feed_trip_distances(path, include=None, geometries=False):
                 coordinates,
                 shapes,
                 geometries,
+                osm,
+                route_meta.get(route_id),
             )
         cumulative, tier, geometry = cache[key]
         results.append((trip_id, cumulative, tier))
@@ -205,6 +259,12 @@ def _feed_trip_distances(path, include=None, geometries=False):
                 polyline_index[pkey] = len(polylines)
                 line, (lon, lat) = shapes()[0][used_shape]
                 polylines.append((lon.tolist(), lat.tolist(), _measures(line)))
+        elif geometry[0] == "osm":
+            _, identity, positions = geometry
+            pkey = ("osm", identity)
+            if pkey not in polyline_index:
+                polyline_index[pkey] = len(polylines)
+                polylines.append(osm.polyline(identity))
         else:
             _, positions = geometry
             pkey = ("chain", stop_ids)
@@ -218,6 +278,49 @@ def _feed_trip_distances(path, include=None, geometries=False):
     return results, polylines, trip_geometries
 
 
+def _route_metadata(path, routes):
+    """Per-route matching metadata for the OSM tiers: ``route_id →
+    (route_id, short_name, long_name, agency identity strings)``."""
+    agency = _read_table(path, "agency.txt", dtype=str)
+    rows = agency.to_dict("records") if agency is not None else []
+    identities = {}
+    for row in rows:
+        identity = tuple(
+            value
+            for value in (row.get("agency_name"), row.get("agency_id"))
+            if _text(value)
+        )
+        if _text(row.get("agency_id")):
+            identities[row["agency_id"]] = identity
+    # A single-agency feed may omit agency_id on either side; its one
+    # identity then covers every route.
+    default = ()
+    if len(rows) == 1:
+        default = tuple(
+            value
+            for value in (rows[0].get("agency_name"), rows[0].get("agency_id"))
+            if _text(value)
+        )
+    meta = {}
+    for row in routes.to_dict("records"):
+        agency_key = row.get("agency_id")
+        identity = identities.get(agency_key, default) if _text(agency_key) else default
+        meta[row["route_id"]] = (
+            row["route_id"],
+            _text(row.get("route_short_name")),
+            _text(row.get("route_long_name")),
+            identity,
+        )
+    return meta
+
+
+def _text(value):
+    """The cell as non-empty text, or ``None`` (missing cells read NaN)."""
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
 def _measures(line):
     """Cumulative meters at each vertex of a projected LineString."""
     coordinates = shapely.get_coordinates(line)
@@ -226,13 +329,22 @@ def _measures(line):
 
 
 def _ladder(
-    shape_id, route_type, stop_ids, raw_distances, coordinates, shapes, geometries
+    shape_id,
+    route_type,
+    stop_ids,
+    raw_distances,
+    coordinates,
+    shapes,
+    geometries,
+    osm=None,
+    route=None,
 ):
     """Best-tier-wins distances for one (shape, mode, stop sequence).
 
     With `geometries`, also how to draw its legs: the shape with the
-    stops located along it whenever the stops verifiably lie on it,
-    otherwise the straight stop chain.
+    stops located along it whenever the stops verifiably lie on it, the
+    matched relation line when tier 3 produced the distances, otherwise
+    the straight stop chain.
     """
     latlon = coordinates.loc[list(stop_ids)].to_numpy()
     located = np.isfinite(latlon).all(axis=1)
@@ -263,6 +375,13 @@ def _ladder(
             cumulative = _linear_referenced(lines[shape_id][0], latlon, transformer)
             if cumulative is not None:
                 return cumulative.tolist(), SHAPE_LINREF, geometry
+    if osm is not None and route is not None:
+        resolved = osm.resolve(route, route_type, stop_ids, latlon, crow[-1])
+        if resolved is not None:
+            cumulative, identity, along = resolved
+            if geometries:
+                geometry = ("osm", identity, along)
+            return cumulative, OSM_RELATION, geometry
     return (crow * _detour(route_type)).tolist(), CROW_FLY, geometry
 
 

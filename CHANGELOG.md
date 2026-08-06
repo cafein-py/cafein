@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- The distance ladder's **`osm_relation` tier (tier 3)**: matched OSM
+  route relations now produce per-trip distances and geometries when a
+  feed's own shapes cannot. `cafein.geometry.trip_distances` gains
+  ``osm_pbf=`` (an OSM extract makes the tiers available) and
+  ``osm_tiers=`` (the explicit opt-in: ``True``, ``False``, or an
+  iterable of mode families — ``bus``, ``trolleybus``, ``tram``,
+  ``subway``, ``train``, ``ferry``; the shipped default keeps every
+  mode **off**, so existing builds are unchanged). Matching is a
+  deterministic eligibility-then-selection rule biased to no-match:
+  GTFS-mode ↔ ``route=`` compatibility, exact folded ``ref``
+  agreement, a 500 m stop-corridor containment check, and the
+  operator/network filter (agency name or id vs the relation tags;
+  present-and-disagreeing metadata disqualifies) gate the candidates,
+  then the lowest normalized stop-sequence edit distance wins only
+  under 0.25 with a 0.10 lead — near-ties drop, and every candidate's
+  component outcome is recorded for diagnostics. Accepted relations
+  are stitched and validated exactly like a tier-2 shape (denser than
+  the stops, every stop within snap tolerance, monotone linear
+  referencing, length inside the crow-fly plausibility band) and cut
+  with the same machinery, surfacing provenance ``osm_relation``. The
+  thresholds are provisional v1 constants pending the calibration
+  sweep. On the Helsinki fixture with shapes withheld, resolved tram
+  patterns land within 1% median (3% max) of the withheld
+  ground-truth lengths.
+
 - The distance ladder's **member-way stitcher** (`cafein._stitch`,
   tier-3 groundwork): a route relation's way members become one
   LineString — relation order leads, adjacency disambiguates shuffles
@@ -9,9 +34,13 @@
   sub-tolerance stubs orient automatically, and closed rings splice in
   under the verified-direction rule (``junction=roundabout/circular``
   or ``oneway=yes``; stored-vertex-order arcs between the entry and
-  exit touch points). Anything ambiguous or broken refuses with a
-  reason code (``gap``, ``branching``, ``ring-direction``,
-  ``ring-touch``, ``unresolved-member``) instead of repairing — the
+  exit touch points), and every open member's chosen orientation is
+  checked against its effective one-way direction — a chain that
+  would traverse a ``oneway`` member (or a split roundabout arc)
+  against its legal direction refuses. Anything ambiguous or broken
+  refuses with a reason code (``gap``, ``branching``,
+  ``ring-direction``, ``ring-touch``, ``member-direction``,
+  ``unresolved-member``) instead of repairing — the
   ladder's fallthrough handles it. On the committed transit fixture,
   20 of Helsinki's 22 tram relations stitch; the two refusals are
   honest gaps, and the gap defect fixture refuses as designed.
