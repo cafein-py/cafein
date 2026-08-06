@@ -190,6 +190,52 @@ def rail_network(source, bounding_box=None):
     return _service_filtered(ways)
 
 
+def rail_ways(source, bounding_box=None):
+    """Rail-family ways with their OSM node identities — the tier-4
+    graph source.
+
+    Returns ``(node_refs, lons, lats, railway, oneway)`` tuples,
+    service ways excluded. Unlike `rail_network`'s frame, connectivity
+    here rests on **node ids**, so coincident-but-distinct vertices
+    (grade-separated tracks) never join. Ways with unresolved node
+    coordinates (boundary-crossing) are dropped whole.
+    """
+    from pyrosm import OSM
+
+    if isinstance(source, OSM):
+        osm = source
+    else:
+        osm = OSM(str(source), bounding_box=bounding_box)
+    if osm._way_records is None:
+        # The lightest cache trigger for this reader: a rail-filtered
+        # criteria read (pyrosm parses the extract on any layer read).
+        osm.get_data_by_custom_criteria(
+            custom_filter={"railway": ["tram", "light_rail", "subway", "rail"]},
+            filter_type="keep",
+            keep_nodes=False,
+            keep_ways=True,
+            keep_relations=False,
+            osm_keys_to_keep=["railway", "oneway", "service"],
+        )
+    if osm._way_records is None or osm._node_coordinates is None:
+        return []
+    ways = []
+    for record in osm._way_records:
+        railway = record.get("railway")
+        if railway not in ("tram", "light_rail", "subway", "rail"):
+            continue
+        if record.get("service") is not None:
+            continue
+        refs = np.asarray(record["nodes"], dtype=np.int64)
+        if len(refs) < 2:
+            continue
+        _, lons, lats = osm._node_coordinates.gather(refs)
+        if len(lons) != len(refs):
+            continue
+        ways.append((refs, lons, lats, railway, record.get("oneway")))
+    return ways
+
+
 def _service_filtered(ways):
     """The graph-relevant keys lifted to columns and service ways
     dropped — split out so the exclusion is testable against a

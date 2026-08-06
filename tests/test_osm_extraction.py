@@ -729,3 +729,119 @@ def test_priority_nodes_mark_their_own_way_only():
     )
     assert list(fwd) == [0, 0, 0]
     assert list(rev) == [0, _osm.JUNCTION_PRIORITY, 0]
+
+
+# --- Bus permissions (tier-4 preprocessing) ----------------------------------
+
+
+def bus_rows(rows):
+    import pandas as pd
+
+    columns = {key for row in rows for key in row}
+    return pd.DataFrame(
+        {column: [row.get(column) for row in rows] for column in columns}
+    )
+
+
+def test_bus_permission_matrix():
+    edges = bus_rows(
+        [
+            {"highway": "residential"},  # plain street: both ways
+            {"highway": "busway"},  # car-forbidden, bus-drivable
+            {"highway": "bus_guideway"},  # guided busway
+            {"highway": "residential", "access": "no", "bus": "yes"},  # bus-only
+            {"highway": "residential", "access": "no", "psv": "yes"},
+            {"highway": "residential", "bus": "no"},  # removed for buses
+            {"highway": "residential", "psv": "no"},
+            {"highway": "footway"},  # never drivable
+            {"highway": "footway", "bus": "yes"},  # explicit override
+            {"highway": "pedestrian", "psv": "yes"},  # transit street
+            {"highway": "track"},  # cars default on, buses never
+            {"highway": "track", "bus": "yes"},
+            {"highway": "residential", "vehicle": "no", "psv": "yes"},
+            {"highway": "residential", "motor_vehicle": "no", "bus": "yes"},
+            {"highway": "residential", "psv": "yes", "bus": "no"},  # bus wins
+        ]
+    )
+    forward, reverse, diagnostics = _osm.bus_permissions(edges)
+    expected = [
+        True,  # residential
+        True,  # busway
+        True,  # bus_guideway
+        True,  # access=no + bus=yes
+        True,  # access=no + psv=yes
+        False,  # bus=no
+        False,  # psv=no
+        False,  # footway
+        True,  # footway + bus=yes
+        True,  # pedestrian + psv=yes
+        False,  # track
+        True,  # track + bus=yes
+        True,  # vehicle=no + psv=yes
+        True,  # motor_vehicle=no + bus=yes
+        False,  # psv=yes overridden by bus=no
+    ]
+    assert forward.tolist() == expected
+    assert reverse.tolist() == expected
+    assert diagnostics["unknown_highway"] == 0
+
+
+def test_bus_oneway_and_exemptions():
+    edges = bus_rows(
+        [
+            {"highway": "residential", "oneway": "yes"},
+            {"highway": "residential", "oneway": "-1"},
+            {"highway": "residential", "junction": "roundabout"},
+            {"highway": "residential", "oneway": "yes", "oneway:bus": "no"},
+            {"highway": "residential", "oneway": "yes", "oneway:psv": "no"},
+            {"highway": "residential", "oneway:bus": "-1"},
+        ]
+    )
+    forward, reverse, _ = _osm.bus_permissions(edges)
+    assert forward.tolist() == [True, False, True, True, True, False]
+    assert reverse.tolist() == [False, True, False, True, True, True]
+
+
+def test_bus_unknown_highway_denies_and_reports():
+    edges = bus_rows(
+        [
+            {"highway": "cowpath"},
+            {"highway": "cowpath", "bus": "yes"},
+        ]
+    )
+    forward, _, diagnostics = _osm.bus_permissions(edges)
+    # Deny-unknown-highway: only the explicit bus tag opens it.
+    assert forward.tolist() == [False, True]
+    assert diagnostics["unknown_highway"] == 2
+
+
+def test_unbusable_filter_excludes_every_area_alias():
+    assert _osm._UNBUSABLE_FILTER["area"] == ["yes", "true", "1"]
+    # Guided busways stay in; pyrosm's driving filters would drop them.
+    assert "bus_guideway" not in _osm._UNBUSABLE_FILTER["highway"]
+    # Classes that can carry explicit bus grants stay in too: the
+    # permission chain, not the extraction, denies their untagged ways.
+    for kept in ("pedestrian", "footway", "path", "track"):
+        assert kept not in _osm._UNBUSABLE_FILTER["highway"]
+
+
+def test_bus_barrier_blocking():
+    cases = [
+        (("gate", {}), True),
+        (("bollard", {}), True),
+        (("lift_gate", {}), True),
+        (("gate", {"bus": "yes"}), False),
+        (("gate", {"psv": "yes"}), False),
+        (("gate", {"access": "yes"}), False),
+        (("bollard", {"motor_vehicle": "yes"}), False),
+        (("cattle_grid", {}), False),
+        (("toll_booth", {}), False),
+        (("kerb", {}), True),  # a curb blocks without explicit allow
+        (("kerb", {"bus": "yes"}), False),
+        (("cattle_grid", {"access": "no"}), True),
+        (("gate", {"access": "yes", "bus": "no"}), True),  # bus most specific
+        (("mystery_barrier", {}), True),  # unknown types block
+        (("gate", {"bus": "no", "psv": "yes"}), True),  # bus beats psv
+    ]
+    for (barrier, tags), expected in cases:
+        assert _osm.bus_barrier_blocks(barrier, tags) is expected, (barrier, tags)

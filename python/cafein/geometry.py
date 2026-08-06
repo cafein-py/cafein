@@ -3,11 +3,11 @@
 The distance ladder, applied per trip at preprocessing time: validated
 ``shape_dist_traveled`` values straight from the feed (``shape_dist``),
 stops linear-referenced onto the feed's shape geometry
-(``shape_linref``), matched OSM route relations (``osm_relation``,
-opt-in via ``osm_tiers=``), and great-circle distances scaled by a mode
-detour coefficient (``crow_fly``). Any validation failing drops the
-trip to the next tier. The map-matching tier arrives with the OSM mode
-graphs.
+(``shape_linref``), matched OSM route relations (``osm_relation``) and
+stop-to-stop shortest paths on OSM mode graphs (``map_matched``) —
+both opt-in via ``osm_tiers=`` — and great-circle distances scaled by
+a mode detour coefficient (``crow_fly``). Any validation failing drops
+the trip to the next tier.
 """
 
 import os
@@ -24,6 +24,7 @@ import shapely
 SHAPE_DIST = "shape_dist"
 SHAPE_LINREF = "shape_linref"
 OSM_RELATION = "osm_relation"
+MAP_MATCHED = "map_matched"
 CROW_FLY = "crow_fly"
 
 SNAP_TOLERANCE = 100.0
@@ -68,17 +69,17 @@ def trip_distances(
         provenance)`` rows suitable for
         ``TransportNetwork.set_trip_distances``: one cumulative distance
         per stop of the trip, and the ladder tier of the estimate
-        (``shape_dist``, ``shape_linref``, ``osm_relation``, or
-        ``crow_fly``). Trip identifiers are feed-qualified when several
-        feeds are given.
+        (``shape_dist``, ``shape_linref``, ``osm_relation``,
+        ``map_matched``, or ``crow_fly``). Trip identifiers are
+        feed-qualified when several feeds are given.
 
         With `geometries`, a ``(distances, geometry)`` pair where
         ``geometry`` is the argument tuple of
         ``TransportNetwork.set_leg_geometries``: deduplicated
         ``polylines`` as ``(longitudes, latitudes, measures)`` triples —
         the shape when the trip has one that its stops lie along, the
-        matched relation line when tier 3 produced the distances,
-        otherwise the straight stop chain — and ``trips`` as
+        matched relation line or map-matched graph path when an OSM
+        tier produced the distances, otherwise the straight stop chain — and ``trips`` as
         ``(trip_id, polyline, stop_positions)`` rows locating each stop
         of the trip on its polyline, in the polyline's measure.
     """
@@ -89,7 +90,7 @@ def trip_distances(
     if modes:
         from cafein import _osm_tiers as osm_tiers_module
 
-        osm = osm_tiers_module.RelationLadder(osm_pbf, modes)
+        osm = osm_tiers_module.OsmLadder(osm_pbf, modes)
     qualify = len(gtfs_paths) > 1
     results = []
     polylines = []
@@ -342,9 +343,9 @@ def _ladder(
     """Best-tier-wins distances for one (shape, mode, stop sequence).
 
     With `geometries`, also how to draw its legs: the shape with the
-    stops located along it whenever the stops verifiably lie on it, the
-    matched relation line when tier 3 produced the distances, otherwise
-    the straight stop chain.
+    stops located along it whenever the stops verifiably lie on it,
+    the matched relation line or map-matched graph path when an OSM
+    tier produced the distances, otherwise the straight stop chain.
     """
     latlon = coordinates.loc[list(stop_ids)].to_numpy()
     located = np.isfinite(latlon).all(axis=1)
@@ -378,10 +379,10 @@ def _ladder(
     if osm is not None and route is not None:
         resolved = osm.resolve(route, route_type, stop_ids, latlon, crow[-1])
         if resolved is not None:
-            cumulative, identity, along = resolved
+            cumulative, identity, along, tier = resolved
             if geometries:
                 geometry = ("osm", identity, along)
-            return cumulative, OSM_RELATION, geometry
+            return cumulative, tier, geometry
     return (crow * _detour(route_type)).tolist(), CROW_FLY, geometry
 
 
