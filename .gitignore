@@ -20,15 +20,7 @@ htmlcov/
 /docs/
 
 # Downloaded test datasets (fetched by scripts/fetch_test_data.py)
-# Fetched/generated test data; the committed transit fixtures are
-# negated back in (a directory-level ignore cannot be pierced, so the
-# contents pattern is used). Henrikki, 2026-08-05: small transit-only
-# subsets live in-repo.
-tests/data/*
-!tests/data/helsinki-transit.osm.pbf
-!tests/data/helsinki-transit-gap.osm.pbf
-!tests/data/helsinki-transit-missing.osm.pbf
-
+tests/data/
 
 # pyrosm parse cache (written when tests read an OSM extract)
 cache/
