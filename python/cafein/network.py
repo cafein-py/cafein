@@ -957,6 +957,8 @@ class TransportNetwork:
             It is a heavy, run-once operation (minutes over a metropolitan
             network); ``save`` the result and reuse it. Off by default.
 
+        Notes
+        -----
         The build reads the input files more than once (timetable,
         distance ladder, footpaths — and with `street_modes`, a second
         pass over `osm_pbf` for the multimodal graph); they must not

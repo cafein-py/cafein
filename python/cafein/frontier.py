@@ -459,8 +459,7 @@ def journey_frontiers(
     date, departure, window
         The service date, window start, and window length, as in
         ``journey_frontier``.
-    max_transfers, factors, components, fares, bucket, router, max_slower,
-    exclude_routes, exclude_trips, exclude_stops
+    max_transfers, factors, components, fares, bucket, router, max_slower
         As in ``journey_frontier`` (``bucket`` is the pareto search's
         emissions bucket width in grams; ``router="tbtr"`` answers over
         the McTBTR engine — one multicriteria transfer set built per
@@ -468,6 +467,8 @@ def journey_frontiers(
         ``max_slower`` restricts each cell to its own band of the
         cell's per-pass fastest journey, which always stays among the
         rows, on either engine).
+    exclude_routes, exclude_trips, exclude_stops
+        As in ``journey_frontier``.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
         Street-search options for the coordinate queries, as in
         ``route_between_coordinates``.
@@ -596,7 +597,8 @@ def frontier_table(
     ----------
     network, origins, destinations, date, departure, window
         As in ``journey_frontiers``.
-    max_transfers, factors, components, bucket, router, max_slower,
+    max_transfers, factors, components, bucket, router, max_slower
+        As in ``journey_frontiers``.
     exclude_routes, exclude_trips, exclude_stops
         As in ``journey_frontiers``.
     walking_speed_kmph, max_walking_time, max_snap_distance : float
