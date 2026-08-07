@@ -330,6 +330,35 @@ def test_car_cost_matrix_resolves_emissions_by_class_and_occupancy(
     assert np.allclose(priced.emissions, priced.network_distance_m / 1000.0 * 100.0)
 
 
+def test_car_geometries_do_not_change_the_numbers(car_network, origins, destinations):
+    # A car matrix without geometries takes the metres-only search; the numbers
+    # it reports are the reconstructed legs' — delays and parking included,
+    # since both ride the same cells.
+    columns = [
+        "from_id",
+        "to_id",
+        "travel_time_s",
+        "distance_m",
+        "network_distance_m",
+        "connector_distance_m",
+        "emissions",
+    ]
+    for extra in ({}, {"intersection_delays": True}, {"parking": (60, 400.0)}):
+        plain = TravelCostMatrix(
+            car_network, origins, destinations, transport_mode="car", **extra
+        )
+        shaped = TravelCostMatrix(
+            car_network,
+            origins,
+            destinations,
+            transport_mode="car",
+            geometries=True,
+            **extra,
+        )
+        assert len(plain) > 0
+        pd.testing.assert_frame_equal(plain[columns], shaped[columns])
+
+
 def test_factor_validation_precedes_routing(
     car_network, origins, destinations, monkeypatch
 ):

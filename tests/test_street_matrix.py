@@ -296,6 +296,44 @@ def test_cost_matrix_columns_with_geometries(streets, origins, destinations):
     assert costs.geometry.dtype == object
 
 
+@pytest.mark.parametrize("mode", ["walk", "bicycle", "e_scooter"])
+def test_geometries_do_not_change_the_numbers(streets, origins, destinations, mode):
+    # Without geometries the rows come from the metres-only search rather than
+    # the reconstructed legs, so the two must agree on every cell they report:
+    # the same pairs, the same times, and the same distances.
+    plain = TravelCostMatrix(streets, origins, destinations, transport_mode=mode)
+    shaped = TravelCostMatrix(
+        streets, origins, destinations, transport_mode=mode, geometries=True
+    )
+    assert len(plain) > 0
+    columns = [
+        "from_id",
+        "to_id",
+        "travel_time_s",
+        "distance_m",
+        "network_distance_m",
+        "connector_distance_m",
+    ]
+    pd.testing.assert_frame_equal(plain[columns], shaped[columns])
+
+
+def test_geometries_do_not_change_the_diagonal(streets, origins):
+    # Destinations default to the origins, so the same-coordinate zero — which
+    # neither search settles, both branches write it in — is exercised too.
+    plain = TravelCostMatrix(streets, origins, transport_mode="bicycle")
+    shaped = TravelCostMatrix(
+        streets, origins, transport_mode="bicycle", geometries=True
+    )
+    diagonal = plain[plain.from_id == plain.to_id]
+    assert len(diagonal) == len(origins)
+    assert (diagonal.travel_time_s == 0).all()
+    assert (diagonal.distance_m == 0.0).all()
+    pd.testing.assert_frame_equal(
+        plain[["from_id", "to_id", "travel_time_s", "distance_m"]],
+        shaped[["from_id", "to_id", "travel_time_s", "distance_m"]],
+    )
+
+
 def test_cost_matrix_distance_is_the_sum_of_its_parts(streets, origins, destinations):
     costs = TravelCostMatrix(streets, origins, destinations, transport_mode="bicycle")
     assert len(costs) > 0
