@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- **Street cost matrices skip the shapes they discard**: without
+  ``geometries=True`` the rows now come from the metres-only street
+  search rather than from fully reconstructed legs, so a time/distance
+  matrix no longer assembles a path geometry for every reachable cell
+  only to throw it away. The reported numbers are unchanged — times,
+  network and connector distances, emissions and costs are the
+  reconstructed legs' cell for cell — and ``geometries=True`` still
+  reconstructs and encodes as before.
+
 ## 0.10.0 — 2026-08-05
 
 - **Resumable streaming runs**: ``resume=True`` on
