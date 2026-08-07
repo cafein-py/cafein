@@ -212,6 +212,8 @@ class TravelCostMatrix(pd.DataFrame):
         carried in a ``currency`` column, never a conversion. A mode
         without a matching row prices NaN, never zero.
 
+    Notes
+    -----
     ``street_policy=`` (a ``cafein.StreetLegPolicy``) opens the access
     and egress to the policy's street modes over the multimodal graph
     (build with ``street_modes=``); point origins and destinations only.
@@ -658,13 +660,14 @@ class TravelTimeMatrix(pd.DataFrame):
     ``TravelCostMatrix``, which also aggregates transfers, distances, and
     emissions.
 
-    With ``window``, every minute mark within ``[departure, departure +
-    window)`` is profiled and the ``travel_time_s`` column is replaced by
-    one ``travel_time_p<p>`` column per requested percentile (the median
-    by default, or ``confidence`` for the symmetric interval plus the
-    median), in seconds and floating-point so an unreachable percentile
-    reads as ``NaN``; a pair appears when at least one of its percentiles
-    is reachable.
+    With ``window``, every minute mark within
+    ``[departure, departure + window)`` is profiled and the
+    ``travel_time_s`` column is replaced by one ``travel_time_p<p>``
+    column per requested percentile (the median by default, or
+    ``confidence`` for the symmetric interval plus the median), in
+    seconds and floating-point so an unreachable percentile reads as
+    ``NaN``; a pair appears when at least one of its percentiles is
+    reachable.
 
     Origins are either stop identifiers or a point GeoDataFrame with an
     ``id`` column; destinations apply to point origins only — stop
@@ -749,6 +752,8 @@ class TravelTimeMatrix(pd.DataFrame):
         destination counts as unreachable (default:
         ``cafein.street_network.MAX_STREET_TIME``, 7200).
 
+    Notes
+    -----
     ``street_policy=`` (a ``cafein.StreetLegPolicy``) opens the access
     and egress to the policy's street modes over the carried multimodal
     graph: point-set origins and destinations only, exclusions honoured,
