@@ -344,7 +344,7 @@ impl StreetNetwork {
     }
 
     /// Whether `profile` may traverse `edge` in either direction.
-    fn edge_permits(&self, edge: u32, profile: &CompiledStreetProfile) -> bool {
+    pub fn edge_permits(&self, edge: u32, profile: &CompiledStreetProfile) -> bool {
         let (forward, reverse) = self.edge_slots(edge);
         [forward, reverse]
             .into_iter()

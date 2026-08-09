@@ -1009,23 +1009,20 @@ def test_an_egress_via_choice_walks_the_forward_transfer(multimodal_network):
 OFFSHORE = (60.05, 24.60)
 
 
-def test_an_unsnapped_policy_side_degrades_to_the_direct_walk(multimodal_network):
+def test_an_unsnapped_coincident_pair_raises_like_any_unsnapped_query(
+    multimodal_network,
+):
     pytest.importorskip("cafein._cafein")
 
     policy = _bike_walk_policy()
-    journeys = multimodal_network.route_between_coordinates(
-        OFFSHORE, OFFSHORE, "2022-02-22", "08:30:00", street_policy=policy
-    )
-    # No policy mode snaps offshore, but the zero walk to the same
-    # coordinate needs no network at all - the query degrades to it
-    # instead of failing, as the policy matrix path does.
-    assert len(journeys) == 1
-    assert journeys[0]["rides"] == 0
-    assert journeys[0]["legs"][0]["type"] == "walk"
-    with pytest.raises(ValueError, match="too far from the multimodal"):
-        multimodal_network.route_between_coordinates(
-            OFFSHORE, DEST, "2022-02-22", "08:30:00", street_policy=policy
-        )
+    # Coincident but off the street network: the zero-walk convention
+    # never outranks snap validation - the pair raises like any other
+    # unsnapped side, matching the matrix path's warn-and-omit contract.
+    for destination in (OFFSHORE, DEST):
+        with pytest.raises(ValueError, match="too far from the multimodal"):
+            multimodal_network.route_between_coordinates(
+                OFFSHORE, destination, "2022-02-22", "08:30:00", street_policy=policy
+            )
 
 
 def _street_factor_rows():

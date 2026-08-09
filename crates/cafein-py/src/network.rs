@@ -960,8 +960,9 @@ impl TransportNetwork {
     /// ``StreetChoice`` token; the coordinate re-snaps for ``mode``, and the
     /// leg runs coordinate → link for access, link → coordinate for egress.
     /// ``None`` when the link is beyond ``max_seconds``. A stop at the
-    /// coordinate itself is a zero leg, matching the reduction's
-    /// zero-coincident convention. Internal.
+    /// coordinate itself is a zero leg when the cutoff admits one, matching
+    /// the reduction's zero-coincident convention; the token and the
+    /// coordinate's snap are validated first either way. Internal.
     #[pyo3(signature = (latitude, longitude, mode, stop, edge, fraction, connector,
                         egress, max_seconds, geometries))]
     #[allow(clippy::too_many_arguments)]
@@ -989,14 +990,7 @@ impl TransportNetwork {
                 "the stop has no coordinates to rebuild the street leg from",
             ));
         };
-        if stop_latitude == latitude && stop_longitude == longitude {
-            return Ok(Some(zero_leg(py, latitude, longitude, geometries)));
-        }
-        let link = Snap {
-            edge,
-            fraction,
-            connector,
-        };
+        let link = multimodal_link(network, &profile, edge, fraction, connector)?;
         let Some(snap) =
             network.snap_for_profile(latitude, longitude, MULTIMODAL_STOP_SNAP, &profile)
         else {
@@ -1004,6 +998,11 @@ impl TransportNetwork {
                 "coordinate too far from the multimodal street network",
             ));
         };
+        if stop_latitude == latitude && stop_longitude == longitude {
+            return Ok(
+                admits_zero(max_seconds).then(|| zero_leg(py, latitude, longitude, geometries))
+            );
+        }
         let coordinate = (latitude, longitude);
         let stop_point = (stop_latitude, stop_longitude);
         let ((from_point, from), (to_point, to)) = if egress {
@@ -1020,7 +1019,8 @@ impl TransportNetwork {
     /// The reconstructed direct street leg between two coordinates over the
     /// multimodal graph — the policy path's door-to-door alternative.
     /// ``None`` when either coordinate has no snap for the mode or the pair
-    /// is beyond ``max_seconds``; equal coordinates are a zero leg. Internal.
+    /// is beyond ``max_seconds``; equal coordinates that snap are a zero leg
+    /// when the cutoff admits one. Internal.
     fn _multimodal_direct_leg(
         &self,
         py: Python<'_>,
@@ -1032,9 +1032,6 @@ impl TransportNetwork {
     ) -> PyResult<Option<StreetLegParts>> {
         let profile = self.multimodal_profile(mode)?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
-        if origin == destination {
-            return Ok(Some(zero_leg(py, origin.0, origin.1, geometries)));
-        }
         let snaps = (
             network.snap_for_profile(origin.0, origin.1, MULTIMODAL_STOP_SNAP, &profile),
             network.snap_for_profile(destination.0, destination.1, MULTIMODAL_STOP_SNAP, &profile),
@@ -1042,6 +1039,11 @@ impl TransportNetwork {
         let (Some(from), Some(to)) = snaps else {
             return Ok(None);
         };
+        if origin == destination {
+            return Ok(
+                admits_zero(max_seconds).then(|| zero_leg(py, origin.0, origin.1, geometries))
+            );
+        }
         let leg = py.allow_threads(|| {
             network.directed_leg(origin, &from, destination, &to, &profile, max_seconds)
         });
@@ -2629,7 +2631,7 @@ impl TransportNetwork {
         longitude: f64,
         max_seconds: f64,
     ) {
-        if !max_seconds.is_finite() || max_seconds < 0.0 {
+        if !admits_zero(max_seconds) {
             return;
         }
         for (index, (_, stop_latitude, stop_longitude)) in self.stops().iter().enumerate() {
@@ -2663,6 +2665,51 @@ impl TransportNetwork {
             })
             .collect()
     }
+}
+
+/// Whether `max_seconds` admits a zero-duration trip — the cutoff gate the
+/// zero-coincident convention applies.
+fn admits_zero(max_seconds: f64) -> bool {
+    max_seconds.is_finite() && max_seconds >= 0.0
+}
+
+/// A caller-supplied `StreetChoice` token checked at the boundary: the edge
+/// must exist on the multimodal graph and be traversable by `profile`, the
+/// fraction must be a position on the edge, and the connector a finite
+/// non-negative distance. Rejecting here keeps an out-of-range index from
+/// panicking in the core and a malformed value from understating costs.
+fn multimodal_link(
+    network: &StreetNetwork,
+    profile: &CompiledStreetProfile,
+    edge: u32,
+    fraction: f64,
+    connector: f64,
+) -> PyResult<Snap> {
+    if edge >= network.edge_count() {
+        return Err(PyValueError::new_err(format!(
+            "street link edge {edge} is out of range for the multimodal graph"
+        )));
+    }
+    if !(0.0..=1.0).contains(&fraction) {
+        return Err(PyValueError::new_err(format!(
+            "street link fraction {fraction} is not a position in [0, 1]"
+        )));
+    }
+    if !connector.is_finite() || connector < 0.0 {
+        return Err(PyValueError::new_err(format!(
+            "street link connector {connector} is not a finite non-negative distance"
+        )));
+    }
+    if !network.edge_permits(edge, profile) {
+        return Err(PyValueError::new_err(format!(
+            "street link edge {edge} is not traversable by the requested mode"
+        )));
+    }
+    Ok(Snap {
+        edge,
+        fraction,
+        connector,
+    })
 }
 
 /// A degenerate zero-length leg at a coordinate — the reconstruction of the

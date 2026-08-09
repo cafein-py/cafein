@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **The multimodal access surface validates before answering**: the
+  internal street-leg rebuild now rejects a malformed ``StreetChoice``
+  token at the boundary — an out-of-range edge index raises
+  ``ValueError`` instead of panicking through core indexing, a
+  non-finite or out-of-range fraction or connector no longer
+  passes through as silent invalid costs, and a token edge the resolved
+  profile may not traverse is refused. The equal-coordinate zero-leg
+  shortcut on the same surface snaps and checks the cutoff first, so a
+  coincident pair off the street network — or a query with a negative
+  or NaN cutoff — is unreachable rather than a zero-duration walk; a
+  street-policy routing query on such a pair now raises like any other
+  unsnapped query, matching the policy matrices' warn-and-omit contract.
+
 - **Street cost matrices skip the shapes they discard**: without
   ``geometries=True`` the rows now come from the metres-only street
   search rather than from fully reconstructed legs, so a time/distance
