@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **cafein.sampledata integration**: `cafein`'s package path now
+  extends over separately installed portions, so the
+  ``cafein.sampledata`` distribution's ``cafein.sampledata.helsinki``
+  module (up-to-date capital-region OSM/GTFS/DEM/population sample
+  data) resolves under editable installs too. A new ``metro_scale``
+  pytest marker and ``helsinki_metro_data`` fixture run metro-scale
+  tests over the downloaded data — skipped when the package is absent
+  or pins no data release, failing instead when
+  ``CAFEIN_REQUIRE_SAMPLEDATA`` is set.
+
 - **The multimodal access surface validates before answering**: the
   internal street-leg rebuild now rejects a malformed ``StreetChoice``
   token at the boundary — an out-of-range edge index raises

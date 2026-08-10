@@ -315,3 +315,23 @@ def helsinki_streets(kantakaupunki_pbf):
     from cafein import StreetNetwork
 
     return StreetNetwork.from_osm(str(kantakaupunki_pbf))
+
+
+@pytest.fixture(scope="session")
+def helsinki_metro_data():
+    """The ``cafein.sampledata.helsinki`` module, for metro-scale tests.
+
+    Skips when the sampledata package is absent or pins no data release;
+    with ``CAFEIN_REQUIRE_SAMPLEDATA`` set (the recurring installed-
+    package job), a broken or invisible install fails loudly instead —
+    mirroring the ``CAFEIN_REQUIRE_TEST_DATA`` convention above.
+    """
+    if os.environ.get("CAFEIN_REQUIRE_SAMPLEDATA"):
+        import cafein.sampledata.helsinki as helsinki  # fail, never skip
+    else:
+        helsinki = pytest.importorskip("cafein.sampledata.helsinki")
+        from cafein.sampledata.helsinki import _registry
+
+        if not _registry.RELEASE:
+            pytest.skip("cafein.sampledata pins no data release yet")
+    return helsinki
