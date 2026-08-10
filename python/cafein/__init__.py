@@ -1,5 +1,10 @@
 """Public-transport routing with per-leg distance and emissions tracking."""
 
+# Let separately installed portions (cafein.sampledata) resolve under
+# this package even when cafein itself is an editable install, whose
+# __path__ points at the source tree rather than site-packages.
+__path__ = __import__("pkgutil").extend_path(__path__, __name__)
+
 __all__ = [
     "TransportNetwork",
     "StreetNetwork",

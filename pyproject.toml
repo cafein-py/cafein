@@ -66,3 +66,6 @@ include = '(python/cafein|tests)/.*\.py$'
 testpaths = ["tests"]
 # Surface the slowest tests on every run.
 addopts = "--durations=25"
+markers = [
+    "metro_scale: metro-scale runs over cafein.sampledata.helsinki (skipped without the package)",
+]
