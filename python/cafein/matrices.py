@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 import shapely
 
+from cafein._validate import component_selection, id_sequence, sequence_not_string
+
 
 class TravelCostMatrix(pd.DataFrame):
     """The fastest journey's aggregated costs per OD pair, long format.
@@ -286,6 +288,8 @@ class TravelCostMatrix(pd.DataFrame):
         currency=None,
         cost_components=None,
     ):
+        origins = sequence_not_string("origins", origins)
+        destinations = sequence_not_string("destinations", destinations)
         if _is_street_network(network):
             data = _street_cost_columns(
                 network,
@@ -321,9 +325,12 @@ class TravelCostMatrix(pd.DataFrame):
                     "candidates": None if candidates == "time" else candidates,
                     "bucket": None if bucket == 25.0 else bucket,
                     "router": None if router == "auto" else router,
-                    "exclude_routes": tuple(exclude_routes) or None,
-                    "exclude_trips": tuple(exclude_trips) or None,
-                    "exclude_stops": tuple(exclude_stops) or None,
+                    "exclude_routes": id_sequence("exclude_routes", exclude_routes)
+                    or None,
+                    "exclude_trips": id_sequence("exclude_trips", exclude_trips)
+                    or None,
+                    "exclude_stops": id_sequence("exclude_stops", exclude_stops)
+                    or None,
                     "street_policy": street_policy,
                 },
             )
@@ -572,9 +579,12 @@ class TravelCostMatrix(pd.DataFrame):
                     "candidates": None if candidates == "time" else candidates,
                     "bucket": None if bucket == 25.0 else bucket,
                     "router": None if router == "auto" else router,
-                    "exclude_routes": tuple(exclude_routes) or None,
-                    "exclude_trips": tuple(exclude_trips) or None,
-                    "exclude_stops": tuple(exclude_stops) or None,
+                    "exclude_routes": id_sequence("exclude_routes", exclude_routes)
+                    or None,
+                    "exclude_trips": id_sequence("exclude_trips", exclude_trips)
+                    or None,
+                    "exclude_stops": id_sequence("exclude_stops", exclude_stops)
+                    or None,
                     "street_policy": None,
                 },
                 factors=factors,
@@ -803,6 +813,8 @@ class TravelTimeMatrix(pd.DataFrame):
         delay_model=None,
         parking=None,
     ):
+        origins = sequence_not_string("origins", origins)
+        destinations = sequence_not_string("destinations", destinations)
         if _is_street_network(network):
             data = _street_time_columns(
                 network,
@@ -826,9 +838,12 @@ class TravelTimeMatrix(pd.DataFrame):
                     "max_walking_time": max_walking_time,
                     "max_transfers": None if max_transfers == 7 else max_transfers,
                     "router": None if router == "auto" else router,
-                    "exclude_routes": tuple(exclude_routes) or None,
-                    "exclude_trips": tuple(exclude_trips) or None,
-                    "exclude_stops": tuple(exclude_stops) or None,
+                    "exclude_routes": id_sequence("exclude_routes", exclude_routes)
+                    or None,
+                    "exclude_trips": id_sequence("exclude_trips", exclude_trips)
+                    or None,
+                    "exclude_stops": id_sequence("exclude_stops", exclude_stops)
+                    or None,
                     "street_policy": street_policy,
                 },
             )
@@ -1013,9 +1028,12 @@ class TravelTimeMatrix(pd.DataFrame):
                     "max_walking_time": max_walking_time,
                     "max_transfers": None if max_transfers == 7 else max_transfers,
                     "router": None if router == "auto" else router,
-                    "exclude_routes": tuple(exclude_routes) or None,
-                    "exclude_trips": tuple(exclude_trips) or None,
-                    "exclude_stops": tuple(exclude_stops) or None,
+                    "exclude_routes": id_sequence("exclude_routes", exclude_routes)
+                    or None,
+                    "exclude_trips": id_sequence("exclude_trips", exclude_trips)
+                    or None,
+                    "exclude_stops": id_sequence("exclude_stops", exclude_stops)
+                    or None,
                     "street_policy": None,
                 },
                 intersection_delays=intersection_delays,
@@ -1276,6 +1294,7 @@ def _street_cost_columns(
     cost_components=None,
 ):
     """The reachable cells of a street cost matrix, in long format."""
+    components = component_selection(components)
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
 
     resolved = _street_cost_resolution(
@@ -1816,9 +1835,9 @@ def _stream_transit_cost(
     _validate_cost_query(date, departure, optimize, window, within, fares, router)
     if candidates not in ("time", "pareto"):
         raise ValueError("candidates must be 'time' or 'pareto'")
-    exclude_routes = [str(route) for route in exclude_routes]
-    exclude_trips = [str(trip) for trip in exclude_trips]
-    exclude_stops = [str(stop) for stop in exclude_stops]
+    exclude_routes = list(id_sequence("exclude_routes", exclude_routes))
+    exclude_trips = list(id_sequence("exclude_trips", exclude_trips))
+    exclude_stops = list(id_sequence("exclude_stops", exclude_stops))
     if chunk is not None:
         chunk = tuple(int(part) for part in chunk)
     from_ids, to_ids, points, to_stops = _cost_endpoints(
@@ -2188,9 +2207,9 @@ def _stream_transit_time(
     # Frozen once: a one-shot percentile iterable drains here, and every
     # batch routes the resolved list, not the caller's mutable value.
     resolved_percentiles = _window_percentiles(window, percentiles, confidence)
-    exclude_routes = [str(route) for route in exclude_routes]
-    exclude_trips = [str(trip) for trip in exclude_trips]
-    exclude_stops = [str(stop) for stop in exclude_stops]
+    exclude_routes = list(id_sequence("exclude_routes", exclude_routes))
+    exclude_trips = list(id_sequence("exclude_trips", exclude_trips))
+    exclude_stops = list(id_sequence("exclude_stops", exclude_stops))
     if chunk is not None:
         chunk = tuple(int(part) for part in chunk)
     from_ids, to_ids, points, _ = _cost_endpoints(network, origins, destinations, chunk)
@@ -2364,8 +2383,14 @@ def _cost_endpoints(network, origins, destinations, chunk):
         rows = _chunk_slice(len(from_ids), chunk)
         return from_ids[rows], to_ids, (origin_points[rows], destination_points), None
     stop_ids = [stop for stop, _, _ in network.stops]
-    from_ids = list(stop_ids) if origins is None else [str(o) for o in origins]
-    to_stops = None if destinations is None else [str(d) for d in destinations]
+    from_ids = (
+        list(stop_ids) if origins is None else list(id_sequence("origins", origins))
+    )
+    to_stops = (
+        None
+        if destinations is None
+        else list(id_sequence("destinations", destinations))
+    )
     return from_ids[_chunk_slice(len(from_ids), chunk)], stop_ids, None, to_stops
 
 
@@ -2404,10 +2429,11 @@ def _cost_columns(
     to_ids, destination_points)`` or ``("stops", from_ids, to_stops)``
     — replacing the resolution below so mutable inputs are only ever
     read once (`_cost_endpoints` mirrors it and must stay in step)."""
+    components = component_selection(components)
     exclusions = (
-        [str(route) for route in exclude_routes],
-        [str(trip) for trip in exclude_trips],
-        [str(stop) for stop in exclude_stops],
+        list(id_sequence("exclude_routes", exclude_routes)),
+        list(id_sequence("exclude_trips", exclude_trips)),
+        list(id_sequence("exclude_stops", exclude_stops)),
     )
     from cafein import emissions
     from cafein.network import _walk_options
@@ -2481,9 +2507,17 @@ def _cost_columns(
         if endpoints is not None:
             _, from_ids, to_stops = endpoints
         else:
-            from_ids = list(stop_ids) if origins is None else [str(o) for o in origins]
+            from_ids = (
+                list(stop_ids)
+                if origins is None
+                else list(id_sequence("origins", origins))
+            )
             from_ids = from_ids[_chunk_slice(len(from_ids), chunk)]
-            to_stops = None if destinations is None else [str(d) for d in destinations]
+            to_stops = (
+                None
+                if destinations is None
+                else list(id_sequence("destinations", destinations))
+            )
         if optimize != "time":
             # The emissions (McRAPTOR) stop matrix relaxes a matching whole-day
             # McULTRA set for the pareto objective, routing door-to-door with
@@ -2691,9 +2725,9 @@ def _policy_time_columns(
         )
     # Materialised once: a one-shot iterable must not exhaust between the
     # per-point reductions, and later mutation must not desynchronise them.
-    exclude_routes = tuple(str(route) for route in exclude_routes)
-    exclude_trips = tuple(str(trip) for trip in exclude_trips)
-    exclude_stops = tuple(str(stop) for stop in exclude_stops)
+    exclude_routes = id_sequence("exclude_routes", exclude_routes)
+    exclude_trips = id_sequence("exclude_trips", exclude_trips)
+    exclude_stops = id_sequence("exclude_stops", exclude_stops)
     from_ids, origin_points = _point_list(origins, "origins")
     if destinations is None:
         to_ids, destination_points = from_ids, origin_points
@@ -2812,6 +2846,9 @@ def _carriage_time_columns(
     from cafein.network import _policy_transfer_mode
     from cafein.policy import carriage_plane_modes, carriage_terms
 
+    exclude_routes = id_sequence("exclude_routes", exclude_routes)
+    exclude_trips = id_sequence("exclude_trips", exclude_trips)
+    exclude_stops = id_sequence("exclude_stops", exclude_stops)
     if any((exclude_routes, exclude_trips, exclude_stops)):
         raise ValueError("take_aboard=True does not combine with exclusions yet")
     core = network._core
@@ -2967,6 +3004,7 @@ def _policy_cost_columns(
     reductions through the engine fan-out, street distances and emissions
     attributed per row from the winning choices, and the direct walking
     alternative folded in over the same multimodal graph."""
+    components = component_selection(components)
     from cafein import emissions
     from cafein import streets as _streets
     from cafein.policy import reduction_modes
@@ -2989,9 +3027,9 @@ def _policy_cost_columns(
         )
     # Materialised once: a one-shot iterable must not exhaust between the
     # per-point reductions, and later mutation must not desynchronise them.
-    exclude_routes = tuple(str(route) for route in exclude_routes)
-    exclude_trips = tuple(str(trip) for trip in exclude_trips)
-    exclude_stops = tuple(str(stop) for stop in exclude_stops)
+    exclude_routes = id_sequence("exclude_routes", exclude_routes)
+    exclude_trips = id_sequence("exclude_trips", exclude_trips)
+    exclude_stops = id_sequence("exclude_stops", exclude_stops)
     from_ids, origin_points = _point_list(origins, "origins")
     if destinations is None:
         to_ids, destination_points = from_ids, origin_points

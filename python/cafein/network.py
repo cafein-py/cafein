@@ -2,6 +2,7 @@
 
 import os
 
+from cafein._validate import component_selection, id_sequence, sequence_not_string
 from cafein._cafein import TransportNetwork as _TransportNetwork
 
 
@@ -71,7 +72,7 @@ def _policy_reduced(core, point, egress, modes, exclude_stops, transfer_mode=Non
         point[1],
         egress,
         modes,
-        [str(stop) for stop in exclude_stops],
+        list(id_sequence("exclude_stops", exclude_stops)),
         transfer_mode=transfer_mode,
     )
     offsets = [(stop, seconds) for stop, seconds, *_ in rows]
@@ -275,9 +276,9 @@ def _policy_journeys(
     # One immutable snapshot of the caller's exclusions, reused across
     # every search below — a one-shot iterable or a list mutated between
     # the GIL-releasing calls must not shift the exclusion set mid-query.
-    exclude_routes = tuple(str(route) for route in exclusions[0])
-    exclude_trips = tuple(str(trip) for trip in exclusions[1])
-    exclude_stops = tuple(str(stop) for stop in exclusions[2])
+    exclude_routes = id_sequence("exclude_routes", exclusions[0])
+    exclude_trips = id_sequence("exclude_trips", exclusions[1])
+    exclude_stops = id_sequence("exclude_stops", exclusions[2])
     access_modes = reduction_modes(policy, "access", _streets.MAX_ACCESS_EGRESS_TIME)
     egress_modes = reduction_modes(policy, "egress", _streets.MAX_ACCESS_EGRESS_TIME)
     transfer_mode = _policy_transfer_mode(policy)
@@ -718,9 +719,9 @@ def _policy_mc_journeys(
                 "cafein.emissions.load_street_factors)"
             )
         transfer_arg = (mode, budget, float(value) / 1000.0)
-    exclude_routes = tuple(str(route) for route in exclusions[0])
-    exclude_trips = tuple(str(trip) for trip in exclusions[1])
-    exclude_stops = tuple(str(stop) for stop in exclusions[2])
+    exclude_routes = id_sequence("exclude_routes", exclusions[0])
+    exclude_trips = id_sequence("exclude_trips", exclusions[1])
+    exclude_stops = id_sequence("exclude_stops", exclusions[2])
     access_modes = pareto_reduction_modes(
         policy, "access", _streets.MAX_ACCESS_EGRESS_TIME, street_factors, components
     )
@@ -1226,6 +1227,7 @@ class TransportNetwork:
             The journeys, with ``emissions`` (grams CO₂e) on every leg
             and journey; see ``cafein.emissions.annotate``.
         """
+        components = component_selection(components)
         from cafein import emissions
 
         return emissions.annotate(journeys, self, factors, components)
@@ -1366,6 +1368,7 @@ class TransportNetwork:
             LCA components to include, as in ``emissions.annotate`` — the
             same arguments the queries will use.
         """
+        components = component_selection(components)
         from cafein import emissions
 
         trip_factors = emissions.trip_factors(self, factors, components)
@@ -1550,9 +1553,9 @@ class TransportNetwork:
             departure,
             max_transfers,
             window,
-            [str(route) for route in exclude_routes],
-            [str(trip) for trip in exclude_trips],
-            [str(stop) for stop in exclude_stops],
+            list(id_sequence("exclude_routes", exclude_routes)),
+            list(id_sequence("exclude_trips", exclude_trips)),
+            list(id_sequence("exclude_stops", exclude_stops)),
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
             geometries,
         )
@@ -1667,6 +1670,9 @@ class TransportNetwork:
             from cafein.policy import carriage_terms
 
             if carriage_terms(street_policy) is not None:
+                exclude_routes = id_sequence("exclude_routes", exclude_routes)
+                exclude_trips = id_sequence("exclude_trips", exclude_trips)
+                exclude_stops = id_sequence("exclude_stops", exclude_stops)
                 if any((exclude_routes, exclude_trips, exclude_stops)):
                     raise ValueError(
                         "take_aboard=True does not combine with exclusions yet"
@@ -1692,9 +1698,9 @@ class TransportNetwork:
                     departure,
                     max_transfers,
                     None,
-                    [str(route) for route in exclude_routes],
-                    [str(trip) for trip in exclude_trips],
-                    [str(stop) for stop in exclude_stops],
+                    list(id_sequence("exclude_routes", exclude_routes)),
+                    list(id_sequence("exclude_trips", exclude_trips)),
+                    list(id_sequence("exclude_stops", exclude_stops)),
                     *_walk_options(None, walk_budget, None),
                     geometries,
                 )
@@ -1721,9 +1727,9 @@ class TransportNetwork:
             departure,
             max_transfers,
             window,
-            [str(route) for route in exclude_routes],
-            [str(trip) for trip in exclude_trips],
-            [str(stop) for stop in exclude_stops],
+            list(id_sequence("exclude_routes", exclude_routes)),
+            list(id_sequence("exclude_trips", exclude_trips)),
+            list(id_sequence("exclude_stops", exclude_stops)),
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
             geometries,
         )
@@ -1854,6 +1860,9 @@ class TransportNetwork:
                     "walking_speed_kmph, max_walking_time, or "
                     "max_snap_distance beside it is a conflict"
                 )
+            exclude_routes = id_sequence("exclude_routes", exclude_routes)
+            exclude_trips = id_sequence("exclude_trips", exclude_trips)
+            exclude_stops = id_sequence("exclude_stops", exclude_stops)
             if any((exclude_routes, exclude_trips, exclude_stops)):
                 raise ValueError("street_policy does not combine with exclusions yet")
             from cafein.network import _policy_transfer_mode
@@ -1963,9 +1972,9 @@ class TransportNetwork:
             date,
             departure,
             max_transfers,
-            [str(route) for route in exclude_routes],
-            [str(trip) for trip in exclude_trips],
-            [str(stop) for stop in exclude_stops],
+            list(id_sequence("exclude_routes", exclude_routes)),
+            list(id_sequence("exclude_trips", exclude_trips)),
+            list(id_sequence("exclude_stops", exclude_stops)),
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
         )
 
@@ -2031,9 +2040,9 @@ class TransportNetwork:
             date,
             departure,
             max_transfers,
-            [str(route) for route in exclude_routes],
-            [str(trip) for trip in exclude_trips],
-            [str(stop) for stop in exclude_stops],
+            list(id_sequence("exclude_routes", exclude_routes)),
+            list(id_sequence("exclude_trips", exclude_trips)),
+            list(id_sequence("exclude_stops", exclude_stops)),
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
         )
 
@@ -2140,6 +2149,9 @@ class TransportNetwork:
             Unreachable pairs hold the maximum uint32 value
             (4294967295).
         """
+        from_stops = sequence_not_string("from_stops", from_stops)
+        if destinations is not None:
+            destinations = sequence_not_string("destinations", destinations)
         matrix, _from_ids, _to_ids, _percentiles = self._time_matrix_with_ids(
             from_stops,
             date,
@@ -2218,9 +2230,9 @@ class TransportNetwork:
                     departure,
                     max_transfers,
                     router,
-                    [str(route) for route in exclude_routes],
-                    [str(trip) for trip in exclude_trips],
-                    [str(stop) for stop in exclude_stops],
+                    list(id_sequence("exclude_routes", exclude_routes)),
+                    list(id_sequence("exclude_trips", exclude_trips)),
+                    list(id_sequence("exclude_stops", exclude_stops)),
                     *walk,
                 )
             else:
@@ -2233,9 +2245,9 @@ class TransportNetwork:
                     percentiles,
                     max_transfers,
                     router,
-                    [str(route) for route in exclude_routes],
-                    [str(trip) for trip in exclude_trips],
-                    [str(stop) for stop in exclude_stops],
+                    list(id_sequence("exclude_routes", exclude_routes)),
+                    list(id_sequence("exclude_trips", exclude_trips)),
+                    list(id_sequence("exclude_stops", exclude_stops)),
                     *walk,
                 )
             _warn_unsnapped(table, from_ids, to_ids)
@@ -2254,9 +2266,9 @@ class TransportNetwork:
                 departure,
                 max_transfers,
                 router,
-                [str(route) for route in exclude_routes],
-                [str(trip) for trip in exclude_trips],
-                [str(stop) for stop in exclude_stops],
+                list(id_sequence("exclude_routes", exclude_routes)),
+                list(id_sequence("exclude_trips", exclude_trips)),
+                list(id_sequence("exclude_stops", exclude_stops)),
                 *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
             )
         else:
@@ -2268,8 +2280,8 @@ class TransportNetwork:
                 percentiles,
                 max_transfers,
                 router,
-                [str(route) for route in exclude_routes],
-                [str(trip) for trip in exclude_trips],
-                [str(stop) for stop in exclude_stops],
+                list(id_sequence("exclude_routes", exclude_routes)),
+                list(id_sequence("exclude_trips", exclude_trips)),
+                list(id_sequence("exclude_stops", exclude_stops)),
             )
         return matrix, from_stops, to_ids, percentiles

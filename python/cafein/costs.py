@@ -177,6 +177,11 @@ def _resolved(table, mode, perspective, components):
         return nan, {component: nan for component in components or ()}
     if components is not None:
         known = set(rows.component)
+        if isinstance(components, str):
+            raise TypeError(
+                f"cost_components must be an iterable of component names, "
+                f"not the string {components!r} — pass ({components!r},)"
+            )
         unknown = set(components) - known
         if unknown:
             raise ValueError(
@@ -207,6 +212,11 @@ def street_cost(transport_mode, perspective, costs=None, components=None):
 def _checked_components(components):
     if components is None:
         return None
+    if isinstance(components, str):
+        raise TypeError(
+            f"cost_components must be an iterable of component names, not "
+            f"the string {components!r} — pass ({components!r},)"
+        )
     chosen = list(components)
     if not chosen or not all(isinstance(name, str) and name for name in chosen):
         raise ValueError("cost_components must be non-empty component names")

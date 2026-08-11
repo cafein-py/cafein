@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **Bare strings are refused wherever id collections are expected**
+  (#237): `exclude_routes`/`exclude_trips`/`exclude_stops` on every
+  entry point, `travel_time_matrix`'s stop set, matrix and itinerary
+  `origins`/`destinations`, and emission/cost `components` now raise a
+  `TypeError` naming the parameter — previously a string dissolved
+  into one-character items, so exclusions silently matched nothing and
+  stop sets failed with per-character KeyErrors.
+
 ## 0.10.1 — 2026-08-11
 
 - **Walking is a street mode by default**: with an OSM extract,
