@@ -175,3 +175,168 @@ def test_the_aggregation_arguments_validate_eagerly(network):
         call(opportunities=opportunities[:-1])
     with pytest.raises(ValueError, match="finite and non-negative"):
         call(opportunities=[-1.0] + opportunities[1:])
+
+
+def test_the_computer_matches_the_stop_oracle(network):
+    import pandas
+
+    from cafein import Accessibility
+
+    origins, destinations = _stop_sets(network)
+    table = pandas.DataFrame(
+        {"id": destinations, "jobs": numpy.arange(1.0, len(destinations) + 1)}
+    )
+    frame = Accessibility(
+        network,
+        origins,
+        table,
+        DATE,
+        DEPARTURE,
+        opportunities="jobs",
+        budgets=(900.0, 1800.0),
+    )
+    assert list(frame.columns) == ["from_id", "opportunity", "budget", "accessibility"]
+    assert len(frame) == len(origins) * 2
+    assert set(frame["opportunity"]) == {"jobs"}
+    times = _oracle_times(network, origins, destinations)
+    for budget in (900.0, 1800.0):
+        expected = numpy.nansum(
+            numpy.where(times <= budget, table["jobs"].to_numpy(), 0.0), axis=1
+        )
+        got = frame[frame["budget"] == budget]["accessibility"].to_numpy()
+        assert numpy.allclose(got, expected)
+
+
+def test_the_computer_counts_features_without_opportunities(network):
+    from cafein import Accessibility
+
+    origins, destinations = _stop_sets(network)
+    frame = Accessibility(network, origins, destinations, DATE, DEPARTURE)
+    assert set(frame["opportunity"]) == {"count"}
+    times = _oracle_times(network, origins, destinations)
+    expected = (times <= 1800.0).sum(axis=1).astype("float64")
+    assert numpy.allclose(frame["accessibility"].to_numpy(), expected)
+
+
+def test_the_computer_routes_point_frames_door_to_door(network_with_footpaths):
+    geopandas = pytest.importorskip("geopandas")
+    from cafein import Accessibility, TravelTimeMatrix
+
+    origins = geopandas.GeoDataFrame(
+        {"id": ["kamppi", "kallio"]},
+        geometry=geopandas.points_from_xy([24.9316, 24.9500], [60.1688, 60.1841]),
+        crs="EPSG:4326",
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["a", "b", "c"], "seats": [10.0, 20.0, 40.0]},
+        geometry=geopandas.points_from_xy(
+            [24.9414, 24.9210, 24.9700], [60.1725, 60.1580, 60.2000]
+        ),
+        crs="EPSG:4326",
+    )
+    frame = Accessibility(
+        network_with_footpaths,
+        origins,
+        destinations,
+        DATE,
+        DEPARTURE,
+        opportunities="seats",
+        budgets=(1800.0,),
+    )
+    matrix = TravelTimeMatrix(
+        network_with_footpaths, origins, destinations, DATE, DEPARTURE
+    )
+    reachable = matrix[matrix.travel_time_s <= 1800.0]
+    seats = dict(zip(destinations["id"], destinations["seats"]))
+    expected = {
+        origin: sum(seats[to] for to in group["to_id"])
+        for origin, group in reachable.groupby("from_id")
+    }
+    got = dict(zip(frame["from_id"], frame["accessibility"]))
+    assert got == expected
+
+
+def test_the_computer_serves_street_modes(helsinki_streets):
+    geopandas = pytest.importorskip("geopandas")
+    from cafein import Accessibility
+
+    origins = geopandas.GeoDataFrame(
+        {"id": ["o1", "o2"]},
+        geometry=geopandas.points_from_xy([24.9384, 24.9600], [60.1699, 60.1866]),
+        crs="EPSG:4326",
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["d1", "d2", "d3"]},
+        geometry=geopandas.points_from_xy(
+            [24.9414, 24.9509, 24.9210], [60.1725, 60.1798, 60.1580]
+        ),
+        crs="EPSG:4326",
+    )
+    frame = Accessibility(
+        helsinki_streets,
+        origins,
+        destinations,
+        transport_mode="walk",
+        budgets=(600.0, 1800.0),
+    )
+    assert len(frame) == 4
+    wide = frame.pivot(index="from_id", columns="budget", values="accessibility")
+    assert (wide[600.0] <= wide[1800.0]).all()
+    assert (wide[1800.0] <= 3.0).all()
+
+
+def test_the_computer_validates_eagerly(network, helsinki_streets):
+    import pandas
+
+    from cafein import Accessibility
+
+    origins, destinations = _stop_sets(network)
+    table = pandas.DataFrame({"id": destinations, "jobs": 1.0})
+
+    with pytest.raises(ValueError, match="unknown decay"):
+        Accessibility(network, origins, table, DATE, DEPARTURE, decay="gravity")
+    with pytest.raises(ValueError, match="decay_params"):
+        Accessibility(network, origins, table, DATE, DEPARTURE, decay="linear")
+    with pytest.raises(TypeError, match="budgets"):
+        Accessibility(network, origins, table, DATE, DEPARTURE, budgets="1800")
+    with pytest.raises(ValueError, match="no column"):
+        Accessibility(network, origins, table, DATE, DEPARTURE, opportunities="people")
+    with pytest.raises(ValueError, match="null value"):
+        nulled = table.assign(jobs=[None] + [1.0] * (len(table) - 1))
+        Accessibility(network, origins, nulled, DATE, DEPARTURE, opportunities="jobs")
+    with pytest.raises(TypeError, match="date and departure"):
+        Accessibility(network, origins, table)
+    with pytest.raises(ValueError, match="transport_mode"):
+        Accessibility(network, origins, table, DATE, DEPARTURE, transport_mode="walk")
+    with pytest.raises(ValueError, match="transport_mode"):
+        Accessibility(helsinki_streets, origins, table)
+    with pytest.raises(TypeError, match="exclude_routes"):
+        Accessibility(network, origins, table, DATE, DEPARTURE, exclude_routes="1001")
+    with pytest.raises(ValueError, match="complex"):
+        Accessibility(
+            network,
+            origins,
+            table.assign(jobs=1.0 + 1.0j),
+            DATE,
+            DEPARTURE,
+            opportunities="jobs",
+        )
+
+
+def test_street_requests_reject_transit_routing_knobs(helsinki_streets):
+    geopandas = pytest.importorskip("geopandas")
+    from cafein import Accessibility
+
+    points = geopandas.GeoDataFrame(
+        {"id": ["p"]},
+        geometry=geopandas.points_from_xy([24.9384], [60.1699]),
+        crs="EPSG:4326",
+    )
+    with pytest.raises(ValueError, match="router"):
+        Accessibility(
+            helsinki_streets, points, points, transport_mode="walk", router="tbtr"
+        )
+    with pytest.raises(ValueError, match="max_transfers"):
+        Accessibility(
+            helsinki_streets, points, points, transport_mode="walk", max_transfers=3
+        )
