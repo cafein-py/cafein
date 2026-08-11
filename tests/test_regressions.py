@@ -331,6 +331,7 @@ def test_component_selections_accept_one_shot_iterables(network):
         "2022-02-22",
         "08:30:00",
         600,
+        candidates="pareto",
         components=iter(["fuel"]),
     )
     assert len(frontier) > 0
