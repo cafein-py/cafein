@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.11.0 — 2026-08-11
 
 - **Walking is a street mode by default**: with an OSM extract,
   `TransportNetwork.from_gtfs` now builds the multimodal street graph
