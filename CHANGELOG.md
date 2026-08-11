@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Walking is a street mode by default**: with an OSM extract,
+  `TransportNetwork.from_gtfs` now builds the multimodal street graph
+  with `("walk",)` unless `street_modes` says otherwise — walking is
+  how public-transport journeys begin and end. Pass `street_modes=()`
+  to opt out. `street_modes` (and `StreetNetwork.from_osm`'s `modes`)
+  are validated eagerly at entry — a bare string, an unknown mode, or
+  a duplicate raises before any file is read, instead of after the
+  full GTFS build (#237).
+
 - **Recurring installed-package checks**: a scheduled `sampledata`
   workflow installs the published `cafein` and `cafein.sampledata` from
   PyPI, downloads the pinned Helsinki data release, and runs the

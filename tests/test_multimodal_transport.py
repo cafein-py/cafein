@@ -92,8 +92,8 @@ def test_without_street_modes_nothing_is_carried(network):
 
 
 def test_a_walk_only_save_is_deterministic(network_with_footpaths, tmp_path):
-    # The multimodal machinery adds nothing varying to a build without
-    # street_modes — including one that carries the walking street graph:
+    # The multimodal machinery adds nothing varying to a default build
+    # (which now carries the walk multimodal graph beside footpaths):
     # saving the same network twice is byte-identical. (Byte identity across
     # a load cycle is not asserted — feed serialization has never guaranteed
     # it — the walking bit-for-bit tests cover behaviour.)
@@ -112,12 +112,38 @@ def test_street_modes_requires_the_extract(helsinki_gtfs):
 
 
 def test_dem_requires_street_modes(helsinki_gtfs, kantakaupunki_pbf):
+    # street_modes=() opts out of the multimodal graph, so a DEM has
+    # nothing to apply to; the walk default would otherwise carry it.
     with pytest.raises(ValueError, match="street_modes"):
         TransportNetwork.from_gtfs(
             [str(helsinki_gtfs)],
             osm_pbf=str(kantakaupunki_pbf),
+            street_modes=(),
             dem=lambda lons, lats: lons,
         )
+
+
+def test_an_extract_carries_walking_by_default(network_with_footpaths):
+    # Walking is how public-transport journeys begin and end: with an
+    # OSM extract the multimodal graph defaults to ("walk",).
+    assert network_with_footpaths.has_multimodal_streets
+    assert network_with_footpaths.street_modes == ("walk",)
+
+
+@pytest.fixture(scope="module")
+def opt_out_network(helsinki_gtfs, kantakaupunki_pbf):
+    """A footpaths network explicitly built without the multimodal graph."""
+    with pytest.warns(UserWarning):
+        return TransportNetwork.from_gtfs(
+            [str(helsinki_gtfs)],
+            osm_pbf=str(kantakaupunki_pbf),
+            street_modes=(),
+        )
+
+
+def test_empty_street_modes_opt_out(opt_out_network):
+    assert not opt_out_network.has_multimodal_streets
+    assert opt_out_network.street_modes is None
 
 
 def test_street_access_and_egress_rows(multimodal_network):
@@ -143,11 +169,9 @@ def test_street_access_and_egress_rows(multimodal_network):
         assert connector >= 0.0
 
 
-def test_street_rows_need_the_multimodal_graph(network_with_footpaths):
+def test_street_rows_need_the_multimodal_graph(opt_out_network):
     with pytest.raises(ValueError, match="street_modes"):
-        network_with_footpaths._core._street_access_seconds(
-            60.169, 24.932, "bicycle", 900.0
-        )
+        opt_out_network._core._street_access_seconds(60.169, 24.932, "bicycle", 900.0)
 
 
 def test_synthetic_links_keep_modes_apart_and_merge_equal_snaps(

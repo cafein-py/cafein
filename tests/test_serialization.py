@@ -14,10 +14,23 @@ HIERARCHY_BBOX = [24.90, 60.15, 25.00, 60.20]  # [min_lon, min_lat, max_lon, max
 
 
 @pytest.fixture(scope="module")
-def artifact_path(network_with_footpaths, tmp_path_factory):
-    """The street-enabled Helsinki network saved to disk once."""
+def artifact_path(helsinki_gtfs, kantakaupunki_pbf, tmp_path_factory):
+    """A walk-only street-enabled Helsinki artifact saved to disk once.
+
+    Built with ``street_modes=()`` deliberately: this module pins the
+    walk-only payload contract (13 core street arrays, fully lazy
+    mapped loads), which the default walk multimodal graph would grow.
+    """
+    from cafein import TransportNetwork
+
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs(
+            [str(helsinki_gtfs)],
+            osm_pbf=str(kantakaupunki_pbf),
+            street_modes=(),
+        )
     path = tmp_path_factory.mktemp("artifact") / "helsinki.cafein"
-    network_with_footpaths.save(path)
+    network.save(path)
     return path
 
 
@@ -116,10 +129,13 @@ def test_round_trip_preserves_the_walking_hierarchy(
     # that lost its hierarchy. Built over a cropped central walking graph, since
     # the serialize/rebuild path under test does not depend on the graph's size.
     with pytest.warns(UserWarning):
+        # street_modes=() keeps the artifact walk-only, so the lazy
+        # mapped-load probe below stays meaningful.
         accelerated = TransportNetwork.from_gtfs(
             [str(helsinki_gtfs)],
             osm_pbf=str(kantakaupunki_pbf),
             bounding_box=HIERARCHY_BBOX,
+            street_modes=(),
         )
     accelerated._core.install_walking_hierarchy()
     assert accelerated._core.has_walking_hierarchy

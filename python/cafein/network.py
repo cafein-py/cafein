@@ -940,7 +940,11 @@ class TransportNetwork:
             of ``StreetNetwork.from_osm``) and carry it with the network —
             the second street section behind cycling / e-scooter access
             and egress. The walking graph and every existing query are
-            untouched. Requires `osm_pbf`.
+            untouched. Requires `osm_pbf`. With `osm_pbf` the default is
+            ``("walk",)`` — walking is how public-transport journeys
+            begin and end — and ``()`` opts out of the multimodal graph
+            entirely. A malformed value (a bare string, an unknown mode)
+            raises before any file is read.
         dem, dem_interval : optional
             Elevation for the multimodal graph, exactly as in
             ``StreetNetwork.from_osm``; only meaningful with
@@ -964,14 +968,22 @@ class TransportNetwork:
         pass over `osm_pbf` for the multimodal graph); they must not
         change underneath it.
         """
+        from cafein import street_network as _street_network
+
+        # Every street_modes problem surfaces here, before any file is
+        # read — not minutes later, once the timetable is built.
+        if street_modes is None:
+            street_modes = ("walk",) if osm_pbf is not None else ()
+        else:
+            street_modes = _street_network.validate_build_modes(street_modes)
         paths = _gtfs_paths(paths)
         if ultra and osm_pbf is None:
             raise ValueError("ultra=True requires an OSM extract; pass osm_pbf=")
-        if street_modes is not None and osm_pbf is None:
+        if street_modes and osm_pbf is None:
             raise ValueError("street_modes requires an OSM extract; pass osm_pbf=")
-        if dem is not None and street_modes is None:
+        if dem is not None and not street_modes:
             raise ValueError("dem applies to the multimodal graph; pass street_modes=")
-        if street_modes is None and any(
+        if "car" not in street_modes and any(
             option is not None for option in (country, urban_areas, speed_limits)
         ):
             raise ValueError(
@@ -1017,10 +1029,7 @@ class TransportNetwork:
                 footpaths.meters,
             )
             core.set_street_network(*street_network)
-            if street_modes is not None:
-                from cafein import street_network as _street_network
-
-                street_modes = tuple(street_modes)
+            if street_modes:
                 core.set_multimodal_streets(
                     list(street_modes),
                     *_street_network.multimodal_payload(
