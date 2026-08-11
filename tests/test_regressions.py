@@ -243,3 +243,28 @@ def test_multimodal_zero_shortcut_validates_snap_and_cutoff(fresh_footpaths_netw
         lat, lon, "walk", stop, edge, fraction, connector, False, 600.0, False
     )
     assert parts is not None and parts[0] == 0
+
+
+def test_street_modes_validate_before_any_file_is_read():
+    # A bare string used to survive to tuple("walk") == ('w','a','l','k')
+    # and only fail after the whole GTFS build (issue #237). The paths
+    # here do not exist: reaching a file error would mean lazy validation.
+    pytest.importorskip("cafein._cafein")
+    from cafein import StreetNetwork, TransportNetwork
+
+    with pytest.raises(TypeError, match="iterable of mode names"):
+        TransportNetwork.from_gtfs(
+            ["no-such-feed.zip"], osm_pbf="no-such.osm.pbf", street_modes="walk"
+        )
+    with pytest.raises(ValueError, match="unknown street mode"):
+        TransportNetwork.from_gtfs(
+            ["no-such-feed.zip"], osm_pbf="no-such.osm.pbf", street_modes=("flying",)
+        )
+    with pytest.raises(ValueError, match="duplicate street mode"):
+        TransportNetwork.from_gtfs(
+            ["no-such-feed.zip"],
+            osm_pbf="no-such.osm.pbf",
+            street_modes=("walk", "walk"),
+        )
+    with pytest.raises(TypeError, match="iterable of mode names"):
+        StreetNetwork.from_osm("no-such.osm.pbf", modes="bicycle")

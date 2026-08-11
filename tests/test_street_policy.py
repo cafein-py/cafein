@@ -328,8 +328,18 @@ def test_parking_eligibility_gates_the_bicycle(multimodal_network):
             assert stop in parking or via in parking
 
 
-def test_a_policy_needs_the_multimodal_graph(network_with_footpaths):
+def test_a_policy_needs_the_multimodal_graph(helsinki_gtfs, kantakaupunki_pbf):
     pytest.importorskip("cafein._cafein")
+    from cafein import TransportNetwork
+
+    # street_modes=() opts out of the graph a policy needs; the walk
+    # default would otherwise carry one.
+    with pytest.warns(UserWarning):
+        network = TransportNetwork.from_gtfs(
+            [str(helsinki_gtfs)],
+            osm_pbf=str(kantakaupunki_pbf),
+            street_modes=(),
+        )
     policy = StreetLegPolicy(
         access={"walk": 1800, "e_scooter": 900},
         vehicles={
@@ -339,7 +349,7 @@ def test_a_policy_needs_the_multimodal_graph(network_with_footpaths):
         },
     )
     with pytest.raises(ValueError, match="street_modes"):
-        network_with_footpaths.travel_times_from_coordinate(
+        network.travel_times_from_coordinate(
             ORIGIN, "2022-02-22", "08:30:00", street_policy=policy
         )
 

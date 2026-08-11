@@ -19,6 +19,33 @@ rides the bicycle permissions with its own speed profile — so it is routable
 without being a separate build mode. `car` requires a build with ``"car"`` in
 `modes` (the persisted driving speeds and junction classes)."""
 
+
+def validate_build_modes(modes):
+    """`modes` as a validated tuple of build-mode names.
+
+    Rejects a bare string outright — ``str`` is iterable, so
+    ``"walk"`` would otherwise dissolve into four one-letter modes —
+    and any name without a permission bit, before any file is read.
+    """
+    if isinstance(modes, str):
+        raise TypeError(
+            f"street modes must be an iterable of mode names, not the "
+            f"string {modes!r} — pass ({modes!r},)"
+        )
+    modes = tuple(modes)
+    seen = set()
+    for mode in modes:
+        if not isinstance(mode, str) or mode not in _osm.MODES:
+            known = ", ".join(sorted(_osm.MODES))
+            raise ValueError(
+                f"unknown street mode {mode!r}: the build modes are {known}"
+            )
+        if mode in seen:
+            raise ValueError(f"duplicate street mode {mode!r}")
+        seen.add(mode)
+    return modes
+
+
 MAX_STREET_TIME = 7200.0
 """Default routing cutoff in seconds, matching the street-time ceiling the
 transit path already applies to access and egress
@@ -51,6 +78,8 @@ class StreetNetwork:
         speed_limits=None,
     ):
         """Build a street network from an OSM PBF extract.
+
+        Raises on a malformed `modes` before the extract is read.
 
         Parameters
         ----------
@@ -99,6 +128,7 @@ class StreetNetwork:
             (e.g. ``{"residential_inside": 30}``); unknown classes and
             non-positive values are rejected. Car builds only.
         """
+        modes = validate_build_modes(modes)
         return cls(
             _CoreStreetNetwork(
                 *multimodal_payload(
