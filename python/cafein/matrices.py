@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import shapely
 
-from cafein._validate import id_sequence, sequence_not_string
+from cafein._validate import component_selection, id_sequence, sequence_not_string
 
 
 class TravelCostMatrix(pd.DataFrame):
@@ -325,9 +325,12 @@ class TravelCostMatrix(pd.DataFrame):
                     "candidates": None if candidates == "time" else candidates,
                     "bucket": None if bucket == 25.0 else bucket,
                     "router": None if router == "auto" else router,
-                    "exclude_routes": tuple(exclude_routes) or None,
-                    "exclude_trips": tuple(exclude_trips) or None,
-                    "exclude_stops": tuple(exclude_stops) or None,
+                    "exclude_routes": id_sequence("exclude_routes", exclude_routes)
+                    or None,
+                    "exclude_trips": id_sequence("exclude_trips", exclude_trips)
+                    or None,
+                    "exclude_stops": id_sequence("exclude_stops", exclude_stops)
+                    or None,
                     "street_policy": street_policy,
                 },
             )
@@ -576,9 +579,12 @@ class TravelCostMatrix(pd.DataFrame):
                     "candidates": None if candidates == "time" else candidates,
                     "bucket": None if bucket == 25.0 else bucket,
                     "router": None if router == "auto" else router,
-                    "exclude_routes": tuple(exclude_routes) or None,
-                    "exclude_trips": tuple(exclude_trips) or None,
-                    "exclude_stops": tuple(exclude_stops) or None,
+                    "exclude_routes": id_sequence("exclude_routes", exclude_routes)
+                    or None,
+                    "exclude_trips": id_sequence("exclude_trips", exclude_trips)
+                    or None,
+                    "exclude_stops": id_sequence("exclude_stops", exclude_stops)
+                    or None,
                     "street_policy": None,
                 },
                 factors=factors,
@@ -832,9 +838,12 @@ class TravelTimeMatrix(pd.DataFrame):
                     "max_walking_time": max_walking_time,
                     "max_transfers": None if max_transfers == 7 else max_transfers,
                     "router": None if router == "auto" else router,
-                    "exclude_routes": tuple(exclude_routes) or None,
-                    "exclude_trips": tuple(exclude_trips) or None,
-                    "exclude_stops": tuple(exclude_stops) or None,
+                    "exclude_routes": id_sequence("exclude_routes", exclude_routes)
+                    or None,
+                    "exclude_trips": id_sequence("exclude_trips", exclude_trips)
+                    or None,
+                    "exclude_stops": id_sequence("exclude_stops", exclude_stops)
+                    or None,
                     "street_policy": street_policy,
                 },
             )
@@ -1019,9 +1028,12 @@ class TravelTimeMatrix(pd.DataFrame):
                     "max_walking_time": max_walking_time,
                     "max_transfers": None if max_transfers == 7 else max_transfers,
                     "router": None if router == "auto" else router,
-                    "exclude_routes": tuple(exclude_routes) or None,
-                    "exclude_trips": tuple(exclude_trips) or None,
-                    "exclude_stops": tuple(exclude_stops) or None,
+                    "exclude_routes": id_sequence("exclude_routes", exclude_routes)
+                    or None,
+                    "exclude_trips": id_sequence("exclude_trips", exclude_trips)
+                    or None,
+                    "exclude_stops": id_sequence("exclude_stops", exclude_stops)
+                    or None,
                     "street_policy": None,
                 },
                 intersection_delays=intersection_delays,
@@ -1282,6 +1294,7 @@ def _street_cost_columns(
     cost_components=None,
 ):
     """The reachable cells of a street cost matrix, in long format."""
+    components = component_selection(components)
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
 
     resolved = _street_cost_resolution(
@@ -2416,6 +2429,7 @@ def _cost_columns(
     to_ids, destination_points)`` or ``("stops", from_ids, to_stops)``
     — replacing the resolution below so mutable inputs are only ever
     read once (`_cost_endpoints` mirrors it and must stay in step)."""
+    components = component_selection(components)
     exclusions = (
         list(id_sequence("exclude_routes", exclude_routes)),
         list(id_sequence("exclude_trips", exclude_trips)),
@@ -2990,6 +3004,7 @@ def _policy_cost_columns(
     reductions through the engine fan-out, street distances and emissions
     attributed per row from the winning choices, and the direct walking
     alternative folded in over the same multimodal graph."""
+    components = component_selection(components)
     from cafein import emissions
     from cafein import streets as _streets
     from cafein.policy import reduction_modes

@@ -322,3 +322,25 @@ def test_component_selections_accept_one_shot_iterables(network):
     annotated = network.annotate_emissions(journeys, components=iter(["fuel"]))
     legs = [leg for j in annotated for leg in j["legs"] if leg["type"] == "transit"]
     assert any(leg.get("emissions") is not None for leg in legs)
+    # The frontier path resolves factors, then annotates: the selection
+    # must be frozen once at entry, not consumed twice.
+    frontier = journey_frontier(
+        network,
+        "4810551",
+        "1250551",
+        "2022-02-22",
+        "08:30:00",
+        600,
+        components=iter(["fuel"]),
+    )
+    assert len(frontier) > 0
+
+
+def test_id_collections_refuse_bytes(network):
+    # Bytes iterate as integers: b"1001" would become ("49", "48", ...).
+    with pytest.raises(TypeError, match="exclude_routes"):
+        network.route_between_stops(
+            "1040280", "1100602", "2022-02-22", "08:30:00", exclude_routes=b"1001"
+        )
+    with pytest.raises(TypeError, match="components"):
+        network.annotate_emissions([], components=b"fuel")

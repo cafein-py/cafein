@@ -41,7 +41,7 @@ import math
 import pandas as pd
 
 from cafein import emissions
-from cafein._validate import id_sequence, sequence_not_string
+from cafein._validate import component_selection, id_sequence, sequence_not_string
 
 _COLUMNS = [
     "departure_s",
@@ -241,6 +241,7 @@ def journey_frontier(
         on any criterion never are), and ``journey``, the annotated
         journey dict as returned by the routing calls.
     """
+    components = component_selection(components)
     if candidates not in ("time", "pareto", "relaxed", "diverse"):
         raise ValueError("candidates must be 'time', 'pareto', 'relaxed', or 'diverse'")
     if router not in ("auto", "raptor", "tbtr"):
@@ -484,6 +485,7 @@ def journey_frontiers(
         rows within a cell the frame's travel-time sort; a cell with no
         feasible journey contributes no rows.
     """
+    components = component_selection(components)
     stops = _frontier_ids(origins, "origins"), _frontier_ids(
         destinations, "destinations"
     )
@@ -613,6 +615,7 @@ def frontier_table(
         ``travel_time``, ``rides``, ``emissions`` (NaN where a transit
         leg's factor is unresolved), and ``frontier``.
     """
+    components = component_selection(components)
     import numpy as np
 
     stops = _frontier_ids(origins, "origins"), _frontier_ids(
@@ -1034,6 +1037,7 @@ def exhaustive_frontier(
         fewest transit legs achieving the point), and ``emissions``
         (grams CO₂e).
     """
+    components = component_selection(components)
     trip_factors = emissions.trip_factors(network, factors, components)
     points = network._core.pareto_oracle(
         origin, destination, date, departure, trip_factors, max_transfers

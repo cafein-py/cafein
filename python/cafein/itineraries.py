@@ -1,7 +1,7 @@
 """Detailed door-to-door itineraries as a GeoDataFrame."""
 
 import math
-from cafein._validate import id_sequence
+from cafein._validate import component_selection, id_sequence
 
 import geopandas as gpd
 import numpy as np
@@ -372,9 +372,12 @@ class DetailedItineraries(gpd.GeoDataFrame):
                         "router": None if router == "auto" else router,
                         "diversity": None if diversity == "time" else diversity,
                         "penalty": None if penalty == "ban" else penalty,
-                        "exclude_routes": tuple(exclude_routes) or None,
-                        "exclude_trips": tuple(exclude_trips) or None,
-                        "exclude_stops": tuple(exclude_stops) or None,
+                        "exclude_routes": id_sequence("exclude_routes", exclude_routes)
+                        or None,
+                        "exclude_trips": id_sequence("exclude_trips", exclude_trips)
+                        or None,
+                        "exclude_stops": id_sequence("exclude_stops", exclude_stops)
+                        or None,
                     },
                 ),
                 geometry="geometry",
@@ -471,6 +474,7 @@ def _itineraries_frame(
     max_snap_distance,
     street_policy=None,
 ):
+    components = component_selection(components)
     from cafein import emissions
     from cafein.frontier import _alternative_options, _exclusion_lists
 

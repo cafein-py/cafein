@@ -2,7 +2,7 @@
 
 import os
 
-from cafein._validate import id_sequence, sequence_not_string
+from cafein._validate import component_selection, id_sequence, sequence_not_string
 from cafein._cafein import TransportNetwork as _TransportNetwork
 
 
@@ -1227,6 +1227,7 @@ class TransportNetwork:
             The journeys, with ``emissions`` (grams CO₂e) on every leg
             and journey; see ``cafein.emissions.annotate``.
         """
+        components = component_selection(components)
         from cafein import emissions
 
         return emissions.annotate(journeys, self, factors, components)
@@ -1367,6 +1368,7 @@ class TransportNetwork:
             LCA components to include, as in ``emissions.annotate`` — the
             same arguments the queries will use.
         """
+        components = component_selection(components)
         from cafein import emissions
 
         trip_factors = emissions.trip_factors(self, factors, components)
