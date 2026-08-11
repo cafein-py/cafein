@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.2 — 2026-08-11
 
 - **Bare strings are refused wherever id collections are expected**
   (#237): `exclude_routes`/`exclude_trips`/`exclude_stops` on every
