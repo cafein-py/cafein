@@ -253,6 +253,7 @@ def main():
         f"({DATE} {DEPARTURE}, single departure)"
     )
     results = []
+    failed = False
     for engine in ["cafein", "r5py"]:
         command = [
             sys.executable,
@@ -272,6 +273,7 @@ def main():
                 f"exit code {completed.returncode}"
             ]
             print(f"{engine}: FAILED\n{detail[-1]}")
+            failed = True
             continue
         results.append(json.loads(completed.stdout.strip().splitlines()[-1]))
 
@@ -295,6 +297,8 @@ def main():
         "access/egress snapping. Both use the OSM extract for walking "
         "transfers.\nfinite_share differs accordingly."
     )
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
