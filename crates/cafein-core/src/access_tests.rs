@@ -96,6 +96,14 @@ fn nearest_keeps_the_k_smallest_across_a_long_stream() {
 }
 
 #[test]
+fn nearest_survives_a_huge_k() {
+    let costs = costs(&[Some(2.0), Some(1.0)]);
+    // k far beyond the destination count must neither allocate for k
+    // nor overflow k + 1.
+    assert_eq!(nearest(&costs, usize::MAX, 10.0), vec![(1, 1.0), (0, 2.0)]);
+}
+
+#[test]
 fn reached_returns_in_index_order_within_the_budget() {
     let costs = costs(&[Some(1800.0), None, Some(1.0), Some(1801.0)]);
     assert_eq!(reached(&costs, 1800.0), vec![0, 2]);

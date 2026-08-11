@@ -58,11 +58,18 @@ pub(super) fn validated_aggregation(
     if fields == 0 {
         return Err(PyValueError::new_err("fields must be at least 1"));
     }
-    if opportunities.len() != destinations * fields {
+    let expected = destinations
+        .checked_mul(fields)
+        .ok_or_else(|| PyValueError::new_err("destinations * fields overflows"))?;
+    budgets
+        .len()
+        .checked_mul(fields)
+        .ok_or_else(|| PyValueError::new_err("budgets * fields overflows"))?;
+    if opportunities.len() != expected {
         return Err(PyValueError::new_err(format!(
             "opportunities carries {} values, expected destinations * fields = {}",
             opportunities.len(),
-            destinations * fields
+            expected
         )));
     }
     if budgets.is_empty() {

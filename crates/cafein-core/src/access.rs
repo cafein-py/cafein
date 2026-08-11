@@ -81,24 +81,26 @@ pub fn opportunity_sums(
 /// `(cost, index)` order. Unreached destinations and those beyond the
 /// horizon are absent, so fewer than `k` pairs can come back.
 pub fn nearest(costs: &[Option<f64>], k: usize, max_cost: f64) -> Vec<(usize, f64)> {
-    if k == 0 {
+    let limit = k.min(costs.len());
+    if limit == 0 {
         return Vec::new();
     }
     // A bounded insertion keeps this O(n * k) with k tiny (closest few
     // schools), no allocation beyond the result.
-    let mut best: Vec<(usize, f64)> = Vec::with_capacity(k + 1);
+    let mut best: Vec<(usize, f64)> = Vec::with_capacity(limit);
     for (destination, cost) in costs.iter().enumerate() {
         let Some(cost) = *cost else { continue };
         if cost > max_cost {
             continue;
         }
-        let candidate = (destination, cost);
         let position = best.partition_point(|(index, held)| {
             *held < cost || (*held == cost && *index < destination)
         });
-        if position < k {
-            best.insert(position, candidate);
-            best.truncate(k);
+        if position < limit {
+            if best.len() == limit {
+                best.pop();
+            }
+            best.insert(position, (destination, cost));
         }
     }
     best
