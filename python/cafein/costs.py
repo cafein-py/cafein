@@ -177,6 +177,11 @@ def _resolved(table, mode, perspective, components):
         return nan, {component: nan for component in components or ()}
     if components is not None:
         known = set(rows.component)
+        if isinstance(components, str):
+            raise TypeError(
+                f"cost_components must be an iterable of component names, "
+                f"not the string {components!r} — pass ({components!r},)"
+            )
         unknown = set(components) - known
         if unknown:
             raise ValueError(

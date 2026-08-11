@@ -337,6 +337,11 @@ def street_factor(
     if components is None:
         selected = COMPONENT_COLUMNS
     else:
+        if isinstance(components, str):
+            raise TypeError(
+                f"components must be an iterable of component names, not "
+                f"the string {components!r} — pass ({components!r},)"
+            )
         chosen = set(components)
         unknown = chosen - set(COMPONENT_COLUMNS)
         if unknown:
@@ -514,6 +519,11 @@ def annotate(journeys, network, factors=None, components=None):
     if components is None:
         components = COMPONENT_COLUMNS
     else:
+        if isinstance(components, str):
+            raise TypeError(
+                f"components must be an iterable of component names, not "
+                f"the string {components!r} — pass ({components!r},)"
+            )
         unknown = set(components) - set(COMPONENT_COLUMNS)
         if unknown:
             raise ValueError(f"unknown component(s): {', '.join(sorted(unknown))}")
@@ -591,6 +601,11 @@ def trip_factors(network, factors=None, components=None):
     if components is None:
         components = COMPONENT_COLUMNS
     else:
+        if isinstance(components, str):
+            raise TypeError(
+                f"components must be an iterable of component names, not "
+                f"the string {components!r} — pass ({components!r},)"
+            )
         unknown = set(components) - set(COMPONENT_COLUMNS)
         if unknown:
             raise ValueError(f"unknown component(s): {', '.join(sorted(unknown))}")

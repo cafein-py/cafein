@@ -41,6 +41,7 @@ import math
 import pandas as pd
 
 from cafein import emissions
+from cafein._validate import id_sequence, sequence_not_string
 
 _COLUMNS = [
     "departure_s",
@@ -685,9 +686,9 @@ def frontier_table(
 def _exclusion_lists(exclude_routes, exclude_trips, exclude_stops):
     """The three exclusion id lists as strings, in one tuple."""
     return (
-        [str(route) for route in exclude_routes],
-        [str(trip) for trip in exclude_trips],
-        [str(stop) for stop in exclude_stops],
+        list(id_sequence("exclude_routes", exclude_routes)),
+        list(id_sequence("exclude_trips", exclude_trips)),
+        list(id_sequence("exclude_stops", exclude_stops)),
     )
 
 

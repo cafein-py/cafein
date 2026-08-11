@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 import shapely
 
+from cafein._validate import id_sequence, sequence_not_string
+
 
 class TravelCostMatrix(pd.DataFrame):
     """The fastest journey's aggregated costs per OD pair, long format.
@@ -286,6 +288,8 @@ class TravelCostMatrix(pd.DataFrame):
         currency=None,
         cost_components=None,
     ):
+        origins = sequence_not_string("origins", origins)
+        destinations = sequence_not_string("destinations", destinations)
         if _is_street_network(network):
             data = _street_cost_columns(
                 network,
@@ -803,6 +807,8 @@ class TravelTimeMatrix(pd.DataFrame):
         delay_model=None,
         parking=None,
     ):
+        origins = sequence_not_string("origins", origins)
+        destinations = sequence_not_string("destinations", destinations)
         if _is_street_network(network):
             data = _street_time_columns(
                 network,
@@ -1816,9 +1822,9 @@ def _stream_transit_cost(
     _validate_cost_query(date, departure, optimize, window, within, fares, router)
     if candidates not in ("time", "pareto"):
         raise ValueError("candidates must be 'time' or 'pareto'")
-    exclude_routes = [str(route) for route in exclude_routes]
-    exclude_trips = [str(trip) for trip in exclude_trips]
-    exclude_stops = [str(stop) for stop in exclude_stops]
+    exclude_routes = list(id_sequence("exclude_routes", exclude_routes))
+    exclude_trips = list(id_sequence("exclude_trips", exclude_trips))
+    exclude_stops = list(id_sequence("exclude_stops", exclude_stops))
     if chunk is not None:
         chunk = tuple(int(part) for part in chunk)
     from_ids, to_ids, points, to_stops = _cost_endpoints(
@@ -2188,9 +2194,9 @@ def _stream_transit_time(
     # Frozen once: a one-shot percentile iterable drains here, and every
     # batch routes the resolved list, not the caller's mutable value.
     resolved_percentiles = _window_percentiles(window, percentiles, confidence)
-    exclude_routes = [str(route) for route in exclude_routes]
-    exclude_trips = [str(trip) for trip in exclude_trips]
-    exclude_stops = [str(stop) for stop in exclude_stops]
+    exclude_routes = list(id_sequence("exclude_routes", exclude_routes))
+    exclude_trips = list(id_sequence("exclude_trips", exclude_trips))
+    exclude_stops = list(id_sequence("exclude_stops", exclude_stops))
     if chunk is not None:
         chunk = tuple(int(part) for part in chunk)
     from_ids, to_ids, points, _ = _cost_endpoints(network, origins, destinations, chunk)
@@ -2405,9 +2411,9 @@ def _cost_columns(
     — replacing the resolution below so mutable inputs are only ever
     read once (`_cost_endpoints` mirrors it and must stay in step)."""
     exclusions = (
-        [str(route) for route in exclude_routes],
-        [str(trip) for trip in exclude_trips],
-        [str(stop) for stop in exclude_stops],
+        list(id_sequence("exclude_routes", exclude_routes)),
+        list(id_sequence("exclude_trips", exclude_trips)),
+        list(id_sequence("exclude_stops", exclude_stops)),
     )
     from cafein import emissions
     from cafein.network import _walk_options
@@ -2691,9 +2697,9 @@ def _policy_time_columns(
         )
     # Materialised once: a one-shot iterable must not exhaust between the
     # per-point reductions, and later mutation must not desynchronise them.
-    exclude_routes = tuple(str(route) for route in exclude_routes)
-    exclude_trips = tuple(str(trip) for trip in exclude_trips)
-    exclude_stops = tuple(str(stop) for stop in exclude_stops)
+    exclude_routes = id_sequence("exclude_routes", exclude_routes)
+    exclude_trips = id_sequence("exclude_trips", exclude_trips)
+    exclude_stops = id_sequence("exclude_stops", exclude_stops)
     from_ids, origin_points = _point_list(origins, "origins")
     if destinations is None:
         to_ids, destination_points = from_ids, origin_points
@@ -2989,9 +2995,9 @@ def _policy_cost_columns(
         )
     # Materialised once: a one-shot iterable must not exhaust between the
     # per-point reductions, and later mutation must not desynchronise them.
-    exclude_routes = tuple(str(route) for route in exclude_routes)
-    exclude_trips = tuple(str(trip) for trip in exclude_trips)
-    exclude_stops = tuple(str(stop) for stop in exclude_stops)
+    exclude_routes = id_sequence("exclude_routes", exclude_routes)
+    exclude_trips = id_sequence("exclude_trips", exclude_trips)
+    exclude_stops = id_sequence("exclude_stops", exclude_stops)
     from_ids, origin_points = _point_list(origins, "origins")
     if destinations is None:
         to_ids, destination_points = from_ids, origin_points

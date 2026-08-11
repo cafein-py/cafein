@@ -1,6 +1,7 @@
 """Detailed door-to-door itineraries as a GeoDataFrame."""
 
 import math
+from cafein._validate import id_sequence
 
 import geopandas as gpd
 import numpy as np
@@ -619,7 +620,7 @@ def _endpoints(value, role):
         if not ids:
             raise ValueError(f"the {role} GeoDataFrame is empty")
         return ids, points, "points"
-    ids = [str(identifier) for identifier in value]
+    ids = list(id_sequence(role, value))
     if not ids:
         raise ValueError(f"{role} must name at least one stop")
     return ids, ids, "stops"

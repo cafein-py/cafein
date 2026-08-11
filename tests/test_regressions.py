@@ -268,3 +268,39 @@ def test_street_modes_validate_before_any_file_is_read():
         )
     with pytest.raises(TypeError, match="iterable of mode names"):
         StreetNetwork.from_osm("no-such.osm.pbf", modes="bicycle")
+
+
+def test_id_collections_refuse_bare_strings(network):
+    # A bare string used to dissolve into one-character ids: exclusions
+    # matched nothing (silently wrong results), stop sets resolved to
+    # confusing per-character KeyErrors (issue #237).
+    from cafein import DetailedItineraries, TravelTimeMatrix
+
+    with pytest.raises(TypeError, match="exclude_routes"):
+        network.route_between_stops(
+            "1040280", "1100602", "2022-02-22", "08:30:00", exclude_routes="1001"
+        )
+    with pytest.raises(TypeError, match="exclude_trips"):
+        network.travel_times_from_stop(
+            "1040280", "2022-02-22", "08:30:00", exclude_trips="t-1"
+        )
+    with pytest.raises(TypeError, match="from_stops"):
+        network.travel_time_matrix("1040280", "2022-02-22", "08:30:00")
+    with pytest.raises(TypeError, match="origins"):
+        TravelTimeMatrix(network, "1040280", None, "2022-02-22", "08:30:00")
+    with pytest.raises(TypeError, match="origins"):
+        DetailedItineraries(
+            network, origins="1040280", date="2022-02-22", departure="08:30:00"
+        )
+    with pytest.raises(TypeError, match="exclude_stops"):
+        journey_frontier(
+            network,
+            "1040280",
+            "1100602",
+            "2022-02-22",
+            "08:30:00",
+            600,
+            exclude_stops="1040280",
+        )
+    with pytest.raises(TypeError, match="components"):
+        network.annotate_emissions([], components="fuel")
