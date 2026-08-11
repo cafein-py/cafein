@@ -29,14 +29,16 @@ pub enum Decay {
 }
 
 impl Decay {
-    /// The weight of a destination at `cost` under `budget`.
+    /// The weight of a destination at `cost` under `budget`; a
+    /// non-finite cost weighs nothing (it cannot lie within a finite
+    /// budget).
     pub fn weight(&self, cost: f64, budget: f64) -> f64 {
-        if cost > budget {
+        if !cost.is_finite() || cost > budget {
             return 0.0;
         }
         match *self {
             Decay::Step => 1.0,
-            Decay::Linear { width } => ((budget + width / 2.0 - cost) / width).clamp(0.0, 1.0),
+            Decay::Linear { width } => ((budget - cost) / width + 0.5).clamp(0.0, 1.0),
             Decay::Exponential { half_life } => (-std::f64::consts::LN_2 * cost / half_life).exp(),
             Decay::Logistic { scale } => 1.0 / (1.0 + ((cost - budget) / scale).exp()),
         }
@@ -61,6 +63,9 @@ pub fn opportunity_sums(
     let mut sums = vec![0.0; budgets.len() * fields];
     for (destination, cost) in costs.iter().enumerate() {
         let Some(cost) = *cost else { continue };
+        if !cost.is_finite() {
+            continue;
+        }
         let row = &opportunities[destination * fields..(destination + 1) * fields];
         for (bucket, budget) in budgets.iter().enumerate() {
             let weight = decay.weight(cost, *budget);
@@ -90,7 +95,7 @@ pub fn nearest(costs: &[Option<f64>], k: usize, max_cost: f64) -> Vec<(usize, f6
     let mut best: Vec<(usize, f64)> = Vec::with_capacity(limit);
     for (destination, cost) in costs.iter().enumerate() {
         let Some(cost) = *cost else { continue };
-        if cost > max_cost {
+        if !cost.is_finite() || cost > max_cost {
             continue;
         }
         let position = best.partition_point(|(index, held)| {
@@ -113,7 +118,7 @@ pub fn reached(costs: &[Option<f64>], budget: f64) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(destination, cost)| match cost {
-            Some(cost) if *cost <= budget => Some(destination),
+            Some(cost) if cost.is_finite() && *cost <= budget => Some(destination),
             _ => None,
         })
         .collect()

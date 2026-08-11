@@ -96,6 +96,24 @@ fn nearest_keeps_the_k_smallest_across_a_long_stream() {
 }
 
 #[test]
+fn non_finite_costs_count_as_unreached_everywhere() {
+    let costs = costs(&[Some(f64::NAN), Some(f64::INFINITY), Some(60.0)]);
+    assert_eq!(Decay::Step.weight(f64::NAN, 1800.0), 0.0);
+    let sums = opportunity_sums(&costs, &[7.0, 7.0, 7.0], 1, &[1800.0], &Decay::Step);
+    assert_eq!(sums, vec![7.0]);
+    assert_eq!(nearest(&costs, 3, f64::MAX), vec![(2, 60.0)]);
+    assert_eq!(reached(&costs, 1800.0), vec![2]);
+}
+
+#[test]
+fn linear_weight_survives_extreme_finite_values() {
+    let decay = Decay::Linear { width: f64::MAX };
+    // budget + width/2 would overflow to infinity; the algebraic form
+    // must still land on the specified 0.5 at cost == budget.
+    assert!((decay.weight(f64::MAX, f64::MAX) - 0.5).abs() < 1e-12);
+}
+
+#[test]
 fn nearest_survives_a_huge_k() {
     let costs = costs(&[Some(2.0), Some(1.0)]);
     // k far beyond the destination count must neither allocate for k
