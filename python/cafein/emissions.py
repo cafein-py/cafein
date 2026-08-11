@@ -524,12 +524,11 @@ def annotate(journeys, network, factors=None, components=None):
                 f"components must be an iterable of component names, not "
                 f"the string {components!r} — pass ({components!r},)"
             )
-        unknown = set(components) - set(COMPONENT_COLUMNS)
+        chosen = set(components)
+        unknown = chosen - set(COMPONENT_COLUMNS)
         if unknown:
             raise ValueError(f"unknown component(s): {', '.join(sorted(unknown))}")
-        components = [
-            column for column in COMPONENT_COLUMNS if column in set(components)
-        ]
+        components = [column for column in COMPONENT_COLUMNS if column in chosen]
         if not components:
             raise ValueError("components must name at least one component column")
     table = default_factors()
@@ -606,12 +605,11 @@ def trip_factors(network, factors=None, components=None):
                 f"components must be an iterable of component names, not "
                 f"the string {components!r} — pass ({components!r},)"
             )
-        unknown = set(components) - set(COMPONENT_COLUMNS)
+        chosen = set(components)
+        unknown = chosen - set(COMPONENT_COLUMNS)
         if unknown:
             raise ValueError(f"unknown component(s): {', '.join(sorted(unknown))}")
-        components = [
-            column for column in COMPONENT_COLUMNS if column in set(components)
-        ]
+        components = [column for column in COMPONENT_COLUMNS if column in chosen]
         if not components:
             raise ValueError("components must name at least one component column")
     table = default_factors()

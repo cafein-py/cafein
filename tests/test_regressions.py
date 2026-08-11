@@ -311,3 +311,14 @@ def test_id_collections_refuse_bare_strings(network):
         )
     with pytest.raises(TypeError, match="origins"):
         travel_cost_table(network, "1040280", None, "2022-02-22", "08:30:00")
+
+
+def test_component_selections_accept_one_shot_iterables(network):
+    # `set(components)` used to run twice, so a generator was exhausted
+    # by validation and the selection came out empty.
+    journeys = network.route_between_stops(
+        "4810551", "1250551", "2022-02-22", "08:30:00"
+    )
+    annotated = network.annotate_emissions(journeys, components=iter(["fuel"]))
+    legs = [leg for j in annotated for leg in j["legs"] if leg["type"] == "transit"]
+    assert any(leg.get("emissions") is not None for leg in legs)

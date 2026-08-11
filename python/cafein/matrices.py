@@ -2832,6 +2832,9 @@ def _carriage_time_columns(
     from cafein.network import _policy_transfer_mode
     from cafein.policy import carriage_plane_modes, carriage_terms
 
+    exclude_routes = id_sequence("exclude_routes", exclude_routes)
+    exclude_trips = id_sequence("exclude_trips", exclude_trips)
+    exclude_stops = id_sequence("exclude_stops", exclude_stops)
     if any((exclude_routes, exclude_trips, exclude_stops)):
         raise ValueError("take_aboard=True does not combine with exclusions yet")
     core = network._core

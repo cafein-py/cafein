@@ -1668,6 +1668,9 @@ class TransportNetwork:
             from cafein.policy import carriage_terms
 
             if carriage_terms(street_policy) is not None:
+                exclude_routes = id_sequence("exclude_routes", exclude_routes)
+                exclude_trips = id_sequence("exclude_trips", exclude_trips)
+                exclude_stops = id_sequence("exclude_stops", exclude_stops)
                 if any((exclude_routes, exclude_trips, exclude_stops)):
                     raise ValueError(
                         "take_aboard=True does not combine with exclusions yet"
@@ -1855,6 +1858,9 @@ class TransportNetwork:
                     "walking_speed_kmph, max_walking_time, or "
                     "max_snap_distance beside it is a conflict"
                 )
+            exclude_routes = id_sequence("exclude_routes", exclude_routes)
+            exclude_trips = id_sequence("exclude_trips", exclude_trips)
+            exclude_stops = id_sequence("exclude_stops", exclude_stops)
             if any((exclude_routes, exclude_trips, exclude_stops)):
                 raise ValueError("street_policy does not combine with exclusions yet")
             from cafein.network import _policy_transfer_mode
