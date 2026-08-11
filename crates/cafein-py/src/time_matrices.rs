@@ -69,6 +69,57 @@ impl TransportNetwork {
         max_walking_time: f64,
         max_snap_distance: f64,
     ) -> PyResult<Bound<'py, PyArray2<u32>>> {
+        let (rows, departure) = self.resolved_time_rows(
+            py,
+            &from_stops,
+            date,
+            departure,
+            max_transfers,
+            router,
+            &exclude_routes,
+            &exclude_trips,
+            &exclude_stops,
+            walking_speed_kmph,
+            max_walking_time,
+            max_snap_distance,
+        )?;
+        let stop_count = self.build.timetable.stop_count() as usize;
+        let count = rows.len();
+        let mut flat = Vec::with_capacity(count * stop_count);
+        for row in rows {
+            flat.extend(row.into_iter().map(|arrival| match arrival {
+                Some(arrival) => arrival - departure,
+                None => u32::MAX,
+            }));
+        }
+        flat.into_pyarray(py)
+            .reshape([count, stop_count])
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+}
+
+impl TransportNetwork {
+    /// One-to-all arrival rows for `from_stops` — the shared engine
+    /// dispatch behind the time matrix and the accessibility
+    /// aggregations, so their costs are identical by construction.
+    /// Returns the rows plus the parsed departure the arrivals are
+    /// relative to.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn resolved_time_rows(
+        &self,
+        py: Python<'_>,
+        from_stops: &[String],
+        date: &str,
+        departure: &str,
+        max_transfers: u8,
+        router: &str,
+        exclude_routes: &[String],
+        exclude_trips: &[String],
+        exclude_stops: &[String],
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+    ) -> PyResult<(Vec<Vec<Option<u32>>>, u32)> {
         if !matches!(router, "auto" | "raptor" | "tbtr") {
             return Err(invalid_router(router));
         }
@@ -79,9 +130,7 @@ impl TransportNetwork {
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
-        let stop_count = self.build.timetable.stop_count() as usize;
-        let count = origins.len();
-        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        let exclusions = self.exclusion_masks(exclude_routes, exclude_trips, exclude_stops)?;
         // The RAPTOR router routes door-to-door under a whole-day ULTRA set,
         // but only for origins that snap; validate the walking speed up front
         // (error creation needs the GIL that `allow_threads` releases) and only
@@ -115,8 +164,8 @@ impl TransportNetwork {
         } else {
             self.resolve_time_router(router, date, exclusions.is_some())?
         };
-        let flat: Vec<u32> = py.allow_threads(|| {
-            let rows: Vec<Vec<Option<u32>>> = if router == "tbtr" {
+        let rows = py.allow_threads(|| {
+            if router == "tbtr" {
                 let engine = self.tbtr_engine(
                     &self.transfers,
                     date,
@@ -156,21 +205,14 @@ impl TransportNetwork {
                     })
                     .collect();
                 Raptor.one_to_all_many(&self.build.timetable, &self.transfers, &requests)
-            };
-            let mut flat = Vec::with_capacity(count * stop_count);
-            for row in rows {
-                flat.extend(row.into_iter().map(|arrival| match arrival {
-                    Some(arrival) => arrival - departure,
-                    None => u32::MAX,
-                }));
             }
-            flat
         });
-        flat.into_pyarray(py)
-            .reshape([count, stop_count])
-            .map_err(|error| PyValueError::new_err(error.to_string()))
+        Ok((rows, departure))
     }
+}
 
+#[pymethods]
+impl TransportNetwork {
     /// Travel-time percentiles over a departure window, as a matrix.
     ///
     /// Every minute mark within ``[departure, departure + window)`` is

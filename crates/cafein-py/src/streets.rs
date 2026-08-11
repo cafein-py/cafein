@@ -890,3 +890,66 @@ fn load_street_mapped(path: &str, verify: Option<bool>) -> PyResult<Result<Loade
     }
     Ok(Ok((inner, streets_read, elevation)))
 }
+
+use super::access::{parse_decay, validated_aggregation};
+use cafein_core::access::opportunity_sums;
+
+#[pymethods]
+impl StreetNetwork {
+    /// Decay-weighted opportunity sums between coordinate sets under a
+    /// street mode, on the time axis (seconds).
+    ///
+    /// Costs are exactly `travel_time_matrix`'s directed searches; the
+    /// dict carries the row-major `[origin][budget * fields]` values
+    /// plus the unsnapped origin/destination indices, mirroring the
+    /// matrix surface.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (origins, destinations, opportunities, fields, budgets,
+                        decay, decay_param, mode, max_seconds, max_snap_distance,
+                        car_model = None))]
+    fn _accessibility_to_points(
+        &mut self,
+        py: Python<'_>,
+        origins: Vec<(f64, f64)>,
+        destinations: Vec<(f64, f64)>,
+        opportunities: Vec<f64>,
+        fields: usize,
+        budgets: Vec<f64>,
+        decay: &str,
+        decay_param: Option<f64>,
+        mode: &str,
+        max_seconds: f64,
+        max_snap_distance: f64,
+        car_model: Option<CarModelPayload>,
+    ) -> PyResult<Py<PyDict>> {
+        let decay = parse_decay(decay, decay_param)?;
+        validated_aggregation(destinations.len(), &opportunities, fields, &budgets)?;
+        let index = self.compiled(mode, car_model.as_ref())?;
+        let (_, profile) = &self.profiles[index];
+        let width = budgets.len() * fields;
+        let (flat, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
+            let (rows, unsnapped_from, unsnapped_to) = self.inner.directed_matrix(
+                &origins,
+                &destinations,
+                profile,
+                max_seconds,
+                max_snap_distance,
+            );
+            let flat: Vec<f64> = rows
+                .par_iter()
+                .flat_map_iter(|row| {
+                    let costs: Vec<Option<f64>> =
+                        row.iter().map(|cell| cell.map(f64::from)).collect();
+                    opportunity_sums(&costs, &opportunities, fields, &budgets, &decay)
+                })
+                .collect();
+            (flat, unsnapped_from, unsnapped_to)
+        });
+        let count = flat.len() / width;
+        let table = PyDict::new(py);
+        table.set_item("values", flat.into_pyarray(py).reshape([count, width])?)?;
+        table.set_item("unsnapped_from", unsnapped_from.into_pyarray(py))?;
+        table.set_item("unsnapped_to", unsnapped_to.into_pyarray(py))?;
+        Ok(table.into())
+    }
+}

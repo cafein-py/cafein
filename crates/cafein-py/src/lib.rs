@@ -174,6 +174,7 @@ impl Backing for MappedArtifact {
     }
 }
 
+mod access;
 mod artifact;
 mod carriage;
 mod cost_matrices;

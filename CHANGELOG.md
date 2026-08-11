@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **The accessibility primitive** (first slice of the accessibility
+  products): `cafein_core::access` computes per-origin decay-weighted
+  opportunity sums, k-nearest destinations, and budget-reached sets
+  from per-destination costs on any axis, with step / linear /
+  exponential / logistic decay weights hard-truncated at the budget.
+  Private engine entries expose the opportunity sums over transit
+  (`_accessibility_from_stops`, sharing `travel_time_matrix`'s exact
+  engine dispatch) and street modes (`_accessibility_to_points`);
+  the public `Accessibility` computer follows.
+
 ## 0.10.2 — 2026-08-11
 
 - **Bare strings are refused wherever id collections are expected**
