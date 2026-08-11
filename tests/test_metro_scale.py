@@ -80,14 +80,17 @@ def test_the_metro_network_exceeds_the_sample_fixture(
 def test_transit_routes_at_metro_scale(metro_network, helsinki_metro_data):
     date = _service_date(helsinki_metro_data.gtfs)
     stops = [stop for stop, lat, lon in metro_network.stops if lat is not None]
-    for origin in stops[:25]:
+    # An even spread: HSL stop ids sort an unserved-station block first,
+    # so the head of the list alone would probe no served stop.
+    sampled = stops[:: max(1, len(stops) // 25)][:25]
+    for origin in sampled:
         times = metro_network.travel_times_from_stop(origin, date, "08:30:00")
         if any(stop != origin and seconds > 0 for stop, seconds in times.items()):
             break
     else:
         pytest.fail(f"no transit service reachable from 25 sampled stops on {date}")
-    # One small stop-to-stop matrix over the same origin neighbourhood.
-    matrix = metro_network.travel_time_matrix(stops[:5], date, "08:30:00")
+    # One small stop-to-stop matrix over the sampled origins.
+    matrix = metro_network.travel_time_matrix(sampled[:5], date, "08:30:00")
     assert len(matrix) > 0
 
 

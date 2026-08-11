@@ -1,0 +1,64 @@
+name: sampledata
+
+# The user-facing path, on a schedule: install the published cafein and
+# cafein.sampledata from PyPI, download the pinned Helsinki data release,
+# and run the metro-scale tests against them.
+
+on:
+  schedule:
+    - cron: "30 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installed-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: metro
+          create-args: >-
+            -c conda-forge
+            python=3.12
+            geopandas
+            pyrosm
+            rioxarray
+            pyarrow
+            pytest
+            pip
+      - name: Install the published packages
+        shell: bash -el {0}
+        run: python -m pip install cafein cafein.sampledata
+      - name: Fetch the pinned sample test data
+        shell: bash -el {0}
+        run: python scripts/fetch_test_data.py
+      - name: Run the metro-scale tests
+        shell: bash -el {0}
+        env:
+          CAFEIN_REQUIRE_SAMPLEDATA: "1"
+          CAFEIN_REQUIRE_TEST_DATA: "1"
+        run: >-
+          python -m pytest tests/test_metro_scale.py -m metro_scale
+          --junitxml=metro-report.xml
+      - name: Require that tests actually ran
+        shell: bash -el {0}
+        # An all-skipped run exits 0; the release contract is that these
+        # tests executed against the published packages.
+        run: |
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("metro-report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+          tests = sum(int(suite.get("tests", 0)) for suite in suites)
+          skipped = sum(int(suite.get("skipped", 0)) for suite in suites)
+          ran = tests - skipped
+          assert ran > 0, f"no metro-scale test ran (tests={tests}, skipped={skipped})"
+          print(f"{ran} metro-scale test(s) ran against the published packages")
+          PY
