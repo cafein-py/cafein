@@ -1,7 +1,6 @@
 //! The accessibility primitive's Python entries: per-origin
 //! decay-weighted opportunity sums over transit (stop destinations)
-//! and street (point destinations) costs. Private surface — the
-//! `Accessibility` computer in `python/cafein/` is the public API.
+//! and street (point destinations) costs.
 
 use super::*;
 
