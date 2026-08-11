@@ -212,6 +212,11 @@ def street_cost(transport_mode, perspective, costs=None, components=None):
 def _checked_components(components):
     if components is None:
         return None
+    if isinstance(components, str):
+        raise TypeError(
+            f"cost_components must be an iterable of component names, not "
+            f"the string {components!r} — pass ({components!r},)"
+        )
     chosen = list(components)
     if not chosen or not all(isinstance(name, str) and name for name in chosen):
         raise ValueError("cost_components must be non-empty component names")

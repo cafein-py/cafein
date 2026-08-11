@@ -2370,8 +2370,14 @@ def _cost_endpoints(network, origins, destinations, chunk):
         rows = _chunk_slice(len(from_ids), chunk)
         return from_ids[rows], to_ids, (origin_points[rows], destination_points), None
     stop_ids = [stop for stop, _, _ in network.stops]
-    from_ids = list(stop_ids) if origins is None else [str(o) for o in origins]
-    to_stops = None if destinations is None else [str(d) for d in destinations]
+    from_ids = (
+        list(stop_ids) if origins is None else list(id_sequence("origins", origins))
+    )
+    to_stops = (
+        None
+        if destinations is None
+        else list(id_sequence("destinations", destinations))
+    )
     return from_ids[_chunk_slice(len(from_ids), chunk)], stop_ids, None, to_stops
 
 
@@ -2487,9 +2493,17 @@ def _cost_columns(
         if endpoints is not None:
             _, from_ids, to_stops = endpoints
         else:
-            from_ids = list(stop_ids) if origins is None else [str(o) for o in origins]
+            from_ids = (
+                list(stop_ids)
+                if origins is None
+                else list(id_sequence("origins", origins))
+            )
             from_ids = from_ids[_chunk_slice(len(from_ids), chunk)]
-            to_stops = None if destinations is None else [str(d) for d in destinations]
+            to_stops = (
+                None
+                if destinations is None
+                else list(id_sequence("destinations", destinations))
+            )
         if optimize != "time":
             # The emissions (McRAPTOR) stop matrix relaxes a matching whole-day
             # McULTRA set for the pareto objective, routing door-to-door with

@@ -711,7 +711,7 @@ def _frontier_ids(values, role):
 
     if _is_point_frame(values):
         return None
-    ids = list(values)
+    ids = list(sequence_not_string(role, values))
     if not ids or not all(isinstance(value, str) for value in ids):
         raise ValueError(
             f"{role} must be a non-empty list of stop ids or a point GeoDataFrame"

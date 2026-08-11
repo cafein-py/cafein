@@ -5,7 +5,8 @@ One test per fixed defect; add new ones here rather than in a new file.
 
 import pytest
 
-from cafein import exhaustive_frontier, journey_frontier
+from cafein import exhaustive_frontier, journey_frontier, journey_frontiers
+from cafein.matrices import travel_cost_table
 
 
 def test_mcraptor_window_profile_keeps_cleaner_earlier_journeys(network_with_footpaths):
@@ -304,3 +305,9 @@ def test_id_collections_refuse_bare_strings(network):
         )
     with pytest.raises(TypeError, match="components"):
         network.annotate_emissions([], components="fuel")
+    with pytest.raises(TypeError, match="origins"):
+        journey_frontiers(
+            network, "1040280", ["1100602"], "2022-02-22", "08:30:00", 600
+        )
+    with pytest.raises(TypeError, match="origins"):
+        travel_cost_table(network, "1040280", None, "2022-02-22", "08:30:00")
