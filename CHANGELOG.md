@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Recurring installed-package checks**: a scheduled `sampledata`
+  workflow installs the published `cafein` and `cafein.sampledata` from
+  PyPI, downloads the pinned Helsinki data release, and runs the
+  metro-scale tests against them — failing when no test actually ran.
+  The metro transit probe samples an even spread of stops (the head of
+  the id-sorted HSL stop list is an unserved-station block), and
+  `scripts/benchmark_vs_r5py.py` gains `--data helsinki` to benchmark
+  on the sampledata release instead of the pinned r5py sample.
+
 - **cafein.sampledata integration**: `cafein`'s package path now
   extends over separately installed portions, so the
   ``cafein.sampledata`` distribution's ``cafein.sampledata.helsinki``

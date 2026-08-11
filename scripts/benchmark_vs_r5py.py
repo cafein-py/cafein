@@ -11,6 +11,12 @@ build time is measured cold rather than as a warm cache load.
     python scripts/benchmark_vs_r5py.py               # sampled stops
     python scripts/benchmark_vs_r5py.py --stops 0     # every stop in the box
     python scripts/benchmark_vs_r5py.py --engine cafein   # one side only
+    python scripts/benchmark_vs_r5py.py --data helsinki   # metro-scale data
+
+With ``--data helsinki`` the inputs come from an installed
+``cafein.sampledata`` (the current HSL feed and the capital-region
+extract, downloaded on first use) instead of the pinned r5py sample;
+the departure date is then read from the feed's own service span.
 
 Requirements: cafein installed (with its compiled core); r5py >= 1.0 and
 a Java runtime for the comparison side (`mamba install r5py` provides
@@ -46,6 +52,55 @@ BBOX = (24.846, 60.145, 25.003, 60.256)
 
 DATE = "2022-02-22"
 DEPARTURE = "08:30:00"
+
+# The capital-region extent of cafein.sampledata.helsinki's extract.
+HELSINKI_BBOX = (24.40, 59.95, 25.27, 60.41)
+
+
+def feed_service_date(gtfs_path):
+    """A Tuesday near the middle of the feed's service span — read from
+    the feed itself, so a dated release keeps benchmarking as time
+    passes."""
+    import csv
+    import io
+
+    dates = []
+    with zipfile.ZipFile(gtfs_path) as archive:
+        names = set(archive.namelist())
+        for name, columns in (
+            ("calendar.txt", ("start_date", "end_date")),
+            ("calendar_dates.txt", ("date",)),
+        ):
+            if name not in names:
+                continue
+            rows = csv.DictReader(io.StringIO(archive.read(name).decode("utf-8-sig")))
+            for row in rows:
+                for column in columns:
+                    value = (row.get(column) or "").strip()
+                    if len(value) == 8 and value.isdigit():
+                        dates.append(value)
+    if not dates:
+        raise SystemExit(f"{gtfs_path} declares no service dates")
+    dates.sort()
+    parse = lambda v: datetime.date(int(v[:4]), int(v[4:6]), int(v[6:]))  # noqa: E731
+    start, end = parse(dates[0]), parse(dates[-1])
+    middle = start + (end - start) / 2
+    tuesday = middle + datetime.timedelta(days=(1 - middle.weekday()) % 7)
+    if tuesday > end:
+        tuesday = middle - datetime.timedelta(days=(middle.weekday() - 1) % 7)
+    return tuesday.isoformat()
+
+
+def resolve_data(source):
+    """Point the module's GTFS/PBF/BBOX/DATE at the chosen source."""
+    global GTFS, PBF, BBOX, DATE
+    if source == "helsinki":
+        from cafein.sampledata import helsinki
+
+        GTFS = pathlib.Path(helsinki.gtfs)
+        PBF = pathlib.Path(helsinki.osm_pbf)
+        BBOX = HELSINKI_BBOX
+        DATE = feed_service_date(GTFS)
 
 
 def stop_selection(count, seed):
@@ -178,7 +233,15 @@ def main():
         choices=["cafein", "r5py"],
         help="run one engine in this process (default: both, in subprocesses)",
     )
+    parser.add_argument(
+        "--data",
+        choices=["sample", "helsinki"],
+        default="sample",
+        help="sample: the pinned r5py test data; helsinki: the installed "
+        "cafein.sampledata release (current HSL feed, capital region)",
+    )
     arguments = parser.parse_args()
+    resolve_data(arguments.data)
     stops = stop_selection(arguments.stops, arguments.seed)
 
     if arguments.engine:
@@ -200,6 +263,8 @@ def main():
             str(arguments.stops),
             "--seed",
             str(arguments.seed),
+            "--data",
+            arguments.data,
         ]
         completed = subprocess.run(command, capture_output=True, text=True)
         if completed.returncode != 0:
