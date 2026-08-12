@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Windowed `Accessibility`**: with a departure `window` (and
+  optional `percentiles`/`confidence`, as on the matrices), the frame
+  gains a ``percentile`` column and each row holds the accessibility
+  at that percentile of the travel-time distribution across the
+  window — percentile costs are weighted, never accessibility values
+  averaged. Street-mode requests reject the window knobs.
+
 - **`Accessibility`**: cumulative-opportunity accessibility as a
   long-format computer — reachable opportunity counts or sums per
   origin, budget, and destination column, with step / linear /

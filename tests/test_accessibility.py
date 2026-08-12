@@ -340,3 +340,62 @@ def test_street_requests_reject_transit_routing_knobs(helsinki_streets):
         Accessibility(
             helsinki_streets, points, points, transport_mode="walk", max_transfers=3
         )
+
+
+def test_percentile_accessibility_matches_the_percentile_matrix(network):
+    from cafein import Accessibility
+
+    origins, destinations = _stop_sets(network)
+    frame = Accessibility(
+        network,
+        origins,
+        destinations,
+        DATE,
+        DEPARTURE,
+        budgets=(1800.0,),
+        window=600,
+        percentiles=(25, 75),
+    )
+    assert list(frame.columns) == [
+        "from_id",
+        "opportunity",
+        "budget",
+        "percentile",
+        "accessibility",
+    ]
+    assert len(frame) == len(origins) * 2
+    spread = network._core.travel_time_percentiles(
+        origins, DATE, DEPARTURE, 600, [25, 75], 7, "auto", [], [], []
+    )
+    column = {stop: at for at, (stop, _, _) in enumerate(network.stops)}
+    selection = [column[stop] for stop in destinations]
+    for at, percentile in enumerate((25, 75)):
+        times = spread[:, selection, at].astype("float64")
+        times[times == UNREACHED] = numpy.nan
+        expected = (times <= 1800.0).sum(axis=1).astype("float64")
+        got = frame[frame["percentile"] == percentile]["accessibility"].to_numpy()
+        assert numpy.allclose(got, expected), percentile
+    # More of the window's departures reach within budget at the lower
+    # percentile: accessibility is non-increasing in the percentile.
+    wide = frame.pivot(index="from_id", columns="percentile", values="accessibility")
+    assert (wide[25] >= wide[75]).all()
+
+
+def test_window_knobs_reject_streets_and_bad_combos(network, helsinki_streets):
+    geopandas = pytest.importorskip("geopandas")
+    from cafein import Accessibility
+
+    origins, destinations = _stop_sets(network)
+    with pytest.raises(ValueError, match="window"):
+        Accessibility(
+            network, origins, destinations, DATE, DEPARTURE, percentiles=(50,)
+        )
+    points = geopandas.GeoDataFrame(
+        {"id": ["p"]},
+        geometry=geopandas.points_from_xy([24.9384], [60.1699]),
+        crs="EPSG:4326",
+    )
+    with pytest.raises(ValueError, match="window"):
+        Accessibility(
+            helsinki_streets, points, points, transport_mode="walk", window=600
+        )
