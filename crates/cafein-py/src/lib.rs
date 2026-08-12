@@ -6,7 +6,6 @@ use chrono::NaiveDate;
 use numpy::{IntoPyArray, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1};
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::wrap_pyfunction;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
 use cafein_core::ch::ContractionHierarchy;
