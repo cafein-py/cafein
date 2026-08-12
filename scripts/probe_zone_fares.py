@@ -266,13 +266,16 @@ def scan():
         row["from_id"]: (round(float(row["fare"]), 2), int(row["travel_time_s"]))
         for _, row in matrix.iterrows()
     }
-    # No fare-carrying engine exists for zone structures, so the oracle
-    # is an exclusion: bar every D and E zone stop and see what the
-    # cheapest surviving journey costs. Anything the matrix charges
-    # above that is a journey the fare-blind candidate fold discarded.
+    # No fare-carrying engine exists for zone structures, so the
+    # witness is a constrained search: bar every D and E zone stop and
+    # see what the cheapest surviving journey costs. Anything the
+    # matrix charges above that is a journey the fare-blind candidate
+    # fold discarded. (This under-approximates the exact optimum — the
+    # planned state-machine engine replaces it.)
     barred = [s for s, z in zones.items() if z in ("D", "E", "Ei HSL")]
-    print(f"barring {len(barred)} D/E stops for the oracle", flush=True)
+    print(f"barring {len(barred)} D/E stops for the witness", flush=True)
     cheapest = {}
+    failures = 0
     for origin in origins:
         try:
             frame = journey_frontier(
@@ -287,7 +290,8 @@ def scan():
                 exclude_stops=barred,
             )
         except Exception as error:  # noqa: BLE001 - reported, not raised
-            print(f"   {origin}: oracle failed: {error}", flush=True)
+            failures += 1
+            print(f"   {origin}: witness search failed: {error}", flush=True)
             continue
         priced_rows = [
             (round(float(row["fare"]), 2), int(row["travel_time_s"]))
@@ -298,11 +302,13 @@ def scan():
             cheapest[origin] = min(priced_rows)
 
     worse = 0
+    compared = 0
     for origin in origins:
         matrix_cell = priced.get(origin)
         frontier_cell = cheapest.get(origin)
         if not matrix_cell or not frontier_cell:
             continue
+        compared += 1
         if matrix_cell[0] > frontier_cell[0] + 1e-6:
             worse += 1
             print(
@@ -319,7 +325,17 @@ def scan():
                 ),
                 flush=True,
             )
-    print(f"\npairs compared: {len(priced)}  matrix overpriced: {worse}")
+    print(
+        f"\norigins: {len(origins)}  matrix-priced: {len(priced)}  "
+        f"witnessed: {len(cheapest)}  compared: {compared}  "
+        f"witness failures: {failures}  matrix overpriced: {worse}"
+    )
+    if failures or not compared:
+        raise SystemExit(
+            "inconclusive: witness failures left cells uncompared"
+            if failures
+            else "inconclusive: no cell had both a matrix fare and a witness"
+        )
 
 
 def case():
@@ -367,9 +383,8 @@ def case():
             )
             for journey in journeys[:2]:
                 legs = [
-                    f"{leg.get('route_short_name')}: "
-                    f"{zones.get(leg['board_stop'])}{leg['board_stop']}@{leg['departure_s']}"
-                    f"->{zones.get(leg['alight_stop'])}{leg['alight_stop']}@{leg['arrival_s']}"
+                    f"{leg.get('route_short_name')}:"
+                    f"{zones.get(leg['board_stop'])}->{zones.get(leg['alight_stop'])}"
                     for leg in journey["legs"]
                     if leg["type"] == "transit"
                 ]
