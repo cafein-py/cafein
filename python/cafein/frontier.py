@@ -1173,6 +1173,12 @@ def fare_frontier(
     over the fare-blind products can reproduce this. Ties on travel
     time resolve to the cheapest, then simplest, journey.
 
+    Rule-based fare structures only: a ``ZoneFareStructure`` is
+    refused, so zone-fare journeys have no fare-carrying search —
+    they price post hoc through ``journey_frontier`` and the cost
+    matrices, whose fare answers carry the retained-candidates caveat
+    documented on ``optimize="fare"``.
+
     Parameters
     ----------
     network : TransportNetwork
