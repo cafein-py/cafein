@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **Cost axes for `Accessibility`**: ``cost="emissions"`` (grams CO2e)
+  and ``cost="money"`` (the fare structure's currency units) compute
+  accessibility against per-destination optima from the cost engines —
+  `window` required, `factors`/`components` and `fares` exactly as on
+  `TravelCostMatrix`; a destination with an unresolved factor or
+  unpriceable fare counts as unreached. ``cost="distance"`` (metres,
+  network plus connector) on street networks; on transit it raises as
+  a non-optimizable axis. The emissions and money optima are single
+  values over the window, so percentiles stay a time-axis feature.
+
 - **Windowed `Accessibility`**: with a departure `window` (and
   optional `percentiles`/`confidence`, as on the matrices), the frame
   gains a ``percentile`` column and each row holds the accessibility
