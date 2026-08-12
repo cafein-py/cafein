@@ -94,6 +94,33 @@ pub(super) fn validated_aggregation(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn aggregated_rows<'py>(
+    py: Python<'py>,
+    rows: Vec<Vec<Option<f64>>>,
+    count: usize,
+    destinations: usize,
+    opportunities: Vec<f64>,
+    fields: usize,
+    budgets: Vec<f64>,
+    decay: &str,
+    decay_param: Option<f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let decay = parse_decay(decay, decay_param)?;
+    validated_aggregation(destinations, &opportunities, fields, &budgets)?;
+    let width = budgets.len() * fields;
+    let flat: Vec<f64> = py.allow_threads(|| {
+        rows.par_iter()
+            .flat_map_iter(|costs| {
+                opportunity_sums(costs, &opportunities, fields, &budgets, &decay)
+            })
+            .collect()
+    });
+    flat.into_pyarray(py)
+        .reshape([count, width])
+        .map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
 /// Decay-weighted opportunity sums over an already-computed time
 /// matrix (`u32` cost cells, `u32::MAX` = unreached): row-major
 /// `[origin][budget * fields]`. Serves every resolution path that
@@ -109,33 +136,77 @@ pub(super) fn aggregate_opportunity_sums<'py>(
     decay: &str,
     decay_param: Option<f64>,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
-    let decay = parse_decay(decay, decay_param)?;
     let matrix = matrix.as_array().to_owned();
     let (count, destinations) = matrix.dim();
-    validated_aggregation(destinations, &opportunities, fields, &budgets)?;
-    let width = budgets.len() * fields;
-    let flat: Vec<f64> = py.allow_threads(|| {
-        let rows: Vec<Vec<Option<f64>>> = matrix
-            .outer_iter()
-            .map(|row| {
-                row.iter()
-                    .map(|&cell| (cell != u32::MAX).then_some(f64::from(cell)))
-                    .collect()
-            })
-            .collect();
-        rows.par_iter()
-            .flat_map_iter(|costs| {
-                opportunity_sums(costs, &opportunities, fields, &budgets, &decay)
-            })
-            .collect()
-    });
-    flat.into_pyarray(py)
-        .reshape([count, width])
-        .map_err(|error| PyValueError::new_err(error.to_string()))
+    let rows: Vec<Vec<Option<f64>>> = matrix
+        .outer_iter()
+        .map(|row| {
+            row.iter()
+                .map(|&cell| (cell != u32::MAX).then_some(f64::from(cell)))
+                .collect()
+        })
+        .collect();
+    aggregated_rows(
+        py,
+        rows,
+        count,
+        destinations,
+        opportunities,
+        fields,
+        budgets,
+        decay,
+        decay_param,
+    )
+}
+
+/// The float twin for cost axes whose cells are `f64` (grams CO2e,
+/// currency units, metres): a non-finite cell is unreached.
+#[pyfunction]
+#[pyo3(signature = (matrix, opportunities, fields, budgets, decay, decay_param))]
+pub(super) fn aggregate_opportunity_sums_f64<'py>(
+    py: Python<'py>,
+    matrix: PyReadonlyArray2<'py, f64>,
+    opportunities: Vec<f64>,
+    fields: usize,
+    budgets: Vec<f64>,
+    decay: &str,
+    decay_param: Option<f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let matrix = matrix.as_array().to_owned();
+    let (count, destinations) = matrix.dim();
+    let rows: Vec<Vec<Option<f64>>> = matrix
+        .outer_iter()
+        .map(|row| {
+            row.iter()
+                .map(|&cell| cell.is_finite().then_some(cell))
+                .collect()
+        })
+        .collect();
+    aggregated_rows(
+        py,
+        rows,
+        count,
+        destinations,
+        opportunities,
+        fields,
+        budgets,
+        decay,
+        decay_param,
+    )
 }
 
 #[pymethods]
 impl TransportNetwork {
+    /// The canonical global stop index per id, through the same
+    /// resolver every routing entry uses (qualified ids, ambiguity
+    /// errors, unknown-id KeyErrors included).
+    fn _stop_indices(&self, stops: Vec<String>) -> PyResult<Vec<u32>> {
+        stops
+            .iter()
+            .map(|stop| self.resolve_stop(stop).map(|index| index.0))
+            .collect()
+    }
+
     /// Decay-weighted opportunity sums from stops, on the time axis.
     ///
     /// Costs are exactly `travel_time_matrix`'s (one shared engine

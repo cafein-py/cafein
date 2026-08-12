@@ -10,8 +10,10 @@ UNREACHED = numpy.iinfo("uint32").max
 
 
 def _stop_sets(network):
+    # Served city stops: the head of the id-sorted list is an
+    # unserved-station block.
     stops = [stop for stop, lat, lon in network.stops if lat is not None]
-    return stops[:5], stops[1000:1050]
+    return stops[1000:1005], stops[1000:1050]
 
 
 def _oracle_times(network, origins, destinations):
@@ -399,3 +401,205 @@ def test_window_knobs_reject_streets_and_bad_combos(network, helsinki_streets):
         Accessibility(
             helsinki_streets, points, points, transport_mode="walk", window=600
         )
+
+
+def _cost_surface(network, origins, destinations, optimize, fares=None):
+    from cafein import TravelCostMatrix
+
+    matrix = TravelCostMatrix(
+        network,
+        origins,
+        destinations,
+        DATE,
+        DEPARTURE,
+        optimize=optimize,
+        window=600,
+        fares=fares,
+    )
+    column = "emissions" if optimize == "emissions" else "fare"
+    surface = numpy.full((len(origins), len(destinations)), numpy.nan)
+    at_origin = {origin: at for at, origin in enumerate(origins)}
+    at_dest = {dest: at for at, dest in enumerate(destinations)}
+    for _, row in matrix.iterrows():
+        surface[at_origin[row["from_id"]], at_dest[row["to_id"]]] = row[column]
+    return surface
+
+
+def test_emissions_accessibility_matches_the_cost_matrix(network):
+    from cafein import Accessibility
+
+    origins, destinations = _stop_sets(network)
+    surface = _cost_surface(network, origins, destinations, "emissions")
+    budgets = (150.0, 600.0)
+    frame = Accessibility(
+        network,
+        origins,
+        destinations,
+        DATE,
+        DEPARTURE,
+        cost="emissions",
+        window=600,
+        budgets=budgets,
+    )
+    assert "percentile" not in frame.columns
+    for budget in budgets:
+        expected = numpy.nansum(numpy.where(surface <= budget, 1.0, 0.0), axis=1)
+        got = frame[frame["budget"] == budget]["accessibility"].to_numpy()
+        assert numpy.allclose(got, expected), budget
+
+
+def test_money_accessibility_matches_the_cost_matrix(network, helsinki_gtfs):
+    from cafein import Accessibility
+    from cafein import fares as fare_module
+
+    structure = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
+    origins, destinations = _stop_sets(network)
+    surface = _cost_surface(network, origins, destinations, "fare", structure)
+    priced = surface[numpy.isfinite(surface)]
+    assert priced.size, "the fixture feed prices no pair — fixture drift"
+    budget = float(numpy.median(priced))
+    frame = Accessibility(
+        network,
+        origins,
+        destinations,
+        DATE,
+        DEPARTURE,
+        cost="money",
+        window=600,
+        budgets=(budget,),
+        fares=structure,
+    )
+    expected = numpy.nansum(numpy.where(surface <= budget, 1.0, 0.0), axis=1)
+    assert numpy.allclose(frame["accessibility"].to_numpy(), expected)
+
+
+def test_street_distance_accessibility_counts_within_metres(helsinki_streets):
+    geopandas = pytest.importorskip("geopandas")
+    from cafein import Accessibility
+
+    origins = geopandas.GeoDataFrame(
+        {"id": ["o1", "o2"]},
+        geometry=geopandas.points_from_xy([24.9384, 24.9600], [60.1699, 60.1866]),
+        crs="EPSG:4326",
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["d1", "d2", "d3"]},
+        geometry=geopandas.points_from_xy(
+            [24.9414, 24.9509, 24.9210], [60.1725, 60.1798, 60.1580]
+        ),
+        crs="EPSG:4326",
+    )
+    frame = Accessibility(
+        helsinki_streets,
+        origins,
+        destinations,
+        transport_mode="walk",
+        cost="distance",
+        budgets=(500.0, 2500.0),
+    )
+    table = helsinki_streets._core.cost_matrix(
+        [(60.1699, 24.9384), (60.1866, 24.9600)],
+        [(60.1725, 24.9414), (60.1798, 24.9509), (60.1580, 24.9210)],
+        "walk",
+        7200.0,
+        1600.0,
+        False,
+        None,
+    )
+    surface = numpy.full((2, 3), numpy.nan)
+    surface[table["from"], table["to"]] = (
+        table["network_distance"] + table["connector_distance"]
+    )
+    for budget in (500.0, 2500.0):
+        expected = numpy.nansum(numpy.where(surface <= budget, 1.0, 0.0), axis=1)
+        got = frame[frame["budget"] == budget]["accessibility"].to_numpy()
+        assert numpy.allclose(got, expected), budget
+
+
+def test_cost_axes_validate_eagerly(network, helsinki_streets):
+    geopandas = pytest.importorskip("geopandas")
+    from cafein import Accessibility
+
+    origins, destinations = _stop_sets(network)
+    points = geopandas.GeoDataFrame(
+        {"id": ["p"]},
+        geometry=geopandas.points_from_xy([24.9384], [60.1699]),
+        crs="EPSG:4326",
+    )
+    with pytest.raises(ValueError, match="unknown cost"):
+        Accessibility(network, origins, destinations, DATE, DEPARTURE, cost="calories")
+    with pytest.raises(ValueError, match="not an optimizable transit axis"):
+        Accessibility(network, origins, destinations, DATE, DEPARTURE, cost="distance")
+    with pytest.raises(ValueError, match="cost engines"):
+        Accessibility(
+            helsinki_streets, points, points, transport_mode="walk", cost="emissions"
+        )
+    with pytest.raises(ValueError, match="window"):
+        Accessibility(network, origins, destinations, DATE, DEPARTURE, cost="emissions")
+    with pytest.raises(ValueError, match="percentiles"):
+        Accessibility(
+            network,
+            origins,
+            destinations,
+            DATE,
+            DEPARTURE,
+            cost="emissions",
+            window=600,
+            percentiles=(25, 75),
+        )
+    with pytest.raises(ValueError, match="fare structure"):
+        Accessibility(
+            network, origins, destinations, DATE, DEPARTURE, cost="money", window=600
+        )
+    with pytest.raises(ValueError, match="fares applies"):
+        Accessibility(network, origins, destinations, DATE, DEPARTURE, fares=object())
+    with pytest.raises(ValueError, match="factors and components"):
+        Accessibility(
+            network,
+            origins,
+            destinations,
+            DATE,
+            DEPARTURE,
+            cost="money",
+            window=600,
+            fares=object(),
+            factors=object(),
+        )
+
+
+def test_empty_origins_and_duplicate_destinations_are_served(network):
+    from cafein import Accessibility
+    from cafein._cafein import aggregate_opportunity_sums_f64
+
+    # A (0, N) surface keeps its destination dimension.
+    empty = aggregate_opportunity_sums_f64(
+        numpy.empty((0, 3)), [1.0, 1.0, 1.0], 1, [600.0], "step", None
+    )
+    assert empty.shape == (0, 1)
+    # Repeated destination stops keep every column on the cost axes,
+    # exactly as on the time axis.
+    origins, destinations = _stop_sets(network)
+    doubled = destinations[:3] + destinations[:3]
+    single = Accessibility(
+        network,
+        origins,
+        destinations[:3],
+        DATE,
+        DEPARTURE,
+        cost="emissions",
+        window=600,
+        budgets=(600.0,),
+    )
+    twice = Accessibility(
+        network,
+        origins,
+        doubled,
+        DATE,
+        DEPARTURE,
+        cost="emissions",
+        window=600,
+        budgets=(600.0,),
+    )
+    assert numpy.allclose(
+        twice["accessibility"].to_numpy(), 2 * single["accessibility"].to_numpy()
+    )
