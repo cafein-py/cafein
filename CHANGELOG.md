@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **`optimize="fare"` documents its real guarantee** (#246): the
+  matrix docstring now states that the cheapest journey is chosen
+  among the candidates the time-and-ride search retains, not over all
+  feasible journeys — a cheaper journey may be omitted when it
+  arrives no earlier, uses more rides, or boards the same trip at a
+  different stop — and `fare_frontier` documents that zone structures
+  are refused. A zone-fare diagnostic
+  (`scripts/probe_zone_fares.py`) and the bounded-footpath benchmark
+  harness (`scripts/benchmark_bounded_footpaths.py`) ship alongside.
+
 - **Footpath transfers are bounded street walks** (#249): the
   stop-to-stop set is no longer transitively closed, so a transfer is
   one street-shortest walk within `max_walking_time` and can never

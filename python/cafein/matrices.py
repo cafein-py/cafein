@@ -100,7 +100,14 @@ class TravelCostMatrix(pd.DataFrame):
         for. Each objective qualifies candidates by its own key: NaN
         emissions drop a candidate under ``"emissions"``, an
         unpriceable fare under ``"fare"`` — pairs with no qualifying
-        candidate are absent.
+        candidate are absent. ``optimize="fare"`` therefore returns
+        the lowest-priced journey **among the candidates the
+        time-and-ride search retains** — it does not search all
+        feasible journeys by fare. A cheaper journey may be omitted
+        when it arrives no earlier, uses more rides, boards the same
+        trip at a different stop, or loses an equal-time
+        canonical-path tie; fares are exact for each retained
+        journey, but global fare optimality is not guaranteed.
     window : int (optional)
         Departure window in seconds; required with
         ``optimize="emissions"`` and ``optimize="fare"``.
