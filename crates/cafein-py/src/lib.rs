@@ -197,6 +197,7 @@ fn _cafein(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<TransportNetwork>()?;
     m.add_class::<streets::StreetNetwork>()?;
+    m.add_function(wrap_pyfunction!(access::aggregate_opportunity_sums, m)?)?;
     m.add(
         "STREET_MAX_SEGMENT_METERS",
         cafein_core::streets::MAX_SEGMENT_METERS,

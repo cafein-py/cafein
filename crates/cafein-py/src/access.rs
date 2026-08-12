@@ -5,6 +5,7 @@
 use super::*;
 
 use cafein_core::access::{opportunity_sums, Decay};
+use numpy::PyReadonlyArray2;
 use rayon::prelude::*;
 
 /// The parsed decay for user input: one optional parameter whose
@@ -91,6 +92,46 @@ pub(super) fn validated_aggregation(
         }
     }
     Ok(())
+}
+
+/// Decay-weighted opportunity sums over an already-computed time
+/// matrix (`u32` cost cells, `u32::MAX` = unreached): row-major
+/// `[origin][budget * fields]`. Serves every resolution path that
+/// produces a cost matrix, so the weight formulas exist once.
+#[pyfunction]
+#[pyo3(signature = (matrix, opportunities, fields, budgets, decay, decay_param))]
+pub(super) fn aggregate_opportunity_sums<'py>(
+    py: Python<'py>,
+    matrix: PyReadonlyArray2<'py, u32>,
+    opportunities: Vec<f64>,
+    fields: usize,
+    budgets: Vec<f64>,
+    decay: &str,
+    decay_param: Option<f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let decay = parse_decay(decay, decay_param)?;
+    let matrix = matrix.as_array().to_owned();
+    let (count, destinations) = matrix.dim();
+    validated_aggregation(destinations, &opportunities, fields, &budgets)?;
+    let width = budgets.len() * fields;
+    let flat: Vec<f64> = py.allow_threads(|| {
+        let rows: Vec<Vec<Option<f64>>> = matrix
+            .outer_iter()
+            .map(|row| {
+                row.iter()
+                    .map(|&cell| (cell != u32::MAX).then_some(f64::from(cell)))
+                    .collect()
+            })
+            .collect();
+        rows.par_iter()
+            .flat_map_iter(|costs| {
+                opportunity_sums(costs, &opportunities, fields, &budgets, &decay)
+            })
+            .collect()
+    });
+    flat.into_pyarray(py)
+        .reshape([count, width])
+        .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 #[pymethods]

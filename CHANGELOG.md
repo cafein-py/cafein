@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **`Accessibility`**: cumulative-opportunity accessibility as a
+  long-format computer — reachable opportunity counts or sums per
+  origin, budget, and destination column, with step / linear /
+  exponential / logistic decay weighting. Routes door to door on a
+  `TransportNetwork` (stop ids or point/polygon GeoDataFrames) and
+  under a street mode on a `StreetNetwork`; costs come from the same
+  engine dispatch as the travel-time matrices, and the weight formulas
+  live in the compiled core.
+
 - **The accessibility primitive** (first slice of the accessibility
   products): `cafein_core::access` computes per-origin decay-weighted
   opportunity sums, k-nearest destinations, and budget-reached sets
