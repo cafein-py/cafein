@@ -124,3 +124,34 @@ def test_the_population_grid_reads_and_counts(helsinki_metro_data):
     assert grid.crs.to_epsg() == 3067
     assert (grid["asukkaita"].dropna() > 0).any()
     assert len(grid) > 3000
+
+
+def test_metro_footpaths_stay_bounded(metro_network, helsinki_metro_data):
+    # Issue #249: the transitive closure turned the one-component
+    # capital-region walking graph into a near-complete transfer set
+    # (50 M edges, ~3000 per stop) and manufactured hours-long transfer
+    # legs. Each transfer is now one street walk within the cutoff.
+    from cafein.streets import MAX_WALKING_TIME
+
+    stops = len(list(metro_network.stops))
+    assert metro_network.transfer_count < 100 * stops
+    durations = [duration for _, _, duration in metro_network._core._transfer_edges()]
+    assert durations and max(durations) <= MAX_WALKING_TIME
+
+    date = _service_date(helsinki_metro_data.gtfs)
+    served = [stop for stop, lat, lon in metro_network.stops if lat is not None]
+    sampled = served[:: max(1, len(served) // 25)][:25]
+    walked = 0
+    for origin in sampled:
+        for destination in sampled:
+            if origin == destination:
+                continue
+            for journey in metro_network.route_between_stops(
+                origin, destination, date, "08:30:00"
+            ):
+                for leg in journey["legs"]:
+                    if leg["type"] != "transfer":
+                        continue
+                    walked += 1
+                    assert leg["arrival_s"] - leg["departure_s"] <= MAX_WALKING_TIME
+    assert walked, "the sampled journeys walked no transfer at all"

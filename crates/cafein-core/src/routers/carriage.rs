@@ -20,6 +20,10 @@ use crate::transfers::Transfers;
 
 const UNREACHED: u32 = u32::MAX;
 
+/// A ride as the labels carry it: trip, board and alight positions,
+/// and the day offset placing its times on the queried day.
+type Ride = (TripIdx, u16, u16, u32);
+
 /// The number of possession states.
 pub const STATES: usize = 2;
 /// The Carrying plane's index.
@@ -50,7 +54,10 @@ pub struct CarriageInputs<'a> {
 /// and the round budget.
 pub struct CarriageRequest {
     pub departure: u32,
-    pub carrying_access: Vec<(StopIdx, u32)>,
+    /// `(stop, seconds, walked)` — `walked` when the reduction already
+    /// extended the row over an installed transfer, so the row has
+    /// spent the single walk a parked vehicle would otherwise take.
+    pub carrying_access: Vec<(StopIdx, u32, bool)>,
     pub free_access: Vec<(StopIdx, u32)>,
     pub max_transfers: u8,
 }
@@ -77,7 +84,7 @@ pub enum CarriageLabel {
         from_stop: StopIdx,
         duration: u32,
         ride: bool,
-        via_transit: Option<(TripIdx, u16, u16, u32)>,
+        via_transit: Option<Ride>,
         /// The walk left a park whose Free label may since have been
         /// overwritten: the park travels inline (the uniform-carry
         /// rule), so reconstruction crosses planes here.
@@ -210,7 +217,8 @@ pub fn search(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Carriag
     // Seeds. Carrying from the policy reduction; Free independently
     // (the vehicle stays at the origin), plus the park transition at
     // eligible seed stops.
-    for &(stop, seconds) in &request.carrying_access {
+    let mut access_walked = vec![false; stop_count];
+    for &(stop, seconds, walked) in &request.carrying_access {
         let Some(arrival) = request
             .departure
             .checked_add(seconds)
@@ -218,7 +226,9 @@ pub fn search(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Carriag
         else {
             continue;
         };
-        planes[CARRYING].improve(0, stop, arrival, CarriageLabel::Access);
+        if planes[CARRYING].improve(0, stop, arrival, CarriageLabel::Access) {
+            access_walked[stop.0 as usize] = walked;
+        }
     }
     for &(stop, seconds) in &request.free_access {
         let Some(arrival) = request
@@ -231,23 +241,26 @@ pub fn search(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Carriag
         planes[FREE].improve(0, stop, arrival, CarriageLabel::Access);
     }
     let mut parked_seeds: Vec<(StopIdx, u32)> = Vec::new();
-    for index in 0..stop_count {
+    for (index, &walked) in access_walked.iter().enumerate() {
         if !inputs.park_mask[index] {
             continue;
         }
         let arrival = planes[CARRYING].tau[0][index];
-        if arrival != UNREACHED {
-            planes[FREE].improve(0, StopIdx(index as u32), arrival, CarriageLabel::Park);
+        if arrival == UNREACHED {
+            continue;
+        }
+        planes[FREE].improve(0, StopIdx(index as u32), arrival, CarriageLabel::Park);
+        if !walked {
             parked_seeds.push((StopIdx(index as u32), arrival));
         }
     }
 
-    // The parked seeds are not walking-closed (the Free access rows
-    // are, by their reduction — walking again from them would compose
-    // closure rows past the budget): relax the closed walking set over
-    // every parking candidate, shadowed or not — a better Free label
-    // may itself be closure-derived and barred from walking again,
-    // while the park walks fresh (the exact rule; the park travels
+    // A directly ridden parking candidate has not walked yet, while the
+    // Free access rows and the walked Carrying rows have (the reduction
+    // extended them over one installed transfer): relax the walking set
+    // over the fresh candidates only, shadowed or not — a better Free
+    // label may itself be transfer-derived and barred from walking
+    // again, while a fresh park walks (the exact rule; the park travels
     // inline for reconstruction). Walk targets mark themselves; marks
     // stay for round one's scan.
     let mut seed_walks: Vec<(StopIdx, u32, CarriageLabel)> = Vec::new();
@@ -282,7 +295,7 @@ pub fn search(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Carriag
     // resets the one-transfer allowance even when an older
     // closure-derived label shadows it).
     let mut transit_arrival = [vec![UNREACHED; stop_count], vec![UNREACHED; stop_count]];
-    let mut transit_ride: [Vec<(TripIdx, u16, u16, u32)>; 2] = [
+    let mut transit_ride: [Vec<Ride>; 2] = [
         vec![(TripIdx(0), 0, 0, 0); stop_count],
         vec![(TripIdx(0), 0, 0, 0); stop_count],
     ];
@@ -365,15 +378,19 @@ pub fn search(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Carriag
                 ));
             }
         }
-        for (stop, arrival, label) in relaxations {
-            planes[CARRYING].improve(round, stop, arrival, label);
+        // Ride rows go in first: on an exact tie the ridden label keeps
+        // the slot, and it is the one a park may still walk out of.
+        for ride_pass in [true, false] {
+            for &(stop, arrival, label) in &relaxations {
+                let ride = matches!(label, CarriageLabel::Transfer { ride: true, .. });
+                if ride == ride_pass {
+                    planes[CARRYING].improve(round, stop, arrival, label);
+                }
+            }
         }
 
         // Park phase: every Carrying label the round produced may park
-        // at an eligible stop, entering Free the same round. The full
-        // candidate list stays as a sidecar — a shadowed park still
-        // walks below, since its shadower may be closure-derived and
-        // barred from walking again (the exact rule).
+        // at an eligible stop, entering Free the same round.
         let carrying_round: Vec<(usize, u32)> = (0..stop_count)
             .filter(|&index| inputs.park_mask[index])
             .map(|index| (index, planes[CARRYING].tau[round][index]))
@@ -382,14 +399,41 @@ pub fn search(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Carriag
         for &(index, arrival) in &carrying_round {
             planes[FREE].improve(round, StopIdx(index as u32), arrival, CarriageLabel::Park);
         }
+        // A park walks on only when the vehicle rode into the stop —
+        // a carried walk has already spent the transfer's single walk,
+        // and walking again would chain two of them past the cutoff.
+        // The round's Carrying transit arrivals walk whether or not
+        // they hold the label slot (a faster carried walk may shadow
+        // one), carrying their ride inline for reconstruction; a
+        // carriage ride row walks only while it holds the slot, since
+        // the chain behind it lives in a slot the phase may still move.
+        let mut parked_riders: Vec<(usize, u32, Option<Ride>)> = Vec::new();
+        for &stop in &transit_touched[CARRYING] {
+            let index = stop as usize;
+            if inputs.park_mask[index] {
+                parked_riders.push((
+                    index,
+                    transit_arrival[CARRYING][index],
+                    Some(transit_ride[CARRYING][index]),
+                ));
+            }
+        }
+        for &(index, arrival) in &carrying_round {
+            if matches!(
+                planes[CARRYING].labels[round][index],
+                CarriageLabel::Transfer { ride: true, .. }
+            ) {
+                parked_riders.push((index, arrival, None));
+            }
+        }
 
-        // Free walking phase: the closed walking closure relaxes from
-        // the sidecar of the round's Free transit arrivals (shadowed
-        // ones included — the fresh ride resets the one-transfer
-        // allowance) and from every parking candidate, each walk
-        // inline-carrying its predecessor (the uniform-carry rule):
-        // reconstruction must never chain closure rows through a
-        // mutable or missing label.
+        // Free walking phase: the walking set relaxes from the sidecar
+        // of the round's Free transit arrivals (shadowed ones included
+        // — the fresh ride resets the one-transfer allowance) and from
+        // the ridden parking candidates, each walk inline-carrying its
+        // predecessor (the uniform-carry rule): reconstruction must
+        // never chain transfer rows through a mutable or missing
+        // label.
         let mut walks: Vec<(StopIdx, u32, CarriageLabel)> = Vec::new();
         for &source in &transit_touched[FREE] {
             let source_stop = StopIdx(source);
@@ -415,7 +459,7 @@ pub fn search(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Carriag
                 ));
             }
         }
-        for &(index, departure_at) in &carrying_round {
+        for &(index, departure_at, ride) in &parked_riders {
             let source = StopIdx(index as u32);
             for edge in inputs.walking.from_stop(source) {
                 let Some(arrival) = departure_at
@@ -431,7 +475,7 @@ pub fn search(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Carriag
                         from_stop: source,
                         duration: edge.duration,
                         ride: false,
-                        via_transit: None,
+                        via_transit: ride,
                         via_park: true,
                     },
                 ));
@@ -702,7 +746,12 @@ impl CarriageSearch {
                         });
                         plane_index = CARRYING;
                         at = from_stop;
-                        continue;
+                        if via_transit.is_none() {
+                            continue;
+                        }
+                        // A carried ride the park walked out of was
+                        // itself shadowed in Carrying: it travels
+                        // inline too, below.
                     }
                     match via_transit {
                         Some((trip, board_position, alight_position, day_offset)) => {

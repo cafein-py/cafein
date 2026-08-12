@@ -427,7 +427,12 @@ impl TransportNetwork {
                         )
                     })
                     .collect();
-                Transfers::from_edges(stop_count, &edges).map_err(|error| error.to_string())
+                let mut set =
+                    Transfers::from_edges(stop_count, &edges).map_err(|error| error.to_string())?;
+                // Each shortcut is one bounded street walk: the engines
+                // relax it with the exact transfer phase, never chained.
+                set.mark_unclosed();
+                Ok::<_, String>(set)
             })
             .map_err(PyValueError::new_err)?;
         let count = set.edge_count();
@@ -504,7 +509,11 @@ impl TransportNetwork {
                     .iter()
                     .map(|s| (s.origin, s.destination, s.seconds, s.meters))
                     .collect();
-                Transfers::from_edges(stop_count, &edges).map_err(|error| error.to_string())
+                let mut set =
+                    Transfers::from_edges(stop_count, &edges).map_err(|error| error.to_string())?;
+                // As the ULTRA path: single bounded walks, exact phase.
+                set.mark_unclosed();
+                Ok::<_, String>(set)
             })
             .map_err(PyValueError::new_err)?;
         let count = set.edge_count();
@@ -562,6 +571,9 @@ impl TransportNetwork {
         }
         self.transfers = Transfers::from_edges(self.build.timetable.stop_count(), &edges)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        // The walking set is bounded, not transitively closed: the
+        // engines relax it with the exact transfer phase.
+        self.transfers.mark_unclosed();
         // The merged mode-transfer and carriage sets folded the old
         // closure; recompute.
         self.mode_transfers = None;
@@ -626,6 +638,9 @@ impl TransportNetwork {
         }
         self.transfers = Transfers::from_edges(self.build.timetable.stop_count(), &edges)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        // The walking set is bounded, not transitively closed: the
+        // engines relax it with the exact transfer phase.
+        self.transfers.mark_unclosed();
         // The merged mode-transfer and carriage sets folded the old
         // closure; recompute.
         self.mode_transfers = None;
@@ -916,7 +931,7 @@ impl TransportNetwork {
 
     /// The installed stop-to-stop transfers as ``(from_stop_id, to_stop_id,
     /// seconds)``. Internal; the street-policy oracles recompute the
-    /// reduction's transfer closure from it.
+    /// reduction's transfer extension from it.
     fn _transfer_edges(&self) -> Vec<(String, String, u32)> {
         let mut edges = Vec::with_capacity(self.transfers.edge_count());
         for from in 0..self.build.timetable.stop_count() {
@@ -1232,10 +1247,10 @@ impl TransportNetwork {
     /// a NaN factor poisons its choices' grams (they survive only where
     /// strictly fastest, surfacing as unresolved journeys — never a
     /// silent zero). Exact ``(seconds, grams)`` ties resolve to fewer
-    /// paid rentals, then the declared order. The transfer closure
-    /// extends every direct frontier point by one installed edge
-    /// (+duration; a rental-bearing merged edge adds its ride grams)
-    /// from a snapshot, then re-Paretos.
+    /// paid rentals, then the declared order. Every direct *vehicle*
+    /// frontier point extends by one installed edge (+duration; a
+    /// rental-bearing merged edge adds its ride grams) from a snapshot,
+    /// then re-Paretos; a walking point has spent its walk and stays.
     /// With every factor zero the frontier degenerates to the time-only
     /// winner, row for row. Returns ``(stop_id, seconds, grams, mode,
     /// link_edge, link_fraction, connector_meters, vehicle_network_m,
@@ -1256,6 +1271,7 @@ impl TransportNetwork {
     ) -> PyResult<Vec<ParetoRow>> {
         let stop_count = self.build.timetable.stop_count() as usize;
         let mut frontiers: Vec<Vec<ParetoChoice>> = vec![Vec::new(); stop_count];
+        let mut vehicle_frontiers: Vec<Vec<ParetoChoice>> = vec![Vec::new(); stop_count];
         let mut snapped = false;
         for (order, (mode, max_seconds, rental, eligible, factor)) in modes.iter().enumerate() {
             let mask = match eligible {
@@ -1290,23 +1306,27 @@ impl TransportNetwork {
                 } else {
                     network_m / 1000.0 * factor
                 };
-                pareto_insert(
-                    &mut frontiers[stop],
-                    ParetoChoice {
-                        winner: Winner {
-                            seconds,
-                            rentals: u8::from(*rental),
-                            transfer_rental: false,
-                            order,
-                            snap,
-                            via: None,
-                            network_m,
-                            total_m,
-                            walk_transfer_m: 0.0,
-                        },
-                        grams,
+                let point = ParetoChoice {
+                    winner: Winner {
+                        seconds,
+                        rentals: u8::from(*rental),
+                        transfer_rental: false,
+                        order,
+                        snap,
+                        via: None,
+                        network_m,
+                        total_m,
+                        walk_transfer_m: 0.0,
                     },
-                );
+                    grams,
+                };
+                pareto_insert(&mut frontiers[stop], point);
+                // The vehicle points are kept apart as the extension
+                // sources: a walking point that dominates one on both
+                // axes must not take its hand-off to a walk with it.
+                if mode != "walk" {
+                    pareto_insert(&mut vehicle_frontiers[stop], point);
+                }
             }
         }
         if !snapped {
@@ -1315,13 +1335,14 @@ impl TransportNetwork {
                  every policy mode",
             ));
         }
-        // Exclusions and the one-edge closure, exactly as the time-only
-        // reduction applies them — here every direct frontier point
-        // extends, not just the winner.
+        // Exclusions and the one-edge hand-off, exactly as the time-only
+        // reduction applies them — here every direct vehicle point
+        // extends, not just the fastest.
         let mut excluded = vec![false; stop_count];
         for stop in &exclude_stops {
             let index = self.resolve_stop(stop)?.0 as usize;
             frontiers[index].clear();
+            vehicle_frontiers[index].clear();
             excluded[index] = true;
         }
         let binding = transfer_mode
@@ -1340,7 +1361,7 @@ impl TransportNetwork {
                 grams_per_meter,
             )
         });
-        let seeds = frontiers.clone();
+        let seeds = vehicle_frontiers;
         for stop in 0..stop_count {
             let range = closure.edge_range(StopIdx(stop as u32));
             for (index, transfer) in closure.from_stop(StopIdx(stop as u32)).iter().enumerate() {
@@ -2387,8 +2408,12 @@ impl TransportNetwork {
     ) -> PyResult<Vec<Option<Winner>>> {
         let stop_count = self.build.timetable.stop_count() as usize;
         let mut best: Vec<Option<Winner>> = vec![None; stop_count];
+        // The fastest non-walking choice per stop, whether or not it won
+        // the stop: only a vehicle choice extends over a transfer.
+        let mut extendable: Vec<Option<Winner>> = vec![None; stop_count];
         let mut snapped = false;
         for (order, (mode, max_seconds, rental, eligible)) in modes.iter().enumerate() {
+            let walking_mode = mode == "walk";
             let mask = match eligible {
                 Some(stops) => {
                     let mut mask = vec![false; stop_count];
@@ -2448,6 +2473,23 @@ impl TransportNetwork {
                 if wins {
                     best[stop] = Some(candidate);
                 }
+                // The fastest vehicle choice is kept apart: it is the one
+                // that may hand off to a walk below, and a faster walking
+                // choice at the same stop must not hide it.
+                if !walking_mode {
+                    let extends = match &extendable[stop] {
+                        None => true,
+                        Some(held) => {
+                            candidate.seconds < held.seconds
+                                || (candidate.seconds == held.seconds
+                                    && (usize::from(candidate.rentals), candidate.order)
+                                        < (usize::from(held.rentals), held.order))
+                        }
+                    };
+                    if extends {
+                        extendable[stop] = Some(candidate);
+                    }
+                }
             }
         }
         if !snapped {
@@ -2466,29 +2508,28 @@ impl TransportNetwork {
         for stop in exclude_stops {
             let index = self.resolve_stop(stop)?.0 as usize;
             best[index] = None;
+            extendable[index] = None;
             excluded[index] = true;
         }
-        // Close the reduction under the installed stop-to-stop transfers:
-        // the engines never relax footpaths out of access-seeded stops,
-        // because the walking access array is footpath-closed by
-        // construction — so a reduced array must be too, or "ride to one
-        // platform, walk to the neighbouring one" would go missing and a
-        // better seed could only prune the transit label that used to feed
-        // that footpath. Direction follows the labels: access labels
-        // propagate along a transfer (reach the seed, then walk it), egress
-        // labels against it (walk it first, then leave from the seed) —
-        // asymmetric footpaths stay honest. The pass relaxes a snapshot of
-        // the direct winners, never its own output: the installed set is
-        // transitively closed within its own walking cutoff, so composing
-        // two installed edges would walk beyond that cutoff. Every carried
-        // choice is thus its seed's direct time plus exactly one installed
-        // transfer, whatever the stop order.
+        // Hand a vehicle choice off to one installed transfer: a stop the
+        // bicycle cannot reach is served by riding to its neighbour and
+        // walking the rest. A walking choice never extends — it has
+        // walked already, and a second walk would carry the array past
+        // its own cutoff; the engines relax footpaths out of transit
+        // arrivals themselves (the exact phase), so nothing is lost.
+        // Direction follows the labels: access labels propagate along a
+        // transfer (reach the seed, then walk it), egress labels against
+        // it (walk it first, then leave from the seed) — asymmetric
+        // footpaths stay honest. The pass relaxes a snapshot of the
+        // direct vehicle choices, never its own output, so every carried
+        // choice is one direct ride plus exactly one transfer, whatever
+        // the stop order.
         let closure = self.policy_transfers(transfer_mode)?;
         let rental_flags = transfer_mode.map(|_| {
             let held = self.mode_transfers.as_ref().expect("binding validated");
             held.rental_edge.as_slice()
         });
-        let seeds = best.clone();
+        let seeds = extendable;
         for stop in 0..stop_count {
             let range = closure.edge_range(StopIdx(stop as u32));
             for (index, transfer) in closure.from_stop(StopIdx(stop as u32)).iter().enumerate() {

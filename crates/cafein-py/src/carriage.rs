@@ -106,7 +106,7 @@ impl TransportNetwork {
     fn _carriage_travel_times(
         &self,
         py: Python<'_>,
-        carrying_access: Vec<(String, u32)>,
+        carrying_access: Vec<(String, u32, bool)>,
         free_access: Vec<(String, u32)>,
         date: &str,
         departure: &str,
@@ -122,9 +122,15 @@ impl TransportNetwork {
                 .map(|(stop, seconds)| Ok((self.resolve_stop(stop)?, *seconds)))
                 .collect::<PyResult<Vec<_>>>()
         };
+        let resolve_carrying = |offsets: &[(String, u32, bool)]| {
+            offsets
+                .iter()
+                .map(|(stop, seconds, walked)| Ok((self.resolve_stop(stop)?, *seconds, *walked)))
+                .collect::<PyResult<Vec<_>>>()
+        };
         let request = CarriageRequest {
             departure,
-            carrying_access: resolve(&carrying_access)?,
+            carrying_access: resolve_carrying(&carrying_access)?,
             free_access: resolve(&free_access)?,
             max_transfers,
         };
@@ -175,7 +181,7 @@ impl TransportNetwork {
     fn _carriage_route(
         &self,
         py: Python<'_>,
-        carrying_access: Vec<(String, u32)>,
+        carrying_access: Vec<(String, u32, bool)>,
         free_access: Vec<(String, u32)>,
         carrying_egress: Vec<(String, u32)>,
         free_egress: Vec<(String, u32)>,
@@ -194,9 +200,15 @@ impl TransportNetwork {
                 .map(|(stop, seconds)| Ok((self.resolve_stop(stop)?, *seconds)))
                 .collect::<PyResult<Vec<_>>>()
         };
+        let resolve_carrying = |offsets: &[(String, u32, bool)]| {
+            offsets
+                .iter()
+                .map(|(stop, seconds, walked)| Ok((self.resolve_stop(stop)?, *seconds, *walked)))
+                .collect::<PyResult<Vec<_>>>()
+        };
         let request = CarriageRequest {
             departure,
-            carrying_access: resolve(&carrying_access)?,
+            carrying_access: resolve_carrying(&carrying_access)?,
             free_access: resolve(&free_access)?,
             max_transfers,
         };
@@ -383,7 +395,7 @@ impl TransportNetwork {
     fn _carriage_time_matrix(
         &self,
         py: Python<'_>,
-        carrying_rows: Vec<Vec<(String, u32)>>,
+        carrying_rows: Vec<Vec<(String, u32, bool)>>,
         free_rows: Vec<Vec<(String, u32)>>,
         carrying_egress_rows: Vec<Vec<(String, u32)>>,
         free_egress_rows: Vec<Vec<(String, u32)>>,
@@ -408,11 +420,17 @@ impl TransportNetwork {
                 .map(|(stop, seconds)| Ok((self.resolve_stop(stop)?, *seconds)))
                 .collect::<PyResult<Vec<_>>>()
         };
+        let resolve_carrying = |offsets: &[(String, u32, bool)]| {
+            offsets
+                .iter()
+                .map(|(stop, seconds, walked)| Ok((self.resolve_stop(stop)?, *seconds, *walked)))
+                .collect::<PyResult<Vec<_>>>()
+        };
         let mut requests = Vec::with_capacity(carrying_rows.len());
         for (carrying, free) in carrying_rows.iter().zip(&free_rows) {
             requests.push(CarriageRequest {
                 departure,
-                carrying_access: resolve(carrying)?,
+                carrying_access: resolve_carrying(carrying)?,
                 free_access: resolve(free)?,
                 max_transfers,
             });

@@ -345,3 +345,74 @@ def test_id_collections_refuse_bytes(network):
         )
     with pytest.raises(TypeError, match="components"):
         network.annotate_emissions([], components=b"fuel")
+
+
+def _chained_walk_feed(path):
+    """Four stops in a line: a trip into B, a trip out of D, and nothing
+    joining them but footpaths B→C and C→D."""
+    import zipfile
+
+    tables = {
+        "agency.txt": [
+            "agency_id,agency_name,agency_url,agency_timezone",
+            "A,Test Agency,http://example.com,Europe/Helsinki",
+        ],
+        "stops.txt": [
+            "stop_id,stop_name,stop_lat,stop_lon",
+            "A,A,60.000,24.000",
+            "B,B,60.001,24.000",
+            "C,C,60.002,24.000",
+            "D,D,60.003,24.000",
+            "E,E,60.004,24.000",
+        ],
+        "routes.txt": ["route_id,route_short_name,route_type", "R1,1,3", "R2,2,3"],
+        "trips.txt": ["route_id,service_id,trip_id", "R1,SV,T_IN", "R2,SV,T_OUT"],
+        "stop_times.txt": [
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+            "T_IN,08:00:00,08:00:00,A,1",
+            "T_IN,08:10:00,08:10:00,B,2",
+            "T_OUT,08:40:00,08:40:00,D,1",
+            "T_OUT,08:50:00,08:50:00,E,2",
+        ],
+        "calendar.txt": [
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+            "sunday,start_date,end_date",
+            "SV,1,1,1,1,1,1,1,20220101,20221231",
+        ],
+    }
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, lines in tables.items():
+            archive.writestr(name, "\n".join(lines) + "\n")
+    return path
+
+
+@pytest.mark.parametrize("router", ["raptor", "tbtr"])
+def test_transfers_never_chain_two_bounded_walks(tmp_path, router):
+    # Issue #249: transfers are single bounded street walks. B→C and
+    # C→D are installed at 600 s each; their 1200 s composition is not,
+    # so no engine may walk B→C→D between the two rides — riding out of
+    # D is simply unreachable, while the single hop to C stands.
+    import numpy as np
+
+    from cafein import TransportNetwork
+    from cafein.streets import Footpaths
+
+    feed = _chained_walk_feed(tmp_path / "chained.zip")
+    network = TransportNetwork.from_gtfs([str(feed)])
+    network.set_transfers(
+        Footpaths(
+            ["A", "B", "C", "D", "E"],
+            [1, 2, 2, 3],
+            [2, 1, 3, 2],
+            [600, 600, 600, 600],
+            [600.0, 600.0, 600.0, 600.0],
+        )
+    )
+    matrix = network.travel_time_matrix(["A"], "2022-02-22", "07:55:00", router=router)
+    unreachable = np.iinfo(np.uint32).max
+    # Ride A→B (08:10), then one 600 s walk to C: 08:20.
+    assert matrix[0][2] == 25 * 60
+    # Chaining B→C→D would reach D at 08:30, in time for the 08:40
+    # departure to E; a single bounded walk never does.
+    assert matrix[0][3] == unreachable
+    assert matrix[0][4] == unreachable

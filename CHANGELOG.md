@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Footpath transfers are bounded street walks** (#249): the
+  stop-to-stop set is no longer transitively closed, so a transfer is
+  one street-shortest walk within `max_walking_time` and can never
+  chain past it. The closure had made every metro-scale network a
+  near-complete graph — 50.2 M transfers (~3000 per stop) on the
+  Helsinki capital region, with `transfer` legs of hours and
+  kilometres in routed journeys; the same network now carries 280 k
+  transfers (33 per stop) and no transfer above the cutoff. The
+  engines relax the bounded set with the exact transfer phase (walks
+  extend transit arrivals, never other walks), which RAPTOR, TBTR and
+  the carriage search already implemented and which the fare frontier
+  now implements too; ULTRA and McULTRA shortcut sets, single bounded
+  walks themselves, take the same phase, as does every set restored
+  from an artifact. The street-policy access and egress reductions
+  follow the same rule: a walking choice stands on its own street
+  search, while the fastest *vehicle* choice at a stop — whether or not
+  a walk beat it there — hands off to one installed transfer, so
+  "ride to the neighbouring stop and walk the rest" survives without
+  composing two walks. A carriage journey's park likewise walks only
+  when the vehicle rode into the stop, and a ridden arrival still walks
+  out when a faster carried walk shadows it.
+
 - **Cost axes for `Accessibility`**: ``cost="emissions"`` (grams CO2e)
   and ``cost="money"`` (the fare structure's currency units) compute
   accessibility against per-destination optima from the cost engines —

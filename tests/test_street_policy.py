@@ -176,16 +176,18 @@ def test_the_reduction_keeps_the_fastest_choice_per_stop(multimodal_network):
         )
     }
     assert reduced
-    # The oracle: per-stop min across the modes, then closed under the
-    # installed transfers (ride to one platform, walk to the neighbour) —
-    # the closure the engines assume of every access array.
+    # The oracle: per-stop min across the modes, then one installed
+    # transfer out of the fastest *vehicle* choice (ride to one
+    # platform, walk to the neighbour) — the single bounded walk every
+    # access array carries, never a chain of them, and never out of a
+    # walking choice that has already walked.
     expected = {
         stop: min(times[stop] for times in (walk, bike) if stop in times)
         for stop in set(walk) | set(bike)
     }
     for origin, to, duration in core._transfer_edges():
-        if origin in expected:
-            candidate = expected[origin] + duration
+        if origin in bike:
+            candidate = bike[origin] + duration
             if candidate < expected.get(to, 10**9):
                 expected[to] = candidate
     assert {stop: seconds for stop, (seconds, _) in reduced.items()} == expected
@@ -439,9 +441,11 @@ def test_the_public_policy_path_matches_a_hand_built_reduction(multimodal_networ
             if stop in times
         ]
         offsets[stop] = min(candidates)[0]
+    # Only the bicycle rows hand off to an installed transfer: a walking
+    # row has spent its walk.
     for origin, to, duration in core._transfer_edges():
-        if origin in offsets:
-            candidate = offsets[origin] + duration
+        if origin in bike:
+            candidate = bike[origin] + duration
             if candidate < offsets.get(to, 10**9):
                 offsets[to] = candidate
     seeded = core._travel_times_with_access(
@@ -1348,12 +1352,18 @@ def test_the_pareto_frontier_keeps_the_cleaner_slower_choice(multimodal_network)
         by_stop.setdefault(row[0], []).append(row)
     doubles = {stop: points for stop, points in by_stop.items() if len(points) > 1}
     assert doubles, "somewhere the scooter must be faster and dirtier than walking"
+    # Somewhere the cleaner point is plain walking; elsewhere it is a
+    # shorter scooter leg the bounded transfer walks on from.
+    assert any(points[-1][3] == "walk" for points in doubles.values())
     for points in doubles.values():
         fast, slow = points[0], points[-1]
         assert fast[1] < slow[1] and fast[2] > slow[2]
-        assert fast[3] == "e_scooter" and slow[3] == "walk"
-        assert fast[2] == pytest.approx(fast[7] / 1000.0 * 100.0)
-        assert slow[2] == 0.0
+        assert fast[3] == "e_scooter"
+        # Grams are the point's own scooter metres; the walking rest of
+        # a point — a walking row, or a scooter row's transfer — rides
+        # free.
+        for point in (fast, slow):
+            assert point[2] == pytest.approx(point[7] / 1000.0 * 100.0)
     # And per-stop points are sorted by seconds with strictly improving
     # grams — a true frontier.
     for points in by_stop.values():

@@ -2887,23 +2887,28 @@ def _carriage_time_columns(
     origin_points = origin_points[rows_slice]
 
     def reduced(points, egress, planes):
+        from cafein.network import _carrying_offsets
+
         carrying_rows, free_rows, unsnapped = [], [], []
         for index, (lat, lon) in enumerate(points):
             rows = []
-            for plane_modes in planes:
+            for plane, plane_modes in enumerate(planes):
                 try:
-                    rows.append(
-                        [
-                            (stop, seconds)
-                            for stop, seconds, *_ in core._reduced_street_offsets(
-                                lat, lon, egress, plane_modes
-                            )
-                        ]
+                    reduction = core._reduced_street_offsets(
+                        lat, lon, egress, plane_modes
                     )
                 except ValueError as error:
                     if "too far from the multimodal street network" not in str(error):
                         raise
                     rows.append([])
+                    continue
+                # The Carrying access rows carry the reduction's walk
+                # flag; the egress rows and the Free plane never walk
+                # again, so they stay plain offsets.
+                if plane == 0 and not egress:
+                    rows.append(_carrying_offsets(reduction))
+                else:
+                    rows.append([(stop, seconds) for stop, seconds, *_ in reduction])
             if not any(rows):
                 # Neither plane snapped; the point's cells are omitted
                 # unless the direct walk below still stands.

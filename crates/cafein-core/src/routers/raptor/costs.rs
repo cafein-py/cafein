@@ -63,8 +63,8 @@ pub struct CostInputs<'a> {
     pub fares: Option<&'a FareTables>,
     /// The merged mode-transfer set's reconstruction view — the rental
     /// tokens and the transfer mode's grams per meter — `Some` only
-    /// when the relaxed set is a merged one, whose chains carry
-    /// exact-phase transfer labels.
+    /// when the relaxed set is a merged one; a bounded walking set
+    /// carries exact-phase transfer labels without any tokens.
     pub rental: Option<RentalCostView<'a>>,
 }
 

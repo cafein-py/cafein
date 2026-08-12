@@ -3,10 +3,12 @@
 The build turns a PBF extract into the two walking structures the routing
 core consumes. Stop-to-stop footpaths become the transfer edge list: snap
 every stop onto its nearest edge (splitting the edge at the snap point),
-run a cutoff-bounded one-to-many Dijkstra from every stop, and
-transitively close the resulting stop-to-stop times — routing relaxes a
-single transfer hop per round, so whenever two footpaths chain, the
-chained pair must be a footpath too. The street network itself is handed
+and run a cutoff-bounded one-to-many Dijkstra from every stop. The
+cutoff is the walking contract: a transfer between two rides is a
+single street-shortest walk within `max_walking_time`, so the direct
+bounded search is already complete for routing's one-hop-per-round
+relaxation — any chain of footpaths whose total stays inside the
+cutoff is a direct footpath by the triangle inequality. The street network itself is handed
 over as flat arrays (edges with their geometry, plus the stops' snap
 links) for the core's query-time access/egress searches from arbitrary
 coordinates. Tiny disconnected components (mapping artifacts, clipped
@@ -58,7 +60,7 @@ are far larger."""
 MAX_FOOTPATH_STOPS = 20_000
 """Ceiling on snapped stops in the footpath build.
 
-The stop-to-stop search and its transitive closure materialize dense
+The stop-to-stop search materializes dense
 stop-by-stop matrices, so memory grows quadratically with the snapped
 stop count; the ceiling keeps the matrices within a few gigabytes.
 Larger stop sets are rejected rather than silently exhausting memory —
@@ -142,8 +144,8 @@ def walking_footpaths(
     walking_speed_kmph : float (optional, default: 3.6)
         Walking speed in km/h, on the network and on the stop connectors.
     max_walking_time : float (optional, default: 1200)
-        Walking-time cutoff of the direct footpath search, in seconds.
-        Transitive closure may produce chained footpaths that exceed it.
+        Walking-time cutoff of the footpath search, in seconds: no
+        stop-to-stop transfer exceeds it.
     max_snap_distance : float (optional, default: 1600)
         Maximum straight-line distance in meters from a stop to its
         nearest walking-network edge.
@@ -158,7 +160,7 @@ def walking_footpaths(
     Returns
     -------
     Footpaths
-        The transitively closed walking edges as flat arrays —
+        The walking edges as flat arrays —
         conservatively rounded seconds plus the exact street-path
         length — suitable for ``TransportNetwork.set_transfers``;
         iterating yields the legacy ``(from_stop, to_stop, seconds,
@@ -334,8 +336,9 @@ def _network_streets(
     if not snapped.empty:
         graph, stop_vertices = _routing_graph(nodes, edges, snapped, speed)
         durations = _stop_durations(graph, stop_vertices, max_walking_time)
-        closed = _transitive_closure(durations)
-        footpaths = _edge_list(snapped["stop_id"].to_numpy(), closed, speed)
+        footpaths = _edge_list(
+            snapped["stop_id"].to_numpy(), durations, speed, max_walking_time
+        )
     return footpaths, _street_payload(nodes, edges, snapped)
 
 
@@ -541,34 +544,25 @@ def _stop_durations(graph, stop_vertices, max_walking_time):
     return durations
 
 
-def _transitive_closure(durations):
-    """All-pairs shortest paths over the footpath set itself.
-
-    Whenever two footpaths chain, the chained pair becomes a footpath as
-    well; direct footpaths are street shortest paths already, so closure
-    never shortens them.
-    """
-    finite = np.isfinite(durations)
-    np.fill_diagonal(finite, False)
-    i, j = np.nonzero(finite)
-    graph = sparse.coo_matrix((durations[i, j], (i, j)), shape=durations.shape).tocsr()
-    return csgraph.dijkstra(graph, directed=False)
-
-
-def _edge_list(stop_ids, durations, speed):
+def _edge_list(stop_ids, durations, speed, max_walking_time=None):
     """The finite off-diagonal durations as `Footpaths` arrays.
 
     Durations are feasibility constraints, so they round up (with a small
     tolerance for floating-point noise): understating a walking time could
-    let routing catch a departure the walk actually misses. The meters
-    stay exact: every walking cost is a street length over the uniform
-    speed, so the unrounded duration times the speed is the walked
-    street-path length.
+    let routing catch a departure the walk actually misses. Rounding up
+    can carry a path past a fractional cutoff, so the kept edges are
+    filtered on the rounded seconds — no stored transfer is longer than
+    the cutoff. The meters stay exact: every walking cost is a street
+    length over the uniform speed, so the unrounded duration times the
+    speed is the walked street-path length.
     """
     finite = np.isfinite(durations)
     np.fill_diagonal(finite, False)
     i, j = np.nonzero(finite)
     seconds = np.ceil(durations[i, j] - 1e-6).astype(np.int64)
+    if max_walking_time is not None:
+        within = seconds <= max_walking_time
+        i, j, seconds = i[within], j[within], seconds[within]
     if len(seconds) and seconds.max() > 4_294_967_295:
         raise ValueError(
             "footpath durations exceed the routing core's 32-bit second "
