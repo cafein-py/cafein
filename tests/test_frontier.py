@@ -488,8 +488,8 @@ def test_pareto_candidates_match_the_oracle_over_footpaths(network_with_footpath
     from cafein import exhaustive_frontier
 
     # The strongest cross-engine check: on the network carrying the
-    # real (transitively closed) footpath set, a vanishing bucket must
-    # reproduce the oracle's frontier — 20 points for this pair.
+    # real (bounded) footpath set, a vanishing bucket must reproduce
+    # the oracle's frontier — 15 points for this pair.
     origin, destination = "1100602", "1040280"
     true_set = exhaustive_frontier(
         network_with_footpaths,
@@ -511,7 +511,7 @@ def test_pareto_candidates_match_the_oracle_over_footpaths(network_with_footpath
         bucket=1e-6,
     )
     on = exact[exact["frontier"]]
-    assert len(true_set) == 20
+    assert len(true_set) == 15
     assert on["arrival_s"].tolist() == true_set["arrival_s"].tolist()
     assert on["rides"].tolist() == true_set["rides"].tolist()
     assert on["emissions"].tolist() == pytest.approx(

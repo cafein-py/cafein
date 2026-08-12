@@ -14,27 +14,30 @@ pub struct Transfer {
 
 /// All stop-to-stop transfers of a network.
 ///
-/// The input edge list must already be transitively closed (the footpath
-/// precompute's responsibility): routing relaxes one transfer hop per
-/// round and does not chain transfers. A set that cannot honor that
-/// contract — the budget-bounded merged mode-transfer set — declares
-/// itself with `mark_unclosed`, and RAPTOR switches to its exact
-/// transfer phase for it.
+/// Transfers are single bounded walks between consecutive rides: the
+/// engines relax them with the exact transfer phase (walks extend
+/// transit arrivals, never other walks), so no chain of transfers can
+/// exceed the walking cutoff. A set may declare itself `closed`
+/// (transitively complete), which lets the engines use the cheaper
+/// label-improving relaxation — the empty set trivially qualifies.
 #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Transfers {
     /// CSR offsets into `edges`, one entry per stop plus a tail.
     offsets: Vec<u32>,
     edges: Vec<Transfer>,
-    /// Whether the set satisfies the transitive-closure contract. Not
-    /// persisted: unclosed sets are runtime-only, so a loaded set is
-    /// always a closure.
+    /// Whether the set is transitively complete (the cheaper
+    /// label-improving relaxation is sound). Not persisted; loaded
+    /// sets take the exact phase.
     #[serde(skip, default = "closed_default")]
     closed: bool,
 }
 
-/// A deserialized transfer set is always a walking closure.
+/// Deserialized sets take the exact transfer phase: correct for
+/// bounded sets by definition, and for legacy closures too — their
+/// chains are single edges, so walk-after-ride relaxation loses
+/// nothing.
 fn closed_default() -> bool {
-    true
+    false
 }
 
 impl Transfers {

@@ -40,7 +40,10 @@ fn fixture() -> (Timetable, Transfers, Transfers, Vec<bool>) {
 fn request(carrying: Vec<(StopIdx, u32)>, free: Vec<(StopIdx, u32)>) -> CarriageRequest {
     CarriageRequest {
         departure: 0,
-        carrying_access: carrying,
+        carrying_access: carrying
+            .into_iter()
+            .map(|(stop, seconds)| (stop, seconds, false))
+            .collect(),
         free_access: free,
         max_transfers: 3,
     }
@@ -252,8 +255,12 @@ fn oracle(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Vec<[Vec<Op
     let stops = timetable.stop_count() as usize;
     let rounds = request.max_transfers as usize + 1;
     let mut best = [vec![UNREACHED; stops], vec![UNREACHED; stops]];
-    for &(stop, seconds) in &request.carrying_access {
+    let mut access_walked = vec![false; stops];
+    for &(stop, seconds, walked) in &request.carrying_access {
         let arrival = request.departure + seconds;
+        if arrival < best[CARRYING][stop.0 as usize] {
+            access_walked[stop.0 as usize] = walked;
+        }
         let slot = &mut best[CARRYING][stop.0 as usize];
         *slot = (*slot).min(arrival);
     }
@@ -287,7 +294,7 @@ fn oracle(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Vec<[Vec<Op
     let carrying_now = best[CARRYING].clone();
     let mut parked_now = vec![UNREACHED; stops];
     for stop in 0..stops {
-        if inputs.park_mask[stop] {
+        if inputs.park_mask[stop] && !access_walked[stop] {
             parked_now[stop] = carrying_now[stop];
         }
     }
@@ -352,13 +359,26 @@ fn oracle(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Vec<[Vec<Op
         // round's Carrying transit arrivals, park over everything the
         // round produced, Free walks over Free transit and parks.
         let mut carrying_round = transit[CARRYING].clone();
+        // Alongside it: the best arrival whose last carriage move was a
+        // ride — only those parks may walk on.
+        let mut ridden_round = transit[CARRYING].clone();
         for (stop, &at) in transit[CARRYING].iter().enumerate() {
             if at == UNREACHED {
                 continue;
             }
-            for edge in inputs.carriage.from_stop(StopIdx(stop as u32)) {
+            let range = inputs.carriage.edge_range(StopIdx(stop as u32));
+            for (offset, edge) in inputs
+                .carriage
+                .from_stop(StopIdx(stop as u32))
+                .iter()
+                .enumerate()
+            {
                 let slot = &mut carrying_round[edge.to.0 as usize];
                 *slot = (*slot).min(at + edge.duration);
+                if inputs.ride_edge[range.start + offset] {
+                    let slot = &mut ridden_round[edge.to.0 as usize];
+                    *slot = (*slot).min(at + edge.duration);
+                }
             }
         }
         for stop in 0..stops {
@@ -366,13 +386,22 @@ fn oracle(inputs: &CarriageInputs<'_>, request: &CarriageRequest) -> Vec<[Vec<Op
         }
         park(&mut best, &carrying_round);
         let mut free_round = transit[FREE].clone();
+        let mut walking_round = transit[FREE].clone();
         for stop in 0..stops {
             if inputs.park_mask[stop] {
                 free_round[stop] = free_round[stop].min(carrying_round[stop]);
+                // A parked walk needs the ride: a carried walk has
+                // spent the transfer's walk already. The round's
+                // Carrying transit arrival walks whatever shadows it;
+                // a ride row walks only while it wins the stop.
+                walking_round[stop] = walking_round[stop].min(transit[CARRYING][stop]);
+                if ridden_round[stop] <= carrying_round[stop] {
+                    walking_round[stop] = walking_round[stop].min(carrying_round[stop]);
+                }
             }
             best[FREE][stop] = best[FREE][stop].min(free_round[stop]);
         }
-        free_walks(&mut best, &free_round);
+        free_walks(&mut best, &walking_round);
         per_round.push(snapshot(&best));
     }
     per_round
@@ -636,7 +665,7 @@ fn over_midnight_trips_carry_and_match_the_oracle() {
         };
         let request = CarriageRequest {
             departure: 3_000,
-            carrying_access: vec![(StopIdx(0), 0)],
+            carrying_access: vec![(StopIdx(0), 0, false)],
             free_access: vec![(StopIdx(0), 0)],
             max_transfers: 3,
         };
@@ -944,4 +973,136 @@ fn shadowed_free_transit_arrivals_still_walk() {
             },
         ]
     );
+}
+
+/// A Carrying access row the reduction already extended over an
+/// installed transfer has spent its walk: parking it must not walk the
+/// bounded set again, while a directly ridden row still walks.
+#[test]
+fn a_walked_access_row_parks_without_walking_again() {
+    let (timetable, walking, carriage, ride_edge) = fixture();
+    let inputs = CarriageInputs {
+        timetable: &timetable,
+        walking: &walking,
+        carriage: &carriage,
+        ride_edge: &ride_edge,
+        carrying_mask: &[false, true],
+        park_mask: &[false, false, true, false],
+        active_services: &[true],
+        active_services_previous: &[],
+    };
+    let ridden = search(
+        &inputs,
+        &CarriageRequest {
+            departure: 0,
+            carrying_access: vec![(StopIdx(2), 5, false)],
+            free_access: vec![],
+            max_transfers: 3,
+        },
+    );
+    // Parked at stop 2, then the walking row 2→3 (100 s).
+    assert_eq!(ridden.arrivals(FREE)[2], Some(5));
+    assert_eq!(ridden.arrivals(FREE)[3], Some(105));
+    let walked = search(
+        &inputs,
+        &CarriageRequest {
+            departure: 0,
+            carrying_access: vec![(StopIdx(2), 5, true)],
+            free_access: vec![],
+            max_transfers: 3,
+        },
+    );
+    assert_eq!(walked.arrivals(FREE)[2], Some(5));
+    assert_eq!(walked.arrivals(FREE)[3], None);
+}
+
+/// A carried walk into a parking stop has spent the transfer's walk:
+/// the park may not walk on. A carriage ride into the same stop may.
+#[test]
+fn a_carried_walk_parks_without_walking_on() {
+    let mut builder = TimetableBuilder::new(4);
+    let line = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    builder
+        .add_trip(line, vec![time(10), time(20)], 0, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let walking = Transfers::from_edges(4, &[(StopIdx(2), StopIdx(3), 100, 100.0)]).unwrap();
+    // Carriage row 1→2, once as the vehicle's ride and once walked.
+    for ride in [true, false] {
+        let mut carriage = Transfers::from_edges(4, &[(StopIdx(1), StopIdx(2), 50, 50.0)]).unwrap();
+        carriage.mark_unclosed();
+        let inputs = CarriageInputs {
+            timetable: &timetable,
+            walking: &walking,
+            carriage: &carriage,
+            ride_edge: &[ride],
+            carrying_mask: &[true],
+            park_mask: &[false, false, true, false],
+            active_services: &[true],
+            active_services_previous: &[],
+        };
+        let result = search(&inputs, &request(vec![(StopIdx(0), 0)], vec![]));
+        // Carried ride 0→1 (20), the carriage row to stop 2 (70), park.
+        assert_eq!(result.arrivals(FREE)[2], Some(70));
+        // Only the ridden row may walk the bounded set on to stop 3.
+        assert_eq!(result.arrivals(FREE)[3], ride.then_some(170));
+    }
+}
+
+/// A carried walk that shadows a slower carried ride into a parking
+/// stop must not silence it: the ride is still the only arrival allowed
+/// to park and walk on, and it carries its trip inline so the
+/// reconstruction does not read the shadower's slot.
+#[test]
+fn a_shadowed_carried_ride_still_parks_and_walks_out() {
+    let mut builder = TimetableBuilder::new(4);
+    let short = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let long = builder.add_pattern(&[StopIdx(0), StopIdx(2)], 1).unwrap();
+    builder
+        .add_trip(short, vec![time(10), time(40)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(long, vec![time(10), time(100)], 0, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    // Stop 2 is the parking stop, reached carried two ways in round
+    // one: a 20 s carried walk from stop 1 (60) and the slower ride
+    // (100). Only the ride may walk on to stop 3.
+    let walking = Transfers::from_edges(4, &[(StopIdx(2), StopIdx(3), 30, 30.0)]).unwrap();
+    let mut carriage = Transfers::from_edges(4, &[(StopIdx(1), StopIdx(2), 20, 20.0)]).unwrap();
+    carriage.mark_unclosed();
+    let inputs = CarriageInputs {
+        timetable: &timetable,
+        walking: &walking,
+        carriage: &carriage,
+        ride_edge: &[false],
+        carrying_mask: &[true, true],
+        park_mask: &[false, false, true, false],
+        active_services: &[true],
+        active_services_previous: &[],
+    };
+    let result = search(&inputs, &request(vec![(StopIdx(0), 0)], vec![]));
+    assert_eq!(result.arrivals(CARRYING)[1], Some(40));
+    // The carried walk wins stop 2 for Carrying and for the park…
+    assert_eq!(result.arrivals(CARRYING)[2], Some(60));
+    assert_eq!(result.arrivals(FREE)[2], Some(60));
+    // …but only the shadowed ride walks on: 100 + 30, never 60 + 30.
+    assert_eq!(result.arrivals(FREE)[3], Some(130));
+    let (round, _) = result.best_round(FREE, StopIdx(3)).unwrap();
+    let legs = result.reconstruct(&timetable, FREE, round, StopIdx(3));
+    assert!(legs.iter().any(|leg| matches!(
+        leg,
+        CarriageLeg::Transit {
+            trip: TripIdx(1),
+            bike_aboard: true,
+            ..
+        }
+    )));
+    assert!(legs.iter().any(|leg| matches!(
+        leg,
+        CarriageLeg::Park {
+            stop: StopIdx(2),
+            at: 100
+        }
+    )));
 }

@@ -375,11 +375,12 @@ impl<'a> Search<'a> {
                     alight_position,
                     day_offset,
                 } => {
-                    // The relaxed merged edge's total meters, split by
-                    // its token: the ride's street meters (connectors
+                    // The relaxed edge's total meters, split by its
+                    // token: the ride's street meters (connectors
                     // included) beside the movement's walking rest, the
-                    // ride grams over its network meters. A walking row
-                    // of the merged set has no token and stays a walk.
+                    // ride grams over its network meters. A walking
+                    // edge — every edge of the bounded walking set, and
+                    // a merged set's untokened rows — stays a walk.
                     let edge_meters = self
                         .transfers
                         .from_stop(from_stop)
@@ -387,15 +388,18 @@ impl<'a> Search<'a> {
                         .find(|transfer| transfer.to == at)
                         .map(|transfer| transfer.meters)
                         .unwrap_or(0.0);
-                    let rental = inputs
-                        .rental
-                        .expect("merged-set cost chains carry the rental view");
-                    match rental.tokens.get(&(from_stop.0, at.0)) {
-                        Some(token) => {
+                    let token = inputs.rental.and_then(|rental| {
+                        rental
+                            .tokens
+                            .get(&(from_stop.0, at.0))
+                            .map(|token| (token, rental.grams_per_meter))
+                    });
+                    match token {
+                        Some((token, grams_per_meter)) => {
                             walk_meters += (edge_meters - token.ride_total_meters).max(0.0);
                             street_meters += token.ride_total_meters;
                             rental_transfers += 1;
-                            grams += token.ride_network_meters * rental.grams_per_meter;
+                            grams += token.ride_network_meters * grams_per_meter;
                         }
                         None => walk_meters += edge_meters,
                     }

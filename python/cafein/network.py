@@ -80,6 +80,15 @@ def _policy_reduced(core, point, egress, modes, exclude_stops, transfer_mode=Non
     return offsets, tokens
 
 
+def _carrying_offsets(rows):
+    """The Carrying plane's seeds, each flagged with whether it walked
+    to get there — the choice itself is a walk, or the reduction reached
+    it over an installed transfer. Such a row has already spent the walk
+    a parked vehicle would take, and the carriage engine must not walk
+    it again; only a row the vehicle rode may park and walk on."""
+    return [(row[0], row[1], row[2] == "walk" or row[-1] is not None) for row in rows]
+
+
 def _transfer_leg_dicts(
     core, from_stop, to_stop, departure_s, arrival_s, geometries, transfer_mode
 ):
@@ -526,8 +535,13 @@ def _carriage_journeys(
         sides[side_name] = (carrying, free, carrying_modes)
     carr_acc, free_acc, acc_modes = sides["access"]
     carr_egr, free_egr, egr_modes = sides["egress"]
+
+    def carrying_seeds(reduction):
+        offsets, tokens = reduction or ([], {})
+        return _carrying_offsets([(stop, *tokens[stop]) for stop, _ in offsets])
+
     journeys = core._carriage_route(
-        (carr_acc or ([], {}))[0],
+        carrying_seeds(carr_acc),
         (free_acc or ([], {}))[0],
         (carr_egr or ([], {}))[0],
         (free_egr or ([], {}))[0],
@@ -1904,24 +1918,22 @@ class TransportNetwork:
                     street_policy, "access", _streets.MAX_ACCESS_EGRESS_TIME
                 )
 
-                def reduced(plane_modes):
+                def reduced(plane_modes, carrying_plane=False):
                     try:
-                        return [
-                            (stop, seconds)
-                            for stop, seconds, *_ in (
-                                self._core._reduced_street_offsets(
-                                    *origin, False, plane_modes
-                                )
-                            )
-                        ]
+                        rows = self._core._reduced_street_offsets(
+                            *origin, False, plane_modes
+                        )
                     except ValueError as error:
                         if "too far from the multimodal street network" not in str(
                             error
                         ):
                             raise
                         return None
+                    if carrying_plane:
+                        return _carrying_offsets(rows)
+                    return [(stop, seconds) for stop, seconds, *_ in rows]
 
-                carrying = reduced(carrying_modes)
+                carrying = reduced(carrying_modes, carrying_plane=True)
                 free = reduced(free_modes)
                 if carrying is None and free is None:
                     raise ValueError(

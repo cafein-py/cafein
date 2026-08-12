@@ -149,18 +149,34 @@ def test_faster_walking_shortens_footpaths():
     assert_footpaths(result, {("s1", "s2"): 100, ("s2", "s1"): 100})
 
 
-def test_transitive_closure_chains_footpaths_beyond_the_cutoff():
+def test_footpaths_never_exceed_the_cutoff():
     result = footpaths(
         STRAIGHT_STREET,
         [("A", "B", 400)],
         [stop("s1", 0, 0), stop("s2", 200, 0), stop("s3", 400, 0)],
         max_walking_time=250.0,
     )
-    # s1-s3 (400 s) exceeds the direct-search cutoff but is the chain of
-    # two direct footpaths, so closure adds it.
+    # s1-s3 (400 s) is beyond the cutoff: a transfer between rides is a
+    # single bounded walk, never a chain past the budget (issue #249 —
+    # the closure that used to add it produced 50M-edge transfer sets
+    # and multi-hour transfer legs at metro scale).
     assert 200 <= result[("s1", "s2")] <= 201
     assert 200 <= result[("s2", "s3")] <= 201
-    assert 400 <= result[("s1", "s3")] <= 402
+    assert ("s1", "s3") not in result
+    assert all(seconds <= 250 for seconds in result.values())
+
+
+def test_a_fractional_cutoff_survives_the_rounding():
+    # Rounding a duration up must not carry it past the cutoff: a
+    # 250.4 s path would be stored as 251 s, one second beyond a 250.5 s
+    # budget, so the edge is dropped instead.
+    durations = np.array([[0.0, 250.4], [250.4, 0.0]])
+    kept = streets._edge_list(np.array(["a", "b"], dtype=object), durations, 1.25)
+    assert {(a, b): s for a, b, s, _ in kept} == {("a", "b"): 251, ("b", "a"): 251}
+    bounded = streets._edge_list(
+        np.array(["a", "b"], dtype=object), durations, 1.25, 250.5
+    )
+    assert len(bounded) == 0
 
 
 def test_durations_round_up_conservatively():
@@ -341,11 +357,12 @@ def helsinki_footpaths(helsinki_walking_streets):
 def test_helsinki_footpaths_cover_the_extract(helsinki_footpaths):
     # The extract covers central Helsinki only: roughly 1750 of the 8305
     # stops snap onto its walking network (shared-use paths and platforms
-    # included, links out to R5's 1.6 km radius), and closure connects
-    # the dense center almost completely.
+    # included, links out to R5's 1.6 km radius); each stop carries the
+    # stops a bounded walk reaches — tens, not thousands.
     origins = {from_stop for from_stop, _, _, _ in helsinki_footpaths}
     assert 1_690 <= len(origins) <= 1_830
-    assert 2_700_000 <= len(helsinki_footpaths) <= 3_000_000
+    assert 90_000 <= len(helsinki_footpaths) <= 120_000
+    assert len(helsinki_footpaths) / len(origins) < 100
 
 
 def test_bounding_box_crops_the_walking_network(
@@ -415,8 +432,16 @@ def test_helsinki_street_network_covers_the_extract(helsinki_walking_streets):
     assert all(0.0 <= link[3] <= streets.MAX_SNAP_DISTANCE for link in links)
 
 
-def test_helsinki_footpaths_are_transitively_closed(helsinki_footpaths):
+def test_helsinki_footpaths_are_bounded_and_hop_complete(helsinki_footpaths):
     lookup = {(a, b): seconds for a, b, seconds, _ in helsinki_footpaths}
+    # The cutoff bounds every transfer outright.
+    assert all(
+        seconds <= streets.MAX_WALKING_TIME + 1
+        for _, _, seconds, _ in helsinki_footpaths
+    )
+    # One-hop completeness within the budget: whenever two footpaths
+    # chain to a within-cutoff total, the direct footpath exists and is
+    # no slower (street shortest paths obey the triangle inequality).
     by_origin = {}
     for from_stop, to_stop, seconds, _ in helsinki_footpaths:
         by_origin.setdefault(from_stop, []).append((to_stop, seconds))
@@ -429,6 +454,8 @@ def test_helsinki_footpaths_are_transitively_closed(helsinki_footpaths):
                 by_origin[middle], min(5, len(by_origin[middle]))
             ):
                 if to_stop == from_stop:
+                    continue
+                if first_leg + second_leg > streets.MAX_WALKING_TIME:
                     continue
                 chained = lookup[(from_stop, to_stop)]
                 # Rounding both legs may undercut the chain by a second.

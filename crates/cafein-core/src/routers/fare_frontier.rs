@@ -13,9 +13,9 @@
 //!
 //! The product is reconstruction-free — per (pair, cutoff) the
 //! minimum travel time with its exact fare and rides — so labels are
-//! plain bag entries with no parent chains. Walking is free and
-//! relaxes the **closed** transfer closure; unclosed sets (merged or
-//! carriage) are out of contract here.
+//! plain bag entries with no parent chains. Walking is free; a
+//! bounded (unclosed) set relaxes under the exact-phase rule, walks
+//! extending the round's transit arrivals only.
 
 use crate::fares::{state_dominates, FareState, RuleFares};
 use crate::routers::raptor::earliest_active_trip;
@@ -32,7 +32,7 @@ const DAY_SECONDS: u32 = 86_400;
 /// The network-and-tariff inputs one frontier query runs on.
 pub struct FareFrontierInputs<'a> {
     pub timetable: &'a Timetable,
-    /// The closed walking closure.
+    /// The walking transfer set; a bounded one takes the exact phase.
     pub transfers: &'a Transfers,
     pub fares: &'a RuleFares,
     /// Ascending monetary cutoffs; the top one bounds the search.
@@ -269,6 +269,15 @@ pub struct FareFrontierSearch<'a> {
     /// Per destination slot × cutoff: the current winner — only the
     /// per-cutoff minimum ever matters, so no arrival set is kept.
     rows: Vec<Vec<Option<FrontierRow>>>,
+    /// Whether the transfer set declared itself unclosed, switching the
+    /// walking phase to relax the round's transit arrivals themselves
+    /// rather than the stop bags — a bag entry that swallowed an
+    /// arrival may be a walk, and a walk must not walk again.
+    exact_walks: bool,
+    /// Exact-phase sidecar, empty unless `exact_walks`: the round's
+    /// transit arrivals per stop, shadowed ones included.
+    arrivals: Vec<Bag>,
+    arrivals_touched: Vec<StopIdx>,
 }
 
 impl<'a> FareFrontierSearch<'a> {
@@ -277,11 +286,8 @@ impl<'a> FareFrontierSearch<'a> {
         request: &'a Request,
         destinations: &[Vec<(StopIdx, u32)>],
     ) -> FareFrontierSearch<'a> {
-        assert!(
-            inputs.transfers.closed(),
-            "the fare frontier relaxes the closed walking closure only"
-        );
         let stop_count = inputs.timetable.stop_count() as usize;
+        let exact_walks = !inputs.transfers.closed();
         let discounts_monotone = inputs.fares.discounts_are_monotone();
         // Freshness is safe only when the budget covers every boarding
         // the query can make (and the tables are monotone at all).
@@ -329,6 +335,13 @@ impl<'a> FareFrontierSearch<'a> {
                 map
             },
             rows: vec![vec![None; inputs.cutoffs.len()]; destinations.len()],
+            exact_walks,
+            arrivals: if exact_walks {
+                vec![Bag::default(); stop_count]
+            } else {
+                Vec::new()
+            },
+            arrivals_touched: Vec::new(),
         }
     }
 
@@ -474,22 +487,40 @@ impl<'a> FareFrontierSearch<'a> {
                 );
             }
             for (stop, entry) in writes {
+                if self.exact_walks {
+                    let first = self.arrivals[stop.0 as usize].entries.is_empty();
+                    if self.arrivals[stop.0 as usize].insert(entry, self.gates) && first {
+                        self.arrivals_touched.push(stop);
+                    }
+                }
                 if self.bags[stop.0 as usize].insert(entry, self.gates) {
                     self.mark(stop);
                     self.collect(stop, &entry, departure);
                 }
             }
 
-            // Walking phase over the closed closure: fare unchanged.
-            let sources: Vec<StopIdx> = self.marked.clone();
+            // Walking phase, fare unchanged. Over a closed closure the
+            // stop bags carry every arrival a walk may extend; over a
+            // bounded set only this round's transit arrivals may walk,
+            // shadowed ones included — the bag entry that swallowed one
+            // may itself be a walk, and walks never chain.
+            let sources: Vec<StopIdx> = if self.exact_walks {
+                std::mem::take(&mut self.arrivals_touched)
+            } else {
+                self.marked.clone()
+            };
             let mut walks: Vec<(StopIdx, Entry)> = Vec::new();
             for &source in &sources {
-                let candidates: Vec<Entry> = self.bags[source.0 as usize]
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.rides as usize == round)
-                    .copied()
-                    .collect();
+                let candidates: Vec<Entry> = if self.exact_walks {
+                    self.arrivals[source.0 as usize].entries.clone()
+                } else {
+                    self.bags[source.0 as usize]
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.rides as usize == round)
+                        .copied()
+                        .collect()
+                };
                 for edge in self.inputs.transfers.from_stop(source) {
                     for entry in &candidates {
                         let Some(arrival) = entry
@@ -514,6 +545,11 @@ impl<'a> FareFrontierSearch<'a> {
                 if self.bags[stop.0 as usize].insert(entry, self.gates) {
                     self.mark(stop);
                     self.collect(stop, &entry, departure);
+                }
+            }
+            if self.exact_walks {
+                for &stop in &sources {
+                    self.arrivals[stop.0 as usize].entries.clear();
                 }
             }
         }

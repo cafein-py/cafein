@@ -292,7 +292,11 @@ def test_merged_feeds_require_qualified_stop_ids(helsinki_gtfs):
 
 
 def test_an_osm_extract_installs_transfers(network_with_footpaths):
-    assert network_with_footpaths.transfer_count > 1_000_000
+    # Bounded footpaths: one street walk per stop pair within the cutoff,
+    # tens of edges per stop rather than a transitive closure's thousands.
+    count = network_with_footpaths.transfer_count
+    assert 50_000 < count < 200_000
+    assert count / network_with_footpaths.stop_count < 100
 
 
 def test_street_stops_are_reachable_only_over_footpaths(
