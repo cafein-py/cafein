@@ -119,7 +119,11 @@ class Accessibility(pd.DataFrame):
     Long format: ``from_id``, ``opportunity`` (the destination column
     or ``"count"``), ``budget`` (seconds), and ``accessibility`` (the
     decay-weighted sum; with the default ``decay="step"``, the exact
-    reachable count or mass).
+    reachable count or mass). With a departure `window`, a
+    ``percentile`` column is added and each row holds the
+    accessibility at that percentile of the travel-time distribution
+    across the window's minute marks (r5-style: percentile costs, then
+    weighting — never averaged accessibility values).
 
     On a ``TransportNetwork``, origins and destinations are either both
     stop-id sequences or both GeoDataFrames with an ``id`` column
@@ -146,6 +150,9 @@ class Accessibility(pd.DataFrame):
         decay_params=None,
         max_transfers=7,
         router="auto",
+        window=None,
+        percentiles=None,
+        confidence=None,
         chunk=None,
         transport_mode=None,
         max_street_time=None,
@@ -182,6 +189,9 @@ class Accessibility(pd.DataFrame):
             rejected = {
                 "date": date,
                 "departure": departure,
+                "window": window,
+                "percentiles": percentiles,
+                "confidence": confidence,
                 "walking_speed_kmph": walking_speed_kmph,
                 "max_walking_time": max_walking_time,
             }
@@ -218,6 +228,7 @@ class Accessibility(pd.DataFrame):
             )
             _warn_unsnapped(table, from_ids, to_ids, network="the street network")
             matrix = table["matrix"]
+            resolved_percentiles = None
         else:
             if transport_mode is not None or max_street_time is not None:
                 raise ValueError(
@@ -232,43 +243,47 @@ class Accessibility(pd.DataFrame):
                     "or both be point GeoDataFrames"
                 )
             if _is_geo(origins):
-                matrix, from_ids, _to_ids, _percentiles = network._time_matrix_with_ids(
-                    origins,
-                    date,
-                    departure,
-                    max_transfers,
-                    destinations=destinations,
-                    window=None,
-                    percentiles=None,
-                    confidence=None,
-                    chunk=chunk,
-                    walking_speed_kmph=walking_speed_kmph,
-                    max_walking_time=max_walking_time,
-                    max_snap_distance=max_snap_distance,
-                    router=router,
-                    exclude_routes=exclude_routes,
-                    exclude_trips=exclude_trips,
-                    exclude_stops=exclude_stops,
+                matrix, from_ids, _to_ids, resolved_percentiles = (
+                    network._time_matrix_with_ids(
+                        origins,
+                        date,
+                        departure,
+                        max_transfers,
+                        destinations=destinations,
+                        window=window,
+                        percentiles=percentiles,
+                        confidence=confidence,
+                        chunk=chunk,
+                        walking_speed_kmph=walking_speed_kmph,
+                        max_walking_time=max_walking_time,
+                        max_snap_distance=max_snap_distance,
+                        router=router,
+                        exclude_routes=exclude_routes,
+                        exclude_trips=exclude_trips,
+                        exclude_stops=exclude_stops,
+                    )
                 )
             else:
                 destination_ids = _stop_ids(destinations, "destinations")
-                matrix, from_ids, to_ids, _percentiles = network._time_matrix_with_ids(
-                    _stop_ids(origins, "origins"),
-                    date,
-                    departure,
-                    max_transfers,
-                    destinations=None,
-                    window=None,
-                    percentiles=None,
-                    confidence=None,
-                    chunk=chunk,
-                    walking_speed_kmph=walking_speed_kmph,
-                    max_walking_time=max_walking_time,
-                    max_snap_distance=max_snap_distance,
-                    router=router,
-                    exclude_routes=exclude_routes,
-                    exclude_trips=exclude_trips,
-                    exclude_stops=exclude_stops,
+                matrix, from_ids, to_ids, resolved_percentiles = (
+                    network._time_matrix_with_ids(
+                        _stop_ids(origins, "origins"),
+                        date,
+                        departure,
+                        max_transfers,
+                        destinations=None,
+                        window=window,
+                        percentiles=percentiles,
+                        confidence=confidence,
+                        chunk=chunk,
+                        walking_speed_kmph=walking_speed_kmph,
+                        max_walking_time=max_walking_time,
+                        max_snap_distance=max_snap_distance,
+                        router=router,
+                        exclude_routes=exclude_routes,
+                        exclude_trips=exclude_trips,
+                        exclude_stops=exclude_stops,
+                    )
                 )
                 column = {stop: at for at, stop in enumerate(to_ids)}
                 try:
@@ -277,24 +292,40 @@ class Accessibility(pd.DataFrame):
                     raise KeyError(
                         f"unknown destination stop {error.args[0]!r}"
                     ) from None
-                matrix = matrix[:, selection]
+                matrix = matrix[:, selection, ...]
 
-        sums = _cafein.aggregate_opportunity_sums(
-            np.ascontiguousarray(matrix, dtype="uint32"),
-            [float(value) for value in values.ravel()],
-            len(labels),
-            budgets,
-            decay,
-            decay_param,
-        )
-        per_origin = len(budgets) * len(labels)
-        super().__init__(
-            pd.DataFrame(
-                {
-                    "from_id": np.repeat(list(from_ids), per_origin),
-                    "opportunity": np.tile(labels, len(budgets) * len(from_ids)),
-                    "budget": np.tile(np.repeat(budgets, len(labels)), len(from_ids)),
-                    "accessibility": sums.ravel(),
-                }
+        flat_values = [float(value) for value in values.ravel()]
+
+        def aggregated(cost_slice):
+            return _cafein.aggregate_opportunity_sums(
+                np.ascontiguousarray(cost_slice, dtype="uint32"),
+                flat_values,
+                len(labels),
+                budgets,
+                decay,
+                decay_param,
             )
+
+        per_origin = len(budgets) * len(labels)
+        columns = {
+            "from_id": np.repeat(list(from_ids), per_origin),
+            "opportunity": np.tile(labels, len(budgets) * len(from_ids)),
+            "budget": np.tile(np.repeat(budgets, len(labels)), len(from_ids)),
+        }
+        if resolved_percentiles is None:
+            columns["accessibility"] = aggregated(matrix).ravel()
+            super().__init__(pd.DataFrame(columns))
+            return
+        # One aggregation per percentile of the windowed cost
+        # distribution: the weights apply to percentile costs, never to
+        # averaged accessibility values.
+        frames = []
+        for at, percentile in enumerate(resolved_percentiles):
+            frame = pd.DataFrame(columns)
+            frame["percentile"] = percentile
+            frame["accessibility"] = aggregated(matrix[:, :, at]).ravel()
+            frames.append(frame)
+        long = pd.concat(frames, ignore_index=True)
+        super().__init__(
+            long[["from_id", "opportunity", "budget", "percentile", "accessibility"]]
         )
