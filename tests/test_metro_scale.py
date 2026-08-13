@@ -194,12 +194,12 @@ def test_zone_fares_price_the_measured_pairs_exactly(
         assert {
             row["cutoff"]: round(row["fare"], 2) for _, row in rows.iterrows()
         } == pinned, origin
-    # And the fare-blind fold still reports 5.00 on the identical
-    # window — the 3.30 is the engine's win, not a departure the fold
-    # could also see.
+    # And the public matrix rides the same exact engine: both cells
+    # price at the frontier's 3.30 — the fare-blind fold this call
+    # refined away reported 5.00 on the identical window.
     from cafein import TravelCostMatrix
 
-    fold = TravelCostMatrix(
+    matrix = TravelCostMatrix(
         metro_network,
         ["9214203", "4340212"],
         ["1000109"],
@@ -207,6 +207,24 @@ def test_zone_fares_price_the_measured_pairs_exactly(
         "08:30:00",
         optimize="fare",
         window=1800,
+        within=3 * 3600,
         fares=structure,
+        geometries=True,
     )
-    assert sorted(round(fare, 2) for fare in fold["fare"]) == [5.00, 5.00]
+    assert sorted(round(fare, 2) for fare in matrix["fare"]) == [3.30, 3.30]
+    # The fold reported 5.00 here, so both cells were beaten by the
+    # exact engine and every cost column below comes from the
+    # reconstructed winning chain, not the fold's journey. Values are
+    # pinned against the pinned sampledata release.
+    pinned = {
+        "9214203": (3521, 2, 23259.0, 1031.0, 2043.48),
+        "4340212": (4465, 2, 28655.0, 691.3, 2277.21),
+    }
+    for _, cell in matrix.iterrows():
+        seconds, transfers, transit, walk, grams = pinned[cell["from_id"]]
+        assert cell["travel_time_s"] == seconds
+        assert cell["transfers"] == transfers
+        assert cell["transit_distance_m"] == pytest.approx(transit, abs=1.0)
+        assert cell["walk_distance_m"] == pytest.approx(walk, abs=1.0)
+        assert cell["emissions"] == pytest.approx(grams, abs=0.5)
+        assert cell["geometry"] is not None

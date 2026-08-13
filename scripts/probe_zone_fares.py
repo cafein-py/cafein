@@ -17,6 +17,8 @@ import sys
 import time
 import zipfile
 
+import os
+
 import cafein.sampledata.helsinki as helsinki
 from cafein import TransportNetwork
 from cafein import fares as fares_module
@@ -222,15 +224,18 @@ def matrix():
 
 
 def scan():
-    """The shipped fare matrix against the exact fare engine.
+    """The shipped fare matrix against the exact fare frontier.
 
-    ``optimize="fare"`` folds over (departure, arrival, rides)-Pareto
-    candidates, so a cheaper-but-slower journey can be dominated before
-    it is ever priced; ``fare_frontier`` carries the fare in the label.
-    Any pair where the matrix charges more than the frontier's cheapest
-    reachable fare is issue #246 in the wild.
+    Both now ride the zone-ticket state machine, through different
+    folds with different pruning — the matrix warm-starts per-slot
+    bounds and an arrival deadline off the fare-blind fold, the
+    frontier folds per cutoff with neither. Per scanned cell the two
+    must agree to the cent, both ways: an overpriced cell is issue
+    #246 back from the dead, an underpriced one a bound pruning a
+    journey it must not.
     """
-    from cafein import TravelCostMatrix, journey_frontier
+    from cafein import TravelCostMatrix
+    from cafein.frontier import fare_frontier
 
     rows = feed_rows()
     zones = {r["stop_id"]: (r.get("zone_id") or "").strip() for r in rows}
@@ -249,9 +254,15 @@ def scan():
         for s in zones
         if zones[s] in ("C", "D") and (coords[s][1] < 24.72 or coords[s][0] > 60.30)
     )
-    origins = far[:: max(1, len(far) // 40)][:40]
+    # Twelve spread origins keep the scan inside a ten-minute local
+    # budget at two workers; the suite pins the measured pairs.
+    origins = far[:: max(1, len(far) // 12)][:12]
     print(f"origins: {len(origins)}", flush=True)
 
+    # Both sides run under the same six-hour duration cap: an
+    # unbounded exact search must prove no cheaper journey exists
+    # anywhere in the service day, which at metro scale takes minutes
+    # per origin.
     matrix = TravelCostMatrix(
         network,
         origins,
@@ -260,81 +271,118 @@ def scan():
         DEPARTURE,
         optimize="fare",
         window=WINDOW,
+        within=3 * 3600,
         fares=structure,
     )
     priced = {
         row["from_id"]: (round(float(row["fare"]), 2), int(row["travel_time_s"]))
         for _, row in matrix.iterrows()
     }
-    # No fare-carrying engine exists for zone structures, so the
-    # witness is a constrained search: bar every D and E zone stop and
-    # see what the cheapest surviving journey costs. Anything the
-    # matrix charges above that is a journey the fare-blind candidate
-    # fold discarded. (This under-approximates the exact optimum — the
-    # planned state-machine engine replaces it.)
-    barred = [s for s, z in zones.items() if z in ("D", "E", "Ei HSL")]
-    print(f"barring {len(barred)} D/E stops for the witness", flush=True)
+    # A frontier row at cutoff c is the FASTEST journey within c, not
+    # the cheapest, so a single cutoff cannot witness the minimum
+    # fare. Every attainable fare is a sum of ticket prices; probing
+    # the ascending attainable sums makes the first cutoff that yields
+    # a row pin the exact minimum (a cheaper journey's sum would be an
+    # earlier grid point with a row). Four tickets cover the 6-hour
+    # duration cap on every HSL window.
+    import itertools
+
+    prices = sorted(set(PRICES.values()))
+    # The universal (dearest) product bounds the optimum: a journey
+    # within the cap partitions into floor(cap / its window) + 1 such
+    # tickets. An optimal sum may still chain up to max_transfers + 1
+    # = 8 cheaper tickets below that ceiling.
+    cap = 3 * 3600
+    dearest_id = max(PRICES, key=PRICES.get)
+    ceiling = (cap // WINDOWS[dearest_id] + 1) * PRICES[dearest_id]
+    sums = set()
+    for count in range(1, 9):
+        for combo in itertools.combinations_with_replacement(prices, count):
+            total = round(sum(combo), 2)
+            if total <= ceiling:
+                sums.add(total)
+    all_sums = sorted(sums)
     cheapest = {}
-    failures = 0
-    for origin in origins:
-        try:
-            frame = journey_frontier(
-                network,
-                origin,
-                DESTINATION,
-                DATE,
-                DEPARTURE,
-                window=WINDOW,
-                fares=structure,
-                router="raptor",
-                exclude_stops=barred,
+    for index, origin in enumerate(origins):
+        started_origin = time.perf_counter()
+        # Matrix-anchored cutoffs keep the cutoff product in its cheap
+        # regime: sums at or below the matrix fare witness both sides
+        # (a row below it is an overpriced matrix cell; a row at it
+        # proves the price is a real journey). A cell the matrix could
+        # not price is checked for emptiness at the ceiling alone.
+        cell = priced.get(origin)
+        if cell is not None:
+            cutoffs = [s for s in all_sums if s <= cell[0] + 1e-6] or [all_sums[0]]
+        else:
+            cutoffs = [round(ceiling, 2)]
+        frame = fare_frontier(
+            network,
+            [origin],
+            [DESTINATION],
+            DATE,
+            DEPARTURE,
+            WINDOW,
+            structure,
+            cutoffs=cutoffs,
+            max_duration=cap,
+            departure_step=None,
+        )
+        priced_rows = sorted(
+            (
+                float(row["cutoff"]),
+                round(float(row["fare"]), 2),
+                int(row["travel_time_s"]),
             )
-        except Exception as error:  # noqa: BLE001 - reported, not raised
-            failures += 1
-            print(f"   {origin}: witness search failed: {error}", flush=True)
-            continue
-        priced_rows = [
-            (round(float(row["fare"]), 2), int(row["travel_time_s"]))
             for _, row in frame.iterrows()
             if row["fare"] == row["fare"]
-        ]
+        )
         if priced_rows:
-            cheapest[origin] = min(priced_rows)
+            _, fare, seconds = priced_rows[0]
+            cheapest[origin] = (fare, seconds)
+        print(
+            f"   [{index + 1}/{len(origins)}] {origin}: "
+            f"{cheapest.get(origin) or 'no row'} "
+            f"({time.perf_counter() - started_origin:.1f}s)",
+            flush=True,
+        )
 
-    worse = 0
+    mismatched = 0
     compared = 0
     for origin in origins:
         matrix_cell = priced.get(origin)
         frontier_cell = cheapest.get(origin)
-        if not matrix_cell or not frontier_cell:
+        if matrix_cell is None and frontier_cell is None:
             continue
         compared += 1
-        if matrix_cell[0] > frontier_cell[0] + 1e-6:
-            worse += 1
+        agree = (
+            matrix_cell is not None
+            and frontier_cell is not None
+            and abs(matrix_cell[0] - frontier_cell[0]) <= 1e-6
+        )
+        if not agree:
+            mismatched += 1
             print(
                 json.dumps(
                     {
                         "origin": origin,
                         "name": names[origin],
                         "zone": zones[origin],
-                        "matrix_fare": matrix_cell[0],
-                        "matrix_seconds": matrix_cell[1],
-                        "frontier_fare": frontier_cell[0],
-                        "frontier_seconds": frontier_cell[1],
+                        "matrix": matrix_cell,
+                        "frontier": frontier_cell,
                     }
                 ),
                 flush=True,
             )
     print(
         f"\norigins: {len(origins)}  matrix-priced: {len(priced)}  "
-        f"witnessed: {len(cheapest)}  compared: {compared}  "
-        f"witness failures: {failures}  matrix overpriced: {worse}"
+        f"frontier-priced: {len(cheapest)}  compared: {compared}  "
+        f"mismatched: {mismatched}"
     )
-    if failures or not compared:
+    if mismatched or not compared:
         raise SystemExit(
-            "inconclusive: witness failures left cells uncompared"
-            if failures
-            else "inconclusive: no cell had both a matrix fare and a witness"
+            "FAIL: matrix and exact frontier disagree"
+            if mismatched
+            else "inconclusive: no cell priced on either side"
         )
 
 
@@ -402,6 +450,11 @@ def case():
 
 
 if __name__ == "__main__":
+    # The exact zone refinement holds per-origin search state;
+    # unguarded host-wide parallelism recreated an OOM once. Two
+    # workers unless the caller says otherwise, matching the recorded
+    # benchmark protocol.
+    os.environ.setdefault("RAYON_NUM_THREADS", "2")
     {"assign": assign, "price": price, "matrix": matrix, "scan": scan, "case": case}[
         sys.argv[1] if len(sys.argv) > 1 else "assign"
     ]()

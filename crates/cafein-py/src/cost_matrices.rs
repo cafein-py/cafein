@@ -868,6 +868,14 @@ impl TransportNetwork {
     /// priceable fare) are absent. The ``"fare"`` objective requires
     /// the flat fare tables ``cafein.fares`` produces.
     ///
+    /// On a zone fare structure the ``"fare"`` objective is exact,
+    /// not a fold: the candidate set's cheapest member warm-starts
+    /// the zone-ticket engine, which searches all journeys in the
+    /// window — slower-but-cheaper ones included — and each cell
+    /// reports the true cheapest fare with its costs reconstructed
+    /// from that winning journey. Exclusions and ``router="tbtr"``
+    /// are rejected there.
+    ///
     /// With ``candidates="pareto"`` (``"emissions"`` objective only)
     /// the candidates per pair are McRAPTOR's (departure, arrival,
     /// emissions bucket) Pareto set instead, which also holds the
@@ -989,6 +997,23 @@ impl TransportNetwork {
                 "route/trip/stop exclusions require router='raptor'",
             ));
         }
+        // A fare objective on a zone tariff refines the fold to the
+        // exact zone engine below; its chains ride RAPTOR only (TBTR's
+        // cached transfer sets were reduced fare-blind).
+        let zone_fare = matches!(objective, Objective::Fare)
+            && matches!(tables.as_ref(), Some(FareTables::Zone(_)));
+        if zone_fare && router == "tbtr" {
+            return Err(PyValueError::new_err(
+                "router='tbtr' cannot price zone fare structures exactly; \
+                 use router='auto'",
+            ));
+        }
+        if zone_fare && exclusions.is_some() {
+            return Err(PyValueError::new_err(
+                "route/trip/stop exclusions are not supported with zone \
+                 fare structures under optimize='fare'",
+            ));
+        }
         let matrix_mcultra = candidates == "pareto"
             && router != "tbtr"
             && exclusions.is_none()
@@ -997,7 +1022,7 @@ impl TransportNetwork {
         // Auto prefers the door-to-door McULTRA path over an engine switch;
         // pareto candidates resolve on the McTBTR cache, time and fare
         // candidates on the cached time set.
-        let router = if matrix_mcultra {
+        let router = if zone_fare || matrix_mcultra {
             "raptor"
         } else if candidates == "pareto" {
             self.resolve_mc_router(router, date, &per_trip, exclusions.is_some())?
@@ -1207,7 +1232,7 @@ impl TransportNetwork {
                     objective,
                 )
             } else {
-                Raptor.least_cost_matrix(
+                let mut rows = Raptor.least_cost_matrix(
                     &self.build.timetable,
                     &self.transfers,
                     &inputs,
@@ -1216,7 +1241,29 @@ impl TransportNetwork {
                     window,
                     budget,
                     objective,
-                )
+                );
+                if let (true, Some(FareTables::Zone(zones))) = (zone_fare, tables.as_ref()) {
+                    let slots: Vec<Vec<(StopIdx, u32, f64)>> = destinations
+                        .iter()
+                        .map(|&stop| vec![(stop, 0, 0.0)])
+                        .collect();
+                    let slot_to: Vec<u32> = destinations.iter().map(|stop| stop.0).collect();
+                    crate::fare_frontiers::refine_zone_fare_rows(
+                        &self.build.timetable,
+                        &self.transfers,
+                        zones,
+                        &inputs,
+                        &requests,
+                        &slots,
+                        &slot_to,
+                        None,
+                        true,
+                        window,
+                        budget,
+                        &mut rows,
+                    );
+                }
+                rows
             }
         });
         cost_rows_dict(py, rows, geometries)
@@ -1260,6 +1307,7 @@ impl TransportNetwork {
             return Err(invalid_router(router));
         }
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        let requested = router;
         let router = self.resolve_time_router(router, date, exclusions.is_some())?;
         let streets = self.installed_streets()?;
         let Some(geometry) = &self.geometry else {
@@ -1287,6 +1335,24 @@ impl TransportNetwork {
             })
             .transpose()?;
         let objective = parse_objective(objective, tables.as_ref())?;
+        // A fare objective on a zone tariff refines the fold to the
+        // exact zone engine below; its chains ride RAPTOR only (TBTR's
+        // cached transfer sets were reduced fare-blind).
+        let zone_fare = matches!(objective, Objective::Fare)
+            && matches!(tables.as_ref(), Some(FareTables::Zone(_)));
+        if zone_fare && requested == "tbtr" {
+            return Err(PyValueError::new_err(
+                "router='tbtr' cannot price zone fare structures exactly; \
+                 use router='auto'",
+            ));
+        }
+        if zone_fare && exclusions.is_some() {
+            return Err(PyValueError::new_err(
+                "route/trip/stop exclusions are not supported with zone \
+                 fare structures under optimize='fare'",
+            ));
+        }
+        let router = if zone_fare { "raptor" } else { router };
         let walk_fare = if tables.is_some() { 0.0 } else { f64::NAN };
         let speed =
             validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
@@ -1453,6 +1519,28 @@ impl TransportNetwork {
                     }
                 }
                 origin_rows.sort_unstable_by_key(|row| row.to);
+            }
+            // Direct walks merge before the exact zone refinement: a
+            // within-budget walk prices at zero — the tariff's global
+            // minimum — so its cells settle without a search.
+            if let (true, Some(FareTables::Zone(zones))) = (zone_fare, tables.as_ref()) {
+                // Point access arrives walk-complete from the street
+                // search, so the engine seeds no further walks.
+                let slot_to: Vec<u32> = (0..egress.len() as u32).collect();
+                crate::fare_frontiers::refine_zone_fare_rows(
+                    &self.build.timetable,
+                    &self.transfers,
+                    zones,
+                    &inputs,
+                    &requests,
+                    &egress,
+                    &slot_to,
+                    Some(&access_meters),
+                    false,
+                    window,
+                    budget,
+                    &mut rows,
+                );
             }
             (rows, unsnapped_from, unsnapped_to)
         });
