@@ -619,7 +619,7 @@ pub(crate) fn refine_zone_fare_rows(
                 // window that truncates to zero covers nothing and
                 // must not enter the bound.
                 let window = product.duration.floor();
-                if !(window >= 1.0) {
+                if window.is_nan() || window < 1.0 {
                     return None;
                 }
                 let tickets = (within as f64 / window).floor() + 1.0;
@@ -672,7 +672,7 @@ pub(crate) fn refine_zone_fare_rows(
     // host-wide fan-out multiplies that peak (an unguarded run once
     // OOM-crashed a workstation). Refinement runs in its own pool,
     // never wider than four workers or the surrounding pool.
-    let workers = rayon::current_num_threads().min(4).max(1);
+    let workers = rayon::current_num_threads().clamp(1, 4);
     let pool = rayon::ThreadPoolBuilder::new().num_threads(workers).build();
     let per_origin = |origin: usize, origin_rows: &mut Vec<CostRow>, request: &Request| {
         {
