@@ -2,16 +2,29 @@
 
 ## Unreleased
 
+- **Exact zone fares in the cost matrices and for point queries**
+  (#246): `TravelCostMatrix(optimize="fare")` on a zone fare structure
+  now refines the fare-blind fold to the exact zone-ticket engine —
+  the fold's fares warm-start per-slot money bounds and an arrival
+  deadline, a fold fare at the tariff's cheapest product settles
+  without a search, fold-less cells climb a doubling ceiling staircase
+  capped at `(max_transfers + 1) ×` the dearest product, and each
+  winning chain is reconstructed into the standard cost columns
+  (distances, emissions, optional geometry). Stop and point origins
+  and destinations, `router="tbtr"` rejected. `fare_frontier` gains
+  point origins and destinations over the street network, with the
+  direct walk as the zero-fare candidate. On the measured #246 pairs
+  the public matrix now prices 3.30 € where it reported 5.00 €.
+
 - **Exact zone fares in `fare_frontier`** (#246): zone fare structures
   now route through a zone-ticket state machine whose labels carry the
   paid total and the active ticket's remaining resources (coverage,
   validity window, boardings), so a slower-or-more-rides-but-cheaper
   journey survives to win its cutoff — including multi-ticket chains
-  and same-trip boardings in a cheaper zone. Stop origins and
-  destinations; always exact (`exact=False` is rejected as the
-  rule-based engine's fast discipline); point origins and destinations
-  stay rule-based-only for now. On the measured #246 pairs the engine
-  prices 3.30 € where the fare-blind candidate fold reports 5.00 €.
+  and same-trip boardings in a cheaper zone. Always exact
+  (`exact=False` is rejected as the rule-based engine's fast
+  discipline). On the measured #246 pairs the engine prices 3.30 €
+  where the fare-blind candidate fold reports 5.00 €.
 
 - **`optimize="fare"` documents its real guarantee** (#246): the
   matrix docstring now states that the cheapest journey is chosen

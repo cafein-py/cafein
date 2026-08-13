@@ -45,8 +45,9 @@ fn run(
         top_cutoff: 50.0,
         max_duration: None,
         departure_step: None,
+        seed_walks: true,
     };
-    zone_frontier(&inputs, request, &[vec![(destination, 0)]], window)[0]
+    zone_frontier(&inputs, request, &[vec![(destination, 0)]], window).0[0]
 }
 
 /// The counterexample that refuted mask dominance (Codex, 2026-08-12):
@@ -500,6 +501,19 @@ fn the_engine_matches_the_enumerator_oracle() {
             },
         ),
         (
+            // A legal zero-price product: partial coverage, so paid
+            // journeys still exist beside free ones — the closed-slot
+            // sentinel must not conflate "free" with "settled".
+            "zero_fare_zone",
+            ZoneFares {
+                stop_zone: vec![0, 0, 1, 1, 1],
+                products: vec![
+                    product(0.0, &[0], 10_000.0),
+                    product(2.0, &[0, 1], 10_000.0),
+                ],
+            },
+        ),
+        (
             "binding_transfers",
             ZoneFares {
                 stop_zone: vec![0, 0, 1, 1, 1],
@@ -520,6 +534,7 @@ fn the_engine_matches_the_enumerator_oracle() {
     let cutoffs = [2.0, 3.0, 4.0, 6.0, 12.0];
     for (name, fares) in &tariffs {
         for origin in [StopIdx(0), StopIdx(2)] {
+            let mut singles: Vec<Option<(f64, u32, u8)>> = Vec::new();
             for destination in [StopIdx(3), StopIdx(4)] {
                 let journeys =
                     Oracle::enumerate(&timetable, &transfers, fares, origin, destination, 4);
@@ -531,6 +546,7 @@ fn the_engine_matches_the_enumerator_oracle() {
                     top_cutoff: 12.0,
                     max_duration: None,
                     departure_step: None,
+                    seed_walks: true,
                 };
                 // The oracle's window filter mirrors the profile: the
                 // journey's leave time falls inside the window.
@@ -542,12 +558,63 @@ fn the_engine_matches_the_enumerator_oracle() {
                     .iter()
                     .map(|&&(leave, arrival, rides, fare)| (fare, arrival - leave, rides))
                     .min_by(|a, b| a.partial_cmp(b).unwrap());
-                let rows = zone_frontier(&inputs, &request, &[vec![(destination, 0)]], window);
+                let (rows, arena) =
+                    zone_frontier(&inputs, &request, &[vec![(destination, 0)]], window);
                 let engine = rows[0].map(|row| (row.fare, row.travel_time, row.rides));
+                // Reconstruction self-check: the winner's chain must
+                // re-price to its own fare through the DP, cent for
+                // cent, walks contributing no legs.
+                if let Some(row) = rows[0] {
+                    let (leave, _seed_stop, steps) = chain(&arena, row.node);
+                    let mut legs = Vec::new();
+                    for step in &steps {
+                        if let ChainStep::Ride {
+                            trip,
+                            day_offset,
+                            board_position,
+                            alight_position,
+                        } = *step
+                        {
+                            let pattern_stops =
+                                timetable.pattern_stops(timetable.trip_pattern(trip));
+                            let times = timetable.trip_stop_times(trip);
+                            legs.push(FareLeg {
+                                route: 0,
+                                board_stop: pattern_stops[board_position as usize].0,
+                                alight_stop: pattern_stops[alight_position as usize].0,
+                                board_time: times[board_position as usize]
+                                    .departure
+                                    .saturating_sub(day_offset),
+                            });
+                        }
+                    }
+                    let repriced = fares.price(&legs);
+                    assert!(
+                        (repriced - row.fare).abs() < 1e-9,
+                        "chain re-prices to {repriced}, row says {} \
+                         (tariff {name} {origin:?}->{destination:?})",
+                        row.fare
+                    );
+                    // The leave time anchors the reported travel time.
+                    assert!(leave < window);
+                }
                 assert_eq!(
                     engine, oracle_cheapest,
                     "cheapest mismatch: tariff {name} {origin:?}->{destination:?}"
                 );
+                singles.push(engine);
+                // The cap invariant: a journey makes at most
+                // max_transfers + 1 boardings and each buys at most
+                // one ticket, so no enumerated fare exceeds that many
+                // dearest products — the matrix staircase's hard cap.
+                let dearest = fares
+                    .products
+                    .iter()
+                    .map(|product| product.price)
+                    .fold(0.0f64, f64::max);
+                for &&(_, _, _, fare) in &in_window {
+                    assert!(fare <= 4.0 * dearest + 1e-9);
+                }
                 let cut_rows = zone_frontier_cutoffs(
                     &inputs,
                     &request,
@@ -569,6 +636,120 @@ fn the_engine_matches_the_enumerator_oracle() {
                     );
                 }
             }
+            // Multi-slot parity: both destinations in one search must
+            // equal the single-slot answers — the shared money bound
+            // and the deadline index may only discard what cannot win.
+            let request = request(vec![(origin, 0)], 3);
+            let inputs = ZoneFrontierInputs {
+                timetable: &timetable,
+                transfers: &transfers,
+                fares,
+                top_cutoff: 12.0,
+                max_duration: None,
+                departure_step: None,
+                seed_walks: true,
+            };
+            let slots = [vec![(StopIdx(3), 0)], vec![(StopIdx(4), 0)]];
+            let (multi, _) = zone_frontier(&inputs, &request, &slots, window);
+            for (slot, single) in singles.iter().enumerate() {
+                let row = multi[slot].map(|row| (row.fare, row.travel_time, row.rides));
+                assert_eq!(
+                    row, *single,
+                    "multi-slot mismatch: tariff {name} {origin:?}"
+                );
+            }
+            // Warm bounds at the optima are true upper bounds, so the
+            // rows stay exact; seeding the optima on top must yield
+            // journeys as good as the seeds, never a fabricated win.
+            let warm: Vec<f64> = singles
+                .iter()
+                .map(|single| single.map_or(0.0, |(fare, _, _)| fare))
+                .collect();
+            let seeds: Vec<Option<u32>> = singles
+                .iter()
+                .map(|single| single.map(|(_, travel_time, _)| travel_time))
+                .collect();
+            let (warmed, _) =
+                zone_frontier_warm(&inputs, &request, &slots, window, warm.clone(), &[]);
+            for (slot, single) in singles.iter().enumerate() {
+                if single.is_none() {
+                    continue;
+                }
+                let row = warmed[slot].map(|row| (row.fare, row.travel_time, row.rides));
+                assert_eq!(row, *single, "warm mismatch: tariff {name} {origin:?}");
+            }
+            let (seeded, _) =
+                zone_frontier_warm(&inputs, &request, &slots, window, warm.clone(), &seeds);
+            for (slot, single) in singles.iter().enumerate() {
+                let Some((fare, travel_time, _)) = *single else {
+                    continue;
+                };
+                let row = seeded[slot].expect("a seeded slot always answers");
+                assert!(
+                    (row.fare, row.travel_time) <= (fare, travel_time),
+                    "a seed outdid the engine: tariff {name} {origin:?}"
+                );
+                if row.node == SEED_NODE {
+                    assert_eq!((row.fare, row.travel_time), (fare, travel_time));
+                }
+            }
+            // A warm bound strictly under a slot's optimum makes that
+            // slot come back empty — never a wrong row. Detectable
+            // emptiness is what the matrix staircase escalates on.
+            let starved: Vec<f64> = warm.iter().map(|&bound| bound - 0.5).collect();
+            let (rows, _) = zone_frontier_warm(&inputs, &request, &slots, window, starved, &[]);
+            for (slot, single) in singles.iter().enumerate() {
+                if single.is_some() {
+                    assert!(
+                        rows[slot].is_none(),
+                        "a starved bound produced a row: tariff {name} {origin:?}"
+                    );
+                }
+            }
         }
     }
+}
+
+#[test]
+fn point_egress_never_chains_onto_a_transfer_walk() {
+    // Ride 0->1, walk 1->2, then a point egress link at 2: two street
+    // walks in a row. Point mode must not fold it; the stop query's
+    // own single footpath still does.
+    let mut builder = TimetableBuilder::new(3);
+    let p1 = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    builder
+        .add_trip(p1, vec![time(100), time(400)], 0, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let mut transfers = Transfers::from_edges(3, &[(StopIdx(1), StopIdx(2), 60, 60.0)]).unwrap();
+    transfers.mark_unclosed();
+    let fares = ZoneFares {
+        stop_zone: vec![0, 0, 0],
+        products: vec![product(2.0, &[0], 10_000.0)],
+    };
+    let request = request(vec![(StopIdx(0), 0)], 3);
+    let point = ZoneFrontierInputs {
+        timetable: &timetable,
+        transfers: &transfers,
+        fares: &fares,
+        top_cutoff: 10.0,
+        max_duration: None,
+        departure_step: None,
+        seed_walks: false,
+    };
+    let (rows, _) = zone_frontier(&point, &request, &[vec![(StopIdx(2), 120)]], 600);
+    assert!(
+        rows[0].is_none(),
+        "a point egress folded onto a transfer walk"
+    );
+    let stop = ZoneFrontierInputs {
+        seed_walks: true,
+        ..point
+    };
+    let (rows, _) = zone_frontier(&stop, &request, &[vec![(StopIdx(2), 0)]], 600);
+    assert_eq!(
+        rows[0].map(|row| row.fare),
+        Some(2.0),
+        "the stop query's single footpath must still fold"
+    );
 }

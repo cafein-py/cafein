@@ -1204,3 +1204,139 @@ def test_travel_time_matrix_defaults_to_all_stops(network):
     assert set(matrix.from_id) == {stops[0]}
     assert set(matrix.to_id) <= set(stops)
     assert len(matrix) > 0
+
+
+def test_zone_fare_matrix_reconstructs_the_exact_journey(network, helsinki_gtfs):
+    from cafein import fares as fare_module
+    from cafein.frontier import fare_frontier
+
+    hsl = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
+    matrix = cost_matrix(
+        network,
+        origins=["1040601", "4810551"],
+        destinations=["1121601", "1250551"],
+        departure="08:30:00",
+        optimize="fare",
+        window=600,
+        fares=hsl,
+        geometries=True,
+    )
+    # The A-zone metro hop rides an AB single at the tariff minimum —
+    # the lower-bound skip keeps the fold's own row for it — and the
+    # C-to-A pair warm-seeds the exact engine; full-chain
+    # reconstruction of a cell the engine strictly improves is pinned
+    # at metro scale, where such cells exist.
+    cell = matrix[(matrix.from_id == "1040601") & (matrix.to_id == "1121601")].iloc[0]
+    assert cell.fare == pytest.approx(2.80)
+    assert cell.travel_time_s == 300
+    assert cell.transfers == 0
+    assert cell.transit_distance_m == pytest.approx(3061, abs=1)
+    assert cell.walk_distance_m == pytest.approx(0.0)
+    assert cell.emissions == pytest.approx(76.53, abs=0.1)
+    assert cell.geometry is not None
+    frontier = fare_frontier(
+        network,
+        ["1040601", "4810551"],
+        ["1121601", "1250551"],
+        "2022-02-22",
+        "08:30:00",
+        600,
+        hsl,
+        cutoffs=[5.70],
+    )
+    for _, row in frontier.iterrows():
+        match = matrix[
+            (matrix.from_id == row.from_id) & (matrix.to_id == row.to_id)
+        ].iloc[0]
+        assert match.fare == pytest.approx(row.fare)
+        assert match.travel_time_s == row.travel_time_s
+
+
+def test_zone_fare_matrix_rejects_exclusions(network, helsinki_gtfs):
+    from cafein import fares as fare_module
+
+    hsl = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
+    with pytest.raises(ValueError, match="exclusions"):
+        cost_matrix(
+            network,
+            origins=["1040601"],
+            destinations=["1121601"],
+            departure="08:30:00",
+            optimize="fare",
+            window=600,
+            fares=hsl,
+            exclude_stops=["1121601"],
+        )
+
+
+def test_zone_fare_point_matrix_prices_and_walks(network_with_footpaths, helsinki_gtfs):
+    from cafein import fares as fare_module
+
+    network = network_with_footpaths
+    hsl = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
+    # A near-stop pair rides transit at the exact fare — the budget
+    # excludes the direct walk, which would otherwise win the cell at
+    # fare zero. The same-point diagonal is the direct walk — fare
+    # zero, from the street search alone, never a composition of
+    # access and egress walks.
+    points = point_frame(
+        network, [("near_kamppi", "1040280"), ("near_kapyla", "1250551")]
+    )
+    matrix = cost_matrix(
+        network,
+        origins=points,
+        destinations=points,
+        departure="08:30:00",
+        optimize="fare",
+        window=600,
+        within=1800,
+        fares=hsl,
+    )
+    ride = matrix[
+        (matrix.from_id == "near_kamppi") & (matrix.to_id == "near_kapyla")
+    ].iloc[0]
+    assert ride.fare == pytest.approx(2.80)
+    assert ride.transit_distance_m > 0
+    walk = matrix[
+        (matrix.from_id == "near_kamppi") & (matrix.to_id == "near_kamppi")
+    ].iloc[0]
+    assert walk.fare == pytest.approx(0.0)
+    assert walk.transfers == 0
+    assert walk.transit_distance_m == pytest.approx(0.0)
+
+
+def test_zone_fare_matrix_prices_zero_fare_products(network, helsinki_gtfs):
+    from cafein import fares as fare_module
+
+    # A fare-free tariff is legal; the exact engine must price the
+    # cells at zero rather than skipping refinement outright.
+    import pandas as pd
+
+    hsl = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
+    free = fare_module.ZoneFareStructure(
+        pd.DataFrame(
+            [
+                {
+                    "fare_id": "FREE",
+                    "price": "0",
+                    "currency_type": "EUR",
+                    "payment_method": "0",
+                    "transfers": float("nan"),
+                    "transfer_duration": "10800",
+                }
+            ]
+        ),
+        {"FREE": frozenset({"A", "B", "C", "D"})},
+        hsl.stop_zones,
+    )
+    matrix = cost_matrix(
+        network,
+        origins=["1040601"],
+        destinations=["1121601"],
+        departure="08:30:00",
+        optimize="fare",
+        window=600,
+        fares=free,
+    )
+    assert matrix.iloc[0].fare == pytest.approx(0.0)
+    assert matrix.iloc[0].travel_time_s == 300

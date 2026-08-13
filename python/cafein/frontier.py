@@ -1173,11 +1173,10 @@ def fare_frontier(
     over the fare-blind products can reproduce this. Ties on travel
     time resolve to the cheapest, then simplest, journey.
 
-    Zone fare structures route through the exact zone-ticket engine
-    (stop origins and destinations; always exact, so ``exact=False``
-    is rejected). Rule-based structures keep their engine and its
-    ``exact`` disciplines. Point origins and destinations remain
-    rule-based-only for now.
+    Zone fare structures route through the exact zone-ticket engine —
+    stop and point origins and destinations alike; always exact, so
+    ``exact=False`` is rejected. Rule-based structures keep their
+    engine and its ``exact`` disciplines.
 
     Parameters
     ----------
@@ -1192,11 +1191,12 @@ def fare_frontier(
     date, departure, window
         The service date, the window's start (``HH:MM:SS``), and its
         length in seconds.
-    fares : FareStructure
-        The rule-based fare model (``cafein.fares``). A zone
-        structure's journeys price through ``journey_frontiers`` and
-        ``annotate_fares`` instead — zone fares are journey-level and
-        do not enter routing yet.
+    fares : FareStructure or ZoneFareStructure
+        The fare model (``cafein.fares``). Rule-based structures ride
+        the rule-based engine with both disciplines; zone structures
+        ride the exact zone-ticket engine, which reads the zone
+        products only (street rentals and grant restrictions do not
+        apply) and accepts ``exact=True`` alone.
     cutoffs : list of float
         Required: the ascending monetary cutoffs to prune and report
         at.
@@ -1272,11 +1272,6 @@ def fare_frontier(
             "the walking options shape the point form's street search; "
             "stop-id queries board at their stops"
         )
-    if from_ids is None and zone_structure:
-        raise ValueError(
-            "the zone fare frontier routes between stops; point origins "
-            "and destinations arrive with the matrix support"
-        )
     if from_ids is None:
         from cafein.matrices import _point_list, _warn_unsnapped
         from cafein.network import _walk_options
@@ -1286,18 +1281,36 @@ def fare_frontier(
         walk = _walk_options(walking_speed_kmph, max_walking_time, max_snap_distance)
         if max_duration is not None:
             walk = (walk[0], min(walk[1], max_duration), walk[2])
-        data = network._core._fare_frontier_table_from_points(
+        if zone_structure:
+            try:
+                spec = fares._flat_tables(network)
+            except ValueError as error:
+                raise ValueError(
+                    "the zone fare frontier prices the zone-only reading; "
+                    'build the structure with zone_fare_structure(..., rules="zones") '
+                    "— route, origin/destination, and agency grants are not "
+                    "priceable here yet"
+                ) from error
+        else:
+            spec = fares._flat_tables(network)
+        entry = (
+            network._core._zone_fare_frontier_table_from_points
+            if zone_structure
+            else network._core._fare_frontier_table_from_points
+        )
+        extra = {} if zone_structure else {"exact": exact}
+        data = entry(
             from_points,
             to_points,
             date,
             departure,
             window,
-            fares._flat_tables(network),
+            spec,
             [float(cutoff) for cutoff in cutoffs],
             max_transfers=max_transfers,
             max_duration=max_duration,
-            exact=exact,
             departure_step=departure_step,
+            **extra,
             **dict(
                 zip(
                     (
