@@ -155,3 +155,58 @@ def test_metro_footpaths_stay_bounded(metro_network, helsinki_metro_data):
                     walked += 1
                     assert leg["arrival_s"] - leg["departure_s"] <= MAX_WALKING_TIME
     assert walked, "the sampled journeys walked no transfer at all"
+
+
+def test_zone_fares_price_the_measured_pairs_exactly(
+    metro_network, helsinki_metro_data
+):
+    # Issue #246's measured pairs: today's fare fold reports 5.00 for
+    # both, but BC-only journeys exist — the exact zone engine must
+    # find them at 3.30.
+    from cafein import fares as fares_module
+    from cafein.frontier import fare_frontier
+
+    date = _service_date(helsinki_metro_data.gtfs)
+    structure = fares_module.zone_fare_structure(
+        str(helsinki_metro_data.gtfs), rules="zones"
+    )
+    frame = fare_frontier(
+        metro_network,
+        ["9214203", "4340212"],
+        ["1000109"],
+        date,
+        "08:30:00",
+        1800,
+        structure,
+        cutoffs=[3.30, 4.50, 5.00],
+        max_duration=3 * 3600,
+        # The event discipline, per the plan's acceptance; the derived
+        # mid-span Tuesday is the plan's pinned witness date for the
+        # pinned sampledata release.
+        departure_step=None,
+    )
+    # The pinned trade-off curve: 3.30 buys the trip, 4.50 buys it
+    # faster, and no cutoff ever needs the fold's 5.00 — it is
+    # dominated everywhere.
+    for origin in ("9214203", "4340212"):
+        rows = frame[frame["from_id"] == origin]
+        pinned = {3.30: 3.30, 4.50: 4.50, 5.00: 4.50}
+        assert {
+            row["cutoff"]: round(row["fare"], 2) for _, row in rows.iterrows()
+        } == pinned, origin
+    # And the fare-blind fold still reports 5.00 on the identical
+    # window — the 3.30 is the engine's win, not a departure the fold
+    # could also see.
+    from cafein import TravelCostMatrix
+
+    fold = TravelCostMatrix(
+        metro_network,
+        ["9214203", "4340212"],
+        ["1000109"],
+        date,
+        "08:30:00",
+        optimize="fare",
+        window=1800,
+        fares=structure,
+    )
+    assert sorted(round(fare, 2) for fare in fold["fare"]) == [5.00, 5.00]

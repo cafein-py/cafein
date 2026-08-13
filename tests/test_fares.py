@@ -561,3 +561,92 @@ def test_compiled_pricer_matches_python_over_random_sequences(network):
             assert (math.isnan(expected) and math.isnan(probed)) or (
                 expected == pytest.approx(probed)
             )
+
+
+def test_zone_fare_frontier_routes_the_exact_engine(network, hsl_zones):
+    from cafein import journey_frontier
+    from cafein.frontier import fare_frontier
+
+    # Two pinned witnesses under the sample feed's 2022 tariff
+    # (AB/BC/D 2.80, CD 3.20, ABC/BCD 4.10, ABCD 5.70). The C-to-A
+    # pair has NO row under the 2.80 cutoff — the cheapest covering
+    # ticket is the 4.10 ABC — and the A-zone metro hop rides an AB
+    # single at every cutoff. Exact equality both ways: an underpriced
+    # or overpriced engine fails these rows.
+    cutoffs = [2.80, 4.10, 5.70]
+    frame = fare_frontier(
+        network,
+        ["4810551", "1040601"],
+        ["1250551", "1121601"],
+        "2022-02-22",
+        "08:30:00",
+        600,
+        hsl_zones,
+        cutoffs=cutoffs,
+    )
+
+    def rows(from_id, to_id):
+        cell = frame[(frame["from_id"] == from_id) & (frame["to_id"] == to_id)]
+        return sorted(
+            (row["cutoff"], row["travel_time_s"], row["fare"], row["rides"])
+            for _, row in cell.iterrows()
+        )
+
+    assert rows("4810551", "1250551") == [
+        (4.10, 1320, 4.10, 1),
+        (5.70, 1320, 4.10, 1),
+    ]
+    assert rows("1040601", "1121601") == [
+        (2.80, 300, 2.80, 1),
+        (4.10, 300, 2.80, 1),
+        (5.70, 300, 2.80, 1),
+    ]
+    # And the fold can never beat the exact engine.
+    candidates = journey_frontier(
+        network,
+        "4810551",
+        "1250551",
+        "2022-02-22",
+        "08:30:00",
+        window=600,
+        fares=hsl_zones,
+    )
+    priced = candidates["fare"].dropna()
+    if len(priced):
+        assert frame["fare"].min() <= priced.min() + 1e-9
+
+
+def test_zone_fare_frontier_rejects_the_fast_discipline(network, hsl_zones):
+    from cafein.frontier import fare_frontier
+
+    with pytest.raises(ValueError, match="always exact"):
+        fare_frontier(
+            network,
+            ["4810551"],
+            ["1250551"],
+            "2022-02-22",
+            "08:30:00",
+            600,
+            hsl_zones,
+            cutoffs=[4.50],
+            exact=False,
+        )
+
+
+def test_zone_fare_frontier_names_the_grant_limitation(network, hsl):
+    # The default reading carries route/OD grants the compiled pricer
+    # rejects; the frontier must say how to proceed, not fail deep in
+    # the core.
+    from cafein.frontier import fare_frontier
+
+    with pytest.raises(ValueError, match='rules="zones"'):
+        fare_frontier(
+            network,
+            ["4810551"],
+            ["1250551"],
+            "2022-02-22",
+            "08:30:00",
+            600,
+            hsl,
+            cutoffs=[4.10],
+        )
