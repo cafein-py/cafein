@@ -1966,12 +1966,15 @@ def test_fare_frontier_rejects_the_unpriceable(network, helsinki_gtfs):
 
     structure = fares.setup_fare_structure(network, base_fare=3.0)
     args = (["4810551"], ["1250551"], "2022-02-22", "08:30:00", 600)
-    with pytest.raises(ValueError, match="rule-based structures only"):
+    # Zone structures route through the exact zone engine; the fast
+    # discipline stays rule-based-only.
+    with pytest.raises(ValueError, match="always exact"):
         fare_frontier(
             network,
             *args,
             fares.zone_fare_structure(helsinki_gtfs),
             cutoffs=[3.0],
+            exact=False,
         )
     with pytest.raises(ValueError, match="FareStructure"):
         fare_frontier(network, *args, object(), cutoffs=[3.0])

@@ -3,6 +3,7 @@
 use super::*;
 use cafein_core::routers::fare_frontier::{frontier, push_walk, FareFrontierInputs, FrontierRow};
 use cafein_core::routers::router::Request;
+use cafein_core::routers::zone_frontier::{zone_frontier_cutoffs, ZoneFrontierInputs};
 use rayon::prelude::*;
 
 use crate::cost_matrices::fare_tables;
@@ -164,6 +165,114 @@ impl TransportNetwork {
                     // candidate, exactly as the walking journey joins
                     // the shipped frontier products — boarding still
                     // starts at the origin stop.
+                    for (slot, egress) in destinations.iter().enumerate() {
+                        for &(stop, _) in egress {
+                            let walk = if stop == origin {
+                                Some(0)
+                            } else {
+                                self.transfers
+                                    .from_stop(origin)
+                                    .iter()
+                                    .find(|edge| edge.to == stop)
+                                    .map(|edge| edge.duration)
+                            };
+                            if let Some(seconds) = walk {
+                                if max_duration.is_none_or(|cap| seconds <= cap) {
+                                    push_walk(&mut rows[slot], &cutoffs, departure, seconds);
+                                }
+                            }
+                        }
+                    }
+                    rows
+                })
+                .collect()
+        });
+        frontier_columns(py, &cells)
+    }
+
+    /// The stop-to-stop (time, fare) frontier under a zone fare
+    /// structure: the exact zone-ticket state machine, the same
+    /// product shape and departure disciplines as the rule-based
+    /// frontier. Always exact — there is no fast discipline to trade
+    /// down to. Internal.
+    #[pyo3(signature = (from_stops, to_stops, date, departure, window, fares, cutoffs,
+                        max_transfers = 7, max_duration = None,
+                        departure_step = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn _zone_fare_frontier_table(
+        &self,
+        py: Python<'_>,
+        from_stops: Vec<String>,
+        to_stops: Vec<String>,
+        date: &str,
+        departure: &str,
+        window: u32,
+        fares: Bound<'_, PyDict>,
+        cutoffs: Vec<f64>,
+        max_transfers: u8,
+        max_duration: Option<u32>,
+        departure_step: Option<u32>,
+    ) -> PyResult<Py<PyDict>> {
+        if window == 0 {
+            return Err(PyValueError::new_err(
+                "window must be a positive number of seconds",
+            ));
+        }
+        validated_step(window, departure_step)?;
+        validated_cutoffs(&cutoffs)?;
+        let tables = fare_tables(
+            &fares,
+            self.feed.routes.len(),
+            self.build.timetable.stop_count() as usize,
+        )?;
+        let cafein_core::fares::FareTables::Zone(zones) = &tables else {
+            return Err(PyValueError::new_err(
+                "the zone frontier takes a zone fare structure",
+            ));
+        };
+        let origins = from_stops
+            .iter()
+            .map(|stop| self.resolve_stop(stop))
+            .collect::<PyResult<Vec<_>>>()?;
+        let destinations = to_stops
+            .iter()
+            .map(|stop| Ok(vec![(self.resolve_stop(stop)?, 0u32)]))
+            .collect::<PyResult<Vec<_>>>()?;
+        let departure = parse_time(departure)?;
+        if departure as u64 + window as u64 > u32::MAX as u64 {
+            return Err(PyValueError::new_err(
+                "departure + window overflows the router clock; narrow \
+                 the window",
+            ));
+        }
+        let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
+        let top_cutoff = cutoffs.last().copied().unwrap_or(0.0);
+        let inputs = ZoneFrontierInputs {
+            timetable: &self.build.timetable,
+            transfers: &self.transfers,
+            fares: zones,
+            top_cutoff,
+            max_duration,
+            departure_step,
+        };
+        let cells: Vec<Vec<Vec<Option<_>>>> = py.allow_threads(|| {
+            origins
+                .par_iter()
+                .map(|&origin| {
+                    let request = Request {
+                        departure,
+                        access: vec![(origin, 0)],
+                        egress: Vec::new(),
+                        active_services: active_services.clone(),
+                        active_services_previous: active_services_previous.clone(),
+                        max_transfers,
+                        exclusions: None,
+                    };
+                    let mut rows =
+                        zone_frontier_cutoffs(&inputs, &request, &destinations, window, &cutoffs);
+                    // The direct walk joins each cell as the zero-fare
+                    // candidate, exactly as on the rule-based product.
                     for (slot, egress) in destinations.iter().enumerate() {
                         for &(stop, _) in egress {
                             let walk = if stop == origin {

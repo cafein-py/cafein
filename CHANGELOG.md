@@ -2,13 +2,25 @@
 
 ## Unreleased
 
+- **Exact zone fares in `fare_frontier`** (#246): zone fare structures
+  now route through a zone-ticket state machine whose labels carry the
+  paid total and the active ticket's remaining resources (coverage,
+  validity window, boardings), so a slower-or-more-rides-but-cheaper
+  journey survives to win its cutoff — including multi-ticket chains
+  and same-trip boardings in a cheaper zone. Stop origins and
+  destinations; always exact (`exact=False` is rejected as the
+  rule-based engine's fast discipline); point origins and destinations
+  stay rule-based-only for now. On the measured #246 pairs the engine
+  prices 3.30 € where the fare-blind candidate fold reports 5.00 €.
+
 - **`optimize="fare"` documents its real guarantee** (#246): the
   matrix docstring now states that the cheapest journey is chosen
   among the candidates the time-and-ride search retains, not over all
   feasible journeys — a cheaper journey may be omitted when it
   arrives no earlier, uses more rides, or boards the same trip at a
-  different stop — and `fare_frontier` documents that zone structures
-  are refused. A zone-fare diagnostic
+  different stop — and `fare_frontier` documented the then-current
+  zone-structure refusal (lifted by the exact zone engine above). A
+  zone-fare diagnostic
   (`scripts/probe_zone_fares.py`) and the bounded-footpath benchmark
   harness (`scripts/benchmark_bounded_footpaths.py`) ship alongside.
 
