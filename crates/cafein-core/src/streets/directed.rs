@@ -160,6 +160,14 @@ impl DirectedState {
         *slot = time;
     }
 
+    /// The `(vertex, milliseconds)` labels the last search settled.
+    pub(super) fn settled(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
+        self.touched
+            .iter()
+            .map(|&vertex| (vertex, self.distances[vertex as usize]))
+            .filter(|&(_, time)| time != u64::MAX)
+    }
+
     /// The best known time to `vertex`, or `u64::MAX` when unreached.
     pub(super) fn time(&self, vertex: u32) -> u64 {
         self.distances[vertex as usize]
@@ -631,6 +639,13 @@ impl StreetNetwork {
             degrees(self.arrays().lons()[position]),
             degrees(self.arrays().lats()[position]),
         ))
+    }
+
+    /// Per-vertex `(longitude, latitude)` degrees — the positions the
+    /// catchment entries' vertices index into. `NaN` marks an isolated
+    /// vertex no search reaches.
+    pub fn vertex_positions(&self) -> &[(f64, f64)] {
+        self.vertex_coordinates()
     }
 
     /// The per-vertex coordinate table, built once per network on the first
@@ -1219,6 +1234,101 @@ impl StreetNetwork {
             let state = &mut cell.borrow_mut();
             let millis = self.directed_astar(profile, &seeds, to, best0, cutoff, state)?;
             Some(seconds(millis as f64 / 1000.0))
+        })
+    }
+
+    /// The settled vertices of a bounded directed search from `from`:
+    /// `(vertex, seconds)` for every graph vertex within `max_seconds`
+    /// under `profile` — a street catchment's target universe.
+    pub fn directed_reached_vertices(
+        &self,
+        from: &Snap,
+        profile: &CompiledStreetProfile,
+        max_seconds: f64,
+    ) -> Vec<(u32, f64)> {
+        if !max_seconds.is_finite() || max_seconds < 0.0 {
+            return Vec::new();
+        }
+        let cutoff = (max_seconds * 1000.0).floor() as u64;
+        let seeds = self.directed_seeds(from, profile);
+        DIRECTED_STATE.with(|cell| {
+            let state = &mut cell.borrow_mut();
+            self.directed_dijkstra(profile, &seeds, cutoff, state);
+            state
+                .settled()
+                .filter(|&(_, millis)| millis <= cutoff)
+                .map(|(vertex, millis)| (vertex, millis as f64 / 1000.0))
+                .collect()
+        })
+    }
+
+    /// The settled vertices of a metres-bounded spread from `from`
+    /// under `profile`'s permissions — the iso-distance catchment's
+    /// target universe: `(vertex, meters)` within `max_meters`.
+    /// Directionality follows the profile exactly as the timed
+    /// spread does; only permitted arcs are walked, weighted by their
+    /// exact street length (`f64` accumulation, as the walking
+    /// searches measure it — never per-arc rounding).
+    pub fn directed_reached_vertices_meters(
+        &self,
+        from: &Snap,
+        profile: &CompiledStreetProfile,
+        max_meters: f64,
+    ) -> Vec<(u32, f64)> {
+        if !max_meters.is_finite() || max_meters < 0.0 {
+            return Vec::new();
+        }
+        let (from_vertex, to_vertex) = self.edge_endpoints(from.edge);
+        let (forward, reverse) = self.snap_arcs(from, profile);
+        let length = self.arrays().lengths()[from.edge as usize];
+        let mut seeds: Vec<(u32, f64)> = Vec::with_capacity(2);
+        if from.fraction == 0.0 || reverse.is_some() {
+            seeds.push((from_vertex, from.connector + from.fraction * length));
+        }
+        if from.fraction == 1.0 || forward.is_some() {
+            seeds.push((to_vertex, from.connector + (1.0 - from.fraction) * length));
+        }
+        let offsets = self.arrays().adjacency_offsets();
+        let targets = self.arrays().adj_targets();
+        let meters_of = self.arrays().adj_meters();
+        let arc_millis = profile.arc_millis();
+        super::search::SEARCH_STATE.with(|cell| {
+            let state = &mut cell.borrow_mut();
+            state.prepare(self.vertex_count() as usize);
+            for &(vertex, start) in &seeds {
+                if start <= max_meters + 1e-9 && start < state.distance(vertex) {
+                    state.set_distance(vertex, start);
+                    state.heap.push(Reverse((start.to_bits(), vertex)));
+                }
+            }
+            while let Some(Reverse((bits, vertex))) = state.heap.pop() {
+                let reached = f64::from_bits(bits);
+                if reached > state.distance(vertex) {
+                    continue;
+                }
+                let start = offsets[vertex as usize] as usize;
+                let end = offsets[vertex as usize + 1] as usize;
+                for slot in start..end {
+                    if arc_millis[slot] == u32::MAX {
+                        continue;
+                    }
+                    let next = reached + meters_of[slot];
+                    let target = targets[slot];
+                    if next <= max_meters + 1e-9 && next < state.distance(target) {
+                        state.set_distance(target, next);
+                        state.heap.push(Reverse((next.to_bits(), target)));
+                    }
+                }
+            }
+            use super::search::Reached;
+
+            let mut field = Vec::new();
+            state.for_each_reached(|vertex, meters| {
+                if meters <= max_meters + 1e-9 {
+                    field.push((vertex, meters));
+                }
+            });
+            field
         })
     }
 

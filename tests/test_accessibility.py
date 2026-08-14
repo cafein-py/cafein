@@ -953,3 +953,281 @@ def test_merged_feed_aliases_share_their_column(helsinki_gtfs, fares_poa):
     )
     assert list(frame["destination_id"]) == ["1250551", "0:1250551"]
     assert frame["cost"].iloc[0] == frame["cost"].iloc[1]
+
+
+def test_catchment_membership_matches_the_walk_field_budget_filter(
+    network_with_footpaths,
+):
+    h3 = pytest.importorskip("h3")
+    from cafein import Catchment
+
+    frame = Catchment(
+        network_with_footpaths,
+        ["1100602"],
+        DEPARTURE,
+        budgets=(10, 20),
+        resolution=9,
+    )
+    assert list(frame["budget"]) == [10.0, 20.0]
+    # The rendering oracle: exactly the union of the reached
+    # vertices' cells, budget for budget, from the same field.
+    arrivals = network_with_footpaths._core.travel_times_from_stop(
+        "1100602", "2022-02-22", "08:30:00", 7, [], [], [], 3.6, 7200.0, 1600.0
+    )
+    reached = list(arrivals)
+    indices = list(network_with_footpaths._core._stop_indices(reached))
+    coordinates = {
+        stop: (lat, lon)
+        for stop, lat, lon in network_with_footpaths.stops
+        if lat is not None
+    }
+    origin = coordinates["1100602"]
+    seeds = [
+        (index, float(arrivals[stop]))
+        for index, stop in zip(indices, reached)
+        if arrivals[stop] <= 1200
+    ]
+    lats, lons, seconds = network_with_footpaths._core._catchment_walk_field(
+        origin, seeds, 1.0, 1200.0, 1600.0
+    )
+    for budget_minutes, row in zip((10, 20), frame.itertuples()):
+        budget = budget_minutes * 60
+        expected = {
+            h3.latlng_to_cell(lat, lon, 9)
+            for lat, lon, cost in zip(lats, lons, seconds)
+            if cost <= budget
+        }
+        import shapely.geometry
+
+        oracle = shapely.geometry.shape(h3.cells_to_h3shape(expected).__geo_interface__)
+        assert row.geometry.equals(oracle)
+
+
+def test_catchment_budgets_nest(network_with_footpaths):
+    pytest.importorskip("h3")
+    from cafein import Catchment
+
+    frame = Catchment(
+        network_with_footpaths, ["1100602"], DEPARTURE, budgets=(5, 15, 30)
+    )
+    geometries = list(frame.geometry)
+    assert len(geometries) == 3
+    for inner, outer in zip(geometries, geometries[1:]):
+        assert inner.within(outer.buffer(1e-9))
+
+
+def test_catchment_off_network_origin_keeps_its_walking_field(network_with_footpaths):
+    pytest.importorskip("h3")
+    geopandas = pytest.importorskip("geopandas")
+    from cafein import Catchment
+
+    # A point with no reachable stop still has a walking catchment:
+    # exclude every stop, leaving the origin seed alone.
+    stops = [stop for stop, _, _ in network_with_footpaths.stops]
+    coordinates = {
+        stop: (lat, lon)
+        for stop, lat, lon in network_with_footpaths.stops
+        if lat is not None
+    }
+    lat, lon = coordinates["1100602"]
+    points = geopandas.GeoDataFrame(
+        {"id": ["o"]},
+        geometry=geopandas.points_from_xy([lon], [lat]),
+        crs="EPSG:4326",
+    )
+    frame = Catchment(
+        network_with_footpaths,
+        points,
+        DEPARTURE,
+        budgets=(10,),
+        exclude_stops=stops,
+    )
+    assert len(frame) == 1
+    assert frame.geometry.iloc[0].area > 0
+
+
+def test_catchment_empty_budget_is_an_absent_row(network_with_footpaths):
+    pytest.importorskip("h3")
+    from cafein import Catchment
+
+    # One second reaches no street vertex from this stop — its snap
+    # connector alone exceeds it — so the tiny budget has no row.
+    frame = Catchment(
+        network_with_footpaths, ["1100602"], DEPARTURE, budgets=(1 / 60, 10)
+    )
+    assert list(frame["budget"]) == [10.0]
+    # A zero-rounding budget is refused, never silently dropped.
+    with pytest.raises(ValueError, match="budgets"):
+        Catchment(network_with_footpaths, ["1100602"], DEPARTURE, budgets=(0.001,))
+
+
+def test_catchment_street_mode_spreads_by_time_and_distance(helsinki_streets):
+    pytest.importorskip("h3")
+    geopandas = pytest.importorskip("geopandas")
+    from cafein import Catchment
+
+    origin = geopandas.GeoDataFrame(
+        {"id": ["o"]},
+        geometry=geopandas.points_from_xy([24.9384], [60.1699]),
+        crs="EPSG:4326",
+    )
+    timed = Catchment(helsinki_streets, origin, transport_mode="walk", budgets=(5, 10))
+    assert len(timed) == 2
+    inner, outer = timed.geometry
+    assert inner.within(outer.buffer(1e-9))
+    metered = Catchment(
+        helsinki_streets,
+        origin,
+        transport_mode="walk",
+        cost="distance",
+        budgets=(400.0, 800.0),
+    )
+    assert len(metered) == 2
+    assert metered.geometry.iloc[0].within(metered.geometry.iloc[1].buffer(1e-9))
+    # An iso-distance area is not an iso-time area rescaled: both
+    # exist independently on their own axes.
+    assert list(metered["budget"]) == [400.0, 800.0]
+
+
+def test_catchment_windowed_percentile_rule(network_with_footpaths):
+    pytest.importorskip("h3")
+    from cafein import Catchment
+
+    # A vertex is reached when the chosen percentile of its stop's
+    # arrival distribution fits the budget: the p90 catchment never
+    # exceeds the p10 one.
+    generous = Catchment(
+        network_with_footpaths,
+        ["1100602"],
+        DEPARTURE,
+        budgets=(25,),
+        departure_time_window=10,
+        percentile=10,
+    )
+    strict = Catchment(
+        network_with_footpaths,
+        ["1100602"],
+        DEPARTURE,
+        budgets=(25,),
+        departure_time_window=10,
+        percentile=90,
+    )
+    assert len(generous) == 1 and len(strict) == 1
+    assert strict.geometry.iloc[0].within(generous.geometry.iloc[0].buffer(1e-9))
+
+
+def test_catchment_validates_eagerly(network_with_footpaths, helsinki_streets):
+    pytest.importorskip("h3")
+    geopandas = pytest.importorskip("geopandas")
+    from cafein import Catchment
+
+    with pytest.raises(ValueError, match="resolution"):
+        Catchment(network_with_footpaths, ["1100602"], DEPARTURE, resolution=22)
+    with pytest.raises(ValueError, match="percentile"):
+        Catchment(network_with_footpaths, ["1100602"], DEPARTURE, percentile=75)
+    with pytest.raises(ValueError, match="departure_time_window"):
+        Catchment(network_with_footpaths, ["1100602"], DEPARTURE, cost="emissions")
+    with pytest.raises(TypeError, match="requires departure"):
+        Catchment(network_with_footpaths, ["1100602"])
+    with pytest.raises(ValueError, match="budgets"):
+        Catchment(network_with_footpaths, ["1100602"], DEPARTURE, budgets=())
+    points = geopandas.GeoDataFrame(
+        {"id": ["p"]},
+        geometry=geopandas.points_from_xy([24.9384], [60.1699]),
+        crs="EPSG:4326",
+    )
+    with pytest.raises(ValueError, match="stop origins"):
+        Catchment(
+            network_with_footpaths,
+            points,
+            DEPARTURE,
+            departure_time_window=10,
+        )
+    with pytest.raises(ValueError, match="transport_mode"):
+        Catchment(helsinki_streets, points)
+    with pytest.raises(ValueError, match="apply to transit"):
+        Catchment(
+            helsinki_streets,
+            points,
+            transport_mode="walk",
+            router="tbtr",
+        )
+
+
+def test_catchment_point_origin_serves_the_emissions_axis(network_with_footpaths):
+    pytest.importorskip("h3")
+    geopandas = pytest.importorskip("geopandas")
+    from cafein import Catchment
+
+    coordinates = {
+        stop: (lat, lon)
+        for stop, lat, lon in network_with_footpaths.stops
+        if lat is not None
+    }
+    lat, lon = coordinates["1100602"]
+    points = geopandas.GeoDataFrame(
+        {"id": ["o"]},
+        geometry=geopandas.points_from_xy([lon], [lat]),
+        crs="EPSG:4326",
+    )
+    frame = Catchment(
+        network_with_footpaths,
+        points,
+        DEPARTURE,
+        cost="emissions",
+        departure_time_window=10,
+        budgets=(600.0,),
+    )
+    assert len(frame) == 1
+    assert frame.geometry.iloc[0].area > 0
+
+
+def test_catchment_rejects_unusable_walking_options(network_with_footpaths):
+    pytest.importorskip("h3")
+    from cafein import Catchment
+
+    with pytest.raises(ValueError, match="walking_speed_kmph"):
+        Catchment(
+            network_with_footpaths,
+            ["1100602"],
+            DEPARTURE,
+            departure_time_window=10,
+            walking_speed_kmph=float("nan"),
+        )
+    with pytest.raises(ValueError, match="snap_distance"):
+        Catchment(
+            network_with_footpaths,
+            ["1100602"],
+            DEPARTURE,
+            snap_distance=0,
+        )
+    with pytest.raises(KeyError, match="no-such-stop"):
+        Catchment(network_with_footpaths, ["no-such-stop"], DEPARTURE)
+    with pytest.raises(ValueError, match="router"):
+        Catchment(network_with_footpaths, ["1100602"], DEPARTURE, router="fastest")
+
+
+def test_catchment_street_snap_and_point_router_validate(
+    network_with_footpaths, helsinki_streets
+):
+    pytest.importorskip("h3")
+    geopandas = pytest.importorskip("geopandas")
+    from cafein import Catchment
+
+    points = geopandas.GeoDataFrame(
+        {"id": ["p"]},
+        geometry=geopandas.points_from_xy([24.9384], [60.1699]),
+        crs="EPSG:4326",
+    )
+    for bad in (0, -1, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="snap_distance"):
+            Catchment(
+                helsinki_streets,
+                points,
+                transport_mode="walk",
+                snap_distance=bad,
+            )
+    # The coordinate one-to-all rides RAPTOR: an explicit tbtr request
+    # is refused, never silently ignored.
+    with pytest.raises(ValueError, match="rides RAPTOR"):
+        Catchment(network_with_footpaths, points, DEPARTURE, router="tbtr")

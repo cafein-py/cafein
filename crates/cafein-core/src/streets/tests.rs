@@ -4472,3 +4472,163 @@ fn coincident_edges_differing_only_in_elevation_order_deterministically() {
     let ba = build([[f32::NAN, 5.0], [0.0, 20.0]]);
     assert_eq!(bits(&ab), bits(&ba));
 }
+
+#[test]
+fn walk_field_blends_seed_head_starts() {
+    // Two weighted seeds on the 0-1-2-3 line (100 m edges, 1 m/s):
+    // the origin at vertex 0 with no head start, a "reached stop" at
+    // vertex 3 carrying 100 s. Every vertex reads the best blend, and
+    // the cutoff bounds the field in seconds.
+    let net = network(
+        4,
+        0,
+        &[
+            (0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0))),
+            (1, 2, 100.0, straight((100.0, 0.0), (200.0, 0.0))),
+            (2, 3, 100.0, straight((200.0, 0.0), (300.0, 0.0))),
+        ],
+        vec![],
+    )
+    .unwrap();
+    let (lon0, lat0) = lonlat(0.0, 0.0);
+    let (lon3, lat3) = lonlat(300.0, 0.0);
+    let origin = net.snap(lat0, lon0, 50.0).unwrap();
+    let stop = net.snap(lat3, lon3, 50.0).unwrap();
+    let field = net.walk_field(&[(origin, 0.0), (stop, 100.0)], 1.0, 250.0);
+    let mut by_vertex: Vec<(u32, f64)> = field;
+    by_vertex.sort_by_key(|&(vertex, _)| vertex);
+    let expected = [(0, 0.0), (1, 100.0), (2, 200.0), (3, 100.0)];
+    assert_eq!(by_vertex.len(), expected.len());
+    for ((vertex, seconds), (want_vertex, want_seconds)) in by_vertex.iter().zip(expected) {
+        assert_eq!(*vertex, want_vertex);
+        // Snapping introduces sub-meter connectors; at 1 m/s that is
+        // well under a twentieth of a second.
+        assert!(
+            (seconds - want_seconds).abs() < 0.05,
+            "vertex {vertex}: {seconds} vs {want_seconds}"
+        );
+    }
+    // A tighter cutoff prunes in seconds space.
+    let tight = net.walk_field(&[(origin, 0.0)], 1.0, 150.0);
+    assert!(tight.iter().all(|&(_, seconds)| seconds <= 150.0));
+    assert!(tight.iter().any(|&(vertex, _)| vertex == 1));
+    assert!(!tight.iter().any(|&(vertex, _)| vertex == 3));
+    // A seed whose head start exceeds the cutoff seeds nothing.
+    assert!(net.walk_field(&[(stop, 1000.0)], 1.0, 250.0).is_empty());
+}
+
+#[test]
+fn directed_reached_vertices_bound_the_mode_spread() {
+    // The triangle under the bicycle profile (4 m/s): a 100-second
+    // spread from vertex 0 settles 0 and 1 (400 m = 100 s) but not 2;
+    // a wider one reaches every vertex.
+    let mut net = triangle();
+    net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
+        .unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let (lon0, lat0) = lonlat(0.0, 0.0);
+    let origin = net.snap(lat0, lon0, 50.0).unwrap();
+    let tight: Vec<u32> = net
+        .directed_reached_vertices(&origin, &bike, 100.0)
+        .into_iter()
+        .map(|(vertex, _)| vertex)
+        .collect();
+    assert!(tight.contains(&1));
+    assert!(!tight.contains(&2));
+    let wide = net.directed_reached_vertices(&origin, &bike, 500.0);
+    let vertices: Vec<u32> = wide.iter().map(|&(vertex, _)| vertex).collect();
+    assert!(vertices.contains(&2) && vertices.contains(&3));
+    for &(_, seconds) in &wide {
+        assert!(seconds <= 500.0);
+    }
+    // An unusable cutoff spreads nowhere.
+    assert!(net
+        .directed_reached_vertices(&origin, &bike, f64::NAN)
+        .is_empty());
+    // The metres spread bounds by street length under the same
+    // permissions: 450 m admits 0-1 (400 m) but not 1-2's end, and
+    // the accumulated metres are exact — 400 plus the snap connector,
+    // never per-arc rounding.
+    let metered = net.directed_reached_vertices_meters(&origin, &bike, 450.0);
+    let vertices: Vec<u32> = metered.iter().map(|&(vertex, _)| vertex).collect();
+    assert!(vertices.contains(&1));
+    assert!(!vertices.contains(&2));
+    for &(vertex, meters) in &metered {
+        assert!(meters <= 450.0 + 1e-9);
+        if vertex == 1 {
+            assert!((meters - 400.0).abs() < 1.0, "vertex 1 at {meters} m");
+        }
+    }
+}
+
+#[test]
+fn spreads_respect_forbidden_arcs() {
+    // Bicycle access everywhere except the 1-2 edge: with no detour in
+    // the triangle chain, vertex 2 is unreachable to the bike spread on
+    // both axes, while the walking profile still passes.
+    let mut net = triangle();
+    let mut attributes = uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0);
+    // Slots pair per edge (forward, reverse); edge index 1 is 1-2.
+    attributes.adj_access[2] = MODE_WALK;
+    attributes.adj_access[3] = MODE_WALK;
+    net.install_street_attributes(attributes).unwrap();
+    let bike = net
+        .compile_profile(&StreetProfileDefinition::bicycle())
+        .unwrap();
+    let walk = net
+        .compile_profile(&StreetProfileDefinition::walk())
+        .unwrap();
+    let (lon0, lat0) = lonlat(0.0, 0.0);
+    let origin = net.snap(lat0, lon0, 50.0).unwrap();
+    let timed: Vec<u32> = net
+        .directed_reached_vertices(&origin, &bike, 10_000.0)
+        .into_iter()
+        .map(|(vertex, _)| vertex)
+        .collect();
+    assert!(timed.contains(&1));
+    assert!(!timed.contains(&2));
+    let metered: Vec<u32> = net
+        .directed_reached_vertices_meters(&origin, &bike, 10_000.0)
+        .into_iter()
+        .map(|(vertex, _)| vertex)
+        .collect();
+    assert!(metered.contains(&1));
+    assert!(!metered.contains(&2));
+    let walked: Vec<u32> = net
+        .directed_reached_vertices(&origin, &walk, 10_000.0)
+        .into_iter()
+        .map(|(vertex, _)| vertex)
+        .collect();
+    assert!(walked.contains(&2));
+}
+
+#[test]
+fn walk_field_agrees_with_and_without_a_hierarchy() {
+    // The field spans EVERY vertex, which the stop-targeted CH buckets
+    // cannot serve — installing a hierarchy must not change the field.
+    let mut net = network(
+        4,
+        0,
+        &[
+            (0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0))),
+            (1, 2, 100.0, straight((100.0, 0.0), (200.0, 0.0))),
+            (2, 3, 100.0, straight((200.0, 0.0), (300.0, 0.0))),
+        ],
+        vec![],
+    )
+    .unwrap();
+    let (lon0, lat0) = lonlat(0.0, 0.0);
+    let origin = net.snap(lat0, lon0, 50.0).unwrap();
+    let mut before = net.walk_field(&[(origin, 0.0)], 1.0, 250.0);
+    before.sort_by_key(|&(vertex, _)| vertex);
+    net.install_hierarchy();
+    let mut after = net.walk_field(&[(origin, 0.0)], 1.0, 250.0);
+    after.sort_by_key(|&(vertex, _)| vertex);
+    assert_eq!(before.len(), after.len());
+    for ((vertex_a, seconds_a), (vertex_b, seconds_b)) in before.iter().zip(&after) {
+        assert_eq!(vertex_a, vertex_b);
+        assert!((seconds_a - seconds_b).abs() < 1e-9);
+    }
+}

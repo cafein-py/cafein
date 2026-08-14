@@ -14,6 +14,7 @@ __all__ = [
     "TravelTimeMatrix",
     "Accessibility",
     "NearestDestinations",
+    "Catchment",
     "DetailedItineraries",
     "travel_cost_table",
     "StreamingResult",
@@ -48,7 +49,7 @@ def __getattr__(name):
         from cafein.matrices import TravelCostMatrix
 
         return TravelCostMatrix
-    if name in ("Accessibility", "NearestDestinations"):
+    if name in ("Accessibility", "NearestDestinations", "Catchment"):
         from cafein import accessibility
 
         return getattr(accessibility, name)
