@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.11.0 — 2026-08-14
 
 - **`Accessibility.to_parquet`**: the accessibility table streamed to
   Parquet in origin batches — `output=` selects the file or directory
