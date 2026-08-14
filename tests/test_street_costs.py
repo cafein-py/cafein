@@ -305,8 +305,7 @@ def test_cost_options_are_guarded(helsinki_streets, origins, destinations, netwo
         TravelCostMatrix(
             network,
             ["1030423"],
-            date="2022-02-22",
-            departure="08:30:00",
+            departure="2022-02-22 08:30:00",
             perspectives="societal",
         )
 

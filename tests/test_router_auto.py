@@ -7,11 +7,12 @@ from shapely.geometry import Point
 
 from test_frontier import build_two_line_gtfs
 
-DATE, DEPARTURE = "2022-02-22", "08:00:00"
+DATE = "2022-02-22"
+DEPARTURE = "2022-02-22 08:00:00"
 FRONTIER_COLUMNS = [
     "departure_s",
     "arrival_s",
-    "travel_time_s",
+    "travel_time",
     "rides",
     "emissions",
     "frontier",
@@ -29,7 +30,7 @@ def two_line_network(tmp_path):
 def frontier_frame(network, **kwargs):
     from cafein import journey_frontier
 
-    frame = journey_frontier(network, "A", "B", DATE, DEPARTURE, 1800, **kwargs)
+    frame = journey_frontier(network, "A", "B", DEPARTURE, 30, **kwargs)
     return frame[FRONTIER_COLUMNS]
 
 
@@ -48,7 +49,7 @@ def test_auto_rides_a_matching_cached_mctbtr_set(two_line_network, capfd, monkey
     # The batched product reports search stats under this flag only when
     # the McTBTR engine actually runs — a direct dispatch observable.
     monkeypatch.setenv("CAFEIN_MCTBTR_PROF", "1")
-    batched = journey_frontiers(two_line_network, ["A"], ["B"], DATE, DEPARTURE, 1800)
+    batched = journey_frontiers(two_line_network, ["A"], ["B"], DEPARTURE, 30)
     assert len(batched) > 0
     assert "MCTBTR-STATS" in capfd.readouterr().err
     auto = frontier_frame(two_line_network, candidates="pareto")
@@ -65,12 +66,12 @@ def test_auto_misses_the_cache_on_another_date_or_factor_set(
     two_line_network.compute_mctbtr_transfers(DATE)
     monkeypatch.setenv("CAFEIN_MCTBTR_PROF", "1")
     other_day = journey_frontiers(
-        two_line_network, ["A"], ["B"], "2022-02-23", DEPARTURE, 1800
+        two_line_network, ["A"], ["B"], "2022-02-23 08:00:00", 30
     )
     assert len(other_day) > 0
     assert "MCTBTR-STATS" not in capfd.readouterr().err
     partial = journey_frontiers(
-        two_line_network, ["A"], ["B"], DATE, DEPARTURE, 1800, components=["vehicle"]
+        two_line_network, ["A"], ["B"], DEPARTURE, 30, components=["vehicle"]
     )
     assert len(partial) > 0
     assert "MCTBTR-STATS" not in capfd.readouterr().err
@@ -93,7 +94,7 @@ def test_raptor_only_features_run_under_the_auto_default(two_line_network):
 def test_explicit_router_constraints_are_unchanged(two_line_network):
     from cafein import TravelCostMatrix, journey_frontier
 
-    args = (two_line_network, "A", "B", DATE, DEPARTURE, 1800)
+    args = (two_line_network, "A", "B", DEPARTURE, 30)
     with pytest.raises(ValueError, match="requires candidates='pareto'"):
         journey_frontier(*args, candidates="relaxed", router="tbtr")
     with pytest.raises(ValueError, match="max_slower requires candidates='pareto'"):
@@ -101,13 +102,11 @@ def test_explicit_router_constraints_are_unchanged(two_line_network):
     with pytest.raises(ValueError, match="'auto', 'raptor', or 'tbtr'"):
         journey_frontier(*args, candidates="pareto", router="fastest")
     with pytest.raises(ValueError, match="'auto', 'raptor', or 'tbtr'"):
-        TravelCostMatrix(
-            two_line_network, ["A"], ["B"], DATE, DEPARTURE, router="fastest"
-        )
+        TravelCostMatrix(two_line_network, ["A"], ["B"], DEPARTURE, router="fastest")
 
 
 def test_auto_time_matrix_matches_both_engines(two_line_network):
-    args = (["A", "H"], DATE, DEPARTURE)
+    args = (["A", "H"], DEPARTURE)
     raptor = two_line_network.travel_time_matrix(*args, router="raptor")
     assert np.array_equal(two_line_network.travel_time_matrix(*args), raptor)
     two_line_network.compute_tbtr_transfers(DATE)
@@ -119,7 +118,7 @@ def test_auto_time_matrix_matches_both_engines(two_line_network):
 def test_auto_windowed_matrix_matches_raptor(two_line_network):
     from cafein import TravelTimeMatrix
 
-    kwargs = dict(date=DATE, departure=DEPARTURE, window=1800)
+    kwargs = dict(departure=DEPARTURE, departure_time_window=30)
     auto = TravelTimeMatrix(two_line_network, ["A"], **kwargs)
     raptor = TravelTimeMatrix(two_line_network, ["A"], router="raptor", **kwargs)
     assert len(auto) > 0
@@ -129,7 +128,7 @@ def test_auto_windowed_matrix_matches_raptor(two_line_network):
 def test_auto_batched_frontiers_match_the_cached_engine(two_line_network):
     from cafein import frontier_table, journey_frontiers
 
-    args = (two_line_network, ["A", "H"], ["B"], DATE, DEPARTURE, 1800)
+    args = (two_line_network, ["A", "H"], ["B"], DEPARTURE, 30)
     two_line_network.compute_mctbtr_transfers(DATE)
     tbtr_rows = journey_frontiers(*args, router="tbtr")
     auto_rows = journey_frontiers(*args)
@@ -145,8 +144,8 @@ def test_auto_batched_frontiers_match_the_cached_engine(two_line_network):
 def test_auto_pareto_cost_matrix_matches_the_cached_engine(two_line_network):
     from cafein import TravelCostMatrix
 
-    kwargs = dict(optimize="emissions", candidates="pareto", window=1800)
-    args = (two_line_network, ["A"], ["B"], DATE, DEPARTURE)
+    kwargs = dict(optimize="emissions", candidates="pareto", departure_time_window=30)
+    args = (two_line_network, ["A"], ["B"], DEPARTURE)
     raptor = TravelCostMatrix(*args, router="raptor", **kwargs)
     assert TravelCostMatrix(*args, **kwargs).equals(raptor)
     two_line_network.compute_mctbtr_transfers(DATE)
@@ -164,9 +163,7 @@ def test_detailed_itineraries_pareto_points_accept_tbtr(network_with_footpaths):
     destinations = gpd.GeoDataFrame(
         {"id": ["destination"]}, geometry=[Point(24.9505, 60.1690)], crs="EPSG:4326"
     )
-    kwargs = dict(
-        date=DATE, departure="08:30:00", candidates="pareto", geometries=False
-    )
+    kwargs = dict(departure=f"{DATE} 08:30:00", candidates="pareto", geometries=False)
     tbtr = DetailedItineraries(
         network_with_footpaths, origins, destinations, router="tbtr", **kwargs
     )
@@ -181,7 +178,7 @@ def test_cost_matrix_routers_agree_across_cache_states(two_line_network):
     from cafein import TravelCostMatrix
     from test_frontier import two_line_fares
 
-    args = (two_line_network, ["A", "H"], None, DATE, DEPARTURE)
+    args = (two_line_network, ["A", "H"], None, DEPARTURE)
     kwargs = dict(fares=two_line_fares())
     raptor = TravelCostMatrix(*args, router="raptor", **kwargs)
     assert len(raptor) > 0
@@ -202,14 +199,14 @@ def test_windowed_cost_matrix_routers_agree(two_line_network):
     from cafein import TravelCostMatrix
     from test_frontier import two_line_fares
 
-    args = (two_line_network, ["A"], ["B"], DATE, DEPARTURE)
+    args = (two_line_network, ["A"], ["B"], DEPARTURE)
     for kwargs in (
-        dict(optimize="emissions", window=1800, geometries=True),
+        dict(optimize="emissions", departure_time_window=30, geometries=True),
         # The fastest journey takes exactly 1800 s: the boundary budget.
-        dict(optimize="emissions", window=1800, within=1800),
+        dict(optimize="emissions", departure_time_window=30, max_travel_time=30),
         dict(
             optimize="fare",
-            window=1800,
+            departure_time_window=30,
             fares=two_line_fares(),
             geometries=True,
         ),
@@ -219,11 +216,11 @@ def test_windowed_cost_matrix_routers_agree(two_line_network):
         assert TravelCostMatrix(*args, router="tbtr", **kwargs).equals(raptor)
         assert TravelCostMatrix(*args, **kwargs).equals(raptor)
     # A rejecting budget empties the cells on both engines alike.
-    kwargs = dict(optimize="emissions", window=1800, within=60)
+    kwargs = dict(optimize="emissions", departure_time_window=30, max_travel_time=1)
     assert TravelCostMatrix(*args, router="raptor", **kwargs).empty
     assert TravelCostMatrix(*args, router="tbtr", **kwargs).empty
     two_line_network.compute_tbtr_transfers(DATE)
-    kwargs = dict(optimize="emissions", window=1800)
+    kwargs = dict(optimize="emissions", departure_time_window=30)
     raptor = TravelCostMatrix(*args, router="raptor", **kwargs)
     assert TravelCostMatrix(*args, **kwargs).equals(raptor)
 
@@ -233,7 +230,7 @@ def test_cost_routers_agree_with_geometry_and_fares(network, helsinki_gtfs):
     from cafein import fares as fare_module
 
     hsl = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
-    args = (network, ["4810551", "1040602"], ["1250551"], "2022-02-22", "08:30:00")
+    args = (network, ["4810551", "1040602"], ["1250551"], "2022-02-22 08:30:00")
     kwargs = dict(geometries=True, fares=hsl)
     # The HSL ferries have no shipped factor; the warning is part of the
     # factor-resolution contract, not of this assertion.
@@ -257,7 +254,7 @@ def test_point_cost_matrices_accept_tbtr(network_with_footpaths, helsinki_gtfs):
     destinations = gpd.GeoDataFrame(
         {"id": ["destination"]}, geometry=[Point(24.9505, 60.1690)], crs="EPSG:4326"
     )
-    args = (network_with_footpaths, origins, destinations, DATE, "08:30:00")
+    args = (network_with_footpaths, origins, destinations, "2022-02-22 08:30:00")
     # The full payload — geometry and fare columns included.
     payload = dict(
         geometries=True,
@@ -270,7 +267,7 @@ def test_point_cost_matrices_accept_tbtr(network_with_footpaths, helsinki_gtfs):
     assert len(fastest_raptor) > 0
     assert fastest_raptor.geometry.notna().any()
     assert fastest_tbtr.equals(fastest_raptor)
-    kwargs = dict(optimize="emissions", window=1800, **payload)
+    kwargs = dict(optimize="emissions", departure_time_window=30, **payload)
     with pytest.warns(UserWarning, match="route_type"):
         least_raptor = TravelCostMatrix(*args, router="raptor", **kwargs)
     with pytest.warns(UserWarning, match="route_type"):
@@ -283,11 +280,11 @@ def test_arrow_cost_table_accepts_router(two_line_network):
     pytest.importorskip("pyarrow")
     from cafein import TravelCostMatrix, travel_cost_table
 
-    args = (two_line_network, ["A", "H"], None, DATE, DEPARTURE)
+    args = (two_line_network, ["A", "H"], None, DEPARTURE)
     table = travel_cost_table(*args, router="tbtr")
     frame = TravelCostMatrix(*args, router="tbtr")
     assert table.num_rows == len(frame) > 0
-    assert table.column("travel_time_s").to_pylist() == list(frame.travel_time_s)
+    assert table.column("travel_time").to_pylist() == list(frame.travel_time)
     assert table.column("transit_distance_m").to_pylist() == list(
         frame.transit_distance_m
     )
@@ -297,20 +294,20 @@ def test_arrow_cost_table_accepts_router(two_line_network):
 def test_a_saved_cached_set_serves_auto_cost_rows(two_line_network, tmp_path):
     from cafein import TransportNetwork, TravelCostMatrix
 
-    raptor = TravelCostMatrix(two_line_network, ["A"], None, DATE, DEPARTURE)
+    raptor = TravelCostMatrix(two_line_network, ["A"], None, DEPARTURE)
     two_line_network.compute_tbtr_transfers(DATE)
     path = tmp_path / "network.cafein"
     two_line_network.save(path)
     loaded = TransportNetwork.load(path)
     assert loaded.has_tbtr_transfers
-    assert TravelCostMatrix(loaded, ["A"], None, DATE, DEPARTURE).equals(raptor)
+    assert TravelCostMatrix(loaded, ["A"], None, DEPARTURE).equals(raptor)
 
 
 def test_max_slower_rides_the_trip_based_engine(two_line_network, capfd, monkeypatch):
     from cafein import journey_frontiers
 
-    args = (two_line_network, ["A"], ["B"], DATE, DEPARTURE, 1800)
-    kwargs = dict(max_slower=600)
+    args = (two_line_network, ["A"], ["B"], DEPARTURE, 30)
+    kwargs = dict(max_slower=10)
     raptor = journey_frontiers(*args, router="raptor", **kwargs)
     assert len(raptor) > 0
     # Explicit TBTR accepts the band and answers cell-for-cell.
@@ -334,13 +331,13 @@ def test_max_slower_rides_the_trip_based_engine(two_line_network, capfd, monkeyp
 def test_one_pair_max_slower_accepts_tbtr(two_line_network):
     from cafein import journey_frontier
 
-    args = (two_line_network, "A", "B", DATE, DEPARTURE, 1800)
+    args = (two_line_network, "A", "B", DEPARTURE, 30)
     raptor = frontier_frame(
-        two_line_network, candidates="pareto", router="raptor", max_slower=600
+        two_line_network, candidates="pareto", router="raptor", max_slower=10
     )
     assert len(raptor) > 0
     tbtr = frontier_frame(
-        two_line_network, candidates="pareto", router="tbtr", max_slower=600
+        two_line_network, candidates="pareto", router="tbtr", max_slower=10
     )
     assert tbtr.equals(raptor)
     # The capability contract is unchanged for the widened candidates.

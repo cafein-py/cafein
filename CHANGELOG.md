@@ -2,19 +2,56 @@
 
 ## Unreleased
 
+- **Human-facing parameters and outputs across the whole API**
+  (breaking). One name per concept, following r5py/r5r: `within`,
+  `max_duration`, and `StreetNetwork.travel_time`'s `max_time` are now
+  `max_travel_time`; `window` is
+  `departure_time_window`; `departure_step` is `departure_time_step`;
+  `max_snap_distance` is `snap_distance`; `max_seconds`
+  (`compute_carriage_transfers`/`compute_mode_transfers`) is
+  `max_transfer_time`; `slack_seconds` is `tolerance_minutes`;
+  stop-level methods take `origins`/`destinations`
+  (`origin`/`destination`). `date` + `departure` merge into one
+  `departure` taking a `datetime.datetime` or an ISO string
+  (`"2022-02-22 08:30"`); street networks also accept a bare
+  `"HH:MM"` or `datetime.time`. `max_transfers` (default 7) is
+  `max_rides` (default 8) and counts boarded vehicles.
+  `fares.zone_fare_structure` takes `gtfs_paths` — one path or a
+  sequence, combining the fare products across feeds. Every duration
+  parameter is minutes (floats allowed) or a `datetime.timedelta`;
+  clock-time parameters (`min_departure`/`max_departure`) take
+  `"HH:MM"` strings or `datetime.time`. Result frames report
+  `travel_time` (formerly `travel_time_s`) in whole minutes rounded
+  to the nearest by default; every computer takes
+  `output_time_units="seconds"` for the exact engine values, and
+  windowed percentile columns are `travel_time_p<p>` in the same
+  units. `Accessibility` time budgets are minutes and the frame's
+  `budget` column echoes the values as passed. The zone-fare
+  120-minute `max_travel_time` default now also applies to
+  `fare_frontier` and the `Accessibility` money axis, matching the
+  cost matrices. `cafein.units.to_minutes` keeps converting the
+  remaining `*_s` clock columns (`departure_s`/`arrival_s`).
+  Journey dicts (`route_between_stops` and friends) still report
+  `*_s` fields in seconds, and the wide
+  `TransportNetwork.travel_time_matrix` array stays exact seconds.
+
 - **Exact zone fares in the cost matrices and for point queries**
   (#246): `TravelCostMatrix(optimize="fare")` on a zone fare structure
   now refines the fare-blind fold to the exact zone-ticket engine —
   the fold's fares warm-start per-slot money bounds and an arrival
   deadline, a fold fare at the tariff's cheapest product settles
   without a search, fold-less cells climb a doubling ceiling staircase
-  capped at `(max_transfers + 1) ×` the dearest product, and each
+  capped at `max_rides ×` the dearest product, and each
   winning chain is reconstructed into the standard cost columns
   (distances, emissions, optional geometry). Stop and point origins
   and destinations, `router="tbtr"` rejected. `fare_frontier` gains
   point origins and destinations over the street network, with the
   direct walk as the zero-fare candidate. On the measured #246 pairs
-  the public matrix now prices 3.30 € where it reported 5.00 €.
+  the public matrix now prices 3.30 € where it reported 5.00 €. On
+  zone structures ``max_travel_time`` defaults to 120 minutes — an
+  exact fare search with no time limit
+  must rule out cheaper journeys across the whole service day; pass
+  ``max_travel_time`` to change the limit.
 
 - **Exact zone fares in `fare_frontier`** (#246): zone fare structures
   now route through a zone-ticket state machine whose labels carry the

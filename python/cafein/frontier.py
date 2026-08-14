@@ -18,17 +18,18 @@ on every annotated criterion. The candidate set is selected by
   also holds the cleaner-but-slower-with-more-rides journeys the time
   candidates provably miss; ``exhaustive_frontier`` is its exact,
   brute-force reference.
-- ``candidates="relaxed"``: the ``"pareto"`` set widened by a time slack
-  in the per-stop dominance — a journey a cleaner or simpler one would
-  dominate is kept unless that dominator is more than ``slack_seconds``
-  earlier. Taken over a departure ``window`` this matches r5py/R5's
-  detailed-itinerary alternatives — a McRAPTOR profile across the window
-  under a per-stop suboptimal slack, with no route penalty, so
-  trunk-sharing options survive — where ``window`` is r5py's
-  ``departure_time_window`` and ``slack_seconds`` its ``suboptimalMinutes``
-  (whose 5-minute default is ``slack_seconds``'s 300 s). Because the slack
-  acts per stop and departures spread across the window, kept journeys can
-  arrive more than ``slack_seconds`` after the fastest.
+- ``candidates="relaxed"``: the ``"pareto"`` set widened by a time
+  tolerance in the per-stop dominance — a journey a cleaner or simpler
+  one would dominate is kept unless that dominator is more than
+  ``tolerance_minutes`` earlier. Taken over a
+  ``departure_time_window`` this matches r5py/R5's detailed-itinerary
+  alternatives — a McRAPTOR profile across the window under a per-stop
+  suboptimal tolerance, with no route penalty, so trunk-sharing
+  options survive — ``tolerance_minutes`` being r5py's
+  ``suboptimalMinutes`` (both default to 5 minutes). Because the
+  tolerance acts per stop and departures spread across the window,
+  kept journeys can arrive more than the tolerance after the
+  fastest.
 - ``candidates="diverse"``: distinct alternatives found by iterative
   route penalization. By default (``penalty="ban"``) each round bans a
   chosen corridor's routes, so the options ride route-disjoint line sets;
@@ -58,18 +59,17 @@ def journey_frontier(
     network,
     origin,
     destination,
-    date,
     departure,
-    window,
+    departure_time_window,
     *,
-    max_transfers=7,
+    max_rides=8,
     factors=None,
     components=None,
     fares=None,
     candidates="time",
     bucket=25.0,
     router="auto",
-    slack_seconds=None,
+    tolerance_minutes=None,
     max_options=None,
     diversity="time",
     penalty="ban",
@@ -79,8 +79,9 @@ def journey_frontier(
     exclude_stops=(),
     walking_speed_kmph=None,
     max_walking_time=None,
-    max_snap_distance=None,
+    snap_distance=None,
     geometries=False,
+    output_time_units="minutes",
 ):
     """The travel time × emissions (× fare) trade-off between two places.
 
@@ -95,7 +96,7 @@ def journey_frontier(
     also finds the cleaner-but-slower journeys the time-optimal set
     misses; emissions are compared at ``bucket`` grams during the
     search and re-annotated exactly afterwards. ``candidates="relaxed"``
-    widens that set by a ``slack_seconds`` slack in the per-stop
+    widens that set by a ``tolerance_minutes`` band in the per-stop
     dominance, keeping suboptimal journeys a nearer one would prune
     (capped by ``max_options``), and ``candidates="diverse"`` returns
     ``max_options`` distinct-corridor alternatives by iterative route
@@ -114,15 +115,15 @@ def journey_frontier(
         Stop ids, or ``(lat, lon)`` coordinates in EPSG:4326 — both of
         the same kind. Coordinate queries route door-to-door and include
         the walking-only journey.
-    date : str
-        Service date as ``YYYY-MM-DD``.
-    departure : str
-        Start of the departure window as ``HH:MM:SS``.
-    window : int
-        Departure window in seconds; candidates leave within
-        ``[departure, departure + window)``.
-    max_transfers : int (optional, default: 7)
-        Maximum number of transfers between rides.
+    departure : datetime.datetime or str
+        Start of the departure window — a datetime, or an ISO string
+        like ``"2022-02-22 08:30"``; the service date is its date part.
+    departure_time_window : float or datetime.timedelta
+        Departure window in minutes; candidates leave within the
+        window.
+    max_rides : int (optional, default: 8)
+        Maximum number of boarded vehicles per journey (rides, not
+        transfers: 8 rides allow 7 transfers).
     factors, components : optional
         Emission-factor rows layered over the shipped defaults and the
         LCA components to include, as in ``emissions.annotate``.
@@ -136,7 +137,7 @@ def journey_frontier(
         time-optimal journeys, ``"pareto"`` for the McRAPTOR journeys
         Pareto-optimal in (departure, arrival, emissions),
         ``"relaxed"`` for the ``"pareto"`` set widened by a
-        ``slack_seconds`` slack in the per-stop dominance — the "a bit
+        ``tolerance_minutes`` band in the per-stop dominance — the "a bit
         slower but a real alternative" options that strict Pareto drops —
         or ``"diverse"`` for ``max_options``
         distinct-corridor alternatives, found by iterative route
@@ -165,24 +166,25 @@ def journey_frontier(
         ``"diverse"`` require ``"raptor"`` (``"auto"`` resolves to it —
         the cached set is reduced under strict unpenalized dominance,
         which slack and route penalties would invalidate).
-    slack_seconds : float (optional, default: None)
-        The time-slack band in seconds. For ``candidates="relaxed"`` a
-        journey is kept even when a cleaner or simpler one dominates it,
-        as long as that dominator is not more than ``slack_seconds``
+    tolerance_minutes : float or datetime.timedelta (optional, default: None)
+        The time-tolerance band in minutes. For ``candidates="relaxed"``
+        a journey is kept even when a cleaner or simpler one dominates
+        it, as long as that dominator is not more than this much
         earlier; ``0`` reproduces the strict ``"pareto"`` frontier. For
         ``candidates="diverse"`` a positive value widens each penalization
         round's pool to that relaxed frontier (relaxed × diverse), so a
         round can pick a slightly suboptimal but more distinct corridor.
-        ``None`` takes the per-family default — 300 s for ``"relaxed"``
-        (r5py's 5-minute ``suboptimalMinutes``), ``0`` (strict pareto per
-        round) for ``"diverse"``. Unused for ``"time"`` and ``"pareto"``.
+        ``None`` takes the per-family default — 5 minutes for
+        ``"relaxed"`` (r5py's ``suboptimalMinutes``), ``0`` (strict
+        pareto per round) for ``"diverse"``. Unused for ``"time"`` and
+        ``"pareto"``.
     max_options : int (optional, default: None)
         For ``candidates="relaxed"``, a cap on the suboptimal
         alternatives kept: the strict frontier is always returned in
         full and the suboptimal journeys nearest to it (smallest
         time-gap) fill the rest up to ``max_options``, so the result can
         exceed it when the frontier is larger; ``None`` returns every
-        journey within the slack. For ``candidates="diverse"``, the
+        journey within the tolerance. For ``candidates="diverse"``, the
         number of distinct-corridor alternatives to return (``None``
         defaults to 3); the search may return fewer when disjoint
         corridors run out. Unused for ``"time"`` and ``"pareto"``.
@@ -210,10 +212,10 @@ def journey_frontier(
         the McRAPTOR path ("auto" resolves to it); excluded stops
         refuse boarding, alighting, transfers, and access/egress while
         vehicles still ride through them.
-    max_slower : float (optional, default: None)
+    max_slower : float or datetime.timedelta (optional, default: None)
         Restrict the ``"pareto"`` frontier (on either engine) to
         journeys near the fast end: per departure pass, every returned
-        journey arrives within ``max_slower`` seconds of the pass's
+        journey arrives within ``max_slower`` minutes of the pass's
         fastest resolved-factor arrival, and that fastest journey is
         always among the rows (the walking-only journey is dropped when
         it falls outside the band of the fastest transit journey).
@@ -222,7 +224,7 @@ def journey_frontier(
         whose final arrival is inside the band may still be excluded
         when its prefix strays outside it. ``None`` (the default) keeps
         today's exact behavior.
-    walking_speed_kmph, max_walking_time, max_snap_distance : float
+    walking_speed_kmph, max_walking_time, snap_distance : float
         Street-search options for the walking access/egress, as in
         ``route_between_coordinates``. For stop origins/destinations they
         apply only when a whole-day shortcut set routes them door-to-door
@@ -234,13 +236,30 @@ def journey_frontier(
     -------
     pandas.DataFrame
         One row per candidate journey, sorted by travel time:
-        ``departure`` and ``arrival`` (seconds past the service day's
-        start), ``travel_time`` (seconds), ``rides``, ``emissions``
+        ``departure_s`` and ``arrival_s`` (seconds past the service
+        day's start), ``travel_time`` (in ``output_time_units`` —
+        whole minutes by default), ``rides``, ``emissions``
         (grams CO₂e; NaN when a ridden trip has no matching factor),
         ``frontier`` (whether the row is Pareto-optimal — rows with NaN
         on any criterion never are), and ``journey``, the annotated
         journey dict as returned by the routing calls.
     """
+    from cafein._units import (
+        departure_parts,
+        duration_seconds,
+        humanize_frame_time,
+        validated_output_time_units,
+    )
+
+    output_time_units = validated_output_time_units(output_time_units)
+    date, departure = departure_parts(departure)
+    window = duration_seconds("departure_time_window", departure_time_window)
+    if max_rides < 1:
+        raise ValueError("max_rides must be at least 1")
+    max_transfers = max_rides - 1
+    slack_seconds = duration_seconds("tolerance_minutes", tolerance_minutes)
+    max_walking_time = duration_seconds("max_walking_time", max_walking_time)
+    max_snap_distance = snap_distance
     components = component_selection(components)
     if candidates not in ("time", "pareto", "relaxed", "diverse"):
         raise ValueError("candidates must be 'time', 'pareto', 'relaxed', or 'diverse'")
@@ -315,7 +334,7 @@ def journey_frontier(
                 exclude_stops=exclusions[2],
             )
         else:
-            journeys = network.route_between_stops(
+            journeys = network._route_between_stops(
                 origin,
                 destination,
                 date,
@@ -354,7 +373,7 @@ def journey_frontier(
             router=router,
         )
     else:
-        journeys = network.route_between_coordinates(
+        journeys = network._route_between_coordinates(
             tuple(origin),
             tuple(destination),
             date,
@@ -374,7 +393,7 @@ def journey_frontier(
         from cafein.fares import annotate_fares
 
         annotate_fares(journeys, fares)
-    return _frontier_frame(journeys, fares)
+    return humanize_frame_time(_frontier_frame(journeys, fares), output_time_units)
 
 
 def _frontier_frame(journeys, fares):
@@ -418,11 +437,10 @@ def journey_frontiers(
     network,
     origins,
     destinations,
-    date,
     departure,
-    window,
+    departure_time_window,
     *,
-    max_transfers=7,
+    max_rides=8,
     factors=None,
     components=None,
     fares=None,
@@ -434,8 +452,9 @@ def journey_frontiers(
     exclude_stops=(),
     walking_speed_kmph=None,
     max_walking_time=None,
-    max_snap_distance=None,
+    snap_distance=None,
     geometries=False,
+    output_time_units="minutes",
 ):
     """Batched ``journey_frontier``: every (origin, destination) cell of two
     point sets, from one window profile per origin.
@@ -458,10 +477,10 @@ def journey_frontiers(
         queries route door-to-door and include the walking-only journey;
         stop-id queries board at the origin stop and route over the
         footpath closure.
-    date, departure, window
-        The service date, window start, and window length, as in
+    departure, departure_time_window
+        The window's start and its length in minutes, as in
         ``journey_frontier``.
-    max_transfers, factors, components, fares, bucket, router, max_slower
+    max_rides, factors, components, fares, bucket, router, max_slower
         As in ``journey_frontier`` (``bucket`` is the pareto search's
         emissions bucket width in grams; ``router="tbtr"`` answers over
         the McTBTR engine — one multicriteria transfer set built per
@@ -471,7 +490,7 @@ def journey_frontiers(
         rows, on either engine).
     exclude_routes, exclude_trips, exclude_stops
         As in ``journey_frontier``.
-    walking_speed_kmph, max_walking_time, max_snap_distance : float
+    walking_speed_kmph, max_walking_time, snap_distance : float
         Street-search options for the coordinate queries, as in
         ``route_between_coordinates``.
     geometries : bool (optional, default: False)
@@ -485,6 +504,21 @@ def journey_frontiers(
         rows within a cell the frame's travel-time sort; a cell with no
         feasible journey contributes no rows.
     """
+    from cafein._units import (
+        departure_parts,
+        duration_seconds,
+        humanize_frame_time,
+        validated_output_time_units,
+    )
+
+    output_time_units = validated_output_time_units(output_time_units)
+    date, departure = departure_parts(departure)
+    window = duration_seconds("departure_time_window", departure_time_window)
+    if max_rides < 1:
+        raise ValueError("max_rides must be at least 1")
+    max_transfers = max_rides - 1
+    max_walking_time = duration_seconds("max_walking_time", max_walking_time)
+    max_snap_distance = snap_distance
     components = component_selection(components)
     stops = _frontier_ids(origins, "origins"), _frontier_ids(
         destinations, "destinations"
@@ -557,23 +591,24 @@ def journey_frontiers(
             frame.insert(1, "to_id", to_id)
             frames.append(frame)
     if frames:
-        return pd.concat(frames, ignore_index=True)
+        return humanize_frame_time(
+            pd.concat(frames, ignore_index=True), output_time_units
+        )
     columns = ["from_id", "to_id", *(c for c in _COLUMNS if c != "journey")]
     if fares is not None:
         columns.append("fare")
     columns.append("journey")
-    return pd.DataFrame(columns=columns)
+    return humanize_frame_time(pd.DataFrame(columns=columns), output_time_units)
 
 
 def frontier_table(
     network,
     origins,
     destinations,
-    date,
     departure,
-    window,
+    departure_time_window,
     *,
-    max_transfers=7,
+    max_rides=8,
     factors=None,
     components=None,
     bucket=25.0,
@@ -584,7 +619,8 @@ def frontier_table(
     exclude_stops=(),
     walking_speed_kmph=None,
     max_walking_time=None,
-    max_snap_distance=None,
+    snap_distance=None,
+    output_time_units="minutes",
 ):
     """``journey_frontiers`` as one flat frame, without journey payloads.
 
@@ -598,13 +634,13 @@ def frontier_table(
 
     Parameters
     ----------
-    network, origins, destinations, date, departure, window
+    network, origins, destinations, departure, departure_time_window
         As in ``journey_frontiers``.
-    max_transfers, factors, components, bucket, router, max_slower
+    max_rides, factors, components, bucket, router, max_slower
         As in ``journey_frontiers``.
     exclude_routes, exclude_trips, exclude_stops
         As in ``journey_frontiers``.
-    walking_speed_kmph, max_walking_time, max_snap_distance : float
+    walking_speed_kmph, max_walking_time, snap_distance : float
         Street-search options for the coordinate queries, as in
         ``route_between_coordinates``.
 
@@ -615,6 +651,21 @@ def frontier_table(
         ``travel_time``, ``rides``, ``emissions`` (NaN where a transit
         leg's factor is unresolved), and ``frontier``.
     """
+    from cafein._units import (
+        departure_parts,
+        duration_seconds,
+        humanize_frame_time,
+        validated_output_time_units,
+    )
+
+    output_time_units = validated_output_time_units(output_time_units)
+    date, departure = departure_parts(departure)
+    window = duration_seconds("departure_time_window", departure_time_window)
+    if max_rides < 1:
+        raise ValueError("max_rides must be at least 1")
+    max_transfers = max_rides - 1
+    max_walking_time = duration_seconds("max_walking_time", max_walking_time)
+    max_snap_distance = snap_distance
     components = component_selection(components)
     import numpy as np
 
@@ -672,17 +723,20 @@ def frontier_table(
         _warn_unsnapped(table, from_ids, to_ids)
     from_id = np.asarray(from_ids, dtype=object)
     to_id = np.asarray(to_ids, dtype=object)
-    return pd.DataFrame(
-        {
-            "from_id": from_id[table["from_index"]],
-            "to_id": to_id[table["to_index"]],
-            "departure_s": table["departure_s"].astype("int64"),
-            "arrival_s": table["arrival_s"].astype("int64"),
-            "travel_time_s": table["travel_time_s"].astype("int64"),
-            "rides": table["rides"].astype("int64"),
-            "emissions": table["emissions"],
-            "frontier": table["frontier"],
-        }
+    return humanize_frame_time(
+        pd.DataFrame(
+            {
+                "from_id": from_id[table["from_index"]],
+                "to_id": to_id[table["to_index"]],
+                "departure_s": table["departure_s"].astype("int64"),
+                "arrival_s": table["arrival_s"].astype("int64"),
+                "travel_time_s": table["travel_time_s"].astype("int64"),
+                "rides": table["rides"].astype("int64"),
+                "emissions": table["emissions"],
+                "frontier": table["frontier"],
+            }
+        ),
+        output_time_units,
     )
 
 
@@ -701,10 +755,9 @@ def _validated_max_slower(max_slower, candidates, router):
         return None
     if candidates != "pareto":
         raise ValueError("max_slower requires candidates='pareto'")
-    band = float(max_slower)
-    if not math.isfinite(band) or band < 0:
-        raise ValueError("max_slower must be a non-negative number of seconds")
-    return int(round(band))
+    from cafein._units import duration_seconds
+
+    return duration_seconds("max_slower", max_slower)
 
 
 def _frontier_ids(values, role):
@@ -991,12 +1044,12 @@ def exhaustive_frontier(
     network,
     origin,
     destination,
-    date,
     departure,
     *,
-    max_transfers=7,
+    max_rides=8,
     factors=None,
     components=None,
+    output_time_units="minutes",
 ):
     """The exact time × emissions Pareto set between two stops.
 
@@ -1019,12 +1072,12 @@ def exhaustive_frontier(
         The network to route on; requires trip distances (the default).
     origin, destination : str
         Stop ids.
-    date : str
-        Service date as ``YYYY-MM-DD``.
-    departure : str
-        Departure time as ``HH:MM:SS``.
-    max_transfers : int (optional, default: 7)
-        Maximum number of transfers between rides.
+    departure : datetime.datetime or str
+        The departure — a datetime, or an ISO string like
+        ``"2022-02-22 08:30"``; the service date is its date part.
+    max_rides : int (optional, default: 8)
+        Maximum number of boarded vehicles per journey (rides, not
+        transfers: 8 rides allow 7 transfers).
     factors, components : optional
         Emission-factor rows layered over the shipped defaults and the
         LCA components to include, as in ``emissions.annotate``.
@@ -1033,10 +1086,22 @@ def exhaustive_frontier(
     -------
     pandas.DataFrame
         One row per true frontier point, sorted by arrival:
-        ``arrival`` and ``travel_time`` (seconds), ``rides`` (the
-        fewest transit legs achieving the point), and ``emissions``
-        (grams CO₂e).
+        ``arrival_s`` (clock seconds past the service day's start),
+        ``travel_time`` (in ``output_time_units`` — whole minutes by
+        default), ``rides`` (the fewest transit legs achieving the
+        point), and ``emissions`` (grams CO₂e).
     """
+    from cafein._units import (
+        departure_parts,
+        humanize_frame_time,
+        validated_output_time_units,
+    )
+
+    output_time_units = validated_output_time_units(output_time_units)
+    date, departure = departure_parts(departure)
+    if max_rides < 1:
+        raise ValueError("max_rides must be at least 1")
+    max_transfers = max_rides - 1
     components = component_selection(components)
     trip_factors = emissions.trip_factors(network, factors, components)
     points = network._core.pareto_oracle(
@@ -1046,10 +1111,13 @@ def exhaustive_frontier(
     start = int(hours) * 3600 + int(minutes) * 60 + int(seconds)
     frame = pd.DataFrame(points, columns=["arrival_s", "emissions", "rides"])
     frame["travel_time_s"] = frame["arrival_s"] - start
-    return frame[["arrival_s", "travel_time_s", "rides", "emissions"]]
+    return humanize_frame_time(
+        frame[["arrival_s", "travel_time_s", "rides", "emissions"]],
+        output_time_units,
+    )
 
 
-def least_emissions(frontier, within=None):
+def least_emissions(frontier, max_travel_time=None):
     """The lowest-emission journey of a frontier, as its row.
 
     Selects among the candidates with resolved emissions — NaN never
@@ -1062,9 +1130,10 @@ def least_emissions(frontier, within=None):
     ----------
     frontier : pandas.DataFrame
         A ``journey_frontier`` result.
-    within : float (optional)
-        A travel-time budget in seconds; only journeys at most this long
-        qualify.
+    max_travel_time : float or datetime.timedelta (optional)
+        A travel-time budget in minutes; only journeys whose exact
+        duration (``arrival_s - departure_s``) is at most this long
+        qualify, whatever the frame's ``output_time_units``.
 
     Returns
     -------
@@ -1074,14 +1143,18 @@ def least_emissions(frontier, within=None):
         qualifies.
     """
     rows = frontier[frontier["emissions"].notna()]
-    if within is not None:
-        rows = rows[rows["travel_time_s"] <= within]
+    if max_travel_time is not None:
+        from cafein._units import duration_seconds
+
+        budget = duration_seconds("max_travel_time", max_travel_time)
+        rows = rows[(rows["arrival_s"] - rows["departure_s"]) <= budget]
     if rows.empty:
         return None
-    return rows.sort_values(["emissions", "travel_time_s"]).iloc[0]
+    rows = rows.assign(_exact_s=rows["arrival_s"] - rows["departure_s"])
+    return rows.sort_values(["emissions", "_exact_s"]).iloc[0].drop("_exact_s")
 
 
-def least_fare(frontier, within=None):
+def least_fare(frontier, max_travel_time=None):
     """The cheapest journey of a frontier, as its row.
 
     Selects among the priced candidates — an unpriceable (NaN) fare
@@ -1094,9 +1167,10 @@ def least_fare(frontier, within=None):
     ----------
     frontier : pandas.DataFrame
         A ``journey_frontier`` result priced with ``fares=``.
-    within : float (optional)
-        A travel-time budget in seconds; only journeys at most this
-        long qualify.
+    max_travel_time : float or datetime.timedelta (optional)
+        A travel-time budget in minutes; only journeys whose exact
+        duration (``arrival_s - departure_s``) is at most this long
+        qualify, whatever the frame's ``output_time_units``.
 
     Returns
     -------
@@ -1110,11 +1184,15 @@ def least_fare(frontier, within=None):
             "the frontier carries no fares; pass fares= to journey_frontier"
         )
     rows = frontier[frontier["fare"].notna()]
-    if within is not None:
-        rows = rows[rows["travel_time_s"] <= within]
+    if max_travel_time is not None:
+        from cafein._units import duration_seconds
+
+        budget = duration_seconds("max_travel_time", max_travel_time)
+        rows = rows[(rows["arrival_s"] - rows["departure_s"]) <= budget]
     if rows.empty:
         return None
-    return rows.sort_values(["fare", "travel_time_s", "emissions"]).iloc[0]
+    rows = rows.assign(_exact_s=rows["arrival_s"] - rows["departure_s"])
+    return rows.sort_values(["fare", "_exact_s", "emissions"]).iloc[0].drop("_exact_s")
 
 
 def _frontier_mask(times, grams, fares=None):
@@ -1148,19 +1226,19 @@ def fare_frontier(
     network,
     origins,
     destinations,
-    date,
     departure,
-    window,
+    departure_time_window,
     fares,
     *,
     cutoffs,
-    max_transfers=7,
-    max_duration=None,
+    max_rides=8,
+    max_travel_time=None,
     exact=True,
-    departure_step=60,
+    departure_time_step=1,
     walking_speed_kmph=None,
     max_walking_time=None,
-    max_snap_distance=None,
+    snap_distance=None,
+    output_time_units="minutes",
 ):
     """The cutoff-pruned (time, fare) frontier over a departure window.
 
@@ -1188,9 +1266,9 @@ def fare_frontier(
         ``id`` column routing door-to-door over the street network —
         both the same kind. Either way the direct walk joins each
         cell as the zero-fare candidate.
-    date, departure, window
-        The service date, the window's start (``HH:MM:SS``), and its
-        length in seconds.
+    departure, departure_time_window
+        The window's start (a datetime or an ISO string; the service
+        date is its date part) and its length in minutes.
     fares : FareStructure or ZoneFareStructure
         The fare model (``cafein.fares``). Rule-based structures ride
         the rule-based engine with both disciplines; zone structures
@@ -1200,22 +1278,23 @@ def fare_frontier(
     cutoffs : list of float
         Required: the ascending monetary cutoffs to prune and report
         at.
-    max_transfers : int (optional, default: 7)
-        Maximum transfers between rides.
-    max_duration : int (optional)
-        A bound on a journey's duration in seconds (r5r caps at 90
-        minutes); ``None`` leaves it unbounded.
+    max_rides : int (optional, default: 8)
+        Maximum number of boarded vehicles per journey.
+    max_travel_time : float or datetime.timedelta (optional)
+        A bound on a journey's duration in minutes (r5r caps at 90
+        minutes); ``None`` leaves it unbounded — except on a zone fare
+        structure, which defaults to 120 minutes.
     exact : bool (optional, default: True)
         ``True`` keeps every journey the tariff's fine structure can
         distinguish — the exhaustively verified mode; runtimes grow
-        steeply with ``max_duration``. ``False`` runs the r5r-style
+        steeply with ``max_travel_time``. ``False`` runs the r5r-style
         discipline (earliest arrival per fare class): exact for
         well-behaved tariffs — every reported fare is real — but a
         cheaper journey can be missed where a scarce discount budget
         interacts with transfer windows; large analyses want this
         mode, as r5r's own frontier does.
-    departure_step : int (optional, default: 60)
-        Seconds between the window's sampled departures — R5's
+    departure_time_step : float or datetime.timedelta (optional, default: 1)
+        Minutes between the window's sampled departures — R5's
         per-minute rasterisation. Every reported journey is real and
         waits from its sampled departure, so travel times are
         measured against the grid. ``None`` searches every exact
@@ -1225,19 +1304,37 @@ def fare_frontier(
         by waiting past the last in-window event belongs to the grid,
         so neither mode's travel times bound the other's at a
         window's edge.
-    walking_speed_kmph, max_walking_time, max_snap_distance : float
+    walking_speed_kmph, max_walking_time, snap_distance : float
         Street-search options for the point form, as in
-        ``route_between_coordinates``; rejected beside stop ids. The
-        walking-time bound is clamped to ``max_duration`` — a longer
-        walk cannot join a journey that fits the cap.
+        ``route_between_coordinates`` (walking time in minutes);
+        rejected beside stop ids. The walking-time bound is clamped to
+        ``max_travel_time`` — a longer walk cannot join a journey that
+        fits the cap.
 
     Returns
     -------
     pandas.DataFrame
-        Columns ``from_id``, ``to_id``, ``cutoff``, ``travel_time_s``,
-        ``fare``, and ``rides``; a (pair, cutoff) whose cutoff no
-        journey fits is absent.
+        Columns ``from_id``, ``to_id``, ``cutoff``, ``travel_time``
+        (in ``output_time_units``), ``fare``, and ``rides``; a
+        (pair, cutoff) whose cutoff no journey fits is absent.
     """
+    from cafein._units import (
+        departure_parts,
+        duration_seconds,
+        humanize_frame_time,
+        validated_output_time_units,
+    )
+
+    output_time_units = validated_output_time_units(output_time_units)
+    date, departure = departure_parts(departure)
+    window = duration_seconds("departure_time_window", departure_time_window)
+    if max_rides < 1:
+        raise ValueError("max_rides must be at least 1")
+    max_transfers = max_rides - 1
+    max_duration = duration_seconds("max_travel_time", max_travel_time)
+    departure_step = duration_seconds("departure_time_step", departure_time_step)
+    max_walking_time = duration_seconds("max_walking_time", max_walking_time)
+    max_snap_distance = snap_distance
     import pandas as pd
 
     from cafein import fares as fares_module
@@ -1246,13 +1343,18 @@ def fare_frontier(
         step = int(departure_step)
         if step <= 0 or step != departure_step:
             raise ValueError(
-                "departure_step must be a positive whole number of "
-                "seconds, or None for every departure event"
+                "departure_time_step must be a positive duration, or "
+                "None for every departure event"
             )
         departure_step = step
     zone_structure = isinstance(fares, fares_module.ZoneFareStructure)
     if not zone_structure and not isinstance(fares, fares_module.FareStructure):
         raise ValueError("fares must be a cafein.fares.FareStructure")
+    # A zone structure's exact fare search needs a time limit to stay
+    # fast; 120 minutes of total travel time is the default cap, as on
+    # the cost matrices.
+    if zone_structure and max_duration is None:
+        max_duration = 7200
     if zone_structure and exact is not True:
         raise ValueError(
             "the zone fare frontier is always exact; exact=False is the "
@@ -1369,4 +1471,4 @@ def fare_frontier(
             "rides": data["rides"],
         }
     )
-    return frame
+    return humanize_frame_time(frame, output_time_units)

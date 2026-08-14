@@ -197,11 +197,15 @@ def test_resolve_merges_partially_and_rejects_garbage():
 
 
 def test_car_matrix_cells_match_single_routes(car_network, origins, destinations):
-    matrix = TravelTimeMatrix(car_network, origins, destinations, transport_mode="car")
+    matrix = TravelTimeMatrix(
+        car_network,
+        origins,
+        destinations,
+        transport_mode="car",
+        output_time_units="seconds",
+    )
     assert len(matrix) > 0
-    by_pair = {
-        (row.from_id, row.to_id): row.travel_time_s for row in matrix.itertuples()
-    }
+    by_pair = {(row.from_id, row.to_id): row.travel_time for row in matrix.itertuples()}
     for _, origin in origins.iterrows():
         for _, destination in destinations.iterrows():
             single = car_network.travel_time(
@@ -226,8 +230,8 @@ def test_car_matrices_take_the_delay_options(car_network, origins, destinations)
         free, delayed, on=["from_id", "to_id"], suffixes=("_free", "_rush")
     )
     assert len(merged) > 0
-    assert (merged.travel_time_s_rush >= merged.travel_time_s_free).all()
-    assert (merged.travel_time_s_rush > merged.travel_time_s_free).any()
+    assert (merged.travel_time_rush >= merged.travel_time_free).all()
+    assert (merged.travel_time_rush > merged.travel_time_free).any()
     with pytest.raises(ValueError, match="intersection_delays=True"):
         TravelTimeMatrix(
             car_network,
@@ -337,7 +341,7 @@ def test_car_geometries_do_not_change_the_numbers(car_network, origins, destinat
     columns = [
         "from_id",
         "to_id",
-        "travel_time_s",
+        "travel_time",
         "distance_m",
         "network_distance_m",
         "connector_distance_m",
@@ -619,7 +623,12 @@ def test_parking_metres_join_distance_and_emissions(car_network, origins, destin
         ]
     )
     plain = TravelCostMatrix(
-        car_network, origins, destinations, transport_mode="car", factors=factors
+        car_network,
+        origins,
+        destinations,
+        transport_mode="car",
+        factors=factors,
+        output_time_units="seconds",
     )
     parked = TravelCostMatrix(
         car_network,
@@ -628,20 +637,26 @@ def test_parking_metres_join_distance_and_emissions(car_network, origins, destin
         transport_mode="car",
         factors=factors,
         parking=(60, 400.0),
+        output_time_units="seconds",
     )
     merged = pd.merge(plain, parked, on=["from_id", "to_id"], suffixes=("", "_p"))
     assert len(merged) == len(plain) == len(parked)
-    assert (merged.travel_time_s_p == merged.travel_time_s + 60).all()
+    assert (merged.travel_time_p == merged.travel_time + 60).all()
     assert np.allclose(merged.network_distance_m_p, merged.network_distance_m + 400.0)
     assert np.allclose(merged.distance_m_p, merged.distance_m + 400.0)
     # The extra metres are driven: they join the emissions basis.
     assert np.allclose(merged.emissions_p, merged.network_distance_m_p / 1000.0 * 162.0)
     # The time matrix gains the same seconds per cell.
     times = TravelTimeMatrix(
-        car_network, origins, destinations, transport_mode="car", parking=(60, 400.0)
+        car_network,
+        origins,
+        destinations,
+        transport_mode="car",
+        parking=(60, 400.0),
+        output_time_units="seconds",
     )
     with_base = pd.merge(plain, times, on=["from_id", "to_id"], suffixes=("", "_t"))
-    assert (with_base.travel_time_s_t == with_base.travel_time_s + 60).all()
+    assert (with_base.travel_time_t == with_base.travel_time + 60).all()
     # Itineraries shift arrivals and keep the geometry free of the search.
     legs = DetailedItineraries(
         car_network,
@@ -650,6 +665,7 @@ def test_parking_metres_join_distance_and_emissions(car_network, origins, destin
         departure="08:00:00",
         transport_mode="car",
         parking=(60, 400.0),
+        output_time_units="seconds",
     )
     bare = DetailedItineraries(
         car_network,
@@ -657,8 +673,9 @@ def test_parking_metres_join_distance_and_emissions(car_network, origins, destin
         destinations.head(1),
         departure="08:00:00",
         transport_mode="car",
+        output_time_units="seconds",
     )
-    assert (legs.travel_time_s.to_numpy() == bare.travel_time_s.to_numpy() + 60).all()
+    assert (legs.travel_time.to_numpy() == bare.travel_time.to_numpy() + 60).all()
     assert (legs.arrival_s.to_numpy() == bare.arrival_s.to_numpy() + 60).all()
     assert legs.geometry.iloc[0].equals(bare.geometry.iloc[0])
 
@@ -668,16 +685,14 @@ def test_transit_matrices_reject_the_delay_options(network):
         TravelTimeMatrix(
             network,
             ["1030423"],
-            date="2022-02-22",
-            departure="08:30:00",
+            departure="2022-02-22 08:30:00",
             intersection_delays=True,
         )
     with pytest.raises(ValueError, match="StreetNetwork car matrix"):
         TravelTimeMatrix(
             network,
             ["1030423"],
-            date="2022-02-22",
-            departure="08:30:00",
+            departure="2022-02-22 08:30:00",
             parking=True,
         )
 

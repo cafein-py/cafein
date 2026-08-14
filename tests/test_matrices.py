@@ -26,8 +26,11 @@ def point_frame(network, named_stops):
 def cost_matrix(network, **kwargs):
     # The HSL feed's ferries have no shipped factor; the warning is part
     # of the resolution contract and irrelevant to most assertions.
+    departure = kwargs.pop("departure", "08:30:00")
+    if len(departure) <= len("HH:MM:SS"):
+        departure = f"2022-02-22 {departure}"
     with pytest.warns(UserWarning, match="route_type"):
-        return TravelCostMatrix(network, date="2022-02-22", **kwargs)
+        return TravelCostMatrix(network, departure=departure, **kwargs)
 
 
 def scattered_points(network, count, seed):
@@ -69,7 +72,7 @@ def test_cost_rows_pin_the_k_train(network):
     )
     row = matrix.iloc[0]
     assert (row.from_id, row.to_id) == ("4810551", "1250551")
-    assert row.travel_time_s == 28 * 60
+    assert row.travel_time == 28
     assert row.transfers == 0
     assert row.transit_distance_m == pytest.approx(16_786, abs=1)
     assert row.walk_distance_m == 0.0
@@ -85,10 +88,11 @@ def test_cost_rows_count_walks_and_transfers(network_with_footpaths):
         origins=["1100602"],
         destinations=["1040280", "1250551"],
         departure="08:30:00",
+        output_time_units="seconds",
     )
     # The 08:31 M2 to Kamppi, then the pinned 20-second footpath.
     m2 = matrix[matrix.to_id == "1040280"].iloc[0]
-    assert m2.travel_time_s == 9 * 60 + 20
+    assert m2.travel_time == 9 * 60 + 20
     assert m2.transfers == 0
     assert m2.transit_distance_m == pytest.approx(4_132, abs=1)
     assert 19 <= m2.walk_distance_m <= 20
@@ -101,20 +105,25 @@ def test_cost_rows_count_walks_and_transfers(network_with_footpaths):
 
 def test_cost_matrix_matches_the_travel_time_matrix(network):
     origins = ["4810551", "1250551"]
-    matrix = cost_matrix(network, origins=origins, departure="08:30:00")
-    times = network.travel_time_matrix(origins, "2022-02-22", "08:30:00")
+    matrix = cost_matrix(
+        network,
+        origins=origins,
+        departure="08:30:00",
+        output_time_units="seconds",
+    )
+    times = network.travel_time_matrix(origins, "2022-02-22 08:30:00")
     stop_order = [stop for stop, _, _ in network.stops]
     for row_index, origin in enumerate(origins):
         rows = matrix[matrix.from_id == origin]
         reachable = np.nonzero(times[row_index] != np.uint32(0xFFFFFFFF))[0]
         assert len(rows) == len(reachable)
         expected = {stop_order[at]: int(times[row_index, at]) for at in reachable}
-        assert dict(zip(rows.to_id, rows.travel_time_s)) == expected
+        assert dict(zip(rows.to_id, rows.travel_time)) == expected
     # The origin reaches itself without riding.
     self_row = matrix[(matrix.from_id == "4810551") & (matrix.to_id == "4810551")].iloc[
         0
     ]
-    assert self_row.travel_time_s == 0
+    assert self_row.travel_time == 0
     assert self_row.transfers == 0
     assert self_row.transit_distance_m == 0.0
     assert self_row.emissions == 0.0
@@ -163,13 +172,14 @@ def test_point_matrices_walk_ride_and_walk(network_with_footpaths):
         origins=origins,
         destinations=destinations,
         departure="08:30:00",
+        output_time_units="seconds",
     )
     assert len(matrix) == 4
     # The door-to-door oracle: M2 plus access and egress walks.
     m2 = matrix[
         (matrix.from_id == "kalasatama") & (matrix.to_id == "kamppi_street")
     ].iloc[0]
-    assert 558 <= m2.travel_time_s <= 562
+    assert 558 <= m2.travel_time <= 562
     assert m2.transfers == 0
     assert m2.transit_distance_m == pytest.approx(4_132, abs=1)
     assert 27 <= m2.walk_distance_m <= 31
@@ -178,19 +188,19 @@ def test_point_matrices_walk_ride_and_walk(network_with_footpaths):
     walk = matrix[
         (matrix.from_id == "kamppi_metro") & (matrix.to_id == "kamppi_street")
     ].iloc[0]
-    assert 19 <= walk.travel_time_s <= 21
+    assert 19 <= walk.travel_time <= 21
     assert walk.transfers == 0
     assert walk.transit_distance_m == 0.0
     assert 19 <= walk.walk_distance_m <= 21
     assert walk.emissions == 0.0
     # The point travel-time matrix agrees pair by pair.
     times = network_with_footpaths.travel_time_matrix(
-        origins, "2022-02-22", "08:30:00", destinations=destinations
+        origins, "2022-02-22 08:30:00", destinations=destinations
     )
     for row in matrix.itertuples():
         origin = list(origins["id"]).index(row.from_id)
         destination = list(destinations["id"]).index(row.to_id)
-        assert times[origin, destination] == row.travel_time_s
+        assert times[origin, destination] == row.travel_time
 
 
 def test_point_matrices_from_arbitrary_locations(network_with_footpaths):
@@ -200,7 +210,7 @@ def test_point_matrices_from_arbitrary_locations(network_with_footpaths):
     buildings = scattered_points(network, 24, seed=7)
     libraries = scattered_points(network, 6, seed=101)
     times = network.travel_time_matrix(
-        buildings, "2022-02-22", "08:30:00", destinations=libraries
+        buildings, "2022-02-22 08:30:00", destinations=libraries
     )
     assert times.shape == (24, 6)
     # Central locations snap onto the walking network, and within the
@@ -208,14 +218,18 @@ def test_point_matrices_from_arbitrary_locations(network_with_footpaths):
     assert (times != UNREACHABLE_POINT).all()
     # The long-format cost matrix agrees cell for cell.
     matrix = cost_matrix(
-        network, origins=buildings, destinations=libraries, departure="08:30:00"
+        network,
+        origins=buildings,
+        destinations=libraries,
+        departure="08:30:00",
+        output_time_units="seconds",
     )
     assert len(matrix) == 24 * 6
     building_order = list(buildings["id"])
     library_order = list(libraries["id"])
     for row in matrix.itertuples():
         at = building_order.index(row.from_id), library_order.index(row.to_id)
-        assert times[at] == row.travel_time_s
+        assert times[at] == row.travel_time
     # Sampled cells equal the per-pair door-to-door routing: the matrix
     # is the bulk face of route_between_coordinates.
     departure = 8 * 3600 + 30 * 60
@@ -224,7 +238,7 @@ def test_point_matrices_from_arbitrary_locations(network_with_footpaths):
             origin = (buildings.geometry.y.iloc[i], buildings.geometry.x.iloc[i])
             destination = (libraries.geometry.y.iloc[j], libraries.geometry.x.iloc[j])
             journeys = network.route_between_coordinates(
-                origin, destination, "2022-02-22", "08:30:00"
+                origin, destination, "2022-02-22 08:30:00"
             )
             assert journeys
             fastest = min(journey["arrival_s"] for journey in journeys)
@@ -236,9 +250,7 @@ def test_point_matrices_from_arbitrary_locations(network_with_footpaths):
         crs="EPSG:4326",
     )
     with pytest.warns(UserWarning, match="off the walking network"):
-        stranded = TravelCostMatrix(
-            network, nowhere, libraries, "2022-02-22", "08:30:00"
-        )
+        stranded = TravelCostMatrix(network, nowhere, libraries, "2022-02-22 08:30:00")
     assert stranded.empty
 
 
@@ -249,19 +261,24 @@ def test_least_emission_cells_match_the_frontier(tmp_path):
     feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
     network = TransportNetwork.from_gtfs([str(feed)])
     frontier = journey_frontier(
-        network, "A", "B", "2022-02-22", "08:00:00", window=1800
+        network,
+        "A",
+        "B",
+        "2022-02-22 08:00:00",
+        departure_time_window=30,
+        output_time_units="seconds",
     )
 
-    def cell(within=None):
+    def cell(max_travel_time=None):
         matrix = TravelCostMatrix(
             network,
             ["A"],
             ["B"],
-            "2022-02-22",
-            "08:00:00",
+            "2022-02-22 08:00:00",
+            output_time_units="seconds",
             optimize="emissions",
-            window=1800,
-            within=within,
+            departure_time_window=30,
+            max_travel_time=max_travel_time,
         )
         rows = matrix[matrix.to_id == "B"]
         return rows.iloc[0] if len(rows) else None
@@ -271,13 +288,17 @@ def test_least_emission_cells_match_the_frontier(tmp_path):
     # within 15 minutes, nothing within a minute.
     cleanest, oracle = cell(), least_emissions(frontier)
     assert cleanest["emissions"] == pytest.approx(oracle["emissions"])
-    assert cleanest["travel_time_s"] == oracle["travel_time_s"] == 1800
+    assert cleanest["travel_time"] == oracle["travel_time"] == 1800
     assert cleanest["transfers"] == 0
-    budgeted, oracle = cell(within=900), least_emissions(frontier, within=900)
+    # The selector's budget is minutes too, whatever the frame's
+    # output units.
+    budgeted, oracle = cell(max_travel_time=15), least_emissions(
+        frontier, max_travel_time=15
+    )
     assert budgeted["emissions"] == pytest.approx(oracle["emissions"])
-    assert budgeted["travel_time_s"] == oracle["travel_time_s"] == 900
+    assert budgeted["travel_time"] == oracle["travel_time"] == 900
     assert budgeted["transfers"] == 1
-    assert cell(within=60) is None
+    assert cell(max_travel_time=1) is None
 
 
 def test_pareto_candidates_lower_the_emission_cells(network):
@@ -293,11 +314,11 @@ def test_pareto_candidates_lower_the_emission_cells(network):
             network,
             [origin],
             [destination],
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
+            output_time_units="seconds",
             optimize="emissions",
-            window=1,
-            max_transfers=4,
+            departure_time_window=0.016666666666666666,
+            max_rides=5,
             **kwargs,
         )
         rows = matrix[matrix.to_id == destination]
@@ -308,11 +329,16 @@ def test_pareto_candidates_lower_the_emission_cells(network):
     # The pareto cell is the true optimum the oracle pins, at that
     # point's own travel time.
     true_set = exhaustive_frontier(
-        network, origin, destination, "2022-02-22", "08:30:00", max_transfers=4
+        network,
+        origin,
+        destination,
+        "2022-02-22 08:30:00",
+        max_rides=5,
+        output_time_units="seconds",
     )
     point = true_set.loc[true_set["emissions"].idxmin()]
     assert pareto["emissions"] == pytest.approx(point["emissions"], abs=1e-3)
-    assert pareto["travel_time_s"] == point["travel_time_s"]
+    assert pareto["travel_time"] == point["travel_time"]
     # The default bucket keeps the gap closed.
     assert cell(candidates="pareto")["emissions"] < interim["emissions"]
 
@@ -328,11 +354,10 @@ def test_the_tbtr_pareto_matrix_matches_mcraptor(network):
             network,
             [origin],
             [destination],
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             optimize="emissions",
-            window=1,
-            max_transfers=4,
+            departure_time_window=0.016666666666666666,
+            max_rides=5,
             candidates="pareto",
             bucket=1e-6,
             router=router,
@@ -340,7 +365,7 @@ def test_the_tbtr_pareto_matrix_matches_mcraptor(network):
         for router in ("raptor", "tbtr")
     ]
     for column in [
-        "travel_time_s",
+        "travel_time",
         "transfers",
         "transit_distance_m",
         "walk_distance_m",
@@ -353,11 +378,10 @@ def test_the_tbtr_pareto_matrix_matches_mcraptor(network):
             network,
             [origin],
             [destination],
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             optimize="emissions",
-            window=1,
-            max_transfers=4,
+            departure_time_window=0.016666666666666666,
+            max_rides=5,
             router=router,
         )
         for router in ("raptor", "tbtr")
@@ -369,7 +393,7 @@ def test_the_tbtr_pareto_matrix_matches_mcraptor(network):
 def test_pareto_matrices_validate_their_options(network):
     from cafein import TravelCostMatrix
 
-    shared = dict(date="2022-02-22", departure="08:30:00")
+    shared = dict(departure="2022-02-22 08:30:00")
     with pytest.raises(ValueError, match="candidates"):
         TravelCostMatrix(
             network,
@@ -377,7 +401,7 @@ def test_pareto_matrices_validate_their_options(network):
             ["4960238"],
             **shared,
             optimize="emissions",
-            window=1,
+            departure_time_window=0.016666666666666666,
             candidates="fastest",
         )
     with pytest.raises(ValueError, match="optimize='emissions'"):
@@ -391,7 +415,7 @@ def test_pareto_matrices_validate_their_options(network):
             ["4960238"],
             **shared,
             optimize="emissions",
-            window=1,
+            departure_time_window=0.016666666666666666,
             candidates="pareto",
             bucket=0.0,
         )
@@ -403,7 +427,7 @@ def test_pareto_matrices_validate_their_options(network):
             points,
             **shared,
             optimize="emissions",
-            window=1,
+            departure_time_window=0.016666666666666666,
             candidates="pareto",
         )
 
@@ -416,14 +440,15 @@ def test_point_emission_cells_prefer_walking(network_with_footpaths):
         origins=origins,
         destinations=destinations,
         departure="08:30:00",
+        output_time_units="seconds",
         optimize="emissions",
-        window=600,
+        departure_time_window=10,
     )
     row = matrix.iloc[0]
     assert row.emissions == 0.0
     assert row.transfers == 0
     assert row.transit_distance_m == 0.0
-    assert 19 <= row.travel_time_s <= 21
+    assert 19 <= row.travel_time <= 21
     assert 19 <= row.walk_distance_m <= 21
 
 
@@ -435,26 +460,27 @@ def test_point_emission_cells_match_the_frontier(network_with_footpaths):
         network_with_footpaths,
         coordinates["1100602"],
         coordinates["1040280"],
-        "2022-02-22",
-        "08:30:00",
-        window=600,
+        "2022-02-22 08:30:00",
+        output_time_units="seconds",
+        departure_time_window=10,
     )
     # A budget below the walking time forces a ride, so the cell must
     # equal the frontier's budgeted least-emission journey exactly.
-    oracle = least_emissions(frontier, within=900)
+    oracle = least_emissions(frontier, max_travel_time=15)
     assert oracle["rides"] >= 1
     matrix = cost_matrix(
         network_with_footpaths,
         origins=point_frame(network_with_footpaths, [("a", "1100602")]),
         destinations=point_frame(network_with_footpaths, [("b", "1040280")]),
         departure="08:30:00",
+        output_time_units="seconds",
         optimize="emissions",
-        window=600,
-        within=900,
+        departure_time_window=10,
+        max_travel_time=15,
     )
     row = matrix.iloc[0]
     assert row.emissions == pytest.approx(oracle["emissions"])
-    assert row.travel_time_s == oracle["travel_time_s"]
+    assert row.travel_time == oracle["travel_time"]
     assert row.transfers == oracle["rides"] - 1
 
 
@@ -466,19 +492,25 @@ def test_least_fare_cells_match_the_frontier(tmp_path):
     network = TransportNetwork.from_gtfs([str(feed)])
     fares = two_line_fares()
     frontier = journey_frontier(
-        network, "A", "B", "2022-02-22", "08:00:00", window=1800, fares=fares
+        network,
+        "A",
+        "B",
+        "2022-02-22 08:00:00",
+        departure_time_window=30,
+        fares=fares,
+        output_time_units="seconds",
     )
 
-    def cell(within=None):
+    def cell(max_travel_time=None):
         matrix = TravelCostMatrix(
             network,
             ["A"],
             ["B"],
-            "2022-02-22",
-            "08:00:00",
+            "2022-02-22 08:00:00",
+            output_time_units="seconds",
             optimize="fare",
-            window=1800,
-            within=within,
+            departure_time_window=30,
+            max_travel_time=max_travel_time,
             fares=fares,
         )
         rows = matrix[matrix.to_id == "B"]
@@ -487,11 +519,13 @@ def test_least_fare_cells_match_the_frontier(tmp_path):
     # The matrix cell is the frontier's cheapest pick, budget for
     # budget: the tram unbudgeted, then the out-of-allowance bus chain,
     # then the fast chain at the pair total, nothing within a minute.
-    for within in (None, 1380, 900):
-        row, oracle = cell(within), least_fare(frontier, within=within)
+    # Both budgets are minutes, whatever the frame's output units.
+    for seconds in (None, 1380, 900):
+        limit = None if seconds is None else seconds / 60
+        row, oracle = cell(limit), least_fare(frontier, max_travel_time=limit)
         assert row["fare"] == pytest.approx(oracle["fare"])
-        assert row["travel_time_s"] == oracle["travel_time_s"]
-    assert cell(within=60) is None
+        assert row["travel_time"] == oracle["travel_time"]
+    assert cell(max_travel_time=1) is None
 
 
 def test_fare_columns_price_the_reported_journeys(network, helsinki_gtfs):
@@ -503,15 +537,14 @@ def test_fare_columns_price_the_reported_journeys(network, helsinki_gtfs):
         origins=["4810551"],
         destinations=["1250551"],
         departure="08:30:00",
+        output_time_units="seconds",
         fares=hsl,
     )
     row = matrix.iloc[0]
     # Korso (C) → Käpylä (A) prices at the ABC ticket, and the matrix
     # price equals the routed journey's python-side price.
     assert row.fare == pytest.approx(4.1)
-    journeys = network.route_between_stops(
-        "4810551", "1250551", "2022-02-22", "08:30:00"
-    )
+    journeys = network.route_between_stops("4810551", "1250551", "2022-02-22 08:30:00")
     fare_module.annotate_fares(journeys, hsl)
     fastest = min(journeys, key=lambda journey: journey["arrival_s"])
     assert row.fare == pytest.approx(fastest["fare"])
@@ -523,10 +556,11 @@ def test_fare_columns_price_the_reported_journeys(network, helsinki_gtfs):
         network,
         origins=["4810551", "1040602", "1250551"],
         departure="08:30:00",
+        output_time_units="seconds",
         fares=seeded,
     )
     expected = np.where(
-        bulk["travel_time_s"] == 0, 0.0, np.maximum(bulk["transfers"], 1) * 3.0
+        bulk["travel_time"] == 0, 0.0, np.maximum(bulk["transfers"], 1) * 3.0
     )
     assert bulk["fare"].to_numpy() == pytest.approx(expected)
 
@@ -544,7 +578,7 @@ def test_fare_cells_survive_unresolved_emissions(network, helsinki_gtfs):
         destinations=["1520703"],
         departure="10:00:00",
         optimize="fare",
-        window=3600,
+        departure_time_window=60,
         fares=hsl,
     )
     assert cheapest.iloc[0].fare == pytest.approx(2.8)
@@ -555,7 +589,7 @@ def test_fare_cells_survive_unresolved_emissions(network, helsinki_gtfs):
         destinations=["1520703"],
         departure="10:00:00",
         optimize="emissions",
-        window=3600,
+        departure_time_window=60,
         fares=hsl,
     )
     assert cleanest.empty
@@ -570,15 +604,16 @@ def test_point_fare_cells_prefer_walking(network_with_footpaths, helsinki_gtfs):
         origins=point_frame(network_with_footpaths, [("metro", "1040602")]),
         destinations=point_frame(network_with_footpaths, [("street", "1040280")]),
         departure="08:30:00",
+        output_time_units="seconds",
         optimize="fare",
-        window=600,
+        departure_time_window=10,
         fares=hsl,
     )
     row = matrix.iloc[0]
     assert row.fare == 0.0
     assert row.transfers == 0
     assert row.transit_distance_m == 0.0
-    assert 19 <= row.travel_time_s <= 21
+    assert 19 <= row.travel_time <= 21
 
 
 def test_fare_matrices_validate_their_options(network, helsinki_gtfs):
@@ -588,17 +623,15 @@ def test_fare_matrices_validate_their_options(network, helsinki_gtfs):
         TravelCostMatrix(
             network,
             ["4810551"],
-            date="2022-02-22",
-            departure="08:30:00",
+            departure="2022-02-22 08:30:00",
             optimize="fare",
-            window=600,
+            departure_time_window=10,
         )
-    with pytest.raises(ValueError, match="requires a departure window"):
+    with pytest.raises(ValueError, match="requires departure_time_window"):
         TravelCostMatrix(
             network,
             ["4810551"],
-            date="2022-02-22",
-            departure="08:30:00",
+            departure="2022-02-22 08:30:00",
             optimize="fare",
             fares=fare_module.zone_fare_structure(helsinki_gtfs, rules="zones"),
         )
@@ -610,28 +643,25 @@ def test_fare_matrices_validate_their_options(network, helsinki_gtfs):
 
 
 def test_emission_matrices_validate_their_options(network):
-    with pytest.raises(ValueError, match="requires a departure window"):
+    with pytest.raises(ValueError, match="requires departure_time_window"):
         TravelCostMatrix(
             network,
             ["4810551"],
-            date="2022-02-22",
-            departure="08:30:00",
+            departure="2022-02-22 08:30:00",
             optimize="emissions",
         )
     with pytest.raises(ValueError, match="optimize='emissions'"):
         TravelCostMatrix(
             network,
             ["4810551"],
-            date="2022-02-22",
-            departure="08:30:00",
-            within=600,
+            departure="2022-02-22 08:30:00",
+            max_travel_time=10,
         )
     with pytest.raises(ValueError, match="optimize must be"):
         TravelCostMatrix(
             network,
             ["4810551"],
-            date="2022-02-22",
-            departure="08:30:00",
+            departure="2022-02-22 08:30:00",
             optimize="fastest",
         )
 
@@ -649,7 +679,7 @@ def test_emission_cells_never_exceed_the_fastest_journeys_emissions(network):
         destinations=["1250551"],
         departure="08:30:00",
         optimize="emissions",
-        window=600,
+        departure_time_window=10,
     )
     assert len(fastest) == 1 and len(cleanest) == 1
     assert cleanest.iloc[0].emissions <= fastest.iloc[0].emissions
@@ -661,9 +691,9 @@ def test_emission_cells_never_exceed_the_fastest_journeys_emissions(network):
         destinations=["4810551"],
         departure="08:30:00",
         optimize="emissions",
-        window=600,
+        departure_time_window=10,
     ).iloc[0]
-    assert self_cell.travel_time_s == 0
+    assert self_cell.travel_time == 0
     assert self_cell.emissions == 0.0
     assert self_cell.transfers == 0
 
@@ -698,26 +728,30 @@ def test_point_matrices_take_the_direct_walk(tmp_path):
         crs="EPSG:4326",
     )
     times = network.travel_time_matrix(
-        origins, "2022-02-22", "07:30:00", destinations=destinations
+        origins, "2022-02-22 07:30:00", destinations=destinations
     )
     assert times[0, 0] in (100, 101)
     # A walk is departure-independent: every percentile plane holds it.
     windowed = network.travel_time_matrix(
         origins,
-        "2022-02-22",
-        "07:30:00",
+        "2022-02-22 07:30:00",
         destinations=destinations,
-        window=600,
+        departure_time_window=10,
         confidence=0.8,
     )
     assert set(windowed[0, 0, :].tolist()) == {times[0, 0]}
     # The cost matrix reports the same walking-only pair: no rides, no
     # transit distance, no emissions, the walk as the distance.
     matrix = TravelCostMatrix(
-        network, origins, destinations, "2022-02-22", "07:30:00", geometries=True
+        network,
+        origins,
+        destinations,
+        "2022-02-22 07:30:00",
+        geometries=True,
+        output_time_units="seconds",
     )
     row = matrix.iloc[0]
-    assert row["travel_time_s"] == times[0, 0]
+    assert row["travel_time"] == times[0, 0]
     assert row["transfers"] == 0
     assert row["transit_distance_m"] == 0.0
     assert row["walk_distance_m"] == pytest.approx(100.0, abs=0.5)
@@ -738,13 +772,12 @@ def test_point_matrices_report_unsnapped_points(network_with_footpaths):
             network_with_footpaths,
             sea,
             destinations,
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
         )
     assert len(matrix) == 0
     with pytest.warns(UserWarning, match="off the walking network"):
         times = network_with_footpaths.travel_time_matrix(
-            sea, "2022-02-22", "08:30:00", destinations=destinations
+            sea, "2022-02-22 08:30:00", destinations=destinations
         )
     assert times.shape == (1, 1)
     assert times[0, 0] == np.uint32(0xFFFFFFFF)
@@ -760,7 +793,7 @@ def test_stop_matrices_gate_walking_options(network):
         network,
         origins=["4810551"],
         departure="08:30:00",
-        max_walking_time=300.0,
+        max_walking_time=5.0,
     )
     assert len(accepted) >= 1
     accepted_emissions = cost_matrix(
@@ -768,19 +801,18 @@ def test_stop_matrices_gate_walking_options(network):
         origins=["4810551"],
         departure="08:30:00",
         optimize="emissions",
-        window=1800,
+        departure_time_window=30,
         walking_speed_kmph=5.0,
     )
     assert len(accepted_emissions) >= 1
     with pytest.raises(ValueError, match="point origins"):
         network.travel_time_matrix(
             ["4810551"],
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             destinations=point_frame(network, [("d", "4810551")]),
         )
     matrix = network.travel_time_matrix(
-        ["4810551"], "2022-02-22", "08:30:00", max_walking_time=300.0
+        ["4810551"], "2022-02-22 08:30:00", max_walking_time=5.0
     )
     assert matrix.shape == (1, network.stop_count)
 
@@ -796,9 +828,8 @@ def test_window_percentiles_match_per_minute_runs(network):
     percentiles = [0.0, 50.0, 100.0]
     matrix = network.travel_time_matrix(
         ["4810551"],
-        "2022-02-22",
-        "08:30:00",
-        window=window,
+        "2022-02-22 08:30:00",
+        departure_time_window=window / 60,
         percentiles=percentiles,
     )
     assert matrix.shape == (1, network.stop_count, 3)
@@ -808,7 +839,7 @@ def test_window_percentiles_match_per_minute_runs(network):
         mark = 8 * 3600 + 30 * 60 + 60 * step
         clock = f"{mark // 3600:02d}:{mark % 3600 // 60:02d}:00"
         per_minute.append(
-            network.travel_times_from_stop("4810551", "2022-02-22", clock)
+            network.travel_times_from_stop("4810551", f"2022-02-22 {clock}")
         )
     unreachable = int(np.uint32(0xFFFFFFFF))
     for column, stop in enumerate(stop_order):
@@ -822,13 +853,12 @@ def test_window_percentiles_match_per_minute_runs(network):
 
 def test_confidence_maps_to_the_symmetric_interval(network):
     left = network.travel_time_matrix(
-        ["4810551"], "2022-02-22", "08:30:00", window=1800, confidence=0.8
+        ["4810551"], "2022-02-22 08:30:00", departure_time_window=30, confidence=0.8
     )
     right = network.travel_time_matrix(
         ["4810551"],
-        "2022-02-22",
-        "08:30:00",
-        window=1800,
+        "2022-02-22 08:30:00",
+        departure_time_window=30,
         percentiles=[10, 50, 90],
     )
     assert np.array_equal(left, right)
@@ -845,10 +875,9 @@ def test_point_window_percentiles_keep_walks_constant(network_with_footpaths):
     destinations = point_frame(network_with_footpaths, [("kamppi_street", "1040280")])
     matrix = network_with_footpaths.travel_time_matrix(
         origins,
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         destinations=destinations,
-        window=1800,
+        departure_time_window=30,
         percentiles=[0, 50, 100],
     )
     assert matrix.shape == (1, 1, 3)
@@ -856,29 +885,25 @@ def test_point_window_percentiles_keep_walks_constant(network_with_footpaths):
 
 
 def test_window_specifications_are_validated(network):
-    with pytest.raises(ValueError, match="require a window"):
-        network.travel_time_matrix(
-            ["4810551"], "2022-02-22", "08:30:00", percentiles=[50]
-        )
+    with pytest.raises(ValueError, match="require departure_time_window"):
+        network.travel_time_matrix(["4810551"], "2022-02-22 08:30:00", percentiles=[50])
     with pytest.raises(ValueError, match="not both"):
         network.travel_time_matrix(
             ["4810551"],
-            "2022-02-22",
-            "08:30:00",
-            window=600,
+            "2022-02-22 08:30:00",
+            departure_time_window=10,
             percentiles=[50],
             confidence=0.8,
         )
     with pytest.raises(ValueError, match="within"):
         network.travel_time_matrix(
-            ["4810551"], "2022-02-22", "08:30:00", window=600, confidence=1.5
+            ["4810551"], "2022-02-22 08:30:00", departure_time_window=10, confidence=1.5
         )
     with pytest.raises(ValueError, match="within"):
         network.travel_time_matrix(
             ["4810551"],
-            "2022-02-22",
-            "08:30:00",
-            window=600,
+            "2022-02-22 08:30:00",
+            departure_time_window=10,
             percentiles=[120],
         )
 
@@ -887,13 +912,12 @@ def test_confidence_bounds_equal_their_decimal_percentiles(network):
     # 31 samples put the 5th percentile's half-up rank exactly on a tie:
     # (1 - 0.9) / 2 * 100 must reach the core as 5, not 4.999999999999999.
     left = network.travel_time_matrix(
-        ["4810551"], "2022-02-22", "08:30:00", window=1860, confidence=0.9
+        ["4810551"], "2022-02-22 08:30:00", departure_time_window=31, confidence=0.9
     )
     right = network.travel_time_matrix(
         ["4810551"],
-        "2022-02-22",
-        "08:30:00",
-        window=1860,
+        "2022-02-22 08:30:00",
+        departure_time_window=31,
         percentiles=[5, 50, 95],
     )
     assert np.array_equal(left, right)
@@ -904,7 +928,11 @@ def test_chunks_partition_the_matrix(network):
 
     origins = [stop for stop, _, _ in network.stops[:10]]
     full = cost_matrix(
-        network, origins=origins, destinations=["1250551"], departure="08:30:00"
+        network,
+        origins=origins,
+        destinations=["1250551"],
+        departure="08:30:00",
+        output_time_units="seconds",
     )
     parts = [
         cost_matrix(
@@ -912,15 +940,16 @@ def test_chunks_partition_the_matrix(network):
             origins=origins,
             destinations=["1250551"],
             departure="08:30:00",
+            output_time_units="seconds",
             chunk=(part, 3),
         )
         for part in range(3)
     ]
     assert pd.concat(parts, ignore_index=True).equals(pd.DataFrame(full))
 
-    matrix = network.travel_time_matrix(origins, "2022-02-22", "08:30:00")
+    matrix = network.travel_time_matrix(origins, "2022-02-22 08:30:00")
     rows = [
-        network.travel_time_matrix(origins, "2022-02-22", "08:30:00", chunk=(part, 3))
+        network.travel_time_matrix(origins, "2022-02-22 08:30:00", chunk=(part, 3))
         for part in range(3)
     ]
     assert np.array_equal(np.vstack(rows), matrix)
@@ -929,9 +958,7 @@ def test_chunks_partition_the_matrix(network):
 def test_chunk_specifications_are_validated(network):
     for chunk in [(3, 3), (-1, 3), (0, 0)]:
         with pytest.raises(ValueError, match="chunk"):
-            network.travel_time_matrix(
-                ["4810551"], "2022-02-22", "08:30:00", chunk=chunk
-            )
+            network.travel_time_matrix(["4810551"], "2022-02-22 08:30:00", chunk=chunk)
 
 
 def test_arrow_table_matches_the_dataframe(network, tmp_path):
@@ -944,8 +971,7 @@ def test_arrow_table_matches_the_dataframe(network, tmp_path):
             network,
             origins=["4810551"],
             destinations=["1250551"],
-            date="2022-02-22",
-            departure="08:30:00",
+            departure="2022-02-22 08:30:00",
             geometries=True,
         )
     frame = cost_matrix(
@@ -958,7 +984,7 @@ def test_arrow_table_matches_the_dataframe(network, tmp_path):
     assert pyarrow.types.is_dictionary(table.schema.field("from_id").type)
     assert table.column("from_id").to_pylist() == list(frame.from_id)
     assert table.column("to_id").to_pylist() == list(frame.to_id)
-    assert table.column("travel_time_s").to_pylist() == list(frame.travel_time_s)
+    assert table.column("travel_time").to_pylist() == list(frame.travel_time)
     assert table.column("transfers").to_pylist() == list(frame.transfers)
     assert table.column("emissions").to_pylist() == pytest.approx(list(frame.emissions))
     decoded = shapely.from_wkb(table.column("geometry").to_pylist()[0])
@@ -986,8 +1012,7 @@ def test_arrow_tables_need_pyarrow(network, monkeypatch):
         travel_cost_table(
             network,
             origins=["4810551"],
-            date="2022-02-22",
-            departure="08:30:00",
+            departure="2022-02-22 08:30:00",
         )
 
 
@@ -996,14 +1021,19 @@ UNREACHABLE = np.iinfo(np.uint32).max
 
 def test_travel_time_matrix_unstacks_the_wide_matrix(network):
     origins = ["4810551", "1250551"]
-    wide = network.travel_time_matrix(origins, "2022-02-22", "08:30:00")
+    wide = network.travel_time_matrix(origins, "2022-02-22 08:30:00")
     stops = [stop for stop, _lat, _lon in network.stops]
-    matrix = TravelTimeMatrix(network, origins, date="2022-02-22", departure="08:30:00")
-    assert list(matrix.columns) == ["from_id", "to_id", "travel_time_s"]
+    matrix = TravelTimeMatrix(
+        network,
+        origins,
+        departure="2022-02-22 08:30:00",
+        output_time_units="seconds",
+    )
+    assert list(matrix.columns) == ["from_id", "to_id", "travel_time"]
     # Every reachable wide cell is a row; unreachable cells are absent.
     assert len(matrix) == int((wide != UNREACHABLE).sum())
     long = {
-        (row.from_id, row.to_id): int(row.travel_time_s) for row in matrix.itertuples()
+        (row.from_id, row.to_id): int(row.travel_time) for row in matrix.itertuples()
     }
     reference = {
         (origin, stops[column]): int(wide[index, column])
@@ -1014,16 +1044,16 @@ def test_travel_time_matrix_unstacks_the_wide_matrix(network):
     assert long == reference
     # The Korso -> Käpylä pair keeps its 28-minute travel time.
     korso = matrix[(matrix.from_id == "4810551") & (matrix.to_id == "1250551")]
-    assert int(korso.travel_time_s.iloc[0]) == 28 * 60
+    assert int(korso.travel_time.iloc[0]) == 28 * 60
     # Slices degrade to plain DataFrames.
     assert type(matrix.iloc[:1]) is pd.DataFrame
 
 
 def test_travel_time_matrix_accepts_the_tbtr_router(network):
     origins = ["4810551", "1040602", "1250551"]
-    raptor = TravelTimeMatrix(network, origins, date="2022-02-22", departure="08:30:00")
+    raptor = TravelTimeMatrix(network, origins, departure="2022-02-22 08:30:00")
     tbtr = TravelTimeMatrix(
-        network, origins, date="2022-02-22", departure="08:30:00", router="tbtr"
+        network, origins, departure="2022-02-22 08:30:00", router="tbtr"
     )
     assert raptor.equals(tbtr)
 
@@ -1034,7 +1064,7 @@ def test_tbtr_transfer_cache_reuse_matches_ad_hoc(network, network_with_tbtr):
     # the same cells as the ad-hoc build. The set-less shared network answers
     # ad hoc; the session fixture carries the expensive precomputed set.
     origins = ["4810551", "1040602", "1250551"]
-    common = dict(date="2022-02-22", departure="08:30:00")
+    common = dict(departure="2022-02-22 08:30:00")
     assert not network.has_tbtr_transfers
     ad_hoc = TravelTimeMatrix(network, origins, router="tbtr", **common)
 
@@ -1046,12 +1076,11 @@ def test_tbtr_transfer_cache_reuse_matches_ad_hoc(network, network_with_tbtr):
     other = TravelTimeMatrix(
         network_with_tbtr,
         origins,
-        date="2022-02-23",
-        departure="08:30:00",
+        departure="2022-02-23 08:30:00",
         router="tbtr",
     )
     other_raptor = TravelTimeMatrix(
-        network_with_tbtr, origins, date="2022-02-23", departure="08:30:00"
+        network_with_tbtr, origins, departure="2022-02-23 08:30:00"
     )
     assert other.equals(other_raptor)
 
@@ -1061,26 +1090,25 @@ def test_travel_time_matrix_windowed_percentiles(network):
     percentiles = [10, 50, 90]
     wide = network.travel_time_matrix(
         origins,
-        "2022-02-22",
-        "08:00:00",
-        window=1800,
+        "2022-02-22 08:00:00",
+        departure_time_window=30,
         percentiles=percentiles,
     )
     stops = [stop for stop, _lat, _lon in network.stops]
     matrix = TravelTimeMatrix(
         network,
         origins,
-        date="2022-02-22",
-        departure="08:00:00",
-        window=1800,
+        departure="2022-02-22 08:00:00",
+        output_time_units="seconds",
+        departure_time_window=30,
         percentiles=percentiles,
     )
     assert list(matrix.columns) == [
         "from_id",
         "to_id",
-        "travel_time_p10_s",
-        "travel_time_p50_s",
-        "travel_time_p90_s",
+        "travel_time_p10",
+        "travel_time_p50",
+        "travel_time_p90",
     ]
     # Each row equals the corresponding wide percentile plane, cell for
     # cell, with unreachable percentile cells read as NaN.
@@ -1088,15 +1116,15 @@ def test_travel_time_matrix_windowed_percentiles(network):
         column = stops.index(row.to_id)
         for offset, percentile in enumerate((10, 50, 90)):
             wide_value = wide[0, column, offset]
-            long_value = getattr(row, f"travel_time_p{percentile}_s")
+            long_value = getattr(row, f"travel_time_p{percentile}")
             if wide_value == UNREACHABLE:
                 assert np.isnan(long_value)
             else:
                 assert long_value == wide_value
     # Percentiles are ordered within a reachable row.
     reachable = matrix.dropna()
-    assert (reachable.travel_time_p10_s <= reachable.travel_time_p50_s).all()
-    assert (reachable.travel_time_p50_s <= reachable.travel_time_p90_s).all()
+    assert (reachable.travel_time_p10 <= reachable.travel_time_p50).all()
+    assert (reachable.travel_time_p50 <= reachable.travel_time_p90).all()
 
 
 def test_windowed_tbtr_matches_raptor_and_reuses_cache(network, network_with_tbtr):
@@ -1106,7 +1134,9 @@ def test_windowed_tbtr_matches_raptor_and_reuses_cache(network, network_with_tbt
     # expensive precomputed set.
     origins = ["4810551", "1040602", "1250551"]
     common = dict(
-        date="2022-02-22", departure="08:00:00", window=1800, percentiles=[10, 50, 90]
+        departure="2022-02-22 08:00:00",
+        departure_time_window=30,
+        percentiles=[10, 50, 90],
     )
     raptor = TravelTimeMatrix(network, origins, **common)
     ad_hoc = TravelTimeMatrix(network, origins, router="tbtr", **common)
@@ -1123,8 +1153,8 @@ def test_tbtr_point_matrices_match_raptor(fresh_footpaths_network):
     destinations = point_frame(
         fresh_footpaths_network, [("C", "1040280"), ("D", "4810551"), ("E", "1100602")]
     )
-    single = dict(date="2022-02-22", departure="08:30:00")
-    windowed = dict(single, window=600, percentiles=[10, 50, 90])
+    single = dict(departure="2022-02-22 08:30:00")
+    windowed = dict(single, departure_time_window=10, percentiles=[10, 50, 90])
     for common in (single, windowed):
         raptor = TravelTimeMatrix(
             fresh_footpaths_network, origins, destinations, **common
@@ -1149,17 +1179,17 @@ def test_travel_time_matrix_over_points(network_with_footpaths):
         network_with_footpaths, [("B", "1040280"), ("C", "1250551")]
     )
     wide = network_with_footpaths.travel_time_matrix(
-        origins, "2022-02-22", "08:30:00", destinations=destinations
+        origins, "2022-02-22 08:30:00", destinations=destinations
     )
     matrix = TravelTimeMatrix(
         network_with_footpaths,
         origins,
         destinations,
-        date="2022-02-22",
-        departure="08:30:00",
+        departure="2022-02-22 08:30:00",
+        output_time_units="seconds",
     )
     long = {
-        (row.from_id, row.to_id): int(row.travel_time_s) for row in matrix.itertuples()
+        (row.from_id, row.to_id): int(row.travel_time) for row in matrix.itertuples()
     }
     reference = {
         ("A", destination): int(wide[0, column])
@@ -1172,10 +1202,10 @@ def test_travel_time_matrix_over_points(network_with_footpaths):
 
 def test_travel_time_matrix_chunks_partition_origins(network):
     origins = ["4810551", "1250551", "4740551"]
-    full = TravelTimeMatrix(network, origins, date="2022-02-22", departure="08:30:00")
+    full = TravelTimeMatrix(network, origins, departure="2022-02-22 08:30:00")
     parts = [
         TravelTimeMatrix(
-            network, origins, date="2022-02-22", departure="08:30:00", chunk=(k, 3)
+            network, origins, departure="2022-02-22 08:30:00", chunk=(k, 3)
         )
         for k in range(3)
     ]
@@ -1187,7 +1217,7 @@ def test_travel_time_matrix_chunks_partition_origins(network):
 
 
 def test_travel_time_matrix_requires_date_and_departure(network):
-    with pytest.raises(TypeError, match="requires date and departure"):
+    with pytest.raises(TypeError, match="requires departure"):
         TravelTimeMatrix(network, ["4810551"])
 
 
@@ -1197,8 +1227,7 @@ def test_travel_time_matrix_defaults_to_all_stops(network):
     # all-stops resolution cheap to exercise.
     matrix = TravelTimeMatrix(
         network,
-        date="2022-02-22",
-        departure="08:30:00",
+        departure="2022-02-22 08:30:00",
         chunk=(0, network.stop_count),
     )
     assert set(matrix.from_id) == {stops[0]}
@@ -1217,9 +1246,10 @@ def test_zone_fare_matrix_reconstructs_the_exact_journey(network, helsinki_gtfs)
         destinations=["1121601", "1250551"],
         departure="08:30:00",
         optimize="fare",
-        window=600,
+        departure_time_window=10,
         fares=hsl,
         geometries=True,
+        output_time_units="seconds",
     )
     # The A-zone metro hop rides an AB single at the tariff minimum —
     # the lower-bound skip keeps the fold's own row for it — and the
@@ -1228,7 +1258,7 @@ def test_zone_fare_matrix_reconstructs_the_exact_journey(network, helsinki_gtfs)
     # at metro scale, where such cells exist.
     cell = matrix[(matrix.from_id == "1040601") & (matrix.to_id == "1121601")].iloc[0]
     assert cell.fare == pytest.approx(2.80)
-    assert cell.travel_time_s == 300
+    assert cell.travel_time == 300
     assert cell.transfers == 0
     assert cell.transit_distance_m == pytest.approx(3061, abs=1)
     assert cell.walk_distance_m == pytest.approx(0.0)
@@ -1238,18 +1268,18 @@ def test_zone_fare_matrix_reconstructs_the_exact_journey(network, helsinki_gtfs)
         network,
         ["1040601", "4810551"],
         ["1121601", "1250551"],
-        "2022-02-22",
-        "08:30:00",
-        600,
+        "2022-02-22 08:30:00",
+        10,
         hsl,
         cutoffs=[5.70],
+        output_time_units="seconds",
     )
     for _, row in frontier.iterrows():
         match = matrix[
             (matrix.from_id == row.from_id) & (matrix.to_id == row.to_id)
         ].iloc[0]
         assert match.fare == pytest.approx(row.fare)
-        assert match.travel_time_s == row.travel_time_s
+        assert match.travel_time == row.travel_time
 
 
 def test_zone_fare_matrix_rejects_exclusions(network, helsinki_gtfs):
@@ -1263,7 +1293,7 @@ def test_zone_fare_matrix_rejects_exclusions(network, helsinki_gtfs):
             destinations=["1121601"],
             departure="08:30:00",
             optimize="fare",
-            window=600,
+            departure_time_window=10,
             fares=hsl,
             exclude_stops=["1121601"],
         )
@@ -1288,8 +1318,8 @@ def test_zone_fare_point_matrix_prices_and_walks(network_with_footpaths, helsink
         destinations=points,
         departure="08:30:00",
         optimize="fare",
-        window=600,
-        within=1800,
+        departure_time_window=10,
+        max_travel_time=30,
         fares=hsl,
     )
     ride = matrix[
@@ -1335,8 +1365,9 @@ def test_zone_fare_matrix_prices_zero_fare_products(network, helsinki_gtfs):
         destinations=["1121601"],
         departure="08:30:00",
         optimize="fare",
-        window=600,
+        departure_time_window=10,
         fares=free,
+        output_time_units="seconds",
     )
     assert matrix.iloc[0].fare == pytest.approx(0.0)
-    assert matrix.iloc[0].travel_time_s == 300
+    assert matrix.iloc[0].travel_time == 300

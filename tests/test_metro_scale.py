@@ -84,13 +84,13 @@ def test_transit_routes_at_metro_scale(metro_network, helsinki_metro_data):
     # so the head of the list alone would probe no served stop.
     sampled = stops[:: max(1, len(stops) // 25)][:25]
     for origin in sampled:
-        times = metro_network.travel_times_from_stop(origin, date, "08:30:00")
+        times = metro_network.travel_times_from_stop(origin, f"{date} 08:30:00")
         if any(stop != origin and seconds > 0 for stop, seconds in times.items()):
             break
     else:
         pytest.fail(f"no transit service reachable from 25 sampled stops on {date}")
     # One small stop-to-stop matrix over the sampled origins.
-    matrix = metro_network.travel_time_matrix(sampled[:5], date, "08:30:00")
+    matrix = metro_network.travel_time_matrix(sampled[:5], f"{date} 08:30:00")
     assert len(matrix) > 0
 
 
@@ -147,7 +147,7 @@ def test_metro_footpaths_stay_bounded(metro_network, helsinki_metro_data):
             if origin == destination:
                 continue
             for journey in metro_network.route_between_stops(
-                origin, destination, date, "08:30:00"
+                origin, destination, f"{date} 08:30:00"
             ):
                 for leg in journey["legs"]:
                     if leg["type"] != "transfer":
@@ -174,16 +174,15 @@ def test_zone_fares_price_the_measured_pairs_exactly(
         metro_network,
         ["9214203", "4340212"],
         ["1000109"],
-        date,
-        "08:30:00",
-        1800,
+        f"{date} 08:30:00",
+        30,
         structure,
         cutoffs=[3.30, 4.50, 5.00],
-        max_duration=3 * 3600,
+        max_travel_time=180,
         # The event discipline, per the plan's acceptance; the derived
         # mid-span Tuesday is the plan's pinned witness date for the
         # pinned sampledata release.
-        departure_step=None,
+        departure_time_step=None,
     )
     # The pinned trade-off curve: 3.30 buys the trip, 4.50 buys it
     # faster, and no cutoff ever needs the fold's 5.00 — it is
@@ -203,13 +202,13 @@ def test_zone_fares_price_the_measured_pairs_exactly(
         metro_network,
         ["9214203", "4340212"],
         ["1000109"],
-        date,
-        "08:30:00",
+        f"{date} 08:30:00",
         optimize="fare",
-        window=1800,
-        within=3 * 3600,
+        departure_time_window=30,
+        max_travel_time=180,
         fares=structure,
         geometries=True,
+        output_time_units="seconds",
     )
     assert sorted(round(fare, 2) for fare in matrix["fare"]) == [3.30, 3.30]
     # The fold reported 5.00 here, so both cells were beaten by the
@@ -222,9 +221,24 @@ def test_zone_fares_price_the_measured_pairs_exactly(
     }
     for _, cell in matrix.iterrows():
         seconds, transfers, transit, walk, grams = pinned[cell["from_id"]]
-        assert cell["travel_time_s"] == seconds
+        assert cell["travel_time"] == seconds
         assert cell["transfers"] == transfers
         assert cell["transit_distance_m"] == pytest.approx(transit, abs=1.0)
         assert cell["walk_distance_m"] == pytest.approx(walk, abs=1.0)
         assert cell["emissions"] == pytest.approx(grams, abs=0.5)
         assert cell["geometry"] is not None
+    # The default output reports the same cells in whole minutes
+    # rounded to the nearest: 3521 s is 59, 4465 s is 74.
+    rounded = TravelCostMatrix(
+        metro_network,
+        ["9214203", "4340212"],
+        ["1000109"],
+        f"{date} 08:30:00",
+        optimize="fare",
+        departure_time_window=30,
+        max_travel_time=180,
+        fares=structure,
+    )
+    by_origin = {cell["from_id"]: cell for _, cell in rounded.iterrows()}
+    assert by_origin["9214203"]["travel_time"] == 59
+    assert by_origin["4340212"]["travel_time"] == 74

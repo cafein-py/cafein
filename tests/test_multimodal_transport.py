@@ -8,7 +8,8 @@ pytest.importorskip("cafein._cafein")
 from cafein import TransportNetwork  # noqa: E402
 
 KAMPPI, HAKANIEMI = (60.1690, 24.9320), (60.1795, 24.9520)
-DATE, DEPARTURE = "2022-02-22", "08:30:00"
+DATE = "2022-02-22"
+DEPARTURE = "2022-02-22 08:30:00"
 
 
 def test_the_multimodal_graph_is_carried_with_its_metadata(multimodal_network):
@@ -24,16 +25,16 @@ def test_walking_stays_bit_for_bit(multimodal_network, network_with_footpaths):
     # The multimodal graph is a second section beside the walking graph, so
     # every walking query answers exactly what a build without it answers.
     with_streets = multimodal_network.route_between_coordinates(
-        KAMPPI, HAKANIEMI, DATE, DEPARTURE
+        KAMPPI, HAKANIEMI, DEPARTURE
     )
     without = network_with_footpaths.route_between_coordinates(
-        KAMPPI, HAKANIEMI, DATE, DEPARTURE
+        KAMPPI, HAKANIEMI, DEPARTURE
     )
     assert with_streets == without
     stops = [stop for stop, _, _ in network_with_footpaths.stops[:40]]
     assert np.array_equal(
-        multimodal_network.travel_time_matrix(stops, DATE, DEPARTURE),
-        network_with_footpaths.travel_time_matrix(stops, DATE, DEPARTURE),
+        multimodal_network.travel_time_matrix(stops, DEPARTURE),
+        network_with_footpaths.travel_time_matrix(stops, DEPARTURE),
     )
 
 
@@ -41,7 +42,7 @@ def test_the_multimodal_section_round_trips(multimodal_network, tmp_path):
     # The session fixture itself came through one save/load; this pins both
     # load paths explicitly, and that walking queries survive them.
     reference = multimodal_network.route_between_coordinates(
-        KAMPPI, HAKANIEMI, DATE, DEPARTURE
+        KAMPPI, HAKANIEMI, DEPARTURE
     )
     path = tmp_path / "multimodal.cafein"
     multimodal_network.save(path)
@@ -58,8 +59,7 @@ def test_the_multimodal_section_round_trips(multimodal_network, tmp_path):
             == multimodal_network.multimodal_elevation_metadata
         )
         assert (
-            loaded.route_between_coordinates(KAMPPI, HAKANIEMI, DATE, DEPARTURE)
-            == reference
+            loaded.route_between_coordinates(KAMPPI, HAKANIEMI, DEPARTURE) == reference
         )
 
 

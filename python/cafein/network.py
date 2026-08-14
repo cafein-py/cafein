@@ -18,7 +18,9 @@ def _window_percentiles(window, percentiles, confidence):
     for; ``None`` without a window."""
     if window is None:
         if percentiles is not None or confidence is not None:
-            raise ValueError("percentiles and confidence require a window")
+            raise ValueError(
+                "percentiles and confidence require departure_time_window="
+            )
         return None
     if percentiles is not None and confidence is not None:
         raise ValueError("pass either percentiles or confidence, not both")
@@ -897,7 +899,7 @@ class TransportNetwork:
         osm_pbf=None,
         walking_speed_kmph=None,
         max_walking_time=None,
-        max_snap_distance=None,
+        snap_distance=None,
         bounding_box=None,
         trip_distances=True,
         leg_geometries=True,
@@ -928,10 +930,10 @@ class TransportNetwork:
             without it the network has neither.
         walking_speed_kmph : float (optional, default: 3.6)
             Walking speed in km/h of the footpath precompute.
-        max_walking_time : float (optional, default: 1200)
+        max_walking_time : float or datetime.timedelta (optional, default: 20 minutes)
             Walking-time cutoff of the direct footpath search, in
-            seconds; chained footpaths may exceed it.
-        max_snap_distance : float (optional, default: 1600)
+            minutes; chained footpaths may exceed it.
+        snap_distance : float (optional, default: 1600)
             Maximum distance in meters from a stop to the walking
             network; stops farther away get no footpaths.
         bounding_box : sequence of float or shapely geometry (optional)
@@ -939,7 +941,7 @@ class TransportNetwork:
             ``[min_lon, min_lat, max_lon, max_lat]`` or a shapely
             geometry, so a region-wide extract can be cropped to the
             stops' neighbourhood; stops snap only to the cropped network,
-            so those beyond `max_snap_distance` of it get no footpaths.
+            so those beyond `snap_distance` of it get no footpaths.
             Only meaningful with `osm_pbf`.
         trip_distances : bool (optional, default: True)
             Compute per-trip travel distances through the fallback
@@ -983,6 +985,10 @@ class TransportNetwork:
         pass over `osm_pbf` for the multimodal graph); they must not
         change underneath it.
         """
+        from cafein._units import duration_seconds
+
+        max_walking_time = duration_seconds("max_walking_time", max_walking_time)
+        max_snap_distance = snap_distance
         from cafein import street_network as _street_network
 
         # Every street_modes problem surfaces here, before any file is
@@ -1028,12 +1034,16 @@ class TransportNetwork:
                 max_walking_time = streets.MAX_WALKING_TIME
             if max_snap_distance is None:
                 max_snap_distance = streets.MAX_SNAP_DISTANCE
+            import datetime as _datetime
+
             footpaths, street_network = streets.walking_streets(
                 osm_pbf,
                 core.stops,
                 walking_speed_kmph=walking_speed_kmph,
-                max_walking_time=max_walking_time,
-                max_snap_distance=max_snap_distance,
+                # Internal values are seconds; the public streets API
+                # takes minutes or timedeltas — a timedelta is exact.
+                max_walking_time=_datetime.timedelta(seconds=max_walking_time),
+                snap_distance=max_snap_distance,
                 bounding_box=bounding_box,
             )
             core.set_transfer_arrays(
@@ -1275,8 +1285,8 @@ class TransportNetwork:
         self,
         *,
         walking_speed_kmph=None,
-        max_transfer_time=1800.0,
-        min_departure=0,
+        max_transfer_time=30.0,
+        min_departure="00:00",
         max_departure=None,
     ):
         """Compute the ULTRA intermediate-transfer shortcuts and store them.
@@ -1313,14 +1323,14 @@ class TransportNetwork:
         ----------
         walking_speed_kmph : float (optional, default: 3.6)
             Walking speed in km/h of the shortcut search.
-        max_transfer_time : float (optional, default: 1800)
-            Cutoff of an intermediate walk, in seconds.
-        min_departure : int (optional, default: 0)
-            Earliest source-departure time to serve, in seconds since
-            midnight.
-        max_departure : int (optional)
-            Latest source-departure time to serve, in seconds since
-            midnight; the whole service day by default.
+        max_transfer_time : float or datetime.timedelta (optional, default: 30)
+            Cutoff of an intermediate walk, in minutes.
+        min_departure : str or datetime.time (optional, default: "00:00")
+            Earliest source-departure clock time to serve, as an
+            ``"HH:MM"`` string or a ``datetime.time``.
+        max_departure : str or datetime.time (optional)
+            Latest source-departure clock time to serve, in the same
+            forms; the whole service day by default.
 
         Returns
         -------
@@ -1328,15 +1338,27 @@ class TransportNetwork:
             The number of shortcuts computed.
         """
         from cafein import streets
+        from cafein._units import clock_time, duration_seconds
 
+        def clock_seconds(name, value):
+            hours, minutes, seconds = clock_time(name, value).split(":")
+            return int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+
+        transfer_seconds = float(
+            duration_seconds("max_transfer_time", max_transfer_time)
+        )
+        earliest = clock_seconds("min_departure", min_departure)
         if walking_speed_kmph is None:
             walking_speed_kmph = streets.WALKING_SPEED_KMPH
         if max_departure is None:
             return self._core.compute_ultra_shortcuts(
-                walking_speed_kmph, max_transfer_time, min_departure
+                walking_speed_kmph, transfer_seconds, earliest
             )
         return self._core.compute_ultra_shortcuts(
-            walking_speed_kmph, max_transfer_time, min_departure, max_departure
+            walking_speed_kmph,
+            transfer_seconds,
+            earliest,
+            clock_seconds("max_departure", max_departure),
         )
 
     def compute_tbtr_transfers(self, date):
@@ -1421,7 +1443,7 @@ class TransportNetwork:
         *,
         walking_speed_kmph=None,
         max_walking_time=None,
-        max_snap_distance=None,
+        snap_distance=None,
     ):
         """Walking times to every transit stop reachable from a coordinate.
 
@@ -1435,9 +1457,9 @@ class TransportNetwork:
             The coordinate, in EPSG:4326.
         walking_speed_kmph : float (optional, default: 3.6)
             Walking speed in km/h, on the network and on the connectors.
-        max_walking_time : float (optional, default: 7200)
-            Walking-time cutoff in seconds.
-        max_snap_distance : float (optional, default: 1600)
+        max_walking_time : float or datetime.timedelta (optional, default: 120 minutes)
+            Walking-time cutoff in minutes.
+        snap_distance : float (optional, default: 1600)
             Maximum straight-line distance in meters from the coordinate
             to the walking network; a coordinate farther away raises
             ``ValueError``.
@@ -1448,6 +1470,10 @@ class TransportNetwork:
             Walking time in seconds to each reachable stop, keyed by
             stop_id; stops beyond the cutoff are absent.
         """
+        from cafein._units import duration_seconds
+
+        max_walking_time = duration_seconds("max_walking_time", max_walking_time)
+        max_snap_distance = snap_distance
         return self._core.access_stops(
             lat,
             lon,
@@ -1474,19 +1500,18 @@ class TransportNetwork:
 
     def route_between_stops(
         self,
-        from_stop,
-        to_stop,
-        date,
+        origin,
+        destination,
         departure,
-        max_transfers=7,
-        window=None,
+        max_rides=8,
+        departure_time_window=None,
         *,
         exclude_routes=(),
         exclude_trips=(),
         exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
-        max_snap_distance=None,
+        snap_distance=None,
         geometries=True,
     ):
         """Route between two transit stops.
@@ -1506,44 +1531,42 @@ class TransportNetwork:
         stops are routed **door-to-door between their coordinates** — the
         same unrestricted initial/intermediate/final walking as
         ``route_between_coordinates`` — and ``walking_speed_kmph``,
-        ``max_walking_time``, and ``max_snap_distance`` bound that walking.
+        ``max_walking_time``, and ``snap_distance`` bound that walking.
         Without such a set (or when a stop has no coordinate or is off the
         walking network) the query boards at the origin stop and relaxes
         the closure transfers, and those three arguments are ignored.
 
         Parameters
         ----------
-        from_stop : str
+        origin : str
             GTFS stop_id of the origin stop; ``<feed_index>:<stop_id>``
             when the id occurs in several merged feeds.
-        to_stop : str
+        destination : str
             GTFS stop_id of the destination stop, qualified the same way.
             Identifiers in the output follow the same convention.
-        date : str
-            Service date as ``YYYY-MM-DD``.
-        departure : str
-            Departure time at the origin as ``HH:MM:SS``.
-        max_transfers : int (optional, default: 7)
-            Maximum number of transfers between rides.
-        window : int (optional)
-            Departure window in seconds. When given, departures within
-            ``[departure, departure + window)`` are profiled: the result
-            is the Pareto set of journeys over (departure, arrival,
-            rides), each journey's departure being the latest time the
-            origin can be left to catch it, sorted by departure and then
-            rides. A journey that leaves within the window but waits for
-            a ride beyond it carries the window's final second as its
-            departure.
+        departure : datetime.datetime or str
+            Departure at the origin — a datetime, or an ISO string like
+            ``"2022-02-22 08:30"``; the service date is its date part.
+        max_rides : int (optional, default: 8)
+            Maximum number of boarded vehicles per journey (rides, not
+            transfers: 8 rides allow 7 transfers).
+        departure_time_window : float or datetime.timedelta (optional)
+            Departure window in minutes. When given, departures within
+            the window are profiled: the result is the Pareto set of
+            journeys over (departure, arrival, rides), each journey's
+            departure being the latest time the origin can be left to
+            catch it, sorted by departure and then rides. A journey that
+            leaves within the window but waits for a ride beyond it
+            carries the window's final second as its departure.
         walking_speed_kmph : float (optional, default: 3.6)
             Walking speed in km/h of the door-to-door searches (whole-day
             ULTRA only; ignored otherwise).
-        max_walking_time : float (optional, default: 7200)
-            Walking-time cutoff in seconds of each street search (whole-day
-            ULTRA only; ignored otherwise).
-        max_snap_distance : float (optional, default: 1600)
+        max_walking_time : float or datetime.timedelta (optional, default: 120 minutes)
+            Walking-time cutoff in minutes of each street search
+            (whole-day ULTRA only; ignored otherwise).
+        snap_distance : float (optional, default: 1600)
             Maximum straight-line distance in meters from a stop to the
             walking network (whole-day ULTRA only; ignored otherwise).
-
         exclude_routes, exclude_trips, exclude_stops : list of str (optional)
             GTFS ids of supply the journey must not use — for
             disruption scenarios and per-individual accessibility
@@ -1555,11 +1578,54 @@ class TransportNetwork:
         Returns
         -------
         list of dict
-            Without `window`, the Pareto set of journeys over (arrival
-            time, number of rides) leaving at the departure time; with
-            it, the departure-window profile. Each journey carries its
-            legs; times are seconds past the service day's start.
+            Without ``departure_time_window``, the Pareto set of
+            journeys over (arrival time, number of rides) leaving at the
+            departure time; with it, the departure-window profile. Each
+            journey carries its legs; the ``*_s`` times are seconds past
+            the service day's start.
         """
+        from cafein._units import departure_parts, duration_seconds
+
+        date, departure = departure_parts(departure)
+        if max_rides < 1:
+            raise ValueError("max_rides must be at least 1")
+        return self._route_between_stops(
+            from_stop=origin,
+            to_stop=destination,
+            date=date,
+            departure=departure,
+            max_transfers=max_rides - 1,
+            window=duration_seconds("departure_time_window", departure_time_window),
+            max_walking_time=duration_seconds("max_walking_time", max_walking_time),
+            max_snap_distance=snap_distance,
+            exclude_routes=exclude_routes,
+            exclude_trips=exclude_trips,
+            exclude_stops=exclude_stops,
+            walking_speed_kmph=walking_speed_kmph,
+            geometries=geometries,
+        )
+
+    def _route_between_stops(
+        self,
+        from_stop,
+        to_stop,
+        date,
+        departure,
+        max_transfers=7,
+        window=None,
+        *,
+        exclude_routes=(),
+        exclude_trips=(),
+        exclude_stops=(),
+        walking_speed_kmph=None,
+        max_walking_time=None,
+        max_snap_distance=None,
+        geometries=True,
+    ):
+        """``route_between_stops`` in core space: split ``date`` +
+        ``departure`` strings, ``max_transfers``, and every duration in
+        seconds — the form internal callers use to avoid double
+        conversion."""
         return self._core.route_between_stops(
             from_stop,
             to_stop,
@@ -1578,17 +1644,16 @@ class TransportNetwork:
         self,
         origin,
         destination,
-        date,
         departure,
-        max_transfers=7,
-        window=None,
+        max_rides=8,
+        departure_time_window=None,
         *,
         exclude_routes=(),
         exclude_trips=(),
         exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
-        max_snap_distance=None,
+        snap_distance=None,
         geometries=True,
         street_policy=None,
     ):
@@ -1610,24 +1675,24 @@ class TransportNetwork:
         ----------
         origin, destination : (float, float)
             ``(lat, lon)`` coordinates, in EPSG:4326. A coordinate
-            farther than `max_snap_distance` from the walking network
+            farther than `snap_distance` from the walking network
             raises ``ValueError``.
-        date : str
-            Service date as ``YYYY-MM-DD``.
-        departure : str
-            Departure time at the origin coordinate as ``HH:MM:SS``.
-        max_transfers : int (optional, default: 7)
-            Maximum number of transfers between rides.
-        window : int (optional)
-            Departure window in seconds, as in ``route_between_stops``.
+        departure : datetime.datetime or str
+            Departure at the origin coordinate — a datetime, or an ISO
+            string like ``"2022-02-22 08:30"``; the service date is its
+            date part.
+        max_rides : int (optional, default: 8)
+            Maximum number of boarded vehicles per journey (rides, not
+            transfers: 8 rides allow 7 transfers).
+        departure_time_window : float or datetime.timedelta (optional)
+            Departure window in minutes, as in ``route_between_stops``.
         walking_speed_kmph : float (optional, default: 3.6)
             Walking speed in km/h of the access and egress searches.
-        max_walking_time : float (optional, default: 7200)
-            Walking-time cutoff in seconds of each street search.
-        max_snap_distance : float (optional, default: 1600)
+        max_walking_time : float or datetime.timedelta (optional, default: 120 minutes)
+            Walking-time cutoff in minutes of each street search.
+        snap_distance : float (optional, default: 1600)
             Maximum straight-line distance in meters from each
             coordinate to the walking network.
-
         exclude_routes, exclude_trips, exclude_stops : list of str (optional)
             GTFS ids of supply the journey must not use — for
             disruption scenarios and per-individual accessibility
@@ -1651,13 +1716,11 @@ class TransportNetwork:
             ``transfers={mode: budget}`` (one shared mode; compute the
             set first with :meth:`compute_mode_transfers`) the run
             relaxes the merged mode-transfer set, and a transfer whose
-            edge rode a rental splits into its walk--ride--walk legs. The direct
-            door-to-door alternative stays the walking one: whether a
-            policy's vehicle may serve a stop-less journey depends on
-            its terms, so that fold arrives with a later stage and the
-            standalone street products answer direct street routing
-            today. Conflicts with the walking knobs above and with
-            ``window``, which are rejected rather than silently ignored.
+            edge rode a rental splits into its walk--ride--walk legs.
+            The direct door-to-door alternative stays the walking one.
+            Conflicts with the walking knobs above and with
+            ``departure_time_window``, which are rejected rather than
+            silently ignored.
 
         Returns
         -------
@@ -1665,6 +1728,50 @@ class TransportNetwork:
             Journeys as in ``route_between_stops``; arrivals include
             the egress walk.
         """
+        from cafein._units import departure_parts, duration_seconds
+
+        date, departure = departure_parts(departure)
+        if max_rides < 1:
+            raise ValueError("max_rides must be at least 1")
+        return self._route_between_coordinates(
+            origin=origin,
+            destination=destination,
+            date=date,
+            departure=departure,
+            max_transfers=max_rides - 1,
+            window=duration_seconds("departure_time_window", departure_time_window),
+            max_walking_time=duration_seconds("max_walking_time", max_walking_time),
+            max_snap_distance=snap_distance,
+            exclude_routes=exclude_routes,
+            exclude_trips=exclude_trips,
+            exclude_stops=exclude_stops,
+            walking_speed_kmph=walking_speed_kmph,
+            geometries=geometries,
+            street_policy=street_policy,
+        )
+
+    def _route_between_coordinates(
+        self,
+        origin,
+        destination,
+        date,
+        departure,
+        max_transfers=7,
+        window=None,
+        *,
+        exclude_routes=(),
+        exclude_trips=(),
+        exclude_stops=(),
+        walking_speed_kmph=None,
+        max_walking_time=None,
+        max_snap_distance=None,
+        geometries=True,
+        street_policy=None,
+    ):
+        """``route_between_coordinates`` in core space: split ``date`` +
+        ``departure`` strings, ``max_transfers``, and every duration
+        in seconds — the form internal callers use to avoid double
+        conversion."""
         if street_policy is not None:
             from cafein.matrices import _walking_only_policy
 
@@ -1675,7 +1782,7 @@ class TransportNetwork:
                 raise ValueError(
                     "street_policy carries its own budgets; passing "
                     "walking_speed_kmph, max_walking_time, or "
-                    "max_snap_distance beside it is a conflict"
+                    "snap_distance beside it is a conflict"
                 )
             if window is not None:
                 raise ValueError(
@@ -1748,14 +1855,14 @@ class TransportNetwork:
             geometries,
         )
 
-    def compute_carriage_transfers(self, mode, max_seconds):
+    def compute_carriage_transfers(self, mode, max_transfer_time):
         """Compute the carriage transfer set for a carried ``mode``.
 
         Per stop pair the faster of the walking closure row and the own
         vehicle's direct ride (ties to walking; ride-only pairs are
         added), each row a single mode. The budget bounds each ride as
         one movement, and queries granting ``transfers={mode:
-        max_seconds}`` beside a carried vehicle relax exactly this set
+        max_transfer_time}`` beside a carried vehicle relax exactly this set
         — a missing or differently parameterised set is an error, never
         a silent fallback. Heavy precompute; persisted by ``save`` and
         restored by ``load`` with its exact binding, and dropped when
@@ -1765,28 +1872,33 @@ class TransportNetwork:
         ----------
         mode : str
             The carried vehicle's street mode (``"bicycle"``).
-        max_seconds : float
-            The per-movement ride budget in seconds.
+        max_transfer_time : float or datetime.timedelta
+            The per-movement ride budget, in minutes.
 
         Returns
         -------
         (int, int)
             Total edges in the merged set, and how many are rides.
         """
-        return self._core._compute_carriage_transfers(mode, float(max_seconds))
+        from cafein._units import duration_seconds
 
-    def compute_mode_transfers(self, mode, max_seconds):
+        seconds = duration_seconds("max_transfer_time", max_transfer_time)
+        return self._core._compute_carriage_transfers(mode, float(seconds))
+
+    def compute_mode_transfers(self, mode, max_transfer_time):
         """Compute the merged shared-vehicle transfer set for ``mode``.
 
         Per stop with a street link for `mode`, one directed search over
         the multimodal graph collects the rental rides to every other
-        link within `max_seconds`; they merge into the installed walking
+        link within `max_transfer_time` (minutes, or a timedelta); they
+        merge into the installed walking
         closure under the one-rental-per-transfer contract — the budget
         bounds a rental-bearing transfer's whole movement (pre-walk,
         ride, post-walk), while pure walking transfers keep the
         installed set's own budget, so the merged set is never weaker
         than the walking one. Queries with
-        ``StreetLegPolicy(transfers={mode: max_seconds})`` then relax
+        ``StreetLegPolicy(transfers={mode: budget})`` — the same budget,
+        in the policy's seconds — then relax
         this set; a missing or differently bound set is rejected, never
         silently substituted. Heavy precompute; persisted by ``save``
         and restored by ``load`` with its exact binding.
@@ -1797,21 +1909,23 @@ class TransportNetwork:
             The merged set's edge count and how many edges ride a
             rental.
         """
-        return self._core._compute_mode_transfers(mode, float(max_seconds))
+        from cafein._units import duration_seconds
+
+        seconds = duration_seconds("max_transfer_time", max_transfer_time)
+        return self._core._compute_mode_transfers(mode, float(seconds))
 
     def travel_times_from_coordinate(
         self,
         origin,
-        date,
         departure,
-        max_transfers=7,
+        max_rides=8,
         *,
         exclude_routes=(),
         exclude_trips=(),
         exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
-        max_snap_distance=None,
+        snap_distance=None,
         street_policy=None,
     ):
         """Earliest arrival at every reachable stop from a coordinate.
@@ -1826,19 +1940,20 @@ class TransportNetwork:
         ----------
         origin : (float, float)
             ``(lat, lon)`` coordinate, in EPSG:4326. A coordinate
-            farther than `max_snap_distance` from the walking network
+            farther than `snap_distance` from the walking network
             raises ``ValueError``.
-        date : str
-            Service date as ``YYYY-MM-DD``.
-        departure : str
-            Departure time at the origin coordinate as ``HH:MM:SS``.
-        max_transfers : int (optional, default: 7)
-            Maximum number of transfers between rides.
+        departure : datetime.datetime or str
+            Departure at the origin coordinate — a datetime, or an ISO
+            string like ``"2022-02-22 08:30"``; the service date is its
+            date part.
+        max_rides : int (optional, default: 8)
+            Maximum number of boarded vehicles per journey (rides, not
+            transfers: 8 rides allow 7 transfers).
         walking_speed_kmph : float (optional, default: 3.6)
             Walking speed in km/h of the access search.
-        max_walking_time : float (optional, default: 7200)
-            Walking-time cutoff in seconds of the access search.
-        max_snap_distance : float (optional, default: 1600)
+        max_walking_time : float or datetime.timedelta (optional, default: 120 minutes)
+            Walking-time cutoff in minutes of the access search.
+        snap_distance : float (optional, default: 1600)
             Maximum straight-line distance in meters from the
             coordinate to the walking network.
         street_policy : StreetLegPolicy, optional
@@ -1861,6 +1976,14 @@ class TransportNetwork:
             Travel time in seconds to every reachable stop, keyed by
             stop_id; unreachable stops are absent.
         """
+        from cafein._units import departure_parts, duration_seconds
+
+        date, departure = departure_parts(departure)
+        if max_rides < 1:
+            raise ValueError("max_rides must be at least 1")
+        max_transfers = max_rides - 1
+        max_walking_time = duration_seconds("max_walking_time", max_walking_time)
+        max_snap_distance = snap_distance
         if street_policy is not None:
             from cafein import streets as _streets
             from cafein.policy import reduction_modes
@@ -1872,7 +1995,7 @@ class TransportNetwork:
                 raise ValueError(
                     "street_policy carries its own budgets; passing "
                     "walking_speed_kmph, max_walking_time, or "
-                    "max_snap_distance beside it is a conflict"
+                    "snap_distance beside it is a conflict"
                 )
             exclude_routes = id_sequence("exclude_routes", exclude_routes)
             exclude_trips = id_sequence("exclude_trips", exclude_trips)
@@ -1992,17 +2115,16 @@ class TransportNetwork:
 
     def travel_times_from_stop(
         self,
-        from_stop,
-        date,
+        origin,
         departure,
-        max_transfers=7,
+        max_rides=8,
         *,
         exclude_routes=(),
         exclude_trips=(),
         exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
-        max_snap_distance=None,
+        snap_distance=None,
     ):
         """Earliest arrival at every reachable stop for a single departure.
 
@@ -2019,22 +2141,22 @@ class TransportNetwork:
 
         Parameters
         ----------
-        from_stop : str
+        origin : str
             GTFS stop_id of the origin stop; ``<feed_index>:<stop_id>``
             when the id occurs in several merged feeds.
-        date : str
-            Service date as ``YYYY-MM-DD``.
-        departure : str
-            Departure time at the origin as ``HH:MM:SS``.
-        max_transfers : int (optional, default: 7)
-            Maximum number of transfers between rides.
+        departure : datetime.datetime or str
+            Departure at the origin — a datetime, or an ISO string like
+            ``"2022-02-22 08:30"``; the service date is its date part.
+        max_rides : int (optional, default: 8)
+            Maximum number of boarded vehicles per journey (rides, not
+            transfers: 8 rides allow 7 transfers).
         walking_speed_kmph : float (optional, default: 3.6)
             Walking speed in km/h of the door-to-door searches (whole-day
             ULTRA only; ignored otherwise).
-        max_walking_time : float (optional, default: 7200)
-            Walking-time cutoff in seconds of the initial and final walks
-            (whole-day ULTRA only; ignored otherwise).
-        max_snap_distance : float (optional, default: 1600)
+        max_walking_time : float or datetime.timedelta (optional, default: 120 minutes)
+            Walking-time cutoff in minutes of the initial and final
+            walks (whole-day ULTRA only; ignored otherwise).
+        snap_distance : float (optional, default: 1600)
             Maximum straight-line distance in meters from the origin stop to
             the walking network (whole-day ULTRA only; ignored otherwise).
 
@@ -2047,6 +2169,15 @@ class TransportNetwork:
             door-to-door time from the origin stop's coordinate, so the origin
             may cost its short walk to the platform.
         """
+        from cafein._units import departure_parts, duration_seconds
+
+        date, departure = departure_parts(departure)
+        from_stop = origin
+        if max_rides < 1:
+            raise ValueError("max_rides must be at least 1")
+        max_transfers = max_rides - 1
+        max_walking_time = duration_seconds("max_walking_time", max_walking_time)
+        max_snap_distance = snap_distance
         return self._core.travel_times_from_stop(
             from_stop,
             date,
@@ -2060,23 +2191,22 @@ class TransportNetwork:
 
     def travel_time_matrix(
         self,
-        from_stops,
-        date,
+        origins,
         departure,
-        max_transfers=7,
+        max_rides=8,
         *,
         exclude_routes=(),
         exclude_trips=(),
         exclude_stops=(),
         destinations=None,
-        window=None,
+        departure_time_window=None,
         percentiles=None,
         confidence=None,
         chunk=None,
         router="auto",
         walking_speed_kmph=None,
         max_walking_time=None,
-        max_snap_distance=None,
+        snap_distance=None,
     ):
         """Travel times as a matrix, from stops or from points.
 
@@ -2085,8 +2215,8 @@ class TransportNetwork:
         deterministic. This is the bulk primitive travel-time matrices
         are assembled from — never per OD pair.
 
-        With `window`, every minute mark within ``[departure,
-        departure + window)`` is evaluated through one descending range
+        With `departure_time_window`, every minute mark within the
+        window is evaluated through one descending range
         scan per origin, and the output holds nearest-rank percentiles
         of the travel-time distribution across the window — exact
         values, since the samples are the full minute-level departure
@@ -2098,7 +2228,7 @@ class TransportNetwork:
 
         Parameters
         ----------
-        from_stops : list of str, or GeoDataFrame
+        origins : list of str, or GeoDataFrame
             GTFS stop_ids of the origin stops
             (``<feed_index>:<stop_id>`` when an id occurs in several
             merged feeds), or a point GeoDataFrame with an ``id``
@@ -2111,24 +2241,25 @@ class TransportNetwork:
             centroids). Point cells hold the faster of transit and
             walking directly (within ``max_walking_time``), so a pair
             best covered on foot reports its walking time.
-        date : str
-            Service date as ``YYYY-MM-DD``.
-        departure : str
-            Departure time at every origin as ``HH:MM:SS``.
-        max_transfers : int (optional, default: 7)
-            Maximum number of transfers between rides.
+        departure : datetime.datetime or str
+            Departure at every origin — a datetime, or an ISO string
+            like ``"2022-02-22 08:30"``; the service date is its date
+            part.
+        max_rides : int (optional, default: 8)
+            Maximum number of boarded vehicles per journey (rides, not
+            transfers: 8 rides allow 7 transfers).
         destinations : GeoDataFrame (optional)
             Destination points; defaults to the origins. Only valid
             with point origins — stop origins always span every stop.
-        window : int (optional)
-            Departure window in seconds; enables percentile output.
+        departure_time_window : float or datetime.timedelta (optional)
+            Departure window in minutes; enables percentile output.
         percentiles : list of float (optional)
             Percentiles in ``[0, 100]`` over the window's departures;
-            requires `window`, defaults to ``[50]``.
+            requires `departure_time_window`, defaults to ``[50]``.
         confidence : float (optional)
             A level in ``(0, 1)`` mapped to the symmetric percentile
-            interval plus the median; requires `window` and excludes
-            `percentiles`.
+            interval plus the median; requires `departure_time_window`
+            and excludes `percentiles`.
         chunk : (int, int) (optional)
             Compute only origin chunk ``k`` of ``n``: a deterministic
             contiguous block of the resolved origins, so ``n`` batch
@@ -2144,8 +2275,10 @@ class TransportNetwork:
             set, where only the RAPTOR path routes door-to-door and
             auto prefers it; point matrices share the ULTRA set on
             both engines, so the cache alone decides there.
-        walking_speed_kmph, max_walking_time, max_snap_distance : float
-            The street-search options, as in ``access_stops``. They apply to
+        walking_speed_kmph, max_walking_time, snap_distance : float
+            The street-search options, as in ``access_stops``: speed in
+            km/h, walking time in minutes (or a timedelta), snap
+            distance in meters. They apply to
             point origins, and to stop origins of the ``"raptor"`` matrix under
             a whole-day ULTRA set (which routes them door-to-door); they are
             ignored for stop origins otherwise.
@@ -2153,7 +2286,9 @@ class TransportNetwork:
         Returns
         -------
         numpy.ndarray
-            A uint32 array of travel times in seconds — origins by all
+            A uint32 array of travel times in seconds — the exact
+            engine values, unlike the minute-rounded frame computers —
+            origins by all
             stops (column order follows ``stops``) for stop origins,
             origins by destination points for point origins; with
             `window`, one plane per percentile as a third axis, in the
@@ -2161,7 +2296,17 @@ class TransportNetwork:
             Unreachable pairs hold the maximum uint32 value
             (4294967295).
         """
-        from_stops = sequence_not_string("from_stops", from_stops)
+        from cafein._units import departure_parts, duration_seconds
+
+        date, departure = departure_parts(departure)
+        from_stops = origins
+        if max_rides < 1:
+            raise ValueError("max_rides must be at least 1")
+        max_transfers = max_rides - 1
+        window = duration_seconds("departure_time_window", departure_time_window)
+        max_walking_time = duration_seconds("max_walking_time", max_walking_time)
+        max_snap_distance = snap_distance
+        from_stops = sequence_not_string("origins", from_stops)
         if destinations is not None:
             destinations = sequence_not_string("destinations", destinations)
         matrix, _from_ids, _to_ids, _percentiles = self._time_matrix_with_ids(

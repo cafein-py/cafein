@@ -4,7 +4,8 @@ import pytest
 
 from test_frontier import build_two_line_gtfs
 
-DATE, DEPARTURE = "2022-02-22", "08:00:00"
+DATE = "2022-02-22"
+DEPARTURE = "2022-02-22 08:00:00"
 
 
 @pytest.fixture()
@@ -25,21 +26,21 @@ def used(journeys, key):
 
 
 def test_excluding_used_supply_reroutes(two_line_network):
-    baseline = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    baseline = two_line_network.route_between_stops("A", "B", DEPARTURE)
     assert baseline
     routes = used(baseline, "route_id")
     assert routes
     # Excluding every ridden route removes those journeys; whatever is
     # left (possibly nothing) rides none of them.
     rerouted = two_line_network.route_between_stops(
-        "A", "B", DATE, DEPARTURE, exclude_routes=sorted(routes)
+        "A", "B", DEPARTURE, exclude_routes=sorted(routes)
     )
     assert not (used(rerouted, "route_id") & routes)
     # Excluding the ridden trips is finer: those departures vanish,
     # while later trips of the same routes still run.
     trips = used(baseline, "trip_id")
     by_trip = two_line_network.route_between_stops(
-        "A", "B", DATE, DEPARTURE, exclude_trips=sorted(trips)
+        "A", "B", DEPARTURE, exclude_trips=sorted(trips)
     )
     assert by_trip
     assert not (used(by_trip, "trip_id") & trips)
@@ -48,25 +49,20 @@ def test_excluding_used_supply_reroutes(two_line_network):
 
 def test_excluded_origin_or_destination_is_unreachable(two_line_network):
     assert (
-        two_line_network.route_between_stops(
-            "A", "B", DATE, DEPARTURE, exclude_stops=["A"]
-        )
+        two_line_network.route_between_stops("A", "B", DEPARTURE, exclude_stops=["A"])
         == []
     )
     assert (
-        two_line_network.route_between_stops(
-            "A", "B", DATE, DEPARTURE, exclude_stops=["B"]
-        )
+        two_line_network.route_between_stops("A", "B", DEPARTURE, exclude_stops=["B"])
         == []
     )
 
 
 def test_unknown_route_and_trip_ids_are_ignored(two_line_network):
-    baseline = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    baseline = two_line_network.route_between_stops("A", "B", DEPARTURE)
     same = two_line_network.route_between_stops(
         "A",
         "B",
-        DATE,
         DEPARTURE,
         exclude_routes=["no-such-route"],
         exclude_trips=["no-such-trip"],
@@ -75,7 +71,7 @@ def test_unknown_route_and_trip_ids_are_ignored(two_line_network):
     # Stop ids must resolve, as everywhere else.
     with pytest.raises(KeyError):
         two_line_network.route_between_stops(
-            "A", "B", DATE, DEPARTURE, exclude_stops=["no-such-stop"]
+            "A", "B", DEPARTURE, exclude_stops=["no-such-stop"]
         )
 
 
@@ -84,11 +80,11 @@ def test_frontier_exclusions_force_the_raptor_family(
 ):
     from cafein import journey_frontier
 
-    args = (two_line_network, "A", "B", DATE, DEPARTURE, 1800)
+    args = (two_line_network, "A", "B", DEPARTURE, 30)
     kwargs = dict(candidates="pareto")
     baseline = journey_frontier(*args, **kwargs)
     assert len(baseline) > 0
-    legs = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    legs = two_line_network.route_between_stops("A", "B", DEPARTURE)
     routes = sorted(used(legs, "route_id"))
     assert routes
     with pytest.raises(ValueError, match="exclusions require router='raptor'"):
@@ -111,7 +107,6 @@ def test_exclusions_compose_with_diverse_alternatives(two_line_network):
         two_line_network,
         ["A"],
         ["B"],
-        DATE,
         DEPARTURE,
         candidates="diverse",
         max_options=2,
@@ -126,7 +121,6 @@ def test_exclusions_compose_with_diverse_alternatives(two_line_network):
         two_line_network,
         ["A"],
         ["B"],
-        DATE,
         DEPARTURE,
         candidates="diverse",
         max_options=2,
@@ -173,7 +167,7 @@ def filtered_feed(source, target, drop_route):
 def test_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
     from cafein import TransportNetwork
 
-    baseline = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    baseline = two_line_network.route_between_stops("A", "B", DEPARTURE)
     excluded = sorted(used(baseline, "route_id"))[0]
 
     def normalized(journeys):
@@ -186,13 +180,13 @@ def test_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
         ]
 
     with_exclusions = two_line_network.route_between_stops(
-        "A", "B", DATE, DEPARTURE, exclude_routes=[excluded]
+        "A", "B", DEPARTURE, exclude_routes=[excluded]
     )
     source = build_two_line_gtfs(tmp_path / "full.zip")
     rebuilt = TransportNetwork.from_gtfs(
         [str(filtered_feed(source, tmp_path / "without.zip", excluded))]
     )
-    oracle = rebuilt.route_between_stops("A", "B", DATE, DEPARTURE)
+    oracle = rebuilt.route_between_stops("A", "B", DEPARTURE)
     assert normalized(with_exclusions) == normalized(oracle)
     assert with_exclusions
 
@@ -200,8 +194,8 @@ def test_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
 def test_frontier_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
     from cafein import TransportNetwork, journey_frontier
 
-    columns = ["departure_s", "arrival_s", "travel_time_s", "rides", "frontier"]
-    baseline = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    columns = ["departure_s", "arrival_s", "travel_time", "rides", "frontier"]
+    baseline = two_line_network.route_between_stops("A", "B", DEPARTURE)
     excluded = sorted(used(baseline, "route_id"))[0]
     source = build_two_line_gtfs(tmp_path / "full.zip")
     rebuilt = TransportNetwork.from_gtfs(
@@ -212,14 +206,13 @@ def test_frontier_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
             two_line_network,
             "A",
             "B",
-            DATE,
             DEPARTURE,
-            1800,
+            30,
             candidates=candidates,
             exclude_routes=[excluded],
         )
         oracle = journey_frontier(
-            rebuilt, "A", "B", DATE, DEPARTURE, 1800, candidates=candidates
+            rebuilt, "A", "B", DEPARTURE, 30, candidates=candidates
         )
         assert len(with_exclusions) > 0, candidates
         assert with_exclusions[columns].equals(oracle[columns]), candidates
@@ -236,9 +229,8 @@ def test_unknown_only_ids_leave_the_router_untouched(two_line_network):
         two_line_network,
         "A",
         "B",
-        DATE,
         DEPARTURE,
-        1800,
+        30,
         candidates="pareto",
         router="tbtr",
         exclude_routes=["no-such-route"],
@@ -254,8 +246,7 @@ def test_itineraries_take_exclusions(network_with_footpaths):
         network_with_footpaths,
         ["1100602"],
         ["1040280"],
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         geometries=False,
     )
     ridden = set(baseline["route_id"].dropna())
@@ -264,8 +255,7 @@ def test_itineraries_take_exclusions(network_with_footpaths):
         network_with_footpaths,
         ["1100602"],
         ["1040280"],
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         geometries=False,
         exclude_routes=sorted(ridden),
     )
@@ -275,13 +265,13 @@ def test_itineraries_take_exclusions(network_with_footpaths):
 def test_matrix_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
     from cafein import TransportNetwork, TravelTimeMatrix
 
-    legs = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    legs = two_line_network.route_between_stops("A", "B", DEPARTURE)
     excluded = sorted(used(legs, "route_id"))[0]
     source = build_two_line_gtfs(tmp_path / "full.zip")
     rebuilt = TransportNetwork.from_gtfs(
         [str(filtered_feed(source, tmp_path / "without.zip", excluded))]
     )
-    kwargs = dict(date=DATE, departure=DEPARTURE)
+    kwargs = dict(departure=DEPARTURE)
     with_exclusions = TravelTimeMatrix(
         two_line_network, exclude_routes=[excluded], **kwargs
     )
@@ -290,16 +280,16 @@ def test_matrix_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
     assert with_exclusions.equals(oracle)
     # The one-to-all query agrees with the rebuilt feed too.
     assert two_line_network.travel_times_from_stop(
-        "A", DATE, DEPARTURE, exclude_routes=[excluded]
-    ) == rebuilt.travel_times_from_stop("A", DATE, DEPARTURE)
+        "A", DEPARTURE, exclude_routes=[excluded]
+    ) == rebuilt.travel_times_from_stop("A", DEPARTURE)
 
 
 def test_matrix_exclusions_router_contract(two_line_network):
     from cafein import TravelTimeMatrix
 
     two_line_network.compute_tbtr_transfers(DATE)
-    kwargs = dict(date=DATE, departure=DEPARTURE)
-    legs = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    kwargs = dict(departure=DEPARTURE)
+    legs = two_line_network.route_between_stops("A", "B", DEPARTURE)
     excluded = sorted(used(legs, "route_id"))
     with pytest.raises(ValueError, match="exclusions require router='raptor'"):
         TravelTimeMatrix(
@@ -324,13 +314,13 @@ def test_matrix_exclusions_router_contract(two_line_network):
 def test_batched_frontiers_match_a_rebuilt_feed(two_line_network, tmp_path):
     from cafein import TransportNetwork, frontier_table, journey_frontiers
 
-    legs = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    legs = two_line_network.route_between_stops("A", "B", DEPARTURE)
     excluded = sorted(used(legs, "route_id"))[0]
     source = build_two_line_gtfs(tmp_path / "full.zip")
     rebuilt = TransportNetwork.from_gtfs(
         [str(filtered_feed(source, tmp_path / "without.zip", excluded))]
     )
-    args = (["A"], ["B"], DATE, DEPARTURE, 1800)
+    args = (["A"], ["B"], DEPARTURE, 30)
     frame = journey_frontiers(two_line_network, *args, exclude_routes=[excluded])
     oracle = journey_frontiers(rebuilt, *args)
     assert len(frame) > 0
@@ -353,9 +343,9 @@ def test_batched_frontiers_match_a_rebuilt_feed(two_line_network, tmp_path):
 def test_batched_frontier_router_contract(two_line_network, capfd, monkeypatch):
     from cafein import journey_frontiers
 
-    legs = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    legs = two_line_network.route_between_stops("A", "B", DEPARTURE)
     excluded = sorted(used(legs, "route_id"))
-    args = (two_line_network, ["A"], ["B"], DATE, DEPARTURE, 1800)
+    args = (two_line_network, ["A"], ["B"], DEPARTURE, 30)
     with pytest.raises(ValueError, match="exclusions require router='raptor'"):
         journey_frontiers(*args, router="tbtr", exclude_routes=excluded)
     # Auto falls back even over a matching cached set: the batched path
@@ -387,7 +377,7 @@ def test_point_frontiers_take_exclusions(network_with_footpaths):
         {"id": ["destination"]}, geometry=[Point(24.9505, 60.1690)], crs="EPSG:4326"
     )
     legs = network_with_footpaths.route_between_coordinates(
-        (60.1689, 24.9330), (60.1690, 24.9505), "2022-02-22", "08:30:00"
+        (60.1689, 24.9330), (60.1690, 24.9505), "2022-02-22 08:30:00"
     )
     ridden = sorted(used(legs, "route_id"))
     assert ridden
@@ -395,9 +385,8 @@ def test_point_frontiers_take_exclusions(network_with_footpaths):
         network_with_footpaths,
         origins,
         destinations,
-        "2022-02-22",
-        "08:30:00",
-        1800,
+        "2022-02-22 08:30:00",
+        30,
     )
     for wrapper in (journey_frontiers, frontier_table):
         baseline = wrapper(*args)
@@ -416,13 +405,13 @@ def test_cost_matrices_match_a_rebuilt_feed(two_line_network, tmp_path):
 
     from cafein import TransportNetwork, TravelCostMatrix, travel_cost_table
 
-    legs = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    legs = two_line_network.route_between_stops("A", "B", DEPARTURE)
     excluded = sorted(used(legs, "route_id"))[0]
     source = build_two_line_gtfs(tmp_path / "full.zip")
     rebuilt = TransportNetwork.from_gtfs(
         [str(filtered_feed(source, tmp_path / "without.zip", excluded))]
     )
-    args = (["A"], None, DATE, DEPARTURE)
+    args = (["A"], None, DEPARTURE)
     fastest = TravelCostMatrix(two_line_network, *args, exclude_routes=[excluded])
     assert len(fastest) > 0
     assert fastest.equals(TravelCostMatrix(rebuilt, *args))
@@ -430,11 +419,11 @@ def test_cost_matrices_match_a_rebuilt_feed(two_line_network, tmp_path):
         two_line_network,
         *args,
         optimize="emissions",
-        window=1800,
+        departure_time_window=30,
         exclude_routes=[excluded],
     )
     assert windowed.equals(
-        TravelCostMatrix(rebuilt, *args, optimize="emissions", window=1800)
+        TravelCostMatrix(rebuilt, *args, optimize="emissions", departure_time_window=30)
     )
     _pytest.importorskip("pyarrow")
     flat = travel_cost_table(two_line_network, *args, exclude_routes=[excluded])
@@ -446,13 +435,13 @@ def test_cost_matrix_router_contract(two_line_network):
 
     two_line_network.compute_tbtr_transfers(DATE)
     two_line_network.compute_mctbtr_transfers(DATE)
-    legs = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    legs = two_line_network.route_between_stops("A", "B", DEPARTURE)
     excluded = sorted(used(legs, "route_id"))
-    args = (two_line_network, ["A"], ["B"], DATE, DEPARTURE)
+    args = (two_line_network, ["A"], ["B"], DEPARTURE)
     for kwargs in (
         {},
-        {"optimize": "emissions", "window": 1800},
-        {"optimize": "emissions", "window": 1800, "candidates": "pareto"},
+        {"optimize": "emissions", "departure_time_window": 30},
+        {"optimize": "emissions", "departure_time_window": 30, "candidates": "pareto"},
     ):
         with pytest.raises(ValueError, match="exclusions require router='raptor'"):
             TravelCostMatrix(*args, router="tbtr", exclude_routes=excluded, **kwargs)
@@ -475,10 +464,10 @@ def test_cost_matrix_unknown_ids_keep_the_cache(two_line_network, capfd, monkeyp
 
     two_line_network.compute_mctbtr_transfers(DATE)
     monkeypatch.setenv("CAFEIN_MCTBTR_PROF", "1")
-    legs = two_line_network.route_between_stops("A", "B", DATE, DEPARTURE)
+    legs = two_line_network.route_between_stops("A", "B", DEPARTURE)
     excluded = sorted(used(legs, "route_id"))
-    kwargs = dict(optimize="emissions", window=1800, candidates="pareto")
-    args = (two_line_network, ["A"], ["B"], DATE, DEPARTURE)
+    kwargs = dict(optimize="emissions", departure_time_window=30, candidates="pareto")
+    args = (two_line_network, ["A"], ["B"], DEPARTURE)
     # The cost path's dispatch observable is inverted: the McRAPTOR
     # stats flag prints only when the fallback engine actually runs, so
     # unknown-only ids (which keep the cached McTBTR engine) stay
@@ -514,12 +503,12 @@ def test_point_cost_matrices_take_exclusions(network_with_footpaths):
         {"id": ["destination"]}, geometry=[Point(to_lon, to_lat)], crs="EPSG:4326"
     )
     legs = network_with_footpaths.route_between_coordinates(
-        (from_lat, from_lon), (to_lat, to_lon), "2022-02-22", "08:30:00"
+        (from_lat, from_lon), (to_lat, to_lon), "2022-02-22 08:30:00"
     )
     ridden = sorted(used(legs, "route_id"))
     assert ridden
-    args = (network_with_footpaths, origins, destinations, "2022-02-22", "08:30:00")
-    for kwargs in ({}, {"optimize": "emissions", "window": 1800}):
+    args = (network_with_footpaths, origins, destinations, "2022-02-22 08:30:00")
+    for kwargs in ({}, {"optimize": "emissions", "departure_time_window": 30}):
         with pytest.warns(UserWarning, match="route_type"):
             baseline = TravelCostMatrix(*args, **kwargs)
         with pytest.warns(UserWarning, match="route_type"):

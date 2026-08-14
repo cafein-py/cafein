@@ -31,9 +31,8 @@ def test_mcraptor_window_profile_keeps_cleaner_earlier_journeys(network_with_foo
         network_with_footpaths,
         origin,
         destination,
-        "2022-02-22",
-        "08:30:00",
-        max_transfers=4,
+        "2022-02-22 08:30:00",
+        max_rides=5,
     )
     cleanest = oracle["emissions"].min()
 
@@ -41,10 +40,9 @@ def test_mcraptor_window_profile_keeps_cleaner_earlier_journeys(network_with_foo
         network_with_footpaths,
         origin,
         destination,
-        "2022-02-22",
-        "08:30:00",
-        window=900,
-        max_transfers=4,
+        "2022-02-22 08:30:00",
+        departure_time_window=15,
+        max_rides=5,
         candidates="pareto",
         bucket=1e-6,
         router="raptor",
@@ -73,9 +71,8 @@ def test_mctbtr_window_profile_keeps_cleaner_earlier_journeys(network_with_footp
         network_with_footpaths,
         origin,
         destination,
-        "2022-02-22",
-        "08:30:00",
-        max_transfers=4,
+        "2022-02-22 08:30:00",
+        max_rides=5,
     )
     cleanest = oracle["emissions"].min()
 
@@ -83,10 +80,9 @@ def test_mctbtr_window_profile_keeps_cleaner_earlier_journeys(network_with_footp
         network_with_footpaths,
         origin,
         destination,
-        "2022-02-22",
-        "08:30:00",
-        window=900,
-        max_transfers=4,
+        "2022-02-22 08:30:00",
+        departure_time_window=15,
+        max_rides=5,
         candidates="pareto",
         bucket=1e-6,
         router="tbtr",
@@ -279,46 +275,39 @@ def test_id_collections_refuse_bare_strings(network):
 
     with pytest.raises(TypeError, match="exclude_routes"):
         network.route_between_stops(
-            "1040280", "1100602", "2022-02-22", "08:30:00", exclude_routes="1001"
+            "1040280", "1100602", "2022-02-22 08:30:00", exclude_routes="1001"
         )
     with pytest.raises(TypeError, match="exclude_trips"):
         network.travel_times_from_stop(
-            "1040280", "2022-02-22", "08:30:00", exclude_trips="t-1"
+            "1040280", "2022-02-22 08:30:00", exclude_trips="t-1"
         )
-    with pytest.raises(TypeError, match="from_stops"):
-        network.travel_time_matrix("1040280", "2022-02-22", "08:30:00")
     with pytest.raises(TypeError, match="origins"):
-        TravelTimeMatrix(network, "1040280", None, "2022-02-22", "08:30:00")
+        network.travel_time_matrix("1040280", "2022-02-22 08:30:00")
     with pytest.raises(TypeError, match="origins"):
-        DetailedItineraries(
-            network, origins="1040280", date="2022-02-22", departure="08:30:00"
-        )
+        TravelTimeMatrix(network, "1040280", None, "2022-02-22 08:30:00")
+    with pytest.raises(TypeError, match="origins"):
+        DetailedItineraries(network, origins="1040280", departure="2022-02-22 08:30:00")
     with pytest.raises(TypeError, match="exclude_stops"):
         journey_frontier(
             network,
             "1040280",
             "1100602",
-            "2022-02-22",
-            "08:30:00",
-            600,
+            "2022-02-22 08:30:00",
+            10,
             exclude_stops="1040280",
         )
     with pytest.raises(TypeError, match="components"):
         network.annotate_emissions([], components="fuel")
     with pytest.raises(TypeError, match="origins"):
-        journey_frontiers(
-            network, "1040280", ["1100602"], "2022-02-22", "08:30:00", 600
-        )
+        journey_frontiers(network, "1040280", ["1100602"], "2022-02-22 08:30:00", 10)
     with pytest.raises(TypeError, match="origins"):
-        travel_cost_table(network, "1040280", None, "2022-02-22", "08:30:00")
+        travel_cost_table(network, "1040280", None, "2022-02-22 08:30:00")
 
 
 def test_component_selections_accept_one_shot_iterables(network):
     # `set(components)` used to run twice, so a generator was exhausted
     # by validation and the selection came out empty.
-    journeys = network.route_between_stops(
-        "4810551", "1250551", "2022-02-22", "08:30:00"
-    )
+    journeys = network.route_between_stops("4810551", "1250551", "2022-02-22 08:30:00")
     annotated = network.annotate_emissions(journeys, components=iter(["fuel"]))
     legs = [leg for j in annotated for leg in j["legs"] if leg["type"] == "transit"]
     assert any(leg.get("emissions") is not None for leg in legs)
@@ -328,9 +317,8 @@ def test_component_selections_accept_one_shot_iterables(network):
         network,
         "4810551",
         "1250551",
-        "2022-02-22",
-        "08:30:00",
-        600,
+        "2022-02-22 08:30:00",
+        10,
         candidates="pareto",
         components=iter(["fuel"]),
     )
@@ -341,7 +329,7 @@ def test_id_collections_refuse_bytes(network):
     # Bytes iterate as integers: b"1001" would become ("49", "48", ...).
     with pytest.raises(TypeError, match="exclude_routes"):
         network.route_between_stops(
-            "1040280", "1100602", "2022-02-22", "08:30:00", exclude_routes=b"1001"
+            "1040280", "1100602", "2022-02-22 08:30:00", exclude_routes=b"1001"
         )
     with pytest.raises(TypeError, match="components"):
         network.annotate_emissions([], components=b"fuel")
@@ -408,7 +396,7 @@ def test_transfers_never_chain_two_bounded_walks(tmp_path, router):
             [600.0, 600.0, 600.0, 600.0],
         )
     )
-    matrix = network.travel_time_matrix(["A"], "2022-02-22", "07:55:00", router=router)
+    matrix = network.travel_time_matrix(["A"], "2022-02-22 07:55:00", router=router)
     unreachable = np.iinfo(np.uint32).max
     # Ride A→B (08:10), then one 600 s walk to C: 08:20.
     assert matrix[0][2] == 25 * 60

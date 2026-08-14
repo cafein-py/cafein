@@ -16,7 +16,7 @@ from cafein import (  # noqa: E402
     TravelTimeMatrix,
 )
 
-QUERY = {"date": "2022-02-22", "departure": "08:30:00"}
+QUERY = {"departure": "2022-02-22 08:30:00"}
 
 
 def _origin_stops(network, count):
@@ -468,13 +468,13 @@ def test_time_to_parquet_transit_equals_constructor(network, tmp_path):
     read, expected = _read_aligned(tmp_path / "ttm.parquet", frame)
     pd.testing.assert_frame_equal(read, expected)
     windowed = TravelTimeMatrix(
-        network, origins=stops[:20], **QUERY, window=600, confidence=0.8
+        network, origins=stops[:20], **QUERY, departure_time_window=10, confidence=0.8
     )
     TravelTimeMatrix.to_parquet(
         network,
         origins=stops[:20],
         **QUERY,
-        window=600,
+        departure_time_window=10,
         confidence=0.8,
         output=tmp_path / "windowed.parquet",
         batch_size=8,
@@ -589,7 +589,7 @@ def test_to_parquet_refusals(network, car_streets, street_points, tmp_path):
             car_streets,
             origins=street_points,
             transport_mode="walk",
-            date="2022-02-22",
+            departure="2022-02-22 08:30:00",
             output=tmp_path / "e.parquet",
         )
     with pytest.raises(ValueError, match="destinations apply to point origins"):
@@ -633,13 +633,17 @@ def test_percentile_iterable_freezes_once(network, tmp_path):
 
     stops = _origin_stops(network, 12)
     frame = TravelTimeMatrix(
-        network, origins=stops, **QUERY, window=600, percentiles=[25.0, 75.0]
+        network,
+        origins=stops,
+        **QUERY,
+        departure_time_window=10,
+        percentiles=[25.0, 75.0],
     )
     TravelTimeMatrix.to_parquet(
         network,
         origins=stops,
         **QUERY,
-        window=600,
+        departure_time_window=10,
         percentiles=iter([25.0, 75.0]),
         output=tmp_path / "generator.parquet",
         batch_size=5,
@@ -1000,11 +1004,11 @@ def test_resume_refuses_tampered_manifests(network, tmp_path, monkeypatch):
     # the content hash does not.
     original = parquet.read_table(target / "part-00000.parquet")
     swapped = original.set_column(
-        original.schema.get_field_index("travel_time_s"),
-        "travel_time_s",
+        original.schema.get_field_index("travel_time"),
+        "travel_time",
         pyarrow.array(
-            [value + 1 for value in original["travel_time_s"].to_pylist()],
-            type=original.schema.field("travel_time_s").type,
+            [value + 1 for value in original["travel_time"].to_pylist()],
+            type=original.schema.field("travel_time").type,
         ),
     )
     _streaming.write_manifest(target, pristine)
@@ -1042,8 +1046,7 @@ def test_sigkilled_run_resumes(network, tmp_path):
         travel_cost_table(
             network,
             origins=stops,
-            date="2022-02-22",
-            departure="08:30:00",
+            departure="2022-02-22 08:30:00",
             output=sys.argv[2],
             batch_size=25,
         )
@@ -1136,8 +1139,7 @@ RSS_SCRIPT = textwrap.dedent("""
     result = stream(
         network,
         origins=origins,
-        date="2022-02-22",
-        departure="08:30:00",
+        departure="2022-02-22 08:30:00",
         output=output,
         batch_size=250,
     )

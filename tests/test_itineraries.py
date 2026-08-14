@@ -20,7 +20,7 @@ def point_frame(network, named_stops):
 
 def test_stop_itinerary_pins_the_k_train(network):
     itineraries = DetailedItineraries(
-        network, ["4810551"], ["1250551"], "2022-02-22", "08:30:00"
+        network, ["4810551"], ["1250551"], "2022-02-22 08:30:00"
     )
     assert isinstance(itineraries, gpd.GeoDataFrame)
     assert itineraries.crs == "EPSG:4326"
@@ -38,7 +38,7 @@ def test_stop_itinerary_pins_the_k_train(network):
     assert transit["to_stop"] == "1250551"
     assert transit["departure_s"] == 8 * 3600 + 36 * 60
     assert transit["arrival_s"] == 8 * 3600 + 58 * 60
-    assert transit["travel_time_s"] == 22 * 60
+    assert transit["travel_time"] == 22
     assert transit["distance_m"] == pytest.approx(16_786, abs=1)
     assert transit["distance_provenance"] == "shape_dist"
     # 16.786 km at the shipped 25 g/pkm urban-rail factor.
@@ -53,7 +53,7 @@ def test_stop_itinerary_pins_the_k_train(network):
 
 def test_options_are_a_pareto_set(network):
     itineraries = DetailedItineraries(
-        network, ["4810551"], ["1250551"], "2022-02-22", "08:30:00"
+        network, ["4810551"], ["1250551"], "2022-02-22 08:30:00"
     )
     # Each option is one journey; later options ride more and arrive
     # earlier, matching the routing Pareto contract.
@@ -71,8 +71,7 @@ def test_geometries_can_be_switched_off(network):
         network,
         ["4810551"],
         ["1250551"],
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         geometries=False,
     )
     assert itineraries["geometry"].isna().all()
@@ -86,7 +85,7 @@ def test_door_to_door_itinerary_walks_the_streets(network_with_footpaths):
     origins = point_frame(network_with_footpaths, [("A", "1100602")])
     destinations = point_frame(network_with_footpaths, [("B", "1040280")])
     itineraries = DetailedItineraries(
-        network_with_footpaths, origins, destinations, "2022-02-22", "08:30:00"
+        network_with_footpaths, origins, destinations, "2022-02-22 08:30:00"
     )
     # Option 0 is the walking-only alternative: one walk leg, no stops.
     option0 = itineraries[itineraries["option"] == 0]
@@ -119,7 +118,7 @@ def test_door_to_door_itinerary_walks_the_streets(network_with_footpaths):
 
 def test_unreachable_pair_yields_an_empty_frame(network):
     itineraries = DetailedItineraries(
-        network, ["4810551"], ["4810551"], "2022-02-22", "08:30:00"
+        network, ["4810551"], ["4810551"], "2022-02-22 08:30:00"
     )
     assert isinstance(itineraries, gpd.GeoDataFrame)
     assert len(itineraries) == 0
@@ -129,7 +128,7 @@ def test_unreachable_pair_yields_an_empty_frame(network):
 
 def test_slices_do_not_re_route(network):
     itineraries = DetailedItineraries(
-        network, ["4810551"], ["1250551"], "2022-02-22", "08:30:00"
+        network, ["4810551"], ["1250551"], "2022-02-22 08:30:00"
     )
     # A slice is a working GeoDataFrame detached from the network.
     head = itineraries.iloc[:1]
@@ -146,18 +145,17 @@ def test_slices_do_not_re_route(network):
 def test_inputs_must_match_and_be_valid(network):
     points = point_frame(network, [("A", "4810551")])
     with pytest.raises(ValueError, match="both be stop ids or both be"):
-        DetailedItineraries(network, ["4810551"], points, "2022-02-22", "08:30:00")
+        DetailedItineraries(network, ["4810551"], points, "2022-02-22 08:30:00")
     with pytest.raises(ValueError, match="walking options apply to point"):
         DetailedItineraries(
             network,
             ["4810551"],
             ["1250551"],
-            "2022-02-22",
-            "08:30:00",
-            max_snap_distance=50,
+            "2022-02-22 08:30:00",
+            snap_distance=50,
         )
     with pytest.raises(ValueError, match="required for detailed itineraries"):
-        DetailedItineraries(network, None, ["1250551"], "2022-02-22", "08:30:00")
+        DetailedItineraries(network, None, ["1250551"], "2022-02-22 08:30:00")
 
 
 def test_pareto_candidates_add_the_cleaner_slower_journey(network):
@@ -175,15 +173,14 @@ def test_pareto_candidates_add_the_cleaner_slower_journey(network):
         return best
 
     time_it = DetailedItineraries(
-        network, [origin], [destination], "2022-02-22", "08:30:00", max_transfers=4
+        network, [origin], [destination], "2022-02-22 08:30:00", max_rides=5
     )
     pareto_it = DetailedItineraries(
         network,
         [origin],
         [destination],
-        "2022-02-22",
-        "08:30:00",
-        max_transfers=4,
+        "2022-02-22 08:30:00",
+        max_rides=5,
         candidates="pareto",
         bucket=1e-6,
     )
@@ -198,8 +195,7 @@ def test_pareto_and_router_options_are_validated(network):
             network,
             ["4810551"],
             ["1250551"],
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             candidates="nonsense",
         )
     with pytest.raises(ValueError, match="requires candidates='pareto'"):
@@ -207,8 +203,7 @@ def test_pareto_and_router_options_are_validated(network):
             network,
             ["4810551"],
             ["1250551"],
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             candidates="time",
             router="tbtr",
         )
@@ -217,8 +212,7 @@ def test_pareto_and_router_options_are_validated(network):
             network,
             ["4810551"],
             ["1250551"],
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             candidates="pareto",
             router="nonsense",
         )
@@ -232,15 +226,14 @@ def _option_summaries(itineraries):
 
 
 def test_relaxed_itineraries_reduce_to_pareto_at_zero_slack(network):
-    # slack_seconds=0 gives back the strict pareto options exactly.
+    # tolerance_minutes=0 gives back the strict pareto options exactly.
     origin, destination = "1370104", "4960238"
-    common = dict(max_transfers=4, bucket=1e-6)
+    common = dict(max_rides=5, bucket=1e-6)
     pareto = DetailedItineraries(
         network,
         [origin],
         [destination],
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         candidates="pareto",
         **common,
     )
@@ -248,10 +241,9 @@ def test_relaxed_itineraries_reduce_to_pareto_at_zero_slack(network):
         network,
         [origin],
         [destination],
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         candidates="relaxed",
-        slack_seconds=0,
+        tolerance_minutes=0,
         **common,
     )
     assert _option_summaries(relaxed) == _option_summaries(pareto)
@@ -267,16 +259,15 @@ def test_relaxed_itineraries_widen_the_pareto_options(network):
             network,
             [origin],
             [destination],
-            "2022-02-22",
-            "08:30:00",
-            max_transfers=4,
+            "2022-02-22 08:30:00",
+            max_rides=5,
             **kw,
         )["option"].nunique()
 
     pareto = options(candidates="pareto")
-    widened = options(candidates="relaxed", slack_seconds=3600)
+    widened = options(candidates="relaxed", tolerance_minutes=60)
     assert widened > pareto
-    capped = options(candidates="relaxed", slack_seconds=3600, max_options=pareto)
+    capped = options(candidates="relaxed", tolerance_minutes=60, max_options=pareto)
     assert capped == pareto
 
 
@@ -286,26 +277,23 @@ def test_relaxed_itinerary_options_are_validated(network):
         DetailedItineraries(
             network,
             *stops,
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             candidates="relaxed",
             router="tbtr",
         )
-    with pytest.raises(ValueError, match="slack"):
+    with pytest.raises(ValueError, match="tolerance"):
         DetailedItineraries(
             network,
             *stops,
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             candidates="relaxed",
-            slack_seconds=-5,
+            tolerance_minutes=-5,
         )
     with pytest.raises(ValueError, match="max_options"):
         DetailedItineraries(
             network,
             *stops,
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             candidates="relaxed",
             max_options=0,
         )
@@ -326,9 +314,8 @@ def test_diverse_itineraries_are_route_disjoint(network):
         network,
         [origin],
         [destination],
-        "2022-02-22",
-        "08:30:00",
-        max_transfers=6,
+        "2022-02-22 08:30:00",
+        max_rides=7,
         candidates="diverse",
         max_options=3,
     )
@@ -350,8 +337,7 @@ def test_diverse_itineraries_stop_at_a_single_corridor(network):
         network,
         ["4810551"],
         ["1250551"],
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         candidates="diverse",
         max_options=5,
     )
@@ -364,8 +350,7 @@ def test_diverse_itinerary_options_are_validated(network):
         DetailedItineraries(
             network,
             *stops,
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             candidates="diverse",
             router="tbtr",
         )
@@ -373,8 +358,7 @@ def test_diverse_itinerary_options_are_validated(network):
         DetailedItineraries(
             network,
             *stops,
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             candidates="diverse",
             max_options=0,
         )
@@ -382,27 +366,24 @@ def test_diverse_itinerary_options_are_validated(network):
         DetailedItineraries(
             network,
             *stops,
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             candidates="diverse",
             diversity="closest",
         )
-    with pytest.raises(ValueError, match="slack_seconds"):
+    with pytest.raises(ValueError, match="tolerance_minutes"):
         DetailedItineraries(
             network,
             *stops,
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             candidates="diverse",
-            slack_seconds=-1,
+            tolerance_minutes=-1,
         )
     for bad in (-5, 0, "nope"):
         with pytest.raises(ValueError, match="penalty must be"):
             DetailedItineraries(
                 network,
                 *stops,
-                "2022-02-22",
-                "08:30:00",
+                "2022-02-22 08:30:00",
                 candidates="diverse",
                 penalty=bad,
             )
@@ -410,8 +391,7 @@ def test_diverse_itinerary_options_are_validated(network):
         DetailedItineraries(
             network,
             *stops,
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             candidates="pareto",
             penalty=300,
         )
@@ -429,8 +409,7 @@ def test_diverse_itineraries_keep_picking_past_the_walking_journey(
         network_with_footpaths,
         origins,
         destinations,
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         candidates="diverse",
         diversity="spread",
         max_options=4,
@@ -449,15 +428,12 @@ def test_diverse_itineraries_soft_penalty_shares_trunks(network):
     # penalty="ban" forces route-disjoint corridors; a positive penalty lets a
     # corridor share a trunk route and surfaces more options before drying up.
     origin, destination = "1281160", "1320107"
-    common = dict(
-        max_transfers=6, candidates="diverse", max_options=5, diversity="spread"
-    )
+    common = dict(max_rides=7, candidates="diverse", max_options=5, diversity="spread")
     ban = DetailedItineraries(
         network,
         [origin],
         [destination],
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         penalty="ban",
         **common,
     )
@@ -465,8 +441,7 @@ def test_diverse_itineraries_soft_penalty_shares_trunks(network):
         network,
         [origin],
         [destination],
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         penalty=600,
         **common,
     )
@@ -481,7 +456,7 @@ def test_diverse_itineraries_spread_reaches_across_the_trade_off(network):
     # Same disjoint corridors, different objective: "spread" seeds on the
     # fastest then reaches the far (slow) corner the fastest-first set skips.
     origin, destination = "1370104", "4960238"
-    common = dict(max_transfers=6, candidates="diverse", max_options=3)
+    common = dict(max_rides=7, candidates="diverse", max_options=3)
 
     def latest(itineraries):
         return max(int(g["arrival_s"].max()) for _, g in itineraries.groupby("option"))
@@ -490,8 +465,7 @@ def test_diverse_itineraries_spread_reaches_across_the_trade_off(network):
         network,
         [origin],
         [destination],
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         diversity="time",
         **common,
     )
@@ -499,8 +473,7 @@ def test_diverse_itineraries_spread_reaches_across_the_trade_off(network):
         network,
         [origin],
         [destination],
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         diversity="spread",
         **common,
     )

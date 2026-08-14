@@ -2,11 +2,13 @@
 
 ``Accessibility`` counts or decay-weights the opportunities reachable
 from every origin within one or more budgets on a chosen cost axis —
-seconds of travel time, grams CO2e, fare currency units, or street
+minutes of travel time, grams CO2e, fare currency units, or street
 metres — in long format: one row per (origin, opportunity field,
 budget). The weight formulas live in the compiled core; costs come
 from the same engine dispatch as the matrix computers.
 """
+
+import datetime
 
 import numpy as np
 import pandas as pd
@@ -126,6 +128,7 @@ def _transit_cost_surface(
     components,
     fares,
     max_transfers,
+    max_travel_time,
     router,
     chunk,
     exclusions,
@@ -144,8 +147,16 @@ def _transit_cost_surface(
     )
     from cafein.network import _walk_options
 
+    from cafein.fares import ZoneFareStructure
+
     objective = "emissions" if cost == "emissions" else "fare"
     fare_tables = fares._flat_tables(network) if fares is not None else None
+    # A zone structure's exact fare search needs a time limit to stay
+    # fast; 120 minutes of total travel time is the default cap, as on
+    # the cost matrices — max_travel_time overrides it.
+    cap = max_travel_time
+    if cap is None and isinstance(fares, ZoneFareStructure):
+        cap = 7200
     _validate_cost_query(date, departure, objective, window, None, fare_tables, router)
     trip_factors = emissions.trip_factors(network, factors, components)
     exclusions = [list(ids) for ids in exclusions]
@@ -165,7 +176,7 @@ def _transit_cost_surface(
             trip_factors,
             objective,
             fare_tables,
-            None,
+            cap,
             max_transfers,
             router,
             *exclusions,
@@ -187,7 +198,7 @@ def _transit_cost_surface(
             trip_factors,
             objective,
             fare_tables,
-            None,
+            cap,
             max_transfers,
             unique_ids,
             "time",
@@ -228,7 +239,7 @@ class Accessibility(pd.DataFrame):
     or ``"count"``), ``budget`` (in the cost axis's unit), and
     ``accessibility`` (the
     decay-weighted sum; with the default ``decay="step"``, the exact
-    reachable count or mass). With a departure `window`, a
+    reachable count or mass). With a `departure_time_window`, a
     ``percentile`` column is added and each row holds the
     accessibility at that percentile of the travel-time distribution
     across the window's minute marks (r5-style: percentile costs, then
@@ -237,25 +248,32 @@ class Accessibility(pd.DataFrame):
     On a ``TransportNetwork``, origins and destinations are either both
     stop-id sequences or both GeoDataFrames with an ``id`` column
     (points, or polygons routed via centroids), routed door to door at
-    `date` and `departure`. On a ``StreetNetwork``, both are
+    the ``departure``. On a ``StreetNetwork``, both are
     GeoDataFrames and `transport_mode` names the street mode.
 
     ``cost`` selects the axis budgets are measured on, with
     ``TravelCostMatrix``'s optimize semantics — the per-destination
     optimum of that axis, not the axis read off the fastest journey:
 
-    - ``"time"`` — seconds (the default; windows/percentiles apply).
+    - ``"time"`` — minutes (the default; windows/percentiles
+      apply).
     - ``"emissions"`` — grams CO2e via the cost engines; requires
-      `window`, takes `factors`/`components`; a destination whose
+      `departure_time_window`, takes `factors`/`components`; a
+      destination whose
       optimum is unresolved (an unpriced trip) counts as unreached.
     - ``"money"`` — the fare structure's own currency units (the
-      ``fare`` column's units); requires `window` and `fares`.
+      ``fare`` column's units); requires `departure_time_window` and
+      `fares`.
     - ``"distance"`` — metres, street networks only (network plus
       connector metres); on transit it is not an optimizable axis and
       raises.
 
     The emissions and money optima are single values over the window,
-    so `percentiles` does not combine with them.
+    so `percentiles` does not combine with them. ``max_travel_time``
+    (minutes or a timedelta) bounds their journeys' total travel time;
+    on a zone fare structure the money axis defaults to 120 minutes,
+    as on the cost matrices, and the time axis rejects it — the
+    budgets already bound time.
     """
 
     @property
@@ -267,17 +285,16 @@ class Accessibility(pd.DataFrame):
         network,
         origins,
         destinations,
-        date=None,
         departure=None,
         *,
         opportunities=None,
         cost="time",
-        budgets=(1800.0,),
+        budgets=(30.0,),
         decay="step",
         decay_params=None,
-        max_transfers=7,
+        max_rides=8,
         router="auto",
-        window=None,
+        departure_time_window=None,
         percentiles=None,
         confidence=None,
         factors=None,
@@ -286,13 +303,32 @@ class Accessibility(pd.DataFrame):
         chunk=None,
         transport_mode=None,
         max_street_time=None,
+        max_travel_time=None,
         exclude_routes=(),
         exclude_trips=(),
         exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
-        max_snap_distance=None,
+        snap_distance=None,
     ):
+        from cafein._units import departure_parts, duration_seconds
+
+        date, departure = (
+            (None, None) if departure is None else departure_parts(departure)
+        )
+        if max_rides < 1:
+            raise ValueError("max_rides must be at least 1")
+        max_transfers = max_rides - 1
+        window = duration_seconds("departure_time_window", departure_time_window)
+        max_walking_time = duration_seconds("max_walking_time", max_walking_time)
+        max_street_time = duration_seconds("max_street_time", max_street_time)
+        if max_travel_time is not None and cost not in ("emissions", "money"):
+            raise ValueError(
+                "max_travel_time bounds the emissions and money axes; "
+                "time budgets already bound the time axis"
+            )
+        max_travel_time = duration_seconds("max_travel_time", max_travel_time)
+        max_snap_distance = snap_distance
         from cafein import _cafein
         from cafein.matrices import (
             _chunk_slice,
@@ -306,8 +342,35 @@ class Accessibility(pd.DataFrame):
         exclude_routes = id_sequence("exclude_routes", exclude_routes)
         exclude_trips = id_sequence("exclude_trips", exclude_trips)
         exclude_stops = id_sequence("exclude_stops", exclude_stops)
+        if cost == "time" and isinstance(decay_params, dict):
+            # Time-axis decay parameters are durations like the
+            # budgets: minutes (or timedeltas) in, seconds to the core.
+            decay_params = {
+                name: duration_seconds("decay_params", value)
+                for name, value in decay_params.items()
+            }
         decay_param = _decay_parameter(decay, decay_params)
-        budgets = _budget_list(budgets)
+        if cost == "time":
+            # Time budgets are durations like every other time input:
+            # minutes (or timedeltas); other cost axes keep their own
+            # units (grams, euros). The frame's budget column echoes the
+            # user's minutes; the core compares seconds.
+            raw_budgets = sequence_not_string("budgets", budgets)
+            budgets = [
+                float(duration_seconds("budgets", budget)) for budget in raw_budgets
+            ]
+            # The frame's budget column echoes the values as passed.
+            budget_column = [
+                (
+                    budget.total_seconds() / 60
+                    if isinstance(budget, datetime.timedelta)
+                    else float(budget)
+                )
+                for budget in raw_budgets
+            ]
+        else:
+            budgets = _budget_list(budgets)
+            budget_column = budgets
         labels, values = _opportunity_columns(destinations, opportunities)
         if cost not in ("time", "emissions", "money", "distance"):
             raise ValueError(
@@ -328,7 +391,8 @@ class Accessibility(pd.DataFrame):
         if cost in ("emissions", "money"):
             if window is None:
                 raise ValueError(
-                    f"cost={cost!r} optimizes over a departure window; pass " "window="
+                    f"cost={cost!r} optimizes over a departure window; "
+                    "pass departure_time_window="
                 )
             if percentiles is not None or confidence is not None:
                 raise ValueError(
@@ -345,7 +409,7 @@ class Accessibility(pd.DataFrame):
             rejected = {
                 "date": date,
                 "departure": departure,
-                "window": window,
+                "departure_time_window": window,
                 "percentiles": percentiles,
                 "confidence": confidence,
                 "walking_speed_kmph": walking_speed_kmph,
@@ -355,12 +419,12 @@ class Accessibility(pd.DataFrame):
             if router != "auto":
                 named.append("router")
             if max_transfers != 7:
-                named.append("max_transfers")
+                named.append("max_rides")
             if named or any((exclude_routes, exclude_trips, exclude_stops)):
                 offending = ", ".join(named) or "exclusions"
                 raise ValueError(
                     f"{offending} apply to transit; a StreetNetwork takes "
-                    "transport_mode, max_street_time, and max_snap_distance"
+                    "transport_mode, max_street_time, and snap_distance"
                 )
             from cafein.street_network import MAX_STREET_TIME
             from cafein.streets import MAX_SNAP_DISTANCE
@@ -410,7 +474,7 @@ class Accessibility(pd.DataFrame):
                     "StreetNetwork; a TransportNetwork routes door to door"
                 )
             if date is None or departure is None:
-                raise TypeError("Accessibility requires date and departure")
+                raise TypeError("Accessibility requires departure")
             if _is_geo(origins) != _is_geo(destinations):
                 raise ValueError(
                     "origins and destinations must both be stop ids/tables "
@@ -436,6 +500,7 @@ class Accessibility(pd.DataFrame):
                     components,
                     fares,
                     max_transfers,
+                    max_travel_time,
                     router,
                     chunk,
                     (exclude_routes, exclude_trips, exclude_stops),
@@ -516,7 +581,7 @@ class Accessibility(pd.DataFrame):
         columns = {
             "from_id": np.repeat(list(from_ids), per_origin),
             "opportunity": np.tile(labels, len(budgets) * len(from_ids)),
-            "budget": np.tile(np.repeat(budgets, len(labels)), len(from_ids)),
+            "budget": np.tile(np.repeat(budget_column, len(labels)), len(from_ids)),
         }
         if resolved_percentiles is None:
             columns["accessibility"] = aggregated(matrix).ravel()
