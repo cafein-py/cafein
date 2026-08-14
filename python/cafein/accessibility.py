@@ -138,6 +138,7 @@ def _transit_cost_surface(
     chunk,
     exclusions,
     walk,
+    _resolved=None,
 ):
     """The dense per-destination optimum surface for an emissions or
     money axis: NaN marks pairs the engines emitted no row for —
@@ -155,7 +156,13 @@ def _transit_cost_surface(
     from cafein.fares import ZoneFareStructure
 
     objective = "emissions" if cost == "emissions" else "fare"
-    fare_tables = fares._flat_tables(network) if fares is not None else None
+    if _resolved is not None:
+        # A streaming run froze the factor and fare resolution once;
+        # every batch prices with the same snapshot.
+        resolved_factors, fare_tables = _resolved
+    else:
+        resolved_factors = None
+        fare_tables = fares._flat_tables(network) if fares is not None else None
     # A zone structure's exact fare search needs a time limit to stay
     # fast; 120 minutes of total travel time is the default cap, as on
     # the cost matrices — max_travel_time overrides it.
@@ -163,7 +170,11 @@ def _transit_cost_surface(
     if cap is None and isinstance(fares, ZoneFareStructure):
         cap = 7200
     _validate_cost_query(date, departure, objective, window, None, fare_tables, router)
-    trip_factors = emissions.trip_factors(network, factors, components)
+    trip_factors = (
+        resolved_factors
+        if resolved_factors is not None
+        else emissions.trip_factors(network, factors, components)
+    )
     exclusions = [list(ids) for ids in exclusions]
     walk = _walk_options(*walk)
     if _is_geo(origins):
@@ -269,6 +280,7 @@ def _resolved_cost_matrix(
     walking_speed_kmph,
     max_walking_time,
     label,
+    _resolved_costs=None,
 ):
     """The per-origin cost matrix on the chosen axis, dispatched by
     network kind exactly as the matrix computers dispatch: (matrix,
@@ -389,6 +401,7 @@ def _resolved_cost_matrix(
                 chunk,
                 (exclude_routes, exclude_trips, exclude_stops),
                 (walking_speed_kmph, max_walking_time, max_snap_distance),
+                _resolved=_resolved_costs,
             )
             resolved_percentiles = None
         elif _is_geo(origins):
@@ -442,6 +455,118 @@ def _resolved_cost_matrix(
     return matrix, from_ids, to_ids, resolved_percentiles
 
 
+def _accessibility_columns(
+    network,
+    origins,
+    destinations,
+    date,
+    departure,
+    cost,
+    window,
+    percentiles,
+    confidence,
+    factors,
+    components,
+    fares,
+    max_transfers,
+    max_travel_time,
+    router,
+    chunk,
+    transport_mode,
+    max_street_time,
+    max_snap_distance,
+    exclude_routes,
+    exclude_trips,
+    exclude_stops,
+    walking_speed_kmph,
+    max_walking_time,
+    labels,
+    values,
+    budgets,
+    budget_column,
+    decay,
+    decay_param,
+    label,
+    _resolved_costs=None,
+):
+    """The long accessibility frame for `origins` — the computation
+    the constructor and the streaming classmethod share, inputs
+    already validated and converted."""
+    from cafein import _cafein
+
+    matrix, from_ids, _to_ids, resolved_percentiles = _resolved_cost_matrix(
+        network,
+        origins,
+        destinations,
+        date,
+        departure,
+        cost,
+        window,
+        percentiles,
+        confidence,
+        factors,
+        components,
+        fares,
+        max_transfers,
+        max_travel_time,
+        router,
+        chunk,
+        transport_mode,
+        max_street_time,
+        max_snap_distance,
+        exclude_routes,
+        exclude_trips,
+        exclude_stops,
+        walking_speed_kmph,
+        max_walking_time,
+        label=label,
+        _resolved_costs=_resolved_costs,
+    )
+
+    flat_values = [float(value) for value in values.ravel()]
+
+    def aggregated(cost_slice):
+        cost_slice = np.asarray(cost_slice)
+        if cost_slice.dtype.kind == "f":
+            return _cafein.aggregate_opportunity_sums_f64(
+                np.ascontiguousarray(cost_slice, dtype="float64"),
+                flat_values,
+                len(labels),
+                budgets,
+                decay,
+                decay_param,
+            )
+        return _cafein.aggregate_opportunity_sums(
+            np.ascontiguousarray(cost_slice, dtype="uint32"),
+            flat_values,
+            len(labels),
+            budgets,
+            decay,
+            decay_param,
+        )
+
+    per_origin = len(budgets) * len(labels)
+    columns = {
+        "from_id": np.repeat(list(from_ids), per_origin),
+        "opportunity": np.tile(labels, len(budgets) * len(from_ids)),
+        "budget": np.tile(np.repeat(budget_column, len(labels)), len(from_ids)),
+    }
+    if resolved_percentiles is None:
+        columns["accessibility"] = aggregated(matrix).ravel()
+        return pd.DataFrame(columns)
+    # One aggregation per percentile of the windowed cost
+    # distribution: the weights apply to percentile costs, never to
+    # averaged accessibility values.
+    frames = []
+    for at, percentile in enumerate(resolved_percentiles):
+        frame = pd.DataFrame(columns)
+        frame["percentile"] = percentile
+        frame["accessibility"] = aggregated(matrix[:, :, at]).ravel()
+        frames.append(frame)
+    long = pd.concat(frames, ignore_index=True)
+    return long[["from_id", "opportunity", "budget", "percentile", "accessibility"]]
+
+
 class Accessibility(pd.DataFrame):
     """Reachable opportunities per origin, budget, and field.
 
@@ -477,6 +602,10 @@ class Accessibility(pd.DataFrame):
     - ``"distance"`` — metres, street networks only (network plus
       connector metres); on transit it is not an optimizable axis and
       raises.
+
+    ``Accessibility.to_parquet(...)`` streams the same table to disk
+    in origin batches with the matrices' resume manifest, so a
+    country-scale run never materialises the whole frame.
 
     The emissions and money optima are single values over the window,
     so `percentiles` does not combine with them. ``max_travel_time``
@@ -539,7 +668,6 @@ class Accessibility(pd.DataFrame):
             )
         max_travel_time = duration_seconds("max_travel_time", max_travel_time)
         max_snap_distance = snap_distance
-        from cafein import _cafein
         from cafein.matrices import _is_street_network
 
         origins = sequence_not_string("origins", origins)
@@ -605,78 +733,342 @@ class Accessibility(pd.DataFrame):
                     "destination; percentiles apply to cost='time'"
                 )
 
-        matrix, from_ids, _to_ids, resolved_percentiles = _resolved_cost_matrix(
-            network,
-            origins,
-            destinations,
-            date,
-            departure,
-            cost,
-            window,
-            percentiles,
-            confidence,
-            factors,
-            components,
-            fares,
-            max_transfers,
-            max_travel_time,
-            router,
-            chunk,
-            transport_mode,
-            max_street_time,
-            max_snap_distance,
-            exclude_routes,
-            exclude_trips,
-            exclude_stops,
-            walking_speed_kmph,
-            max_walking_time,
-            label="Accessibility",
-        )
-
-        flat_values = [float(value) for value in values.ravel()]
-
-        def aggregated(cost_slice):
-            cost_slice = np.asarray(cost_slice)
-            if cost_slice.dtype.kind == "f":
-                return _cafein.aggregate_opportunity_sums_f64(
-                    np.ascontiguousarray(cost_slice, dtype="float64"),
-                    flat_values,
-                    len(labels),
-                    budgets,
-                    decay,
-                    decay_param,
-                )
-            return _cafein.aggregate_opportunity_sums(
-                np.ascontiguousarray(cost_slice, dtype="uint32"),
-                flat_values,
-                len(labels),
+        super().__init__(
+            _accessibility_columns(
+                network,
+                origins,
+                destinations,
+                date,
+                departure,
+                cost,
+                window,
+                percentiles,
+                confidence,
+                factors,
+                components,
+                fares,
+                max_transfers,
+                max_travel_time,
+                router,
+                chunk,
+                transport_mode,
+                max_street_time,
+                max_snap_distance,
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+                labels,
+                values,
                 budgets,
+                budget_column,
                 decay,
                 decay_param,
+                label="Accessibility",
             )
+        )
 
-        per_origin = len(budgets) * len(labels)
-        columns = {
-            "from_id": np.repeat(list(from_ids), per_origin),
-            "opportunity": np.tile(labels, len(budgets) * len(from_ids)),
-            "budget": np.tile(np.repeat(budget_column, len(labels)), len(from_ids)),
+    @classmethod
+    def to_parquet(
+        cls,
+        network,
+        origins,
+        destinations,
+        departure=None,
+        *,
+        opportunities=None,
+        cost="time",
+        budgets=(30.0,),
+        decay="step",
+        decay_params=None,
+        max_rides=8,
+        router="auto",
+        departure_time_window=None,
+        percentiles=None,
+        confidence=None,
+        factors=None,
+        components=None,
+        fares=None,
+        chunk=None,
+        transport_mode=None,
+        max_street_time=None,
+        max_travel_time=None,
+        exclude_routes=(),
+        exclude_trips=(),
+        exclude_stops=(),
+        walking_speed_kmph=None,
+        max_walking_time=None,
+        snap_distance=None,
+        output,
+        batch_size=None,
+        resume=False,
+    ):
+        """The accessibility table streamed to Parquet — the
+        constructor's semantics with ``travel_cost_table``'s
+        ``output=`` behavior.
+
+        Origins are processed in ``batch_size`` slices (default 500)
+        and each batch is written as it completes, so a country-scale
+        run never materialises the whole frame. ``output=`` selects
+        the form by suffix exactly as ``travel_cost_table`` does and
+        the return value is a :class:`cafein.StreamingResult`;
+        ``resume=True`` continues a matching partial directory run
+        with the same manifest contract.
+        """
+        from cafein._units import departure_parts, duration_seconds
+
+        date, departure = (
+            (None, None) if departure is None else departure_parts(departure)
+        )
+        if max_rides < 1:
+            raise ValueError("max_rides must be at least 1")
+        max_transfers = max_rides - 1
+        window = duration_seconds("departure_time_window", departure_time_window)
+        max_walking_time = duration_seconds("max_walking_time", max_walking_time)
+        max_street_time = duration_seconds("max_street_time", max_street_time)
+        if max_travel_time is not None and cost not in ("emissions", "money"):
+            raise ValueError(
+                "max_travel_time bounds the emissions and money axes; "
+                "time budgets already bound the time axis"
+            )
+        max_travel_time = duration_seconds("max_travel_time", max_travel_time)
+        max_snap_distance = snap_distance
+        from cafein.matrices import _is_street_network
+
+        origins = sequence_not_string("origins", origins)
+        destinations = sequence_not_string("destinations", destinations)
+        exclude_routes = id_sequence("exclude_routes", exclude_routes)
+        exclude_trips = id_sequence("exclude_trips", exclude_trips)
+        exclude_stops = id_sequence("exclude_stops", exclude_stops)
+        if cost == "time" and isinstance(decay_params, dict):
+            # Time-axis decay parameters are durations like the
+            # budgets: minutes (or timedeltas) in, seconds to the core.
+            decay_params = {
+                name: duration_seconds("decay_params", value)
+                for name, value in decay_params.items()
+            }
+        decay_param = _decay_parameter(decay, decay_params)
+        if cost == "time":
+            # Time budgets are durations like every other time input:
+            # minutes (or timedeltas); other cost axes keep their own
+            # units (grams, euros). The frame's budget column echoes the
+            # user's minutes; the core compares seconds.
+            raw_budgets = sequence_not_string("budgets", budgets)
+            budgets = [
+                float(duration_seconds("budgets", budget)) for budget in raw_budgets
+            ]
+            # The frame's budget column echoes the values as passed.
+            budget_column = [
+                (
+                    budget.total_seconds() / 60
+                    if isinstance(budget, datetime.timedelta)
+                    else float(budget)
+                )
+                for budget in raw_budgets
+            ]
+        else:
+            budgets = _budget_list(budgets)
+            budget_column = budgets
+        labels, values = _opportunity_columns(destinations, opportunities)
+        if cost not in ("time", "emissions", "money", "distance"):
+            raise ValueError(
+                f"unknown cost {cost!r}: the axes are time, emissions, "
+                "money, distance"
+            )
+        if cost != "emissions" and (factors is not None or components is not None):
+            raise ValueError("factors and components apply to cost='emissions'")
+        if cost != "money" and fares is not None:
+            raise ValueError("fares applies to cost='money'")
+        if cost == "money" and fares is None:
+            raise ValueError("cost='money' requires a fare structure (fares=)")
+        if _is_street_network(network) and cost in ("emissions", "money"):
+            raise ValueError(
+                f"cost={cost!r} needs the transit cost engines; a "
+                "StreetNetwork serves cost='time' and cost='distance'"
+            )
+        if cost in ("emissions", "money"):
+            if window is None:
+                raise ValueError(
+                    f"cost={cost!r} optimizes over a departure window; "
+                    "pass departure_time_window="
+                )
+            if percentiles is not None or confidence is not None:
+                raise ValueError(
+                    f"cost={cost!r} yields the window's single optimum per "
+                    "destination; percentiles apply to cost='time'"
+                )
+
+        import pyarrow
+
+        from cafein.matrices import (
+            _chunk_slice,
+            _point_frame,
+            _point_list,
+            _stream_run,
+            _stream_size,
+        )
+
+        size = _stream_size(batch_size, resume)
+        geo = _is_geo(origins)
+        if geo:
+            from_ids, origin_points = _point_list(origins, "origins")
+        else:
+            from_ids = _stop_ids(origins, "origins")
+            origin_points = None
+        keep = _chunk_slice(len(from_ids), chunk)
+        from_ids = list(from_ids[keep])
+        if origin_points is not None:
+            origin_points = list(origin_points[keep])
+        if _is_geo(destinations):
+            to_ids, to_points = _point_list(destinations, "destinations")
+            to_ids = list(to_ids)
+            to_points = list(to_points)
+        elif _is_table(destinations):
+            to_ids = _stop_ids(destinations, "destinations")
+            to_points = None
+        else:
+            to_ids = list(id_sequence("destinations", destinations))
+            to_points = None
+        flat_values = [float(value) for value in values.ravel()]
+        resolved_costs = None
+        if cost in ("emissions", "money"):
+            # One resolution serves every batch and the fingerprint:
+            # factor rows, component selection, and fare tables are
+            # frozen here, never re-read from the caller's mutables.
+            from cafein import emissions as emissions_module
+
+            resolved_costs = (
+                emissions_module.trip_factors(network, factors, components),
+                None if fares is None else fares._flat_tables(network),
+            )
+        resolved_percentiles = None
+        if cost == "time" and window is not None:
+            from cafein.network import _window_percentiles
+
+            resolved_percentiles = _window_percentiles(window, percentiles, confidence)
+        columns = ["from_id", "opportunity", "budget", "accessibility"]
+        if resolved_percentiles is not None:
+            columns = [
+                "from_id",
+                "opportunity",
+                "budget",
+                "percentile",
+                "accessibility",
+            ]
+        parameters = {
+            "date": date,
+            "departure": departure,
+            "cost": cost,
+            "window": window,
+            "budgets": budgets,
+            "budget_column": budget_column,
+            "decay": decay,
+            "decay_param": decay_param,
+            "labels": labels,
+            "opportunities": flat_values,
+            "percentiles": resolved_percentiles,
+            "max_transfers": max_transfers,
+            "max_travel_time": max_travel_time,
+            "router": router,
+            "transport_mode": transport_mode,
+            "max_street_time": max_street_time,
+            "exclude_routes": list(exclude_routes),
+            "exclude_trips": list(exclude_trips),
+            "exclude_stops": list(exclude_stops),
+            "walking_speed_kmph": walking_speed_kmph,
+            "max_walking_time": max_walking_time,
+            "max_snap_distance": max_snap_distance,
+            # Sorted for the hash only, exactly as the matrix
+            # streamers record their resolved factor set.
+            "factors": (None if resolved_costs is None else sorted(resolved_costs[0])),
+            "fares": None if resolved_costs is None else resolved_costs[1],
         }
-        if resolved_percentiles is None:
-            columns["accessibility"] = aggregated(matrix).ravel()
-            super().__init__(pd.DataFrame(columns))
-            return
-        # One aggregation per percentile of the windowed cost
-        # distribution: the weights apply to percentile costs, never to
-        # averaged accessibility values.
-        frames = []
-        for at, percentile in enumerate(resolved_percentiles):
-            frame = pd.DataFrame(columns)
-            frame["percentile"] = percentile
-            frame["accessibility"] = aggregated(matrix[:, :, at]).ravel()
-            frames.append(frame)
-        long = pd.concat(frames, ignore_index=True)
-        super().__init__(
-            long[["from_id", "opportunity", "budget", "percentile", "accessibility"]]
+        per_origin = len(budgets) * len(labels)
+
+        def make_batch(rows, shared_from, shared_to):
+            if origin_points is None:
+                batch_origins = from_ids[rows]
+            else:
+                batch_origins = _point_frame(from_ids[rows], origin_points[rows])
+            if to_points is None:
+                batch_destinations = to_ids
+            else:
+                batch_destinations = _point_frame(to_ids, to_points)
+            frame = _accessibility_columns(
+                network,
+                batch_origins,
+                batch_destinations,
+                date,
+                departure,
+                cost,
+                window,
+                resolved_percentiles,
+                None,
+                factors,
+                components,
+                fares,
+                max_transfers,
+                max_travel_time,
+                router,
+                None,
+                transport_mode,
+                max_street_time,
+                max_snap_distance,
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+                labels,
+                values,
+                budgets,
+                budget_column,
+                decay,
+                decay_param,
+                label="Accessibility.to_parquet",
+                _resolved_costs=resolved_costs,
+            )
+            block = np.repeat(np.arange(rows.start, rows.stop), per_origin)
+            planes = 1 if resolved_percentiles is None else len(resolved_percentiles)
+            indices = np.tile(block, planes)
+            if len(indices) != len(frame):
+                raise ValueError(
+                    "a batch resolved a different row structure than the "
+                    "frozen query; the stream never re-resolves"
+                )
+            data = {
+                "from_id": pyarrow.DictionaryArray.from_arrays(
+                    pyarrow.array(indices), shared_from
+                ),
+                "opportunity": pyarrow.array(
+                    frame["opportunity"], type=pyarrow.string()
+                ),
+                "budget": pyarrow.array(np.asarray(frame["budget"], dtype="float64")),
+            }
+            if resolved_percentiles is not None:
+                data["percentile"] = pyarrow.array(
+                    np.asarray(frame["percentile"], dtype="float64")
+                )
+            data["accessibility"] = pyarrow.array(
+                np.asarray(frame["accessibility"], dtype="float64")
+            )
+            return pyarrow.table(data)
+
+        return _stream_run(
+            "Accessibility.to_parquet",
+            network,
+            columns,
+            parameters,
+            from_ids,
+            to_ids,
+            (origin_points, to_points),
+            output,
+            size,
+            make_batch,
+            pyarrow,
+            resume=resume,
+            dictionary_columns=("from_id",),
         )
 
 

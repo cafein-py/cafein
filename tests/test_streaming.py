@@ -1191,3 +1191,116 @@ def test_streaming_peak_rss_is_flat_in_origins(network, tmp_path, entry):
     # approximately flat — the residual is allocator retention, well
     # under the materialisation signal.
     assert large_peak - small_peak < 250 * 1024 * 1024
+
+
+def test_accessibility_to_parquet_equals_constructor(network, tmp_path):
+    import pandas as pd
+
+    from cafein import Accessibility
+
+    stops = _origin_stops(network, 20)
+    destinations = [stop for stop, _, _ in network.stops][1200:1240]
+    kwargs = dict(budgets=(15.0, 30.0))
+    frame = Accessibility(network, stops, destinations, **QUERY, **kwargs)
+    target = tmp_path / "accessibility.parquet"
+    result = Accessibility.to_parquet(
+        network, stops, destinations, **QUERY, **kwargs, output=target, batch_size=7
+    )
+    import pyarrow.parquet
+
+    read = pyarrow.parquet.read_table(target).to_pandas()
+    read["from_id"] = read["from_id"].astype(str)
+    key = ["from_id", "opportunity", "budget"]
+    a = frame.sort_values(key).reset_index(drop=True)
+    b = read.sort_values(key).reset_index(drop=True)
+    assert result.rows == len(frame)
+    pd.testing.assert_frame_equal(pd.DataFrame(a), b, check_dtype=False)
+    # The windowed percentile form streams its extra column too.
+    windowed = dict(budgets=(30.0,), departure_time_window=10, percentiles=[25, 75])
+    wide = Accessibility(network, stops, destinations, **QUERY, **windowed)
+    target = tmp_path / "windowed.parquet"
+    Accessibility.to_parquet(
+        network, stops, destinations, **QUERY, **windowed, output=target, batch_size=7
+    )
+    read = pyarrow.parquet.read_table(target).to_pandas()
+    read["from_id"] = read["from_id"].astype(str)
+    key = ["from_id", "opportunity", "budget", "percentile"]
+    a = wide.sort_values(key).reset_index(drop=True)
+    b = read.sort_values(key).reset_index(drop=True)
+    pd.testing.assert_frame_equal(pd.DataFrame(a), b, check_dtype=False)
+
+
+def test_accessibility_resume_completes_and_guards_the_query(
+    network, tmp_path, monkeypatch
+):
+    from cafein import Accessibility
+
+    stops = _origin_stops(network, 20)
+    destinations = [stop for stop, _, _ in network.stops][1200:1220]
+    target = tmp_path / "run"
+    # The accessibility batches ride their own column builder.
+    from cafein import accessibility
+
+    calls = {"n": 0}
+    real = accessibility._accessibility_columns
+
+    def wrapped(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("injected crash")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(accessibility, "_accessibility_columns", wrapped)
+    # The baseline is windowed with explicit percentiles, so the
+    # refusals below isolate single fields of the frozen query.
+    windowed = dict(budgets=(30.0,), departure_time_window=10, percentiles=[50])
+    with pytest.raises(RuntimeError, match="injected"):
+        Accessibility.to_parquet(
+            network,
+            stops,
+            destinations,
+            **QUERY,
+            **windowed,
+            output=target,
+            batch_size=10,
+        )
+    # A changed budget set is a different query: the resume refuses.
+    with pytest.raises(ValueError, match="fingerprint"):
+        Accessibility.to_parquet(
+            network,
+            stops,
+            destinations,
+            **QUERY,
+            budgets=(15.0,),
+            departure_time_window=10,
+            percentiles=[50],
+            output=target,
+            batch_size=10,
+            resume=True,
+        )
+    # So is a changed window under the identical explicit percentiles.
+    with pytest.raises(ValueError, match="fingerprint"):
+        Accessibility.to_parquet(
+            network,
+            stops,
+            destinations,
+            **QUERY,
+            budgets=(30.0,),
+            departure_time_window=20,
+            percentiles=[50],
+            output=target,
+            batch_size=10,
+            resume=True,
+        )
+    result = Accessibility.to_parquet(
+        network,
+        stops,
+        destinations,
+        **QUERY,
+        **windowed,
+        output=target,
+        batch_size=10,
+        resume=True,
+    )
+    frame = Accessibility(network, stops, destinations, **QUERY, **windowed)
+    assert result.rows == len(frame)

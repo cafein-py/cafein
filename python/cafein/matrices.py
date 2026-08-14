@@ -2125,6 +2125,7 @@ def _stream_run(
     make_batch,
     pyarrow,
     resume=False,
+    dictionary_columns=("from_id", "to_id"),
 ):
     """The shared streaming driver: fingerprint, claim, batch, write.
 
@@ -2175,12 +2176,13 @@ def _stream_run(
         "batch_size": size,
         "origin_count": count,
     }
+    shared = {"from_id": shared_from, "to_id": shared_to}
     return _streaming.write_stream(
         mode,
         path,
         produce(),
         manifest_seed,
-        {"from_id": shared_from, "to_id": shared_to},
+        {name: shared[name] for name in dictionary_columns},
         manifest=manifest,
     )
 
