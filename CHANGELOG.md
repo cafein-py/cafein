@@ -2,174 +2,56 @@
 
 ## 0.11.0 — 2026-08-14
 
-- **`Accessibility.to_parquet`**: the accessibility table streamed to
-  Parquet in origin batches — `output=` selects the file or directory
-  form exactly as `travel_cost_table` does, `resume=True` continues a
-  matching partial directory run under the same fingerprint contract
-  (budgets, decay, opportunities, percentiles, and the routing knobs
-  all guard it), and the windowed percentile column streams too.
-  Metro-scale tests ride the sampledata POI layers: libraries within
-  15/30 PT minutes, the nearest swimming hall door to door, and a
-  15-minute catchment from region-spread origins.
+- `Accessibility.to_parquet`: the accessibility table streamed to
+  Parquet in origin batches with the matrices' resume manifest;
+  metro-scale tests ride the sampledata POI layers.
+  ([#260](https://github.com/cafein-py/cafein/pull/260))
 
-- **`Catchment`**: budget catchments on any cost axis as H3-cell
-  polygons — a GeoDataFrame with one row per (origin, budget) over
-  the street network's own vertices, the door-to-door contract
-  seeding the walking spread from the snapped origin and every
-  reached stop at its arrival cost (zero-cost walking bounded by
-  `max_walking_time` on the emissions/money axes; mode spreads by
-  seconds or street metres on a `StreetNetwork`). Budgets echo as
-  passed; nested budgets yield nested cell unions; empty reached sets
-  are absent rows; a scalar `percentile` serves windowed time
-  catchments from stop origins. Requires the `cafein[h3]` extra.
+- `Catchment`: budget catchments on any cost axis as H3-cell
+  polygons, one row per (origin, budget) over the street network's
+  own vertices; needs the `cafein[h3]` extra.
+  ([#259](https://github.com/cafein-py/cafein/pull/259))
 
-- **`NearestDestinations`**: the closest-`k` destinations per origin
-  on any cost axis — one row per (origin, rank) with the destination
-  and its cost (time in whole minutes by default,
-  `output_time_units="seconds"` for exact values; ranking always uses
-  the exact engine values, ties deterministic). `max_cost` bounds the
-  search horizon in the axis's unit; unreachable ranks are absent.
-  `dominance_areas(origins)` dissolves polygon origins by their
-  rank-1 destination into the network-Voronoi map. Engines, axes,
-  modes, and validation follow `Accessibility`, whose cost-surface
-  dispatch the two computers now share.
+- `NearestDestinations`: the closest-`k` destinations per origin on
+  any cost axis, with `dominance_areas()` dissolving polygon origins
+  into the network-Voronoi map.
+  ([#258](https://github.com/cafein-py/cafein/pull/258))
 
-- **`optimize="fare"` documents the zone-exact contract** (#246): the
-  cost-matrix docstring now states the two-tier guarantee — rule-based
-  structures price the retained time-and-ride candidates (global fare
-  optimality not guaranteed), zone structures are refined cell for
-  cell by the exact zone-ticket engine within `max_travel_time` — and
-  the fare-frontier and matrix docs carry the metropolitan-scale
-  guidance for the 120-minute default.
+- **Breaking — the public API is humanized**: one r5py-aligned name
+  per concept, `date` + `departure` merged into one `departure`,
+  `max_rides` (boardings, default 8) replacing `max_transfers`, every
+  duration in minutes or a `timedelta`, clock inputs as `"HH:MM"`,
+  and result frames reporting `travel_time` in whole minutes with
+  `output_time_units="seconds"` for the exact values.
+  `zone_fare_structure` takes `gtfs_paths` and combines feeds with
+  collision refusal. The docs state the two-tier `optimize="fare"`
+  contract in the new vocabulary.
+  ([#256](https://github.com/cafein-py/cafein/pull/256),
+  [#257](https://github.com/cafein-py/cafein/pull/257))
 
-- **Human-facing parameters and outputs across the whole API**
-  (breaking). One name per concept, following r5py/r5r: `within`,
-  `max_duration`, and `StreetNetwork.travel_time`'s `max_time` are now
-  `max_travel_time`; `window` is
-  `departure_time_window`; `departure_step` is `departure_time_step`;
-  `max_snap_distance` is `snap_distance`; `max_seconds`
-  (`compute_carriage_transfers`/`compute_mode_transfers`) is
-  `max_transfer_time`; `slack_seconds` is `tolerance_minutes`;
-  stop-level methods take `origins`/`destinations`
-  (`origin`/`destination`). `date` + `departure` merge into one
-  `departure` taking a `datetime.datetime` or an ISO string
-  (`"2022-02-22 08:30"`); street networks also accept a bare
-  `"HH:MM"` or `datetime.time`. `max_transfers` (default 7) is
-  `max_rides` (default 8) and counts boarded vehicles.
-  `fares.zone_fare_structure` takes `gtfs_paths` — one path or a
-  sequence, combining the fare products across feeds. Every duration
-  parameter is minutes (floats allowed) or a `datetime.timedelta`;
-  clock-time parameters (`min_departure`/`max_departure`) take
-  `"HH:MM"` strings or `datetime.time`. Result frames report
-  `travel_time` (formerly `travel_time_s`) in whole minutes rounded
-  to the nearest by default; every computer takes
-  `output_time_units="seconds"` for the exact engine values, and
-  windowed percentile columns are `travel_time_p<p>` in the same
-  units. `Accessibility` time budgets are minutes and the frame's
-  `budget` column echoes the values as passed. The zone-fare
-  120-minute `max_travel_time` default now also applies to
-  `fare_frontier` and the `Accessibility` money axis, matching the
-  cost matrices. `cafein.units.to_minutes` keeps converting the
-  remaining `*_s` clock columns (`departure_s`/`arrival_s`).
-  Journey dicts (`route_between_stops` and friends) still report
-  `*_s` fields in seconds, and the wide
-  `TransportNetwork.travel_time_matrix` array stays exact seconds.
+- Zone fare structures price **exactly** — in `fare_frontier`, the
+  cost matrices, and the point frontiers the fare-blind fold is only
+  the warm start for the zone-ticket engine, and `max_travel_time`
+  defaults to 120 minutes on the zone paths. Closes
+  [#246](https://github.com/cafein-py/cafein/issues/246).
+  ([#253](https://github.com/cafein-py/cafein/pull/253),
+  [#254](https://github.com/cafein-py/cafein/pull/254),
+  [#255](https://github.com/cafein-py/cafein/pull/255))
 
-- **Exact zone fares in the cost matrices and for point queries**
-  (#246): `TravelCostMatrix(optimize="fare")` on a zone fare structure
-  now refines the fare-blind fold to the exact zone-ticket engine —
-  the fold's fares warm-start per-slot money bounds and an arrival
-  deadline, a fold fare at the tariff's cheapest product settles
-  without a search, fold-less cells climb a doubling ceiling staircase
-  capped at `max_rides ×` the dearest product, and each
-  winning chain is reconstructed into the standard cost columns
-  (distances, emissions, optional geometry). Stop and point origins
-  and destinations, `router="tbtr"` rejected. `fare_frontier` gains
-  point origins and destinations over the street network, with the
-  direct walk as the zero-fare candidate. On the measured #246 pairs
-  the public matrix now prices 3.30 € where it reported 5.00 €. On
-  zone structures ``max_travel_time`` defaults to 120 minutes — an
-  exact fare search with no time limit
-  must rule out cheaper journeys across the whole service day; pass
-  ``max_travel_time`` to change the limit.
+- Footpath transfers are **bounded street walks**: the uncapped
+  transitive closure is gone, with the exact unclosed-set phase on
+  every engine. Fixes
+  [#249](https://github.com/cafein-py/cafein/issues/249).
+  ([#250](https://github.com/cafein-py/cafein/pull/250))
 
-- **Exact zone fares in `fare_frontier`** (#246): zone fare structures
-  now route through a zone-ticket state machine whose labels carry the
-  paid total and the active ticket's remaining resources (coverage,
-  validity window, boardings), so a slower-or-more-rides-but-cheaper
-  journey survives to win its cutoff — including multi-ticket chains
-  and same-trip boardings in a cheaper zone. Always exact
-  (`exact=False` is rejected as the rule-based engine's fast
-  discipline). On the measured #246 pairs the engine prices 3.30 €
-  where the fare-blind candidate fold reports 5.00 €.
-
-- **`optimize="fare"` documents its real guarantee** (#246): the
-  matrix docstring now states that the cheapest journey is chosen
-  among the candidates the time-and-ride search retains, not over all
-  feasible journeys — a cheaper journey may be omitted when it
-  arrives no earlier, uses more rides, or boards the same trip at a
-  different stop — and `fare_frontier` documented the then-current
-  zone-structure refusal (lifted by the exact zone engine above). A
-  zone-fare diagnostic
-  (`scripts/probe_zone_fares.py`) and the bounded-footpath benchmark
-  harness (`scripts/benchmark_bounded_footpaths.py`) ship alongside.
-
-- **Footpath transfers are bounded street walks** (#249): the
-  stop-to-stop set is no longer transitively closed, so a transfer is
-  one street-shortest walk within `max_walking_time` and can never
-  chain past it. The closure had made every metro-scale network a
-  near-complete graph — 50.2 M transfers (~3000 per stop) on the
-  Helsinki capital region, with `transfer` legs of hours and
-  kilometres in routed journeys; the same network now carries 280 k
-  transfers (33 per stop) and no transfer above the cutoff. The
-  engines relax the bounded set with the exact transfer phase (walks
-  extend transit arrivals, never other walks), which RAPTOR, TBTR and
-  the carriage search already implemented and which the fare frontier
-  now implements too; ULTRA and McULTRA shortcut sets, single bounded
-  walks themselves, take the same phase, as does every set restored
-  from an artifact. The street-policy access and egress reductions
-  follow the same rule: a walking choice stands on its own street
-  search, while the fastest *vehicle* choice at a stop — whether or not
-  a walk beat it there — hands off to one installed transfer, so
-  "ride to the neighbouring stop and walk the rest" survives without
-  composing two walks. A carriage journey's park likewise walks only
-  when the vehicle rode into the stop, and a ridden arrival still walks
-  out when a faster carried walk shadows it.
-
-- **Cost axes for `Accessibility`**: ``cost="emissions"`` (grams CO2e)
-  and ``cost="money"`` (the fare structure's currency units) compute
-  accessibility against per-destination optima from the cost engines —
-  `window` required, `factors`/`components` and `fares` exactly as on
-  `TravelCostMatrix`; a destination with an unresolved factor or
-  unpriceable fare counts as unreached. ``cost="distance"`` (metres,
-  network plus connector) on street networks; on transit it raises as
-  a non-optimizable axis. The emissions and money optima are single
-  values over the window, so percentiles stay a time-axis feature.
-
-- **Windowed `Accessibility`**: with a departure `window` (and
-  optional `percentiles`/`confidence`, as on the matrices), the frame
-  gains a ``percentile`` column and each row holds the accessibility
-  at that percentile of the travel-time distribution across the
-  window — percentile costs are weighted, never accessibility values
-  averaged. Street-mode requests reject the window knobs.
-
-- **`Accessibility`**: cumulative-opportunity accessibility as a
-  long-format computer — reachable opportunity counts or sums per
-  origin, budget, and destination column, with step / linear /
-  exponential / logistic decay weighting. Routes door to door on a
-  `TransportNetwork` (stop ids or point/polygon GeoDataFrames) and
-  under a street mode on a `StreetNetwork`; costs come from the same
-  engine dispatch as the travel-time matrices, and the weight formulas
-  live in the compiled core.
-
-- **The accessibility primitive** (first slice of the accessibility
-  products): `cafein_core::access` computes per-origin decay-weighted
-  opportunity sums, k-nearest destinations, and budget-reached sets
-  from per-destination costs on any axis, with step / linear /
-  exponential / logistic decay weights hard-truncated at the budget.
-  Private engine entries expose the opportunity sums over transit
-  (`_accessibility_from_stops`, sharing `travel_time_matrix`'s exact
-  engine dispatch) and street modes (`_accessibility_to_points`).
+- `Accessibility`: cumulative-opportunity accessibility over the four
+  cost axes — step/linear/exponential/logistic decays, departure
+  windows with r5-style percentiles, emissions/money/street-distance
+  surfaces — as the first accessibility-pillar computer.
+  ([#242](https://github.com/cafein-py/cafein/pull/242),
+  [#243](https://github.com/cafein-py/cafein/pull/243),
+  [#244](https://github.com/cafein-py/cafein/pull/244),
+  [#245](https://github.com/cafein-py/cafein/pull/245))
 
 ## 0.10.2 — 2026-08-11
 
