@@ -1,883 +1,201 @@
 # Changelog
 
-## Unreleased
+## 0.11.0 — 2026-08-14
 
-- **`Accessibility.to_parquet`**: the accessibility table streamed to
-  Parquet in origin batches — `output=` selects the file or directory
-  form exactly as `travel_cost_table` does, `resume=True` continues a
-  matching partial directory run under the same fingerprint contract
-  (budgets, decay, opportunities, percentiles, and the routing knobs
-  all guard it), and the windowed percentile column streams too.
-  Metro-scale tests ride the sampledata POI layers: libraries within
-  15/30 PT minutes, the nearest swimming hall door to door, and a
-  15-minute catchment from region-spread origins.
+- `Accessibility.to_parquet`: the accessibility table streamed to
+  Parquet in origin batches with the matrices' resume manifest;
+  metro-scale tests ride the sampledata POI layers.
+  ([#260](https://github.com/cafein-py/cafein/pull/260))
 
-- **`Catchment`**: budget catchments on any cost axis as H3-cell
-  polygons — a GeoDataFrame with one row per (origin, budget) over
-  the street network's own vertices, the door-to-door contract
-  seeding the walking spread from the snapped origin and every
-  reached stop at its arrival cost (zero-cost walking bounded by
-  `max_walking_time` on the emissions/money axes; mode spreads by
-  seconds or street metres on a `StreetNetwork`). Budgets echo as
-  passed; nested budgets yield nested cell unions; empty reached sets
-  are absent rows; a scalar `percentile` serves windowed time
-  catchments from stop origins. Requires the `cafein[h3]` extra.
+- `Catchment`: budget catchments on any cost axis as H3-cell
+  polygons, one row per (origin, budget) over the street network's
+  own vertices; needs the `cafein[h3]` extra.
+  ([#259](https://github.com/cafein-py/cafein/pull/259))
 
-- **`NearestDestinations`**: the closest-`k` destinations per origin
-  on any cost axis — one row per (origin, rank) with the destination
-  and its cost (time in whole minutes by default,
-  `output_time_units="seconds"` for exact values; ranking always uses
-  the exact engine values, ties deterministic). `max_cost` bounds the
-  search horizon in the axis's unit; unreachable ranks are absent.
-  `dominance_areas(origins)` dissolves polygon origins by their
-  rank-1 destination into the network-Voronoi map. Engines, axes,
-  modes, and validation follow `Accessibility`, whose cost-surface
-  dispatch the two computers now share.
+- `NearestDestinations`: the closest-`k` destinations per origin on
+  any cost axis, with `dominance_areas()` dissolving polygon origins
+  into the network-Voronoi map.
+  ([#258](https://github.com/cafein-py/cafein/pull/258))
 
-- **`optimize="fare"` documents the zone-exact contract** (#246): the
-  cost-matrix docstring now states the two-tier guarantee — rule-based
-  structures price the retained time-and-ride candidates (global fare
-  optimality not guaranteed), zone structures are refined cell for
-  cell by the exact zone-ticket engine within `max_travel_time` — and
-  the fare-frontier and matrix docs carry the metropolitan-scale
-  guidance for the 120-minute default.
+- **Breaking — the public API is humanized**: one r5py-aligned name
+  per concept, `date` + `departure` merged into one `departure`,
+  `max_rides` (boardings, default 8) replacing `max_transfers`, every
+  duration in minutes or a `timedelta`, clock inputs as `"HH:MM"`,
+  and result frames reporting `travel_time` in whole minutes with
+  `output_time_units="seconds"` for the exact values.
+  `zone_fare_structure` takes `gtfs_paths` and combines feeds with
+  collision refusal. The docs state the two-tier `optimize="fare"`
+  contract in the new vocabulary.
+  ([#256](https://github.com/cafein-py/cafein/pull/256),
+  [#257](https://github.com/cafein-py/cafein/pull/257))
 
-- **Human-facing parameters and outputs across the whole API**
-  (breaking). One name per concept, following r5py/r5r: `within`,
-  `max_duration`, and `StreetNetwork.travel_time`'s `max_time` are now
-  `max_travel_time`; `window` is
-  `departure_time_window`; `departure_step` is `departure_time_step`;
-  `max_snap_distance` is `snap_distance`; `max_seconds`
-  (`compute_carriage_transfers`/`compute_mode_transfers`) is
-  `max_transfer_time`; `slack_seconds` is `tolerance_minutes`;
-  stop-level methods take `origins`/`destinations`
-  (`origin`/`destination`). `date` + `departure` merge into one
-  `departure` taking a `datetime.datetime` or an ISO string
-  (`"2022-02-22 08:30"`); street networks also accept a bare
-  `"HH:MM"` or `datetime.time`. `max_transfers` (default 7) is
-  `max_rides` (default 8) and counts boarded vehicles.
-  `fares.zone_fare_structure` takes `gtfs_paths` — one path or a
-  sequence, combining the fare products across feeds. Every duration
-  parameter is minutes (floats allowed) or a `datetime.timedelta`;
-  clock-time parameters (`min_departure`/`max_departure`) take
-  `"HH:MM"` strings or `datetime.time`. Result frames report
-  `travel_time` (formerly `travel_time_s`) in whole minutes rounded
-  to the nearest by default; every computer takes
-  `output_time_units="seconds"` for the exact engine values, and
-  windowed percentile columns are `travel_time_p<p>` in the same
-  units. `Accessibility` time budgets are minutes and the frame's
-  `budget` column echoes the values as passed. The zone-fare
-  120-minute `max_travel_time` default now also applies to
-  `fare_frontier` and the `Accessibility` money axis, matching the
-  cost matrices. `cafein.units.to_minutes` keeps converting the
-  remaining `*_s` clock columns (`departure_s`/`arrival_s`).
-  Journey dicts (`route_between_stops` and friends) still report
-  `*_s` fields in seconds, and the wide
-  `TransportNetwork.travel_time_matrix` array stays exact seconds.
+- Zone fare structures price **exactly** — in `fare_frontier`, the
+  cost matrices, and the point frontiers the fare-blind fold is only
+  the warm start for the zone-ticket engine, and `max_travel_time`
+  defaults to 120 minutes on the zone paths. Closes
+  [#246](https://github.com/cafein-py/cafein/issues/246).
+  ([#253](https://github.com/cafein-py/cafein/pull/253),
+  [#254](https://github.com/cafein-py/cafein/pull/254),
+  [#255](https://github.com/cafein-py/cafein/pull/255))
 
-- **Exact zone fares in the cost matrices and for point queries**
-  (#246): `TravelCostMatrix(optimize="fare")` on a zone fare structure
-  now refines the fare-blind fold to the exact zone-ticket engine —
-  the fold's fares warm-start per-slot money bounds and an arrival
-  deadline, a fold fare at the tariff's cheapest product settles
-  without a search, fold-less cells climb a doubling ceiling staircase
-  capped at `max_rides ×` the dearest product, and each
-  winning chain is reconstructed into the standard cost columns
-  (distances, emissions, optional geometry). Stop and point origins
-  and destinations, `router="tbtr"` rejected. `fare_frontier` gains
-  point origins and destinations over the street network, with the
-  direct walk as the zero-fare candidate. On the measured #246 pairs
-  the public matrix now prices 3.30 € where it reported 5.00 €. On
-  zone structures ``max_travel_time`` defaults to 120 minutes — an
-  exact fare search with no time limit
-  must rule out cheaper journeys across the whole service day; pass
-  ``max_travel_time`` to change the limit.
+- Footpath transfers are **bounded street walks**: the uncapped
+  transitive closure is gone, with the exact unclosed-set phase on
+  every engine. Fixes
+  [#249](https://github.com/cafein-py/cafein/issues/249).
+  ([#250](https://github.com/cafein-py/cafein/pull/250))
 
-- **Exact zone fares in `fare_frontier`** (#246): zone fare structures
-  now route through a zone-ticket state machine whose labels carry the
-  paid total and the active ticket's remaining resources (coverage,
-  validity window, boardings), so a slower-or-more-rides-but-cheaper
-  journey survives to win its cutoff — including multi-ticket chains
-  and same-trip boardings in a cheaper zone. Always exact
-  (`exact=False` is rejected as the rule-based engine's fast
-  discipline). On the measured #246 pairs the engine prices 3.30 €
-  where the fare-blind candidate fold reports 5.00 €.
-
-- **`optimize="fare"` documents its real guarantee** (#246): the
-  matrix docstring now states that the cheapest journey is chosen
-  among the candidates the time-and-ride search retains, not over all
-  feasible journeys — a cheaper journey may be omitted when it
-  arrives no earlier, uses more rides, or boards the same trip at a
-  different stop — and `fare_frontier` documented the then-current
-  zone-structure refusal (lifted by the exact zone engine above). A
-  zone-fare diagnostic
-  (`scripts/probe_zone_fares.py`) and the bounded-footpath benchmark
-  harness (`scripts/benchmark_bounded_footpaths.py`) ship alongside.
-
-- **Footpath transfers are bounded street walks** (#249): the
-  stop-to-stop set is no longer transitively closed, so a transfer is
-  one street-shortest walk within `max_walking_time` and can never
-  chain past it. The closure had made every metro-scale network a
-  near-complete graph — 50.2 M transfers (~3000 per stop) on the
-  Helsinki capital region, with `transfer` legs of hours and
-  kilometres in routed journeys; the same network now carries 280 k
-  transfers (33 per stop) and no transfer above the cutoff. The
-  engines relax the bounded set with the exact transfer phase (walks
-  extend transit arrivals, never other walks), which RAPTOR, TBTR and
-  the carriage search already implemented and which the fare frontier
-  now implements too; ULTRA and McULTRA shortcut sets, single bounded
-  walks themselves, take the same phase, as does every set restored
-  from an artifact. The street-policy access and egress reductions
-  follow the same rule: a walking choice stands on its own street
-  search, while the fastest *vehicle* choice at a stop — whether or not
-  a walk beat it there — hands off to one installed transfer, so
-  "ride to the neighbouring stop and walk the rest" survives without
-  composing two walks. A carriage journey's park likewise walks only
-  when the vehicle rode into the stop, and a ridden arrival still walks
-  out when a faster carried walk shadows it.
-
-- **Cost axes for `Accessibility`**: ``cost="emissions"`` (grams CO2e)
-  and ``cost="money"`` (the fare structure's currency units) compute
-  accessibility against per-destination optima from the cost engines —
-  `window` required, `factors`/`components` and `fares` exactly as on
-  `TravelCostMatrix`; a destination with an unresolved factor or
-  unpriceable fare counts as unreached. ``cost="distance"`` (metres,
-  network plus connector) on street networks; on transit it raises as
-  a non-optimizable axis. The emissions and money optima are single
-  values over the window, so percentiles stay a time-axis feature.
-
-- **Windowed `Accessibility`**: with a departure `window` (and
-  optional `percentiles`/`confidence`, as on the matrices), the frame
-  gains a ``percentile`` column and each row holds the accessibility
-  at that percentile of the travel-time distribution across the
-  window — percentile costs are weighted, never accessibility values
-  averaged. Street-mode requests reject the window knobs.
-
-- **`Accessibility`**: cumulative-opportunity accessibility as a
-  long-format computer — reachable opportunity counts or sums per
-  origin, budget, and destination column, with step / linear /
-  exponential / logistic decay weighting. Routes door to door on a
-  `TransportNetwork` (stop ids or point/polygon GeoDataFrames) and
-  under a street mode on a `StreetNetwork`; costs come from the same
-  engine dispatch as the travel-time matrices, and the weight formulas
-  live in the compiled core.
-
-- **The accessibility primitive** (first slice of the accessibility
-  products): `cafein_core::access` computes per-origin decay-weighted
-  opportunity sums, k-nearest destinations, and budget-reached sets
-  from per-destination costs on any axis, with step / linear /
-  exponential / logistic decay weights hard-truncated at the budget.
-  Private engine entries expose the opportunity sums over transit
-  (`_accessibility_from_stops`, sharing `travel_time_matrix`'s exact
-  engine dispatch) and street modes (`_accessibility_to_points`).
+- `Accessibility`: cumulative-opportunity accessibility over the four
+  cost axes — step/linear/exponential/logistic decays, departure
+  windows with r5-style percentiles, emissions/money/street-distance
+  surfaces — as the first accessibility-pillar computer.
+  ([#242](https://github.com/cafein-py/cafein/pull/242),
+  [#243](https://github.com/cafein-py/cafein/pull/243),
+  [#244](https://github.com/cafein-py/cafein/pull/244),
+  [#245](https://github.com/cafein-py/cafein/pull/245))
 
 ## 0.10.2 — 2026-08-11
 
-- **Bare strings are refused wherever id collections are expected**
-  (#237): `exclude_routes`/`exclude_trips`/`exclude_stops` on every
-  entry point, `travel_time_matrix`'s stop set, matrix and itinerary
-  `origins`/`destinations`, and emission/cost `components` now raise a
-  `TypeError` naming the parameter — previously a string dissolved
-  into one-character items, so exclusions silently matched nothing and
-  stop sets failed with per-character KeyErrors.
+- Bare strings are **refused wherever id collections are expected** —
+  the exclusion sets, stop sets, matrix and itinerary
+  `origins`/`destinations`, and `components` raise a `TypeError`
+  naming the parameter instead of dissolving into characters
+  ([#237](https://github.com/cafein-py/cafein/issues/237)). ([#240](https://github.com/cafein-py/cafein/pull/240))
 
 ## 0.10.1 — 2026-08-11
 
 - **Walking is a street mode by default**: with an OSM extract,
-  `TransportNetwork.from_gtfs` now builds the multimodal street graph
-  with `("walk",)` unless `street_modes` says otherwise — walking is
-  how public-transport journeys begin and end. Pass `street_modes=()`
-  to opt out. `street_modes` (and `StreetNetwork.from_osm`'s `modes`)
-  are validated eagerly at entry — a bare string, an unknown mode, or
-  a duplicate raises before any file is read, instead of after the
-  full GTFS build (#237).
+  `from_gtfs` builds the multimodal graph with `("walk",)` unless
+  `street_modes` says otherwise; street modes validate eagerly at
+  entry ([#237](https://github.com/cafein-py/cafein/issues/237)). ([#238](https://github.com/cafein-py/cafein/pull/238))
 
-- **Recurring installed-package checks**: a scheduled `sampledata`
-  workflow installs the published `cafein` and `cafein.sampledata` from
-  PyPI, downloads the pinned Helsinki data release, and runs the
-  metro-scale tests against them — failing when no test actually ran.
-  The metro transit probe samples an even spread of stops (the head of
-  the id-sorted HSL stop list is an unserved-station block), and
-  `scripts/benchmark_vs_r5py.py` gains `--data helsinki` to benchmark
-  on the sampledata release instead of the pinned r5py sample.
+- **Recurring installed-package checks**: a scheduled workflow runs
+  the metro-scale tests against the published PyPI packages and the
+  pinned Helsinki data release. ([#236](https://github.com/cafein-py/cafein/pull/236))
 
-- **cafein.sampledata integration**: `cafein`'s package path now
-  extends over separately installed portions, so the
-  ``cafein.sampledata`` distribution's ``cafein.sampledata.helsinki``
-  module (up-to-date capital-region OSM/GTFS/DEM/population sample
-  data) resolves under editable installs too. A new ``metro_scale``
-  pytest marker and ``helsinki_metro_data`` fixture run metro-scale
-  tests over the downloaded data — skipped when the package is absent
-  or pins no data release, failing instead when
-  ``CAFEIN_REQUIRE_SAMPLEDATA`` is set.
+- **`cafein.sampledata` integration**: the separately installed
+  `cafein.sampledata.helsinki` module resolves under the `cafein`
+  namespace, with a `metro_scale` marker and fixture running tests
+  over the downloaded capital-region data. ([#235](https://github.com/cafein-py/cafein/pull/235))
 
-- **The multimodal access surface validates before answering**: the
-  internal street-leg rebuild now rejects a malformed ``StreetChoice``
-  token at the boundary — an out-of-range edge index raises
-  ``ValueError`` instead of panicking through core indexing, a
-  non-finite or out-of-range fraction or connector no longer
-  passes through as silent invalid costs, and a token edge the resolved
-  profile may not traverse is refused. The equal-coordinate zero-leg
-  shortcut on the same surface snaps and checks the cutoff first, so a
-  coincident pair off the street network — or a query with a negative
-  or NaN cutoff — is unreachable rather than a zero-duration walk; a
-  street-policy routing query on such a pair now raises like any other
-  unsnapped query, matching the policy matrices' warn-and-omit contract.
+- The **multimodal access surface validates before answering**:
+  malformed street-choice tokens, invalid fractions/connectors, and
+  unsnappable equal-coordinate pairs raise instead of panicking or
+  passing silently. ([#234](https://github.com/cafein-py/cafein/pull/234))
 
 - **Street cost matrices skip the shapes they discard**: without
-  ``geometries=True`` the rows now come from the metres-only street
-  search rather than from fully reconstructed legs, so a time/distance
-  matrix no longer assembles a path geometry for every reachable cell
-  only to throw it away. The reported numbers are unchanged — times,
-  network and connector distances, emissions and costs are the
-  reconstructed legs' cell for cell — and ``geometries=True`` still
-  reconstructs and encodes as before.
+  `geometries=True` the rows come from the metres-only search, same
+  numbers cell for cell. ([#233](https://github.com/cafein-py/cafein/pull/233))
 
 ## 0.10.0 — 2026-08-05
 
-- **Resumable streaming runs**: ``resume=True`` on
-  ``travel_cost_table`` and the matrix ``to_parquet`` classmethods
-  continues an interrupted directory-form run — completed shards are
-  skipped untouched (their batches never recompute), a shard from a
-  run killed between its rename and its manifest marker is rewritten,
-  and stale temporaries are cleaned up. The manifest's query
-  fingerprint must match exactly — same network content, inputs,
-  parameters, ``chunk``, and ``batch_size`` — and the schema digest
-  must agree, else the directory is refused rather than overwritten;
-  concurrent resumes of one directory are excluded by a claim. The
-  fingerprint's network identity is now the **artifact content
-  checksum** (the CRCs over exactly what ``save`` persists, computed
-  on demand), so networks differing in any persisted state — 
-  timetables, transfers, street data — never share a fingerprint
-  (fingerprint version 3). A refused non-empty output directory now
-  names ``resume=True`` as the way to continue a matching partial run.
+- **Resumable streaming runs**: `resume=True` continues an
+  interrupted directory-form run under an exact query fingerprint
+  whose network identity is the artifact content checksum.
+  ([#226](https://github.com/cafein-py/cafein/pull/226))
 
-- **Streaming matrix classmethods**: ``TravelCostMatrix.to_parquet``
-  and ``TravelTimeMatrix.to_parquet`` stream the matrix computers'
-  results to disk with the constructors' semantics — transit and
-  street branches alike, the car matrices with their delay, parking,
-  emission, and cost options included, and the windowed time matrix
-  with its percentile columns — through the same batch writer, output
-  forms, and manifest as ``travel_cost_table(output=...)``, returning
-  ``cafein.StreamingResult``. Peak memory holds one batch, never the
-  whole constructor frame; street geometries stream as plain WKB
-  binary. The constructors are unchanged; ``street_policy`` matrices
-  do not stream yet and are rejected. The recorded fingerprint version
-  rose to 2 with this change (the producing operation and enlarged
-  parameter sets join the hashed material); the resumability entry
-  above supersedes it with version 3.
+- **Streaming matrix classmethods**: `TravelCostMatrix.to_parquet`
+  and `TravelTimeMatrix.to_parquet` stream the computers' results —
+  transit, street, and car branches alike — through the shared batch
+  writer and manifest. ([#225](https://github.com/cafein-py/cafein/pull/225))
 
-- **Streaming `travel_cost_table`**: ``output=`` streams the matrix to
-  disk in origin batches (``batch_size=``, default 500) instead of
-  materialising it — a ``.parquet`` path becomes one file written one
-  row group per batch (up to Parquet's 64 Mi rows-per-group cap), any
-  other path a directory of per-batch shards
-  beside a ``manifest.json`` carrying the query fingerprint and
-  per-shard completion markers (temp-write + rename throughout). The
-  streamed output concatenates bit-for-bit to the unstreamed table,
-  with ``from_id``/``to_id`` dictionary-encoded over shared domains in
-  every batch; peak memory holds one batch. Returns the new
-  ``cafein.StreamingResult`` record. ``chunk=`` composes with
-  ``output=``; ``resume=True`` continues an interrupted directory run
-  (the entry above).
+- **Streaming `travel_cost_table`**: `output=` streams the matrix in
+  origin batches to one Parquet file or a shard directory with a
+  manifest, concatenating bit-for-bit to the unstreamed table.
+  ([#224](https://github.com/cafein-py/cafein/pull/224))
 
-- **OD zone surfaces** (``cafein.zones``): ``square_grid(area,
-  cell_size, crs=None)`` lays lattice-snapped square cells of
-  ``cell_size`` metres over an area (ids ``"{column}_{row}"`` on the
-  generation CRS's fixed lattice, so overlapping areas share cells and
-  ids), and ``h3_grid(area, resolution)`` covers it with canonical H3
-  cells (requires the new ``cafein[h3]`` extra). Both accept a
-  ``(west, south, east, north)`` bbox, a polygon frame, or a built
-  ``StreetNetwork``/``TransportNetwork`` (its street extent), and
-  return EPSG:4326 polygon frames with explicit
-  ``centroid_lat``/``centroid_lon`` routing coordinates. The matrix
-  and itinerary computers now accept polygon frames as origins and
-  destinations, routed by centroid — those columns when present,
-  local-UTM centroids otherwise.
+- **OD zone surfaces** (`cafein.zones`): `square_grid` and
+  `h3_grid` lay zone lattices whose polygons route as matrix
+  origins/destinations via their centroids. ([#223](https://github.com/cafein-py/cafein/pull/223))
 
 ## 0.9.0 — 2026-08-04
 
-- **The car benchmark harness** (``scripts/benchmark_car_vs_r5py.py``,
-  run manually): a parity run comparing cafein's default free-flow car
-  regime against r5py's CAR mode door-to-door — both engines fed the
-  same restriction-free PBF, written with pyrosm alone
-  (``write_pbf(delete=…)`` over every ``type=restriction`` relation)
-  and cafein's untagged-way defaults aligned to R5's documented
-  per-class speeds for the run — reporting coverage, agreement within
-  ±60 s, difference quantiles, bias, and build/matrix times; and a
-  cafein-only realism run reporting the rush-vs-free-flow travel time
-  ratio distribution of the intersection-delay model. Requires r5py
-  (≥ 1.0) and a Java runtime for the parity side only.
+- **Car routing lands**: the car street mode with free-flow speeds
+  and the empirical intersection-delay model, plus the `parking=`
+  search model ending car trips.
+  ([#214](https://github.com/cafein-py/cafein/pull/214), [#215](https://github.com/cafein-py/cafein/pull/215), [#216](https://github.com/cafein-py/cafein/pull/216))
 
-- **The monetary cost account** (``cafein.costs``): street matrices and
-  itineraries price the driven kilometres under two selectable
-  perspectives — a **separate account from fares, never summed with
-  them**. ``perspectives=`` adds ``cost_private`` (the
-  vehicle-operation bundle) and/or ``cost_societal`` (the external
-  cost) columns from the shipped Gössling et al. (2019, Table 2)
-  values: car 0.250 / +0.108, bicycle 0.047 / −0.184, walking
-  0.041 / −0.370 per km in 2017 euros, the car's societal account
-  fully component-resolved (climate through accidents, summing to
-  0.108) and the active-mode health benefits **reported signed, never
-  clamped**. Totals are always derived from components:
-  ``cost_components=`` (one perspective at a time) restricts the sum
-  and adds per-component columns, ``costs=`` layers a user table by
-  (perspective, street_mode, component) key with loud validation
-  (street-only rows, finite values, no duplicates), and ``currency=``
-  (default ``"EUR2017"``) is a declared label carried beside the
-  outputs, never a conversion. The basis is the driven network
-  distance including parking-search metres; the e-bike rides the
-  bicycle rows; a mode without a row (the e-scooter has none) prices
-  NaN with a warning, and transit surfaces reject the account loudly —
-  transit perspective costs are a recorded follow-up.
+- **Car emissions and monetary costs**: the GEMMAT per-powertrain
+  factor table (`vehicle_class=`, `occupancy=`) and the
+  `cafein.costs` private/societal account over driven kilometres;
+  a car benchmark harness measures r5py parity and delay realism.
+  ([#217](https://github.com/cafein-py/cafein/pull/217), [#218](https://github.com/cafein-py/cafein/pull/218), [#219](https://github.com/cafein-py/cafein/pull/219))
 
-- **Car emission factors ship**: the street factor table gains the five
-  car powertrains of GEMMAT's Table 4 (Dey, Marín-Flores & Tenkanen
-  2026 — the ITF LCA tool calibrated to Finland's energy mix) —
-  ``vehicle_class`` ∈ ICE (162), HEV (133), PHEV (88), BEV (70), FCEV
-  (134 g CO₂ per **vehicle**-kilometre, driver-only basis), split into
-  the four life-cycle component columns, each row
-  ``service_model="private"`` and resolved most-specific-wins under the
-  existing ladder (user ``factors=`` rows still win). Car cost matrices
-  and itineraries therefore price emissions out of the box: the default
-  powertrain is ICE, ``vehicle_class=`` selects another, and a new
-  ``occupancy=`` option (at least 1, default 1) divides the per-vehicle
-  emissions across the persons carried without ever rescaling the
-  factors; the basis stays the driven network distance including any
-  parking-search metres. Both options are car-only and rejected loudly
-  elsewhere; an unknown powertrain reports unresolved (NaN) emissions
-  with a warning, never a silent zero.
+- **The cutoff-pruned (time, fare) frontier**: `fare_frontier`
+  reports the fastest journey per fare cutoff with fares inside the
+  engine's dominance — rule grants, the incremental fare state
+  machine, point-to-point form with fan-out and the `exact=`
+  disciplines, and per-minute departure-window sampling
+  (`departure_step`).
+  ([#209](https://github.com/cafein-py/cafein/pull/209), [#210](https://github.com/cafein-py/cafein/pull/210), [#211](https://github.com/cafein-py/cafein/pull/211),
+  [#212](https://github.com/cafein-py/cafein/pull/212), [#213](https://github.com/cafein-py/cafein/pull/213))
 
-- **The car parking search model**: car queries gain ``parking=`` on
-  ``StreetNetwork.travel_time``, ``TravelTimeMatrix``,
-  ``TravelCostMatrix``, and ``DetailedItineraries`` — the search that
-  ends a car trip, costed as time and extra driving distance (GEMMAT's
-  model; Fink et al. 2024), never as a walking leg. Off by default;
-  ``parking=True`` applies the shipped constant (300 s, 0 m — inside
-  Jaakkola's 245–322 s Helsinki-region estimates), a number sets the
-  seconds, a ``(seconds, metres)`` pair both constants, and a polygon
-  GeoDataFrame with a ``seconds`` column (optional ``metres``) resolves
-  per destination by point-in-polygon — overlaps take the largest
-  seconds (ties: largest metres, then lowest row), destinations outside
-  every polygon the shipped constant. The seconds join the travel time
-  (and arrivals), the metres join the driven network distance and with
-  it the emissions basis; path geometry never shows the search loop,
-  the driving cutoff bounds the driving alone, and negative or NaN
-  values, non-car modes, and transit surfaces reject the option loudly.
-
-- **Car routing lands**: building with ``"car"`` in the street modes
-  computes and persists per-arc driving speeds (tagged ``maxspeed``
-  with the world speed-limit defaults filling untagged ways, selected
-  by ``country=`` / ``urban_areas=`` / ``speed_limits=`` on
-  ``StreetNetwork.from_osm`` and ``TransportNetwork.from_gtfs``) and
-  junction head classes (topological / signalized / ramp-junction by
-  the calibration's own hierarchy, priority signs recorded but never
-  charged), plus a roundabout edge flag — carried through
-  save/load as two new optional street arrays (artifact format 17;
-  earlier artifacts must be rebuilt). ``mode="car"`` /
-  ``transport_mode="car"`` then routes door-to-door and through the
-  matrix and itinerary computers on the standalone street network.
-  **By default car queries are free-flow** — speed-limit travel
-  times, no delay model; passing ``intersection_delays=True`` applies
-  the empirical intersection-delay model (Jaakkola 2013, the
-  calibration behind MetropAccess-Digiroad and GEMMAT) in an exactly
-  edge-separable form — per-endpoint crossing shares, ramp period
-  shares with the low-speed branch, junction-free ramp and congestion
-  multipliers, ``b/4`` roundabout interiors — under a ``profile=``
-  period (``rush``, ``midday`` — the default — or ``day-average``)
-  with ``delay_model=`` partial overrides of every shipped number.
-  ``profile=`` or ``delay_model=`` without the gate raise. Car legs
-  never serve transit access or egress (no park-and-ride); the car
-  emission factors ship in the entry above, ICE by default.
-
-- Groundwork for **realistic car routing** (the car arc's driving
-  graph): the OSM permission compiler gains the ``car`` mode —
-  resolved down the ``access → vehicle → motor_vehicle → motorcar``
-  hierarchy with the house deny-unknown semantics, strict one-way
-  (roundabouts and motorway carriageways implied, no contraflow
-  grants), and the motor-only highway classes entering the
-  extraction only when a car build requests them. Beside it: a
-  ``maxspeed`` parser (numeric km/h, ``mph``, anything else falls to
-  the class default, never infinity), world-covering per-country
-  legal default speed limits for untagged ways (the prototype's
-  OSM-wiki compilation — 48 ISO-addressable countries with BE/CA/US
-  subdivision rows, urban and rural values per class, a Generic
-  fallback —
-  selected by an ISO ``country=`` code with a pinned fallback chain,
-  urban membership by polygon spatial join), and the junction delay
-  classes for the coming crossing-delay model (signalized,
-  priority-controlled with way-and-direction association, plain
-  intersections). Compiler-level only; the car routing engine and
-  its matrices land in the next slices.
-
-- ``fare_frontier`` **samples the departure window**:
-  ``departure_step`` (default 60 seconds) rasterises the window
-  exactly as R5 does — every reported journey is real and waits from
-  its sampled departure, so travel times are measured against the
-  grid — and ``departure_step=None`` searches every exact
-  (trip departure − access walk) event instead: the shipped frontier
-  products' wait-free event semantics, at far more search passes on
-  point origins.
-
-- **The fare frontier goes point-to-point**: ``fare_frontier`` gains the
-  point-to-point form (walking access and egress over the street
-  network with the walking-time bound clamped to ``max_duration``,
-  the direct walk joining each cell at fare zero, unsnapped points
-  warned), a rayon fan-out over origins, and an ``exact=`` mode
-  switch. ``exact=True`` (the default) keeps the exhaustively
-  verified state bags — every journey the tariff's fine structure
-  distinguishes, with runtimes growing steeply in ``max_duration``;
-  ``exact=False`` runs the r5r-style per-class discipline — exact
-  for well-behaved tariffs, every reported fare real, a cheaper
-  journey possibly missed where a scarce discount budget meets
-  transfer windows — for large analyses. The exact engine also
-  gains sound structural pruning (a duration-cap horizon
-  everywhere, discount-exhausted state collapse, the R5-style
-  transfer-allowance bound as a second dominance rule, and
-  insert-time result folding).
-
-- **The cutoff-pruned (time, fare) frontier** ships as
-  ``fare_frontier``: per origin-destination pair and fare cutoff, the
-  minimum travel time over a departure window — r5r's
-  ``pareto_frontier`` shape — reported with the winning journey's
-  exact fare and rides, ties to the cheapest-then-simplest journey.
-  Fare enters routing as a dominance axis: labels carry the
-  rule-based calculator's exact continuation state in per-stop bags
-  under the groundwork slice's gated relation, so a
-  slower-but-cheaper journey survives to win its cutoff — no fold
-  over the fare-blind products can reproduce this — and an exhaustive
-  fare-blind oracle pins the engine cell for cell across cutoff and
-  duration-cap sweeps. Stop-to-stop and rule-based structures only
-  for now (a zone structure's journeys keep pricing through
-  ``journey_frontiers`` and ``annotate_fares``); the scale slice
-  above adds the point-to-point form and the origin fan-out.
-
-- Groundwork for the **cutoff-pruned (time, fare) frontier**: the
-  rule-based fare calculator gains its incremental form — a
-  per-boarding ``FareState`` step machine pinned equal to the journey
-  pricer over randomized sequences on both the Rust and the Python
-  side, the continuation-state dominance relation the coming frontier
-  engine's label bags will use — equal previous type and route, fare
-  ≤ and previous full fare ≥ always; spent discounts ≤ and window
-  freshness ≥ only under per-query table gates (monotone integration
-  pairs, and a discount budget covering every boarding), equality
-  otherwise — and the sound cutoff-pruning discount margin. Internal
-  until the product lands.
-
-- The zone fare model **prices the rule shapes it previously
-  ignored**: a product's restriction dimensions are now alternative
-  grants — the zone-set cover, a **route grant** (route-only
-  ``fare_rules`` rows; a set, so one ticket covers a transfer between
-  its routes), and **origin/destination clauses** (endpoint zones of
-  the covered stretch, a named route binding to its clause) — any one
-  of which validates a stretch, matching real tariffs (HSL's ``D``
-  ticket carries all three shapes at once and still covers plain
-  D-zone trips). Agency scope (``fare_attributes.agency_id`` resolved
-  through ``routes.txt``) bounds every grant, and a multi-agency feed
-  whose fares omit it is rejected. A fare without any rule rows is
-  unrestricted, the spec's reading. ``zone_fare_structure`` gains
-  ``rules="zones"`` for the pre-grant zone-only reading; the compiled
-  matrix fare path prices that model only and rejects grant-bearing
-  or unrestricted structures loudly rather than silently diverging
-  from ``annotate_fares``.
-
-- **Street rental pricing** joins the fare models: ``FareStructure``
-  and ``ZoneFareStructure`` accept a ``street`` tariff — per rental
-  mode, an ``unlock`` price plus a ``per_minute`` price billed per
-  started minute — and ``annotate_fares`` gains ``shared_modes``, the
-  street modes the journeys rode as rentals under their street
-  policy. Each rental leg prices its unlock plus started minutes
-  beside the transit fare; own-vehicle and walking legs stay free —
-  a fare is what is paid, never an imputed cost — and a ridden
-  rental mode without a tariff prices ``NaN``, never a silent zero.
-  The r5r fare-structure zip format is unchanged (street tariffs do
-  not round-trip it).
+- **Street rental pricing** joins the fare models: unlock plus
+  started-minutes tariffs for shared modes beside the transit fare.
+  ([#208](https://github.com/cafein-py/cafein/pull/208))
 
 ## 0.8.0 — 2026-08-02
 
-- **The carriage `TravelTimeMatrix`** (17c, closing the carriage
-  stage): a street policy with a carried bicycle runs the
-  possession-state search per origin through the rayon fan-out — per
-  cell the cross-plane earliest arrival over the per-plane egress
-  offsets (a carried egress folds from the Carrying plane only, since
-  a parked chain lives in Free), with the direct walking alternative
-  folded in over the same multimodal graph. Every cell equals the
-  route surface's best arrival; the forbid default equals the
-  no-carriage baseline exactly (pure option value at matrix level); a
-  walking-only carriage policy matches the plain walking-only cells; a
-  cached trip-based set never claims the query; and exclusions are
-  rejected rather than silently dropped. The cost matrix and the
-  multicriteria candidates still reject carriage.
-
-- **Carriage journeys on the route and itinerary surfaces** (17b,
-  second slice): ``route_between_coordinates`` and time-candidate
-  ``DetailedItineraries`` reconstruct carriage journeys on the
-  ``(arrival, rides)`` frontier, with the direct walking alternative
-  folded in exactly as on the policy route (exclusions are rejected
-  rather than silently dropped). Transit legs carry a ``bike_aboard``
-  flag, their distances, and — with ``geometries`` — their shapes; the
-  park event appears as a zero-length ``park`` leg at its stop,
-  carriage-set ride transfers decorate as bicycle legs with
-  network/connector distances and drawn shapes, and access/egress
-  rebuild from the per-plane policy reductions (a carried side keeps
-  the vehicle to the door). The
-  itineraries frame gains a ``bike_aboard`` column under a street
-  policy, ``compute_carriage_transfers`` becomes the public precompute
-  wrapper, and the engine is pinned against an exhaustive brute-force
-  possession-state oracle across park/permission-mask sweeps. The
-  matrix surfaces and multicriteria candidates still reject carriage
-  until the next slice.
-
-- The **possession-state carriage engine** (17b, first slice):
-  ``travel_times_from_coordinate`` routes carriage policies. The
-  search runs two label planes — Carrying (the bicycle rides along)
-  and Free (parked, or left at the origin: carriage is optional, so
-  every no-bicycle journey stays available) — with carried boardings
-  masked by the GTFS tri-state under the policy's ``unknown_bike_trips``
-  rule, the park transition crossing the planes within its round at
-  facility-eligible stops, the (unclosed) carriage set relaxed under
-  the exact-phase rule when the own ``transfers=`` grant is bound, and
-  the reported time the cross-plane minimum. On the Helsinki fixture a
-  carried bicycle with the transfers grant improves 1674 stops over
-  the no-carriage baseline and worsens none — the pure-option-value
-  contract, pinned by tests together with the forbid-default equality
-  and the parking-restriction monotonicity.
-
-- Groundwork for **own-bicycle carriage aboard PT** (the carriage
-  stage, 17a of the street-policy arc): the GTFS per-trip
-  ``bikes_allowed`` tri-state is ingested (trip field only — the
-  standard defines no route fallback); ``VehiclePolicy`` accepts
-  ``take_aboard=True`` for own vehicles on ``side="origin"`` with an
-  explicit ``unknown_bike_trips`` rule (``"forbid"`` default /
-  ``"allow"`` — never silently assumed), and an own-vehicle
-  ``transfers=`` grant becomes legal vehicle terms beside it; the
-  carriage transfer-set precompute builds and persists (artifact
-  format 16) the carriage set — per stop
-  pair the faster of the walking row and the own vehicle's direct
-  ride, each row a single mode, unclosed by construction with the
-  exact ``(mode, budget)`` binding (internal until the engine).
-  ``travel_times_from_coordinate``, ``route_between_coordinates``,
-  and ``DetailedItineraries`` route carriage since the engine slices
-  above.
+- **Own-bicycle carriage aboard PT**: bike-aboard permissions and
+  policy terms, the possession-state carriage engine, carriage
+  journeys on the route and itinerary surfaces, and the policy
+  `TravelTimeMatrix` riding the carriage engine.
+  ([#203](https://github.com/cafein-py/cafein/pull/203), [#204](https://github.com/cafein-py/cafein/pull/204), [#205](https://github.com/cafein-py/cafein/pull/205),
+  [#206](https://github.com/cafein-py/cafein/pull/206))
 
 ## 0.7.0 — 2026-07-28
 
-- Street-policy **time queries auto-ride the cached trip-based set**:
-  with a whole-day TBTR cache (``compute_tbtr_transfers``) matching the
-  query's date, ``travel_times_from_coordinate(street_policy=...)`` and
-  the policy ``TravelTimeMatrix`` run on the trip-based engine — the
-  merged ``transfers=`` binding included, since the cache is
-  timetable-only and both engines now relax unclosed sets exactly.
-  Answers are engine-identical (pinned by tests); on the Helsinki
-  fixture the trip-based arm is ~1.1× faster on walking closures and
-  ~1.3× on merged sets per one-to-all. Exclusion queries keep RAPTOR,
-  as on the legacy paths.
+- **Standalone street routing**: the public `StreetNetwork` — union
+  OSM extraction with mode permissions, compiled street profiles, the
+  directed profile-aware search, street-only artifacts, and the
+  standalone travel-time/cost matrices and itineraries.
+  ([#160](https://github.com/cafein-py/cafein/pull/160), [#161](https://github.com/cafein-py/cafein/pull/161), [#162](https://github.com/cafein-py/cafein/pull/162),
+  [#163](https://github.com/cafein-py/cafein/pull/163), [#164](https://github.com/cafein-py/cafein/pull/164), [#166](https://github.com/cafein-py/cafein/pull/166),
+  [#167](https://github.com/cafein-py/cafein/pull/167), [#168](https://github.com/cafein-py/cafein/pull/168), [#172](https://github.com/cafein-py/cafein/pull/172),
+  [#173](https://github.com/cafein-py/cafein/pull/173), [#174](https://github.com/cafein-py/cafein/pull/174), [#175](https://github.com/cafein-py/cafein/pull/175))
 
-- The **trip-based engine serves merged transfer sets exactly**: its
-  query-time footpath joins relaxed only from label-improving transit
-  arrivals — the closure assumption the merged set cannot honor — so a
-  faster rental-transfer label could shadow a transit arrival's legal
-  walk extension, exactly as in pre-fix RAPTOR. All three TBTR scans
-  (one-to-all, the profile's via-joins and walks, and the window
-  samples) now relax shadowed arrivals from a per-round transit-best
-  sidecar when the set declares itself unclosed; closed sets keep the
-  current gates bit for bit, and the segment DAG already reconstructs
-  shadow-free. RAPTOR and TBTR answer merged-set queries identically,
-  pinned by an engine-neutrality test over the reduced arrays.
+- **Breaking — outputs carry their units in their names** (the
+  seconds/metres suffixes), with `cafein.to_minutes` converting
+  seconds columns. ([#176](https://github.com/cafein-py/cafein/pull/176), [#177](https://github.com/cafein-py/cafein/pull/177))
 
-- The **cost matrix attributes rental transfers**, completing the
-  ``transfers=`` surface: ``TravelCostMatrix(street_policy=...)``
-  accepts the binding, the winning journey's rental-bearing transfers
-  add their ride meters to ``street_distance_m`` (connectors included)
-  and their ride grams — the shared-fleet factor over ridden network
-  meters — to ``emissions``, with the movement's walking rest in
-  ``walk_distance_m``; access and egress ends composed through a
-  rental edge split the same way. Cells reconcile exactly with the
-  fastest ``DetailedItineraries`` option's per-leg sums. The transfer
-  mode's factor must resolve, and stop exclusions keep rejecting the
-  binding.
+- **Street-mode emissions, elevation, and goal-directed routes**:
+  per-mode emission factors and the street `emissions` column, DEM
+  intake with slope-aware bicycle costs, and target-directed A* for
+  single routes.
+  ([#180](https://github.com/cafein-py/cafein/pull/180), [#182](https://github.com/cafein-py/cafein/pull/182), [#183](https://github.com/cafein-py/cafein/pull/183),
+  [#184](https://github.com/cafein-py/cafein/pull/184))
 
-- The merged shared-vehicle transfer set is now **persisted** with the
-  network artifact (format 15): ``save`` writes the set, its
-  reconstruction tokens, and the exact ``(mode, budget)`` binding —
-  token order canonicalised so a re-save stays byte-identical — and
-  ``load`` restores it with the unclosed marking re-applied, so a
-  loaded network answers ``transfers=`` queries without repeating the
-  merge and with the exact transfer phase intact. Rental transfer legs
-  also gain their **drawn street path**: the ride's pickup-to-drop
-  shape under the transfer mode's profile as a WKB LineString (the
-  leg's times and meters stay the token's, as with walked transfer
-  shapes).
+- **Cycling and e-scooter access to public transport** behind
+  explicit street-leg policies: the carried multimodal graph, the
+  per-stop time-only reduction, and the policy travel-time, cost, and
+  itinerary surfaces — emissions-aware on McRAPTOR and served by
+  McTBTR too.
+  ([#185](https://github.com/cafein-py/cafein/pull/185), [#186](https://github.com/cafein-py/cafein/pull/186), [#187](https://github.com/cafein-py/cafein/pull/187),
+  [#188](https://github.com/cafein-py/cafein/pull/188), [#189](https://github.com/cafein-py/cafein/pull/189), [#192](https://github.com/cafein-py/cafein/pull/192),
+  [#193](https://github.com/cafein-py/cafein/pull/193), [#194](https://github.com/cafein-py/cafein/pull/194))
 
-- Shared **transfer rentals enter the multicriteria dominance**. The
-  ``transfers={mode: budget}`` policy grant now works with
-  ``DetailedItineraries``' ``"pareto"`` and ``"relaxed"`` candidates:
-  a rental-bearing merged transfer edge adds its ride grams — the
-  shared-fleet factor over the ridden network meters — inside the
-  (arrival, emissions bucket) dominance, so faster-but-dirtier rental
-  options join the frontier beside cleaner walking-transfer options
-  rather than replacing them, and reconstructed rental transfer legs
-  carry their mode, distances, and emissions. The transfer mode's
-  factor must resolve (as any granted vehicle mode's must), and the
-  exactness rule of the time-only stage carries over in bag form: a
-  transit arrival dominated only by rental-origin points still relaxes
-  its walks, because a rental point cannot legally extend by a further
-  walk. Merged-set multicriteria queries run on McRAPTOR (the
-  trip-based engines still assume a closed footpath set); the cost
-  matrix takes the binding too — see above.
+- **Shared vehicles serve the transfers between rides**: rental
+  transfers behind the policy with multicriteria dominance, sourced
+  street-mode factors shipped by default, the merged set persisted
+  with the artifact, and rental rides attributed in the cost matrix.
+  ([#195](https://github.com/cafein-py/cafein/pull/195), [#196](https://github.com/cafein-py/cafein/pull/196), [#197](https://github.com/cafein-py/cafein/pull/197),
+  [#198](https://github.com/cafein-py/cafein/pull/198), [#199](https://github.com/cafein-py/cafein/pull/199))
 
-- Shared vehicles may now serve the **transfers between rides**, behind
-  the same policy. ``TransportNetwork.compute_mode_transfers(mode,
-  max_seconds)`` builds a merged transfer set beside the walking
-  closure: per stop pair the walking row survives untouched unless one
-  walk--ride--walk movement on the shared mode is strictly faster
-  within the budget — at most one rental per transfer, the walks each
-  one closure row, ties to walking.
-  ``StreetLegPolicy(transfers={mode: budget})`` then relaxes that set
-  on the time-only paths (``route_between_coordinates``,
-  ``travel_times_from_coordinate``, ``TravelTimeMatrix``, and
-  ``DetailedItineraries`` with ``candidates="time"``); the binding is
-  checked exactly — a missing or differently parameterised set is an
-  error, never a silent walking fallback — and reconstructed journeys
-  split a rental-bearing transfer into its walk--ride--walk legs, the
-  ride carrying the mode and its exact distances. Because a
-  budget-bounded rental row cannot close over walks past its budget,
-  the merged set declares itself outside the engines'
-  transitive-closure contract and RAPTOR runs an exact transfer phase
-  for it, relaxing walks from every transit arrival of a round rather
-  than only label-improving ones. The trip-based engines decline the
-  binding until their stage lands (the multicriteria candidates and
-  the cost matrix take it — see above).
-
-- **Sourced street-mode emission factors ship by default.** The
-  micromobility rows of ``cafein.emissions.street_factors()`` now
-  resolve out of the box: ITF *Good to Go?* (Cazzola & Crist 2020)
-  life-cycle components computed on the Finland 2020 electricity mix
-  through the ``cafein-lca`` reimplementation — bicycle 7/21*/9/0,
-  e-bike 13/3/9/0, private e-scooter 26/1/9/0 g CO₂e per person-km over
-  (vehicle/fuel/infrastructure/operations; *the bicycle's dietary
-  energy factor stays) — and a shared e-scooter row from the Helsinki
-  fleet study of Judl et al. (2026, doi:10.1007/s11367-026-02685-2):
-  the current-generation scenario's gross impacts split by its
-  contribution shares, plus the ITF infrastructure component grafted on
-  for one boundary across rows. ``street_factor()`` gains a
-  ``service_model=`` override, and the street-policy products resolve a
-  rental mode's shared-fleet factors automatically — an emissions-aware
-  policy query now works without user factor rows. Walking is the
-  explicit zero baseline. User ``factors=`` rows still beat everything.
-
-- Cycling and e-scooter **access to public transport**, behind an explicit
-  policy. ``cafein.StreetLegPolicy`` names which street modes may serve a
-  journey's access and egress, each with its own time budget, and
-  ``cafein.VehiclePolicy`` states the vehicle terms — an own vehicle serves
-  one declared side and names where it may be left or picked up
-  (``bicycle_parking`` stops, a user list, or the explicit ``any_stop``
-  assumption; never silently assumed), a shared vehicle states its
-  availability. ``travel_times_from_coordinate(street_policy=...)`` then
-  reduces, per stop, the fastest permitted street choice over the carried
-  multimodal graph — closed under the stop-to-stop transfers, ties to
-  fewer paid rentals then declared order — and feeds the same
-  earliest-arrival engine as today. A walking-only policy is the current
-  walking path, bit for bit. ``TravelTimeMatrix(street_policy=...)`` runs
-  the same reduction per point-set origin and destination through the
-  engine's parallel fan-out, egress folded per destination and the direct
-  walking alternative over the same graph folded in.
-  ``route_between_coordinates(street_policy=...)`` and
-  ``DetailedItineraries(street_policy=...)`` reconstruct the full
-  journeys: every access and egress leg rebuilds from its winning street
-  choice with the mode, the exact network and connector distances and
-  shape over the multimodal graph, the street distance provenance, and —
-  in the itineraries frame, which gains a ``mode`` column beside
-  ``leg_type`` — the mode's street emissions over its network meters. A
-  choice carried through the transfer closure splits into the vehicle leg
-  to its seed stop plus the walked transfer, so no leg blends two modes.
-  ``TravelCostMatrix(street_policy=...)`` completes the policy products:
-  the frame gains ``street_distance_m`` beside the transit and walking
-  distances — the vehicle legs' network meters plus their connectors at
-  the journey ends — and ``emissions`` adds each vehicle mode's street
-  emissions over its network meters only (NaN where the factor is unresolved, never a silent
-  zero), attributed per pair from the winning journey's access and
-  egress choices outside the routing engine. The policy journey products
-  also compose the zero-ride alternative — ride the street to a stop and
-  leave on foot without boarding — which the engine never emits and
-  which only walking-only queries could safely omit.
-  With ``candidates="pareto"`` or ``"relaxed"``, street-leg emissions
-  now enter the McRAPTOR dominance itself: each journey end reduces to
-  its (seconds, grams) Pareto frontier over the policy's modes, the
-  engine seeds and drains those label sets — zero-ride street
-  compositions included — and the options genuinely trade street
-  emissions against time (an e-scooter access can be the fast, dirtier
-  alternative beside the slower, cleaner walk). Granted vehicle modes
-  then require resolved emission factors; unresolved ones are rejected,
-  never silently zeroed. A walking-only policy rides the legacy
-  multicriteria path bit for bit. Both multicriteria engines serve the
-  policy: ``router="auto"`` resolves to McTBTR when the cached
-  multicriteria transfer set (``compute_mctbtr_transfers``) matches the
-  query, answering exactly what McRAPTOR answers; policy queries always
-  relax the full transfer closure — the McULTRA shortcut set never
-  serves them.
-
-- A ``TransportNetwork`` can now carry the multimodal union street graph.
-  ``from_gtfs(..., street_modes=("walk", "bicycle", "e_scooter"), dem=...)``
-  builds the same directional multimodal graph a standalone
-  ``StreetNetwork.from_osm`` builds — per-arc mode permissions, street
-  attributes, optional slope-ready elevations — from the same OSM extract,
-  and persists it as a second street graph in the artifact's street
-  section (format 14;
-  owned and mapped loads restore it). It is groundwork for cycling and
-  e-scooter access and egress in PT routing: the walking graph, its
-  footpaths, and every existing query stay untouched — walking results are
-  bit-for-bit identical with and without it, enforced by tests. Exposed as
-  ``has_multimodal_streets`` and ``multimodal_elevation_metadata``.
-
-- Single street routes are goal-directed. ``StreetNetwork.travel_time`` and
-  the single-pair leg reconstruction now run a target-directed A* search
-  with an admissible straight-line heuristic, answering exactly what the
-  Dijkstra search answers — cell-for-cell identical, enforced by tests —
-  while exploring only the route's surroundings instead of everything the
-  time cutoff reaches. Typical door-to-door queries on a city extract run
-  more than an order of magnitude faster; matrix computations keep the
-  one-to-many Dijkstra, where one search serves a whole row.
-
-- Cycling is slope-aware on elevated street networks. The bicycle profile
-  compiles the owner-published cost model ``w = d · (1 + f(s))`` — ``f(s) = s``
-  uphill, ``0.3·s`` downhill (a bounded credit) — per stored sub-segment and
-  per direction, so an edge that climbs and descends is costed on both parts
-  and the reverse arc sees the negated slopes. Slopes are clamped to ±100 %
-  (DEM-spike guard) and every sub-segment multiplier is floored, so no
-  downhill can compile a vanishing cost. Unavailable elevation (NaN) stays
-  flat — a network built without ``dem=`` routes exactly as before, and walk,
-  e-bike, and e-scooter stay slope-free until sourced models exist.
-
-- Street networks can now carry elevation.
-  ``StreetNetwork.from_osm(..., dem=...)`` samples a user-supplied DEM —
-  a GeoTIFF path or tile paths read through the optional ``rioxarray``
-  dependency (``pip install cafein[dem]``), or a
-  ``(lons, lats) -> elevations`` callable — at every geometry
-  coordinate, densified to ``dem_interval`` metres (default 25) so the
-  profile between OSM nodes is captured. Missing data is ``NaN``, never
-  invented; bridge and tunnel interiors interpolate between their
-  endpoint elevations instead of tracking the terrain below or above;
-  and ``elevation_metadata`` records the source, interval, nodata
-  policy, sampled coverage, and inferred-structure count. The values
-  ride the street artifact through ``save``/``load`` (owned and
-  mapped). Carrying elevations changes nothing for slope-free profiles —
-  the entry above is where they get costed. The conventional bicycle's
-  operational emission factor is now 21 g CO₂e per person-km (dietary
-  energy expenditure, average European diet).
-
-- Standalone street routing: cycling, e-scooter, e-bike, and walking as
-  door-to-door modes of their own. ``cafein.StreetNetwork.from_osm``
-  builds a directional multimodal street graph from an OpenStreetMap
-  extract in one pass — per-arc mode permissions with one-way and
-  contraflow handling, highway/surface/smoothness classes, and per-mode
-  connectivity pruning — and ``save``/``load`` round-trip it through its
-  own versioned artifact (mappable, like the network artifact).
-  ``travel_time`` routes a pair; ``TravelTimeMatrix``,
-  ``TravelCostMatrix``, and ``DetailedItineraries`` accept a
-  ``StreetNetwork`` with ``transport_mode=`` for matrices and leg-level
-  itineraries — times, exact street distances split into network and
-  connector metres with their provenance, route geometry, and emissions.
-  Profiles compile once per mode and are cached on the network; snapping
-  is profile-aware, so a bicycle query never starts on a footway it may
-  not ride. Street emissions resolve over a
-  ``street_mode``/``vehicle_class``/``service_model`` ladder
-  (``cafein.emissions.street_factors``) at grams CO₂e per person-km over
-  network metres only; walking and the conventional bicycle ship with
-  zero operational components. (The remaining components initially
-  shipped unresolved; the sourced defaults above supersede that within
-  this release — never a silent zero either way.)
-  ([#164](https://github.com/cafein-py/cafein/pull/164),
-  [#166](https://github.com/cafein-py/cafein/pull/166),
-  [#167](https://github.com/cafein-py/cafein/pull/167),
-  [#168](https://github.com/cafein-py/cafein/pull/168),
-  [#172](https://github.com/cafein-py/cafein/pull/172),
-  [#173](https://github.com/cafein-py/cafein/pull/173),
-  [#174](https://github.com/cafein-py/cafein/pull/174),
-  [#175](https://github.com/cafein-py/cafein/pull/175))
-
-- **Breaking:** every time column now carries its unit in its name too.
-  ``travel_time`` becomes ``travel_time_s``, the departure-window
-  percentiles become ``travel_time_p<p>_s``, and the journey and leg
-  clocks become ``departure_s`` and ``arrival_s`` — in the frames and in
-  the dicts ``route_between_stops`` and ``route_between_coordinates``
-  return alike. The unit is worth stating: r5py, which cafein offers an
-  alternative to, reports travel times in **minutes**, so an unqualified
-  ``travel_time`` invited a silently 60-fold error. Both clocks remain
-  seconds since midnight of the *service date* and can exceed 86400 for
-  journeys running past midnight. Method and parameter names are
-  unchanged (``StreetNetwork.travel_time``, ``max_street_time``,
-  ``max_walking_time``, and the ``departure=`` argument).
-
-- ``cafein.to_minutes(frame)`` converts a result's seconds columns to
-  minutes: each ``*_s`` column becomes a floating-point ``*_min`` column
-  in a copy, leaving the exact integer seconds in the original. It takes
-  the frame as an argument rather than living on the result classes,
-  which degrade to plain pandas on any slice or filter, so it keeps
-  working on anything derived from a result. Pass ``columns=`` to
-  convert only some.
-
-- **Breaking:** every distance column now carries its unit in its name.
-  ``TravelCostMatrix`` and ``travel_cost_table`` report
-  ``transit_distance_m`` and ``walk_distance_m`` in place of
-  ``transit_distance`` and ``walk_distance``, and
-  ``DetailedItineraries`` reports ``distance_m`` in place of
-  ``distance``. The journey legs that ``route_between_stops`` and
-  ``route_between_coordinates`` return carry ``distance_m`` in place of
-  ``distance`` too, so the same quantity has one name whether it is read
-  from a leg or from a frame. Code reading the old names must be
-  updated. Besides
-  stating the unit at the point of use, the new name for the itinerary
-  column no longer collides with ``GeoDataFrame.distance``, the
-  geopandas method that shadowed the column on attribute access, so
-  ``legs.distance_m`` reads the column where ``legs.distance`` returned
-  the method. ``distance_provenance`` is unchanged, carrying a tier name
-  rather than a measurement.
-
-- The saved artifact's STREETS section can now carry optional multimodal
-  street arrays after the core walking graph — per-adjacency-slot mode
-  permissions and facility flags, per-edge class codes, and per-coordinate
-  elevations — laying the on-disk groundwork for cycling and e-scooter
-  routing. A walk-only build writes none of them and is byte-for-byte a
-  walking artifact. The format bumps to 12; artifacts written by earlier
-  versions are refused with the usual rebuild message.
+- **The trip-based engine serves merged transfer sets exactly**, and
+  street-policy time queries auto-ride a matching cached set.
+  ([#200](https://github.com/cafein-py/cafein/pull/200), [#201](https://github.com/cafein-py/cafein/pull/201))
 
 ## 0.6.0 — 2026-07-19
 
-- Query-time exclusion sets: ``exclude_routes=``, ``exclude_trips=``,
-  and ``exclude_stops=`` (GTFS ids) on every routing product — the
-  one-pair queries (``route_between_stops``,
-  ``route_between_coordinates``, ``journey_frontier``,
-  ``DetailedItineraries``), the time queries
-  (``travel_times_from_stop``, ``travel_times_from_coordinate``,
-  ``travel_time_matrix``, ``TravelTimeMatrix``; stop, point, and
-  percentile forms), the batched frontiers (``journey_frontiers``,
-  ``frontier_table``, stop and point forms, composing with
-  ``max_slower``), and the cost matrices (``TravelCostMatrix``,
-  ``travel_cost_table``, every optimize mode and candidate set). One
-  built network serves many disruption scenarios ("line X closed",
-  "stop Y shut") and per-individual accessibility filters, with no
-  rebuild. An excluded stop refuses boarding, alighting, transfers,
-  and access/egress while vehicles still ride through it; an excluded
-  origin or destination yields no journeys; unknown route and trip ids
-  are ignored; exclusions compose with the diverse candidates' bans
-  and penalties. Excluded queries answer exactly as a network built
-  without that supply: they run on the RAPTOR engines
-  (``router="auto"`` falls back, explicit ``"tbtr"`` raises; the
-  precomputed trip-based and (Mc)ULTRA sets are reduced against
-  witnesses the removed supply may have carried).
-  ([#154](https://github.com/cafein-py/cafein/pull/154),
-  [#155](https://github.com/cafein-py/cafein/pull/155),
-  [#156](https://github.com/cafein-py/cafein/pull/156),
+- **Query-time exclusion sets**: `exclude_routes=`, `exclude_trips=`,
+  and `exclude_stops=` on the one-pair surface, the time matrices,
+  the batched frontiers, and the cost matrices — disruption and
+  per-individual accessibility filters.
+  ([#154](https://github.com/cafein-py/cafein/pull/154), [#155](https://github.com/cafein-py/cafein/pull/155), [#156](https://github.com/cafein-py/cafein/pull/156),
   [#157](https://github.com/cafein-py/cafein/pull/157))
 
-- The cached McULTRA and McTBTR transfer sets are bound to the per-trip
-  emission-factor configuration they were built with by the full factor
-  vector, compared exactly, instead of a 64-bit fingerprint whose
-  collision could silently reuse a set built for other factors. Saved
-  artifacts use format 11; artifacts written by earlier versions are
-  refused with the usual rebuild message.
-  ([#158](https://github.com/cafein-py/cafein/pull/158))
+- Cached McULTRA/McTBTR transfer sets **bind to the exact per-trip
+  factor vector**, so changed emission factors can never ride a stale
+  multicriteria cache. ([#158](https://github.com/cafein-py/cafein/pull/158))
 
 ## 0.5.0 — 2026-07-19
 
