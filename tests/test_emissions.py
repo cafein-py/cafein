@@ -243,9 +243,7 @@ def test_invalid_factor_tables_are_rejected(tmp_path):
 def test_helsinki_k_train_journey_emissions(network):
     # Korso -> Käpylä on the K train: 16.786 km (raw shape_dist tables)
     # at the urban-rail factor of 25 g CO2e/pkm.
-    journeys = network.route_between_stops(
-        "4810551", "1250551", "2022-02-22", "08:30:00"
-    )
+    journeys = network.route_between_stops("4810551", "1250551", "2022-02-22 08:30:00")
     (annotated,) = network.annotate_emissions([journeys[0]])
     transit = annotated["legs"][1]
     assert transit["emissions"] == pytest.approx(16.786 * 25, rel=0.001)

@@ -4,7 +4,8 @@ import pytest
 
 from cafein import TransportNetwork
 
-QUERY_DATE, QUERY_TIME = "2022-02-22", "08:30:00"
+QUERY_DATE = "2022-02-22"
+QUERY_TIME = "2022-02-22 08:30:00"
 # The compute/inspect tests use the full feed with a bounded window (fast, no
 # routing). The routing tests use a centrally-cropped feed, because routing
 # only relaxes a whole-day set and a whole-day compute over the region-wide
@@ -15,7 +16,7 @@ from conftest import ULTRA_WINDOW as WINDOW  # noqa: E402
 CENTRAL_BBOX = (60.14, 24.88, 60.20, 25.00)  # (min_lat, min_lon, max_lat, max_lon)
 # A short access/egress radius makes journeys rely on transit and the
 # intermediate transfers ULTRA widens, rather than walking the ends.
-ACCESS = 200.0
+ACCESS = 200 / 60
 
 
 @pytest.fixture(scope="module")
@@ -90,7 +91,6 @@ def _door_to_door(net, coords, endpoints, time):
                     net.route_between_coordinates(
                         coords[origin],
                         coords[destination],
-                        QUERY_DATE,
                         time,
                         max_walking_time=ACCESS,
                     )
@@ -122,27 +122,25 @@ def test_point_destination_routing(central_gtfs, kantakaupunki_pbf):
     # the closure.
     with pytest.warns(UserWarning):
         net = TransportNetwork.from_gtfs(
-            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=60
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=1 / 60
         )
     coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
     endpoints = list(coords)[:15]
     closure = _door_to_door(net, coords, endpoints, QUERY_TIME)
-    stop_before = net.travel_times_from_stop(endpoints[0], QUERY_DATE, QUERY_TIME)
+    stop_before = net.travel_times_from_stop(endpoints[0], QUERY_TIME)
     assert any(pareto for pareto in closure.values())
 
     # A partial-window set is stored but not relaxed by routing — door-to-door
     # and the one-to-all stop query alike keep the closure.
     net.compute_ultra_shortcuts(
-        max_transfer_time=600.0, min_departure=29700, max_departure=31500
+        max_transfer_time=10, min_departure="08:15", max_departure="08:45"
     )
     assert _door_to_door(net, coords, endpoints, QUERY_TIME) == closure
-    assert (
-        net.travel_times_from_stop(endpoints[0], QUERY_DATE, QUERY_TIME) == stop_before
-    )
+    assert net.travel_times_from_stop(endpoints[0], QUERY_TIME) == stop_before
 
     # A whole-day set is: superset, at least one gained journey, and transfer
     # legs report a distance looked up in the ULTRA set (which carries metres).
-    net.compute_ultra_shortcuts(max_transfer_time=600.0)  # whole day
+    net.compute_ultra_shortcuts(max_transfer_time=10)  # whole day
     ultra = _door_to_door(net, coords, endpoints, QUERY_TIME)
     improved = 0
     for pair, before in closure.items():
@@ -157,7 +155,6 @@ def test_point_destination_routing(central_gtfs, kantakaupunki_pbf):
         for journey in net.route_between_coordinates(
             coords[origin],
             coords[destination],
-            QUERY_DATE,
             QUERY_TIME,
             max_walking_time=ACCESS,
         ):
@@ -180,7 +177,7 @@ def test_point_matrix_supersets_and_emissions_ignore(central_gtfs, kantakaupunki
 
     with pytest.warns(UserWarning):
         net = TransportNetwork.from_gtfs(
-            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=60
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=1 / 60
         )
     coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
     endpoints = list(coords)[:12]
@@ -195,27 +192,25 @@ def test_point_matrix_supersets_and_emissions_ignore(central_gtfs, kantakaupunki
             (o, d)
             for o in endpoints
             for d in endpoints
-            if o != d and net.route_between_stops(o, d, QUERY_DATE, QUERY_TIME)
+            if o != d and net.route_between_stops(o, d, QUERY_TIME)
         ),
         None,
     )
     assert frontier_pair is not None
 
     def matrix():
-        frame = TravelTimeMatrix(
-            net, points, points, date=QUERY_DATE, departure=QUERY_TIME
-        )
+        frame = TravelTimeMatrix(net, points, points, departure=QUERY_TIME)
         return {
-            (row["from_id"], row["to_id"]): row["travel_time_s"]
+            (row["from_id"], row["to_id"]): row["travel_time"]
             for _, row in frame.iterrows()
-            if row["travel_time_s"] == row["travel_time_s"]  # drop NaN (unreachable)
+            if row["travel_time"] == row["travel_time"]  # drop NaN (unreachable)
         }
 
     def frontier():
         frame = journey_frontier(
-            net, *frontier_pair, QUERY_DATE, QUERY_TIME, 1800, candidates="pareto"
+            net, *frontier_pair, QUERY_TIME, 30, candidates="pareto"
         )
-        rows = frame[["travel_time_s", "emissions", "rides", "frontier"]]
+        rows = frame[["travel_time", "emissions", "rides", "frontier"]]
         return sorted(rows.round(3).itertuples(index=False, name=None))
 
     closure_matrix = matrix()
@@ -236,7 +231,7 @@ def test_save_load_round_trips_the_ultra_set(central_gtfs, kantakaupunki_pbf, tm
     # is restored but stays unused (its scope is not mistaken for whole-day).
     with pytest.warns(UserWarning):
         net = TransportNetwork.from_gtfs(
-            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=60
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=1 / 60
         )
     coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
     endpoints = list(coords)[:15]
@@ -245,25 +240,22 @@ def test_save_load_round_trips_the_ultra_set(central_gtfs, kantakaupunki_pbf, tm
     # A whole-day set: shortcuts and routing behaviour reproduce after a
     # round-trip, and the routed result genuinely differs from the closure so
     # the equality below is not trivially satisfied.
-    net.compute_ultra_shortcuts(max_transfer_time=600.0)
+    net.compute_ultra_shortcuts(max_transfer_time=10)
     shortcuts = net.ultra_shortcuts
     routed = _door_to_door(net, coords, endpoints, QUERY_TIME)
     assert routed != closure
-    stop_before = net.travel_times_from_stop(endpoints[0], QUERY_DATE, QUERY_TIME)
+    stop_before = net.travel_times_from_stop(endpoints[0], QUERY_TIME)
     whole = tmp_path / "whole.cafein"
     net.save(whole)
     loaded = TransportNetwork.load(whole)
     assert loaded.ultra_shortcuts == shortcuts
     assert _door_to_door(loaded, coords, endpoints, QUERY_TIME) == routed
-    assert (
-        loaded.travel_times_from_stop(endpoints[0], QUERY_DATE, QUERY_TIME)
-        == stop_before
-    )
+    assert loaded.travel_times_from_stop(endpoints[0], QUERY_TIME) == stop_before
 
     # A partial-window set: restored and inspectable, but routing keeps the
     # closure — the persisted window is a partial one, not whole-day.
     net.compute_ultra_shortcuts(
-        max_transfer_time=600.0, min_departure=29700, max_departure=31500
+        max_transfer_time=10, min_departure="08:15", max_departure="08:45"
     )
     partial_shortcuts = net.ultra_shortcuts
     partial = tmp_path / "partial.cafein"
@@ -319,13 +311,13 @@ def test_route_between_stops_door_to_door_under_ultra(central_gtfs, kantakaupunk
     # it keeps the closure and ignores the walking arguments.
     with pytest.warns(UserWarning):
         net = TransportNetwork.from_gtfs(
-            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=60
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=1 / 60
         )
     coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
     endpoints = list(coords)[:15]
 
     def stops_pareto(o, d, **kw):
-        return _pareto(net.route_between_stops(o, d, QUERY_DATE, QUERY_TIME, **kw))
+        return _pareto(net.route_between_stops(o, d, QUERY_TIME, **kw))
 
     a, b = endpoints[0], endpoints[1]
     assert stops_pareto(a, b, max_walking_time=ACCESS) == stops_pareto(a, b)
@@ -333,14 +325,14 @@ def test_route_between_stops_door_to_door_under_ultra(central_gtfs, kantakaupunk
         (o, d): stops_pareto(o, d) for o in endpoints for d in endpoints if o != d
     }
 
-    net.compute_ultra_shortcuts(max_transfer_time=600.0)  # whole day
+    net.compute_ultra_shortcuts(max_transfer_time=10)  # whole day
 
     improved = 0
     for (o, d), before in closure.items():
         via_stops = stops_pareto(o, d, max_walking_time=ACCESS)
         via_coords = _pareto(
             net.route_between_coordinates(
-                coords[o], coords[d], QUERY_DATE, QUERY_TIME, max_walking_time=ACCESS
+                coords[o], coords[d], QUERY_TIME, max_walking_time=ACCESS
             )
         )
         assert via_stops == via_coords
@@ -351,16 +343,15 @@ def test_route_between_stops_door_to_door_under_ultra(central_gtfs, kantakaupunk
     # The windowed (range) query is door-to-door too.
     ranged = _pareto(
         net.route_between_stops(
-            a, b, QUERY_DATE, QUERY_TIME, window=1800, max_walking_time=ACCESS
+            a, b, QUERY_TIME, departure_time_window=30, max_walking_time=ACCESS
         )
     )
     assert ranged == _pareto(
         net.route_between_coordinates(
             coords[a],
             coords[b],
-            QUERY_DATE,
             QUERY_TIME,
-            window=1800,
+            departure_time_window=30,
             max_walking_time=ACCESS,
         )
     )
@@ -377,28 +368,24 @@ def test_travel_times_from_stop_door_to_door_under_ultra(
     # arguments.
     with pytest.warns(UserWarning):
         net = TransportNetwork.from_gtfs(
-            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=60
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=1 / 60
         )
     coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
     origin = next(iter(coords))
 
-    closure = net.travel_times_from_stop(origin, QUERY_DATE, QUERY_TIME)
+    closure = net.travel_times_from_stop(origin, QUERY_TIME)
     # The walking arguments are ignored without a whole-day set.
     assert (
-        net.travel_times_from_stop(
-            origin, QUERY_DATE, QUERY_TIME, max_walking_time=ACCESS
-        )
+        net.travel_times_from_stop(origin, QUERY_TIME, max_walking_time=ACCESS)
         == closure
     )
 
-    net.compute_ultra_shortcuts(max_transfer_time=600.0)  # whole day
+    net.compute_ultra_shortcuts(max_transfer_time=10)  # whole day
 
-    ultra = net.travel_times_from_stop(
-        origin, QUERY_DATE, QUERY_TIME, max_walking_time=ACCESS
-    )
+    ultra = net.travel_times_from_stop(origin, QUERY_TIME, max_walking_time=ACCESS)
     # Door-to-door: identical to routing from the origin stop's coordinate.
     assert ultra == net.travel_times_from_coordinate(
-        coords[origin], QUERY_DATE, QUERY_TIME, max_walking_time=ACCESS
+        coords[origin], QUERY_TIME, max_walking_time=ACCESS
     )
     # Reachability superset of the closure, and strictly more stops reached
     # (the origin itself now costs its stop-to-platform connector walk, so this
@@ -440,16 +427,14 @@ def test_travel_time_matrix_mixed_origins_under_ultra(
 
     with pytest.warns(UserWarning):
         net = TransportNetwork.from_gtfs(
-            [str(feed)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=60
+            [str(feed)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=1 / 60
         )
-    net.compute_ultra_shortcuts(max_transfer_time=600.0)  # whole day
+    net.compute_ultra_shortcuts(max_transfer_time=10)  # whole day
     stops = [s for s, _, _ in net.stops]
     usable = [s for s, lat, _ in net.stops if lat is not None and abs(lat) > 1][:3]
     origins = [offnet, *usable]  # mixed, fallback origin first
 
-    matrix = net.travel_time_matrix(
-        origins, QUERY_DATE, QUERY_TIME, max_walking_time=ACCESS
-    )
+    matrix = net.travel_time_matrix(origins, QUERY_TIME, max_walking_time=ACCESS)
     unreached = np.iinfo(np.uint32).max
     for i, origin in enumerate(origins):
         row = {
@@ -458,7 +443,7 @@ def test_travel_time_matrix_mixed_origins_under_ultra(
             if matrix[i, j] != unreached
         }
         assert row == net.travel_times_from_stop(
-            origin, QUERY_DATE, QUERY_TIME, max_walking_time=ACCESS
+            origin, QUERY_TIME, max_walking_time=ACCESS
         )
     # The off-network origin fell back to closure board-at-origin (maps to 0);
     # a usable origin routes door-to-door (its own cell costs the connector).
@@ -503,7 +488,7 @@ def test_travel_cost_matrix_agrees_with_time_matrix_under_ultra(
 
     with pytest.warns(UserWarning):
         net = TransportNetwork.from_gtfs(
-            [str(feed)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=60
+            [str(feed)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=1 / 60
         )
     stops = [s for s, _, _ in net.stops]
     usable = [s for s, lat, _ in net.stops if lat is not None and abs(lat) > 1][:3]
@@ -513,10 +498,15 @@ def test_travel_cost_matrix_agrees_with_time_matrix_under_ultra(
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")  # emissions-factor gaps aren't the subject
             frame = TravelCostMatrix(
-                net, origins, stops, QUERY_DATE, QUERY_TIME, **walk
+                net,
+                origins,
+                stops,
+                QUERY_TIME,
+                output_time_units="seconds",
+                **walk,
             )
         return {
-            (row["from_id"], row["to_id"]): int(row["travel_time_s"])
+            (row["from_id"], row["to_id"]): int(row["travel_time"])
             for _, row in frame.iterrows()
         }
 
@@ -524,14 +514,12 @@ def test_travel_cost_matrix_agrees_with_time_matrix_under_ultra(
     closure = cost_times()
     assert cost_times(max_walking_time=ACCESS) == closure
 
-    net.compute_ultra_shortcuts(max_transfer_time=600.0)  # whole day
+    net.compute_ultra_shortcuts(max_transfer_time=10)  # whole day
     ultra = cost_times(max_walking_time=ACCESS)
 
     # Time agreement: each cost-matrix travel_time equals the time-matrix cell,
     # the same location-based door-to-door routing.
-    matrix = net.travel_time_matrix(
-        origins, QUERY_DATE, QUERY_TIME, max_walking_time=ACCESS
-    )
+    matrix = net.travel_time_matrix(origins, QUERY_TIME, max_walking_time=ACCESS)
     unreached = np.iinfo(np.uint32).max
     time_cells = {
         (origins[i], stops[j]): int(matrix[i, j])
@@ -576,9 +564,9 @@ def test_travel_cost_matrix_transit_columns_match_the_point_matrix(
 
     with pytest.warns(UserWarning):
         net = TransportNetwork.from_gtfs(
-            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=60
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=1 / 60
         )
-    net.compute_ultra_shortcuts(max_transfer_time=600.0)  # whole day
+    net.compute_ultra_shortcuts(max_transfer_time=10)  # whole day
     coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
     endpoints = list(coords)[:12]
     points = gpd.GeoDataFrame(
@@ -587,7 +575,7 @@ def test_travel_cost_matrix_transit_columns_match_the_point_matrix(
         crs="EPSG:4326",
     )
     cols = [
-        "travel_time_s",
+        "travel_time",
         "transfers",
         "transit_distance_m",
         "walk_distance_m",
@@ -611,7 +599,6 @@ def test_travel_cost_matrix_transit_columns_match_the_point_matrix(
                 net,
                 endpoints,
                 endpoints,
-                QUERY_DATE,
                 QUERY_TIME,
                 max_walking_time=ACCESS,
             )
@@ -621,7 +608,6 @@ def test_travel_cost_matrix_transit_columns_match_the_point_matrix(
                 net,
                 points,
                 points,
-                date=QUERY_DATE,
                 departure=QUERY_TIME,
                 max_walking_time=ACCESS,
             )
@@ -647,13 +633,13 @@ def test_final_walk_respects_max_walking_time(central_gtfs, kantakaupunki_pbf):
     # sooner than the capped route flags such a "cap-biting" destination.
     with pytest.warns(UserWarning):
         net = TransportNetwork.from_gtfs(
-            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=60
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=1 / 60
         )
-    net.compute_ultra_shortcuts(max_transfer_time=600.0)  # whole day
+    net.compute_ultra_shortcuts(max_transfer_time=10)  # whole day
     coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
     origin = next(iter(coords))
     tight = net.travel_times_from_coordinate(
-        coords[origin], QUERY_DATE, QUERY_TIME, max_walking_time=ACCESS
+        coords[origin], QUERY_TIME, max_walking_time=ACCESS
     )
 
     def earliest(destination, cap):
@@ -662,7 +648,6 @@ def test_final_walk_respects_max_walking_time(central_gtfs, kantakaupunki_pbf):
             for journey in net.route_between_coordinates(
                 coords[origin],
                 coords[destination],
-                QUERY_DATE,
                 QUERY_TIME,
                 max_walking_time=cap,
             )
@@ -675,7 +660,7 @@ def test_final_walk_respects_max_walking_time(central_gtfs, kantakaupunki_pbf):
             continue
         try:
             capped = earliest(dd, ACCESS)
-            loose = earliest(dd, 3000.0)  # allows the long walk the cap forbids
+            loose = earliest(dd, 50)  # allows the long walk the cap forbids
         except ValueError:  # dd's coordinate off the walking network
             continue
         # The one-to-all (capped) arrival agrees with the capped coordinate query
@@ -742,7 +727,7 @@ def test_mcultra_wires_into_the_door_to_door_emissions_frontier(
 
     with pytest.warns(UserWarning):
         net = TransportNetwork.from_gtfs(
-            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=300
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=5
         )
     coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
     ids = list(coords)[:20]
@@ -752,14 +737,13 @@ def test_mcultra_wires_into_the_door_to_door_emissions_frontier(
             net,
             coords[o],
             coords[d],
-            QUERY_DATE,
             QUERY_TIME,
-            1800,
+            30,
             candidates="pareto",
             components=components,
         )
         return sorted(
-            frame[["travel_time_s", "emissions", "rides"]]
+            frame[["travel_time", "emissions", "rides"]]
             .round(3)
             .itertuples(index=False, name=None)
         )
@@ -815,28 +799,25 @@ def test_mcultra_routes_stop_pareto_queries_door_to_door(
 
     with pytest.warns(UserWarning):
         net = TransportNetwork.from_gtfs(
-            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=300
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=5
         )
     coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
     ids = list(coords)[:25]
-    walk = dict(
-        walking_speed_kmph=3.6, max_walking_time=300.0, max_snap_distance=1600.0
-    )
+    walk = dict(walking_speed_kmph=3.6, max_walking_time=5.0, snap_distance=1600.0)
 
     def frontier(origin, destination, components=None):
         frame = journey_frontier(
             net,
             origin,
             destination,
-            QUERY_DATE,
             QUERY_TIME,
-            1800,
+            30,
             candidates="pareto",
             components=components,
             **walk,
         )
         return sorted(
-            frame[["travel_time_s", "emissions", "rides"]]
+            frame[["travel_time", "emissions", "rides"]]
             .round(3)
             .itertuples(index=False, name=None)
         )
@@ -890,22 +871,19 @@ def test_mcultra_routes_the_emissions_matrix_door_to_door(
 
     with pytest.warns(UserWarning):
         net = TransportNetwork.from_gtfs(
-            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=300
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=5
         )
     coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
     ids = list(coords)[:25]
-    walk = dict(
-        walking_speed_kmph=3.6, max_walking_time=300.0, max_snap_distance=1600.0
-    )
+    walk = dict(walking_speed_kmph=3.6, max_walking_time=5.0, snap_distance=1600.0)
 
     def frontier(origin, destination, components=None):
         return journey_frontier(
             net,
             origin,
             destination,
-            QUERY_DATE,
             QUERY_TIME,
-            1800,
+            30,
             candidates="pareto",
             components=components,
             bucket=1e-6,
@@ -923,11 +901,10 @@ def test_mcultra_routes_the_emissions_matrix_door_to_door(
             net,
             [origin],
             [destination],
-            QUERY_DATE,
             QUERY_TIME,
             optimize="emissions",
             candidates="pareto",
-            window=1800,
+            departure_time_window=30,
             bucket=1e-6,
             components=components,
             **walk,
@@ -1007,7 +984,7 @@ def test_mcultra_routes_the_emissions_matrix_door_to_door(
     # rather than charging the origin's stop connector).
     diagonal = matrix_cell(origin, origin)
     assert diagonal is not None
-    assert diagonal["travel_time_s"] == 0
+    assert diagonal["travel_time"] == 0
     assert diagonal["emissions"] == pytest.approx(0.0, abs=1e-6)
 
 
@@ -1024,10 +1001,10 @@ def test_auto_router_prefers_the_ultra_door_to_door_path(
         net = TransportNetwork.from_gtfs(
             [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf)
         )
-    net.compute_ultra_shortcuts(max_transfer_time=600.0)  # whole day
+    net.compute_ultra_shortcuts(max_transfer_time=10)  # whole day
     net.compute_tbtr_transfers(QUERY_DATE)
     origins = [stop for stop, _lat, _lon in net.stops][:5]
-    args = (origins, QUERY_DATE, QUERY_TIME)
+    args = (origins, QUERY_TIME)
     auto = net.travel_time_matrix(*args)
     raptor = net.travel_time_matrix(*args, router="raptor")
     tbtr = net.travel_time_matrix(*args, router="tbtr")
@@ -1049,7 +1026,7 @@ def test_auto_router_prefers_the_mcultra_door_to_door_path(
 
     with pytest.warns(UserWarning):
         net = TransportNetwork.from_gtfs(
-            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=300
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=5
         )
     default = emissions.trip_factors(net)
     count = net._core.compute_mcultra_shortcuts(3.6, 300.0, default, 0, 4_294_967_294)
@@ -1063,18 +1040,17 @@ def test_auto_router_prefers_the_mcultra_door_to_door_path(
             net,
             origins,
             origins,
-            QUERY_DATE,
             QUERY_TIME,
             optimize="emissions",
             candidates="pareto",
-            window=1800,
+            departure_time_window=30,
             walking_speed_kmph=3.6,
-            max_walking_time=300.0,
-            max_snap_distance=1600.0,
+            max_walking_time=5.0,
+            snap_distance=1600.0,
             **extra,
         )
         return sorted(
-            frame[["from_id", "to_id", "travel_time_s", "emissions"]]
+            frame[["from_id", "to_id", "travel_time", "emissions"]]
             .round(3)
             .itertuples(index=False, name=None)
         )
@@ -1093,14 +1069,14 @@ def test_whole_day_set_keeps_auto_cost_rows_door_to_door(
 
     with pytest.warns(UserWarning):
         net = TransportNetwork.from_gtfs(
-            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=60
+            [str(central_gtfs)], osm_pbf=str(kantakaupunki_pbf), max_walking_time=1 / 60
         )
-    net.compute_ultra_shortcuts(max_transfer_time=600.0)  # whole day
+    net.compute_ultra_shortcuts(max_transfer_time=10)  # whole day
     # With a matching cached trip-based set installed, only the ULTRA
     # precedence keeps auto on the door-to-door RAPTOR path.
     net.compute_tbtr_transfers(QUERY_DATE)
     origins = [stop for stop, lat, _ in net.stops if lat is not None][:3]
-    args = (net, origins, None, QUERY_DATE, QUERY_TIME)
+    args = (net, origins, None, QUERY_TIME)
     auto = TravelCostMatrix(*args)
     raptor = TravelCostMatrix(*args, router="raptor")
     tbtr = TravelCostMatrix(*args, router="tbtr")

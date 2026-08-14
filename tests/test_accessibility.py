@@ -5,7 +5,9 @@ import pytest
 
 pytest.importorskip("cafein._cafein")
 
-DATE, DEPARTURE = "2022-02-22", "08:30:00"
+DATE = "2022-02-22"
+DEPARTURE = "2022-02-22 08:30:00"
+DEPARTURE_TIME = "08:30:00"
 UNREACHED = numpy.iinfo("uint32").max
 
 
@@ -18,7 +20,7 @@ def _stop_sets(network):
 
 def _oracle_times(network, origins, destinations):
     matrix = network._core.travel_time_matrix(
-        origins, DATE, DEPARTURE, 7, "auto", [], [], [], 5.0, 1800.0, 500.0
+        origins, DATE, DEPARTURE_TIME, 7, "auto", [], [], [], 5.0, 1800.0, 500.0
     )
     column = {stop: at for at, (stop, _, _) in enumerate(network.stops)}
     times = matrix[:, [column[stop] for stop in destinations]].astype("float64")
@@ -36,7 +38,7 @@ def _sums(network, origins, destinations, opportunities, budgets, decay, param):
         decay,
         param,
         DATE,
-        DEPARTURE,
+        DEPARTURE_TIME,
         7,
         "auto",
         [],
@@ -192,18 +194,17 @@ def test_the_computer_matches_the_stop_oracle(network):
         network,
         origins,
         table,
-        DATE,
         DEPARTURE,
         opportunities="jobs",
-        budgets=(900.0, 1800.0),
+        budgets=(15.0, 30.0),
     )
     assert list(frame.columns) == ["from_id", "opportunity", "budget", "accessibility"]
     assert len(frame) == len(origins) * 2
     assert set(frame["opportunity"]) == {"jobs"}
     times = _oracle_times(network, origins, destinations)
-    for budget in (900.0, 1800.0):
+    for budget in (15.0, 30.0):
         expected = numpy.nansum(
-            numpy.where(times <= budget, table["jobs"].to_numpy(), 0.0), axis=1
+            numpy.where(times <= budget * 60, table["jobs"].to_numpy(), 0.0), axis=1
         )
         got = frame[frame["budget"] == budget]["accessibility"].to_numpy()
         assert numpy.allclose(got, expected)
@@ -213,7 +214,7 @@ def test_the_computer_counts_features_without_opportunities(network):
     from cafein import Accessibility
 
     origins, destinations = _stop_sets(network)
-    frame = Accessibility(network, origins, destinations, DATE, DEPARTURE)
+    frame = Accessibility(network, origins, destinations, DEPARTURE)
     assert set(frame["opportunity"]) == {"count"}
     times = _oracle_times(network, origins, destinations)
     expected = (times <= 1800.0).sum(axis=1).astype("float64")
@@ -240,15 +241,18 @@ def test_the_computer_routes_point_frames_door_to_door(network_with_footpaths):
         network_with_footpaths,
         origins,
         destinations,
-        DATE,
         DEPARTURE,
         opportunities="seats",
-        budgets=(1800.0,),
+        budgets=(30.0,),
     )
     matrix = TravelTimeMatrix(
-        network_with_footpaths, origins, destinations, DATE, DEPARTURE
+        network_with_footpaths,
+        origins,
+        destinations,
+        DEPARTURE,
+        output_time_units="seconds",
     )
-    reachable = matrix[matrix.travel_time_s <= 1800.0]
+    reachable = matrix[matrix.travel_time <= 1800.0]
     seats = dict(zip(destinations["id"], destinations["seats"]))
     expected = {
         origin: sum(seats[to] for to in group["to_id"])
@@ -279,12 +283,12 @@ def test_the_computer_serves_street_modes(helsinki_streets):
         origins,
         destinations,
         transport_mode="walk",
-        budgets=(600.0, 1800.0),
+        budgets=(10.0, 30.0),
     )
     assert len(frame) == 4
     wide = frame.pivot(index="from_id", columns="budget", values="accessibility")
-    assert (wide[600.0] <= wide[1800.0]).all()
-    assert (wide[1800.0] <= 3.0).all()
+    assert (wide[10.0] <= wide[30.0]).all()
+    assert (wide[30.0] <= 3.0).all()
 
 
 def test_the_computer_validates_eagerly(network, helsinki_streets):
@@ -296,30 +300,31 @@ def test_the_computer_validates_eagerly(network, helsinki_streets):
     table = pandas.DataFrame({"id": destinations, "jobs": 1.0})
 
     with pytest.raises(ValueError, match="unknown decay"):
-        Accessibility(network, origins, table, DATE, DEPARTURE, decay="gravity")
+        Accessibility(network, origins, table, DEPARTURE, decay="gravity")
     with pytest.raises(ValueError, match="decay_params"):
-        Accessibility(network, origins, table, DATE, DEPARTURE, decay="linear")
+        Accessibility(network, origins, table, DEPARTURE, decay="linear")
     with pytest.raises(TypeError, match="budgets"):
-        Accessibility(network, origins, table, DATE, DEPARTURE, budgets="1800")
+        Accessibility(network, origins, table, DEPARTURE, budgets="1800")
     with pytest.raises(ValueError, match="no column"):
-        Accessibility(network, origins, table, DATE, DEPARTURE, opportunities="people")
+        Accessibility(network, origins, table, DEPARTURE, opportunities="people")
+    with pytest.raises(ValueError, match="max_travel_time"):
+        Accessibility(network, origins, table, DEPARTURE, max_travel_time=30)
     with pytest.raises(ValueError, match="null value"):
         nulled = table.assign(jobs=[None] + [1.0] * (len(table) - 1))
-        Accessibility(network, origins, nulled, DATE, DEPARTURE, opportunities="jobs")
-    with pytest.raises(TypeError, match="date and departure"):
+        Accessibility(network, origins, nulled, DEPARTURE, opportunities="jobs")
+    with pytest.raises(TypeError, match="requires departure"):
         Accessibility(network, origins, table)
     with pytest.raises(ValueError, match="transport_mode"):
-        Accessibility(network, origins, table, DATE, DEPARTURE, transport_mode="walk")
+        Accessibility(network, origins, table, DEPARTURE, transport_mode="walk")
     with pytest.raises(ValueError, match="transport_mode"):
         Accessibility(helsinki_streets, origins, table)
     with pytest.raises(TypeError, match="exclude_routes"):
-        Accessibility(network, origins, table, DATE, DEPARTURE, exclude_routes="1001")
+        Accessibility(network, origins, table, DEPARTURE, exclude_routes="1001")
     with pytest.raises(ValueError, match="complex"):
         Accessibility(
             network,
             origins,
             table.assign(jobs=1.0 + 1.0j),
-            DATE,
             DEPARTURE,
             opportunities="jobs",
         )
@@ -338,9 +343,9 @@ def test_street_requests_reject_transit_routing_knobs(helsinki_streets):
         Accessibility(
             helsinki_streets, points, points, transport_mode="walk", router="tbtr"
         )
-    with pytest.raises(ValueError, match="max_transfers"):
+    with pytest.raises(ValueError, match="max_rides"):
         Accessibility(
-            helsinki_streets, points, points, transport_mode="walk", max_transfers=3
+            helsinki_streets, points, points, transport_mode="walk", max_rides=4
         )
 
 
@@ -352,10 +357,9 @@ def test_percentile_accessibility_matches_the_percentile_matrix(network):
         network,
         origins,
         destinations,
-        DATE,
         DEPARTURE,
-        budgets=(1800.0,),
-        window=600,
+        budgets=(30.0,),
+        departure_time_window=10,
         percentiles=(25, 75),
     )
     assert list(frame.columns) == [
@@ -367,7 +371,7 @@ def test_percentile_accessibility_matches_the_percentile_matrix(network):
     ]
     assert len(frame) == len(origins) * 2
     spread = network._core.travel_time_percentiles(
-        origins, DATE, DEPARTURE, 600, [25, 75], 7, "auto", [], [], []
+        origins, DATE, DEPARTURE_TIME, 600, [25, 75], 7, "auto", [], [], []
     )
     column = {stop: at for at, (stop, _, _) in enumerate(network.stops)}
     selection = [column[stop] for stop in destinations]
@@ -389,9 +393,7 @@ def test_window_knobs_reject_streets_and_bad_combos(network, helsinki_streets):
 
     origins, destinations = _stop_sets(network)
     with pytest.raises(ValueError, match="window"):
-        Accessibility(
-            network, origins, destinations, DATE, DEPARTURE, percentiles=(50,)
-        )
+        Accessibility(network, origins, destinations, DEPARTURE, percentiles=(50,))
     points = geopandas.GeoDataFrame(
         {"id": ["p"]},
         geometry=geopandas.points_from_xy([24.9384], [60.1699]),
@@ -399,7 +401,11 @@ def test_window_knobs_reject_streets_and_bad_combos(network, helsinki_streets):
     )
     with pytest.raises(ValueError, match="window"):
         Accessibility(
-            helsinki_streets, points, points, transport_mode="walk", window=600
+            helsinki_streets,
+            points,
+            points,
+            transport_mode="walk",
+            departure_time_window=10,
         )
 
 
@@ -410,10 +416,9 @@ def _cost_surface(network, origins, destinations, optimize, fares=None):
         network,
         origins,
         destinations,
-        DATE,
         DEPARTURE,
         optimize=optimize,
-        window=600,
+        departure_time_window=10,
         fares=fares,
     )
     column = "emissions" if optimize == "emissions" else "fare"
@@ -435,10 +440,9 @@ def test_emissions_accessibility_matches_the_cost_matrix(network):
         network,
         origins,
         destinations,
-        DATE,
         DEPARTURE,
         cost="emissions",
-        window=600,
+        departure_time_window=10,
         budgets=budgets,
     )
     assert "percentile" not in frame.columns
@@ -446,6 +450,20 @@ def test_emissions_accessibility_matches_the_cost_matrix(network):
         expected = numpy.nansum(numpy.where(surface <= budget, 1.0, 0.0), axis=1)
         got = frame[frame["budget"] == budget]["accessibility"].to_numpy()
         assert numpy.allclose(got, expected), budget
+    # max_travel_time bounds the optimum's journeys: within one
+    # minute only an origin's own zero-ride floor can qualify.
+    capped = Accessibility(
+        network,
+        origins,
+        destinations,
+        DEPARTURE,
+        cost="emissions",
+        departure_time_window=10,
+        budgets=budgets,
+        max_travel_time=1,
+    )
+    assert (capped["accessibility"] <= 1).all()
+    assert capped["accessibility"].sum() < frame["accessibility"].sum()
 
 
 def test_money_accessibility_matches_the_cost_matrix(network, helsinki_gtfs):
@@ -462,10 +480,9 @@ def test_money_accessibility_matches_the_cost_matrix(network, helsinki_gtfs):
         network,
         origins,
         destinations,
-        DATE,
         DEPARTURE,
         cost="money",
-        window=600,
+        departure_time_window=10,
         budgets=(budget,),
         fares=structure,
     )
@@ -527,41 +544,44 @@ def test_cost_axes_validate_eagerly(network, helsinki_streets):
         crs="EPSG:4326",
     )
     with pytest.raises(ValueError, match="unknown cost"):
-        Accessibility(network, origins, destinations, DATE, DEPARTURE, cost="calories")
+        Accessibility(network, origins, destinations, DEPARTURE, cost="calories")
     with pytest.raises(ValueError, match="not an optimizable transit axis"):
-        Accessibility(network, origins, destinations, DATE, DEPARTURE, cost="distance")
+        Accessibility(network, origins, destinations, DEPARTURE, cost="distance")
     with pytest.raises(ValueError, match="cost engines"):
         Accessibility(
             helsinki_streets, points, points, transport_mode="walk", cost="emissions"
         )
     with pytest.raises(ValueError, match="window"):
-        Accessibility(network, origins, destinations, DATE, DEPARTURE, cost="emissions")
+        Accessibility(network, origins, destinations, DEPARTURE, cost="emissions")
     with pytest.raises(ValueError, match="percentiles"):
         Accessibility(
             network,
             origins,
             destinations,
-            DATE,
             DEPARTURE,
             cost="emissions",
-            window=600,
+            departure_time_window=10,
             percentiles=(25, 75),
         )
     with pytest.raises(ValueError, match="fare structure"):
         Accessibility(
-            network, origins, destinations, DATE, DEPARTURE, cost="money", window=600
+            network,
+            origins,
+            destinations,
+            DEPARTURE,
+            cost="money",
+            departure_time_window=10,
         )
     with pytest.raises(ValueError, match="fares applies"):
-        Accessibility(network, origins, destinations, DATE, DEPARTURE, fares=object())
+        Accessibility(network, origins, destinations, DEPARTURE, fares=object())
     with pytest.raises(ValueError, match="factors and components"):
         Accessibility(
             network,
             origins,
             destinations,
-            DATE,
             DEPARTURE,
             cost="money",
-            window=600,
+            departure_time_window=10,
             fares=object(),
             factors=object(),
         )
@@ -584,20 +604,18 @@ def test_empty_origins_and_duplicate_destinations_are_served(network):
         network,
         origins,
         destinations[:3],
-        DATE,
         DEPARTURE,
         cost="emissions",
-        window=600,
+        departure_time_window=10,
         budgets=(600.0,),
     )
     twice = Accessibility(
         network,
         origins,
         doubled,
-        DATE,
         DEPARTURE,
         cost="emissions",
-        window=600,
+        departure_time_window=10,
         budgets=(600.0,),
     )
     assert numpy.allclose(

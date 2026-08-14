@@ -126,8 +126,8 @@ def walking_footpaths(
     stops,
     *,
     walking_speed_kmph=WALKING_SPEED_KMPH,
-    max_walking_time=MAX_WALKING_TIME,
-    max_snap_distance=MAX_SNAP_DISTANCE,
+    max_walking_time=None,
+    snap_distance=MAX_SNAP_DISTANCE,
     bounding_box=None,
 ):
     """Precompute stop-to-stop walking transfers from an OSM extract.
@@ -139,14 +139,14 @@ def walking_footpaths(
     stops : list of (str, float, float)
         ``(stop_id, latitude, longitude)`` triples, as produced by
         ``TransportNetwork.stops``. Stops without coordinates or farther
-        than `max_snap_distance` from the walking network get no
+        than `snap_distance` from the walking network get no
         footpaths.
     walking_speed_kmph : float (optional, default: 3.6)
         Walking speed in km/h, on the network and on the stop connectors.
-    max_walking_time : float (optional, default: 1200)
-        Walking-time cutoff of the footpath search, in seconds: no
+    max_walking_time : float or datetime.timedelta (optional, default: 20 minutes)
+        Walking-time cutoff of the footpath search, in minutes: no
         stop-to-stop transfer exceeds it.
-    max_snap_distance : float (optional, default: 1600)
+    snap_distance : float (optional, default: 1600)
         Maximum straight-line distance in meters from a stop to its
         nearest walking-network edge.
     bounding_box : sequence of float or shapely geometry (optional)
@@ -154,7 +154,7 @@ def walking_footpaths(
         ``[min_lon, min_lat, max_lon, max_lat]`` or a shapely geometry;
         ways outside it are dropped, so a region-wide extract can be
         cropped to the stops' neighbourhood. Stops then snap only to the
-        cropped network, so a stop with no edge within `max_snap_distance`
+        cropped network, so a stop with no edge within `snap_distance`
         of it gets no footpaths.
 
     Returns
@@ -166,6 +166,14 @@ def walking_footpaths(
         iterating yields the legacy ``(from_stop, to_stop, seconds,
         meters)`` tuples.
     """
+    from cafein._units import duration_seconds
+
+    max_walking_time = (
+        MAX_WALKING_TIME
+        if max_walking_time is None
+        else duration_seconds("max_walking_time", max_walking_time)
+    )
+    max_snap_distance = snap_distance
     nodes, edges = _walking_network(osm_pbf, bounding_box)
     return _network_footpaths(
         stops,
@@ -182,8 +190,8 @@ def walking_streets(
     stops,
     *,
     walking_speed_kmph=WALKING_SPEED_KMPH,
-    max_walking_time=MAX_WALKING_TIME,
-    max_snap_distance=MAX_SNAP_DISTANCE,
+    max_walking_time=None,
+    snap_distance=MAX_SNAP_DISTANCE,
     bounding_box=None,
 ):
     """Both walking structures of an OSM extract, from one load.
@@ -202,6 +210,14 @@ def walking_streets(
         links as ``(stop_id, edge, fraction, connector_meters)`` snap
         records.
     """
+    from cafein._units import duration_seconds
+
+    max_walking_time = (
+        MAX_WALKING_TIME
+        if max_walking_time is None
+        else duration_seconds("max_walking_time", max_walking_time)
+    )
+    max_snap_distance = snap_distance
     nodes, edges = _walking_network(osm_pbf, bounding_box)
     return _network_streets(
         stops,
@@ -315,7 +331,7 @@ def _network_streets(
     if not (math.isfinite(max_walking_time) and max_walking_time >= 0):
         raise ValueError("max_walking_time must be a non-negative, finite number")
     if not (math.isfinite(max_snap_distance) and max_snap_distance >= 0):
-        raise ValueError("max_snap_distance must be a non-negative, finite number")
+        raise ValueError("snap_distance must be a non-negative, finite number")
     speed = walking_speed_kmph / 3.6  # m/s
     nodes = nodes.reset_index(drop=True)
     edges = edges.reset_index(drop=True)

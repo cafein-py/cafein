@@ -186,7 +186,7 @@ def multimodal_transfers_network(multimodal_network, artifact_cache):
     from cafein import TransportNetwork
 
     network = TransportNetwork.load(artifact_cache / "helsinki-multimodal.cafein")
-    network.compute_mode_transfers("e_scooter", 600)
+    network.compute_mode_transfers("e_scooter", 10)
     return network
 
 
@@ -204,8 +204,8 @@ def fresh_footpaths_network(network_with_footpaths, artifact_cache):
     return TransportNetwork.load(artifact_cache / "helsinki-footpaths.cafein")
 
 
-ULTRA_CUTOFF = 300.0
-ULTRA_WINDOW = {"min_departure": 28800, "max_departure": 29400}  # 08:00-08:10
+ULTRA_CUTOFF = 5.0
+ULTRA_WINDOW = {"min_departure": "08:00", "max_departure": "08:10"}
 
 
 @pytest.fixture(scope="session")

@@ -173,6 +173,123 @@ def test_zone_prices_cover_the_journeys_zones(hsl):
     assert hsl.price(journey()) == 0.0
 
 
+def test_zone_structure_combines_products_across_feeds(tmp_path):
+    import zipfile as zf
+
+    # Two feeds, each pricing its own zone: the merged structure sells
+    # both products and keeps each feed's stop-zone assignments.
+    first = tmp_path / "first.zip"
+    with zf.ZipFile(first, "w") as archive:
+        archive.writestr(
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method\nFA,2.0,EUR,0\n",
+        )
+        archive.writestr("fare_rules.txt", "fare_id,contains_id\nFA,A\n")
+        archive.writestr("stops.txt", "stop_id,stop_name,zone_id\nS1,One,A\n")
+    second = tmp_path / "second.zip"
+    with zf.ZipFile(second, "w") as archive:
+        archive.writestr(
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method\nFB,3.0,EUR,0\n",
+        )
+        archive.writestr("fare_rules.txt", "fare_id,contains_id\nFB,B\n")
+        archive.writestr("stops.txt", "stop_id,stop_name,zone_id\nS2,Two,B\n")
+    merged = fares.zone_fare_structure([first, second])
+    assert set(merged.fares["fare_id"]) == {"FA", "FB"}
+    assert merged.fare_zones == {"FA": frozenset({"A"}), "FB": frozenset({"B"})}
+    assert merged.price(journey(ride("any", 0, "S1", "S1"))) == pytest.approx(2.0)
+    assert merged.price(journey(ride("any", 0, "S2", "S2"))) == pytest.approx(3.0)
+    # One path still reads as one feed, and an empty sequence is refused.
+    alone = fares.zone_fare_structure(first)
+    assert set(alone.fares["fare_id"]) == {"FA"}
+    with pytest.raises(ValueError, match="at least one feed"):
+        fares.zone_fare_structure([])
+    # Identifiers are feed-local: a zone shared across feeds is refused
+    # over the whole namespace, never silently merged — a feed's stops
+    # must not satisfy another feed's grants.
+    clashing = tmp_path / "clashing.zip"
+    with zf.ZipFile(clashing, "w") as archive:
+        archive.writestr(
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method\nFC,4.0,EUR,0\n",
+        )
+        archive.writestr("fare_rules.txt", "fare_id,contains_id\nFC,A\n")
+        archive.writestr("stops.txt", "stop_id,stop_name,zone_id\nS3,Three,A\n")
+    with pytest.raises(ValueError, match="share zone"):
+        fares.zone_fare_structure([first, clashing])
+    with pytest.raises(ValueError, match="share fare"):
+        fares.zone_fare_structure([first, first])
+    # A colliding currency is a refusal too, not a silent mixed sum.
+    dollars = tmp_path / "dollars.zip"
+    with zf.ZipFile(dollars, "w") as archive:
+        archive.writestr(
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method\nFD,1.0,USD,0\n",
+        )
+        archive.writestr("fare_rules.txt", "fare_id,contains_id\nFD,D\n")
+        archive.writestr("stops.txt", "stop_id,stop_name,zone_id\nS4,Four,D\n")
+    with pytest.raises(ValueError, match="currencies"):
+        fares.zone_fare_structure([first, dollars])
+
+
+def test_feed_combination_collides_over_whole_namespaces(tmp_path):
+    import zipfile as zf
+
+    # Every raw identifier kind collides, referenced by a fare or not:
+    # a feed's ordinary entities must never satisfy another feed's
+    # grants.
+    def feed(name, attributes, rules, stops, routes=None):
+        path = tmp_path / name
+        with zf.ZipFile(path, "w") as archive:
+            archive.writestr(
+                "fare_attributes.txt",
+                "fare_id,price,currency_type,payment_method\n" + attributes,
+            )
+            if rules is not None:
+                archive.writestr(
+                    "fare_rules.txt",
+                    "fare_id,contains_id,route_id,origin_id,destination_id\n" + rules,
+                )
+            archive.writestr("stops.txt", "stop_id,stop_name,zone_id\n" + stops)
+            if routes is not None:
+                archive.writestr("routes.txt", "route_id,route_type\n" + routes)
+        return path
+
+    base = feed("base.zip", "FA,2.0,EUR,0\n", "FA,A,,,\n", "S1,One,A\n", "R1,3\n")
+    # A raw stop id shared with the base feed, zones disjoint.
+    stop_clash = feed("stop.zip", "FB,3.0,EUR,0\n", "FB,B,,,\n", "S1,Other,B\n")
+    with pytest.raises(ValueError, match="share stop"):
+        fares.zone_fare_structure([base, stop_clash])
+    # A raw routes.txt id the base feed's rules never reference.
+    route_clash = feed(
+        "route.zip", "FB,3.0,EUR,0\n", "FB,B,,,\n", "S2,Two,B\n", "R1,3\n"
+    )
+    with pytest.raises(ValueError, match="share route"):
+        fares.zone_fare_structure([base, route_clash])
+    # An OD endpoint naming the base feed's zone, and only there.
+    od_clash = feed("od.zip", "FB,3.0,EUR,0\n", "FB,,,A,B\n", "S2,Two,B\n")
+    with pytest.raises(ValueError, match="share zone"):
+        fares.zone_fare_structure([base, od_clash])
+    # The zones-only reading still collides on those dropped grants.
+    with pytest.raises(ValueError, match="share zone"):
+        fares.zone_fare_structure([base, od_clash], rules="zones")
+    # An orphan rule row keys grants by the base feed's fare id.
+    orphan = feed("orphan.zip", "FB,3.0,EUR,0\n", "FB,B,,,\nFA,C,,,\n", "S2,Two,B\n")
+    with pytest.raises(ValueError, match="share fare"):
+        fares.zone_fare_structure([base, orphan])
+
+
+def test_real_fixture_feeds_refuse_combination(helsinki_gtfs):
+    # The sample and Porto Alegre feeds price in different currencies
+    # (and overlap in raw identifiers); combining them is a refusal,
+    # never a silently mixed catalogue.
+    poa = helsinki_gtfs.parent / "poa_eptc.zip"
+    if not poa.exists():
+        pytest.skip("poa_eptc.zip not fetched")
+    with pytest.raises(ValueError, match="the combined feeds"):
+        fares.zone_fare_structure([helsinki_gtfs, poa])
+
+
 def test_zone_structure_tolerates_missing_fare_columns(tmp_path):
     import zipfile as zf
 
@@ -246,9 +363,8 @@ def test_frontier_carries_fares(network, hsl):
         network,
         "4810551",
         "1250551",
-        "2022-02-22",
-        "08:30:00",
-        window=600,
+        "2022-02-22 08:30:00",
+        departure_time_window=10,
         fares=hsl,
     )
     assert "fare" in frame.columns
@@ -578,17 +694,17 @@ def test_zone_fare_frontier_routes_the_exact_engine(network, hsl_zones):
         network,
         ["4810551", "1040601"],
         ["1250551", "1121601"],
-        "2022-02-22",
-        "08:30:00",
-        600,
+        "2022-02-22 08:30:00",
+        10,
         hsl_zones,
         cutoffs=cutoffs,
+        output_time_units="seconds",
     )
 
     def rows(from_id, to_id):
         cell = frame[(frame["from_id"] == from_id) & (frame["to_id"] == to_id)]
         return sorted(
-            (row["cutoff"], row["travel_time_s"], row["fare"], row["rides"])
+            (row["cutoff"], row["travel_time"], row["fare"], row["rides"])
             for _, row in cell.iterrows()
         )
 
@@ -606,9 +722,8 @@ def test_zone_fare_frontier_routes_the_exact_engine(network, hsl_zones):
         network,
         "4810551",
         "1250551",
-        "2022-02-22",
-        "08:30:00",
-        window=600,
+        "2022-02-22 08:30:00",
+        departure_time_window=10,
         fares=hsl_zones,
     )
     priced = candidates["fare"].dropna()
@@ -624,9 +739,8 @@ def test_zone_fare_frontier_rejects_the_fast_discipline(network, hsl_zones):
             network,
             ["4810551"],
             ["1250551"],
-            "2022-02-22",
-            "08:30:00",
-            600,
+            "2022-02-22 08:30:00",
+            10,
             hsl_zones,
             cutoffs=[4.50],
             exact=False,
@@ -644,9 +758,8 @@ def test_zone_fare_frontier_names_the_grant_limitation(network, hsl):
             network,
             ["4810551"],
             ["1250551"],
-            "2022-02-22",
-            "08:30:00",
-            600,
+            "2022-02-22 08:30:00",
+            10,
             hsl,
             cutoffs=[4.10],
         )

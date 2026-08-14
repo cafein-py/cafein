@@ -271,10 +271,10 @@ def test_a_walking_only_policy_is_the_walking_path(multimodal_network):
     pytest.importorskip("cafein._cafein")
     policy = StreetLegPolicy(access={"walk": 1800})
     with_policy = multimodal_network.travel_times_from_coordinate(
-        ORIGIN, "2022-02-22", "08:30:00", street_policy=policy
+        ORIGIN, "2022-02-22 08:30:00", street_policy=policy
     )
     legacy = multimodal_network.travel_times_from_coordinate(
-        ORIGIN, "2022-02-22", "08:30:00", max_walking_time=1800
+        ORIGIN, "2022-02-22 08:30:00", max_walking_time=30
     )
     assert with_policy == legacy
 
@@ -288,7 +288,7 @@ def test_cycling_access_only_improves_arrivals(multimodal_network):
         },
     )
     mixed = multimodal_network.travel_times_from_coordinate(
-        ORIGIN, "2022-02-22", "08:30:00", street_policy=policy
+        ORIGIN, "2022-02-22 08:30:00", street_policy=policy
     )
     # The apples-to-apples baseline is walking over the same multimodal
     # graph (a walking-only *policy* deliberately takes the legacy walking
@@ -352,7 +352,7 @@ def test_a_policy_needs_the_multimodal_graph(helsinki_gtfs, kantakaupunki_pbf):
     )
     with pytest.raises(ValueError, match="street_modes"):
         network.travel_times_from_coordinate(
-            ORIGIN, "2022-02-22", "08:30:00", street_policy=policy
+            ORIGIN, "2022-02-22 08:30:00", street_policy=policy
         )
 
 
@@ -364,9 +364,7 @@ def test_hand_seeded_access_matches_the_stop_query(multimodal_network):
     core = multimodal_network._core
     stop = next(s for s, la, _ in multimodal_network.stops if la is not None)
     seeded = core._travel_times_with_access([(stop, 0)], "2022-02-22", "08:30:00", 7)
-    reference = multimodal_network.travel_times_from_stop(
-        stop, "2022-02-22", "08:30:00"
-    )
+    reference = multimodal_network.travel_times_from_stop(stop, "2022-02-22 08:30:00")
     assert seeded == reference
 
 
@@ -377,13 +375,12 @@ def test_an_omitted_side_means_walking_at_the_usual_budget(multimodal_network):
     empty = StreetLegPolicy()
     assert empty.access is None and empty.egress is None
     with_default = multimodal_network.travel_times_from_coordinate(
-        ORIGIN, "2022-02-22", "08:30:00", street_policy=empty
+        ORIGIN, "2022-02-22 08:30:00", street_policy=empty
     )
     legacy = multimodal_network.travel_times_from_coordinate(
         ORIGIN,
-        "2022-02-22",
-        "08:30:00",
-        max_walking_time=streets.MAX_ACCESS_EGRESS_TIME,
+        "2022-02-22 08:30:00",
+        max_walking_time=streets.MAX_ACCESS_EGRESS_TIME / 60,
     )
     assert with_default == legacy
 
@@ -393,10 +390,9 @@ def test_policy_and_legacy_walk_knobs_conflict(multimodal_network):
     with pytest.raises(ValueError, match="conflict"):
         multimodal_network.travel_times_from_coordinate(
             ORIGIN,
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             street_policy=StreetLegPolicy(access={"walk": 900}),
-            max_walking_time=1200,
+            max_walking_time=20,
         )
 
 
@@ -458,7 +454,7 @@ def test_the_public_policy_path_matches_a_hand_built_reduction(multimodal_networ
         },
     )
     public = multimodal_network.travel_times_from_coordinate(
-        ORIGIN, "2022-02-22", "08:30:00", street_policy=policy
+        ORIGIN, "2022-02-22 08:30:00", street_policy=policy
     )
     assert public == seeded
 
@@ -497,16 +493,16 @@ def test_policy_matrix_cells_reconcile_with_single_queries(multimodal_network):
         multimodal_network,
         _points_frame(MATRIX_POINTS),
         _points_frame(MATRIX_POINTS),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=policy,
+        output_time_units="seconds",
     )
     core = multimodal_network._core
     egress_modes = reduction_modes(policy, "egress", _streets.MAX_ACCESS_EGRESS_TIME)
-    cells = {(row.from_id, row.to_id): row.travel_time_s for row in frame.itertuples()}
+    cells = {(row.from_id, row.to_id): row.travel_time for row in frame.itertuples()}
     for i, origin in enumerate(MATRIX_POINTS):
         arrivals = multimodal_network.travel_times_from_coordinate(
-            origin, "2022-02-22", "08:30:00", street_policy=policy
+            origin, "2022-02-22 08:30:00", street_policy=policy
         )
         for j, destination in enumerate(MATRIX_POINTS):
             egress = {
@@ -540,17 +536,15 @@ def test_a_walking_only_policy_matrix_is_the_legacy_matrix(multimodal_network):
         multimodal_network,
         _points_frame(MATRIX_POINTS),
         _points_frame(MATRIX_POINTS),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=StreetLegPolicy(access={"walk": 1200}, egress={"walk": 1200}),
     )
     legacy_frame = TravelTimeMatrix(
         multimodal_network,
         _points_frame(MATRIX_POINTS),
         _points_frame(MATRIX_POINTS),
-        "2022-02-22",
-        "08:30:00",
-        max_walking_time=1200,
+        "2022-02-22 08:30:00",
+        max_walking_time=20,
     )
     key = ["from_id", "to_id"]
     assert (
@@ -560,7 +554,7 @@ def test_a_walking_only_policy_matrix_is_the_legacy_matrix(multimodal_network):
     )
     # And the diagonal is a zero-length trip.
     diagonal = policy_frame[policy_frame.from_id == policy_frame.to_id]
-    assert (diagonal.travel_time_s == 0).all()
+    assert (diagonal.travel_time == 0).all()
 
 
 def test_policy_matrix_honours_exclusions(multimodal_network):
@@ -578,8 +572,7 @@ def test_policy_matrix_honours_exclusions(multimodal_network):
         multimodal_network,
         _points_frame(MATRIX_POINTS[:1]),
         _points_frame(MATRIX_POINTS[1:2]),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=policy,
         **extra,
     )
@@ -588,7 +581,7 @@ def test_policy_matrix_honours_exclusions(multimodal_network):
     routes = [str(route) for route in range(1, 120)]
     restricted = build(exclude_routes=routes)
     if len(restricted) and len(unrestricted):
-        assert restricted.travel_time_s.iloc[0] >= unrestricted.travel_time_s.iloc[0]
+        assert restricted.travel_time.iloc[0] >= unrestricted.travel_time.iloc[0]
 
 
 def test_policy_matrix_rejects_incompatible_knobs(multimodal_network):
@@ -600,10 +593,9 @@ def test_policy_matrix_rejects_incompatible_knobs(multimodal_network):
             multimodal_network,
             _points_frame(MATRIX_POINTS),
             _points_frame(MATRIX_POINTS),
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             street_policy=StreetLegPolicy(access={"walk": 1200}),
-            max_walking_time=900,
+            max_walking_time=15,
         )
 
 
@@ -624,8 +616,7 @@ def test_an_unsnapped_matrix_point_warns_and_yields_no_rows(multimodal_network):
             multimodal_network,
             _points_frame(points),
             _points_frame(MATRIX_POINTS),
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             street_policy=policy,
         )
     assert "p3" not in set(frame.from_id)
@@ -640,8 +631,7 @@ def test_the_direct_walk_survives_a_walkless_access_policy(multimodal_network):
         multimodal_network,
         _points_frame(MATRIX_POINTS[:1]),
         _points_frame(MATRIX_POINTS[:1]),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=StreetLegPolicy(
             access={"bicycle": 900},
             egress={"walk": 900},
@@ -654,7 +644,7 @@ def test_the_direct_walk_survives_a_walkless_access_policy(multimodal_network):
     )
     # The same coordinate is a zero-length direct walk whatever the
     # access modes.
-    assert int(frame.travel_time_s.iloc[0]) == 0
+    assert int(frame.travel_time.iloc[0]) == 0
 
 
 DEST = (60.2043, 24.9615)
@@ -676,7 +666,7 @@ def test_policy_journeys_rebuild_the_street_legs(multimodal_network):
     core = multimodal_network._core
     policy = _bike_walk_policy()
     journeys = multimodal_network.route_between_coordinates(
-        ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=policy
+        ORIGIN, DEST, "2022-02-22 08:30:00", street_policy=policy
     )
     assert journeys
     access_tokens = {
@@ -727,13 +717,12 @@ def test_a_walking_only_policy_routes_the_legacy_journeys(multimodal_network):
     pytest.importorskip("cafein._cafein")
 
     legacy = multimodal_network.route_between_coordinates(
-        ORIGIN, DEST, "2022-02-22", "08:30:00"
+        ORIGIN, DEST, "2022-02-22 08:30:00"
     )
     policied = multimodal_network.route_between_coordinates(
         ORIGIN,
         DEST,
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=StreetLegPolicy(access={"walk": 7200}, egress={"walk": 7200}),
     )
     assert policied == legacy
@@ -814,10 +803,10 @@ def test_policy_itineraries_carry_modes_and_street_emissions(multimodal_network)
         multimodal_network,
         _points_frame([ORIGIN]),
         _points_frame([DEST]),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=policy,
         factors=factors,
+        output_time_units="seconds",
     )
     assert list(frame.columns[:6]) == [
         "from_id",
@@ -843,7 +832,7 @@ def test_policy_itineraries_carry_modes_and_street_emissions(multimodal_network)
     bicycle = street[street["mode"] == "bicycle"]
     assert not bicycle.empty
     journeys = multimodal_network.route_between_coordinates(
-        ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=policy
+        ORIGIN, DEST, "2022-02-22 08:30:00", street_policy=policy
     )
     expected = sorted(
         leg["network_distance_m"] / 1000.0 * 21.0
@@ -869,8 +858,7 @@ def test_policy_itineraries_reject_incompatible_knobs(multimodal_network):
             DetailedItineraries(
                 multimodal_network,
                 *points,
-                "2022-02-22",
-                "08:30:00",
+                "2022-02-22 08:30:00",
                 street_policy=policy,
                 **kwargs,
             )
@@ -879,17 +867,15 @@ def test_policy_itineraries_reject_incompatible_knobs(multimodal_network):
             multimodal_network,
             ["1130446"],
             ["1140447"],
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             street_policy=policy,
         )
     with pytest.raises(ValueError, match="departure window"):
         multimodal_network.route_between_coordinates(
             ORIGIN,
             DEST,
-            "2022-02-22",
-            "08:30:00",
-            window=600,
+            "2022-02-22 08:30:00",
+            departure_time_window=10,
             street_policy=policy,
         )
 
@@ -898,7 +884,7 @@ def test_the_direct_walk_dominates_the_policy_journeys(multimodal_network):
     pytest.importorskip("cafein._cafein")
 
     journeys = multimodal_network.route_between_coordinates(
-        ORIGIN, ORIGIN, "2022-02-22", "08:30:00", street_policy=_bike_walk_policy()
+        ORIGIN, ORIGIN, "2022-02-22 08:30:00", street_policy=_bike_walk_policy()
     )
     assert len(journeys) == 1
     walk = journeys[0]
@@ -913,7 +899,7 @@ def test_policy_journeys_honour_exclusions(multimodal_network):
 
     policy = _bike_walk_policy()
     journeys = multimodal_network.route_between_coordinates(
-        ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=policy
+        ORIGIN, DEST, "2022-02-22 08:30:00", street_policy=policy
     )
     boarded = next(
         leg["board_stop"]
@@ -924,8 +910,7 @@ def test_policy_journeys_honour_exclusions(multimodal_network):
     excluded = multimodal_network.route_between_coordinates(
         ORIGIN,
         DEST,
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=policy,
         exclude_stops=[boarded],
     )
@@ -944,8 +929,7 @@ def test_policy_itineraries_reconcile_with_the_time_matrix(multimodal_network):
         multimodal_network,
         _points_frame([ORIGIN]),
         _points_frame([DEST]),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=policy,
         geometries=False,
     )
@@ -957,11 +941,11 @@ def test_policy_itineraries_reconcile_with_the_time_matrix(multimodal_network):
         multimodal_network,
         _points_frame([ORIGIN]),
         _points_frame([DEST]),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=policy,
+        output_time_units="seconds",
     )
-    assert int(matrix["travel_time_s"].iloc[0]) == fastest
+    assert int(matrix["travel_time"].iloc[0]) == fastest
 
 
 def test_an_egress_via_choice_walks_the_forward_transfer(multimodal_network):
@@ -1035,7 +1019,7 @@ def test_an_unsnapped_coincident_pair_raises_like_any_unsnapped_query(
     for destination in (OFFSHORE, DEST):
         with pytest.raises(ValueError, match="too far from the multimodal"):
             multimodal_network.route_between_coordinates(
-                OFFSHORE, destination, "2022-02-22", "08:30:00", street_policy=policy
+                OFFSHORE, destination, "2022-02-22 08:30:00", street_policy=policy
             )
 
 
@@ -1063,13 +1047,13 @@ def test_policy_cost_matrix_reconciles_with_the_itineraries(multimodal_network):
         multimodal_network,
         origins,
         destinations,
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=policy,
         factors=factors,
+        output_time_units="seconds",
     )
     assert set(matrix.columns) >= {
-        "travel_time_s",
+        "travel_time",
         "transfers",
         "transit_distance_m",
         "walk_distance_m",
@@ -1084,8 +1068,7 @@ def test_policy_cost_matrix_reconciles_with_the_itineraries(multimodal_network):
             multimodal_network,
             origins[origins["id"] == from_id],
             destinations[destinations["id"] == to_id],
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             street_policy=policy,
             factors=factors,
             geometries=False,
@@ -1097,7 +1080,7 @@ def test_policy_cost_matrix_reconciles_with_the_itineraries(multimodal_network):
             distance=("distance_m", "sum"),
         )
         durations = options["arrival"] - options["departure"]
-        assert int(cell["travel_time_s"]) == int(durations.min())
+        assert int(cell["travel_time"]) == int(durations.min())
         # Where one option alone attains the fastest time, the matrix
         # aggregated exactly that journey: its distances and emissions
         # match the legs' sums.
@@ -1121,14 +1104,13 @@ def test_a_walking_only_policy_cost_matrix_is_the_legacy_matrix(multimodal_netwo
     origins = _points_frame(MATRIX_POINTS[:2])
     destinations = _points_frame(MATRIX_POINTS[1:])
     legacy = TravelCostMatrix(
-        multimodal_network, origins, destinations, "2022-02-22", "08:30:00"
+        multimodal_network, origins, destinations, "2022-02-22 08:30:00"
     )
     policied = TravelCostMatrix(
         multimodal_network,
         origins,
         destinations,
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=StreetLegPolicy(access={"walk": 7200}, egress={"walk": 7200}),
     )
     assert (policied["street_distance_m"] == 0.0).all()
@@ -1145,7 +1127,7 @@ def test_policy_cost_matrix_rejects_incompatible_knobs(multimodal_network):
     policy = _bike_walk_policy()
     points = (_points_frame([ORIGIN]), _points_frame([DEST]))
     for kwargs in [
-        {"optimize": "emissions", "window": 3600},
+        {"optimize": "emissions", "departure_time_window": 60},
         {"router": "tbtr"},
         {"max_walking_time": 900},
         {"candidates": "pareto"},
@@ -1154,8 +1136,7 @@ def test_policy_cost_matrix_rejects_incompatible_knobs(multimodal_network):
             TravelCostMatrix(
                 multimodal_network,
                 *points,
-                "2022-02-22",
-                "08:30:00",
+                "2022-02-22 08:30:00",
                 street_policy=policy,
                 **kwargs,
             )
@@ -1190,8 +1171,7 @@ def test_policy_cost_matrix_street_emissions_never_zero_silently(multimodal_netw
             multimodal_network,
             origins,
             destinations,
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             street_policy=policy,
             factors=unresolved_rows,
         )
@@ -1202,8 +1182,7 @@ def test_policy_cost_matrix_street_emissions_never_zero_silently(multimodal_netw
         multimodal_network,
         origins,
         destinations,
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=policy,
         factors=_street_factor_rows(),
     )
@@ -1220,12 +1199,11 @@ def test_the_policy_cost_matrix_zero_walk_is_free(multimodal_network):
         multimodal_network,
         _points_frame([ORIGIN]),
         _points_frame([ORIGIN]),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=_bike_walk_policy(),
     )
     cell = frame.iloc[0]
-    assert int(cell["travel_time_s"]) == 0
+    assert int(cell["travel_time"]) == 0
     assert cell["walk_distance_m"] == 0.0
     assert cell["street_distance_m"] == 0.0
     assert cell["emissions"] == 0.0
@@ -1242,8 +1220,7 @@ def test_a_zero_ride_street_composition_is_a_journey(multimodal_network):
     journeys = multimodal_network.route_between_coordinates(
         ORIGIN,
         MATRIX_POINTS[2],
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=_bike_walk_policy(),
     )
     assert journeys
@@ -1269,8 +1246,7 @@ def test_an_unsnapped_coincident_pair_yields_no_cost_rows(multimodal_network):
             multimodal_network,
             _points_frame([OFFSHORE]),
             _points_frame([OFFSHORE]),
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             street_policy=_bike_walk_policy(),
         )
     assert frame.empty
@@ -1286,8 +1262,7 @@ def test_a_walking_only_policy_accepts_street_factor_rows(multimodal_network):
         multimodal_network,
         _points_frame([ORIGIN]),
         _points_frame([DEST]),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=StreetLegPolicy(access={"walk": 7200}, egress={"walk": 7200}),
         factors=_street_factor_rows(),
     )
@@ -1306,7 +1281,7 @@ def test_the_composition_coexists_with_faster_transit(multimodal_network):
     # as the walking journey always has. Here transit is fastest, the
     # bicycle composition beats walking, and both are returned.
     journeys = multimodal_network.route_between_coordinates(
-        ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=_bike_walk_policy()
+        ORIGIN, DEST, "2022-02-22 08:30:00", street_policy=_bike_walk_policy()
     )
     ridden = [j for j in journeys if j["rides"] > 0]
     zero = [j for j in journeys if j["rides"] == 0]
@@ -1450,8 +1425,7 @@ def test_mc_policy_options_form_a_true_frontier(multimodal_network):
         multimodal_network,
         _points_frame([ORIGIN]),
         _points_frame([DEST]),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         candidates="pareto",
         street_policy=_scooter_policy(),
         factors=_scooter_factor_rows(),
@@ -1483,8 +1457,7 @@ def test_mc_policy_surfaces_zero_ride_street_compositions(multimodal_network):
         multimodal_network,
         _points_frame([ORIGIN]),
         _points_frame([DEST]),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         candidates="pareto",
         street_policy=_scooter_policy(),
         factors=_scooter_factor_rows(),
@@ -1510,18 +1483,16 @@ def test_a_walking_only_policy_rides_the_legacy_pareto_path(multimodal_network):
         multimodal_network,
         _points_frame([ORIGIN]),
         _points_frame([DEST]),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         candidates="pareto",
-        max_walking_time=1200,
+        max_walking_time=20,
         geometries=False,
     )
     policied = DetailedItineraries(
         multimodal_network,
         _points_frame([ORIGIN]),
         _points_frame([DEST]),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         candidates="pareto",
         street_policy=StreetLegPolicy(access={"walk": 1200}, egress={"walk": 1200}),
         geometries=False,
@@ -1551,8 +1522,7 @@ def test_mc_policy_rejects_unresolved_street_factors(multimodal_network):
             multimodal_network,
             _points_frame([ORIGIN]),
             _points_frame([DEST]),
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             candidates="pareto",
             street_policy=_scooter_policy(),
             factors=unresolved_rows,
@@ -1564,8 +1534,7 @@ def test_mc_policy_rejects_unresolved_street_factors(multimodal_network):
         multimodal_network,
         _points_frame([ORIGIN]),
         _points_frame([DEST]),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         candidates="pareto",
         street_policy=_scooter_policy(),
         geometries=False,
@@ -1578,8 +1547,7 @@ def test_mc_policy_rejects_unresolved_street_factors(multimodal_network):
             multimodal_network,
             _points_frame([ORIGIN]),
             _points_frame([DEST]),
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             candidates="diverse",
             street_policy=_scooter_policy(),
             factors=_scooter_factor_rows(),
@@ -1592,8 +1560,7 @@ def test_relaxed_policy_candidates_widen_the_frontier(multimodal_network):
     from cafein import DetailedItineraries
 
     shared_kwargs = dict(
-        date="2022-02-22",
-        departure="08:30:00",
+        departure="2022-02-22 08:30:00",
         street_policy=_scooter_policy(),
         factors=_scooter_factor_rows(),
         geometries=False,
@@ -1625,8 +1592,7 @@ def test_mc_policy_engines_answer_identically(multimodal_mctbtr_network):
             multimodal_mctbtr_network,
             _points_frame([ORIGIN]),
             _points_frame([DEST]),
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             candidates="pareto",
             router=router,
             street_policy=_scooter_policy(),
@@ -1718,8 +1684,7 @@ def test_transfers_need_the_matching_merged_set(multimodal_network):
         multimodal_network.route_between_coordinates(
             ORIGIN,
             DEST,
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             street_policy=_transfer_policy(),
         )
 
@@ -1731,8 +1696,7 @@ def test_a_mismatched_transfer_binding_is_rejected(multimodal_transfers_network)
         multimodal_transfers_network.route_between_coordinates(
             ORIGIN,
             DEST,
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             street_policy=_transfer_policy(budget=500),
         )
 
@@ -1780,7 +1744,7 @@ def test_rented_transfer_legs_split_from_their_tokens(multimodal_transfers_netwo
     pytest.importorskip("cafein._cafein")
 
     journeys = multimodal_transfers_network.route_between_coordinates(
-        ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=_transfer_policy()
+        ORIGIN, DEST, "2022-02-22 08:30:00", street_policy=_transfer_policy()
     )
     scooter = [
         leg
@@ -1841,15 +1805,15 @@ def test_the_transfer_matrix_reconciles_with_single_queries(
         multimodal_transfers_network,
         _points_frame([ORIGIN]),
         _points_frame([DEST]),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=policy,
+        output_time_units="seconds",
     )
     journeys = multimodal_transfers_network.route_between_coordinates(
-        ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=policy
+        ORIGIN, DEST, "2022-02-22 08:30:00", street_policy=policy
     )
     fastest = min(j["arrival_s"] - j["departure_s"] for j in journeys)
-    assert int(matrix["travel_time_s"].iloc[0]) == fastest
+    assert int(matrix["travel_time"].iloc[0]) == fastest
 
 
 def test_the_cost_matrix_attributes_rental_transfers(multimodal_transfers_network):
@@ -1860,8 +1824,7 @@ def test_the_cost_matrix_attributes_rental_transfers(multimodal_transfers_networ
         multimodal_transfers_network,
         _points_frame([ORIGIN]),
         _points_frame([DEST]),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
     )
     cost = TravelCostMatrix(*args, street_policy=_transfer_policy())
     time = TravelTimeMatrix(*args, street_policy=_transfer_policy())
@@ -1870,8 +1833,8 @@ def test_the_cost_matrix_attributes_rental_transfers(multimodal_transfers_networ
     )
     row = cost.iloc[0]
     # The same engine and set as the time matrix, cell for cell.
-    assert row["travel_time_s"] == time.iloc[0]["travel_time_s"]
-    assert row["travel_time_s"] < walking.iloc[0]["travel_time_s"]
+    assert row["travel_time"] == time.iloc[0]["travel_time"]
+    assert row["travel_time"] < walking.iloc[0]["travel_time"]
     # The winning journey rides rental transfers: their street meters
     # and grams are attributed, never silently walked.
     assert row["street_distance_m"] > 0.0
@@ -1906,8 +1869,7 @@ def test_stop_exclusions_do_not_combine_with_transfers(multimodal_transfers_netw
         multimodal_transfers_network.route_between_coordinates(
             ORIGIN,
             DEST,
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             street_policy=_transfer_policy(),
             exclude_stops=["1230109"],
         )
@@ -1916,8 +1878,7 @@ def test_stop_exclusions_do_not_combine_with_transfers(multimodal_transfers_netw
             multimodal_transfers_network,
             _points_frame([ORIGIN]),
             _points_frame([DEST]),
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             street_policy=_transfer_policy(),
             exclude_stops=["1230109"],
         )
@@ -1928,14 +1889,14 @@ def test_replacing_the_closure_drops_the_merged_set(multimodal_network, artifact
     from cafein import TransportNetwork
 
     network = TransportNetwork.load(artifact_cache / "helsinki-multimodal.cafein")
-    network.compute_mode_transfers("e_scooter", 600)
+    network.compute_mode_transfers("e_scooter", 10)
     assert network._core._mode_transfer_binding is not None
     # The merged set folded the replaced closure; it must not survive.
     network._core.set_transfers([])
     assert network._core._mode_transfer_binding is None
     with pytest.raises(ValueError, match="compute_mode_transfers"):
         network.route_between_coordinates(
-            ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=_transfer_policy()
+            ORIGIN, DEST, "2022-02-22 08:30:00", street_policy=_transfer_policy()
         )
 
 
@@ -1948,8 +1909,7 @@ def test_mc_transfers_join_the_frontier(multimodal_transfers_network):
             multimodal_transfers_network,
             _points_frame([ORIGIN]),
             _points_frame([DEST]),
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             candidates="pareto",
             street_policy=policy,
             factors=_scooter_factor_rows(),
@@ -1991,10 +1951,9 @@ def test_mc_relaxed_candidates_take_transfers(multimodal_transfers_network):
         multimodal_transfers_network,
         _points_frame([ORIGIN]),
         _points_frame([DEST]),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         candidates="relaxed",
-        slack_seconds=120,
+        tolerance_minutes=2,
         street_policy=_transfer_policy(),
         factors=_scooter_factor_rows(),
         geometries=False,
@@ -2014,8 +1973,7 @@ def test_mc_transfer_bindings_are_checked(
             network,
             _points_frame([ORIGIN]),
             _points_frame([DEST]),
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             candidates="pareto",
             street_policy=policy,
             factors=_scooter_factor_rows(),
@@ -2091,10 +2049,10 @@ def test_the_merged_set_survives_the_artifact(multimodal_transfers_network, tmp_
     assert any(rented[stop] < seconds for stop, seconds in walking.items())
     # And the journeys match the saving network's, tokens intact.
     before = multimodal_transfers_network.route_between_coordinates(
-        ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=_transfer_policy()
+        ORIGIN, DEST, "2022-02-22 08:30:00", street_policy=_transfer_policy()
     )
     after = loaded.route_between_coordinates(
-        ORIGIN, DEST, "2022-02-22", "08:30:00", street_policy=_transfer_policy()
+        ORIGIN, DEST, "2022-02-22 08:30:00", street_policy=_transfer_policy()
     )
     assert before == after
 
@@ -2106,8 +2064,7 @@ def test_rental_ride_legs_draw_their_shape(multimodal_transfers_network):
     journeys = multimodal_transfers_network.route_between_coordinates(
         ORIGIN,
         DEST,
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=_transfer_policy(),
         geometries=True,
     )
@@ -2161,7 +2118,7 @@ def test_policy_time_queries_auto_ride_the_cached_tbtr_set(
 
     # A private copy: computing the caches mutates network state.
     network = TransportNetwork.load(artifact_cache / "helsinki-multimodal.cafein")
-    network.compute_mode_transfers("e_scooter", 600)
+    network.compute_mode_transfers("e_scooter", 10)
     core = network._core
     modes = reduction_modes(
         _transfer_policy(), "access", _streets.MAX_ACCESS_EGRESS_TIME
@@ -2180,8 +2137,7 @@ def test_policy_time_queries_auto_ride_the_cached_tbtr_set(
             network,
             _points_frame([ORIGIN]),
             _points_frame([DEST]),
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             street_policy=_transfer_policy(),
         )
 
@@ -2215,8 +2171,7 @@ def test_policy_time_queries_auto_ride_the_cached_tbtr_set(
             network,
             _points_frame([ORIGIN]),
             _points_frame([DEST]),
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             street_policy=_transfer_policy(),
             router="raptor",
         )
@@ -2290,7 +2245,7 @@ def test_carriage_travel_times_are_pure_option_value(
             "bicycle": VehiclePolicy(source="own", side="origin", facilities="any_stop")
         },
     )
-    args = (ORIGIN, "2022-02-22", "08:30:00")
+    args = (ORIGIN, "2022-02-22 08:30:00")
     baseline = network.travel_times_from_coordinate(
         *args, street_policy=baseline_policy
     )
@@ -2380,7 +2335,7 @@ def test_carriage_rejects_the_matrix_surfaces(multimodal_transfers_network):
         vehicles={"bicycle": _carried()},
     )
     frames = (_points_frame([ORIGIN]), _points_frame([DEST]))
-    args = (*frames, "2022-02-22", "08:30:00")
+    args = (*frames, "2022-02-22 08:30:00")
     with pytest.raises(ValueError, match="not wired into matrix computation"):
         TravelCostMatrix(multimodal_transfers_network, *args, street_policy=walk_only)
     with pytest.raises(ValueError, match="not wired into matrix computation"):
@@ -2418,7 +2373,7 @@ def test_carriage_routes_carry_park_and_decorate(multimodal_network, artifact_ca
     from cafein import TransportNetwork
 
     network = TransportNetwork.load(artifact_cache / "helsinki-multimodal.cafein")
-    network.compute_carriage_transfers("bicycle", 900)
+    network.compute_carriage_transfers("bicycle", 15)
     both_ends = _carriage_policy(
         _carried(unknown_bike_trips="allow"),
         transfers={"bicycle": 900},
@@ -2431,7 +2386,7 @@ def test_carriage_routes_carry_park_and_decorate(multimodal_network, artifact_ca
             "bicycle": VehiclePolicy(source="own", side="origin", facilities="any_stop")
         },
     )
-    args = (ORIGIN, DEST, "2022-02-22", "08:30:00")
+    args = (ORIGIN, DEST, "2022-02-22 08:30:00")
     baseline = network.route_between_coordinates(*args, street_policy=baseline_policy)
     carried = network.route_between_coordinates(*args, street_policy=both_ends)
     assert carried
@@ -2454,7 +2409,7 @@ def test_carriage_routes_carry_park_and_decorate(multimodal_network, artifact_ca
     )
     journey = min(
         network.route_between_coordinates(
-            ORIGIN, PARK_DEST, "2022-02-22", "08:30:00", street_policy=walk_egress
+            ORIGIN, PARK_DEST, "2022-02-22 08:30:00", street_policy=walk_egress
         ),
         key=lambda journey: journey["arrival_s"],
     )
@@ -2475,7 +2430,7 @@ def test_carriage_itineraries_render_the_frame(multimodal_network, artifact_cach
     from cafein import DetailedItineraries, TransportNetwork
 
     network = TransportNetwork.load(artifact_cache / "helsinki-multimodal.cafein")
-    network.compute_carriage_transfers("bicycle", 900)
+    network.compute_carriage_transfers("bicycle", 15)
     both_ends = _carriage_policy(
         _carried(unknown_bike_trips="allow"),
         transfers={"bicycle": 900},
@@ -2485,8 +2440,7 @@ def test_carriage_itineraries_render_the_frame(multimodal_network, artifact_cach
         network,
         _points_frame([ORIGIN]),
         _points_frame([DEST]),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=both_ends,
         geometries=False,
     )
@@ -2502,8 +2456,7 @@ def test_carriage_itineraries_render_the_frame(multimodal_network, artifact_cach
         network,
         _points_frame([ORIGIN]),
         _points_frame([PARK_DEST]),
-        "2022-02-22",
-        "08:30:00",
+        "2022-02-22 08:30:00",
         street_policy=walk_egress,
         geometries=False,
     )
@@ -2511,7 +2464,7 @@ def test_carriage_itineraries_render_the_frame(multimodal_network, artifact_cach
     assert len(park) >= 1
     assert (park["from_stop"] == park["to_stop"]).all()
     assert park["mode"].isna().all()
-    assert (park["travel_time_s"] == 0).all()
+    assert (park["travel_time"] == 0).all()
 
 
 def test_carriage_time_matrix_matches_the_route_surface(
@@ -2521,15 +2474,17 @@ def test_carriage_time_matrix_matches_the_route_surface(
     from cafein import TransportNetwork, TravelTimeMatrix
 
     network = TransportNetwork.load(artifact_cache / "helsinki-multimodal.cafein")
-    network.compute_carriage_transfers("bicycle", 900)
+    network.compute_carriage_transfers("bicycle", 15)
     policy = _carriage_policy(
         _carried(unknown_bike_trips="allow"),
         transfers={"bicycle": 900},
         egress={"bicycle": 600, "walk": 900},
     )
     frames = (_points_frame([ORIGIN]), _points_frame([DEST, PARK_DEST]))
-    args = (*frames, "2022-02-22", "08:30:00")
-    matrix = TravelTimeMatrix(network, *args, street_policy=policy)
+    args = (*frames, "2022-02-22 08:30:00")
+    matrix = TravelTimeMatrix(
+        network, *args, street_policy=policy, output_time_units="seconds"
+    )
     departed = 8 * 3600 + 30 * 60
     # Every cell is the route surface's best arrival, door to door.
     for index, destination in enumerate([DEST, PARK_DEST]):
@@ -2539,14 +2494,13 @@ def test_carriage_time_matrix_matches_the_route_surface(
                 for journey in network.route_between_coordinates(
                     ORIGIN,
                     destination,
-                    "2022-02-22",
-                    "08:30:00",
+                    "2022-02-22 08:30:00",
                     street_policy=policy,
                 )
             )
             - departed
         )
-        cell = matrix.loc[matrix["to_id"] == f"p{index}", "travel_time_s"]
+        cell = matrix.loc[matrix["to_id"] == f"p{index}", "travel_time"]
         assert int(cell.iloc[0]) == best
     # Pure option value at the matrix level: the forbid default equals
     # the no-carriage baseline exactly.
@@ -2579,16 +2533,16 @@ def test_carriage_time_matrix_matches_the_route_surface(
         _points_frame([DEST, PARK_DEST, (60.1866, 24.9600)]),
     )
     carriage_cells = TravelTimeMatrix(
-        network, *wide, "2022-02-22", "08:30:00", street_policy=walk_only_carriage
+        network, *wide, "2022-02-22 08:30:00", street_policy=walk_only_carriage
     )
     plain_cells = TravelTimeMatrix(
-        network, *wide, "2022-02-22", "08:30:00", street_policy=walk_only
+        network, *wide, "2022-02-22 08:30:00", street_policy=walk_only
     )
     merged = plain_cells.merge(
         carriage_cells, on=["from_id", "to_id"], suffixes=("_plain", "_carriage")
     )
     assert len(merged) == len(plain_cells)
-    assert (merged["travel_time_s_plain"] == merged["travel_time_s_carriage"]).all()
+    assert (merged["travel_time_plain"] == merged["travel_time_carriage"]).all()
     assert len(carriage_cells) > len(plain_cells)
     # Exclusions are rejected rather than silently dropped.
     with pytest.raises(ValueError, match="does not combine with exclusions"):
@@ -2598,5 +2552,7 @@ def test_carriage_time_matrix_matches_the_route_surface(
     # A cached trip-based set never claims the carriage query: the
     # cells are identical with and without it.
     network._core.compute_tbtr_transfers("2022-02-22")
-    cached = TravelTimeMatrix(network, *args, street_policy=policy)
+    cached = TravelTimeMatrix(
+        network, *args, street_policy=policy, output_time_units="seconds"
+    )
     pd.testing.assert_frame_equal(pd.DataFrame(cached), pd.DataFrame(matrix))

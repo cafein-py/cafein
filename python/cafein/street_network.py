@@ -218,8 +218,8 @@ class StreetNetwork:
         destination,
         *,
         mode,
-        max_time=MAX_STREET_TIME,
-        max_snap_distance=streets.MAX_SNAP_DISTANCE,
+        max_travel_time=None,
+        snap_distance=streets.MAX_SNAP_DISTANCE,
         intersection_delays=False,
         profile=None,
         delay_model=None,
@@ -231,12 +231,14 @@ class StreetNetwork:
         ----------
         origin, destination : (float, float)
             ``(lat, lon)`` coordinates in EPSG:4326. A coordinate farther than
-            `max_snap_distance` from the network raises ``ValueError``.
+            `snap_distance` from the network raises ``ValueError``.
         mode : str
             ``walk``, ``bicycle``, ``e_bike``, ``e_scooter``, or ``car``.
-        max_time : float
-            Cutoff in seconds; beyond it the destination counts as unreachable.
-        max_snap_distance : float
+        max_travel_time : float or datetime.timedelta (optional)
+            Cutoff in minutes; beyond it the destination counts as
+            unreachable. Unset uses the shipped street default (120
+            minutes).
+        snap_distance : float
             How far a coordinate may be from the network, in meters.
         intersection_delays : bool
             Car only. ``False`` (the default) computes free-flow,
@@ -261,14 +263,22 @@ class StreetNetwork:
             destination inside several polygons takes the largest seconds
             (ties: largest metres, then lowest row), outside every polygon
             the shipped constant. Parking adds after the driving search:
-            `max_time` bounds the driving alone.
+            `max_travel_time` bounds the driving alone.
 
         Returns
         -------
         int or None
             Seconds, or ``None`` when the destination is not reachable within
-            `max_time`.
+            `max_travel_time`. Returned times are seconds.
         """
+        from cafein._units import duration_seconds
+
+        max_time = (
+            MAX_STREET_TIME
+            if max_travel_time is None
+            else duration_seconds("max_travel_time", max_travel_time)
+        )
+        max_snap_distance = snap_distance
         from . import _parking
 
         resolved = _parking.resolve(parking, mode)

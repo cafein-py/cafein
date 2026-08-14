@@ -76,18 +76,18 @@ def test_round_trip_preserves_the_network(network_with_footpaths, reloaded):
 def test_round_trip_preserves_routing(network_with_footpaths, reloaded):
     # Stop-to-stop journeys, including transfer legs and WKB geometries.
     before = network_with_footpaths.route_between_stops(
-        "1100602", "1040280", "2022-02-22", "08:30:00"
+        "1100602", "1040280", "2022-02-22 08:30:00"
     )
-    after = reloaded.route_between_stops("1100602", "1040280", "2022-02-22", "08:30:00")
+    after = reloaded.route_between_stops("1100602", "1040280", "2022-02-22 08:30:00")
     assert after == before
     # Door-to-door from coordinates exercises the persisted street index.
     coordinates = {stop: (lat, lon) for stop, lat, lon in reloaded.stops}
     origin = coordinates["1100602"]
     destination = coordinates["1040280"]
     assert reloaded.route_between_coordinates(
-        origin, destination, "2022-02-22", "08:30:00"
+        origin, destination, "2022-02-22 08:30:00"
     ) == network_with_footpaths.route_between_coordinates(
-        origin, destination, "2022-02-22", "08:30:00"
+        origin, destination, "2022-02-22 08:30:00"
     )
     assert reloaded.access_stops(*origin) == network_with_footpaths.access_stops(
         *origin
@@ -97,15 +97,15 @@ def test_round_trip_preserves_routing(network_with_footpaths, reloaded):
 def test_round_trip_preserves_matrices(network_with_footpaths, reloaded):
     origins = ["4810551", "1100602"]
     assert np.array_equal(
-        reloaded.travel_time_matrix(origins, "2022-02-22", "08:30:00"),
-        network_with_footpaths.travel_time_matrix(origins, "2022-02-22", "08:30:00"),
+        reloaded.travel_time_matrix(origins, "2022-02-22 08:30:00"),
+        network_with_footpaths.travel_time_matrix(origins, "2022-02-22 08:30:00"),
     )
     assert np.array_equal(
         reloaded.travel_time_matrix(
-            origins, "2022-02-22", "08:30:00", window=600, confidence=0.8
+            origins, "2022-02-22 08:30:00", departure_time_window=10, confidence=0.8
         ),
         network_with_footpaths.travel_time_matrix(
-            origins, "2022-02-22", "08:30:00", window=600, confidence=0.8
+            origins, "2022-02-22 08:30:00", departure_time_window=10, confidence=0.8
         ),
     )
 
@@ -150,9 +150,9 @@ def test_round_trip_preserves_the_walking_hierarchy(
     destination = coordinates["1040280"]
     assert restored.access_stops(*origin) == accelerated.access_stops(*origin)
     assert restored.route_between_coordinates(
-        origin, destination, "2022-02-22", "08:30:00"
+        origin, destination, "2022-02-22 08:30:00"
     ) == accelerated.route_between_coordinates(
-        origin, destination, "2022-02-22", "08:30:00"
+        origin, destination, "2022-02-22 08:30:00"
     )
 
     # A lazy mapped load restores the hierarchy from META and rebuilds its
@@ -356,14 +356,14 @@ def test_round_trip_preserves_the_tbtr_transfer_cache(
     origins = ["4810551", "1040602", "1250551"]
     assert network_with_tbtr.has_tbtr_transfers
     before = network_with_tbtr.travel_time_matrix(
-        origins, "2022-02-22", "08:30:00", router="tbtr"
+        origins, "2022-02-22 08:30:00", router="tbtr"
     )
 
     path = tmp_path / "tbtr.cafein"
     network_with_tbtr.save(path)
     loaded = TransportNetwork.load(path)
     assert loaded.has_tbtr_transfers
-    after = loaded.travel_time_matrix(origins, "2022-02-22", "08:30:00", router="tbtr")
+    after = loaded.travel_time_matrix(origins, "2022-02-22 08:30:00", router="tbtr")
     assert np.array_equal(before, after)
 
     # A network that never cached one round-trips to no cache.
@@ -478,15 +478,15 @@ def test_mapped_loads_match_owned(
     origin = coordinates["1100602"]
     destination = coordinates["1040280"]
     assert mapped.route_between_coordinates(
-        origin, destination, "2022-02-22", "08:30:00"
+        origin, destination, "2022-02-22 08:30:00"
     ) == network_with_footpaths.route_between_coordinates(
-        origin, destination, "2022-02-22", "08:30:00"
+        origin, destination, "2022-02-22 08:30:00"
     )
     assert mapped.access_stops(*origin) == network_with_footpaths.access_stops(*origin)
     origins = ["4810551", "1100602"]
     assert np.array_equal(
-        mapped.travel_time_matrix(origins, "2022-02-22", "08:30:00"),
-        network_with_footpaths.travel_time_matrix(origins, "2022-02-22", "08:30:00"),
+        mapped.travel_time_matrix(origins, "2022-02-22 08:30:00"),
+        network_with_footpaths.travel_time_matrix(origins, "2022-02-22 08:30:00"),
     )
 
 
@@ -640,8 +640,10 @@ def test_round_trip_preserves_the_mctbtr_transfer_cache(
     from cafein.frontier import journey_frontier
 
     assert network_with_mctbtr.has_mctbtr_transfers
-    args = ("1370104", "4960238", "2022-02-22", "08:30:00")
-    kwargs = dict(window=600, candidates="pareto", router="tbtr", bucket=1e-6)
+    args = ("1370104", "4960238", "2022-02-22 08:30:00")
+    kwargs = dict(
+        departure_time_window=10, candidates="pareto", router="tbtr", bucket=1e-6
+    )
     before = journey_frontier(network_with_mctbtr, *args, **kwargs)
     assert len(before) > 0
 

@@ -154,7 +154,7 @@ def test_footpaths_never_exceed_the_cutoff():
         STRAIGHT_STREET,
         [("A", "B", 400)],
         [stop("s1", 0, 0), stop("s2", 200, 0), stop("s3", 400, 0)],
-        max_walking_time=250.0,
+        max_walking_time=250,
     )
     # s1-s3 (400 s) is beyond the cutoff: a transfer between rides is a
     # single bounded walk, never a chain past the budget (issue #249 —
@@ -324,7 +324,7 @@ def test_an_empty_network_yields_an_empty_payload():
         pd.DataFrame({"id": []}),
         empty_edges,
         walking_speed_kmph=3.6,
-        max_walking_time=600.0,
+        max_walking_time=10.0,
         max_snap_distance=100.0,
     )
     assert list(footpath_list) == []

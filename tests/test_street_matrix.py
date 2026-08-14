@@ -58,25 +58,36 @@ def test_matrix_cells_match_single_routes(streets, origins, destinations, mode):
     # runs one search per origin rather than one per pair, so this pins that the
     # shared arrival step produces identical times.
     matrix = TravelTimeMatrix(
-        streets, origins, destinations, transport_mode=mode, max_street_time=3600
+        streets,
+        origins,
+        destinations,
+        transport_mode=mode,
+        max_street_time=60,
+        output_time_units="seconds",
     )
     cells = {
-        (row.from_id, row.to_id): int(row.travel_time_s)
+        (row.from_id, row.to_id): int(row.travel_time)
         for row in matrix.itertuples(index=False)
     }
     for from_id, origin in zip(origins["id"], coordinates(origins)):
         for to_id, destination in zip(destinations["id"], coordinates(destinations)):
             expected = streets.travel_time(
-                origin, destination, mode=mode, max_time=3600
+                origin, destination, mode=mode, max_travel_time=60
             )
             assert cells.get((from_id, to_id)) == expected
 
 
 def test_matrix_columns_and_long_format(streets, origins, destinations):
-    matrix = TravelTimeMatrix(streets, origins, destinations, transport_mode="bicycle")
-    assert list(matrix.columns) == ["from_id", "to_id", "travel_time_s"]
+    matrix = TravelTimeMatrix(
+        streets,
+        origins,
+        destinations,
+        transport_mode="bicycle",
+        output_time_units="seconds",
+    )
+    assert list(matrix.columns) == ["from_id", "to_id", "travel_time"]
     assert len(matrix) <= len(origins) * len(destinations)
-    assert matrix["travel_time_s"].dtype == np.uint32
+    assert matrix["travel_time"].dtype == np.uint32
     # Slices degrade to plain DataFrames, as the transit matrix does.
     assert type(matrix.iloc[:1]) is pd.DataFrame
 
@@ -85,21 +96,19 @@ def test_diagonal_is_zero_when_destinations_are_the_origins(streets, origins):
     matrix = TravelTimeMatrix(streets, origins, transport_mode="bicycle")
     diagonal = matrix[matrix.from_id == matrix.to_id]
     assert len(diagonal) == len(origins)
-    assert (diagonal.travel_time_s == 0).all()
+    assert (diagonal.travel_time == 0).all()
 
 
 def test_cycling_beats_walking_over_the_same_pairs(streets, origins, destinations):
     walk = TravelTimeMatrix(
-        streets, origins, destinations, transport_mode="walk", max_street_time=3600
+        streets, origins, destinations, transport_mode="walk", max_street_time=60
     )
     bicycle = TravelTimeMatrix(
-        streets, origins, destinations, transport_mode="bicycle", max_street_time=3600
+        streets, origins, destinations, transport_mode="bicycle", max_street_time=60
     )
-    walked = {
-        (r.from_id, r.to_id): r.travel_time_s for r in walk.itertuples(index=False)
-    }
+    walked = {(r.from_id, r.to_id): r.travel_time for r in walk.itertuples(index=False)}
     rode = {
-        (r.from_id, r.to_id): r.travel_time_s for r in bicycle.itertuples(index=False)
+        (r.from_id, r.to_id): r.travel_time for r in bicycle.itertuples(index=False)
     }
     shared = set(walked) & set(rode)
     assert shared
@@ -112,13 +121,24 @@ def test_cycling_beats_walking_over_the_same_pairs(streets, origins, destination
 
 def test_a_tighter_cutoff_drops_cells(streets, origins, destinations):
     generous = TravelTimeMatrix(
-        streets, origins, destinations, transport_mode="walk", max_street_time=3600
+        streets, origins, destinations, transport_mode="walk", max_street_time=60
     )
     tight = TravelTimeMatrix(
-        streets, origins, destinations, transport_mode="walk", max_street_time=120
+        streets, origins, destinations, transport_mode="walk", max_street_time=2
     )
     assert len(tight) < len(generous)
-    assert (tight.travel_time_s <= 120).all()
+    # Default output is whole minutes: every cell fits the two-minute
+    # cutoff in its own unit.
+    assert (tight.travel_time <= 2).all()
+    exact = TravelTimeMatrix(
+        streets,
+        origins,
+        destinations,
+        transport_mode="walk",
+        max_street_time=2,
+        output_time_units="seconds",
+    )
+    assert (exact.travel_time <= 120).all()
 
 
 def test_matrix_is_deterministic(streets, origins, destinations):
@@ -175,32 +195,29 @@ def test_unknown_mode_is_rejected(streets, origins):
 def test_street_mode_on_a_transport_network_is_rejected(network):
     with pytest.raises(ValueError, match="is a street mode"):
         TravelTimeMatrix(
-            network, None, None, "2022-02-22", "08:30:00", transport_mode="bicycle"
+            network, None, None, "2022-02-22 08:30:00", transport_mode="bicycle"
         )
 
 
 def test_max_street_time_on_a_transport_network_is_rejected(network):
     with pytest.raises(ValueError, match="applies to a StreetNetwork"):
-        TravelTimeMatrix(
-            network, None, None, "2022-02-22", "08:30:00", max_street_time=600
-        )
+        TravelTimeMatrix(network, None, None, "2022-02-22 08:30:00", max_street_time=10)
 
 
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"date": "2022-02-22"},
-        {"departure": "08:30:00"},
-        {"max_transfers": 3},
+        {"departure": "2022-02-22 08:30:00"},
+        {"max_rides": 3},
         {"router": "raptor"},
-        {"window": 600},
+        {"departure_time_window": 10},
         {"percentiles": [50.0]},
         {"confidence": 90.0},
         {"exclude_routes": ["1001"]},
         {"exclude_trips": ["t1"]},
         {"exclude_stops": ["s1"]},
         {"walking_speed_kmph": 5.0},
-        {"max_walking_time": 600.0},
+        {"max_walking_time": 10.0},
     ],
 )
 def test_transit_only_arguments_are_rejected(streets, origins, kwargs):
@@ -215,18 +232,16 @@ def test_stop_id_origins_are_rejected(streets):
 
 
 @pytest.mark.parametrize("cutoff", [-1.0, float("nan"), float("inf")])
-def test_a_cutoff_admitting_nothing_leaves_even_the_diagonal_unreachable(
-    streets, origins, cutoff
-):
-    # The same-coordinate zero is still a route the cutoff must admit, so an
-    # unusable cutoff leaves the cell absent — exactly as the single route
-    # reports it, which is what makes the matrix and the route agree.
-    matrix = TravelTimeMatrix(
-        streets, origins, transport_mode="bicycle", max_street_time=cutoff
-    )
-    assert len(matrix) == 0
+def test_an_unusable_cutoff_is_refused_loudly(streets, origins, cutoff):
+    # A negative, NaN, or infinite duration is a caller error, not an
+    # empty result.
+    with pytest.raises(ValueError, match="max_street_time"):
+        TravelTimeMatrix(
+            streets, origins, transport_mode="bicycle", max_street_time=cutoff
+        )
     origin = coordinates(origins)[0]
-    assert streets.travel_time(origin, origin, mode="bicycle", max_time=cutoff) is None
+    with pytest.raises(ValueError, match="max_travel_time"):
+        streets.travel_time(origin, origin, mode="bicycle", max_travel_time=cutoff)
 
 
 # ---- Cost matrix ----
@@ -268,7 +283,7 @@ def _on_network_points(streets, shift=0.0):
 COST_COLUMNS = [
     "from_id",
     "to_id",
-    "travel_time_s",
+    "travel_time",
     "distance_m",
     "network_distance_m",
     "connector_distance_m",
@@ -278,9 +293,15 @@ COST_COLUMNS = [
 
 
 def test_cost_matrix_columns_and_dtypes(streets, origins, destinations):
-    costs = TravelCostMatrix(streets, origins, destinations, transport_mode="bicycle")
+    costs = TravelCostMatrix(
+        streets,
+        origins,
+        destinations,
+        transport_mode="bicycle",
+        output_time_units="seconds",
+    )
     assert list(costs.columns) == COST_COLUMNS
-    assert costs.travel_time_s.dtype == np.uint32
+    assert costs.travel_time.dtype == np.uint32
     for column in ("distance_m", "network_distance_m", "connector_distance_m"):
         assert costs[column].dtype == np.float64
     assert pd.api.types.is_string_dtype(costs.distance_provenance)
@@ -309,7 +330,7 @@ def test_geometries_do_not_change_the_numbers(streets, origins, destinations, mo
     columns = [
         "from_id",
         "to_id",
-        "travel_time_s",
+        "travel_time",
         "distance_m",
         "network_distance_m",
         "connector_distance_m",
@@ -326,11 +347,11 @@ def test_geometries_do_not_change_the_diagonal(streets, origins):
     )
     diagonal = plain[plain.from_id == plain.to_id]
     assert len(diagonal) == len(origins)
-    assert (diagonal.travel_time_s == 0).all()
+    assert (diagonal.travel_time == 0).all()
     assert (diagonal.distance_m == 0.0).all()
     pd.testing.assert_frame_equal(
-        plain[["from_id", "to_id", "travel_time_s", "distance_m"]],
-        shaped[["from_id", "to_id", "travel_time_s", "distance_m"]],
+        plain[["from_id", "to_id", "travel_time", "distance_m"]],
+        shaped[["from_id", "to_id", "travel_time", "distance_m"]],
     )
 
 
@@ -347,11 +368,9 @@ def test_cost_matrix_times_match_the_time_matrix(streets, origins, destinations)
     # The two computers run the same search; they must not disagree.
     times = TravelTimeMatrix(streets, origins, destinations, transport_mode="bicycle")
     costs = TravelCostMatrix(streets, origins, destinations, transport_mode="bicycle")
-    timed = {
-        (r.from_id, r.to_id): r.travel_time_s for r in times.itertuples(index=False)
-    }
+    timed = {(r.from_id, r.to_id): r.travel_time for r in times.itertuples(index=False)}
     costed = {
-        (r.from_id, r.to_id): r.travel_time_s for r in costs.itertuples(index=False)
+        (r.from_id, r.to_id): r.travel_time for r in costs.itertuples(index=False)
     }
     assert timed == costed
 
@@ -362,7 +381,7 @@ def test_cost_matrix_matches_single_pair_reconstruction(streets, origins, destin
     whole = TravelCostMatrix(streets, origins, destinations, transport_mode="walk")
     rows = {
         (r.from_id, r.to_id): (
-            r.travel_time_s,
+            r.travel_time,
             r.network_distance_m,
             r.connector_distance_m,
         )
@@ -382,7 +401,7 @@ def test_cost_matrix_matches_single_pair_reconstruction(streets, origins, destin
                 continue
             only = single.iloc[0]
             assert rows[(from_id, to_id)] == pytest.approx(
-                (only.travel_time_s, only.network_distance_m, only.connector_distance_m)
+                (only.travel_time, only.network_distance_m, only.connector_distance_m)
             )
 
 
@@ -410,10 +429,10 @@ def test_cycling_detours_cover_more_network_than_walking(
     # network distance over the shared pairs is longer somewhere and never
     # shorter by more than rounding.
     walk = TravelCostMatrix(
-        streets, origins, destinations, transport_mode="walk", max_street_time=3600
+        streets, origins, destinations, transport_mode="walk", max_street_time=60
     )
     bicycle = TravelCostMatrix(
-        streets, origins, destinations, transport_mode="bicycle", max_street_time=3600
+        streets, origins, destinations, transport_mode="bicycle", max_street_time=60
     )
     walked = {
         (r.from_id, r.to_id): r.network_distance_m
@@ -452,17 +471,17 @@ def test_cost_matrix_geometry(streets, origins, destinations):
 def test_cost_matrix_rejects_a_street_mode_on_a_transport_network(network):
     with pytest.raises(ValueError, match="is a street mode"):
         TravelCostMatrix(
-            network, None, None, "2022-02-22", "08:30:00", transport_mode="bicycle"
+            network, None, None, "2022-02-22 08:30:00", transport_mode="bicycle"
         )
 
 
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"date": "2022-02-22"},
+        {"departure": "2022-02-22 08:30:00"},
         {"optimize": "emissions"},
         {"router": "raptor"},
-        {"max_transfers": 3},
+        {"max_rides": 3},
     ],
 )
 def test_cost_matrix_rejects_transit_only_arguments(streets, origins, kwargs):
@@ -477,13 +496,13 @@ def test_cost_matrix_requires_an_explicit_mode(streets, origins):
 
 
 @pytest.mark.parametrize("cutoff", [-1.0, float("nan"), float("inf")])
-def test_cost_matrix_cutoff_admitting_nothing_yields_no_rows(streets, origins, cutoff):
-    # Including the diagonal: a same-coordinate pair is still a route the
-    # cutoff must admit, exactly as the time matrix has it.
-    costs = TravelCostMatrix(
-        streets, origins, transport_mode="bicycle", max_street_time=cutoff
-    )
-    assert len(costs) == 0
+def test_cost_matrix_refuses_an_unusable_cutoff(streets, origins, cutoff):
+    # A negative, NaN, or infinite duration is a caller error, not an
+    # empty result — matching the time matrix.
+    with pytest.raises(ValueError, match="max_street_time"):
+        TravelCostMatrix(
+            streets, origins, transport_mode="bicycle", max_street_time=cutoff
+        )
 
 
 def test_diagonal_geometry_is_a_valid_line(streets, origins):
@@ -506,9 +525,8 @@ def test_diagonal_geometry_is_a_valid_line(streets, origins):
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"departure": "08:30:00"},
-        {"window": 600},
-        {"within": 600},
+        {"departure_time_window": 10},
+        {"max_travel_time": 10},
         {"candidates": "pareto"},
         {"bucket": 50.0},
         {"fares": object()},
@@ -516,7 +534,7 @@ def test_diagonal_geometry_is_a_valid_line(streets, origins):
         {"exclude_trips": ["t1"]},
         {"exclude_stops": ["s1"]},
         {"walking_speed_kmph": 5.0},
-        {"max_walking_time": 600.0},
+        {"max_walking_time": 10.0},
     ],
 )
 def test_cost_matrix_rejects_the_remaining_transit_arguments(streets, origins, kwargs):

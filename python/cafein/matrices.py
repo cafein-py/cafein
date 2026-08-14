@@ -14,7 +14,9 @@ class TravelCostMatrix(pd.DataFrame):
     """The fastest journey's aggregated costs per OD pair, long format.
 
     A pandas DataFrame with one row per reachable OD pair: ``from_id``
-    and ``to_id``, ``travel_time_s`` (seconds), ``transfers``,
+    and ``to_id``, ``travel_time`` (whole minutes rounded to the
+    nearest by default; exact seconds with
+    ``output_time_units="seconds"``), ``transfers``,
     ``transit_distance_m`` and ``walk_distance_m`` (meters), and
     ``emissions`` (grams CO₂e over the ridden legs; NaN where a ridden
     trip has no matching factor row). With ``geometries=True`` each row
@@ -52,7 +54,7 @@ class TravelCostMatrix(pd.DataFrame):
     Given a ``StreetNetwork`` instead, the matrix is a standalone street
     computation over the compiled profile of ``transport_mode``, bounded
     by ``max_street_time``. Its columns are ``from_id``, ``to_id``,
-    ``travel_time_s``, ``distance_m``, ``network_distance_m``,
+    ``travel_time``, ``distance_m``, ``network_distance_m``,
     ``connector_distance_m``, ``distance_provenance``, ``emissions``,
     and — with ``geometries=True`` — the route as a shapely LineString. The
     distances carry their unit in the name: ``network_distance_m`` sums
@@ -64,7 +66,7 @@ class TravelCostMatrix(pd.DataFrame):
     grams CO₂e — ``network_distance_m`` at the mode's resolved factor
     (see ``cafein.emissions.street_factors``; connectors are excluded,
     and an unresolved factor reports NA rather than a silent zero).
-    ``date``, ``departure``, and the other timetable-only arguments are
+    ``departure`` and the other timetable-only arguments are
     rejected; ``factors=`` and ``components=`` configure the factor.
 
     Parameters
@@ -81,19 +83,19 @@ class TravelCostMatrix(pd.DataFrame):
     destinations : list of str, or GeoDataFrame (optional)
         Destination stop_ids (every stop when omitted), or points; with
         point origins the destinations default to the origins.
-    date : str
-        Service date as ``YYYY-MM-DD``.
-    departure : str
-        Departure time at every origin as ``HH:MM:SS``.
-    max_transfers : int (optional, default: 7)
-        Maximum number of transfers between rides.
+    departure : datetime.datetime or str
+        Departure at every origin — a datetime, or an ISO string like
+        ``"2022-02-22 08:30"``; the service date is its date part.
+    max_rides : int (optional, default: 8)
+        Maximum number of boarded vehicles per journey (rides, not
+        transfers: 8 rides allow 7 transfers).
     optimize : str (optional, default: "time")
         What each cell's journey minimises. ``"time"`` (the default)
         reports the fastest journey. ``"emissions"`` and ``"fare"``
         report the lowest-emission or cheapest journey among the
         departure window's (departure, arrival, rides)-Pareto
         candidates — the same ride candidates ``journey_frontier``
-        sees — optionally within the ``within`` travel-time budget. A
+        sees — optionally within the ``max_travel_time`` budget. A
         zero-ride floor (zero emissions, zero fare) joins the
         candidates: for stop pairs the origin itself, for point pairs
         the walking-only alternative, which wins any cell it qualifies
@@ -108,13 +110,19 @@ class TravelCostMatrix(pd.DataFrame):
         trip at a different stop, or loses an equal-time
         canonical-path tie; fares are exact for each retained
         journey, but global fare optimality is not guaranteed.
-    window : int (optional)
-        Departure window in seconds; required with
+    departure_time_window : float or datetime.timedelta (optional)
+        Departure window in minutes; required with
         ``optimize="emissions"`` and ``optimize="fare"``.
-    within : int (optional)
-        Travel-time budget in seconds for the windowed optimize modes:
-        only journeys at most this long qualify. Unbudgeted, the
-        cleanest (cheapest) reachable journey wins.
+    max_travel_time : float or datetime.timedelta (optional)
+        Maximum total travel time in minutes for the windowed optimize
+        modes: only journeys at most this long qualify. Unset, the
+        cleanest (cheapest) reachable journey wins with no time limit —
+        except on a zone fare structure, where ``optimize="fare"``
+        defaults to 120 minutes: an exact fare search without a
+        time limit must rule out cheaper journeys across the whole
+        service day, which is far slower and rarely what an analysis
+        means. Pass ``max_travel_time`` explicitly to change the
+        limit.
     candidates : str (optional, default: "time")
         The candidate journey set of the windowed optimize modes.
         ``"pareto"`` (with ``optimize="emissions"``, stop origins and
@@ -162,22 +170,24 @@ class TravelCostMatrix(pd.DataFrame):
         Compute only origin chunk ``k`` of ``n``: a deterministic
         contiguous block of the resolved origins, so ``n`` batch jobs
         cover all origins disjointly and their shards concatenate.
-    walking_speed_kmph, max_walking_time, max_snap_distance : float
+    walking_speed_kmph, max_walking_time, snap_distance : float
         The street-search options for the walking access/egress, as in
-        ``TransportNetwork.access_stops``. They bound the walking for point
-        origins/destinations, and for stop origins/destinations only when a
-        whole-day shortcut set routes them door-to-door; otherwise stop
-        matrices ignore them. Only ``max_snap_distance`` applies to a
-        ``StreetNetwork``, whose speeds come from the mode's profile.
+        ``TransportNetwork.access_stops``: speed in km/h, walking time
+        in minutes (or a timedelta), snap distance in meters. They
+        bound the walking for point origins/destinations, and for stop
+        origins/destinations only when a whole-day shortcut set routes
+        them door-to-door; otherwise stop matrices ignore them. Only
+        ``snap_distance`` applies to a ``StreetNetwork``, whose speeds
+        come from the mode's profile.
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
         one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
         ``"car"`` (a car build; the shipped per-powertrain factors price
         emissions with ICE as the default class, and ``factors=`` rows
         still win).
-    max_street_time : float (optional)
-        Cutoff in seconds for a ``StreetNetwork`` matrix (default:
-        ``cafein.street_network.MAX_STREET_TIME``, 7200).
+    max_street_time : float or datetime.timedelta (optional)
+        Cutoff in minutes for a ``StreetNetwork`` matrix (default: 120
+        minutes, ``cafein.street_network.MAX_STREET_TIME`` seconds).
     intersection_delays, profile, delay_model : optional
         Car matrices only. By default car cells are free-flow,
         speed-limit travel times; ``intersection_delays=True`` applies
@@ -194,7 +204,7 @@ class TravelCostMatrix(pd.DataFrame):
         ``seconds`` column (optional ``metres``) resolved by
         point-in-polygon (largest seconds, ties by largest metres then
         lowest row; outside every polygon the shipped constant). The
-        seconds join ``travel_time_s`` and the metres join the driven
+        seconds join ``travel_time`` and the metres join the driven
         network distance and the emissions basis; geometry never shows
         the search loop, and ``max_street_time`` bounds the driving
         alone.
@@ -246,9 +256,14 @@ class TravelCostMatrix(pd.DataFrame):
     and a walking-only policy at one shared budget rides the legacy
     cost matrix bit for bit (its ``street_distance_m`` is identically
     zero). Policy cost matrices run the time-fastest engine arm and do
-    not price fares; ``optimize``, ``window``, ``within``, ``fares``,
-    ``candidates``, ``router``, and the walking knobs are rejected
-    beside a policy rather than silently ignored.
+    not price fares; ``optimize``, ``departure_time_window``,
+    ``max_travel_time``, ``fares``, ``candidates``, ``router``, and the
+    walking knobs are rejected beside a policy rather than silently
+    ignored.
+
+    ``output_time_units=`` selects the ``travel_time`` unit:
+    ``"minutes"`` (the default; whole minutes rounded to the nearest)
+    or ``"seconds"`` (the engine's exact values).
     """
 
     @property
@@ -260,13 +275,12 @@ class TravelCostMatrix(pd.DataFrame):
         network,
         origins=None,
         destinations=None,
-        date=None,
         departure=None,
         *,
-        max_transfers=7,
+        max_rides=8,
         optimize="time",
-        window=None,
-        within=None,
+        departure_time_window=None,
+        max_travel_time=None,
         factors=None,
         components=None,
         fares=None,
@@ -280,7 +294,7 @@ class TravelCostMatrix(pd.DataFrame):
         chunk=None,
         walking_speed_kmph=None,
         max_walking_time=None,
-        max_snap_distance=None,
+        snap_distance=None,
         transport_mode=None,
         max_street_time=None,
         street_policy=None,
@@ -294,9 +308,28 @@ class TravelCostMatrix(pd.DataFrame):
         costs=None,
         currency=None,
         cost_components=None,
+        output_time_units="minutes",
     ):
         origins = sequence_not_string("origins", origins)
         destinations = sequence_not_string("destinations", destinations)
+        from cafein._units import (
+            departure_parts,
+            duration_seconds,
+            validated_output_time_units,
+        )
+
+        output_time_units = validated_output_time_units(output_time_units)
+        date, departure = (
+            (None, None) if departure is None else departure_parts(departure)
+        )
+        if max_rides < 1:
+            raise ValueError("max_rides must be at least 1")
+        max_transfers = max_rides - 1
+        window = duration_seconds("departure_time_window", departure_time_window)
+        max_walking_time = duration_seconds("max_walking_time", max_walking_time)
+        max_street_time = duration_seconds("max_street_time", max_street_time)
+        max_snap_distance = snap_distance
+        within = duration_seconds("max_travel_time", max_travel_time)
         if _is_street_network(network):
             data = _street_cost_columns(
                 network,
@@ -320,14 +353,13 @@ class TravelCostMatrix(pd.DataFrame):
                 currency=currency,
                 cost_components=cost_components,
                 transit_only={
-                    "date": date,
                     "departure": departure,
-                    "window": window,
-                    "within": within,
+                    "departure_time_window": window,
+                    "max_travel_time": within,
                     "fares": fares,
                     "walking_speed_kmph": walking_speed_kmph,
                     "max_walking_time": max_walking_time,
-                    "max_transfers": None if max_transfers == 7 else max_transfers,
+                    "max_rides": None if max_rides == 8 else max_rides,
                     "optimize": None if optimize == "time" else optimize,
                     "candidates": None if candidates == "time" else candidates,
                     "bucket": None if bucket == 25.0 else bucket,
@@ -341,7 +373,9 @@ class TravelCostMatrix(pd.DataFrame):
                     "street_policy": street_policy,
                 },
             )
-            super().__init__(pd.DataFrame(data))
+            super().__init__(
+                pd.DataFrame(_humanize_time_columns(data, output_time_units))
+            )
             return
         _reject_cost_street_args(
             transport_mode,
@@ -363,14 +397,14 @@ class TravelCostMatrix(pd.DataFrame):
                     name
                     for name, value in (
                         ("optimize", None if optimize == "time" else optimize),
-                        ("window", window),
-                        ("within", within),
+                        ("departure_time_window", window),
+                        ("max_travel_time", within),
                         ("fares", fares),
                         ("candidates", None if candidates == "time" else candidates),
                         ("router", None if router == "auto" else router),
                         ("walking_speed_kmph", walking_speed_kmph),
                         ("max_walking_time", max_walking_time),
-                        ("max_snap_distance", max_snap_distance),
+                        ("snap_distance", max_snap_distance),
                     )
                     if value is not None
                 ),
@@ -452,7 +486,9 @@ class TravelCostMatrix(pd.DataFrame):
                 data["geometry"] = shapely.from_wkb(
                     np.array(table["geometry"], dtype=object)
                 )
-            super().__init__(pd.DataFrame(data))
+            super().__init__(
+                pd.DataFrame(_humanize_time_columns(data, output_time_units))
+            )
             return
         table, from_ids, to_ids = _cost_columns(
             network,
@@ -494,7 +530,7 @@ class TravelCostMatrix(pd.DataFrame):
             data["geometry"] = shapely.from_wkb(
                 np.array(table["geometry"], dtype=object)
             )
-        super().__init__(pd.DataFrame(data))
+        super().__init__(pd.DataFrame(_humanize_time_columns(data, output_time_units)))
 
     @classmethod
     def to_parquet(
@@ -502,16 +538,15 @@ class TravelCostMatrix(pd.DataFrame):
         network,
         origins=None,
         destinations=None,
-        date=None,
         departure=None,
         *,
         output,
         batch_size=None,
         resume=False,
-        max_transfers=7,
+        max_rides=8,
         optimize="time",
-        window=None,
-        within=None,
+        departure_time_window=None,
+        max_travel_time=None,
         factors=None,
         components=None,
         fares=None,
@@ -525,7 +560,7 @@ class TravelCostMatrix(pd.DataFrame):
         chunk=None,
         walking_speed_kmph=None,
         max_walking_time=None,
-        max_snap_distance=None,
+        snap_distance=None,
         transport_mode=None,
         max_street_time=None,
         street_policy=None,
@@ -539,6 +574,7 @@ class TravelCostMatrix(pd.DataFrame):
         costs=None,
         currency=None,
         cost_components=None,
+        output_time_units="minutes",
     ):
         """The cost matrix streamed to Parquet — the constructor's
         semantics with `travel_cost_table`'s ``output=`` behavior.
@@ -556,6 +592,24 @@ class TravelCostMatrix(pd.DataFrame):
         """
         import pyarrow
 
+        from cafein._units import (
+            departure_parts,
+            duration_seconds,
+            validated_output_time_units,
+        )
+
+        output_time_units = validated_output_time_units(output_time_units)
+        date, departure = (
+            (None, None) if departure is None else departure_parts(departure)
+        )
+        if max_rides < 1:
+            raise ValueError("max_rides must be at least 1")
+        max_transfers = max_rides - 1
+        window = duration_seconds("departure_time_window", departure_time_window)
+        max_walking_time = duration_seconds("max_walking_time", max_walking_time)
+        max_street_time = duration_seconds("max_street_time", max_street_time)
+        max_snap_distance = snap_distance
+        within = duration_seconds("max_travel_time", max_travel_time)
         size = _stream_size(batch_size, resume)
         if street_policy is not None:
             raise NotImplementedError(
@@ -574,14 +628,13 @@ class TravelCostMatrix(pd.DataFrame):
                 max_snap_distance=max_snap_distance,
                 chunk=chunk,
                 transit_only={
-                    "date": date,
                     "departure": departure,
-                    "window": window,
-                    "within": within,
+                    "departure_time_window": window,
+                    "max_travel_time": within,
                     "fares": fares,
                     "walking_speed_kmph": walking_speed_kmph,
                     "max_walking_time": max_walking_time,
-                    "max_transfers": None if max_transfers == 7 else max_transfers,
+                    "max_rides": None if max_rides == 8 else max_rides,
                     "optimize": None if optimize == "time" else optimize,
                     "candidates": None if candidates == "time" else candidates,
                     "bucket": None if bucket == 25.0 else bucket,
@@ -617,6 +670,7 @@ class TravelCostMatrix(pd.DataFrame):
                 size,
                 pyarrow,
                 resume=resume,
+                output_time_units=output_time_units,
             )
         _reject_cost_street_args(
             transport_mode,
@@ -661,6 +715,7 @@ class TravelCostMatrix(pd.DataFrame):
             size=size,
             pyarrow=pyarrow,
             resume=resume,
+            output_time_units=output_time_units,
         )
 
 
@@ -668,7 +723,9 @@ class TravelTimeMatrix(pd.DataFrame):
     """Travel times per OD pair, long format — the lean r5py-style mode.
 
     A pandas DataFrame with one row per reachable OD pair: ``from_id``,
-    ``to_id``, and ``travel_time_s`` in seconds. It is the long-format face
+    ``to_id``, and ``travel_time`` — whole minutes rounded to the
+    nearest by default, exact seconds with
+    ``output_time_units="seconds"``. It is the long-format face
     of ``TransportNetwork.travel_time_matrix``: one RAPTOR run serves
     each origin, fanned out over all cores, and the reachable cells of
     the resulting wide matrix are unstacked into rows. Unreachable pairs
@@ -677,14 +734,13 @@ class TravelTimeMatrix(pd.DataFrame):
     ``TravelCostMatrix``, which also aggregates transfers, distances, and
     emissions.
 
-    With ``window``, every minute mark within
-    ``[departure, departure + window)`` is profiled and the
-    ``travel_time_s`` column is replaced by one ``travel_time_p<p>``
-    column per requested percentile (the median by default, or
-    ``confidence`` for the symmetric interval plus the median), in
-    seconds and floating-point so an unreachable percentile reads as
-    ``NaN``; a pair appears when at least one of its percentiles is
-    reachable.
+    With ``departure_time_window``, every minute mark within the
+    window is profiled and the ``travel_time`` column is replaced by
+    one ``travel_time_p<p>`` column per requested percentile (the
+    median by default, or ``confidence`` for the symmetric interval
+    plus the median), floating-point in the output units so an
+    unreachable percentile reads as ``NaN``; a pair appears when at
+    least one of its percentiles is reachable.
 
     Origins are either stop identifiers or a point GeoDataFrame with an
     ``id`` column; destinations apply to point origins only — stop
@@ -704,8 +760,8 @@ class TravelTimeMatrix(pd.DataFrame):
     ``profile=`` and ``delay_model=`` applies the intersection-delay
     model, and ``parking=`` adds each destination's parking search
     seconds, as in ``StreetNetwork.travel_time``. It needs no
-    timetable, so ``date`` and ``departure`` do not apply, and the
-    arguments that only mean something to a timetable — ``max_transfers``,
+    timetable, so ``departure`` does not apply, and the
+    arguments that only mean something to a timetable — ``max_rides``,
     ``router``, the departure-window percentiles, the transit exclusions,
     and the walking-speed options, whose speeds come from the profile —
     are rejected. Origins and destinations are point GeoDataFrames (or
@@ -723,21 +779,21 @@ class TravelTimeMatrix(pd.DataFrame):
     destinations : GeoDataFrame (optional)
         Destination points; defaults to the origins. Only valid with
         point origins — stop origins always span every stop.
-    date : str
-        Service date as ``YYYY-MM-DD``.
-    departure : str
-        Departure time at every origin as ``HH:MM:SS``.
-    max_transfers : int (optional, default: 7)
-        Maximum number of transfers between rides.
-    window : int (optional)
-        Departure window in seconds; enables percentile columns.
+    departure : datetime.datetime or str
+        Departure at every origin — a datetime, or an ISO string like
+        ``"2022-02-22 08:30"``; the service date is its date part.
+    max_rides : int (optional, default: 8)
+        Maximum number of boarded vehicles per journey (rides, not
+        transfers: 8 rides allow 7 transfers).
+    departure_time_window : float or datetime.timedelta (optional)
+        Departure window in minutes; enables percentile columns.
     percentiles : list of float (optional)
         Percentiles in ``[0, 100]`` over the window's departures;
-        requires `window`, defaults to ``[50]``.
+        requires `departure_time_window`, defaults to ``[50]``.
     confidence : float (optional)
         A level in ``(0, 1)`` mapped to the symmetric percentile
-        interval plus the median; requires `window` and excludes
-        `percentiles`.
+        interval plus the median; requires `departure_time_window` and
+        excludes `percentiles`.
     chunk : (int, int) (optional)
         Compute only origin chunk ``k`` of ``n``: a deterministic
         contiguous block of the resolved origins, so ``n`` batch jobs
@@ -752,22 +808,24 @@ class TravelTimeMatrix(pd.DataFrame):
         RAPTOR path routes door-to-door and auto prefers it; point
         matrices share the ULTRA set on both engines, so the cache
         alone decides there.
-    walking_speed_kmph, max_walking_time, max_snap_distance : float
+    walking_speed_kmph, max_walking_time, snap_distance : float
         The street-search options for the walking access/egress, as in
-        ``TransportNetwork.access_stops``. They bound the walking for point
-        origins/destinations, and for stop origins/destinations only when a
-        whole-day shortcut set routes them door-to-door; otherwise stop
-        matrices ignore them. Only ``max_snap_distance`` applies to a
-        ``StreetNetwork``, whose speeds come from the mode's profile.
+        ``TransportNetwork.access_stops``: speed in km/h, walking time
+        in minutes (or a timedelta), snap distance in meters. They
+        bound the walking for point origins/destinations, and for stop
+        origins/destinations only when a whole-day shortcut set routes
+        them door-to-door; otherwise stop matrices ignore them. Only
+        ``snap_distance`` applies to a ``StreetNetwork``, whose speeds
+        come from the mode's profile.
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
         one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
         ``"car"``; for a ``TransportNetwork`` only ``"public_transport"``
         (the default meaning) applies.
-    max_street_time : float (optional)
-        Cutoff in seconds for a ``StreetNetwork`` matrix, beyond which a
-        destination counts as unreachable (default:
-        ``cafein.street_network.MAX_STREET_TIME``, 7200).
+    max_street_time : float or datetime.timedelta (optional)
+        Cutoff in minutes for a ``StreetNetwork`` matrix, beyond which
+        a destination counts as unreachable (default: 120 minutes,
+        ``cafein.street_network.MAX_STREET_TIME`` seconds).
 
     Notes
     -----
@@ -797,11 +855,10 @@ class TravelTimeMatrix(pd.DataFrame):
         network,
         origins=None,
         destinations=None,
-        date=None,
         departure=None,
         *,
-        max_transfers=7,
-        window=None,
+        max_rides=8,
+        departure_time_window=None,
         percentiles=None,
         confidence=None,
         chunk=None,
@@ -811,7 +868,7 @@ class TravelTimeMatrix(pd.DataFrame):
         exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
-        max_snap_distance=None,
+        snap_distance=None,
         transport_mode=None,
         max_street_time=None,
         street_policy=None,
@@ -819,9 +876,27 @@ class TravelTimeMatrix(pd.DataFrame):
         profile=None,
         delay_model=None,
         parking=None,
+        output_time_units="minutes",
     ):
         origins = sequence_not_string("origins", origins)
         destinations = sequence_not_string("destinations", destinations)
+        from cafein._units import (
+            departure_parts,
+            duration_seconds,
+            validated_output_time_units,
+        )
+
+        output_time_units = validated_output_time_units(output_time_units)
+        date, departure = (
+            (None, None) if departure is None else departure_parts(departure)
+        )
+        if max_rides < 1:
+            raise ValueError("max_rides must be at least 1")
+        max_transfers = max_rides - 1
+        window = duration_seconds("departure_time_window", departure_time_window)
+        max_walking_time = duration_seconds("max_walking_time", max_walking_time)
+        max_street_time = duration_seconds("max_street_time", max_street_time)
+        max_snap_distance = snap_distance
         if _is_street_network(network):
             data = _street_time_columns(
                 network,
@@ -836,14 +911,13 @@ class TravelTimeMatrix(pd.DataFrame):
                 delay_model=delay_model,
                 parking=parking,
                 transit_only={
-                    "date": date,
                     "departure": departure,
-                    "window": window,
+                    "departure_time_window": window,
                     "percentiles": percentiles,
                     "confidence": confidence,
                     "walking_speed_kmph": walking_speed_kmph,
                     "max_walking_time": max_walking_time,
-                    "max_transfers": None if max_transfers == 7 else max_transfers,
+                    "max_rides": None if max_rides == 8 else max_rides,
                     "router": None if router == "auto" else router,
                     "exclude_routes": id_sequence("exclude_routes", exclude_routes)
                     or None,
@@ -854,7 +928,9 @@ class TravelTimeMatrix(pd.DataFrame):
                     "street_policy": street_policy,
                 },
             )
-            super().__init__(pd.DataFrame(data))
+            super().__init__(
+                pd.DataFrame(_humanize_time_columns(data, output_time_units))
+            )
             return
         _reject_time_street_args(
             transport_mode,
@@ -897,7 +973,9 @@ class TravelTimeMatrix(pd.DataFrame):
                     exclude_trips,
                     exclude_stops,
                 )
-                super().__init__(pd.DataFrame(data))
+                super().__init__(
+                    pd.DataFrame(_humanize_time_columns(data, output_time_units))
+                )
                 return
             walk_only, walk_budget = _walking_only_policy(street_policy)
             if walk_only:
@@ -922,7 +1000,9 @@ class TravelTimeMatrix(pd.DataFrame):
                     max_walking_time=walk_budget,
                     max_snap_distance=None,
                 )
-                super().__init__(pd.DataFrame(data))
+                super().__init__(
+                    pd.DataFrame(_humanize_time_columns(data, output_time_units))
+                )
                 return
             data = _policy_time_columns(
                 network,
@@ -937,7 +1017,9 @@ class TravelTimeMatrix(pd.DataFrame):
                 exclude_trips,
                 exclude_stops,
             )
-            super().__init__(pd.DataFrame(data))
+            super().__init__(
+                pd.DataFrame(_humanize_time_columns(data, output_time_units))
+            )
             return
         data = _time_columns(
             network,
@@ -958,7 +1040,7 @@ class TravelTimeMatrix(pd.DataFrame):
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
         )
-        super().__init__(pd.DataFrame(data))
+        super().__init__(pd.DataFrame(_humanize_time_columns(data, output_time_units)))
 
     @classmethod
     def to_parquet(
@@ -966,14 +1048,13 @@ class TravelTimeMatrix(pd.DataFrame):
         network,
         origins=None,
         destinations=None,
-        date=None,
         departure=None,
         *,
         output,
         batch_size=None,
         resume=False,
-        max_transfers=7,
-        window=None,
+        max_rides=8,
+        departure_time_window=None,
         percentiles=None,
         confidence=None,
         chunk=None,
@@ -983,7 +1064,7 @@ class TravelTimeMatrix(pd.DataFrame):
         exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
-        max_snap_distance=None,
+        snap_distance=None,
         transport_mode=None,
         max_street_time=None,
         street_policy=None,
@@ -991,6 +1072,7 @@ class TravelTimeMatrix(pd.DataFrame):
         profile=None,
         delay_model=None,
         parking=None,
+        output_time_units="minutes",
     ):
         """The travel-time matrix streamed to Parquet — the
         constructor's semantics with ``travel_cost_table``'s
@@ -1009,6 +1091,23 @@ class TravelTimeMatrix(pd.DataFrame):
         """
         import pyarrow
 
+        from cafein._units import (
+            departure_parts,
+            duration_seconds,
+            validated_output_time_units,
+        )
+
+        output_time_units = validated_output_time_units(output_time_units)
+        date, departure = (
+            (None, None) if departure is None else departure_parts(departure)
+        )
+        if max_rides < 1:
+            raise ValueError("max_rides must be at least 1")
+        max_transfers = max_rides - 1
+        window = duration_seconds("departure_time_window", departure_time_window)
+        max_walking_time = duration_seconds("max_walking_time", max_walking_time)
+        max_street_time = duration_seconds("max_street_time", max_street_time)
+        max_snap_distance = snap_distance
         size = _stream_size(batch_size, resume)
         if street_policy is not None:
             raise NotImplementedError(
@@ -1026,14 +1125,13 @@ class TravelTimeMatrix(pd.DataFrame):
                 max_snap_distance=max_snap_distance,
                 chunk=chunk,
                 transit_only={
-                    "date": date,
                     "departure": departure,
-                    "window": window,
+                    "departure_time_window": window,
                     "percentiles": percentiles,
                     "confidence": confidence,
                     "walking_speed_kmph": walking_speed_kmph,
                     "max_walking_time": max_walking_time,
-                    "max_transfers": None if max_transfers == 7 else max_transfers,
+                    "max_rides": None if max_rides == 8 else max_rides,
                     "router": None if router == "auto" else router,
                     "exclude_routes": id_sequence("exclude_routes", exclude_routes)
                     or None,
@@ -1057,6 +1155,7 @@ class TravelTimeMatrix(pd.DataFrame):
                 size,
                 pyarrow,
                 resume=resume,
+                output_time_units=output_time_units,
             )
         _reject_time_street_args(
             transport_mode,
@@ -1089,7 +1188,25 @@ class TravelTimeMatrix(pd.DataFrame):
             size=size,
             pyarrow=pyarrow,
             resume=resume,
+            output_time_units=output_time_units,
         )
+
+
+def _humanize_time_columns(data, output_time_units):
+    """``travel_time_s`` (and percentile columns) → ``travel_time`` in
+    the requested output units, keeping column order."""
+    from cafein._units import travel_time_output
+
+    out = {}
+    for key, value in data.items():
+        if key == "travel_time_s":
+            out["travel_time"] = travel_time_output(value, output_time_units)
+        elif key.startswith("travel_time_p"):
+            name = key[: -len("_s")] if key.endswith("_s") else key
+            out[name] = travel_time_output(value, output_time_units)
+        else:
+            out[key] = value
+    return out
 
 
 def _is_street_network(network):
@@ -1612,7 +1729,7 @@ def _time_columns(
 ):
     """The reachable cells of the travel-time matrix, in long format."""
     if date is None or departure is None:
-        raise TypeError("TravelTimeMatrix requires date and departure")
+        raise TypeError("TravelTimeMatrix requires departure")
     matrix, from_ids, to_ids, resolved = network._time_matrix_with_ids(
         origins,
         date,
@@ -1654,13 +1771,12 @@ def travel_cost_table(
     network,
     origins=None,
     destinations=None,
-    date=None,
     departure=None,
     *,
-    max_transfers=7,
+    max_rides=8,
     optimize="time",
-    window=None,
-    within=None,
+    departure_time_window=None,
+    max_travel_time=None,
     factors=None,
     components=None,
     fares=None,
@@ -1672,16 +1788,18 @@ def travel_cost_table(
     exclude_stops=(),
     walking_speed_kmph=None,
     max_walking_time=None,
-    max_snap_distance=None,
+    snap_distance=None,
     output=None,
     batch_size=None,
     resume=False,
+    output_time_units="minutes",
 ):
     """The travel-cost matrix as a pyarrow Table — the shard-writing form.
 
     Semantics and parameters follow `TravelCostMatrix` — including the
-    windowed optimize modes with their ``window``/``within``, the
-    ``fares`` pricing, and the ``router`` engine choice, though always
+    windowed optimize modes with their
+    ``departure_time_window``/``max_travel_time``, the ``fares``
+    pricing, and the ``router`` engine choice, though always
     over the time candidates
     (no ``candidates``/``bucket``); the output is an
     Arrow table with ``from_id`` and ``to_id`` dictionary-encoded over
@@ -1732,6 +1850,21 @@ def travel_cost_table(
             "Arrow tables need the optional pyarrow dependency; install "
             "cafein[arrow] or pyarrow"
         ) from error
+    from cafein._units import (
+        departure_parts,
+        duration_seconds,
+        validated_output_time_units,
+    )
+
+    output_time_units = validated_output_time_units(output_time_units)
+    date, departure = (None, None) if departure is None else departure_parts(departure)
+    if max_rides < 1:
+        raise ValueError("max_rides must be at least 1")
+    max_transfers = max_rides - 1
+    window = duration_seconds("departure_time_window", departure_time_window)
+    within = duration_seconds("max_travel_time", max_travel_time)
+    max_walking_time = duration_seconds("max_walking_time", max_walking_time)
+    max_snap_distance = snap_distance
     if output is None:
         if batch_size is not None:
             raise ValueError("batch_size requires output=")
@@ -1768,6 +1901,7 @@ def travel_cost_table(
             fares,
             geometries,
             pyarrow,
+            output_time_units,
         )
     size = _stream_size(batch_size, resume)
     return _stream_transit_cost(
@@ -1799,6 +1933,7 @@ def travel_cost_table(
         size=size,
         pyarrow=pyarrow,
         resume=resume,
+        output_time_units=output_time_units,
     )
 
 
@@ -1832,6 +1967,7 @@ def _stream_transit_cost(
     size,
     pyarrow,
     resume=False,
+    output_time_units="minutes",
 ):
     """The transit cost matrix streamed in origin batches — shared by
     ``travel_cost_table`` and ``TravelCostMatrix.to_parquet``."""
@@ -1862,7 +1998,7 @@ def _stream_transit_cost(
     columns = [
         "from_id",
         "to_id",
-        "travel_time_s",
+        "travel_time",
         "transfers",
         "transit_distance_m",
         "walk_distance_m",
@@ -1895,6 +2031,7 @@ def _stream_transit_cost(
         "walking_speed_kmph": walking_speed_kmph,
         "max_walking_time": max_walking_time,
         "max_snap_distance": max_snap_distance,
+        "output_time_units": output_time_units,
     }
 
     def make_batch(rows, shared_from, shared_to):
@@ -1936,7 +2073,14 @@ def _stream_transit_cost(
             _resolved=(trip_factors, fare_tables, endpoints),
         )
         return _arrow_table(
-            table, shared_from, shared_to, rows.start, fares, geometries, pyarrow
+            table,
+            shared_from,
+            shared_to,
+            rows.start,
+            fares,
+            geometries,
+            pyarrow,
+            output_time_units,
         )
 
     return _stream_run(
@@ -2029,18 +2173,28 @@ def _stream_run(
 
 
 def _stream_street_cost(
-    operation, network, resolved, geometries, chunk, output, size, pa, resume=False
+    operation,
+    network,
+    resolved,
+    geometries,
+    chunk,
+    output,
+    size,
+    pa,
+    resume=False,
+    output_time_units="minutes",
 ):
     """The street cost matrix streamed in origin batches over a frozen
     resolution — `TravelCostMatrix.to_parquet`'s street arm."""
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
+    from cafein._units import travel_time_output
 
     query = resolved["query"]
     account = resolved["account"]
     columns = [
         "from_id",
         "to_id",
-        "travel_time_s",
+        "travel_time",
         "distance_m",
         "network_distance_m",
         "connector_distance_m",
@@ -2067,6 +2221,7 @@ def _stream_street_cost(
         "occupancy": resolved["occupancy"],
         "factor": resolved["factor"],
         "account": None if account is None else [totals, breakdown, label],
+        "output_time_units": output_time_units,
     }
 
     def make_batch(rows, shared_from, shared_to):
@@ -2088,7 +2243,9 @@ def _stream_street_cost(
                 shared_from,
             ),
             "to_id": pa.DictionaryArray.from_arrays(pa.array(to_index), shared_to),
-            "travel_time_s": pa.array(numeric["travel_time_s"]),
+            "travel_time": pa.array(
+                travel_time_output(numeric["travel_time_s"], output_time_units)
+            ),
             "distance_m": pa.array(numeric["distance_m"]),
             "network_distance_m": pa.array(numeric["network_distance_m"]),
             "connector_distance_m": pa.array(numeric["connector_distance_m"]),
@@ -2123,10 +2280,20 @@ def _stream_street_cost(
 
 
 def _stream_street_time(
-    operation, network, resolved, chunk, output, size, pa, resume=False
+    operation,
+    network,
+    resolved,
+    chunk,
+    output,
+    size,
+    pa,
+    resume=False,
+    output_time_units="minutes",
 ):
     """The street time matrix streamed in origin batches over a frozen
     resolution — `TravelTimeMatrix.to_parquet`'s street arm."""
+    from cafein._units import travel_time_output
+
     query = resolved["query"]
     parameters = {
         "transport_mode": resolved["transport_mode"],
@@ -2135,6 +2302,7 @@ def _stream_street_time(
         "chunk": None if chunk is None else list(chunk),
         "car_model": resolved["car_model"],
         "parking_seconds": resolved["parking_seconds"],
+        "output_time_units": output_time_units,
     }
 
     def make_batch(rows, shared_from, shared_to):
@@ -2158,14 +2326,16 @@ def _stream_street_time(
                 "to_id": pa.DictionaryArray.from_arrays(
                     pa.array(cell_columns), shared_to
                 ),
-                "travel_time_s": pa.array(travel_time_s),
+                "travel_time": pa.array(
+                    travel_time_output(travel_time_s, output_time_units)
+                ),
             }
         )
 
     return _stream_run(
         operation,
         network,
-        ["from_id", "to_id", "travel_time_s"],
+        ["from_id", "to_id", "travel_time"],
         parameters,
         list(query.from_ids),
         list(query.to_ids),
@@ -2202,13 +2372,15 @@ def _stream_transit_time(
     size,
     pyarrow,
     resume=False,
+    output_time_units="minutes",
 ):
     """The transit time matrix streamed in origin batches —
     `TravelTimeMatrix.to_parquet`'s transit arm."""
+    from cafein._units import travel_time_output
     from cafein.network import _window_percentiles
 
     if date is None or departure is None:
-        raise TypeError("TravelTimeMatrix requires date and departure")
+        raise TypeError("TravelTimeMatrix requires departure")
     if router not in ("auto", "raptor", "tbtr"):
         raise ValueError(f"router must be 'auto', 'raptor', or 'tbtr', not {router!r}")
     # Frozen once: a one-shot percentile iterable drains here, and every
@@ -2228,10 +2400,10 @@ def _stream_transit_time(
         _, destination_points = points
         destination_frame = _point_frame(to_ids, destination_points)
     if resolved_percentiles is None:
-        columns = ["from_id", "to_id", "travel_time_s"]
+        columns = ["from_id", "to_id", "travel_time"]
     else:
         columns = ["from_id", "to_id"] + [
-            f"travel_time_p{percentile:g}_s" for percentile in resolved_percentiles
+            f"travel_time_p{percentile:g}" for percentile in resolved_percentiles
         ]
     parameters = {
         "date": date,
@@ -2247,6 +2419,7 @@ def _stream_transit_time(
         "walking_speed_kmph": walking_speed_kmph,
         "max_walking_time": max_walking_time,
         "max_snap_distance": max_snap_distance,
+        "output_time_units": output_time_units,
     }
 
     def make_batch(rows, shared_from, shared_to):
@@ -2283,13 +2456,21 @@ def _stream_transit_time(
         unreachable = np.iinfo(np.uint32).max
         if resolved_percentiles is None:
             cell_rows, cell_columns = np.nonzero(matrix != unreachable)
-            values = {"travel_time_s": pyarrow.array(matrix[cell_rows, cell_columns])}
+            values = {
+                "travel_time": pyarrow.array(
+                    travel_time_output(
+                        matrix[cell_rows, cell_columns], output_time_units
+                    )
+                )
+            }
         else:
             cell_rows, cell_columns = np.nonzero((matrix != unreachable).any(axis=2))
             spread = matrix[cell_rows, cell_columns, :].astype(float)
             spread[spread == unreachable] = np.nan
             values = {
-                f"travel_time_p{percentile:g}_s": pyarrow.array(spread[:, index])
+                f"travel_time_p{percentile:g}": pyarrow.array(
+                    travel_time_output(spread[:, index], output_time_units)
+                )
                 for index, percentile in enumerate(resolved_percentiles)
             }
         return pyarrow.table(
@@ -2348,19 +2529,32 @@ def _stream_size(batch_size, resume):
     return size
 
 
-def _arrow_table(table, from_dictionary, to_dictionary, offset, fares, geometries, pa):
+def _arrow_table(
+    table,
+    from_dictionary,
+    to_dictionary,
+    offset,
+    fares,
+    geometries,
+    pa,
+    output_time_units,
+):
     """One batch's Arrow table over the shared id dictionary domains.
 
     ``offset`` shifts the batch-relative origin indices into the shared
     ``from_dictionary`` domain; destination indices already span theirs.
     """
+    from cafein._units import travel_time_output
+
     origin_indices = table["from"] if not offset else table["from"] + offset
     columns = {
         "from_id": pa.DictionaryArray.from_arrays(
             pa.array(origin_indices), from_dictionary
         ),
         "to_id": pa.DictionaryArray.from_arrays(pa.array(table["to"]), to_dictionary),
-        "travel_time_s": pa.array(table["travel_time_s"]),
+        "travel_time": pa.array(
+            travel_time_output(np.asarray(table["travel_time_s"]), output_time_units)
+        ),
         "transfers": pa.array(np.maximum(table["rides"], 1) - 1),
         "transit_distance_m": pa.array(table["transit_distance"]),
         "walk_distance_m": pa.array(table["walk_distance"]),
@@ -2443,9 +2637,14 @@ def _cost_columns(
         list(id_sequence("exclude_stops", exclude_stops)),
     )
     from cafein import emissions
+    from cafein.fares import ZoneFareStructure
     from cafein.network import _walk_options
 
     _validate_cost_query(date, departure, optimize, window, within, fares, router)
+    # A zone structure's exact fare search needs a time limit to stay
+    # fast; 120 minutes of total travel time is the default cap.
+    if optimize == "fare" and within is None and isinstance(fares, ZoneFareStructure):
+        within = 7200
     if candidates not in ("time", "pareto"):
         raise ValueError("candidates must be 'time' or 'pareto'")
     if candidates == "pareto":
@@ -2572,15 +2771,18 @@ def _validate_cost_query(date, departure, optimize, window, within, fares, route
     """The cost-matrix argument contract, shared by `_cost_columns` and
     the streaming path (which must validate before claiming outputs)."""
     if date is None or departure is None:
-        raise TypeError("TravelCostMatrix requires date and departure")
+        raise TypeError("TravelCostMatrix requires departure")
     if optimize not in ("time", "emissions", "fare"):
         raise ValueError(
             f"optimize must be 'time', 'emissions', or 'fare', not {optimize!r}"
         )
     if optimize != "time" and window is None:
-        raise ValueError(f"optimize={optimize!r} requires a departure window")
+        raise ValueError(f"optimize={optimize!r} requires departure_time_window=")
     if optimize == "time" and not (window is None and within is None):
-        raise ValueError("window and within require optimize='emissions' or 'fare'")
+        raise ValueError(
+            "departure_time_window and max_travel_time require "
+            "optimize='emissions' or 'fare'"
+        )
     if optimize == "fare" and fares is None:
         raise ValueError("optimize='fare' requires a fare structure (fares=)")
     if router not in ("auto", "raptor", "tbtr"):

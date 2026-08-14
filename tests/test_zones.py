@@ -290,9 +290,9 @@ def test_zones_route_as_centroid_points(network_with_footpaths):
         crs="EPSG:4326",
     )
     as_zones = TravelTimeMatrix(
-        network_with_footpaths, origins=grid, date="2022-02-22", departure="08:30:00"
+        network_with_footpaths, origins=grid, departure="2022-02-22 08:30:00"
     )
     as_points = TravelTimeMatrix(
-        network_with_footpaths, origins=points, date="2022-02-22", departure="08:30:00"
+        network_with_footpaths, origins=points, departure="2022-02-22 08:30:00"
     )
     pd.testing.assert_frame_equal(pd.DataFrame(as_zones), pd.DataFrame(as_points))

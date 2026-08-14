@@ -660,7 +660,7 @@ def save_fare_structure(structure, path):
             archive.writestr(name, frame.to_csv(index=False))
 
 
-def zone_fare_structure(gtfs_path, rules="model"):
+def zone_fare_structure(gtfs_paths, rules="model"):
     """A zone-based fare structure from a GTFS feed's fare files.
 
     Reads ``fare_attributes.txt``, ``fare_rules.txt``, and the stops'
@@ -676,6 +676,12 @@ def zone_fare_structure(gtfs_path, rules="model"):
     ``rules="zones"`` for the pre-grant zone-only reading (route, OD,
     and agency rules ignored) — the model the compiled matrix fare
     path still prices.
+
+    ``gtfs_paths`` takes one archive or a sequence: each feed is read
+    on its own and the products combine into one catalogue. GTFS
+    identifiers are feed-local, so the combination requires disjoint
+    fare, zone, stop, and route id spaces and one currency — a
+    collision is refused, never merged.
     """
     if rules not in ("model", "zones"):
         raise ValueError(f"rules must be 'model' or 'zones', not {rules!r}")
@@ -687,121 +693,234 @@ def zone_fare_structure(gtfs_path, rules="model"):
     def read(handle):
         return pd.read_csv(handle, dtype=str, keep_default_na=False)
 
-    with zipfile.ZipFile(gtfs_path) as archive:
-        names = set(archive.namelist())
-        if "fare_attributes.txt" not in names:
-            raise ValueError(f"'{gtfs_path}' carries no GTFS fare files")
-        attributes = read(archive.open("fare_attributes.txt"))
-        # fare_rules.txt is optional: a feed with attributes alone
-        # sells unrestricted, network-wide products.
-        rule_rows = (
-            read(archive.open("fare_rules.txt"))
-            if "fare_rules.txt" in names
-            else pd.DataFrame(columns=["fare_id"])
-        )
-        stops = read(archive.open("stops.txt"))
-        routes_table = (
-            read(archive.open("routes.txt")) if "routes.txt" in names else None
-        )
-        agency_table = (
-            read(archive.open("agency.txt")) if "agency.txt" in names else None
-        )
-    # The optional numeric columns come back as text; an empty cell is
-    # absent, exactly as the NaN the pricer already handles.
-    for column in ("transfers", "transfer_duration"):
-        if column in attributes.columns:
-            attributes[column] = attributes[column].map(
-                lambda value: math.nan if not str(value).strip() else value
-            )
+    import os
+
+    paths = (
+        [gtfs_paths] if isinstance(gtfs_paths, (str, os.PathLike)) else list(gtfs_paths)
+    )
+    if not paths:
+        raise ValueError("gtfs_paths must name at least one feed")
+
+    def load(path):
+        with zipfile.ZipFile(path) as archive:
+            names = set(archive.namelist())
+            if "fare_attributes.txt" not in names:
+                raise ValueError(f"'{path}' carries no GTFS fare files")
+            return {
+                "attributes": read(archive.open("fare_attributes.txt")),
+                # fare_rules.txt is optional: a feed with attributes
+                # alone sells unrestricted, network-wide products.
+                "rules": (
+                    read(archive.open("fare_rules.txt"))
+                    if "fare_rules.txt" in names
+                    else pd.DataFrame(columns=["fare_id"])
+                ),
+                "stops": read(archive.open("stops.txt")),
+                "routes": (
+                    read(archive.open("routes.txt")) if "routes.txt" in names else None
+                ),
+                "agency": (
+                    read(archive.open("agency.txt")) if "agency.txt" in names else None
+                ),
+            }
 
     def cell(row, column):
         value = getattr(row, column, None)
         return value if isinstance(value, str) and value.strip() else None
 
-    fare_zones = {}
-    fare_routes = {}
-    fare_od = {}
-    for row in rule_rows.itertuples():
-        fare = cell(row, "fare_id")
-        if fare is None:
-            continue
-        contains = cell(row, "contains_id")
-        if contains is not None:
-            fare_zones.setdefault(fare, set()).add(contains)
-        origin = cell(row, "origin_id")
-        destination = cell(row, "destination_id")
-        route = cell(row, "route_id")
-        if origin is not None or destination is not None:
-            fare_od.setdefault(fare, []).append((origin, destination, route))
-        elif route is not None and contains is None:
-            # Only a row whose sole field is the route joins the route
-            # grant; a contains-bearing row contributes its zone alone,
-            # or the fare would turn valid on that route outside its
-            # covered zones.
-            fare_routes.setdefault(fare, set()).add(route)
-    stop_zones = {}
-    if "zone_id" in stops.columns:
-        stop_zones = {
-            row.stop_id: row.zone_id
-            for row in stops.itertuples()
-            if isinstance(row.zone_id, str) and row.zone_id.strip()
-        }
-    if rules == "zones":
-        # The zone-only reading must not turn a fare whose (dropped)
-        # rules were route- or OD-keyed into an unrestricted one:
-        # fares with rule rows but no contains rows stay out entirely,
-        # exactly the pre-grant behaviour.
-        ruled = {
-            cell(row, "fare_id")
-            for row in rule_rows.itertuples()
-            if cell(row, "fare_id") is not None
-        }
-        keep = attributes["fare_id"].map(
-            lambda fare: str(fare) in fare_zones or str(fare) not in ruled
-        )
-        return ZoneFareStructure(attributes[keep], fare_zones, stop_zones)
-    agency_of_route = {}
-    if routes_table is not None:
-        for row in routes_table.itertuples():
-            route = cell(row, "route_id")
-            if route is not None:
-                agency_of_route[route] = cell(row, "agency_id")
-    agencies = set()
-    if agency_table is not None:
-        for row in agency_table.itertuples():
-            agencies.add(cell(row, "agency_id"))
-    agency_routes = {}
-    if "agency_id" in attributes.columns or len(agencies) > 1:
-        # In a single-agency feed, routes may omit agency_id yet
-        # belong to the one agency; without routes.txt the scope
-        # cannot be resolved and the fare stays unscoped.
-        sole_agency = next(iter(agencies)) if len(agencies) == 1 else None
-        for row in attributes.itertuples():
-            fare = str(row.fare_id)
-            agency = cell(row, "agency_id")
-            if agency is None:
-                if len(agencies) > 1:
-                    raise ValueError(
-                        f"fare {fare!r} names no agency_id in a "
-                        "multi-agency feed; the spec requires it — fix "
-                        "the feed or load with rules='zones'"
-                    )
+    def build(tables):
+        attributes = tables["attributes"]
+        rule_rows = tables["rules"]
+        stops = tables["stops"]
+        routes_table = tables["routes"]
+        agency_table = tables["agency"]
+        # The optional numeric columns come back as text; an empty cell is
+        # absent, exactly as the NaN the pricer already handles.
+        for column in ("transfers", "transfer_duration"):
+            if column in attributes.columns:
+                attributes[column] = attributes[column].map(
+                    lambda value: math.nan if not str(value).strip() else value
+                )
+
+        fare_zones = {}
+        fare_routes = {}
+        fare_od = {}
+        for row in rule_rows.itertuples():
+            fare = cell(row, "fare_id")
+            if fare is None:
                 continue
-            # Kept even when empty: an agency with no resolvable
-            # routes surfaces as an unpriceable fare, never as one
-            # valid everywhere.
-            agency_routes[fare] = {
-                route
-                for route, owner in agency_of_route.items()
-                if (owner or sole_agency) == agency
+            contains = cell(row, "contains_id")
+            if contains is not None:
+                fare_zones.setdefault(fare, set()).add(contains)
+            origin = cell(row, "origin_id")
+            destination = cell(row, "destination_id")
+            route = cell(row, "route_id")
+            if origin is not None or destination is not None:
+                fare_od.setdefault(fare, []).append((origin, destination, route))
+            elif route is not None and contains is None:
+                # Only a row whose sole field is the route joins the route
+                # grant; a contains-bearing row contributes its zone alone,
+                # or the fare would turn valid on that route outside its
+                # covered zones.
+                fare_routes.setdefault(fare, set()).add(route)
+        stop_zones = {}
+        if "zone_id" in stops.columns:
+            stop_zones = {
+                row.stop_id: row.zone_id
+                for row in stops.itertuples()
+                if isinstance(row.zone_id, str) and row.zone_id.strip()
             }
+        if rules == "zones":
+            # The zone-only reading must not turn a fare whose (dropped)
+            # rules were route- or OD-keyed into an unrestricted one:
+            # fares with rule rows but no contains rows stay out entirely,
+            # exactly the pre-grant behaviour.
+            ruled = {
+                cell(row, "fare_id")
+                for row in rule_rows.itertuples()
+                if cell(row, "fare_id") is not None
+            }
+            keep = attributes["fare_id"].map(
+                lambda fare: str(fare) in fare_zones or str(fare) not in ruled
+            )
+            return ZoneFareStructure(attributes[keep], fare_zones, stop_zones)
+        agency_of_route = {}
+        if routes_table is not None:
+            for row in routes_table.itertuples():
+                route = cell(row, "route_id")
+                if route is not None:
+                    agency_of_route[route] = cell(row, "agency_id")
+        agencies = set()
+        if agency_table is not None:
+            for row in agency_table.itertuples():
+                agencies.add(cell(row, "agency_id"))
+        agency_routes = {}
+        if "agency_id" in attributes.columns or len(agencies) > 1:
+            # In a single-agency feed, routes may omit agency_id yet
+            # belong to the one agency; without routes.txt the scope
+            # cannot be resolved and the fare stays unscoped.
+            sole_agency = next(iter(agencies)) if len(agencies) == 1 else None
+            for row in attributes.itertuples():
+                fare = str(row.fare_id)
+                agency = cell(row, "agency_id")
+                if agency is None:
+                    if len(agencies) > 1:
+                        raise ValueError(
+                            f"fare {fare!r} names no agency_id in a "
+                            "multi-agency feed; the spec requires it — fix "
+                            "the feed or load with rules='zones'"
+                        )
+                    continue
+                # Kept even when empty: an agency with no resolvable
+                # routes surfaces as an unpriceable fare, never as one
+                # valid everywhere.
+                agency_routes[fare] = {
+                    route
+                    for route, owner in agency_of_route.items()
+                    if (owner or sole_agency) == agency
+                }
+        return ZoneFareStructure(
+            attributes,
+            fare_zones,
+            stop_zones,
+            fare_routes=fare_routes,
+            fare_od=fare_od,
+            agency_routes=agency_routes,
+        )
+
+    def column_values(frame, column):
+        if frame is None or column not in frame.columns:
+            return set()
+        return {str(value) for value in frame[column] if str(value).strip()}
+
+    def namespaces(tables):
+        # The raw tables, not the built structure: a ``rules="zones"``
+        # build drops route and OD grants, but the identifiers still
+        # exist in the feed and must still collide.
+        rules_table = tables["rules"]
+        zones = column_values(tables["stops"], "zone_id")
+        for column in ("contains_id", "origin_id", "destination_id"):
+            zones |= column_values(rules_table, column)
+        routes = column_values(tables["routes"], "route_id")
+        routes |= column_values(rules_table, "route_id")
+        return {
+            # Rules too: an orphan rule row still keys grants by its
+            # fare id and must still collide across feeds.
+            "fare": (
+                column_values(tables["attributes"], "fare_id")
+                | column_values(rules_table, "fare_id")
+            ),
+            "zone": zones,
+            "stop": column_values(tables["stops"], "stop_id"),
+            "route": routes,
+        }
+
+    built = []
+    for path in paths:
+        tables = load(path)
+        spaces = namespaces(tables)
+        built.append((build(tables), spaces))
+    if len(built) == 1:
+        return built[0][0]
+    return _combined_zone_structure(built)
+
+
+def _combined_zone_structure(built):
+    """Zone structures of several feeds as one product catalogue.
+
+    Each feed is read on its own — grants, stop zones, and agency
+    scope never mix across feeds — and the combination refuses
+    identifier collisions over the feeds' **whole** namespaces (every
+    stop and route the feed carries, every zone it names) rather than
+    guessing: GTFS identifiers are feed-local, so a fare, zone, stop,
+    route, or currency shared across feeds has no sound joint meaning
+    here, and an unreferenced entity in one feed must not satisfy
+    another feed's grant.
+    """
+
+    def refuse(kind, clash):
+        listed = ", ".join(sorted(map(repr, clash))[:5])
+        raise ValueError(
+            f"the combined feeds share {kind} identifier(s) ({listed}); "
+            "identifiers are feed-local, so combining requires disjoint "
+            "id spaces — rename them or price the feeds separately"
+        )
+
+    structures = [structure for structure, _ in built]
+    seen = {"fare": set(), "zone": set(), "stop": set(), "route": set()}
+    currencies = set()
+    for structure, spaces in built:
+        for kind, here in spaces.items():
+            clash = seen[kind] & here
+            if clash:
+                refuse(kind, clash)
+            seen[kind] |= here
+        if "currency_type" in structure.fares.columns:
+            currencies |= {
+                str(value)
+                for value in structure.fares["currency_type"]
+                if str(value).strip()
+            }
+    if len(currencies) > 1:
+        raise ValueError(
+            "the combined feeds price in several currencies "
+            f"({', '.join(sorted(currencies))}); combine feeds of one "
+            "currency or price them separately"
+        )
+
+    def union(field):
+        merged = {}
+        for structure in structures:
+            merged.update(getattr(structure, field))
+        return merged
+
     return ZoneFareStructure(
-        attributes,
-        fare_zones,
-        stop_zones,
-        fare_routes=fare_routes,
-        fare_od=fare_od,
-        agency_routes=agency_routes,
+        pd.concat([structure.fares for structure in structures], ignore_index=True),
+        union("fare_zones"),
+        union("stop_zones"),
+        fare_routes=union("fare_routes"),
+        fare_od=union("fare_od"),
+        agency_routes=union("agency_routes"),
     )
 
 

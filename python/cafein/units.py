@@ -7,11 +7,12 @@ MINUTES_SUFFIX = "_min"
 def to_minutes(frame, columns=None):
     """A copy of `frame` with its seconds columns converted to minutes.
 
-    cafein reports every time in whole seconds, the resolution GTFS itself
-    carries and the one the routing arithmetic is exact in. Minutes are often
-    friendlier to read and to plot, so this converts them in the one direction
-    that loses nothing: each ``*_s`` column becomes a floating-point ``*_min``
-    column in its place, leaving the original frame untouched.
+    cafein reports durations in minutes by default (the ``travel_time``
+    column), but clock-time columns such as ``departure_s`` and
+    ``arrival_s`` stay in whole seconds since midnight, the resolution
+    GTFS itself carries. This converts those in the one direction that
+    loses nothing: each ``*_s`` column becomes a floating-point
+    ``*_min`` column in its place, leaving the original frame untouched.
 
     Works on any frame cafein produces — the matrices, the itineraries, the
     frontiers — and on anything derived from one, since it takes the frame as

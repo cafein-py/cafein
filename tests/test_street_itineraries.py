@@ -19,7 +19,7 @@ COLUMNS = [
     "mode",
     "departure_s",
     "arrival_s",
-    "travel_time_s",
+    "travel_time",
     "distance_m",
     "network_distance_m",
     "connector_distance_m",
@@ -74,7 +74,7 @@ def test_agrees_with_the_cost_matrix(streets, places):
     routes = DetailedItineraries(streets, places, transport_mode="bicycle")
     costs = TravelCostMatrix(streets, places, transport_mode="bicycle")
     columns = [
-        "travel_time_s",
+        "travel_time",
         "distance_m",
         "network_distance_m",
         "connector_distance_m",
@@ -96,16 +96,20 @@ def test_absolute_times_are_absent_without_a_departure(streets, places):
     routes = DetailedItineraries(streets, places, transport_mode="bicycle")
     assert routes.departure_s.isna().all()
     assert routes.arrival_s.isna().all()
-    assert (routes.travel_time_s >= 0).all()
+    assert (routes.travel_time >= 0).all()
 
 
 def test_a_departure_places_the_leg_on_a_clock(streets, places):
     routes = DetailedItineraries(
-        streets, places, departure="08:30:00", transport_mode="bicycle"
+        streets,
+        places,
+        departure="08:30:00",
+        transport_mode="bicycle",
+        output_time_units="seconds",
     )
     start = 8 * 3600 + 30 * 60
     assert (routes.departure_s == start).all()
-    assert (routes.arrival_s == start + routes.travel_time_s).all()
+    assert (routes.arrival_s == start + routes.travel_time).all()
 
 
 def test_geometry_runs_from_origin_to_destination(streets, places):
@@ -127,7 +131,7 @@ def test_the_diagonal_is_a_readable_zero_length_leg(streets, places):
     routes = DetailedItineraries(streets, places, transport_mode="walk")
     diagonal = routes[routes.from_id == routes.to_id]
     assert len(diagonal) == len(places)
-    assert (diagonal.travel_time_s == 0).all()
+    assert (diagonal.travel_time == 0).all()
     # Subscripted, not attribute access: `.distance_m` is geopandas' own method.
     assert (diagonal["distance_m"] == 0).all()
     coordinates = dict(zip(places["id"], zip(places.geometry.y, places.geometry.x)))
@@ -147,7 +151,7 @@ def test_geometries_false_drops_the_shapes(streets, places):
         streets, places, transport_mode="walk", geometries=False
     )
     assert routes.geometry.isna().all()
-    assert (routes.travel_time_s >= 0).all()
+    assert (routes.travel_time >= 0).all()
 
 
 def test_requires_an_explicit_mode(streets, places):
@@ -158,18 +162,17 @@ def test_requires_an_explicit_mode(streets, places):
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"date": "2022-02-22"},
-        {"max_transfers": 3},
+        {"max_rides": 3},
         {"router": "raptor"},
         {"candidates": "pareto"},
         {"bucket": 50.0},
-        {"slack_seconds": 300},
+        {"tolerance_minutes": 5},
         {"max_options": 3},
         {"diversity": "spread"},
         {"penalty": 60},
         {"exclude_routes": ["1001"]},
         {"walking_speed_kmph": 5.0},
-        {"max_walking_time": 600.0},
+        {"max_walking_time": 10.0},
     ],
 )
 def test_rejects_transit_only_arguments(streets, places, kwargs):
@@ -201,11 +204,15 @@ def test_the_column_dtypes_are_the_same_with_or_without_a_departure(
     # The clock columns are nullable integer seconds either way: supplying a
     # departure fills them, it does not reshape the shipped schema.
     routes = DetailedItineraries(
-        streets, places, departure=departure, transport_mode="bicycle"
+        streets,
+        places,
+        departure=departure,
+        transport_mode="bicycle",
+        output_time_units="seconds",
     )
     assert routes.departure_s.dtype == "Int64"
     assert routes.arrival_s.dtype == "Int64"
-    assert routes.travel_time_s.dtype == np.uint32
+    assert routes.travel_time.dtype == np.uint32
     assert routes.option.dtype == np.int64
     assert routes.segment.dtype == np.int64
     for column in ("distance_m", "network_distance_m", "connector_distance_m"):
@@ -224,8 +231,7 @@ def test_transit_itineraries_reject_the_street_keywords(network):
             network,
             ["1010101"],
             ["1010102"],
-            "2022-02-22",
-            "08:30:00",
+            "2022-02-22 08:30:00",
             transport_mode="bicycle",
         )
     with pytest.raises(ValueError, match="applies to a StreetNetwork"):
@@ -233,7 +239,6 @@ def test_transit_itineraries_reject_the_street_keywords(network):
             network,
             ["1010101"],
             ["1010102"],
-            "2022-02-22",
-            "08:30:00",
-            max_street_time=600,
+            "2022-02-22 08:30:00",
+            max_street_time=10,
         )

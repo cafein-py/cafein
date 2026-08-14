@@ -50,7 +50,9 @@ def test_repeated_queries_reuse_the_cached_profile(helsinki_network):
 
 def test_unreachable_within_the_cutoff_is_none(helsinki_network):
     assert (
-        helsinki_network.travel_time(KAMPPI, HAKANIEMI, mode="walk", max_time=1.0)
+        helsinki_network.travel_time(
+            KAMPPI, HAKANIEMI, mode="walk", max_travel_time=1 / 60
+        )
         is None
     )
 
@@ -62,7 +64,10 @@ def test_a_coordinate_routes_to_itself_in_zero_seconds(helsinki_network):
     for mode in ("walk", "bicycle", "e_scooter"):
         assert helsinki_network.travel_time(KAMPPI, KAMPPI, mode=mode) == 0
     # Zero time fits inside any non-negative cutoff.
-    assert helsinki_network.travel_time(KAMPPI, KAMPPI, mode="walk", max_time=0.0) == 0
+    assert (
+        helsinki_network.travel_time(KAMPPI, KAMPPI, mode="walk", max_travel_time=0.0)
+        == 0
+    )
     # An off-network coordinate is still an error, not a silent zero.
     with pytest.raises(ValueError, match="origin"):
         helsinki_network.travel_time(NOWHERE, NOWHERE, mode="walk")

@@ -64,8 +64,10 @@ class DetailedItineraries(gpd.GeoDataFrame):
     ``egress``, ``walk`` for a walking-only door-to-door journey, or
     ``park`` for a carried vehicle left at a stop — a zero-length
     event under a carriage street policy),
-    ``departure`` and ``arrival`` and ``travel_time`` in
-    seconds, ``from_stop`` and ``to_stop`` (the boarding and alighting
+    ``departure_s`` and ``arrival_s`` (clock seconds past the service
+    day's start) and ``travel_time`` (whole minutes rounded to the
+    nearest by default; exact seconds with
+    ``output_time_units="seconds"``), ``from_stop`` and ``to_stop`` (the boarding and alighting
     stops; ``None`` at the walked ends of a door-to-door journey),
     ``trip_id``/``route_id``/``route_short_name`` on transit legs,
     ``distance_m`` (meters) and its ``distance_provenance``, ``emissions``
@@ -101,9 +103,10 @@ class DetailedItineraries(gpd.GeoDataFrame):
     distance columns carry their unit in the name — ``distance_m`` with
     its ``network_distance_m`` and ``connector_distance_m`` parts — plus
     ``distance_provenance``. A street
-    network has no timetable, so ``departure`` and ``arrival`` are null
-    unless ``departure`` is given purely to place the leg on a clock, and
-    ``date`` and the timetable-only arguments are rejected, while
+    network has no timetable, so the departure and arrival columns are
+    null unless ``departure`` is given purely to place the leg on a
+    clock (a bare ``"HH:MM"`` or ``datetime.time`` works there), and
+    the timetable-only arguments are rejected, while
     ``factors=`` and ``components=`` configure the mode's emission factor
     (``emissions`` is NA where it is unresolved, never a silent zero).
 
@@ -120,12 +123,12 @@ class DetailedItineraries(gpd.GeoDataFrame):
     destinations : list of str, or GeoDataFrame
         Destination stop_ids, or points with an ``id`` column; the same
         kind as `origins`.
-    date : str
-        Service date as ``YYYY-MM-DD``.
-    departure : str
-        Departure time at every origin as ``HH:MM:SS``.
-    max_transfers : int (optional, default: 7)
-        Maximum number of transfers between rides.
+    departure : datetime.datetime or str
+        Departure at every origin — a datetime, or an ISO string like
+        ``"2022-02-22 08:30"``; the service date is its date part.
+    max_rides : int (optional, default: 8)
+        Maximum number of boarded vehicles per journey (rides, not
+        transfers: 8 rides allow 7 transfers).
     factors : DataFrame or path (optional)
         Extra emission-factor rows layered over the shipped defaults;
         see ``cafein.emissions.load_factors`` — or, for a
@@ -140,8 +143,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
         ``"pareto"`` draws the (arrival, emissions) journeys of the
         McRAPTOR engine — the cleaner-but-slower alternatives the
         time-optimal set misses — at the single given departure;
-        ``"relaxed"`` widens the ``"pareto"`` set by a ``slack_seconds``
-        slack in the per-stop dominance; ``"diverse"`` returns
+        ``"relaxed"`` widens the ``"pareto"`` set by a
+        ``tolerance_minutes`` band in the per-stop dominance;
+        ``"diverse"`` returns
         ``max_options`` distinct alternatives by iterative route
         penalization — by default (``penalty="ban"``) banning each chosen
         corridor's routes so the options ride disjoint line sets, or with a
@@ -159,24 +163,24 @@ class DetailedItineraries(gpd.GeoDataFrame):
         query's date and factors, else on McRAPTOR. ``"tbtr"`` requires
         ``candidates="pareto"``; ``"relaxed"`` and ``"diverse"`` require
         ``"raptor"`` (``"auto"`` resolves to it).
-    slack_seconds : float (optional, default: None)
-        The time-slack band in seconds. For ``candidates="relaxed"`` a
-        journey is kept even when a cleaner or simpler one dominates it,
-        as long as that dominator is not more than ``slack_seconds``
+    tolerance_minutes : float or datetime.timedelta (optional, default: None)
+        The time-tolerance band in minutes. For ``candidates="relaxed"``
+        a journey is kept even when a cleaner or simpler one dominates
+        it, as long as that dominator is not more than this much
         earlier (``0`` reproduces ``candidates="pareto"``) — the same
-        suboptimal-arrival slack as r5py's ``suboptimalMinutes``, here at
-        the single given departure (``journey_frontier`` applies it across
-        a departure ``window``, the r5py-equivalent profile). For
-        ``candidates="diverse"`` a positive value widens each penalization
-        round's pool to that relaxed frontier (relaxed × diverse). ``None``
-        takes the per-family default — 300 s for ``"relaxed"`` (r5py's
-        5-minute ``suboptimalMinutes``), ``0`` for ``"diverse"``. Unused
-        for ``"time"`` and ``"pareto"``.
+        suboptimal-arrival tolerance as r5py's ``suboptimalMinutes``,
+        here at the single given departure (``journey_frontier`` applies
+        it across a ``departure_time_window``, the r5py-equivalent
+        profile). For ``candidates="diverse"`` a positive value widens
+        each penalization round's pool to that relaxed frontier
+        (relaxed × diverse). ``None`` takes the per-family default — 5
+        minutes for ``"relaxed"`` (r5py's ``suboptimalMinutes``), ``0``
+        for ``"diverse"``. Unused for ``"time"`` and ``"pareto"``.
     max_options : int (optional, default: None)
         For ``candidates="relaxed"``, a cap on the suboptimal alternatives
         kept per OD pair — the frontier is always returned and the nearest
         suboptimal journeys fill the rest, ``None`` keeping every journey
-        within the slack. For ``candidates="diverse"``, the number of
+        within the tolerance. For ``candidates="diverse"``, the number of
         distinct-corridor alternatives per OD pair (``None`` defaults to
         3); fewer are returned when the disjoint corridors run out.
     diversity : str (optional, default: "time")
@@ -204,20 +208,22 @@ class DetailedItineraries(gpd.GeoDataFrame):
     geometries : bool (optional, default: True)
         Attach each leg's geometry. Turn off to skip the geometry work
         when only the leg records are needed.
-    walking_speed_kmph, max_walking_time, max_snap_distance : float
+    walking_speed_kmph, max_walking_time, snap_distance : float
         The street-search options for point origins/destinations, as in
-        ``TransportNetwork.route_between_coordinates``; only valid with
-        points. Only ``max_snap_distance`` applies to a ``StreetNetwork``,
-        whose speeds come from the mode's profile.
+        ``TransportNetwork.route_between_coordinates``: speed in km/h,
+        walking time in minutes (or a timedelta), snap distance in
+        meters; only valid with points. Only ``snap_distance`` applies
+        to a ``StreetNetwork``, whose speeds come from the mode's
+        profile.
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
         one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
         ``"car"`` (a car build). A ``TransportNetwork`` routes public
         transport and takes none.
-    max_street_time : float (optional)
-        Cutoff in seconds for a ``StreetNetwork``, beyond which a
-        destination counts as unreachable (default:
-        ``cafein.street_network.MAX_STREET_TIME``, 7200).
+    max_street_time : float or datetime.timedelta (optional)
+        Cutoff in minutes for a ``StreetNetwork``, beyond which a
+        destination counts as unreachable (default: 120 minutes,
+        ``cafein.street_network.MAX_STREET_TIME`` seconds).
     intersection_delays, profile, delay_model : optional
         Car legs only. Free-flow by default;
         ``intersection_delays=True`` applies the intersection-delay
@@ -295,16 +301,15 @@ class DetailedItineraries(gpd.GeoDataFrame):
         network=None,
         origins=None,
         destinations=None,
-        date=None,
         departure=None,
         *,
-        max_transfers=7,
+        max_rides=8,
         factors=None,
         components=None,
         candidates="time",
         bucket=25.0,
         router="auto",
-        slack_seconds=None,
+        tolerance_minutes=None,
         max_options=None,
         diversity="time",
         penalty="ban",
@@ -314,7 +319,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         geometries=True,
         walking_speed_kmph=None,
         max_walking_time=None,
-        max_snap_distance=None,
+        snap_distance=None,
         transport_mode=None,
         max_street_time=None,
         street_policy=None,
@@ -328,7 +333,25 @@ class DetailedItineraries(gpd.GeoDataFrame):
         costs=None,
         currency=None,
         cost_components=None,
+        output_time_units="minutes",
     ):
+        from cafein._units import (
+            departure_parts,
+            duration_seconds,
+            validated_output_time_units,
+        )
+
+        output_time_units = validated_output_time_units(output_time_units)
+        date, departure = (
+            (None, None) if departure is None else departure_parts(departure)
+        )
+        if max_rides < 1:
+            raise ValueError("max_rides must be at least 1")
+        max_transfers = max_rides - 1
+        slack_seconds = duration_seconds("tolerance_minutes", tolerance_minutes)
+        max_walking_time = duration_seconds("max_walking_time", max_walking_time)
+        max_street_time = duration_seconds("max_street_time", max_street_time)
+        max_snap_distance = snap_distance
         # Before the reconstruction guard below: a StreetNetwork has no
         # `route_between_stops` either, so it would be mistaken for frame data.
         if _is_street_network(network):
@@ -338,48 +361,56 @@ class DetailedItineraries(gpd.GeoDataFrame):
                     "egress; a StreetNetwork routes one mode directly — pass "
                     "transport_mode instead"
                 )
+            street_frame = _street_itineraries_frame(
+                network,
+                origins,
+                destinations,
+                departure=departure,
+                transport_mode=transport_mode,
+                max_street_time=max_street_time,
+                max_snap_distance=max_snap_distance,
+                geometries=geometries,
+                factors=factors,
+                components=components,
+                intersection_delays=intersection_delays,
+                profile=profile,
+                delay_model=delay_model,
+                parking=parking,
+                occupancy=occupancy,
+                vehicle_class=vehicle_class,
+                perspectives=perspectives,
+                costs=costs,
+                currency=currency,
+                cost_components=cost_components,
+                transit_only={
+                    "tolerance_minutes": slack_seconds,
+                    "max_options": max_options,
+                    "walking_speed_kmph": walking_speed_kmph,
+                    "max_walking_time": max_walking_time,
+                    "max_rides": None if max_rides == 8 else max_rides,
+                    "candidates": None if candidates == "time" else candidates,
+                    "bucket": None if bucket == 25.0 else bucket,
+                    "router": None if router == "auto" else router,
+                    "diversity": None if diversity == "time" else diversity,
+                    "penalty": None if penalty == "ban" else penalty,
+                    "exclude_routes": id_sequence("exclude_routes", exclude_routes)
+                    or None,
+                    "exclude_trips": id_sequence("exclude_trips", exclude_trips)
+                    or None,
+                    "exclude_stops": id_sequence("exclude_stops", exclude_stops)
+                    or None,
+                },
+            )
+            if "travel_time_s" in street_frame.columns:
+                from cafein._units import travel_time_output
+
+                position = list(street_frame.columns).index("travel_time_s")
+                converted = travel_time_output(
+                    street_frame.pop("travel_time_s"), output_time_units
+                )
+                street_frame.insert(position, "travel_time", converted)
             super().__init__(
-                _street_itineraries_frame(
-                    network,
-                    origins,
-                    destinations,
-                    departure=departure,
-                    transport_mode=transport_mode,
-                    max_street_time=max_street_time,
-                    max_snap_distance=max_snap_distance,
-                    geometries=geometries,
-                    factors=factors,
-                    components=components,
-                    intersection_delays=intersection_delays,
-                    profile=profile,
-                    delay_model=delay_model,
-                    parking=parking,
-                    occupancy=occupancy,
-                    vehicle_class=vehicle_class,
-                    perspectives=perspectives,
-                    costs=costs,
-                    currency=currency,
-                    cost_components=cost_components,
-                    transit_only={
-                        "date": date,
-                        "slack_seconds": slack_seconds,
-                        "max_options": max_options,
-                        "walking_speed_kmph": walking_speed_kmph,
-                        "max_walking_time": max_walking_time,
-                        "max_transfers": None if max_transfers == 7 else max_transfers,
-                        "candidates": None if candidates == "time" else candidates,
-                        "bucket": None if bucket == 25.0 else bucket,
-                        "router": None if router == "auto" else router,
-                        "diversity": None if diversity == "time" else diversity,
-                        "penalty": None if penalty == "ban" else penalty,
-                        "exclude_routes": id_sequence("exclude_routes", exclude_routes)
-                        or None,
-                        "exclude_trips": id_sequence("exclude_trips", exclude_trips)
-                        or None,
-                        "exclude_stops": id_sequence("exclude_stops", exclude_stops)
-                        or None,
-                    },
-                ),
+                street_frame,
                 geometry="geometry",
                 crs="EPSG:4326",
             )
@@ -445,6 +476,14 @@ class DetailedItineraries(gpd.GeoDataFrame):
             max_snap_distance=max_snap_distance,
             street_policy=street_policy,
         )
+        if "travel_time_s" in frame.columns:
+            from cafein._units import travel_time_output
+
+            position = list(frame.columns).index("travel_time_s")
+            converted = travel_time_output(
+                frame.pop("travel_time_s"), output_time_units
+            )
+            frame.insert(position, "travel_time", converted)
         super().__init__(frame, geometry="geometry", crs="EPSG:4326")
 
 
@@ -677,7 +716,7 @@ def _route(
         )
     if kind == "points":
         walking_speed_kmph, max_walking_time, max_snap_distance = walk
-        return network.route_between_coordinates(
+        return network._route_between_coordinates(
             origin_key,
             dest_key,
             date,
@@ -692,7 +731,7 @@ def _route(
             geometries=geometries,
             street_policy=street_policy,
         )
-    return network.route_between_stops(
+    return network._route_between_stops(
         origin_key,
         dest_key,
         date,
