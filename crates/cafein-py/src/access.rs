@@ -4,7 +4,7 @@
 
 use super::*;
 
-use cafein_core::access::{opportunity_sums, Decay};
+use cafein_core::access::{nearest, opportunity_sums, Decay};
 use numpy::PyReadonlyArray2;
 use rayon::prelude::*;
 
@@ -193,6 +193,122 @@ pub(super) fn aggregate_opportunity_sums_f64<'py>(
         decay,
         decay_param,
     )
+}
+
+/// Padded `[origin, rank]` twins: destination column indices (`-1` =
+/// absent rank) and costs (`NaN` = absent).
+type NearestArrays<'py> = (Bound<'py, PyArray2<i64>>, Bound<'py, PyArray2<f64>>);
+
+fn nearest_rows<'py>(
+    py: Python<'py>,
+    rows: Vec<Vec<Option<f64>>>,
+    count: usize,
+    columns: usize,
+    k: usize,
+    max_cost: Option<f64>,
+) -> PyResult<NearestArrays<'py>> {
+    if k == 0 {
+        return Err(PyValueError::new_err("k must be at least 1"));
+    }
+    // Ranks past the column count are always absent, so clamping keeps
+    // the output complete while bounding the allocation by the matrix
+    // the caller already holds — count * k cannot overflow. A
+    // zero-column matrix yields correctly shaped empty twins.
+    let k = k.min(columns);
+    if k == 0 {
+        let indices = Vec::<i64>::new()
+            .into_pyarray(py)
+            .reshape([count, 0])
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let costs = Vec::<f64>::new()
+            .into_pyarray(py)
+            .reshape([count, 0])
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        return Ok((indices, costs));
+    }
+    // None: the engine's natural horizon — every reached destination
+    // competes.
+    let max_cost = match max_cost {
+        None => f64::INFINITY,
+        Some(value) if value.is_finite() && value > 0.0 => value,
+        Some(value) => {
+            return Err(PyValueError::new_err(format!(
+                "max_cost must be a positive finite number, not {value:?}"
+            )))
+        }
+    };
+    let ranked: Vec<Vec<(usize, f64)>> = py.allow_threads(|| {
+        rows.par_iter()
+            .map(|costs| nearest(costs, k, max_cost))
+            .collect()
+    });
+    // Padded [count, k] twins: index -1 / cost NaN mark an absent rank.
+    let mut indices = vec![-1_i64; count * k];
+    let mut costs = vec![f64::NAN; count * k];
+    for (origin, pairs) in ranked.iter().enumerate() {
+        for (rank, (destination, cost)) in pairs.iter().enumerate() {
+            indices[origin * k + rank] = *destination as i64;
+            costs[origin * k + rank] = *cost;
+        }
+    }
+    let indices = indices
+        .into_pyarray(py)
+        .reshape([count, k])
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let costs = costs
+        .into_pyarray(py)
+        .reshape([count, k])
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    Ok((indices, costs))
+}
+
+/// The `k` nearest destinations per origin over an already-computed
+/// time matrix (`u32` cost cells, `u32::MAX` = unreached), within the
+/// `max_cost` horizon: padded `[origin, rank]` twins of destination
+/// column indices (`-1` = absent rank) and costs (`NaN` = absent).
+/// Ties break deterministically by (cost, column index).
+#[pyfunction]
+#[pyo3(signature = (matrix, k, max_cost=None))]
+pub(super) fn aggregate_nearest<'py>(
+    py: Python<'py>,
+    matrix: PyReadonlyArray2<'py, u32>,
+    k: usize,
+    max_cost: Option<f64>,
+) -> PyResult<NearestArrays<'py>> {
+    let matrix = matrix.as_array().to_owned();
+    let (count, columns) = matrix.dim();
+    let rows: Vec<Vec<Option<f64>>> = matrix
+        .outer_iter()
+        .map(|row| {
+            row.iter()
+                .map(|&cell| (cell != u32::MAX).then_some(f64::from(cell)))
+                .collect()
+        })
+        .collect();
+    nearest_rows(py, rows, count, columns, k, max_cost)
+}
+
+/// The float twin for cost axes whose cells are `f64` (grams CO2e,
+/// currency units, metres): a non-finite cell is unreached.
+#[pyfunction]
+#[pyo3(signature = (matrix, k, max_cost=None))]
+pub(super) fn aggregate_nearest_f64<'py>(
+    py: Python<'py>,
+    matrix: PyReadonlyArray2<'py, f64>,
+    k: usize,
+    max_cost: Option<f64>,
+) -> PyResult<NearestArrays<'py>> {
+    let matrix = matrix.as_array().to_owned();
+    let (count, columns) = matrix.dim();
+    let rows: Vec<Vec<Option<f64>>> = matrix
+        .outer_iter()
+        .map(|row| {
+            row.iter()
+                .map(|&cell| cell.is_finite().then_some(cell))
+                .collect()
+        })
+        .collect();
+    nearest_rows(py, rows, count, columns, k, max_cost)
 }
 
 #[pymethods]

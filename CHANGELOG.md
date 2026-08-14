@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **`NearestDestinations`**: the closest-`k` destinations per origin
+  on any cost axis — one row per (origin, rank) with the destination
+  and its cost (time in whole minutes by default,
+  `output_time_units="seconds"` for exact values; ranking always uses
+  the exact engine values, ties deterministic). `max_cost` bounds the
+  search horizon in the axis's unit; unreachable ranks are absent.
+  `dominance_areas(origins)` dissolves polygon origins by their
+  rank-1 destination into the network-Voronoi map. Engines, axes,
+  modes, and validation follow `Accessibility`, whose cost-surface
+  dispatch the two computers now share.
+
 - **`optimize="fare"` documents the zone-exact contract** (#246): the
   cost-matrix docstring now states the two-tier guarantee — rule-based
   structures price the retained time-and-ride candidates (global fare

@@ -621,3 +621,335 @@ def test_empty_origins_and_duplicate_destinations_are_served(network):
     assert numpy.allclose(
         twice["accessibility"].to_numpy(), 2 * single["accessibility"].to_numpy()
     )
+
+
+def _nearest_oracle(matrix, to_ids, k, horizon=None):
+    ranked = {}
+    for row, costs in enumerate(matrix):
+        pairs = [
+            (float(cost), position)
+            for position, cost in enumerate(costs)
+            if cost != UNREACHED and (horizon is None or cost <= horizon)
+        ]
+        pairs.sort()
+        ranked[row] = [(to_ids[position], cost) for cost, position in pairs[:k]]
+    return ranked
+
+
+def test_nearest_destinations_match_the_matrix_sort(network):
+    from cafein import NearestDestinations
+
+    origins, destinations = _stop_sets(network)
+    wide = network.travel_time_matrix(origins, DEPARTURE)
+    column = {stop: at for at, (stop, _, _) in enumerate(network.stops)}
+    selected = wide[:, [column[stop] for stop in destinations]]
+    frame = NearestDestinations(
+        network,
+        origins,
+        destinations,
+        DEPARTURE,
+        k=3,
+        output_time_units="seconds",
+    )
+    oracle = _nearest_oracle(selected, destinations, 3)
+    for row, origin in enumerate(origins):
+        cell = frame[frame["from_id"] == origin]
+        assert list(cell["rank"]) == list(range(1, len(oracle[row]) + 1))
+        assert list(cell["destination_id"]) == [stop for stop, _ in oracle[row]]
+        assert list(cell["cost"]) == [cost for _, cost in oracle[row]]
+    # The horizon prunes in the same axis unit (minutes in): ranks
+    # beyond it are absent, exactly like unreachable destinations.
+    capped = NearestDestinations(
+        network,
+        origins,
+        destinations,
+        DEPARTURE,
+        k=3,
+        max_cost=20,
+        output_time_units="seconds",
+    )
+    capped_oracle = _nearest_oracle(selected, destinations, 3, horizon=1200)
+    for row, origin in enumerate(origins):
+        cell = capped[capped["from_id"] == origin]
+        assert list(cell["destination_id"]) == [stop for stop, _ in capped_oracle[row]]
+    # The default output reports the same ranks in whole minutes.
+    rounded = NearestDestinations(network, origins, destinations, DEPARTURE, k=3)
+    assert list(rounded["destination_id"]) == list(frame["destination_id"])
+    assert (rounded["cost"] == numpy.rint(frame["cost"] / 60)).all()
+
+
+def test_nearest_ranks_break_ties_deterministically():
+    from cafein import _cafein
+
+    matrix = numpy.array(
+        [[300, 100, UNREACHED, 100], [50, UNREACHED, UNREACHED, UNREACHED]],
+        dtype="uint32",
+    )
+    indices, costs = _cafein.aggregate_nearest(matrix, 3, None)
+    assert indices.tolist() == [[1, 3, 0], [0, -1, -1]]
+    assert costs[0].tolist() == [100.0, 100.0, 300.0]
+    assert numpy.isnan(costs[1][1]) and numpy.isnan(costs[1][2])
+
+
+def test_nearest_windowed_percentile_ranks_match_the_percentile_matrix(network):
+    from cafein import NearestDestinations
+
+    origins, destinations = _stop_sets(network)
+    wide = network.travel_time_matrix(
+        origins, DEPARTURE, departure_time_window=10, percentiles=[75]
+    )
+    column = {stop: at for at, (stop, _, _) in enumerate(network.stops)}
+    selected = wide[:, [column[stop] for stop in destinations], 0]
+    frame = NearestDestinations(
+        network,
+        origins,
+        destinations,
+        DEPARTURE,
+        k=2,
+        departure_time_window=10,
+        percentile=75,
+        output_time_units="seconds",
+    )
+    oracle = _nearest_oracle(selected, destinations, 2)
+    for row, origin in enumerate(origins):
+        cell = frame[frame["from_id"] == origin]
+        assert list(cell["destination_id"]) == [stop for stop, _ in oracle[row]]
+
+
+def test_dominance_areas_dissolve_polygon_origins(network):
+    geopandas = pytest.importorskip("geopandas")
+    from shapely.geometry import box
+
+    from cafein import NearestDestinations
+
+    coordinates = {
+        stop: (lat, lon) for stop, lat, lon in network.stops if lat is not None
+    }
+    origins, destinations = _stop_sets(network)
+    frames = geopandas.GeoDataFrame(
+        {"id": origins},
+        geometry=[
+            box(
+                coordinates[stop][1] - 0.001,
+                coordinates[stop][0] - 0.001,
+                coordinates[stop][1] + 0.001,
+                coordinates[stop][0] + 0.001,
+            )
+            for stop in origins
+        ],
+        crs="EPSG:4326",
+    )
+    frame = NearestDestinations(network, origins, destinations[:2], DEPARTURE, k=1)
+    areas = frame.dominance_areas(frames)
+    assert set(areas.columns) == {"destination_id", "geometry", "origins"}
+    assert areas["origins"].sum() == frame[frame["rank"] == 1]["from_id"].nunique()
+    assert areas.crs == frames.crs
+    points = geopandas.GeoDataFrame(
+        {"id": origins},
+        geometry=geopandas.points_from_xy(
+            [coordinates[stop][1] for stop in origins],
+            [coordinates[stop][0] for stop in origins],
+        ),
+        crs="EPSG:4326",
+    )
+    with pytest.raises(ValueError, match="polygon"):
+        frame.dominance_areas(points)
+
+
+def test_nearest_destinations_validate_eagerly(network):
+    from cafein import NearestDestinations
+
+    origins, destinations = _stop_sets(network)
+    with pytest.raises(ValueError, match="k must be"):
+        NearestDestinations(network, origins, destinations, DEPARTURE, k=0)
+    with pytest.raises(ValueError, match="percentile"):
+        NearestDestinations(network, origins, destinations, DEPARTURE, percentile=75)
+    with pytest.raises(ValueError, match="max_cost"):
+        NearestDestinations(
+            network,
+            origins,
+            destinations,
+            DEPARTURE,
+            cost="emissions",
+            departure_time_window=10,
+            max_cost=float("inf"),
+        )
+    with pytest.raises(ValueError, match="departure_time_window"):
+        NearestDestinations(network, origins, destinations, DEPARTURE, cost="emissions")
+    with pytest.raises(TypeError, match="requires departure"):
+        NearestDestinations(network, origins, destinations)
+
+
+def test_nearest_oversize_k_clamps_to_the_columns():
+    from cafein import _cafein
+
+    matrix = numpy.array([[120, 60]], dtype="uint32")
+    indices, costs = _cafein.aggregate_nearest(matrix, 10**9, None)
+    assert indices.shape[1] == 2
+    assert indices.tolist() == [[1, 0]]
+    assert costs.tolist() == [[60.0, 120.0]]
+
+
+def test_nearest_money_points_keep_their_own_ids(network_with_footpaths, helsinki_gtfs):
+    geopandas = pytest.importorskip("geopandas")
+
+    from cafein import NearestDestinations
+    from cafein import fares as fare_module
+
+    hsl = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
+
+    coordinates = {
+        stop: (lat, lon)
+        for stop, lat, lon in network_with_footpaths.stops
+        if lat is not None
+    }
+    frame_o = geopandas.GeoDataFrame(
+        {"id": [1]},
+        geometry=geopandas.points_from_xy(
+            [coordinates["1100602"][1]], [coordinates["1100602"][0]]
+        ),
+        crs="EPSG:4326",
+    )
+    frame_d = geopandas.GeoDataFrame(
+        {"id": [7, 9]},
+        geometry=geopandas.points_from_xy(
+            [coordinates["1040280"][1], coordinates["1250551"][1]],
+            [coordinates["1040280"][0], coordinates["1250551"][0]],
+        ),
+        crs="EPSG:4326",
+    )
+    frame = NearestDestinations(
+        network_with_footpaths,
+        frame_o,
+        frame_d,
+        DEPARTURE,
+        k=2,
+        cost="money",
+        departure_time_window=10,
+        fares=hsl,
+    )
+    # Ids follow the house point contract: strings, exactly as the
+    # matrix computers report from_id/to_id.
+    assert set(frame["destination_id"]) <= {str(v) for v in frame_d["id"]}
+    assert set(frame["from_id"]) <= {str(v) for v in frame_o["id"]}
+    assert len(frame) > 0
+
+
+def test_dominance_areas_reject_duplicate_origin_ids(network):
+    geopandas = pytest.importorskip("geopandas")
+    from shapely.geometry import box
+
+    from cafein import NearestDestinations
+
+    origins, destinations = _stop_sets(network)
+    frame = NearestDestinations(network, origins, destinations[:2], DEPARTURE, k=1)
+    doubled = geopandas.GeoDataFrame(
+        {"id": [origins[0], origins[0]]},
+        geometry=[box(24.9, 60.1, 24.91, 60.11), box(24.92, 60.1, 24.93, 60.11)],
+        crs="EPSG:4326",
+    )
+    with pytest.raises(ValueError, match="unique origin ids"):
+        frame.dominance_areas(doubled)
+    # The frame side guards too: ranks computed from repeated origins
+    # would replicate polygons through the join.
+    repeated = NearestDestinations(
+        network, [origins[0], origins[0]], destinations[:2], DEPARTURE, k=1
+    )
+    single = geopandas.GeoDataFrame(
+        {"id": [origins[0]]},
+        geometry=[box(24.9, 60.1, 24.91, 60.11)],
+        crs="EPSG:4326",
+    )
+    with pytest.raises(ValueError, match="repeated origin id"):
+        repeated.dominance_areas(single)
+    # A renamed geometry column is legal input.
+    renamed = doubled.iloc[:1].rename_geometry("shape")
+    assert len(frame.dominance_areas(renamed)) <= 2
+
+
+def test_nearest_zero_destinations_yield_empty_shapes():
+    from cafein import _cafein
+
+    matrix = numpy.zeros((3, 0), dtype="uint32")
+    indices, costs = _cafein.aggregate_nearest(matrix, 2, None)
+    assert indices.shape == (3, 0)
+    assert costs.shape == (3, 0)
+
+
+def test_dominance_areas_join_numeric_origin_ids(network_with_footpaths):
+    geopandas = pytest.importorskip("geopandas")
+    from shapely.geometry import box
+
+    from cafein import NearestDestinations
+
+    network = network_with_footpaths
+    stop_origins, destinations = _stop_sets(network)
+    coordinates = {
+        stop: (lat, lon) for stop, lat, lon in network.stops if lat is not None
+    }
+    numbered = geopandas.GeoDataFrame(
+        {"id": list(range(len(stop_origins)))},
+        geometry=[
+            box(
+                coordinates[stop][1] - 0.001,
+                coordinates[stop][0] - 0.001,
+                coordinates[stop][1] + 0.001,
+                coordinates[stop][0] + 0.001,
+            )
+            for stop in stop_origins
+        ],
+        crs="EPSG:4326",
+    )
+    points = geopandas.GeoDataFrame(
+        {"id": list(range(len(stop_origins)))},
+        geometry=geopandas.points_from_xy(
+            [coordinates[stop][1] for stop in stop_origins],
+            [coordinates[stop][0] for stop in stop_origins],
+        ),
+        crs="EPSG:4326",
+    )
+    frame = NearestDestinations(
+        network, points, points_to_frame(network, destinations[:2]), DEPARTURE, k=1
+    )
+    areas = frame.dominance_areas(numbered)
+    assert len(areas) > 0
+    assert areas["origins"].sum() == frame[frame["rank"] == 1]["from_id"].nunique()
+
+
+def points_to_frame(network, stops):
+    import geopandas
+
+    coordinates = {
+        stop: (lat, lon) for stop, lat, lon in network.stops if lat is not None
+    }
+    return geopandas.GeoDataFrame(
+        {"id": stops},
+        geometry=geopandas.points_from_xy(
+            [coordinates[stop][1] for stop in stops],
+            [coordinates[stop][0] for stop in stops],
+        ),
+        crs="EPSG:4326",
+    )
+
+
+def test_merged_feed_aliases_share_their_column(helsinki_gtfs, fares_poa):
+    # On a merged feed a unique unqualified id and its qualified form
+    # resolve to the same stop; the cost surfaces must fill both
+    # columns instead of NaN-ing whichever alias lost the dedupe.
+    from cafein import NearestDestinations, TransportNetwork
+
+    poa = helsinki_gtfs.parent / "poa_eptc.zip"
+    if not poa.exists():
+        pytest.skip("poa_eptc.zip not fetched")
+    merged = TransportNetwork.from_gtfs([str(helsinki_gtfs), str(poa)])
+    frame = NearestDestinations(
+        merged,
+        ["0:4810551"],
+        ["1250551", "0:1250551"],
+        DEPARTURE,
+        k=2,
+        cost="emissions",
+        departure_time_window=10,
+    )
+    assert list(frame["destination_id"]) == ["1250551", "0:1250551"]
+    assert frame["cost"].iloc[0] == frame["cost"].iloc[1]
