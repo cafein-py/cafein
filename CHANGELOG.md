@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **`Accessibility.to_parquet`**: the accessibility table streamed to
+  Parquet in origin batches — `output=` selects the file or directory
+  form exactly as `travel_cost_table` does, `resume=True` continues a
+  matching partial directory run under the same fingerprint contract
+  (budgets, decay, opportunities, percentiles, and the routing knobs
+  all guard it), and the windowed percentile column streams too.
+  Metro-scale tests ride the sampledata POI layers: libraries within
+  15/30 PT minutes, the nearest swimming hall door to door, and a
+  15-minute catchment from region-spread origins.
+
 - **`Catchment`**: budget catchments on any cost axis as H3-cell
   polygons — a GeoDataFrame with one row per (origin, budget) over
   the street network's own vertices, the door-to-door contract

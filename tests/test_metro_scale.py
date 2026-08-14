@@ -242,3 +242,54 @@ def test_zone_fares_price_the_measured_pairs_exactly(
     by_origin = {cell["from_id"]: cell for _, cell in rounded.iterrows()}
     assert by_origin["9214203"]["travel_time"] == 59
     assert by_origin["4340212"]["travel_time"] == 74
+
+
+def test_accessibility_products_ride_the_sampledata_pois(
+    metro_network, helsinki_metro_data
+):
+    # The design's acceptance pair: libraries reachable within 30 PT
+    # minutes, and the nearest swimming hall, from region-spread
+    # origins over the sampledata POI layers.
+    import geopandas
+
+    from cafein import Accessibility, Catchment, NearestDestinations
+    from cafein.sampledata.helsinki import pois
+
+    date = _service_date(helsinki_metro_data.gtfs)
+    departure = f"{date} 08:30:00"
+    libraries = geopandas.read_file(pois.library).rename(columns={"osm_id": "id"})
+    halls = geopandas.read_file(pois.swimming_hall).rename(columns={"osm_id": "id"})
+    origins = geopandas.GeoDataFrame(
+        {"id": ["kamppi", "espoo", "tikkurila"]},
+        geometry=geopandas.points_from_xy(
+            [24.9384, 24.6559, 25.0378], [60.1699, 60.2055, 60.2934]
+        ),
+        crs="EPSG:4326",
+    )
+    reachable = Accessibility(
+        metro_network, origins, libraries, departure, budgets=(15.0, 30.0)
+    )
+    counts = reachable.pivot(index="from_id", columns="budget", values="accessibility")
+    # Central Helsinki reaches libraries inside 15 minutes; every
+    # origin's 30-minute count dominates its 15-minute count.
+    assert counts.loc["kamppi", 15.0] > 0
+    assert (counts[30.0] >= counts[15.0]).all()
+    assert counts[30.0].sum() > counts[15.0].sum()
+    nearest = NearestDestinations(
+        metro_network,
+        origins,
+        halls,
+        departure,
+        k=1,
+        max_cost=60,
+        output_time_units="seconds",
+    )
+    by_origin = {row.from_id: row.cost for row in nearest.itertuples()}
+    # Every origin has a nearest hall within the hour, door to door —
+    # the horizon filters on exact costs, and the seconds mode proves
+    # it without rounding slack.
+    assert set(by_origin) == {"kamppi", "espoo", "tikkurila"}
+    assert all(cost <= 3600 for cost in by_origin.values())
+    catchment = Catchment(metro_network, origins.iloc[:1], departure, budgets=(15.0,))
+    assert len(catchment) == 1
+    assert catchment.geometry.iloc[0].area > 0
