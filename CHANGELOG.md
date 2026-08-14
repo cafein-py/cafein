@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **`Catchment`**: budget catchments on any cost axis as H3-cell
+  polygons — a GeoDataFrame with one row per (origin, budget) over
+  the street network's own vertices, the door-to-door contract
+  seeding the walking spread from the snapped origin and every
+  reached stop at its arrival cost (zero-cost walking bounded by
+  `max_walking_time` on the emissions/money axes; mode spreads by
+  seconds or street metres on a `StreetNetwork`). Budgets echo as
+  passed; nested budgets yield nested cell unions; empty reached sets
+  are absent rows; a scalar `percentile` serves windowed time
+  catchments from stop origins. Requires the `cafein[h3]` extra.
+
 - **`NearestDestinations`**: the closest-`k` destinations per origin
   on any cost axis — one row per (origin, rank) with the destination
   and its cost (time in whole minutes by default,

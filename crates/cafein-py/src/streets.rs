@@ -280,6 +280,63 @@ impl StreetNetwork {
         Ok(StreetNetwork::adopt(inner, bytes_read, elevation, source))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    /// The reached street vertices of a mode spread from `origin`:
+    /// `(latitudes, longitudes, costs)` arrays under `mode`, bounded
+    /// by `budget` on the chosen `axis` — seconds for `"time"`,
+    /// street metres for `"distance"`. A street catchment's target
+    /// universe.
+    #[pyo3(signature = (origin, mode, budget, axis, max_snap_distance, car_model = None))]
+    fn _reached_vertices(
+        &mut self,
+        py: Python<'_>,
+        origin: (f64, f64),
+        mode: &str,
+        budget: f64,
+        axis: &str,
+        max_snap_distance: f64,
+        car_model: Option<CarModelPayload>,
+    ) -> PyResult<(Py<PyAny>, Py<PyAny>, Py<PyAny>)> {
+        if axis != "time" && axis != "distance" {
+            return Err(PyValueError::new_err(format!(
+                "axis must be 'time' or 'distance', not {axis:?}"
+            )));
+        }
+        let index = self.compiled(mode, car_model.as_ref())?;
+        let (_, profile) = &self.profiles[index];
+        let field: Vec<(f64, f64, f64)> = py.allow_threads(|| {
+            let (latitude, longitude) = origin;
+            let Some(snap) =
+                self.inner
+                    .snap_for_profile(latitude, longitude, max_snap_distance, profile)
+            else {
+                return Vec::new();
+            };
+            let reached = if axis == "time" {
+                self.inner.directed_reached_vertices(&snap, profile, budget)
+            } else {
+                self.inner
+                    .directed_reached_vertices_meters(&snap, profile, budget)
+            };
+            let positions = self.inner.vertex_positions();
+            reached
+                .into_iter()
+                .filter_map(|(vertex, cost)| {
+                    let (lon, lat) = positions[vertex as usize];
+                    (lon.is_finite() && lat.is_finite()).then_some((lat, lon, cost))
+                })
+                .collect()
+        });
+        let lats: Vec<f64> = field.iter().map(|&(lat, _, _)| lat).collect();
+        let lons: Vec<f64> = field.iter().map(|&(_, lon, _)| lon).collect();
+        let costs: Vec<f64> = field.iter().map(|&(_, _, c)| c).collect();
+        Ok((
+            lats.into_pyarray(py).into_any().unbind(),
+            lons.into_pyarray(py).into_any().unbind(),
+            costs.into_pyarray(py).into_any().unbind(),
+        ))
+    }
+
     /// The origins × destinations travel-time matrix under `mode`, in whole
     /// seconds with `u32::MAX` for unreachable.
     ///

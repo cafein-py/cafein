@@ -5,7 +5,7 @@
 use super::*;
 
 use cafein_core::access::{nearest, opportunity_sums, Decay};
-use numpy::PyReadonlyArray2;
+use numpy::{PyArray1, PyReadonlyArray2};
 use rayon::prelude::*;
 
 /// The parsed decay for user input: one optional parameter whose
@@ -311,8 +311,65 @@ pub(super) fn aggregate_nearest_f64<'py>(
     nearest_rows(py, rows, count, columns, k, max_cost)
 }
 
+/// A catchment field as `(latitudes, longitudes, values)` arrays.
+type FieldArrays<'py> = (
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+);
+
 #[pymethods]
 impl TransportNetwork {
+    /// The door-to-door walking field of a catchment: reached street
+    /// vertices as `(latitudes, longitudes, seconds)` arrays, seeded
+    /// from the snapped origin at zero seconds and every listed
+    /// stop's street links at that stop's arrival seconds, spread to
+    /// `cutoff_seconds`. Stops are global indices; an unsnappable
+    /// origin still spreads from its reached stops.
+    #[pyo3(signature = (origin, stop_costs, walking_speed, cutoff_seconds, max_snap_distance))]
+    fn _catchment_walk_field<'py>(
+        &self,
+        py: Python<'py>,
+        origin: (f64, f64),
+        stop_costs: Vec<(u32, f64)>,
+        walking_speed: f64,
+        cutoff_seconds: f64,
+        max_snap_distance: f64,
+    ) -> PyResult<FieldArrays<'py>> {
+        use cafein_core::timetable::StopIdx;
+
+        let streets = self.installed_streets()?;
+        let field: Vec<(f64, f64, f64)> = py.allow_threads(|| {
+            let mut seeds = Vec::with_capacity(stop_costs.len() + 1);
+            let (latitude, longitude) = origin;
+            if let Some(snap) = streets.snap(latitude, longitude, max_snap_distance) {
+                seeds.push((snap, 0.0));
+            }
+            for &(stop, seconds) in &stop_costs {
+                for snap in streets.stop_snaps(StopIdx(stop)) {
+                    seeds.push((snap, seconds));
+                }
+            }
+            let positions = streets.vertex_positions();
+            streets
+                .walk_field(&seeds, walking_speed, cutoff_seconds)
+                .into_iter()
+                .filter_map(|(vertex, seconds)| {
+                    let (lon, lat) = positions[vertex as usize];
+                    (lon.is_finite() && lat.is_finite()).then_some((lat, lon, seconds))
+                })
+                .collect()
+        });
+        let lats: Vec<f64> = field.iter().map(|&(lat, _, _)| lat).collect();
+        let lons: Vec<f64> = field.iter().map(|&(_, lon, _)| lon).collect();
+        let seconds: Vec<f64> = field.iter().map(|&(_, _, s)| s).collect();
+        Ok((
+            lats.into_pyarray(py),
+            lons.into_pyarray(py),
+            seconds.into_pyarray(py),
+        ))
+    }
+
     /// The canonical global stop index per id, through the same
     /// resolver every routing entry uses (qualified ids, ambiguity
     /// errors, unknown-id KeyErrors included).

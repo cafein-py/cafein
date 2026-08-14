@@ -187,6 +187,63 @@ impl StreetNetwork {
         }
     }
 
+    /// The walking-time field of a door-to-door catchment: per-vertex
+    /// seconds as the best over `seeds`, each seed a snapped point
+    /// carrying its own initial seconds (a reached stop's arrival
+    /// cost, the origin itself at zero), bounded by `cutoff_seconds`.
+    /// The caller reads positions off the graph's coordinates and
+    /// filters per budget.
+    pub fn walk_field(
+        &self,
+        seeds: &[(Snap, f64)],
+        walking_speed: f64,
+        cutoff_seconds: f64,
+    ) -> Vec<(u32, f64)> {
+        if !walking_speed.is_finite()
+            || walking_speed <= 0.0
+            || !cutoff_seconds.is_finite()
+            || cutoff_seconds < 0.0
+        {
+            return Vec::new();
+        }
+        let cutoff = cutoff_seconds * walking_speed;
+        let mut weighted: Vec<(u32, f64)> = Vec::with_capacity(seeds.len() * 2);
+        for (snap, initial_seconds) in seeds {
+            if !initial_seconds.is_finite() || *initial_seconds < 0.0 {
+                continue;
+            }
+            let head_start = initial_seconds * walking_speed;
+            if head_start > cutoff {
+                continue;
+            }
+            let (from, to) = self.edge_endpoints(snap.edge);
+            let length = self.arrays().lengths()[snap.edge as usize];
+            weighted.push((from, head_start + snap.connector + snap.fraction * length));
+            weighted.push((
+                to,
+                head_start + snap.connector + (1.0 - snap.fraction) * length,
+            ));
+        }
+        if weighted.is_empty() {
+            return Vec::new();
+        }
+        // Always the bounded Dijkstra: the installed hierarchy's
+        // one-to-many buckets target stop-link endpoint vertices only,
+        // so its reached set would be sparse — a field over EVERY
+        // vertex needs the full graph search.
+        SEARCH_STATE.with(|cell| {
+            let state = &mut cell.borrow_mut();
+            self.bounded_dijkstra(&weighted, cutoff, state);
+            let mut field = Vec::new();
+            (**state).for_each_reached(|vertex, meters| {
+                if meters <= cutoff {
+                    field.push((vertex, meters / walking_speed));
+                }
+            });
+            field
+        })
+    }
+
     /// Joins per-vertex reached `distances` to the stops through their links —
     /// each stop's walk is the minimum over its links of the reached
     /// edge-endpoint distance plus the on-edge offset and connector, and the
@@ -669,6 +726,21 @@ impl StreetNetwork {
                 })
             })
         })
+    }
+
+    /// Every link of `stop` as a snap — the seeds of a door-to-door
+    /// catchment spread, so a stop with several street links spreads
+    /// through each of them.
+    pub fn stop_snaps(&self, stop: StopIdx) -> Vec<Snap> {
+        self.links()
+            .iter()
+            .filter(|link| link.stop == stop)
+            .map(|link| Snap {
+                edge: link.edge,
+                fraction: link.fraction,
+                connector: link.connector,
+            })
+            .collect()
     }
 
     /// A stop's snap link as a [`Snap`], when the stop is linked. A

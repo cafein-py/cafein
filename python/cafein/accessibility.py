@@ -14,6 +14,7 @@ dispatch as the matrix computers.
 import datetime
 import math
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 
@@ -954,3 +955,561 @@ class NearestDestinations(pd.DataFrame):
             },
             crs=origins.crs,
         )
+
+
+def _h3_module():
+    try:
+        import h3
+    except ImportError as error:
+        raise ImportError(
+            "Catchment renders H3 cells; install the optional extra: "
+            "pip install 'cafein[h3]'"
+        ) from error
+    return h3
+
+
+class Catchment(gpd.GeoDataFrame):
+    """Budget catchments on a cost axis: one cell-union polygon per row.
+
+    A GeoDataFrame with one row per (origin, budget):
+    ``from_id``, ``budget`` (echoed as passed — minutes on the time
+    axis, the axis's native unit otherwise), and ``geometry``, the
+    union of H3 cells at `resolution` over every street-network vertex
+    reached within the budget (EPSG:4326). Rows record their budget,
+    so banded rings are a difference operation downstream; nested
+    budgets yield nested cell unions. An origin reaching nothing under
+    a budget has no row — absence, exactly like an unreachable rank.
+    Slices and copies are ordinary GeoDataFrame views.
+
+    The target universe is the network's own street vertices — no
+    destinations argument. On a ``TransportNetwork`` the door-to-door
+    contract seeds the walking spread BOTH from the snapped origin
+    itself (an origin with no reachable stop still has a walking
+    catchment) AND from every reached stop at its arrival cost: on the
+    time axis a vertex is reached when stop arrival plus the walk fits
+    the budget; on the emissions/money axes walking is zero-cost and
+    each qualifying stop's spread is bounded by ``max_walking_time``
+    alone. On a ``StreetNetwork`` the vertices are the mode spread
+    under `transport_mode` — seconds on the time axis, street metres
+    with ``cost="distance"``.
+
+    Parameters
+    ----------
+    origins : list of str, or GeoDataFrame
+        Stop ids, or points with an ``id`` column (polygons route via
+        centroids); typically one or a few origins.
+    budgets : sequence of float or datetime.timedelta (optional, default: (30.0,))
+        One or more cutoffs — minutes (or timedeltas) on the time
+        axis, grams, currency units, or metres on the others.
+    resolution : int (optional, default: 9)
+        The H3 cell resolution of the rendering; it never affects
+        reachability.
+    percentile : float (optional, default: 50)
+        With ``cost="time"``, a ``departure_time_window``, and stop
+        origins: a vertex is reached when this single percentile of
+        the per-departure arrival distribution fits the budget. The
+        output carries no percentile dimension.
+
+    ``cost``, ``departure``, ``departure_time_window``, ``max_rides``,
+    ``router``, ``factors``/``components``/``fares``,
+    ``transport_mode``, the exclusions, and the walking options follow
+    ``Accessibility``; requires the optional ``h3`` extra
+    (``cafein[h3]``).
+    """
+
+    @property
+    def _constructor(self):
+        return gpd.GeoDataFrame
+
+    def __init__(
+        self,
+        network,
+        origins,
+        departure=None,
+        *,
+        cost="time",
+        budgets=(30.0,),
+        resolution=9,
+        percentile=50,
+        max_rides=8,
+        router="auto",
+        departure_time_window=None,
+        factors=None,
+        components=None,
+        fares=None,
+        chunk=None,
+        transport_mode=None,
+        exclude_routes=(),
+        exclude_trips=(),
+        exclude_stops=(),
+        walking_speed_kmph=None,
+        max_walking_time=None,
+        snap_distance=None,
+    ):
+        import shapely.geometry
+
+        from cafein._units import departure_parts, duration_seconds
+
+        h3 = _h3_module()
+        date, departure = (
+            (None, None) if departure is None else departure_parts(departure)
+        )
+        if max_rides < 1:
+            raise ValueError("max_rides must be at least 1")
+        max_transfers = max_rides - 1
+        window = duration_seconds("departure_time_window", departure_time_window)
+        max_walking_time = duration_seconds("max_walking_time", max_walking_time)
+        max_snap_distance = snap_distance
+        if not isinstance(resolution, int) or isinstance(resolution, bool):
+            raise ValueError(f"resolution is an H3 level 0-15, not {resolution!r}")
+        if not 0 <= resolution <= 15:
+            raise ValueError(f"resolution must be within 0-15, not {resolution}")
+        if router not in ("auto", "raptor", "tbtr"):
+            raise ValueError(
+                f"router must be 'auto', 'raptor', or 'tbtr', not {router!r}"
+            )
+        if isinstance(percentile, bool) or not isinstance(percentile, (int, float)):
+            raise ValueError(
+                f"percentile is one number in [0, 100], not {percentile!r}"
+            )
+        percentile = float(percentile)
+        if not 0.0 <= percentile <= 100.0:
+            raise ValueError(f"percentile must be within [0, 100], not {percentile}")
+        from cafein import _cafein  # noqa: F401  (asserts the compiled core)
+        from cafein.matrices import _chunk_slice, _is_street_network, _point_list
+
+        origins = sequence_not_string("origins", origins)
+        exclude_routes = id_sequence("exclude_routes", exclude_routes)
+        exclude_trips = id_sequence("exclude_trips", exclude_trips)
+        exclude_stops = id_sequence("exclude_stops", exclude_stops)
+        if cost not in ("time", "emissions", "money", "distance"):
+            raise ValueError(
+                f"unknown cost {cost!r}: the axes are time, emissions, "
+                "money, distance"
+            )
+        if cost != "emissions" and (factors is not None or components is not None):
+            raise ValueError("factors and components apply to cost='emissions'")
+        if cost != "money" and fares is not None:
+            raise ValueError("fares applies to cost='money'")
+        if cost == "money" and fares is None:
+            raise ValueError("cost='money' requires a fare structure (fares=)")
+        if cost == "time":
+            raw_budgets = sequence_not_string("budgets", budgets)
+            budget_values = [
+                float(duration_seconds("budgets", budget)) for budget in raw_budgets
+            ]
+            budget_column = [
+                (
+                    budget.total_seconds() / 60
+                    if isinstance(budget, datetime.timedelta)
+                    else float(budget)
+                )
+                for budget in raw_budgets
+            ]
+        else:
+            budget_values = _budget_list(budgets)
+            budget_column = budget_values
+        if not budget_values:
+            raise ValueError("budgets must name at least one cutoff")
+        for budget in budget_values:
+            if not math.isfinite(budget) or budget <= 0.0:
+                raise ValueError(
+                    f"budgets must be positive finite numbers, not {budget!r}"
+                )
+        street_kind = _is_street_network(network)
+        if percentile != 50.0 and not (
+            cost == "time" and window is not None and not street_kind
+        ):
+            raise ValueError(
+                "percentile ranks the departure window's arrival "
+                "distribution; it needs cost='time', "
+                "departure_time_window=, and a TransportNetwork"
+            )
+        rows = []
+        if street_kind:
+            if transport_mode is None:
+                raise ValueError(
+                    "a StreetNetwork needs transport_mode= (walk, bicycle, "
+                    "e_bike, e_scooter, or car on a car-enabled build)"
+                )
+            if cost not in ("time", "distance"):
+                raise ValueError(
+                    f"cost={cost!r} needs the transit cost engines; a "
+                    "StreetNetwork serves cost='time' and cost='distance'"
+                )
+            rejected = {
+                "departure": departure,
+                "departure_time_window": window,
+                "walking_speed_kmph": walking_speed_kmph,
+                "max_walking_time": max_walking_time,
+            }
+            named = [name for name, value in rejected.items() if value is not None]
+            if router != "auto":
+                named.append("router")
+            if max_transfers != 7:
+                named.append("max_rides")
+            if named or any((exclude_routes, exclude_trips, exclude_stops)):
+                offending = ", ".join(named) or "exclusions"
+                raise ValueError(
+                    f"{offending} apply to transit; a StreetNetwork takes "
+                    "transport_mode and snap_distance"
+                )
+            from cafein.streets import MAX_SNAP_DISTANCE
+
+            snap = float(
+                MAX_SNAP_DISTANCE if max_snap_distance is None else max_snap_distance
+            )
+            if not math.isfinite(snap) or snap <= 0.0:
+                raise ValueError(
+                    "snap_distance must be a positive finite distance, "
+                    f"not {max_snap_distance!r}"
+                )
+            from_ids, points = _point_list(origins, "origins")
+            keep = _chunk_slice(len(from_ids), chunk)
+            from_ids = from_ids[keep]
+            points = points[keep]
+            horizon = max(budget_values)
+            for identifier, point in zip(from_ids, points):
+                lats, lons, costs = network._core._reached_vertices(
+                    point, transport_mode, horizon, cost, snap
+                )
+                rows.extend(
+                    _cell_rows(
+                        h3,
+                        shapely.geometry,
+                        identifier,
+                        lats,
+                        lons,
+                        costs,
+                        budget_values,
+                        budget_column,
+                        resolution,
+                    )
+                )
+        else:
+            if transport_mode is not None:
+                raise ValueError(
+                    "transport_mode applies to a StreetNetwork; a "
+                    "TransportNetwork routes door to door"
+                )
+            if date is None or departure is None:
+                raise TypeError("Catchment requires departure")
+            if cost == "distance":
+                raise ValueError(
+                    "cost='distance' is not an optimizable transit axis; "
+                    "street networks serve cost='distance' natively"
+                )
+            if cost in ("emissions", "money") and window is None:
+                raise ValueError(
+                    f"cost={cost!r} optimizes over a departure window; "
+                    "pass departure_time_window="
+                )
+            geo = _is_geo(origins)
+            if geo and cost == "time" and window is None and router == "tbtr":
+                raise ValueError(
+                    "the coordinate one-to-all rides RAPTOR; router='tbtr' "
+                    "serves stop origins"
+                )
+            if geo and cost == "time" and window is not None:
+                raise ValueError(
+                    "windowed time catchments rank per-stop arrival "
+                    "distributions over all stops; stop origins serve "
+                    "them today"
+                )
+            from cafein.network import _walk_options
+
+            speed_kmph, walk_cutoff, snap = _walk_options(
+                walking_speed_kmph, max_walking_time, max_snap_distance
+            )
+            speed_kmph = float(speed_kmph)
+            walk_cutoff = float(walk_cutoff)
+            snap = float(snap)
+            if not math.isfinite(speed_kmph) or speed_kmph <= 0.0:
+                raise ValueError(
+                    "walking_speed_kmph must be a positive finite speed, "
+                    f"not {walking_speed_kmph!r}"
+                )
+            if not math.isfinite(snap) or snap <= 0.0:
+                raise ValueError(
+                    "snap_distance must be a positive finite distance, "
+                    f"not {max_snap_distance!r}"
+                )
+            stop_ids = [stop for stop, _, _ in network.stops]
+            if geo:
+                from_ids, points = _point_list(origins, "origins")
+            else:
+                from_ids = _stop_ids(origins, "origins")
+                # The canonical resolver: qualified ids, merged-feed
+                # aliases, and unknown-id errors behave as they do on
+                # every routing entry.
+                resolved = list(network._core._stop_indices(from_ids))
+                stops_list = network.stops
+                points = []
+                for stop, index in zip(from_ids, resolved):
+                    _, lat, lon = stops_list[index]
+                    if lat is None:
+                        raise ValueError(
+                            f"origin stop {stop!r} carries no coordinate; "
+                            "a catchment spreads from the origin's location"
+                        )
+                    points.append((lat, lon))
+            keep = _chunk_slice(len(from_ids), chunk)
+            from_ids = list(from_ids[keep] if geo else from_ids[keep])
+            points = list(points[keep])
+            surfaces = _catchment_stop_costs(
+                network,
+                origins,
+                from_ids,
+                points,
+                geo,
+                date,
+                departure,
+                cost,
+                window,
+                percentile,
+                factors,
+                components,
+                fares,
+                max_transfers,
+                router,
+                chunk,
+                (exclude_routes, exclude_trips, exclude_stops),
+                (speed_kmph, walk_cutoff, snap),
+                stop_ids,
+            )
+            speed_ms = speed_kmph / 3.6
+            for identifier, point, stop_costs in zip(from_ids, points, surfaces):
+                if cost == "time":
+                    horizon = max(budget_values)
+                    seeds = [
+                        (index, seconds)
+                        for index, seconds in stop_costs
+                        if seconds <= horizon
+                    ]
+                    lats, lons, costs = network._core._catchment_walk_field(
+                        point, seeds, speed_ms, horizon, snap
+                    )
+                    rows.extend(
+                        _cell_rows(
+                            h3,
+                            shapely.geometry,
+                            identifier,
+                            lats,
+                            lons,
+                            costs,
+                            budget_values,
+                            budget_column,
+                            resolution,
+                        )
+                    )
+                else:
+                    for budget, echoed in zip(budget_values, budget_column):
+                        seeds = [
+                            (index, 0.0)
+                            for index, value in stop_costs
+                            if value <= budget
+                        ]
+                        lats, lons, _costs = network._core._catchment_walk_field(
+                            point, seeds, speed_ms, walk_cutoff, snap
+                        )
+                        cells = {
+                            h3.latlng_to_cell(lat, lon, resolution)
+                            for lat, lon in zip(lats, lons)
+                        }
+                        if cells:
+                            rows.append(
+                                (
+                                    identifier,
+                                    echoed,
+                                    shapely.geometry.shape(
+                                        h3.cells_to_h3shape(cells).__geo_interface__
+                                    ),
+                                )
+                            )
+        import geopandas
+
+        frame = geopandas.GeoDataFrame(
+            {
+                "from_id": [row[0] for row in rows],
+                "budget": [row[1] for row in rows],
+            },
+            geometry=[row[2] for row in rows],
+            crs="EPSG:4326",
+        )
+        super().__init__(frame)
+
+
+def _cell_rows(
+    h3,
+    geometry_module,
+    identifier,
+    lats,
+    lons,
+    costs,
+    budget_values,
+    budget_column,
+    resolution,
+):
+    """One (from_id, budget, polygon) row per non-empty budget filter
+    of a reached-vertex field whose costs share the budgets' unit."""
+    rows = []
+    costs = np.asarray(costs)
+    for budget, echoed in zip(budget_values, budget_column):
+        within = costs <= budget
+        cells = {
+            h3.latlng_to_cell(lat, lon, resolution)
+            for lat, lon in zip(np.asarray(lats)[within], np.asarray(lons)[within])
+        }
+        if cells:
+            rows.append(
+                (
+                    identifier,
+                    echoed,
+                    geometry_module.shape(h3.cells_to_h3shape(cells).__geo_interface__),
+                )
+            )
+    return rows
+
+
+def _catchment_stop_costs(
+    network,
+    origins,
+    from_ids,
+    points,
+    geo,
+    date,
+    departure,
+    cost,
+    window,
+    percentile,
+    factors,
+    components,
+    fares,
+    max_transfers,
+    router,
+    chunk,
+    exclusions,
+    walk,
+    stop_ids,
+):
+    """Per origin, the ``(global stop index, cost)`` pairs of every
+    reached stop on the chosen axis — the walking field's seeds."""
+    import numpy as np
+
+    if cost in ("emissions", "money"):
+        if geo:
+            # Point origins ride the point-form cost surface; the
+            # destinations are the coordinate-bearing stops as points,
+            # so the columns align with those stops.
+            import geopandas
+
+            located = [
+                (stop, lat, lon) for stop, lat, lon in network.stops if lat is not None
+            ]
+            destinations = geopandas.GeoDataFrame(
+                {"id": [stop for stop, _, _ in located]},
+                geometry=geopandas.points_from_xy(
+                    [lon for _, _, lon in located],
+                    [lat for _, lat, _ in located],
+                ),
+                crs="EPSG:4326",
+            )
+            surface_stops = [stop for stop, _, _ in located]
+        else:
+            destinations = stop_ids
+            surface_stops = stop_ids
+        surface, _from, _to = _transit_cost_surface(
+            network,
+            origins,
+            destinations,
+            date,
+            departure,
+            cost,
+            window,
+            factors,
+            components,
+            fares,
+            max_transfers,
+            None,
+            router,
+            chunk,
+            [list(ids) for ids in exclusions],
+            walk,
+        )
+        columns = np.asarray(list(network._core._stop_indices(surface_stops)))
+        return [
+            [
+                (int(columns[at]), float(value))
+                for at, value in enumerate(row)
+                if np.isfinite(value)
+            ]
+            for row in np.asarray(surface)
+        ]
+    exclude_routes, exclude_trips, exclude_stops = exclusions
+    if geo:
+        # Point origins: the door-to-door one-to-all per origin — a
+        # dict of arrival seconds keyed by stop id. The walking trio
+        # arrives resolved and validated by the constructor.
+        speed, cutoff, snap = (float(value) for value in walk)
+        fields = []
+        for point in points:
+            arrivals = network._core.travel_times_from_coordinate(
+                point,
+                date,
+                departure,
+                max_transfers,
+                list(exclude_routes),
+                list(exclude_trips),
+                list(exclude_stops),
+                speed,
+                cutoff,
+                snap,
+            )
+            reached_ids = list(arrivals)
+            indices = list(network._core._stop_indices(reached_ids))
+            fields.append(
+                [
+                    (int(index), float(arrivals[stop]))
+                    for index, stop in zip(indices, reached_ids)
+                ]
+            )
+        return fields
+    if window is not None:
+        matrix = network._core.travel_time_percentiles(
+            list(from_ids),
+            date,
+            departure,
+            int(window),
+            [percentile],
+            max_transfers,
+            router,
+            list(exclude_routes),
+            list(exclude_trips),
+            list(exclude_stops),
+        )
+        matrix = np.asarray(matrix)[:, :, 0]
+    else:
+        matrix, _ids, _to, _res = network._time_matrix_with_ids(
+            list(from_ids),
+            date,
+            departure,
+            max_transfers,
+            destinations=None,
+            window=None,
+            percentiles=None,
+            confidence=None,
+            chunk=None,
+            router=router,
+            exclude_routes=exclude_routes,
+            exclude_trips=exclude_trips,
+            exclude_stops=exclude_stops,
+            walking_speed_kmph=walk[0],
+            max_walking_time=walk[1],
+            max_snap_distance=walk[2],
+        )
+        matrix = np.asarray(matrix)
+    unreached = np.iinfo(np.uint32).max
+    return [
+        [(index, float(value)) for index, value in enumerate(row) if value != unreached]
+        for row in matrix
+    ]
