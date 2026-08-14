@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **`optimize="fare"` documents the zone-exact contract** (#246): the
+  cost-matrix docstring now states the two-tier guarantee — rule-based
+  structures price the retained time-and-ride candidates (global fare
+  optimality not guaranteed), zone structures are refined cell for
+  cell by the exact zone-ticket engine within `max_travel_time` — and
+  the fare-frontier and matrix docs carry the metropolitan-scale
+  guidance for the 120-minute default.
+
 - **Human-facing parameters and outputs across the whole API**
   (breaking). One name per concept, following r5py/r5r: `within`,
   `max_duration`, and `StreetNetwork.travel_time`'s `max_time` are now

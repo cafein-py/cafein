@@ -102,14 +102,27 @@ class TravelCostMatrix(pd.DataFrame):
         for. Each objective qualifies candidates by its own key: NaN
         emissions drop a candidate under ``"emissions"``, an
         unpriceable fare under ``"fare"`` — pairs with no qualifying
-        candidate are absent. ``optimize="fare"`` therefore returns
-        the lowest-priced journey **among the candidates the
-        time-and-ride search retains** — it does not search all
-        feasible journeys by fare. A cheaper journey may be omitted
-        when it arrives no earlier, uses more rides, boards the same
-        trip at a different stop, or loses an equal-time
-        canonical-path tie; fares are exact for each retained
-        journey, but global fare optimality is not guaranteed.
+        candidate are absent. On a **rule-based** fare structure,
+        ``optimize="fare"`` returns the lowest-priced journey **among
+        the candidates the time-and-ride search retains** — it does
+        not search all feasible journeys by fare. A cheaper journey
+        may be omitted when it arrives no earlier, uses more rides,
+        boards the same trip at a different stop, or loses an
+        equal-time canonical-path tie; fares are exact for each
+        retained journey, but global fare optimality is not
+        guaranteed. On a **zone** fare structure
+        (``fares.zone_fare_structure``), that candidate fold is only
+        the warm start: every cell is refined by the exact
+        zone-ticket engine, and the reported journey is the cheapest
+        of **all** journeys within ``max_travel_time`` — slower or
+        more-ride journeys on cheaper tickets and multi-ticket chains
+        included — with its distances, emissions, and geometry
+        reconstructed from the winning chain. The exactness is what
+        the 120-minute ``max_travel_time`` default buys its time
+        limit for: proving no cheaper journey exists must otherwise
+        rule out the whole service day. At metropolitan scale keep a
+        bounded ``max_travel_time``; cells whose destinations carry
+        no fare zone cannot price and cost the search most.
     departure_time_window : float or datetime.timedelta (optional)
         Departure window in minutes; required with
         ``optimize="emissions"`` and ``optimize="fare"``.

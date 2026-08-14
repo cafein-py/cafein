@@ -1283,7 +1283,11 @@ def fare_frontier(
     max_travel_time : float or datetime.timedelta (optional)
         A bound on a journey's duration in minutes (r5r caps at 90
         minutes); ``None`` leaves it unbounded — except on a zone fare
-        structure, which defaults to 120 minutes.
+        structure, which defaults to 120 minutes: the exact engine
+        must otherwise prove no cheaper journey exists anywhere in
+        the service day. Keep it bounded at metropolitan scale;
+        destinations carrying no fare zone cannot price and cost the
+        search most.
     exact : bool (optional, default: True)
         ``True`` keeps every journey the tariff's fine structure can
         distinguish — the exhaustively verified mode; runtimes grow
