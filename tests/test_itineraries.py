@@ -480,3 +480,52 @@ def test_diverse_itineraries_spread_reaches_across_the_trade_off(network):
     assert fast["option"].nunique() == spread["option"].nunique() == 3
     assert _itinerary_corridors(spread) != _itinerary_corridors(fast)
     assert latest(spread) > latest(fast)
+
+
+def test_fares_price_each_option(network, helsinki_gtfs):
+    from cafein import fares
+
+    structure = fares.zone_fare_structure(helsinki_gtfs, rules="zones")
+    itineraries = DetailedItineraries(
+        network, ["4810551"], ["1250551"], "2022-02-22 08:30:00", fares=structure
+    )
+    columns = list(itineraries.columns)
+    assert columns.index("fare") == columns.index("emissions") + 1
+    # A fare prices the whole journey: every row of an option repeats it.
+    per_option = itineraries.groupby(["from_id", "to_id", "option"])["fare"]
+    assert (per_option.nunique() == 1).all()
+    assert (itineraries["fare"] > 0.0).all()
+    # Exactly the annotate_fares prices of the same journeys, by option.
+    journeys = network.route_between_stops("4810551", "1250551", "2022-02-22 08:30:00")
+    expected = [
+        journey["fare"] for journey in fares.annotate_fares(journeys, structure)
+    ]
+    assert list(per_option.first()) == pytest.approx(expected)
+    # Without a fare model the column does not exist.
+    plain = DetailedItineraries(
+        network, ["4810551"], ["1250551"], "2022-02-22 08:30:00"
+    )
+    assert "fare" not in plain.columns
+
+
+def test_door_to_door_fares_price_the_walk_free(network_with_footpaths, helsinki_gtfs):
+    from cafein import fares
+
+    structure = fares.zone_fare_structure(helsinki_gtfs, rules="zones")
+    origins = point_frame(network_with_footpaths, [("A", "1100602")])
+    destinations = point_frame(network_with_footpaths, [("B", "1040280")])
+    itineraries = DetailedItineraries(
+        network_with_footpaths,
+        origins,
+        destinations,
+        "2022-02-22 08:30:00",
+        fares=structure,
+    )
+    # Option 0 is the walking-only alternative: nothing is paid.
+    option0 = itineraries[itineraries["option"] == 0]
+    assert list(option0["leg_type"]) == ["walk"]
+    assert (option0["fare"] == 0.0).all()
+    # A ridden option pays its ticket, on every one of its rows.
+    option1 = itineraries[itineraries["option"] == 1]
+    assert (option1["fare"] > 0.0).all()
+    assert option1["fare"].nunique() == 1

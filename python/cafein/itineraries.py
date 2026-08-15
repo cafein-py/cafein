@@ -72,7 +72,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
     ``trip_id``/``route_id``/``route_short_name`` on transit legs,
     ``distance_m`` (meters) and its ``distance_provenance``, ``emissions``
     (grams CO₂e; ``0`` on walks, ``NaN`` where a ridden trip has no
-    matching factor), and ``geometry`` — the leg's shape in EPSG:4326,
+    matching factor), with ``fares=`` a ``fare`` column — the option's
+    whole-journey ticket price, repeated on each of its rows — and
+    ``geometry`` — the leg's shape in EPSG:4326,
     a transit polyline or a walked street path, absent where a leg has
     none. Group by ``["from_id", "to_id", "option"]`` to recover whole
     journeys.
@@ -137,6 +139,19 @@ class DetailedItineraries(gpd.GeoDataFrame):
     components : list of str (optional)
         The life-cycle components to include (default: all four); see
         ``cafein.emissions.annotate``.
+    fares : FareStructure or ZoneFareStructure (optional)
+        A fare model (see ``cafein.fares``); adds a ``fare`` column.
+        A fare prices the whole journey (tickets span legs), so every
+        row of an option repeats the option's fare — group by
+        ``["from_id", "to_id", "option"]`` and take ``first()`` for
+        per-journey fares. ``NaN`` where the structure cannot price a
+        journey, ``0.0`` on a walking-only one. Pricing is exact for
+        each returned journey and never changes which journeys are
+        searched or returned. Rental legs under a ``street_policy``
+        (its ``source="shared"`` modes) price from the structure's
+        ``street`` tariffs, as in ``cafein.fares.annotate_fares``.
+        A ``StreetNetwork`` rejects it with the other timetable-only
+        arguments.
     candidates : {"time", "pareto", "relaxed", "diverse"} (default: "time")
         Which alternatives to return per OD pair. ``"time"`` draws the
         time-optimal (arrival, rides) journeys of the RAPTOR engine;
@@ -306,6 +321,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         max_rides=8,
         factors=None,
         components=None,
+        fares=None,
         candidates="time",
         bucket=25.0,
         router="auto",
@@ -383,6 +399,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
                 currency=currency,
                 cost_components=cost_components,
                 transit_only={
+                    "fares": fares,
                     "tolerance_minutes": slack_seconds,
                     "max_options": max_options,
                     "walking_speed_kmph": walking_speed_kmph,
@@ -460,6 +477,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
             max_transfers=max_transfers,
             factors=factors,
             components=components,
+            fares=fares,
             candidates=candidates,
             bucket=bucket,
             router=router,
@@ -497,6 +515,7 @@ def _itineraries_frame(
     max_transfers,
     factors,
     components,
+    fares,
     candidates,
     bucket,
     router,
@@ -513,8 +532,11 @@ def _itineraries_frame(
     max_snap_distance,
     street_policy=None,
 ):
+    import copy
+
     components = component_selection(components)
     from cafein import emissions
+    from cafein.fares import annotate_fares
     from cafein.frontier import _alternative_options, _exclusion_lists
 
     origin_ids, origin_keys, kind = _endpoints(origins, "origins")
@@ -563,9 +585,12 @@ def _itineraries_frame(
     multicriteria = candidates in ("pareto", "relaxed", "diverse")
     transit_factors, street_factors = factors, None
     shared_modes = frozenset()
+    if fares is not None:
+        # One frozen fare model for the whole frame, like the policy
+        # below: every OD pair prices under the same version, even if
+        # the caller mutates theirs mid-build.
+        fares = copy.deepcopy(fares)
     if street_policy is not None:
-        import copy
-
         # One frozen policy for the whole frame: every OD pair routes,
         # decorates, and prices emissions under the same version, even
         # if the caller mutates theirs mid-build.
@@ -638,19 +663,27 @@ def _itineraries_frame(
                 _street_leg_emissions(
                     journeys, street_factors, components, shared_modes
                 )
+            if fares is not None:
+                annotate_fares(journeys, fares, shared_modes=shared_modes)
             for option, journey in enumerate(journeys):
                 for segment, leg in enumerate(journey["legs"]):
-                    records.append(
-                        _leg_record(
-                            origin_id,
-                            dest_id,
-                            option,
-                            segment,
-                            leg,
-                            mode=street_policy is not None,
-                        )
+                    record = _leg_record(
+                        origin_id,
+                        dest_id,
+                        option,
+                        segment,
+                        leg,
+                        mode=street_policy is not None,
                     )
+                    if fares is not None:
+                        # A fare prices the whole journey (tickets span
+                        # legs); every row of the option repeats it.
+                        record["fare"] = journey["fare"]
+                    records.append(record)
     columns = _COLUMNS if street_policy is None else _POLICY_COLUMNS
+    if fares is not None:
+        columns = list(columns)
+        columns.insert(columns.index("emissions") + 1, "fare")
     return _to_geodataframe(records, columns)
 
 

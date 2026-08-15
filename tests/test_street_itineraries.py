@@ -9,6 +9,7 @@ pytest.importorskip("cafein._cafein")
 
 from cafein import DetailedItineraries, StreetNetwork, TravelCostMatrix  # noqa: E402
 from cafein._cafein import STREET_DISTANCE_PROVENANCE  # noqa: E402
+from cafein.fares import FareStructure  # noqa: E402
 
 COLUMNS = [
     "from_id",
@@ -173,6 +174,7 @@ def test_requires_an_explicit_mode(streets, places):
         {"exclude_routes": ["1001"]},
         {"walking_speed_kmph": 5.0},
         {"max_walking_time": 10.0},
+        {"fares": FareStructure()},
     ],
 )
 def test_rejects_transit_only_arguments(streets, places, kwargs):
