@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read as _, Write as _};
 use std::path::Path;
 
-use gtfs_structures::{BikesAllowedType, DirectionType, Gtfs, GtfsReader};
+use gtfs_structures::{Availability, BikesAllowedType, DirectionType, Gtfs, GtfsReader};
 
 use crate::model::{
     Agency, Calendar, CalendarDate, Feed, FeedIndex, FeedInfo, Route, RouteIndex, Stop, StopIndex,
@@ -134,6 +134,16 @@ fn without_colour_columns(bytes: &[u8]) -> Result<Vec<u8>, SanitizeError> {
     Ok(writer.into_inner()?)
 }
 
+/// The GTFS availability tri-state as a flag: no information and
+/// out-of-spec values stay unknown.
+fn availability_flag(availability: Availability) -> Option<bool> {
+    match availability {
+        Availability::Available => Some(true),
+        Availability::NotAvailable => Some(false),
+        _ => None,
+    }
+}
+
 fn append_gtfs(feed: &mut Feed, feed_index: FeedIndex, gtfs: Gtfs) -> Result<(), Error> {
     for agency in gtfs.agencies {
         feed.agencies.push(Agency {
@@ -158,7 +168,27 @@ fn append_gtfs(feed: &mut Feed, feed_index: FeedIndex, gtfs: Gtfs) -> Result<(),
             latitude: stop.latitude,
             longitude: stop.longitude,
             parent_station: stop.parent_station.clone(),
+            wheelchair_boarding: availability_flag(stop.wheelchair_boarding),
         });
+    }
+    // A stop that says nothing inherits its parent station's known
+    // value (GTFS wheelchair_boarding semantics), one level: only the
+    // parent's own field counts, from a snapshot so order cannot chain.
+    let own: Vec<Option<bool>> = feed.stops[stop_base as usize..]
+        .iter()
+        .map(|stop| stop.wheelchair_boarding)
+        .collect();
+    for offset in 0..own.len() {
+        if own[offset].is_some() {
+            continue;
+        }
+        let index = stop_base as usize + offset;
+        let inherited = feed.stops[index]
+            .parent_station
+            .as_ref()
+            .and_then(|id| stop_index_by_id.get(id))
+            .and_then(|&parent| own[(parent - stop_base) as usize]);
+        feed.stops[index].wheelchair_boarding = inherited;
     }
 
     let route_base = feed.routes.len() as RouteIndex;
@@ -221,6 +251,7 @@ fn append_gtfs(feed: &mut Feed, feed_index: FeedIndex, gtfs: Gtfs) -> Result<(),
                 // No information and out-of-spec values stay unknown.
                 _ => None,
             },
+            wheelchair_accessible: availability_flag(trip.wheelchair_accessible),
             stop_times,
         });
     }

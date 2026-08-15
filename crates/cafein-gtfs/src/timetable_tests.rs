@@ -10,6 +10,7 @@ fn stop(feed_stop: u32) -> Stop {
         latitude: None,
         longitude: None,
         parent_station: None,
+        wheelchair_boarding: None,
     }
 }
 
@@ -23,6 +24,7 @@ fn trip(id: &str, stop_times: Vec<crate::StopTime>) -> Trip {
         shape_id: None,
         headsign: None,
         bikes_allowed: None,
+        wheelchair_accessible: None,
         stop_times,
     }
 }

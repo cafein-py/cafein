@@ -542,6 +542,42 @@ impl TransportNetwork {
             .collect()
     }
 
+    /// Per-stop GTFS ``wheelchair_boarding`` as ``(stop_id, flag)``
+    /// tuples: ``True`` = accessible, ``False`` = not accessible,
+    /// ``None`` = the feed says nothing. A stop without a value
+    /// inherits its parent station's known value at ingest.
+    #[getter]
+    fn stop_wheelchair_boarding(&self) -> Vec<(String, Option<bool>)> {
+        self.feed
+            .stops
+            .iter()
+            .enumerate()
+            .map(|(index, stop)| {
+                (
+                    self.public_stop_id(StopIdx(index as u32)),
+                    stop.wheelchair_boarding,
+                )
+            })
+            .collect()
+    }
+
+    /// Per-trip GTFS ``wheelchair_accessible`` as ``(trip_id, flag)``
+    /// tuples: ``True`` = accessible, ``False`` = not accessible,
+    /// ``None`` = the feed says nothing.
+    #[getter]
+    fn trip_wheelchair_accessible(&self) -> Vec<(String, Option<bool>)> {
+        self.feed
+            .trips
+            .iter()
+            .map(|trip| {
+                (
+                    self.public_id(trip.feed, &trip.id),
+                    trip.wheelchair_accessible,
+                )
+            })
+            .collect()
+    }
+
     /// Install precomputed stop-to-stop transfers (footpaths).
     ///
     /// Parameters

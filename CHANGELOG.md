@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The GTFS wheelchair tri-states ride the feed model: per-stop
+  `wheelchair_boarding` (with parent-station inheritance) and per-trip
+  `wheelchair_accessible`, exposed as core getters; network artifact
+  format 18. ([#263](https://github.com/cafein-py/cafein/pull/263))
+
 - `DetailedItineraries` takes `fares=`: each option's whole-journey
   ticket price as a `fare` column repeated on the option's rows;
   rental legs under a `street_policy` price from the street tariffs.

@@ -91,6 +91,7 @@ fn trip_only_services_have_no_calendar_data() {
             shape_id: None,
             headsign: None,
             bikes_allowed: None,
+            wheelchair_accessible: None,
             stop_times: Vec::new(),
         }],
         ..Feed::default()
