@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The wheelchair profile caps gradients: on a DEM-built network, arcs
+  with a sub-segment steeper than 8 % are forbidden; without a DEM the
+  tag rules alone apply.
+  ([#266](https://github.com/cafein-py/cafein/pull/266))
+
 - The `"wheelchair"` street mode: walk-speed routing that avoids
   stairs and respects OSM `wheelchair` tags, on every street product
   via `transport_mode="wheelchair"`; network artifact formats 19/4.

@@ -4632,3 +4632,153 @@ fn walk_field_agrees_with_and_without_a_hierarchy() {
         assert!((seconds_a - seconds_b).abs() < 1e-9);
     }
 }
+
+// ---- The max_gradient cap ----
+
+/// A chain 0—1—2 climbing 5 % then 10 %, walkable and wheelable.
+fn sloped_chain() -> StreetNetwork {
+    let edges: Vec<TestEdge> = vec![
+        (0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0))),
+        (1, 2, 100.0, straight((100.0, 0.0), (200.0, 0.0))),
+    ];
+    let both = MODE_WALK | MODE_WHEELCHAIR;
+    let attrs = Attrs {
+        highway: vec![0; 2],
+        surface: vec![0; 2],
+        smoothness: vec![0; 2],
+        flags: vec![0; 2],
+        access_forward: vec![both; 2],
+        access_reverse: vec![both; 2],
+        facility_forward: vec![0; 2],
+        facility_reverse: vec![0; 2],
+    };
+    elevated_network(3, &edges, &attrs, |x, _| {
+        if x <= 100.0 {
+            (0.05 * x) as f32
+        } else {
+            (5.0 + 0.10 * (x - 100.0)) as f32
+        }
+    })
+}
+
+#[test]
+fn the_gradient_cap_forbids_steeper_arcs_for_the_wheelchair() {
+    // The wheelchair's 8 % cap crosses the 5 % edge and refuses the 10 %
+    // one; capless walking passes both.
+    let net = sloped_chain();
+    let chair = net
+        .compile_profile(&StreetProfileDefinition::wheelchair())
+        .unwrap();
+    let walk = net
+        .compile_profile(&StreetProfileDefinition::walk())
+        .unwrap();
+    let (lon0, lat0) = lonlat(0.0, 0.0);
+    let origin = net.snap(lat0, lon0, 50.0).unwrap();
+    let wheeled: Vec<u32> = net
+        .directed_reached_vertices(&origin, &chair, 10_000.0)
+        .into_iter()
+        .map(|(vertex, _)| vertex)
+        .collect();
+    assert!(wheeled.contains(&1));
+    assert!(!wheeled.contains(&2));
+    let walked: Vec<u32> = net
+        .directed_reached_vertices(&origin, &walk, 10_000.0)
+        .into_iter()
+        .map(|(vertex, _)| vertex)
+        .collect();
+    assert!(walked.contains(&2));
+}
+
+#[test]
+fn the_cap_bites_around_the_measured_gradient() {
+    // Caps bracketing the gentle edge's 5 %: the tighter one forbids the
+    // whole chain, the looser one keeps the gentle edge.
+    let net = sloped_chain();
+    let mut tight = StreetProfileDefinition::wheelchair();
+    tight.max_gradient = Some(0.049);
+    let mut loose = StreetProfileDefinition::wheelchair();
+    loose.max_gradient = Some(0.051);
+    let tight = net.compile_profile(&tight).unwrap();
+    let loose = net.compile_profile(&loose).unwrap();
+    assert!(tight.arc_millis().iter().all(|&millis| millis == u32::MAX));
+    assert!(loose.arc_millis().iter().any(|&millis| millis != u32::MAX));
+}
+
+#[test]
+fn unavailable_elevations_never_cap() {
+    // NaN elevations count flat: the cap forbids nothing it cannot see.
+    let edges: Vec<TestEdge> = vec![(0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0)))];
+    let both = MODE_WALK | MODE_WHEELCHAIR;
+    let attrs = Attrs {
+        highway: vec![0; 1],
+        surface: vec![0; 1],
+        smoothness: vec![0; 1],
+        flags: vec![0; 1],
+        access_forward: vec![both; 1],
+        access_reverse: vec![both; 1],
+        facility_forward: vec![0; 1],
+        facility_reverse: vec![0; 1],
+    };
+    let net = elevated_network(2, &edges, &attrs, |_, _| f32::NAN);
+    let chair = net
+        .compile_profile(&StreetProfileDefinition::wheelchair())
+        .unwrap();
+    assert!(chair.arc_millis().iter().any(|&millis| millis != u32::MAX));
+}
+
+#[test]
+fn a_network_without_elevations_never_caps() {
+    // No DEM: the wheelchair routes on the tag rules alone.
+    let mut net = triangle();
+    let attributes = uniform_attributes(&net, MODE_WALK | MODE_WHEELCHAIR, 0);
+    net.install_street_attributes(attributes).unwrap();
+    let chair = net
+        .compile_profile(&StreetProfileDefinition::wheelchair())
+        .unwrap();
+    assert!(chair.arc_millis().iter().all(|&millis| millis != u32::MAX));
+}
+
+#[test]
+fn max_gradient_ships_on_the_wheelchair_and_validates() {
+    assert_eq!(
+        StreetProfileDefinition::wheelchair().max_gradient,
+        Some(0.08)
+    );
+    assert_eq!(StreetProfileDefinition::walk().max_gradient, None);
+    assert_eq!(StreetProfileDefinition::bicycle().max_gradient, None);
+    for bad_cap in [0.0, -0.05, f64::NAN, f64::INFINITY] {
+        let mut bad = StreetProfileDefinition::wheelchair();
+        bad.max_gradient = Some(bad_cap);
+        assert_eq!(bad.validate(), Err(ProfileError::InvalidMaxGradient));
+    }
+}
+
+#[test]
+fn the_boundary_is_strictly_greater() {
+    // An edge exactly at the cap stays open: measure the chain's stored
+    // gentler maximum, compile with the cap at precisely that value, then
+    // at the next representable step below it.
+    let net = sloped_chain();
+    let definition = StreetProfileDefinition::wheelchair();
+    let (_, maxima) = net.slope_means(&definition).unwrap();
+    let gentle = maxima.iter().cloned().fold(f64::MAX, f64::min);
+    assert!(gentle > 0.0);
+    let mut at = StreetProfileDefinition::wheelchair();
+    at.max_gradient = Some(gentle);
+    let at = net.compile_profile(&at).unwrap();
+    assert!(at.arc_millis().iter().any(|&millis| millis != u32::MAX));
+    let mut below = StreetProfileDefinition::wheelchair();
+    below.max_gradient = Some(gentle * (1.0 - 4.0 * f64::EPSILON));
+    let below = net.compile_profile(&below).unwrap();
+    assert!(below.arc_millis().iter().all(|&millis| millis == u32::MAX));
+}
+
+#[test]
+fn a_car_profile_rejects_a_gradient_cap() {
+    let mut car = StreetProfileDefinition::car(None);
+    car.max_gradient = Some(0.08);
+    assert_eq!(car.validate(), Err(ProfileError::InvalidMaxGradient));
+    let mut bad = StreetProfileDefinition::car(None);
+    bad.max_gradient = Some(f64::NAN);
+    assert_eq!(bad.validate(), Err(ProfileError::InvalidMaxGradient));
+}
