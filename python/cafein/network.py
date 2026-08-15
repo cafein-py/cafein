@@ -3,6 +3,7 @@
 import os
 
 from cafein._validate import component_selection, id_sequence, sequence_not_string
+from cafein.travelers import folded_constraints
 from cafein._cafein import TransportNetwork as _TransportNetwork
 
 
@@ -1508,6 +1509,7 @@ class TransportNetwork:
         *,
         exclude_routes=(),
         exclude_trips=(),
+        traveler=None,
         exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
@@ -1575,6 +1577,11 @@ class TransportNetwork:
             through it; an excluded origin or destination yields no
             journeys. Unknown route and trip ids are ignored.
 
+        traveler : TravelerProfile (optional)
+            One traveler's constraint profile (``cafein.TravelerProfile``):
+            its compiled exclusions union the ``exclude_*`` lists, and its
+            walking knobs fill the unset walking arguments — a knob set on
+            both the call and the profile is rejected.
         Returns
         -------
         list of dict
@@ -1584,6 +1591,21 @@ class TransportNetwork:
             journey carries its legs; the ``*_s`` times are seconds past
             the service day's start.
         """
+        (
+            exclude_routes,
+            exclude_trips,
+            exclude_stops,
+            walking_speed_kmph,
+            max_walking_time,
+        ) = folded_constraints(
+            traveler,
+            self,
+            exclude_routes,
+            exclude_trips,
+            exclude_stops,
+            walking_speed_kmph,
+            max_walking_time,
+        )
         from cafein._units import departure_parts, duration_seconds
 
         date, departure = departure_parts(departure)
@@ -1650,6 +1672,7 @@ class TransportNetwork:
         *,
         exclude_routes=(),
         exclude_trips=(),
+        traveler=None,
         exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
@@ -1700,6 +1723,11 @@ class TransportNetwork:
             transfers, and access/egress, but vehicles still ride
             through it; an excluded origin or destination yields no
             journeys. Unknown route and trip ids are ignored.
+        traveler : TravelerProfile (optional)
+            One traveler's constraint profile (``cafein.TravelerProfile``):
+            its compiled exclusions union the ``exclude_*`` lists, and its
+            walking knobs fill the unset walking arguments — a knob set on
+            both the call and the profile is rejected.
         street_policy : StreetLegPolicy, optional
             Which street modes may serve the access and egress, on what
             vehicle terms (``cafein.StreetLegPolicy``). A walking-only
@@ -1728,6 +1756,21 @@ class TransportNetwork:
             Journeys as in ``route_between_stops``; arrivals include
             the egress walk.
         """
+        (
+            exclude_routes,
+            exclude_trips,
+            exclude_stops,
+            walking_speed_kmph,
+            max_walking_time,
+        ) = folded_constraints(
+            traveler,
+            self,
+            exclude_routes,
+            exclude_trips,
+            exclude_stops,
+            walking_speed_kmph,
+            max_walking_time,
+        )
         from cafein._units import departure_parts, duration_seconds
 
         date, departure = departure_parts(departure)
@@ -1922,6 +1965,7 @@ class TransportNetwork:
         *,
         exclude_routes=(),
         exclude_trips=(),
+        traveler=None,
         exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
@@ -1976,6 +2020,21 @@ class TransportNetwork:
             Travel time in seconds to every reachable stop, keyed by
             stop_id; unreachable stops are absent.
         """
+        (
+            exclude_routes,
+            exclude_trips,
+            exclude_stops,
+            walking_speed_kmph,
+            max_walking_time,
+        ) = folded_constraints(
+            traveler,
+            self,
+            exclude_routes,
+            exclude_trips,
+            exclude_stops,
+            walking_speed_kmph,
+            max_walking_time,
+        )
         from cafein._units import departure_parts, duration_seconds
 
         date, departure = departure_parts(departure)
@@ -2121,6 +2180,7 @@ class TransportNetwork:
         *,
         exclude_routes=(),
         exclude_trips=(),
+        traveler=None,
         exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
@@ -2169,6 +2229,21 @@ class TransportNetwork:
             door-to-door time from the origin stop's coordinate, so the origin
             may cost its short walk to the platform.
         """
+        (
+            exclude_routes,
+            exclude_trips,
+            exclude_stops,
+            walking_speed_kmph,
+            max_walking_time,
+        ) = folded_constraints(
+            traveler,
+            self,
+            exclude_routes,
+            exclude_trips,
+            exclude_stops,
+            walking_speed_kmph,
+            max_walking_time,
+        )
         from cafein._units import departure_parts, duration_seconds
 
         date, departure = departure_parts(departure)
@@ -2197,6 +2272,7 @@ class TransportNetwork:
         *,
         exclude_routes=(),
         exclude_trips=(),
+        traveler=None,
         exclude_stops=(),
         destinations=None,
         departure_time_window=None,
@@ -2296,6 +2372,21 @@ class TransportNetwork:
             Unreachable pairs hold the maximum uint32 value
             (4294967295).
         """
+        (
+            exclude_routes,
+            exclude_trips,
+            exclude_stops,
+            walking_speed_kmph,
+            max_walking_time,
+        ) = folded_constraints(
+            traveler,
+            self,
+            exclude_routes,
+            exclude_trips,
+            exclude_stops,
+            walking_speed_kmph,
+            max_walking_time,
+        )
         from cafein._units import departure_parts, duration_seconds
 
         date, departure = departure_parts(departure)

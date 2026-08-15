@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from cafein._validate import id_sequence, sequence_not_string
+from cafein.travelers import folded_constraints
 
 #: The parameter each decay family takes (None: no parameter).
 DECAY_PARAMETERS = {
@@ -645,11 +646,33 @@ class Accessibility(pd.DataFrame):
         max_travel_time=None,
         exclude_routes=(),
         exclude_trips=(),
+        traveler=None,
         exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
         snap_distance=None,
     ):
+        if hasattr(network, "route_between_stops"):
+            (
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+            ) = folded_constraints(
+                traveler,
+                network,
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+            )
+        elif traveler is not None:
+            raise ValueError(
+                "traveler applies to transit; a StreetNetwork takes "
+                "transport_mode, max_street_time, and snap_distance"
+            )
         from cafein._units import departure_parts, duration_seconds
 
         date, departure = (
@@ -796,6 +819,7 @@ class Accessibility(pd.DataFrame):
         max_travel_time=None,
         exclude_routes=(),
         exclude_trips=(),
+        traveler=None,
         exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
@@ -816,6 +840,27 @@ class Accessibility(pd.DataFrame):
         ``resume=True`` continues a matching partial directory run
         with the same manifest contract.
         """
+        if hasattr(network, "route_between_stops"):
+            (
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+            ) = folded_constraints(
+                traveler,
+                network,
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+            )
+        elif traveler is not None:
+            raise ValueError(
+                "traveler applies to transit; a StreetNetwork takes "
+                "transport_mode, max_street_time, and snap_distance"
+            )
         from cafein._units import departure_parts, duration_seconds
 
         date, departure = (
@@ -1144,12 +1189,34 @@ class NearestDestinations(pd.DataFrame):
         max_travel_time=None,
         exclude_routes=(),
         exclude_trips=(),
+        traveler=None,
         exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
         snap_distance=None,
         output_time_units="minutes",
     ):
+        if hasattr(network, "route_between_stops"):
+            (
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+            ) = folded_constraints(
+                traveler,
+                network,
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+            )
+        elif traveler is not None:
+            raise ValueError(
+                "traveler applies to transit; a StreetNetwork takes "
+                "transport_mode, max_street_time, and snap_distance"
+            )
         from cafein._units import (
             departure_parts,
             duration_seconds,
@@ -1433,11 +1500,33 @@ class Catchment(gpd.GeoDataFrame):
         transport_mode=None,
         exclude_routes=(),
         exclude_trips=(),
+        traveler=None,
         exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
         snap_distance=None,
     ):
+        if hasattr(network, "route_between_stops"):
+            (
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+            ) = folded_constraints(
+                traveler,
+                network,
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+            )
+        elif traveler is not None:
+            raise ValueError(
+                "traveler applies to transit; a StreetNetwork takes "
+                "transport_mode, max_street_time, and snap_distance"
+            )
         import shapely.geometry
 
         from cafein._units import departure_parts, duration_seconds

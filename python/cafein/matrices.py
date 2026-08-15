@@ -8,6 +8,7 @@ import pandas as pd
 import shapely
 
 from cafein._validate import component_selection, id_sequence, sequence_not_string
+from cafein.travelers import folded_constraints
 
 
 class TravelCostMatrix(pd.DataFrame):
@@ -152,6 +153,11 @@ class TravelCostMatrix(pd.DataFrame):
         GTFS ids of supply the journeys must not use - disruption and
         accessibility filters, as in ``route_between_stops``. Runs on
         the RAPTOR engines (``"auto"`` resolves to them).
+    traveler : TravelerProfile (optional)
+        One traveler's constraint profile (``cafein.TravelerProfile``):
+        its compiled exclusions union the ``exclude_*`` lists, and its
+        walking knobs fill the unset walking arguments — a knob set on
+        both the call and the profile is rejected.
     router : str (optional, default: "auto")
         The routing engine. With time candidates the engines are RAPTOR
         (``"raptor"``) and TBTR (``"tbtr"``), the latter over the
@@ -302,6 +308,7 @@ class TravelCostMatrix(pd.DataFrame):
         router="auto",
         exclude_routes=(),
         exclude_trips=(),
+        traveler=None,
         exclude_stops=(),
         geometries=False,
         chunk=None,
@@ -323,6 +330,22 @@ class TravelCostMatrix(pd.DataFrame):
         cost_components=None,
         output_time_units="minutes",
     ):
+        if not _is_street_network(network):
+            (
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+            ) = folded_constraints(
+                traveler,
+                network,
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+            )
         origins = sequence_not_string("origins", origins)
         destinations = sequence_not_string("destinations", destinations)
         from cafein._units import (
@@ -367,6 +390,7 @@ class TravelCostMatrix(pd.DataFrame):
                 cost_components=cost_components,
                 transit_only={
                     "departure": departure,
+                    "traveler": traveler,
                     "departure_time_window": window,
                     "max_travel_time": within,
                     "fares": fares,
@@ -568,6 +592,7 @@ class TravelCostMatrix(pd.DataFrame):
         router="auto",
         exclude_routes=(),
         exclude_trips=(),
+        traveler=None,
         exclude_stops=(),
         geometries=False,
         chunk=None,
@@ -603,6 +628,22 @@ class TravelCostMatrix(pd.DataFrame):
         rejected. ``resume=True`` continues a matching partial
         directory run exactly as ``travel_cost_table`` does.
         """
+        if not _is_street_network(network):
+            (
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+            ) = folded_constraints(
+                traveler,
+                network,
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+            )
         import pyarrow
 
         from cafein._units import (
@@ -642,6 +683,7 @@ class TravelCostMatrix(pd.DataFrame):
                 chunk=chunk,
                 transit_only={
                     "departure": departure,
+                    "traveler": traveler,
                     "departure_time_window": window,
                     "max_travel_time": within,
                     "fares": fares,
@@ -878,6 +920,7 @@ class TravelTimeMatrix(pd.DataFrame):
         router="auto",
         exclude_routes=(),
         exclude_trips=(),
+        traveler=None,
         exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
@@ -891,6 +934,22 @@ class TravelTimeMatrix(pd.DataFrame):
         parking=None,
         output_time_units="minutes",
     ):
+        if not _is_street_network(network):
+            (
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+            ) = folded_constraints(
+                traveler,
+                network,
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+            )
         origins = sequence_not_string("origins", origins)
         destinations = sequence_not_string("destinations", destinations)
         from cafein._units import (
@@ -925,6 +984,7 @@ class TravelTimeMatrix(pd.DataFrame):
                 parking=parking,
                 transit_only={
                     "departure": departure,
+                    "traveler": traveler,
                     "departure_time_window": window,
                     "percentiles": percentiles,
                     "confidence": confidence,
@@ -1074,6 +1134,7 @@ class TravelTimeMatrix(pd.DataFrame):
         router="auto",
         exclude_routes=(),
         exclude_trips=(),
+        traveler=None,
         exclude_stops=(),
         walking_speed_kmph=None,
         max_walking_time=None,
@@ -1102,6 +1163,22 @@ class TravelTimeMatrix(pd.DataFrame):
         ``resume=True`` continues a matching partial directory run
         exactly as ``travel_cost_table`` does.
         """
+        if not _is_street_network(network):
+            (
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+            ) = folded_constraints(
+                traveler,
+                network,
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+            )
         import pyarrow
 
         from cafein._units import (
@@ -1139,6 +1216,7 @@ class TravelTimeMatrix(pd.DataFrame):
                 chunk=chunk,
                 transit_only={
                     "departure": departure,
+                    "traveler": traveler,
                     "departure_time_window": window,
                     "percentiles": percentiles,
                     "confidence": confidence,
@@ -1798,6 +1876,7 @@ def travel_cost_table(
     router="auto",
     exclude_routes=(),
     exclude_trips=(),
+    traveler=None,
     exclude_stops=(),
     walking_speed_kmph=None,
     max_walking_time=None,
@@ -1856,6 +1935,22 @@ def travel_cost_table(
     ``chunk``, and ``batch_size`` — else the directory is refused,
     never overwritten.
     """
+    if not _is_street_network(network):
+        (
+            exclude_routes,
+            exclude_trips,
+            exclude_stops,
+            walking_speed_kmph,
+            max_walking_time,
+        ) = folded_constraints(
+            traveler,
+            network,
+            exclude_routes,
+            exclude_trips,
+            exclude_stops,
+            walking_speed_kmph,
+            max_walking_time,
+        )
     try:
         import pyarrow
     except ImportError as error:

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `TravelerProfile`: per-traveler constraints as `traveler=` on every
+  exclusion surface — wheelchair exclusions compiled from the feed
+  (optimistic by default, `unknown="excluded"` strict), plus bundled
+  walking knobs and manual exclusions.
+  ([#264](https://github.com/cafein-py/cafein/pull/264))
+
 - The GTFS wheelchair tri-states ride the feed model: per-stop
   `wheelchair_boarding` (with parent-station inheritance) and per-trip
   `wheelchair_accessible`, exposed as core getters; network artifact
