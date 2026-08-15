@@ -43,6 +43,7 @@ import pandas as pd
 
 from cafein import emissions
 from cafein._validate import component_selection, id_sequence, sequence_not_string
+from cafein.travelers import folded_constraints
 
 _COLUMNS = [
     "departure_s",
@@ -76,6 +77,7 @@ def journey_frontier(
     max_slower=None,
     exclude_routes=(),
     exclude_trips=(),
+    traveler=None,
     exclude_stops=(),
     walking_speed_kmph=None,
     max_walking_time=None,
@@ -212,6 +214,11 @@ def journey_frontier(
         the McRAPTOR path ("auto" resolves to it); excluded stops
         refuse boarding, alighting, transfers, and access/egress while
         vehicles still ride through them.
+    traveler : TravelerProfile (optional)
+        One traveler's constraint profile (``cafein.TravelerProfile``):
+        its compiled exclusions union the ``exclude_*`` lists, and its
+        walking knobs fill the unset walking arguments — a knob set on
+        both the call and the profile is rejected.
     max_slower : float or datetime.timedelta (optional, default: None)
         Restrict the ``"pareto"`` frontier (on either engine) to
         journeys near the fast end: per departure pass, every returned
@@ -244,6 +251,21 @@ def journey_frontier(
         on any criterion never are), and ``journey``, the annotated
         journey dict as returned by the routing calls.
     """
+    (
+        exclude_routes,
+        exclude_trips,
+        exclude_stops,
+        walking_speed_kmph,
+        max_walking_time,
+    ) = folded_constraints(
+        traveler,
+        network,
+        exclude_routes,
+        exclude_trips,
+        exclude_stops,
+        walking_speed_kmph,
+        max_walking_time,
+    )
     from cafein._units import (
         departure_parts,
         duration_seconds,
@@ -449,6 +471,7 @@ def journey_frontiers(
     max_slower=None,
     exclude_routes=(),
     exclude_trips=(),
+    traveler=None,
     exclude_stops=(),
     walking_speed_kmph=None,
     max_walking_time=None,
@@ -504,6 +527,21 @@ def journey_frontiers(
         rows within a cell the frame's travel-time sort; a cell with no
         feasible journey contributes no rows.
     """
+    (
+        exclude_routes,
+        exclude_trips,
+        exclude_stops,
+        walking_speed_kmph,
+        max_walking_time,
+    ) = folded_constraints(
+        traveler,
+        network,
+        exclude_routes,
+        exclude_trips,
+        exclude_stops,
+        walking_speed_kmph,
+        max_walking_time,
+    )
     from cafein._units import (
         departure_parts,
         duration_seconds,
@@ -616,6 +654,7 @@ def frontier_table(
     max_slower=None,
     exclude_routes=(),
     exclude_trips=(),
+    traveler=None,
     exclude_stops=(),
     walking_speed_kmph=None,
     max_walking_time=None,
@@ -651,6 +690,21 @@ def frontier_table(
         ``travel_time``, ``rides``, ``emissions`` (NaN where a transit
         leg's factor is unresolved), and ``frontier``.
     """
+    (
+        exclude_routes,
+        exclude_trips,
+        exclude_stops,
+        walking_speed_kmph,
+        max_walking_time,
+    ) = folded_constraints(
+        traveler,
+        network,
+        exclude_routes,
+        exclude_trips,
+        exclude_stops,
+        walking_speed_kmph,
+        max_walking_time,
+    )
     from cafein._units import (
         departure_parts,
         duration_seconds,

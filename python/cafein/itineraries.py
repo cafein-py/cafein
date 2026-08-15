@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import shapely
 
+from cafein.travelers import folded_constraints
 from cafein.matrices import (
     _factor_tables,
     _is_point_frame,
@@ -220,6 +221,11 @@ class DetailedItineraries(gpd.GeoDataFrame):
         Excluded stops refuse boarding, alighting, transfers, and
         access/egress while vehicles still ride through them; excluded
         origins or destinations yield no rows.
+    traveler : TravelerProfile (optional)
+        One traveler's constraint profile (``cafein.TravelerProfile``):
+        its compiled exclusions union the ``exclude_*`` lists, and its
+        walking knobs fill the unset walking arguments — a knob set on
+        both the call and the profile is rejected.
     geometries : bool (optional, default: True)
         Attach each leg's geometry. Turn off to skip the geometry work
         when only the leg records are needed.
@@ -331,6 +337,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         penalty="ban",
         exclude_routes=(),
         exclude_trips=(),
+        traveler=None,
         exclude_stops=(),
         geometries=True,
         walking_speed_kmph=None,
@@ -351,6 +358,22 @@ class DetailedItineraries(gpd.GeoDataFrame):
         cost_components=None,
         output_time_units="minutes",
     ):
+        if not _is_street_network(network) and hasattr(network, "route_between_stops"):
+            (
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+            ) = folded_constraints(
+                traveler,
+                network,
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+            )
         from cafein._units import (
             departure_parts,
             duration_seconds,
@@ -400,6 +423,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
                 cost_components=cost_components,
                 transit_only={
                     "fares": fares,
+                    "traveler": traveler,
                     "tolerance_minutes": slack_seconds,
                     "max_options": max_options,
                     "walking_speed_kmph": walking_speed_kmph,
