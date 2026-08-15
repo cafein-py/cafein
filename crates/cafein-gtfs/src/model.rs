@@ -51,6 +51,11 @@ pub struct Stop {
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub parent_station: Option<String>,
+    /// GTFS ``wheelchair_boarding``: ``Some(true)`` = accessible,
+    /// ``Some(false)`` = not accessible, ``None`` = the feed says
+    /// nothing. A stop without a value inherits its parent station's
+    /// known value at ingest.
+    pub wheelchair_boarding: Option<bool>,
 }
 
 /// A route (`routes.txt`).
@@ -78,6 +83,10 @@ pub struct Trip {
     /// GTFS ``bikes_allowed``: ``Some(true)`` = bicycles allowed,
     /// ``Some(false)`` = forbidden, ``None`` = the feed says nothing.
     pub bikes_allowed: Option<bool>,
+    /// GTFS ``wheelchair_accessible``: ``Some(true)`` = accessible,
+    /// ``Some(false)`` = not accessible, ``None`` = the feed says
+    /// nothing.
+    pub wheelchair_accessible: Option<bool>,
     pub stop_times: Vec<StopTime>,
 }
 

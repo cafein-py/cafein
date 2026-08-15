@@ -659,3 +659,14 @@ def test_round_trip_preserves_the_mctbtr_transfer_cache(
     plain_path = tmp_path / "plain_mc.cafein"
     network.save(plain_path)
     assert not TransportNetwork.load(plain_path).has_mctbtr_transfers
+
+
+def test_round_trip_preserves_the_wheelchair_fields(network_with_footpaths, reloaded):
+    assert (
+        reloaded._core.stop_wheelchair_boarding
+        == network_with_footpaths._core.stop_wheelchair_boarding
+    )
+    assert (
+        reloaded._core.trip_wheelchair_accessible
+        == network_with_footpaths._core.trip_wheelchair_accessible
+    )

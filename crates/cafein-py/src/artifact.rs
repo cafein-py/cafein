@@ -360,6 +360,8 @@ pub(super) const STREET_ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINST";
 // format 13.
 pub(super) const STREET_ARTIFACT_FORMAT: u32 = 3;
 
+// 18: the feed's stops and trips carry the GTFS wheelchair tri-states
+// (`wheelchair_boarding`, `wheelchair_accessible`).
 // 17: the STREETS section gains the optional car array group — per-slot
 // driving speeds (f32 km/h) and junction head classes (u8) — after the
 // elevations, present on car builds only.
@@ -373,7 +375,7 @@ pub(super) const STREET_ARTIFACT_FORMAT: u32 = 3;
 // STREETS section (descriptor offsets pre-shifted to their position).
 // 13 added optional elevation metadata to `StreetsMeta`. Earlier formats
 // must be rebuilt.
-pub(super) const ARTIFACT_FORMAT: u32 = 17;
+pub(super) const ARTIFACT_FORMAT: u32 = 18;
 
 /// Section tags in the container directory.
 pub(super) const SECTION_META: u16 = 1;

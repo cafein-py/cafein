@@ -13,6 +13,7 @@ fn flags_coordinate_less_stops_and_never_running_trips() {
                 latitude: Some(60.0),
                 longitude: Some(24.0),
                 parent_station: None,
+                wheelchair_boarding: None,
             },
             Stop {
                 feed: 0,
@@ -22,6 +23,7 @@ fn flags_coordinate_less_stops_and_never_running_trips() {
                 latitude: None,
                 longitude: None,
                 parent_station: None,
+                wheelchair_boarding: None,
             },
         ],
         trips: vec![Trip {
@@ -33,6 +35,7 @@ fn flags_coordinate_less_stops_and_never_running_trips() {
             shape_id: None,
             headsign: None,
             bikes_allowed: None,
+            wheelchair_accessible: None,
             stop_times: Vec::new(),
         }],
         ..Feed::default()

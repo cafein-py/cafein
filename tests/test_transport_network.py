@@ -1050,3 +1050,22 @@ def test_max_rides_counts_boardings(network):
     for journey in single:
         boardings = sum(1 for leg in journey["legs"] if leg["type"] == "transit")
         assert boardings <= 1
+
+
+def test_wheelchair_fields_ride_the_feed(network):
+    # HSL marks 407 stops accessible, 1965 not, and leaves the rest
+    # unsaid; every trip carries an explicit flag.
+    stops = dict(network._core.stop_wheelchair_boarding)
+    assert len(stops) == 8305
+    counts = {True: 0, False: 0, None: 0}
+    for flag in stops.values():
+        counts[flag] += 1
+    assert counts == {True: 407, False: 1965, None: 5933}
+    assert stops["1010419"] is True
+    assert stops["1010107"] is False
+    trips = network._core.trip_wheelchair_accessible
+    assert len(trips) == 195_351
+    trip_counts = {True: 0, False: 0, None: 0}
+    for _, flag in trips:
+        trip_counts[flag] += 1
+    assert trip_counts == {True: 191_929, False: 3422, None: 0}

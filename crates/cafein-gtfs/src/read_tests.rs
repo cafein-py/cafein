@@ -86,3 +86,94 @@ fn keeps_routes_errors_that_are_not_colours() {
     let ragged = minimal_feed_zip(",route_text_color", ",0,i-am-an-extra-field");
     assert!(read_zip_bytes("ragged", &ragged).is_err());
 }
+
+/// A feed whose stops and trips carry every wheelchair tri-state, a
+/// station for children to inherit from, and an out-of-spec code.
+fn wheelchair_feed_zip() -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default();
+    let files = [
+        (
+            "agency.txt",
+            "agency_id,agency_name,agency_url,agency_timezone\n\
+                 A,Agency,http://example.com,Europe/Helsinki\n",
+        ),
+        (
+            "stops.txt",
+            "stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station,wheelchair_boarding\n\
+                 STATION,Hub,60.0,24.0,1,,1\n\
+                 CHILD_BLANK,Inherits,60.0,24.0,0,STATION,\n\
+                 CHILD_ZERO,Inherits too,60.0,24.0,0,STATION,0\n\
+                 CHILD_OWN,Keeps its own,60.0,24.0,0,STATION,2\n\
+                 LONER_YES,Accessible,60.01,24.01,0,,1\n\
+                 LONER_NO,Not accessible,60.02,24.02,0,,2\n\
+                 LONER_BLANK,Unknown,60.03,24.03,0,,\n\
+                 LONER_ODD,Out of spec,60.04,24.04,0,,3\n",
+        ),
+        (
+            "routes.txt",
+            "route_id,route_short_name,route_type\nR1,1,3\n",
+        ),
+        (
+            "trips.txt",
+            "route_id,service_id,trip_id,wheelchair_accessible\n\
+                 R1,SV,T_YES,1\nR1,SV,T_NO,2\nR1,SV,T_BLANK,\nR1,SV,T_ODD,3\n",
+        ),
+        (
+            "stop_times.txt",
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+                 T_YES,08:00:00,08:00:00,LONER_YES,1\n\
+                 T_YES,08:10:00,08:10:00,LONER_NO,2\n\
+                 T_NO,09:00:00,09:00:00,LONER_YES,1\n\
+                 T_NO,09:10:00,09:10:00,LONER_NO,2\n\
+                 T_BLANK,10:00:00,10:00:00,LONER_YES,1\n\
+                 T_BLANK,10:10:00,10:10:00,LONER_NO,2\n\
+                 T_ODD,11:00:00,11:00:00,LONER_YES,1\n\
+                 T_ODD,11:10:00,11:10:00,LONER_NO,2\n",
+        ),
+        (
+            "calendar.txt",
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,\
+                 start_date,end_date\nSV,1,1,1,1,1,1,1,20220101,20221231\n",
+        ),
+    ];
+    for (name, content) in files {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(content.as_bytes()).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn maps_the_wheelchair_tri_states_and_inherits_the_parent_station() {
+    let feed = read_zip_bytes("wheelchair", &wheelchair_feed_zip()).unwrap();
+    let stop = |id: &str| {
+        feed.stops
+            .iter()
+            .find(|stop| stop.id == id)
+            .unwrap()
+            .wheelchair_boarding
+    };
+    assert_eq!(stop("STATION"), Some(true));
+    assert_eq!(stop("LONER_YES"), Some(true));
+    assert_eq!(stop("LONER_NO"), Some(false));
+    assert_eq!(stop("LONER_BLANK"), None);
+    // An out-of-spec integer code stays unknown, never a guess.
+    assert_eq!(stop("LONER_ODD"), None);
+    // Blank and 0 both inherit the parent station's known value; an
+    // explicit value of the stop's own wins over the parent's.
+    assert_eq!(stop("CHILD_BLANK"), Some(true));
+    assert_eq!(stop("CHILD_ZERO"), Some(true));
+    assert_eq!(stop("CHILD_OWN"), Some(false));
+    let trip = |id: &str| {
+        feed.trips
+            .iter()
+            .find(|trip| trip.id == id)
+            .unwrap()
+            .wheelchair_accessible
+    };
+    assert_eq!(trip("T_YES"), Some(true));
+    assert_eq!(trip("T_NO"), Some(false));
+    assert_eq!(trip("T_BLANK"), None);
+    assert_eq!(trip("T_ODD"), None);
+}
