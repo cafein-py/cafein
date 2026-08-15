@@ -33,10 +33,11 @@ pub(super) fn profile_definition(mode: &str) -> PyResult<StreetProfileDefinition
         "bicycle" => Ok(StreetProfileDefinition::bicycle()),
         "e_bike" => Ok(StreetProfileDefinition::e_bike()),
         "e_scooter" => Ok(StreetProfileDefinition::e_scooter()),
+        "wheelchair" => Ok(StreetProfileDefinition::wheelchair()),
         "car" => Ok(StreetProfileDefinition::car(None)),
         other => Err(PyValueError::new_err(format!(
             "unknown street mode '{other}'; expected one of \
-             'walk', 'bicycle', 'e_bike', 'e_scooter', 'car'"
+             'walk', 'bicycle', 'e_bike', 'e_scooter', 'wheelchair', 'car'"
         ))),
     }
 }

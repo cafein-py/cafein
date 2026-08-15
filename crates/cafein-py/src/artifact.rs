@@ -354,12 +354,17 @@ pub(super) const ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINET";
 /// failing later in a checksum or a decode.
 pub(super) const STREET_ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINST";
 
+// 4: `adj_access` carries the wheelchair permission bit, as in network
+// format 19.
 // 3: the optional car array group (per-slot driving speeds and junction
 // head classes), as in network format 17.
 // 2 added optional elevation metadata in `StreetsMeta`, as in network
 // format 13.
-pub(super) const STREET_ARTIFACT_FORMAT: u32 = 3;
+pub(super) const STREET_ARTIFACT_FORMAT: u32 = 4;
 
+// 19: `adj_access` carries the wheelchair permission bit (MODE_WHEELCHAIR);
+// earlier builds compiled no wheelchair permissions, so earlier formats
+// must be rebuilt.
 // 18: the feed's stops and trips carry the GTFS wheelchair tri-states
 // (`wheelchair_boarding`, `wheelchair_accessible`).
 // 17: the STREETS section gains the optional car array group — per-slot
@@ -375,7 +380,7 @@ pub(super) const STREET_ARTIFACT_FORMAT: u32 = 3;
 // STREETS section (descriptor offsets pre-shifted to their position).
 // 13 added optional elevation metadata to `StreetsMeta`. Earlier formats
 // must be rebuilt.
-pub(super) const ARTIFACT_FORMAT: u32 = 18;
+pub(super) const ARTIFACT_FORMAT: u32 = 19;
 
 /// Section tags in the container directory.
 pub(super) const SECTION_META: u16 = 1;

@@ -19,6 +19,7 @@ pub const MODE_WALK: u8 = 1 << 0;
 pub const MODE_BICYCLE: u8 = 1 << 1;
 pub const MODE_E_SCOOTER: u8 = 1 << 2;
 pub const MODE_CAR: u8 = 1 << 3;
+pub const MODE_WHEELCHAIR: u8 = 1 << 4;
 
 // The per-edge `edge_flags` bits, mirroring `_osm.py` exactly. `FLAG_DISMOUNT`
 // is the only one the profile compiler reads today (it lowers the bicycle to
@@ -90,6 +91,7 @@ pub enum StreetMode {
     Bicycle,
     EScooter,
     Car,
+    Wheelchair,
 }
 
 impl StreetMode {
@@ -100,6 +102,7 @@ impl StreetMode {
             StreetMode::Bicycle => MODE_BICYCLE,
             StreetMode::EScooter => MODE_E_SCOOTER,
             StreetMode::Car => MODE_CAR,
+            StreetMode::Wheelchair => MODE_WHEELCHAIR,
         }
     }
 }
@@ -269,6 +272,18 @@ impl StreetProfileDefinition {
     /// The default walking profile, 3.6 km/h (matching the time engines).
     pub fn walk() -> StreetProfileDefinition {
         StreetProfileDefinition::flat("walk", StreetMode::Walk, "walk", WALK_SPEED)
+    }
+
+    /// The default wheelchair profile: walk speed over the wheelchair
+    /// permission bit — walkable arcs without stairs, per the
+    /// extraction's tag rules.
+    pub fn wheelchair() -> StreetProfileDefinition {
+        StreetProfileDefinition::flat(
+            "wheelchair",
+            StreetMode::Wheelchair,
+            "wheelchair",
+            WALK_SPEED,
+        )
     }
 
     /// The default bicycle profile, 14.4 km/h (R5's 4 m/s default), with the

@@ -28,11 +28,18 @@ WALK = 1 << 0
 BICYCLE = 1 << 1
 E_SCOOTER = 1 << 2
 CAR = 1 << 3
+WHEELCHAIR = 1 << 4
 
-MODES = {"walk": WALK, "bicycle": BICYCLE, "e_scooter": E_SCOOTER, "car": CAR}
+MODES = {
+    "walk": WALK,
+    "bicycle": BICYCLE,
+    "e_scooter": E_SCOOTER,
+    "car": CAR,
+    "wheelchair": WHEELCHAIR,
+}
 """The street modes and their permission bits. An e-bike reuses the bicycle
 bit (same permissions, different speed); the e-scooter has its own bit,
-"bicycle_like" by default."""
+"bicycle_like" by default. The wheelchair is walk-like without stairs."""
 
 
 # --- Per-edge facility / directional flags -----------------------------------
@@ -183,6 +190,20 @@ _DENIED_ACCESS = frozenset(
 """Access values that deny general routing. `dismount`/`use_sidepath` are
 handled specially for bicycle before this set is consulted; for foot they
 deny."""
+
+
+def _wheelchair_permission(foot_default, highway, access, foot, wheelchair):
+    """Wheelchair permission: the walk access ladder, then the `steps`
+    class veto, then the `wheelchair` tag. `wheelchair=yes` rescues only
+    the steps veto — never an access-ladder denial or a non-walkable
+    class — and `wheelchair=no` denies everywhere; `limited` and unknown
+    values keep the resolved default. Symmetric, like walking."""
+    allowed, unknown = _resolve_mode(foot_default, access, foot)
+    if highway == "steps" and wheelchair != "yes":
+        allowed = False
+    if wheelchair == "no":
+        allowed = False
+    return allowed, unknown
 
 
 def _resolve_mode(default, general, specific, denied_extra=()):
@@ -351,6 +372,9 @@ def _row_permissions(row):
     access = row.get("access")
 
     foot_ok, foot_unknown = _resolve_mode(foot_default, access, row.get("foot"))
+    chair_ok, _ = _wheelchair_permission(
+        foot_default, highway, access, row.get("foot"), row.get("wheelchair")
+    )
     bike_ok, dismount, bike_unknown = _bicycle_permission(
         bike_default, access, row.get("vehicle"), row.get("bicycle")
     )
@@ -416,12 +440,14 @@ def _row_permissions(row):
         | (BICYCLE if bike_forward else 0)
         | (E_SCOOTER if bike_forward else 0)
         | (CAR if car_forward else 0)
+        | (WHEELCHAIR if chair_ok else 0)
     )
     reverse = (
         (WALK if foot_ok else 0)
         | (BICYCLE if bike_reverse else 0)
         | (E_SCOOTER if bike_reverse else 0)
         | (CAR if car_reverse else 0)
+        | (WHEELCHAIR if chair_ok else 0)
     )
     flags = FLAG_DISMOUNT if dismount else 0
     unknown = foot_unknown or bike_unknown or car_unknown
@@ -448,6 +474,7 @@ def edge_permissions(edges):
             "highway",
             "access",
             "foot",
+            "wheelchair",
             "bicycle",
             "vehicle",
             "motor_vehicle",
@@ -848,6 +875,7 @@ _EXTRA_ATTRIBUTES = [
     "layer",
     "indoor",
     "incline",
+    "wheelchair",
     # Also requested explicitly (though in pyrosm's default highway columns) so
     # the directional and facility logic never silently loses them to a config
     # change: `oneway:bicycle`, `junction`, `segregated`.

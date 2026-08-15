@@ -35,6 +35,7 @@ STREET_KEY_COLUMNS = ["street_mode", "vehicle_class", "service_model"]
 # bicycle permissions in routing.
 STREET_MODE_IDENTITIES = {
     "walk": ("walk", "on_foot", "private"),
+    "wheelchair": ("wheelchair", "manual", "private"),
     "bicycle": ("bicycle", "conventional", "private"),
     "e_bike": ("bicycle", "e_bike", "private"),
     "e_scooter": ("e_scooter", "battery", "private"),
@@ -133,6 +134,16 @@ def street_factors():
         {
             "street_mode": "walk",
             "vehicle_class": "on_foot",
+            "service_model": "private",
+            "vehicle": 0.0,
+            "fuel": 0.0,
+            "infrastructure": 0.0,
+            "operations": 0.0,
+        },
+        {
+            # A manual wheelchair shares the walking zero baseline.
+            "street_mode": "wheelchair",
+            "vehicle_class": "manual",
             "service_model": "private",
             "vehicle": 0.0,
             "fuel": 0.0,

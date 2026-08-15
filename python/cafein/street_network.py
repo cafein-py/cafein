@@ -10,10 +10,10 @@ from . import _osm, elevation, streets
 from ._cafein import STREET_MAX_SEGMENT_METERS
 from ._cafein import StreetNetwork as _CoreStreetNetwork
 
-MODES = ("walk", "bicycle", "e_scooter")
+MODES = ("walk", "bicycle", "e_scooter", "wheelchair")
 """The modes built by default — those with their own permission bit."""
 
-STREET_MODES = ("walk", "bicycle", "e_bike", "e_scooter", "car")
+STREET_MODES = ("walk", "bicycle", "e_bike", "e_scooter", "wheelchair", "car")
 """The modes that can be routed. `e_bike` has no permission bit of its own — it
 rides the bicycle permissions with its own speed profile — so it is routable
 without being a separate build mode. `car` requires a build with ``"car"`` in
@@ -87,7 +87,7 @@ class StreetNetwork:
             Path to an ``.osm.pbf`` extract.
         modes : iterable of str
             The modes to prune connectivity for, from ``walk``, ``bicycle``,
-            ``e_scooter``, and ``car``. For the non-car modes the selection
+            ``e_scooter``, ``wheelchair``, and ``car``. For the non-car modes the selection
             changes pruning only — every physical edge is kept whatever is
             listed, so a mode left out can still be routed later, just
             without its small-component pruning. ``car`` is the exception:
@@ -233,7 +233,8 @@ class StreetNetwork:
             ``(lat, lon)`` coordinates in EPSG:4326. A coordinate farther than
             `snap_distance` from the network raises ``ValueError``.
         mode : str
-            ``walk``, ``bicycle``, ``e_bike``, ``e_scooter``, or ``car``.
+            ``walk``, ``bicycle``, ``e_bike``, ``e_scooter``,
+            ``wheelchair``, or ``car``.
         max_travel_time : float or datetime.timedelta (optional)
             Cutoff in minutes; beyond it the destination counts as
             unreachable. Unset uses the shipped street default (120
