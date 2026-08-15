@@ -31,6 +31,21 @@ class TravelerProfile:
     beside a call-level value for the same knob is rejected rather
     than silently resolved.
 
+    On a door-to-door query over a network built with the
+    ``"wheelchair"`` street mode, ``wheelchair=True`` also takes the
+    streets: access, egress, and the direct street alternative ride
+    the wheelchair profile — no stairs, ``wheelchair=no`` respected,
+    gradients capped on DEM builds — via an internally synthesized
+    street policy (an explicit ``street_policy=`` beside it is
+    rejected, as is ``walking_speed_kmph``: the profile's speed is
+    fixed). Mid-journey transfers ride the installed walking closure
+    with excluded stops refused at the endpoints; a transfer's walked
+    path may itself cross stairs until exclusion-aware wheelchair
+    transfer sets arrive. Surfaces without street-policy support
+    refuse the wheelchair traveler on point queries rather than
+    walking silently, and stop queries everywhere stay
+    timetable-only.
+
     Parameters
     ----------
     wheelchair : bool (optional, default: False)
@@ -93,6 +108,82 @@ class TravelerProfile:
                 if flag is False or (flag is None and strict):
                     trips.append(trip_id)
         return list(self.exclude_routes), trips, stops
+
+
+def folded_street_policy(
+    traveler,
+    network,
+    street_policy,
+    walking_speed_kmph,
+    max_walking_time,
+):
+    """The door-to-door query's street policy with the traveler's
+    wheelchair folded in, and the walking-time knob it consumed.
+
+    A non-wheelchair traveler (or none) passes the policy through. A
+    wheelchair traveler synthesizes the wheelchair walking-class policy:
+    access and egress at the walking budget. Mid-journey transfers ride
+    the installed walking closure with the traveler's excluded stops
+    refused at the transfer endpoints; the documented gap is that a
+    transfer's walked path itself may cross stairs — exclusion-aware
+    wheelchair transfer sets are the follow-up that closes it, and
+    ``compute_mode_transfers("wheelchair", ...)`` already serves
+    exclusion-free explicit policies.
+    Passing an explicit ``street_policy`` beside such a traveler is a
+    conflict (a policy names its own modes), a network built without
+    the wheelchair street mode raises with a rebuild hint, and
+    ``walking_speed_kmph`` is rejected — the wheelchair profile rides
+    its fixed speed. The synthesized policy carries the street-policy
+    query restrictions: a ``departure_time_window`` on a door-to-door
+    query is rejected beside it, exactly as beside any policy.
+    Returns ``(street_policy, max_walking_time)`` with the walking
+    budget consumed into the synthesized policy.
+    """
+    if traveler is None or not traveler.wheelchair:
+        return street_policy, max_walking_time
+    if street_policy is not None:
+        raise ValueError(
+            "a wheelchair traveler synthesizes its own street policy; "
+            "passing street_policy= beside it is a conflict — grant the "
+            "wheelchair mode in the policy instead"
+        )
+    if "wheelchair" not in (network._core.street_modes or ()):
+        raise ValueError(
+            "the wheelchair traveler routes the streets on the wheelchair "
+            "mode; build the network with "
+            "street_modes=('walk', 'wheelchair') (or load such an artifact)"
+        )
+    if walking_speed_kmph is not None:
+        raise ValueError(
+            "walking_speed_kmph cannot reshape the wheelchair street "
+            "profile, which rides its fixed speed"
+        )
+    from cafein import streets as _streets
+    from cafein._units import duration_seconds
+    from cafein.policy import StreetLegPolicy
+
+    seconds = duration_seconds("max_walking_time", max_walking_time)
+    budget = float(_streets.MAX_ACCESS_EGRESS_TIME if seconds is None else seconds)
+    policy = StreetLegPolicy(
+        access={"wheelchair": budget},
+        egress={"wheelchair": budget},
+    )
+    return policy, None
+
+
+def refuse_wheelchair_streets(traveler, surface):
+    """Refuses a wheelchair traveler on a point query of a surface with
+    no street-policy support: its access and egress would silently ride
+    the plain walking graph, stairs included. Stop queries pass — they
+    have no street legs, and the timetable exclusions apply as usual."""
+    if traveler is not None and traveler.wheelchair:
+        raise ValueError(
+            f"{surface} routes point queries over the plain walking "
+            "streets and cannot honour the wheelchair traveler's street "
+            "side; route between stops, or use a street_policy-capable "
+            "computer (the matrices, the itineraries, or the routing "
+            "calls)"
+        )
 
 
 def folded_constraints(

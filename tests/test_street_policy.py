@@ -2595,3 +2595,196 @@ def test_policy_itineraries_price_shared_street_tariffs(
     assert list(per_option.first()) == pytest.approx(
         [journey["fare"] for journey in journeys]
     )
+
+
+def test_wheelchair_is_a_walking_class_policy_mode():
+    # Access and egress without vehicle terms; never a vehicle itself.
+    from cafein.policy import reduction_modes
+
+    policy = StreetLegPolicy(access={"wheelchair": 900}, egress={"walk": 900})
+    assert policy.access == {"wheelchair": 900.0}
+    assert reduction_modes(policy, "access", 900.0) == [
+        ("wheelchair", 900.0, False, None)
+    ]
+    with pytest.raises(ValueError, match="unknown vehicle mode"):
+        StreetLegPolicy(vehicles={"wheelchair": shared()})
+    # A wheelchair transfer grant needs no vehicle terms either.
+    granted = StreetLegPolicy(transfers={"wheelchair": 600})
+    assert granted.transfers == {"wheelchair": 600.0}
+    # Never the legacy walking fast path: the multimodal arm owns it.
+    from cafein.matrices import _walking_only_policy
+
+    walk_only, _ = _walking_only_policy(
+        StreetLegPolicy(access={"wheelchair": 900}, egress={"wheelchair": 900})
+    )
+    assert not walk_only
+
+
+def test_wheelchair_access_and_egress_ride_the_mode(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    policy = StreetLegPolicy(access={"wheelchair": 900}, egress={"wheelchair": 900})
+    journeys = multimodal_network.route_between_coordinates(
+        (60.1580, 24.9350),
+        (60.1870, 24.9610),
+        "2022-02-22 08:30:00",
+        street_policy=policy,
+    )
+    transit = [
+        j for j in journeys if any(leg["type"] == "transit" for leg in j["legs"])
+    ]
+    assert transit
+    for journey in transit:
+        for leg in journey["legs"]:
+            if leg["type"] in ("access", "egress"):
+                assert leg["mode"] == "wheelchair"
+
+
+def test_a_wheelchair_transfer_set_computes_and_serves_a_policy(
+    wheelchair_transfers_network,
+):
+    pytest.importorskip("cafein._cafein")
+    network = wheelchair_transfers_network
+    edges, rentals = network.compute_mode_transfers("wheelchair", 10)
+    assert edges > 0
+    policy = StreetLegPolicy(
+        access={"wheelchair": 900},
+        egress={"wheelchair": 900},
+        transfers={"wheelchair": 600.0},
+    )
+    journeys = network.route_between_coordinates(
+        (60.1580, 24.9350),
+        (60.1870, 24.9610),
+        "2022-02-22 08:30:00",
+        street_policy=policy,
+    )
+    assert journeys
+    # The grant is genuinely consumed: a reconstructed wheelchair
+    # transfer leg appears, and the result differs from the same policy
+    # without the grant (which relaxes the walking closure instead).
+    ridden = [
+        leg
+        for journey in journeys
+        for leg in journey["legs"]
+        if leg["type"] == "transfer" and leg.get("mode") == "wheelchair"
+    ]
+    assert ridden
+    ungranted = network.route_between_coordinates(
+        (60.1580, 24.9350),
+        (60.1870, 24.9610),
+        "2022-02-22 08:30:00",
+        street_policy=StreetLegPolicy(
+            access={"wheelchair": 900}, egress={"wheelchair": 900}
+        ),
+    )
+
+    def shape(journeys):
+        return [(j["departure_s"], j["arrival_s"], j["rides"]) for j in journeys]
+
+    assert shape(journeys) != shape(ungranted)
+
+
+@pytest.fixture()
+def wheelchair_transfers_network(multimodal_network, artifact_cache):
+    """A private multimodal copy for the wheelchair transfer set:
+    computing a binding mutates network state, so the shared session
+    fixture is never touched (the e_scooter twin has its own copy)."""
+    from cafein import TransportNetwork
+
+    return TransportNetwork.load(artifact_cache / "helsinki-multimodal.cafein")
+
+
+def test_the_wheelchair_transfer_set_is_pure(wheelchair_transfers_network):
+    # No walking-closure union: every edge of the wheelchair set is a
+    # wheelchair movement with its reconstruction token, and the set is
+    # strictly smaller than the installed walking closure it refuses to
+    # absorb (the stairs shortcuts stay out).
+    pytest.importorskip("cafein._cafein")
+    network = wheelchair_transfers_network
+    edges, rides = network.compute_mode_transfers("wheelchair", 10)
+    assert edges == rides
+    assert edges < network.transfer_count
+
+
+def test_a_wheelchair_only_policy_rides_a_wheelchair_direct(multimodal_network):
+    # The direct door-to-door alternative obeys the policy's walking
+    # class: under a wheelchair-only policy it cannot be a stairs-capable
+    # plain walk.
+    pytest.importorskip("cafein._cafein")
+    policy = StreetLegPolicy(access={"wheelchair": 7200}, egress={"wheelchair": 7200})
+    # The pinned stairway's ends (test_street_matrix): walking crosses
+    # the steps directly, the wheelchair profile must detour, so the
+    # direct leg is strictly slower than a walk-policy direct.
+    top, bottom = (60.168853, 24.931183), (60.1684778, 24.9300526)
+    wheeled = multimodal_network.route_between_coordinates(
+        top, bottom, "2022-02-22 08:30:00", street_policy=policy
+    )
+    walked = multimodal_network.route_between_coordinates(
+        top,
+        bottom,
+        "2022-02-22 08:30:00",
+        street_policy=StreetLegPolicy(access={"walk": 7200}, egress={"walk": 7199}),
+    )
+
+    def direct_seconds(journeys):
+        return min(
+            j["arrival_s"] - j["departure_s"]
+            for j in journeys
+            if all(leg["type"] == "walk" for leg in j["legs"])
+        )
+
+    assert direct_seconds(wheeled) > direct_seconds(walked)
+
+
+def test_a_wheelchair_only_cost_matrix_direct_obeys_the_profile(multimodal_network):
+    # The cost matrix's direct street candidate rides the policy's
+    # walking class too: across the pinned stairway, the wheelchair cell
+    # is strictly slower than the walking cell.
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelCostMatrix
+
+    top_bottom = _points_frame([(60.168853, 24.931183), (60.1684778, 24.9300526)])
+    wheeled = TravelCostMatrix(
+        multimodal_network,
+        top_bottom,
+        top_bottom,
+        "2022-02-22 08:30:00",
+        street_policy=StreetLegPolicy(
+            access={"wheelchair": 7200}, egress={"wheelchair": 7200}
+        ),
+        output_time_units="seconds",
+    )
+    walked = TravelCostMatrix(
+        multimodal_network,
+        top_bottom,
+        top_bottom,
+        "2022-02-22 08:30:00",
+        street_policy=StreetLegPolicy(access={"walk": 7200}, egress={"walk": 7199}),
+        output_time_units="seconds",
+    )
+    key = ["from_id", "to_id"]
+    wheeled_cell = wheeled.set_index(key)["travel_time"][("p0", "p1")]
+    walked_cell = walked.set_index(key)["travel_time"][("p0", "p1")]
+    assert wheeled_cell > walked_cell
+
+
+def test_wheelchair_pareto_access_rides_the_mode(multimodal_network):
+    # The multicriteria arm classifies the wheelchair as walking-class
+    # too: its rebuilt access and egress legs carry the mode and are
+    # never extended over the plain walking transfer set.
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries
+
+    frame = DetailedItineraries(
+        multimodal_network,
+        _points_frame([(60.1580, 24.9350)]),
+        _points_frame([(60.1870, 24.9610)]),
+        "2022-02-22 08:30:00",
+        candidates="pareto",
+        street_policy=StreetLegPolicy(
+            access={"wheelchair": 900}, egress={"wheelchair": 900}
+        ),
+        geometries=False,
+    )
+    ends = frame[frame["leg_type"].isin(["access", "egress"])]
+    assert not ends.empty
+    assert (ends["mode"] == "wheelchair").all()

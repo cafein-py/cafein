@@ -81,6 +81,10 @@ def _cached_network(cache, name, build):
             time.sleep(0.25)
             continue
         try:
+            if artifact.exists():
+                # Another worker published while this one awaited the
+                # lock; the build-once guarantee holds.
+                break
             staged = cache / f"{name}.building"
             build().save(staged)
             staged.replace(artifact)
@@ -140,7 +144,7 @@ def multimodal_network(helsinki_gtfs, kantakaupunki_pbf, artifact_cache):
             return TransportNetwork.from_gtfs(
                 [str(helsinki_gtfs)],
                 osm_pbf=str(kantakaupunki_pbf),
-                street_modes=("walk", "bicycle", "e_scooter"),
+                street_modes=("walk", "bicycle", "e_scooter", "wheelchair"),
                 dem=ramp,
             )
 
@@ -165,7 +169,7 @@ def multimodal_mctbtr_network(helsinki_gtfs, kantakaupunki_pbf, artifact_cache):
                 return TransportNetwork.from_gtfs(
                     [str(helsinki_gtfs)],
                     osm_pbf=str(kantakaupunki_pbf),
-                    street_modes=("walk", "bicycle", "e_scooter"),
+                    street_modes=("walk", "bicycle", "e_scooter", "wheelchair"),
                     dem=ramp,
                 )
 

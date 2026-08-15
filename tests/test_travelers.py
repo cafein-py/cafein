@@ -288,3 +288,240 @@ def test_street_surfaces_reject_the_traveler(helsinki_streets):
             transport_mode="walk",
             traveler=profile,
         )
+
+
+def test_the_wheelchair_traveler_bridges_to_the_street_policy(multimodal_network):
+    from cafein import StreetLegPolicy
+    from cafein.streets import MAX_ACCESS_EGRESS_TIME
+
+    profile = TravelerProfile(wheelchair=True)
+    origin, destination = (60.1580, 24.9350), (60.1870, 24.9610)
+    bridged = multimodal_network.route_between_coordinates(
+        origin, destination, "2022-02-22 08:30:00", traveler=profile
+    )
+    assert bridged
+    _, trips, stops = profile._resolve(multimodal_network)
+    explicit = multimodal_network.route_between_coordinates(
+        origin,
+        destination,
+        "2022-02-22 08:30:00",
+        exclude_stops=stops,
+        exclude_trips=trips,
+        street_policy=StreetLegPolicy(
+            access={"wheelchair": MAX_ACCESS_EGRESS_TIME},
+            egress={"wheelchair": MAX_ACCESS_EGRESS_TIME},
+        ),
+    )
+    assert bridged == explicit
+    # Access and egress ride the wheelchair mode; transfer endpoints
+    # respect the traveler's exclusions.
+    excluded = set(stops)
+    transfers = []
+    for journey in bridged:
+        for leg in journey["legs"]:
+            if leg["type"] in ("access", "egress"):
+                assert leg["mode"] == "wheelchair"
+            if leg["type"] == "transfer":
+                transfers.append(leg)
+    # The route genuinely transfers, and never through an excluded stop.
+    assert transfers
+    for leg in transfers:
+        assert leg["from_stop"] not in excluded
+        assert leg["to_stop"] not in excluded
+    with pytest.raises(ValueError, match="conflict"):
+        multimodal_network.route_between_coordinates(
+            origin,
+            destination,
+            "2022-02-22 08:30:00",
+            traveler=profile,
+            street_policy=StreetLegPolicy(access={"walk": 900}, egress={"walk": 900}),
+        )
+    with pytest.raises(ValueError, match="fixed speed"):
+        multimodal_network.route_between_coordinates(
+            origin,
+            destination,
+            "2022-02-22 08:30:00",
+            traveler=profile,
+            walking_speed_kmph=5.0,
+        )
+
+
+def test_the_bridge_serves_the_point_computers(multimodal_network):
+    from cafein import DetailedItineraries, StreetLegPolicy, TravelTimeMatrix
+    from cafein.streets import MAX_ACCESS_EGRESS_TIME
+
+    profile = TravelerProfile(wheelchair=True)
+    _, trips, stops = profile._resolve(multimodal_network)
+    points = gpd.GeoDataFrame(
+        {"id": ["a", "b"]},
+        geometry=gpd.points_from_xy([24.9350, 24.9610], [60.1580, 60.1870]),
+        crs="EPSG:4326",
+    )
+    policy = StreetLegPolicy(
+        access={"wheelchair": MAX_ACCESS_EGRESS_TIME},
+        egress={"wheelchair": MAX_ACCESS_EGRESS_TIME},
+    )
+    bridged = TravelTimeMatrix(
+        multimodal_network, points, departure="2022-02-22 08:30:00", traveler=profile
+    )
+    manual = TravelTimeMatrix(
+        multimodal_network,
+        points,
+        departure="2022-02-22 08:30:00",
+        exclude_stops=stops,
+        exclude_trips=trips,
+        street_policy=policy,
+    )
+    pd.testing.assert_frame_equal(pd.DataFrame(bridged), pd.DataFrame(manual))
+    itineraries = DetailedItineraries(
+        multimodal_network,
+        points.iloc[:1],
+        points.iloc[1:],
+        "2022-02-22 08:30:00",
+        traveler=profile,
+        geometries=False,
+    )
+    hand_built = DetailedItineraries(
+        multimodal_network,
+        points.iloc[:1],
+        points.iloc[1:],
+        "2022-02-22 08:30:00",
+        exclude_stops=stops,
+        exclude_trips=trips,
+        street_policy=policy,
+        geometries=False,
+    )
+    pd.testing.assert_frame_equal(pd.DataFrame(itineraries), pd.DataFrame(hand_built))
+    ends = itineraries[itineraries["leg_type"].isin(["access", "egress"])]
+    assert not ends.empty and (ends["mode"] == "wheelchair").all()
+
+
+def test_the_bridge_serves_the_one_to_all_surface(multimodal_network):
+    from cafein import StreetLegPolicy
+    from cafein.streets import MAX_ACCESS_EGRESS_TIME
+
+    profile = TravelerProfile(wheelchair=True)
+    bridged = multimodal_network.travel_times_from_coordinate(
+        (60.1580, 24.9350), "2022-02-22 08:30:00", traveler=profile
+    )
+    assert bridged
+    _, trips, stops = profile._resolve(multimodal_network)
+    explicit = multimodal_network.travel_times_from_coordinate(
+        (60.1580, 24.9350),
+        "2022-02-22 08:30:00",
+        exclude_stops=stops,
+        exclude_trips=trips,
+        street_policy=StreetLegPolicy(
+            access={"wheelchair": MAX_ACCESS_EGRESS_TIME},
+            egress={"wheelchair": MAX_ACCESS_EGRESS_TIME},
+        ),
+    )
+    assert bridged == explicit
+    # An explicitly inaccessible stop never appears among the arrivals.
+    assert not set(stops) & set(bridged)
+
+
+def test_the_bridge_needs_the_wheelchair_build(network_with_footpaths):
+    with pytest.raises(
+        ValueError, match=r"wheelchair.*street_modes=\('walk', 'wheelchair'\)"
+    ):
+        network_with_footpaths.route_between_coordinates(
+            (60.1690, 24.9320),
+            (60.2043, 24.9615),
+            "2022-02-22 08:30:00",
+            traveler=TravelerProfile(wheelchair=True),
+        )
+
+
+def test_policy_less_point_surfaces_refuse_the_wheelchair_traveler(
+    multimodal_network,
+):
+    from cafein import Accessibility, journey_frontier
+
+    profile = TravelerProfile(wheelchair=True)
+    with pytest.raises(ValueError, match="cannot honour"):
+        journey_frontier(
+            multimodal_network,
+            (60.1580, 24.9350),
+            (60.1870, 24.9610),
+            "2022-02-22 08:30:00",
+            10,
+            traveler=profile,
+        )
+    points = gpd.GeoDataFrame(
+        {"id": ["a"], "jobs": [1.0]},
+        geometry=gpd.points_from_xy([24.935], [60.158]),
+        crs="EPSG:4326",
+    )
+    with pytest.raises(ValueError, match="cannot honour"):
+        Accessibility(
+            multimodal_network,
+            points,
+            points,
+            "2022-02-22 08:30:00",
+            opportunities="jobs",
+            traveler=profile,
+        )
+    # The remaining policy-less point surfaces refuse it too.
+    pyarrow = pytest.importorskip("pyarrow")  # noqa: F841
+    from cafein import frontier_table, travel_cost_table
+
+    with pytest.raises(ValueError, match="cannot honour"):
+        travel_cost_table(
+            multimodal_network,
+            points,
+            points,
+            "2022-02-22 08:30:00",
+            output="unused.parquet",
+            traveler=profile,
+        )
+    with pytest.raises(ValueError, match="cannot honour"):
+        frontier_table(
+            multimodal_network,
+            points,
+            points,
+            "2022-02-22 08:30:00",
+            10,
+            traveler=profile,
+        )
+    # A transit Catchment refuses the wheelchair traveler even from
+    # stop origins: its walking spread is mode-blind.
+    from cafein import Catchment
+
+    pytest.importorskip("h3")
+    with pytest.raises(ValueError, match="cannot honour"):
+        Catchment(
+            multimodal_network,
+            ["1020453"],
+            "2022-02-22 08:30:00",
+            budgets=(15.0,),
+            traveler=profile,
+        )
+    # Stop queries stay timetable-only and pass — the streaming table
+    # included, where the profile must equal its explicit exclusions.
+    table_profiled = travel_cost_table(
+        multimodal_network,
+        ["1020453"],
+        ["1070422"],
+        "2022-02-22 08:30:00",
+        traveler=profile,
+    )
+    _, trips, stops = profile._resolve(multimodal_network)
+    table_manual = travel_cost_table(
+        multimodal_network,
+        ["1020453"],
+        ["1070422"],
+        "2022-02-22 08:30:00",
+        exclude_stops=stops,
+        exclude_trips=trips,
+    )
+    assert table_profiled.equals(table_manual)
+    frontier = journey_frontier(
+        multimodal_network,
+        "1020453",
+        "1070422",
+        "2022-02-22 08:30:00",
+        10,
+        traveler=profile,
+    )
+    assert frontier is not None

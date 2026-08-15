@@ -362,6 +362,9 @@ pub(super) const STREET_ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINST";
 // format 13.
 pub(super) const STREET_ARTIFACT_FORMAT: u32 = 4;
 
+// 20: a persisted wheelchair mode-transfer set is the pure
+// walking-class build (no walking-closure union); earlier formats'
+// wheelchair sets carried the merge and must be rebuilt.
 // 19: `adj_access` carries the wheelchair permission bit (MODE_WHEELCHAIR);
 // earlier builds compiled no wheelchair permissions, so earlier formats
 // must be rebuilt.
@@ -380,7 +383,7 @@ pub(super) const STREET_ARTIFACT_FORMAT: u32 = 4;
 // STREETS section (descriptor offsets pre-shifted to their position).
 // 13 added optional elevation metadata to `StreetsMeta`. Earlier formats
 // must be rebuilt.
-pub(super) const ARTIFACT_FORMAT: u32 = 19;
+pub(super) const ARTIFACT_FORMAT: u32 = 20;
 
 /// Section tags in the container directory.
 pub(super) const SECTION_META: u16 = 1;

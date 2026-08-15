@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Wheelchair transit access: `"wheelchair"` as a walking-class
+  street-policy mode with per-stop links and mode-transfer sets, and
+  `TravelerProfile(wheelchair=True)` taking the streets on
+  door-to-door queries via a synthesized policy.
+  ([#267](https://github.com/cafein-py/cafein/pull/267))
+
 - The wheelchair profile caps gradients: on a DEM-built network, arcs
   with a sub-segment steeper than 8 % are forbidden; without a DEM the
   tag rules alone apply.

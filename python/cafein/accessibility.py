@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from cafein._validate import id_sequence, sequence_not_string
-from cafein.travelers import folded_constraints
+from cafein.travelers import folded_constraints, refuse_wheelchair_streets
 
 #: The parameter each decay family takes (None: no parameter).
 DECAY_PARAMETERS = {
@@ -673,6 +673,10 @@ class Accessibility(pd.DataFrame):
                 "traveler applies to transit; a StreetNetwork takes "
                 "transport_mode, max_street_time, and snap_distance"
             )
+        from cafein.matrices import _is_point_frame as _points
+
+        if hasattr(network, "route_between_stops") and _points(origins):
+            refuse_wheelchair_streets(traveler, "Accessibility")
         from cafein._units import departure_parts, duration_seconds
 
         date, departure = (
@@ -861,6 +865,10 @@ class Accessibility(pd.DataFrame):
                 "traveler applies to transit; a StreetNetwork takes "
                 "transport_mode, max_street_time, and snap_distance"
             )
+        from cafein.matrices import _is_point_frame as _points
+
+        if hasattr(network, "route_between_stops") and _points(origins):
+            refuse_wheelchair_streets(traveler, "Accessibility.to_parquet")
         from cafein._units import departure_parts, duration_seconds
 
         date, departure = (
@@ -1217,6 +1225,10 @@ class NearestDestinations(pd.DataFrame):
                 "traveler applies to transit; a StreetNetwork takes "
                 "transport_mode, max_street_time, and snap_distance"
             )
+        from cafein.matrices import _is_point_frame as _points
+
+        if hasattr(network, "route_between_stops") and _points(origins):
+            refuse_wheelchair_streets(traveler, "NearestDestinations")
         from cafein._units import (
             departure_parts,
             duration_seconds,
@@ -1527,6 +1539,14 @@ class Catchment(gpd.GeoDataFrame):
                 "traveler applies to transit; a StreetNetwork takes "
                 "transport_mode, max_street_time, and snap_distance"
             )
+        from cafein.matrices import _is_point_frame as _points
+
+        if hasattr(network, "route_between_stops"):
+            # Stop origins too: the catchment's residual walking
+            # spread rides the mode-blind walking field, which the
+            # wheelchair contract cannot accept; the profile-aware
+            # spread is the follow-up.
+            refuse_wheelchair_streets(traveler, "Catchment")
         import shapely.geometry
 
         from cafein._units import departure_parts, duration_seconds
