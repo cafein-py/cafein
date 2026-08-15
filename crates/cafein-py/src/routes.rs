@@ -467,7 +467,7 @@ impl TransportNetwork {
     /// closure: the ULTRA shortcut set models *walking* egress, so policy
     /// queries stay off it until multimodal ULTRA arrives. Internal until
     /// the policy surface stabilises.
-    #[pyo3(signature = (access, date, departure, max_transfers, router = "auto", transfer_mode = None))]
+    #[pyo3(signature = (access, date, departure, max_transfers, router = "auto", transfer_mode = None, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![]))]
     #[allow(clippy::too_many_arguments)]
     fn _travel_times_with_access(
         &self,
@@ -478,7 +478,26 @@ impl TransportNetwork {
         max_transfers: u8,
         router: &str,
         transfer_mode: Option<(String, f64)>,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
     ) -> PyResult<Py<PyDict>> {
+        if transfer_mode.is_some() && !exclude_stops.is_empty() {
+            // As on the route path: a merged edge's interior stops are
+            // hidden in the token, so the engine cannot exclude them.
+            return Err(PyValueError::new_err(
+                "stop exclusions do not combine with street_policy \
+                 transfers= yet; a rental transfer's interior stops are \
+                 not exclusion-aware",
+            ));
+        }
+        let excluded =
+            !(exclude_routes.is_empty() && exclude_trips.is_empty() && exclude_stops.is_empty());
+        let exclusions = if excluded {
+            self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?
+        } else {
+            None
+        };
         let departure = parse_time(departure)?;
         let offsets = access
             .iter()
@@ -487,8 +506,9 @@ impl TransportNetwork {
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
         // The cached whole-day set is timetable-only, so it serves the
-        // merged transfer binding as-is.
-        let router = self.resolve_time_router(router, date, false)?;
+        // merged transfer binding as-is; the resolver rejects an
+        // explicit trip-based engine beside effective exclusions.
+        let router = self.resolve_time_router(router, date, excluded)?;
         let arrivals = match router {
             "raptor" => {
                 let request = Request {
@@ -498,7 +518,7 @@ impl TransportNetwork {
                     active_services,
                     active_services_previous,
                     max_transfers,
-                    exclusions: None,
+                    exclusions,
                 };
                 let relaxed = self.policy_transfers(transfer_mode.as_ref())?;
                 py.allow_threads(|| Raptor.one_to_all(&self.build.timetable, relaxed, &request))

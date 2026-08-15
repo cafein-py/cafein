@@ -108,6 +108,12 @@ struct Winner {
     walk_transfer_m: f64,
 }
 
+/// The walking-class street modes: no vehicle, never extended over the
+/// installed walking closure, meters and grams attributed as walking.
+pub(crate) fn walking_class(mode: &str) -> bool {
+    matches!(mode, "walk" | "wheelchair")
+}
+
 #[pymethods]
 impl TransportNetwork {
     /// Build a network from one or several GTFS zip archives.
@@ -1337,7 +1343,7 @@ impl TransportNetwork {
                 // Zero meters ridden are zero grams whatever the factor —
                 // the zero-coincident convention stays exact even when
                 // the factor is unresolved.
-                let grams = if mode == "walk" || network_m <= 0.0 {
+                let grams = if walking_class(mode) || network_m <= 0.0 {
                     0.0
                 } else {
                     network_m / 1000.0 * factor
@@ -1360,7 +1366,7 @@ impl TransportNetwork {
                 // The vehicle points are kept apart as the extension
                 // sources: a walking point that dominates one on both
                 // axes must not take its hand-off to a walk with it.
-                if mode != "walk" {
+                if !walking_class(mode) {
                     pareto_insert(&mut vehicle_frontiers[stop], point);
                 }
             }
@@ -1441,7 +1447,7 @@ impl TransportNetwork {
             for point in frontier.iter() {
                 let winner = &point.winner;
                 let mode = modes[winner.order].0.clone();
-                let (vehicle_network, vehicle_connector, walk) = if mode == "walk" {
+                let (vehicle_network, vehicle_connector, walk) = if walking_class(&mode) {
                     (0.0, 0.0, winner.total_m + winner.walk_transfer_m)
                 } else {
                     (
@@ -1507,7 +1513,7 @@ impl TransportNetwork {
             .filter_map(|(stop, winner)| {
                 winner.map(|winner| {
                     let mode = modes[winner.order].0.clone();
-                    let (vehicle_network, vehicle_connector, mut walk) = if mode == "walk" {
+                    let (vehicle_network, vehicle_connector, mut walk) = if walking_class(&mode) {
                         (0.0, 0.0, winner.total_m + winner.walk_transfer_m)
                     } else {
                         (
@@ -1619,12 +1625,19 @@ impl TransportNetwork {
                         .collect()
                 })
                 .collect();
-            cafein_core::mode_transfers::merge_mode_transfers(
-                &self.transfers,
-                &rentals,
-                stop_count,
-                max_seconds.floor() as u32,
-            )
+            if mode == "wheelchair" {
+                // The walking-class set: the wheelchair movements alone.
+                // Unioning the installed walking closure would keep its
+                // stairs shortcuts, which at equal speed dominate.
+                cafein_core::mode_transfers::pure_mode_transfers(&rentals)
+            } else {
+                cafein_core::mode_transfers::merge_mode_transfers(
+                    &self.transfers,
+                    &rentals,
+                    stop_count,
+                    max_seconds.floor() as u32,
+                )
+            }
         });
         let mut set = Transfers::from_edges(stop_count, &edges)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -1633,15 +1646,19 @@ impl TransportNetwork {
         set.mark_unclosed();
         let counts = (set.edge_count(), tokens.len());
         // Ridden network meters per CSR edge, aligned for the
-        // multicriteria relax; walking rows stay zero.
+        // multicriteria relax; walking rows stay zero. A walking-class
+        // set keeps its tokens for reconstruction but is never a
+        // rental: its meters and counts attribute as walking.
         let mut rental_network_meters = vec![0.0; set.edge_count()];
         let mut rental_edge = vec![false; set.edge_count()];
-        for stop in 0..stop_count {
-            let range = set.edge_range(StopIdx(stop));
-            for (edge, slot) in set.from_stop(StopIdx(stop)).iter().zip(range) {
-                if let Some(token) = tokens.get(&(stop, edge.to.0)) {
-                    rental_network_meters[slot] = token.ride_network_meters;
-                    rental_edge[slot] = true;
+        if !walking_class(mode) {
+            for stop in 0..stop_count {
+                let range = set.edge_range(StopIdx(stop));
+                for (edge, slot) in set.from_stop(StopIdx(stop)).iter().zip(range) {
+                    if let Some(token) = tokens.get(&(stop, edge.to.0)) {
+                        rental_network_meters[slot] = token.ride_network_meters;
+                        rental_edge[slot] = true;
+                    }
                 }
             }
         }
@@ -2338,8 +2355,14 @@ impl TransportNetwork {
     /// beside a `foot=no` cycleway links for the bicycle without granting
     /// walking that edge, and the other way round.
     fn multimodal_stop_links(&self, network: &StreetNetwork) -> &[Vec<(Snap, u8)>] {
-        use cafein_core::streets::{MODE_BICYCLE, MODE_E_SCOOTER, MODE_WALK};
+        use cafein_core::streets::{MODE_BICYCLE, MODE_E_SCOOTER, MODE_WALK, MODE_WHEELCHAIR};
         self.multimodal_links.get_or_init(|| {
+            // The wheelchair snaps by its compiled profile, not its bit:
+            // the gradient cap lives only in the compiled arc costs, and
+            // a bit-snapped link could sit on a capped edge.
+            let wheelchair = network
+                .compile_profile(&cafein_core::streets::StreetProfileDefinition::wheelchair())
+                .ok();
             self.stops()
                 .iter()
                 .map(|(_, latitude, longitude)| {
@@ -2347,13 +2370,25 @@ impl TransportNetwork {
                         return Vec::new();
                     };
                     let mut links: Vec<(Snap, u8)> = Vec::new();
-                    for bit in [MODE_WALK, MODE_BICYCLE, MODE_E_SCOOTER] {
-                        let Some(snap) = network.snap_for_mode_bit(
-                            *latitude,
-                            *longitude,
-                            MULTIMODAL_STOP_SNAP,
-                            bit,
-                        ) else {
+                    for bit in [MODE_WALK, MODE_BICYCLE, MODE_E_SCOOTER, MODE_WHEELCHAIR] {
+                        let snap = if bit == MODE_WHEELCHAIR {
+                            wheelchair.as_ref().and_then(|profile| {
+                                network.snap_for_profile(
+                                    *latitude,
+                                    *longitude,
+                                    MULTIMODAL_STOP_SNAP,
+                                    profile,
+                                )
+                            })
+                        } else {
+                            network.snap_for_mode_bit(
+                                *latitude,
+                                *longitude,
+                                MULTIMODAL_STOP_SNAP,
+                                bit,
+                            )
+                        };
+                        let Some(snap) = snap else {
                             continue;
                         };
                         match links.iter_mut().find(|(known, _)| {
@@ -2449,7 +2484,7 @@ impl TransportNetwork {
         let mut extendable: Vec<Option<Winner>> = vec![None; stop_count];
         let mut snapped = false;
         for (order, (mode, max_seconds, rental, eligible)) in modes.iter().enumerate() {
-            let walking_mode = mode == "walk";
+            let walking_mode = walking_class(mode);
             let mask = match eligible {
                 Some(stops) => {
                     let mut mask = vec![false; stop_count];

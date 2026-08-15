@@ -64,13 +64,19 @@ def test_the_multimodal_section_round_trips(multimodal_network, tmp_path):
 
 
 def test_the_modes_are_exposed_and_persisted(multimodal_network, tmp_path):
-    assert multimodal_network.street_modes == ("walk", "bicycle", "e_scooter")
+    assert multimodal_network.street_modes == (
+        "walk",
+        "bicycle",
+        "e_scooter",
+        "wheelchair",
+    )
     path = tmp_path / "modes.cafein"
     multimodal_network.save(path)
     assert TransportNetwork.load(path).street_modes == (
         "walk",
         "bicycle",
         "e_scooter",
+        "wheelchair",
     )
 
 

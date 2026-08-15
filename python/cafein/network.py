@@ -3,7 +3,11 @@
 import os
 
 from cafein._validate import component_selection, id_sequence, sequence_not_string
-from cafein.travelers import folded_constraints
+from cafein.travelers import (
+    folded_constraints,
+    folded_street_policy,
+    refuse_wheelchair_streets,
+)
 from cafein._cafein import TransportNetwork as _TransportNetwork
 
 
@@ -55,6 +59,25 @@ def _departure_seconds(departure):
     """``HH:MM:SS`` as seconds past the service day's start."""
     hours, minutes, seconds = str(departure).split(":")
     return int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+
+
+def _direct_walking_mode(access_budgets, egress_budgets):
+    """The walking-class mode the direct door-to-door alternative rides,
+    with its access-side budget. Walking keeps the legacy convention —
+    it stands whatever the policy grants — except under a policy whose
+    only walking-class grant is the wheelchair: there the direct
+    movement must obey the same constraints as every other leg, so it
+    rides the wheelchair profile at the wheelchair budget."""
+    from cafein import streets as _streets
+
+    granted = set(access_budgets or {}) | set(egress_budgets or {})
+    if "wheelchair" in granted and "walk" not in granted:
+        budget = (access_budgets or {}).get(
+            "wheelchair", _streets.MAX_ACCESS_EGRESS_TIME
+        )
+        return "wheelchair", budget
+    budget = (access_budgets or {}).get("walk", _streets.MAX_ACCESS_EGRESS_TIME)
+    return "walk", budget
 
 
 def _policy_transfer_mode(policy):
@@ -432,12 +455,12 @@ def _policy_journeys(
                 leg["mode"] = "walk" if leg["type"] == "transfer" else None
                 legs.append(leg)
         journey["legs"] = legs
-    # The direct walking alternative rides nothing and needs no stop, so
-    # it stands whatever the policy grants; its budget is the policy's
-    # walking access budget when walking is granted, else the usual one.
-    walk_budget = access_budgets.get("walk", _streets.MAX_ACCESS_EGRESS_TIME)
+    # The direct street alternative rides nothing and needs no stop; it
+    # rides the policy's walking-class mode — the wheelchair under a
+    # wheelchair-only policy, else walking at the legacy convention.
+    direct_mode, walk_budget = _direct_walking_mode(access_budgets, egress_budgets)
     direct = core._multimodal_direct_leg(
-        origin, destination, "walk", walk_budget, geometries
+        origin, destination, direct_mode, walk_budget, geometries
     )
     if direct is None:
         unsnapped = access_error or egress_error
@@ -461,7 +484,7 @@ def _policy_journeys(
         "legs": [
             {
                 "type": "walk",
-                "mode": "walk",
+                "mode": direct_mode,
                 "departure_s": departed,
                 "arrival_s": departed + walk_seconds,
                 "distance_m": network_m + connector_m,
@@ -845,9 +868,9 @@ def _policy_mc_journeys(
                 leg["mode"] = "walk" if leg["type"] == "transfer" else None
                 legs.append(leg)
         journey["legs"] = legs
-    walk_budget = access_budgets.get("walk", _streets.MAX_ACCESS_EGRESS_TIME)
+    direct_mode, walk_budget = _direct_walking_mode(access_budgets, egress_budgets)
     direct = core._multimodal_direct_leg(
-        origin, destination, "walk", walk_budget, geometries
+        origin, destination, direct_mode, walk_budget, geometries
     )
     if direct is None:
         unsnapped = access_error or egress_error
@@ -868,7 +891,7 @@ def _policy_mc_journeys(
         "legs": [
             {
                 "type": "walk",
-                "mode": "walk",
+                "mode": direct_mode,
                 "departure_s": departed,
                 "arrival_s": departed + walk_seconds,
                 "distance_m": network_m + connector_m,
@@ -1745,7 +1768,9 @@ class TransportNetwork:
             set first with :meth:`compute_mode_transfers`) the run
             relaxes the merged mode-transfer set, and a transfer whose
             edge rode a rental splits into its walk--ride--walk legs.
-            The direct door-to-door alternative stays the walking one.
+            The direct door-to-door alternative rides the policy's
+            walking class: the wheelchair under a wheelchair-only
+            policy, else walking.
             Conflicts with the walking knobs above and with
             ``departure_time_window``, which are rejected rather than
             silently ignored.
@@ -1770,6 +1795,9 @@ class TransportNetwork:
             exclude_stops,
             walking_speed_kmph,
             max_walking_time,
+        )
+        street_policy, max_walking_time = folded_street_policy(
+            traveler, self, street_policy, walking_speed_kmph, max_walking_time
         )
         from cafein._units import departure_parts, duration_seconds
 
@@ -1946,11 +1974,17 @@ class TransportNetwork:
         silently substituted. Heavy precompute; persisted by ``save``
         and restored by ``load`` with its exact binding.
 
+        The ``"wheelchair"`` mode builds a walking-class set instead:
+        the wheelchair-profile movements alone, with no walking-closure
+        union — a stricter same-speed profile would always lose to the
+        unrestricted walking rows — and its edges attribute as walking,
+        never as rentals.
+
         Returns
         -------
         (int, int)
-            The merged set's edge count and how many edges ride a
-            rental.
+            The merged set's edge count and how many edges carry a
+            reconstruction token (every edge, for a walking-class set).
         """
         from cafein._units import duration_seconds
 
@@ -2035,6 +2069,9 @@ class TransportNetwork:
             walking_speed_kmph,
             max_walking_time,
         )
+        street_policy, max_walking_time = folded_street_policy(
+            traveler, self, street_policy, walking_speed_kmph, max_walking_time
+        )
         from cafein._units import departure_parts, duration_seconds
 
         date, departure = departure_parts(departure)
@@ -2059,8 +2096,6 @@ class TransportNetwork:
             exclude_routes = id_sequence("exclude_routes", exclude_routes)
             exclude_trips = id_sequence("exclude_trips", exclude_trips)
             exclude_stops = id_sequence("exclude_stops", exclude_stops)
-            if any((exclude_routes, exclude_trips, exclude_stops)):
-                raise ValueError("street_policy does not combine with exclusions yet")
             from cafein.network import _policy_transfer_mode
             from cafein.policy import carriage_terms
 
@@ -2070,6 +2105,10 @@ class TransportNetwork:
             transfer_mode = _policy_transfer_mode(street_policy)
             carriage = carriage_terms(street_policy)
             if carriage is not None:
+                if any((exclude_routes, exclude_trips, exclude_stops)):
+                    raise ValueError(
+                        "take_aboard=True does not combine with exclusions yet"
+                    )
                 # The possession-state search: Carrying seeds from the
                 # policy reduction, Free seeds from the walking-only
                 # reduction — carriage is optional, so every journey
@@ -2142,9 +2181,9 @@ class TransportNetwork:
                     date,
                     departure,
                     max_transfers,
-                    [],
-                    [],
-                    [],
+                    list(exclude_routes),
+                    list(exclude_trips),
+                    list(exclude_stops),
                     *_walk_options(walking_speed_kmph, walk_budget, max_snap_distance),
                 )
             if not self._core.has_multimodal_streets:
@@ -2159,7 +2198,14 @@ class TransportNetwork:
                 )
             ]
             return self._core._travel_times_with_access(
-                access, date, departure, max_transfers, transfer_mode=transfer_mode
+                access,
+                date,
+                departure,
+                max_transfers,
+                transfer_mode=transfer_mode,
+                exclude_routes=list(exclude_routes),
+                exclude_trips=list(exclude_trips),
+                exclude_stops=list(exclude_stops),
             )
         return self._core.travel_times_from_coordinate(
             tuple(origin),
@@ -2387,6 +2433,10 @@ class TransportNetwork:
             walking_speed_kmph,
             max_walking_time,
         )
+        from cafein.matrices import _is_point_frame as _points
+
+        if _points(origins):
+            refuse_wheelchair_streets(traveler, "travel_time_matrix")
         from cafein._units import departure_parts, duration_seconds
 
         date, departure = departure_parts(departure)

@@ -506,7 +506,7 @@ impl TransportNetwork {
     #[pyo3(signature = (access_rows, egress_rows, origins, destinations, date, departure,
                         factors, walk_budget, max_transfers,
                         exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![],
-                        geometries = false, transfer_mode = None))]
+                        geometries = false, transfer_mode = None, direct_mode = "walk"))]
     #[allow(clippy::too_many_arguments)]
     fn _cost_matrix_with_access(
         &self,
@@ -525,6 +525,7 @@ impl TransportNetwork {
         exclude_stops: Vec<String>,
         geometries: bool,
         transfer_mode: Option<(String, f64, f64)>,
+        direct_mode: &str,
     ) -> PyResult<Py<PyDict>> {
         if access_rows.len() != origins.len() || egress_rows.len() != destinations.len() {
             return Err(PyValueError::new_err(
@@ -629,13 +630,19 @@ impl TransportNetwork {
             .as_ref()
             .map(|(mode, budget, _)| (mode.clone(), *budget));
         let relaxed = self.policy_transfers(binding.as_ref())?;
-        let rental = transfer_mode.as_ref().map(|&(_, _, grams_per_meter)| {
-            let held = self.mode_transfers.as_ref().expect("binding validated");
-            RentalCostView {
-                tokens: &held.tokens,
-                grams_per_meter,
-            }
-        });
+        // A walking-class transfer set keeps its tokens for itinerary
+        // reconstruction only: no rental view, so its meters stay
+        // walking meters in the attribution.
+        let rental = transfer_mode
+            .as_ref()
+            .filter(|(mode, _, _)| !crate::network::walking_class(mode))
+            .map(|&(_, _, grams_per_meter)| {
+                let held = self.mode_transfers.as_ref().expect("binding validated");
+                RentalCostView {
+                    tokens: &held.tokens,
+                    grams_per_meter,
+                }
+            });
         let transfer_grams_per_meter = transfer_mode
             .as_ref()
             .map(|&(_, _, grams_per_meter)| grams_per_meter)
@@ -648,7 +655,7 @@ impl TransportNetwork {
             fares: None,
             rental,
         };
-        let walk_profile = self.multimodal_profile("walk")?;
+        let walk_profile = self.multimodal_profile(direct_mode)?;
         let multimodal = self.multimodal.as_ref().ok_or_else(|| {
             PyValueError::new_err(
                 "no multimodal street graph is installed; build with street_modes=",

@@ -66,6 +66,43 @@ struct RentalUse {
     pre_seconds: u32,
 }
 
+/// The walking-class variant of the merge: the mode's own stop-to-stop
+/// movements alone, with no walking-closure union and no pre/post
+/// walks. A stricter same-speed profile (the wheelchair) would always
+/// lose to the unrestricted walking rows a union keeps, leaving the
+/// "accessible" set inaccessible in practice. Every edge carries its
+/// whole movement as the token's ride, so reconstruction labels it
+/// with the mode.
+pub fn pure_mode_transfers(
+    rentals: &[Vec<RentalEdge>],
+) -> (Vec<MergedEdge>, HashMap<(u32, u32), RentalToken>) {
+    let mut edges = Vec::new();
+    let mut tokens = HashMap::new();
+    for (source, rows) in rentals.iter().enumerate() {
+        for edge in rows {
+            edges.push((
+                StopIdx(source as u32),
+                StopIdx(edge.to),
+                edge.seconds,
+                edge.total_meters,
+            ));
+            tokens.insert(
+                (source as u32, edge.to),
+                RentalToken {
+                    pickup: StopIdx(source as u32),
+                    drop: StopIdx(edge.to),
+                    ride_seconds: edge.seconds,
+                    ride_network_meters: edge.network_meters,
+                    ride_total_meters: edge.total_meters,
+                    pre_seconds: 0,
+                    post_seconds: 0,
+                },
+            );
+        }
+    }
+    (edges, tokens)
+}
+
 /// Builds the merged, closed transfer set from the walking closure and
 /// per-stop rental candidate edges, with one reconstruction token per
 /// merged edge that used a rental.

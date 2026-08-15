@@ -8,7 +8,11 @@ import pandas as pd
 import shapely
 
 from cafein._validate import component_selection, id_sequence, sequence_not_string
-from cafein.travelers import folded_constraints
+from cafein.travelers import (
+    folded_constraints,
+    folded_street_policy,
+    refuse_wheelchair_streets,
+)
 
 
 class TravelCostMatrix(pd.DataFrame):
@@ -346,6 +350,10 @@ class TravelCostMatrix(pd.DataFrame):
                 walking_speed_kmph,
                 max_walking_time,
             )
+        if not _is_street_network(network) and _is_point_frame(origins):
+            street_policy, max_walking_time = folded_street_policy(
+                traveler, network, street_policy, walking_speed_kmph, max_walking_time
+            )
         origins = sequence_not_string("origins", origins)
         destinations = sequence_not_string("destinations", destinations)
         from cafein._units import (
@@ -643,6 +651,10 @@ class TravelCostMatrix(pd.DataFrame):
                 exclude_stops,
                 walking_speed_kmph,
                 max_walking_time,
+            )
+        if not _is_street_network(network) and _is_point_frame(origins):
+            street_policy, max_walking_time = folded_street_policy(
+                traveler, network, street_policy, walking_speed_kmph, max_walking_time
             )
         import pyarrow
 
@@ -950,6 +962,10 @@ class TravelTimeMatrix(pd.DataFrame):
                 walking_speed_kmph,
                 max_walking_time,
             )
+        if not _is_street_network(network) and _is_point_frame(origins):
+            street_policy, max_walking_time = folded_street_policy(
+                traveler, network, street_policy, walking_speed_kmph, max_walking_time
+            )
         origins = sequence_not_string("origins", origins)
         destinations = sequence_not_string("destinations", destinations)
         from cafein._units import (
@@ -1178,6 +1194,10 @@ class TravelTimeMatrix(pd.DataFrame):
                 exclude_stops,
                 walking_speed_kmph,
                 max_walking_time,
+            )
+        if not _is_street_network(network) and _is_point_frame(origins):
+            street_policy, max_walking_time = folded_street_policy(
+                traveler, network, street_policy, walking_speed_kmph, max_walking_time
             )
         import pyarrow
 
@@ -1951,6 +1971,8 @@ def travel_cost_table(
             walking_speed_kmph,
             max_walking_time,
         )
+    if not _is_street_network(network) and _is_point_frame(origins):
+        refuse_wheelchair_streets(traveler, "travel_cost_table")
     try:
         import pyarrow
     except ImportError as error:
@@ -3105,14 +3127,21 @@ def _policy_time_columns(
     # The direct walking alternative always applies — walking needs no
     # vehicle — at the policy's walking access budget when it names one,
     # else the usual door-to-door cutoff.
+    from cafein.network import _direct_walking_mode
+
     access_budgets = (
         policy.access
         if policy.access is not None
         else {"walk": _streets.MAX_ACCESS_EGRESS_TIME}
     )
-    walk_budget = access_budgets.get("walk", _streets.MAX_ACCESS_EGRESS_TIME)
+    egress_budgets = (
+        policy.egress
+        if policy.egress is not None
+        else {"walk": _streets.MAX_ACCESS_EGRESS_TIME}
+    )
+    direct_mode, walk_budget = _direct_walking_mode(access_budgets, egress_budgets)
     direct, walk_unsnapped_from, walk_unsnapped_to = core._multimodal_direct_matrix(
-        list(origin_points), list(destination_points), "walk", float(walk_budget)
+        list(origin_points), list(destination_points), direct_mode, float(walk_budget)
     )
     # A point is unsnapped only when neither the policy's modes nor the
     # direct walking alternative can snap it — a snap fact from both
@@ -3451,12 +3480,19 @@ def _policy_cost_columns(
     # The direct walking alternative always applies — walking needs no
     # vehicle — at the policy's walking access budget when it names one,
     # else the usual door-to-door cutoff.
+    from cafein.network import _direct_walking_mode
+
     access_budgets = (
         policy.access
         if policy.access is not None
         else {"walk": _streets.MAX_ACCESS_EGRESS_TIME}
     )
-    walk_budget = access_budgets.get("walk", _streets.MAX_ACCESS_EGRESS_TIME)
+    egress_budgets = (
+        policy.egress
+        if policy.egress is not None
+        else {"walk": _streets.MAX_ACCESS_EGRESS_TIME}
+    )
+    direct_mode, walk_budget = _direct_walking_mode(access_budgets, egress_budgets)
     table = core._cost_matrix_with_access(
         access_rows,
         egress_rows,
@@ -3472,6 +3508,7 @@ def _policy_cost_columns(
         exclude_stops=list(exclude_stops),
         geometries=bool(geometries),
         transfer_mode=transfer_arg,
+        direct_mode=direct_mode,
     )
     # A point is unsnapped only when neither the policy's modes nor the
     # direct walking alternative can snap it — a snap fact from both

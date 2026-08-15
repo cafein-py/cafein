@@ -13,7 +13,7 @@ its availability — nothing is silently assumed.
 
 import math
 
-STREET_POLICY_MODES = ("walk", "bicycle", "e_bike", "e_scooter")
+STREET_POLICY_MODES = ("walk", "bicycle", "e_bike", "e_scooter", "wheelchair")
 
 _OWN_SIDES = ("origin", "destination")
 
@@ -150,7 +150,8 @@ class StreetLegPolicy:
     ----------
     access, egress : dict, optional
         ``{mode: seconds}`` time budgets, from ``walk``, ``bicycle``,
-        ``e_bike``, and ``e_scooter``. An omitted dict means walking at
+        ``e_bike``, ``e_scooter``, and ``wheelchair`` (walking-class:
+        no vehicle terms). An omitted dict means walking at
         the query's usual walking budget.
     transfers : dict, optional
         ``{mode: seconds}`` for stop-to-stop transfers mid-journey, one
@@ -193,13 +194,14 @@ class StreetLegPolicy:
         self.transfers = transfers
         vehicles = dict(vehicles or {})
         for mode, policy in vehicles.items():
-            if mode not in STREET_POLICY_MODES or mode == "walk":
+            if mode not in STREET_POLICY_MODES or mode in ("walk", "wheelchair"):
                 raise ValueError(f"vehicles= names an unknown vehicle mode {mode!r}")
             if not isinstance(policy, VehiclePolicy):
                 raise ValueError(f"vehicles[{mode!r}] must be a VehiclePolicy")
         for side_name, budgets in (("access", self.access), ("egress", self.egress)):
             for mode in budgets or {}:
-                if mode == "walk":
+                if mode in ("walk", "wheelchair"):
+                    # Walking-class modes ride no vehicle: no terms needed.
                     continue
                 policy = vehicles.get(mode)
                 if policy is None:
@@ -220,6 +222,10 @@ class StreetLegPolicy:
                             "too"
                         )
         for mode in self.transfers or {}:
+            if mode == "wheelchair":
+                # A walking-class transfer set: computed per mode like the
+                # shared ones, ridden without vehicle terms.
+                continue
             policy = vehicles.get(mode)
             if policy is None:
                 raise ValueError(
@@ -308,7 +314,7 @@ def reduction_modes(policy, side, walking_budget):
         raise ValueError(f"street_policy grants no {side} modes")
     modes = []
     for mode, seconds in budgets.items():
-        if mode == "walk":
+        if mode in ("walk", "wheelchair"):
             modes.append((mode, seconds, False, None))
             continue
         terms = policy.vehicles[mode]

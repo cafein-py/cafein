@@ -43,7 +43,7 @@ import pandas as pd
 
 from cafein import emissions
 from cafein._validate import component_selection, id_sequence, sequence_not_string
-from cafein.travelers import folded_constraints
+from cafein.travelers import folded_constraints, refuse_wheelchair_streets
 
 _COLUMNS = [
     "departure_s",
@@ -266,6 +266,8 @@ def journey_frontier(
         walking_speed_kmph,
         max_walking_time,
     )
+    if not isinstance(origin, str) or not isinstance(destination, str):
+        refuse_wheelchair_streets(traveler, "journey_frontier")
     from cafein._units import (
         departure_parts,
         duration_seconds,
@@ -542,6 +544,10 @@ def journey_frontiers(
         walking_speed_kmph,
         max_walking_time,
     )
+    from cafein.matrices import _is_point_frame as _points
+
+    if _points(origins) or _points(destinations):
+        refuse_wheelchair_streets(traveler, "journey_frontiers")
     from cafein._units import (
         departure_parts,
         duration_seconds,
@@ -705,6 +711,10 @@ def frontier_table(
         walking_speed_kmph,
         max_walking_time,
     )
+    from cafein.matrices import _is_point_frame as _points
+
+    if _points(origins) or _points(destinations):
+        refuse_wheelchair_streets(traveler, "frontier_table")
     from cafein._units import (
         departure_parts,
         duration_seconds,

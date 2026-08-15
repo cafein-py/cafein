@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import shapely
 
-from cafein.travelers import folded_constraints
+from cafein.travelers import folded_constraints, folded_street_policy
 from cafein.matrices import (
     _factor_tables,
     _is_point_frame,
@@ -373,6 +373,14 @@ class DetailedItineraries(gpd.GeoDataFrame):
                 exclude_stops,
                 walking_speed_kmph,
                 max_walking_time,
+            )
+        if (
+            not _is_street_network(network)
+            and hasattr(network, "route_between_stops")
+            and _is_point_frame(origins)
+        ):
+            street_policy, max_walking_time = folded_street_policy(
+                traveler, network, street_policy, walking_speed_kmph, max_walking_time
             )
         from cafein._units import (
             departure_parts,
