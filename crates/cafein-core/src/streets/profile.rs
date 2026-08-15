@@ -120,6 +120,9 @@ pub enum ProfileError {
     MaxSpeedTooLow,
     /// A slope factor is not finite and non-negative.
     InvalidSlopeFactors,
+    /// `max_gradient` is not finite and positive, or set on a car
+    /// profile (the car models no gradients).
+    InvalidMaxGradient,
     /// A non-walk profile has no `adj_access` to route by — the network was
     /// built without the multimodal attributes.
     MissingAttributes,
@@ -144,6 +147,9 @@ impl std::fmt::Display for ProfileError {
             }
             ProfileError::InvalidSlopeFactors => {
                 write!(f, "a slope factor is not finite and non-negative")
+            }
+            ProfileError::InvalidMaxGradient => {
+                write!(f, "max_gradient is malformed or set on a car profile")
             }
             ProfileError::MaxSpeedTooLow => {
                 write!(f, "max_speed is below the greatest attainable speed")
@@ -210,6 +216,12 @@ pub struct StreetProfileDefinition {
     /// Cost factor on a descending sub-segment: `1 + slope_downhill·s` with
     /// `s < 0` — a bounded credit. Zero disables it.
     pub slope_downhill: f64,
+    /// The steepest sub-segment gradient the profile tolerates, as an
+    /// absolute slope fraction: an arc whose edge holds a steeper
+    /// sub-segment compiles forbidden in both directions. `None`
+    /// disables the cap; without installed elevations it is inert
+    /// (unavailable data never forbids).
+    pub max_gradient: Option<f64>,
     /// The car delay model, resolved to one period's flat numbers. `None`
     /// compiles free-flow — the default regime; only a car profile may carry
     /// `Some`. The car mode reads the per-arc driving speeds either way; this
@@ -265,6 +277,7 @@ impl StreetProfileDefinition {
             smoothness_multipliers: vec![1.0; SMOOTHNESS_CODE_COUNT],
             slope_uphill: 0.0,
             slope_downhill: 0.0,
+            max_gradient: None,
             car: None,
         }
     }
@@ -278,12 +291,15 @@ impl StreetProfileDefinition {
     /// permission bit — walkable arcs without stairs, per the
     /// extraction's tag rules.
     pub fn wheelchair() -> StreetProfileDefinition {
-        StreetProfileDefinition::flat(
+        let mut definition = StreetProfileDefinition::flat(
             "wheelchair",
             StreetMode::Wheelchair,
             "wheelchair",
             WALK_SPEED,
-        )
+        );
+        // Near the ADA 1:12 ramp standard; strictly steeper is forbidden.
+        definition.max_gradient = Some(0.08);
+        definition
     }
 
     /// The default bicycle profile, 14.4 km/h (R5's 4 m/s default), with the
@@ -340,6 +356,14 @@ impl StreetProfileDefinition {
         }
         if self.car.is_some() && self.mode != StreetMode::Car {
             return Err(ProfileError::InvalidCarModel);
+        }
+        if let Some(cap) = self.max_gradient {
+            // Checked before the car branch returns: a malformed cap never
+            // validates, and the car — which rides its persisted speeds and
+            // models no gradients — rejects a cap outright.
+            if !(cap.is_finite() && cap > 0.0) || self.mode == StreetMode::Car {
+                return Err(ProfileError::InvalidMaxGradient);
+            }
         }
         if let Some(model) = &self.car {
             let factor = |value: f64| value.is_finite() && value >= 0.0;
@@ -584,6 +608,7 @@ impl StreetNetwork {
         // loop below scales its length by the one for its direction.
         let slope = self.slope_means(definition);
         let slot_reverse = slope.as_ref().map(|_| self.slot_directions());
+        let cap = definition.max_gradient;
         let mut arc_millis = vec![u32::MAX; meters.len()];
         for slot in 0..meters.len() {
             let permitted = match attributes {
@@ -593,8 +618,15 @@ impl StreetNetwork {
             if !permitted {
                 continue;
             }
+            if let (Some((_, maxima)), Some(cap)) = (&slope, cap) {
+                // Strictly steeper than the profile tolerates: the arc is
+                // forbidden in both directions (the maximum is unsigned).
+                if maxima[edges[slot] as usize] > cap {
+                    continue;
+                }
+            }
             let mut length = meters[slot];
-            if let (Some(means), Some(reverse)) = (&slope, &slot_reverse) {
+            if let (Some((means, _)), Some(reverse)) = (&slope, &slot_reverse) {
                 let (forward_mean, reverse_mean) = means[edges[slot] as usize];
                 length *= if reverse[slot] {
                     reverse_mean
@@ -776,17 +808,23 @@ impl StreetNetwork {
         })
     }
 
-    /// The distance-weighted mean slope multiplier per edge and direction
-    /// (`(forward, reverse)`), integrating `1 + f(s)` over the stored
-    /// sub-segments — `None` when the network carries no elevations or the
-    /// definition's slope is off, which compiles flat.
+    /// Per edge: the distance-weighted mean slope multiplier per direction
+    /// (`(forward, reverse)`, integrating `1 + f(s)` over the stored
+    /// sub-segments) and the maximum absolute sub-segment slope, for the
+    /// `max_gradient` cap — `None` when the network carries no elevations
+    /// or the definition needs neither (slope off and no cap), which
+    /// compiles flat.
     ///
     /// A sub-segment with unavailable elevation (NaN) or no length counts as
-    /// flat in both directions: unavailable data never invents a penalty or a
-    /// credit, so an elevation-less profile means multiplier 1.0 exactly and
-    /// the compiled costs are bit-identical to a flat compilation.
-    fn slope_means(&self, definition: &StreetProfileDefinition) -> Option<Vec<(f64, f64)>> {
-        if definition.slope_uphill == 0.0 && definition.slope_downhill == 0.0 {
+    /// flat in both directions: unavailable data never invents a penalty, a
+    /// credit, or a forbidden arc, so an elevation-less profile means
+    /// multiplier 1.0 exactly and the compiled costs are bit-identical to a
+    /// flat compilation.
+    pub(super) fn slope_means(&self, definition: &StreetProfileDefinition) -> Option<EdgeSlopes> {
+        if definition.slope_uphill == 0.0
+            && definition.slope_downhill == 0.0
+            && definition.max_gradient.is_none()
+        {
             return None;
         }
         let elevations = self.elevations()?;
@@ -801,10 +839,12 @@ impl StreetNetwork {
             (1.0 + f).max(MIN_SLOPE_MULTIPLIER)
         };
         let mut means = Vec::with_capacity(offsets.len() - 1);
+        let mut maxima = Vec::with_capacity(offsets.len() - 1);
         for edge in 0..offsets.len() - 1 {
             let start = offsets[edge] as usize;
             let end = offsets[edge + 1] as usize;
             let (mut total, mut forward, mut reverse) = (0.0f64, 0.0f64, 0.0f64);
+            let mut steepest = 0.0f64;
             for point in start..end.saturating_sub(1) {
                 let length = f64::from(cumulative[point + 1]) - f64::from(cumulative[point]);
                 if length.is_nan() || length <= 0.0 {
@@ -815,6 +855,7 @@ impl StreetNetwork {
                     (1.0, 1.0)
                 } else {
                     let slope = (rise / length).clamp(-MAX_SLOPE, MAX_SLOPE);
+                    steepest = steepest.max(slope.abs());
                     (multiplier(slope), multiplier(-slope))
                 };
                 total += length;
@@ -826,8 +867,9 @@ impl StreetNetwork {
             } else {
                 (1.0, 1.0)
             });
+            maxima.push(steepest);
         }
-        Some(means)
+        Some((means, maxima))
     }
 
     /// Whether each adjacency slot traverses its edge against the stored
@@ -848,6 +890,10 @@ impl StreetNetwork {
         reverse
     }
 }
+
+/// Per edge: the `(forward, reverse)` mean slope multipliers and the
+/// maximum absolute sub-segment slope.
+type EdgeSlopes = (Vec<(f64, f64)>, Vec<f64>);
 
 /// A class multiplier by code. Every attribute path validates codes against
 /// the table sizes (`check_street_attributes`) and every profile validates its

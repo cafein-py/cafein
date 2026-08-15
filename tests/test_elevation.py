@@ -128,13 +128,15 @@ def test_stored_elevations_match_the_ramp(elevated):
 
 def test_routing_is_unchanged_for_slope_free_modes(elevated, helsinki_streets):
     # Same extract with and without the DEM: profiles without a slope model
-    # must route identically — only the bicycle carries one.
+    # must route identically — only the bicycle carries one. The ramp
+    # tops out near 1.8 %, so the wheelchair's 8 % cap never bites and
+    # its routing matches the capless build exactly.
     pairs = [
         (KAMPPI, HAKANIEMI),
         (HAKANIEMI, KAMPPI),
         ((60.1580, 24.9350), KAMPPI),
     ]
-    for mode in ("walk", "e_bike", "e_scooter"):
+    for mode in ("walk", "e_bike", "e_scooter", "wheelchair"):
         for origin, destination in pairs:
             with_dem = elevated.travel_time(origin, destination, mode=mode)
             without = helsinki_streets.travel_time(origin, destination, mode=mode)
@@ -345,3 +347,21 @@ def test_a_scaled_geotiff_decodes_to_physical_elevations(tmp_path):
     # Pixel centers of the top row, so interpolation is exact.
     values = elevation.sample_dem([24.25, 24.75], [60.75, 60.75], str(path))
     assert values == pytest.approx([110.0, 120.0])
+
+
+def test_the_wheelchair_gradient_cap_bites_on_a_steep_dem(
+    kantakaupunki_pbf, helsinki_streets
+):
+    # A near-vertical west-east wall: after the ±100 % slope clamp, any
+    # arc drifting more than a few degrees off north-south is steeper
+    # than the 8 % cap. The eastward crossing that walking makes directly
+    # becomes unreachable on wheels within the street cutoff, while
+    # capless walking is untouched by the DEM.
+    def cliff(lons, lats):
+        return ((np.asarray(lons) - 24.8) * 2_000_000.0).astype("float32")
+
+    steep = StreetNetwork.from_osm(str(kantakaupunki_pbf), dem=cliff)
+    walked = steep.travel_time(KAMPPI, HAKANIEMI, mode="walk")
+    assert walked is not None
+    assert walked == helsinki_streets.travel_time(KAMPPI, HAKANIEMI, mode="walk")
+    assert steep.travel_time(KAMPPI, HAKANIEMI, mode="wheelchair") is None
