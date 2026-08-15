@@ -36,7 +36,7 @@ def test_cycling_is_faster_than_walking(helsinki_network):
 
 
 def test_every_shipped_mode_routes(helsinki_network):
-    for mode in ("walk", "bicycle", "e_bike", "e_scooter"):
+    for mode in ("walk", "bicycle", "e_bike", "e_scooter", "wheelchair"):
         assert helsinki_network.travel_time(KAMPPI, HAKANIEMI, mode=mode) is not None
 
 
@@ -140,7 +140,7 @@ def test_round_trip_preserves_the_graph_and_its_routes(helsinki_network, artifac
     assert loaded.vertex_count == helsinki_network.vertex_count
     assert loaded.edge_count == helsinki_network.edge_count
     assert not loaded.mapped
-    for mode in ("walk", "bicycle", "e_bike", "e_scooter"):
+    for mode in ("walk", "bicycle", "e_bike", "e_scooter", "wheelchair"):
         assert loaded.travel_time(KAMPPI, HAKANIEMI, mode=mode) == (
             helsinki_network.travel_time(KAMPPI, HAKANIEMI, mode=mode)
         )
@@ -161,7 +161,7 @@ def test_mapped_load_routes_identically(helsinki_network, artifact, mmap_availab
         pytest.skip("memory mapping unavailable in this environment")
     mapped = StreetNetwork.load(artifact, mmap=True)
     assert mapped.mapped
-    for mode in ("walk", "bicycle", "e_bike", "e_scooter"):
+    for mode in ("walk", "bicycle", "e_bike", "e_scooter", "wheelchair"):
         assert mapped.travel_time(KAMPPI, HAKANIEMI, mode=mode) == (
             helsinki_network.travel_time(KAMPPI, HAKANIEMI, mode=mode)
         )

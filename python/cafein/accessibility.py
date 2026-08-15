@@ -301,7 +301,7 @@ def _resolved_cost_matrix(
         if transport_mode is None:
             raise ValueError(
                 "a StreetNetwork needs transport_mode= (walk, bicycle, "
-                "e_bike, e_scooter, or car on a car-enabled build)"
+                "e_bike, e_scooter, wheelchair, or car on a car-enabled build)"
             )
         rejected = {
             "date": date,
@@ -1611,7 +1611,7 @@ class Catchment(gpd.GeoDataFrame):
             if transport_mode is None:
                 raise ValueError(
                     "a StreetNetwork needs transport_mode= (walk, bicycle, "
-                    "e_bike, e_scooter, or car on a car-enabled build)"
+                    "e_bike, e_scooter, wheelchair, or car on a car-enabled build)"
                 )
             if cost not in ("time", "distance"):
                 raise ValueError(

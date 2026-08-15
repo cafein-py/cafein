@@ -6,13 +6,21 @@ import pytest
 from cafein import _osm
 
 W, B, S, C = _osm.WALK, _osm.BICYCLE, _osm.E_SCOOTER, _osm.CAR
+WC = _osm.WHEELCHAIR
+_LEGACY = W | B | S | C
 
 
 def test_mode_and_flag_bits_match_the_rust_abi():
     # These integer values cross to the Rust profile compiler (streets/profile.rs)
     # as the raw u8/u16 attribute arrays, so a change here is a breaking ABI
     # change and must be mirrored on the Rust side (and vice versa).
-    assert (_osm.WALK, _osm.BICYCLE, _osm.E_SCOOTER, _osm.CAR) == (1, 2, 4, 8)
+    assert (
+        _osm.WALK,
+        _osm.BICYCLE,
+        _osm.E_SCOOTER,
+        _osm.CAR,
+        _osm.WHEELCHAIR,
+    ) == (1, 2, 4, 8, 16)
     assert (
         _osm.FLAG_DISMOUNT,
         _osm.FLAG_BRIDGE,
@@ -289,20 +297,61 @@ def _perm(**tags):
     ],
 )
 def test_edge_permission_matrix(tags, forward, reverse, flags):
+    # The legacy four-mode pins; the wheelchair bit has its own matrix.
     got_forward, got_reverse, got_flags, _, _ = _perm(**tags)
-    assert got_forward == forward
-    assert got_reverse == reverse
+    assert got_forward & _LEGACY == forward
+    assert got_reverse & _LEGACY == reverse
     assert got_flags == flags
+
+
+@pytest.mark.parametrize(
+    "tags, allowed",
+    [
+        # Walkable classes are wheelchair classes; stairs are the veto.
+        (dict(highway="footway"), True),
+        (dict(highway="pedestrian"), True),
+        (dict(highway="elevator"), True),
+        (dict(highway="residential"), True),
+        (dict(highway="steps"), False),
+        # wheelchair=yes rescues only the steps class veto…
+        (dict(highway="steps", wheelchair="yes"), True),
+        # …and only the literal `yes`: other values, `designated`
+        # included, keep the veto.
+        (dict(highway="steps", wheelchair="designated"), False),
+        # …never an access-ladder denial or a non-walkable class.
+        (dict(highway="steps", wheelchair="yes", access="private"), False),
+        (dict(highway="steps", wheelchair="yes", foot="no"), False),
+        (dict(highway="motorway", wheelchair="yes"), False),
+        (dict(highway="trunk", wheelchair="yes"), False),
+        # A foot tag never opens stairs for wheels.
+        (dict(highway="steps", foot="designated"), False),
+        # wheelchair=no denies an otherwise walkable way.
+        (dict(highway="footway", wheelchair="no"), False),
+        (dict(highway="residential", wheelchair="no"), False),
+        # limited and unknown values keep the resolved default.
+        (dict(highway="footway", wheelchair="limited"), True),
+        (dict(highway="steps", wheelchair="limited"), False),
+        # The walk access ladder applies beneath it all.
+        (dict(highway="footway", access="private"), False),
+        (dict(highway="residential", foot="no"), False),
+        (dict(highway="something_new"), False),
+        (dict(highway="something_new", foot="yes"), True),
+    ],
+)
+def test_wheelchair_permission_matrix(tags, allowed):
+    forward, reverse, _, _, _ = _perm(**tags)
+    assert bool(forward & WC) == allowed
+    assert bool(reverse & WC) == allowed
 
 
 def test_unknown_access_is_conservative_and_counted():
     # An unrecognised access value neither newly permits nor denies — the
     # highway default stands — and it is reported for diagnostics.
     forward, reverse, _, unknown_access, _ = _perm(highway="residential", access="wat")
-    assert forward == reverse == W | B | S | C
+    assert forward == reverse == W | B | S | C | WC
     assert unknown_access
     forward, _, _, unknown_access, _ = _perm(highway="footway", access="wat")
-    assert forward == W
+    assert forward == W | WC
     assert unknown_access
 
 
@@ -316,7 +365,7 @@ def test_unknown_highway_denies_and_is_counted():
     forward, _, _, unknown_access, unknown_highway = _perm(
         highway="rest_area", foot="yes"
     )
-    assert forward == W
+    assert forward == W | WC
     assert unknown_highway and not unknown_access
 
 
@@ -729,3 +778,22 @@ def test_priority_nodes_mark_their_own_way_only():
     )
     assert list(fwd) == [0, 0, 0]
     assert list(rev) == [0, _osm.JUNCTION_PRIORITY, 0]
+
+
+def test_prune_judges_wheelchair_connectivity_across_stairs():
+    # Two clusters joined only by a stairway: one walking component, but
+    # two sub-threshold wheelchair components — both pruned for the
+    # wheelchair while walking survives across the stairs.
+    left = [(i, i + 1) for i in range(19)]
+    right = [(i, i + 1) for i in range(20, 39)]
+    stairs = [(19, 20)]
+    edges = left + right + stairs
+    u = np.array([a for a, _ in edges])
+    v = np.array([b for _, b in edges])
+    wwc = W | WC
+    forward = np.array([wwc] * (len(left) + len(right)) + [W], dtype=np.uint8)
+    reverse = forward.copy()
+    pruned_f, pruned_r = _osm.prune_components_per_profile(u, v, 40, forward, reverse)
+    assert (pruned_f & WC == 0).all() and (pruned_r & WC == 0).all()
+    assert (pruned_f[: len(left) + len(right)] & W != 0).all()
+    assert pruned_f[-1] & W

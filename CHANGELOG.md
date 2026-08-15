@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The `"wheelchair"` street mode: walk-speed routing that avoids
+  stairs and respects OSM `wheelchair` tags, on every street product
+  via `transport_mode="wheelchair"`; network artifact formats 19/4.
+  ([#265](https://github.com/cafein-py/cafein/pull/265))
+
 - `TravelerProfile`: per-traveler constraints as `traveler=` on every
   exclusion surface — wheelchair exclusions compiled from the feed
   (optimistic by default, `unknown="excluded"` strict), plus bundled

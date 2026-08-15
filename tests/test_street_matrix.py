@@ -749,3 +749,67 @@ def test_itineraries_agree_with_the_cost_matrix_on_emissions(streets, origins):
     by_pair = {(r.from_id, r.to_id): r.emissions for r in costs.itertuples(index=False)}
     for row in legs.itertuples(index=False):
         assert row.emissions == pytest.approx(by_pair[(row.from_id, row.to_id)])
+
+
+def test_wheelchair_detours_the_stairs(streets):
+    # The longest stairway in the extract (75 m of highway=steps); walking
+    # shortcuts straight over it, the wheelchair profile must go around.
+    places = gpd.GeoDataFrame(
+        {"id": ["top", "bottom"]},
+        geometry=gpd.points_from_xy([24.931183, 24.9300526], [60.168853, 60.1684778]),
+        crs="EPSG:4326",
+    )
+    walk = TravelTimeMatrix(
+        streets, places, transport_mode="walk", output_time_units="seconds"
+    )
+    chair = TravelTimeMatrix(
+        streets, places, transport_mode="wheelchair", output_time_units="seconds"
+    )
+    walked = walk.set_index(["from_id", "to_id"])["travel_time"]
+    chaired = chair.set_index(["from_id", "to_id"])["travel_time"]
+    # Same speed, stricter permissions: never faster, strictly slower here.
+    assert chaired[("top", "bottom")] > walked[("top", "bottom")]
+    assert chaired[("bottom", "top")] > walked[("bottom", "top")]
+
+
+def test_wheelchair_is_never_faster_and_snaps_off_the_stairs(streets, origins):
+    # Same speed, subset permissions: wheelchair times dominate walking
+    # everywhere, and match it away from the stairs.
+    walk = TravelTimeMatrix(
+        streets, origins, transport_mode="walk", output_time_units="seconds"
+    )
+    chair = TravelTimeMatrix(
+        streets, origins, transport_mode="wheelchair", output_time_units="seconds"
+    )
+    merged = walk.merge(
+        chair, on=["from_id", "to_id"], suffixes=("_walk", "_chair")
+    ).dropna()
+    assert (merged["travel_time_chair"] >= merged["travel_time_walk"]).all()
+    assert (merged["travel_time_chair"] == merged["travel_time_walk"]).any()
+    # A point halfway up the stairway: walking snaps onto the steps edge,
+    # the wheelchair snap must find a permitted street instead — reachable
+    # both, never faster wheeled.
+    mid_stairs = gpd.GeoDataFrame(
+        {"id": ["mid"]},
+        geometry=gpd.points_from_xy([24.9306178], [60.1686654]),
+        crs="EPSG:4326",
+    )
+    to_mid_walk = TravelTimeMatrix(
+        streets,
+        origins,
+        mid_stairs,
+        transport_mode="walk",
+        output_time_units="seconds",
+    )
+    to_mid_chair = TravelTimeMatrix(
+        streets,
+        origins,
+        mid_stairs,
+        transport_mode="wheelchair",
+        output_time_units="seconds",
+    )
+    walked = to_mid_walk.set_index("from_id")["travel_time"].dropna()
+    chaired = to_mid_chair.set_index("from_id")["travel_time"].dropna()
+    assert not chaired.empty
+    shared = walked.index.intersection(chaired.index)
+    assert (chaired[shared] >= walked[shared]).all()

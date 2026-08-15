@@ -244,3 +244,16 @@ def test_transit_itineraries_reject_the_street_keywords(network):
             "2022-02-22 08:30:00",
             max_street_time=10,
         )
+
+
+def test_wheelchair_dispatch_across_the_street_products(streets, places):
+    # The mode name reaches every standalone product's dispatch.
+    routes = DetailedItineraries(
+        streets, places, transport_mode="wheelchair", geometries=False
+    )
+    assert not routes.empty
+    assert (routes["mode"] == "wheelchair").all()
+    assert (routes["leg_type"] == "wheelchair").all()
+    costs = TravelCostMatrix(streets, places, transport_mode="wheelchair")
+    assert not costs.empty
+    assert (costs["travel_time"] >= 0).all()

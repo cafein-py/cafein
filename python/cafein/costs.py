@@ -43,7 +43,7 @@ CURRENCY = "EUR2017"
 """The shipped values' declared currency and base year — a label, never
 a conversion."""
 
-_STREET_MODES = ("walk", "bicycle", "e_scooter", "car")
+_STREET_MODES = ("walk", "bicycle", "e_scooter", "wheelchair", "car")
 """The street modes a cost row may name; transit rows are rejected."""
 
 
