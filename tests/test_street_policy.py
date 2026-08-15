@@ -2556,3 +2556,42 @@ def test_carriage_time_matrix_matches_the_route_surface(
         network, *args, street_policy=policy, output_time_units="seconds"
     )
     pd.testing.assert_frame_equal(pd.DataFrame(cached), pd.DataFrame(matrix))
+
+
+def test_policy_itineraries_price_shared_street_tariffs(
+    multimodal_network, helsinki_gtfs
+):
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries, fares
+
+    structure = fares.zone_fare_structure(helsinki_gtfs, rules="zones")
+    structure.street = {"e_scooter": (1.0, 0.25)}
+    # Scooter-only access: every transit option's access rides the rental.
+    policy = StreetLegPolicy(
+        access={"e_scooter": 900},
+        egress={"walk": 900},
+        vehicles={"e_scooter": shared()},
+    )
+    frame = DetailedItineraries(
+        multimodal_network,
+        _points_frame([ORIGIN]),
+        _points_frame([DEST]),
+        "2022-02-22 08:30:00",
+        street_policy=policy,
+        factors=_scooter_factor_rows(),
+        fares=structure,
+        geometries=False,
+    )
+    assert not frame[frame["mode"] == "e_scooter"].empty
+    per_option = frame.groupby("option")["fare"]
+    assert (per_option.nunique() == 1).all()
+    # The frame prices exactly as annotate_fares on the same journeys —
+    # the policy's shared modes ride the structure's street tariffs, so
+    # each fare carries the rental unlock and minutes over the ticket.
+    journeys = multimodal_network.route_between_coordinates(
+        ORIGIN, DEST, "2022-02-22 08:30:00", street_policy=policy
+    )
+    fares.annotate_fares(journeys, structure, shared_modes={"e_scooter"})
+    assert list(per_option.first()) == pytest.approx(
+        [journey["fare"] for journey in journeys]
+    )

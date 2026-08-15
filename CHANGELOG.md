@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `DetailedItineraries` takes `fares=`: each option's whole-journey
+  ticket price as a `fare` column repeated on the option's rows;
+  rental legs under a `street_policy` price from the street tariffs.
+  ([#262](https://github.com/cafein-py/cafein/pull/262))
+
 ## 0.11.0 — 2026-08-14
 
 - `Accessibility.to_parquet`: the accessibility table streamed to
