@@ -48,6 +48,13 @@ impl TransportNetwork {
     ///     journey that leaves within the window but waits for a ride
     ///     beyond it carries the window's final second as its departure.
     ///
+    /// With ``arrive_by`` the given time is the arrival deadline and the
+    /// result is the latest-departure Pareto set — (latest departure,
+    /// fewest rides), earliest arrival breaking ties — each journey
+    /// leg-identical to the plain answer for the departure it discovers.
+    /// The reverse run boards at the origin stop over the closure; a
+    /// whole-day ULTRA set is never claimed, and a window is rejected.
+    ///
     /// Returns
     /// -------
     /// list of dict
@@ -55,7 +62,7 @@ impl TransportNetwork {
     ///     time, number of rides) leaving at the departure time; with it,
     ///     the departure-window profile. Each journey carries its legs;
     ///     times are seconds past the service day's start.
-    #[pyo3(signature = (from_stop, to_stop, date, departure, max_transfers = 7, window = None, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true))]
+    #[pyo3(signature = (from_stop, to_stop, date, departure, max_transfers = 7, window = None, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, arrive_by = false))]
     #[allow(clippy::too_many_arguments)]
     fn route_between_stops(
         &self,
@@ -73,7 +80,13 @@ impl TransportNetwork {
         max_walking_time: f64,
         max_snap_distance: f64,
         geometries: bool,
+        arrive_by: bool,
     ) -> PyResult<Py<PyList>> {
+        if arrive_by && window.is_some() {
+            return Err(PyValueError::new_err(
+                "a departure window does not combine with an arrival deadline",
+            ));
+        }
         let origin = self.resolve_stop(from_stop)?;
         let destination = self.resolve_stop(to_stop)?;
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
@@ -89,7 +102,7 @@ impl TransportNetwork {
         // coordinates for unrestricted walking; otherwise board at the origin
         // stop and relax the closure (today's behaviour). Exclusions keep
         // the closure path.
-        if self.ultra_active() && exclusions.is_none() {
+        if self.ultra_active() && exclusions.is_none() && !arrive_by {
             if let (Some(streets), Some(from_xy), Some(to_xy)) = (
                 self.streets.as_ref(),
                 self.stop_coordinate(origin),
@@ -115,6 +128,7 @@ impl TransportNetwork {
                         max_walking_time,
                         max_snap_distance,
                         geometries,
+                        arrive_by,
                     );
                 }
             }
@@ -128,6 +142,9 @@ impl TransportNetwork {
             max_transfers,
             exclusions,
         };
+        if arrive_by {
+            return self.reverse_route_request(py, &request, geometries);
+        }
         self.route_request(py, &request, window, None, None, geometries)
     }
 
@@ -167,12 +184,17 @@ impl TransportNetwork {
     ///     Maximum straight-line distance in meters from each coordinate
     ///     to the walking network.
     ///
+    /// With ``arrive_by`` the given time is the arrival deadline, as in
+    /// ``route_between_stops``; the direct walking alternative is placed
+    /// to arrive exactly at the deadline and takes its position in the
+    /// (latest departure, fewest rides) order.
+    ///
     /// Returns
     /// -------
     /// list of dict
     ///     Journeys as in ``route_between_stops``; arrivals include the
     ///     egress walk.
-    #[pyo3(signature = (origin, destination, date, departure, max_transfers = 7, window = None, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true))]
+    #[pyo3(signature = (origin, destination, date, departure, max_transfers = 7, window = None, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = true, arrive_by = false))]
     #[allow(clippy::too_many_arguments)]
     fn route_between_coordinates(
         &self,
@@ -190,7 +212,13 @@ impl TransportNetwork {
         max_walking_time: f64,
         max_snap_distance: f64,
         geometries: bool,
+        arrive_by: bool,
     ) -> PyResult<Py<PyList>> {
+        if arrive_by && window.is_some() {
+            return Err(PyValueError::new_err(
+                "a departure window does not combine with an arrival deadline",
+            ));
+        }
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         let streets = self.installed_streets()?;
         let speed =
@@ -256,33 +284,52 @@ impl TransportNetwork {
         // ULTRA-routed leg is measured in the ULTRA set. Exclusions keep
         // the closure: the shortcut set's witness pruning is not robust
         // under supply removal.
-        let transfers = if request.exclusions.is_some() {
+        let transfers = if arrive_by || request.exclusions.is_some() {
             &self.transfers
         } else {
             self.time_transfers()
         };
-        let journeys = match window {
-            None => Raptor.route(&self.build.timetable, transfers, &request),
-            Some(window) => Raptor.route_range(&self.build.timetable, transfers, &request, window),
+        let journeys = if arrive_by {
+            self.reverse_journeys(&request)
+        } else {
+            match window {
+                None => Raptor.route(&self.build.timetable, transfers, &request),
+                Some(window) => {
+                    Raptor.route_range(&self.build.timetable, transfers, &request, window)
+                }
+            }
+        };
+        // The walking-only alternative's dominance depends on the
+        // axis. Depart-at: both leave at the departure, so a journey
+        // survives only when strictly faster than walking. Arrive-by:
+        // the walk leaves at deadline − walk with zero rides, so it
+        // dominates every journey leaving no later — a journey
+        // survives only by leaving strictly later than the walk.
+        let walk_departure = match direct {
+            Some((walk_seconds, _)) if arrive_by => request.departure.checked_sub(walk_seconds),
+            Some(_) => Some(request.departure),
+            None => None,
         };
         let kept: Vec<&Journey> = journeys
             .iter()
-            .filter(|journey| match direct {
-                Some((walk_seconds, _)) => journey.arrival - journey.departure < walk_seconds,
-                None => true,
+            .filter(|journey| match (direct, walk_departure) {
+                (Some((walk_seconds, _)), _) if !arrive_by => {
+                    journey.arrival - journey.departure < walk_seconds
+                }
+                (Some(_), Some(at)) => journey.departure > at,
+                // A walk longer than the whole clock cannot be placed
+                // to arrive by the deadline; it dominates nothing.
+                _ => true,
             })
             .collect();
         let result = PyList::empty(py);
-        if let Some(walk) = direct.filter(|_| !kept.iter().any(|journey| journey.rides() == 0)) {
-            // Journeys sort by (departure, rides); the walk leaves at the
-            // requested departure with zero rides, so it leads the list.
-            result.append(self.walk_journey_dict(
-                py,
-                request.departure,
-                walk,
-                &ends,
-                geometries,
-            )?)?;
+        let walk_entry = direct
+            .filter(|_| !kept.iter().any(|journey| journey.rides() == 0))
+            .zip(walk_departure);
+        // The forward walk leads (equal departure, zero rides); the
+        // arrive-by walk trails (every kept journey leaves later).
+        if let Some((walk, at)) = walk_entry.filter(|_| !arrive_by) {
+            result.append(self.walk_journey_dict(py, at, walk, &ends, geometries)?)?;
         }
         for journey in kept {
             result.append(self.journey_to_dict(
@@ -293,6 +340,9 @@ impl TransportNetwork {
                 geometries,
                 transfers,
             )?)?;
+        }
+        if let Some((walk, at)) = walk_entry.filter(|_| arrive_by) {
+            result.append(self.walk_journey_dict(py, at, walk, &ends, geometries)?)?;
         }
         Ok(result.unbind())
     }
@@ -586,7 +636,14 @@ impl TransportNetwork {
     /// dict
     ///     Travel time in seconds to every reachable stop, keyed by
     ///     stop_id; unreachable stops are absent.
-    #[pyo3(signature = (origin, date, departure, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    /// With ``arrive_by`` the given time is the arrival deadline and the
+    /// coordinate becomes the **destination**: the result maps every
+    /// origin stop to the travel time of its latest-departure journey
+    /// arriving there by the deadline — each journey's own duration.
+    /// Stops within the walking cutoff appear with their walking time,
+    /// the walk placed to arrive exactly at the deadline. A whole-day
+    /// ULTRA set is never claimed by a reverse run.
+    #[pyo3(signature = (origin, date, departure, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, arrive_by = false))]
     #[allow(clippy::too_many_arguments)]
     fn travel_times_from_coordinate(
         &self,
@@ -601,6 +658,7 @@ impl TransportNetwork {
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
+        arrive_by: bool,
     ) -> PyResult<Py<PyDict>> {
         let streets = self.installed_streets()?;
         let speed =
@@ -615,6 +673,22 @@ impl TransportNetwork {
         )?;
         let departure = parse_time(departure)?;
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        if arrive_by {
+            // The coordinate is the destination: its street links serve
+            // as the egress, and one reverse run maps every origin stop
+            // to its latest-departure journey.
+            let links = request_offsets(&access);
+            let request = Request {
+                departure,
+                access: Vec::new(),
+                egress: links.clone(),
+                active_services: self.active_services(date)?,
+                active_services_previous: self.active_services_previous(date)?,
+                max_transfers,
+                exclusions,
+            };
+            return self.reverse_times_dict(py, &request, &links);
+        }
         let request = Request {
             departure,
             access: request_offsets(&access),
@@ -675,7 +749,13 @@ impl TransportNetwork {
     ///     the origin maps to 0; under a whole-day ULTRA set it is the
     ///     door-to-door time from the origin stop's coordinate and may cost
     ///     the short walk to the platform.
-    #[pyo3(signature = (from_stop, date, departure, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    /// With ``arrive_by`` the given time is the arrival deadline and the
+    /// stop becomes the **destination**: the result maps every origin
+    /// stop to the travel time of its latest-departure journey arriving
+    /// there by the deadline — each journey's own duration, the
+    /// destination itself at 0. The reverse run relaxes the closure; a
+    /// whole-day ULTRA set is never claimed.
+    #[pyo3(signature = (from_stop, date, departure, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, arrive_by = false))]
     #[allow(clippy::too_many_arguments)]
     fn travel_times_from_stop(
         &self,
@@ -690,10 +770,23 @@ impl TransportNetwork {
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
+        arrive_by: bool,
     ) -> PyResult<Py<PyDict>> {
         let origin = self.resolve_stop(from_stop)?;
         let departure = parse_time(departure)?;
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        if arrive_by {
+            let request = Request {
+                departure,
+                access: Vec::new(),
+                egress: vec![(origin, 0)],
+                active_services: self.active_services(date)?,
+                active_services_previous: self.active_services_previous(date)?,
+                max_transfers,
+                exclusions,
+            };
+            return self.reverse_times_dict(py, &request, &[(origin, 0)]);
+        }
         // With a whole-day ULTRA set, treat the origin stop as its coordinate
         // and reach every stop door-to-door (coordinate access, ULTRA
         // intermediate transfers, one final walk bounded by max_walking_time);

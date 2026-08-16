@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `arrival=` on the routing calls: `route_between_stops`,
+  `route_between_coordinates`, `travel_times_from_stop`, and
+  `travel_times_from_coordinate` take an arrival deadline as the twin
+  of `departure=` (exactly one of the two) — latest-departure journeys
+  identical to the closure-routed `departure=` answers (a whole-day
+  ULTRA set is never claimed by a reverse run), and one-to-all queries
+  whose direction flips to the given destination.
+  ([#272](https://github.com/cafein-py/cafein/pull/272))
 - The reverse RAPTOR core: latest-departure journeys for an arrival
   deadline, with frontier labels, a reversed transfer view, and exact
   forward-profile oracle tests — the engine behind `arrival=`.

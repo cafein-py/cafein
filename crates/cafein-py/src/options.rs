@@ -64,6 +64,99 @@ impl TransportNetwork {
         Ok(result.unbind())
     }
 
+    /// The arrive-by journeys of a request whose ``departure`` carries
+    /// the deadline: the reverse engine over the installed closure —
+    /// a whole-day ULTRA set is never claimed by a reverse run.
+    pub(super) fn reverse_journeys(&self, request: &Request) -> Vec<Journey> {
+        let reversed = ReversedTransfers::build(&self.transfers);
+        reverse::reverse_route(&self.build.timetable, &self.transfers, &reversed, request)
+    }
+
+    /// Runs an arrive-by request through the reverse engine and
+    /// converts the journeys, latest departure first.
+    pub(super) fn reverse_route_request(
+        &self,
+        py: Python<'_>,
+        request: &Request,
+        geometries: bool,
+    ) -> PyResult<Py<PyList>> {
+        let journeys = self.reverse_journeys(request);
+        let result = PyList::empty(py);
+        for journey in &journeys {
+            result.append(self.journey_to_dict(
+                py,
+                journey,
+                None,
+                None,
+                geometries,
+                &self.transfers,
+            )?)?;
+        }
+        Ok(result.unbind())
+    }
+
+    /// The ``{public_stop_id: travel_time}`` dict of an arrive-by
+    /// one-to-all run: per origin stop the complete-journey order's
+    /// best state — latest departure, fewest rides, then earliest
+    /// arrival — with `walk_only` candidates (stop, walk seconds)
+    /// walking straight to the destination, placed to arrive exactly
+    /// at the deadline. Travel time is the winning journey's own
+    /// duration, never deadline minus departure.
+    pub(super) fn reverse_times_dict(
+        &self,
+        py: Python<'_>,
+        request: &Request,
+        walk_only: &[(StopIdx, u32)],
+    ) -> PyResult<Py<PyDict>> {
+        let reversed = ReversedTransfers::build(&self.transfers);
+        let states = reverse::reverse_one_to_all(&self.build.timetable, &reversed, request);
+        let deadline = request.departure;
+        // (departure, rides, achieved) per stop under the
+        // complete-journey order; stop-query origins walk 0.
+        let mut best: Vec<Option<(u32, u32, u32)>> = vec![None; states.len()];
+        let consider = |slot: &mut Option<(u32, u32, u32)>, candidate: (u32, u32, u32)| {
+            let wins = match *slot {
+                None => true,
+                Some(held) => {
+                    candidate.0 > held.0
+                        || (candidate.0 == held.0 && candidate.1 < held.1)
+                        || (candidate.0 == held.0 && candidate.1 == held.1 && candidate.2 < held.2)
+                }
+            };
+            if wins {
+                *slot = Some(candidate);
+            }
+        };
+        for (stop, stop_states) in states.iter().enumerate() {
+            for &(round, departure, achieved) in stop_states {
+                consider(&mut best[stop], (departure, round as u32, achieved));
+            }
+        }
+        for &(stop, walk) in walk_only {
+            if request
+                .exclusions
+                .as_deref()
+                .is_some_and(|excluded| excluded.excludes_stop(stop))
+            {
+                continue;
+            }
+            let Some(departure) = deadline.checked_sub(walk) else {
+                continue;
+            };
+            consider(&mut best[stop.0 as usize], (departure, 0, deadline));
+        }
+        let result = PyDict::new(py);
+        for (stop, entry) in best.iter().enumerate() {
+            if let Some((departure, _, achieved)) = entry {
+                result.set_item(
+                    self.public_stop_id(StopIdx(stop as u32)),
+                    achieved - departure,
+                )?;
+            }
+        }
+        Ok(result.unbind())
+    }
+
     /// A walking-only journey between the query coordinates, as a dict
     /// shaped like ``journey_to_dict``'s: one ``walk`` leg carrying the
     /// exact street distance and, when asked, the walked path.
