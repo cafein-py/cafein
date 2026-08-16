@@ -26,6 +26,10 @@ name = "helsinki_services"
 path = "helsinki_services.rs"
 
 [[test]]
+name = "helsinki_arrive_by"
+path = "helsinki_arrive_by.rs"
+
+[[test]]
 name = "helsinki_routing"
 path = "helsinki_routing.rs"
 

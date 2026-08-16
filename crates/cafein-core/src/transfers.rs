@@ -40,6 +40,54 @@ fn closed_default() -> bool {
     false
 }
 
+/// The incoming-edge view of a transfer set: for each stop, the
+/// `(from, duration)` pairs of every forward edge that ends there. A
+/// derived index — built from the forward CSR on demand and never
+/// persisted — so reverse relaxation walks genuine incoming edges
+/// rather than assuming the set is symmetric.
+#[derive(Debug)]
+pub struct ReversedTransfers {
+    offsets: Vec<u32>,
+    edges: Vec<(StopIdx, u32)>,
+}
+
+impl ReversedTransfers {
+    /// Builds the incoming-edge CSR of `transfers`.
+    pub fn build(transfers: &Transfers) -> ReversedTransfers {
+        let stops = transfers.offsets.len() - 1;
+        let mut counts = vec![0u32; stops + 1];
+        for edge in &transfers.edges {
+            counts[edge.to.0 as usize + 1] += 1;
+        }
+        for index in 1..counts.len() {
+            counts[index] += counts[index - 1];
+        }
+        let offsets = counts.clone();
+        let mut cursor = offsets.clone();
+        let mut edges = vec![(StopIdx(0), 0u32); transfers.edges.len()];
+        for (from, range) in transfers
+            .offsets
+            .windows(2)
+            .enumerate()
+            .map(|(stop, window)| (stop as u32, window[0] as usize..window[1] as usize))
+        {
+            for edge in &transfers.edges[range] {
+                let slot = cursor[edge.to.0 as usize] as usize;
+                edges[slot] = (StopIdx(from), edge.duration);
+                cursor[edge.to.0 as usize] += 1;
+            }
+        }
+        ReversedTransfers { offsets, edges }
+    }
+
+    /// The `(from, duration)` incoming edges of `stop`.
+    pub fn into_stop(&self, stop: StopIdx) -> &[(StopIdx, u32)] {
+        let start = self.offsets[stop.0 as usize] as usize;
+        let end = self.offsets[stop.0 as usize + 1] as usize;
+        &self.edges[start..end]
+    }
+}
+
 impl Transfers {
     /// A network with no transfers.
     pub fn empty(stop_count: u32) -> Transfers {
