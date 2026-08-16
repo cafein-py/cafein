@@ -30,7 +30,10 @@ use crate::transfers::ReversedTransfers;
 
 mod search;
 
-pub use search::{reverse_one_to_all, reverse_one_to_all_fold, reverse_route, ReverseState};
+pub use search::{
+    reverse_one_to_all, reverse_one_to_all_fold, reverse_profile_states, reverse_route,
+    reverse_route_profile, ReverseState,
+};
 
 #[cfg(test)]
 mod tests;

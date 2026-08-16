@@ -88,6 +88,28 @@ def arrival_parts(value):
     return moment_parts("arrival", value)
 
 
+def window_axis(arrive_by, departure_time_window, arrival_time_window):
+    """Each window names its own axis; returns the active window.
+
+    ``departure_time_window`` profiles departures and belongs beside
+    ``departure=``; ``arrival_time_window`` profiles arrival deadlines
+    and belongs beside ``arrival=``. A window on the wrong axis is
+    rejected naming both, never silently ignored.
+    """
+    if arrival_time_window is not None and not arrive_by:
+        raise ValueError(
+            "arrival_time_window= profiles arrival deadlines; give it "
+            "beside arrival=, not departure= (whose window is "
+            "departure_time_window=)"
+        )
+    if departure_time_window is not None and arrive_by:
+        raise ValueError(
+            "departure_time_window= profiles departures; beside "
+            "arrival= the window is arrival_time_window="
+        )
+    return arrival_time_window if arrive_by else departure_time_window
+
+
 def time_axis(departure, arrival):
     """Exactly one of ``departure``/``arrival`` → (date, clock, arrive_by).
 

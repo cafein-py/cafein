@@ -42,24 +42,6 @@ def _window_percentiles(window, percentiles, confidence):
     return [float(percentile) for percentile in percentiles]
 
 
-def _reject_arrive_by_window(arrive_by, window, percentiles, confidence, router):
-    """The arrive-by matrix rejections: windowed percentiles are a
-    later step, and the reverse rides RAPTOR — an explicit trip-based
-    engine is refused, never silently swapped."""
-    if not arrive_by:
-        return
-    if window is not None or percentiles is not None or confidence is not None:
-        raise ValueError(
-            "departure_time_window=, percentiles=, and confidence= do "
-            "not combine with arrival=; windowed arrive-by queries are "
-            "not available yet"
-        )
-    if router == "tbtr":
-        raise ValueError(
-            "router='tbtr' does not serve arrival=; the reverse search " "rides RAPTOR"
-        )
-
-
 def _walk_options(walking_speed_kmph, max_walking_time, max_snap_distance):
     """Street-query options with the shared defaults filled in."""
     from cafein import streets
@@ -1549,6 +1531,7 @@ class TransportNetwork:
         departure_time_window=None,
         *,
         arrival=None,
+        arrival_time_window=None,
         exclude_routes=(),
         exclude_trips=(),
         traveler=None,
@@ -1600,8 +1583,16 @@ class TransportNetwork:
             answer for the departure it discovers; travel time is each
             journey's own duration, never the span to the deadline. The
             reverse search boards at the origin stop over the closure (a
-            whole-day ULTRA set is not claimed), and
-            ``departure_time_window`` does not combine with it.
+            whole-day ULTRA set is not claimed); its window is
+            ``arrival_time_window``, never ``departure_time_window``.
+        arrival_time_window : float or datetime.timedelta (optional)
+            Arrival window in minutes, beside ``arrival=`` only:
+            deadlines profile at every minute mark within
+            ``[arrival, arrival + window)`` and the result is the
+            union of the marks' latest-departure Pareto sets — the
+            deadline profile — sorted by departure and then rides,
+            every journey still the ``departure=`` answer for the
+            departure it discovers.
         max_rides : int (optional, default: 8)
             Maximum number of boarded vehicles per journey (rides, not
             transfers: 8 rides allow 7 transfers).
@@ -1659,14 +1650,10 @@ class TransportNetwork:
             walking_speed_kmph,
             max_walking_time,
         )
-        from cafein._units import duration_seconds, time_axis
+        from cafein._units import duration_seconds, time_axis, window_axis
 
         date, departure, arrive_by = time_axis(departure, arrival)
-        if arrive_by and departure_time_window is not None:
-            raise ValueError(
-                "departure_time_window= does not combine with arrival=; "
-                "windowed arrive-by queries are not available yet"
-            )
+        window = window_axis(arrive_by, departure_time_window, arrival_time_window)
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         return self._route_between_stops(
@@ -1676,7 +1663,10 @@ class TransportNetwork:
             departure=departure,
             arrive_by=arrive_by,
             max_transfers=max_rides - 1,
-            window=duration_seconds("departure_time_window", departure_time_window),
+            window=duration_seconds(
+                "arrival_time_window" if arrive_by else "departure_time_window",
+                window,
+            ),
             max_walking_time=duration_seconds("max_walking_time", max_walking_time),
             max_snap_distance=snap_distance,
             exclude_routes=exclude_routes,
@@ -1733,6 +1723,7 @@ class TransportNetwork:
         departure_time_window=None,
         *,
         arrival=None,
+        arrival_time_window=None,
         exclude_routes=(),
         exclude_trips=(),
         traveler=None,
@@ -1772,9 +1763,16 @@ class TransportNetwork:
             Arrival deadline at the destination coordinate, as in
             ``route_between_stops``: the latest-departure Pareto set,
             egress walks included in the deadline. The direct walking
-            alternative is placed to arrive exactly at the deadline.
-            ``departure_time_window`` and ``street_policy`` (a
-            traveler's street bridge included) do not combine with it.
+            alternative is placed to arrive exactly at the deadline
+            (under ``arrival_time_window`` the walk competes inside
+            every mark's Pareto selection, so the result is exactly
+            the union of the marks' answers, walks included).
+            ``street_policy`` (a traveler's street bridge
+            included) does not combine with it; the window twin is
+            ``arrival_time_window``.
+        arrival_time_window : float or datetime.timedelta (optional)
+            Arrival window in minutes, beside ``arrival=`` only, as in
+            ``route_between_stops``.
         max_rides : int (optional, default: 8)
             Maximum number of boarded vehicles per journey (rides, not
             transfers: 8 rides allow 7 transfers).
@@ -1847,20 +1845,15 @@ class TransportNetwork:
         street_policy, max_walking_time = folded_street_policy(
             traveler, self, street_policy, walking_speed_kmph, max_walking_time
         )
-        from cafein._units import duration_seconds, time_axis
+        from cafein._units import duration_seconds, time_axis, window_axis
 
         date, departure, arrive_by = time_axis(departure, arrival)
-        if arrive_by:
-            if departure_time_window is not None:
-                raise ValueError(
-                    "departure_time_window= does not combine with arrival=; "
-                    "windowed arrive-by queries are not available yet"
-                )
-            if street_policy is not None:
-                raise ValueError(
-                    "street_policy= (a traveler's street bridge included) "
-                    "does not combine with arrival= yet"
-                )
+        window = window_axis(arrive_by, departure_time_window, arrival_time_window)
+        if arrive_by and street_policy is not None:
+            raise ValueError(
+                "street_policy= (a traveler's street bridge included) "
+                "does not combine with arrival= yet"
+            )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         return self._route_between_coordinates(
@@ -1870,7 +1863,10 @@ class TransportNetwork:
             departure=departure,
             arrive_by=arrive_by,
             max_transfers=max_rides - 1,
-            window=duration_seconds("departure_time_window", departure_time_window),
+            window=duration_seconds(
+                "arrival_time_window" if arrive_by else "departure_time_window",
+                window,
+            ),
             max_walking_time=duration_seconds("max_walking_time", max_walking_time),
             max_snap_distance=snap_distance,
             exclude_routes=exclude_routes,
@@ -2412,6 +2408,7 @@ class TransportNetwork:
         max_rides=8,
         *,
         arrival=None,
+        arrival_time_window=None,
         exclude_routes=(),
         exclude_trips=(),
         traveler=None,
@@ -2549,17 +2546,23 @@ class TransportNetwork:
 
         if _points(origins):
             refuse_wheelchair_streets(traveler, "travel_time_matrix")
-        from cafein._units import duration_seconds, time_axis
+        from cafein._units import duration_seconds, time_axis, window_axis
 
         date, departure, arrive_by = time_axis(departure, arrival)
-        _reject_arrive_by_window(
-            arrive_by, departure_time_window, percentiles, confidence, router
-        )
+        raw_window = window_axis(arrive_by, departure_time_window, arrival_time_window)
+        if arrive_by and router == "tbtr":
+            raise ValueError(
+                "router='tbtr' does not serve arrival=; the reverse search "
+                "rides RAPTOR"
+            )
         from_stops = origins
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         max_transfers = max_rides - 1
-        window = duration_seconds("departure_time_window", departure_time_window)
+        window = duration_seconds(
+            "arrival_time_window" if arrive_by else "departure_time_window",
+            raw_window,
+        )
         max_walking_time = duration_seconds("max_walking_time", max_walking_time)
         max_snap_distance = snap_distance
         from_stops = sequence_not_string("origins", from_stops)
@@ -2641,19 +2644,34 @@ class TransportNetwork:
                 walk = _walk_options(
                     walking_speed_kmph, max_walking_time, max_snap_distance
                 )
-                table = self._core._arrive_by_time_matrix_from_points(
-                    origin_points,
-                    destination_points,
-                    date,
-                    departure,
-                    max_transfers,
-                    list(id_sequence("exclude_routes", exclude_routes)),
-                    list(id_sequence("exclude_trips", exclude_trips)),
-                    list(id_sequence("exclude_stops", exclude_stops)),
-                    *walk,
-                )
+                if percentiles is None:
+                    table = self._core._arrive_by_time_matrix_from_points(
+                        origin_points,
+                        destination_points,
+                        date,
+                        departure,
+                        max_transfers,
+                        list(id_sequence("exclude_routes", exclude_routes)),
+                        list(id_sequence("exclude_trips", exclude_trips)),
+                        list(id_sequence("exclude_stops", exclude_stops)),
+                        *walk,
+                    )
+                else:
+                    table = self._core._arrive_by_time_percentiles_from_points(
+                        origin_points,
+                        destination_points,
+                        date,
+                        departure,
+                        window,
+                        percentiles,
+                        max_transfers,
+                        list(id_sequence("exclude_routes", exclude_routes)),
+                        list(id_sequence("exclude_trips", exclude_trips)),
+                        list(id_sequence("exclude_stops", exclude_stops)),
+                        *walk,
+                    )
                 _warn_unsnapped(table, from_ids, to_ids)
-                return table["matrix"], from_ids, to_ids, None
+                return table["matrix"], from_ids, to_ids, percentiles
             rows = _chunk_slice(len(from_ids), chunk)
             from_ids = from_ids[rows]
             origin_points = origin_points[rows]
@@ -2698,17 +2716,31 @@ class TransportNetwork:
             # One reverse run per destination stop: chunking slices the
             # destination axis (all stops), never the origin rows.
             to_ids = to_ids[_chunk_slice(len(to_ids), chunk)]
-            matrix = self._core._arrive_by_time_matrix(
-                from_stops,
-                to_ids,
-                date,
-                departure,
-                max_transfers,
-                list(id_sequence("exclude_routes", exclude_routes)),
-                list(id_sequence("exclude_trips", exclude_trips)),
-                list(id_sequence("exclude_stops", exclude_stops)),
-            )
-            return matrix, from_stops, to_ids, None
+            if percentiles is None:
+                matrix = self._core._arrive_by_time_matrix(
+                    from_stops,
+                    to_ids,
+                    date,
+                    departure,
+                    max_transfers,
+                    list(id_sequence("exclude_routes", exclude_routes)),
+                    list(id_sequence("exclude_trips", exclude_trips)),
+                    list(id_sequence("exclude_stops", exclude_stops)),
+                )
+            else:
+                matrix = self._core._arrive_by_time_percentiles(
+                    from_stops,
+                    to_ids,
+                    date,
+                    departure,
+                    window,
+                    percentiles,
+                    max_transfers,
+                    list(id_sequence("exclude_routes", exclude_routes)),
+                    list(id_sequence("exclude_trips", exclude_trips)),
+                    list(id_sequence("exclude_stops", exclude_stops)),
+                )
+            return matrix, from_stops, to_ids, percentiles
         from_stops = from_stops[_chunk_slice(len(from_stops), chunk)]
         if percentiles is None:
             # The walking options bound the door-to-door raptor matrix under a

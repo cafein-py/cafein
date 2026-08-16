@@ -563,7 +563,7 @@ pub(crate) fn travel_time(arrival: u32, mark: u32, walk_floor: u32) -> u32 {
 /// The nearest-rank percentile of ascending samples; ranks exactly
 /// between two samples round up (the upper median), keeping the
 /// convention reproducible across languages.
-pub(crate) fn nearest_rank(sorted: &[u32], percentile: f64) -> u32 {
+pub fn nearest_rank(sorted: &[u32], percentile: f64) -> u32 {
     let position = (percentile / 100.0) * (sorted.len() - 1) as f64;
     sorted[((position + 0.5).floor() as usize).min(sorted.len() - 1)]
 }

@@ -674,3 +674,86 @@ fn round_256_states_survive_the_widest_transfer_budget() {
     let rounds: Vec<u16> = states[0].iter().map(|&(round, _, _)| round).collect();
     assert_eq!(rounds, vec![256]);
 }
+
+#[test]
+fn the_frontier_evaluates_every_deadline_mark_exactly() {
+    // The frontier of one T2 run answers every mark: per mark and
+    // round, the evaluation equals an independent single-deadline
+    // run's states. The fixture includes a mark whose winner is a
+    // state a later mark's winner dominates on departure alone (the
+    // early K departing 100 arriving 400 versus the later 700→1000):
+    // both survive the frontier, and the evaluation must pick per
+    // mark, never globally.
+    let (timetable, transfers) = network();
+    let reversed = ReversedTransfers::build(&transfers);
+    let marks = [400, 450, 999, 1000, 1500];
+    let full = reverse_one_to_all(
+        &timetable,
+        &reversed,
+        &request(StopIdx(0), StopIdx(3), 1500, 4),
+    );
+    for (at, &mark) in marks.iter().enumerate() {
+        let single = reverse_one_to_all(
+            &timetable,
+            &reversed,
+            &request(StopIdx(0), StopIdx(3), mark, 4),
+        );
+        for stop in 0..timetable.stop_count() as usize {
+            let mut evaluated = reverse_profile_states(&full[stop], &marks)[at].clone();
+            let mut expected: Vec<(u16, u32, u32)> = Vec::new();
+            let mut rounds: Vec<u16> = single[stop].iter().map(|&(round, _, _)| round).collect();
+            rounds.sort_unstable();
+            rounds.dedup();
+            for round in rounds {
+                let mut best: Option<(u32, u32)> = None;
+                for &(held, departure, achieved) in &single[stop] {
+                    if held != round {
+                        continue;
+                    }
+                    let wins = match best {
+                        None => true,
+                        Some((d, a)) => departure > d || (departure == d && achieved < a),
+                    };
+                    if wins {
+                        best = Some((departure, achieved));
+                    }
+                }
+                if let Some((departure, achieved)) = best {
+                    expected.push((round, departure, achieved));
+                }
+            }
+            evaluated.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(evaluated, expected, "stop {stop} mark {mark}");
+        }
+    }
+}
+
+#[test]
+fn early_marks_resurrect_states_later_winners_shadow() {
+    // Two direct trips 0→1: the early one departs 100 arriving 200,
+    // the late one departs 700 arriving 800. At mark 200 the early
+    // trip is the only answer; at mark 800 the late one wins. A
+    // global winner would erase the early mark's answer.
+    let mut builder = TimetableBuilder::new(2);
+    let a = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    builder
+        .add_trip(a, vec![time(100), time(200)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(a, vec![time(700), time(800)], 1, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let transfers = Transfers::empty(2);
+    let reversed = ReversedTransfers::build(&transfers);
+    let states = reverse_one_to_all(
+        &timetable,
+        &reversed,
+        &request(StopIdx(0), StopIdx(1), 900, 3),
+    );
+    let marks = [200, 500, 800];
+    let evaluated = reverse_profile_states(&states[0], &marks);
+    assert_eq!(evaluated[0], vec![(1, 100, 200)]);
+    assert_eq!(evaluated[1], vec![(1, 100, 200)]);
+    assert_eq!(evaluated[2], vec![(1, 700, 800)]);
+}
