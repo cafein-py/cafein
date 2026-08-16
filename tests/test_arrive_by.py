@@ -348,3 +348,186 @@ def test_itineraries_require_exactly_one_axis(network):
 
     with pytest.raises(ValueError, match="exactly one of departure= or arrival="):
         DetailedItineraries(network, origins=[KORSO], destinations=[KAPYLA])
+
+
+def test_accessibility_scores_recompute_from_the_reverse_durations(network):
+    from cafein import Accessibility
+
+    origins = [KORSO, "1020453"]
+    destinations = [KAPYLA, "1070422"]
+    frame = Accessibility(
+        network, origins, destinations, arrival=DEADLINE, budgets=[30, 60]
+    )
+    durations = {
+        (origin, destination): (
+            journeys[0]["arrival_s"] - journeys[0]["departure_s"]
+            if (
+                journeys := network.route_between_stops(
+                    origin, destination, arrival=DEADLINE
+                )
+            )
+            else None
+        )
+        for origin in origins
+        for destination in destinations
+    }
+    for row in frame.itertuples(index=False):
+        expected = sum(
+            1
+            for destination in destinations
+            if durations[(row.from_id, destination)] is not None
+            and durations[(row.from_id, destination)] <= row.budget * 60
+        )
+        assert row.accessibility == expected
+
+
+def test_nearest_destinations_rank_by_reverse_durations(network):
+    from cafein import NearestDestinations
+
+    destinations = [KAPYLA, "1070422"]
+    frame = NearestDestinations(
+        network,
+        [KORSO],
+        destinations,
+        arrival=DEADLINE,
+        k=2,
+        output_time_units="seconds",
+    )
+    durations = {}
+    for destination in destinations:
+        journeys = network.route_between_stops(KORSO, destination, arrival=DEADLINE)
+        if journeys:
+            durations[destination] = journeys[0]
+    expected = sorted(
+        (best["arrival_s"] - best["departure_s"], stop)
+        for stop, best in durations.items()
+    )
+    # Unreachable destinations have no rank row — absence, exactly as
+    # on the departure axis.
+    assert expected
+    assert list(frame["destination_id"]) == [stop for _, stop in expected]
+    assert list(frame["cost"]) == [cost for cost, _ in expected]
+
+
+def test_the_arrive_by_catchment_reaches_the_place_by_the_deadline(
+    network_with_footpaths,
+):
+    pytest.importorskip("h3")
+    from shapely.geometry import Point
+
+    from cafein import Catchment
+
+    reverse = Catchment(
+        network_with_footpaths, [KAPYLA], arrival=DEADLINE, budgets=[15, 30]
+    )
+    assert set(reverse["budget"]) == {15, 30}
+    small = reverse[reverse["budget"] == 15].geometry.iloc[0]
+    large = reverse[reverse["budget"] == 30].geometry.iloc[0]
+    # Nested budgets nest; the destination's own location belongs to
+    # every budget's region.
+    assert large.covers(small.buffer(-1e-9))
+    stop = dict((s, (lat, lon)) for s, lat, lon in network_with_footpaths.stops)[KAPYLA]
+    assert small.covers(Point(stop[1], stop[0]))
+    # "Be there by 9:30" differs from "leave at 9:30".
+    forward = Catchment(network_with_footpaths, [KAPYLA], DEADLINE, budgets=[30])
+    assert not large.equals(forward.geometry.iloc[0])
+
+
+def test_street_itineraries_place_the_clock_at_the_deadline(helsinki_streets):
+    import geopandas as gpd
+
+    from cafein import DetailedItineraries
+
+    places = gpd.GeoDataFrame(
+        {"id": ["kamppi", "hakaniemi"]},
+        geometry=gpd.points_from_xy([24.9320, 24.9520], [60.1690, 60.1795]),
+        crs="EPSG:4326",
+    )
+    routes = DetailedItineraries(
+        helsinki_streets,
+        places,
+        transport_mode="walk",
+        arrival="09:30",
+        output_time_units="seconds",
+    )
+    assert len(routes)
+    assert (routes["arrival_s"] == DEADLINE_S).all()
+    assert (routes["departure_s"] == DEADLINE_S - routes["travel_time"]).all()
+    departing = DetailedItineraries(
+        helsinki_streets,
+        places,
+        transport_mode="walk",
+        departure="09:30",
+        output_time_units="seconds",
+    )
+    assert list(routes["travel_time"]) == list(departing["travel_time"])
+
+
+def test_product_rejections_on_the_arrival_axis(network, network_with_footpaths):
+    from cafein import Accessibility, Catchment
+
+    with pytest.raises(ValueError, match="does not combine with arrival="):
+        Accessibility(
+            network,
+            [KORSO],
+            [KAPYLA],
+            arrival=DEADLINE,
+            cost="emissions",
+            departure_time_window=60,
+        )
+    with pytest.raises(ValueError, match="exactly one of departure= or arrival="):
+        Accessibility(network, [KORSO], [KAPYLA], DEADLINE, arrival=DEADLINE)
+    with pytest.raises(ValueError, match="router must be"):
+        Accessibility(network, [KORSO], [KAPYLA], arrival=DEADLINE, router="bogus")
+    with pytest.raises(ValueError, match="percentiles"):
+        Accessibility(network, [KORSO], [KAPYLA], arrival=DEADLINE, percentiles=[50])
+    pytest.importorskip("h3")
+    with pytest.raises(ValueError, match="departure_time_window"):
+        Catchment(
+            network_with_footpaths,
+            [KAPYLA],
+            arrival=DEADLINE,
+            departure_time_window=60,
+        )
+
+
+def test_the_wheelchair_bridge_rejects_the_arrival_axis(multimodal_network):
+    pytest.importorskip("h3")
+    from cafein import Catchment, TravelerProfile
+
+    with pytest.raises(ValueError, match="does not combine with arrival="):
+        Catchment(
+            multimodal_network,
+            [KAPYLA],
+            arrival=DEADLINE,
+            traveler=TravelerProfile(wheelchair=True),
+        )
+
+
+def test_catchment_seeds_derive_from_the_reverse_states(network_with_footpaths):
+    # The derivational check: the catchment's stop seeds are exactly
+    # the reverse one-to-all winners — per stop the routing call's
+    # first journey (departure, rides, achieved), and the one-to-all
+    # surface reads the same winners' durations.
+    reaches = network_with_footpaths._core._arrive_by_reaches(
+        [(KAPYLA, 0)], "2022-02-22", "09:30:00", 7, [], [], []
+    )
+    stops = [stop for stop, *_ in network_with_footpaths._core.stops]
+    by_stop = {
+        stops[stop]: (departure, rides, achieved)
+        for stop, departure, rides, achieved in reaches
+    }
+    for origin in [KORSO, "1020453"]:
+        best = network_with_footpaths.route_between_stops(
+            origin, KAPYLA, arrival=DEADLINE
+        )[0]
+        assert by_stop[origin] == (
+            best["departure_s"],
+            best["rides"],
+            best["arrival_s"],
+        )
+    times = network_with_footpaths.travel_times_from_stop(KAPYLA, arrival=DEADLINE)
+    for stop, (departure, _rides, achieved) in by_stop.items():
+        if stop == KAPYLA:
+            continue
+        assert times[stop] == achieved - departure

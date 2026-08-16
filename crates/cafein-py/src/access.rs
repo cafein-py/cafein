@@ -431,6 +431,115 @@ impl TransportNetwork {
         ))
     }
 
+    /// The arrive-by catchment's stop reaches: one reverse one-to-all
+    /// from the egress seeds, each origin stop reduced to the
+    /// complete-journey order's winner — `(stop index, latest
+    /// departure, rides, achieved arrival)`, seconds past the service
+    /// day's start. Internal.
+    #[allow(clippy::too_many_arguments)]
+    fn _arrive_by_reaches(
+        &self,
+        py: Python<'_>,
+        egress: Vec<(String, u32)>,
+        date: &str,
+        deadline: &str,
+        max_transfers: u8,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
+    ) -> PyResult<Vec<(u32, u32, u32, u32)>> {
+        let deadline = parse_time(deadline)?;
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        let egress = egress
+            .iter()
+            .map(|(stop, seconds)| Ok((self.resolve_stop(stop)?, *seconds)))
+            .collect::<PyResult<Vec<_>>>()?;
+        let request = Request {
+            departure: deadline,
+            access: Vec::new(),
+            egress,
+            active_services: self.active_services(date)?,
+            active_services_previous: self.active_services_previous(date)?,
+            max_transfers,
+            exclusions,
+        };
+        Ok(py.allow_threads(|| {
+            let reversed = ReversedTransfers::build(&self.transfers);
+            let states = reverse::reverse_one_to_all(&self.build.timetable, &reversed, &request);
+            let mut reaches = Vec::new();
+            for (stop, stop_states) in states.iter().enumerate() {
+                let mut best: Option<(u32, u32, u32)> = None;
+                for &(round, departure, achieved) in stop_states {
+                    crate::options::arrive_by_winner(
+                        &mut best,
+                        (departure, round as u32, achieved),
+                    );
+                }
+                if let Some((departure, rides, achieved)) = best {
+                    reaches.push((stop as u32, departure, rides, achieved));
+                }
+            }
+            reaches
+        }))
+    }
+
+    /// The arrive-by walking field of a catchment: reached street
+    /// vertices as `(latitudes, longitudes, durations)` arrays. Seeds
+    /// carry the before-deadline key (`deadline − departure`), rides,
+    /// and slack (`deadline − achieved`); the destination point seeds
+    /// at zero on all three (walking straight there arrives exactly at
+    /// the deadline). `cutoff_seconds` is the extended bound — budget
+    /// plus the maximum retained seed slack — and the returned value
+    /// per vertex is its winning label's own duration (key − slack),
+    /// which the caller judges against the budgets. Internal.
+    #[pyo3(signature = (origin, stop_seeds, walking_speed, cutoff_seconds, max_snap_distance))]
+    fn _arrive_by_catchment_walk_field<'py>(
+        &self,
+        py: Python<'py>,
+        origin: (f64, f64),
+        stop_seeds: Vec<(u32, f64, u32, f64)>,
+        walking_speed: f64,
+        cutoff_seconds: f64,
+        max_snap_distance: f64,
+    ) -> PyResult<FieldArrays<'py>> {
+        use cafein_core::timetable::StopIdx;
+
+        let streets = self.installed_streets()?;
+        let field: Vec<(f64, f64, f64)> = py.allow_threads(|| {
+            let mut seeds = Vec::with_capacity(stop_seeds.len() + 1);
+            let (latitude, longitude) = origin;
+            if let Some(snap) = streets.snap(latitude, longitude, max_snap_distance) {
+                seeds.push((snap, 0.0, 0, 0.0));
+            }
+            for &(stop, key, rides, slack) in &stop_seeds {
+                for snap in streets.stop_snaps(StopIdx(stop)) {
+                    seeds.push((snap, key, rides, slack));
+                }
+            }
+            let positions = streets.vertex_positions();
+            streets
+                .arrive_by_walk_field(&seeds, walking_speed, cutoff_seconds)
+                .into_iter()
+                .filter_map(|(vertex, key, _, slack)| {
+                    let (lon, lat) = positions[vertex as usize];
+                    (lon.is_finite() && lat.is_finite()).then_some((
+                        lat,
+                        lon,
+                        (key - slack).max(0.0),
+                    ))
+                })
+                .collect()
+        });
+        let lats: Vec<f64> = field.iter().map(|&(lat, _, _)| lat).collect();
+        let lons: Vec<f64> = field.iter().map(|&(_, lon, _)| lon).collect();
+        let seconds: Vec<f64> = field.iter().map(|&(_, _, s)| s).collect();
+        Ok((
+            lats.into_pyarray(py),
+            lons.into_pyarray(py),
+            seconds.into_pyarray(py),
+        ))
+    }
+
     /// The canonical global stop index per id, through the same
     /// resolver every routing entry uses (qualified ids, ambiguity
     /// errors, unknown-id KeyErrors included).

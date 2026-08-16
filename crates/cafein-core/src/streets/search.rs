@@ -113,6 +113,17 @@ thread_local! {
         std::cell::RefCell::new(crate::ch::ChScratch::default());
 }
 
+/// An arrive-by field seed: snap, before-deadline key (seconds past
+/// which the deadline sits), rides, and slack (seconds).
+pub type ArriveBySeed = (Snap, f64, u32, f64);
+
+/// A reached arrive-by vertex: vertex id, key (seconds), rides, slack.
+pub type ArriveByVertex = (u32, f64, u32, f64);
+
+/// The label heap's entry: key bits ascending, rides ascending, slack
+/// bits descending, then the vertex — mirroring the winner order.
+type ArriveByHeapEntry = std::cmp::Reverse<(u64, u32, std::cmp::Reverse<u64>, u32)>;
+
 impl StreetNetwork {
     /// Every transit stop reachable on foot from a coordinate, sorted by
     /// stop index, or `None` when the coordinate is farther than
@@ -242,6 +253,122 @@ impl StreetNetwork {
             });
             field
         })
+    }
+
+    /// The arrive-by catchment field. Seeds carry before-deadline keys
+    /// (`deadline − departure`, seconds) beside their journey riders —
+    /// ride count and seed slack (`deadline − achieved arrival`) — and
+    /// each vertex keeps the complete-journey order's winner: minimal
+    /// key (the latest composed departure), then fewest rides, then
+    /// the largest slack (the earliest achieved arrival). The reported
+    /// per-vertex value keeps the key domain; the winner's own
+    /// duration is `key − slack`, so the caller extends
+    /// `cutoff_seconds` by the maximum retained seed slack and judges
+    /// membership on the duration, never on the key. Runs its own
+    /// label search — the scalar hot-path state stays untouched.
+    pub fn arrive_by_walk_field(
+        &self,
+        seeds: &[ArriveBySeed],
+        walking_speed: f64,
+        cutoff_seconds: f64,
+    ) -> Vec<ArriveByVertex> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+
+        if !walking_speed.is_finite()
+            || walking_speed <= 0.0
+            || !cutoff_seconds.is_finite()
+            || cutoff_seconds < 0.0
+        {
+            return Vec::new();
+        }
+        let cutoff = cutoff_seconds * walking_speed;
+        // (key meters, rides, slack seconds) per label; slack rides
+        // along unscaled — walking extends the key, never the slack.
+        let mut weighted: Vec<(u32, f64, u32, f64)> = Vec::with_capacity(seeds.len() * 2);
+        for &(snap, key_seconds, rides, slack) in seeds {
+            if !key_seconds.is_finite() || key_seconds < 0.0 || !slack.is_finite() || slack < 0.0 {
+                continue;
+            }
+            let head_start = key_seconds * walking_speed;
+            if head_start > cutoff {
+                continue;
+            }
+            let (from, to) = self.edge_endpoints(snap.edge);
+            let length = self.arrays().lengths()[snap.edge as usize];
+            weighted.push((
+                from,
+                head_start + snap.connector + snap.fraction * length,
+                rides,
+                slack,
+            ));
+            weighted.push((
+                to,
+                head_start + snap.connector + (1.0 - snap.fraction) * length,
+                rides,
+                slack,
+            ));
+        }
+        if weighted.is_empty() {
+            return Vec::new();
+        }
+        fn wins(candidate: (f64, u32, f64), held: (f64, u32, f64)) -> bool {
+            candidate.0 < held.0
+                || (candidate.0 == held.0 && candidate.1 < held.1)
+                || (candidate.0 == held.0 && candidate.1 == held.1 && candidate.2 > held.2)
+        }
+        let mut best: Vec<Option<(f64, u32, f64)>> = vec![None; self.vertex_count() as usize];
+        // Heap order mirrors `wins`: key ascending, rides ascending,
+        // slack descending (nonnegative f64 bits order like the floats).
+        let mut heap: BinaryHeap<ArriveByHeapEntry> = BinaryHeap::new();
+        for &(vertex, meters, rides, slack) in &weighted {
+            let label = (meters, rides, slack);
+            if meters <= cutoff + 1e-9 && best[vertex as usize].is_none_or(|held| wins(label, held))
+            {
+                best[vertex as usize] = Some(label);
+                heap.push(Reverse((
+                    meters.to_bits(),
+                    rides,
+                    Reverse(slack.to_bits()),
+                    vertex,
+                )));
+            }
+        }
+        let adjacency_offsets = self.arrays().adjacency_offsets();
+        let adj_targets = self.arrays().adj_targets();
+        let adj_meters = self.arrays().adj_meters();
+        while let Some(Reverse((bits, rides, Reverse(slack_bits), vertex))) = heap.pop() {
+            let label = (f64::from_bits(bits), rides, f64::from_bits(slack_bits));
+            match best[vertex as usize] {
+                Some(held) if held == label => {}
+                _ => continue,
+            }
+            let start = adjacency_offsets[vertex as usize] as usize;
+            let end = adjacency_offsets[vertex as usize + 1] as usize;
+            for slot in start..end {
+                let target = adj_targets[slot];
+                let next = (label.0 + adj_meters[slot], rides, label.2);
+                if next.0 <= cutoff + 1e-9
+                    && best[target as usize].is_none_or(|held| wins(next, held))
+                {
+                    best[target as usize] = Some(next);
+                    heap.push(Reverse((
+                        next.0.to_bits(),
+                        rides,
+                        Reverse(next.2.to_bits()),
+                        target,
+                    )));
+                }
+            }
+        }
+        best.iter()
+            .enumerate()
+            .filter_map(|(vertex, held)| {
+                held.map(|(meters, rides, slack)| {
+                    (vertex as u32, meters / walking_speed, rides, slack)
+                })
+            })
+            .collect()
     }
 
     /// Joins per-vertex reached `distances` to the stops through their links —

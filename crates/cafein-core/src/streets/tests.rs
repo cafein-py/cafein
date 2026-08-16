@@ -4782,3 +4782,137 @@ fn a_car_profile_rejects_a_gradient_cap() {
     bad.max_gradient = Some(f64::NAN);
     assert_eq!(bad.validate(), Err(ProfileError::InvalidMaxGradient));
 }
+
+#[test]
+fn the_arrive_by_field_prefers_the_latest_departure() {
+    // The counterexample to duration seeding: on the 0-1-2-3 line
+    // (100 m edges, 1 m/s), the seed at vertex 0 departs earlier
+    // (key 200) but rides a fast journey (slack 100, duration 100);
+    // the seed at vertex 3 departs later (key 50) with no slack.
+    // Vertex 1 composes keys 300 versus 250 — the latest-departure
+    // objective picks the vertex-3 suffix (duration 250) even though
+    // the vertex-0 suffix's duration (200) is smaller.
+    let net = network(
+        4,
+        0,
+        &[
+            (0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0))),
+            (1, 2, 100.0, straight((100.0, 0.0), (200.0, 0.0))),
+            (2, 3, 100.0, straight((200.0, 0.0), (300.0, 0.0))),
+        ],
+        vec![],
+    )
+    .unwrap();
+    let (lon0, lat0) = lonlat(0.0, 0.0);
+    let (lon3, lat3) = lonlat(300.0, 0.0);
+    let early_fast = net.snap(lat0, lon0, 50.0).unwrap();
+    let late = net.snap(lat3, lon3, 50.0).unwrap();
+    let field = net.arrive_by_walk_field(
+        &[(early_fast, 200.0, 1, 100.0), (late, 50.0, 1, 0.0)],
+        1.0,
+        400.0,
+    );
+    let vertex_one = field
+        .iter()
+        .find(|&&(vertex, _, _, _)| vertex == 1)
+        .copied()
+        .expect("vertex 1 is reached");
+    let (_, key, _, slack) = vertex_one;
+    assert!((key - 250.0).abs() < 0.05, "key {key}");
+    assert_eq!(slack, 0.0, "the later-departing seed wins");
+    assert!(
+        (key - slack - 250.0).abs() < 0.05,
+        "duration follows the winner"
+    );
+}
+
+#[test]
+fn early_arrivals_keep_cells_beyond_the_naive_budget() {
+    // A journey arriving well before the deadline: key 300 exceeds a
+    // 200-second budget, but its slack of 150 leaves a 150-second
+    // duration that fits. The field bound extends by the slack, and
+    // membership judges the duration, never the key.
+    let net = network(
+        2,
+        0,
+        &[(0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0)))],
+        vec![],
+    )
+    .unwrap();
+    let (lon0, lat0) = lonlat(0.0, 0.0);
+    let seed = net.snap(lat0, lon0, 50.0).unwrap();
+    let budget = 200.0;
+    let slack = 150.0;
+    let field = net.arrive_by_walk_field(&[(seed, 300.0, 1, slack)], 1.0, budget + slack);
+    let vertex_zero = field
+        .iter()
+        .find(|&&(vertex, _, _, _)| vertex == 0)
+        .copied()
+        .expect("the seed vertex is reached");
+    let (_, key, _, seed_slack) = vertex_zero;
+    assert!(key > budget, "the key alone would evict the cell");
+    assert!(
+        key - seed_slack <= budget + 0.05,
+        "the duration fits the budget"
+    );
+}
+
+#[test]
+fn outward_walks_equal_inward_ones() {
+    // The walking graph is undirected by construction, so the spread
+    // toward a seed equals the spread away from it: d(u→v) = d(v→u)
+    // for EVERY ordered pair — the directionality invariant the
+    // arrive-by residual field rests on. The branch fixture is not
+    // mirror-symmetric (unequal arm lengths), so a reflection cannot
+    // fake the equality; a single one-way edge would break some pair.
+    // The build renumbers vertices internally (Hilbert layout), so
+    // each position's vertex is identified from its own field.
+    let net = network(
+        4,
+        0,
+        &[
+            (0, 1, 120.0, straight((0.0, 0.0), (120.0, 0.0))),
+            (1, 2, 80.0, straight((120.0, 0.0), (200.0, 0.0))),
+            (1, 3, 60.0, straight((120.0, 0.0), (120.0, 60.0))),
+        ],
+        vec![],
+    )
+    .unwrap();
+    let positions = [(0.0, 0.0), (120.0, 0.0), (200.0, 0.0), (120.0, 60.0)];
+    let fields: Vec<Vec<(u32, f64)>> = positions
+        .iter()
+        .map(|&(x, y)| {
+            let (lon, lat) = lonlat(x, y);
+            let snap = net.snap(lat, lon, 50.0).unwrap();
+            net.walk_field(&[(snap, 0.0)], 1.0, 1000.0)
+        })
+        .collect();
+    let own_vertex: Vec<u32> = fields
+        .iter()
+        .map(|field| {
+            field
+                .iter()
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .expect("every seed reaches its own vertex")
+                .0
+        })
+        .collect();
+    let seconds = |field: &[(u32, f64)], vertex: u32| {
+        field
+            .iter()
+            .find(|&&(held, _)| held == vertex)
+            .map(|&(_, s)| s)
+            .unwrap()
+    };
+    for from in 0..positions.len() {
+        for to in 0..positions.len() {
+            let there = seconds(&fields[from], own_vertex[to]);
+            let back = seconds(&fields[to], own_vertex[from]);
+            assert!((there - back).abs() < 0.1, "{from}→{to}: {there} vs {back}");
+        }
+    }
+    // The arms genuinely differ, so no mirror symmetry explains this.
+    let d02 = seconds(&fields[0], own_vertex[2]);
+    let d03 = seconds(&fields[0], own_vertex[3]);
+    assert!((d02 - d03).abs() > 10.0, "{d02} vs {d03}");
+}

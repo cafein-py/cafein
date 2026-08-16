@@ -107,8 +107,10 @@ class DetailedItineraries(gpd.GeoDataFrame):
     its ``network_distance_m`` and ``connector_distance_m`` parts — plus
     ``distance_provenance``. A street
     network has no timetable, so the departure and arrival columns are
-    null unless ``departure`` is given purely to place the leg on a
-    clock (a bare ``"HH:MM"`` or ``datetime.time`` works there), and
+    null unless ``departure`` or ``arrival`` is given purely to place
+    the leg on a clock — a departure anchors the start, an arrival
+    deadline the end (a bare ``"HH:MM"`` or ``datetime.time`` works
+    there) — and
     the timetable-only arguments are rejected, while
     ``factors=`` and ``components=`` configure the mode's emission factor
     (``emissions`` is NA where it is unresolved, never a silent zero).
@@ -140,7 +142,10 @@ class DetailedItineraries(gpd.GeoDataFrame):
         a journey's duration spans its first departure to its final
         arrival, never the span to the deadline. The
         departure-window parameters, ``router="tbtr"``, and
-        ``street_policy`` do not combine with it.
+        ``street_policy`` do not combine with it. On a
+        ``StreetNetwork`` the deadline is pure clock placement:
+        durations are unchanged and every leg's ``arrival_s`` is the
+        deadline.
     max_rides : int (optional, default: 8)
         Maximum number of boarded vehicles per journey (rides, not
         transfers: 8 rides allow 7 transfers).
@@ -449,6 +454,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
                 origins,
                 destinations,
                 departure=departure,
+                arrive_by=arrive_by,
                 transport_mode=transport_mode,
                 max_street_time=max_street_time,
                 max_snap_distance=max_snap_distance,
@@ -466,7 +472,6 @@ class DetailedItineraries(gpd.GeoDataFrame):
                 currency=currency,
                 cost_components=cost_components,
                 transit_only={
-                    "arrival": arrival,
                     "fares": fares,
                     "traveler": traveler,
                     "tolerance_minutes": slack_seconds,
@@ -1101,6 +1106,7 @@ def _street_itineraries_frame(
     destinations,
     *,
     departure,
+    arrive_by=False,
     transport_mode,
     max_street_time,
     max_snap_distance,
@@ -1178,17 +1184,22 @@ def _street_itineraries_frame(
         network_distance = network_distance + metres[to_index]
     rows = len(travel_time)
     # A street network has no timetable, so absolute times exist only when a
-    # departure is supplied to place the leg on a clock.
+    # time is supplied to place the leg on a clock: departures anchor
+    # the start, an arrival deadline anchors the end — the durations
+    # are identical either way.
     if departure is None:
         starts = pd.array([None] * rows, dtype="Int64")
         arrivals = pd.array([None] * rows, dtype="Int64")
     else:
         hours, minutes, seconds = str(departure).split(":")
-        start = int(hours) * 3600 + int(minutes) * 60 + int(seconds)
-        starts = pd.array(np.full(rows, start, dtype=np.int64), dtype="Int64")
-        arrivals = pd.array(
-            np.asarray(travel_time, dtype=np.int64) + start, dtype="Int64"
-        )
+        moment = int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+        times = np.asarray(travel_time, dtype=np.int64)
+        if arrive_by:
+            starts = pd.array(moment - times, dtype="Int64")
+            arrivals = pd.array(np.full(rows, moment, dtype=np.int64), dtype="Int64")
+        else:
+            starts = pd.array(np.full(rows, moment, dtype=np.int64), dtype="Int64")
+            arrivals = pd.array(times + moment, dtype="Int64")
     connector_distance = table["connector_distance"]
     frame = pd.DataFrame(
         {
