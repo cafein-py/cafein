@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.12.0 — 2026-08-16
 
 - `Catchment` serves wheelchair travelers: the residual spread rides
   the compiled wheelchair profile over the multimodal graph (a new
