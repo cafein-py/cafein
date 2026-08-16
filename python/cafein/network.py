@@ -42,6 +42,24 @@ def _window_percentiles(window, percentiles, confidence):
     return [float(percentile) for percentile in percentiles]
 
 
+def _reject_arrive_by_window(arrive_by, window, percentiles, confidence, router):
+    """The arrive-by matrix rejections: windowed percentiles are a
+    later step, and the reverse rides RAPTOR — an explicit trip-based
+    engine is refused, never silently swapped."""
+    if not arrive_by:
+        return
+    if window is not None or percentiles is not None or confidence is not None:
+        raise ValueError(
+            "departure_time_window=, percentiles=, and confidence= do "
+            "not combine with arrival=; windowed arrive-by queries are "
+            "not available yet"
+        )
+    if router == "tbtr":
+        raise ValueError(
+            "router='tbtr' does not serve arrival=; the reverse search " "rides RAPTOR"
+        )
+
+
 def _walk_options(walking_speed_kmph, max_walking_time, max_snap_distance):
     """Street-query options with the shared defaults filled in."""
     from cafein import streets
@@ -2390,9 +2408,10 @@ class TransportNetwork:
     def travel_time_matrix(
         self,
         origins,
-        departure,
+        departure=None,
         max_rides=8,
         *,
+        arrival=None,
         exclude_routes=(),
         exclude_trips=(),
         traveler=None,
@@ -2409,8 +2428,9 @@ class TransportNetwork:
     ):
         """Travel times as a matrix, from stops or from points.
 
-        One RAPTOR run serves each origin, computed in parallel across
-        the origins with per-worker state reuse; the result is
+        One run serves each origin — each destination with
+        ``arrival=``, where the fan-out flips with the axis — computed
+        in parallel with per-worker state reuse; the result is
         deterministic. This is the bulk primitive travel-time matrices
         are assembled from — never per OD pair.
 
@@ -2440,10 +2460,23 @@ class TransportNetwork:
             centroids). Point cells hold the faster of transit and
             walking directly (within ``max_walking_time``), so a pair
             best covered on foot reports its walking time.
-        departure : datetime.datetime or str
+        departure : datetime.datetime or str (optional)
             Departure at every origin — a datetime, or an ISO string
             like ``"2022-02-22 08:30"``; the service date is its date
-            part.
+            part. Give exactly one of ``departure`` and ``arrival``.
+        arrival : datetime.datetime or str (optional)
+            Arrival deadline at every destination, in the same forms.
+            Each cell holds the travel time of that pair's
+            latest-departure journey arriving by the deadline (fewest
+            rides, then earliest arrival, breaking ties) — the
+            journey's own duration, never the span to the deadline —
+            identical to ``route_between_stops(arrival=)``. One
+            reverse run serves each **destination** (the fan-out flips
+            with the axis), so ``chunk`` slices the destination axis
+            and a stop matrix's columns follow the chunk. The reverse
+            rides the closure (a whole-day ULTRA set is never
+            claimed); the departure-window parameters and
+            ``router="tbtr"`` do not combine with it.
         max_rides : int (optional, default: 8)
             Maximum number of boarded vehicles per journey (rides, not
             transfers: 8 rides allow 7 transfers).
@@ -2460,9 +2493,11 @@ class TransportNetwork:
             interval plus the median; requires `departure_time_window`
             and excludes `percentiles`.
         chunk : (int, int) (optional)
-            Compute only origin chunk ``k`` of ``n``: a deterministic
-            contiguous block of the resolved origins, so ``n`` batch
-            jobs cover all origins disjointly; rows follow the chunk.
+            Compute only chunk ``k`` of ``n``: a deterministic
+            contiguous block of the fan-out axis — the resolved
+            origins with ``departure=`` (rows follow the chunk), the
+            destinations with ``arrival=`` (columns follow it) — so
+            ``n`` batch jobs cover all pairs disjointly.
         router : str (optional, default: "auto")
             The routing engine: ``"raptor"``, or ``"tbtr"`` to
             precompute a TBTR day engine (Trip-Based Transit Routing:
@@ -2514,9 +2549,12 @@ class TransportNetwork:
 
         if _points(origins):
             refuse_wheelchair_streets(traveler, "travel_time_matrix")
-        from cafein._units import departure_parts, duration_seconds
+        from cafein._units import duration_seconds, time_axis
 
-        date, departure = departure_parts(departure)
+        date, departure, arrive_by = time_axis(departure, arrival)
+        _reject_arrive_by_window(
+            arrive_by, departure_time_window, percentiles, confidence, router
+        )
         from_stops = origins
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
@@ -2544,6 +2582,7 @@ class TransportNetwork:
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
+            arrive_by=arrive_by,
         )
         return matrix
 
@@ -2566,6 +2605,7 @@ class TransportNetwork:
         exclude_routes=(),
         exclude_trips=(),
         exclude_stops=(),
+        arrive_by=False,
     ):
         """The travel-time matrix with its origin and destination id
         axes and the resolved percentile list (``None`` without a
@@ -2591,6 +2631,29 @@ class TransportNetwork:
                 to_ids, destination_points = from_ids, origin_points
             else:
                 to_ids, destination_points = _point_list(destinations, "destinations")
+            if arrive_by:
+                # The fan-out flips with the axis: one reverse run per
+                # destination fills a column, so chunking slices the
+                # destination axis for disjoint batch jobs.
+                columns = _chunk_slice(len(to_ids), chunk)
+                to_ids = to_ids[columns]
+                destination_points = destination_points[columns]
+                walk = _walk_options(
+                    walking_speed_kmph, max_walking_time, max_snap_distance
+                )
+                table = self._core._arrive_by_time_matrix_from_points(
+                    origin_points,
+                    destination_points,
+                    date,
+                    departure,
+                    max_transfers,
+                    list(id_sequence("exclude_routes", exclude_routes)),
+                    list(id_sequence("exclude_trips", exclude_trips)),
+                    list(id_sequence("exclude_stops", exclude_stops)),
+                    *walk,
+                )
+                _warn_unsnapped(table, from_ids, to_ids)
+                return table["matrix"], from_ids, to_ids, None
             rows = _chunk_slice(len(from_ids), chunk)
             from_ids = from_ids[rows]
             origin_points = origin_points[rows]
@@ -2631,6 +2694,21 @@ class TransportNetwork:
             raise ValueError("destinations apply to point origins")
         to_ids = [stop for stop, _latitude, _longitude in self._core.stops]
         from_stops = list(to_ids) if from_stops is None else list(from_stops)
+        if arrive_by:
+            # One reverse run per destination stop: chunking slices the
+            # destination axis (all stops), never the origin rows.
+            to_ids = to_ids[_chunk_slice(len(to_ids), chunk)]
+            matrix = self._core._arrive_by_time_matrix(
+                from_stops,
+                to_ids,
+                date,
+                departure,
+                max_transfers,
+                list(id_sequence("exclude_routes", exclude_routes)),
+                list(id_sequence("exclude_trips", exclude_trips)),
+                list(id_sequence("exclude_stops", exclude_stops)),
+            )
+            return matrix, from_stops, to_ids, None
         from_stops = from_stops[_chunk_slice(len(from_stops), chunk)]
         if percentiles is None:
             # The walking options bound the door-to-door raptor matrix under a

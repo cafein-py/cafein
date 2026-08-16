@@ -793,9 +793,10 @@ class TravelTimeMatrix(pd.DataFrame):
     ``to_id``, and ``travel_time`` — whole minutes rounded to the
     nearest by default, exact seconds with
     ``output_time_units="seconds"``. It is the long-format face
-    of ``TransportNetwork.travel_time_matrix``: one RAPTOR run serves
-    each origin, fanned out over all cores, and the reachable cells of
-    the resulting wide matrix are unstacked into rows. Unreachable pairs
+    of ``TransportNetwork.travel_time_matrix``: one run serves each
+    origin (each destination with ``arrival=``), fanned out over all
+    cores, and the reachable cells of the resulting wide matrix are
+    unstacked into rows. Unreachable pairs
     are absent (never a sentinel), so the frame joins straight onto other
     tables. Where travel times only are needed, this is lighter than
     ``TravelCostMatrix``, which also aggregates transfers, distances, and
@@ -846,9 +847,22 @@ class TravelTimeMatrix(pd.DataFrame):
     destinations : GeoDataFrame (optional)
         Destination points; defaults to the origins. Only valid with
         point origins — stop origins always span every stop.
-    departure : datetime.datetime or str
+    departure : datetime.datetime or str (optional)
         Departure at every origin — a datetime, or an ISO string like
         ``"2022-02-22 08:30"``; the service date is its date part.
+        Give exactly one of ``departure`` and ``arrival``.
+    arrival : datetime.datetime or str (optional)
+        Arrival deadline at every destination, in the same forms. Each
+        row's ``travel_time`` is that pair's latest-departure journey
+        arriving by the deadline (fewest rides, then earliest arrival,
+        breaking ties) — the journey's own duration, identical to
+        ``route_between_stops(arrival=)``. One reverse run serves each
+        **destination**, so ``chunk`` slices the destination axis and
+        chunked frames still concatenate to full coverage. The reverse
+        rides the closure (a whole-day ULTRA set is never claimed);
+        the departure-window parameters, ``router="tbtr"``, and
+        ``street_policy`` do not combine with it, and a
+        ``StreetNetwork`` matrix has no timetable axis at all.
     max_rides : int (optional, default: 8)
         Maximum number of boarded vehicles per journey (rides, not
         transfers: 8 rides allow 7 transfers).
@@ -862,9 +876,11 @@ class TravelTimeMatrix(pd.DataFrame):
         interval plus the median; requires `departure_time_window` and
         excludes `percentiles`.
     chunk : (int, int) (optional)
-        Compute only origin chunk ``k`` of ``n``: a deterministic
-        contiguous block of the resolved origins, so ``n`` batch jobs
-        cover all origins disjointly and their rows concatenate.
+        Compute only chunk ``k`` of ``n``: a deterministic contiguous
+        block of the fan-out axis — the resolved origins with
+        ``departure=``, the destinations with ``arrival=`` — so ``n``
+        batch jobs cover all pairs disjointly and their rows
+        concatenate.
     router : str (optional, default: "auto")
         The routing engine: ``"raptor"``, or ``"tbtr"`` to precompute a
         TBTR day engine for the date and fan the origins out over it,
@@ -924,6 +940,7 @@ class TravelTimeMatrix(pd.DataFrame):
         destinations=None,
         departure=None,
         *,
+        arrival=None,
         max_rides=8,
         departure_time_window=None,
         percentiles=None,
@@ -975,9 +992,26 @@ class TravelTimeMatrix(pd.DataFrame):
         )
 
         output_time_units = validated_output_time_units(output_time_units)
-        date, departure = (
-            (None, None) if departure is None else departure_parts(departure)
-        )
+        if departure is not None and arrival is not None:
+            raise ValueError("give exactly one of departure= or arrival=")
+        arrive_by = arrival is not None
+        if arrive_by:
+            from cafein._units import arrival_parts
+            from cafein.network import _reject_arrive_by_window
+
+            date, departure = arrival_parts(arrival)
+            _reject_arrive_by_window(
+                arrive_by, departure_time_window, percentiles, confidence, router
+            )
+            if street_policy is not None:
+                raise ValueError(
+                    "street_policy= (a traveler's street bridge included) "
+                    "does not combine with arrival= yet"
+                )
+        else:
+            date, departure = (
+                (None, None) if departure is None else departure_parts(departure)
+            )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         max_transfers = max_rides - 1
@@ -1000,6 +1034,7 @@ class TravelTimeMatrix(pd.DataFrame):
                 parking=parking,
                 transit_only={
                     "departure": departure,
+                    "arrival": arrival,
                     "traveler": traveler,
                     "departure_time_window": window,
                     "percentiles": percentiles,
@@ -1128,6 +1163,7 @@ class TravelTimeMatrix(pd.DataFrame):
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
+            arrive_by=arrive_by,
         )
         super().__init__(pd.DataFrame(_humanize_time_columns(data, output_time_units)))
 
@@ -1139,6 +1175,7 @@ class TravelTimeMatrix(pd.DataFrame):
         destinations=None,
         departure=None,
         *,
+        arrival=None,
         output,
         batch_size=None,
         resume=False,
@@ -1219,6 +1256,12 @@ class TravelTimeMatrix(pd.DataFrame):
         max_street_time = duration_seconds("max_street_time", max_street_time)
         max_snap_distance = snap_distance
         size = _stream_size(batch_size, resume)
+        if arrival is not None:
+            raise NotImplementedError(
+                "arrive-by matrices do not stream yet; compute the frame "
+                "with the constructor (chunk= slices the destination axis "
+                "for batch jobs)"
+            )
         if street_policy is not None:
             raise NotImplementedError(
                 "street_policy matrices do not stream yet; compute the "
@@ -1837,10 +1880,11 @@ def _time_columns(
     exclude_routes=(),
     exclude_trips=(),
     exclude_stops=(),
+    arrive_by=False,
 ):
     """The reachable cells of the travel-time matrix, in long format."""
     if date is None or departure is None:
-        raise TypeError("TravelTimeMatrix requires departure")
+        raise TypeError("TravelTimeMatrix requires departure or arrival")
     matrix, from_ids, to_ids, resolved = network._time_matrix_with_ids(
         origins,
         date,
@@ -1858,6 +1902,7 @@ def _time_columns(
         walking_speed_kmph=walking_speed_kmph,
         max_walking_time=max_walking_time,
         max_snap_distance=max_snap_distance,
+        arrive_by=arrive_by,
     )
     from_ids = np.asarray(from_ids, dtype=object)
     to_ids = np.asarray(to_ids, dtype=object)
@@ -2922,9 +2967,10 @@ def _validate_cost_query(date, departure, optimize, window, within, fares, route
 
 
 def _chunk_slice(count, chunk):
-    """The deterministic contiguous origin block ``chunk = (k, n)``
+    """The deterministic contiguous axis block ``chunk = (k, n)``
     selects: chunk ``k`` of ``n`` equal blocks (the last possibly
-    shorter), covering all origins disjointly across ``k = 0..n-1``."""
+    shorter), covering the caller's axis disjointly across
+    ``k = 0..n-1``."""
     if chunk is None:
         return slice(None)
     index, total = chunk

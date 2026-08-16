@@ -218,3 +218,133 @@ def test_exclusions_apply_on_the_reverse_axis(network):
     )
     assert without
     assert tuples(without) == inverted_profile(profile, DEADLINE_S)
+
+
+def test_the_matrix_cells_are_the_routing_calls_durations(network):
+    from cafein import TravelTimeMatrix
+
+    # The chunk slices the destination axis; pick the block holding
+    # Käpylä so the sample has reachable pairs.
+    stops = [stop for stop, *_ in network._core.stops]
+    block = -(-len(stops) // 400)
+    frame = TravelTimeMatrix(
+        network,
+        origins=[KORSO, "1020453"],
+        arrival=DEADLINE,
+        chunk=(stops.index(KAPYLA) // block, 400),
+        output_time_units="seconds",
+    )
+    assert KAPYLA in set(frame["to_id"])
+    for row in frame.itertuples(index=False):
+        journeys = network.route_between_stops(row.from_id, row.to_id, arrival=DEADLINE)
+        best = journeys[0]
+        assert row.travel_time == best["arrival_s"] - best["departure_s"]
+
+
+def test_the_wide_matrix_chunks_the_destination_axis(network):
+    matrix = network.travel_time_matrix([KORSO], arrival=DEADLINE, chunk=(0, 400))
+    stops = network.stop_count
+    expected = stops // 400 + (1 if stops % 400 else 0)
+    assert matrix.shape == (1, expected)
+
+
+def test_the_point_matrix_matches_the_coordinate_call(network_with_footpaths):
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    from cafein import TravelTimeMatrix
+
+    coordinates = [KAMPPI, HAKANIEMI]
+    points = gpd.GeoDataFrame(
+        {"id": ["kamppi", "hakaniemi"]},
+        geometry=[Point(lon, lat) for lat, lon in coordinates],
+        crs="EPSG:4326",
+    )
+    frame = TravelTimeMatrix(
+        network_with_footpaths,
+        origins=points,
+        arrival=DEADLINE,
+        output_time_units="seconds",
+    )
+    cells = {
+        (row.from_id, row.to_id): row.travel_time
+        for row in frame.itertuples(index=False)
+    }
+    lookup = dict(zip(points["id"], coordinates))
+    for (from_id, to_id), seconds in cells.items():
+        if from_id == to_id:
+            continue
+        journeys = network_with_footpaths.route_between_coordinates(
+            lookup[from_id], lookup[to_id], arrival=DEADLINE
+        )
+        best = journeys[0]
+        assert seconds == best["arrival_s"] - best["departure_s"]
+    assert cells[("kamppi", "hakaniemi")]
+
+
+def test_itinerary_rows_reconcile_with_the_routing_call(network):
+    from cafein import DetailedItineraries
+
+    frame = DetailedItineraries(
+        network,
+        origins=[KORSO],
+        destinations=[KAPYLA],
+        arrival=DEADLINE,
+        output_time_units="seconds",
+    )
+    journeys = network.route_between_stops(KORSO, KAPYLA, arrival=DEADLINE)
+    assert sorted(frame["option"].unique()) == list(range(len(journeys)))
+    for option, journey in enumerate(journeys):
+        rows = frame[frame["option"] == option].sort_values("segment")
+        assert len(rows) == len(journey["legs"])
+        assert list(rows["leg_type"]) == [leg["type"] for leg in journey["legs"]]
+        assert rows["departure_s"].iloc[0] == journey["departure_s"]
+        assert rows["arrival_s"].iloc[-1] == journey["arrival_s"]
+    # Options order latest departure first, like the routing call.
+    departures = [journey["departure_s"] for journey in journeys]
+    assert departures == sorted(departures, reverse=True)
+
+
+def test_matrix_rejections_on_the_arrival_axis(network):
+    from cafein import TravelTimeMatrix
+
+    with pytest.raises(ValueError, match="exactly one of departure= or arrival="):
+        TravelTimeMatrix(network, origins=[KORSO], departure=DEADLINE, arrival=DEADLINE)
+    with pytest.raises(ValueError, match="departure_time_window"):
+        TravelTimeMatrix(
+            network, origins=[KORSO], arrival=DEADLINE, departure_time_window=30
+        )
+    with pytest.raises(ValueError, match="router='tbtr'"):
+        TravelTimeMatrix(network, origins=[KORSO], arrival=DEADLINE, router="tbtr")
+    with pytest.raises(NotImplementedError, match="do not stream"):
+        TravelTimeMatrix.to_parquet(
+            network, origins=[KORSO], arrival=DEADLINE, output="/tmp/never.parquet"
+        )
+
+
+def test_itinerary_rejections_on_the_arrival_axis(network):
+    from cafein import DetailedItineraries
+
+    with pytest.raises(ValueError, match="candidates='pareto'"):
+        DetailedItineraries(
+            network,
+            origins=[KORSO],
+            destinations=[KAPYLA],
+            arrival=DEADLINE,
+            candidates="pareto",
+        )
+    with pytest.raises(ValueError, match="exactly one of departure= or arrival="):
+        DetailedItineraries(
+            network,
+            origins=[KORSO],
+            destinations=[KAPYLA],
+            departure=DEADLINE,
+            arrival=DEADLINE,
+        )
+
+
+def test_itineraries_require_exactly_one_axis(network):
+    from cafein import DetailedItineraries
+
+    with pytest.raises(ValueError, match="exactly one of departure= or arrival="):
+        DetailedItineraries(network, origins=[KORSO], destinations=[KAPYLA])

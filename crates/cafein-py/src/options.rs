@@ -114,22 +114,9 @@ impl TransportNetwork {
         // (departure, rides, achieved) per stop under the
         // complete-journey order; stop-query origins walk 0.
         let mut best: Vec<Option<(u32, u32, u32)>> = vec![None; states.len()];
-        let consider = |slot: &mut Option<(u32, u32, u32)>, candidate: (u32, u32, u32)| {
-            let wins = match *slot {
-                None => true,
-                Some(held) => {
-                    candidate.0 > held.0
-                        || (candidate.0 == held.0 && candidate.1 < held.1)
-                        || (candidate.0 == held.0 && candidate.1 == held.1 && candidate.2 < held.2)
-                }
-            };
-            if wins {
-                *slot = Some(candidate);
-            }
-        };
         for (stop, stop_states) in states.iter().enumerate() {
             for &(round, departure, achieved) in stop_states {
-                consider(&mut best[stop], (departure, round as u32, achieved));
+                arrive_by_winner(&mut best[stop], (departure, round as u32, achieved));
             }
         }
         for &(stop, walk) in walk_only {
@@ -143,7 +130,7 @@ impl TransportNetwork {
             let Some(departure) = deadline.checked_sub(walk) else {
                 continue;
             };
-            consider(&mut best[stop.0 as usize], (departure, 0, deadline));
+            arrive_by_winner(&mut best[stop.0 as usize], (departure, 0, deadline));
         }
         let result = PyDict::new(py);
         for (stop, entry) in best.iter().enumerate() {
@@ -602,5 +589,22 @@ pub(super) fn parse_provenance(value: &str) -> PyResult<DistanceProvenance> {
         other => Err(PyValueError::new_err(format!(
             "unknown distance provenance '{other}'"
         ))),
+    }
+}
+
+/// Keeps the complete-journey order's winner among arrive-by
+/// candidates (departure, rides, achieved arrival): latest departure,
+/// then fewest rides, then earliest arrival.
+pub(super) fn arrive_by_winner(slot: &mut Option<(u32, u32, u32)>, candidate: (u32, u32, u32)) {
+    let wins = match *slot {
+        None => true,
+        Some(held) => {
+            candidate.0 > held.0
+                || (candidate.0 == held.0 && candidate.1 < held.1)
+                || (candidate.0 == held.0 && candidate.1 == held.1 && candidate.2 < held.2)
+        }
+    };
+    if wins {
+        *slot = Some(candidate);
     }
 }

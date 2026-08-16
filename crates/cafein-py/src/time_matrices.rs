@@ -614,6 +614,224 @@ impl TransportNetwork {
     }
 }
 
+#[pymethods]
+impl TransportNetwork {
+    /// The arrive-by stop-matrix core: one reverse one-to-all per
+    /// destination stop fills a column — per cell the latest-departure
+    /// journey arriving by the deadline (fewest rides, then earliest
+    /// arrival, breaking ties), holding its own duration; the
+    /// destination itself at 0. The reverse rides the closure — a
+    /// whole-day ULTRA set is never claimed — and the Python wrapper
+    /// owns axis validation and destination chunking. Internal until
+    /// the arrive-by surface stabilises.
+    #[pyo3(signature = (from_stops, to_stops, date, deadline, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![]))]
+    #[allow(clippy::too_many_arguments)]
+    fn _arrive_by_time_matrix<'py>(
+        &self,
+        py: Python<'py>,
+        from_stops: Vec<String>,
+        to_stops: Vec<String>,
+        date: &str,
+        deadline: &str,
+        max_transfers: u8,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
+    ) -> PyResult<Bound<'py, PyArray2<u32>>> {
+        let origins: Vec<StopIdx> = from_stops
+            .iter()
+            .map(|stop| self.resolve_stop(stop))
+            .collect::<PyResult<_>>()?;
+        let destinations: Vec<StopIdx> = to_stops
+            .iter()
+            .map(|stop| self.resolve_stop(stop))
+            .collect::<PyResult<_>>()?;
+        let deadline = parse_time(deadline)?;
+        let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        let requests: Vec<Request> = destinations
+            .iter()
+            .map(|&destination| Request {
+                departure: deadline,
+                access: Vec::new(),
+                egress: vec![(destination, 0)],
+                active_services: active_services.clone(),
+                active_services_previous: active_services_previous.clone(),
+                max_transfers,
+                exclusions: exclusions.clone(),
+            })
+            .collect();
+        let destination_count = destinations.len();
+        let flat: Vec<u32> = py.allow_threads(|| {
+            let reversed = ReversedTransfers::build(&self.transfers);
+            // Each run folds into its dense column inside the worker;
+            // per-stop frontiers never accumulate across destinations.
+            let columns: Vec<Vec<u32>> = reverse::reverse_one_to_all_fold(
+                &self.build.timetable,
+                &reversed,
+                &requests,
+                |column, states| {
+                    let destination = destinations[column];
+                    let excluded = exclusions
+                        .as_deref()
+                        .is_some_and(|excluded| excluded.excludes_stop(destination));
+                    origins
+                        .iter()
+                        .map(|&origin| {
+                            let mut best: Option<(u32, u32, u32)> = None;
+                            for &(round, departure, achieved) in &states[origin.0 as usize] {
+                                crate::options::arrive_by_winner(
+                                    &mut best,
+                                    (departure, round as u32, achieved),
+                                );
+                            }
+                            if origin == destination && !excluded {
+                                crate::options::arrive_by_winner(
+                                    &mut best,
+                                    (deadline, 0, deadline),
+                                );
+                            }
+                            best.map_or(u32::MAX, |(departure, _, achieved)| achieved - departure)
+                        })
+                        .collect()
+                },
+            );
+            let mut flat = vec![u32::MAX; origins.len() * destination_count];
+            for (column, cells) in columns.iter().enumerate() {
+                for (row, &cell) in cells.iter().enumerate() {
+                    flat[row * destination_count + column] = cell;
+                }
+            }
+            flat
+        });
+        flat.into_pyarray(py)
+            .reshape([origins.len(), destination_count])
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
+    /// The arrive-by point-matrix core: each destination's street
+    /// links seed one reverse run; a cell composes the origin's access
+    /// links over the returned states beside the direct-walk candidate
+    /// placed to arrive exactly at the deadline, and holds the
+    /// complete-journey order winner's own duration. Internal until
+    /// the arrive-by surface stabilises.
+    #[pyo3(signature = (origins, destinations, date, deadline, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn _arrive_by_time_matrix_from_points(
+        &self,
+        py: Python<'_>,
+        origins: Vec<(f64, f64)>,
+        destinations: Vec<(f64, f64)>,
+        date: &str,
+        deadline: &str,
+        max_transfers: u8,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+    ) -> PyResult<Py<PyDict>> {
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        let streets = self.installed_streets()?;
+        let speed =
+            validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
+        validate_points(&origins)?;
+        validate_points(&destinations)?;
+        let deadline = parse_time(deadline)?;
+        let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
+        let destination_count = destinations.len();
+        let (flat, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
+            let mut linked = streets.link_pointsets(
+                &[&origins[..], &destinations[..]],
+                speed,
+                max_walking_time,
+                max_snap_distance,
+            );
+            let destination_links = linked.pop().unwrap();
+            let origin_links = linked.pop().unwrap();
+            let unsnapped_from = unsnapped(&origin_links);
+            let unsnapped_to = unsnapped(&destination_links);
+            let requests: Vec<Request> = destination_links
+                .iter()
+                .map(|links| Request {
+                    departure: deadline,
+                    access: Vec::new(),
+                    egress: request_offsets(links.as_deref().unwrap_or(&[])),
+                    active_services: active_services.clone(),
+                    active_services_previous: active_services_previous.clone(),
+                    max_transfers,
+                    exclusions: exclusions.clone(),
+                })
+                .collect();
+            let access = egress_tables(&origin_links);
+            let reversed = ReversedTransfers::build(&self.transfers);
+            let walk = streets.walk_matrix(
+                &origins,
+                &destinations,
+                speed,
+                max_walking_time,
+                max_snap_distance,
+            );
+            // Each run folds into its dense column inside the worker;
+            // per-stop frontiers never accumulate across destinations.
+            let columns: Vec<Vec<u32>> = reverse::reverse_one_to_all_fold(
+                &self.build.timetable,
+                &reversed,
+                &requests,
+                |column, states| {
+                    access
+                        .iter()
+                        .enumerate()
+                        .map(|(row, links)| {
+                            let mut best: Option<(u32, u32, u32)> = None;
+                            for &(stop, seconds, _) in links {
+                                for &(round, departure, achieved) in &states[stop.0 as usize] {
+                                    let Some(composed) = departure.checked_sub(seconds) else {
+                                        continue;
+                                    };
+                                    crate::options::arrive_by_winner(
+                                        &mut best,
+                                        (composed, round as u32, achieved),
+                                    );
+                                }
+                            }
+                            if let Some((walk_seconds, _)) = walk[row][column] {
+                                if let Some(placed) = deadline.checked_sub(walk_seconds) {
+                                    crate::options::arrive_by_winner(
+                                        &mut best,
+                                        (placed, 0, deadline),
+                                    );
+                                }
+                            }
+                            best.map_or(u32::MAX, |(departure, _, achieved)| achieved - departure)
+                        })
+                        .collect()
+                },
+            );
+            let mut flat = vec![u32::MAX; origins.len() * destination_count];
+            for (column, cells) in columns.iter().enumerate() {
+                for (row, &cell) in cells.iter().enumerate() {
+                    flat[row * destination_count + column] = cell;
+                }
+            }
+            (flat, unsnapped_from, unsnapped_to)
+        });
+        let result = PyDict::new(py);
+        result.set_item(
+            "matrix",
+            flat.into_pyarray(py)
+                .reshape([origins.len(), destination_count])
+                .map_err(|error| PyValueError::new_err(error.to_string()))?,
+        )?;
+        result.set_item("unsnapped_from", unsnapped_from.into_pyarray(py))?;
+        result.set_item("unsnapped_to", unsnapped_to.into_pyarray(py))?;
+        Ok(result.unbind())
+    }
+}
+
 impl TransportNetwork {
     /// A one-to-all arrival array as a `{public_stop_id: travel_time}` dict,
     /// travel time measured from `departure`; unreachable stops are absent.

@@ -293,7 +293,7 @@ fn unequal_access_walks_order_by_rides_after_composition() {
         &reversed,
         &request(StopIdx(0), StopIdx(3), 450, 4),
     );
-    let composed: Vec<(u32, u8, u32)> = [(0usize, 0u32), (1usize, 150u32)]
+    let composed: Vec<(u32, u16, u32)> = [(0usize, 0u32), (1usize, 150u32)]
         .iter()
         .flat_map(|&(stop, walk)| {
             states[stop].iter().filter_map(move |&(round, dep, ach)| {
@@ -641,4 +641,36 @@ fn competing_egress_seeds_are_order_independent() {
     assert_eq!(results[0].len(), 1);
     assert_eq!(results[0][0].departure, 100);
     assert_eq!(results[0][0].arrival, 350);
+}
+
+#[test]
+fn round_256_states_survive_the_widest_transfer_budget() {
+    // A 257-stop chain of single-hop patterns forces a 256-ride
+    // journey under max_transfers=255 — the widest legal budget. The
+    // returned round must be 256, never wrapped to a zero-ride state.
+    let stops = 257u32;
+    let mut builder = TimetableBuilder::new(stops);
+    for hop in 0..stops - 1 {
+        let pattern = builder
+            .add_pattern(&[StopIdx(hop), StopIdx(hop + 1)], hop)
+            .unwrap();
+        builder
+            .add_trip(pattern, vec![time(10 * hop), time(10 * hop + 5)], 0, 0)
+            .unwrap();
+    }
+    let timetable = builder.finish();
+    let transfers = Transfers::empty(stops);
+    let reversed = ReversedTransfers::build(&transfers);
+    let query = Request {
+        departure: 10 * stops,
+        access: vec![(StopIdx(0), 0)],
+        egress: vec![(StopIdx(stops - 1), 0)],
+        active_services: vec![true],
+        active_services_previous: Vec::new(),
+        max_transfers: 255,
+        exclusions: None,
+    };
+    let states = reverse_one_to_all(&timetable, &reversed, &query);
+    let rounds: Vec<u16> = states[0].iter().map(|&(round, _, _)| round).collect();
+    assert_eq!(rounds, vec![256]);
 }
