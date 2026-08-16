@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `arrival=` on the accessibility products: `Accessibility` and
+  `NearestDestinations` score the latest-departure durations into
+  each destination, and `Catchment` renders the region that can
+  *reach* a place by the deadline — the walking field runs in the
+  before-deadline domain with membership judged on each journey's own
+  duration. `DetailedItineraries` on a `StreetNetwork` takes
+  `arrival=` as pure clock placement.
+  ([#274](https://github.com/cafein-py/cafein/pull/274))
 - `arrival=` on `TravelTimeMatrix` / `travel_time_matrix` and
   `DetailedItineraries`: matrix cells hold the latest-departure
   journey's own duration per OD pair — one reverse run per

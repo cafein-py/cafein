@@ -105,6 +105,42 @@ def _opportunity_columns(destinations, opportunities):
     return [str(name) for name in opportunities], values
 
 
+def _product_time_axis(
+    departure, arrival, *, cost, window, router, percentiles=None, confidence=None
+):
+    """Exactly one time axis for a product; the reverse serves
+    single-departure ``cost='time'`` queries on RAPTOR only. The
+    arrive-by branch owns the full validation — its stop dispatch
+    bypasses the forward matrix layer's checks, so nothing may be
+    silently accepted or ignored here."""
+    from cafein._units import arrival_parts, departure_parts
+
+    if departure is not None and arrival is not None:
+        raise ValueError("give exactly one of departure= or arrival=")
+    if arrival is None:
+        date, moment = (None, None) if departure is None else departure_parts(departure)
+        return date, moment, False
+    if cost != "time":
+        raise ValueError(
+            f"cost={cost!r} does not combine with arrival=; the "
+            "multicriteria reverse is a later arc"
+        )
+    if window is not None or percentiles is not None or confidence is not None:
+        raise ValueError(
+            "departure_time_window=, percentiles=, and confidence= do "
+            "not combine with arrival=; windowed arrive-by queries are "
+            "not available yet"
+        )
+    if router not in ("auto", "raptor", "tbtr"):
+        raise ValueError(f"router must be 'auto', 'raptor', or 'tbtr', not {router!r}")
+    if router == "tbtr":
+        raise ValueError(
+            "router='tbtr' does not serve arrival=; the reverse search " "rides RAPTOR"
+        )
+    date, moment = arrival_parts(arrival)
+    return date, moment, True
+
+
 def _is_table(value):
     return hasattr(value, "columns")
 
@@ -282,6 +318,7 @@ def _resolved_cost_matrix(
     max_walking_time,
     label,
     _resolved_costs=None,
+    arrive_by=False,
 ):
     """The per-origin cost matrix on the chosen axis, dispatched by
     network kind exactly as the matrix computers dispatch: (matrix,
@@ -298,6 +335,11 @@ def _resolved_cost_matrix(
 
     to_ids = None
     if _is_street_network(network):
+        if arrive_by:
+            raise ValueError(
+                "arrival applies to transit; a StreetNetwork takes "
+                "transport_mode, max_street_time, and snap_distance"
+            )
         if transport_mode is None:
             raise ValueError(
                 "a StreetNetwork needs transport_mode= (walk, bicycle, "
@@ -371,7 +413,7 @@ def _resolved_cost_matrix(
                 "StreetNetwork; a TransportNetwork routes door to door"
             )
         if date is None or departure is None:
-            raise TypeError(f"{label} requires departure")
+            raise TypeError(f"{label} requires departure or arrival")
         if _is_geo(origins) != _is_geo(destinations):
             raise ValueError(
                 "origins and destinations must both be stop ids/tables "
@@ -406,6 +448,11 @@ def _resolved_cost_matrix(
             )
             resolved_percentiles = None
         elif _is_geo(origins):
+            if arrive_by:
+                # A product's chunk stays on the origins — its scores
+                # need every destination — so the matrix layer's
+                # destination chunking is bypassed.
+                origins = origins.iloc[_chunk_slice(len(origins), chunk)]
             matrix, from_ids, to_ids, resolved_percentiles = (
                 network._time_matrix_with_ids(
                     origins,
@@ -416,7 +463,7 @@ def _resolved_cost_matrix(
                     window=window,
                     percentiles=percentiles,
                     confidence=confidence,
-                    chunk=chunk,
+                    chunk=None if arrive_by else chunk,
                     walking_speed_kmph=walking_speed_kmph,
                     max_walking_time=max_walking_time,
                     max_snap_distance=max_snap_distance,
@@ -424,8 +471,28 @@ def _resolved_cost_matrix(
                     exclude_routes=exclude_routes,
                     exclude_trips=exclude_trips,
                     exclude_stops=exclude_stops,
+                    arrive_by=arrive_by,
                 )
             )
+        elif arrive_by:
+            # One reverse run per named destination — never the
+            # all-stops fan-out — with the chunk on the origin rows.
+            destination_ids = _stop_ids(destinations, "destinations")
+            origin_ids = _stop_ids(origins, "origins")
+            origin_ids = list(origin_ids[_chunk_slice(len(origin_ids), chunk)])
+            matrix = network._core._arrive_by_time_matrix(
+                origin_ids,
+                destination_ids,
+                date,
+                departure,
+                max_transfers,
+                list(exclude_routes),
+                list(exclude_trips),
+                list(exclude_stops),
+            )
+            from_ids = origin_ids
+            to_ids = destination_ids
+            resolved_percentiles = None
         else:
             destination_ids = _stop_ids(destinations, "destinations")
             matrix, from_ids, to_ids, resolved_percentiles = (
@@ -489,6 +556,7 @@ def _accessibility_columns(
     decay_param,
     label,
     _resolved_costs=None,
+    arrive_by=False,
 ):
     """The long accessibility frame for `origins` — the computation
     the constructor and the streaming classmethod share, inputs
@@ -522,6 +590,7 @@ def _accessibility_columns(
         max_walking_time,
         label=label,
         _resolved_costs=_resolved_costs,
+        arrive_by=arrive_by,
     )
 
     flat_values = [float(value) for value in values.ravel()]
@@ -584,7 +653,13 @@ class Accessibility(pd.DataFrame):
     On a ``TransportNetwork``, origins and destinations are either both
     stop-id sequences or both GeoDataFrames with an ``id`` column
     (points, or polygons routed via centroids), routed door to door at
-    the ``departure``. On a ``StreetNetwork``, both are
+    the ``departure`` — or, with ``arrival=`` (exactly one of the
+    two), by the arrival deadline: every cost is then the
+    latest-departure journey's own duration into the destination, one
+    reverse run per destination, with ``chunk`` still slicing the
+    origins (a score needs every destination). ``arrival`` serves
+    ``cost="time"`` without a window, rides RAPTOR, and applies to
+    transit only. On a ``StreetNetwork``, both are
     GeoDataFrames and `transport_mode` names the street mode.
 
     ``cost`` selects the axis budgets are measured on, with
@@ -627,6 +702,7 @@ class Accessibility(pd.DataFrame):
         destinations,
         departure=None,
         *,
+        arrival=None,
         opportunities=None,
         cost="time",
         budgets=(30.0,),
@@ -677,10 +753,16 @@ class Accessibility(pd.DataFrame):
 
         if hasattr(network, "route_between_stops") and _points(origins):
             refuse_wheelchair_streets(traveler, "Accessibility")
-        from cafein._units import departure_parts, duration_seconds
+        from cafein._units import duration_seconds
 
-        date, departure = (
-            (None, None) if departure is None else departure_parts(departure)
+        date, departure, arrive_by = _product_time_axis(
+            departure,
+            arrival,
+            cost=cost,
+            window=departure_time_window,
+            router=router,
+            percentiles=percentiles,
+            confidence=confidence,
         )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
@@ -793,6 +875,7 @@ class Accessibility(pd.DataFrame):
                 decay,
                 decay_param,
                 label="Accessibility",
+                arrive_by=arrive_by,
             )
         )
 
@@ -804,6 +887,7 @@ class Accessibility(pd.DataFrame):
         destinations,
         departure=None,
         *,
+        arrival=None,
         opportunities=None,
         cost="time",
         budgets=(30.0,),
@@ -871,6 +955,11 @@ class Accessibility(pd.DataFrame):
             refuse_wheelchair_streets(traveler, "Accessibility.to_parquet")
         from cafein._units import departure_parts, duration_seconds
 
+        if arrival is not None:
+            raise NotImplementedError(
+                "arrive-by accessibility does not stream yet; compute the "
+                "frame with the constructor (chunk= keeps slicing origins)"
+            )
         date, departure = (
             (None, None) if departure is None else departure_parts(departure)
         )
@@ -1142,7 +1231,8 @@ class NearestDestinations(pd.DataFrame):
     GeoDataFrames with an ``id`` column (polygons route via their
     centroids), both of the same kind on a ``TransportNetwork``; a
     ``StreetNetwork`` takes point frames and ``transport_mode``. The
-    cost axes, engines, and validation match ``Accessibility``:
+    cost axes, engines, validation, and the ``arrival=`` twin of
+    ``departure`` match ``Accessibility``:
     ``cost="emissions"``/``"money"`` require ``departure_time_window``
     (and ``fares=`` for money), ``cost="distance"`` is street-only.
     Slices and copies degrade to plain DataFrames.
@@ -1181,6 +1271,7 @@ class NearestDestinations(pd.DataFrame):
         destinations,
         departure=None,
         *,
+        arrival=None,
         k=1,
         cost="time",
         max_cost=None,
@@ -1230,15 +1321,14 @@ class NearestDestinations(pd.DataFrame):
         if hasattr(network, "route_between_stops") and _points(origins):
             refuse_wheelchair_streets(traveler, "NearestDestinations")
         from cafein._units import (
-            departure_parts,
             duration_seconds,
             travel_time_output,
             validated_output_time_units,
         )
 
         output_time_units = validated_output_time_units(output_time_units)
-        date, departure = (
-            (None, None) if departure is None else departure_parts(departure)
+        date, departure, arrive_by = _product_time_axis(
+            departure, arrival, cost=cost, window=departure_time_window, router=router
         )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
@@ -1336,6 +1426,7 @@ class NearestDestinations(pd.DataFrame):
             walking_speed_kmph,
             max_walking_time,
             label="NearestDestinations",
+            arrive_by=arrive_by,
         )
         matrix = np.asarray(matrix)
         if resolved_percentiles is not None:
@@ -1484,7 +1575,15 @@ class Catchment(gpd.GeoDataFrame):
     ``cost``, ``departure``, ``departure_time_window``, ``max_rides``,
     ``router``, ``factors``/``components``/``fares``,
     ``transport_mode``, the exclusions, and the walking options follow
-    ``Accessibility``. A wheelchair traveler's catchment rides the
+    ``Accessibility``. With ``arrival=`` (exactly one of the two, on
+    the transit time axis) the catchment is the region that can
+    *reach* the origin by the deadline: stop seeds run in the
+    before-deadline domain so the walking field maximizes the
+    composed departure, and a cell belongs to a budget when its
+    winning journey's own duration fits — a journey arriving well
+    before the deadline keeps its cells even when the span to the
+    deadline does not. The wheelchair traveler's directed street
+    bridge does not combine with ``arrival=`` yet. A wheelchair traveler's catchment rides the
     fixed compiled profile at the multimodal snap radius —
     ``walking_speed_kmph`` and ``snap_distance`` are rejected beside
     it, while ``max_walking_time`` stays configurable. Requires the
@@ -1501,6 +1600,7 @@ class Catchment(gpd.GeoDataFrame):
         origins,
         departure=None,
         *,
+        arrival=None,
         cost="time",
         budgets=(30.0,),
         resolution=9,
@@ -1575,12 +1675,17 @@ class Catchment(gpd.GeoDataFrame):
                 )
         import shapely.geometry
 
-        from cafein._units import departure_parts, duration_seconds
+        from cafein._units import duration_seconds
 
         h3 = _h3_module()
-        date, departure = (
-            (None, None) if departure is None else departure_parts(departure)
+        date, departure, arrive_by = _product_time_axis(
+            departure, arrival, cost=cost, window=departure_time_window, router=router
         )
+        if arrive_by and wheeled:
+            raise ValueError(
+                "the wheelchair traveler's street bridge is a directed "
+                "surface; it does not combine with arrival= yet"
+            )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         max_transfers = max_rides - 1
@@ -1654,6 +1759,11 @@ class Catchment(gpd.GeoDataFrame):
             )
         rows = []
         if street_kind:
+            if arrive_by:
+                raise ValueError(
+                    "arrival applies to transit; a StreetNetwork takes "
+                    "transport_mode and snap_distance"
+                )
             if transport_mode is None:
                 raise ValueError(
                     "a StreetNetwork needs transport_mode= (walk, bicycle, "
@@ -1720,7 +1830,7 @@ class Catchment(gpd.GeoDataFrame):
                     "TransportNetwork routes door to door"
                 )
             if date is None or departure is None:
-                raise TypeError("Catchment requires departure")
+                raise TypeError("Catchment requires departure or arrival")
             if cost == "distance":
                 raise ValueError(
                     "cost='distance' is not an optimizable transit axis; "
@@ -1783,6 +1893,75 @@ class Catchment(gpd.GeoDataFrame):
             keep = _chunk_slice(len(from_ids), chunk)
             from_ids = list(from_ids[keep] if geo else from_ids[keep])
             points = list(points[keep])
+            if arrive_by:
+                # The arrive-by catchment: the region that can REACH
+                # the given place by the deadline. Stop seeds run in
+                # the before-deadline domain — `deadline − departure`
+                # keys maximize the composed departure through the
+                # walk — with each seed's achieved arrival and rides
+                # as riders; membership judges the winner's own
+                # duration, so the field bound extends by the maximum
+                # retained seed slack (`deadline − achieved`).
+                hours, minutes, seconds = str(departure).split(":")
+                deadline_s = int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+                speed_ms = speed_kmph / 3.6
+                horizon = max(budget_values)
+                for identifier, point in zip(from_ids, points):
+                    if geo:
+                        walks = network._core.access_stops(
+                            point[0], point[1], speed_kmph, walk_cutoff, snap
+                        )
+                        egress = [
+                            (stop, int(walk_seconds))
+                            for stop, walk_seconds in walks.items()
+                        ]
+                    else:
+                        egress = [(identifier, 0)]
+                    reaches = network._core._arrive_by_reaches(
+                        egress,
+                        date,
+                        departure,
+                        max_transfers,
+                        list(exclude_routes),
+                        list(exclude_trips),
+                        list(exclude_stops),
+                    )
+                    seeds = []
+                    max_slack = 0.0
+                    for stop, latest, _rides, achieved in reaches:
+                        if achieved - latest > horizon:
+                            continue
+                        slack = float(deadline_s - achieved)
+                        seeds.append((stop, float(deadline_s - latest), _rides, slack))
+                        max_slack = max(max_slack, slack)
+                    lats, lons, costs = network._core._arrive_by_catchment_walk_field(
+                        point, seeds, speed_ms, horizon + max_slack, snap
+                    )
+                    rows.extend(
+                        _cell_rows(
+                            h3,
+                            shapely.geometry,
+                            identifier,
+                            lats,
+                            lons,
+                            costs,
+                            budget_values,
+                            budget_column,
+                            resolution,
+                        )
+                    )
+                import geopandas
+
+                frame = geopandas.GeoDataFrame(
+                    {
+                        "from_id": [row[0] for row in rows],
+                        "budget": [row[1] for row in rows],
+                    },
+                    geometry=[row[2] for row in rows],
+                    crs="EPSG:4326",
+                )
+                super().__init__(frame)
+                return
             surfaces = _catchment_stop_costs(
                 network,
                 origins,
