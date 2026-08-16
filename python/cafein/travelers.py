@@ -43,10 +43,11 @@ class TravelerProfile:
     excluded stops refused at the endpoints — and otherwise the
     installed walking closure with excluded endpoints refused, whose
     walked paths may cross stairs; compute the wheelchair set for the
-    fully accessible configuration. Surfaces without street-policy support
-    refuse the wheelchair traveler on point queries rather than
-    walking silently, and stop queries everywhere stay
-    timetable-only.
+    fully accessible configuration. ``Catchment`` spreads ride the
+    compiled wheelchair profile over the multimodal graph; the other
+    surfaces without street-policy support refuse the wheelchair
+    traveler on point queries rather than walking silently, and stop
+    queries everywhere stay timetable-only.
 
     Parameters
     ----------

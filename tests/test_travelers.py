@@ -435,6 +435,7 @@ def test_the_bridge_needs_the_wheelchair_build(network_with_footpaths):
 
 def test_policy_less_point_surfaces_refuse_the_wheelchair_traveler(
     multimodal_network,
+    network_with_footpaths,
 ):
     from cafein import Accessibility, journey_frontier
 
@@ -484,18 +485,89 @@ def test_policy_less_point_surfaces_refuse_the_wheelchair_traveler(
             10,
             traveler=profile,
         )
-    # A transit Catchment refuses the wheelchair traveler even from
-    # stop origins: its walking spread is mode-blind.
+    # A transit Catchment serves the wheelchair traveler through the
+    # profile-aware directed spread: its cells are a subset of the
+    # walking catchment's (stairs and capped gradients pruned), and the
+    # fixed profile speed rejects the walking knob.
     from cafein import Catchment
 
     pytest.importorskip("h3")
-    with pytest.raises(ValueError, match="cannot honour"):
+    wheeled = Catchment(
+        multimodal_network,
+        ["1020453"],
+        "2022-02-22 08:30:00",
+        budgets=(15.0,),
+        traveler=profile,
+    )
+    assert not wheeled.empty
+    walked = Catchment(
+        multimodal_network,
+        ["1020453"],
+        "2022-02-22 08:30:00",
+        budgets=(15.0,),
+    )
+    assert wheeled.iloc[0].geometry.within(walked.iloc[0].geometry.buffer(1e-6))
+    with pytest.raises(ValueError, match="fixed speed"):
         Catchment(
             multimodal_network,
             ["1020453"],
             "2022-02-22 08:30:00",
             budgets=(15.0,),
             traveler=profile,
+            walking_speed_kmph=5.0,
+        )
+    with pytest.raises(ValueError, match="street_modes"):
+        Catchment(
+            network_with_footpaths,
+            ["1020453"],
+            "2022-02-22 08:30:00",
+            budgets=(15.0,),
+            traveler=profile,
+        )
+    # Point origins ride the synthesized policy for the seeds too; the
+    # cost surfaces carry no policy support, so those axes refuse.
+    origin_points = gpd.GeoDataFrame(
+        {"id": ["o"]},
+        geometry=gpd.points_from_xy([24.9350], [60.1580]),
+        crs="EPSG:4326",
+    )
+    geo_wheeled = Catchment(
+        multimodal_network,
+        origin_points,
+        "2022-02-22 08:30:00",
+        budgets=(15.0,),
+        traveler=profile,
+    )
+    assert not geo_wheeled.empty
+    geo_walked = Catchment(
+        multimodal_network,
+        origin_points,
+        "2022-02-22 08:30:00",
+        budgets=(15.0,),
+    )
+    assert geo_wheeled.iloc[0].geometry.within(geo_walked.iloc[0].geometry.buffer(1e-6))
+    with pytest.raises(ValueError, match="snap_distance"):
+        Catchment(
+            multimodal_network,
+            origin_points,
+            "2022-02-22 08:30:00",
+            budgets=(15.0,),
+            snap_distance=500.0,
+            traveler=profile,
+        )
+    with pytest.raises(ValueError, match="time axis"):
+        Catchment(
+            multimodal_network,
+            origin_points,
+            "2022-02-22 08:30:00",
+            cost="emissions",
+            budgets=(500.0,),
+            departure_time_window=10,
+            traveler=profile,
+        )
+    with pytest.raises(ValueError, match="outside the network's stop range"):
+        multimodal_network._core._catchment_directed_field(
+            (60.1580, 24.9350), [(10_000_000, 0.0)], "wheelchair", 900.0, 500.0
         )
     # Stop queries stay timetable-only and pass — the streaming table
     # included, where the profile must equal its explicit exclusions.

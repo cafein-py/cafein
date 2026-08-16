@@ -1240,6 +1240,54 @@ impl StreetNetwork {
     /// The settled vertices of a bounded directed search from `from`:
     /// `(vertex, seconds)` for every graph vertex within `max_seconds`
     /// under `profile` — a street catchment's target universe.
+    /// The settled vertices of a time-bounded multi-seed spread under
+    /// `profile` — the profile-aware catchment field, the directed twin
+    /// of `walk_field`. Each seed is a snap with its initial seconds (a
+    /// stop's transit arrival cost, zero for the origin); the spread
+    /// walks only the profile's permitted arcs, so a wheelchair field
+    /// never crosses stairs or capped gradients. `(vertex, seconds)`
+    /// within `cutoff_seconds`.
+    pub fn directed_field(
+        &self,
+        seeds: &[(Snap, f64)],
+        profile: &CompiledStreetProfile,
+        cutoff_seconds: f64,
+    ) -> Vec<(u32, f64)> {
+        if !cutoff_seconds.is_finite() || cutoff_seconds < 0.0 {
+            return Vec::new();
+        }
+        let cutoff = (cutoff_seconds * 1000.0).floor() as u64;
+        let mut weighted: Vec<Endpoint> = Vec::with_capacity(seeds.len() * 2);
+        for (snap, initial_seconds) in seeds {
+            if !initial_seconds.is_finite() || *initial_seconds < 0.0 {
+                continue;
+            }
+            let head_start = (initial_seconds * 1000.0).floor() as u64;
+            if head_start > cutoff {
+                continue;
+            }
+            for seed in self.directed_seeds(snap, profile) {
+                weighted.push(Endpoint::new(
+                    seed.vertex,
+                    seed.millis.saturating_add(head_start),
+                    seed.fraction,
+                ));
+            }
+        }
+        if weighted.is_empty() {
+            return Vec::new();
+        }
+        DIRECTED_STATE.with(|cell| {
+            let state = &mut cell.borrow_mut();
+            self.directed_dijkstra(profile, &weighted, cutoff, state);
+            state
+                .settled()
+                .filter(|&(_, millis)| millis <= cutoff)
+                .map(|(vertex, millis)| (vertex, millis as f64 / 1000.0))
+                .collect()
+        })
+    }
+
     pub fn directed_reached_vertices(
         &self,
         from: &Snap,

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `Catchment` serves wheelchair travelers: the residual spread rides
+  the compiled wheelchair profile over the multimodal graph (a new
+  multi-seed directed field), stairs and capped gradients pruned.
+  ([#269](https://github.com/cafein-py/cafein/pull/269))
+
 - Walking-class transfer grants combine with exclusions (their tokens
   hide no interior stops), and the wheelchair traveler bridge rides
   the computed wheelchair transfer set automatically.

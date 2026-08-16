@@ -1484,8 +1484,11 @@ class Catchment(gpd.GeoDataFrame):
     ``cost``, ``departure``, ``departure_time_window``, ``max_rides``,
     ``router``, ``factors``/``components``/``fares``,
     ``transport_mode``, the exclusions, and the walking options follow
-    ``Accessibility``; requires the optional ``h3`` extra
-    (``cafein[h3]``).
+    ``Accessibility``. A wheelchair traveler's catchment rides the
+    fixed compiled profile at the multimodal snap radius —
+    ``walking_speed_kmph`` and ``snap_distance`` are rejected beside
+    it, while ``max_walking_time`` stays configurable. Requires the
+    optional ``h3`` extra (``cafein[h3]``).
     """
 
     @property
@@ -1539,14 +1542,37 @@ class Catchment(gpd.GeoDataFrame):
                 "traveler applies to transit; a StreetNetwork takes "
                 "transport_mode, max_street_time, and snap_distance"
             )
-        from cafein.matrices import _is_point_frame as _points
+        from cafein.matrices import _is_point_frame as _points  # noqa: F401
 
-        if hasattr(network, "route_between_stops"):
-            # Stop origins too: the catchment's residual walking
-            # spread rides the mode-blind walking field, which the
-            # wheelchair contract cannot accept; the profile-aware
-            # spread is the follow-up.
-            refuse_wheelchair_streets(traveler, "Catchment")
+        wheeled = (
+            traveler is not None
+            and traveler.wheelchair
+            and hasattr(network, "route_between_stops")
+        )
+        if wheeled:
+            # The residual spread rides the compiled wheelchair profile
+            # over the multimodal graph instead of the walking field.
+            if "wheelchair" not in (network._core.street_modes or ()):
+                raise ValueError(
+                    "the wheelchair traveler routes the streets on the "
+                    "wheelchair mode; build the network with "
+                    "street_modes=('walk', 'wheelchair') (or load such an "
+                    "artifact)"
+                )
+            if walking_speed_kmph is not None:
+                raise ValueError(
+                    "walking_speed_kmph cannot reshape the wheelchair "
+                    "street profile, which rides its fixed speed"
+                )
+            if snap_distance is not None:
+                # The synthesized policy's transit seeds snap at the
+                # fixed multimodal radius; a divergent field radius
+                # would mix snapping rules within one catchment.
+                raise ValueError(
+                    "the wheelchair traveler's street side snaps at the "
+                    "multimodal radius; snap_distance= beside it is a "
+                    "conflict"
+                )
         import shapely.geometry
 
         from cafein._units import departure_parts, duration_seconds
@@ -1777,6 +1803,7 @@ class Catchment(gpd.GeoDataFrame):
                 (exclude_routes, exclude_trips, exclude_stops),
                 (speed_kmph, walk_cutoff, snap),
                 stop_ids,
+                wheeled,
             )
             speed_ms = speed_kmph / 3.6
             for identifier, point, stop_costs in zip(from_ids, points, surfaces):
@@ -1787,9 +1814,14 @@ class Catchment(gpd.GeoDataFrame):
                         for index, seconds in stop_costs
                         if seconds <= horizon
                     ]
-                    lats, lons, costs = network._core._catchment_walk_field(
-                        point, seeds, speed_ms, horizon, snap
-                    )
+                    if wheeled:
+                        lats, lons, costs = network._core._catchment_directed_field(
+                            point, seeds, "wheelchair", horizon, snap
+                        )
+                    else:
+                        lats, lons, costs = network._core._catchment_walk_field(
+                            point, seeds, speed_ms, horizon, snap
+                        )
                     rows.extend(
                         _cell_rows(
                             h3,
@@ -1810,9 +1842,16 @@ class Catchment(gpd.GeoDataFrame):
                             for index, value in stop_costs
                             if value <= budget
                         ]
-                        lats, lons, _costs = network._core._catchment_walk_field(
-                            point, seeds, speed_ms, walk_cutoff, snap
-                        )
+                        if wheeled:
+                            lats, lons, _costs = (
+                                network._core._catchment_directed_field(
+                                    point, seeds, "wheelchair", walk_cutoff, snap
+                                )
+                            )
+                        else:
+                            lats, lons, _costs = network._core._catchment_walk_field(
+                                point, seeds, speed_ms, walk_cutoff, snap
+                            )
                         cells = {
                             h3.latlng_to_cell(lat, lon, resolution)
                             for lat, lon in zip(lats, lons)
@@ -1892,12 +1931,24 @@ def _catchment_stop_costs(
     exclusions,
     walk,
     stop_ids,
+    wheeled=False,
 ):
     """Per origin, the ``(global stop index, cost)`` pairs of every
-    reached stop on the chosen axis — the walking field's seeds."""
+    reached stop on the chosen axis — the walking field's seeds. With
+    `wheeled`, point origins reach the stops through the synthesized
+    wheelchair street policy — the seeds themselves never ride stairs
+    — on the time axis; the cost surfaces carry no policy support yet,
+    so a wheeled point origin on the emissions or money axis is
+    refused rather than silently walked."""
     import numpy as np
 
     if cost in ("emissions", "money"):
+        if geo and wheeled:
+            raise ValueError(
+                "wheelchair point-origin catchments ride the time axis; "
+                f"the {cost} cost surface has no street-policy support "
+                "yet — route from stop origins instead"
+            )
         if geo:
             # Point origins ride the point-form cost surface; the
             # destinations are the coordinate-bearing stops as points,
@@ -1950,22 +2001,60 @@ def _catchment_stop_costs(
     if geo:
         # Point origins: the door-to-door one-to-all per origin — a
         # dict of arrival seconds keyed by stop id. The walking trio
-        # arrives resolved and validated by the constructor.
+        # arrives resolved and validated by the constructor. A wheeled
+        # origin reaches the stops through the synthesized wheelchair
+        # policy, transfer grant included when the set is computed.
         speed, cutoff, snap = (float(value) for value in walk)
+        wheel_policy = None
+        if wheeled:
+            from cafein.policy import StreetLegPolicy
+
+            transfers = None
+            binding = network._core._mode_transfer_binding
+            if binding is not None and binding[0] == "wheelchair":
+                transfers = {"wheelchair": binding[1]}
+            wheel_policy = StreetLegPolicy(
+                access={"wheelchair": cutoff},
+                egress={"wheelchair": cutoff},
+                transfers=transfers,
+            )
         fields = []
         for point in points:
-            arrivals = network._core.travel_times_from_coordinate(
-                point,
-                date,
-                departure,
-                max_transfers,
-                list(exclude_routes),
-                list(exclude_trips),
-                list(exclude_stops),
-                speed,
-                cutoff,
-                snap,
-            )
+            if wheel_policy is not None:
+                from cafein.network import _policy_transfer_mode
+                from cafein.policy import reduction_modes
+
+                modes = reduction_modes(wheel_policy, "access", cutoff)
+                transfer_arg = _policy_transfer_mode(wheel_policy)
+                access = [
+                    (stop, seconds)
+                    for stop, seconds, *_ in network._core._reduced_street_offsets(
+                        *point, False, modes, transfer_mode=transfer_arg
+                    )
+                ]
+                arrivals = network._core._travel_times_with_access(
+                    access,
+                    date,
+                    departure,
+                    max_transfers,
+                    transfer_mode=transfer_arg,
+                    exclude_routes=list(exclude_routes),
+                    exclude_trips=list(exclude_trips),
+                    exclude_stops=list(exclude_stops),
+                )
+            else:
+                arrivals = network._core.travel_times_from_coordinate(
+                    point,
+                    date,
+                    departure,
+                    max_transfers,
+                    list(exclude_routes),
+                    list(exclude_trips),
+                    list(exclude_stops),
+                    speed,
+                    cutoff,
+                    snap,
+                )
             reached_ids = list(arrivals)
             indices = list(network._core._stop_indices(reached_ids))
             fields.append(
