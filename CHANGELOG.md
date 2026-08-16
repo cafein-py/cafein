@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- The reverse RAPTOR core: latest-departure journeys for an arrival
+  deadline, with frontier labels, a reversed transfer view, and exact
+  forward-profile oracle tests — the engine behind `arrival=`.
+  ([#271](https://github.com/cafein-py/cafein/pull/271))
+
 ## 0.12.0 — 2026-08-16
 
 - `Catchment` serves wheelchair travelers: the residual spread rides

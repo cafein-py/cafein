@@ -8,6 +8,7 @@ pub mod fare_frontier;
 pub mod mcraptor;
 pub mod mctbtr;
 pub mod raptor;
+pub mod reverse;
 pub mod router;
 pub mod tbtr;
 pub mod zone_frontier;

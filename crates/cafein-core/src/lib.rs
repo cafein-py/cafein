@@ -16,6 +16,7 @@ pub use routers::mcraptor;
 pub use routers::mctbtr;
 pub(crate) use routers::path_key;
 pub use routers::raptor;
+pub use routers::reverse;
 pub use routers::router;
 pub use routers::tbtr;
 pub mod streets;

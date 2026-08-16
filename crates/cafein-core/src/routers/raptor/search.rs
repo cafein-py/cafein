@@ -1151,6 +1151,41 @@ impl<'a> Search<'a> {
     }
 }
 
+/// The latest trip of `pattern` *arriving* at `position` at or before
+/// `reached` whose service is `active` — the reverse boarding search.
+/// Valid because arrivals at every position are sorted within a FIFO
+/// pattern, exactly as departures are for the forward twin.
+pub(crate) fn latest_active_trip(
+    timetable: &Timetable,
+    active: &[bool],
+    exclusions: Option<&Exclusions>,
+    pattern: PatternIdx,
+    position: usize,
+    reached: u32,
+) -> Option<TripIdx> {
+    if exclusions.is_some_and(|excluded| excluded.excludes_route(timetable.pattern_route(pattern)))
+    {
+        return None;
+    }
+    let range = timetable.pattern_trip_range(pattern);
+    let (mut low, mut high) = (range.start, range.end);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if timetable.trip_stop_times(TripIdx(mid))[position].arrival <= reached {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    (range.start..low).rev().map(TripIdx).find(|&trip| {
+        active
+            .get(timetable.trip_service(trip) as usize)
+            .copied()
+            .unwrap_or(false)
+            && !exclusions.is_some_and(|excluded| excluded.excludes_trip(trip))
+    })
+}
+
 /// The earliest trip of `pattern` departing `position` at or after `reached`
 /// whose service is `active`. Valid because departures at every position are
 /// sorted within a FIFO pattern.
