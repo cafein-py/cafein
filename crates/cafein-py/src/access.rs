@@ -483,6 +483,94 @@ impl TransportNetwork {
         }))
     }
 
+    /// The windowed arrive-by stop reaches: per origin stop, the
+    /// winner whose duration is the nearest-rank `percentile` of that
+    /// stop's per-mark duration distribution — deadlines profiling at
+    /// every minute mark of `[arrival, arrival + window)` from one
+    /// final-mark reverse run. Stops unreachable at the percentile
+    /// are absent. Internal.
+    #[allow(clippy::too_many_arguments)]
+    fn _arrive_by_percentile_reaches(
+        &self,
+        py: Python<'_>,
+        egress: Vec<(String, u32)>,
+        date: &str,
+        arrival: &str,
+        window: u32,
+        percentile: f64,
+        max_transfers: u8,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
+    ) -> PyResult<Vec<(u32, u32, u32, u32)>> {
+        if window == 0 {
+            return Err(PyValueError::new_err("window must be at least 1 second"));
+        }
+        let start = parse_time(arrival)?;
+        let marks = crate::options::arrival_marks(start, window)?;
+        let deadline = *marks.last().expect("a positive window holds a mark");
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        let egress = egress
+            .iter()
+            .map(|(stop, seconds)| Ok((self.resolve_stop(stop)?, *seconds)))
+            .collect::<PyResult<Vec<_>>>()?;
+        let request = Request {
+            departure: deadline,
+            access: Vec::new(),
+            egress,
+            active_services: self.active_services(date)?,
+            active_services_previous: self.active_services_previous(date)?,
+            max_transfers,
+            exclusions,
+        };
+        Ok(py.allow_threads(|| {
+            let reversed = ReversedTransfers::build(&self.transfers);
+            let states = reverse::reverse_one_to_all(&self.build.timetable, &reversed, &request);
+            let mut reaches = Vec::new();
+            for (stop, stop_states) in states.iter().enumerate() {
+                if stop_states.is_empty() {
+                    continue;
+                }
+                let profile = reverse::reverse_profile_states(stop_states, &marks);
+                // Per mark the cross-round winner; the percentile picks
+                // among the marks by duration, its winner seeding the
+                // field with that mark's (departure, rides, achieved).
+                let mut per_mark: Vec<(u32, (u32, u32, u32))> = profile
+                    .iter()
+                    .filter_map(|winners| {
+                        let mut best: Option<(u32, u32, u32)> = None;
+                        for &(round, departure, achieved) in winners {
+                            crate::options::arrive_by_winner(
+                                &mut best,
+                                (departure, round as u32, achieved),
+                            );
+                        }
+                        best.map(|winner| (winner.2 - winner.0, winner))
+                    })
+                    .collect();
+                if per_mark.is_empty() {
+                    continue;
+                }
+                // Unreachable marks rank as unreachable: pad to the full
+                // mark count so the percentile sees the true distribution.
+                let mut durations: Vec<u32> = per_mark.iter().map(|&(d, _)| d).collect();
+                durations.resize(marks.len(), u32::MAX);
+                durations.sort_unstable();
+                let rank = crate::cafein_core_nearest_rank(&durations, percentile);
+                if rank == u32::MAX {
+                    continue;
+                }
+                per_mark.sort_by_key(|&(duration, _)| duration);
+                let &(_, (departure, rides, achieved)) = per_mark
+                    .iter()
+                    .find(|&&(duration, _)| duration == rank)
+                    .expect("the rank comes from the same distribution");
+                reaches.push((stop as u32, departure, rides, achieved));
+            }
+            reaches
+        }))
+    }
+
     /// The arrive-by walking field of a catchment: reached street
     /// vertices as `(latitudes, longitudes, durations)` arrays. Seeds
     /// carry the before-deadline key (`deadline − departure`), rides,

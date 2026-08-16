@@ -106,30 +106,40 @@ def _opportunity_columns(destinations, opportunities):
 
 
 def _product_time_axis(
-    departure, arrival, *, cost, window, router, percentiles=None, confidence=None
+    departure,
+    arrival,
+    *,
+    cost,
+    window,
+    router,
+    arrival_window=None,
+    percentiles=None,
+    confidence=None,
 ):
-    """Exactly one time axis for a product; the reverse serves
-    single-departure ``cost='time'`` queries on RAPTOR only. The
-    arrive-by branch owns the full validation — its stop dispatch
+    """Exactly one time axis for a product, each window naming its own
+    axis; the reverse serves ``cost='time'`` queries on RAPTOR only.
+    The arrive-by branch owns the full validation — its stop dispatch
     bypasses the forward matrix layer's checks, so nothing may be
-    silently accepted or ignored here."""
-    from cafein._units import arrival_parts, departure_parts
+    silently accepted or ignored here. Returns (date, clock,
+    arrive_by, active window)."""
+    from cafein._units import arrival_parts, departure_parts, window_axis
 
     if departure is not None and arrival is not None:
         raise ValueError("give exactly one of departure= or arrival=")
-    if arrival is None:
+    arrive_by = arrival is not None
+    active_window = window_axis(arrive_by, window, arrival_window)
+    if not arrive_by:
         date, moment = (None, None) if departure is None else departure_parts(departure)
-        return date, moment, False
+        return date, moment, False, active_window
     if cost != "time":
         raise ValueError(
             f"cost={cost!r} does not combine with arrival=; the "
             "multicriteria reverse is a later arc"
         )
-    if window is not None or percentiles is not None or confidence is not None:
+    if active_window is None and (percentiles is not None or confidence is not None):
         raise ValueError(
-            "departure_time_window=, percentiles=, and confidence= do "
-            "not combine with arrival=; windowed arrive-by queries are "
-            "not available yet"
+            "percentiles= and confidence= rank an arrival window's "
+            "duration distribution; pass arrival_time_window="
         )
     if router not in ("auto", "raptor", "tbtr"):
         raise ValueError(f"router must be 'auto', 'raptor', or 'tbtr', not {router!r}")
@@ -138,7 +148,7 @@ def _product_time_axis(
             "router='tbtr' does not serve arrival=; the reverse search " "rides RAPTOR"
         )
     date, moment = arrival_parts(arrival)
-    return date, moment, True
+    return date, moment, True, active_window
 
 
 def _is_table(value):
@@ -477,22 +487,38 @@ def _resolved_cost_matrix(
         elif arrive_by:
             # One reverse run per named destination — never the
             # all-stops fan-out — with the chunk on the origin rows.
+            from cafein.network import _window_percentiles
+
             destination_ids = _stop_ids(destinations, "destinations")
             origin_ids = _stop_ids(origins, "origins")
             origin_ids = list(origin_ids[_chunk_slice(len(origin_ids), chunk)])
-            matrix = network._core._arrive_by_time_matrix(
-                origin_ids,
-                destination_ids,
-                date,
-                departure,
-                max_transfers,
-                list(exclude_routes),
-                list(exclude_trips),
-                list(exclude_stops),
-            )
+            resolved_percentiles = _window_percentiles(window, percentiles, confidence)
+            if resolved_percentiles is None:
+                matrix = network._core._arrive_by_time_matrix(
+                    origin_ids,
+                    destination_ids,
+                    date,
+                    departure,
+                    max_transfers,
+                    list(exclude_routes),
+                    list(exclude_trips),
+                    list(exclude_stops),
+                )
+            else:
+                matrix = network._core._arrive_by_time_percentiles(
+                    origin_ids,
+                    destination_ids,
+                    date,
+                    departure,
+                    window,
+                    resolved_percentiles,
+                    max_transfers,
+                    list(exclude_routes),
+                    list(exclude_trips),
+                    list(exclude_stops),
+                )
             from_ids = origin_ids
             to_ids = destination_ids
-            resolved_percentiles = None
         else:
             destination_ids = _stop_ids(destinations, "destinations")
             matrix, from_ids, to_ids, resolved_percentiles = (
@@ -703,6 +729,7 @@ class Accessibility(pd.DataFrame):
         departure=None,
         *,
         arrival=None,
+        arrival_time_window=None,
         opportunities=None,
         cost="time",
         budgets=(30.0,),
@@ -755,19 +782,23 @@ class Accessibility(pd.DataFrame):
             refuse_wheelchair_streets(traveler, "Accessibility")
         from cafein._units import duration_seconds
 
-        date, departure, arrive_by = _product_time_axis(
+        date, departure, arrive_by, raw_window = _product_time_axis(
             departure,
             arrival,
             cost=cost,
             window=departure_time_window,
             router=router,
+            arrival_window=arrival_time_window,
             percentiles=percentiles,
             confidence=confidence,
         )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         max_transfers = max_rides - 1
-        window = duration_seconds("departure_time_window", departure_time_window)
+        window = duration_seconds(
+            "arrival_time_window" if arrive_by else "departure_time_window",
+            raw_window,
+        )
         max_walking_time = duration_seconds("max_walking_time", max_walking_time)
         max_street_time = duration_seconds("max_street_time", max_street_time)
         if max_travel_time is not None and cost not in ("emissions", "money"):
@@ -888,6 +919,7 @@ class Accessibility(pd.DataFrame):
         departure=None,
         *,
         arrival=None,
+        arrival_time_window=None,
         opportunities=None,
         cost="time",
         budgets=(30.0,),
@@ -955,7 +987,7 @@ class Accessibility(pd.DataFrame):
             refuse_wheelchair_streets(traveler, "Accessibility.to_parquet")
         from cafein._units import departure_parts, duration_seconds
 
-        if arrival is not None:
+        if arrival is not None or arrival_time_window is not None:
             raise NotImplementedError(
                 "arrive-by accessibility does not stream yet; compute the "
                 "frame with the constructor (chunk= keeps slicing origins)"
@@ -1272,6 +1304,7 @@ class NearestDestinations(pd.DataFrame):
         departure=None,
         *,
         arrival=None,
+        arrival_time_window=None,
         k=1,
         cost="time",
         max_cost=None,
@@ -1327,13 +1360,22 @@ class NearestDestinations(pd.DataFrame):
         )
 
         output_time_units = validated_output_time_units(output_time_units)
-        date, departure, arrive_by = _product_time_axis(
-            departure, arrival, cost=cost, window=departure_time_window, router=router
+        date, departure, arrive_by, raw_window = _product_time_axis(
+            departure,
+            arrival,
+            cost=cost,
+            window=departure_time_window,
+            router=router,
+            arrival_window=arrival_time_window,
+            percentiles=[percentile] if percentile != 50 else None,
         )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         max_transfers = max_rides - 1
-        window = duration_seconds("departure_time_window", departure_time_window)
+        window = duration_seconds(
+            "arrival_time_window" if arrive_by else "departure_time_window",
+            raw_window,
+        )
         max_walking_time = duration_seconds("max_walking_time", max_walking_time)
         max_street_time = duration_seconds("max_street_time", max_street_time)
         if max_travel_time is not None and cost not in ("emissions", "money"):
@@ -1601,6 +1643,7 @@ class Catchment(gpd.GeoDataFrame):
         departure=None,
         *,
         arrival=None,
+        arrival_time_window=None,
         cost="time",
         budgets=(30.0,),
         resolution=9,
@@ -1678,8 +1721,14 @@ class Catchment(gpd.GeoDataFrame):
         from cafein._units import duration_seconds
 
         h3 = _h3_module()
-        date, departure, arrive_by = _product_time_axis(
-            departure, arrival, cost=cost, window=departure_time_window, router=router
+        date, departure, arrive_by, raw_window = _product_time_axis(
+            departure,
+            arrival,
+            cost=cost,
+            window=departure_time_window,
+            router=router,
+            arrival_window=arrival_time_window,
+            percentiles=[percentile] if percentile != 50 else None,
         )
         if arrive_by and wheeled:
             raise ValueError(
@@ -1689,7 +1738,10 @@ class Catchment(gpd.GeoDataFrame):
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         max_transfers = max_rides - 1
-        window = duration_seconds("departure_time_window", departure_time_window)
+        window = duration_seconds(
+            "arrival_time_window" if arrive_by else "departure_time_window",
+            raw_window,
+        )
         max_walking_time = duration_seconds("max_walking_time", max_walking_time)
         max_snap_distance = snap_distance
         if not isinstance(resolution, int) or isinstance(resolution, bool):
@@ -1904,6 +1956,13 @@ class Catchment(gpd.GeoDataFrame):
                 # retained seed slack (`deadline − achieved`).
                 hours, minutes, seconds = str(departure).split(":")
                 deadline_s = int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+                if window is not None:
+                    # The before-deadline domain anchors at the final
+                    # mark: winners serve marks across the window, and
+                    # an anchor before a winner's own mark would push
+                    # its key negative. Durations are anchor-invariant
+                    # (key minus slack), so membership is unchanged.
+                    deadline_s += 60 * ((int(window) - 1) // 60)
                 speed_ms = speed_kmph / 3.6
                 horizon = max(budget_values)
                 for identifier, point in zip(from_ids, points):
@@ -1917,15 +1976,30 @@ class Catchment(gpd.GeoDataFrame):
                         ]
                     else:
                         egress = [(identifier, 0)]
-                    reaches = network._core._arrive_by_reaches(
-                        egress,
-                        date,
-                        departure,
-                        max_transfers,
-                        list(exclude_routes),
-                        list(exclude_trips),
-                        list(exclude_stops),
-                    )
+                    if window is None:
+                        reaches = network._core._arrive_by_reaches(
+                            egress,
+                            date,
+                            departure,
+                            max_transfers,
+                            list(exclude_routes),
+                            list(exclude_trips),
+                            list(exclude_stops),
+                        )
+                    else:
+                        # Deadlines profile over the arrival window and
+                        # each stop seeds with its percentile winner.
+                        reaches = network._core._arrive_by_percentile_reaches(
+                            egress,
+                            date,
+                            departure,
+                            window,
+                            percentile,
+                            max_transfers,
+                            list(exclude_routes),
+                            list(exclude_trips),
+                            list(exclude_stops),
+                        )
                     seeds = []
                     max_slack = 0.0
                     for stop, latest, _rides, achieved in reaches:

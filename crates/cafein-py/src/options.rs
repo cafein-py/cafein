@@ -65,11 +65,43 @@ impl TransportNetwork {
     }
 
     /// The arrive-by journeys of a request whose ``departure`` carries
-    /// the deadline: the reverse engine over the installed closure —
-    /// a whole-day ULTRA set is never claimed by a reverse run.
-    pub(super) fn reverse_journeys(&self, request: &Request) -> Vec<Journey> {
+    /// the deadline (the arrival-window start when `window` is given:
+    /// deadlines then profile at the window's minute marks; a
+    /// zero-length window is empty, exactly like its forward twin) —
+    /// the reverse engine over the installed closure, a whole-day
+    /// ULTRA set never claimed. Windowed walk winners come back as
+    /// (departure, arrival) placements beside the journeys.
+    pub(super) fn reverse_journeys(
+        &self,
+        request: &Request,
+        window: Option<u32>,
+        walk: Option<u32>,
+    ) -> PyResult<(Vec<Journey>, ProfileWalks)> {
         let reversed = ReversedTransfers::build(&self.transfers);
-        reverse::reverse_route(&self.build.timetable, &self.transfers, &reversed, request)
+        match window {
+            None => Ok((
+                reverse::reverse_route(&self.build.timetable, &self.transfers, &reversed, request),
+                Vec::new(),
+            )),
+            Some(window) => {
+                let marks = arrival_marks(request.departure, window)?;
+                let Some(&last) = marks.last() else {
+                    return Ok((Vec::new(), Vec::new()));
+                };
+                let profiled = Request {
+                    departure: last,
+                    ..request.clone()
+                };
+                Ok(reverse::reverse_route_profile(
+                    &self.build.timetable,
+                    &self.transfers,
+                    &reversed,
+                    &profiled,
+                    &marks,
+                    walk,
+                ))
+            }
+        }
     }
 
     /// Runs an arrive-by request through the reverse engine and
@@ -78,9 +110,10 @@ impl TransportNetwork {
         &self,
         py: Python<'_>,
         request: &Request,
+        window: Option<u32>,
         geometries: bool,
     ) -> PyResult<Py<PyList>> {
-        let journeys = self.reverse_journeys(request);
+        let (journeys, _walks) = self.reverse_journeys(request, window, None)?;
         let result = PyList::empty(py);
         for journey in &journeys {
             result.append(self.journey_to_dict(
@@ -590,6 +623,31 @@ pub(super) fn parse_provenance(value: &str) -> PyResult<DistanceProvenance> {
             "unknown distance provenance '{other}'"
         ))),
     }
+}
+
+/// The arrival window's minute marks: `start, start+60, …` strictly
+/// inside the half-open `[start, start + window)` — empty when the
+/// window is zero, exactly like the forward twin — with checked
+/// arithmetic so a legal clock/window pair near the router clock's
+/// ceiling errors instead of wrapping.
+pub(super) type ProfileWalks = Vec<(u32, u32)>;
+
+pub(super) fn arrival_marks(start: u32, window: u32) -> PyResult<Vec<u32>> {
+    let Some(end) = start.checked_add(window) else {
+        return Err(PyValueError::new_err(
+            "the arrival window overflows the router clock; narrow it",
+        ));
+    };
+    let mut marks = Vec::new();
+    let mut mark = start;
+    while mark < end {
+        marks.push(mark);
+        match mark.checked_add(60) {
+            Some(next) => mark = next,
+            None => break,
+        }
+    }
+    Ok(marks)
 }
 
 /// Keeps the complete-journey order's winner among arrive-by

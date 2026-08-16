@@ -467,12 +467,13 @@ def test_product_rejections_on_the_arrival_axis(network, network_with_footpaths)
     from cafein import Accessibility, Catchment
 
     with pytest.raises(ValueError, match="does not combine with arrival="):
+        Accessibility(network, [KORSO], [KAPYLA], arrival=DEADLINE, cost="emissions")
+    with pytest.raises(ValueError, match="arrival_time_window"):
         Accessibility(
             network,
             [KORSO],
             [KAPYLA],
             arrival=DEADLINE,
-            cost="emissions",
             departure_time_window=60,
         )
     with pytest.raises(ValueError, match="exactly one of departure= or arrival="):
@@ -531,3 +532,222 @@ def test_catchment_seeds_derive_from_the_reverse_states(network_with_footpaths):
         if stop == KAPYLA:
             continue
         assert times[stop] == achieved - departure
+
+
+WINDOW_START = "2022-02-22 09:00:00"
+
+
+def test_the_arrival_window_unions_the_per_mark_answers(network):
+    # The windowed route call returns the deadline profile: the union
+    # of each minute mark's latest-departure Pareto set, every member
+    # exactly its mark's single-deadline answer.
+    windowed = network.route_between_stops(
+        KORSO, KAPYLA, arrival=WINDOW_START, arrival_time_window=30
+    )
+    assert windowed
+    marks = [9 * 3600 + 60 * i for i in range(30)]
+    expected = []
+    for mark in marks:
+        single = network.route_between_stops(KORSO, KAPYLA, arrival=clock(mark))
+        for journey in single:
+            if journey not in expected:
+                expected.append(journey)
+    expected.sort(key=lambda j: (-j["departure_s"], j["rides"], j["arrival_s"]))
+    assert windowed == expected
+    departures = [j["departure_s"] for j in windowed]
+    assert departures == sorted(departures, reverse=True)
+
+
+def test_windowed_percentiles_recompute_from_single_deadlines(network):
+    from cafein import TravelTimeMatrix
+
+    import numpy as np
+
+    frame = TravelTimeMatrix(
+        network,
+        origins=[KORSO],
+        arrival=WINDOW_START,
+        arrival_time_window=30,
+        percentiles=[10, 50, 90],
+        chunk=(stop_chunk(network, KAPYLA, 400), 400),
+        output_time_units="seconds",
+    )
+    rows = frame[frame["to_id"] == KAPYLA]
+    assert len(rows) == 1
+    durations = []
+    for i in range(30):
+        journeys = network.route_between_stops(
+            KORSO, KAPYLA, arrival=clock(9 * 3600 + 60 * i)
+        )
+        durations.append(
+            journeys[0]["arrival_s"] - journeys[0]["departure_s"]
+            if journeys
+            else np.iinfo(np.uint32).max
+        )
+    durations.sort()
+    for percentile in (10, 50, 90):
+        position = (percentile / 100) * (len(durations) - 1)
+        expected = durations[min(int(position + 0.5), len(durations) - 1)]
+        assert rows[f"travel_time_p{percentile:g}"].iloc[0] == expected
+
+
+def stop_chunk(network, stop, n):
+    stops = [held for held, *_ in network._core.stops]
+    block = -(-len(stops) // n)
+    return stops.index(stop) // block
+
+
+def test_the_windowed_catchment_ranks_per_mark_durations(network_with_footpaths):
+    pytest.importorskip("h3")
+    from cafein import Catchment
+
+    ranked = Catchment(
+        network_with_footpaths,
+        [KAPYLA],
+        arrival=WINDOW_START,
+        arrival_time_window=30,
+        budgets=[30],
+        percentile=90,
+    )
+    assert len(ranked)
+    # The seeds are derivational: each stop's percentile reach equals
+    # the nearest rank of its per-mark single-deadline durations.
+    reaches = network_with_footpaths._core._arrive_by_percentile_reaches(
+        [(KAPYLA, 0)], "2022-02-22", "09:00:00", 30 * 60, 90.0, 7, [], [], []
+    )
+    stops = [stop for stop, *_ in network_with_footpaths._core.stops]
+    by_stop = {
+        stops[stop]: achieved - departure
+        for stop, departure, _rides, achieved in reaches
+    }
+    marks = [9 * 3600 + 60 * i for i in range(30)]
+    unreachable = 2**32 - 1
+    for origin in [KORSO, "1020453"]:
+        durations = sorted(
+            network_with_footpaths.travel_times_from_stop(
+                KAPYLA, arrival=clock(mark)
+            ).get(origin, unreachable)
+            for mark in marks
+        )
+        position = 0.9 * (len(durations) - 1)
+        expected = durations[min(int(position + 0.5), len(durations) - 1)]
+        if expected == unreachable:
+            assert origin not in by_stop
+        else:
+            assert by_stop[origin] == expected
+
+
+def test_window_axes_reject_each_others_windows(network):
+    with pytest.raises(ValueError, match="arrival_time_window"):
+        network.route_between_stops(
+            KORSO, KAPYLA, arrival=DEADLINE, departure_time_window=30
+        )
+    with pytest.raises(ValueError, match="beside arrival="):
+        network.route_between_stops(
+            KORSO, KAPYLA, "2022-02-22 08:30:00", arrival_time_window=30
+        )
+
+
+def test_the_windowed_coordinate_union_matches_per_mark_answers(
+    network_with_footpaths,
+):
+    # The exact per-mark union, walks included: the direct walk
+    # competes inside every mark's Pareto selection, so the windowed
+    # result equals the union of single-deadline answers.
+    windowed = network_with_footpaths.route_between_coordinates(
+        KAMPPI, HAKANIEMI, arrival=WINDOW_START, arrival_time_window=10
+    )
+    assert windowed
+    expected = []
+    for i in range(10):
+        single = network_with_footpaths.route_between_coordinates(
+            KAMPPI, HAKANIEMI, arrival=clock(9 * 3600 + 60 * i)
+        )
+        for journey in single:
+            if journey not in expected:
+                expected.append(journey)
+    key = lambda j: (-j["departure_s"], j["rides"], j["arrival_s"])  # noqa: E731
+    assert sorted(windowed, key=key) == sorted(expected, key=key)
+
+
+def test_windowed_accessibility_scores_rank_pessimistically(network):
+    from cafein import Accessibility
+
+    frames = {
+        percentile: Accessibility(
+            network,
+            [KORSO],
+            [KAPYLA, "1020453"],
+            arrival=WINDOW_START,
+            arrival_time_window=30,
+            percentiles=[percentile],
+        )
+        for percentile in (10, 90)
+    }
+    for percentile, frame in frames.items():
+        assert set(frame["percentile"]) == {percentile}
+    scores = {
+        percentile: frame["accessibility"].sum() for percentile, frame in frames.items()
+    }
+    # Pessimistic durations reach no more than optimistic ones.
+    assert scores[90] <= scores[10]
+
+
+def test_windowed_point_percentiles_recompute_from_single_deadlines(
+    network_with_footpaths,
+):
+    import geopandas as gpd
+    import numpy as np
+
+    from cafein import TravelTimeMatrix
+
+    points = gpd.GeoDataFrame(
+        {"id": ["kamppi", "hakaniemi"]},
+        geometry=gpd.points_from_xy(
+            [KAMPPI[1], HAKANIEMI[1]], [KAMPPI[0], HAKANIEMI[0]]
+        ),
+        crs="EPSG:4326",
+    )
+    frame = TravelTimeMatrix(
+        network_with_footpaths,
+        origins=points,
+        arrival=WINDOW_START,
+        arrival_time_window=10,
+        percentiles=[50],
+        output_time_units="seconds",
+    )
+    row = frame[(frame["from_id"] == "kamppi") & (frame["to_id"] == "hakaniemi")]
+    assert len(row) == 1
+    durations = []
+    for i in range(10):
+        journeys = network_with_footpaths.route_between_coordinates(
+            KAMPPI, HAKANIEMI, arrival=clock(9 * 3600 + 60 * i)
+        )
+        durations.append(
+            journeys[0]["arrival_s"] - journeys[0]["departure_s"]
+            if journeys
+            else np.iinfo(np.uint32).max
+        )
+    durations.sort()
+    position = 0.5 * (len(durations) - 1)
+    expected = durations[min(int(position + 0.5), len(durations) - 1)]
+    assert row["travel_time_p50"].iloc[0] == expected
+
+
+def test_confidence_maps_to_the_symmetric_arrival_percentiles(network):
+    from cafein import TravelTimeMatrix
+
+    frame = TravelTimeMatrix(
+        network,
+        origins=[KORSO],
+        arrival=WINDOW_START,
+        arrival_time_window=30,
+        confidence=0.8,
+        chunk=(stop_chunk(network, KAPYLA, 400), 400),
+    )
+    percentile_columns = [c for c in frame.columns if c.startswith("travel_time_p")]
+    assert percentile_columns == [
+        "travel_time_p10",
+        "travel_time_p50",
+        "travel_time_p90",
+    ]

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `arrival_time_window=`, the twin of `departure_time_window=` on the
+  arrival axis: route calls return the deadline profile (the union of
+  each minute mark's latest-departure Pareto set), matrices and the
+  accessibility products report nearest-rank percentiles of per-mark
+  durations, and `Catchment` ranks its stop seeds at a percentile —
+  all from one reverse run per destination, the frontier itself being
+  the deadline profile.
+  ([#275](https://github.com/cafein-py/cafein/pull/275))
+
 - `arrival=` on the accessibility products: `Accessibility` and
   `NearestDestinations` score the latest-departure durations into
   each destination, and `Catchment` renders the region that can

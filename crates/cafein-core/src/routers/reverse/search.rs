@@ -16,6 +16,10 @@ pub(crate) const UNSET: u32 = u32::MAX;
 
 const DAY_SECONDS: u32 = 86_400;
 
+/// One stop's per-mark per-round winners, as `reverse_profile_states`
+/// returns them.
+pub type MarkWinners = Vec<Vec<(u16, u32, u32)>>;
+
 #[derive(Debug, Clone, Copy)]
 struct RLabel {
     stop: StopIdx,
@@ -401,16 +405,21 @@ pub fn reverse_route(
     let mut state = ReverseState::new();
     search.run(&mut state);
 
-    // Candidate complete journeys: every fixed ride-rooted label at an
-    // access stop, composed with its access walk. Forward journeys
-    // always begin access → ride, so only ride-rooted labels are legal
-    // here — a walk root would invent an access → transfer opening no
-    // forward search produces.
+    let selected = mark_candidates(&state, request, request.departure);
+    replay(timetable, transfers, request, &selected)
+}
+
+/// One deadline mark's complete-journey candidates: every fixed
+/// ride-rooted label at an access stop with `achieved ≤ mark`,
+/// composed with its access walk — forward journeys always begin
+/// access → ride, so only ride-rooted labels are legal here — then
+/// the complete-journey order's nondominated prefix.
+fn mark_candidates(state: &ReverseState, request: &Request, mark: u32) -> Vec<(u32, usize, u32)> {
     let mut candidates: Vec<(u32, usize, u32)> = Vec::new();
     for &(stop, walk) in &request.access {
         for (round, bags) in state.bags.iter().enumerate() {
             for label in &bags[stop.0 as usize] {
-                if !label.fixed() || !label.ride_rooted {
+                if !label.fixed() || !label.ride_rooted || label.achieved > mark {
                     continue;
                 }
                 let Some(composed) = label.departure.checked_sub(walk) else {
@@ -424,22 +433,35 @@ pub fn reverse_route(
     // asc; then the nondominated prefix over (departure, rides) with
     // the achieved tie-break.
     candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-    let mut journeys = Vec::new();
+    let mut selected = Vec::new();
     let mut best_rides = usize::MAX;
-    let mut seen_departures: Vec<(u32, usize)> = Vec::new();
     for (departure, rides, achieved) in candidates {
         let dominated = best_rides <= rides
-            && seen_departures
+            && selected
                 .iter()
-                .any(|&(d, r)| d >= departure && r <= rides && (d > departure || r < rides));
-        let duplicate = seen_departures
+                .any(|&(d, r, _)| d >= departure && r <= rides && (d > departure || r < rides));
+        let duplicate = selected
             .iter()
-            .any(|&(d, r)| d == departure && r == rides);
+            .any(|&(d, r, _)| d == departure && r == rides);
         if dominated || duplicate {
             continue;
         }
-        seen_departures.push((departure, rides));
         best_rides = best_rides.min(rides);
+        selected.push((departure, rides, achieved));
+    }
+    selected
+}
+
+/// Materializes candidate tuples through the forward engine, latest
+/// departure first — the arc's replay guarantee.
+fn replay(
+    timetable: &Timetable,
+    transfers: &Transfers,
+    request: &Request,
+    selected: &[(u32, usize, u32)],
+) -> Vec<Journey> {
+    let mut journeys = Vec::new();
+    for &(departure, rides, achieved) in selected {
         let forward = Request {
             departure,
             ..request.clone()
@@ -453,6 +475,102 @@ pub fn reverse_route(
         journeys.push(journey);
     }
     journeys
+}
+
+/// The deadline profile's journeys over ascending minute `marks`: one
+/// reverse run at the final mark, each mark's complete-journey Pareto
+/// candidates collected, the union deduplicated on exact tuples, and
+/// every distinct journey materialized by forward replay — sorted by
+/// (departure desc, rides asc, achieved asc), the union's members
+/// each being some mark's answer (never globally re-filtered: a later
+/// mark's later-departing winner does not erase an earlier mark's).
+/// `walk` is a direct walking alternative's seconds: each mark's
+/// Pareto selection then competes against the walk placed to arrive
+/// exactly at that mark (zero rides), so the union is exactly the
+/// union of the marks' single-deadline answers — a duration test
+/// alone would keep journeys a mark's own walk dominates. Walk
+/// winners come back as the second element, (departure, arrival)
+/// placements the caller renders itself.
+pub fn reverse_route_profile(
+    timetable: &Timetable,
+    transfers: &Transfers,
+    reversed: &ReversedTransfers,
+    request: &Request,
+    marks: &[u32],
+    walk: Option<u32>,
+) -> (Vec<Journey>, Vec<(u32, u32)>) {
+    let search = ReverseSearch::new(timetable, reversed, request);
+    let mut state = ReverseState::new();
+    search.run(&mut state);
+    // Each access stop's frontier evaluates once through the rolling
+    // per-mark evaluator; a mark's candidate pool is then the tiny
+    // per-round winner set per access stop, never a rescan of every
+    // label per mark.
+    let profiles: Vec<(u32, MarkWinners)> = request
+        .access
+        .iter()
+        .map(|&(stop, walk_seconds)| {
+            let states: Vec<(u16, u32, u32)> = state
+                .bags
+                .iter()
+                .enumerate()
+                .flat_map(|(round, bags)| {
+                    bags[stop.0 as usize]
+                        .iter()
+                        .filter(|label| label.fixed() && label.ride_rooted)
+                        .map(move |label| (round as u16, label.departure, label.achieved))
+                })
+                .collect();
+            (walk_seconds, reverse_profile_states(&states, marks))
+        })
+        .collect();
+    let mut union: Vec<(u32, usize, u32)> = Vec::new();
+    for (at, &mark) in marks.iter().enumerate() {
+        let mut candidates: Vec<(u32, usize, u32)> = Vec::new();
+        for (walk_seconds, profile) in &profiles {
+            for &(round, departure, achieved) in &profile[at] {
+                if let Some(composed) = departure.checked_sub(*walk_seconds) {
+                    candidates.push((composed, round as usize, achieved));
+                }
+            }
+        }
+        if let Some(seconds) = walk {
+            if let Some(placed) = mark.checked_sub(seconds) {
+                candidates.push((placed, 0, mark));
+            }
+        }
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        let mut kept: Vec<(u32, usize, u32)> = Vec::new();
+        let mut best_rides = usize::MAX;
+        for (departure, rides, achieved) in candidates {
+            let dominated = best_rides <= rides
+                && kept
+                    .iter()
+                    .any(|&(d, r, _)| d >= departure && r <= rides && (d > departure || r < rides));
+            let duplicate = kept.iter().any(|&(d, r, _)| d == departure && r == rides);
+            if dominated || duplicate {
+                continue;
+            }
+            best_rides = best_rides.min(rides);
+            kept.push((departure, rides, achieved));
+        }
+        for candidate in kept {
+            if !union.contains(&candidate) {
+                union.push(candidate);
+            }
+        }
+    }
+    union.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    let walks: Vec<(u32, u32)> = union
+        .iter()
+        .filter(|&&(_, rides, _)| rides == 0)
+        .map(|&(departure, _, achieved)| (departure, achieved))
+        .collect();
+    let transit: Vec<(u32, usize, u32)> = union
+        .into_iter()
+        .filter(|&(_, rides, _)| rides > 0)
+        .collect();
+    (replay(timetable, transfers, request, &transit), walks)
 }
 
 /// Per-origin per-round fixed frontier states: `result[stop]` lists
@@ -497,6 +615,65 @@ where
             fold(index, &collect_states(timetable, state))
         })
         .collect()
+}
+
+/// The deadline profile of one stop's frontier states: for each
+/// ascending deadline mark, each round's winner — the latest-departure
+/// state among that round's states with `achieved ≤ mark` (earliest
+/// achieved breaking exact departure ties). One `T2` run's frontier
+/// serves every mark because dominance can only prune a state in
+/// favour of one that serves the same mark at least as well; the
+/// consumers compose access walks and apply the complete-journey
+/// order across rounds after composition, exactly as on the
+/// single-deadline surfaces. Sorting each round's states by achieved
+/// and rolling a best pointer over the ascending marks makes this
+/// O(states log states + rounds × marks), never O(states × marks).
+pub fn reverse_profile_states(
+    states: &[(u16, u32, u32)],
+    marks: &[u32],
+) -> Vec<Vec<(u16, u32, u32)>> {
+    // One sort orders by (round, achieved); grouping consecutive
+    // rounds is then a single pass — O(states log states) setup with
+    // no per-state scans.
+    let mut sorted: Vec<(u16, u32, u32)> = states
+        .iter()
+        .map(|&(round, departure, achieved)| (round, achieved, departure))
+        .collect();
+    sorted.sort_unstable();
+    let mut per_round: Vec<(u16, Vec<(u32, u32)>)> = Vec::new();
+    for (round, achieved, departure) in sorted {
+        match per_round.last_mut() {
+            Some((held, entries)) if *held == round => entries.push((achieved, departure)),
+            _ => per_round.push((round, vec![(achieved, departure)])),
+        }
+    }
+    let mut cursors = vec![0usize; per_round.len()];
+    let mut bests: Vec<Option<(u32, u32)>> = vec![None; per_round.len()];
+    let mut result = Vec::with_capacity(marks.len());
+    for &mark in marks {
+        let mut winners = Vec::new();
+        for (slot, (round, entries)) in per_round.iter_mut().enumerate() {
+            while cursors[slot] < entries.len() && entries[cursors[slot]].0 <= mark {
+                let (achieved, departure) = entries[cursors[slot]];
+                let wins = match bests[slot] {
+                    None => true,
+                    Some((held_departure, held_achieved)) => {
+                        departure > held_departure
+                            || (departure == held_departure && achieved < held_achieved)
+                    }
+                };
+                if wins {
+                    bests[slot] = Some((departure, achieved));
+                }
+                cursors[slot] += 1;
+            }
+            if let Some((departure, achieved)) = bests[slot] {
+                winners.push((*round, departure, achieved));
+            }
+        }
+        result.push(winners);
+    }
+    result
 }
 
 /// The per-stop fixed ride-rooted frontier states of a finished run:

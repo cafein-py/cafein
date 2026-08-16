@@ -53,7 +53,10 @@ impl TransportNetwork {
     /// fewest rides), earliest arrival breaking ties — each journey
     /// leg-identical to the plain answer for the departure it discovers.
     /// The reverse run boards at the origin stop over the closure; a
-    /// whole-day ULTRA set is never claimed, and a window is rejected.
+    /// whole-day ULTRA set is never claimed. With ``arrive_by`` the
+    /// window profiles arrival deadlines at its minute marks and the
+    /// result is the deadline profile — the union of the marks'
+    /// latest-departure Pareto sets.
     ///
     /// Returns
     /// -------
@@ -82,11 +85,6 @@ impl TransportNetwork {
         geometries: bool,
         arrive_by: bool,
     ) -> PyResult<Py<PyList>> {
-        if arrive_by && window.is_some() {
-            return Err(PyValueError::new_err(
-                "a departure window does not combine with an arrival deadline",
-            ));
-        }
         let origin = self.resolve_stop(from_stop)?;
         let destination = self.resolve_stop(to_stop)?;
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
@@ -143,7 +141,7 @@ impl TransportNetwork {
             exclusions,
         };
         if arrive_by {
-            return self.reverse_route_request(py, &request, geometries);
+            return self.reverse_route_request(py, &request, window, geometries);
         }
         self.route_request(py, &request, window, None, None, geometries)
     }
@@ -214,11 +212,6 @@ impl TransportNetwork {
         geometries: bool,
         arrive_by: bool,
     ) -> PyResult<Py<PyList>> {
-        if arrive_by && window.is_some() {
-            return Err(PyValueError::new_err(
-                "a departure window does not combine with an arrival deadline",
-            ));
-        }
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         let streets = self.installed_streets()?;
         let speed =
@@ -289,22 +282,27 @@ impl TransportNetwork {
         } else {
             self.time_transfers()
         };
-        let journeys = if arrive_by {
-            self.reverse_journeys(&request)
+        let (journeys, profile_walks) = if arrive_by {
+            self.reverse_journeys(&request, window, direct.map(|(seconds, _)| seconds))?
         } else {
-            match window {
+            let journeys = match window {
                 None => Raptor.route(&self.build.timetable, transfers, &request),
                 Some(window) => {
                     Raptor.route_range(&self.build.timetable, transfers, &request, window)
                 }
-            }
+            };
+            (journeys, Vec::new())
         };
         // The walking-only alternative's dominance depends on the
         // axis. Depart-at: both leave at the departure, so a journey
-        // survives only when strictly faster than walking. Arrive-by:
-        // the walk leaves at deadline − walk with zero rides, so it
-        // dominates every journey leaving no later — a journey
-        // survives only by leaving strictly later than the walk.
+        // survives only when strictly faster than walking. Arrive-by
+        // at one deadline: the walk leaves at deadline − walk with
+        // zero rides, so it dominates every journey leaving no later.
+        // Over an arrival window the walk competed inside every
+        // mark's Pareto selection in the core, so the returned
+        // journeys and walk placements are already exact — nothing is
+        // filtered here.
+        let windowed = arrive_by && window.is_some();
         let walk_departure = match direct {
             Some((walk_seconds, _)) if arrive_by => request.departure.checked_sub(walk_seconds),
             Some(_) => Some(request.departure),
@@ -313,6 +311,7 @@ impl TransportNetwork {
         let kept: Vec<&Journey> = journeys
             .iter()
             .filter(|journey| match (direct, walk_departure) {
+                _ if windowed => true,
                 (Some((walk_seconds, _)), _) if !arrive_by => {
                     journey.arrival - journey.departure < walk_seconds
                 }
@@ -323,15 +322,74 @@ impl TransportNetwork {
             })
             .collect();
         let result = PyList::empty(py);
+        if windowed {
+            // Two departure-descending streams merge; equal departures
+            // put the walk first (zero rides sorts first).
+            let mut placements = profile_walks.iter().peekable();
+            if let Some((_, meters)) = direct {
+                for journey in &kept {
+                    while placements
+                        .peek()
+                        .is_some_and(|&&(departure, _)| departure >= journey.departure)
+                    {
+                        let &(departure, arrival) = placements.next().expect("peeked");
+                        result.append(self.walk_journey_dict(
+                            py,
+                            departure,
+                            (arrival - departure, meters),
+                            &ends,
+                            geometries,
+                        )?)?;
+                    }
+                    result.append(self.journey_to_dict(
+                        py,
+                        journey,
+                        Some(&walks),
+                        Some(&ends),
+                        geometries,
+                        transfers,
+                    )?)?;
+                }
+                for &(departure, arrival) in placements {
+                    result.append(self.walk_journey_dict(
+                        py,
+                        departure,
+                        (arrival - departure, meters),
+                        &ends,
+                        geometries,
+                    )?)?;
+                }
+            } else {
+                for journey in &kept {
+                    result.append(self.journey_to_dict(
+                        py,
+                        journey,
+                        Some(&walks),
+                        Some(&ends),
+                        geometries,
+                        transfers,
+                    )?)?;
+                }
+            }
+            return Ok(result.unbind());
+        }
         let walk_entry = direct
             .filter(|_| !kept.iter().any(|journey| journey.rides() == 0))
             .zip(walk_departure);
         // The forward walk leads (equal departure, zero rides); the
-        // arrive-by walk trails (every kept journey leaves later).
+        // single-deadline arrive-by walk takes its place in the
+        // (departure desc, rides asc) order.
+        let mut walk_pending = walk_entry.filter(|_| arrive_by);
         if let Some((walk, at)) = walk_entry.filter(|_| !arrive_by) {
             result.append(self.walk_journey_dict(py, at, walk, &ends, geometries)?)?;
         }
         for journey in kept {
+            if let Some((walk, at)) = walk_pending {
+                if journey.departure <= at {
+                    result.append(self.walk_journey_dict(py, at, walk, &ends, geometries)?)?;
+                    walk_pending = None;
+                }
+            }
             result.append(self.journey_to_dict(
                 py,
                 journey,
@@ -341,7 +399,7 @@ impl TransportNetwork {
                 transfers,
             )?)?;
         }
-        if let Some((walk, at)) = walk_entry.filter(|_| arrive_by) {
+        if let Some((walk, at)) = walk_pending {
             result.append(self.walk_journey_dict(py, at, walk, &ends, geometries)?)?;
         }
         Ok(result.unbind())

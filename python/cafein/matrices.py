@@ -941,6 +941,7 @@ class TravelTimeMatrix(pd.DataFrame):
         departure=None,
         *,
         arrival=None,
+        arrival_time_window=None,
         max_rides=8,
         departure_time_window=None,
         percentiles=None,
@@ -995,14 +996,18 @@ class TravelTimeMatrix(pd.DataFrame):
         if departure is not None and arrival is not None:
             raise ValueError("give exactly one of departure= or arrival=")
         arrive_by = arrival is not None
+        from cafein._units import window_axis
+
+        raw_window = window_axis(arrive_by, departure_time_window, arrival_time_window)
         if arrive_by:
             from cafein._units import arrival_parts
-            from cafein.network import _reject_arrive_by_window
 
             date, departure = arrival_parts(arrival)
-            _reject_arrive_by_window(
-                arrive_by, departure_time_window, percentiles, confidence, router
-            )
+            if router == "tbtr":
+                raise ValueError(
+                    "router='tbtr' does not serve arrival=; the reverse "
+                    "search rides RAPTOR"
+                )
             if street_policy is not None:
                 raise ValueError(
                     "street_policy= (a traveler's street bridge included) "
@@ -1015,7 +1020,10 @@ class TravelTimeMatrix(pd.DataFrame):
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         max_transfers = max_rides - 1
-        window = duration_seconds("departure_time_window", departure_time_window)
+        window = duration_seconds(
+            "arrival_time_window" if arrive_by else "departure_time_window",
+            raw_window,
+        )
         max_walking_time = duration_seconds("max_walking_time", max_walking_time)
         max_street_time = duration_seconds("max_street_time", max_street_time)
         max_snap_distance = snap_distance
@@ -1176,6 +1184,7 @@ class TravelTimeMatrix(pd.DataFrame):
         departure=None,
         *,
         arrival=None,
+        arrival_time_window=None,
         output,
         batch_size=None,
         resume=False,
@@ -1256,7 +1265,7 @@ class TravelTimeMatrix(pd.DataFrame):
         max_street_time = duration_seconds("max_street_time", max_street_time)
         max_snap_distance = snap_distance
         size = _stream_size(batch_size, resume)
-        if arrival is not None:
+        if arrival is not None or arrival_time_window is not None:
             raise NotImplementedError(
                 "arrive-by matrices do not stream yet; compute the frame "
                 "with the constructor (chunk= slices the destination axis "
