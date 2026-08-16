@@ -1526,10 +1526,11 @@ class TransportNetwork:
         self,
         origin,
         destination,
-        departure,
+        departure=None,
         max_rides=8,
         departure_time_window=None,
         *,
+        arrival=None,
         exclude_routes=(),
         exclude_trips=(),
         traveler=None,
@@ -1569,9 +1570,20 @@ class TransportNetwork:
         destination : str
             GTFS stop_id of the destination stop, qualified the same way.
             Identifiers in the output follow the same convention.
-        departure : datetime.datetime or str
+        departure : datetime.datetime or str (optional)
             Departure at the origin — a datetime, or an ISO string like
             ``"2022-02-22 08:30"``; the service date is its date part.
+            Give exactly one of ``departure`` and ``arrival``.
+        arrival : datetime.datetime or str (optional)
+            Arrival deadline at the destination, in the same forms. The
+            result is the latest-departure Pareto set — journeys ordered
+            by (latest departure, fewest rides), earliest arrival
+            breaking ties — each journey identical to the ``departure=``
+            answer for the departure it discovers; travel time is each
+            journey's own duration, never the span to the deadline. The
+            reverse search boards at the origin stop over the closure (a
+            whole-day ULTRA set is not claimed), and
+            ``departure_time_window`` does not combine with it.
         max_rides : int (optional, default: 8)
             Maximum number of boarded vehicles per journey (rides, not
             transfers: 8 rides allow 7 transfers).
@@ -1629,9 +1641,14 @@ class TransportNetwork:
             walking_speed_kmph,
             max_walking_time,
         )
-        from cafein._units import departure_parts, duration_seconds
+        from cafein._units import duration_seconds, time_axis
 
-        date, departure = departure_parts(departure)
+        date, departure, arrive_by = time_axis(departure, arrival)
+        if arrive_by and departure_time_window is not None:
+            raise ValueError(
+                "departure_time_window= does not combine with arrival=; "
+                "windowed arrive-by queries are not available yet"
+            )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         return self._route_between_stops(
@@ -1639,6 +1656,7 @@ class TransportNetwork:
             to_stop=destination,
             date=date,
             departure=departure,
+            arrive_by=arrive_by,
             max_transfers=max_rides - 1,
             window=duration_seconds("departure_time_window", departure_time_window),
             max_walking_time=duration_seconds("max_walking_time", max_walking_time),
@@ -1666,11 +1684,13 @@ class TransportNetwork:
         max_walking_time=None,
         max_snap_distance=None,
         geometries=True,
+        arrive_by=False,
     ):
         """``route_between_stops`` in core space: split ``date`` +
         ``departure`` strings, ``max_transfers``, and every duration in
         seconds — the form internal callers use to avoid double
-        conversion."""
+        conversion. With ``arrive_by`` the time is the arrival
+        deadline."""
         return self._core.route_between_stops(
             from_stop,
             to_stop,
@@ -1683,16 +1703,18 @@ class TransportNetwork:
             list(id_sequence("exclude_stops", exclude_stops)),
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
             geometries,
+            arrive_by,
         )
 
     def route_between_coordinates(
         self,
         origin,
         destination,
-        departure,
+        departure=None,
         max_rides=8,
         departure_time_window=None,
         *,
+        arrival=None,
         exclude_routes=(),
         exclude_trips=(),
         traveler=None,
@@ -1723,10 +1745,18 @@ class TransportNetwork:
             ``(lat, lon)`` coordinates, in EPSG:4326. A coordinate
             farther than `snap_distance` from the walking network
             raises ``ValueError``.
-        departure : datetime.datetime or str
+        departure : datetime.datetime or str (optional)
             Departure at the origin coordinate — a datetime, or an ISO
             string like ``"2022-02-22 08:30"``; the service date is its
-            date part.
+            date part. Give exactly one of ``departure`` and
+            ``arrival``.
+        arrival : datetime.datetime or str (optional)
+            Arrival deadline at the destination coordinate, as in
+            ``route_between_stops``: the latest-departure Pareto set,
+            egress walks included in the deadline. The direct walking
+            alternative is placed to arrive exactly at the deadline.
+            ``departure_time_window`` and ``street_policy`` (a
+            traveler's street bridge included) do not combine with it.
         max_rides : int (optional, default: 8)
             Maximum number of boarded vehicles per journey (rides, not
             transfers: 8 rides allow 7 transfers).
@@ -1799,9 +1829,20 @@ class TransportNetwork:
         street_policy, max_walking_time = folded_street_policy(
             traveler, self, street_policy, walking_speed_kmph, max_walking_time
         )
-        from cafein._units import departure_parts, duration_seconds
+        from cafein._units import duration_seconds, time_axis
 
-        date, departure = departure_parts(departure)
+        date, departure, arrive_by = time_axis(departure, arrival)
+        if arrive_by:
+            if departure_time_window is not None:
+                raise ValueError(
+                    "departure_time_window= does not combine with arrival=; "
+                    "windowed arrive-by queries are not available yet"
+                )
+            if street_policy is not None:
+                raise ValueError(
+                    "street_policy= (a traveler's street bridge included) "
+                    "does not combine with arrival= yet"
+                )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         return self._route_between_coordinates(
@@ -1809,6 +1850,7 @@ class TransportNetwork:
             destination=destination,
             date=date,
             departure=departure,
+            arrive_by=arrive_by,
             max_transfers=max_rides - 1,
             window=duration_seconds("departure_time_window", departure_time_window),
             max_walking_time=duration_seconds("max_walking_time", max_walking_time),
@@ -1838,11 +1880,13 @@ class TransportNetwork:
         max_snap_distance=None,
         geometries=True,
         street_policy=None,
+        arrive_by=False,
     ):
         """``route_between_coordinates`` in core space: split ``date`` +
         ``departure`` strings, ``max_transfers``, and every duration
         in seconds — the form internal callers use to avoid double
-        conversion."""
+        conversion. With ``arrive_by`` the time is the arrival deadline
+        (the public wrapper rejects a policy beside it)."""
         if street_policy is not None:
             from cafein.matrices import _walking_only_policy
 
@@ -1924,6 +1968,7 @@ class TransportNetwork:
             list(id_sequence("exclude_stops", exclude_stops)),
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
             geometries,
+            arrive_by,
         )
 
     def compute_carriage_transfers(self, mode, max_transfer_time):
@@ -1994,9 +2039,10 @@ class TransportNetwork:
     def travel_times_from_coordinate(
         self,
         origin,
-        departure,
+        departure=None,
         max_rides=8,
         *,
+        arrival=None,
         exclude_routes=(),
         exclude_trips=(),
         traveler=None,
@@ -2020,10 +2066,22 @@ class TransportNetwork:
             ``(lat, lon)`` coordinate, in EPSG:4326. A coordinate
             farther than `snap_distance` from the walking network
             raises ``ValueError``.
-        departure : datetime.datetime or str
+        departure : datetime.datetime or str (optional)
             Departure at the origin coordinate — a datetime, or an ISO
             string like ``"2022-02-22 08:30"``; the service date is its
-            date part.
+            date part. Give exactly one of ``departure`` and
+            ``arrival``.
+        arrival : datetime.datetime or str (optional)
+            Arrival deadline, in the same forms — and the one-to-all
+            direction flips with the axis: the given coordinate becomes
+            the **destination**, and the result maps every origin stop
+            to the travel time of its latest-departure journey arriving
+            there by the deadline (fewest rides, then earliest arrival,
+            breaking ties) — each journey's own duration, egress walk
+            included. Stops within the walking cutoff appear with their
+            walking time, the walk placed to arrive exactly at the
+            deadline. ``street_policy`` (a traveler's street bridge
+            included) does not combine with it.
         max_rides : int (optional, default: 8)
             Maximum number of boarded vehicles per journey (rides, not
             transfers: 8 rides allow 7 transfers).
@@ -2072,9 +2130,14 @@ class TransportNetwork:
         street_policy, max_walking_time = folded_street_policy(
             traveler, self, street_policy, walking_speed_kmph, max_walking_time
         )
-        from cafein._units import departure_parts, duration_seconds
+        from cafein._units import duration_seconds, time_axis
 
-        date, departure = departure_parts(departure)
+        date, departure, arrive_by = time_axis(departure, arrival)
+        if arrive_by and street_policy is not None:
+            raise ValueError(
+                "street_policy= (a traveler's street bridge included) "
+                "does not combine with arrival= yet"
+            )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         max_transfers = max_rides - 1
@@ -2216,14 +2279,16 @@ class TransportNetwork:
             list(id_sequence("exclude_trips", exclude_trips)),
             list(id_sequence("exclude_stops", exclude_stops)),
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
+            arrive_by,
         )
 
     def travel_times_from_stop(
         self,
         origin,
-        departure,
+        departure=None,
         max_rides=8,
         *,
+        arrival=None,
         exclude_routes=(),
         exclude_trips=(),
         traveler=None,
@@ -2250,9 +2315,20 @@ class TransportNetwork:
         origin : str
             GTFS stop_id of the origin stop; ``<feed_index>:<stop_id>``
             when the id occurs in several merged feeds.
-        departure : datetime.datetime or str
+        departure : datetime.datetime or str (optional)
             Departure at the origin — a datetime, or an ISO string like
             ``"2022-02-22 08:30"``; the service date is its date part.
+            Give exactly one of ``departure`` and ``arrival``.
+        arrival : datetime.datetime or str (optional)
+            Arrival deadline, in the same forms — and the one-to-all
+            direction flips with the axis: the given stop becomes the
+            **destination**, and the result maps every origin stop to
+            the travel time of its latest-departure journey arriving
+            there by the deadline (fewest rides, then earliest arrival,
+            breaking ties) — each journey's own duration, never the
+            span to the deadline; the destination itself maps to 0. The
+            reverse search relaxes the closure (a whole-day ULTRA set
+            is not claimed).
         max_rides : int (optional, default: 8)
             Maximum number of boarded vehicles per journey (rides, not
             transfers: 8 rides allow 7 transfers).
@@ -2290,9 +2366,9 @@ class TransportNetwork:
             walking_speed_kmph,
             max_walking_time,
         )
-        from cafein._units import departure_parts, duration_seconds
+        from cafein._units import duration_seconds, time_axis
 
-        date, departure = departure_parts(departure)
+        date, departure, arrive_by = time_axis(departure, arrival)
         from_stop = origin
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
@@ -2308,6 +2384,7 @@ class TransportNetwork:
             list(id_sequence("exclude_trips", exclude_trips)),
             list(id_sequence("exclude_stops", exclude_stops)),
             *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
+            arrive_by,
         )
 
     def travel_time_matrix(

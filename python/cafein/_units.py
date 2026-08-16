@@ -44,8 +44,8 @@ def clock_time(name, value):
     raise ValueError(f'{name} takes an "HH:MM" string or a datetime.time')
 
 
-def departure_parts(value):
-    """One ``departure`` → the core's (date, time-of-day) string pair.
+def moment_parts(name, value):
+    """One time-axis moment → the core's (date, time-of-day) string pair.
 
     Accepts a ``datetime.datetime`` or an ISO-style string
     ("YYYY-MM-DD HH:MM", seconds optional, "T" separator tolerated).
@@ -60,7 +60,7 @@ def departure_parts(value):
     if isinstance(value, str):
         parts = value.strip().split(":")
         if 2 <= len(parts) <= 3 and all(p.isdigit() for p in parts):
-            return None, clock_time("departure", value.strip())
+            return None, clock_time(name, value.strip())
     if isinstance(value, str):
         text = value.strip().replace("T", " ")
         date_part, _, time_part = text.partition(" ")
@@ -68,14 +68,38 @@ def departure_parts(value):
             datetime.date.fromisoformat(date_part)
         except ValueError:
             raise ValueError(
-                "departure takes a datetime or an ISO-style string like "
+                f"{name} takes a datetime or an ISO-style string like "
                 '"2026-09-08 08:30"'
             ) from None
-        return date_part, clock_time("departure", time_part or "00:00")
+        return date_part, clock_time(name, time_part or "00:00")
     raise TypeError(
-        "departure takes a datetime.datetime or an ISO-style string like "
+        f"{name} takes a datetime.datetime or an ISO-style string like "
         '"2026-09-08 08:30"'
     )
+
+
+def departure_parts(value):
+    """One ``departure`` → the core's (date, time-of-day) string pair."""
+    return moment_parts("departure", value)
+
+
+def arrival_parts(value):
+    """One ``arrival`` deadline → the core's (date, time-of-day) pair."""
+    return moment_parts("arrival", value)
+
+
+def time_axis(departure, arrival):
+    """Exactly one of ``departure``/``arrival`` → (date, clock, arrive_by).
+
+    The shared time-axis validation: every timetable query names its
+    moment on exactly one axis — a departure to leave at, or an
+    arrival deadline to be there by.
+    """
+    if (departure is None) == (arrival is None):
+        raise ValueError("give exactly one of departure= or arrival=")
+    if arrival is None:
+        return (*moment_parts("departure", departure), False)
+    return (*moment_parts("arrival", arrival), True)
 
 
 def validated_output_time_units(value):
