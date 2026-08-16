@@ -532,9 +532,15 @@ impl TransportNetwork {
                 "reduced rows and coordinates must align",
             ));
         }
-        if transfer_mode.is_some() && !exclude_stops.is_empty() {
-            // A rental token's interior stops are invisible to the
-            // engine's exclusion checks.
+        if transfer_mode
+            .as_ref()
+            .is_some_and(|binding| !crate::network::walking_class(&binding.0))
+            && !exclude_stops.is_empty()
+        {
+            // A rental-bearing merged edge hides its pickup and drop
+            // stops inside the token; a walking-class set's tokens have
+            // no interiors, so its endpoints are exclusion-checked like
+            // any transfer edge and the combination is sound.
             return Err(PyValueError::new_err(
                 "stop exclusions do not combine with street_policy \
                  transfers= yet; a rental transfer's interior stops are \

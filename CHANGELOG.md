@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Walking-class transfer grants combine with exclusions (their tokens
+  hide no interior stops), and the wheelchair traveler bridge rides
+  the computed wheelchair transfer set automatically.
+  ([#268](https://github.com/cafein-py/cafein/pull/268))
+
 - Wheelchair transit access: `"wheelchair"` as a walking-class
   street-policy mode with per-stop links and mode-transfer sets, and
   `TravelerProfile(wheelchair=True)` taking the streets on

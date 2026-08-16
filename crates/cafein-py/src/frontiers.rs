@@ -657,7 +657,13 @@ impl TransportNetwork {
                     "street_policy transfers= multicriteria queries run on McRAPTOR",
                 ));
             }
-            if !exclude_stops.is_empty() {
+            if transfer_mode
+                .as_ref()
+                .is_some_and(|binding| !crate::network::walking_class(&binding.0))
+                && !exclude_stops.is_empty()
+            {
+                // Rental tokens hide interior stops; walking-class sets
+                // have none, so their endpoints exclusion-check soundly.
                 return Err(PyValueError::new_err(
                     "stop exclusions do not combine with street_policy \
                      transfers= yet; a rental transfer's interior stops are \
