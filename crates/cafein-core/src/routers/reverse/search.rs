@@ -464,19 +464,51 @@ pub fn reverse_one_to_all(
     timetable: &Timetable,
     reversed: &ReversedTransfers,
     request: &Request,
-) -> Vec<Vec<(u8, u32, u32)>> {
+) -> Vec<Vec<(u16, u32, u32)>> {
     let search = ReverseSearch::new(timetable, reversed, request);
     let mut state = ReverseState::new();
     search.run(&mut state);
+    collect_states(timetable, &state)
+}
+
+/// `reverse_one_to_all` for many requests, fanned out in parallel with
+/// per-worker state reuse — one request per arrive-by matrix
+/// destination. Each finished run folds into `fold`'s compact value
+/// (typically one dense column over the requested origins) inside the
+/// worker, so only one run's per-stop frontiers are ever held per
+/// worker — never O(destinations × stops) retained nested state.
+pub fn reverse_one_to_all_fold<T, F>(
+    timetable: &Timetable,
+    reversed: &ReversedTransfers,
+    requests: &[Request],
+    fold: F,
+) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize, &[Vec<(u16, u32, u32)>]) -> T + Sync,
+{
+    use rayon::prelude::*;
+    requests
+        .par_iter()
+        .enumerate()
+        .map_init(ReverseState::new, |state, (index, request)| {
+            let search = ReverseSearch::new(timetable, reversed, request);
+            search.run(state);
+            fold(index, &collect_states(timetable, state))
+        })
+        .collect()
+}
+
+/// The per-stop fixed ride-rooted frontier states of a finished run:
+/// these are journey starts for the composing consumer.
+fn collect_states(timetable: &Timetable, state: &ReverseState) -> Vec<Vec<(u16, u32, u32)>> {
     let stops = timetable.stop_count() as usize;
     let mut result = vec![Vec::new(); stops];
     for (round, bags) in state.bags.iter().enumerate() {
         for (stop, bag) in bags.iter().enumerate() {
             for label in bag {
-                // Ride-rooted only, as on the route path: these states
-                // are journey starts for the composing consumer.
                 if label.fixed() && label.ride_rooted {
-                    result[stop].push((round as u8, label.departure, label.achieved));
+                    result[stop].push((round as u16, label.departure, label.achieved));
                 }
             }
         }

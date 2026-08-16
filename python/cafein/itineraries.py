@@ -126,9 +126,21 @@ class DetailedItineraries(gpd.GeoDataFrame):
     destinations : list of str, or GeoDataFrame
         Destination stop_ids, or points with an ``id`` column; the same
         kind as `origins`.
-    departure : datetime.datetime or str
+    departure : datetime.datetime or str (optional)
         Departure at every origin — a datetime, or an ISO string like
         ``"2022-02-22 08:30"``; the service date is its date part.
+        Give exactly one of ``departure`` and ``arrival``.
+    arrival : datetime.datetime or str (optional)
+        Arrival deadline at every destination, in the same forms —
+        ``candidates="time"`` only. Each pair's rows hold the
+        latest-departure Pareto set's full legs, options ordered
+        latest departure first, every journey identical to the
+        ``departure=`` answer for the departure it discovers. As
+        always, each row's ``travel_time`` is its own leg's duration —
+        a journey's duration spans its first departure to its final
+        arrival, never the span to the deadline. The
+        departure-window parameters, ``router="tbtr"``, and
+        ``street_policy`` do not combine with it.
     max_rides : int (optional, default: 8)
         Maximum number of boarded vehicles per journey (rides, not
         transfers: 8 rides allow 7 transfers).
@@ -324,6 +336,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         destinations=None,
         departure=None,
         *,
+        arrival=None,
         max_rides=8,
         factors=None,
         components=None,
@@ -389,9 +402,32 @@ class DetailedItineraries(gpd.GeoDataFrame):
         )
 
         output_time_units = validated_output_time_units(output_time_units)
-        date, departure = (
-            (None, None) if departure is None else departure_parts(departure)
-        )
+        if departure is not None and arrival is not None:
+            raise ValueError("give exactly one of departure= or arrival=")
+        arrive_by = arrival is not None
+        if arrive_by:
+            from cafein._units import arrival_parts
+
+            if candidates != "time":
+                raise ValueError(
+                    f"candidates={candidates!r} does not combine with "
+                    "arrival=; multicriteria arrive-by is a later arc"
+                )
+            if router == "tbtr":
+                raise ValueError(
+                    "router='tbtr' does not serve arrival=; the reverse "
+                    "search rides RAPTOR"
+                )
+            if street_policy is not None:
+                raise ValueError(
+                    "street_policy= (a traveler's street bridge included) "
+                    "does not combine with arrival= yet"
+                )
+            date, departure = arrival_parts(arrival)
+        else:
+            date, departure = (
+                (None, None) if departure is None else departure_parts(departure)
+            )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         max_transfers = max_rides - 1
@@ -430,6 +466,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
                 currency=currency,
                 cost_components=cost_components,
                 transit_only={
+                    "arrival": arrival,
                     "fares": fares,
                     "traveler": traveler,
                     "tolerance_minutes": slack_seconds,
@@ -500,6 +537,8 @@ class DetailedItineraries(gpd.GeoDataFrame):
                 "street kilometres and apply to a StreetNetwork query "
                 "(transit perspective costs are not supported)"
             )
+        if departure is None and not arrive_by:
+            raise ValueError("give exactly one of departure= or arrival=")
         frame = _itineraries_frame(
             network,
             origins,
@@ -507,6 +546,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
             date,
             departure,
             max_transfers=max_transfers,
+            arrive_by=arrive_by,
             factors=factors,
             components=components,
             fares=fares,
@@ -545,6 +585,7 @@ def _itineraries_frame(
     departure,
     *,
     max_transfers,
+    arrive_by=False,
     factors,
     components,
     fares,
@@ -687,6 +728,7 @@ def _itineraries_frame(
                     street_policy,
                     street_factors,
                     components,
+                    arrive_by=arrive_by,
                 )
             if not journeys:
                 continue
@@ -754,6 +796,7 @@ def _route(
     street_policy=None,
     street_factors=None,
     components=None,
+    arrive_by=False,
 ):
     """The Pareto-optimal journeys of one OD pair — the time-optimal
     (arrival, rides) set, or the (arrival, emissions) McRAPTOR set with
@@ -795,6 +838,7 @@ def _route(
             max_snap_distance=max_snap_distance,
             geometries=geometries,
             street_policy=street_policy,
+            arrive_by=arrive_by,
         )
     return network._route_between_stops(
         origin_key,
@@ -806,6 +850,7 @@ def _route(
         exclude_trips=exclusions[1],
         exclude_stops=exclusions[2],
         geometries=geometries,
+        arrive_by=arrive_by,
     )
 
 

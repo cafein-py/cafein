@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `arrival=` on `TravelTimeMatrix` / `travel_time_matrix` and
+  `DetailedItineraries`: matrix cells hold the latest-departure
+  journey's own duration per OD pair — one reverse run per
+  destination, `chunk=` slicing the destination axis — and itinerary
+  frames emit the latest-departure Pareto set's full legs for
+  `candidates="time"`.
+  ([#273](https://github.com/cafein-py/cafein/pull/273))
 - `arrival=` on the routing calls: `route_between_stops`,
   `route_between_coordinates`, `travel_times_from_stop`, and
   `travel_times_from_coordinate` take an arrival deadline as the twin
