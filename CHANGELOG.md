@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Streamed arrive-by outputs: `TravelTimeMatrix.to_parquet` takes
+  `arrival=` (and `arrival_time_window=`), batching the destination
+  axis — the reverse fan-out axis — with the resume manifest
+  fingerprinting the complete time query; `Accessibility.to_parquet`
+  computes the destination fan-out once and streams origin batches
+  from the duration surface.
+  ([#276](https://github.com/cafein-py/cafein/pull/276))
+
 - `arrival_time_window=`, the twin of `departure_time_window=` on the
   arrival axis: route calls return the deadline profile (the union of
   each minute mark's latest-departure Pareto set), matrices and the

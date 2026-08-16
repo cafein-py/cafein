@@ -1216,14 +1216,22 @@ class TravelTimeMatrix(pd.DataFrame):
 
         Origins are processed in ``batch_size`` slices (default 500)
         and each batch is written as it completes, so peak memory holds
-        one batch — never the whole constructor result. ``output=``
-        selects the form by suffix exactly as ``travel_cost_table``
-        does and the return value is a :class:`cafein.StreamingResult`.
-        ``from_id``/``to_id`` are dictionary-encoded over the shared id
-        domains; a windowed matrix streams its percentile columns.
-        ``street_policy`` matrices do not stream yet and are rejected.
-        ``resume=True`` continues a matching partial directory run
-        exactly as ``travel_cost_table`` does.
+        one batch — never the whole constructor result. With
+        ``arrival=`` the batches slice the **destination axis** instead
+        (the fan-out axis, exactly as ``chunk=``), single-deadline and
+        ``arrival_time_window=`` forms alike, so shards order
+        destination-major; rows align by key, never by position. The
+        resume manifest fingerprints the complete time query — axis,
+        moment, window, and the resolved percentiles — so a resume
+        differing in any of them refuses instead of mixing shards.
+        ``output=`` selects the form by suffix exactly as
+        ``travel_cost_table`` does and the return value is a
+        :class:`cafein.StreamingResult`. ``from_id``/``to_id`` are
+        dictionary-encoded over the shared id domains; a windowed
+        matrix streams its percentile columns. ``street_policy``
+        matrices do not stream yet and are rejected. ``resume=True``
+        continues a matching partial directory run exactly as
+        ``travel_cost_table`` does.
         """
         if not _is_street_network(network):
             (
@@ -1254,23 +1262,46 @@ class TravelTimeMatrix(pd.DataFrame):
         )
 
         output_time_units = validated_output_time_units(output_time_units)
-        date, departure = (
-            (None, None) if departure is None else departure_parts(departure)
-        )
+        if departure is not None and arrival is not None:
+            raise ValueError("give exactly one of departure= or arrival=")
+        arrive_by = arrival is not None
+        from cafein._units import window_axis
+
+        raw_window = window_axis(arrive_by, departure_time_window, arrival_time_window)
+        if arrive_by:
+            from cafein._units import arrival_parts
+
+            if _is_street_network(network):
+                raise ValueError(
+                    "arrival applies to transit; a StreetNetwork matrix "
+                    "has no timetable axis"
+                )
+            if router == "tbtr":
+                raise ValueError(
+                    "router='tbtr' does not serve arrival=; the reverse "
+                    "search rides RAPTOR"
+                )
+            if street_policy is not None:
+                raise ValueError(
+                    "street_policy= (a traveler's street bridge included) "
+                    "does not combine with arrival= yet"
+                )
+            date, departure = arrival_parts(arrival)
+        if not arrive_by:
+            date, departure = (
+                (None, None) if departure is None else departure_parts(departure)
+            )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         max_transfers = max_rides - 1
-        window = duration_seconds("departure_time_window", departure_time_window)
+        window = duration_seconds(
+            "arrival_time_window" if arrive_by else "departure_time_window",
+            raw_window,
+        )
         max_walking_time = duration_seconds("max_walking_time", max_walking_time)
         max_street_time = duration_seconds("max_street_time", max_street_time)
         max_snap_distance = snap_distance
         size = _stream_size(batch_size, resume)
-        if arrival is not None or arrival_time_window is not None:
-            raise NotImplementedError(
-                "arrive-by matrices do not stream yet; compute the frame "
-                "with the constructor (chunk= slices the destination axis "
-                "for batch jobs)"
-            )
         if street_policy is not None:
             raise NotImplementedError(
                 "street_policy matrices do not stream yet; compute the "
@@ -1352,6 +1383,7 @@ class TravelTimeMatrix(pd.DataFrame):
             pyarrow=pyarrow,
             resume=resume,
             output_time_units=output_time_units,
+            arrive_by=arrive_by,
         )
 
 
@@ -2297,13 +2329,16 @@ def _stream_run(
     pyarrow,
     resume=False,
     dictionary_columns=("from_id", "to_id"),
+    slice_axis="from",
 ):
     """The shared streaming driver: fingerprint, claim, batch, write.
 
     ``make_batch(rows, shared_from, shared_to)`` returns one batch's
-    Arrow table for the origin slice ``rows`` — inputs must already be
-    frozen by the caller. Used by ``travel_cost_table`` and the matrix
-    computers' ``to_parquet`` classmethods identically. With
+    Arrow table for the sliced-axis slice ``rows`` — the origins by
+    default, the destinations with ``slice_axis="to"`` (the arrive-by
+    fan-out axis) — inputs must already be frozen by the caller. Used
+    by ``travel_cost_table`` and the matrix computers' ``to_parquet``
+    classmethods identically. With
     ``resume=True`` (directory form) the completed shards of a matching
     partial run are skipped — their batches never compute — and only
     the remainder routes.
@@ -2312,7 +2347,7 @@ def _stream_run(
 
     shared_from = pyarrow.array(from_ids, type=pyarrow.string())
     shared_to = pyarrow.array(to_ids, type=pyarrow.string())
-    count = len(from_ids)
+    count = len(from_ids) if slice_axis == "from" else len(to_ids)
     batches = max(1, -(-count // size))
     fingerprint = _streaming.fingerprint(
         operation,
@@ -2345,7 +2380,10 @@ def _stream_run(
         "fingerprint": fingerprint,
         "fingerprint_version": _streaming.FINGERPRINT_VERSION,
         "batch_size": size,
+        # Historically named; the sliced axis's length, whichever axis
+        # batches (recorded beside it).
         "origin_count": count,
+        "batch_axis": slice_axis,
     }
     shared = {"from_id": shared_from, "to_id": shared_to}
     return _streaming.write_stream(
@@ -2559,14 +2597,17 @@ def _stream_transit_time(
     pyarrow,
     resume=False,
     output_time_units="minutes",
+    arrive_by=False,
 ):
-    """The transit time matrix streamed in origin batches —
-    `TravelTimeMatrix.to_parquet`'s transit arm."""
+    """The transit time matrix streamed in sliced-axis batches — the
+    origins on the departure axis, the destinations (the fan-out axis)
+    with ``arrive_by`` — `TravelTimeMatrix.to_parquet`'s transit
+    arm."""
     from cafein._units import travel_time_output
     from cafein.network import _window_percentiles
 
     if date is None or departure is None:
-        raise TypeError("TravelTimeMatrix requires departure")
+        raise TypeError("TravelTimeMatrix requires departure or arrival")
     if router not in ("auto", "raptor", "tbtr"):
         raise ValueError(f"router must be 'auto', 'raptor', or 'tbtr', not {router!r}")
     # Frozen once: a one-shot percentile iterable drains here, and every
@@ -2577,9 +2618,19 @@ def _stream_transit_time(
     exclude_stops = list(id_sequence("exclude_stops", exclude_stops))
     if chunk is not None:
         chunk = tuple(int(part) for part in chunk)
-    from_ids, to_ids, points, _ = _cost_endpoints(network, origins, destinations, chunk)
+    from_ids, to_ids, points, _ = _cost_endpoints(
+        network, origins, destinations, None if arrive_by else chunk
+    )
     if points is None and destinations is not None:
         raise ValueError("destinations apply to point origins")
+    if arrive_by and chunk is not None:
+        # The arrive-by chunk slices the destination axis, exactly as
+        # the constructor's; batches then stream within the chunk.
+        columns_keep = _chunk_slice(len(to_ids), chunk)
+        to_ids = to_ids[columns_keep]
+        if points is not None:
+            origin_points_all, destination_points_all = points
+            points = (origin_points_all, destination_points_all[columns_keep])
     if points is None:
         destination_frame = None
     else:
@@ -2594,6 +2645,7 @@ def _stream_transit_time(
     parameters = {
         "date": date,
         "departure": departure,
+        "time_axis": "arrival" if arrive_by else "departure",
         "max_transfers": max_transfers,
         "window": window,
         "percentiles": resolved_percentiles,
@@ -2609,6 +2661,8 @@ def _stream_transit_time(
     }
 
     def make_batch(rows, shared_from, shared_to):
+        if arrive_by:
+            return make_arrival_batch(rows, shared_from, shared_to)
         if points is None:
             origins_batch = list(from_ids[rows])
             destinations_batch = None
@@ -2672,6 +2726,94 @@ def _stream_transit_time(
             }
         )
 
+    def make_arrival_batch(rows, shared_from, shared_to):
+        unreachable = np.iinfo(np.uint32).max
+        if points is None:
+            if resolved_percentiles is None:
+                matrix = network._core._arrive_by_time_matrix(
+                    list(from_ids),
+                    list(to_ids[rows]),
+                    date,
+                    departure,
+                    max_transfers,
+                    exclude_routes,
+                    exclude_trips,
+                    exclude_stops,
+                )
+            else:
+                matrix = network._core._arrive_by_time_percentiles(
+                    list(from_ids),
+                    list(to_ids[rows]),
+                    date,
+                    departure,
+                    window,
+                    resolved_percentiles,
+                    max_transfers,
+                    exclude_routes,
+                    exclude_trips,
+                    exclude_stops,
+                )
+        else:
+            origin_points, destination_points = points
+            matrix, _, _, batch_percentiles = network._time_matrix_with_ids(
+                _point_frame(from_ids, origin_points),
+                date,
+                departure,
+                max_transfers,
+                destinations=_point_frame(to_ids[rows], destination_points[rows]),
+                window=window,
+                percentiles=resolved_percentiles,
+                confidence=None,
+                chunk=None,
+                router=router,
+                exclude_routes=exclude_routes,
+                exclude_trips=exclude_trips,
+                exclude_stops=exclude_stops,
+                walking_speed_kmph=walking_speed_kmph,
+                max_walking_time=max_walking_time,
+                max_snap_distance=max_snap_distance,
+                arrive_by=True,
+            )
+            if batch_percentiles != resolved_percentiles:
+                raise ValueError(
+                    "a batch resolved different percentiles than the frozen "
+                    "query; the stream never re-resolves"
+                )
+        matrix = np.asarray(matrix)
+        if resolved_percentiles is None:
+            cell_rows, cell_columns = np.nonzero(matrix != unreachable)
+            values = {
+                "travel_time": pyarrow.array(
+                    travel_time_output(
+                        matrix[cell_rows, cell_columns], output_time_units
+                    )
+                )
+            }
+        else:
+            cell_rows, cell_columns = np.nonzero((matrix != unreachable).any(axis=2))
+            spread = matrix[cell_rows, cell_columns, :].astype(float)
+            spread[spread == unreachable] = np.nan
+            values = {
+                f"travel_time_p{percentile:g}": pyarrow.array(
+                    travel_time_output(spread[:, index], output_time_units)
+                )
+                for index, percentile in enumerate(resolved_percentiles)
+            }
+        return pyarrow.table(
+            {
+                "from_id": pyarrow.DictionaryArray.from_arrays(
+                    pyarrow.array(cell_rows), shared_from
+                ),
+                "to_id": pyarrow.DictionaryArray.from_arrays(
+                    pyarrow.array(
+                        cell_columns + rows.start if rows.start else cell_columns
+                    ),
+                    shared_to,
+                ),
+                **values,
+            }
+        )
+
     return _stream_run(
         operation,
         network,
@@ -2685,6 +2827,7 @@ def _stream_transit_time(
         make_batch,
         pyarrow,
         resume=resume,
+        slice_axis="to" if arrive_by else "from",
     )
 
 
