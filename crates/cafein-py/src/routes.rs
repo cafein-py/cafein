@@ -323,10 +323,15 @@ impl TransportNetwork {
         transfer_mode: Option<(String, f64)>,
         router: &str,
     ) -> PyResult<Vec<Vec<Option<u32>>>> {
-        if transfer_mode.is_some() && !exclude_stops.is_empty() {
+        if transfer_mode
+            .as_ref()
+            .is_some_and(|binding| !crate::network::walking_class(&binding.0))
+            && !exclude_stops.is_empty()
+        {
             // A rental-bearing merged edge hides its pickup and drop
-            // stops inside the token; the engine's exclusion checks see
-            // only the edge's endpoints.
+            // stops inside the token; a walking-class set's tokens have
+            // no interiors, so its endpoints are exclusion-checked like
+            // any transfer edge and the combination is sound.
             return Err(PyValueError::new_err(
                 "stop exclusions do not combine with street_policy \
                  transfers= yet; a rental transfer's interior stops are \
@@ -427,10 +432,15 @@ impl TransportNetwork {
         geometries: bool,
         transfer_mode: Option<(String, f64)>,
     ) -> PyResult<Py<PyList>> {
-        if transfer_mode.is_some() && !exclude_stops.is_empty() {
+        if transfer_mode
+            .as_ref()
+            .is_some_and(|binding| !crate::network::walking_class(&binding.0))
+            && !exclude_stops.is_empty()
+        {
             // A rental-bearing merged edge hides its pickup and drop
-            // stops inside the token; the engine's exclusion checks see
-            // only the edge's endpoints.
+            // stops inside the token; a walking-class set's tokens have
+            // no interiors, so its endpoints are exclusion-checked like
+            // any transfer edge and the combination is sound.
             return Err(PyValueError::new_err(
                 "stop exclusions do not combine with street_policy \
                  transfers= yet; a rental transfer's interior stops are \
@@ -482,9 +492,15 @@ impl TransportNetwork {
         exclude_trips: Vec<String>,
         exclude_stops: Vec<String>,
     ) -> PyResult<Py<PyDict>> {
-        if transfer_mode.is_some() && !exclude_stops.is_empty() {
-            // As on the route path: a merged edge's interior stops are
-            // hidden in the token, so the engine cannot exclude them.
+        if transfer_mode
+            .as_ref()
+            .is_some_and(|binding| !crate::network::walking_class(&binding.0))
+            && !exclude_stops.is_empty()
+        {
+            // A rental-bearing merged edge hides its pickup and drop
+            // stops inside the token; a walking-class set's tokens have
+            // no interiors, so its endpoints are exclusion-checked like
+            // any transfer edge and the combination is sound.
             return Err(PyValueError::new_err(
                 "stop exclusions do not combine with street_policy \
                  transfers= yet; a rental transfer's interior stops are \

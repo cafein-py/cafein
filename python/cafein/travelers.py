@@ -38,10 +38,12 @@ class TravelerProfile:
     gradients capped on DEM builds — via an internally synthesized
     street policy (an explicit ``street_policy=`` beside it is
     rejected, as is ``walking_speed_kmph``: the profile's speed is
-    fixed). Mid-journey transfers ride the installed walking closure
-    with excluded stops refused at the endpoints; a transfer's walked
-    path may itself cross stairs until exclusion-aware wheelchair
-    transfer sets arrive. Surfaces without street-policy support
+    fixed). Mid-journey transfers ride the computed wheelchair
+    transfer set when the network carries one — accessible end to end,
+    excluded stops refused at the endpoints — and otherwise the
+    installed walking closure with excluded endpoints refused, whose
+    walked paths may cross stairs; compute the wheelchair set for the
+    fully accessible configuration. Surfaces without street-policy support
     refuse the wheelchair traveler on point queries rather than
     walking silently, and stop queries everywhere stay
     timetable-only.
@@ -122,13 +124,17 @@ def folded_street_policy(
 
     A non-wheelchair traveler (or none) passes the policy through. A
     wheelchair traveler synthesizes the wheelchair walking-class policy:
-    access and egress at the walking budget. Mid-journey transfers ride
-    the installed walking closure with the traveler's excluded stops
-    refused at the transfer endpoints; the documented gap is that a
-    transfer's walked path itself may cross stairs — exclusion-aware
-    wheelchair transfer sets are the follow-up that closes it, and
-    ``compute_mode_transfers("wheelchair", ...)`` already serves
-    exclusion-free explicit policies.
+    access and egress at the walking budget, and — when the network
+    carries a wheelchair mode-transfer set
+    (``compute_mode_transfers("wheelchair", ...)``) — a matching
+    transfer grant at the set's own budget, so mid-journey transfers
+    ride wheelchair-profile movements with the traveler's excluded
+    stops refused at the endpoints (a walking-class set has no interior
+    stops, so exclusions combine soundly). Without a computed set,
+    transfers ride the installed walking closure with excluded
+    endpoints refused; that closure's walked paths may cross stairs,
+    so computing the wheelchair set is the accessible-end-to-end
+    configuration.
     Passing an explicit ``street_policy`` beside such a traveler is a
     conflict (a policy names its own modes), a network built without
     the wheelchair street mode raises with a rebuild hint, and
@@ -164,9 +170,14 @@ def folded_street_policy(
 
     seconds = duration_seconds("max_walking_time", max_walking_time)
     budget = float(_streets.MAX_ACCESS_EGRESS_TIME if seconds is None else seconds)
+    transfers = None
+    binding = network._core._mode_transfer_binding
+    if binding is not None and binding[0] == "wheelchair":
+        transfers = {"wheelchair": binding[1]}
     policy = StreetLegPolicy(
         access={"wheelchair": budget},
         egress={"wheelchair": budget},
+        transfers=transfers,
     )
     return policy, None
 

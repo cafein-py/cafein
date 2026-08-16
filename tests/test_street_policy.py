@@ -2788,3 +2788,76 @@ def test_wheelchair_pareto_access_rides_the_mode(multimodal_network):
     ends = frame[frame["leg_type"].isin(["access", "egress"])]
     assert not ends.empty
     assert (ends["mode"] == "wheelchair").all()
+
+
+def test_rental_transfer_grants_still_reject_exclusions(multimodal_transfers_network):
+    # The narrowing is walking-class only: a rental-bearing binding
+    # keeps the rejection, its tokens hide interior stops.
+    pytest.importorskip("cafein._cafein")
+    policy = StreetLegPolicy(
+        access={"walk": 900},
+        egress={"walk": 899},
+        transfers={"e_scooter": 600.0},
+        vehicles={"e_scooter": shared()},
+    )
+    with pytest.raises(ValueError, match="not exclusion-aware"):
+        multimodal_transfers_network.route_between_coordinates(
+            (60.1580, 24.9350),
+            (60.1870, 24.9610),
+            "2022-02-22 08:30:00",
+            street_policy=policy,
+            exclude_stops=["1020453"],
+        )
+
+
+def test_the_wheelchair_bridge_rides_the_computed_transfer_set(
+    wheelchair_transfers_network,
+):
+    # With the set computed, the bridge grants it: the traveler's
+    # journeys carry wheelchair transfer legs, equal the explicit
+    # granted policy, and a manual exclusion silences an endpoint.
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelerProfile
+
+    network = wheelchair_transfers_network
+    network.compute_mode_transfers("wheelchair", 10)
+    profile = TravelerProfile(wheelchair=True)
+    origin, destination = (60.1580, 24.9350), (60.1870, 24.9610)
+    bridged = network.route_between_coordinates(
+        origin, destination, "2022-02-22 08:30:00", traveler=profile
+    )
+    ridden = [
+        leg
+        for journey in bridged
+        for leg in journey["legs"]
+        if leg["type"] == "transfer" and leg.get("mode") == "wheelchair"
+    ]
+    assert ridden
+    from cafein.streets import MAX_ACCESS_EGRESS_TIME
+
+    _, trips, stops = profile._resolve(network)
+    explicit = network.route_between_coordinates(
+        origin,
+        destination,
+        "2022-02-22 08:30:00",
+        exclude_stops=stops,
+        exclude_trips=trips,
+        street_policy=StreetLegPolicy(
+            access={"wheelchair": MAX_ACCESS_EGRESS_TIME},
+            egress={"wheelchair": MAX_ACCESS_EGRESS_TIME},
+            transfers={"wheelchair": 600.0},
+        ),
+    )
+    assert bridged == explicit
+    # A personal exclusion of the ridden endpoint reroutes around it.
+    endpoint = ridden[0]["from_stop"]
+    constrained = network.route_between_coordinates(
+        origin,
+        destination,
+        "2022-02-22 08:30:00",
+        traveler=TravelerProfile(wheelchair=True, exclude_stops=[endpoint]),
+    )
+    for journey in constrained:
+        for leg in journey["legs"]:
+            if leg["type"] == "transfer":
+                assert endpoint not in (leg["from_stop"], leg["to_stop"])
