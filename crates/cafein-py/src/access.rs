@@ -320,6 +320,67 @@ type FieldArrays<'py> = (
 
 #[pymethods]
 impl TransportNetwork {
+    /// The profile-aware catchment field: the multi-seed directed
+    /// spread over the multimodal graph under `mode`'s compiled
+    /// profile, seeded at the origin (profile-aware snap) and at each
+    /// stop's mode link with its transit arrival cost. The wheelchair
+    /// arm of `_catchment_walk_field`. Internal.
+    fn _catchment_directed_field<'py>(
+        &self,
+        py: Python<'py>,
+        origin: (f64, f64),
+        stop_costs: Vec<(u32, f64)>,
+        mode: &str,
+        cutoff_seconds: f64,
+        max_snap_distance: f64,
+    ) -> PyResult<FieldArrays<'py>> {
+        let profile = self.multimodal_profile(mode)?;
+        let network = self.multimodal.as_ref().ok_or_else(|| {
+            PyValueError::new_err(
+                "no multimodal street graph is installed; build with street_modes=",
+            )
+        })?;
+        let links = self.mode_link_targets(network, profile.definition.mode.bit());
+        for &(stop, _) in &stop_costs {
+            if stop as usize >= links.len() {
+                return Err(PyValueError::new_err(format!(
+                    "stop index {stop} is outside the network's stop range"
+                )));
+            }
+        }
+        let field: Vec<(f64, f64, f64)> = py.allow_threads(|| {
+            let mut seeds = Vec::with_capacity(stop_costs.len() + 1);
+            let (latitude, longitude) = origin;
+            if let Some(snap) =
+                network.snap_for_profile(latitude, longitude, max_snap_distance, &profile)
+            {
+                seeds.push((snap, 0.0));
+            }
+            for &(stop, seconds) in &stop_costs {
+                if let Some(snap) = links[stop as usize] {
+                    seeds.push((snap, seconds));
+                }
+            }
+            let positions = network.vertex_positions();
+            network
+                .directed_field(&seeds, &profile, cutoff_seconds)
+                .into_iter()
+                .filter_map(|(vertex, seconds)| {
+                    let (lon, lat) = positions[vertex as usize];
+                    (lon.is_finite() && lat.is_finite()).then_some((lat, lon, seconds))
+                })
+                .collect()
+        });
+        let lats: Vec<f64> = field.iter().map(|&(lat, _, _)| lat).collect();
+        let lons: Vec<f64> = field.iter().map(|&(_, lon, _)| lon).collect();
+        let seconds: Vec<f64> = field.iter().map(|&(_, _, s)| s).collect();
+        Ok((
+            lats.into_pyarray(py),
+            lons.into_pyarray(py),
+            seconds.into_pyarray(py),
+        ))
+    }
+
     /// The door-to-door walking field of a catchment: reached street
     /// vertices as `(latitudes, longitudes, seconds)` arrays, seeded
     /// from the snapped origin at zero seconds and every listed

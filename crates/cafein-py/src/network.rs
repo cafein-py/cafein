@@ -2405,7 +2405,7 @@ impl TransportNetwork {
     }
 
     /// Each stop's link snap for a mode bit, aligned with the stop indices.
-    fn mode_link_targets(&self, network: &StreetNetwork, bit: u8) -> Vec<Option<Snap>> {
+    pub(crate) fn mode_link_targets(&self, network: &StreetNetwork, bit: u8) -> Vec<Option<Snap>> {
         self.multimodal_stop_links(network)
             .iter()
             .map(|candidates| {
