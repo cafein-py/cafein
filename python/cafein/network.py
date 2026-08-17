@@ -2904,6 +2904,13 @@ class TransportNetwork:
                 f"router must be 'auto', 'raptor', or 'tbtr', not {router!r}"
             )
         percentiles = _window_percentiles(window, percentiles, confidence)
+        # Stop-id sequences normalise to the engines' string ids here;
+        # integer inputs round-trip back to their dtype at the frame
+        # boundary.
+        if from_stops is not None and not _is_point_frame(from_stops):
+            from_stops = [str(stop) for stop in from_stops]
+        if destinations is not None and not _is_point_frame(destinations):
+            destinations = [str(stop) for stop in destinations]
         if _is_point_frame(from_stops):
             from_ids, origin_points = _point_list(from_stops, "origins")
             if destinations is None:
