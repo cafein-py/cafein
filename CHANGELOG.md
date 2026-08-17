@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.0 — 2026-08-17
 
 - Emissions and money deadlines: the cost surfaces —
   `TravelCostMatrix`, `travel_cost_table` (streaming included), and
