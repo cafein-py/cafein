@@ -583,41 +583,48 @@ def _accessibility_columns(
     label,
     _resolved_costs=None,
     arrive_by=False,
+    _surface=None,
 ):
     """The long accessibility frame for `origins` — the computation
     the constructor and the streaming classmethod share, inputs
     already validated and converted."""
     from cafein import _cafein
 
-    matrix, from_ids, _to_ids, resolved_percentiles = _resolved_cost_matrix(
-        network,
-        origins,
-        destinations,
-        date,
-        departure,
-        cost,
-        window,
-        percentiles,
-        confidence,
-        factors,
-        components,
-        fares,
-        max_transfers,
-        max_travel_time,
-        router,
-        chunk,
-        transport_mode,
-        max_street_time,
-        max_snap_distance,
-        exclude_routes,
-        exclude_trips,
-        exclude_stops,
-        walking_speed_kmph,
-        max_walking_time,
-        label=label,
-        _resolved_costs=_resolved_costs,
-        arrive_by=arrive_by,
-    )
+    if _surface is not None:
+        # A precomputed cost surface (the arrive-by streamer computes
+        # its destination fan-out once and slices origin batches from
+        # it) skips the per-batch engine dispatch entirely.
+        matrix, from_ids, _to_ids, resolved_percentiles = _surface
+    else:
+        matrix, from_ids, _to_ids, resolved_percentiles = _resolved_cost_matrix(
+            network,
+            origins,
+            destinations,
+            date,
+            departure,
+            cost,
+            window,
+            percentiles,
+            confidence,
+            factors,
+            components,
+            fares,
+            max_transfers,
+            max_travel_time,
+            router,
+            chunk,
+            transport_mode,
+            max_street_time,
+            max_snap_distance,
+            exclude_routes,
+            exclude_trips,
+            exclude_stops,
+            walking_speed_kmph,
+            max_walking_time,
+            label=label,
+            _resolved_costs=_resolved_costs,
+            arrive_by=arrive_by,
+        )
 
     flat_values = [float(value) for value in values.ravel()]
 
@@ -958,7 +965,13 @@ class Accessibility(pd.DataFrame):
         the form by suffix exactly as ``travel_cost_table`` does and
         the return value is a :class:`cafein.StreamingResult`;
         ``resume=True`` continues a matching partial directory run
-        with the same manifest contract.
+        with the same manifest contract. With ``arrival=`` the
+        destination fan-out runs once up front and origin batches
+        stream from the resulting (origins × destinations) duration
+        surface — skinny by construction, so its peak memory is that
+        surface plus one batch — and the manifest fingerprints the
+        complete time query, refusing a resume that differs in axis,
+        moment, window, or percentiles.
         """
         if hasattr(network, "route_between_stops"):
             (
@@ -985,20 +998,25 @@ class Accessibility(pd.DataFrame):
 
         if hasattr(network, "route_between_stops") and _points(origins):
             refuse_wheelchair_streets(traveler, "Accessibility.to_parquet")
-        from cafein._units import departure_parts, duration_seconds
+        from cafein._units import duration_seconds
 
-        if arrival is not None or arrival_time_window is not None:
-            raise NotImplementedError(
-                "arrive-by accessibility does not stream yet; compute the "
-                "frame with the constructor (chunk= keeps slicing origins)"
-            )
-        date, departure = (
-            (None, None) if departure is None else departure_parts(departure)
+        date, departure, arrive_by, raw_window = _product_time_axis(
+            departure,
+            arrival,
+            cost=cost,
+            window=departure_time_window,
+            router=router,
+            arrival_window=arrival_time_window,
+            percentiles=percentiles,
+            confidence=confidence,
         )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         max_transfers = max_rides - 1
-        window = duration_seconds("departure_time_window", departure_time_window)
+        window = duration_seconds(
+            "arrival_time_window" if arrive_by else "departure_time_window",
+            raw_window,
+        )
         max_walking_time = duration_seconds("max_walking_time", max_walking_time)
         max_street_time = duration_seconds("max_street_time", max_street_time)
         if max_travel_time is not None and cost not in ("emissions", "money"):
@@ -1133,6 +1151,7 @@ class Accessibility(pd.DataFrame):
         parameters = {
             "date": date,
             "departure": departure,
+            "time_axis": "arrival" if arrive_by else "departure",
             "cost": cost,
             "window": window,
             "budgets": budgets,
@@ -1159,6 +1178,48 @@ class Accessibility(pd.DataFrame):
             "fares": None if resolved_costs is None else resolved_costs[1],
         }
         per_origin = len(budgets) * len(labels)
+        surface = None
+        if arrive_by:
+            # The destination fan-out runs ONCE; origin batches then
+            # stream from the skinny (origins × destinations) surface
+            # instead of re-running every destination per batch.
+            surface_origins = (
+                list(from_ids)
+                if origin_points is None
+                else _point_frame(from_ids, origin_points)
+            )
+            surface_destinations = (
+                to_ids if to_points is None else _point_frame(to_ids, to_points)
+            )
+            surface = _resolved_cost_matrix(
+                network,
+                surface_origins,
+                surface_destinations,
+                date,
+                departure,
+                cost,
+                window,
+                resolved_percentiles,
+                None,
+                factors,
+                components,
+                fares,
+                max_transfers,
+                max_travel_time,
+                router,
+                None,
+                transport_mode,
+                max_street_time,
+                max_snap_distance,
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                walking_speed_kmph,
+                max_walking_time,
+                label="Accessibility.to_parquet",
+                _resolved_costs=resolved_costs,
+                arrive_by=True,
+            )
 
         def make_batch(rows, shared_from, shared_to):
             if origin_points is None:
@@ -1169,6 +1230,15 @@ class Accessibility(pd.DataFrame):
                 batch_destinations = to_ids
             else:
                 batch_destinations = _point_frame(to_ids, to_points)
+            batch_surface = None
+            if surface is not None:
+                matrix, surface_from, surface_to, surface_pct = surface
+                batch_surface = (
+                    matrix[rows],
+                    list(surface_from[rows]),
+                    surface_to,
+                    surface_pct,
+                )
             frame = _accessibility_columns(
                 network,
                 batch_origins,
@@ -1202,6 +1272,8 @@ class Accessibility(pd.DataFrame):
                 decay_param,
                 label="Accessibility.to_parquet",
                 _resolved_costs=resolved_costs,
+                arrive_by=arrive_by,
+                _surface=batch_surface,
             )
             block = np.repeat(np.arange(rows.start, rows.stop), per_origin)
             planes = 1 if resolved_percentiles is None else len(resolved_percentiles)

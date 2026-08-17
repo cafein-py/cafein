@@ -316,9 +316,13 @@ def test_matrix_rejections_on_the_arrival_axis(network):
         )
     with pytest.raises(ValueError, match="router='tbtr'"):
         TravelTimeMatrix(network, origins=[KORSO], arrival=DEADLINE, router="tbtr")
-    with pytest.raises(NotImplementedError, match="do not stream"):
+    with pytest.raises(ValueError, match="router='tbtr'"):
         TravelTimeMatrix.to_parquet(
-            network, origins=[KORSO], arrival=DEADLINE, output="/tmp/never.parquet"
+            network,
+            origins=[KORSO],
+            arrival=DEADLINE,
+            router="tbtr",
+            output="/tmp/never.parquet",
         )
 
 
@@ -751,3 +755,147 @@ def test_confidence_maps_to_the_symmetric_arrival_percentiles(network):
         "travel_time_p50",
         "travel_time_p90",
     ]
+
+
+def test_streamed_arrive_by_matrix_equals_the_constructor(network, tmp_path):
+    import pandas as pd
+
+    from cafein import TravelTimeMatrix
+    from test_streaming import _read_aligned
+
+    chunk = (stop_chunk(network, KAPYLA, 400), 400)
+    frame = TravelTimeMatrix(
+        network,
+        origins=[KORSO, "1020453"],
+        arrival=DEADLINE,
+        chunk=chunk,
+        output_time_units="seconds",
+    )
+    result = TravelTimeMatrix.to_parquet(
+        network,
+        origins=[KORSO, "1020453"],
+        arrival=DEADLINE,
+        chunk=chunk,
+        output=tmp_path / "arrive.parquet",
+        batch_size=7,
+        output_time_units="seconds",
+    )
+    # The destination block splits across batches mid-frame. The
+    # arrive-by stream is destination-major, so rows align by key.
+    assert result.batches >= 3
+    read, expected = _read_aligned(tmp_path / "arrive.parquet", frame)
+    keys = ["from_id", "to_id"]
+    read = read.sort_values(keys).reset_index(drop=True)
+    expected = expected.sort_values(keys).reset_index(drop=True)
+    pd.testing.assert_frame_equal(read, expected)
+
+    windowed = TravelTimeMatrix(
+        network,
+        origins=[KORSO, "1020453"],
+        arrival=WINDOW_START,
+        arrival_time_window=10,
+        percentiles=[50],
+        chunk=chunk,
+        output_time_units="seconds",
+    )
+    TravelTimeMatrix.to_parquet(
+        network,
+        origins=[KORSO, "1020453"],
+        arrival=WINDOW_START,
+        arrival_time_window=10,
+        percentiles=[50],
+        chunk=chunk,
+        output=tmp_path / "windowed.parquet",
+        batch_size=7,
+        output_time_units="seconds",
+    )
+    read, expected = _read_aligned(tmp_path / "windowed.parquet", windowed)
+    read = read.sort_values(keys).reset_index(drop=True)
+    expected = expected.sort_values(keys).reset_index(drop=True)
+    pd.testing.assert_frame_equal(read, expected)
+
+
+def test_streamed_arrive_by_accessibility_equals_the_constructor(network, tmp_path):
+    import pandas as pd
+
+    from cafein import Accessibility
+
+    origins = [KORSO, "1020453"]
+    destinations = [KAPYLA, "1070422"]
+    frame = Accessibility(
+        network,
+        origins,
+        destinations,
+        arrival=WINDOW_START,
+        arrival_time_window=30,
+        percentiles=[50],
+        budgets=[30, 60],
+    )
+    Accessibility.to_parquet(
+        network,
+        origins,
+        destinations,
+        arrival=WINDOW_START,
+        arrival_time_window=30,
+        percentiles=[50],
+        budgets=[30, 60],
+        output=tmp_path / "accessibility.parquet",
+        batch_size=1,
+    )
+    import pyarrow.parquet as parquet
+
+    read = parquet.read_table(tmp_path / "accessibility.parquet").to_pandas()
+    keys = ["from_id", "opportunity", "budget", "percentile"]
+    read = read[list(frame.columns)].astype({"from_id": str})
+    read = read.sort_values(keys).reset_index(drop=True)
+    expected = pd.DataFrame(frame).astype({"from_id": str})
+    expected = expected.sort_values(keys).reset_index(drop=True)
+    pd.testing.assert_frame_equal(read, expected)
+
+    # The single-deadline form streams identically.
+    single = Accessibility(
+        network, origins, destinations, arrival=DEADLINE, budgets=[30, 60]
+    )
+    Accessibility.to_parquet(
+        network,
+        origins,
+        destinations,
+        arrival=DEADLINE,
+        budgets=[30, 60],
+        output=tmp_path / "single.parquet",
+        batch_size=1,
+    )
+    read = parquet.read_table(tmp_path / "single.parquet").to_pandas()
+    keys = ["from_id", "opportunity", "budget"]
+    read = read[list(single.columns)].astype({"from_id": str})
+    read = read.sort_values(keys).reset_index(drop=True)
+    expected = pd.DataFrame(single).astype({"from_id": str})
+    expected = expected.sort_values(keys).reset_index(drop=True)
+    pd.testing.assert_frame_equal(read, expected)
+
+
+def test_arrive_by_resume_refuses_a_different_time_query(network, tmp_path):
+    from cafein import TravelTimeMatrix
+
+    chunk = (stop_chunk(network, KAPYLA, 400), 400)
+    common = dict(
+        origins=[KORSO],
+        chunk=chunk,
+        batch_size=7,
+        output=tmp_path / "run",
+        output_time_units="seconds",
+    )
+    TravelTimeMatrix.to_parquet(network, arrival=DEADLINE, **common)
+    # The other axis at the same clock refuses; so does the same
+    # deadline under a different window.
+    with pytest.raises(ValueError, match="fingerprint|manifest"):
+        TravelTimeMatrix.to_parquet(network, departure=DEADLINE, resume=True, **common)
+    with pytest.raises(ValueError, match="fingerprint|manifest"):
+        TravelTimeMatrix.to_parquet(
+            network,
+            arrival=DEADLINE,
+            arrival_time_window=10,
+            percentiles=[50],
+            resume=True,
+            **common,
+        )
