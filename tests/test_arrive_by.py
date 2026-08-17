@@ -899,3 +899,151 @@ def test_arrive_by_resume_refuses_a_different_time_query(network, tmp_path):
             resume=True,
             **common,
         )
+
+
+def test_the_nearest_fast_path_matches_the_fan_out(network):
+    import pandas as pd
+
+    from cafein import NearestDestinations
+
+    destinations = [KAPYLA, "1070422", "1020453"]
+    fast = NearestDestinations(
+        network,
+        [KORSO, "1020453"],
+        destinations,
+        arrival=DEADLINE,
+        k=1,
+        output_time_units="seconds",
+    )
+    # k=2 rides the per-destination fan-out; its rank-1 rows are the
+    # same query answered the slow way.
+    fanned = NearestDestinations(
+        network,
+        [KORSO, "1020453"],
+        destinations,
+        arrival=DEADLINE,
+        k=2,
+        output_time_units="seconds",
+    )
+    slow = fanned[fanned["rank"] == 1].reset_index(drop=True)
+    pd.testing.assert_frame_equal(fast.reset_index(drop=True), slow)
+
+
+def test_the_nearest_fast_path_matches_on_points(network_with_footpaths):
+    import geopandas as gpd
+    import pandas as pd
+
+    from cafein import NearestDestinations
+
+    origins = gpd.GeoDataFrame(
+        {"id": ["kamppi"]},
+        geometry=gpd.points_from_xy([KAMPPI[1]], [KAMPPI[0]]),
+        crs="EPSG:4326",
+    )
+    destinations = gpd.GeoDataFrame(
+        {"id": ["hakaniemi", "toolo"]},
+        geometry=gpd.points_from_xy([HAKANIEMI[1], 24.9220], [HAKANIEMI[0], 60.1810]),
+        crs="EPSG:4326",
+    )
+    fast = NearestDestinations(
+        network_with_footpaths,
+        origins,
+        destinations,
+        arrival=DEADLINE,
+        k=1,
+        output_time_units="seconds",
+    )
+    fanned = NearestDestinations(
+        network_with_footpaths,
+        origins,
+        destinations,
+        arrival=DEADLINE,
+        k=2,
+        output_time_units="seconds",
+    )
+    slow = fanned[fanned["rank"] == 1].reset_index(drop=True)
+    pd.testing.assert_frame_equal(fast.reset_index(drop=True), slow)
+
+
+def test_tied_destinations_attribute_deterministically(network_with_footpaths):
+    import geopandas as gpd
+
+    from cafein import NearestDestinations
+
+    # Two DISTINCT destinations at the same coordinate: exactly equal
+    # winner durations. The lower-position destination wins, and
+    # repeated runs agree.
+    origins = gpd.GeoDataFrame(
+        {"id": ["kamppi"]},
+        geometry=gpd.points_from_xy([KAMPPI[1]], [KAMPPI[0]]),
+        crs="EPSG:4326",
+    )
+    destinations = gpd.GeoDataFrame(
+        {"id": ["beta", "alpha"]},
+        geometry=gpd.points_from_xy(
+            [HAKANIEMI[1], HAKANIEMI[1]], [HAKANIEMI[0], HAKANIEMI[0]]
+        ),
+        crs="EPSG:4326",
+    )
+    first = NearestDestinations(
+        network_with_footpaths, origins, destinations, arrival=DEADLINE, k=1
+    )
+    second = NearestDestinations(
+        network_with_footpaths, origins, destinations, arrival=DEADLINE, k=1
+    )
+    assert first.equals(second)
+    # "beta" is listed first: position, never name, breaks the tie.
+    assert list(first["destination_id"]) == ["beta"]
+
+
+def test_aliased_stop_destinations_tie_to_the_first_listing(network):
+    import pandas as pd
+
+    from cafein import NearestDestinations
+
+    # The same stop listed twice as two destinations: an exact tie the
+    # fan-out and the fast path must resolve identically, and an
+    # origin that IS the destination answers itself at zero.
+    fast = NearestDestinations(
+        network,
+        [KORSO, KAPYLA],
+        [KAPYLA, KAPYLA],
+        arrival=DEADLINE,
+        k=1,
+        output_time_units="seconds",
+    )
+    fanned = NearestDestinations(
+        network,
+        [KORSO, KAPYLA],
+        [KAPYLA, KAPYLA],
+        arrival=DEADLINE,
+        k=2,
+        output_time_units="seconds",
+    )
+    slow = fanned[fanned["rank"] == 1].reset_index(drop=True)
+    pd.testing.assert_frame_equal(fast.reset_index(drop=True), slow)
+    assert list(fast[fast["from_id"] == KAPYLA]["cost"]) == [0.0]
+
+
+def test_the_fast_path_keeps_the_street_argument_rejections(network):
+    from cafein import NearestDestinations
+
+    with pytest.raises(ValueError, match="apply to a"):
+        NearestDestinations(
+            network,
+            [KORSO],
+            [KAPYLA],
+            arrival=DEADLINE,
+            k=1,
+            transport_mode="walk",
+        )
+
+
+def test_the_fast_path_validates_the_horizon_like_the_fan_out(network):
+    from cafein import NearestDestinations
+
+    for k in (1, 2):
+        with pytest.raises(ValueError, match="max_cost"):
+            NearestDestinations(
+                network, [KORSO], [KAPYLA], arrival=DEADLINE, k=k, max_cost=0
+            )

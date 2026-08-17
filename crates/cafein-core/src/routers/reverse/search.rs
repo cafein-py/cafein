@@ -36,6 +36,11 @@ struct RLabel {
     /// journey opening, and therefore the only kind that may serve as
     /// an origin-side candidate.
     ride_rooted: bool,
+    /// The egress seed this chain serves — set at seeding, inherited
+    /// unchanged through rides and walks, ignored by dominance and by
+    /// every untagged consumer. Multi-destination queries read it to
+    /// attribute each winner to its destination.
+    seed: u32,
 }
 
 impl RLabel {
@@ -94,6 +99,18 @@ pub(crate) struct ReverseSearch<'a> {
     timetable: &'a Timetable,
     reversed: &'a ReversedTransfers,
     request: &'a Request,
+    /// Tagged multi-destination runs isolate dominance per seed:
+    /// labels of different destinations never prune each other, so
+    /// every destination's own winner survives the shared frontier —
+    /// the fan-out's per-destination answers stay exactly
+    /// reproducible. Untagged runs keep the shared frontier.
+    seed_isolated: bool,
+    /// Optional owner map for tagged runs: `seed_of[i]` tags egress
+    /// entry `i`. Several egress entries (a point destination's many
+    /// street links) share one owner seed, so isolation groups by
+    /// DESTINATION — one isolated frontier per link would blow the
+    /// bags up quadratically. `None` tags each entry by its index.
+    seed_of: Option<&'a [u32]>,
 }
 
 impl<'a> ReverseSearch<'a> {
@@ -106,6 +123,23 @@ impl<'a> ReverseSearch<'a> {
             timetable,
             reversed,
             request,
+            seed_isolated: false,
+            seed_of: None,
+        }
+    }
+
+    pub(crate) fn new_seed_isolated(
+        timetable: &'a Timetable,
+        reversed: &'a ReversedTransfers,
+        request: &'a Request,
+        seed_of: Option<&'a [u32]>,
+    ) -> ReverseSearch<'a> {
+        ReverseSearch {
+            timetable,
+            reversed,
+            request,
+            seed_isolated: true,
+            seed_of,
         }
     }
 
@@ -120,15 +154,17 @@ impl<'a> ReverseSearch<'a> {
     /// dominance; returns whether it was admitted. Exact ties keep the
     /// incumbent: the choice is output-neutral, since the tuples are
     /// equal and journeys never come from the labels themselves.
-    fn insert(state: &mut ReverseState, round: usize, label: RLabel) -> bool {
+    fn insert(&self, state: &mut ReverseState, round: usize, label: RLabel) -> bool {
         let stop = label.stop.0 as usize;
-        if state.bags[round][stop]
-            .iter()
-            .any(|incumbent| dominates(incumbent, &label))
-        {
+        let isolated = self.seed_isolated;
+        if state.bags[round][stop].iter().any(|incumbent| {
+            (!isolated || incumbent.seed == label.seed) && dominates(incumbent, &label)
+        }) {
             return false;
         }
-        state.bags[round][stop].retain(|incumbent| !dominates(&label, incumbent));
+        state.bags[round][stop].retain(|incumbent| {
+            (isolated && incumbent.seed != label.seed) || !dominates(&label, incumbent)
+        });
         state.bags[round][stop].push(label);
         if !state.is_marked[stop] {
             state.is_marked[stop] = true;
@@ -152,14 +188,15 @@ impl<'a> ReverseSearch<'a> {
         // Round 0: pending labels at the egress stops. Walks never
         // extend these (the exact-transfer mirror), so the trailing
         // walk is fixed here once.
-        for &(stop, walk) in &self.request.egress {
+        for (index, &(stop, walk)) in self.request.egress.iter().enumerate() {
+            let seed = self.seed_of.map_or(index as u32, |owners| owners[index]);
             if self.stop_excluded(stop) {
                 continue;
             }
             let Some(departure) = deadline.checked_sub(walk) else {
                 continue;
             };
-            Self::insert(
+            self.insert(
                 state,
                 0,
                 RLabel {
@@ -168,6 +205,7 @@ impl<'a> ReverseSearch<'a> {
                     achieved: UNSET,
                     trailing: walk,
                     ride_rooted: false,
+                    seed,
                 },
             );
             // Forward journeys may end ride → transfer → egress (the
@@ -186,7 +224,7 @@ impl<'a> ReverseSearch<'a> {
                 let Some(extended) = departure.checked_sub(duration) else {
                     continue;
                 };
-                Self::insert(
+                self.insert(
                     state,
                     0,
                     RLabel {
@@ -195,6 +233,7 @@ impl<'a> ReverseSearch<'a> {
                         achieved: UNSET,
                         trailing: walk + duration,
                         ride_rooted: false,
+                        seed,
                     },
                 );
             }
@@ -244,7 +283,7 @@ impl<'a> ReverseSearch<'a> {
                     let Some(departure) = label.departure.checked_sub(duration) else {
                         continue;
                     };
-                    Self::insert(
+                    self.insert(
                         state,
                         round,
                         RLabel {
@@ -253,6 +292,7 @@ impl<'a> ReverseSearch<'a> {
                             achieved: label.achieved,
                             trailing: 0,
                             ride_rooted: false,
+                            seed: label.seed,
                         },
                     );
                 }
@@ -272,8 +312,8 @@ impl<'a> ReverseSearch<'a> {
         has_previous: bool,
     ) {
         let stops = self.timetable.pattern_stops(pattern);
-        // (trip, offset, achieved, alight_position)
-        let mut onboard: Vec<(TripIdx, u32, u32, u16)> = Vec::new();
+        // (trip, offset, achieved, alight_position, seed)
+        let mut onboard: Vec<(TripIdx, u32, u32, u16, u32)> = Vec::new();
         for position in (0..=max_position as usize).rev() {
             let stop = stops[position];
             if self.stop_excluded(stop) {
@@ -282,8 +322,8 @@ impl<'a> ReverseSearch<'a> {
             // 1) Board here: contribute every onboard continuation.
             let contributions: Vec<RLabel> = onboard
                 .iter()
-                .filter(|&&(_, _, _, alight)| (alight as usize) > position)
-                .filter_map(|&(trip, offset, achieved, _)| {
+                .filter(|&&(_, _, _, alight, _)| (alight as usize) > position)
+                .filter_map(|&(trip, offset, achieved, _, seed)| {
                     let departure = self.timetable.trip_stop_times(trip)[position]
                         .departure
                         .checked_sub(offset)?;
@@ -293,11 +333,12 @@ impl<'a> ReverseSearch<'a> {
                         achieved,
                         trailing: 0,
                         ride_rooted: true,
+                        seed,
                     })
                 })
                 .collect();
             for label in contributions {
-                if Self::insert(state, round, label) {
+                if self.insert(state, round, label) {
                     state.ride_touched.push(label);
                 }
             }
@@ -368,18 +409,25 @@ impl<'a> ReverseSearch<'a> {
                         };
                         // Light dedupe: one onboard entry per (trip,
                         // offset), keeping the earliest achieved; the
-                        // stop bags' dominance is authoritative.
-                        match onboard
-                            .iter_mut()
-                            .find(|entry| entry.0 == trip && entry.1 == offset)
-                        {
+                        // stop bags' dominance is authoritative. A
+                        // seed-isolated run dedupes per seed too —
+                        // merging across seeds would silently discard
+                        // a destination that shares the trip.
+                        match onboard.iter_mut().find(|entry| {
+                            entry.0 == trip
+                                && entry.1 == offset
+                                && (!self.seed_isolated || entry.4 == label.seed)
+                        }) {
                             Some(entry) => {
                                 if achieved < entry.2 {
                                     entry.2 = achieved;
                                     entry.3 = position as u16;
+                                    entry.4 = label.seed;
                                 }
                             }
-                            None => onboard.push((trip, offset, achieved, position as u16)),
+                            None => {
+                                onboard.push((trip, offset, achieved, position as u16, label.seed))
+                            }
                         }
                     }
                 }
@@ -691,4 +739,36 @@ fn collect_states(timetable: &Timetable, state: &ReverseState) -> Vec<Vec<(u16, 
         }
     }
     result
+}
+
+/// `collect_states` with each state's egress-seed tag — the one
+/// consumer that attributes winners to destinations reads these; the
+/// untagged surfaces stay byte-identical.
+fn collect_tagged(timetable: &Timetable, state: &ReverseState) -> Vec<Vec<(u16, u32, u32, u32)>> {
+    let stops = timetable.stop_count() as usize;
+    let mut result = vec![Vec::new(); stops];
+    for (round, bags) in state.bags.iter().enumerate() {
+        for (stop, bag) in bags.iter().enumerate() {
+            for label in bag {
+                if label.fixed() && label.ride_rooted {
+                    result[stop].push((round as u16, label.departure, label.achieved, label.seed));
+                }
+            }
+        }
+    }
+    result
+}
+
+/// `reverse_one_to_all` with seed tags: per stop the fixed ride-rooted
+/// frontier states as (round, departure, achieved, egress seed index).
+pub fn reverse_one_to_all_tagged(
+    timetable: &Timetable,
+    reversed: &ReversedTransfers,
+    request: &Request,
+    seed_of: Option<&[u32]>,
+) -> Vec<Vec<(u16, u32, u32, u32)>> {
+    let search = ReverseSearch::new_seed_isolated(timetable, reversed, request, seed_of);
+    let mut state = ReverseState::new();
+    search.run(&mut state);
+    collect_tagged(timetable, &state)
 }

@@ -483,6 +483,239 @@ impl TransportNetwork {
         }))
     }
 
+    /// The nearest-of-set fast path, stop form: ONE tagged reverse
+    /// seeded with every destination stop answers, per origin stop,
+    /// which destination its latest-departure journey reaches and at
+    /// what duration — `(duration, destination index)`, `None` where
+    /// nothing is reachable. Destinations answer themselves at zero.
+    /// Behavior-invariant with the per-destination fan-out; ties keep
+    /// the incumbent, so attribution is deterministic. Internal.
+    #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments)]
+    fn _arrive_by_nearest(
+        &self,
+        py: Python<'_>,
+        from_stops: Vec<String>,
+        to_stops: Vec<String>,
+        date: &str,
+        deadline: &str,
+        max_transfers: u8,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
+    ) -> PyResult<Vec<Option<(u32, u32)>>> {
+        let origins: Vec<StopIdx> = from_stops
+            .iter()
+            .map(|stop| self.resolve_stop(stop))
+            .collect::<PyResult<_>>()?;
+        let destinations: Vec<StopIdx> = to_stops
+            .iter()
+            .map(|stop| self.resolve_stop(stop))
+            .collect::<PyResult<_>>()?;
+        let deadline = parse_time(deadline)?;
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        let request = Request {
+            departure: deadline,
+            access: Vec::new(),
+            egress: destinations.iter().map(|&stop| (stop, 0)).collect(),
+            active_services: self.active_services(date)?,
+            active_services_previous: self.active_services_previous(date)?,
+            max_transfers,
+            exclusions: exclusions.clone(),
+        };
+        Ok(py.allow_threads(|| {
+            let reversed = ReversedTransfers::build(&self.transfers);
+            let states = reverse::reverse_one_to_all_tagged(
+                &self.build.timetable,
+                &reversed,
+                &request,
+                None,
+            );
+            origins
+                .iter()
+                .map(|&origin| {
+                    // Each destination's own arrive-by winner first —
+                    // the fan-out's cell — then the nearest by that
+                    // winner's duration, ties to the lowest position.
+                    let mut per_seed: Vec<Option<(u32, u32, u32)>> = vec![None; destinations.len()];
+                    for &(round, departure, achieved, seed) in &states[origin.0 as usize] {
+                        crate::options::arrive_by_winner(
+                            &mut per_seed[seed as usize],
+                            (departure, round as u32, achieved),
+                        );
+                    }
+                    for (seed, &destination) in destinations.iter().enumerate() {
+                        if destination != origin {
+                            continue;
+                        }
+                        if exclusions
+                            .as_deref()
+                            .is_some_and(|excluded| excluded.excludes_stop(destination))
+                        {
+                            continue;
+                        }
+                        crate::options::arrive_by_winner(
+                            &mut per_seed[seed],
+                            (deadline, 0, deadline),
+                        );
+                    }
+                    let mut nearest: Option<(u32, u32)> = None;
+                    for (seed, winner) in per_seed.iter().enumerate() {
+                        if let Some((departure, _, achieved)) = winner {
+                            let duration = achieved - departure;
+                            if nearest.is_none_or(|(held, _)| duration < held) {
+                                nearest = Some((duration, seed as u32));
+                            }
+                        }
+                    }
+                    nearest
+                })
+                .collect()
+        }))
+    }
+
+    /// The nearest-of-set fast path, point form: the union of every
+    /// destination's street links seeds one tagged reverse, each link
+    /// tagged by its destination; per origin point the winner composes
+    /// its access links over the tagged states beside every
+    /// destination's direct-walk candidate placed to arrive exactly at
+    /// the deadline. Returns per origin `(duration, destination
+    /// index)` — `u32::MAX` duration where nothing is reachable — plus
+    /// the unsnapped indices. Internal.
+    #[pyo3(signature = (origins, destinations, date, deadline, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn _arrive_by_nearest_points(
+        &self,
+        py: Python<'_>,
+        origins: Vec<(f64, f64)>,
+        destinations: Vec<(f64, f64)>,
+        date: &str,
+        deadline: &str,
+        max_transfers: u8,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+    ) -> PyResult<Py<PyDict>> {
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        let streets = self.installed_streets()?;
+        let speed =
+            validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
+        validate_points(&origins)?;
+        validate_points(&destinations)?;
+        let deadline = parse_time(deadline)?;
+        let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
+        let (cells, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
+            let mut linked = streets.link_pointsets(
+                &[&origins[..], &destinations[..]],
+                speed,
+                max_walking_time,
+                max_snap_distance,
+            );
+            let destination_links = linked.pop().unwrap();
+            let origin_links = linked.pop().unwrap();
+            let unsnapped_from = unsnapped(&origin_links);
+            let unsnapped_to = unsnapped(&destination_links);
+            // The union egress: every destination's links, tagged by
+            // the destination through the egress index mapping.
+            let mut egress: Vec<(StopIdx, u32)> = Vec::new();
+            let mut egress_owner: Vec<u32> = Vec::new();
+            for (destination, links) in destination_links.iter().enumerate() {
+                for &(stop, seconds) in
+                    crate::request_offsets(links.as_deref().unwrap_or(&[])).iter()
+                {
+                    egress.push((stop, seconds));
+                    egress_owner.push(destination as u32);
+                }
+            }
+            let request = Request {
+                departure: deadline,
+                access: Vec::new(),
+                egress,
+                active_services: active_services.clone(),
+                active_services_previous: active_services_previous.clone(),
+                max_transfers,
+                exclusions: exclusions.clone(),
+            };
+            let reversed = ReversedTransfers::build(&self.transfers);
+            // The owner map groups isolation by destination: every
+            // link of a destination shares one seed.
+            let states = reverse::reverse_one_to_all_tagged(
+                &self.build.timetable,
+                &reversed,
+                &request,
+                Some(&egress_owner),
+            );
+            let access = egress_tables(&origin_links);
+            let walk = streets.walk_matrix(
+                &origins,
+                &destinations,
+                speed,
+                max_walking_time,
+                max_snap_distance,
+            );
+            let cells: Vec<(u32, u32)> = access
+                .iter()
+                .enumerate()
+                .map(|(row, links)| {
+                    // Each destination's own arrive-by winner first —
+                    // its links' composed states beside its direct
+                    // walk — then the nearest by winner duration,
+                    // ties to the lowest position.
+                    let mut per_destination: Vec<Option<(u32, u32, u32)>> =
+                        vec![None; destinations.len()];
+                    for &(stop, seconds, _) in links {
+                        for &(round, departure, achieved, seed) in &states[stop.0 as usize] {
+                            let Some(composed) = departure.checked_sub(seconds) else {
+                                continue;
+                            };
+                            crate::options::arrive_by_winner(
+                                &mut per_destination[seed as usize],
+                                (composed, round as u32, achieved),
+                            );
+                        }
+                    }
+                    for (destination, cell) in walk[row].iter().enumerate() {
+                        if let Some((walk_seconds, _)) = cell {
+                            if let Some(placed) = deadline.checked_sub(*walk_seconds) {
+                                crate::options::arrive_by_winner(
+                                    &mut per_destination[destination],
+                                    (placed, 0, deadline),
+                                );
+                            }
+                        }
+                    }
+                    let mut nearest: Option<(u32, u32)> = None;
+                    for (destination, winner) in per_destination.iter().enumerate() {
+                        if let Some((departure, _, achieved)) = winner {
+                            let duration = achieved - departure;
+                            if nearest.is_none_or(|(held, _)| duration < held) {
+                                nearest = Some((duration, destination as u32));
+                            }
+                        }
+                    }
+                    nearest.unwrap_or((u32::MAX, 0))
+                })
+                .collect();
+            (cells, unsnapped_from, unsnapped_to)
+        });
+        let result = PyDict::new(py);
+        result.set_item(
+            "costs",
+            cells.iter().map(|&(cost, _)| cost).collect::<Vec<u32>>(),
+        )?;
+        result.set_item(
+            "seeds",
+            cells.iter().map(|&(_, seed)| seed).collect::<Vec<u32>>(),
+        )?;
+        result.set_item("unsnapped_from", unsnapped_from.into_pyarray(py))?;
+        result.set_item("unsnapped_to", unsnapped_to.into_pyarray(py))?;
+        Ok(result.unbind())
+    }
+
     /// The windowed arrive-by stop reaches: per origin stop, the
     /// winner whose duration is the nearest-rank `percentile` of that
     /// stop's per-mark duration distribution — deadlines profiling at
