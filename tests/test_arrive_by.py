@@ -1076,15 +1076,11 @@ def test_the_forward_cost_frame_is_pinned_with_the_ceiling_dormant(network):
         output_time_units="seconds",
     )
     assert len(frame) == 273
-    assert [str(dtype) for dtype in frame.dtypes] == [
-        "str",
-        "str",
-        "uint32",
-        "uint32",
-        "float64",
-        "float64",
-        "float64",
-    ]
+    # Older pandas names string columns "object", newer "str"; the id
+    # columns accept either while the value columns stay exact.
+    dtypes = [str(dtype) for dtype in frame.dtypes]
+    assert all(dtype in ("object", "str") for dtype in dtypes[:2])
+    assert dtypes[2:] == ["uint32", "uint32", "float64", "float64", "float64"]
     assert int(frame.isna().sum().sum()) == 0
     ids = "\n".join(frame["from_id"] + ">" + frame["to_id"]).encode()
     assert (
