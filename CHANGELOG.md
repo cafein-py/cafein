@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Feed service metadata: `TransportNetwork.service_window` (the first
+  and last date any service runs; `None` when the feed never runs)
+  and `daily_trip_counts` (a date-indexed Series of scheduled trips
+  per day — `.plot.bar()` for the histogram, `.idxmax()` for the
+  busiest date), resolved through the same calendar machinery the
+  routing uses.
+  ([#281](https://github.com/cafein-py/cafein/pull/281))
+
 - Geo layers as lazy properties: `TransportNetwork.stops_gdf`,
   `routes_gdf`, `streets_gdf`, and `connectors_gdf` — stops as named
   points, routes as

@@ -1350,6 +1350,67 @@ class TransportNetwork:
         return self._routes_gdf_cache
 
     @property
+    def service_window(self):
+        """When routing works: the feed's active service span.
+
+        ``(first_date, last_date)`` as ``datetime.date`` — the first
+        and last date any service actually runs, calendar ranges and
+        added exception dates combined (removal-only services never
+        extend it). ``None`` when the resolution yields no running
+        date at all: the answer to "when does routing work" is then
+        simply "never". Computed lazily on first access and cached on
+        the network.
+        """
+        if getattr(self, "_service_calendar_cache", None) is None:
+            self._service_calendar_cache = (self._core._service_calendar(),)
+        resolved = self._service_calendar_cache[0]
+        if resolved is None:
+            return None
+        import datetime
+
+        first, last, _ = resolved
+        return (
+            datetime.date.fromisoformat(first),
+            datetime.date.fromisoformat(last),
+        )
+
+    @property
+    def daily_trip_counts(self):
+        """Scheduled trips per day over the service window.
+
+        A pandas Series indexed by date, one row per day between the
+        window's first and last date inclusive (days nothing runs hold
+        zero), resolved through the calendar and exception machinery
+        the routing itself uses. ``.plot.bar()`` draws the per-day
+        bars and ``.idxmax()`` names the busiest date — the day most
+        connections work as intended, the natural default date for
+        analyses. An empty Series (datetime index, integer dtype) when
+        the feed never runs. Computed lazily on first access and
+        cached on the network.
+        """
+        if getattr(self, "_daily_trip_counts_cache", None) is None:
+            if getattr(self, "_service_calendar_cache", None) is None:
+                self._service_calendar_cache = (self._core._service_calendar(),)
+            resolved = self._service_calendar_cache[0]
+            import pandas
+
+            if resolved is None:
+                self._daily_trip_counts_cache = pandas.Series(
+                    [], index=pandas.DatetimeIndex([]), dtype="int64"
+                )
+            else:
+                first, last, counts = resolved
+                # Second resolution: nanosecond timestamps overflow
+                # beyond year 2262, and GTFS calendars may legally
+                # reach further.
+                self._daily_trip_counts_cache = pandas.Series(
+                    counts,
+                    index=pandas.date_range(first, last, freq="D", unit="s"),
+                    dtype="int64",
+                )
+        return self._daily_trip_counts_cache
+
+    @property
     def connectors_gdf(self):
         """The stop-to-street connectors as a GeoDataFrame.
 

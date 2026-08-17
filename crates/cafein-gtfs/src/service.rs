@@ -75,6 +75,38 @@ impl ServiceCalendar {
         }
     }
 
+    /// The raw candidate span of the calendar data: the earliest and
+    /// latest date any weekly pattern covers or any *added* exception
+    /// names. Removal exceptions never extend it. `None` when no
+    /// qualifying source exists: no nonempty-weekday pattern with a
+    /// valid range and no added exception (removal-only data included).
+    /// The bounds are candidates — a
+    /// pattern's range may contain days its weekday mask never fires —
+    /// so consumers trim to actually-running dates with
+    /// [`ServiceCalendar::active_on`].
+    pub fn date_bounds(&self) -> Option<(NaiveDate, NaiveDate)> {
+        let mut bounds: Option<(NaiveDate, NaiveDate)> = None;
+        let mut extend = |from: NaiveDate, to: NaiveDate| {
+            bounds = Some(match bounds {
+                None => (from, to),
+                Some((lo, hi)) => (lo.min(from), hi.max(to)),
+            });
+        };
+        for pattern in self.weekly.iter().flatten() {
+            if pattern.start_date <= pattern.end_date && pattern.weekdays.iter().any(|&day| day) {
+                extend(pattern.start_date, pattern.end_date);
+            }
+        }
+        for exceptions in &self.exceptions {
+            for &(date, added) in exceptions {
+                if added {
+                    extend(date, date);
+                }
+            }
+        }
+        bounds
+    }
+
     pub fn service_count(&self) -> u32 {
         self.weekly.len() as u32
     }
