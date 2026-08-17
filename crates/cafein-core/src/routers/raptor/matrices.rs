@@ -198,6 +198,7 @@ impl Raptor {
                             inputs,
                             None,
                             objective,
+                            None,
                             &mut thresholds,
                             &mut best,
                         );
@@ -250,6 +251,136 @@ impl Raptor {
                             inputs,
                             access,
                             objective,
+                            None,
+                            &mut thresholds,
+                            &mut best,
+                        );
+                    }
+                    best.into_iter().flatten().collect()
+                },
+            )
+            .collect()
+    }
+
+    /// The objective-best journey's aggregated costs per destination
+    /// under a deadline profile — the arrive-by counterpart of
+    /// [`Raptor::least_cost_matrix`]. Per origin, the caller supplies
+    /// each destination's deadline-profile candidates: the exact
+    /// (departure, arrival, rides) tuples of the windowed arrive-by
+    /// route output, composed and cross-round Pareto-filtered per
+    /// mark. One descending scan over the union of the candidates'
+    /// departure instants prices them with the forward engine under
+    /// the final mark's ceiling; a cell is the cheapest row matching
+    /// its own destination's candidates, so a journey time-dominated
+    /// at every deadline never wins.
+    #[allow(clippy::too_many_arguments)]
+    pub fn arrive_by_least_cost_matrix(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        destinations: &[StopIdx],
+        candidates: &[Vec<CandidateTuples>],
+        ceiling: u32,
+        budget: Option<u32>,
+        objective: Objective,
+    ) -> Vec<Vec<CostRow>> {
+        assert_eq!(requests.len(), candidates.len());
+        requests
+            .par_iter()
+            .zip(candidates.par_iter())
+            .map_init(
+                || None,
+                |pooled: &mut Option<Search>, (request, allowed)| {
+                    assert_eq!(allowed.len(), destinations.len());
+                    let search = match pooled {
+                        Some(search) if search.rounds == request.max_transfers as usize + 1 => {
+                            search.reset(request);
+                            search
+                        }
+                        _ => pooled.insert(Search::new(timetable, transfers, request)),
+                    };
+                    let departures = candidate_departures(allowed);
+                    let pricing = ArriveByPricing {
+                        ceiling,
+                        allowed: allowed.as_slice(),
+                    };
+                    let mut thresholds = vec![UNREACHED; destinations.len() * (search.rounds + 1)];
+                    let mut best: Vec<Option<CostRow>> = vec![None; destinations.len()];
+                    for &departure in &departures {
+                        search.run(departure);
+                        search.fold_best(
+                            departure,
+                            destinations,
+                            budget,
+                            inputs,
+                            None,
+                            objective,
+                            Some(&pricing),
+                            &mut thresholds,
+                            &mut best,
+                        );
+                    }
+                    best.into_iter().flatten().collect()
+                },
+            )
+            .collect()
+    }
+
+    /// [`Raptor::arrive_by_least_cost_matrix`] over destination
+    /// points, joined through the points' egress link tables like
+    /// [`Raptor::least_cost_matrix_to_points`]. The candidate tuples
+    /// carry the link-composed arrivals, so the filter matches the
+    /// folded rows exactly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn arrive_by_least_cost_matrix_to_points(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        access_meters: &[HashMap<StopIdx, f64>],
+        egress: &[Vec<(StopIdx, u32, f64)>],
+        candidates: &[Vec<CandidateTuples>],
+        ceiling: u32,
+        budget: Option<u32>,
+        objective: Objective,
+    ) -> Vec<Vec<CostRow>> {
+        assert_eq!(requests.len(), access_meters.len());
+        assert_eq!(requests.len(), candidates.len());
+        requests
+            .par_iter()
+            .zip(access_meters.par_iter())
+            .zip(candidates.par_iter())
+            .map_init(
+                || None,
+                |pooled: &mut Option<Search>, ((request, access), allowed)| {
+                    assert_eq!(allowed.len(), egress.len());
+                    let search = match pooled {
+                        Some(search) if search.rounds == request.max_transfers as usize + 1 => {
+                            search.reset(request);
+                            search
+                        }
+                        _ => pooled.insert(Search::new(timetable, transfers, request)),
+                    };
+                    let departures = candidate_departures(allowed);
+                    let pricing = ArriveByPricing {
+                        ceiling,
+                        allowed: allowed.as_slice(),
+                    };
+                    let mut thresholds = vec![UNREACHED; egress.len() * (search.rounds + 1)];
+                    let mut best: Vec<Option<CostRow>> = vec![None; egress.len()];
+                    for &departure in &departures {
+                        search.run(departure);
+                        search.fold_best_points(
+                            departure,
+                            egress,
+                            budget,
+                            inputs,
+                            access,
+                            objective,
+                            Some(&pricing),
                             &mut thresholds,
                             &mut best,
                         );
@@ -367,6 +498,20 @@ impl Raptor {
         let departures = departure_candidates(timetable, request, window);
         Search::new(timetable, transfers, request).profile(&departures)
     }
+}
+
+/// The union of an origin's deadline-profile candidates' exact
+/// departure instants, descending and deduplicated — the arrive-by
+/// pricing scan runs one forward pass per instant.
+fn candidate_departures(candidates: &[CandidateTuples]) -> Vec<u32> {
+    let mut departures: Vec<u32> = candidates
+        .iter()
+        .flatten()
+        .map(|&(departure, _, _)| departure)
+        .collect();
+    departures.sort_unstable_by(|a, b| b.cmp(a));
+    departures.dedup();
+    departures
 }
 
 /// The origin departure times within `[request.departure,

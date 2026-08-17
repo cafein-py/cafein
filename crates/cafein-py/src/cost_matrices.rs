@@ -1566,6 +1566,458 @@ impl TransportNetwork {
             .set_item("unsnapped_to", unsnapped_to.into_pyarray(py))?;
         Ok(result)
     }
+
+    /// The objective-best journey's costs per OD pair under an
+    /// arrive-by deadline profile, long format — ``least_cost_matrix``
+    /// on the arrival axis. Internal.
+    ///
+    /// The candidates per pair are the deadline profile's journeys —
+    /// each minute mark's complete-journey Pareto set from one reverse
+    /// run per destination at the final mark, the same tuples the
+    /// windowed arrive-by route returns — and a cell reports its
+    /// lowest-objective member within `budget`, ties resolved toward
+    /// the shorter travel time. Pricing replays the forward engine
+    /// over the union of each origin's candidate departure instants
+    /// under the final mark's ceiling; a journey outside the profile —
+    /// time-dominated at every deadline — never prices. An origin that
+    /// is its own destination answers itself at zero, as on the
+    /// arrive-by time matrix.
+    #[pyo3(signature = (from_stops, date, arrival, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, to_stops = None, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], geometries = false))]
+    #[allow(clippy::too_many_arguments)]
+    fn _arrive_by_least_cost_matrix(
+        &self,
+        py: Python<'_>,
+        from_stops: Vec<String>,
+        date: &str,
+        arrival: &str,
+        window: u32,
+        factors: Vec<(String, f64)>,
+        objective: &str,
+        fares: Option<Bound<'_, PyDict>>,
+        budget: Option<u32>,
+        max_transfers: u8,
+        to_stops: Option<Vec<String>>,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
+        geometries: bool,
+    ) -> PyResult<Py<PyDict>> {
+        let Some(geometry) = &self.geometry else {
+            return Err(PyValueError::new_err(
+                "no trip distances installed; build the network with trip distances enabled",
+            ));
+        };
+        if geometries && self.leg_geometry.is_none() {
+            return Err(PyValueError::new_err(
+                "no leg geometries installed; build the network with leg geometries enabled",
+            ));
+        }
+        if window == 0 {
+            return Err(PyValueError::new_err(
+                "window must be a positive number of seconds",
+            ));
+        }
+        let tables = fares
+            .map(|spec| {
+                fare_tables(
+                    &spec,
+                    self.feed.routes.len(),
+                    self.build.timetable.stop_count() as usize,
+                )
+            })
+            .transpose()?;
+        let objective = parse_objective(objective, tables.as_ref())?;
+        let origins: Vec<StopIdx> = from_stops
+            .iter()
+            .map(|stop| self.resolve_stop(stop))
+            .collect::<PyResult<_>>()?;
+        let destinations: Vec<StopIdx> = match to_stops {
+            Some(stops) => stops
+                .iter()
+                .map(|stop| self.resolve_stop(stop))
+                .collect::<PyResult<_>>()?,
+            None => (0..self.build.timetable.stop_count())
+                .map(StopIdx)
+                .collect(),
+        };
+        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
+        for (trip_id, factor) in &factors {
+            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
+                per_trip[trip.0 as usize] = *factor;
+            }
+        }
+        let start = parse_time(arrival)?;
+        let marks = crate::options::arrival_marks(start, window)?;
+        let deadline = *marks.last().expect("a validated window holds a mark");
+        let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        let inputs = CostInputs {
+            geometry,
+            factors: &per_trip,
+            leg_geometry: self.leg_geometry.as_ref(),
+            with_geometry: geometries,
+            fares: tables.as_ref(),
+            rental: None,
+        };
+        let rows = py.allow_threads(|| {
+            let reversed = ReversedTransfers::build(&self.transfers);
+            let reverse_requests: Vec<Request> = destinations
+                .iter()
+                .map(|&destination| Request {
+                    departure: deadline,
+                    access: Vec::new(),
+                    egress: vec![(destination, 0)],
+                    active_services: active_services.clone(),
+                    active_services_previous: active_services_previous.clone(),
+                    max_transfers,
+                    exclusions: exclusions.clone(),
+                })
+                .collect();
+            // Each destination's run folds to its origins' candidate
+            // tuples; the self cell rides the forward fold's zero-ride
+            // round through an injected (deadline, deadline, 0) tuple.
+            let columns: Vec<Vec<Vec<(u32, u32, u16)>>> = reverse::reverse_one_to_all_fold(
+                &self.build.timetable,
+                &reversed,
+                &reverse_requests,
+                |column, states| {
+                    let destination = destinations[column];
+                    let excluded = exclusions
+                        .as_deref()
+                        .is_some_and(|excluded| excluded.excludes_stop(destination));
+                    origins
+                        .iter()
+                        .map(|&origin| {
+                            let profile =
+                                reverse::reverse_profile_states(&states[origin.0 as usize], &marks);
+                            let mut allowed: Vec<(u32, u32, u16)> =
+                                reverse::profile_union(&[(0, profile)], &marks, None)
+                                    .into_iter()
+                                    .map(|(departure, rides, achieved)| {
+                                        (departure, achieved, rides as u16)
+                                    })
+                                    .collect();
+                            if origin == destination && !excluded {
+                                allowed.push((deadline, deadline, 0));
+                            }
+                            allowed
+                        })
+                        .collect()
+                },
+            );
+            let mut allowed: Vec<Vec<Vec<(u32, u32, u16)>>> =
+                vec![Vec::with_capacity(destinations.len()); origins.len()];
+            for column in columns {
+                for (row, cell) in column.into_iter().enumerate() {
+                    allowed[row].push(cell);
+                }
+            }
+            let requests: Vec<Request> = origins
+                .iter()
+                .map(|&origin| Request {
+                    departure: start,
+                    access: vec![(origin, 0)],
+                    egress: Vec::new(),
+                    active_services: active_services.clone(),
+                    active_services_previous: active_services_previous.clone(),
+                    max_transfers,
+                    exclusions: exclusions.clone(),
+                })
+                .collect();
+            Raptor.arrive_by_least_cost_matrix(
+                &self.build.timetable,
+                &self.transfers,
+                &inputs,
+                &requests,
+                &destinations,
+                &allowed,
+                deadline,
+                budget,
+                objective,
+            )
+        });
+        cost_rows_dict(py, rows, geometries)
+    }
+
+    /// ``_arrive_by_least_cost_matrix`` between coordinate points,
+    /// linked through the street network — including the walking-only
+    /// alternative, whose zero emissions (and zero fare) win any cell
+    /// they qualify for within the budget, exactly as on the forward
+    /// axis. The direct walk also competes inside every mark's
+    /// candidate election, so a transit journey a mark's own walk
+    /// dominates is no candidate, mirroring the windowed arrive-by
+    /// route. Internal.
+    #[pyo3(signature = (origins, destinations, date, arrival, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false))]
+    #[allow(clippy::too_many_arguments)]
+    fn _arrive_by_least_cost_matrix_from_points(
+        &self,
+        py: Python<'_>,
+        origins: Vec<(f64, f64)>,
+        destinations: Vec<(f64, f64)>,
+        date: &str,
+        arrival: &str,
+        window: u32,
+        factors: Vec<(String, f64)>,
+        objective: &str,
+        fares: Option<Bound<'_, PyDict>>,
+        budget: Option<u32>,
+        max_transfers: u8,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+        geometries: bool,
+    ) -> PyResult<Py<PyDict>> {
+        let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
+        let streets = self.installed_streets()?;
+        let Some(geometry) = &self.geometry else {
+            return Err(PyValueError::new_err(
+                "no trip distances installed; build the network with trip distances enabled",
+            ));
+        };
+        if geometries && self.leg_geometry.is_none() {
+            return Err(PyValueError::new_err(
+                "no leg geometries installed; build the network with leg geometries enabled",
+            ));
+        }
+        if window == 0 {
+            return Err(PyValueError::new_err(
+                "window must be a positive number of seconds",
+            ));
+        }
+        let tables = fares
+            .map(|spec| {
+                fare_tables(
+                    &spec,
+                    self.feed.routes.len(),
+                    self.build.timetable.stop_count() as usize,
+                )
+            })
+            .transpose()?;
+        let objective = parse_objective(objective, tables.as_ref())?;
+        let walk_fare = if tables.is_some() { 0.0 } else { f64::NAN };
+        let speed =
+            validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
+        validate_points(&origins)?;
+        validate_points(&destinations)?;
+        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
+        for (trip_id, factor) in &factors {
+            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
+                per_trip[trip.0 as usize] = *factor;
+            }
+        }
+        let start = parse_time(arrival)?;
+        let marks = crate::options::arrival_marks(start, window)?;
+        let deadline = *marks.last().expect("a validated window holds a mark");
+        let active_services = self.active_services(date)?;
+        let active_services_previous = self.active_services_previous(date)?;
+        let inputs = CostInputs {
+            geometry,
+            factors: &per_trip,
+            leg_geometry: self.leg_geometry.as_ref(),
+            with_geometry: geometries,
+            fares: tables.as_ref(),
+            rental: None,
+        };
+        let (rows, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
+            let mut linked = streets.link_pointsets(
+                &[&origins[..], &destinations[..]],
+                speed,
+                max_walking_time,
+                max_snap_distance,
+            );
+            let destination_links = linked.pop().unwrap();
+            let origin_links = linked.pop().unwrap();
+            let unsnapped_from = unsnapped(&origin_links);
+            let unsnapped_to = unsnapped(&destination_links);
+            let mut requests = Vec::with_capacity(origin_links.len());
+            let mut access_meters = Vec::with_capacity(origin_links.len());
+            for links in &origin_links {
+                let links = links.as_deref().unwrap_or(&[]);
+                requests.push(Request {
+                    departure: start,
+                    access: request_offsets(links),
+                    egress: Vec::new(),
+                    active_services: active_services.clone(),
+                    active_services_previous: active_services_previous.clone(),
+                    max_transfers,
+                    exclusions: exclusions.clone(),
+                });
+                access_meters.push(
+                    links
+                        .iter()
+                        .map(|walk| (walk.stop, walk.meters))
+                        .collect::<HashMap<_, _>>(),
+                );
+            }
+            let egress = egress_tables(&destination_links);
+            let access = egress_tables(&origin_links);
+            let walk = streets.walk_matrix(
+                &origins,
+                &destinations,
+                speed,
+                max_walking_time,
+                max_snap_distance,
+            );
+            let reversed = ReversedTransfers::build(&self.transfers);
+            let reverse_requests: Vec<Request> = destination_links
+                .iter()
+                .map(|links| Request {
+                    departure: deadline,
+                    access: Vec::new(),
+                    egress: request_offsets(links.as_deref().unwrap_or(&[])),
+                    active_services: active_services.clone(),
+                    active_services_previous: active_services_previous.clone(),
+                    max_transfers,
+                    exclusions: exclusions.clone(),
+                })
+                .collect();
+            let columns: Vec<Vec<Vec<(u32, u32, u16)>>> = reverse::reverse_one_to_all_fold(
+                &self.build.timetable,
+                &reversed,
+                &reverse_requests,
+                |column, states| {
+                    access
+                        .iter()
+                        .enumerate()
+                        .map(|(row, links)| {
+                            let profiles: Vec<(u32, reverse::MarkWinners)> = links
+                                .iter()
+                                .map(|&(stop, seconds, _)| {
+                                    (
+                                        seconds,
+                                        reverse::reverse_profile_states(
+                                            &states[stop.0 as usize],
+                                            &marks,
+                                        ),
+                                    )
+                                })
+                                .collect();
+                            let walk_seconds = walk[row][column].map(|(seconds, _)| seconds);
+                            reverse::profile_union(&profiles, &marks, walk_seconds)
+                                .into_iter()
+                                .filter(|&(_, rides, _)| rides > 0)
+                                .map(|(departure, rides, achieved)| {
+                                    (departure, achieved, rides as u16)
+                                })
+                                .collect()
+                        })
+                        .collect()
+                },
+            );
+            let mut allowed: Vec<Vec<Vec<(u32, u32, u16)>>> =
+                vec![Vec::with_capacity(egress.len()); origins.len()];
+            for column in columns {
+                for (row, cell) in column.into_iter().enumerate() {
+                    allowed[row].push(cell);
+                }
+            }
+            let mut rows = Raptor.arrive_by_least_cost_matrix_to_points(
+                &self.build.timetable,
+                &self.transfers,
+                &inputs,
+                &requests,
+                &access_meters,
+                &egress,
+                &allowed,
+                deadline,
+                budget,
+                objective,
+            );
+            // The walking-only alternative: zero grams and zero fare,
+            // so within the budget it wins any cell (equal-key cells
+            // resolve toward the shorter travel time, as everywhere).
+            let key = |row: &CostRow| match objective {
+                Objective::Emissions => row.emission_grams,
+                Objective::Fare => row.fare,
+            };
+            let walk_geometry = |origin: usize, point: usize| -> Option<Vec<u8>> {
+                if !geometries {
+                    return None;
+                }
+                let from_point = origins[origin];
+                let to_point = destinations[point];
+                if from_point == to_point {
+                    let at = (from_point.1, from_point.0);
+                    return Some(wkb_multi_line_string(&[vec![at, at]]));
+                }
+                let from = streets.snap(from_point.0, from_point.1, max_snap_distance)?;
+                let to = streets.snap(to_point.0, to_point.1, max_snap_distance)?;
+                let (path, _) = streets.walk_path(from_point, &from, to_point, &to)?;
+                Some(wkb_multi_line_string(&[path]))
+            };
+            for (origin, origin_rows) in rows.iter_mut().enumerate() {
+                let walk_row = &walk[origin];
+                let mut reached = vec![false; destinations.len()];
+                for row in origin_rows.iter_mut() {
+                    reached[row.to as usize] = true;
+                    if let Some((walk_seconds, meters)) = walk_row[row.to as usize] {
+                        // A walk longer than the final mark cannot be
+                        // placed to arrive by any profiled deadline —
+                        // it is no candidate, exactly as in the
+                        // profile election.
+                        if walk_seconds > deadline {
+                            continue;
+                        }
+                        if budget.is_some_and(|budget| walk_seconds > budget) {
+                            continue;
+                        }
+                        if key(row) > 0.0 || (key(row) == 0.0 && walk_seconds < row.seconds) {
+                            row.seconds = walk_seconds;
+                            row.rides = 0;
+                            row.access_stop = NO_STOP;
+                            row.egress_stop = NO_STOP;
+                            row.transit_meters = 0.0;
+                            row.walk_meters = meters;
+                            row.emission_grams = 0.0;
+                            row.fare = walk_fare;
+                            row.geometry = walk_geometry(origin, row.to as usize);
+                        }
+                    }
+                }
+                for (point, cell) in walk_row.iter().enumerate() {
+                    if reached[point] {
+                        continue;
+                    }
+                    if let Some((walk_seconds, meters)) = cell {
+                        if *walk_seconds > deadline {
+                            continue;
+                        }
+                        if budget.is_some_and(|budget| *walk_seconds > budget) {
+                            continue;
+                        }
+                        origin_rows.push(CostRow {
+                            to: point as u32,
+                            access_stop: NO_STOP,
+                            egress_stop: NO_STOP,
+                            seconds: *walk_seconds,
+                            rides: 0,
+                            transit_meters: 0.0,
+                            walk_meters: *meters,
+                            street_meters: 0.0,
+                            rental_transfers: 0,
+                            emission_grams: 0.0,
+                            fare: walk_fare,
+                            geometry: walk_geometry(origin, point),
+                        });
+                    }
+                }
+                origin_rows.sort_unstable_by_key(|row| row.to);
+            }
+            (rows, unsnapped_from, unsnapped_to)
+        });
+        let result = cost_rows_dict(py, rows, geometries)?;
+        result
+            .bind(py)
+            .set_item("unsnapped_from", unsnapped_from.into_pyarray(py))?;
+        result
+            .bind(py)
+            .set_item("unsnapped_to", unsnapped_to.into_pyarray(py))?;
+        Ok(result)
+    }
 }
 
 impl TransportNetwork {

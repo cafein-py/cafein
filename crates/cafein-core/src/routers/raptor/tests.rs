@@ -1053,3 +1053,300 @@ fn unclosed_sets_relax_walks_from_shadowed_transit_arrivals() {
         }
     );
 }
+
+/// The arrive-by pricing pipeline exactly as the bindings run it: one
+/// reverse run per destination at the final mark, each origin's
+/// per-mark winners elected through the shared `profile_union`, and
+/// the forward scan pricing the candidate tuples under the ceiling.
+fn arrive_by_rows(
+    timetable: &Timetable,
+    transfers: &Transfers,
+    inputs: &CostInputs<'_>,
+    origin: StopIdx,
+    destinations: &[StopIdx],
+    marks: &[u32],
+    budget: Option<u32>,
+) -> Vec<CostRow> {
+    use crate::routers::reverse;
+    use crate::transfers::ReversedTransfers;
+
+    let deadline = *marks.last().unwrap();
+    let reversed = ReversedTransfers::build(transfers);
+    let allowed: Vec<Vec<(u32, u32, u16)>> = destinations
+        .iter()
+        .map(|&destination| {
+            let mut reverse_request = request(origin, destination, deadline);
+            reverse_request.access = Vec::new();
+            reverse_request.egress = vec![(destination, 0)];
+            let states = reverse::reverse_one_to_all(timetable, &reversed, &reverse_request);
+            let profile = reverse::reverse_profile_states(&states[origin.0 as usize], marks);
+            reverse::profile_union(&[(0, profile)], marks, None)
+                .into_iter()
+                .map(|(departure, rides, achieved)| (departure, achieved, rides as u16))
+                .collect()
+        })
+        .collect();
+    let mut forward = request(origin, destinations[0], deadline);
+    forward.egress = Vec::new();
+    Raptor.arrive_by_least_cost_matrix(
+        timetable,
+        transfers,
+        inputs,
+        std::slice::from_ref(&forward),
+        destinations,
+        std::slice::from_ref(&allowed),
+        deadline,
+        budget,
+        Objective::Emissions,
+    )[0]
+    .clone()
+}
+
+#[test]
+fn a_time_dominated_cheaper_journey_never_wins_a_deadline_cell() {
+    // Two direct rides 0→1: the clean trip departs earlier AND
+    // arrives later than the dirty one, so every deadline mark's
+    // Pareto set holds only the dirty ride — the profile-only
+    // contract prices it, and the cleaner-but-dominated journey
+    // never leaks into a cell.
+    let mut builder = TimetableBuilder::new(2);
+    let dirty = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let clean = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 1).unwrap();
+    builder
+        .add_trip(dirty, vec![time(100), time(200)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(clean, vec![time(50), time(210)], 1, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let transfers = Transfers::from_edges(2, &[]).unwrap();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let factors = [100.0, 1.0];
+    let inputs = CostInputs {
+        geometry: &geometry,
+        factors: &factors,
+        leg_geometry: None,
+        with_geometry: false,
+        fares: None,
+        rental: None,
+    };
+    let rows = arrive_by_rows(
+        &timetable,
+        &transfers,
+        &inputs,
+        StopIdx(0),
+        &[StopIdx(1)],
+        &[240, 300],
+        None,
+    );
+    assert_eq!(rows.len(), 1);
+    // The dirty ride: 1 km at 100 g/pkm. The clean 1 g/pkm ride is
+    // dominated at both marks and must not price.
+    assert!((rows[0].emission_grams - 100.0).abs() < 1e-9);
+    assert_eq!((rows[0].seconds, rows[0].rides), (100, 1));
+}
+
+#[test]
+fn a_non_minute_departure_instant_prices_exactly() {
+    // The candidate departs at 130 — no minute mark — and the scan
+    // must run at that exact instant, never a rounded one.
+    let mut builder = TimetableBuilder::new(2);
+    let a = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    builder
+        .add_trip(a, vec![time(130), time(207)], 0, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let transfers = Transfers::from_edges(2, &[]).unwrap();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![(TripIdx(0), vec![0.0, 500.0], DistanceProvenance::CrowFly)],
+    )
+    .unwrap();
+    let factors = [10.0];
+    let inputs = CostInputs {
+        geometry: &geometry,
+        factors: &factors,
+        leg_geometry: None,
+        with_geometry: false,
+        fares: None,
+        rental: None,
+    };
+    let rows = arrive_by_rows(
+        &timetable,
+        &transfers,
+        &inputs,
+        StopIdx(0),
+        &[StopIdx(1)],
+        &[240],
+        None,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].seconds, rows[0].rides), (77, 1));
+    assert!((rows[0].emission_grams - 5.0).abs() < 1e-9);
+}
+
+#[test]
+fn an_arrival_between_the_last_mark_and_the_window_end_is_refused() {
+    // Marks stop at 60 (a 90-second window holds no further minute
+    // mark). The cheap ride arrives at 70 — inside the window's raw
+    // end but past the final mark — so it satisfies no profiled
+    // deadline and must not price; the pricier ride arriving by 60
+    // wins the cell instead.
+    let mut builder = TimetableBuilder::new(2);
+    let cheap = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let priced = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 1).unwrap();
+    builder
+        .add_trip(cheap, vec![time(20), time(70)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(priced, vec![time(10), time(60)], 1, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let transfers = Transfers::from_edges(2, &[]).unwrap();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let factors = [1.0, 50.0];
+    let inputs = CostInputs {
+        geometry: &geometry,
+        factors: &factors,
+        leg_geometry: None,
+        with_geometry: false,
+        fares: None,
+        rental: None,
+    };
+    let rows = arrive_by_rows(
+        &timetable,
+        &transfers,
+        &inputs,
+        StopIdx(0),
+        &[StopIdx(1)],
+        &[0, 60],
+        None,
+    );
+    assert_eq!(rows.len(), 1);
+    assert!((rows[0].emission_grams - 50.0).abs() < 1e-9);
+    assert_eq!((rows[0].seconds, rows[0].rides), (50, 1));
+    // The ceiling itself, not just the election: hand the fold an
+    // allowed set that DOES list the out-of-ceiling cheap tuple. The
+    // `arrival > ceiling` guard alone must refuse it.
+    let allowed: Vec<Vec<(u32, u32, u16)>> = vec![vec![(20, 70, 1), (10, 60, 1)]];
+    let mut pricing_request = request(StopIdx(0), StopIdx(1), 60);
+    pricing_request.egress = Vec::new();
+    let rows = Raptor.arrive_by_least_cost_matrix(
+        &timetable,
+        &transfers,
+        &inputs,
+        std::slice::from_ref(&pricing_request),
+        &[StopIdx(1)],
+        std::slice::from_ref(&allowed),
+        60,
+        None,
+        Objective::Emissions,
+    );
+    assert_eq!(rows[0].len(), 1);
+    assert!((rows[0][0].emission_grams - 50.0).abs() < 1e-9);
+    assert_eq!((rows[0][0].seconds, rows[0][0].rides), (50, 1));
+}
+
+#[test]
+fn equal_tuple_journeys_price_the_canonical_one() {
+    // Two rides share the exact (departure, arrival, rides) tuple but
+    // differ in emissions. Candidate identity is the canonical
+    // journey: the forward engine's own winner at that departure —
+    // the label chain the fold reconstructs — prices the cell, even
+    // when the shadowed twin is cheaper.
+    let mut builder = TimetableBuilder::new(2);
+    let first = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 0).unwrap();
+    let second = builder.add_pattern(&[StopIdx(0), StopIdx(1)], 1).unwrap();
+    builder
+        .add_trip(first, vec![time(100), time(200)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(second, vec![time(100), time(200)], 1, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let transfers = Transfers::from_edges(2, &[]).unwrap();
+    let geometry = TripGeometry::from_trips(
+        &timetable,
+        vec![
+            (TripIdx(0), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+            (TripIdx(1), vec![0.0, 1000.0], DistanceProvenance::CrowFly),
+        ],
+    )
+    .unwrap();
+    let factors = [40.0, 5.0];
+    let inputs = CostInputs {
+        geometry: &geometry,
+        factors: &factors,
+        leg_geometry: None,
+        with_geometry: false,
+        fares: None,
+        rental: None,
+    };
+    // The canonical winner is whatever the forward engine elects at
+    // departure 100 — derive it from the engine itself, never assume.
+    let mut forward = request(StopIdx(0), StopIdx(1), 100);
+    forward.active_services = vec![true, true];
+    let journeys = Raptor.route(&timetable, &transfers, &forward);
+    assert_eq!(journeys.len(), 1);
+    let canonical_trip = journeys[0]
+        .legs
+        .iter()
+        .find_map(|leg| match leg {
+            Leg::Transit { trip, .. } => Some(*trip),
+            _ => None,
+        })
+        .unwrap();
+    let canonical_grams = factors[canonical_trip.0 as usize];
+    let cheaper_grams = factors.iter().copied().fold(f64::INFINITY, f64::min);
+    // The fixture only discriminates when the canonical twin is the
+    // pricier one — a cell equal to the cheaper twin would also pass
+    // a min-pricing bug.
+    assert!(canonical_grams > cheaper_grams);
+
+    use crate::routers::reverse;
+    use crate::transfers::ReversedTransfers;
+    let reversed = ReversedTransfers::build(&transfers);
+    let mut reverse_request = request(StopIdx(0), StopIdx(1), 240);
+    reverse_request.active_services = vec![true, true];
+    reverse_request.access = Vec::new();
+    reverse_request.egress = vec![(StopIdx(1), 0)];
+    let states = reverse::reverse_one_to_all(&timetable, &reversed, &reverse_request);
+    let profile = reverse::reverse_profile_states(&states[0], &[240]);
+    let allowed: Vec<Vec<(u32, u32, u16)>> =
+        vec![reverse::profile_union(&[(0, profile)], &[240], None)
+            .into_iter()
+            .map(|(departure, rides, achieved)| (departure, achieved, rides as u16))
+            .collect()];
+    // One tuple: the twins collapse to a single candidate identity.
+    assert_eq!(allowed[0], vec![(100, 200, 1)]);
+    let mut pricing_request = request(StopIdx(0), StopIdx(1), 240);
+    pricing_request.active_services = vec![true, true];
+    pricing_request.egress = Vec::new();
+    let rows = Raptor.arrive_by_least_cost_matrix(
+        &timetable,
+        &transfers,
+        &inputs,
+        std::slice::from_ref(&pricing_request),
+        &[StopIdx(1)],
+        std::slice::from_ref(&allowed),
+        240,
+        None,
+        Objective::Emissions,
+    );
+    assert_eq!(rows[0].len(), 1);
+    assert!((rows[0][0].emission_grams - canonical_grams).abs() < 1e-9);
+}

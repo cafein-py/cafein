@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Emissions and money deadlines: the cost surfaces —
+  `TravelCostMatrix`, `travel_cost_table` (streaming included), and
+  `Accessibility`/`NearestDestinations`/`Catchment` with
+  `cost="emissions"`/`"money"` — take `arrival=` +
+  `arrival_time_window=`. Each cell prices the pair's deadline
+  profile: the windowed arrive-by route's own candidates, replayed
+  forward under the final mark's ceiling, so a journey time-dominated
+  at every deadline never wins.
+  ([#278](https://github.com/cafein-py/cafein/pull/278))
+
 - The nearest-of-set fast path: `NearestDestinations(k=1, arrival=)`
   runs ONE reverse search seeded with every destination instead of
   one per destination — labels carry their egress seed as a rider and
