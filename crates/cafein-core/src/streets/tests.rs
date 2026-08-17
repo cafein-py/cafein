@@ -4959,3 +4959,35 @@ fn the_edge_layer_reports_directional_access_and_self_loops() {
         }
     }
 }
+
+#[test]
+fn connector_interpolation_survives_the_antimeridian() {
+    // A segment spanning the antimeridian exceeds the signed 32-bit
+    // range as a raw coordinate difference; the interpolation must
+    // neither wrap nor panic, and the snap point stays numerically
+    // between the endpoints.
+    let network = StreetNetwork::new(
+        2,
+        1,
+        &[(0, 1, 1000.0)],
+        &[0, 2],
+        &[179.9999, -179.9999],
+        &[0.0, 0.0],
+        vec![StopLink {
+            stop: StopIdx(0),
+            edge: 0,
+            fraction: 0.5,
+            connector: 5.0,
+        }],
+    )
+    .unwrap();
+    let layer = network.connector_layer();
+    assert_eq!(layer.len(), 1);
+    let (stop, connector, lon, lat) = layer[0];
+    assert_eq!(stop, StopIdx(0));
+    assert!((connector - 5.0).abs() < 1e-9);
+    // The short way round: the midpoint sits AT the antimeridian,
+    // never at 0° (the long way's midpoint).
+    assert!((lon.abs() - 180.0).abs() < 1e-4, "midpoint {lon}");
+    assert!(lat.abs() < 1e-6);
+}

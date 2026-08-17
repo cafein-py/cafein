@@ -1341,3 +1341,136 @@ def test_routes_gdf_provenance_ignores_the_distance_tiers(tmp_path):
     # surviving tier dependency cannot hide behind it.
     network._routes_gdf_cache = None
     assert network.routes_gdf["geometry_provenance"].iloc[0] == "stop_sequence"
+
+
+def test_connectors_gdf_matches_the_stored_links(network_with_footpaths):
+    frame = network_with_footpaths.connectors_gdf
+    assert list(frame.columns) == ["id", "name", "connector_m", "geometry"]
+    assert str(frame.crs) == "EPSG:4326"
+    assert len(frame) > 0
+    assert (frame["connector_m"] >= 0).all()
+    # Every connector's stop id resolves, and its line starts at that
+    # stop's own coordinate.
+    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+    lines = frame[frame.geometry.geom_type == "LineString"]
+    assert len(lines) > 0
+    for row in lines.head(50).itertuples(index=False):
+        lat, lon = coordinates[row.id]
+        first = row.geometry.coords[0]
+        assert abs(first[0] - lon) < 1e-9 and abs(first[1] - lat) < 1e-9
+    assert network_with_footpaths.connectors_gdf is frame
+
+
+def test_connectors_gdf_interpolates_the_synthetic_snap_point(tmp_path):
+    # Input-derived: stop A sits ON the first vertex (fraction 0,
+    # connector 0 — a point), and a second link places a stop at half
+    # the straight second edge with a known connector hop.
+    feed = _two_pattern_feed(tmp_path / "feed.zip", shaped=False)
+    network = TransportNetwork.from_gtfs([str(feed)])
+    network.set_street_network(
+        3,
+        [(0, 1, 700.0), (1, 2, 1000.0)],
+        [0, 3, 5],
+        [24.0, 24.005, 24.01, 24.01, 24.02],
+        [60.0, 60.003, 60.0, 60.0, 60.0],
+        [("A", 0, 0.0, 0.0), ("B", 1, 0.5, 25.0)],
+    )
+    frame = network.connectors_gdf
+    rows = {row.id: row for row in frame.itertuples(index=False)}
+    assert rows["A"].geometry.geom_type == "Point"
+    assert rows["A"].connector_m == 0.0
+    assert abs(rows["A"].geometry.x - 24.0) < 1e-7
+    snapped = rows["B"]
+    assert snapped.connector_m == 25.0
+    end = snapped.geometry.coords[-1]
+    # Half the straight (24.01→24.02, lat 60) edge by true length.
+    assert abs(end[0] - 24.015) < 1e-6 and abs(end[1] - 60.0) < 1e-6
+    # The line starts at stop B's own coordinate.
+    start = snapped.geometry.coords[0]
+    assert abs(start[0] - 24.01) < 1e-9 and abs(start[1] - 60.0) < 1e-9
+
+
+def test_connectors_gdf_requires_streets(network):
+    with pytest.raises(ValueError, match="street network"):
+        network.connectors_gdf
+
+
+def test_street_links_reject_coordinate_less_stops(tmp_path):
+    # A stop link asserts a snap from the stop's own coordinate; a
+    # coordinate-less stop cannot honestly carry one.
+    feed = _two_pattern_feed(
+        tmp_path / "feed.zip", shaped=False, drop_coordinates_of="B"
+    )
+    network = TransportNetwork.from_gtfs(
+        [str(feed)], trip_distances=False, leg_geometries=False
+    )
+    with pytest.raises(ValueError, match="carries no coordinate"):
+        network.set_street_network(
+            2,
+            [(0, 1, 100.0)],
+            [0, 2],
+            [24.0, 24.001],
+            [60.0, 60.0],
+            [("B", 0, 0.5, 10.0)],
+        )
+
+
+def test_connectors_gdf_handles_the_grid_and_the_antimeridian(tmp_path):
+    import zipfile
+
+    # Stop N sits within one 1e-7-degree grid cell of its snap point
+    # (a point, never a hair-thin line); stop W and its snap point
+    # straddle ±180°, and the drawn connector must take the short way.
+    tables = {
+        "agency.txt": [
+            "agency_id,agency_name,agency_url,agency_timezone",
+            "A,Test,http://example.com,Europe/Helsinki",
+        ],
+        "stops.txt": [
+            "stop_id,stop_name,stop_lat,stop_lon",
+            "N,N,60.0,24.0000000371",
+            "W,W,0.0,179.99995",
+            "E,E,0.0,-179.99999999",
+        ],
+        "routes.txt": ["route_id,route_short_name,route_type", "R1,1,3"],
+        "trips.txt": ["route_id,service_id,trip_id", "R1,SV,T1"],
+        "stop_times.txt": [
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+            "T1,08:00:00,08:00:00,N,1",
+            "T1,08:10:00,08:10:00,W,2",
+            "T1,08:20:00,08:20:00,E,3",
+        ],
+        "calendar.txt": [
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+            "sunday,start_date,end_date",
+            "SV,1,1,1,1,1,1,1,20220101,20221231",
+        ],
+    }
+    feed = tmp_path / "feed.zip"
+    with zipfile.ZipFile(feed, "w") as archive:
+        for name, lines in tables.items():
+            archive.writestr(name, "\n".join(lines) + "\n")
+    network = TransportNetwork.from_gtfs(
+        [str(feed)], trip_distances=False, leg_geometries=False
+    )
+    network.set_street_network(
+        4,
+        [(0, 1, 100.0), (2, 3, 1000.0)],
+        [0, 2, 4],
+        [24.0, 24.001, 179.9999, -179.9999],
+        [60.0, 60.0, 0.0, 0.0],
+        [("N", 0, 0.0, 0.0), ("W", 1, 0.5, 8.0), ("E", 1, 0.5, 0.0)],
+    )
+    frame = network.connectors_gdf
+    rows = {row.id: row for row in frame.itertuples(index=False)}
+    # One grid cell off: a point, not a sub-centimetre line.
+    assert rows["N"].geometry.geom_type == "Point"
+    # The snap midpoint normalises to ±180; drawn from 179.99995 the
+    # short way, the line never spans the globe.
+    west = rows["W"].geometry
+    assert west.geom_type == "LineString"
+    xs = [x for x, _ in west.coords]
+    assert max(xs) - min(xs) < 1.0
+    # Within one grid cell ACROSS ±180°: the wrapped delta decides —
+    # a point, never a hair-thin round-the-world line.
+    assert rows["E"].geometry.geom_type == "Point"

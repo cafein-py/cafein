@@ -845,6 +845,64 @@ impl StreetNetwork {
         Some(bounds)
     }
 
+    /// Per-stop-link export for the geo-layer surface: the stop, its
+    /// connector length in meters, and the snap point on the edge in
+    /// EPSG:4326 degrees — interpolated along the edge's stored
+    /// geometry at the link's true-length fraction.
+    pub fn connector_layer(&self) -> Vec<(StopIdx, f64, f64, f64)> {
+        let arrays = &self.graph.arrays;
+        let offsets = arrays.coordinate_offsets();
+        let lons = arrays.lons();
+        let lats = arrays.lats();
+        let cumulative = arrays.cumulative();
+        let scale = 1.0 / crate::streets::index::COORDINATE_SCALE;
+        self.stop_links
+            .links
+            .iter()
+            .map(|link| {
+                let start = offsets[link.edge as usize] as usize;
+                let end = offsets[link.edge as usize + 1] as usize;
+                let total = f64::from(cumulative[end - 1] - cumulative[start]);
+                let target = f64::from(cumulative[start]) + link.fraction * total;
+                // Bracket the target measure, then interpolate within
+                // its segment; a zero-length edge answers its head.
+                let mut at = start;
+                while at + 1 < end - 1 && f64::from(cumulative[at + 1]) < target {
+                    at += 1;
+                }
+                let span = f64::from(cumulative[at + 1] - cumulative[at]);
+                let within = if span > 0.0 {
+                    (target - f64::from(cumulative[at])) / span
+                } else {
+                    0.0
+                };
+                // Deltas in f64 (a raw i32 difference overflows across
+                // the antimeridian), wrapped onto the short way round
+                // so the interpolant follows the segment's own
+                // geometry, and the result normalised back into
+                // [-180, 180].
+                let full = 360.0 * crate::streets::index::COORDINATE_SCALE;
+                let from_lon = f64::from(lons[at]);
+                let mut lon_delta = f64::from(lons[at + 1]) - from_lon;
+                if lon_delta > full / 2.0 {
+                    lon_delta -= full;
+                } else if lon_delta < -full / 2.0 {
+                    lon_delta += full;
+                }
+                let mut lon = (from_lon + within * lon_delta) * scale;
+                if lon > 180.0 {
+                    lon -= 360.0;
+                } else if lon < -180.0 {
+                    lon += 360.0;
+                }
+                let lat = (f64::from(lats[at])
+                    + within * (f64::from(lats[at + 1]) - f64::from(lats[at])))
+                    * scale;
+                (link.stop, link.connector, lon, lat)
+            })
+            .collect()
+    }
+
     /// Per-edge export for the geo-layer surface: each physical
     /// edge's polyline in EPSG:4326 degrees, its stored length in
     /// meters, and — when the multimodal attribute group is present —

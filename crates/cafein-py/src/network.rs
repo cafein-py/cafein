@@ -669,6 +669,22 @@ impl TransportNetwork {
         }
     }
 
+    /// Per-stop-link rows for ``connectors_gdf``: the public stop id,
+    /// the connector's straight-line meters, and the snap point on
+    /// the street edge. Always the WALKING graph: it owns the
+    /// canonical access/egress stop links, and link edge indices are
+    /// graph-specific (the union graph stores none — its link tables
+    /// derive lazily). The walking ways exist in the union graph too,
+    /// so the overlay with ``streets_gdf`` stays coherent. Internal.
+    fn _connector_layer(&self) -> PyResult<Vec<(String, f64, f64, f64)>> {
+        let streets = self.installed_streets()?;
+        Ok(streets
+            .connector_layer()
+            .into_iter()
+            .map(|(stop, meters, lon, lat)| (self.public_stop_id(stop), meters, lon, lat))
+            .collect())
+    }
+
     /// Per-edge rows for ``streets_gdf``: polyline coordinates, stored
     /// length, and — on multimodal builds — the highway-class code and
     /// ``(forward, reverse)`` mode-permission bytes. The attribute
@@ -937,8 +953,17 @@ impl TransportNetwork {
         self.source = None;
         let mut links = Vec::with_capacity(stop_links.len());
         for (stop_id, edge, fraction, connector) in &stop_links {
+            let stop = self.resolve_stop(stop_id)?;
+            // A link asserts a snap from the stop's coordinate; a
+            // coordinate-less stop cannot have one.
+            let record = &self.feed.stops[stop.0 as usize];
+            if record.latitude.is_none() || record.longitude.is_none() {
+                return Err(PyValueError::new_err(format!(
+                    "stop link for {stop_id:?}: the stop carries no coordinate"
+                )));
+            }
             links.push(StopLink {
-                stop: self.resolve_stop(stop_id)?,
+                stop,
                 edge: *edge,
                 fraction: *fraction,
                 connector: *connector,

@@ -1350,6 +1350,64 @@ class TransportNetwork:
         return self._routes_gdf_cache
 
     @property
+    def connectors_gdf(self):
+        """The stop-to-street connectors as a GeoDataFrame.
+
+        One row per stop link: ``id``, ``name``, ``connector_m``
+        (the straight-line hop from the stop to its snap point on the
+        street network), and geometry — the connector line from the
+        stop's coordinate to that snap point, EPSG:4326. The snap
+        points ride the walking graph's stop links — the canonical
+        access/egress links — whose ways exist in the multimodal
+        union graph too, so overlaying ``streets_gdf`` stays
+        coherent; stops off the street network carry no link and no
+        row, and a stop the snapping linked through several edges
+        keeps one row per link. Raises when no street
+        network is installed. Computed lazily on first access and
+        cached on the network.
+        """
+        if getattr(self, "_connectors_gdf_cache", None) is None:
+            import geopandas
+            from shapely.geometry import LineString, Point
+
+            links = self._core._connector_layer()
+            coordinates = {stop: (lat, lon) for stop, lat, lon in self._core.stops}
+            names = dict(
+                zip((stop for stop, _, _ in self._core.stops), self._core._stop_names)
+            )
+            ids, labels, meters, geometry = [], [], [], []
+            for stop, connector, lon, lat in links:
+                ids.append(stop)
+                labels.append(names.get(stop))
+                meters.append(connector)
+                stop_lat, stop_lon = coordinates[stop]
+                # Unwrap the snap longitude toward the stop first (a
+                # pair straddling ±180° differs by ~360° raw), then
+                # classify on the wrapped delta: within one 1e-7-degree
+                # grid cell — the street store's own quantization — the
+                # stop sits on the network and the connector is a
+                # point, not a degenerate line.
+                drawn_lon = lon
+                if stop_lon is not None and abs(stop_lon - drawn_lon) > 180.0:
+                    drawn_lon += 360.0 if stop_lon > drawn_lon else -360.0
+                if (
+                    stop_lat is not None
+                    and stop_lon is not None
+                    and (abs(stop_lon - drawn_lon) > 1e-7 or abs(stop_lat - lat) > 1e-7)
+                ):
+                    geometry.append(
+                        LineString([(stop_lon, stop_lat), (drawn_lon, lat)])
+                    )
+                else:
+                    geometry.append(Point(lon, lat))
+            self._connectors_gdf_cache = geopandas.GeoDataFrame(
+                {"id": ids, "name": labels, "connector_m": meters},
+                geometry=geometry,
+                crs="EPSG:4326",
+            )
+        return self._connectors_gdf_cache
+
+    @property
     def streets_gdf(self):
         """The walking street network as a GeoDataFrame of edge lines.
 
@@ -1615,6 +1673,7 @@ class TransportNetwork:
         """
         self._core.set_street_network(*street_network)
         self._streets_gdf_cache = None
+        self._connectors_gdf_cache = None
 
     def access_stops(
         self,
