@@ -151,6 +151,100 @@ def _product_time_axis(
     return date, moment, True, active_window
 
 
+def _nearest_of_set(
+    network,
+    origins,
+    destinations,
+    date,
+    departure,
+    max_transfers,
+    horizon,
+    chunk,
+    exclusions,
+    walk_options,
+    travel_time_output,
+    output_time_units,
+):
+    """The k=1 arrive-by frame from one tagged reverse run."""
+    import numpy as np
+    import pandas as pd
+
+    from cafein.matrices import _chunk_slice, _point_list, _warn_unsnapped
+    from cafein.network import _walk_options
+
+    exclude_routes, exclude_trips, exclude_stops = exclusions
+    if _is_geo(origins) != _is_geo(destinations):
+        raise ValueError(
+            "origins and destinations must both be stop ids/tables "
+            "or both be point GeoDataFrames"
+        )
+    rows = []
+    if _is_geo(origins):
+        from_ids, origin_points = _point_list(origins, "origins")
+        keep = _chunk_slice(len(from_ids), chunk)
+        from_ids = list(from_ids[keep])
+        origin_points = list(origin_points[keep])
+        to_ids, destination_points = _point_list(destinations, "destinations")
+        walking_speed_kmph, max_walking_time, snap_distance = walk_options
+        table = network._core._arrive_by_nearest_points(
+            origin_points,
+            list(destination_points),
+            date,
+            departure,
+            max_transfers,
+            list(exclude_routes),
+            list(exclude_trips),
+            list(exclude_stops),
+            *_walk_options(walking_speed_kmph, max_walking_time, snap_distance),
+        )
+        _warn_unsnapped(table, from_ids, to_ids)
+        unreachable = np.iinfo(np.uint32).max
+        for identifier, cost_value, seed in zip(
+            from_ids, table["costs"], table["seeds"]
+        ):
+            if cost_value == unreachable:
+                continue
+            if horizon is not None and cost_value > horizon:
+                continue
+            rows.append((identifier, to_ids[seed], cost_value))
+    else:
+        from_ids = _stop_ids(origins, "origins")
+        keep = _chunk_slice(len(from_ids), chunk)
+        from_ids = list(from_ids[keep])
+        to_ids = _stop_ids(destinations, "destinations")
+        winners = network._core._arrive_by_nearest(
+            from_ids,
+            to_ids,
+            date,
+            departure,
+            max_transfers,
+            list(exclude_routes),
+            list(exclude_trips),
+            list(exclude_stops),
+        )
+        for identifier, winner in zip(from_ids, winners):
+            if winner is None:
+                continue
+            cost_value, seed = winner
+            if horizon is not None and cost_value > horizon:
+                continue
+            rows.append((identifier, to_ids[seed], cost_value))
+    costs = travel_time_output(
+        # The fan-out's ranking emits float costs; the fast path
+        # matches its dtype exactly.
+        np.asarray([row[2] for row in rows], dtype="float64"),
+        output_time_units,
+    )
+    return pd.DataFrame(
+        {
+            "from_id": np.asarray([row[0] for row in rows], dtype=object),
+            "rank": np.ones(len(rows), dtype="int64"),
+            "destination_id": np.asarray([row[1] for row in rows], dtype=object),
+            "cost": costs,
+        }
+    )
+
+
 def _is_table(value):
     return hasattr(value, "columns")
 
@@ -1514,6 +1608,43 @@ class NearestDestinations(pd.DataFrame):
                 "pass departure_time_window="
             )
         percentiles = [percentile] if cost == "time" and window is not None else None
+        if (
+            arrive_by
+            and k == 1
+            and cost == "time"
+            and window is None
+            and not _is_street_network(network)
+        ):
+            # The nearest-of-set fast path: ONE tagged reverse seeded
+            # with every destination replaces one run per destination;
+            # the winner's tag names the destination. Behavior matches
+            # the per-destination fan-out exactly — the shared cost
+            # surface's validations included.
+            if transport_mode is not None or max_street_time is not None:
+                raise ValueError(
+                    "transport_mode and max_street_time apply to a "
+                    "StreetNetwork; a TransportNetwork routes door to door"
+                )
+            if horizon is not None and (not math.isfinite(horizon) or horizon <= 0.0):
+                raise ValueError(
+                    f"max_cost must be a positive finite number, not {max_cost!r}"
+                )
+            frame = _nearest_of_set(
+                network,
+                origins,
+                destinations,
+                date,
+                departure,
+                max_transfers,
+                horizon,
+                chunk,
+                (exclude_routes, exclude_trips, exclude_stops),
+                (walking_speed_kmph, max_walking_time, snap_distance),
+                travel_time_output,
+                output_time_units,
+            )
+            super().__init__(frame)
+            return
         matrix, from_ids, to_ids, resolved_percentiles = _resolved_cost_matrix(
             network,
             origins,

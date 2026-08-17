@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- The nearest-of-set fast path: `NearestDestinations(k=1, arrival=)`
+  runs ONE reverse search seeded with every destination instead of
+  one per destination — labels carry their egress seed as a rider and
+  the winner's tag names the destination — behavior-identical to the
+  per-destination fan-out, on stop and point forms alike.
+  ([#277](https://github.com/cafein-py/cafein/pull/277))
+
 - Streamed arrive-by outputs: `TravelTimeMatrix.to_parquet` takes
   `arrival=` (and `arrival_time_window=`), batching the destination
   axis — the reverse fan-out axis — with the resume manifest

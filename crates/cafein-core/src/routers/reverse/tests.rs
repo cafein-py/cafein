@@ -757,3 +757,84 @@ fn early_marks_resurrect_states_later_winners_shadow() {
     assert_eq!(evaluated[1], vec![(1, 100, 200)]);
     assert_eq!(evaluated[2], vec![(1, 700, 800)]);
 }
+
+#[test]
+fn tagged_states_attribute_winners_to_their_seeds() {
+    // Two egress seeds compete: stop 3 (seed 0, via pattern B arriving
+    // 400) and stop 4 (seed 1, via the 2→4 footpath achieving 350).
+    // Tagged runs isolate dominance per seed, so BOTH destinations'
+    // chains survive the shared frontier — each destination's own
+    // winner stays exactly reproducible — and the reduction picks the
+    // shortest winner duration.
+    let (timetable, transfers) = network();
+    let reversed = ReversedTransfers::build(&transfers);
+    let query = Request {
+        departure: 1000,
+        access: vec![(StopIdx(0), 0)],
+        egress: vec![(StopIdx(3), 0), (StopIdx(4), 0)],
+        active_services: vec![true; 4],
+        active_services_previous: Vec::new(),
+        max_transfers: 3,
+        exclusions: None,
+    };
+    let states = reverse_one_to_all_tagged(&timetable, &reversed, &query, None);
+    let winner = states[0]
+        .iter()
+        .copied()
+        .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)).then(b.2.cmp(&a.2)))
+        .expect("origin reached");
+    let (_, departure, achieved, seed) = winner;
+    assert_eq!(seed, 1, "the footpath destination is nearest");
+    assert_eq!(achieved - departure, 250);
+    // Isolation keeps the other destination's chains alive too.
+    assert!(states[0].iter().any(|&(_, _, _, seed)| seed == 0));
+    // Alone, every chain carries the only seed's tag.
+    let only_three = Request {
+        egress: vec![(StopIdx(3), 0)],
+        ..query.clone()
+    };
+    let states = reverse_one_to_all_tagged(&timetable, &reversed, &only_three, None);
+    assert!(!states[0].is_empty());
+    assert!(states[0].iter().all(|&(_, _, _, seed)| seed == 0));
+}
+
+#[test]
+fn shared_trip_destinations_both_survive_a_tagged_run() {
+    // One trip 0→1→2 serves BOTH destinations (stop 1, seed 0; stop
+    // 2, seed 1). The onboard dedupe must keep one continuation per
+    // seed — merged by (trip, offset) alone, the earlier alighting
+    // would silently erase the farther destination from the frontier.
+    let mut builder = TimetableBuilder::new(3);
+    let a = builder
+        .add_pattern(&[StopIdx(0), StopIdx(1), StopIdx(2)], 0)
+        .unwrap();
+    builder
+        .add_trip(a, vec![time(100), time(200), time(300)], 0, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let transfers = Transfers::empty(3);
+    let reversed = ReversedTransfers::build(&transfers);
+    let query = Request {
+        departure: 1000,
+        access: vec![(StopIdx(0), 0)],
+        egress: vec![(StopIdx(1), 0), (StopIdx(2), 0)],
+        active_services: vec![true],
+        active_services_previous: Vec::new(),
+        max_transfers: 3,
+        exclusions: None,
+    };
+    let states = reverse_one_to_all_tagged(&timetable, &reversed, &query, None);
+    let seeds: Vec<u32> = states[0].iter().map(|&(_, _, _, seed)| seed).collect();
+    assert!(seeds.contains(&0), "the nearer destination survives");
+    assert!(seeds.contains(&1), "the farther destination survives");
+    let nearer = states[0]
+        .iter()
+        .find(|&&(_, _, _, seed)| seed == 0)
+        .unwrap();
+    let farther = states[0]
+        .iter()
+        .find(|&&(_, _, _, seed)| seed == 1)
+        .unwrap();
+    assert_eq!(nearer.2 - nearer.1, 100);
+    assert_eq!(farther.2 - farther.1, 200);
+}
