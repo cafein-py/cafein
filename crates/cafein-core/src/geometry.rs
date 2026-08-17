@@ -332,6 +332,19 @@ impl LegGeometry {
         })
     }
 
+    /// The deduplicated polyline a trip rides, for consumers that
+    /// group shared shapes (the geo layers): the polyline's index.
+    pub fn trip_polyline_id(&self, trip: TripIdx) -> u32 {
+        self.polyline_of[trip.0 as usize]
+    }
+
+    /// One deduplicated polyline's coordinates as `(lons, lats)`.
+    pub fn polyline_coordinates(&self, polyline: u32) -> (&[f64], &[f64]) {
+        let start = self.coordinate_offsets[polyline as usize] as usize;
+        let end = self.coordinate_offsets[polyline as usize + 1] as usize;
+        (&self.xs[start..end], &self.ys[start..end])
+    }
+
     /// The coordinates travelled on `trip` between two stop positions:
     /// the polyline slice between the stops' measures, endpoints
     /// interpolated. Always at least two points; a zero-length slice

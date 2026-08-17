@@ -548,6 +548,159 @@ impl TransportNetwork {
             .collect()
     }
 
+    /// Per-stop GTFS ``stop_name`` values, aligned with ``stops``'
+    /// order; ``None`` where the feed omits the name. Internal — the
+    /// ``stops_gdf`` property joins them.
+    #[getter]
+    fn _stop_names(&self) -> Vec<Option<String>> {
+        self.feed
+            .stops
+            .iter()
+            .map(|stop| stop.name.clone())
+            .collect()
+    }
+
+    /// Per-route ``(route_short_name, route_long_name)`` pairs,
+    /// aligned with ``routes``' order. Internal — the ``routes_gdf``
+    /// property joins them.
+    #[getter]
+    fn _route_names(&self) -> Vec<(Option<String>, Option<String>)> {
+        self.feed
+            .routes
+            .iter()
+            .map(|route| (route.short_name.clone(), route.long_name.clone()))
+            .collect()
+    }
+
+    /// Per-route geometry components for ``routes_gdf``, aligned with
+    /// ``routes``' order: each route's distinct contributing pattern
+    /// polylines as ``(tier mask, lons, lats)`` — bit 1 a real shape
+    /// line, bit 2 the straight stop-sequence chain (judged from the
+    /// polyline's own vertices against the pattern's stops, or built
+    /// here when no leg geometries are installed); a polyline riding
+    /// patterns of both kinds carries both bits. A pattern whose stops
+    /// lack coordinates contributes nothing: a missing coordinate
+    /// never bridges a gap. Internal.
+    #[allow(clippy::type_complexity)]
+    fn _route_geometries(&self) -> Vec<Vec<(u8, Vec<f64>, Vec<f64>)>> {
+        use std::collections::HashMap;
+
+        let timetable = &self.build.timetable;
+        let route_count = self.feed.routes.len();
+        #[allow(clippy::type_complexity)]
+        let mut layers: Vec<Vec<(u8, Vec<f64>, Vec<f64>)>> = vec![Vec::new(); route_count];
+        // Tier contributions per deduplicated polyline, independent of
+        // trip iteration order: bit 1 a shape tier, bit 2 the
+        // crow-fly (stop-sequence) tier — a polyline both tiers ride
+        // carries both bits, so the route-level label cannot depend
+        // on which trip was seen first.
+        let mut tiers: Vec<HashMap<u32, u8>> = vec![HashMap::new(); route_count];
+        for index in 0..timetable.pattern_count() {
+            let pattern = cafein_core::timetable::PatternIdx(index);
+            let route = timetable.pattern_route(pattern) as usize;
+            if let Some(legs) = &self.leg_geometry {
+                // The label describes the drawn line itself — is it
+                // the straight stop-to-stop chain? — never the
+                // independently replaceable distance tiers, so neither
+                // setter can leave a stale or untruthful label.
+                let stops = timetable.pattern_stops(pattern);
+                for trip in timetable.pattern_trips(pattern) {
+                    let polyline = legs.trip_polyline_id(trip);
+                    let (lons, lats) = legs.polyline_coordinates(polyline);
+                    let is_chain = lons.len() == stops.len()
+                        && stops.iter().enumerate().all(|(at, &stop)| {
+                            let record = &self.feed.stops[stop.0 as usize];
+                            match (record.longitude, record.latitude) {
+                                (Some(lon), Some(lat)) => {
+                                    (lons[at] - lon).abs() < 1e-9 && (lats[at] - lat).abs() < 1e-9
+                                }
+                                _ => false,
+                            }
+                        });
+                    let bit = if is_chain { 2u8 } else { 1u8 };
+                    *tiers[route].entry(polyline).or_insert(0) |= bit;
+                }
+            } else {
+                let stops = timetable.pattern_stops(pattern);
+                if stops.len() < 2 {
+                    continue;
+                }
+                let mut lons = Vec::with_capacity(stops.len());
+                let mut lats = Vec::with_capacity(stops.len());
+                let mut complete = true;
+                for &stop in stops {
+                    let record = &self.feed.stops[stop.0 as usize];
+                    match (record.longitude, record.latitude) {
+                        (Some(lon), Some(lat)) => {
+                            lons.push(lon);
+                            lats.push(lat);
+                        }
+                        _ => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if complete {
+                    layers[route].push((2, lons, lats));
+                }
+            }
+        }
+        if let Some(legs) = &self.leg_geometry {
+            for (route, polylines) in tiers.into_iter().enumerate() {
+                let mut ordered: Vec<(u32, u8)> = polylines.into_iter().collect();
+                ordered.sort_unstable();
+                for (polyline, mask) in ordered {
+                    let (lons, lats) = legs.polyline_coordinates(polyline);
+                    layers[route].push((mask, lons.to_vec(), lats.to_vec()));
+                }
+            }
+        }
+        layers
+    }
+
+    /// The geo layer's street graph's physical edge count. Internal —
+    /// the ``streets_gdf`` tests pin the layer against it.
+    #[getter]
+    fn _street_edge_count(&self) -> PyResult<u32> {
+        match &self.multimodal {
+            Some(streets) => Ok(streets.edge_count()),
+            None => Ok(self.installed_streets()?.edge_count()),
+        }
+    }
+
+    /// Per-stop-link rows for ``connectors_gdf``: the public stop id,
+    /// the connector's straight-line meters, and the snap point on
+    /// the street edge. Always the WALKING graph: it owns the
+    /// canonical access/egress stop links, and link edge indices are
+    /// graph-specific (the union graph stores none — its link tables
+    /// derive lazily). The walking ways exist in the union graph too,
+    /// so the overlay with ``streets_gdf`` stays coherent. Internal.
+    fn _connector_layer(&self) -> PyResult<Vec<(String, f64, f64, f64)>> {
+        let streets = self.installed_streets()?;
+        Ok(streets
+            .connector_layer()
+            .into_iter()
+            .map(|(stop, meters, lon, lat)| (self.public_stop_id(stop), meters, lon, lat))
+            .collect())
+    }
+
+    /// Per-edge rows for ``streets_gdf``: polyline coordinates, stored
+    /// length, and — on multimodal builds — the highway-class code and
+    /// ``(forward, reverse)`` mode-permission bytes. The attribute
+    /// arrays live on the multimodal union graph, so a multimodal
+    /// build exports that graph; a walk-only build exports the
+    /// walking graph. Internal.
+    #[allow(clippy::type_complexity)]
+    fn _street_edge_layer(
+        &self,
+    ) -> PyResult<Vec<(Vec<f64>, Vec<f64>, f64, Option<u8>, Option<(u8, u8)>)>> {
+        match &self.multimodal {
+            Some(streets) => Ok(streets.edge_layer()),
+            None => Ok(self.installed_streets()?.edge_layer()),
+        }
+    }
+
     /// Per-stop GTFS ``wheelchair_boarding`` as ``(stop_id, flag)``
     /// tuples: ``True`` = accessible, ``False`` = not accessible,
     /// ``None`` = the feed says nothing. A stop without a value
@@ -800,8 +953,17 @@ impl TransportNetwork {
         self.source = None;
         let mut links = Vec::with_capacity(stop_links.len());
         for (stop_id, edge, fraction, connector) in &stop_links {
+            let stop = self.resolve_stop(stop_id)?;
+            // A link asserts a snap from the stop's coordinate; a
+            // coordinate-less stop cannot have one.
+            let record = &self.feed.stops[stop.0 as usize];
+            if record.latitude.is_none() || record.longitude.is_none() {
+                return Err(PyValueError::new_err(format!(
+                    "stop link for {stop_id:?}: the stop carries no coordinate"
+                )));
+            }
             links.push(StopLink {
-                stop: self.resolve_stop(stop_id)?,
+                stop,
                 edge: *edge,
                 fraction: *fraction,
                 connector: *connector,

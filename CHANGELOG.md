@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Geo layers as lazy properties: `TransportNetwork.stops_gdf`,
+  `routes_gdf`, `streets_gdf`, and `connectors_gdf` — stops as named
+  points, routes as
+  their pattern shapes with a `geometry_provenance` column
+  (`shape`/`stop_sequence`/`mixed`/`none`), and the street edges with
+  lengths plus, on multimodal builds, highway classes and per-mode
+  permissions, and each stop's connector line to its street snap
+  point — all EPSG:4326, ready for `.explore()`.
+  ([#280](https://github.com/cafein-py/cafein/pull/280))
+
 ## 0.13.0 — 2026-08-17
 
 - Emissions and money deadlines: the cost surfaces —
