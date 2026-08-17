@@ -31,8 +31,8 @@ use crate::transfers::ReversedTransfers;
 mod search;
 
 pub use search::{
-    reverse_one_to_all, reverse_one_to_all_fold, reverse_one_to_all_tagged, reverse_profile_states,
-    reverse_route, reverse_route_profile, ReverseState,
+    profile_union, reverse_one_to_all, reverse_one_to_all_fold, reverse_one_to_all_tagged,
+    reverse_profile_states, reverse_route, reverse_route_profile, MarkWinners, ReverseState,
 };
 
 #[cfg(test)]

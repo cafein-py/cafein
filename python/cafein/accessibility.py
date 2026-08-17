@@ -117,7 +117,9 @@ def _product_time_axis(
     confidence=None,
 ):
     """Exactly one time axis for a product, each window naming its own
-    axis; the reverse serves ``cost='time'`` queries on RAPTOR only.
+    axis; the reverse serves arrive-by queries on RAPTOR only, and the
+    cost axes require the arrival window (the deadline profile prices
+    a window's candidates, never a bare deadline).
     The arrive-by branch owns the full validation — its stop dispatch
     bypasses the forward matrix layer's checks, so nothing may be
     silently accepted or ignored here. Returns (date, clock,
@@ -131,11 +133,13 @@ def _product_time_axis(
     if not arrive_by:
         date, moment = (None, None) if departure is None else departure_parts(departure)
         return date, moment, False, active_window
-    if cost != "time":
+    if cost in ("emissions", "money") and active_window is None:
         raise ValueError(
-            f"cost={cost!r} does not combine with arrival=; the "
-            "multicriteria reverse is a later arc"
+            f"cost={cost!r} with arrival= prices the deadline profile "
+            "over a window; pass arrival_time_window="
         )
+    if cost not in ("time", "emissions", "money"):
+        raise ValueError(f"cost={cost!r} does not combine with arrival=")
     if active_window is None and (percentiles is not None or confidence is not None):
         raise ValueError(
             "percentiles= and confidence= rank an arrival window's "
@@ -280,11 +284,14 @@ def _transit_cost_surface(
     exclusions,
     walk,
     _resolved=None,
+    arrive_by=False,
 ):
     """The dense per-destination optimum surface for an emissions or
     money axis: NaN marks pairs the engines emitted no row for —
     unreachable within the window, or carrying an unresolved factor or
-    unpriceable fare, none of which can satisfy a finite budget."""
+    unpriceable fare, none of which can satisfy a finite budget. With
+    ``arrive_by`` the window is an arrival window and each cell prices
+    the pair's deadline-profile candidates."""
     from cafein import emissions
     from cafein.matrices import (
         _chunk_slice,
@@ -308,9 +315,18 @@ def _transit_cost_surface(
     # fast; 120 minutes of total travel time is the default cap, as on
     # the cost matrices — max_travel_time overrides it.
     cap = max_travel_time
-    if cap is None and isinstance(fares, ZoneFareStructure):
+    if not arrive_by and cap is None and isinstance(fares, ZoneFareStructure):
         cap = 7200
-    _validate_cost_query(date, departure, objective, window, None, fare_tables, router)
+    _validate_cost_query(
+        date,
+        departure,
+        objective,
+        window,
+        None,
+        fare_tables,
+        router,
+        arrive_by=arrive_by,
+    )
     trip_factors = (
         resolved_factors
         if resolved_factors is not None
@@ -324,22 +340,39 @@ def _transit_cost_surface(
         rows = _chunk_slice(len(from_ids), chunk)
         from_ids = from_ids[rows]
         origin_points = origin_points[rows]
-        table = network._core.least_cost_matrix_from_points(
-            origin_points,
-            destination_points,
-            date,
-            departure,
-            window,
-            trip_factors,
-            objective,
-            fare_tables,
-            cap,
-            max_transfers,
-            router,
-            *exclusions,
-            *walk,
-            False,
-        )
+        if arrive_by:
+            table = network._core._arrive_by_least_cost_matrix_from_points(
+                origin_points,
+                destination_points,
+                date,
+                departure,
+                window,
+                trip_factors,
+                objective,
+                fare_tables,
+                cap,
+                max_transfers,
+                *exclusions,
+                *walk,
+                False,
+            )
+        else:
+            table = network._core.least_cost_matrix_from_points(
+                origin_points,
+                destination_points,
+                date,
+                departure,
+                window,
+                trip_factors,
+                objective,
+                fare_tables,
+                cap,
+                max_transfers,
+                router,
+                *exclusions,
+                *walk,
+                False,
+            )
         _warn_unsnapped(table, from_ids, to_ids)
         columns = np.asarray(table["to"], dtype="int64")
     else:
@@ -356,24 +389,40 @@ def _transit_cost_surface(
             if index not in position_of:
                 position_of[index] = len(unique_ids)
                 unique_ids.append(stop)
-        table = network._core.least_cost_matrix(
-            from_ids,
-            date,
-            departure,
-            window,
-            trip_factors,
-            objective,
-            fare_tables,
-            cap,
-            max_transfers,
-            unique_ids,
-            "time",
-            25.0,
-            router,
-            *exclusions,
-            *walk,
-            False,
-        )
+        if arrive_by:
+            table = network._core._arrive_by_least_cost_matrix(
+                from_ids,
+                date,
+                departure,
+                window,
+                trip_factors,
+                objective,
+                fare_tables,
+                cap,
+                max_transfers,
+                unique_ids,
+                *exclusions,
+                False,
+            )
+        else:
+            table = network._core.least_cost_matrix(
+                from_ids,
+                date,
+                departure,
+                window,
+                trip_factors,
+                objective,
+                fare_tables,
+                cap,
+                max_transfers,
+                unique_ids,
+                "time",
+                25.0,
+                router,
+                *exclusions,
+                *walk,
+                False,
+            )
         # The stop path reports destinations as global stop indices;
         # densify over the deduped columns, then expand back so
         # repeated destinations and aliases keep every column, exactly
@@ -549,6 +598,7 @@ def _resolved_cost_matrix(
                 (exclude_routes, exclude_trips, exclude_stops),
                 (walking_speed_kmph, max_walking_time, max_snap_distance),
                 _resolved=_resolved_costs,
+                arrive_by=arrive_by,
             )
             resolved_percentiles = None
         elif _is_geo(origins):
@@ -784,9 +834,12 @@ class Accessibility(pd.DataFrame):
     two), by the arrival deadline: every cost is then the
     latest-departure journey's own duration into the destination, one
     reverse run per destination, with ``chunk`` still slicing the
-    origins (a score needs every destination). ``arrival`` serves
-    ``cost="time"`` without a window, rides RAPTOR, and applies to
-    transit only. On a ``StreetNetwork``, both are
+    origins (a score needs every destination). ``arrival`` rides
+    RAPTOR and applies to transit only; ``cost="time"`` takes it bare
+    or windowed, while the emissions and money axes require
+    ``arrival_time_window=`` beside it and price each destination's
+    deadline profile exactly as ``TravelCostMatrix(arrival=)`` does.
+    On a ``StreetNetwork``, both are
     GeoDataFrames and `transport_mode` names the street mode.
 
     ``cost`` selects the axis budgets are measured on, with
@@ -795,12 +848,13 @@ class Accessibility(pd.DataFrame):
 
     - ``"time"`` — minutes (the default; windows/percentiles
       apply).
-    - ``"emissions"`` — grams CO2e via the cost engines; requires
-      `departure_time_window`, takes `factors`/`components`; a
+    - ``"emissions"`` — grams CO2e via the cost engines; requires its
+      axis's window (`departure_time_window`, or `arrival_time_window`
+      beside ``arrival=``), takes `factors`/`components`; a
       destination whose
       optimum is unresolved (an unpriced trip) counts as unreached.
     - ``"money"`` — the fare structure's own currency units (the
-      ``fare`` column's units); requires `departure_time_window` and
+      ``fare`` column's units); requires its axis's window and
       `fares`.
     - ``"distance"`` — metres, street networks only (network plus
       connector metres); on transit it is not an optimizable axis and
@@ -813,9 +867,10 @@ class Accessibility(pd.DataFrame):
     The emissions and money optima are single values over the window,
     so `percentiles` does not combine with them. ``max_travel_time``
     (minutes or a timedelta) bounds their journeys' total travel time;
-    on a zone fare structure the money axis defaults to 120 minutes,
-    as on the cost matrices, and the time axis rejects it — the
-    budgets already bound time.
+    on a zone fare structure the money axis defaults to 120 minutes
+    on the departure axis, as on the cost matrices (the arrival axis
+    prices pre-enumerated candidates and takes no implicit cap), and
+    the time axis rejects it — the budgets already bound time.
     """
 
     @property
@@ -1431,8 +1486,10 @@ class NearestDestinations(pd.DataFrame):
     ``StreetNetwork`` takes point frames and ``transport_mode``. The
     cost axes, engines, validation, and the ``arrival=`` twin of
     ``departure`` match ``Accessibility``:
-    ``cost="emissions"``/``"money"`` require ``departure_time_window``
-    (and ``fares=`` for money), ``cost="distance"`` is street-only.
+    ``cost="emissions"``/``"money"`` require their axis's window
+    (``departure_time_window``, or ``arrival_time_window`` beside
+    ``arrival=``, pricing each destination's deadline profile) and
+    ``fares=`` for money; ``cost="distance"`` is street-only.
     Slices and copies degrade to plain DataFrames.
 
     Parameters
@@ -1820,14 +1877,18 @@ class Catchment(gpd.GeoDataFrame):
     ``cost``, ``departure``, ``departure_time_window``, ``max_rides``,
     ``router``, ``factors``/``components``/``fares``,
     ``transport_mode``, the exclusions, and the walking options follow
-    ``Accessibility``. With ``arrival=`` (exactly one of the two, on
-    the transit time axis) the catchment is the region that can
-    *reach* the origin by the deadline: stop seeds run in the
+    ``Accessibility``. With ``arrival=`` (exactly one of the two) the
+    catchment is the region that can *reach* the origin by the
+    deadline. On the time axis stop seeds run in the
     before-deadline domain so the walking field maximizes the
     composed departure, and a cell belongs to a budget when its
     winning journey's own duration fits — a journey arriving well
     before the deadline keeps its cells even when the span to the
-    deadline does not. The wheelchair traveler's directed street
+    deadline does not. On the emissions and money axes (their
+    ``arrival_time_window`` beside ``arrival=``) each stop seeds at
+    its deadline-profile optimum toward the origin, so the region is
+    everything that can reach the place within the cost budget by
+    some profiled deadline. The wheelchair traveler's directed street
     bridge does not combine with ``arrival=`` yet. A wheelchair traveler's catchment rides the
     fixed compiled profile at the multimodal snap radius —
     ``walking_speed_kmph`` and ``snap_distance`` are rejected beside
@@ -2148,7 +2209,7 @@ class Catchment(gpd.GeoDataFrame):
             keep = _chunk_slice(len(from_ids), chunk)
             from_ids = list(from_ids[keep] if geo else from_ids[keep])
             points = list(points[keep])
-            if arrive_by:
+            if arrive_by and cost == "time":
                 # The arrive-by catchment: the region that can REACH
                 # the given place by the deadline. Stop seeds run in
                 # the before-deadline domain — `deadline − departure`
@@ -2260,6 +2321,7 @@ class Catchment(gpd.GeoDataFrame):
                 (speed_kmph, walk_cutoff, snap),
                 stop_ids,
                 wheeled,
+                arrive_by=arrive_by,
             )
             speed_ms = speed_kmph / 3.6
             for identifier, point, stop_costs in zip(from_ids, points, surfaces):
@@ -2388,9 +2450,13 @@ def _catchment_stop_costs(
     walk,
     stop_ids,
     wheeled=False,
+    arrive_by=False,
 ):
     """Per origin, the ``(global stop index, cost)`` pairs of every
     reached stop on the chosen axis — the walking field's seeds. With
+    ``arrive_by`` the cost surface transposes: each pair is a stop's
+    deadline-profile optimum TO the place, so the field seeds the
+    region that can reach it. With
     `wheeled`, point origins reach the stops through the synthesized
     wheelchair street policy — the seeds themselves never ride stairs
     — on the time axis; the cost surfaces carry no policy support yet,
@@ -2407,14 +2473,14 @@ def _catchment_stop_costs(
             )
         if geo:
             # Point origins ride the point-form cost surface; the
-            # destinations are the coordinate-bearing stops as points,
-            # so the columns align with those stops.
+            # stop side is the coordinate-bearing stops as points, so
+            # its axis aligns with those stops.
             import geopandas
 
             located = [
                 (stop, lat, lon) for stop, lat, lon in network.stops if lat is not None
             ]
-            destinations = geopandas.GeoDataFrame(
+            stop_frame = geopandas.GeoDataFrame(
                 {"id": [stop for stop, _, _ in located]},
                 geometry=geopandas.points_from_xy(
                     [lon for _, _, lon in located],
@@ -2424,12 +2490,48 @@ def _catchment_stop_costs(
             )
             surface_stops = [stop for stop, _, _ in located]
         else:
-            destinations = stop_ids
+            stop_frame = stop_ids
             surface_stops = stop_ids
+        if arrive_by:
+            # Transposed: the stops are the surface's origins and the
+            # (already chunked) places its destinations; each place's
+            # seed list is then its column over the stop axis.
+            from cafein.matrices import _point_frame
+
+            places = _point_frame(from_ids, points) if geo else list(from_ids)
+            surface, _from, _to = _transit_cost_surface(
+                network,
+                stop_frame,
+                places,
+                date,
+                departure,
+                cost,
+                window,
+                factors,
+                components,
+                fares,
+                max_transfers,
+                None,
+                router,
+                None,
+                [list(ids) for ids in exclusions],
+                walk,
+                arrive_by=True,
+            )
+            columns = np.asarray(list(network._core._stop_indices(surface_stops)))
+            surface = np.asarray(surface)
+            return [
+                [
+                    (int(columns[at]), float(value))
+                    for at, value in enumerate(surface[:, place])
+                    if np.isfinite(value)
+                ]
+                for place in range(surface.shape[1])
+            ]
         surface, _from, _to = _transit_cost_surface(
             network,
             origins,
-            destinations,
+            stop_frame,
             date,
             departure,
             cost,

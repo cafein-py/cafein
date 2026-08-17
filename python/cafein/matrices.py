@@ -91,6 +91,28 @@ class TravelCostMatrix(pd.DataFrame):
     departure : datetime.datetime or str
         Departure at every origin — a datetime, or an ISO string like
         ``"2022-02-22 08:30"``; the service date is its date part.
+        Give exactly one of ``departure`` and ``arrival``.
+    arrival : datetime.datetime or str (optional)
+        Arrival deadline at every destination, in the same forms, with
+        ``arrival_time_window`` beside it — the windowed optimize
+        modes are the only arrive-by cost modes (``optimize="time"``
+        rides ``TravelTimeMatrix``). Each cell prices the pair's
+        deadline profile: the exact journeys
+        ``route_between_stops(arrival=, arrival_time_window=)``
+        returns, replayed forward at their own departure instants
+        under the final minute mark's arrival ceiling, so the cell is
+        the lowest-objective candidate and a journey time-dominated
+        at every deadline never wins. On a zone fare structure the
+        cell is the cheapest candidate — the forward axis's exact
+        whole-window zone search (and its implicit 120-minute cap)
+        stays on the departure axis. One reverse run serves each
+        destination, so ``chunk`` slices the destination axis;
+        ``router="tbtr"``, ``candidates="pareto"``, and
+        ``street_policy`` do not combine with it.
+    arrival_time_window : float or datetime.timedelta (optional)
+        The arrival window in minutes beside ``arrival=``: deadlines
+        profile at every minute mark within it. Required with the
+        arrive-by cost modes; rejected beside ``departure=``.
     max_rides : int (optional, default: 8)
         Maximum number of boarded vehicles per journey (rides, not
         transfers: 8 rides allow 7 transfers).
@@ -190,9 +212,11 @@ class TravelCostMatrix(pd.DataFrame):
         Attach each pair's ridden legs as geometry. Off by default:
         per-pair geometries over large matrices are enormous.
     chunk : (int, int) (optional)
-        Compute only origin chunk ``k`` of ``n``: a deterministic
-        contiguous block of the resolved origins, so ``n`` batch jobs
-        cover all origins disjointly and their shards concatenate.
+        Compute only chunk ``k`` of ``n``: a deterministic contiguous
+        block of the fan-out axis — the resolved origins with
+        ``departure=``, the destinations with ``arrival=`` — so ``n``
+        batch jobs cover all pairs disjointly and their shards
+        concatenate.
     walking_speed_kmph, max_walking_time, snap_distance : float
         The street-search options for the walking access/egress, as in
         ``TransportNetwork.access_stops``: speed in km/h, walking time
@@ -300,6 +324,8 @@ class TravelCostMatrix(pd.DataFrame):
         destinations=None,
         departure=None,
         *,
+        arrival=None,
+        arrival_time_window=None,
         max_rides=8,
         optimize="time",
         departure_time_window=None,
@@ -363,13 +389,43 @@ class TravelCostMatrix(pd.DataFrame):
         )
 
         output_time_units = validated_output_time_units(output_time_units)
-        date, departure = (
-            (None, None) if departure is None else departure_parts(departure)
-        )
+        if departure is not None and arrival is not None:
+            raise ValueError("give exactly one of departure= or arrival=")
+        arrive_by = arrival is not None
+        from cafein._units import window_axis
+
+        raw_window = window_axis(arrive_by, departure_time_window, arrival_time_window)
+        if arrive_by:
+            from cafein._units import arrival_parts
+
+            if not _is_street_network(network):
+                if candidates != "time":
+                    raise ValueError(
+                        f"candidates={candidates!r} does not combine with "
+                        "arrival=; multicriteria arrive-by is a later arc"
+                    )
+                if router == "tbtr":
+                    raise ValueError(
+                        "router='tbtr' does not serve arrival=; the reverse "
+                        "search rides RAPTOR"
+                    )
+                if street_policy is not None:
+                    raise ValueError(
+                        "street_policy= (a traveler's street bridge included) "
+                        "does not combine with arrival= yet"
+                    )
+            date, departure = arrival_parts(arrival)
+        else:
+            date, departure = (
+                (None, None) if departure is None else departure_parts(departure)
+            )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         max_transfers = max_rides - 1
-        window = duration_seconds("departure_time_window", departure_time_window)
+        window = duration_seconds(
+            "arrival_time_window" if arrive_by else "departure_time_window",
+            raw_window,
+        )
         max_walking_time = duration_seconds("max_walking_time", max_walking_time)
         max_street_time = duration_seconds("max_street_time", max_street_time)
         max_snap_distance = snap_distance
@@ -398,6 +454,7 @@ class TravelCostMatrix(pd.DataFrame):
                 cost_components=cost_components,
                 transit_only={
                     "departure": departure,
+                    "arrival": arrival,
                     "traveler": traveler,
                     "departure_time_window": window,
                     "max_travel_time": within,
@@ -556,6 +613,7 @@ class TravelCostMatrix(pd.DataFrame):
             exclude_stops=exclude_stops,
             geometries=geometries,
             chunk=chunk,
+            arrive_by=arrive_by,
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
@@ -585,6 +643,8 @@ class TravelCostMatrix(pd.DataFrame):
         destinations=None,
         departure=None,
         *,
+        arrival=None,
+        arrival_time_window=None,
         output,
         batch_size=None,
         resume=False,
@@ -625,7 +685,9 @@ class TravelCostMatrix(pd.DataFrame):
         """The cost matrix streamed to Parquet — the constructor's
         semantics with `travel_cost_table`'s ``output=`` behavior.
 
-        Origins are processed in ``batch_size`` slices (default 500)
+        The fan-out axis — the origins with ``departure=``, the
+        destinations with ``arrival=`` — is processed in
+        ``batch_size`` slices (default 500)
         and each batch is written as it completes, so peak memory holds
         one batch — never the whole constructor result. ``output=``
         selects the form by suffix exactly as ``travel_cost_table``
@@ -665,13 +727,38 @@ class TravelCostMatrix(pd.DataFrame):
         )
 
         output_time_units = validated_output_time_units(output_time_units)
-        date, departure = (
-            (None, None) if departure is None else departure_parts(departure)
-        )
+        if departure is not None and arrival is not None:
+            raise ValueError("give exactly one of departure= or arrival=")
+        arrive_by = arrival is not None
+        from cafein._units import window_axis
+
+        raw_window = window_axis(arrive_by, departure_time_window, arrival_time_window)
+        if arrive_by:
+            from cafein._units import arrival_parts
+
+            if not _is_street_network(network):
+                if candidates != "time":
+                    raise ValueError(
+                        f"candidates={candidates!r} does not combine with "
+                        "arrival=; multicriteria arrive-by is a later arc"
+                    )
+                if router == "tbtr":
+                    raise ValueError(
+                        "router='tbtr' does not serve arrival=; the reverse "
+                        "search rides RAPTOR"
+                    )
+            date, departure = arrival_parts(arrival)
+        else:
+            date, departure = (
+                (None, None) if departure is None else departure_parts(departure)
+            )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         max_transfers = max_rides - 1
-        window = duration_seconds("departure_time_window", departure_time_window)
+        window = duration_seconds(
+            "arrival_time_window" if arrive_by else "departure_time_window",
+            raw_window,
+        )
         max_walking_time = duration_seconds("max_walking_time", max_walking_time)
         max_street_time = duration_seconds("max_street_time", max_street_time)
         max_snap_distance = snap_distance
@@ -695,6 +782,7 @@ class TravelCostMatrix(pd.DataFrame):
                 chunk=chunk,
                 transit_only={
                     "departure": departure,
+                    "arrival": arrival,
                     "traveler": traveler,
                     "departure_time_window": window,
                     "max_travel_time": within,
@@ -775,6 +863,7 @@ class TravelCostMatrix(pd.DataFrame):
             exclude_stops=exclude_stops,
             geometries=geometries,
             chunk=chunk,
+            arrive_by=arrive_by,
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
@@ -1970,6 +2059,8 @@ def travel_cost_table(
     destinations=None,
     departure=None,
     *,
+    arrival=None,
+    arrival_time_window=None,
     max_rides=8,
     optimize="time",
     departure_time_window=None,
@@ -1996,7 +2087,9 @@ def travel_cost_table(
 
     Semantics and parameters follow `TravelCostMatrix` — including the
     windowed optimize modes with their
-    ``departure_time_window``/``max_travel_time``, the ``fares``
+    ``departure_time_window``/``max_travel_time``, the arrive-by cost
+    axes (``arrival=`` beside ``arrival_time_window=``, whose batches
+    slice the destination axis), the ``fares``
     pricing, and the ``router`` engine choice, though always
     over the time candidates
     (no ``candidates``/``bucket``); the output is an
@@ -2014,7 +2107,9 @@ def travel_cost_table(
     ``cafein[arrow]``).
 
     With ``output=`` the matrix **streams to disk** instead of
-    materialising: origins are processed in ``batch_size`` slices
+    materialising: the fan-out axis — the origins with ``departure=``,
+    the destinations with ``arrival=`` — is processed in
+    ``batch_size`` slices
     (default 500) and the return value is a
     :class:`cafein.StreamingResult`, not a table. The form is chosen by
     suffix — a path whose final component ends in ``.parquet``
@@ -2073,11 +2168,31 @@ def travel_cost_table(
     )
 
     output_time_units = validated_output_time_units(output_time_units)
-    date, departure = (None, None) if departure is None else departure_parts(departure)
+    if departure is not None and arrival is not None:
+        raise ValueError("give exactly one of departure= or arrival=")
+    arrive_by = arrival is not None
+    from cafein._units import window_axis
+
+    raw_window = window_axis(arrive_by, departure_time_window, arrival_time_window)
+    if arrive_by:
+        from cafein._units import arrival_parts
+
+        if router == "tbtr":
+            raise ValueError(
+                "router='tbtr' does not serve arrival=; the reverse "
+                "search rides RAPTOR"
+            )
+        date, departure = arrival_parts(arrival)
+    else:
+        date, departure = (
+            (None, None) if departure is None else departure_parts(departure)
+        )
     if max_rides < 1:
         raise ValueError("max_rides must be at least 1")
     max_transfers = max_rides - 1
-    window = duration_seconds("departure_time_window", departure_time_window)
+    window = duration_seconds(
+        "arrival_time_window" if arrive_by else "departure_time_window", raw_window
+    )
     within = duration_seconds("max_travel_time", max_travel_time)
     max_walking_time = duration_seconds("max_walking_time", max_walking_time)
     max_snap_distance = snap_distance
@@ -2105,6 +2220,7 @@ def travel_cost_table(
             exclude_routes=exclude_routes,
             exclude_trips=exclude_trips,
             exclude_stops=exclude_stops,
+            arrive_by=arrive_by,
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
@@ -2137,6 +2253,7 @@ def travel_cost_table(
         candidates="time",
         bucket=25.0,
         router=router,
+        arrive_by=arrive_by,
         exclude_routes=exclude_routes,
         exclude_trips=exclude_trips,
         exclude_stops=exclude_stops,
@@ -2182,16 +2299,21 @@ def _stream_transit_cost(
     output,
     size,
     pyarrow,
+    arrive_by=False,
     resume=False,
     output_time_units="minutes",
 ):
-    """The transit cost matrix streamed in origin batches — shared by
-    ``travel_cost_table`` and ``TravelCostMatrix.to_parquet``."""
+    """The transit cost matrix streamed in sliced-axis batches — the
+    origins on the departure axis, the destinations (the reverse
+    fan-out axis) with ``arrive_by`` — shared by ``travel_cost_table``
+    and ``TravelCostMatrix.to_parquet``."""
     # Everything result-affecting resolves and freezes ONCE, before the
     # output is claimed: one-shot iterables drain here, later mutation of
     # the input frames cannot desynchronise batches from the fingerprint,
     # and an invalid query never leaves an empty claimed output behind.
-    _validate_cost_query(date, departure, optimize, window, within, fares, router)
+    _validate_cost_query(
+        date, departure, optimize, window, within, fares, router, arrive_by=arrive_by
+    )
     if candidates not in ("time", "pareto"):
         raise ValueError("candidates must be 'time' or 'pareto'")
     exclude_routes = list(id_sequence("exclude_routes", exclude_routes))
@@ -2200,8 +2322,24 @@ def _stream_transit_cost(
     if chunk is not None:
         chunk = tuple(int(part) for part in chunk)
     from_ids, to_ids, points, to_stops = _cost_endpoints(
-        network, origins, destinations, chunk
+        network, origins, destinations, None if arrive_by else chunk
     )
+    if arrive_by:
+        # The sliced (and chunked) axis is the destination selection —
+        # the reverse fan-out axis, exactly as the constructor's chunk.
+        # A stop table's ``to_id`` domain stays the full one so its
+        # rows keep their global keys.
+        if points is None:
+            to_axis = to_stops if to_stops is not None else list(to_ids)
+            if chunk is not None:
+                to_axis = to_axis[_chunk_slice(len(to_axis), chunk)]
+        else:
+            if chunk is not None:
+                keep = _chunk_slice(len(to_ids), chunk)
+                origin_points_all, destination_points_all = points
+                to_ids = to_ids[keep]
+                points = (origin_points_all, destination_points_all[keep])
+            to_axis = to_ids
     if candidates == "pareto":
         if optimize != "emissions":
             raise ValueError("candidates='pareto' requires optimize='emissions'")
@@ -2227,6 +2365,7 @@ def _stream_transit_cost(
     parameters = {
         "date": date,
         "departure": departure,
+        "time_axis": "arrival" if arrive_by else "departure",
         "max_transfers": max_transfers,
         "optimize": optimize,
         "window": window,
@@ -2251,7 +2390,18 @@ def _stream_transit_cost(
     }
 
     def make_batch(rows, shared_from, shared_to):
-        if points is None:
+        if arrive_by and points is None:
+            endpoints = ("stops", from_ids, to_axis[rows])
+        elif arrive_by:
+            origin_points, destination_points = points
+            endpoints = (
+                "points",
+                from_ids,
+                origin_points,
+                to_ids[rows],
+                destination_points[rows],
+            )
+        elif points is None:
             endpoints = ("stops", from_ids[rows], to_stops)
         else:
             origin_points, destination_points = points
@@ -2283,6 +2433,7 @@ def _stream_transit_cost(
             exclude_routes=exclude_routes,
             exclude_trips=exclude_trips,
             exclude_stops=exclude_stops,
+            arrive_by=arrive_by,
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
@@ -2292,11 +2443,14 @@ def _stream_transit_cost(
             table,
             shared_from,
             shared_to,
-            rows.start,
+            0 if arrive_by else rows.start,
             fares,
             geometries,
             pyarrow,
             output_time_units,
+            # Point rows key destinations by batch position; stop rows
+            # keep their global keys, so only the point form offsets.
+            to_offset=rows.start if arrive_by and points is not None else 0,
         )
 
     return _stream_run(
@@ -2312,6 +2466,8 @@ def _stream_transit_cost(
         make_batch,
         pyarrow,
         resume=resume,
+        slice_axis="to" if arrive_by else "from",
+        axis_count=len(to_axis) if arrive_by else None,
     )
 
 
@@ -2330,6 +2486,7 @@ def _stream_run(
     resume=False,
     dictionary_columns=("from_id", "to_id"),
     slice_axis="from",
+    axis_count=None,
 ):
     """The shared streaming driver: fingerprint, claim, batch, write.
 
@@ -2347,7 +2504,12 @@ def _stream_run(
 
     shared_from = pyarrow.array(from_ids, type=pyarrow.string())
     shared_to = pyarrow.array(to_ids, type=pyarrow.string())
-    count = len(from_ids) if slice_axis == "from" else len(to_ids)
+    # ``axis_count`` overrides when the sliced axis is a selection
+    # narrower than its id domain (a stop cost table's destinations).
+    if axis_count is not None:
+        count = axis_count
+    else:
+        count = len(from_ids) if slice_axis == "from" else len(to_ids)
     batches = max(1, -(-count // size))
     fingerprint = _streaming.fingerprint(
         operation,
@@ -2867,20 +3029,24 @@ def _arrow_table(
     geometries,
     pa,
     output_time_units,
+    to_offset=0,
 ):
     """One batch's Arrow table over the shared id dictionary domains.
 
     ``offset`` shifts the batch-relative origin indices into the shared
-    ``from_dictionary`` domain; destination indices already span theirs.
+    ``from_dictionary`` domain; ``to_offset`` does the same for
+    destination indices where they are batch-relative (the arrive-by
+    point batches), and is zero where they already span their domain.
     """
     from cafein._units import travel_time_output
 
     origin_indices = table["from"] if not offset else table["from"] + offset
+    to_indices = table["to"] if not to_offset else table["to"] + to_offset
     columns = {
         "from_id": pa.DictionaryArray.from_arrays(
             pa.array(origin_indices), from_dictionary
         ),
-        "to_id": pa.DictionaryArray.from_arrays(pa.array(table["to"]), to_dictionary),
+        "to_id": pa.DictionaryArray.from_arrays(pa.array(to_indices), to_dictionary),
         "travel_time": pa.array(
             travel_time_output(np.asarray(table["travel_time_s"]), output_time_units)
         ),
@@ -2949,6 +3115,7 @@ def _cost_columns(
     exclude_routes=(),
     exclude_trips=(),
     exclude_stops=(),
+    arrive_by=False,
     _resolved=None,
 ):
     """The core's cost arrays plus the origin and destination ids.
@@ -2969,10 +3136,19 @@ def _cost_columns(
     from cafein.fares import ZoneFareStructure
     from cafein.network import _walk_options
 
-    _validate_cost_query(date, departure, optimize, window, within, fares, router)
+    _validate_cost_query(
+        date, departure, optimize, window, within, fares, router, arrive_by=arrive_by
+    )
     # A zone structure's exact fare search needs a time limit to stay
-    # fast; 120 minutes of total travel time is the default cap.
-    if optimize == "fare" and within is None and isinstance(fares, ZoneFareStructure):
+    # fast; 120 minutes of total travel time is the default cap. The
+    # arrive-by axis prices pre-enumerated candidates, so it takes no
+    # implicit cap.
+    if (
+        not arrive_by
+        and optimize == "fare"
+        and within is None
+        and isinstance(fares, ZoneFareStructure)
+    ):
         within = 7200
     if candidates not in ("time", "pareto"):
         raise ValueError("candidates must be 'time' or 'pareto'")
@@ -3001,11 +3177,34 @@ def _cost_columns(
                 to_ids, destination_points = from_ids, origin_points
             else:
                 to_ids, destination_points = _point_list(destinations, "destinations")
-            rows = _chunk_slice(len(from_ids), chunk)
-            from_ids = from_ids[rows]
-            origin_points = origin_points[rows]
+            if arrive_by:
+                # The arrive-by chunk slices the destination axis — the
+                # reverse fan-out axis — exactly as the time matrix's.
+                keep = _chunk_slice(len(to_ids), chunk)
+                to_ids = to_ids[keep]
+                destination_points = destination_points[keep]
+            else:
+                rows = _chunk_slice(len(from_ids), chunk)
+                from_ids = from_ids[rows]
+                origin_points = origin_points[rows]
         walk = _walk_options(walking_speed_kmph, max_walking_time, max_snap_distance)
-        if optimize != "time":
+        if optimize != "time" and arrive_by:
+            table = network._core._arrive_by_least_cost_matrix_from_points(
+                origin_points,
+                destination_points,
+                date,
+                departure,
+                window,
+                trip_factors,
+                optimize,
+                fare_tables,
+                within,
+                max_transfers,
+                *exclusions,
+                *walk,
+                geometries,
+            )
+        elif optimize != "time":
             table = network._core.least_cost_matrix_from_points(
                 origin_points,
                 destination_points,
@@ -3047,13 +3246,35 @@ def _cost_columns(
                 if origins is None
                 else list(id_sequence("origins", origins))
             )
-            from_ids = from_ids[_chunk_slice(len(from_ids), chunk)]
             to_stops = (
                 None
                 if destinations is None
                 else list(id_sequence("destinations", destinations))
             )
-        if optimize != "time":
+            if arrive_by:
+                # The arrive-by chunk slices the destination axis — the
+                # reverse fan-out axis — exactly as the time matrix's.
+                if to_stops is None:
+                    to_stops = list(stop_ids)
+                to_stops = to_stops[_chunk_slice(len(to_stops), chunk)]
+            else:
+                from_ids = from_ids[_chunk_slice(len(from_ids), chunk)]
+        if optimize != "time" and arrive_by:
+            table = network._core._arrive_by_least_cost_matrix(
+                from_ids,
+                date,
+                departure,
+                window,
+                trip_factors,
+                optimize,
+                fare_tables,
+                within,
+                max_transfers,
+                to_stops,
+                *exclusions,
+                geometries,
+            )
+        elif optimize != "time":
             # The emissions (McRAPTOR) stop matrix relaxes a matching whole-day
             # McULTRA set for the pareto objective, routing door-to-door with
             # these walking options; otherwise it keeps the closure and ignores
@@ -3096,7 +3317,9 @@ def _cost_columns(
     return table, from_ids, to_ids
 
 
-def _validate_cost_query(date, departure, optimize, window, within, fares, router):
+def _validate_cost_query(
+    date, departure, optimize, window, within, fares, router, arrive_by=False
+):
     """The cost-matrix argument contract, shared by `_cost_columns` and
     the streaming path (which must validate before claiming outputs)."""
     if date is None or departure is None:
@@ -3105,8 +3328,14 @@ def _validate_cost_query(date, departure, optimize, window, within, fares, route
         raise ValueError(
             f"optimize must be 'time', 'emissions', or 'fare', not {optimize!r}"
         )
+    if arrive_by and optimize == "time":
+        raise ValueError(
+            "arrival= requires optimize='emissions' or 'fare'; the time "
+            "axis rides TravelTimeMatrix"
+        )
     if optimize != "time" and window is None:
-        raise ValueError(f"optimize={optimize!r} requires departure_time_window=")
+        name = "arrival_time_window" if arrive_by else "departure_time_window"
+        raise ValueError(f"optimize={optimize!r} requires {name}=")
     if optimize == "time" and not (window is None and within is None):
         raise ValueError(
             "departure_time_window and max_travel_time require "

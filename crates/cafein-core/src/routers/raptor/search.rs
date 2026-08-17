@@ -164,6 +164,22 @@ pub(crate) struct Search<'a> {
     transit_touched: Vec<StopIdx>,
 }
 
+/// One destination slot's deadline-profile candidates as exact
+/// (departure, arrival, rides) tuples — the arrive-by pricing
+/// filter's currency.
+pub type CandidateTuples = Vec<(u32, u32, u16)>;
+
+/// The arrive-by pricing filter of the cost folds: the final
+/// deadline mark's ceiling and, per destination slot, the deadline
+/// profile's exact (departure, arrival, rides) candidate tuples —
+/// composed and cross-round Pareto-filtered upstream, byte-identical
+/// to the windowed route output's. A row outside the candidates never
+/// prices, so a journey time-dominated at every deadline never wins.
+pub struct ArriveByPricing<'a> {
+    pub ceiling: u32,
+    pub allowed: &'a [CandidateTuples],
+}
+
 impl<'a> Search<'a> {
     pub(crate) fn new(
         timetable: &'a Timetable,
@@ -482,7 +498,10 @@ impl<'a> Search<'a> {
     /// Folds a pass's improved arrivals into each destination's best
     /// candidate on the objective: the lowest-key journey within the
     /// travel-time budget seen so far, ties resolved toward the
-    /// shorter travel time.
+    /// shorter travel time. With an [`ArriveByPricing`] filter, only
+    /// rows matching a destination's deadline-profile candidates —
+    /// exact (departure, arrival, rides) tuples arriving by the final
+    /// mark — are priced; everything else behaves bit-identically.
     ///
     /// `thresholds` carries the best arrival per (destination, round)
     /// across the descending departures; an arrival that does not
@@ -500,6 +519,7 @@ impl<'a> Search<'a> {
         inputs: &CostInputs<'_>,
         access_meters: Option<&HashMap<StopIdx, f64>>,
         objective: Objective,
+        arrive_by: Option<&ArriveByPricing<'_>>,
         thresholds: &mut [u32],
         best: &mut [Option<CostRow>],
     ) {
@@ -524,6 +544,16 @@ impl<'a> Search<'a> {
                 if budget.is_some_and(|budget| seconds > budget) {
                     continue;
                 }
+                if let Some(pricing) = arrive_by {
+                    // The ceiling is the final deadline mark — an
+                    // arrival past it satisfies no profiled deadline —
+                    // and only the destination's own candidates price.
+                    if arrival > pricing.ceiling
+                        || !pricing.allowed[slot].contains(&(departure, arrival, round as u16))
+                    {
+                        continue;
+                    }
+                }
                 let mut row = self.walk_costs(stop, round, inputs, access_meters);
                 row.seconds = seconds;
                 fold_better(&mut best[slot], row, objective);
@@ -543,6 +573,7 @@ impl<'a> Search<'a> {
         inputs: &CostInputs<'_>,
         access_meters: &HashMap<StopIdx, f64>,
         objective: Objective,
+        arrive_by: Option<&ArriveByPricing<'_>>,
         thresholds: &mut [u32],
         best: &mut [Option<CostRow>],
     ) {
@@ -582,6 +613,13 @@ impl<'a> Search<'a> {
                 let seconds = arrival - departure;
                 if budget.is_some_and(|budget| seconds > budget) {
                     continue;
+                }
+                if let Some(pricing) = arrive_by {
+                    if arrival > pricing.ceiling
+                        || !pricing.allowed[point].contains(&(departure, arrival, round as u16))
+                    {
+                        continue;
+                    }
                 }
                 let mut row = self.walk_costs(stop, round, inputs, Some(access_meters));
                 row.to = point as u32;

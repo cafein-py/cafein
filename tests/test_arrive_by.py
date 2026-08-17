@@ -470,7 +470,7 @@ def test_street_itineraries_place_the_clock_at_the_deadline(helsinki_streets):
 def test_product_rejections_on_the_arrival_axis(network, network_with_footpaths):
     from cafein import Accessibility, Catchment
 
-    with pytest.raises(ValueError, match="does not combine with arrival="):
+    with pytest.raises(ValueError, match="arrival_time_window"):
         Accessibility(network, [KORSO], [KAPYLA], arrival=DEADLINE, cost="emissions")
     with pytest.raises(ValueError, match="arrival_time_window"):
         Accessibility(
@@ -1047,3 +1047,432 @@ def test_the_fast_path_validates_the_horizon_like_the_fan_out(network):
             NearestDestinations(
                 network, [KORSO], [KAPYLA], arrival=DEADLINE, k=k, max_cost=0
             )
+
+
+def _profile_emissions(network, origin, destination, window):
+    journeys = network.route_between_stops(
+        origin, destination, arrival=DEADLINE, arrival_time_window=window
+    )
+    return [journey["emissions"] for journey in network.annotate_emissions(journeys)]
+
+
+def test_the_forward_cost_frame_is_pinned_with_the_ceiling_dormant(network):
+    # The arrival ceiling threads through every cost fold as an
+    # optional parameter; this pins the forward (ceiling-less) frame —
+    # row order, dtypes, the exact integer columns, and null placement
+    # — so a drifted cell cannot hide behind an unchanged shape.
+    import hashlib
+
+    import numpy as np
+
+    from cafein import TravelCostMatrix
+
+    frame = TravelCostMatrix(
+        network,
+        origins=[KORSO, "1020453", KAPYLA],
+        departure="2022-02-22 08:30:00",
+        optimize="emissions",
+        departure_time_window=20,
+        output_time_units="seconds",
+    )
+    assert len(frame) == 273
+    assert [str(dtype) for dtype in frame.dtypes] == [
+        "str",
+        "str",
+        "uint32",
+        "uint32",
+        "float64",
+        "float64",
+        "float64",
+    ]
+    assert int(frame.isna().sum().sum()) == 0
+    ids = "\n".join(frame["from_id"] + ">" + frame["to_id"]).encode()
+    assert (
+        hashlib.sha256(ids).hexdigest()
+        == "75c3fae9d5fb3e861189094f39de1a259dd37dd167ed90c1da0b2a9e2b7c652d"
+    )
+    integers = np.stack(
+        [frame["travel_time"].to_numpy(), frame["transfers"].to_numpy()]
+    ).astype("uint32")
+    assert (
+        hashlib.sha256(integers.tobytes()).hexdigest()
+        == "ad4b35edef670e779706907592a67111548d58904e1c09bb341729992b8976f8"
+    )
+    assert abs(frame["emissions"].sum() - 35138.225) < 1e-6
+    assert abs(frame["transit_distance_m"].sum() - 1405529.0) < 1e-6
+    assert frame["walk_distance_m"].sum() == 0.0
+    # A restricted query's full frame, cell by cell.
+    small = TravelCostMatrix(
+        network,
+        origins=[KORSO, KAPYLA],
+        destinations=[KORSO, KAPYLA, "1020453"],
+        departure="2022-02-22 08:30:00",
+        optimize="emissions",
+        departure_time_window=20,
+        output_time_units="seconds",
+    )
+    expected = [
+        (KORSO, KORSO, 0, 0, 0.0, 0.0, 0.0),
+        (KORSO, KAPYLA, 1320, 0, 16786.0, 0.0, 419.65),
+        (KAPYLA, KAPYLA, 0, 0, 0.0, 0.0, 0.0),
+    ]
+    assert len(small) == len(expected)
+    for row, want in zip(small.itertuples(index=False), expected):
+        assert (row.from_id, row.to_id) == want[:2]
+        assert (row.travel_time, row.transfers) == want[2:4]
+        assert abs(row.transit_distance_m - want[4]) < 1e-9
+        assert abs(row.walk_distance_m - want[5]) < 1e-9
+        assert abs(row.emissions - want[6]) < 1e-9
+
+
+def test_cost_cells_price_the_deadline_profiles_minimum(network):
+    # Every cell equals the minimum emissions over the pair's deadline
+    # profile, recomputed independently from the windowed arrive-by
+    # route plus annotation; self cells answer at zero and pairs whose
+    # profile is empty are absent — route parity, cell for cell.
+    from cafein import TravelCostMatrix
+
+    stops = [KORSO, "1020453", KAPYLA]
+    frame = TravelCostMatrix(
+        network,
+        origins=stops,
+        destinations=stops,
+        arrival=DEADLINE,
+        arrival_time_window=20,
+        optimize="emissions",
+        output_time_units="seconds",
+    )
+    cells = {(row.from_id, row.to_id): row for row in frame.itertuples(index=False)}
+    for origin in stops:
+        for destination in stops:
+            if origin == destination:
+                row = cells[(origin, destination)]
+                assert row.travel_time == 0 and row.emissions == 0.0
+                continue
+            values = _profile_emissions(network, origin, destination, 20)
+            if not values:
+                assert (origin, destination) not in cells
+                continue
+            assert abs(min(values) - cells[(origin, destination)].emissions) < 1e-9
+
+
+def test_the_money_axis_prices_the_zone_fares(network, helsinki_gtfs):
+    # The HSL zone tariff on the arrival axis: each cell is the
+    # cheapest fare among the deadline profile's candidates.
+    from cafein import TravelCostMatrix, fares
+
+    hsl = fares.zone_fare_structure(str(helsinki_gtfs), rules="zones")
+    frame = TravelCostMatrix(
+        network,
+        origins=[KORSO],
+        destinations=[KAPYLA],
+        arrival=DEADLINE,
+        arrival_time_window=30,
+        optimize="fare",
+        fares=hsl,
+        output_time_units="seconds",
+    )
+    journeys = network.route_between_stops(
+        KORSO, KAPYLA, arrival=DEADLINE, arrival_time_window=30
+    )
+    priced = fares.annotate_fares(journeys, hsl)
+    assert len(frame) == 1
+    assert abs(min(j["fare"] for j in priced) - frame["fare"].iloc[0]) < 1e-9
+
+
+def test_point_cost_cells_take_the_walk_and_the_budgeted_transit(
+    network_with_footpaths,
+):
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    from cafein import TravelCostMatrix
+
+    points = gpd.GeoDataFrame(
+        {"id": ["kamppi", "hakaniemi"]},
+        geometry=[Point(lon, lat) for lat, lon in [KAMPPI, HAKANIEMI]],
+        crs="EPSG:4326",
+    )
+    frame = TravelCostMatrix(
+        network_with_footpaths,
+        origins=points.iloc[:1],
+        destinations=points,
+        arrival=DEADLINE,
+        arrival_time_window=20,
+        optimize="emissions",
+        output_time_units="seconds",
+    )
+    cells = {row.to_id: row for row in frame.itertuples(index=False)}
+    # The walking-only alternative's zero grams win the open cell, and
+    # the self cell answers at zero — exactly the forward axis's rule.
+    walked = cells["hakaniemi"]
+    assert walked.emissions == 0.0 and walked.transfers == 0
+    assert walked.walk_distance_m > 0.0 and walked.transit_distance_m == 0.0
+    assert cells["kamppi"].travel_time == 0
+    # A budget below the walk's duration hands the cell to the
+    # cheapest within-budget transit candidate of the profile.
+    budgeted = TravelCostMatrix(
+        network_with_footpaths,
+        origins=points.iloc[:1],
+        destinations=points.iloc[1:],
+        arrival=DEADLINE,
+        arrival_time_window=20,
+        optimize="emissions",
+        max_travel_time=20,
+        output_time_units="seconds",
+    )
+    journeys = network_with_footpaths.route_between_coordinates(
+        KAMPPI, HAKANIEMI, arrival=DEADLINE, arrival_time_window=20
+    )
+    annotated = network_with_footpaths.annotate_emissions(journeys)
+    within = [
+        journey["emissions"]
+        for journey in annotated
+        if journey["rides"] > 0
+        and journey["arrival_s"] - journey["departure_s"] <= 1200
+    ]
+    assert len(budgeted) == 1
+    assert budgeted["transit_distance_m"].iloc[0] > 0.0
+    assert abs(min(within) - budgeted["emissions"].iloc[0]) < 1e-9
+
+
+def test_cost_products_ride_the_deadline_profile(network):
+    # Accessibility counts destinations whose deadline-profile optimum
+    # fits the budget, and NearestDestinations reports that optimum —
+    # both against the matrix cell they must share.
+    import pandas as pd
+
+    from cafein import Accessibility, NearestDestinations, TravelCostMatrix
+
+    cell = TravelCostMatrix(
+        network,
+        origins=[KORSO],
+        destinations=[KAPYLA],
+        arrival=DEADLINE,
+        arrival_time_window=20,
+        optimize="emissions",
+        output_time_units="seconds",
+    )["emissions"].iloc[0]
+    destinations = pd.DataFrame({"id": [KAPYLA], "reachable": [1]})
+    scores = Accessibility(
+        network,
+        origins=[KORSO],
+        destinations=destinations,
+        arrival=DEADLINE,
+        arrival_time_window=20,
+        cost="emissions",
+        budgets=[cell - 1.0, cell + 1.0],
+    )
+    below = scores[scores["budget"] == cell - 1.0]["accessibility"].iloc[0]
+    above = scores[scores["budget"] == cell + 1.0]["accessibility"].iloc[0]
+    assert (below, above) == (0.0, 1.0)
+    nearest = NearestDestinations(
+        network,
+        origins=[KORSO],
+        destinations=[KAPYLA],
+        arrival=DEADLINE,
+        arrival_time_window=20,
+        cost="emissions",
+        k=1,
+    )
+    assert abs(nearest["cost"].iloc[0] - cell) < 1e-9
+
+
+def test_the_arrive_by_cost_catchment_seeds_the_fitting_stops(
+    network_with_footpaths,
+):
+    # The emissions catchment of a place on the arrival axis: a stop
+    # whose deadline-profile optimum fits the budget seeds the region,
+    # so its location lies inside; a budget below every candidate
+    # leaves it out. Central stops, so the walking field has streets,
+    # and a tight walking cutoff so only the seed itself can cover it.
+    pytest.importorskip("h3")
+    from shapely.geometry import Point
+
+    from cafein import Catchment, TravelCostMatrix
+
+    place, seed_stop = "1010125", "1010108"
+    cell = TravelCostMatrix(
+        network_with_footpaths,
+        origins=[seed_stop],
+        destinations=[place],
+        arrival=DEADLINE,
+        arrival_time_window=20,
+        optimize="emissions",
+        output_time_units="seconds",
+    )["emissions"].iloc[0]
+    regions = Catchment(
+        network_with_footpaths,
+        origins=[place],
+        arrival=DEADLINE,
+        arrival_time_window=20,
+        cost="emissions",
+        budgets=[cell - 1.0, cell + 1.0],
+        max_walking_time=2,
+    )
+    seed = next(
+        Point(lon, lat)
+        for stop, lat, lon in network_with_footpaths.stops
+        if stop == seed_stop
+    )
+    tight = regions[regions["budget"] == cell - 1.0].geometry
+    loose = regions[regions["budget"] == cell + 1.0].geometry
+    assert not any(region.contains(seed) for region in tight)
+    assert any(region.contains(seed) for region in loose)
+
+
+def test_the_streamed_cost_table_slices_the_destination_axis(network, tmp_path):
+    import json
+
+    import pandas as pd
+    import pyarrow.parquet as pq
+
+    from cafein import travel_cost_table
+
+    query = dict(
+        origins=[KORSO, KAPYLA],
+        destinations=[KORSO, KAPYLA, "1020453"],
+        arrival=DEADLINE,
+        arrival_time_window=20,
+        optimize="emissions",
+        output_time_units="seconds",
+    )
+    table = travel_cost_table(network, **query)
+    result = travel_cost_table(
+        network, output=str(tmp_path / "shards"), batch_size=1, **query
+    )
+    manifest = json.loads((tmp_path / "shards" / "manifest.json").read_text())
+    assert manifest["batch_axis"] == "to"
+    assert result.batches == 3
+    shards = sorted((tmp_path / "shards").glob("part-*.parquet"))
+    streamed = pd.concat([pq.read_table(shard).to_pandas() for shard in shards])
+    keys = ["from_id", "to_id"]
+    left = table.to_pandas()
+    right = streamed
+    left[keys] = left[keys].astype(str)
+    right[keys] = right[keys].astype(str)
+    left = left.sort_values(keys).reset_index(drop=True)
+    right = right.sort_values(keys).reset_index(drop=True)
+    pd.testing.assert_frame_equal(left, right)
+    # A resumed run must refuse a different arrival query.
+    with pytest.raises(ValueError, match="fingerprint"):
+        travel_cost_table(
+            network,
+            output=str(tmp_path / "shards"),
+            batch_size=1,
+            resume=True,
+            **{**query, "arrival": WINDOW_START},
+        )
+
+
+def test_cost_rejections_on_the_arrival_axis(network, helsinki_gtfs):
+    import pandas as pd
+
+    from cafein import (
+        Accessibility,
+        Catchment,
+        NearestDestinations,
+        TravelCostMatrix,
+        travel_cost_table,
+    )
+
+    with pytest.raises(ValueError, match="optimize='emissions' or 'fare'"):
+        TravelCostMatrix(
+            network, origins=[KORSO], arrival=DEADLINE, arrival_time_window=20
+        )
+    with pytest.raises(ValueError, match="arrival_time_window"):
+        TravelCostMatrix(
+            network, origins=[KORSO], arrival=DEADLINE, optimize="emissions"
+        )
+    with pytest.raises(ValueError, match="reverse search rides RAPTOR"):
+        TravelCostMatrix(
+            network,
+            origins=[KORSO],
+            arrival=DEADLINE,
+            arrival_time_window=20,
+            optimize="emissions",
+            router="tbtr",
+        )
+    with pytest.raises(ValueError, match="departure_time_window= profiles"):
+        TravelCostMatrix(
+            network,
+            origins=[KORSO],
+            arrival=DEADLINE,
+            departure_time_window=20,
+            optimize="emissions",
+        )
+    with pytest.raises(ValueError, match="multicriteria arrive-by"):
+        TravelCostMatrix(
+            network,
+            origins=[KORSO],
+            arrival=DEADLINE,
+            arrival_time_window=20,
+            optimize="emissions",
+            candidates="pareto",
+        )
+    with pytest.raises(ValueError, match="reverse search rides RAPTOR"):
+        travel_cost_table(
+            network,
+            origins=[KORSO],
+            arrival=DEADLINE,
+            arrival_time_window=20,
+            optimize="emissions",
+            router="tbtr",
+        )
+    destinations = pd.DataFrame({"id": [KAPYLA], "reachable": [1]})
+    for bare in (
+        lambda: Accessibility(
+            network,
+            origins=[KORSO],
+            destinations=destinations,
+            arrival=DEADLINE,
+            cost="emissions",
+            budgets=[100.0],
+        ),
+        lambda: NearestDestinations(
+            network,
+            origins=[KORSO],
+            destinations=[KAPYLA],
+            arrival=DEADLINE,
+            cost="money",
+            k=1,
+        ),
+        lambda: Catchment(
+            network,
+            origins=[KAPYLA],
+            arrival=DEADLINE,
+            cost="emissions",
+            budgets=[100.0],
+        ),
+    ):
+        with pytest.raises(ValueError, match="arrival_time_window"):
+            bare()
+
+
+def test_a_walk_longer_than_every_deadline_is_no_candidate(network_with_footpaths):
+    # Near midnight the direct walk cannot be placed to arrive by any
+    # mark — the overlay must not invent a walking journey departing
+    # the previous day.
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    from cafein import TravelCostMatrix
+
+    points = gpd.GeoDataFrame(
+        {"id": ["kamppi", "hakaniemi"]},
+        geometry=[Point(lon, lat) for lat, lon in [KAMPPI, HAKANIEMI]],
+        crs="EPSG:4326",
+    )
+    frame = TravelCostMatrix(
+        network_with_footpaths,
+        origins=points.iloc[:1],
+        destinations=points.iloc[1:],
+        arrival="2022-02-22 00:20:00",
+        arrival_time_window=10,
+        optimize="emissions",
+        output_time_units="seconds",
+    )
+    deadline_s = 20 * 60 + 9 * 60
+    walks = frame[(frame["transit_distance_m"] == 0.0) & (frame["walk_distance_m"] > 0)]
+    assert walks.empty
+    assert (frame["travel_time"] <= deadline_s).all()

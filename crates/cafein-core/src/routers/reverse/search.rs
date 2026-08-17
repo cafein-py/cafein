@@ -572,10 +572,36 @@ pub fn reverse_route_profile(
             (walk_seconds, reverse_profile_states(&states, marks))
         })
         .collect();
+    let union = profile_union(&profiles, marks, walk);
+    let walks: Vec<(u32, u32)> = union
+        .iter()
+        .filter(|&&(_, rides, _)| rides == 0)
+        .map(|&(departure, _, achieved)| (departure, achieved))
+        .collect();
+    let transit: Vec<(u32, usize, u32)> = union
+        .into_iter()
+        .filter(|&(_, rides, _)| rides > 0)
+        .collect();
+    (replay(timetable, transfers, request, &transit), walks)
+}
+
+/// The deadline profile's candidate union over ascending `marks`:
+/// each mark's access-composed complete-journey Pareto set — an
+/// optional direct walk competing inside every mark's selection,
+/// placed to arrive exactly at that mark — deduplicated on exact
+/// tuples and sorted by the complete-journey order. These are the
+/// windowed route output's tuples; the arrive-by cost surfaces share
+/// this election verbatim, so their candidates are byte-identical by
+/// construction.
+pub fn profile_union(
+    profiles: &[(u32, MarkWinners)],
+    marks: &[u32],
+    walk: Option<u32>,
+) -> Vec<(u32, usize, u32)> {
     let mut union: Vec<(u32, usize, u32)> = Vec::new();
     for (at, &mark) in marks.iter().enumerate() {
         let mut candidates: Vec<(u32, usize, u32)> = Vec::new();
-        for (walk_seconds, profile) in &profiles {
+        for (walk_seconds, profile) in profiles {
             for &(round, departure, achieved) in &profile[at] {
                 if let Some(composed) = departure.checked_sub(*walk_seconds) {
                     candidates.push((composed, round as usize, achieved));
@@ -609,16 +635,7 @@ pub fn reverse_route_profile(
         }
     }
     union.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-    let walks: Vec<(u32, u32)> = union
-        .iter()
-        .filter(|&&(_, rides, _)| rides == 0)
-        .map(|&(departure, _, achieved)| (departure, achieved))
-        .collect();
-    let transit: Vec<(u32, usize, u32)> = union
-        .into_iter()
-        .filter(|&(_, rides, _)| rides > 0)
-        .collect();
-    (replay(timetable, transfers, request, &transit), walks)
+    union
 }
 
 /// Per-origin per-round fixed frontier states: `result[stop]` lists
