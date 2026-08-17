@@ -4916,3 +4916,46 @@ fn outward_walks_equal_inward_ones() {
     let d03 = seconds(&fields[0], own_vertex[3]);
     assert!((d02 - d03).abs() > 10.0, "{d02} vs {d03}");
 }
+
+#[test]
+fn the_edge_layer_reports_directional_access_and_self_loops() {
+    // The expectations come from the INPUT attribute arrays, never the
+    // exporter: an asymmetric two-way edge and a self-loop (both slots
+    // on one vertex — the first takes forward, the second reverse).
+    let edges: Vec<TestEdge> = vec![
+        (0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0))),
+        (1, 1, 50.0, vec![(100.0, 0.0), (120.0, 10.0), (100.0, 0.0)]),
+    ];
+    let attrs = Attrs {
+        highway: vec![5, 16],
+        surface: vec![0, 0],
+        smoothness: vec![0, 0],
+        flags: vec![0, 0],
+        access_forward: vec![MODE_WALK | MODE_BICYCLE, MODE_WALK],
+        access_reverse: vec![MODE_WALK, 0],
+        facility_forward: vec![0, 0],
+        facility_reverse: vec![0, 0],
+    };
+    let net = multimodal_network(2, &edges, &attrs).unwrap();
+    let layer = net.edge_layer();
+    assert_eq!(layer.len(), 2);
+    for (lons, lats, meters, highway, access) in &layer {
+        assert_eq!(lons.len(), lats.len());
+        if (*meters - 100.0).abs() < 1e-9 {
+            assert_eq!(*highway, Some(5));
+            assert_eq!(*access, Some((MODE_WALK | MODE_BICYCLE, MODE_WALK)));
+            // The polyline reproduces the input endpoints on the
+            // fixed-point grid.
+            let (lon0, lat0) = lonlat(0.0, 0.0);
+            let (lon1, lat1) = lonlat(100.0, 0.0);
+            assert!((lons[0] - lon0).abs() < 1e-6 && (lats[0] - lat0).abs() < 1e-6);
+            let last = lons.len() - 1;
+            assert!((lons[last] - lon1).abs() < 1e-6 && (lats[last] - lat1).abs() < 1e-6);
+        } else {
+            assert!((*meters - 50.0).abs() < 1e-9);
+            assert_eq!(*highway, Some(16));
+            assert_eq!(*access, Some((MODE_WALK, 0)));
+            assert_eq!(lons.len(), 3);
+        }
+    }
+}

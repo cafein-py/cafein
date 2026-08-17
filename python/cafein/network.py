@@ -1254,6 +1254,160 @@ class TransportNetwork:
         """The routable trips as ``(trip_id, route_id)`` tuples."""
         return self._core.trips
 
+    @property
+    def stops_gdf(self):
+        """The stops as a GeoDataFrame for direct mapping.
+
+        One row per stop: ``id``, ``name`` (the GTFS ``stop_name``;
+        ``None`` where the feed omits it), and point geometry in
+        EPSG:4326 — ready for ``.explore()`` and spatial joins. Stops
+        without coordinates keep their row with missing geometry, so
+        the ids stay joinable to the matrix outputs. Computed lazily
+        on first access and cached on the network.
+        """
+        if getattr(self, "_stops_gdf_cache", None) is None:
+            import geopandas
+            from shapely.geometry import Point
+
+            rows = self._core.stops
+            geometry = [
+                Point(lon, lat) if lat is not None and lon is not None else None
+                for _, lat, lon in rows
+            ]
+            self._stops_gdf_cache = geopandas.GeoDataFrame(
+                {
+                    "id": [stop for stop, _, _ in rows],
+                    "name": self._core._stop_names,
+                },
+                geometry=geometry,
+                crs="EPSG:4326",
+            )
+        return self._stops_gdf_cache
+
+    @property
+    def routes_gdf(self):
+        """The routes as a GeoDataFrame for direct mapping.
+
+        One row per route: ``id``, ``name`` (the GTFS
+        ``route_short_name``, falling back to ``route_long_name``),
+        ``route_type`` (the numeric GTFS code), ``geometry``, and
+        ``geometry_provenance`` — all EPSG:4326. Geometry is the
+        MultiLineString of the route's distinct pattern shapes,
+        selected per pattern: the installed leg geometry, else the
+        straight line through the
+        pattern's stop coordinates — and only when every stop in the
+        pattern carries coordinates (a missing coordinate never
+        bridges a gap; such a pattern contributes nothing).
+        ``geometry_provenance`` describes the drawn lines themselves —
+        a component whose vertices are exactly the pattern's stop
+        chain is ``"stop_sequence"``, any other is ``"shape"``, and a
+        route with both kinds is ``"mixed"``; ``"none"`` means no
+        pattern could contribute (the row stays, geometry missing).
+        The label never reads the distance tiers, so replacing trip
+        distances cannot relabel an unchanged line. Computed lazily on
+        first access and cached on the network; installing new leg
+        geometries recomputes it.
+        """
+        if getattr(self, "_routes_gdf_cache", None) is None:
+            import geopandas
+            from shapely.geometry import MultiLineString
+
+            rows = self._core.routes
+            names = self._core._route_names
+            components = self._core._route_geometries()
+            label_of = {1: "shape", 2: "stop_sequence"}
+            ids, labels, types, provenances, geometry = [], [], [], [], []
+            for (route_id, _agency, route_type), (short, long), parts in zip(
+                rows, names, components
+            ):
+                ids.append(route_id)
+                labels.append(short if short is not None else long)
+                types.append(route_type)
+                if not parts:
+                    provenances.append("none")
+                    geometry.append(None)
+                    continue
+                # Each part carries a tier bitmask (a polyline both
+                # tiers ride carries both bits), so the label cannot
+                # depend on contribution order.
+                bits = 0
+                for mask, _, _ in parts:
+                    bits |= mask
+                provenances.append(label_of.get(bits, "mixed"))
+                geometry.append(
+                    MultiLineString([list(zip(lons, lats)) for _, lons, lats in parts])
+                )
+            self._routes_gdf_cache = geopandas.GeoDataFrame(
+                {
+                    "id": ids,
+                    "name": labels,
+                    "route_type": types,
+                    "geometry_provenance": provenances,
+                },
+                geometry=geometry,
+                crs="EPSG:4326",
+            )
+        return self._routes_gdf_cache
+
+    @property
+    def streets_gdf(self):
+        """The walking street network as a GeoDataFrame of edge lines.
+
+        One row per graph edge — the multimodal union graph on
+        multimodal builds (the attribute carrier), the walking graph
+        otherwise: the edge's real polyline (EPSG:4326)
+        and ``length_m``; on multimodal builds additionally the OSM
+        ``highway`` class and one column per street mode (``walk``,
+        ``bicycle``, ``e_scooter``, ``car``, ``wheelchair``) holding
+        the edge's permission as ``"both"``, ``"forward"``,
+        ``"reverse"``, or ``"no"`` (forward is the stored geometry
+        direction). Raises when no street network is installed.
+        Computed lazily on first access and cached on the network.
+        """
+        if getattr(self, "_streets_gdf_cache", None) is None:
+            import geopandas
+            from shapely.geometry import LineString
+
+            from cafein._osm import (
+                BICYCLE,
+                CAR,
+                E_SCOOTER,
+                HIGHWAY_CODES,
+                WALK,
+                WHEELCHAIR,
+            )
+
+            rows = self._core._street_edge_layer()
+            data = {"length_m": [meters for _, _, meters, _, _ in rows]}
+            if rows and rows[0][3] is not None:
+                highway_names = {code: name for name, code in HIGHWAY_CODES.items()}
+                data["highway"] = [highway_names[code] for _, _, _, code, _ in rows]
+                modes = (
+                    ("walk", WALK),
+                    ("bicycle", BICYCLE),
+                    ("e_scooter", E_SCOOTER),
+                    ("car", CAR),
+                    ("wheelchair", WHEELCHAIR),
+                )
+                directions = {
+                    (True, True): "both",
+                    (True, False): "forward",
+                    (False, True): "reverse",
+                    (False, False): "no",
+                }
+                for mode, bit in modes:
+                    data[mode] = [
+                        directions[(bool(forward & bit), bool(reverse & bit))]
+                        for _, _, _, _, (forward, reverse) in rows
+                    ]
+            geometry = [
+                LineString(list(zip(lons, lats))) for lons, lats, _, _, _ in rows
+            ]
+            self._streets_gdf_cache = geopandas.GeoDataFrame(
+                data, geometry=geometry, crs="EPSG:4326"
+            )
+        return self._streets_gdf_cache
+
     def annotate_emissions(self, journeys, factors=None, components=None):
         """Attach per-leg and per-journey emissions to routed journeys.
 
@@ -1447,6 +1601,7 @@ class TransportNetwork:
             ``cafein.geometry.trip_distances(..., geometries=True)``.
         """
         self._core.set_leg_geometries(*leg_geometries)
+        self._routes_gdf_cache = None
 
     def set_street_network(self, *street_network):
         """Install the street network for coordinate access/egress.
@@ -1459,6 +1614,7 @@ class TransportNetwork:
             footpaths) by ``cafein.streets.walking_streets``.
         """
         self._core.set_street_network(*street_network)
+        self._streets_gdf_cache = None
 
     def access_stops(
         self,

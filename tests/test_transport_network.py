@@ -1069,3 +1069,275 @@ def test_wheelchair_fields_ride_the_feed(network):
     for _, flag in trips:
         trip_counts[flag] += 1
     assert trip_counts == {True: 191_929, False: 3422, None: 0}
+
+
+def _two_pattern_feed(path, shaped=True, drop_coordinates_of=None, both_shaped=False):
+    """One route, two trips on two patterns (A→B→C and A→B); an optional
+    dense shape on the first trip only, or on both with ``both_shaped``."""
+    import zipfile
+
+    stops = [("A", 60.0, 24.0), ("B", 60.0, 24.01), ("C", 60.0, 24.02)]
+    stop_rows = [
+        f"{sid},{sid},," if sid == drop_coordinates_of else f"{sid},{sid},{lat},{lon}"
+        for sid, lat, lon in stops
+    ]
+    # Stops sit on shape vertices; the detour vertex between B and C
+    # sits off every stop-to-stop segment.
+    shape = [
+        (60.0, 24.0),
+        (60.0, 24.005),
+        (60.0, 24.01),
+        (60.0005, 24.0125),
+        (60.0, 24.015),
+        (60.0, 24.02),
+    ]
+    tables = {
+        "agency.txt": [
+            "agency_id,agency_name,agency_url,agency_timezone",
+            "A,Test,http://example.com,Europe/Helsinki",
+        ],
+        "stops.txt": ["stop_id,stop_name,stop_lat,stop_lon"] + stop_rows,
+        "routes.txt": ["route_id,route_short_name,route_type", "R1,1,3"],
+        "trips.txt": [
+            "route_id,service_id,trip_id,shape_id",
+            "R1,SV,T1," + ("S1" if shaped else ""),
+            "R1,SV,T2," + ("S2" if both_shaped else ""),
+        ],
+        "stop_times.txt": [
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+            "T1,08:00:00,08:00:00,A,1",
+            "T1,08:01:00,08:01:00,B,2",
+            "T1,08:02:00,08:02:00,C,3",
+            "T2,09:00:00,09:00:00,A,1",
+            "T2,09:01:00,09:01:00,B,2",
+        ],
+        "calendar.txt": [
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+            "sunday,start_date,end_date",
+            "SV,1,1,1,1,1,1,1,20220101,20221231",
+        ],
+    }
+    if shaped:
+        second = [(60.0, 24.0), (60.0004, 24.005), (60.0, 24.01)]
+        tables["shapes.txt"] = (
+            ["shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence"]
+            + (
+                [
+                    f"S2,{lat},{lon},{sequence}"
+                    for sequence, (lat, lon) in enumerate(second)
+                ]
+                if both_shaped
+                else []
+            )
+        ) + [f"S1,{lat},{lon},{sequence}" for sequence, (lat, lon) in enumerate(shape)]
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, lines in tables.items():
+            archive.writestr(name, "\n".join(lines) + "\n")
+    return path
+
+
+def test_stops_gdf_matches_the_tuple_surface(network):
+    frame = network.stops_gdf
+    tuples = network.stops
+    assert list(frame.columns) == ["id", "name", "geometry"]
+    assert str(frame.crs) == "EPSG:4326"
+    assert len(frame) == len(tuples)
+    for (sid, lat, lon), row in zip(tuples, frame.itertuples(index=False)):
+        assert row.id == sid
+        if lat is None or lon is None:
+            assert row.geometry is None
+        else:
+            assert abs(row.geometry.y - lat) < 1e-12
+            assert abs(row.geometry.x - lon) < 1e-12
+    assert frame["name"].notna().any()
+    # The ids join the matrix outputs directly.
+    from cafein import TravelTimeMatrix
+
+    matrix = TravelTimeMatrix(
+        network,
+        origins=[tuples[0][0]],
+        departure="2022-02-22 08:30:00",
+        output_time_units="seconds",
+    )
+    joined = matrix.merge(frame[["id", "name"]], left_on="to_id", right_on="id")
+    assert len(joined) == len(matrix)
+    assert network.stops_gdf is frame
+
+
+def test_routes_gdf_distinguishes_shapes_from_fallback(tmp_path):
+    feed = _two_pattern_feed(tmp_path / "feed.zip", shaped=True)
+    shaped = TransportNetwork.from_gtfs([str(feed)])
+    frame = shaped.routes_gdf
+    assert list(frame.columns) == [
+        "id",
+        "name",
+        "route_type",
+        "geometry_provenance",
+        "geometry",
+    ]
+    assert str(frame.crs) == "EPSG:4326"
+    assert list(frame["id"]) == ["R1"] and list(frame["name"]) == ["1"]
+    assert list(frame["route_type"]) == [3]
+    # T1 rides the dense shape (linear-referenced tier), T2 crow-flies:
+    # the honest per-pattern union is mixed.
+    assert frame["geometry_provenance"].iloc[0] == "mixed"
+    parts = list(frame.geometry.iloc[0].geoms)
+    vertex_counts = sorted(len(part.coords) for part in parts)
+    # The shape part carries more vertices than its three stops and an
+    # off-segment bend vertex — a flattened or substituted stop line
+    # could never contain it.
+    assert vertex_counts[-1] > 3
+    assert any(
+        any(abs(x - 24.0125) < 1e-9 and abs(y - 60.0005) < 1e-9 for x, y in part.coords)
+        for part in parts
+    )
+    plain = TransportNetwork.from_gtfs([str(feed)], leg_geometries=False)
+    fallback = plain.routes_gdf
+    assert fallback["geometry_provenance"].iloc[0] == "stop_sequence"
+    lines = sorted(
+        [list(part.coords) for part in fallback.geometry.iloc[0].geoms], key=len
+    )
+    assert lines[0] == [(24.0, 60.0), (24.01, 60.0)]
+    assert lines[1] == [(24.0, 60.0), (24.01, 60.0), (24.02, 60.0)]
+
+
+def test_routes_gdf_keeps_a_row_when_no_pattern_contributes(tmp_path):
+    feed = _two_pattern_feed(
+        tmp_path / "feed.zip", shaped=False, drop_coordinates_of="B"
+    )
+    # The distance ladder refuses coordinate-less stops; without it the
+    # network builds and the layer must still answer honestly.
+    network = TransportNetwork.from_gtfs(
+        [str(feed)], trip_distances=False, leg_geometries=False
+    )
+    frame = network.routes_gdf
+    # Both patterns ride B, whose coordinate is missing: neither may
+    # bridge the gap, the row stays with empty geometry.
+    assert list(frame["id"]) == ["R1"]
+    assert frame["geometry_provenance"].iloc[0] == "none"
+    assert frame.geometry.iloc[0] is None
+
+
+def test_streets_gdf_matches_the_stored_arrays(network_with_footpaths):
+    frame = network_with_footpaths.streets_gdf
+    assert len(frame) == network_with_footpaths._core._street_edge_count
+    assert str(frame.crs) == "EPSG:4326"
+    assert (frame["length_m"] > 0).all()
+    rows = network_with_footpaths._core._street_edge_layer()
+    # A curved edge exists, and the frame's polyline equals the stored
+    # coordinate arrays vertex for vertex.
+    curved = next(i for i, row in enumerate(rows) if len(row[0]) > 2)
+    coordinates = list(frame.geometry.iloc[curved].coords)
+    assert coordinates == list(zip(rows[curved][0], rows[curved][1]))
+    assert frame["length_m"].iloc[curved] == rows[curved][2]
+    assert network_with_footpaths.streets_gdf is frame
+
+
+def test_streets_gdf_carries_modes_on_multimodal(multimodal_network):
+    frame = multimodal_network.streets_gdf
+    for column in ("highway", "walk", "bicycle", "e_scooter", "car", "wheelchair"):
+        assert column in frame.columns
+    allowed = {"both", "forward", "reverse", "no"}
+    for mode in ("walk", "bicycle", "e_scooter", "car", "wheelchair"):
+        assert set(frame[mode].unique()) <= allowed
+    assert (frame["walk"] != "no").any()
+    assert frame["highway"].isin(["footway", "residential", "path"]).any()
+
+
+def test_streets_gdf_requires_streets(network):
+    with pytest.raises(ValueError, match="street network"):
+        network.streets_gdf
+
+
+def test_streets_gdf_reproduces_an_independent_synthetic_graph(tmp_path):
+    # The expected values come from the INPUT arrays handed to
+    # set_street_network, never from the exporter under test: a curved
+    # two-edge graph whose intermediate vertex, lengths, and vertex
+    # coordinates must come back verbatim (to the fixed-point grid).
+    feed = _two_pattern_feed(tmp_path / "feed.zip", shaped=False)
+    network = TransportNetwork.from_gtfs([str(feed)])
+    lons = [24.0, 24.005, 24.01, 24.01, 24.02]
+    lats = [60.0, 60.003, 60.0, 60.0, 60.0]
+    network.set_street_network(
+        3,
+        [(0, 1, 700.0), (1, 2, 555.0)],
+        [0, 3, 5],
+        lons,
+        lats,
+        [("A", 0, 0.0, 0.0)],
+    )
+    frame = network.streets_gdf
+    assert len(frame) == 2
+    by_length = {row.length_m: row for row in frame.itertuples(index=False)}
+    curved = by_length[700.0]
+    coordinates = list(curved.geometry.coords)
+    # The store densifies edge geometry; the input vertices must appear
+    # in order (endpoints exact, the bend among the interior vertices).
+    positions = []
+    for lon, lat in zip(lons[:3], lats[:3]):
+        positions.append(
+            next(
+                i
+                for i, (x, y) in enumerate(coordinates)
+                if abs(x - lon) < 1e-6 and abs(y - lat) < 1e-6
+            )
+        )
+    assert positions[0] == 0 and positions[-1] == len(coordinates) - 1
+    assert positions == sorted(positions)
+    straight = by_length[555.0]
+    tail = list(straight.geometry.coords)
+    assert abs(tail[0][0] - 24.01) < 1e-6 and abs(tail[-1][0] - 24.02) < 1e-6
+    # Walk-only synthetic graphs carry no attribute group.
+    assert list(frame.columns) == ["length_m", "geometry"]
+
+
+def test_streets_gdf_recomputes_after_a_street_replacement(tmp_path):
+    feed = _two_pattern_feed(tmp_path / "feed.zip", shaped=False)
+    network = TransportNetwork.from_gtfs([str(feed)])
+    network.set_street_network(
+        2,
+        [(0, 1, 100.0)],
+        [0, 2],
+        [24.0, 24.001],
+        [60.0, 60.0],
+        [("A", 0, 0.0, 0.0)],
+    )
+    first = network.streets_gdf
+    assert len(first) == 1
+    network.set_street_network(
+        3,
+        [(0, 1, 100.0), (1, 2, 100.0)],
+        [0, 2, 4],
+        [24.0, 24.001, 24.001, 24.002],
+        [60.0, 60.0, 60.0, 60.0],
+        [("A", 0, 0.0, 0.0)],
+    )
+    assert len(network.streets_gdf) == 2
+
+
+def test_routes_gdf_labels_an_all_shape_build(tmp_path):
+    # Both patterns ride real bent shapes: no drawn line equals its
+    # stop chain, so the pure-shape label applies.
+    feed = _two_pattern_feed(tmp_path / "feed.zip", shaped=True, both_shaped=True)
+    network = TransportNetwork.from_gtfs([str(feed)])
+    frame = network.routes_gdf
+    assert list(frame["geometry_provenance"]) == ["shape"]
+
+
+def test_routes_gdf_provenance_ignores_the_distance_tiers(tmp_path):
+    feed = _two_pattern_feed(tmp_path / "feed.zip", shaped=False)
+    network = TransportNetwork.from_gtfs([str(feed)])
+    # Without shapes every polyline IS the stop chain: the label says
+    # so, judged from the line's own vertices.
+    assert network.routes_gdf["geometry_provenance"].iloc[0] == "stop_sequence"
+    # Replacing the distance tiers must NOT relabel unchanged lines —
+    # the label describes the geometry, never the tier metadata.
+    rows = [
+        ("T1", [0.0, 556.0, 1112.0], "shape_linref"),
+        ("T2", [0.0, 556.0], "shape_linref"),
+    ]
+    network.set_trip_distances(rows)
+    # A fresh computation, never the cached frame: drop the cache so a
+    # surviving tier dependency cannot hide behind it.
+    network._routes_gdf_cache = None
+    assert network.routes_gdf["geometry_provenance"].iloc[0] == "stop_sequence"
