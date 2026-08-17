@@ -1474,3 +1474,230 @@ def test_connectors_gdf_handles_the_grid_and_the_antimeridian(tmp_path):
     # Within one grid cell ACROSS ±180°: the wrapped delta decides —
     # a point, never a hair-thin round-the-world line.
     assert rows["E"].geometry.geom_type == "Point"
+
+
+def _calendar_rules(gtfs_zip):
+    """The calendar files parsed once: weekly rows and exceptions —
+    the tests' independent oracle evaluates dates against these."""
+    import csv
+    import datetime
+    import io
+    import zipfile
+
+    def parse(raw):
+        return datetime.date(int(raw[:4]), int(raw[4:6]), int(raw[6:8]))
+
+    weekly, exceptions = [], []
+    with zipfile.ZipFile(gtfs_zip) as archive:
+        names = set(archive.namelist())
+        if "calendar.txt" in names:
+            with archive.open("calendar.txt") as handle:
+                for row in csv.DictReader(io.TextIOWrapper(handle, "utf-8-sig")):
+                    weekly.append(
+                        (
+                            row["service_id"],
+                            [
+                                row[day] == "1"
+                                for day in (
+                                    "monday",
+                                    "tuesday",
+                                    "wednesday",
+                                    "thursday",
+                                    "friday",
+                                    "saturday",
+                                    "sunday",
+                                )
+                            ],
+                            parse(row["start_date"]),
+                            parse(row["end_date"]),
+                        )
+                    )
+        if "calendar_dates.txt" in names:
+            with archive.open("calendar_dates.txt") as handle:
+                for row in csv.DictReader(io.TextIOWrapper(handle, "utf-8-sig")):
+                    exceptions.append(
+                        (
+                            row["service_id"],
+                            parse(row["date"]),
+                            row["exception_type"] == "1",
+                        )
+                    )
+    return weekly, exceptions
+
+
+def _services_running_on(rules, date):
+    weekly, exceptions = rules
+    running = {
+        service
+        for service, weekdays, start, end in weekly
+        if start <= date <= end and weekdays[date.weekday()]
+    }
+    for service, at, added in exceptions:
+        if at == date:
+            (running.add if added else running.discard)(service)
+    return running
+
+
+def _trip_services(gtfs_zip):
+    import csv
+    import io
+    import zipfile
+
+    with zipfile.ZipFile(gtfs_zip) as archive:
+        with archive.open("trips.txt") as handle:
+            return {
+                row["trip_id"]: row["service_id"]
+                for row in csv.DictReader(io.TextIOWrapper(handle, "utf-8-sig"))
+            }
+
+
+def test_the_service_window_and_daily_counts_answer_when_routing_works(
+    network, helsinki_gtfs
+):
+    import datetime
+
+    window = network.service_window
+    assert window is not None
+    first, last = window
+    assert isinstance(first, datetime.date) and isinstance(last, datetime.date)
+    # The canonical query date lies inside the fixture's window.
+    assert first <= datetime.date(2022, 2, 22) <= last
+    series = network.daily_trip_counts
+    assert series.index[0].date() == first and series.index[-1].date() == last
+    assert len(series) == (last - first).days + 1
+    assert str(series.dtype) == "int64"
+    # Endpoint days run by definition (the window trims to running days).
+    assert series.iloc[0] > 0 and series.iloc[-1] > 0
+    # The exact endpoints recompute from the calendar FILES: over the
+    # files' raw candidate span, the first and last date any routable
+    # trip's service runs must BE the window — silent truncation at
+    # either end cannot hide.
+    rules = _calendar_rules(str(helsinki_gtfs))
+    services_of = _trip_services(str(helsinki_gtfs))
+    routable = {services_of[trip_id] for trip_id, _ in network.trips}
+    weekly, exceptions = rules
+    candidates = [start for _, _, start, _ in weekly] + [
+        at for _, at, added in exceptions if added
+    ]
+    ends = [end for _, _, _, end in weekly] + [
+        at for _, at, added in exceptions if added
+    ]
+    lower, upper = min(candidates), max(ends)
+    running_days = [
+        lower + datetime.timedelta(days=offset)
+        for offset in range((upper - lower).days + 1)
+        if _services_running_on(rules, lower + datetime.timedelta(days=offset))
+        & routable
+    ]
+    assert (first, last) == (running_days[0], running_days[-1])
+    # Sampled days' counts equal the files' own resolution applied to
+    # the network's routable trips.
+    for offset in (0, (last - first).days // 2, (last - first).days):
+        date = first + datetime.timedelta(days=offset)
+        running = _services_running_on(rules, date)
+        expected = sum(
+            1 for trip_id, _ in network.trips if services_of[trip_id] in running
+        )
+        assert series.iloc[offset] == expected
+    # The busiest date is a real date inside the window.
+    busiest = series.idxmax().date()
+    assert first <= busiest <= last
+    assert network.daily_trip_counts is series
+
+
+def test_service_metadata_survives_a_save_load_round_trip(network, tmp_path):
+    network.save(tmp_path / "net.cafein")
+    from cafein import TransportNetwork
+
+    loaded = TransportNetwork.load(tmp_path / "net.cafein")
+    assert loaded.service_window == network.service_window
+    first_read = loaded.daily_trip_counts
+    assert first_read.equals(network.daily_trip_counts)
+    assert loaded.daily_trip_counts is first_read
+
+
+def test_far_future_calendars_stay_countable(tmp_path):
+    import datetime
+    import zipfile
+
+    # Nanosecond timestamps end at year 2262; a legal GTFS calendar
+    # reaching further must still produce the Series.
+    tables = {
+        "agency.txt": [
+            "agency_id,agency_name,agency_url,agency_timezone",
+            "A,Test,http://example.com,Europe/Helsinki",
+        ],
+        "stops.txt": [
+            "stop_id,stop_name,stop_lat,stop_lon",
+            "A,A,60.0,24.0",
+            "B,B,60.0,24.01",
+        ],
+        "routes.txt": ["route_id,route_short_name,route_type", "R1,1,3"],
+        "trips.txt": ["route_id,service_id,trip_id", "R1,SV,T1"],
+        "stop_times.txt": [
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+            "T1,08:00:00,08:00:00,A,1",
+            "T1,08:10:00,08:10:00,B,2",
+        ],
+        "calendar.txt": [
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+            "sunday,start_date,end_date",
+            "SV,1,1,1,1,1,1,1,25000101,25000107",
+        ],
+    }
+    feed = tmp_path / "future.zip"
+    with zipfile.ZipFile(feed, "w") as archive:
+        for name, lines in tables.items():
+            archive.writestr(name, "\n".join(lines) + "\n")
+    network = TransportNetwork.from_gtfs(
+        [str(feed)], trip_distances=False, leg_geometries=False
+    )
+    assert network.service_window == (
+        datetime.date(2500, 1, 1),
+        datetime.date(2500, 1, 7),
+    )
+    series = network.daily_trip_counts
+    assert len(series) == 7 and (series == 1).all()
+    assert series.idxmax().date() == datetime.date(2500, 1, 1)
+
+
+def test_a_feed_that_never_runs_answers_never(tmp_path):
+    import zipfile
+
+    tables = {
+        "agency.txt": [
+            "agency_id,agency_name,agency_url,agency_timezone",
+            "A,Test,http://example.com,Europe/Helsinki",
+        ],
+        "stops.txt": [
+            "stop_id,stop_name,stop_lat,stop_lon",
+            "A,A,60.0,24.0",
+            "B,B,60.0,24.01",
+        ],
+        "routes.txt": ["route_id,route_short_name,route_type", "R1,1,3"],
+        "trips.txt": ["route_id,service_id,trip_id", "R1,SV,T1"],
+        "stop_times.txt": [
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+            "T1,08:00:00,08:00:00,A,1",
+            "T1,08:10:00,08:10:00,B,2",
+        ],
+        # No calendar.txt: the service exists only through a REMOVAL
+        # exception, so no date ever runs.
+        "calendar_dates.txt": [
+            "service_id,date,exception_type",
+            "SV,20220222,2",
+        ],
+    }
+    feed = tmp_path / "never.zip"
+    with zipfile.ZipFile(feed, "w") as archive:
+        for name, lines in tables.items():
+            archive.writestr(name, "\n".join(lines) + "\n")
+    network = TransportNetwork.from_gtfs(
+        [str(feed)], trip_distances=False, leg_geometries=False
+    )
+    assert network.service_window is None
+    series = network.daily_trip_counts
+    import pandas
+
+    assert len(series) == 0 and str(series.dtype) == "int64"
+    assert isinstance(series.index, pandas.DatetimeIndex)

@@ -548,6 +548,54 @@ impl TransportNetwork {
             .collect()
     }
 
+    /// The resolved service calendar for the metadata properties:
+    /// the first and last date any service actually runs (candidate
+    /// bounds trimmed to running days) and the scheduled trip count
+    /// of every day between them, inclusive and consecutive. ``None``
+    /// when the resolution yields no running date at all (a feed of
+    /// removals answers "never"). Internal.
+    fn _service_calendar(&self) -> Option<(String, String, Vec<u64>)> {
+        let services = &self.build.services;
+        let (lower, upper) = services.date_bounds()?;
+        let timetable = &self.build.timetable;
+        let mut per_service = vec![0u64; services.service_count() as usize];
+        for trip in 0..timetable.trip_count() {
+            let service = timetable.trip_service(cafein_core::timetable::TripIdx(trip));
+            per_service[service as usize] += 1;
+        }
+        let count_on = |date: chrono::NaiveDate| -> u64 {
+            services
+                .active_on(date)
+                .iter()
+                .zip(&per_service)
+                .filter_map(|(&active, &trips)| active.then_some(trips))
+                .sum()
+        };
+        // Trim the candidate bounds to days where something runs.
+        let mut first = lower;
+        while first <= upper && count_on(first) == 0 {
+            first = first.succ_opt()?;
+        }
+        if first > upper {
+            return None;
+        }
+        let mut last = upper;
+        while last >= first && count_on(last) == 0 {
+            last = last.pred_opt()?;
+        }
+        let mut counts = Vec::new();
+        let mut date = first;
+        while date <= last {
+            counts.push(count_on(date));
+            date = date.succ_opt()?;
+        }
+        Some((
+            first.format("%Y-%m-%d").to_string(),
+            last.format("%Y-%m-%d").to_string(),
+            counts,
+        ))
+    }
+
     /// Per-stop GTFS ``stop_name`` values, aligned with ``stops``'
     /// order; ``None`` where the feed omits the name. Internal — the
     /// ``stops_gdf`` property joins them.
