@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Matrix and product id columns carry the input's dtype: an axis
+  supplied with uniform integer ids (numpy widths and pandas nullable
+  integers alike) gets its `from_id`/`to_id`/`destination_id` column
+  back in that exact dtype, so merges against the user's own frames
+  need no casting; string, mixed, and all-stops axes stay strings,
+  and the Arrow surfaces keep dictionary-encoded string ids for shard
+  schema stability.
+  ([#282](https://github.com/cafein-py/cafein/pull/282))
+
 - Feed service metadata: `TransportNetwork.service_window` (the first
   and last date any service runs; `None` when the feed never runs)
   and `daily_trip_counts` (a date-indexed Series of scheduled trips

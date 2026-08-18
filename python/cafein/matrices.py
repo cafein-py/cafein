@@ -7,7 +7,13 @@ import numpy as np
 import pandas as pd
 import shapely
 
-from cafein._validate import component_selection, id_sequence, sequence_not_string
+from cafein._validate import (
+    component_selection,
+    freeze_ids,
+    id_sequence,
+    restore_id_dtypes,
+    sequence_not_string,
+)
 from cafein.travelers import (
     folded_constraints,
     folded_street_policy,
@@ -380,6 +386,14 @@ class TravelCostMatrix(pd.DataFrame):
             street_policy, max_walking_time = folded_street_policy(
                 traveler, network, street_policy, walking_speed_kmph, max_walking_time
             )
+        origins, _origin_dtype = freeze_ids(origins)
+        destinations, _destination_dtype = freeze_ids(destinations)
+        if destinations is None and _is_point_frame(origins):
+            # Omitted point destinations default to the origins, and so
+            # does their dtype; omitted stop destinations mean every
+            # stop (native string ids).
+            _destination_dtype = _origin_dtype
+        _id_dtypes = {"from_id": _origin_dtype, "to_id": _destination_dtype}
         origins = sequence_not_string("origins", origins)
         destinations = sequence_not_string("destinations", destinations)
         from cafein._units import (
@@ -476,7 +490,10 @@ class TravelCostMatrix(pd.DataFrame):
                 },
             )
             super().__init__(
-                pd.DataFrame(_humanize_time_columns(data, output_time_units))
+                restore_id_dtypes(
+                    pd.DataFrame(_humanize_time_columns(data, output_time_units)),
+                    _id_dtypes,
+                )
             )
             return
         _reject_cost_street_args(
@@ -589,7 +606,10 @@ class TravelCostMatrix(pd.DataFrame):
                     np.array(table["geometry"], dtype=object)
                 )
             super().__init__(
-                pd.DataFrame(_humanize_time_columns(data, output_time_units))
+                restore_id_dtypes(
+                    pd.DataFrame(_humanize_time_columns(data, output_time_units)),
+                    _id_dtypes,
+                )
             )
             return
         table, from_ids, to_ids = _cost_columns(
@@ -633,7 +653,12 @@ class TravelCostMatrix(pd.DataFrame):
             data["geometry"] = shapely.from_wkb(
                 np.array(table["geometry"], dtype=object)
             )
-        super().__init__(pd.DataFrame(_humanize_time_columns(data, output_time_units)))
+        super().__init__(
+            restore_id_dtypes(
+                pd.DataFrame(_humanize_time_columns(data, output_time_units)),
+                _id_dtypes,
+            )
+        )
 
     @classmethod
     def to_parquet(
@@ -693,7 +718,10 @@ class TravelCostMatrix(pd.DataFrame):
         selects the form by suffix exactly as ``travel_cost_table``
         does and the return value is a :class:`cafein.StreamingResult`.
         ``from_id``/``to_id`` are dictionary-encoded over the shared id
-        domains; a street matrix's geometry streams as plain WKB
+        domains, and the dictionary values are strings whatever the
+        input dtype — the streamed surfaces deliberately do not
+        round-trip integer ids, keeping every shard's schema
+        identical; a street matrix's geometry streams as plain WKB
         binary. ``street_policy`` matrices do not stream yet and are
         rejected. ``resume=True`` continues a matching partial
         directory run exactly as ``travel_cost_table`` does.
@@ -901,7 +929,11 @@ class TravelTimeMatrix(pd.DataFrame):
 
     Origins are either stop identifiers or a point GeoDataFrame with an
     ``id`` column; destinations apply to point origins only — stop
-    origins always span every stop (the ``stops`` order). Points are
+    origins always span every stop (the ``stops`` order). Integer ids
+    round-trip: an axis supplied with a uniform integer dtype gets its
+    ``from_id``/``to_id`` column back in that exact dtype (the engines
+    speak strings internally), while string, mixed, and all-stops axes
+    stay strings. Points are
     linked once against the street network (requires ``osm_pbf=`` at
     build time); points off the walking network are reported with a
     warning and stay unreachable. Polygon frames route from their
@@ -1073,6 +1105,14 @@ class TravelTimeMatrix(pd.DataFrame):
             street_policy, max_walking_time = folded_street_policy(
                 traveler, network, street_policy, walking_speed_kmph, max_walking_time
             )
+        origins, _origin_dtype = freeze_ids(origins)
+        destinations, _destination_dtype = freeze_ids(destinations)
+        if destinations is None and _is_point_frame(origins):
+            # Omitted point destinations default to the origins, and so
+            # does their dtype; omitted stop destinations mean every
+            # stop (native string ids).
+            _destination_dtype = _origin_dtype
+        _id_dtypes = {"from_id": _origin_dtype, "to_id": _destination_dtype}
         origins = sequence_not_string("origins", origins)
         destinations = sequence_not_string("destinations", destinations)
         from cafein._units import (
@@ -1150,7 +1190,10 @@ class TravelTimeMatrix(pd.DataFrame):
                 },
             )
             super().__init__(
-                pd.DataFrame(_humanize_time_columns(data, output_time_units))
+                restore_id_dtypes(
+                    pd.DataFrame(_humanize_time_columns(data, output_time_units)),
+                    _id_dtypes,
+                )
             )
             return
         _reject_time_street_args(
@@ -1195,7 +1238,10 @@ class TravelTimeMatrix(pd.DataFrame):
                     exclude_stops,
                 )
                 super().__init__(
-                    pd.DataFrame(_humanize_time_columns(data, output_time_units))
+                    restore_id_dtypes(
+                        pd.DataFrame(_humanize_time_columns(data, output_time_units)),
+                        _id_dtypes,
+                    )
                 )
                 return
             walk_only, walk_budget = _walking_only_policy(street_policy)
@@ -1222,7 +1268,10 @@ class TravelTimeMatrix(pd.DataFrame):
                     max_snap_distance=None,
                 )
                 super().__init__(
-                    pd.DataFrame(_humanize_time_columns(data, output_time_units))
+                    restore_id_dtypes(
+                        pd.DataFrame(_humanize_time_columns(data, output_time_units)),
+                        _id_dtypes,
+                    )
                 )
                 return
             data = _policy_time_columns(
@@ -1239,7 +1288,10 @@ class TravelTimeMatrix(pd.DataFrame):
                 exclude_stops,
             )
             super().__init__(
-                pd.DataFrame(_humanize_time_columns(data, output_time_units))
+                restore_id_dtypes(
+                    pd.DataFrame(_humanize_time_columns(data, output_time_units)),
+                    _id_dtypes,
+                )
             )
             return
         data = _time_columns(
@@ -1262,7 +1314,12 @@ class TravelTimeMatrix(pd.DataFrame):
             max_snap_distance=max_snap_distance,
             arrive_by=arrive_by,
         )
-        super().__init__(pd.DataFrame(_humanize_time_columns(data, output_time_units)))
+        super().__init__(
+            restore_id_dtypes(
+                pd.DataFrame(_humanize_time_columns(data, output_time_units)),
+                _id_dtypes,
+            )
+        )
 
     @classmethod
     def to_parquet(
@@ -1316,7 +1373,10 @@ class TravelTimeMatrix(pd.DataFrame):
         ``output=`` selects the form by suffix exactly as
         ``travel_cost_table`` does and the return value is a
         :class:`cafein.StreamingResult`. ``from_id``/``to_id`` are
-        dictionary-encoded over the shared id domains; a windowed
+        dictionary-encoded over the shared id domains — the dictionary
+        values are strings whatever the input dtype, so integer ids
+        deliberately do not round-trip on the streamed surface; a
+        windowed
         matrix streams its percentile columns. ``street_policy``
         matrices do not stream yet and are rejected. ``resume=True``
         continues a matching partial directory run exactly as
@@ -2104,7 +2164,10 @@ def travel_cost_table(
         pyarrow.parquet.write_table(table, f"shard-{k:04d}.parquet")
 
     Shards concatenate trivially. Requires pyarrow (install
-    ``cafein[arrow]``).
+    ``cafein[arrow]``). The Arrow surfaces keep ``from_id``/``to_id``
+    dictionary-encoded as strings whatever the input dtype: shard
+    schema stability across batches and resumes outranks dtype
+    round-tripping here.
 
     With ``output=`` the matrix **streams to disk** instead of
     materialising: the fan-out axis — the origins with ``departure=``,

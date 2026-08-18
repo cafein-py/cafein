@@ -828,10 +828,12 @@ def test_nearest_money_points_keep_their_own_ids(network_with_footpaths, helsink
         departure_time_window=10,
         fares=hsl,
     )
-    # Ids follow the house point contract: strings, exactly as the
-    # matrix computers report from_id/to_id.
-    assert set(frame["destination_id"]) <= {str(v) for v in frame_d["id"]}
-    assert set(frame["from_id"]) <= {str(v) for v in frame_o["id"]}
+    # Integer point-frame ids round-trip in their own dtype — the
+    # engines speak strings internally, the frame boundary casts back.
+    assert set(frame["destination_id"]) <= set(frame_d["id"])
+    assert set(frame["from_id"]) <= set(frame_o["id"])
+    assert str(frame["destination_id"].dtype) == str(frame_d["id"].dtype)
+    assert str(frame["from_id"].dtype) == str(frame_o["id"].dtype)
     assert len(frame) > 0
 
 
@@ -1231,3 +1233,35 @@ def test_catchment_street_snap_and_point_router_validate(
     # is refused, never silently ignored.
     with pytest.raises(ValueError, match="rides RAPTOR"):
         Catchment(network_with_footpaths, points, DEPARTURE, router="tbtr")
+
+
+def test_products_carry_the_inputs_id_dtypes(network):
+    import pandas as pd
+
+    from cafein import Accessibility, DetailedItineraries, NearestDestinations
+
+    nearest = NearestDestinations(
+        network,
+        origins=[4810551],
+        destinations=pd.Series([1250551], dtype="Int64"),
+        arrival="2022-02-22 09:30:00",
+        k=1,
+    )
+    assert str(nearest["from_id"].dtype) == "int64"
+    assert str(nearest["destination_id"].dtype) == "Int64"
+    scores = Accessibility(
+        network,
+        origins=[4810551],
+        destinations=pd.DataFrame({"id": [1250551], "reachable": [1]}),
+        departure="2022-02-22 08:30:00",
+        budgets=[60.0],
+    )
+    assert str(scores["from_id"].dtype) == "int64"
+    legs = DetailedItineraries(
+        network,
+        origins=[4810551],
+        destinations=[1250551],
+        departure="2022-02-22 08:30:00",
+    )
+    assert str(legs["from_id"].dtype) == "int64"
+    assert str(legs["to_id"].dtype) == "int64"

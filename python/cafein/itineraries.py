@@ -1,7 +1,12 @@
 """Detailed door-to-door itineraries as a GeoDataFrame."""
 
 import math
-from cafein._validate import component_selection, id_sequence
+from cafein._validate import (
+    component_selection,
+    freeze_ids,
+    id_sequence,
+    restore_id_dtypes,
+)
 
 import geopandas as gpd
 import numpy as np
@@ -376,6 +381,11 @@ class DetailedItineraries(gpd.GeoDataFrame):
         cost_components=None,
         output_time_units="minutes",
     ):
+        origins, _origin_dtype = freeze_ids(origins)
+        destinations, _destination_dtype = freeze_ids(destinations)
+        if destinations is None and hasattr(origins, "geometry"):
+            _destination_dtype = _origin_dtype
+        _id_dtypes = {"from_id": _origin_dtype, "to_id": _destination_dtype}
         if not _is_street_network(network) and hasattr(network, "route_between_stops"):
             (
                 exclude_routes,
@@ -501,7 +511,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
                 )
                 street_frame.insert(position, "travel_time", converted)
             super().__init__(
-                street_frame,
+                restore_id_dtypes(street_frame, _id_dtypes),
                 geometry="geometry",
                 crs="EPSG:4326",
             )
@@ -579,7 +589,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
                 frame.pop("travel_time_s"), output_time_units
             )
             frame.insert(position, "travel_time", converted)
-        super().__init__(frame, geometry="geometry", crs="EPSG:4326")
+        super().__init__(
+            restore_id_dtypes(frame, _id_dtypes), geometry="geometry", crs="EPSG:4326"
+        )
 
 
 def _itineraries_frame(

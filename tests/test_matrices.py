@@ -1371,3 +1371,69 @@ def test_zone_fare_matrix_prices_zero_fare_products(network, helsinki_gtfs):
     )
     assert matrix.iloc[0].fare == pytest.approx(0.0)
     assert matrix.iloc[0].travel_time == 300
+
+
+def test_integer_ids_round_trip_with_their_exact_dtype(network):
+    import numpy as np
+    import pandas as pd
+
+    from cafein import TravelCostMatrix, TravelTimeMatrix
+
+    for dtype in ("int32", "int64", "uint32"):
+        frame = TravelTimeMatrix(
+            network,
+            origins=np.array([4810551], dtype=dtype),
+            departure="2022-02-22 08:30:00",
+        )
+        assert str(frame["from_id"].dtype) == dtype
+    nullable = TravelTimeMatrix(
+        network,
+        origins=pd.Series([4810551], dtype="Int64"),
+        departure="2022-02-22 08:30:00",
+    )
+    assert str(nullable["from_id"].dtype) == "Int64"
+    plain = TravelTimeMatrix(
+        network, origins=[4810551], departure="2022-02-22 08:30:00"
+    )
+    assert str(plain["from_id"].dtype) == "int64"
+    # The all-stops destination axis keeps the native string GTFS ids.
+    assert str(plain["to_id"].dtype) in ("object", "str")
+    # A merge against the user's own integer frame needs no casting.
+    joined = plain.merge(
+        pd.DataFrame({"from_id": pd.array([4810551]), "population": [7]}),
+        on="from_id",
+    )
+    assert len(joined) == len(plain)
+    # Strings stay strings; mixed inputs stay strings.
+    strings = TravelTimeMatrix(
+        network, origins=["4810551"], departure="2022-02-22 08:30:00"
+    )
+    assert str(strings["from_id"].dtype) in ("object", "str")
+    mixed = TravelTimeMatrix(
+        network, origins=[4810551, "1250551"], departure="2022-02-22 08:30:00"
+    )
+    assert str(mixed["from_id"].dtype) in ("object", "str")
+    # Both axes cast on the cost matrix when both were integer-typed.
+    cost = TravelCostMatrix(
+        network,
+        origins=[4810551, 1250551],
+        destinations=[1250551],
+        departure="2022-02-22 08:30:00",
+    )
+    assert str(cost["from_id"].dtype) == "int64"
+    assert str(cost["to_id"].dtype) == "int64"
+
+
+def test_the_arrow_table_keeps_string_ids(network):
+    pytest.importorskip("pyarrow")
+    import pyarrow
+
+    from cafein import travel_cost_table
+
+    table = travel_cost_table(
+        network, origins=[4810551], departure="2022-02-22 08:30:00"
+    )
+    # Shard-schema stability outranks dtype round-tripping on the Arrow
+    # surfaces: the ids stay dictionary-encoded strings.
+    assert pyarrow.types.is_dictionary(table.schema.field("from_id").type)
+    assert pyarrow.types.is_string(table.schema.field("from_id").type.value_type)

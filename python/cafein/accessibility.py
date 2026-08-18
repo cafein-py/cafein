@@ -18,7 +18,12 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 
-from cafein._validate import id_sequence, sequence_not_string
+from cafein._validate import (
+    freeze_ids,
+    id_sequence,
+    restore_id_dtypes,
+    sequence_not_string,
+)
 from cafein.travelers import folded_constraints, refuse_wheelchair_streets
 
 #: The parameter each decay family takes (None: no parameter).
@@ -862,7 +867,10 @@ class Accessibility(pd.DataFrame):
 
     ``Accessibility.to_parquet(...)`` streams the same table to disk
     in origin batches with the matrices' resume manifest, so a
-    country-scale run never materialises the whole frame.
+    country-scale run never materialises the whole frame; its streamed
+    ``from_id`` stays a dictionary-encoded string whatever the input
+    dtype (shard schema stability), even where this constructor would
+    restore an integer dtype.
 
     The emissions and money optima are single values over the window,
     so `percentiles` does not combine with them. ``max_travel_time``
@@ -966,6 +974,8 @@ class Accessibility(pd.DataFrame):
         max_snap_distance = snap_distance
         from cafein.matrices import _is_street_network
 
+        origins, _origin_dtype = freeze_ids(origins)
+        _id_dtypes = {"from_id": _origin_dtype}
         origins = sequence_not_string("origins", origins)
         destinations = sequence_not_string("destinations", destinations)
         exclude_routes = id_sequence("exclude_routes", exclude_routes)
@@ -1029,42 +1039,41 @@ class Accessibility(pd.DataFrame):
                     "destination; percentiles apply to cost='time'"
                 )
 
-        super().__init__(
-            _accessibility_columns(
-                network,
-                origins,
-                destinations,
-                date,
-                departure,
-                cost,
-                window,
-                percentiles,
-                confidence,
-                factors,
-                components,
-                fares,
-                max_transfers,
-                max_travel_time,
-                router,
-                chunk,
-                transport_mode,
-                max_street_time,
-                max_snap_distance,
-                exclude_routes,
-                exclude_trips,
-                exclude_stops,
-                walking_speed_kmph,
-                max_walking_time,
-                labels,
-                values,
-                budgets,
-                budget_column,
-                decay,
-                decay_param,
-                label="Accessibility",
-                arrive_by=arrive_by,
-            )
+        frame = _accessibility_columns(
+            network,
+            origins,
+            destinations,
+            date,
+            departure,
+            cost,
+            window,
+            percentiles,
+            confidence,
+            factors,
+            components,
+            fares,
+            max_transfers,
+            max_travel_time,
+            router,
+            chunk,
+            transport_mode,
+            max_street_time,
+            max_snap_distance,
+            exclude_routes,
+            exclude_trips,
+            exclude_stops,
+            walking_speed_kmph,
+            max_walking_time,
+            labels,
+            values,
+            budgets,
+            budget_column,
+            decay,
+            decay_param,
+            label="Accessibility",
+            arrive_by=arrive_by,
         )
+        super().__init__(restore_id_dtypes(frame, _id_dtypes))
 
     @classmethod
     def to_parquet(
@@ -1638,6 +1647,12 @@ class NearestDestinations(pd.DataFrame):
         from cafein import _cafein
         from cafein.matrices import _is_street_network
 
+        origins, _origin_dtype = freeze_ids(origins)
+        destinations, _destination_dtype = freeze_ids(destinations)
+        _id_dtypes = {
+            "from_id": _origin_dtype,
+            "destination_id": _destination_dtype,
+        }
         origins = sequence_not_string("origins", origins)
         destinations = sequence_not_string("destinations", destinations)
         exclude_routes = id_sequence("exclude_routes", exclude_routes)
@@ -1700,7 +1715,7 @@ class NearestDestinations(pd.DataFrame):
                 travel_time_output,
                 output_time_units,
             )
-            super().__init__(frame)
+            super().__init__(restore_id_dtypes(frame, _id_dtypes))
             return
         matrix, from_ids, to_ids, resolved_percentiles = _resolved_cost_matrix(
             network,
@@ -1750,16 +1765,15 @@ class NearestDestinations(pd.DataFrame):
             kept_costs = travel_time_output(kept_costs, output_time_units)
         identifiers = np.asarray(list(from_ids), dtype=object)
         targets = np.asarray(list(to_ids), dtype=object)
-        super().__init__(
-            pd.DataFrame(
-                {
-                    "from_id": identifiers[origin_rows],
-                    "rank": ranks.astype("int64") + 1,
-                    "destination_id": targets[kept],
-                    "cost": kept_costs,
-                }
-            )
+        frame = pd.DataFrame(
+            {
+                "from_id": identifiers[origin_rows],
+                "rank": ranks.astype("int64") + 1,
+                "destination_id": targets[kept],
+                "cost": kept_costs,
+            }
         )
+        super().__init__(restore_id_dtypes(frame, _id_dtypes))
 
     def dominance_areas(self, origins):
         """Polygon origins dissolved by their rank-1 destination.
@@ -1784,10 +1798,10 @@ class NearestDestinations(pd.DataFrame):
                 "dominance_areas dissolves polygon origins; point "
                 "origins have no area to dissolve"
             )
-        # The frames report ids in the house string convention
-        # (_point_list stringifies); join on the same normalization so
-        # numeric origin ids merge, and duplicates cannot hide behind
-        # a dtype difference. A fresh two-column frame keeps the join
+        # The frame's from_id may carry a restored integer dtype and
+        # the caller's origin ids any dtype at all; both sides join on
+        # the same string key so duplicates cannot hide behind a dtype
+        # difference. A fresh two-column frame keeps the join
         # immune to the caller's own column names (a renamed geometry
         # column, a pre-existing destination_id).
         slim = geopandas.GeoDataFrame(
@@ -1808,7 +1822,10 @@ class NearestDestinations(pd.DataFrame):
                 "dominance_areas needs unique origin ids; the frame "
                 f"ranks {int(repeated.sum())} repeated origin id(s)"
             )
-        joined = slim.merge(first, left_on="_key", right_on="from_id", how="inner")
+        # The frame's from_id may carry a restored integer dtype;
+        # normalise both sides to the same string key for the join.
+        first = first.assign(_key=first["from_id"].astype(str))
+        joined = slim.merge(first, on="_key", how="inner")
         dissolved = joined[["destination_id", "geometry"]].dissolve(by="destination_id")
         counts = joined.groupby("destination_id").size()
         return geopandas.GeoDataFrame(
@@ -2026,6 +2043,8 @@ class Catchment(gpd.GeoDataFrame):
         from cafein import _cafein  # noqa: F401  (asserts the compiled core)
         from cafein.matrices import _chunk_slice, _is_street_network, _point_list
 
+        origins, _origin_dtype = freeze_ids(origins)
+        _id_dtypes = {"from_id": _origin_dtype}
         origins = sequence_not_string("origins", origins)
         exclude_routes = id_sequence("exclude_routes", exclude_routes)
         exclude_trips = id_sequence("exclude_trips", exclude_trips)
@@ -2298,7 +2317,7 @@ class Catchment(gpd.GeoDataFrame):
                     geometry=[row[2] for row in rows],
                     crs="EPSG:4326",
                 )
-                super().__init__(frame)
+                super().__init__(restore_id_dtypes(frame, _id_dtypes))
                 return
             surfaces = _catchment_stop_costs(
                 network,
@@ -2394,7 +2413,7 @@ class Catchment(gpd.GeoDataFrame):
             geometry=[row[2] for row in rows],
             crs="EPSG:4326",
         )
-        super().__init__(frame)
+        super().__init__(restore_id_dtypes(frame, _id_dtypes))
 
 
 def _cell_rows(
