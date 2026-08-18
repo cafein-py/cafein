@@ -1153,6 +1153,12 @@ RSS_SCRIPT = textwrap.dedent("""
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="resource module is Unix-only")
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="macOS peak-RSS accounting (allocator page retention) sits at the "
+    "fixed delta budget's noise floor and flakes across Python versions; "
+    "Linux guards the flatness property",
+)
 @pytest.mark.parametrize("entry", ["table", "classmethod"])
 def test_streaming_peak_rss_is_flat_in_origins(network, tmp_path, entry):
     """The subprocess RSS guard: growing origins at fixed destinations
