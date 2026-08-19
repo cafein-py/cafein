@@ -775,6 +775,86 @@ impl TransportNetwork {
         self.streets_generation
     }
 
+    /// A transfer's query-time direct walk between two stops, as its
+    /// traversed ``(edge, fraction)`` provenance plus the SAME
+    /// reconstruction's total walked meters — the matrix exposure
+    /// fold's transfer cache fills from it. ``None`` when either stop
+    /// has no snap or no path exists. Internal.
+    #[allow(clippy::type_complexity)]
+    fn _transfer_walk_edges(
+        &self,
+        from_index: u32,
+        to_index: u32,
+    ) -> PyResult<Option<(Vec<(u32, f64)>, f64)>> {
+        let stops = self.feed.stops.len();
+        if from_index as usize >= stops || to_index as usize >= stops {
+            return Err(PyValueError::new_err("stop index out of range"));
+        }
+        let streets = self.installed_streets()?;
+        let Some((from_point, from_snap)) = self.stop_walk_endpoint(StopIdx(from_index)) else {
+            return Ok(None);
+        };
+        let Some((to_point, to_snap)) = self.stop_walk_endpoint(StopIdx(to_index)) else {
+            return Ok(None);
+        };
+        Ok(streets
+            .walk_path_edges(from_point, &from_snap, to_point, &to_snap)
+            .map(|(_, meters, edges)| (edges, meters)))
+    }
+
+    /// A coordinate's walk to (or from) a stop — the matrix exposure
+    /// fold's access and egress caches fill from it. Internal.
+    #[allow(clippy::type_complexity)]
+    fn _coordinate_stop_walk_edges(
+        &self,
+        latitude: f64,
+        longitude: f64,
+        stop_index: u32,
+        max_snap_distance: f64,
+    ) -> PyResult<Option<(Vec<(u32, f64)>, f64)>> {
+        if stop_index as usize >= self.feed.stops.len() {
+            return Err(PyValueError::new_err("stop index out of range"));
+        }
+        let streets = self.installed_streets()?;
+        let Some(snap) = streets.snap(latitude, longitude, max_snap_distance) else {
+            return Ok(None);
+        };
+        let Some((stop_point, stop_snap)) = self.stop_walk_endpoint(StopIdx(stop_index)) else {
+            return Ok(None);
+        };
+        Ok(streets
+            .walk_path_edges((latitude, longitude), &snap, stop_point, &stop_snap)
+            .map(|(_, meters, edges)| (edges, meters)))
+    }
+
+    /// A direct coordinate-to-coordinate walk — the walking-only
+    /// matrix cells' provenance. Internal.
+    #[allow(clippy::type_complexity)]
+    fn _direct_walk_edges(
+        &self,
+        from_latitude: f64,
+        from_longitude: f64,
+        to_latitude: f64,
+        to_longitude: f64,
+        max_snap_distance: f64,
+    ) -> PyResult<Option<(Vec<(u32, f64)>, f64)>> {
+        let streets = self.installed_streets()?;
+        let Some(from_snap) = streets.snap(from_latitude, from_longitude, max_snap_distance) else {
+            return Ok(None);
+        };
+        let Some(to_snap) = streets.snap(to_latitude, to_longitude, max_snap_distance) else {
+            return Ok(None);
+        };
+        Ok(streets
+            .walk_path_edges(
+                (from_latitude, from_longitude),
+                &from_snap,
+                (to_latitude, to_longitude),
+                &to_snap,
+            )
+            .map(|(_, meters, edges)| (edges, meters)))
+    }
+
     /// Per-stop GTFS ``wheelchair_boarding`` as ``(stop_id, flag)``
     /// tuples: ``True`` = accessible, ``False`` = not accessible,
     /// ``None`` = the feed says nothing. A stop without a value

@@ -895,6 +895,28 @@ def test_the_helsinki_sampledata_layers_ingest(street_network):
         for column in ("noise", "pollution", "greenery"):
             assert (edges[f"{column}_coverage"].values > 0).any()
             assert np.isfinite(edges[column].values).all()
+        # the practical performance check: a small matrix with the real
+        # layers computes inside the ordinary suite budget
+        import geopandas as gpd
+        from shapely.geometry import Point as _Point
+
+        from cafein import TravelCostMatrix
+
+        origins = gpd.GeoDataFrame(
+            {"id": ["a"]}, geometry=[_Point(24.9320, 60.1690)], crs="EPSG:4326"
+        )
+        destinations = gpd.GeoDataFrame(
+            {"id": ["b"]}, geometry=[_Point(24.9520, 60.1795)], crs="EPSG:4326"
+        )
+        matrix = TravelCostMatrix(
+            street_network,
+            origins,
+            destinations,
+            "2022-02-22 08:30",
+            exposure=ex,
+        )
+        assert len(matrix) == 1
+        assert np.isfinite(matrix["pollution_mean"].iloc[0])
     finally:
         _drop_layer_columns(edges, "noise", (55,))
         _drop_layer_columns(edges, "pollution", ())
@@ -1921,7 +1943,8 @@ def test_matrix_exposure_refusals(
     from cafein.matrices import travel_cost_table
 
     origins, destinations = _matrix_points()
-    with pytest.raises(ValueError, match="does not take it yet"):
+    # a street-built exposure cannot serve the transit network
+    with pytest.raises(ValueError, match="not built on the network"):
         TravelCostMatrix(
             street_network,
             ["x"],
@@ -1929,7 +1952,7 @@ def test_matrix_exposure_refusals(
             departure="2022-02-22 08:30",
             exposure=street_exposure,
         )
-    with pytest.raises(ValueError, match="does not take it yet"):
+    with pytest.raises(ValueError, match="not built on the network"):
         travel_cost_table(
             street_network,
             ["x"],
@@ -2028,6 +2051,315 @@ def test_parking_stays_outside_the_exposure_basis(car_streets):
             assert parked[column].iloc[0] == pytest.approx(plain[column].iloc[0])
     finally:
         _drop_layer_columns(edges, "noise", (55,))
+
+
+def test_travel_cost_table_serves_street_networks(
+    helsinki_streets, street_exposure, tmp_path
+):
+    pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    from cafein import TravelCostMatrix
+    from cafein.matrices import travel_cost_table
+
+    origins, destinations = _matrix_points()
+    kwargs = dict(transport_mode="bicycle", exposure=street_exposure)
+    frame = TravelCostMatrix(helsinki_streets, origins, destinations, **kwargs)
+    table = travel_cost_table(helsinki_streets, origins, destinations, **kwargs)
+    frame_names = [
+        "travel_time" if name == "travel_time_s" else name for name in frame.columns
+    ]
+    assert table.column_names == frame_names
+    materialized = table.to_pandas()
+    assert list(materialized["from_id"]) == [str(x) for x in frame["from_id"]]
+    for column in street_exposure.column_names():
+        assert materialized[column].to_numpy() == pytest.approx(
+            frame[column].to_numpy()
+        )
+    # the streamed form writes the same schema
+    travel_cost_table(
+        helsinki_streets,
+        origins,
+        destinations,
+        output=tmp_path / "cells.parquet",
+        **kwargs,
+    )
+    streamed = pq.read_table(tmp_path / "cells.parquet")
+    assert streamed.column_names == table.column_names
+    # timetable arguments reject exactly as on the matrix
+    with pytest.raises(ValueError, match="no meaning for a street matrix"):
+        travel_cost_table(
+            helsinki_streets,
+            origins,
+            destinations,
+            departure="2022-02-22 08:30",
+            **kwargs,
+        )
+
+
+# --- matrices: exposure= on the transit cost matrix ---------------------------
+
+
+def _matching_option_totals(frame, totals, matrix_cell):
+    """The itinerary option the matrix cell describes: unique on the
+    journey's seconds AND its ride count (the cell's transfers)."""
+    key = (matrix_cell["from_id"], matrix_cell["to_id"])
+    matches = []
+    for (from_id, to_id, option), journey in frame.groupby(
+        ["from_id", "to_id", "option"]
+    ):
+        if (from_id, to_id) != key:
+            continue
+        seconds = journey["arrival_s"].max() - journey["departure_s"].min()
+        rides = int((journey["leg_type"] == "transit").sum())
+        ridden = journey.loc[journey["leg_type"] == "transit", "distance_m"].sum()
+        if (
+            seconds == matrix_cell["travel_time"]
+            and rides == matrix_cell["transfers"] + 1
+            and ridden == pytest.approx(matrix_cell["transit_distance_m"], abs=0.5)
+        ):
+            matches.append((from_id, to_id, option))
+    assert len(matches) == 1, f"ambiguous or missing option match: {matches}"
+    return totals.set_index(["from_id", "to_id", "option"]).loc[matches[0]]
+
+
+def test_transit_matrix_cells_equal_the_itinerary_totals(street_network):
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+    from shapely.geometry import Point
+
+    from cafein import DetailedItineraries, TravelCostMatrix
+
+    # the half-plane layer: non-trivial means, coverage, and minutes
+    edges = street_network.streets_gdf
+    west, south, east, north = _extent(street_network)
+    zones = geopandas.GeoDataFrame(
+        {"level": [61.0]},
+        geometry=[box(west - 0.01, south - 0.01, east + 0.01, 60.180)],
+        crs="EPSG:4326",
+    )
+    partial = Exposure(street_network, din=(zones, "level"), thresholds={"din": (55,)})
+    try:
+        origins = geopandas.GeoDataFrame(
+            {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
+        )
+        destinations = geopandas.GeoDataFrame(
+            {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
+        )
+        matrix = TravelCostMatrix(
+            street_network,
+            origins,
+            destinations,
+            "2022-02-22 08:30",
+            exposure=partial,
+            output_time_units="seconds",
+        )
+        frame = DetailedItineraries(
+            street_network,
+            origins,
+            destinations,
+            "2022-02-22 08:30",
+            exposure=partial,
+        )
+        totals = frame.exposure_totals()
+        assert len(matrix) == 1
+        cell = matrix.iloc[0]
+        row = _matching_option_totals(frame, totals, cell)
+        for column in partial.column_names():
+            assert cell[column] == pytest.approx(row[column], rel=1e-9, abs=1e-12)
+    finally:
+        _drop_layer_columns(edges, "din", (55,))
+
+
+def test_transit_matrix_matches_totals_on_the_constant_layer(
+    street_network, reporting_exposure
+):
+    geopandas = pytest.importorskip("geopandas")
+    from shapely.geometry import Point
+
+    from cafein import DetailedItineraries, TravelCostMatrix
+
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
+    )
+    matrix = TravelCostMatrix(
+        street_network,
+        origins,
+        destinations,
+        "2022-02-22 08:30",
+        exposure=reporting_exposure,
+        output_time_units="seconds",
+    )
+    frame = DetailedItineraries(
+        street_network,
+        origins,
+        destinations,
+        "2022-02-22 08:30",
+        exposure=reporting_exposure,
+    )
+    totals = frame.exposure_totals()
+    cell = matrix.iloc[0]
+    row = _matching_option_totals(frame, totals, cell)
+    for column in reporting_exposure.column_names():
+        assert cell[column] == pytest.approx(row[column], rel=1e-9, abs=1e-12)
+
+
+def test_stop_matrix_exposure_folds_waits_and_transfers(street_network, reported_frame):
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+
+    from cafein import DetailedItineraries, TravelCostMatrix
+
+    # a half-plane partial layer: transfers and waits meet nontrivial
+    # coverage, so the fold's spatial reconstruction is genuinely probed
+    edges = street_network.streets_gdf
+    west, south, east, north = _extent(street_network)
+    zones = geopandas.GeoDataFrame(
+        {"level": [61.0]},
+        geometry=[box(west - 0.01, south - 0.01, east + 0.01, 60.180)],
+        crs="EPSG:4326",
+    )
+    partial = Exposure(street_network, dan=(zones, "level"), thresholds={"dan": (55,)})
+    try:
+        # an OD whose MATRIX journey itself is multi-ride, so transfer
+        # pieces (and their waits) genuinely fold — candidates come
+        # from the fixture's multi-ride itinerary options
+        matrix = None
+        for _, journey in reported_frame.groupby(["from_id", "to_id", "option"]):
+            transit = journey[journey["leg_type"] == "transit"]
+            if len(transit) < 2:
+                continue
+            board = transit.iloc[0]["from_stop"]
+            alight = transit.iloc[-1]["to_stop"]
+            candidate = TravelCostMatrix(
+                street_network,
+                [board],
+                [alight],
+                "2022-02-22 08:30",
+                exposure=partial,
+                output_time_units="seconds",
+            )
+            if len(candidate) and candidate.iloc[0]["transfers"] >= 1:
+                matrix = candidate
+                break
+        assert matrix is not None, "no OD with a multi-ride matrix journey found"
+        assert matrix.iloc[0]["transfers"] >= 1
+        frame = DetailedItineraries(
+            street_network,
+            [board],
+            [alight],
+            departure="2022-02-22 08:30",
+            exposure=partial,
+        )
+        totals = frame.exposure_totals()
+        cell = matrix[(matrix["from_id"] == board) & (matrix["to_id"] == alight)].iloc[
+            0
+        ]
+        row = _matching_option_totals(frame, totals, cell)
+        for column in partial.column_names():
+            assert cell[column] == pytest.approx(row[column], rel=1e-9, abs=1e-12)
+    finally:
+        _drop_layer_columns(edges, "dan", (55,))
+
+
+def test_transit_matrix_exposure_refusals(street_network, reporting_exposure):
+    from cafein import TravelCostMatrix
+
+    for kwargs, message in (
+        (
+            {"optimize": "emissions", "departure_time_window": 3600},
+            "does not combine with optimize=",
+        ),
+        (
+            {"optimize": "fare", "departure_time_window": 3600},
+            "does not combine with optimize=",
+        ),
+        ({"max_travel_time": 90}, "does not combine with max_travel_time="),
+        ({"candidates": "pareto"}, "does not combine with candidates="),
+        (
+            {"arrival": "2022-02-22 09:30", "departure": None},
+            "does not combine with arrival=",
+        ),
+        ({"router": "tbtr"}, "does not serve it"),
+        ({"router": "nope"}, "router must be"),
+    ):
+        call = dict(departure="2022-02-22 08:30")
+        call.update(kwargs)
+        departure = call.pop("departure")
+        with pytest.raises(ValueError, match=message):
+            TravelCostMatrix(
+                street_network,
+                ["x"],
+                ["y"],
+                departure,
+                exposure=reporting_exposure,
+                **call,
+            )
+    # the time-only surface has no exposure parameter at all
+    from cafein import TravelTimeMatrix
+
+    with pytest.raises(TypeError):
+        TravelTimeMatrix(
+            street_network,
+            ["x"],
+            ["y"],
+            "2022-02-22 08:30",
+            exposure=reporting_exposure,
+        )
+
+
+def test_transit_cost_table_carries_exposure(
+    street_network, reporting_exposure, reported_frame, tmp_path
+):
+    pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    from cafein import TravelCostMatrix
+    from cafein.matrices import travel_cost_table
+
+    transit = reported_frame[reported_frame["leg_type"] == "transit"]
+    board = transit.iloc[0]["from_stop"]
+    alight = transit.iloc[0]["to_stop"]
+    matrix = TravelCostMatrix(
+        street_network,
+        [board],
+        [alight],
+        "2022-02-22 08:30",
+        exposure=reporting_exposure,
+    )
+    table = travel_cost_table(
+        street_network,
+        [board],
+        [alight],
+        "2022-02-22 08:30",
+        exposure=reporting_exposure,
+    )
+    materialized = table.to_pandas()
+    cell = matrix[(matrix["from_id"] == board) & (matrix["to_id"] == alight)].iloc[0]
+    mask = (materialized["from_id"] == board) & (materialized["to_id"] == alight)
+    arrow_cell = materialized[mask].iloc[0]
+    for column in reporting_exposure.column_names():
+        assert arrow_cell[column] == pytest.approx(cell[column], rel=1e-12)
+    # the streamed form writes the same schema and values
+    travel_cost_table(
+        street_network,
+        [board],
+        [alight],
+        "2022-02-22 08:30",
+        exposure=reporting_exposure,
+        output=tmp_path / "cells.parquet",
+    )
+    streamed = pq.read_table(tmp_path / "cells.parquet")
+    assert streamed.column_names == table.column_names
+    streamed_frame = streamed.to_pandas()
+    row = streamed_frame[
+        (streamed_frame["from_id"] == board) & (streamed_frame["to_id"] == alight)
+    ].iloc[0]
+    for column in reporting_exposure.column_names():
+        assert row[column] == pytest.approx(cell[column], rel=1e-12)
 
 
 def test_layer_names_inside_reserved_column_families_are_refused():

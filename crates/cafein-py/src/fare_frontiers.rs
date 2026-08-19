@@ -951,5 +951,6 @@ fn zone_cost_row(
         } else {
             None
         },
+        pieces: None,
     }
 }

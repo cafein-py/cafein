@@ -256,7 +256,7 @@ impl<'a> Search<'a> {
         access_meters: &HashMap<StopIdx, f64>,
     ) -> Option<CostRow> {
         let best = self.best.last().expect("search always has a round");
-        let mut chosen: Option<(u32, StopIdx, f64)> = None;
+        let mut chosen: Option<(u32, StopIdx, u32, f64)> = None;
         for &(stop, seconds, meters) in egress {
             let at_stop = best[stop.0 as usize];
             if at_stop == UNREACHED {
@@ -265,16 +265,24 @@ impl<'a> Search<'a> {
             let Some(arrival) = at_stop.checked_add(seconds).filter(|&at| at != UNREACHED) else {
                 continue;
             };
-            if chosen.is_none_or(|(current, _, _)| arrival < current) {
-                chosen = Some((arrival, stop, meters));
+            if chosen.is_none_or(|(current, _, _, _)| arrival < current) {
+                chosen = Some((arrival, stop, seconds, meters));
             }
         }
-        let (arrival, stop, egress_meters) = chosen?;
+        let (arrival, stop, egress_seconds, egress_meters) = chosen?;
         let mut row = self.costs_to(stop, departure, inputs, Some(access_meters))?;
         row.to = point;
         row.egress_stop = stop.0;
         row.seconds = arrival - departure;
         row.walk_meters += egress_meters;
+        if egress_seconds > 0 {
+            if let Some(pieces) = row.pieces.as_mut() {
+                pieces.push(JourneyPiece::Egress {
+                    stop: stop.0,
+                    seconds: egress_seconds,
+                });
+            }
+        }
         Some(row)
     }
 
@@ -328,6 +336,13 @@ impl<'a> Search<'a> {
         let mut resolved = true;
         let mut legs: Vec<(TripIdx, u16, u16)> = Vec::new();
         let mut fare_legs: Vec<FareLeg> = Vec::new();
+        let mut pieces: Vec<JourneyPiece> = Vec::new();
+        // A boarding awaiting its chain arrival, walking backward:
+        // (board stop, board departure, transfer seconds in between).
+        // The wait settles at the first concrete arrival behind it — a
+        // ride's alight time or the access link — plus the transfers
+        // walked between the two.
+        let mut pending_wait: Option<(u32, u32, u32)> = None;
         // The chain always ends at its access label, whose stop the
         // loop yields.
         let access_stop = loop {
@@ -365,12 +380,32 @@ impl<'a> Search<'a> {
                                 .saturating_sub(day_offset),
                         });
                     }
+                    if inputs.with_pieces {
+                        let times = timetable.trip_stop_times(trip);
+                        let arrival = times[alight_position as usize]
+                            .arrival
+                            .saturating_sub(day_offset);
+                        if let Some((stop, board_departure, walked)) = pending_wait.take() {
+                            let wait =
+                                board_departure.saturating_sub(arrival.saturating_add(walked));
+                            if wait > 0 {
+                                pieces.push(JourneyPiece::Wait {
+                                    stop,
+                                    seconds: wait,
+                                });
+                            }
+                        }
+                        let board_departure = times[board_position as usize]
+                            .departure
+                            .saturating_sub(day_offset);
+                        pending_wait = Some((board_stop.0, board_departure, 0));
+                    }
                     at = board_stop;
                     round -= 1;
                 }
                 Label::Transfer {
                     from_stop,
-                    duration: _,
+                    duration,
                 } => {
                     // Transfers are deduplicated per stop pair: the one
                     // edge found is the one routing relaxed.
@@ -381,11 +416,21 @@ impl<'a> Search<'a> {
                         .find(|transfer| transfer.to == at)
                         .map(|transfer| transfer.meters)
                         .unwrap_or(0.0);
+                    if inputs.with_pieces {
+                        pieces.push(JourneyPiece::Transfer {
+                            from_stop: from_stop.0,
+                            to_stop: at.0,
+                            seconds: duration,
+                        });
+                        if let Some(pending) = pending_wait.as_mut() {
+                            pending.2 = pending.2.saturating_add(duration);
+                        }
+                    }
                     at = from_stop;
                 }
                 Label::TransferFromRide {
                     from_stop,
-                    duration: _,
+                    duration,
                     trip,
                     board_position,
                     alight_position,
@@ -447,12 +492,63 @@ impl<'a> Search<'a> {
                                 .saturating_sub(day_offset),
                         });
                     }
+                    if inputs.with_pieces {
+                        pieces.push(JourneyPiece::Transfer {
+                            from_stop: from_stop.0,
+                            to_stop: at.0,
+                            seconds: duration,
+                        });
+                        // The carried ride's own alight time — the
+                        // label slot at `from_stop` may hold a better
+                        // earlier-transfer arrival that shadows it.
+                        let times = timetable.trip_stop_times(trip);
+                        let arrival = times[alight_position as usize]
+                            .arrival
+                            .saturating_sub(day_offset);
+                        if let Some((stop, board_departure, walked)) = pending_wait.take() {
+                            let wait = board_departure.saturating_sub(
+                                arrival.saturating_add(duration).saturating_add(walked),
+                            );
+                            if wait > 0 {
+                                pieces.push(JourneyPiece::Wait {
+                                    stop,
+                                    seconds: wait,
+                                });
+                            }
+                        }
+                        let board_departure = times[board_position as usize]
+                            .departure
+                            .saturating_sub(day_offset);
+                        pending_wait = Some((board_stop.0, board_departure, 0));
+                    }
                     at = board_stop;
                     round -= 1;
                 }
-                Label::Access { .. } => {
+                Label::Access {
+                    departure,
+                    duration,
+                } => {
                     if let Some(access) = access_meters {
                         walk_meters += access.get(&at).copied().unwrap_or(0.0);
+                    }
+                    if inputs.with_pieces {
+                        if duration > 0 {
+                            pieces.push(JourneyPiece::Access {
+                                stop: at.0,
+                                seconds: duration,
+                            });
+                        }
+                        if let Some((stop, board_departure, walked)) = pending_wait.take() {
+                            let wait = board_departure.saturating_sub(
+                                departure.saturating_add(duration).saturating_add(walked),
+                            );
+                            if wait > 0 {
+                                pieces.push(JourneyPiece::Wait {
+                                    stop,
+                                    seconds: wait,
+                                });
+                            }
+                        }
                     }
                     break at.0;
                 }
@@ -492,6 +588,7 @@ impl<'a> Search<'a> {
             emission_grams: if resolved { grams } else { f64::NAN },
             fare,
             geometry,
+            pieces: inputs.with_pieces.then_some(pieces),
         }
     }
 

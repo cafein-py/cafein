@@ -45,6 +45,32 @@ pub struct CostRow {
     /// The ridden legs' geometry as a WKB MultiLineString, when asked
     /// for and leg geometries are installed.
     pub geometry: Option<Vec<u8>>,
+    /// The journey's walk-and-wait skeleton, when asked for — the
+    /// exposure fold's provenance. Piece order is UNSPECIFIED (waits
+    /// settle after the element that resolves them; the egress
+    /// appends where its link is chosen) — the fold is order-free.
+    pub pieces: Option<Vec<JourneyPiece>>,
+}
+
+/// One walk-or-wait component of a reconstructed journey. In-vehicle
+/// time carries no piece — outdoor exposure never applies there.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JourneyPiece {
+    /// The access link: the origin's walk into `stop`. Absent for a
+    /// zero-second seed (a stop-origin query starts at its stop).
+    Access { stop: u32, seconds: u32 },
+    /// The egress link: the walk out of `stop` to the destination.
+    Egress { stop: u32, seconds: u32 },
+    /// A stop-to-stop transfer walk, at its stored duration.
+    Transfer {
+        from_stop: u32,
+        to_stop: u32,
+        seconds: u32,
+    },
+    /// A stationary boarding wait at `stop` — the board departure
+    /// minus the chain's arrival there, the initial wait after the
+    /// access link included. Zero-length waits carry no piece.
+    Wait { stop: u32, seconds: u32 },
 }
 
 /// Everything the cost reconstruction reads besides the search state.
@@ -66,6 +92,9 @@ pub struct CostInputs<'a> {
     /// when the relaxed set is a merged one; a bounded walking set
     /// carries exact-phase transfer labels without any tokens.
     pub rental: Option<RentalCostView<'a>>,
+    /// Collect each row's walk-and-wait skeleton (the exposure fold's
+    /// provenance); plain matrices pay nothing.
+    pub with_pieces: bool,
 }
 
 /// The cost walker's view of a merged set's rentals: token lookups by

@@ -1519,6 +1519,7 @@ impl<'a> Search<'a> {
             emission_grams: grams,
             fare,
             geometry,
+            pieces: None,
         }
     }
 

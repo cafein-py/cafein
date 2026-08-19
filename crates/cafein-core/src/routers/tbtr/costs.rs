@@ -225,6 +225,7 @@ impl<'a> TbtrEngine<'a> {
             emission_grams: if resolved { grams } else { f64::NAN },
             fare,
             geometry,
+            pieces: None,
         }
     }
 

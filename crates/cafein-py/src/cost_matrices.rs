@@ -91,7 +91,7 @@ impl TransportNetwork {
     ///     NaN when unresolved), ``fare`` (NaN without `fares` or when
     ///     unpriceable), and with `geometries` a ``geometry`` list of
     ///     WKB bytes.
-    #[pyo3(signature = (from_stops, date, departure, factors, max_transfers = 7, to_stops = None, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, fares = None))]
+    #[pyo3(signature = (from_stops, date, departure, factors, max_transfers = 7, to_stops = None, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, fares = None, pieces = false))]
     #[allow(clippy::too_many_arguments)]
     fn travel_cost_matrix(
         &self,
@@ -111,10 +111,14 @@ impl TransportNetwork {
         max_snap_distance: f64,
         geometries: bool,
         fares: Option<Bound<'_, PyDict>>,
+        pieces: bool,
     ) -> PyResult<Py<PyDict>> {
         if !matches!(router, "auto" | "raptor" | "tbtr") {
             return Err(invalid_router(router));
         }
+        // The journey skeleton rides the RAPTOR reconstruction; a TBTR
+        // arm would return rows without it.
+        let router = if pieces { "raptor" } else { router };
         let Some(geometry) = &self.geometry else {
             return Err(PyValueError::new_err(
                 "no trip distances installed; build the network with trip distances enabled",
@@ -163,12 +167,14 @@ impl TransportNetwork {
             with_geometry: geometries,
             fares: tables.as_ref(),
             rental: None,
+            with_pieces: pieces,
         };
         // Under a whole-day set, snappable origins route door-to-door (the stop
         // cost matrix as a point cost matrix over the stops' coordinates);
         // validate the walking speed only when at least one origin is usable.
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         let ultra_usable = router != "tbtr"
+            && !pieces
             && exclusions.is_none()
             && self.ultra_active()
             && self.streets.as_ref().is_some_and(|streets| {
@@ -247,7 +253,7 @@ impl TransportNetwork {
                 }
             }
         });
-        cost_rows_dict(py, rows, geometries)
+        cost_rows_dict(py, rows, geometries, pieces)
     }
 
     /// The fastest journey's aggregated costs between coordinate
@@ -272,7 +278,7 @@ impl TransportNetwork {
     ///     origin and destination point lists — plus
     ///     ``unsnapped_from`` / ``unsnapped_to`` with the indices of
     ///     points off the walking network.
-    #[pyo3(signature = (origins, destinations, date, departure, factors, max_transfers = 7, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, fares = None))]
+    #[pyo3(signature = (origins, destinations, date, departure, factors, max_transfers = 7, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, fares = None, pieces = false))]
     #[allow(clippy::too_many_arguments)]
     fn travel_cost_matrix_from_points(
         &self,
@@ -292,10 +298,14 @@ impl TransportNetwork {
         max_snap_distance: f64,
         geometries: bool,
         fares: Option<Bound<'_, PyDict>>,
+        pieces: bool,
     ) -> PyResult<Py<PyDict>> {
         if !matches!(router, "auto" | "raptor" | "tbtr") {
             return Err(invalid_router(router));
         }
+        // The journey skeleton rides the RAPTOR reconstruction; a TBTR
+        // arm would return rows without it.
+        let router = if pieces { "raptor" } else { router };
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         let router = self.resolve_time_router(router, date, exclusions.is_some())?;
         let streets = self.installed_streets()?;
@@ -341,6 +351,7 @@ impl TransportNetwork {
             with_geometry: geometries,
             fares: tables.as_ref(),
             rental: None,
+            with_pieces: pieces,
         };
         let (rows, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
             // One stop-search pass links both the origins (access) and the
@@ -444,6 +455,9 @@ impl TransportNetwork {
                             row.emission_grams = 0.0;
                             row.fare = walk_fare;
                             row.geometry = walk_geometry(origin, row.to as usize);
+                            if row.pieces.is_some() {
+                                row.pieces = Some(Vec::new());
+                            }
                         }
                     }
                 }
@@ -465,6 +479,7 @@ impl TransportNetwork {
                             emission_grams: 0.0,
                             fare: walk_fare,
                             geometry: walk_geometry(origin, point),
+                            pieces: None,
                         });
                     }
                 }
@@ -472,7 +487,7 @@ impl TransportNetwork {
             }
             (rows, unsnapped_from, unsnapped_to)
         });
-        let result = cost_rows_dict(py, rows, geometries)?;
+        let result = cost_rows_dict(py, rows, geometries, pieces)?;
         result
             .bind(py)
             .set_item("unsnapped_from", unsnapped_from.into_pyarray(py))?;
@@ -660,6 +675,7 @@ impl TransportNetwork {
             with_geometry: geometries,
             fares: None,
             rental,
+            with_pieces: false,
         };
         let walk_profile = self.multimodal_profile(direct_mode)?;
         let multimodal = self.multimodal.as_ref().ok_or_else(|| {
@@ -819,6 +835,7 @@ impl TransportNetwork {
                                 emission_grams: 0.0,
                                 fare: f64::NAN,
                                 geometry: walk_geometry(point),
+                                pieces: None,
                             };
                             policy_row.street_meters = 0.0;
                             policy_row.street_used = false;
@@ -844,6 +861,7 @@ impl TransportNetwork {
                                 emission_grams: 0.0,
                                 fare: f64::NAN,
                                 geometry: walk_geometry(point),
+                                pieces: None,
                             },
                             street_meters: 0.0,
                             street_used: false,
@@ -1124,6 +1142,7 @@ impl TransportNetwork {
             with_geometry: geometries,
             fares: tables.as_ref(),
             rental: None,
+            with_pieces: false,
         };
         let rows = py.allow_threads(|| {
             if candidates == "pareto" && router == "tbtr" {
@@ -1279,7 +1298,7 @@ impl TransportNetwork {
                 rows
             }
         });
-        cost_rows_dict(py, rows, geometries)
+        cost_rows_dict(py, rows, geometries, false)
     }
 
     /// ``least_cost_matrix`` between coordinate points, linked through
@@ -1387,6 +1406,7 @@ impl TransportNetwork {
             with_geometry: geometries,
             fares: tables.as_ref(),
             rental: None,
+            with_pieces: false,
         };
         let (rows, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
             // One stop-search pass links both the origins (access) and the
@@ -1504,6 +1524,9 @@ impl TransportNetwork {
                             row.emission_grams = 0.0;
                             row.fare = walk_fare;
                             row.geometry = walk_geometry(origin, row.to as usize);
+                            if row.pieces.is_some() {
+                                row.pieces = Some(Vec::new());
+                            }
                         }
                     }
                 }
@@ -1528,6 +1551,7 @@ impl TransportNetwork {
                             emission_grams: 0.0,
                             fare: walk_fare,
                             geometry: walk_geometry(origin, point),
+                            pieces: None,
                         });
                     }
                 }
@@ -1557,7 +1581,7 @@ impl TransportNetwork {
             }
             (rows, unsnapped_from, unsnapped_to)
         });
-        let result = cost_rows_dict(py, rows, geometries)?;
+        let result = cost_rows_dict(py, rows, geometries, false)?;
         result
             .bind(py)
             .set_item("unsnapped_from", unsnapped_from.into_pyarray(py))?;
@@ -1659,6 +1683,7 @@ impl TransportNetwork {
             with_geometry: geometries,
             fares: tables.as_ref(),
             rental: None,
+            with_pieces: false,
         };
         let rows = py.allow_threads(|| {
             let reversed = ReversedTransfers::build(&self.transfers);
@@ -1737,7 +1762,7 @@ impl TransportNetwork {
                 objective,
             )
         });
-        cost_rows_dict(py, rows, geometries)
+        cost_rows_dict(py, rows, geometries, false)
     }
 
     /// ``_arrive_by_least_cost_matrix`` between coordinate points,
@@ -1821,6 +1846,7 @@ impl TransportNetwork {
             with_geometry: geometries,
             fares: tables.as_ref(),
             rental: None,
+            with_pieces: false,
         };
         let (rows, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
             let mut linked = streets.link_pointsets(
@@ -1975,6 +2001,9 @@ impl TransportNetwork {
                             row.emission_grams = 0.0;
                             row.fare = walk_fare;
                             row.geometry = walk_geometry(origin, row.to as usize);
+                            if row.pieces.is_some() {
+                                row.pieces = Some(Vec::new());
+                            }
                         }
                     }
                 }
@@ -2002,6 +2031,7 @@ impl TransportNetwork {
                             emission_grams: 0.0,
                             fare: walk_fare,
                             geometry: walk_geometry(origin, point),
+                            pieces: None,
                         });
                     }
                 }
@@ -2009,7 +2039,7 @@ impl TransportNetwork {
             }
             (rows, unsnapped_from, unsnapped_to)
         });
-        let result = cost_rows_dict(py, rows, geometries)?;
+        let result = cost_rows_dict(py, rows, geometries, false)?;
         result
             .bind(py)
             .set_item("unsnapped_from", unsnapped_from.into_pyarray(py))?;
@@ -2317,7 +2347,7 @@ fn policy_cost_rows_dict(
                 .collect()
         })
         .collect();
-    let result = cost_rows_dict(py, plain, geometries)?;
+    let result = cost_rows_dict(py, plain, geometries, false)?;
     result
         .bind(py)
         .set_item("street_distance", street.into_pyarray(py))?;
@@ -2331,6 +2361,7 @@ pub(super) fn cost_rows_dict(
     py: Python<'_>,
     rows: Vec<Vec<CostRow>>,
     geometries: bool,
+    with_pieces: bool,
 ) -> PyResult<Py<PyDict>> {
     let total: usize = rows.iter().map(Vec::len).sum();
     let mut from = Vec::with_capacity(total);
@@ -2342,6 +2373,22 @@ pub(super) fn cost_rows_dict(
     let mut emissions = Vec::with_capacity(total);
     let mut fare = Vec::with_capacity(total);
     let wkbs = PyList::empty(py);
+    // The journey skeletons, flattened CSR-style: per cell an offset
+    // range into the piece arrays. Kinds: 0 access, 1 egress,
+    // 2 transfer (stop = from, other = to), 3 wait. The flag comes
+    // from the request — an all-walking or empty result still emits
+    // the (empty) payload the caller asked for.
+    let mut piece_offsets: Vec<u64> = Vec::new();
+    let mut piece_kind: Vec<u8> = Vec::new();
+    let mut piece_stop: Vec<u32> = Vec::new();
+    let mut piece_other: Vec<u32> = Vec::new();
+    let mut piece_seconds: Vec<u32> = Vec::new();
+    let mut access_stops: Vec<u32> = Vec::new();
+    if with_pieces {
+        piece_offsets.reserve(total + 1);
+        piece_offsets.push(0);
+        access_stops.reserve(total);
+    }
     for (origin, origin_rows) in rows.into_iter().enumerate() {
         for row in origin_rows {
             from.push(origin as u32);
@@ -2358,6 +2405,26 @@ pub(super) fn cost_rows_dict(
                     None => wkbs.append(py.None())?,
                 }
             }
+            if with_pieces {
+                access_stops.push(row.access_stop);
+                for piece in row.pieces.iter().flatten() {
+                    let (kind, stop, other, seconds) = match *piece {
+                        JourneyPiece::Access { stop, seconds } => (0u8, stop, 0, seconds),
+                        JourneyPiece::Egress { stop, seconds } => (1, stop, 0, seconds),
+                        JourneyPiece::Transfer {
+                            from_stop,
+                            to_stop,
+                            seconds,
+                        } => (2, from_stop, to_stop, seconds),
+                        JourneyPiece::Wait { stop, seconds } => (3, stop, 0, seconds),
+                    };
+                    piece_kind.push(kind);
+                    piece_stop.push(stop);
+                    piece_other.push(other);
+                    piece_seconds.push(seconds);
+                }
+                piece_offsets.push(piece_kind.len() as u64);
+            }
         }
     }
     let result = PyDict::new(py);
@@ -2371,6 +2438,14 @@ pub(super) fn cost_rows_dict(
     result.set_item("fare", fare.into_pyarray(py))?;
     if geometries {
         result.set_item("geometry", wkbs)?;
+    }
+    if with_pieces {
+        result.set_item("access_stop", access_stops.into_pyarray(py))?;
+        result.set_item("piece_offsets", piece_offsets.into_pyarray(py))?;
+        result.set_item("piece_kind", piece_kind.into_pyarray(py))?;
+        result.set_item("piece_stop", piece_stop.into_pyarray(py))?;
+        result.set_item("piece_other", piece_other.into_pyarray(py))?;
+        result.set_item("piece_seconds", piece_seconds.into_pyarray(py))?;
     }
     Ok(result.unbind())
 }
@@ -2432,6 +2507,7 @@ pub(super) fn merge_direct_walk_cells(
             emission_grams: 0.0,
             fare: if priced { 0.0 } else { f64::NAN },
             geometry: None,
+            pieces: None,
         };
         match row.iter_mut().find(|existing| existing.to == to) {
             Some(existing) => {

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Transit matrices report exposure: `TravelCostMatrix(..., exposure=)`
+  on a `TransportNetwork` folds each cell's time-optimal journey —
+  access, egress, and transfer walks from their reconstructed edges,
+  boarding waits sampled at the stops, in-vehicle time excluded —
+  into the `exposure_totals()` columns at matrix scale, every
+  distinct walk reconstructed once. `travel_cost_table` serves
+  street networks and carries the exposure columns on both network
+  kinds, in-memory and streamed.
+  ([#288](https://github.com/cafein-py/cafein/pull/288))
+
 - Exposure at matrix scale: `TravelCostMatrix(..., exposure=)` on a
   `StreetNetwork` adds each cell's per-layer exposure columns
   (`{layer}_mean`, maxima, coverage, `minutes_above`) — exact from
