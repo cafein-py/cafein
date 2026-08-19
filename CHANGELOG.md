@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.14.0 — 2026-08-19
 
 - Transit matrices report exposure: `TravelCostMatrix(..., exposure=)`
   on a `TransportNetwork` folds each cell's time-optimal journey —
