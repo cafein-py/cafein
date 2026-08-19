@@ -1641,7 +1641,10 @@ impl StreetNetwork {
         profile: &CompiledStreetProfile,
         max_seconds: f64,
     ) -> Vec<Option<(u32, f64)>> {
-        self.meters_to_snaps_impl(from, targets, profile, None, max_seconds)
+        self.meters_to_snaps_impl(from, targets, profile, None, false, max_seconds)
+            .into_iter()
+            .map(|cell| cell.map(|(seconds, meters, _)| (seconds, meters)))
+            .collect()
     }
 
     /// [`directed_meters_to_snaps`](Self::directed_meters_to_snaps) under
@@ -1655,17 +1658,58 @@ impl StreetNetwork {
         unweighted: &CompiledStreetProfile,
         max_seconds: f64,
     ) -> Vec<Option<(u32, f64)>> {
-        self.meters_to_snaps_impl(from, targets, weighted, Some(unweighted), max_seconds)
+        self.meters_to_snaps_impl(
+            from,
+            targets,
+            weighted,
+            Some(unweighted),
+            false,
+            max_seconds,
+        )
+        .into_iter()
+        .map(|cell| cell.map(|(seconds, meters, _)| (seconds, meters)))
+        .collect()
     }
 
+    /// [`directed_meters_to_snaps`](Self::directed_meters_to_snaps) plus
+    /// each reachable cell's traversed ``(edge, fraction, seconds)``
+    /// provenance, read off the winning chain the metres already walk —
+    /// matrix-scale exposure reporting without assembling a shape.
+    #[allow(clippy::type_complexity)]
+    pub fn directed_meters_edges_to_snaps(
+        &self,
+        from: &Snap,
+        targets: &[Option<Snap>],
+        profile: &CompiledStreetProfile,
+        max_seconds: f64,
+    ) -> Vec<Option<(u32, f64, Vec<(u32, f64, f64)>)>> {
+        self.meters_to_snaps_impl(from, targets, profile, None, true, max_seconds)
+    }
+
+    /// [`directed_meters_edges_to_snaps`](Self::directed_meters_edges_to_snaps)
+    /// under an objective-weighted profile.
+    #[allow(clippy::type_complexity)]
+    pub fn directed_meters_edges_to_snaps_weighted(
+        &self,
+        from: &Snap,
+        targets: &[Option<Snap>],
+        weighted: &CompiledStreetProfile,
+        unweighted: &CompiledStreetProfile,
+        max_seconds: f64,
+    ) -> Vec<Option<(u32, f64, Vec<(u32, f64, f64)>)>> {
+        self.meters_to_snaps_impl(from, targets, weighted, Some(unweighted), true, max_seconds)
+    }
+
+    #[allow(clippy::type_complexity)]
     fn meters_to_snaps_impl(
         &self,
         from: &Snap,
         targets: &[Option<Snap>],
         profile: &CompiledStreetProfile,
         unweighted: Option<&CompiledStreetProfile>,
+        street_edges: bool,
         max_seconds: f64,
-    ) -> Vec<Option<(u32, f64)>> {
+    ) -> Vec<Option<(u32, f64, Vec<(u32, f64, f64)>)>> {
         if !max_seconds.is_finite() || max_seconds < 0.0 {
             return vec![None; targets.len()];
         }
@@ -1696,11 +1740,17 @@ impl StreetNetwork {
                                 + self.partial_meters(from, to, *entry_fraction, *exit_fraction)
                         }
                     };
+                    let true_profile = unweighted.unwrap_or(profile);
                     let millis = match unweighted {
                         Some(profile) => self.route_millis(from, to, &route, profile),
                         None => millis,
                     };
-                    Some((seconds(millis as f64 / 1000.0), meters))
+                    let edges = if street_edges {
+                        self.route_edges(from, to, &route, true_profile)
+                    } else {
+                        Vec::new()
+                    };
+                    Some((seconds(millis as f64 / 1000.0), meters, edges))
                 })
                 .collect()
         })

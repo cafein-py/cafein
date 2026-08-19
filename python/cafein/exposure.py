@@ -259,8 +259,11 @@ class Exposure:
         ``name=(source, value)`` — `source` is a raster path or an
         opened rioxarray object (`value` names the band), or a
         GeoDataFrame of polygons or lines (`value` names the numeric
-        column). More-is-better data enters as its deficit if it is
-        to be minimized against (e.g. ``100 - Comb_GVI``).
+        column). Names inside the ``cost`` or ``travel_time`` column
+        families — the bare name, or a ``cost_``/``travel_time_``
+        prefix — are refused: the result frames classify those
+        families by prefix. More-is-better data enters as its deficit
+        if it is to be minimized against (e.g. ``100 - Comb_GVI``).
     """
 
     def __init__(self, network, *, thresholds=None, rasterize=1.0, **layers):
@@ -449,6 +452,43 @@ class Exposure:
                 "(or the network's street graph was replaced since); "
                 "build Exposure(network, ...) on the current network"
             )
+
+    def _fingerprint(self):
+        """A stable digest of everything the reporting reads — layer
+        names, thresholds, the reporting arrays, and the edge lengths
+        that weight them — so streaming manifests can tell two
+        exposures apart by their data, not their names. Every field is
+        framed (name, dtype, shape, then bytes) so distinct inputs can
+        never collide by concatenation."""
+        import hashlib
+
+        digest = hashlib.sha256()
+
+        def frame(label, array):
+            array = np.ascontiguousarray(array)
+            digest.update(f"{label}|{array.dtype.str}|{array.shape}|".encode())
+            digest.update(array.tobytes())
+
+        frame("lengths", self._report_lengths)
+        for name in self._layers:
+            digest.update(f"layer|{name}|".encode())
+            digest.update(repr(tuple(self._thresholds.get(name, ()))).encode())
+            products = self._report[name]
+            frame("mean", products["mean"])
+            frame("coverage", products["coverage"])
+            frame("max", products["max"])
+            for threshold in sorted(products["shares"]):
+                frame(f"share|{threshold!r}", products["shares"][threshold])
+        return digest.hexdigest()
+
+    def _reporting_snapshot(self):
+        """An immutable copy of the reporting surface — the arrays, the
+        layer order, and the thresholds — so a long computation (a
+        streamed matrix and its manifest fingerprint especially) reads
+        one frozen state whatever happens to this Exposure meanwhile.
+        The same frozen-input pattern the fare and policy computers
+        follow."""
+        return _ReportingSnapshot(self)
 
     def _objective_multipliers(self, optimize):
         """The combined per-edge cost multiplier ``1 + Σ λ·value`` for
@@ -658,6 +698,37 @@ class Exposure:
         return columns
 
 
+class _ReportingSnapshot:
+    """A frozen copy of an Exposure's reporting surface. Shares the
+    reporting methods with ``Exposure`` — they read only the attributes
+    copied here."""
+
+    def __init__(self, exposure):
+        self._layers = {name: None for name in exposure._layers}
+        self._thresholds = {
+            name: tuple(levels) for name, levels in exposure._thresholds.items()
+        }
+        self._report = {
+            name: {
+                "mean": products["mean"].copy(),
+                "coverage": products["coverage"].copy(),
+                "max": products["max"].copy(),
+                "shares": {
+                    threshold: share.copy()
+                    for threshold, share in products["shares"].items()
+                },
+            }
+            for name, products in exposure._report.items()
+        }
+        self._report_lengths = exposure._report_lengths.copy()
+
+    layers = Exposure.layers
+    thresholds = Exposure.thresholds
+    column_names = Exposure.column_names
+    street_leg_columns = Exposure.street_leg_columns
+    _fingerprint = Exposure._fingerprint
+
+
 def _stop_values(name, source, value, points, metric_crs):
     """One sampled value per stop point (NaN = uncovered): raster
     lookups, point-in-polygon maxima, nearest lines in tolerance."""
@@ -762,6 +833,17 @@ def _validate_names(layers, thresholds, existing):
     for name in layers:
         if not _NAME.fullmatch(name):
             raise ValueError(f"layer name {name!r} is not a lowercase identifier")
+        for prefix in ("cost", "travel_time"):
+            # The result frames classify these families by prefix
+            # (monetary columns, time unit conversion); a layer whose
+            # DERIVED columns land inside either family would be
+            # mistaken for them — the bare family name included, whose
+            # ``_mean`` suffix already collides.
+            if name == prefix or name.startswith((f"{prefix}_",)):
+                raise ValueError(
+                    f"layer name {name!r} collides with the {prefix}* "
+                    "column family of the result frames; rename the layer"
+                )
         for column in _derived_columns(name, thresholds.get(name, ())):
             if column in existing:
                 raise ValueError(

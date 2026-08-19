@@ -1781,3 +1781,345 @@ def test_an_exposure_from_another_network_refuses_street_journeys(
             transport_mode="bicycle",
             exposure=reporting_exposure,
         )
+
+
+# --- matrices: exposure= on the street cost matrix ----------------------------
+
+
+def _matrix_points():
+    geopandas = pytest.importorskip("geopandas")
+
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a", "b"]},
+        geometry=[Point(24.9320, 60.1690), Point(24.9410, 60.1720)],
+        crs="EPSG:4326",
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["c", "d"]},
+        geometry=[Point(24.9520, 60.1795), Point(24.9460, 60.1750)],
+        crs="EPSG:4326",
+    )
+    return origins, destinations
+
+
+def test_street_cost_matrix_reports_exposure(helsinki_streets, street_exposure):
+    from cafein import TravelCostMatrix
+
+    origins, destinations = _matrix_points()
+    matrix = TravelCostMatrix(
+        helsinki_streets,
+        origins,
+        destinations,
+        transport_mode="bicycle",
+        exposure=street_exposure,
+    )
+    assert len(matrix) > 0
+    assert matrix["noise_mean"].values == pytest.approx(61.0)
+    assert matrix["noise_max"].values == pytest.approx(61.0)
+    assert matrix["noise_coverage"].values == pytest.approx(1.0)
+    above = matrix["noise_minutes_above_55"]
+    assert (above > 0).all()
+    assert (above <= matrix["travel_time"] + 0.5).all()
+    # the exposure block follows the cost block
+    names = list(matrix.columns)
+    assert names.index("noise_mean") > names.index("emissions")
+
+
+def test_the_metres_path_matches_the_reconstructed_legs(helsinki_streets, tmp_path):
+    rasterio = pytest.importorskip("rasterio")
+    pytest.importorskip("rioxarray")
+    from rasterio.transform import from_bounds
+
+    from cafein import TravelCostMatrix
+
+    # a longitude gradient: every edge carries a DIFFERENT value, so a
+    # wrong edge index or traversal fraction breaks the parity below
+    edges = helsinki_streets.streets_gdf
+    west, south, east, north = edges.total_bounds
+    n = 400
+    path = tmp_path / "gradient.tif"
+    centers = np.linspace(west, east, n, endpoint=False) + (east - west) / (2 * n)
+    grid = np.tile((centers - west) * 1000.0, (n, 1)).astype("float32")
+    with rasterio.open(
+        str(path),
+        "w",
+        driver="GTiff",
+        width=n,
+        height=n,
+        count=1,
+        dtype="float32",
+        crs="EPSG:4326",
+        transform=from_bounds(west, south, east, north, n, n),
+    ) as sink:
+        sink.write(grid[None, ...])
+        sink.descriptions = ("Gradient [x]",)
+    gradient = Exposure(
+        helsinki_streets, grad=(str(path), "Gradient"), thresholds={"grad": (100.0,)}
+    )
+    try:
+        origins, destinations = _matrix_points()
+        kwargs = dict(transport_mode="bicycle", exposure=gradient)
+        plain = TravelCostMatrix(helsinki_streets, origins, destinations, **kwargs)
+        shaped = TravelCostMatrix(
+            helsinki_streets, origins, destinations, geometries=True, **kwargs
+        )
+        assert len(plain) > 0
+        # per-cell values vary across the gradient and must agree
+        # between the two provenance sources exactly
+        assert plain["grad_mean"].nunique() > 1
+        for column in gradient.column_names():
+            assert shaped[column].values == pytest.approx(
+                plain[column].values, rel=1e-12
+            )
+    finally:
+        _drop_layer_columns(edges, "grad", (100.0,))
+
+
+def test_the_synthetic_matrix_cell_is_hand_computable():
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+    from cafein import TravelCostMatrix
+
+    streets = _two_route_network()
+    zones = geopandas.GeoDataFrame(
+        {"level": [1.0]},
+        geometry=[box(24.9290, 60.1690, 24.9364, 60.17005)],
+        crs="EPSG:4326",
+    )
+    exposure_object = Exposure(
+        streets, noise=(zones, "level"), thresholds={"noise": (0.5,)}
+    )
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(24.9300, 60.1700)], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["b"]}, geometry=[Point(24.9354, 60.1700)], crs="EPSG:4326"
+    )
+    matrix = TravelCostMatrix(
+        streets,
+        origins,
+        destinations,
+        transport_mode="walk",
+        exposure=exposure_object,
+        output_time_units="seconds",
+    )
+    cell = matrix.iloc[0]
+    assert cell["distance_m"] == pytest.approx(300.0)
+    assert cell["noise_mean"] == pytest.approx(1.0)
+    assert cell["noise_coverage"] == pytest.approx(1.0)
+    # the fully covered corridor's minutes at-or-above are exactly its
+    # true traversal minutes (a vertex snap has no connector)
+    assert cell["noise_minutes_above_0_5"] == pytest.approx(
+        cell["travel_time"] / 60.0, abs=0.02
+    )
+
+
+def test_matrix_exposure_refusals(
+    street_network, helsinki_streets, street_exposure, reporting_exposure
+):
+    from cafein import TravelCostMatrix
+    from cafein.matrices import travel_cost_table
+
+    origins, destinations = _matrix_points()
+    with pytest.raises(ValueError, match="does not take it yet"):
+        TravelCostMatrix(
+            street_network,
+            ["x"],
+            ["y"],
+            departure="2022-02-22 08:30",
+            exposure=street_exposure,
+        )
+    with pytest.raises(ValueError, match="does not take it yet"):
+        travel_cost_table(
+            street_network,
+            ["x"],
+            ["y"],
+            departure="2022-02-22 08:30",
+            exposure=street_exposure,
+        )
+    with pytest.raises(ValueError, match="not built on the network"):
+        TravelCostMatrix(
+            helsinki_streets,
+            origins,
+            destinations,
+            transport_mode="bicycle",
+            exposure=reporting_exposure,
+        )
+
+
+def test_windowed_and_multicriteria_args_cannot_reach_street_exposure(
+    helsinki_streets, street_exposure
+):
+    from cafein import TravelCostMatrix
+
+    origins, destinations = _matrix_points()
+    # timetable-only arguments reject on a street matrix wholesale —
+    # with or without exposure — so no windowed or multicriteria
+    # combination reaches the exposure path
+    for extra in (
+        {"departure": "2022-02-22 08:30", "departure_time_window": 3600},
+        {"arrival": "2022-02-22 09:00"},
+        {"optimize": "emissions"},
+        {"candidates": "pareto"},
+    ):
+        with pytest.raises(ValueError, match="no meaning for a street matrix"):
+            TravelCostMatrix(
+                helsinki_streets,
+                origins,
+                destinations,
+                transport_mode="bicycle",
+                exposure=street_exposure,
+                **extra,
+            )
+
+
+@pytest.fixture(scope="module")
+def car_streets(kantakaupunki_pbf):
+    import warnings
+
+    from cafein import StreetNetwork
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return StreetNetwork.from_osm(
+            str(kantakaupunki_pbf),
+            modes=("walk", "car"),
+            bounding_box=[24.92, 60.16, 24.96, 60.185],
+        )
+
+
+def test_parking_stays_outside_the_exposure_basis(car_streets):
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+    from cafein import TravelCostMatrix
+
+    edges = car_streets.streets_gdf
+    west, south, east, north = edges.total_bounds
+    zones = geopandas.GeoDataFrame(
+        {"level": [61.0]},
+        geometry=[box(west - 0.01, south - 0.01, east + 0.01, north + 0.01)],
+        crs="EPSG:4326",
+    )
+    exposure_object = Exposure(
+        car_streets, noise=(zones, "level"), thresholds={"noise": (55,)}
+    )
+    try:
+        origins = geopandas.GeoDataFrame(
+            {"id": ["a"]}, geometry=[Point(24.9320, 60.1690)], crs="EPSG:4326"
+        )
+        destinations = geopandas.GeoDataFrame(
+            {"id": ["b"]}, geometry=[Point(24.9410, 60.1720)], crs="EPSG:4326"
+        )
+        kwargs = dict(
+            transport_mode="car",
+            exposure=exposure_object,
+            output_time_units="seconds",
+        )
+        plain = TravelCostMatrix(car_streets, origins, destinations, **kwargs)
+        parked = TravelCostMatrix(
+            car_streets, origins, destinations, parking=(120, 300.0), **kwargs
+        )
+        assert len(plain) == 1 and len(parked) == 1
+        # the parking search joins the public time and distance, never
+        # the exposure basis
+        assert parked["travel_time"].iloc[0] > plain["travel_time"].iloc[0]
+        assert parked["distance_m"].iloc[0] > plain["distance_m"].iloc[0]
+        for column in exposure_object.column_names():
+            assert parked[column].iloc[0] == pytest.approx(plain[column].iloc[0])
+    finally:
+        _drop_layer_columns(edges, "noise", (55,))
+
+
+def test_layer_names_inside_reserved_column_families_are_refused():
+    geopandas = pytest.importorskip("geopandas")
+
+    zones = geopandas.GeoDataFrame(
+        {"level": [1.0]},
+        geometry=[box(24.9290, 60.1690, 24.9364, 60.1750)],
+        crs="EPSG:4326",
+    )
+    streets = _two_route_network()
+    for name in ("cost", "cost_noise", "travel_time", "travel_time_p90"):
+        with pytest.raises(ValueError, match="column family"):
+            Exposure(streets, **{name: (zones, "level")})
+
+
+def test_street_matrix_exposure_streams_to_parquet(
+    helsinki_streets, street_exposure, tmp_path
+):
+    pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    from cafein import TravelCostMatrix
+
+    origins, destinations = _matrix_points()
+    kwargs = dict(
+        transport_mode="bicycle",
+        perspectives="private",
+        exposure=street_exposure,
+    )
+    frame = TravelCostMatrix(helsinki_streets, origins, destinations, **kwargs)
+    TravelCostMatrix.to_parquet(
+        helsinki_streets,
+        origins,
+        destinations,
+        output=tmp_path / "cells.parquet",
+        **kwargs,
+    )
+    table = pq.read_table(tmp_path / "cells.parquet")
+    streamed = table.to_pandas()
+    # the streamed schema and the in-memory frame agree column for
+    # column — the monetary block with its currency before the
+    # exposure block in both
+    frame_names = ["travel_time" if n == "travel_time_s" else n for n in frame.columns]
+    assert table.column_names == frame_names
+    for column in street_exposure.column_names():
+        assert streamed[column].to_numpy() == pytest.approx(frame[column].to_numpy())
+
+
+def test_a_same_coordinate_cell_reports_journey_totals(
+    helsinki_streets, street_exposure
+):
+    geopandas = pytest.importorskip("geopandas")
+    from cafein import TravelCostMatrix
+
+    points = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(24.9320, 60.1690)], crs="EPSG:4326"
+    )
+    matrix = TravelCostMatrix(
+        helsinki_streets,
+        points,
+        points,
+        transport_mode="bicycle",
+        exposure=street_exposure,
+    )
+    cell = matrix.iloc[0]
+    # a zero-length journey traverses no edge: no dose to describe,
+    # but zero minutes at any level
+    assert np.isnan(cell["noise_mean"])
+    assert np.isnan(cell["noise_max"])
+    assert np.isnan(cell["noise_coverage"])
+    assert cell["noise_minutes_above_55"] == 0.0
+
+
+def test_the_fingerprint_covers_the_report_lengths():
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+
+    zones = geopandas.GeoDataFrame(
+        {"level": [1.0]},
+        geometry=[box(24.9290, 60.1690, 24.9364, 60.1750)],
+        crs="EPSG:4326",
+    )
+    one = Exposure(_two_route_network(), din=(zones, "level"))
+    same = Exposure(_two_route_network(), din=(zones, "level"))
+    assert one._fingerprint() == same._fingerprint()
+    # identical products, different edge-length weights: the digest
+    # must tell them apart (the lengths weight the reported means)
+    stretched_network = _two_route_network()
+    edges = stretched_network.streets_gdf
+    edges["length_m"] = edges["length_m"] * 2
+    stretched = Exposure(stretched_network, din=(zones, "level"))
+    assert stretched._fingerprint() != one._fingerprint()
+    # the frozen snapshot digests identically to its source
+    assert one._reporting_snapshot()._fingerprint() == one._fingerprint()

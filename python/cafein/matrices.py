@@ -217,6 +217,20 @@ class TravelCostMatrix(pd.DataFrame):
     geometries : bool (optional, default: False)
         Attach each pair's ridden legs as geometry. Off by default:
         per-pair geometries over large matrices are enormous.
+    exposure : Exposure (optional)
+        Report exposure per cell — street-mode matrices (a
+        ``StreetNetwork`` with ``transport_mode=``) for now, with a
+        ``cafein.Exposure`` built on that network. Each reachable cell
+        gains, per layer, the journey's ``{layer}_mean``,
+        ``{layer}_max``, ``{layer}_coverage``, and one
+        ``{layer}_minutes_above_{X}`` per declared threshold — exact
+        from the traversed edges' true per-edge times, with
+        snap-connector time and any parking search outside the basis.
+        The default ``geometries=False`` matrix reads the provenance
+        off the metres-only search and assembles no shape;
+        ``geometries=True`` reads the identical values off the
+        reconstructed legs. A transit cost matrix does not take it
+        yet.
     chunk : (int, int) (optional)
         Compute only chunk ``k`` of ``n``: a deterministic contiguous
         block of the fan-out axis — the resolved origins with
@@ -364,9 +378,15 @@ class TravelCostMatrix(pd.DataFrame):
         costs=None,
         currency=None,
         cost_components=None,
+        exposure=None,
         output_time_units="minutes",
     ):
         if not _is_street_network(network):
+            if exposure is not None:
+                raise ValueError(
+                    "exposure= covers street-mode cost matrices for now; "
+                    "a transit cost matrix does not take it yet"
+                )
             (
                 exclude_routes,
                 exclude_trips,
@@ -466,6 +486,7 @@ class TravelCostMatrix(pd.DataFrame):
                 costs=costs,
                 currency=currency,
                 cost_components=cost_components,
+                exposure=exposure,
                 transit_only={
                     "departure": departure,
                     "arrival": arrival,
@@ -705,6 +726,7 @@ class TravelCostMatrix(pd.DataFrame):
         costs=None,
         currency=None,
         cost_components=None,
+        exposure=None,
         output_time_units="minutes",
     ):
         """The cost matrix streamed to Parquet — the constructor's
@@ -842,6 +864,7 @@ class TravelCostMatrix(pd.DataFrame):
                 costs=costs,
                 currency=currency,
                 cost_components=cost_components,
+                exposure=exposure,
             )
             return _stream_street_cost(
                 "TravelCostMatrix.to_parquet",
@@ -854,6 +877,11 @@ class TravelCostMatrix(pd.DataFrame):
                 pyarrow,
                 resume=resume,
                 output_time_units=output_time_units,
+            )
+        if exposure is not None:
+            raise ValueError(
+                "exposure= covers street-mode cost matrices for now; "
+                "a transit cost matrix does not take it yet"
             )
         _reject_cost_street_args(
             transport_mode,
@@ -1760,6 +1788,7 @@ def _street_cost_columns(
     costs=None,
     currency=None,
     cost_components=None,
+    exposure=None,
 ):
     """The reachable cells of a street cost matrix, in long format."""
     components = component_selection(components)
@@ -1786,6 +1815,7 @@ def _street_cost_columns(
         costs=costs,
         currency=currency,
         cost_components=cost_components,
+        exposure=exposure,
     )
     query = resolved["query"]
     from_index, to_index, numeric, wkb = _street_cost_cells(
@@ -1803,11 +1833,18 @@ def _street_cost_columns(
         data["currency"] = np.full(count, resolved["account"][2], dtype=object)
     if geometries:
         data["geometry"] = shapely.from_wkb(np.array(wkb, dtype=object))
-    # The frame orders provenance before the cost block, as documented.
+    # The frame orders provenance before the cost block, then the
+    # monetary block with its currency, then the exposure block, then
+    # geometry — the exact order the streamed shards emit.
     order = ["from_id", "to_id", "travel_time_s", "distance_m"]
     order += ["network_distance_m", "connector_distance_m", "distance_provenance"]
     order += ["emissions"]
-    order += [name for name in data if name not in order]
+    order += [name for name in data if name.startswith("cost_")]
+    if "currency" in data:
+        order.append("currency")
+    order += [name for name in data if name not in order and name != "geometry"]
+    if "geometry" in data:
+        order.append("geometry")
     return {name: data[name] for name in order}
 
 
@@ -1833,6 +1870,7 @@ def _street_cost_resolution(
     costs,
     currency,
     cost_components,
+    exposure=None,
 ):
     """Every result-affecting street-cost input resolved exactly once —
     validation first, then the frozen snapshot the cells (and the
@@ -1840,6 +1878,8 @@ def _street_cost_resolution(
     from cafein import _parking, costs as _costs, emissions
     from cafein.street_network import _resolved_delays
 
+    if exposure is not None:
+        exposure._check_network(network)
     resolved_parking = _parking.resolve(parking, transport_mode)
     occupancy, vehicle_class = emissions._car_query_options(
         transport_mode, occupancy, vehicle_class
@@ -1878,6 +1918,10 @@ def _street_cost_resolution(
         "occupancy": occupancy,
         "factor": factor,
         "account": account,
+        # A frozen copy: the streamed batches and the manifest
+        # fingerprint read one state, whatever happens to the caller's
+        # Exposure meanwhile — the fare/policy frozen-input pattern.
+        "exposure": None if exposure is None else exposure._reporting_snapshot(),
     }
 
 
@@ -1885,6 +1929,7 @@ def _street_cost_cells(network, query, *, geometries, resolved):
     """One street-cost batch: origin/destination indices, the numeric
     columns, and the WKB geometries (``None`` without ``geometries``)."""
     transport_mode = resolved["transport_mode"]
+    exposure = resolved["exposure"]
     table = network._core.cost_matrix(
         query.origin_points,
         query.destination_points,
@@ -1893,6 +1938,7 @@ def _street_cost_cells(network, query, *, geometries, resolved):
         query.max_snap_distance,
         bool(geometries),
         car_model=resolved["car_model"],
+        street_edges=exposure is not None,
     )
     _warn_unsnapped(
         table,
@@ -1937,6 +1983,29 @@ def _street_cost_cells(network, query, *, geometries, resolved):
             numeric[f"cost_{perspective}"] = kilometres * per_km
         for (perspective, component), per_km in breakdown.items():
             numeric[f"cost_{perspective}_{component}"] = kilometres * per_km
+    if exposure is not None:
+        from cafein.exposure import _threshold_suffix
+
+        # Each cell's journey is one street leg; its totals are the
+        # leg's reporting columns from the traversed-edge provenance
+        # (true per-edge seconds — parking never joins the basis).
+        reported = [
+            exposure.street_leg_columns(edges) for edges in table["street_edges"]
+        ]
+        minute_columns = {
+            f"{name}_minutes_above_{_threshold_suffix(threshold)}"
+            for name in exposure.layers
+            for threshold in exposure.thresholds(name)
+        }
+        for column in exposure.column_names():
+            values = np.asarray([row[column] for row in reported], dtype=float)
+            if column in minute_columns:
+                # Journey-total semantics: a reachable cell without a
+                # traversed edge (a same-coordinate pair, a
+                # connector-only hop) spends 0 minutes at any level,
+                # while its mean/max/coverage stay NaN.
+                values = np.nan_to_num(values, nan=0.0)
+            numeric[column] = values
     geometry = table["geometry"] if geometries else None
     return table["from"], table["to"], numeric, geometry
 
@@ -2138,6 +2207,7 @@ def travel_cost_table(
     walking_speed_kmph=None,
     max_walking_time=None,
     snap_distance=None,
+    exposure=None,
     output=None,
     batch_size=None,
     resume=False,
@@ -2217,6 +2287,17 @@ def travel_cost_table(
         )
     if not _is_street_network(network) and _is_point_frame(origins):
         refuse_wheelchair_streets(traveler, "travel_cost_table")
+    if exposure is not None:
+        if _is_street_network(network):
+            raise ValueError(
+                "travel_cost_table serves transit networks; a street "
+                "cost matrix with exposure= computes through "
+                "TravelCostMatrix, and streams through its to_parquet"
+            )
+        raise ValueError(
+            "exposure= covers street-mode cost matrices for now; "
+            "travel_cost_table does not take it yet"
+        )
     try:
         import pyarrow
     except ImportError as error:
@@ -2640,6 +2721,7 @@ def _stream_street_cost(
 
     query = resolved["query"]
     account = resolved["account"]
+    exposure = resolved["exposure"]
     columns = [
         "from_id",
         "to_id",
@@ -2657,6 +2739,8 @@ def _stream_street_cost(
             f"cost_{perspective}_{component}" for perspective, component in breakdown
         ]
         columns.append("currency")
+    if exposure is not None:
+        columns += exposure.column_names()
     if geometries:
         columns.append("geometry")
     parameters = {
@@ -2670,6 +2754,9 @@ def _stream_street_cost(
         "occupancy": resolved["occupancy"],
         "factor": resolved["factor"],
         "account": None if account is None else [totals, breakdown, label],
+        # The fingerprint hashes the layer data itself, so a resume with
+        # a same-named but different exposure can never wrongly match.
+        "exposure": None if exposure is None else exposure._fingerprint(),
         "output_time_units": output_time_units,
     }
 
@@ -2708,6 +2795,9 @@ def _stream_street_cost(
                 data[name] = pa.array(values)
         if account is not None:
             data["currency"] = pa.array([label] * count, type=pa.string())
+        if exposure is not None:
+            for name in exposure.column_names():
+                data[name] = pa.array(numeric[name])
         if geometries:
             data["geometry"] = pa.array(list(wkb), type=pa.binary())
         return pa.table(data)
