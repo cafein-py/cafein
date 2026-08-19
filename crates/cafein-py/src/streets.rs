@@ -73,6 +73,9 @@ struct CostCell {
     connector_meters: f64,
     /// The leg's shape in (longitude, latitude); `None` without geometries.
     geometry: Option<Vec<(f64, f64)>>,
+    /// The traversed ``(edge, fraction, true seconds)`` provenance;
+    /// populated only by the reconstructed-legs search.
+    edges: Vec<(u32, f64, f64)>,
 }
 
 impl CostCell {
@@ -82,6 +85,7 @@ impl CostCell {
             network_meters: leg.network_meters,
             connector_meters: leg.connector_meters,
             geometry: Some(leg.geometry),
+            edges: leg.edges,
         }
     }
 }
@@ -394,9 +398,18 @@ impl StreetNetwork {
     /// Without `geometries` the rows come from the metres-only search, so a
     /// time/distance matrix never assembles a shape it would only discard;
     /// the numbers are the reconstructed legs' cell for cell.
+    ///
+    /// `multipliers` — the exposure objective's per-edge cost multipliers
+    /// (each finite, at least 1, one per physical edge): the search and
+    /// route choice run the weighted costs, while every reported second
+    /// stays the chosen route's TRUE time; `max_seconds` then bounds the
+    /// weighted (perceived) cost, which the true time can never exceed.
+    /// `street_edges` attaches each cell's traversed ``(edge, fraction)``
+    /// provenance (reconstructed legs only, so it needs `geometries`).
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (origins, destinations, mode, max_seconds, max_snap_distance,
-                        geometries, car_model = None))]
+                        geometries, car_model = None, multipliers = None,
+                        street_edges = false))]
     fn cost_matrix(
         &mut self,
         py: Python<'_>,
@@ -407,9 +420,24 @@ impl StreetNetwork {
         max_snap_distance: f64,
         geometries: bool,
         car_model: Option<CarModelPayload>,
+        multipliers: Option<Vec<f64>>,
+        street_edges: bool,
     ) -> PyResult<Py<PyDict>> {
+        if street_edges && !geometries {
+            return Err(PyValueError::new_err(
+                "street_edges provenance rides the reconstructed legs; pass geometries=True",
+            ));
+        }
         let index = self.compiled(mode, car_model.as_ref())?;
         let (_, profile) = &self.profiles[index];
+        let weighted = match &multipliers {
+            Some(multipliers) => Some(
+                self.inner
+                    .weighted_profile(profile, multipliers)
+                    .map_err(|error| PyValueError::new_err(error.to_string()))?,
+            ),
+            None => None,
+        };
         let rows = py.allow_threads(|| {
             let snap = |&(latitude, longitude): &(f64, f64)| {
                 self.inner
@@ -434,30 +462,59 @@ impl StreetNetwork {
                     None => vec![None; destinations.len()],
                     Some(from) => {
                         let mut row: Vec<Option<CostCell>> = if geometries {
-                            self.inner
-                                .directed_legs_to_snaps(point, from, &targets, profile, max_seconds)
-                                .into_iter()
-                                .map(|leg| leg.map(CostCell::from_leg))
-                                .collect()
+                            match &weighted {
+                                Some(search) => self.inner.directed_legs_to_snaps_weighted(
+                                    point,
+                                    from,
+                                    &targets,
+                                    search,
+                                    profile,
+                                    max_seconds,
+                                ),
+                                None => self.inner.directed_legs_to_snaps(
+                                    point,
+                                    from,
+                                    &targets,
+                                    profile,
+                                    max_seconds,
+                                ),
+                            }
+                            .into_iter()
+                            .map(|leg| leg.map(CostCell::from_leg))
+                            .collect()
                         } else {
-                            self.inner
-                                .directed_meters_to_snaps(from, &target_snaps, profile, max_seconds)
-                                .into_iter()
-                                .zip(&target_snaps)
-                                .map(|(cell, target)| {
-                                    let (seconds, network_meters) = cell?;
-                                    // A cell settles only against a snapped
-                                    // destination, so the connectors at both
-                                    // ends are the snaps' own.
-                                    let to = target.as_ref()?;
-                                    Some(CostCell {
-                                        seconds,
-                                        network_meters,
-                                        connector_meters: from.connector + to.connector,
-                                        geometry: None,
-                                    })
+                            match &weighted {
+                                Some(search) => self.inner.directed_meters_to_snaps_weighted(
+                                    from,
+                                    &target_snaps,
+                                    search,
+                                    profile,
+                                    max_seconds,
+                                ),
+                                None => self.inner.directed_meters_to_snaps(
+                                    from,
+                                    &target_snaps,
+                                    profile,
+                                    max_seconds,
+                                ),
+                            }
+                            .into_iter()
+                            .zip(&target_snaps)
+                            .map(|(cell, target)| {
+                                let (seconds, network_meters) = cell?;
+                                // A cell settles only against a snapped
+                                // destination, so the connectors at both
+                                // ends are the snaps' own.
+                                let to = target.as_ref()?;
+                                Some(CostCell {
+                                    seconds,
+                                    network_meters,
+                                    connector_meters: from.connector + to.connector,
+                                    geometry: None,
+                                    edges: Vec::new(),
                                 })
-                                .collect()
+                            })
+                            .collect()
                         };
                         if routable {
                             // A coordinate is no distance and no time from
@@ -471,6 +528,7 @@ impl StreetNetwork {
                                         connector_meters: 0.0,
                                         geometry: geometries
                                             .then(|| vec![(point.1, point.0), (point.1, point.0)]),
+                                        edges: Vec::new(),
                                     });
                                 }
                             }
@@ -485,6 +543,7 @@ impl StreetNetwork {
         let (mut from, mut to, mut seconds) = (Vec::new(), Vec::new(), Vec::new());
         let (mut network, mut connector) = (Vec::new(), Vec::new());
         let shapes = PyList::empty(py);
+        let traversed = PyList::empty(py);
         for (origin, row) in cells.iter().enumerate() {
             for (destination, cell) in row.iter().enumerate() {
                 let Some(cell) = cell else { continue };
@@ -495,6 +554,9 @@ impl StreetNetwork {
                 connector.push(cell.connector_meters);
                 if let Some(geometry) = &cell.geometry {
                     shapes.append(PyBytes::new(py, &wkb_line_string(geometry)))?;
+                }
+                if street_edges {
+                    traversed.append(cell.edges.clone())?;
                 }
             }
         }
@@ -514,6 +576,9 @@ impl StreetNetwork {
         table.set_item("connector_distance", connector.into_pyarray(py))?;
         if geometries {
             table.set_item("geometry", shapes)?;
+        }
+        if street_edges {
+            table.set_item("street_edges", traversed)?;
         }
         table.set_item("unsnapped_from", unsnapped(&origin_snaps).into_pyarray(py))?;
         table.set_item("unsnapped_to", unsnapped(&target_snaps).into_pyarray(py))?;
@@ -585,6 +650,16 @@ impl StreetNetwork {
     #[getter]
     fn edge_count(&self) -> u32 {
         self.inner.edge_count()
+    }
+
+    /// Per-edge rows for ``streets_gdf``: polyline coordinates, stored
+    /// length, the highway-class code, and the ``(forward, reverse)``
+    /// mode-permission bytes — in the graph's edge order, the same index
+    /// space the searches and the ``street_edges`` provenance speak.
+    /// Internal.
+    #[allow(clippy::type_complexity)]
+    fn _street_edge_layer(&self) -> Vec<(Vec<f64>, Vec<f64>, f64, Option<u8>, Option<(u8, u8)>)> {
+        self.inner.edge_layer()
     }
 
     /// The travel time in whole seconds from `origin` to `destination` under

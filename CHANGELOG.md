@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- The exposure objective: `DetailedItineraries(..., optimize=)` on a
+  `StreetNetwork` scales each edge's cost by `1 + Σ weight × value`
+  over the layers of `exposure=`, so chosen routes trade time against
+  exposure while reported travel times stay the true times; all-zero
+  weights reproduce the unweighted journeys bit-for-bit. `Exposure`
+  now also ingests onto a standalone `StreetNetwork` (new
+  `streets_gdf` property), whose street legs carry the exposure
+  reporting columns.
+  ([#286](https://github.com/cafein-py/cafein/pull/286))
+
 - `DetailedItineraries(..., exposure=)` reports per-leg exposure:
   walk-based legs exact from their traversed edges, stationary waits
   as sampled `wait` rows, in-vehicle legs NaN — with per-layer means,

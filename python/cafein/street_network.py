@@ -212,6 +212,24 @@ class StreetNetwork:
         """Number of physical edges in the street graph."""
         return self._core.edge_count
 
+    @property
+    def streets_gdf(self):
+        """The street network as a GeoDataFrame of edge lines.
+
+        One row per graph edge, in the graph's edge order — the same
+        index space the searches and exposure reporting speak: the
+        edge's real polyline (EPSG:4326), ``length_m``, the OSM
+        ``highway`` class, and one column per street mode (``walk``,
+        ``bicycle``, ``e_scooter``, ``car``, ``wheelchair``) holding
+        the edge's permission as ``"both"``, ``"forward"``,
+        ``"reverse"``, or ``"no"`` (forward is the stored geometry
+        direction). Computed lazily on first access and cached on the
+        network.
+        """
+        if getattr(self, "_streets_gdf_cache", None) is None:
+            self._streets_gdf_cache = _edge_layer_frame(self._core._street_edge_layer())
+        return self._streets_gdf_cache
+
     def travel_time(
         self,
         origin,
@@ -318,6 +336,49 @@ def _resolved_delays(mode, intersection_delays, profile, delay_model):
             "intersection_delays, profile, and delay_model apply to mode='car'"
         )
     return _delays.resolve(intersection_delays, profile, delay_model)
+
+
+def _edge_layer_frame(rows):
+    """One GeoDataFrame row per graph edge from a core edge layer, in
+    the graph's edge order: geometry, ``length_m``, and — when the
+    graph carries attributes — the highway class and per-mode
+    permission columns."""
+    import geopandas
+    from shapely.geometry import LineString
+
+    from cafein._osm import (
+        BICYCLE,
+        CAR,
+        E_SCOOTER,
+        HIGHWAY_CODES,
+        WALK,
+        WHEELCHAIR,
+    )
+
+    data = {"length_m": [meters for _, _, meters, _, _ in rows]}
+    if rows and rows[0][3] is not None:
+        highway_names = {code: name for name, code in HIGHWAY_CODES.items()}
+        data["highway"] = [highway_names[code] for _, _, _, code, _ in rows]
+        modes = (
+            ("walk", WALK),
+            ("bicycle", BICYCLE),
+            ("e_scooter", E_SCOOTER),
+            ("car", CAR),
+            ("wheelchair", WHEELCHAIR),
+        )
+        directions = {
+            (True, True): "both",
+            (True, False): "forward",
+            (False, True): "reverse",
+            (False, False): "no",
+        }
+        for mode, bit in modes:
+            data[mode] = [
+                directions[(bool(forward & bit), bool(reverse & bit))]
+                for _, _, _, _, (forward, reverse) in rows
+            ]
+    geometry = [LineString(list(zip(lons, lats))) for lons, lats, _, _, _ in rows]
+    return geopandas.GeoDataFrame(data, geometry=geometry, crs="EPSG:4326")
 
 
 def multimodal_payload(

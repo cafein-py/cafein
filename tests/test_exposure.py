@@ -1085,32 +1085,6 @@ def test_the_plain_frame_contract_is_untouched(street_network):
         frame.exposure_totals()
 
 
-def test_street_mode_journeys_refuse_exposure_for_now(
-    street_network, reporting_exposure
-):
-    geopandas = pytest.importorskip("geopandas")
-    from shapely.geometry import Point
-
-    from cafein import DetailedItineraries, StreetNetwork
-
-    streets = StreetNetwork.from_osm("tests/data/kantakaupunki.osm.pbf")
-    origins = geopandas.GeoDataFrame(
-        {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
-    )
-    destinations = geopandas.GeoDataFrame(
-        {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
-    )
-    with pytest.raises(ValueError, match="street-mode journeys gain it"):
-        DetailedItineraries(
-            streets,
-            origins,
-            destinations,
-            departure="2022-02-22 08:30",
-            transport_mode="bicycle",
-            exposure=reporting_exposure,
-        )
-
-
 def test_connector_time_stays_out_of_threshold_minutes(reporting_exposure):
     length = float(reporting_exposure._report_lengths[0])
     # half the walked meters are off-graph connector: half the minutes
@@ -1482,3 +1456,326 @@ def test_leg_means_match_an_independent_geometry_integration(street_network, tmp
             assert leg["grad_mean"] == pytest.approx(independent, rel=0.05, abs=2.0)
     finally:
         _drop_layer_columns(edges, "grad", ())
+
+
+# --- objective: optimize= on street journeys ---------------------------------
+
+
+KAMPPI = (24.9320, 60.1690)
+HAKANIEMI = (24.9520, 60.1795)
+
+
+def _street_points():
+    geopandas = pytest.importorskip("geopandas")
+
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(*KAMPPI)], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["b"]}, geometry=[Point(*HAKANIEMI)], crs="EPSG:4326"
+    )
+    return origins, destinations
+
+
+@pytest.fixture(scope="module")
+def street_exposure(helsinki_streets):
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+
+    edges = helsinki_streets.streets_gdf
+    west, south, east, north = edges.total_bounds
+    zones = geopandas.GeoDataFrame(
+        {"level": [61.0]},
+        geometry=[box(west - 0.01, south - 0.01, east + 0.01, north + 0.01)],
+        crs="EPSG:4326",
+    )
+    exposure_object = Exposure(
+        helsinki_streets, noise=(zones, "level"), thresholds={"noise": (55,)}
+    )
+    yield exposure_object
+    _drop_layer_columns(edges, "noise", (55,))
+
+
+def test_street_legs_report_their_traversed_edges(helsinki_streets, street_exposure):
+    from cafein import DetailedItineraries
+
+    origins, destinations = _street_points()
+    frame = DetailedItineraries(
+        helsinki_streets,
+        origins,
+        destinations,
+        transport_mode="bicycle",
+        exposure=street_exposure,
+    )
+    assert len(frame) == 1
+    leg = frame.iloc[0]
+    assert leg["noise_mean"] == pytest.approx(61.0)
+    assert leg["noise_max"] == pytest.approx(61.0)
+    assert leg["noise_coverage"] == pytest.approx(1.0)
+    # on-street minutes only (the snap connectors carry no edge data)
+    assert 0 < leg["noise_minutes_above_55"] <= leg["travel_time"] + 0.5
+    assert "street_edges" not in frame.columns
+    assert "wait" not in set(frame["leg_type"])
+    totals = frame.exposure_totals()
+    assert totals["noise_mean"].iloc[0] == pytest.approx(leg["noise_mean"])
+    assert totals["noise_minutes_above_55"].iloc[0] == pytest.approx(
+        leg["noise_minutes_above_55"]
+    )
+
+
+def test_the_standalone_network_gains_the_layer_columns(
+    helsinki_streets, street_exposure
+):
+    edges = helsinki_streets.streets_gdf
+    assert edges["noise"].values == pytest.approx(61.0)
+    assert edges["noise_share_above_55"].values == pytest.approx(1.0)
+
+
+def test_the_plain_street_frame_is_untouched(helsinki_streets):
+    from cafein import DetailedItineraries
+
+    origins, destinations = _street_points()
+    frame = DetailedItineraries(
+        helsinki_streets, origins, destinations, transport_mode="bicycle"
+    )
+    assert not any(column.startswith("noise") for column in frame.columns)
+    with pytest.raises(ValueError, match="exposure_totals needs"):
+        frame.exposure_totals()
+
+
+def test_zero_weights_reproduce_the_unweighted_journeys(
+    helsinki_streets, street_exposure
+):
+    from cafein import DetailedItineraries
+
+    origins, destinations = _street_points()
+    kwargs = dict(transport_mode="bicycle", output_time_units="seconds")
+    plain = DetailedItineraries(helsinki_streets, origins, destinations, **kwargs)
+    zero = DetailedItineraries(
+        helsinki_streets,
+        origins,
+        destinations,
+        exposure=street_exposure,
+        optimize={"noise": 0.0},
+        **kwargs,
+    )
+    # the pinned identity: bit-for-bit the unweighted journey
+    assert zero["travel_time"].iloc[0] == plain["travel_time"].iloc[0]
+    assert zero["distance_m"].iloc[0] == plain["distance_m"].iloc[0]
+    assert zero.geometry.iloc[0].equals_exact(plain.geometry.iloc[0], 0)
+
+
+def test_a_uniform_layer_bends_no_choice_and_never_the_clock(
+    helsinki_streets, street_exposure
+):
+    from cafein import DetailedItineraries
+
+    origins, destinations = _street_points()
+    kwargs = dict(transport_mode="bicycle", output_time_units="seconds")
+    plain = DetailedItineraries(helsinki_streets, origins, destinations, **kwargs)
+    heavy = DetailedItineraries(
+        helsinki_streets,
+        origins,
+        destinations,
+        exposure=street_exposure,
+        optimize={"noise": 0.05},
+        **kwargs,
+    )
+    # a constant layer scales every edge alike: the route cannot change,
+    # and the reported clock stays the TRUE time despite the weighting
+    assert heavy["travel_time"].iloc[0] == plain["travel_time"].iloc[0]
+    assert heavy["distance_m"].iloc[0] == plain["distance_m"].iloc[0]
+
+
+def test_street_reporting_is_independent_of_geometries(
+    helsinki_streets, street_exposure
+):
+    from cafein import DetailedItineraries
+
+    origins, destinations = _street_points()
+    frame = DetailedItineraries(
+        helsinki_streets,
+        origins,
+        destinations,
+        transport_mode="bicycle",
+        geometries=False,
+        exposure=street_exposure,
+    )
+    assert frame["noise_mean"].iloc[0] == pytest.approx(61.0)
+    assert frame.geometry.isna().all()
+
+
+def _two_route_network():
+    """Two corridors between the same endpoints: a short straight street
+    inside the zone below, and a 1.5x longer detour outside it."""
+    from cafein import StreetNetwork
+    from cafein._cafein import StreetNetwork as _CoreStreetNetwork
+    from cafein._osm import HIGHWAY_CODES, WALK
+
+    lons = [24.9300, 24.9354, 24.9300, 24.9327, 24.9354]
+    lats = [60.1700, 60.1700, 60.1700, 60.1740, 60.1700]
+    core = _CoreStreetNetwork(
+        2,
+        [(0, 1, 300.0), (0, 1, 450.0)],
+        [0, 2, 5],
+        lons,
+        lats,
+        [HIGHWAY_CODES["residential"]] * 2,
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [WALK, WALK],
+        [WALK, WALK],
+        [0, 0],
+        [0, 0],
+    )
+    return StreetNetwork(core)
+
+
+def test_raising_the_weight_flips_the_route_at_the_threshold():
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+    from cafein import DetailedItineraries
+
+    streets = _two_route_network()
+    # value 1.0 over the short corridor only: its cost is t(1 + λ), the
+    # detour's 1.5t — the choice flips exactly at λ = 0.5
+    zones = geopandas.GeoDataFrame(
+        {"level": [1.0]},
+        geometry=[box(24.9290, 60.1690, 24.9364, 60.17005)],
+        crs="EPSG:4326",
+    )
+    exposure_object = Exposure(
+        streets, noise=(zones, "level"), thresholds={"noise": (0.5,)}
+    )
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(24.9300, 60.1700)], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["b"]}, geometry=[Point(24.9354, 60.1700)], crs="EPSG:4326"
+    )
+
+    def leg(**kwargs):
+        frame = DetailedItineraries(
+            streets,
+            origins,
+            destinations,
+            transport_mode="walk",
+            output_time_units="seconds",
+            exposure=exposure_object,
+            **kwargs,
+        )
+        assert len(frame) == 1
+        return frame.iloc[0]
+
+    plain = leg()
+    assert plain["distance_m"] == pytest.approx(300.0)
+    assert plain["noise_mean"] == pytest.approx(1.0)
+    # a vertex snap has no connector, so the fully covered corridor's
+    # minutes at-or-above are exactly its true traversal minutes
+    assert plain["noise_minutes_above_0_5"] == pytest.approx(
+        plain["travel_time"] / 60.0, abs=0.02
+    )
+    below = leg(optimize={"noise": 0.4})
+    assert below["distance_m"] == pytest.approx(300.0)
+    assert below["travel_time"] == plain["travel_time"]
+    above = leg(optimize={"noise": 0.6})
+    assert above["distance_m"] == pytest.approx(450.0)
+    assert above["noise_mean"] == pytest.approx(0.0)
+    assert above["noise_coverage"] == pytest.approx(0.0)
+    assert above["noise_minutes_above_0_5"] == pytest.approx(0.0)
+    # the reported clock is the chosen detour's TRUE time
+    assert above["travel_time"] == pytest.approx(1.5 * plain["travel_time"], abs=1.0)
+
+
+def test_objective_refusals(helsinki_streets, street_exposure, street_network):
+    from cafein import DetailedItineraries
+
+    origins, destinations = _street_points()
+    with pytest.raises(ValueError, match="pass the Exposure"):
+        DetailedItineraries(
+            helsinki_streets,
+            origins,
+            destinations,
+            transport_mode="bicycle",
+            optimize={"noise": 1.0},
+        )
+    for optimize, message in (
+        ({"nope": 1.0}, "unknown layer"),
+        ({"noise": -1.0}, "finite non-negative"),
+        ({"noise": float("nan")}, "finite non-negative"),
+        ({"noise": float("inf")}, "finite non-negative"),
+        # weight × value leaves the floats: an error naming the layer,
+        # never a silently unreachable edge
+        ({"noise": 1e308}, "overflows the edge cost multiplier"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            DetailedItineraries(
+                helsinki_streets,
+                origins,
+                destinations,
+                transport_mode="bicycle",
+                exposure=street_exposure,
+                optimize=optimize,
+            )
+    # transit journeys reject the objective until the Pareto arc
+    with pytest.raises(ValueError, match="Pareto arc"):
+        DetailedItineraries(
+            street_network,
+            ["x"],
+            ["y"],
+            departure="2022-02-22 08:30",
+            optimize={"noise": 1.0},
+        )
+
+
+def test_a_negative_valued_layer_refuses_the_objective():
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+
+    streets = _two_route_network()
+    zones = geopandas.GeoDataFrame(
+        {"level": [-5.0]},
+        geometry=[box(24.9290, 60.1690, 24.9364, 60.1750)],
+        crs="EPSG:4326",
+    )
+    exposure_object = Exposure(streets, chill=(zones, "level"))
+    with pytest.raises(ValueError, match="deficit"):
+        exposure_object._objective_multipliers({"chill": 1.0})
+    # a zero weight still names the layer and must still refuse it
+    with pytest.raises(ValueError, match="deficit"):
+        exposure_object._objective_multipliers({"chill": 0.0})
+
+
+def test_individually_finite_terms_refuse_a_combined_overflow():
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+
+    streets = _two_route_network()
+    everywhere = box(24.9290, 60.1690, 24.9364, 60.1750)
+    zones = geopandas.GeoDataFrame(
+        {"level": [1.0]}, geometry=[everywhere], crs="EPSG:4326"
+    )
+    other = geopandas.GeoDataFrame(
+        {"level": [1.0]}, geometry=[everywhere], crs="EPSG:4326"
+    )
+    exposure_object = Exposure(streets, din=(zones, "level"), dan=(other, "level"))
+    # each 1e308 × 1.0 term is finite; their sum is not
+    with pytest.raises(ValueError, match="combined exposure cost multiplier"):
+        exposure_object._objective_multipliers({"din": 1e308, "dan": 1e308})
+
+
+def test_an_exposure_from_another_network_refuses_street_journeys(
+    helsinki_streets, reporting_exposure
+):
+    from cafein import DetailedItineraries
+
+    origins, destinations = _street_points()
+    with pytest.raises(ValueError, match="not built on the network"):
+        DetailedItineraries(
+            helsinki_streets,
+            origins,
+            destinations,
+            transport_mode="bicycle",
+            exposure=reporting_exposure,
+        )
