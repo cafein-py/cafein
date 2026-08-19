@@ -19,6 +19,22 @@ impl StreetNetwork {
         to_point: (f64, f64),
         to: &Snap,
     ) -> Option<(Vec<(f64, f64)>, f64)> {
+        self.walk_path_edges(from_point, from, to_point, to)
+            .map(|(path, meters, _)| (path, meters))
+    }
+
+    /// [`walk_path`](Self::walk_path) plus the traversed edges as
+    /// ``(edge index, traversed fraction of the edge's length)`` —
+    /// partial first/last edges at the snap fractions, 1.0 for full
+    /// edges between. Connectors are not edges and carry no entry.
+    #[allow(clippy::type_complexity)]
+    pub fn walk_path_edges(
+        &self,
+        from_point: (f64, f64),
+        from: &Snap,
+        to_point: (f64, f64),
+        to: &Snap,
+    ) -> Option<(Vec<(f64, f64)>, f64, Vec<(u32, f64)>)> {
         let from_length = self.arrays().lengths()[from.edge as usize];
         let to_length = self.arrays().lengths()[to.edge as usize];
         // The direct candidate: both points on one edge.
@@ -83,10 +99,13 @@ impl StreetNetwork {
             } else {
                 1.0
             };
+            let mut traversed = Vec::with_capacity(edges.len() + 2);
+            traversed.push((from.edge, (from.fraction - entry_fraction).abs()));
             path.extend(self.edge_slice(from.edge, from.fraction, entry_fraction));
             for (step, &edge) in edges.iter().enumerate() {
                 let (u, _) = self.edge_endpoints(edge);
                 let forward = vertices[step] == u;
+                traversed.push((edge, 1.0));
                 path.extend(self.edge_slice(
                     edge,
                     if forward { 0.0 } else { 1.0 },
@@ -109,7 +128,8 @@ impl StreetNetwork {
             path.extend(self.edge_slice(to.edge, exit_fraction, to.fraction));
             path.push(self.point_at(to.edge, to.fraction));
             path.push((to_point.1, to_point.0));
-            return Some((dedup_consecutive(path), best_transit));
+            traversed.push((to.edge, (to.fraction - exit_fraction).abs()));
+            return Some((dedup_consecutive(path), best_transit, traversed));
         }
 
         let meters = direct?;
@@ -118,7 +138,8 @@ impl StreetNetwork {
         path.extend(self.edge_slice(from.edge, from.fraction, to.fraction));
         path.push(self.point_at(to.edge, to.fraction));
         path.push((to_point.1, to_point.0));
-        Some((dedup_consecutive(path), meters))
+        let traversed = vec![(from.edge, (from.fraction - to.fraction).abs())];
+        Some((dedup_consecutive(path), meters, traversed))
     }
 
     /// A Dijkstra from the seed vertices into the search state, recording

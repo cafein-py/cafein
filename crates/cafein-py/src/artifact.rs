@@ -1943,6 +1943,7 @@ pub(super) fn assemble(
         stops_by_qualified_id,
         trips_by_public_id,
         streets_bytes_read,
+        streets_generation: 0,
         source: Some(source),
     }
 }
