@@ -1701,6 +1701,8 @@ def test_objective_refusals(helsinki_streets, street_exposure, street_network):
             optimize={"noise": 1.0},
         )
     for optimize, message in (
+        # the string form selects a Pareto criterion, not street weights
+        ("noise", "layer: weight"),
         ({"nope": 1.0}, "unknown layer"),
         ({"noise": -1.0}, "finite non-negative"),
         ({"noise": float("nan")}, "finite non-negative"),

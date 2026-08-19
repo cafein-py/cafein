@@ -459,6 +459,15 @@ class Exposure:
         search's non-negative-cost invariant holds."""
         if not optimize:
             return None
+        if not isinstance(optimize, dict):
+            # One optimize= name, two value shapes: a dict folds weights
+            # into the single objective here; a string selects a Pareto
+            # criterion and arrives with the Pareto arc.
+            raise ValueError(
+                "the street objective takes optimize={layer: weight}; "
+                "a string optimize= selects a Pareto criterion and "
+                "arrives with the Pareto arc"
+            )
         unknown = sorted(name for name in optimize if name not in self._layers)
         if unknown:
             raise ValueError(
