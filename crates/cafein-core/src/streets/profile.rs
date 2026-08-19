@@ -566,6 +566,55 @@ impl CompiledStreetProfile {
     pub(super) fn effective_speed_cache(&self) -> &std::sync::OnceLock<f64> {
         &self.max_effective_speed
     }
+
+    /// This profile with every permitted arc's cost inflated by its
+    /// edge's objective multiplier: `ceil(millis × m)`, with `m` read
+    /// through `adj_edges` so both directions of an edge inflate alike.
+    /// The forbidden sentinel survives untouched (identical
+    /// permissions), connectors read the unchanged definition, and a
+    /// multiplier of exactly 1 reproduces the cost bit-for-bit. The car
+    /// split scales per component — the sum of ceils can exceed the
+    /// inflated whole by rounding, so a partial can never undercut the
+    /// full relaxation.
+    pub(super) fn weighted(
+        &self,
+        multipliers: &[f64],
+        adj_edges: &[u32],
+    ) -> Result<CompiledStreetProfile, ProfileError> {
+        let scale = |cost: u32, slot: usize| -> Result<u32, ProfileError> {
+            let inflated = (f64::from(cost) * multipliers[adj_edges[slot] as usize]).ceil();
+            if inflated >= f64::from(u32::MAX) {
+                return Err(ProfileError::ArcCostOverflow);
+            }
+            Ok(inflated as u32)
+        };
+        let mut arc_millis = self.arc_millis.clone();
+        for (slot, cost) in arc_millis.iter_mut().enumerate() {
+            if *cost != u32::MAX {
+                *cost = scale(*cost, slot)?;
+            }
+        }
+        let car_partials = match &self.car_partials {
+            Some(partials) => {
+                let mut scaled = partials.clone();
+                for slot in 0..scaled.base.len() {
+                    if self.arc_millis[slot] != u32::MAX {
+                        scaled.base[slot] = scale(scaled.base[slot], slot)?;
+                        scaled.head[slot] = scale(scaled.head[slot], slot)?;
+                        scaled.tail[slot] = scale(scaled.tail[slot], slot)?;
+                    }
+                }
+                Some(scaled)
+            }
+            None => None,
+        };
+        Ok(CompiledStreetProfile {
+            definition: self.definition.clone(),
+            arc_millis,
+            car_partials,
+            max_effective_speed: std::sync::OnceLock::new(),
+        })
+    }
 }
 
 impl StreetNetwork {
@@ -586,6 +635,23 @@ impl StreetNetwork {
     /// so only the walking profile compiles over it (every arc permitted at
     /// the base speed); a non-walk profile has nothing to route by and returns
     /// [`ProfileError::MissingAttributes`].
+    /// `profile` with every permitted arc's cost inflated by its edge's
+    /// objective multiplier — one entry per physical edge, each finite
+    /// and at least 1, so the weighted cost can never undercut the true
+    /// one (see [`CompiledStreetProfile::weighted`]).
+    pub fn weighted_profile(
+        &self,
+        profile: &CompiledStreetProfile,
+        multipliers: &[f64],
+    ) -> Result<CompiledStreetProfile, ProfileError> {
+        if multipliers.len() != self.arrays().lengths().len()
+            || multipliers.iter().any(|m| !m.is_finite() || *m < 1.0)
+        {
+            return Err(ProfileError::InvalidMultipliers);
+        }
+        profile.weighted(multipliers, self.arrays().adj_edges())
+    }
+
     pub fn compile_profile(
         &self,
         definition: &StreetProfileDefinition,

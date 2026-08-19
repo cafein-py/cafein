@@ -1484,47 +1484,9 @@ class TransportNetwork:
         Computed lazily on first access and cached on the network.
         """
         if getattr(self, "_streets_gdf_cache", None) is None:
-            import geopandas
-            from shapely.geometry import LineString
+            from cafein.street_network import _edge_layer_frame
 
-            from cafein._osm import (
-                BICYCLE,
-                CAR,
-                E_SCOOTER,
-                HIGHWAY_CODES,
-                WALK,
-                WHEELCHAIR,
-            )
-
-            rows = self._core._street_edge_layer()
-            data = {"length_m": [meters for _, _, meters, _, _ in rows]}
-            if rows and rows[0][3] is not None:
-                highway_names = {code: name for name, code in HIGHWAY_CODES.items()}
-                data["highway"] = [highway_names[code] for _, _, _, code, _ in rows]
-                modes = (
-                    ("walk", WALK),
-                    ("bicycle", BICYCLE),
-                    ("e_scooter", E_SCOOTER),
-                    ("car", CAR),
-                    ("wheelchair", WHEELCHAIR),
-                )
-                directions = {
-                    (True, True): "both",
-                    (True, False): "forward",
-                    (False, True): "reverse",
-                    (False, False): "no",
-                }
-                for mode, bit in modes:
-                    data[mode] = [
-                        directions[(bool(forward & bit), bool(reverse & bit))]
-                        for _, _, _, _, (forward, reverse) in rows
-                    ]
-            geometry = [
-                LineString(list(zip(lons, lats))) for lons, lats, _, _, _ in rows
-            ]
-            self._streets_gdf_cache = geopandas.GeoDataFrame(
-                data, geometry=geometry, crs="EPSG:4326"
-            )
+            self._streets_gdf_cache = _edge_layer_frame(self._core._street_edge_layer())
         return self._streets_gdf_cache
 
     def annotate_emissions(self, journeys, factors=None, components=None):

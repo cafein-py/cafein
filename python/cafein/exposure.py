@@ -4,8 +4,9 @@
 value columns, cafein assigns no meaning to the names — to the
 street network's edges: a coverage-adjusted (zero-filled) dose mean,
 a covered maximum, a coverage share, and one at-or-above length
-share per declared threshold, all visible as columns of
-``TransportNetwork.streets_gdf``. Ingestion runs once, eagerly, at
+share per declared threshold, all visible as columns of the
+network's ``streets_gdf`` (a ``TransportNetwork`` or a standalone
+``StreetNetwork`` alike). Ingestion runs once, eagerly, at
 construction; routing never touches geometry or GDAL again.
 
 Raster and line ingestion are sampling estimates: values are read at
@@ -236,8 +237,12 @@ class Exposure:
 
     Parameters
     ----------
-    network : TransportNetwork
-        A network built with a street network (``osm_pbf=``).
+    network : TransportNetwork or StreetNetwork
+        A transit network built with a street network (``osm_pbf=``),
+        or a standalone street network. Layers ingest onto the
+        network's own graph: a ``StreetNetwork``'s single union graph
+        serves its searches directly (it has no stops, so no wait
+        sampling).
     thresholds : dict, optional
         ``{layer name: level or sequence of levels}`` — declares
         "minutes at or above X" aggregates. The comparison is
@@ -288,7 +293,9 @@ class Exposure:
 
         self._network = network
         self._streets_frame = edges
-        self._streets_generation = network._core._streets_generation
+        # A TransportNetwork's counter bumps on street replacement; the
+        # standalone StreetNetwork is immutable once built and has none.
+        self._streets_generation = getattr(network._core, "_streets_generation", None)
         self._edge_count = len(edges)
         # Every layer ingests into staging first; the frame is written
         # only after the whole constructor succeeded, so a failing
@@ -333,9 +340,10 @@ class Exposure:
         # provenance) speak the WALKING graph's edge indices, which on
         # multimodal builds differ from streets_gdf's union-graph rows.
         # Ingest a second, walking-aligned array set there; on
-        # walk-only builds the graphs coincide and the arrays are
-        # shared.
-        if network.has_multimodal_streets:
+        # walk-only builds — and on a standalone StreetNetwork, whose
+        # single union graph is exactly what its searches ride — the
+        # graphs coincide and the arrays are shared.
+        if getattr(network, "has_multimodal_streets", False):
             rows = network._core._walking_edge_layer()
             import geopandas
             from shapely.geometry import LineString
@@ -377,9 +385,11 @@ class Exposure:
 
         # Stop-point values for wait-leg sampling: raster lookups,
         # point-in-polygon maxima, nearest lines within the tolerance.
+        # A standalone StreetNetwork has no stops (and its journeys no
+        # waits), so the sampling pass is empty there.
         stop_points = [
             (stop, lat, lon)
-            for stop, lat, lon in network.stops
+            for stop, lat, lon in getattr(network, "stops", ())
             if lat is not None and lon is not None
         ]
         self._stop_values = {}
@@ -414,19 +424,23 @@ class Exposure:
         """Refuse reporting against a network this Exposure was not
         built on, or whose street graph was replaced since — the cached
         per-edge arrays speak that build's edge indices only. Beyond
-        the frame-identity token, the WALKING graph (which backs the
-        reporting arrays) must still be the ingested install: the
-        core's generation counter bumps on every street-network
-        install, and the edge count guards the array alignment."""
+        the frame-identity token, the graph backing the reporting
+        arrays must still be the ingested install: a TransportNetwork's
+        generation counter bumps on every street-network install, a
+        standalone StreetNetwork is immutable once built, and the edge
+        count guards the array alignment either way."""
         stale = network is not self._network or (
             getattr(network, "_streets_gdf_cache", None) is not self._streets_frame
         )
         if not stale:
             try:
                 core = network._core
-                stale = core._streets_generation != self._streets_generation or (
-                    core._walking_edge_count != len(self._report_lengths)
-                )
+                if self._streets_generation is not None:
+                    stale = core._streets_generation != self._streets_generation or (
+                        core._walking_edge_count != len(self._report_lengths)
+                    )
+                else:
+                    stale = core.edge_count != len(self._report_lengths)
             except Exception:
                 stale = True
         if stale:
@@ -435,6 +449,63 @@ class Exposure:
                 "(or the network's street graph was replaced since); "
                 "build Exposure(network, ...) on the current network"
             )
+
+    def _objective_multipliers(self, optimize):
+        """The combined per-edge cost multiplier ``1 + Σ λ·value`` for
+        the street search, or ``None`` when nothing is weighted. Keys
+        must name this Exposure's layers, weights be finite and
+        non-negative, and every weighted layer's edge values
+        non-negative — so the multiplier is provably at least 1 and the
+        search's non-negative-cost invariant holds."""
+        if not optimize:
+            return None
+        if not isinstance(optimize, dict):
+            # One optimize= name, two value shapes: a dict folds weights
+            # into the single objective here; a string selects a Pareto
+            # criterion and arrives with the Pareto arc.
+            raise ValueError(
+                "the street objective takes optimize={layer: weight}; "
+                "a string optimize= selects a Pareto criterion and "
+                "arrives with the Pareto arc"
+            )
+        unknown = sorted(name for name in optimize if name not in self._layers)
+        if unknown:
+            raise ValueError(
+                f"optimize= names unknown layer(s) {unknown}; this "
+                f"Exposure carries {sorted(self._layers)}"
+            )
+        combined = np.ones(len(self._report_lengths), dtype=float)
+        for name, weight in optimize.items():
+            weight = float(weight)
+            if not math.isfinite(weight) or weight < 0:
+                raise ValueError(
+                    f"optimize[{name!r}] must be a finite non-negative " "weight"
+                )
+            values = self._report[name]["mean"]
+            # Every NAMED layer must be weightable, a zero weight
+            # included — a silent pass would hide the problem until the
+            # weight is raised.
+            if (values < 0).any():
+                raise ValueError(
+                    f"layer {name!r} carries negative edge values, which "
+                    "the objective cannot weight; enter more-is-better "
+                    "data as its deficit (e.g. 100 - value) instead"
+                )
+            if weight == 0:
+                continue
+            term = weight * values
+            if not np.isfinite(term).all():
+                raise ValueError(
+                    f"optimize[{name!r}] overflows the edge cost "
+                    "multiplier; lower the weight or rescale the layer"
+                )
+            combined += term
+        if not np.isfinite(combined).all():
+            raise ValueError(
+                "the combined exposure cost multiplier overflows; lower "
+                "the optimize= weights or rescale the layers"
+            )
+        return combined
 
     @property
     def layers(self):
@@ -505,6 +576,58 @@ class Exposure:
                     suffix = _threshold_suffix(threshold)
                     columns[f"{name}_minutes_above_{suffix}"] = float(
                         minutes * (shares[indices] * share).sum()
+                    )
+            else:
+                columns[f"{name}_mean"] = np.nan
+                columns[f"{name}_max"] = np.nan
+                columns[f"{name}_coverage"] = np.nan
+                for threshold in self._thresholds.get(name, ()):
+                    suffix = _threshold_suffix(threshold)
+                    columns[f"{name}_minutes_above_{suffix}"] = np.nan
+        return columns
+
+    def street_leg_columns(self, street_edges):
+        """Reporting columns for one street-mode leg from its traversed
+        ``(edge, fraction, seconds)`` provenance. The dose products stay
+        length-weighted (the reporting contract), while the threshold
+        minutes sum each edge's TRUE traversal time — street profiles
+        ride different speeds per edge, so length shares are not time
+        shares there. Connector time never appears: connectors are not
+        edges and carry no entry."""
+        columns = {}
+        if not street_edges:
+            for name in self.column_names():
+                columns[name] = np.nan
+            return columns
+        indices = np.asarray([edge for edge, _, _ in street_edges], dtype=int)
+        fractions = np.asarray(
+            [fraction for _, fraction, _ in street_edges], dtype=float
+        )
+        seconds = np.asarray([elapsed for _, _, elapsed in street_edges], dtype=float)
+        weights = fractions * self._report_lengths[indices]
+        # Zero-fraction end edges are not traversed (see leg_columns).
+        traversed = weights > 0
+        indices = indices[traversed]
+        weights = weights[traversed]
+        seconds = seconds[traversed]
+        total = weights.sum()
+        for name, products in self._report.items():
+            if total > 0:
+                share = weights / total
+                columns[f"{name}_mean"] = float(
+                    (products["mean"][indices] * share).sum()
+                )
+                maxima = products["max"][indices]
+                columns[f"{name}_max"] = (
+                    float(np.nanmax(maxima)) if np.isfinite(maxima).any() else np.nan
+                )
+                columns[f"{name}_coverage"] = float(
+                    (products["coverage"][indices] * share).sum()
+                )
+                for threshold, shares in products["shares"].items():
+                    suffix = _threshold_suffix(threshold)
+                    columns[f"{name}_minutes_above_{suffix}"] = float(
+                        ((seconds / 60.0) * shares[indices]).sum()
                     )
             else:
                 columns[f"{name}_mean"] = np.nan

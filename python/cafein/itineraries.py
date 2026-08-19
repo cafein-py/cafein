@@ -185,11 +185,30 @@ class DetailedItineraries(gpd.GeoDataFrame):
         every walk-based leg (``NaN`` on in-vehicle legs), and
         synthesizes ``wait`` rows — the layers sampled at the stop —
         for every stationary gap, including a first boarding after the
-        option's departure; segments renumber to include them.
-        Journey-level totals via ``exposure_totals()``. Reporting is
-        independent of ``geometries=``. Street-mode journeys (a
-        ``StreetNetwork`` or a ``street_policy``) gain reporting with
-        the exposure objective and reject it for now.
+        option's departure; segments renumber to include them. On a
+        ``StreetNetwork`` the same columns join each street leg, exact
+        from its traversed edges (snap-connector time never counts
+        toward a threshold). Journey-level totals via
+        ``exposure_totals()``. Reporting is independent of
+        ``geometries=``. ``street_policy`` journeys gain reporting
+        with a later stage and reject it for now.
+    optimize : dict (optional)
+        The exposure objective, ``StreetNetwork`` journeys only:
+        ``{layer name: weight}`` over the layers of ``exposure=``,
+        which must be passed too. Each edge's traversal cost scales by
+        ``1 + Σ weight × value`` — one unit of a layer makes a second
+        of travel that many times more costly — so the chosen routes
+        trade time against exposure, while the reported travel times
+        stay the TRUE times of the chosen route (the weighting bends
+        the choice, never the clock). Under ``optimize=``,
+        ``max_street_time`` bounds the weighted (perceived) cost; the
+        multiplier is at least 1, so every returned journey's true
+        time is within the budget too. Weights must be finite and
+        non-negative, weighted layers' edge values non-negative
+        (enter more-is-better data as its deficit, e.g.
+        ``100 - value``), and all-zero weights reproduce the
+        unweighted journeys exactly. Transit journeys reject it —
+        transit optimization arrives with the Pareto arc.
     candidates : {"time", "pareto", "relaxed", "diverse"} (default: "time")
         Which alternatives to return per OD pair. ``"time"`` draws the
         time-optimal (arrival, rides) journeys of the RAPTOR engine;
@@ -364,8 +383,11 @@ class DetailedItineraries(gpd.GeoDataFrame):
 
         exposure = self._exposure
         # Exact seconds — the public travel_time column rounds to whole
-        # minutes by default, which would distort the weights.
-        seconds = self["arrival_s"] - self["departure_s"]
+        # minutes by default, which would distort the weights. A
+        # clock-less street frame carries null times but single-leg
+        # options, where any positive weight is exact.
+        seconds = (self["arrival_s"] - self["departure_s"]).astype(float)
+        seconds = seconds.fillna(1.0)
         records = []
         grouped = self.assign(_seconds=seconds).groupby(
             ["from_id", "to_id", "option"], sort=False, dropna=False
@@ -441,6 +463,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         snap_distance=None,
         transport_mode=None,
         exposure=None,
+        optimize=None,
         max_street_time=None,
         street_policy=None,
         intersection_delays=False,
@@ -527,18 +550,21 @@ class DetailedItineraries(gpd.GeoDataFrame):
         # Before the reconstruction guard below: a StreetNetwork has no
         # `route_between_stops` either, so it would be mistaken for frame data.
         if _is_street_network(network):
-            if exposure is not None:
-                raise ValueError(
-                    "exposure= reporting covers transit and walking "
-                    "journeys for now; street-mode journeys gain it with "
-                    "the exposure objective"
-                )
             if street_policy is not None:
                 raise ValueError(
                     "street_policy shapes a TransportNetwork's access and "
                     "egress; a StreetNetwork routes one mode directly — pass "
                     "transport_mode instead"
                 )
+            if optimize is not None and exposure is None:
+                raise ValueError(
+                    "optimize= weights exposure layers; pass the Exposure "
+                    "carrying them as exposure= too"
+                )
+            multipliers = None
+            if exposure is not None:
+                exposure._check_network(network)
+                multipliers = exposure._objective_multipliers(optimize)
             street_frame = _street_itineraries_frame(
                 network,
                 origins,
@@ -549,6 +575,8 @@ class DetailedItineraries(gpd.GeoDataFrame):
                 max_street_time=max_street_time,
                 max_snap_distance=max_snap_distance,
                 geometries=geometries,
+                exposure=exposure,
+                multipliers=multipliers,
                 factors=factors,
                 components=components,
                 intersection_delays=intersection_delays,
@@ -595,6 +623,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
                 geometry="geometry",
                 crs="EPSG:4326",
             )
+            self._exposure = exposure
             return
         if not hasattr(network, "route_between_stops"):
             # pandas/geopandas reconstruct subclasses by passing data in
@@ -634,13 +663,18 @@ class DetailedItineraries(gpd.GeoDataFrame):
             )
         if departure is None and not arrive_by:
             raise ValueError("give exactly one of departure= or arrival=")
+        if optimize is not None:
+            raise ValueError(
+                "optimize= shapes street-mode journeys on a StreetNetwork; "
+                "transit optimization arrives with the Pareto arc"
+            )
         if exposure is not None:
             exposure._check_network(network)
             if street_policy is not None:
                 raise ValueError(
-                    "exposure= reporting covers transit and walking "
-                    "journeys for now; street_policy journeys gain it "
-                    "with the exposure objective"
+                    "exposure= reporting covers transit, walking, and "
+                    "StreetNetwork journeys; street_policy journeys gain "
+                    "it with a later stage"
                 )
         frame = _itineraries_frame(
             network,
@@ -1332,6 +1366,8 @@ def _street_itineraries_frame(
     costs=None,
     currency=None,
     cost_components=None,
+    exposure=None,
+    multipliers=None,
 ):
     """Street routes as one leg per reachable pair."""
     from cafein import _parking, costs as _costs, emissions
@@ -1359,16 +1395,20 @@ def _street_itineraries_frame(
     account = _costs.resolve_query(
         transport_mode, perspectives, costs, currency, cost_components
     )
+    # Exposure reporting rides the reconstructed legs' edge provenance,
+    # so the reconstruction runs regardless of the geometry ask.
     table = network._core.cost_matrix(
         query.origin_points,
         query.destination_points,
         transport_mode,
         query.max_seconds,
         query.max_snap_distance,
-        bool(geometries),
+        bool(geometries) or exposure is not None,
         car_model=_resolved_delays(
             transport_mode, intersection_delays, profile, delay_model
         ),
+        multipliers=None if multipliers is None else list(multipliers),
+        street_edges=exposure is not None,
     )
     _warn_unsnapped(
         table,
@@ -1380,6 +1420,13 @@ def _street_itineraries_frame(
     to_ids = np.asarray(query.to_ids, dtype=object)
     travel_time = table["travel_time_s"]
     network_distance = table["network_distance"]
+    if exposure is not None:
+        # The routed street leg is the reporting basis — each traversed
+        # edge's true seconds, before any parking search joins the
+        # public time and distance.
+        reported = [
+            exposure.street_leg_columns(edges) for edges in table["street_edges"]
+        ]
     if resolved_parking is not None:
         # The parking search ends each leg: seconds join the travel time
         # (and through it the arrival), metres the driven distance and the
@@ -1447,6 +1494,9 @@ def _street_itineraries_frame(
         for (perspective, component), per_km in breakdown.items():
             frame[f"cost_{perspective}_{component}"] = kilometres * per_km
         frame["currency"] = label
+    if exposure is not None:
+        for column in exposure.column_names():
+            frame[column] = [row[column] for row in reported]
     if geometries:
         shapes = list(shapely.from_wkb(np.array(table["geometry"], dtype=object)))
     else:

@@ -45,6 +45,11 @@ pub struct StreetLeg {
     pub connector_meters: f64,
     /// The leg's shape in (longitude, latitude), connectors included.
     pub geometry: Vec<(f64, f64)>,
+    /// The traversed edges as ``(edge index, traversed fraction, true
+    /// traversal seconds)`` — partial snap edges at the ends, 1.0
+    /// between, each edge's UNWEIGHTED time under the mode's own
+    /// per-edge speed. Connectors are not edges and carry no entry.
+    pub edges: Vec<(u32, f64, f64)>,
 }
 
 /// One end of a snapped edge as the search sees it: the vertex, the cost of
@@ -1533,6 +1538,7 @@ impl StreetNetwork {
                 to_point,
                 to,
                 profile,
+                None,
                 millis,
                 state,
                 &mut prefix,
@@ -1551,6 +1557,44 @@ impl StreetNetwork {
         from: &Snap,
         targets: &[((f64, f64), Option<Snap>)],
         profile: &CompiledStreetProfile,
+        max_seconds: f64,
+    ) -> Vec<Option<StreetLeg>> {
+        self.legs_to_snaps_impl(from_point, from, targets, profile, None, max_seconds)
+    }
+
+    /// [`directed_legs_to_snaps`](Self::directed_legs_to_snaps) under an
+    /// objective-weighted profile: the search and route choice ride
+    /// `weighted`, while every reported second recomputes the chosen
+    /// route under `unweighted` — the weighting bends the choice, never
+    /// the clock. `max_seconds` bounds the WEIGHTED (perceived) cost;
+    /// the multiplier is at least 1, so every returned leg's true time
+    /// is within the budget too.
+    pub fn directed_legs_to_snaps_weighted(
+        &self,
+        from_point: (f64, f64),
+        from: &Snap,
+        targets: &[((f64, f64), Option<Snap>)],
+        weighted: &CompiledStreetProfile,
+        unweighted: &CompiledStreetProfile,
+        max_seconds: f64,
+    ) -> Vec<Option<StreetLeg>> {
+        self.legs_to_snaps_impl(
+            from_point,
+            from,
+            targets,
+            weighted,
+            Some(unweighted),
+            max_seconds,
+        )
+    }
+
+    fn legs_to_snaps_impl(
+        &self,
+        from_point: (f64, f64),
+        from: &Snap,
+        targets: &[((f64, f64), Option<Snap>)],
+        profile: &CompiledStreetProfile,
+        unweighted: Option<&CompiledStreetProfile>,
         max_seconds: f64,
     ) -> Vec<Option<StreetLeg>> {
         if !max_seconds.is_finite() || max_seconds < 0.0 {
@@ -1573,6 +1617,7 @@ impl StreetNetwork {
                         *to_point,
                         to,
                         profile,
+                        unweighted,
                         millis,
                         state,
                         &mut prefix,
@@ -1596,6 +1641,31 @@ impl StreetNetwork {
         profile: &CompiledStreetProfile,
         max_seconds: f64,
     ) -> Vec<Option<(u32, f64)>> {
+        self.meters_to_snaps_impl(from, targets, profile, None, max_seconds)
+    }
+
+    /// [`directed_meters_to_snaps`](Self::directed_meters_to_snaps) under
+    /// an objective-weighted profile — the same choice/clock split as
+    /// [`directed_legs_to_snaps_weighted`](Self::directed_legs_to_snaps_weighted).
+    pub fn directed_meters_to_snaps_weighted(
+        &self,
+        from: &Snap,
+        targets: &[Option<Snap>],
+        weighted: &CompiledStreetProfile,
+        unweighted: &CompiledStreetProfile,
+        max_seconds: f64,
+    ) -> Vec<Option<(u32, f64)>> {
+        self.meters_to_snaps_impl(from, targets, weighted, Some(unweighted), max_seconds)
+    }
+
+    fn meters_to_snaps_impl(
+        &self,
+        from: &Snap,
+        targets: &[Option<Snap>],
+        profile: &CompiledStreetProfile,
+        unweighted: Option<&CompiledStreetProfile>,
+        max_seconds: f64,
+    ) -> Vec<Option<(u32, f64)>> {
         if !max_seconds.is_finite() || max_seconds < 0.0 {
             return vec![None; targets.len()];
         }
@@ -1610,7 +1680,8 @@ impl StreetNetwork {
                 .map(|target| {
                     let to = target.as_ref()?;
                     let millis = self.arrival_millis(from, to, profile, cutoff, state)?;
-                    let meters = match &self.winning_route(from, to, profile, millis, state) {
+                    let route = self.winning_route(from, to, profile, millis, state);
+                    let meters = match &route {
                         WinningRoute::SameEdge => {
                             let length = self.arrays().lengths()[from.edge as usize];
                             (to.fraction - from.fraction).abs() * length
@@ -1625,6 +1696,10 @@ impl StreetNetwork {
                                 + self.partial_meters(from, to, *entry_fraction, *exit_fraction)
                         }
                     };
+                    let millis = match unweighted {
+                        Some(profile) => self.route_millis(from, to, &route, profile),
+                        None => millis,
+                    };
                     Some((seconds(millis as f64 / 1000.0), meters))
                 })
                 .collect()
@@ -1632,7 +1707,9 @@ impl StreetNetwork {
     }
 
     /// Builds the leg for a destination the search has already reached, whose
-    /// best cost is `millis`.
+    /// best cost is `millis`. With `unweighted` set, the search (and so the
+    /// route choice) ran an objective-weighted profile; the reported seconds
+    /// recompute the chosen route under the true costs.
     #[allow(clippy::too_many_arguments)]
     fn assemble_leg(
         &self,
@@ -1641,6 +1718,7 @@ impl StreetNetwork {
         to_point: (f64, f64),
         to: &Snap,
         profile: &CompiledStreetProfile,
+        unweighted: Option<&CompiledStreetProfile>,
         millis: u64,
         state: &DirectedState,
         prefix: &mut HashMap<u32, f64>,
@@ -1684,12 +1762,142 @@ impl StreetNetwork {
                 (meters, path)
             }
         };
+        let millis = match unweighted {
+            Some(profile) => self.route_millis(from, to, &route, profile),
+            None => millis,
+        };
         StreetLeg {
             seconds: seconds(millis as f64 / 1000.0),
             network_meters,
             connector_meters,
             geometry: dedup_consecutive(path),
+            edges: self.route_edges(from, to, &route, unweighted.unwrap_or(profile)),
         }
+    }
+
+    /// The route's cost under `profile` — how the seed, chain, and egress
+    /// compose is exactly what the search summed, so recomputing under the
+    /// profile the search ran reproduces its settled cost bit-for-bit, and
+    /// recomputing under the TRUE profile prices a weighted search's chosen
+    /// route at its true clock. Permissions are identical between the two
+    /// (weighting preserves the forbidden sentinel), so every lookup finds
+    /// its counterpart.
+    fn route_millis(
+        &self,
+        from: &Snap,
+        to: &Snap,
+        route: &WinningRoute,
+        profile: &CompiledStreetProfile,
+    ) -> u64 {
+        match route {
+            WinningRoute::SameEdge => self
+                .same_edge_millis(from, to, profile)
+                .expect("the same-edge route is permitted under the same mode"),
+            WinningRoute::Chain {
+                vertices,
+                edges,
+                entry_fraction,
+                exit_fraction,
+            } => {
+                let seed = self
+                    .directed_seeds(from, profile)
+                    .into_iter()
+                    .find(|seed| seed.vertex == vertices[0] && seed.fraction == *entry_fraction)
+                    .expect("the route's entry seed is permitted under the same mode");
+                let exit = *vertices.last().expect("a chain has at least one vertex");
+                let egress = self
+                    .directed_egress(to, profile)
+                    .into_iter()
+                    .find(|end| end.vertex == exit && end.fraction == *exit_fraction)
+                    .expect("the route's exit is permitted under the same mode");
+                let mut total = seed.millis;
+                for (step, &edge) in edges.iter().enumerate() {
+                    let slot = self.arc_slot(vertices[step], vertices[step + 1], edge);
+                    total = total.saturating_add(u64::from(profile.arc_millis()[slot]));
+                }
+                total.saturating_add(egress.millis)
+            }
+        }
+    }
+
+    /// The route's traversed edges as ``(edge, fraction, seconds)`` —
+    /// the partial snap edges at the ends (zero when the route enters at
+    /// the snap itself), 1.0 for the whole edges between, each with its
+    /// TRUE traversal time under `profile` (street profiles ride
+    /// different speeds per edge, so length shares are not time shares).
+    /// Connector time is subtracted out of the end partials.
+    fn route_edges(
+        &self,
+        from: &Snap,
+        to: &Snap,
+        route: &WinningRoute,
+        profile: &CompiledStreetProfile,
+    ) -> Vec<(u32, f64, f64)> {
+        let connector_speed = profile.definition.connector_speed;
+        let elapsed = |millis: u64| millis as f64 / 1000.0;
+        match route {
+            WinningRoute::SameEdge => {
+                let connectors = connector_millis(from.connector, connector_speed)
+                    .saturating_add(connector_millis(to.connector, connector_speed));
+                let on_edge = self
+                    .same_edge_millis(from, to, profile)
+                    .expect("the same-edge route is permitted under the same mode")
+                    .saturating_sub(connectors);
+                vec![(
+                    from.edge,
+                    (to.fraction - from.fraction).abs(),
+                    elapsed(on_edge),
+                )]
+            }
+            WinningRoute::Chain {
+                vertices,
+                edges,
+                entry_fraction,
+                exit_fraction,
+            } => {
+                let seed = self
+                    .directed_seeds(from, profile)
+                    .into_iter()
+                    .find(|seed| seed.vertex == vertices[0] && seed.fraction == *entry_fraction)
+                    .expect("the route's entry seed is permitted under the same mode");
+                let entry = seed
+                    .millis
+                    .saturating_sub(connector_millis(from.connector, connector_speed));
+                let exit = *vertices.last().expect("a chain has at least one vertex");
+                let egress = self
+                    .directed_egress(to, profile)
+                    .into_iter()
+                    .find(|end| end.vertex == exit && end.fraction == *exit_fraction)
+                    .expect("the route's exit is permitted under the same mode");
+                let leave = egress
+                    .millis
+                    .saturating_sub(connector_millis(to.connector, connector_speed));
+                let mut traversed = Vec::with_capacity(edges.len() + 2);
+                traversed.push((
+                    from.edge,
+                    (from.fraction - entry_fraction).abs(),
+                    elapsed(entry),
+                ));
+                for (step, &edge) in edges.iter().enumerate() {
+                    let slot = self.arc_slot(vertices[step], vertices[step + 1], edge);
+                    traversed.push((edge, 1.0, f64::from(profile.arc_millis()[slot]) / 1000.0));
+                }
+                traversed.push((to.edge, (to.fraction - exit_fraction).abs(), elapsed(leave)));
+                traversed
+            }
+        }
+    }
+
+    /// The adjacency slot of `edge` leaving `tail` for `head`. A
+    /// self-loop's two arcs are indistinguishable here and resolve to the
+    /// first, mirroring the reconstruction's own direction convention.
+    fn arc_slot(&self, tail: u32, head: u32, edge: u32) -> usize {
+        let arrays = self.arrays();
+        let start = arrays.adjacency_offsets()[tail as usize] as usize;
+        let end = arrays.adjacency_offsets()[tail as usize + 1] as usize;
+        (start..end)
+            .find(|&slot| arrays.adj_edges()[slot] == edge && arrays.adj_targets()[slot] == head)
+            .expect("the chain's arc exists in the adjacency")
     }
 
     /// The winning route behind a settled forward-search cost: the direct
