@@ -609,6 +609,7 @@ fn cost_rows_agree(
         with_geometry: false,
         fares: None,
         rental: None,
+        with_pieces: false,
     };
     let stop_count = timetable.stop_count();
     let destinations: Vec<StopIdx> = (0..stop_count).map(StopIdx).collect();
@@ -820,6 +821,7 @@ fn least_cost_rows_match_raptor_on_the_tie_fixtures() {
         with_geometry: false,
         fares: None,
         rental: None,
+        with_pieces: false,
     };
     let stop_count = timetable.stop_count();
     let destinations: Vec<StopIdx> = (0..stop_count).map(StopIdx).collect();
@@ -968,6 +970,7 @@ fn point_and_fare_cost_rows_match_raptor() {
         with_geometry: false,
         fares: Some(&fares),
         rental: None,
+        with_pieces: false,
     };
     let requests: Vec<Request> = (0..2)
         .map(|origin| Request {
@@ -1075,6 +1078,7 @@ fn cost_cell(
         with_geometry: false,
         fares: None,
         rental: None,
+        with_pieces: false,
     };
     let request = Request {
         departure: 0,
@@ -1557,6 +1561,7 @@ fn generated_networks_match_raptor_across_the_sweep() {
             with_geometry: true,
             fares: Some(&net.fares),
             rental: None,
+            with_pieces: false,
         };
         let previous = seed % 3 == 2;
         let engine = TbtrEngine::for_date(

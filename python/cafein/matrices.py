@@ -218,19 +218,22 @@ class TravelCostMatrix(pd.DataFrame):
         Attach each pair's ridden legs as geometry. Off by default:
         per-pair geometries over large matrices are enormous.
     exposure : Exposure (optional)
-        Report exposure per cell — street-mode matrices (a
-        ``StreetNetwork`` with ``transport_mode=``) for now, with a
-        ``cafein.Exposure`` built on that network. Each reachable cell
-        gains, per layer, the journey's ``{layer}_mean``,
-        ``{layer}_max``, ``{layer}_coverage``, and one
-        ``{layer}_minutes_above_{X}`` per declared threshold — exact
-        from the traversed edges' true per-edge times, with
-        snap-connector time and any parking search outside the basis.
-        The default ``geometries=False`` matrix reads the provenance
-        off the metres-only search and assembles no shape;
-        ``geometries=True`` reads the identical values off the
-        reconstructed legs. A transit cost matrix does not take it
-        yet.
+        Report exposure per cell, with a ``cafein.Exposure`` built on
+        the network being routed. Each reachable cell gains, per
+        layer, the journey's ``{layer}_mean``, ``{layer}_max``,
+        ``{layer}_coverage``, and one ``{layer}_minutes_above_{X}``
+        per declared threshold — the ``exposure_totals()`` arithmetic
+        per cell. Street matrices compute exactly from the traversed
+        edges' true per-edge times (snap-connector time and any
+        parking search outside the basis; no geometry is assembled on
+        the default metres-only search). Transit matrices fold the
+        time-optimal journey's walk-and-wait skeleton — access,
+        egress, and transfer walks at their reconstructed provenance,
+        boarding waits sampled at the stops, in-vehicle time excluded
+        — with every distinct walk reconstructed once, never per
+        cell. Single-departure time-optimal mode only: the windowed
+        and Pareto modes, ``arrival=``, ``router='tbtr'`` (the engine
+        resolves to RAPTOR), and ``street_policy`` refuse it.
     chunk : (int, int) (optional)
         Compute only chunk ``k`` of ``n``: a deterministic contiguous
         block of the fan-out axis — the resolved origins with
@@ -382,11 +385,6 @@ class TravelCostMatrix(pd.DataFrame):
         output_time_units="minutes",
     ):
         if not _is_street_network(network):
-            if exposure is not None:
-                raise ValueError(
-                    "exposure= covers street-mode cost matrices for now; "
-                    "a transit cost matrix does not take it yet"
-                )
             (
                 exclude_routes,
                 exclude_trips,
@@ -532,6 +530,12 @@ class TravelCostMatrix(pd.DataFrame):
             cost_components,
         )
         if street_policy is not None:
+            if exposure is not None:
+                raise ValueError(
+                    "exposure= reporting covers transit, walking, and "
+                    "StreetNetwork computations; street_policy matrices "
+                    "gain it with a later stage"
+                )
             offending = next(
                 (
                     name
@@ -633,6 +637,18 @@ class TravelCostMatrix(pd.DataFrame):
                 )
             )
             return
+        if exposure is not None:
+            router = _validate_transit_exposure(
+                exposure,
+                network,
+                optimize=optimize,
+                window=window,
+                within=within,
+                candidates=candidates,
+                arrival=arrival,
+                arrive_by=arrive_by,
+                router=router,
+            )
         table, from_ids, to_ids = _cost_columns(
             network,
             origins,
@@ -658,7 +674,13 @@ class TravelCostMatrix(pd.DataFrame):
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
+            exposure=None if exposure is None else exposure._reporting_snapshot(),
         )
+        if exposure is not None:
+            # Re-verify the binding after the routing (the itineraries
+            # precedent): a street graph replaced mid-computation must
+            # not pair fresh edge indices with the stale snapshot.
+            exposure._check_network(network)
         data = {
             "from_id": np.array(from_ids, dtype=object)[table["from"]],
             "to_id": np.array(to_ids, dtype=object)[table["to"]],
@@ -670,6 +692,9 @@ class TravelCostMatrix(pd.DataFrame):
         }
         if fares is not None:
             data["fare"] = table["fare"]
+        if exposure is not None:
+            for column in exposure.column_names():
+                data[column] = table[column]
         if geometries:
             data["geometry"] = shapely.from_wkb(
                 np.array(table["geometry"], dtype=object)
@@ -878,11 +903,20 @@ class TravelCostMatrix(pd.DataFrame):
                 resume=resume,
                 output_time_units=output_time_units,
             )
+        exposure_snapshot = None
         if exposure is not None:
-            raise ValueError(
-                "exposure= covers street-mode cost matrices for now; "
-                "a transit cost matrix does not take it yet"
+            router = _validate_transit_exposure(
+                exposure,
+                network,
+                optimize=optimize,
+                window=window,
+                within=within,
+                candidates=candidates,
+                arrival=arrival,
+                arrive_by=arrive_by,
+                router=router,
             )
+            exposure_snapshot = exposure._reporting_snapshot()
         _reject_cost_street_args(
             transport_mode,
             max_street_time,
@@ -928,6 +962,7 @@ class TravelCostMatrix(pd.DataFrame):
             pyarrow=pyarrow,
             resume=resume,
             output_time_units=output_time_units,
+            exposure=exposure_snapshot,
         )
 
 
@@ -2207,6 +2242,18 @@ def travel_cost_table(
     walking_speed_kmph=None,
     max_walking_time=None,
     snap_distance=None,
+    transport_mode=None,
+    max_street_time=None,
+    intersection_delays=False,
+    profile=None,
+    delay_model=None,
+    parking=None,
+    occupancy=None,
+    vehicle_class=None,
+    perspectives=None,
+    costs=None,
+    currency=None,
+    cost_components=None,
     exposure=None,
     output=None,
     batch_size=None,
@@ -2226,7 +2273,12 @@ def travel_cost_table(
     Arrow table with ``from_id`` and ``to_id`` dictionary-encoded over
     the origin and destination identifiers, the numeric columns wrapping
     the computed arrays zero-copy, and — with ``geometries=True`` — the
-    ridden legs as WKB in a binary ``geometry`` column. The batch
+    ridden legs as WKB in a binary ``geometry`` column. A
+    ``StreetNetwork`` computes the street cost matrix exactly as
+    ``TravelCostMatrix`` does (``transport_mode=`` required, the car
+    and monetary options included, ``exposure=`` columns included; the
+    timetable arguments reject as there), as one Arrow table or
+    streamed with ``output=``. The batch
     workflow writes one shard per origin chunk::
 
         network = TransportNetwork.load("network.cafein")
@@ -2287,17 +2339,6 @@ def travel_cost_table(
         )
     if not _is_street_network(network) and _is_point_frame(origins):
         refuse_wheelchair_streets(traveler, "travel_cost_table")
-    if exposure is not None:
-        if _is_street_network(network):
-            raise ValueError(
-                "travel_cost_table serves transit networks; a street "
-                "cost matrix with exposure= computes through "
-                "TravelCostMatrix, and streams through its to_parquet"
-            )
-        raise ValueError(
-            "exposure= covers street-mode cost matrices for now; "
-            "travel_cost_table does not take it yet"
-        )
     try:
         import pyarrow
     except ImportError as error:
@@ -2340,6 +2381,94 @@ def travel_cost_table(
     within = duration_seconds("max_travel_time", max_travel_time)
     max_walking_time = duration_seconds("max_walking_time", max_walking_time)
     max_snap_distance = snap_distance
+    exposure_snapshot = None
+    if exposure is not None and not _is_street_network(network):
+        router = _validate_transit_exposure(
+            exposure,
+            network,
+            optimize=optimize,
+            window=window,
+            within=within,
+            arrival=arrival,
+            arrive_by=arrive_by,
+            router=router,
+        )
+        exposure_snapshot = exposure._reporting_snapshot()
+    if _is_street_network(network):
+        chunk = None if chunk is None else tuple(int(part) for part in chunk)
+        resolved = _street_cost_resolution(
+            network,
+            origins,
+            destinations,
+            transport_mode=transport_mode,
+            max_street_time=duration_seconds("max_street_time", max_street_time),
+            max_snap_distance=max_snap_distance,
+            chunk=chunk,
+            transit_only={
+                "departure": departure,
+                "arrival": arrival,
+                "traveler": traveler,
+                "departure_time_window": window,
+                "max_travel_time": within,
+                "fares": fares,
+                "walking_speed_kmph": walking_speed_kmph,
+                "max_walking_time": max_walking_time,
+                "max_rides": None if max_rides == 8 else max_rides,
+                "optimize": None if optimize == "time" else optimize,
+                "router": None if router == "auto" else router,
+                "exclude_routes": id_sequence("exclude_routes", exclude_routes) or None,
+                "exclude_trips": id_sequence("exclude_trips", exclude_trips) or None,
+                "exclude_stops": id_sequence("exclude_stops", exclude_stops) or None,
+            },
+            factors=factors,
+            components=components,
+            intersection_delays=intersection_delays,
+            profile=profile,
+            delay_model=delay_model,
+            parking=parking,
+            occupancy=occupancy,
+            vehicle_class=vehicle_class,
+            perspectives=perspectives,
+            costs=costs,
+            currency=currency,
+            cost_components=cost_components,
+            exposure=exposure,
+        )
+        if output is None:
+            if batch_size is not None:
+                raise ValueError("batch_size requires output=")
+            if resume:
+                raise ValueError("resume=True requires output=")
+            return _street_arrow_table(
+                network, resolved, geometries, pyarrow, output_time_units
+            )
+        size = _stream_size(batch_size, resume)
+        return _stream_street_cost(
+            "travel_cost_table",
+            network,
+            resolved,
+            geometries,
+            chunk,
+            output,
+            size,
+            pyarrow,
+            resume=resume,
+            output_time_units=output_time_units,
+        )
+    _reject_cost_street_args(
+        transport_mode,
+        max_street_time,
+        intersection_delays,
+        profile,
+        delay_model,
+        parking,
+        occupancy,
+        vehicle_class,
+        perspectives,
+        costs,
+        currency,
+        cost_components,
+    )
     if output is None:
         if batch_size is not None:
             raise ValueError("batch_size requires output=")
@@ -2368,7 +2497,10 @@ def travel_cost_table(
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
+            exposure=exposure_snapshot,
         )
+        if exposure is not None:
+            exposure._check_network(network)
         return _arrow_table(
             table,
             pyarrow.array(from_ids, type=pyarrow.string()),
@@ -2378,6 +2510,7 @@ def travel_cost_table(
             geometries,
             pyarrow,
             output_time_units,
+            exposure=exposure_snapshot,
         )
     size = _stream_size(batch_size, resume)
     return _stream_transit_cost(
@@ -2411,6 +2544,7 @@ def travel_cost_table(
         pyarrow=pyarrow,
         resume=resume,
         output_time_units=output_time_units,
+        exposure=exposure_snapshot,
     )
 
 
@@ -2446,6 +2580,7 @@ def _stream_transit_cost(
     arrive_by=False,
     resume=False,
     output_time_units="minutes",
+    exposure=None,
 ):
     """The transit cost matrix streamed in sliced-axis batches — the
     origins on the departure axis, the destinations (the reverse
@@ -2504,6 +2639,8 @@ def _stream_transit_cost(
     ]
     if fares is not None:
         columns.append("fare")
+    if exposure is not None:
+        columns += exposure.column_names()
     if geometries:
         columns.append("geometry")
     parameters = {
@@ -2530,6 +2667,9 @@ def _stream_transit_cost(
         "walking_speed_kmph": walking_speed_kmph,
         "max_walking_time": max_walking_time,
         "max_snap_distance": max_snap_distance,
+        # The fingerprint hashes the layer data itself, so a resume with
+        # a same-named but different exposure can never wrongly match.
+        "exposure": None if exposure is None else exposure._fingerprint(),
         "output_time_units": output_time_units,
     }
 
@@ -2581,6 +2721,7 @@ def _stream_transit_cost(
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
+            exposure=exposure,
             _resolved=(trip_factors, fare_tables, endpoints),
         )
         return _arrow_table(
@@ -2595,6 +2736,7 @@ def _stream_transit_cost(
             # Point rows key destinations by batch position; stop rows
             # keep their global keys, so only the point form offsets.
             to_offset=rows.start if arrive_by and points is not None else 0,
+            exposure=exposure,
         )
 
     return _stream_run(
@@ -2700,6 +2842,325 @@ def _stream_run(
         {name: shared[name] for name in dictionary_columns},
         manifest=manifest,
     )
+
+
+def _validate_transit_exposure(
+    exposure,
+    network,
+    *,
+    optimize,
+    window,
+    within,
+    candidates="time",
+    arrival=None,
+    arrive_by=False,
+    router="auto",
+):
+    """The exposure slice is the single-departure, time-optimal mode:
+    refuse the windowed, Pareto, and arrive-by combinations by name,
+    force the RAPTOR engine (its journey reconstruction carries the
+    skeletons), and verify the binding. Returns the resolved router."""
+    if router not in ("auto", "raptor", "tbtr"):
+        raise ValueError("router must be 'auto', 'raptor', or 'tbtr'")
+    for name, value in (
+        ("optimize", None if optimize == "time" else optimize),
+        ("arrival", arrival if arrive_by else None),
+        ("departure_time_window", None if arrive_by else window),
+        ("arrival_time_window", window if arrive_by else None),
+        ("max_travel_time", within),
+        ("candidates", None if candidates == "time" else candidates),
+    ):
+        if value is not None:
+            raise ValueError(
+                "exposure= joins the single-departure time-optimal cost "
+                f"matrix; it does not combine with {name}="
+            )
+    if router == "tbtr":
+        raise ValueError(
+            "exposure= rides the RAPTOR engine's journey reconstruction; "
+            "router='tbtr' does not serve it"
+        )
+    exposure._check_network(network)
+    return "raptor"
+
+
+_NO_STOP = 2**32 - 1
+"""The core's absent-stop sentinel on cost rows."""
+
+
+def _transit_exposure_columns(
+    network,
+    exposure,
+    table,
+    *,
+    origin_points,
+    destination_points,
+    max_snap_distance,
+):
+    """Per-cell exposure totals folded from the journey skeletons — the
+    ``exposure_totals()`` arithmetic at matrix scale.
+
+    Every DISTINCT walk component reconstructs once — access per
+    (origin, boarding stop), egress per (destination, alighting stop),
+    transfers per stored pair, the walking-direct cells per pair — into
+    a per-minute ``leg_columns`` record; waits fold straight from the
+    sampled stop values. The per-cell combine is ``np.add.at`` over the
+    flattened skeleton, never a per-cell reconstruction. A component
+    whose walk cannot be reconstructed folds as an uncovered leg,
+    exactly as an itinerary leg without provenance does."""
+    from cafein import streets as _streets
+    from cafein.exposure import _threshold_suffix
+
+    snap_limit = (
+        _streets.MAX_SNAP_DISTANCE if max_snap_distance is None else max_snap_distance
+    )
+    layers = list(exposure.layers)
+    thresholds = {name: exposure.thresholds(name) for name in layers}
+    cells = len(table["from"])
+    weight_total = np.zeros(cells)
+    weighted_mean = {name: np.zeros(cells) for name in layers}
+    weighted_coverage = {name: np.zeros(cells) for name in layers}
+    maxima = {name: np.full(cells, -np.inf) for name in layers}
+    minutes = {
+        (name, threshold): np.zeros(cells)
+        for name in layers
+        for threshold in thresholds[name]
+    }
+
+    offsets = np.asarray(table["piece_offsets"], dtype=np.int64)
+    kind = np.asarray(table["piece_kind"])
+    stop = np.asarray(table["piece_stop"], dtype=np.int64)
+    other = np.asarray(table["piece_other"], dtype=np.int64)
+    seconds = np.asarray(table["piece_seconds"], dtype=float)
+    cell_of = np.repeat(np.arange(cells, dtype=np.int64), np.diff(offsets))
+    from_index = np.asarray(table["from"], dtype=np.int64)
+    to_index = np.asarray(table["to"], dtype=np.int64)
+
+    # Waits fold straight from the sampled stop values, wait_columns
+    # semantics: an unsampleable stop counts its time at value 0 with
+    # coverage 0, never NaN.
+    stop_ids = [identifier for identifier, _, _ in network.stops]
+    stop_values = {
+        name: np.asarray(
+            [
+                exposure._stop_values.get(name, {}).get(identifier, np.nan)
+                for identifier in stop_ids
+            ],
+            dtype=float,
+        )
+        for name in layers
+    }
+    waits = kind == 3
+    if waits.any():
+        cell = cell_of[waits]
+        wait_seconds = seconds[waits]
+        wait_stop = stop[waits]
+        np.add.at(weight_total, cell, wait_seconds)
+        for name in layers:
+            value = stop_values[name][wait_stop]
+            covered = np.isfinite(value)
+            np.add.at(
+                weighted_mean[name], cell, np.where(covered, value, 0.0) * wait_seconds
+            )
+            np.add.at(
+                weighted_coverage[name], cell, covered.astype(float) * wait_seconds
+            )
+            np.fmax.at(maxima[name], cell[covered], value[covered])
+            for threshold in thresholds[name]:
+                above = covered & (value >= threshold)
+                np.add.at(
+                    minutes[(name, threshold)],
+                    cell,
+                    np.where(above, wait_seconds / 60.0, 0.0),
+                )
+
+    # Walk components: one reconstruction per distinct component, one
+    # per-minute leg record each, then a vectorized fold. The cache
+    # lives on the frozen snapshot, so a streamed run's batches share
+    # every reconstruction instead of repeating it per batch.
+    walks = ~waits
+    core = network._core
+    records = getattr(exposure, "_component_cache", None)
+    if records is None:
+        records = {}
+        exposure._component_cache = records
+
+    def leg_record(walked):
+        if walked is None:
+            return None
+        edges, meters = walked
+        columns = exposure.leg_columns(edges, 60.0, meters)
+        if not np.isfinite(columns[f"{layers[0]}_coverage"]):
+            return None
+        return columns
+
+    if walks.any():
+        indices = np.flatnonzero(walks)
+        component = np.full(len(indices), -1, dtype=np.int64)
+        component_records = []
+        component_ids = {}
+        for position, piece in enumerate(indices):
+            piece_cell = int(cell_of[piece])
+            at = int(stop[piece])
+            # Coordinate-keyed: origin/destination indices are local to
+            # each sliced call, while the snapshot's cache spans a whole
+            # streamed run — the coordinate is the walk's identity.
+            if kind[piece] == 0:
+                origin = origin_points[int(from_index[piece_cell])]
+                key = ("a", origin[0], origin[1], at)
+                if key not in records:
+                    records[key] = leg_record(
+                        core._coordinate_stop_walk_edges(
+                            origin[0], origin[1], at, snap_limit
+                        )
+                    )
+            elif kind[piece] == 1:
+                destination = destination_points[int(to_index[piece_cell])]
+                key = ("e", destination[0], destination[1], at)
+                if key not in records:
+                    records[key] = leg_record(
+                        core._coordinate_stop_walk_edges(
+                            destination[0], destination[1], at, snap_limit
+                        )
+                    )
+            else:
+                key = ("t", at, int(other[piece]))
+                if key not in records:
+                    records[key] = leg_record(
+                        core._transfer_walk_edges(at, int(other[piece]))
+                    )
+            columns = records[key]
+            if columns is None:
+                continue
+            if key not in component_ids:
+                component_ids[key] = len(component_records)
+                component_records.append(columns)
+            component[position] = component_ids[key]
+        chosen_mask = component >= 0
+        if chosen_mask.any():
+            cell = cell_of[indices[chosen_mask]]
+            walk_seconds = seconds[indices[chosen_mask]]
+            chosen = component[chosen_mask]
+
+            def gather(column):
+                return np.asarray(
+                    [record[column] for record in component_records], dtype=float
+                )[chosen]
+
+            np.add.at(weight_total, cell, walk_seconds)
+            for name in layers:
+                np.add.at(
+                    weighted_mean[name], cell, gather(f"{name}_mean") * walk_seconds
+                )
+                np.add.at(
+                    weighted_coverage[name],
+                    cell,
+                    gather(f"{name}_coverage") * walk_seconds,
+                )
+                top = gather(f"{name}_max")
+                finite = np.isfinite(top)
+                np.fmax.at(maxima[name], cell[finite], top[finite])
+                for threshold in thresholds[name]:
+                    column = f"{name}_minutes_above_{_threshold_suffix(threshold)}"
+                    np.add.at(
+                        minutes[(name, threshold)],
+                        cell,
+                        gather(column) * walk_seconds / 60.0,
+                    )
+
+    # Walking-direct cells: the whole journey is one walk between the
+    # query coordinates; reconstruct per distinct pair.
+    if origin_points is not None and destination_points is not None:
+        rides = np.asarray(table["rides"])
+        travel_seconds = np.asarray(table["travel_time_s"], dtype=float)
+        access = np.asarray(table["access_stop"], dtype=np.int64)
+        direct = (rides == 0) & (access == _NO_STOP) & (travel_seconds > 0)
+        for index in np.flatnonzero(direct):
+            origin = origin_points[int(from_index[index])]
+            destination = destination_points[int(to_index[index])]
+            key = ("d", origin[0], origin[1], destination[0], destination[1])
+            if key not in records:
+                records[key] = leg_record(
+                    core._direct_walk_edges(
+                        origin[0],
+                        origin[1],
+                        destination[0],
+                        destination[1],
+                        snap_limit,
+                    )
+                )
+            record = records[key]
+            if record is None:
+                continue
+            weight = travel_seconds[index]
+            weight_total[index] += weight
+            for name in layers:
+                weighted_mean[name][index] += record[f"{name}_mean"] * weight
+                weighted_coverage[name][index] += record[f"{name}_coverage"] * weight
+                top = record[f"{name}_max"]
+                if np.isfinite(top):
+                    maxima[name][index] = max(maxima[name][index], top)
+                for threshold in thresholds[name]:
+                    column = f"{name}_minutes_above_{_threshold_suffix(threshold)}"
+                    minutes[(name, threshold)][index] += record[column] * weight / 60.0
+
+    out = {}
+    with np.errstate(invalid="ignore", divide="ignore"):
+        for name in layers:
+            out[f"{name}_mean"] = weighted_mean[name] / weight_total
+            out[f"{name}_max"] = np.where(
+                np.isfinite(maxima[name]), maxima[name], np.nan
+            )
+            out[f"{name}_coverage"] = weighted_coverage[name] / weight_total
+            for threshold in thresholds[name]:
+                column = f"{name}_minutes_above_{_threshold_suffix(threshold)}"
+                out[column] = minutes[(name, threshold)]
+    return out
+
+
+def _street_arrow_table(network, resolved, geometries, pa, output_time_units):
+    """The street cost matrix as one Arrow table — ``travel_cost_table``'s
+    street form, the streamed shards' schema in a single batch."""
+    from cafein._cafein import STREET_DISTANCE_PROVENANCE
+    from cafein._units import travel_time_output
+
+    query = resolved["query"]
+    from_index, to_index, numeric, wkb = _street_cost_cells(
+        network, query, geometries=geometries, resolved=resolved
+    )
+    count = len(from_index)
+    data = {
+        "from_id": pa.DictionaryArray.from_arrays(
+            pa.array(from_index),
+            pa.array(list(query.from_ids), type=pa.string()),
+        ),
+        "to_id": pa.DictionaryArray.from_arrays(
+            pa.array(to_index),
+            pa.array(list(query.to_ids), type=pa.string()),
+        ),
+        "travel_time": pa.array(
+            travel_time_output(numeric["travel_time_s"], output_time_units)
+        ),
+        "distance_m": pa.array(numeric["distance_m"]),
+        "network_distance_m": pa.array(numeric["network_distance_m"]),
+        "connector_distance_m": pa.array(numeric["connector_distance_m"]),
+        "distance_provenance": pa.array(
+            [STREET_DISTANCE_PROVENANCE] * count, type=pa.string()
+        ),
+        "emissions": pa.array(numeric["emissions"]),
+    }
+    for name, values in numeric.items():
+        if name.startswith("cost_"):
+            data[name] = pa.array(values)
+    if resolved["account"] is not None:
+        data["currency"] = pa.array([resolved["account"][2]] * count, type=pa.string())
+    exposure = resolved["exposure"]
+    if exposure is not None:
+        for name in exposure.column_names():
+            data[name] = pa.array(numeric[name])
+    if geometries:
+        data["geometry"] = pa.array(list(wkb), type=pa.binary())
+    return pa.table(data)
 
 
 def _stream_street_cost(
@@ -3183,6 +3644,7 @@ def _arrow_table(
     pa,
     output_time_units,
     to_offset=0,
+    exposure=None,
 ):
     """One batch's Arrow table over the shared id dictionary domains.
 
@@ -3210,6 +3672,9 @@ def _arrow_table(
     }
     if fares is not None:
         columns["fare"] = pa.array(table["fare"])
+    if exposure is not None:
+        for name in exposure.column_names():
+            columns[name] = pa.array(np.asarray(table[name], dtype=float))
     if geometries:
         columns["geometry"] = pa.array(list(table["geometry"]), type=pa.binary())
     return pa.table(columns)
@@ -3269,6 +3734,7 @@ def _cost_columns(
     exclude_trips=(),
     exclude_stops=(),
     arrive_by=False,
+    exposure=None,
     _resolved=None,
 ):
     """The core's cost arrays plus the origin and destination ids.
@@ -3387,7 +3853,19 @@ def _cost_columns(
                 *walk,
                 geometries,
                 fare_tables,
+                pieces=exposure is not None,
             )
+            if exposure is not None:
+                table.update(
+                    _transit_exposure_columns(
+                        network,
+                        exposure,
+                        table,
+                        origin_points=origin_points,
+                        destination_points=destination_points,
+                        max_snap_distance=max_snap_distance,
+                    )
+                )
         _warn_unsnapped(table, from_ids, to_ids)
     else:
         stop_ids = [stop for stop, _, _ in network.stops]
@@ -3465,7 +3943,19 @@ def _cost_columns(
                 *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
                 geometries,
                 fare_tables,
+                pieces=exposure is not None,
             )
+            if exposure is not None:
+                table.update(
+                    _transit_exposure_columns(
+                        network,
+                        exposure,
+                        table,
+                        origin_points=None,
+                        destination_points=None,
+                        max_snap_distance=max_snap_distance,
+                    )
+                )
         to_ids = stop_ids
     return table, from_ids, to_ids
 

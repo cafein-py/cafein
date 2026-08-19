@@ -364,6 +364,7 @@ impl<'a> McTbtrEngine<'a> {
             emission_grams: winner.grams,
             fare,
             geometry,
+            pieces: None,
         }
     }
 

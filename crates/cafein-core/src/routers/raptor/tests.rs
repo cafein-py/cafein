@@ -177,6 +177,7 @@ fn cost_rows_aggregate_the_fastest_journey() {
         with_geometry: false,
         fares: None,
         rental: None,
+        with_pieces: false,
     };
     let mut request = request(StopIdx(0), StopIdx(3), 0);
     request.egress = Vec::new();
@@ -249,6 +250,7 @@ fn point_rows_join_over_egress_links() {
         with_geometry: false,
         fares: None,
         rental: None,
+        with_pieces: false,
     };
     let mut request = request(StopIdx(0), StopIdx(3), 0);
     request.egress = Vec::new();
@@ -328,6 +330,7 @@ fn cost_rows_carry_fares() {
             with_geometry: false,
             fares: Some(tables),
             rental: None,
+            with_pieces: false,
         };
         Raptor.cost_matrix(
             &timetable,
@@ -366,6 +369,7 @@ fn cost_rows_carry_fares() {
         with_geometry: false,
         fares: Some(&rules(200.0)),
         rental: None,
+        with_pieces: false,
     };
     let rows = Raptor.least_cost_matrix(
         &timetable,
@@ -1136,6 +1140,7 @@ fn a_time_dominated_cheaper_journey_never_wins_a_deadline_cell() {
         with_geometry: false,
         fares: None,
         rental: None,
+        with_pieces: false,
     };
     let rows = arrive_by_rows(
         &timetable,
@@ -1177,6 +1182,7 @@ fn a_non_minute_departure_instant_prices_exactly() {
         with_geometry: false,
         fares: None,
         rental: None,
+        with_pieces: false,
     };
     let rows = arrive_by_rows(
         &timetable,
@@ -1226,6 +1232,7 @@ fn an_arrival_between_the_last_mark_and_the_window_end_is_refused() {
         with_geometry: false,
         fares: None,
         rental: None,
+        with_pieces: false,
     };
     let rows = arrive_by_rows(
         &timetable,
@@ -1295,6 +1302,7 @@ fn equal_tuple_journeys_price_the_canonical_one() {
         with_geometry: false,
         fares: None,
         rental: None,
+        with_pieces: false,
     };
     // The canonical winner is whatever the forward engine elects at
     // departure 100 — derive it from the engine itself, never assume.

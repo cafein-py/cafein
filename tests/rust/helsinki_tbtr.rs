@@ -400,6 +400,7 @@ fn cost_rows_match_raptor_across_sampled_origins() {
         with_geometry: false,
         fares: None,
         rental: None,
+        with_pieces: false,
     };
     let destinations: Vec<StopIdx> = (0..timetable.stop_count())
         .step_by(97)

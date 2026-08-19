@@ -479,6 +479,13 @@ class Exposure:
             frame("max", products["max"])
             for threshold in sorted(products["shares"]):
                 frame(f"share|{threshold!r}", products["shares"][threshold])
+            for stop, value in sorted(self._stop_values.get(name, {}).items()):
+                # Length-framed: a stop id may legally contain the
+                # delimiter, and two snapshots must never collide.
+                token = stop.encode()
+                digest.update(f"stop|{len(token)}|".encode())
+                digest.update(token)
+                digest.update(f"|{value!r}|".encode())
         return digest.hexdigest()
 
     def _reporting_snapshot(self):
@@ -721,11 +728,16 @@ class _ReportingSnapshot:
             for name, products in exposure._report.items()
         }
         self._report_lengths = exposure._report_lengths.copy()
+        self._stop_values = {
+            name: dict(values) for name, values in exposure._stop_values.items()
+        }
 
     layers = Exposure.layers
     thresholds = Exposure.thresholds
     column_names = Exposure.column_names
+    leg_columns = Exposure.leg_columns
     street_leg_columns = Exposure.street_leg_columns
+    wait_columns = Exposure.wait_columns
     _fingerprint = Exposure._fingerprint
 
 

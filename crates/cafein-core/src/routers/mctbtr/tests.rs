@@ -520,6 +520,7 @@ fn the_matrix_matches_the_mcraptor_matrix() {
         with_geometry: false,
         fares: None,
         rental: None,
+        with_pieces: false,
     };
     let requests = vec![Request {
         departure: 0,
@@ -1978,6 +1979,7 @@ fn repeated_destination_stops_keep_every_matrix_cell() {
         with_geometry: false,
         fares: None,
         rental: None,
+        with_pieces: false,
     };
     let requests = vec![Request {
         departure: 0,
@@ -2024,6 +2026,7 @@ fn the_transfer_cap_saturates_at_the_ride_count_limit() {
         with_geometry: false,
         fares: None,
         rental: None,
+        with_pieces: false,
     };
     let request = |max_transfers: u8| {
         vec![Request {
