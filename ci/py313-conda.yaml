@@ -11,4 +11,5 @@ dependencies:
   - pytest-xdist
   - h3-py
   - pyarrow
+  - rioxarray
   - pyyaml

@@ -536,9 +536,16 @@ def _ingest_polygons_rasterized(frame, projected, thresholds, resolution, sample
     max-wins) and read the burn at the edges' midpoint samples. A
     resolution-bounded estimate; the exact overlay is the
     ``rasterize=None`` opt-in."""
-    import rasterio.features
+    try:
+        import rasterio.features
+        from affine import Affine
+    except ImportError as error:
+        raise ImportError(
+            "the default rasterized polygon ingestion needs rasterio "
+            "(install cafein[dem]); pass rasterize=None for the exact "
+            "overlay instead"
+        ) from error
     import shapely
-    from affine import Affine
 
     points, owners = samples
     n = len(projected)

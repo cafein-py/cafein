@@ -384,6 +384,7 @@ def test_self_crossing_edges_claim_by_sampling():
 
 
 def test_an_absurdly_fine_rasterize_is_refused(street_network, monkeypatch):
+    pytest.importorskip("rasterio")
     geopandas = pytest.importorskip("geopandas")
     from cafein import exposure as exposure_module
 
@@ -588,6 +589,7 @@ def _extent(network):
 
 
 def test_constant_polygon_layer_covers_every_edge(street_network):
+    pytest.importorskip("rasterio")
     geopandas = pytest.importorskip("geopandas")
     west, south, east, north = _extent(street_network)
     zones = geopandas.GeoDataFrame(
@@ -612,6 +614,7 @@ def test_constant_polygon_layer_covers_every_edge(street_network):
 
 
 def test_differing_crs_vectors_reproject_to_identical_results(street_network):
+    pytest.importorskip("rasterio")
     geopandas = pytest.importorskip("geopandas")
     west, south, east, north = _extent(street_network)
     midx = (west + east) / 2
@@ -695,6 +698,7 @@ def test_raster_layer_samples_by_band_name(street_network, tmp_path):
 
 
 def test_refusals(street_network, tmp_path):
+    pytest.importorskip("rasterio")
     geopandas = pytest.importorskip("geopandas")
     west, south, east, north = _extent(street_network)
     world = box(west - 0.01, south - 0.01, east + 0.01, north + 0.01)
@@ -740,6 +744,7 @@ def test_refusals(street_network, tmp_path):
 
 
 def test_a_failing_layer_leaves_streets_gdf_untouched(street_network):
+    pytest.importorskip("rasterio")
     geopandas = pytest.importorskip("geopandas")
     west, south, east, north = _extent(street_network)
     world = box(west - 0.01, south - 0.01, east + 0.01, north + 0.01)
@@ -759,6 +764,7 @@ def test_a_filtered_frame_with_retained_indices_ingests_correctly(
 ):
     # sjoin returns labels: a pre-filtered source frame keeping its
     # original index must not be indexed positionally.
+    pytest.importorskip("rasterio")
     geopandas = pytest.importorskip("geopandas")
     west, south, east, north = _extent(street_network)
     world = box(west - 0.01, south - 0.01, east + 0.01, north + 0.01)
@@ -780,6 +786,7 @@ def test_a_filtered_frame_with_retained_indices_ingests_correctly(
 
 
 def test_threshold_share_columns_join_the_collision_checks(street_network):
+    pytest.importorskip("rasterio")
     geopandas = pytest.importorskip("geopandas")
     west, south, east, north = _extent(street_network)
     world = box(west - 0.01, south - 0.01, east + 0.01, north + 0.01)
