@@ -299,6 +299,162 @@ def test_lineal_make_valid_remnants_carry_no_area_exposure():
     assert mean == pytest.approx(60.0 * 0.3)
 
 
+def test_rasterized_default_matches_exact_on_synthetic_zones(street_network):
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+    west, south, east, north = _extent(street_network)
+    midx = (west + east) / 2
+    half = geopandas.GeoDataFrame(
+        {"level": [61.0]},
+        geometry=[box(west - 0.01, south - 0.01, midx, north + 0.01)],
+        crs="EPSG:4326",
+    )
+    edges = street_network.streets_gdf
+    try:
+        Exposure(street_network, a=(half, "level"))  # default: rasterized
+        burned = edges["a"].copy()
+        _drop_layer_columns(edges, "a", ())
+        Exposure(street_network, a=(half, "level"), rasterize=None)
+        exact = edges["a"].copy()
+        agree = np.isclose(burned.values, exact.values, atol=1.0)
+        assert agree.mean() > 0.97  # boundary cells differ, the rest match
+    finally:
+        _drop_layer_columns(edges, "a", ())
+
+
+def test_strip_tiled_burning_matches_untiled(street_network, monkeypatch):
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+    from cafein import exposure as exposure_module
+
+    west, south, east, north = _extent(street_network)
+    zones = geopandas.GeoDataFrame(
+        {"level": [61.0]},
+        geometry=[box(west - 0.01, south - 0.01, east + 0.01, north + 0.01)],
+        crs="EPSG:4326",
+    )
+    edges = street_network.streets_gdf
+    try:
+        Exposure(street_network, a=(zones, "level"), rasterize=8.0)
+        untiled = edges["a"].copy()
+        _drop_layer_columns(edges, "a", ())
+        monkeypatch.setattr(exposure_module, "BURN_STRIP_CELLS", 10_000)
+        Exposure(street_network, a=(zones, "level"), rasterize=8.0)
+        tiled = edges["a"].copy()
+        assert tiled.values == pytest.approx(untiled.values)
+    finally:
+        _drop_layer_columns(edges, "a", ())
+
+
+def test_rasterize_validation(street_network):
+    geopandas = pytest.importorskip("geopandas")
+    west, south, east, north = _extent(street_network)
+    zones = geopandas.GeoDataFrame(
+        {"level": [61.0]},
+        geometry=[box(west, south, east, north)],
+        crs="EPSG:4326",
+    )
+    for bad in (0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="positive cell size"):
+            Exposure(street_network, a=(zones, "level"), rasterize=bad)
+
+
+def test_self_crossing_edges_claim_by_sampling():
+    from cafein.exposure import _claimed_lengths
+
+    # a figure-eight edge: both traversals through the crossing must
+    # keep their own coverage (interval projection would collapse them)
+    eight = LineString(
+        [
+            (0, 0),
+            (10, 0),
+            (10, 10),
+            (0, 10),
+            (0, 0),
+            (-10, 0),
+            (-10, -10),
+            (0, -10),
+            (0, 0),
+        ]
+    )
+    full = LineString(eight.coords)
+    lengths = _claimed_lengths([(60.0, full)], eight)
+    total = sum(l for _, l in lengths)
+    assert total == pytest.approx(eight.length, rel=0.02)
+
+
+def test_an_absurdly_fine_rasterize_is_refused(street_network, monkeypatch):
+    geopandas = pytest.importorskip("geopandas")
+    from cafein import exposure as exposure_module
+
+    west, south, east, north = _extent(street_network)
+    zones = geopandas.GeoDataFrame(
+        {"level": [61.0]},
+        geometry=[box(west - 0.01, south - 0.01, east + 0.01, north + 0.01)],
+        crs="EPSG:4326",
+    )
+    monkeypatch.setattr(exposure_module, "BURN_STRIP_CELLS", 1000)
+    with pytest.raises(ValueError, match="strip budget"):
+        Exposure(street_network, a=(zones, "level"), rasterize=0.5)
+
+
+def test_closed_edges_claim_by_midpoint_parameterization():
+    from cafein.exposure import _claimed_lengths
+
+    # a closed square edge fully covered by two overlapping pieces:
+    # endpoint projection would collapse to zero-length intervals
+    ring = LineString([(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)])
+    lengths = _claimed_lengths(
+        [(70.0, ring), (75.0, LineString([(0, 0), (10, 0)]))], ring
+    )
+    total = sum(l for _, l in lengths)
+    assert total == pytest.approx(ring.length)
+    assert lengths[0][0] == 75.0  # worst wins on the shared stretch
+
+
+def test_nearly_coincident_nested_zones_stay_bounded():
+    # the real-data condition: the inner zone's linework is offset by
+    # coordinate noise, which defeats GEOS union/difference — interval
+    # claiming must still keep coverage at 1
+    geopandas = pytest.importorskip("geopandas")
+    from cafein.exposure import _VALUE, _ingest_polygons
+
+    frame = geopandas.GeoDataFrame(
+        {_VALUE: [70.0, 75.0]},
+        geometry=[
+            box(0, -10, 100, 10),
+            box(1e-7, -10 + 1e-9, 40 + 1e-7, 10 - 1e-9),
+        ],
+        crs="EPSG:32635",
+    )
+    edges = _edge_series([LineString([(0, 0), (100, 0)])])
+    products = _ingest_polygons(frame, edges, ())
+    assert products["coverage"][0] <= 1 + 1e-9
+    assert products["coverage"][0] == pytest.approx(1.0)
+    assert products["mean"][0] == pytest.approx(75 * 0.4 + 70 * 0.6, rel=1e-4)
+
+
+def test_overlapping_zones_claim_in_interval_space():
+    # The real noise layer nests zones (a 75 dB band inside a 70 dB
+    # zone covering the whole edge); nearly-coincident linework defeats
+    # GEOS union/difference, so claiming runs on 1-D intervals. The
+    # regression: coverage stayed <= 1 and worst-wins holds.
+    geopandas = pytest.importorskip("geopandas")
+    from cafein.exposure import _VALUE, _ingest_polygons
+
+    frame = geopandas.GeoDataFrame(
+        {_VALUE: [70.0, 75.0]},
+        geometry=[box(0, -10, 100, 10), box(0, -10, 40, 10)],
+        crs="EPSG:32635",
+    )
+    edges = _edge_series([LineString([(0, 0), (100, 0)])])
+    products = _ingest_polygons(frame, edges, (75,))
+    assert products["coverage"][0] == pytest.approx(1.0)
+    assert products["mean"][0] == pytest.approx(75 * 0.4 + 70 * 0.6)
+    assert products["max"][0] == 75.0
+    assert products["shares"][75][0] == pytest.approx(0.4)
+
+
 def test_an_invalid_polygon_straight_into_the_overlay_is_survivable():
     # _ingest_vector repairs with make_valid, but the overlay itself
     # must also survive dirty geometry (clip output can be dirty too).

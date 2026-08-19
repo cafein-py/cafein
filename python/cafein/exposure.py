@@ -8,10 +8,15 @@ share per declared threshold, all visible as columns of
 ``TransportNetwork.streets_gdf``. Ingestion runs once, eagerly, at
 construction; routing never touches geometry or GDAL again.
 
-Polygon ingestion is exact (length-true overlay, overlaps resolved
-by the maximum value present). Raster and line ingestion are
-sampling estimates: values are read at the midpoints of
-``ceil(length / 25 m)`` equal subdivisions of each edge.
+Raster and line ingestion are sampling estimates: values are read at
+the midpoints of ``ceil(length / 25 m)`` equal subdivisions of each
+edge. Polygon layers are BY DEFAULT rasterized onto a 1 m grid
+(``all_touched``, overlaps burned max-wins) and read through the same
+samples — a resolution-bounded estimate roughly two orders of
+magnitude faster than exact overlay on real zone layers;
+``rasterize=None`` opts into the exact length-true overlay with
+worst-wins interval claiming (exact on simple edges; self-crossing
+or retraced edges claim through a dense-sampling fallback).
 """
 
 from __future__ import annotations
@@ -34,6 +39,10 @@ _VALUE = "_cafein_exposure_value"
 """The private value column the spatial joins carry — user column
 names never meet the join machinery."""
 _DERIVED = ("", "_coverage", "_max")
+
+BURN_STRIP_CELLS = 32_000_000
+"""Cells per rasterization strip (float32: ~128 MB peak), bounding
+memory at metro scale regardless of region size."""
 
 
 def _threshold_suffix(value):
@@ -65,18 +74,112 @@ def midpoint_samples(line, step=SAMPLE_STEP_M):
     return [line.interpolate((i + 0.5) * line.length / n) for i in range(n)]
 
 
-def _claimed_lengths(pieces):
-    """Worst-wins claiming over lineal pieces of one edge: higher
-    values claim their stretch first, lower values keep only what is
-    left. Returns ``[(value, claimed length)]``."""
-    claimed = None
+def _piece_intervals(line, piece):
+    """A piece's lineal components as ``[start, end]`` parameters
+    along `line`. Interval space is immune to the coordinate noise
+    that defeats GEOS union/difference on nearly-coincident linework
+    (real zone layers produce exactly that).
+
+    Components parameterize by their MIDPOINT plus half-length to
+    each side: endpoint projection is ambiguous on closed edges (both
+    endpoints of a full-loop piece project to 0), while a midpoint is
+    unambiguous and the interval wraps around the seam of a closed
+    line as two pieces.
+    """
+    import shapely
+
+    total = line.length
+    closed = line.is_closed
+    intervals = []
+    for part in (
+        shapely.get_parts(piece)
+        if piece.geom_type.startswith(("Multi", "Geometry"))
+        else [piece]
+    ):
+        if part.geom_type != "LineString" or part.length == 0:
+            continue
+        half = float(part.length) / 2
+        midpoint = part.interpolate(0.5, normalized=True)
+        center = float(line.project(midpoint))
+        low, high = center - half, center + half
+        if closed:
+            if low < 0:
+                intervals.extend([(0.0, high), (total + low, total)])
+            elif high > total:
+                intervals.extend([(low, total), (0.0, high - total)])
+            else:
+                intervals.append((low, high))
+        else:
+            low, high = max(0.0, low), min(total, high)
+            if high > low:
+                intervals.append((low, high))
+    return intervals
+
+
+def _subtract_intervals(intervals, claimed):
+    """`intervals` minus `claimed`, both sorted-merged interval lists."""
+    remaining = []
+    for low, high in intervals:
+        cursor = low
+        for c_low, c_high in claimed:
+            if c_high <= cursor or c_low >= high:
+                continue
+            if c_low > cursor:
+                remaining.append((cursor, min(c_low, high)))
+            cursor = max(cursor, c_high)
+            if cursor >= high:
+                break
+        if cursor < high:
+            remaining.append((cursor, high))
+    return [(low, high) for low, high in remaining if high > low]
+
+
+def _merge_intervals(intervals):
+    merged = []
+    for low, high in sorted(intervals):
+        if merged and low <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], high))
+        else:
+            merged.append((low, high))
+    return merged
+
+
+def _sampled_claim(line, pieces):
+    """Worst-wins claiming by dense sampling — the fallback for
+    self-crossing or retraced edges, where any 1-D parameterization is
+    ambiguous (projection cannot tell traversals apart). Exact in the
+    sampling limit; only degenerate edges take this path."""
+    import shapely
+
+    step = min(1.0, max(0.05, line.length / 128))
+    points = np.asarray(midpoint_samples(line, step=step), dtype=object)
+    best = np.full(len(points), -np.inf)
+    for value, piece in pieces:
+        near = shapely.distance(points, piece) < 1e-6
+        best[near] = np.maximum(best[near], value)
+    share = line.length / len(points)
+    lengths = {}
+    for value in best[np.isfinite(best)]:
+        lengths[value] = lengths.get(value, 0.0) + share
+    return sorted(lengths.items(), key=lambda p: -p[0])
+
+
+def _claimed_lengths(pieces, line):
+    """Worst-wins claiming over lineal pieces of one edge, computed in
+    1-D parameter space along `line`: higher values claim their
+    stretch first, lower values keep only what is left. Returns
+    ``[(value, claimed length)]``."""
+    if not line.is_simple:
+        return _sampled_claim(line, pieces)
+    claimed = []
     lengths = []
     for value, piece in sorted(pieces, key=lambda p: -p[0]):
-        if claimed is not None:
-            piece = piece.difference(claimed)
-        if piece.length > 0:
-            lengths.append((value, piece.length))
-            claimed = piece if claimed is None else claimed.union(piece)
+        intervals = _merge_intervals(_piece_intervals(line, piece))
+        kept = _subtract_intervals(intervals, claimed)
+        length = sum(high - low for low, high in kept)
+        if length > 0:
+            lengths.append((value, length))
+            claimed = _merge_intervals(claimed + kept)
     return lengths
 
 
@@ -96,7 +199,9 @@ def _length_products(length, lengths, thresholds):
 
 
 def polygon_edge_products(line, pieces, thresholds=()):
-    """Exact per-edge products from ``(value, polygon)`` pieces.
+    """Per-edge products from ``(value, polygon)`` pieces — exact on
+    simple edges; self-crossing or retraced edges claim through the
+    dense-sampling fallback.
 
     Higher values claim their stretch of the line first, so overlaps
     resolve as "the worst thing present"; a boundary touch has zero
@@ -107,7 +212,7 @@ def polygon_edge_products(line, pieces, thresholds=()):
     if length == 0:
         return 0.0, 0.0, np.nan, {x: 0.0 for x in thresholds}
     intersected = [(value, line.intersection(polygon)) for value, polygon in pieces]
-    return _length_products(length, _claimed_lengths(intersected), thresholds)
+    return _length_products(length, _claimed_lengths(intersected, line), thresholds)
 
 
 def sample_products(values, thresholds=()):
@@ -140,6 +245,11 @@ class Exposure:
         column) counts its own class at its bound. Thresholds live
         here because the at-or-above share is computed in the same
         pass as the mean and cannot be recovered later.
+    rasterize : float or None (default: 1.0)
+        Cell size in metres for the default rasterized polygon
+        ingestion (burned ``all_touched``, max-wins; dilation of up
+        to one cell at zone borders is part of the estimate).
+        ``None`` selects the exact length-true overlay instead.
     **layers : tuple
         ``name=(source, value)`` — `source` is a raster path or an
         opened rioxarray object (`value` names the band), or a
@@ -148,19 +258,27 @@ class Exposure:
         to be minimized against (e.g. ``100 - Comb_GVI``).
     """
 
-    def __init__(self, network, *, thresholds=None, **layers):
+    def __init__(self, network, *, thresholds=None, rasterize=1.0, **layers):
         if not layers:
             raise ValueError(
                 "Exposure needs at least one layer, e.g. " "noise=(zones_gdf, 'db_low')"
             )
         edges = network.streets_gdf
+        if rasterize is not None:
+            rasterize = float(rasterize)
+            if not (math.isfinite(rasterize) and rasterize > 0):
+                raise ValueError(
+                    "rasterize must be a positive cell size in metres, "
+                    "or None for the exact polygon overlay"
+                )
         self._thresholds = _validated_thresholds(thresholds, layers)
         _validate_names(layers, self._thresholds, edges.columns)
 
         metric_crs = edges.estimate_utm_crs()
         projected = edges.geometry.to_crs(metric_crs)
-        # Samples serve only raster/line layers; built once on first
-        # need, never for polygon-only ingestion.
+        # Samples serve raster/line layers and the default rasterized
+        # polygon path; built once on first need (the exact polygon
+        # opt-in never builds them).
         cache = {}
 
         def samples():
@@ -185,6 +303,7 @@ class Exposure:
                 metric_crs,
                 samples,
                 layer_thresholds,
+                rasterize,
             )
             if not (np.asarray(products["coverage"]) > 0).any():
                 raise ValueError(
@@ -224,6 +343,14 @@ def _validate_products(name, products):
         raise ValueError(
             f"layer {name!r} produced non-finite per-edge products — "
             "the values are too large to aggregate"
+        )
+    bounded = (products["coverage"] <= 1 + 1e-9).all() and all(
+        (s <= 1 + 1e-9).all() for s in products["shares"].values()
+    )
+    if not bounded:
+        raise ValueError(
+            f"layer {name!r} produced a coverage or threshold share "
+            "above 1 — an ingestion invariant broke; please report this"
         )
 
 
@@ -303,12 +430,12 @@ def _edge_samples(projected):
     return points, owners
 
 
-def _ingest(name, source, value, projected, metric_crs, samples, thresholds):
+def _ingest(name, source, value, projected, metric_crs, samples, thresholds, rasterize):
     import geopandas
 
     if isinstance(source, geopandas.GeoDataFrame):
         return _ingest_vector(
-            name, source, value, projected, metric_crs, samples, thresholds
+            name, source, value, projected, metric_crs, samples, thresholds, rasterize
         )
     return _ingest_raster(
         name,
@@ -321,7 +448,9 @@ def _ingest(name, source, value, projected, metric_crs, samples, thresholds):
     )
 
 
-def _ingest_vector(name, frame, value, projected, metric_crs, samples, thresholds):
+def _ingest_vector(
+    name, frame, value, projected, metric_crs, samples, thresholds, rasterize
+):
     if value not in frame.columns:
         raise ValueError(
             f"layer {name!r} has no column {value!r} "
@@ -366,6 +495,10 @@ def _ingest_vector(name, frame, value, projected, metric_crs, samples, threshold
         sources = sources.set_geometry(
             [_polygonal(geometry) for geometry in make_valid(sources.geometry.values)]
         )
+        if rasterize is not None:
+            return _ingest_polygons_rasterized(
+                sources, projected, thresholds, rasterize, samples()
+            )
         return _ingest_polygons(sources, projected, thresholds)
     if kinds <= linear:
         return _ingest_lines(sources, samples(), thresholds, len(projected))
@@ -394,6 +527,77 @@ def _polygonal(geometry):
     if len(parts) == 1:
         return parts[0]
     return shapely.union_all(np.asarray(parts, dtype=object))
+
+
+def _ingest_polygons_rasterized(frame, projected, thresholds, resolution, samples):
+    """The default polygon path: burn the zones at `resolution` metres
+    (all_touched — center-touch burning silently drops class bands
+    thinner than a cell; ascending value order so overlaps resolve
+    max-wins) and read the burn at the edges' midpoint samples. A
+    resolution-bounded estimate; the exact overlay is the
+    ``rasterize=None`` opt-in."""
+    import rasterio.features
+    import shapely
+    from affine import Affine
+
+    points, owners = samples
+    n = len(projected)
+    xs = shapely.get_x(np.asarray(points))
+    ys = shapely.get_y(np.asarray(points))
+    layer_bounds = frame.total_bounds
+    west = max(float(layer_bounds[0]), float(xs.min())) - resolution
+    south = max(float(layer_bounds[1]), float(ys.min())) - resolution
+    east = min(float(layer_bounds[2]), float(xs.max())) + resolution
+    north = min(float(layer_bounds[3]), float(ys.max())) + resolution
+    values = np.full(len(points), np.nan)
+    if east > west and north > south:
+        width_cells = float(np.ceil((east - west) / resolution))
+        height_cells = float(np.ceil((north - south) / resolution))
+        # The budget check runs in float space: an absurdly fine
+        # resolution overflows to inf, which must still refuse
+        # actionably rather than crash on int conversion.
+        if not (
+            width_cells <= BURN_STRIP_CELLS
+            and height_cells <= BURN_STRIP_CELLS * BURN_STRIP_CELLS
+        ):
+            raise ValueError(
+                f"rasterize={resolution:g} needs {width_cells:g} x "
+                f"{height_cells:g} cells over this extent, past the "
+                f"{BURN_STRIP_CELLS}-cell strip budget — coarsen "
+                "rasterize or pass rasterize=None"
+            )
+        width = max(1, int(width_cells))
+        height = max(1, int(height_cells))
+        ordered = frame.sort_values(_VALUE)
+        shapes = [
+            (geometry, value)
+            for geometry, value in zip(ordered.geometry.values, ordered[_VALUE].values)
+            if not geometry.is_empty
+        ]
+        strip_rows = max(1, BURN_STRIP_CELLS // width)
+        for row0 in range(0, height, strip_rows):
+            rows_here = min(strip_rows, height - row0)
+            strip_north = north - row0 * resolution
+            strip_south = strip_north - rows_here * resolution
+            transform = Affine(resolution, 0, west, 0, -resolution, strip_north)
+            inside = (
+                (xs >= west) & (xs < east) & (ys <= strip_north) & (ys > strip_south)
+            )
+            if not inside.any():
+                continue
+            burned = rasterio.features.rasterize(
+                shapes,
+                out_shape=(rows_here, width),
+                transform=transform,
+                fill=np.nan,
+                dtype="float32",
+                all_touched=True,
+            )
+            cols, rows = (~transform) * (xs[inside], ys[inside])
+            cols = np.clip(np.floor(cols).astype(int), 0, width - 1)
+            rows = np.clip(np.floor(rows).astype(int), 0, rows_here - 1)
+            values[inside] = burned[rows, cols]
+    return _sampled_products(values, owners, thresholds, n)
 
 
 def _ingest_polygons(frame, projected, thresholds):
@@ -493,30 +697,27 @@ def _ingest_polygons(frame, projected, thresholds):
         # constructor turns that into the empty-overlap refusal.
         return {"mean": mean, "coverage": coverage, "max": maximum, "shares": shares}
 
-    import shapely as _shapely
-
     order = np.argsort(pair_edges, kind="stable")
     boundaries = np.flatnonzero(np.diff(pair_edges[order])) + 1
+    lines = edges.geometry.values
+    simple = shapely.is_simple(lines)
     for group in np.split(order, boundaries):
         edge_index = int(pair_edges[group[0]])
         length = float(edge_lengths[edge_index])
-        if len(group) == 1:
-            # One piece: its length is the covered length, no claiming.
+        if len(group) == 1 and simple[edge_index]:
+            # One piece cannot overlap itself on a simple edge: its
+            # length is the covered length, no claiming. Retraced
+            # edges must claim (GEOS collapses their doubled stretch
+            # while the edge length counts it twice).
             lengths = [(float(pair_values[group[0]]), float(piece_lengths[group[0]]))]
         else:
-            # Zone-band layers are near-always mutually disjoint; one
-            # union-length check proves it per edge, and the GEOS
-            # claiming loop runs only for genuinely overlapping pieces.
-            total = float(piece_lengths[group].sum())
-            union_length = _shapely.length(_shapely.union_all(pieces[group]))
-            if abs(union_length - total) <= 1e-9 * max(total, 1.0):
-                lengths = [
-                    (float(pair_values[g]), float(piece_lengths[g])) for g in group
-                ]
-            else:
-                lengths = _claimed_lengths(
-                    [(float(pair_values[g]), pieces[g]) for g in group]
-                )
+            # Multi-piece edges always claim, in interval space: real
+            # zone layers overlap with coordinate-noise-level offsets
+            # that defeat any GEOS union/difference-based shortcut.
+            lengths = _claimed_lengths(
+                [(float(pair_values[g]), pieces[g]) for g in group],
+                lines[edge_index],
+            )
         m, c, mx, s = _length_products(length, lengths, thresholds)
         mean[edge_index] = m
         coverage[edge_index] = c
