@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `DetailedItineraries(..., exposure=)` reports per-leg exposure:
+  walk-based legs exact from their traversed edges, stationary waits
+  as sampled `wait` rows, in-vehicle legs NaN — with per-layer means,
+  maxima, coverage, and `minutes_above` columns, and journey totals
+  via `exposure_totals()`.
+  ([#285](https://github.com/cafein-py/cafein/pull/285))
+
 - `Exposure`: user-named environmental layers (raster bands or
   polygon/line value columns — noise zones, air-quality grids, green
   view segments) ingested onto the street network's edges as dose

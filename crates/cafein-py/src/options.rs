@@ -199,14 +199,14 @@ impl TransportNetwork {
         entry.set_item("arrival_s", arrival)?;
         entry.set_item("distance_m", meters)?;
         entry.set_item("distance_provenance", py.None())?;
-        let geometry = geometries
+        let walked = geometries
             .then(|| {
                 if ends.origin == ends.destination {
                     // A zero walk degenerates at its own coordinate.
                     let at = (ends.origin.1, ends.origin.0);
-                    Some(wkb_line_string(py, &[at, at]))
+                    Some((wkb_line_string(py, &[at, at]), Vec::new(), 0.0))
                 } else {
-                    self.walk_wkb(
+                    self.walk_wkb_edges(
                         py,
                         ends.origin,
                         &ends.origin_snap,
@@ -216,7 +216,14 @@ impl TransportNetwork {
                 }
             })
             .flatten();
-        entry.set_item("geometry", geometry)?;
+        match walked {
+            Some((geometry, edges, walk_meters)) => {
+                entry.set_item("geometry", geometry)?;
+                entry.set_item("street_edges", edges)?;
+                entry.set_item("street_meters", walk_meters)?;
+            }
+            None => entry.set_item("geometry", py.None())?,
+        }
         let legs = PyList::empty(py);
         legs.append(entry)?;
         dict.set_item("legs", legs)?;
@@ -240,9 +247,27 @@ impl TransportNetwork {
         to_point: (f64, f64),
         to_snap: &Snap,
     ) -> Option<Bound<'py, PyBytes>> {
+        self.walk_wkb_edges(py, from_point, from_snap, to_point, to_snap)
+            .map(|(wkb, _, _)| wkb)
+    }
+
+    /// [`walk_wkb`](Self::walk_wkb) plus the traversed walking-graph
+    /// edges as ``(edge index, traversed fraction)`` and the SAME
+    /// reconstruction's total walked meters (connectors included) —
+    /// the provenance exposure reporting reads.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn walk_wkb_edges<'py>(
+        &self,
+        py: Python<'py>,
+        from_point: (f64, f64),
+        from_snap: &Snap,
+        to_point: (f64, f64),
+        to_snap: &Snap,
+    ) -> Option<(Bound<'py, PyBytes>, Vec<(u32, f64)>, f64)> {
         let streets = self.streets.as_ref()?;
-        let (path, _) = streets.walk_path(from_point, from_snap, to_point, to_snap)?;
-        Some(wkb_line_string(py, &path))
+        let (path, meters, edges) =
+            streets.walk_path_edges(from_point, from_snap, to_point, to_snap)?;
+        Some((wkb_line_string(py, &path), edges, meters))
     }
 
     /// The public form of a stop identifier: raw for a single feed,
@@ -402,11 +427,18 @@ impl TransportNetwork {
                         walks.and_then(|walks| walks.access.get(&to_stop)).copied(),
                     )?;
                     entry.set_item("distance_provenance", py.None())?;
-                    let geometry = ends.filter(|_| geometries).and_then(|ends| {
+                    let walked = ends.filter(|_| geometries).and_then(|ends| {
                         let (point, snap) = self.stop_walk_endpoint(to_stop)?;
-                        self.walk_wkb(py, ends.origin, &ends.origin_snap, point, &snap)
+                        self.walk_wkb_edges(py, ends.origin, &ends.origin_snap, point, &snap)
                     });
-                    entry.set_item("geometry", geometry)?;
+                    match walked {
+                        Some((geometry, edges, walk_meters)) => {
+                            entry.set_item("geometry", geometry)?;
+                            entry.set_item("street_edges", edges)?;
+                            entry.set_item("street_meters", walk_meters)?;
+                        }
+                        None => entry.set_item("geometry", py.None())?,
+                    }
                 }
                 Leg::Transit {
                     trip,
@@ -483,14 +515,21 @@ impl TransportNetwork {
                     entry.set_item("arrival_s", arrival)?;
                     entry.set_item("distance_m", meters)?;
                     entry.set_item("distance_provenance", py.None())?;
-                    let geometry = geometries
+                    let walked = geometries
                         .then(|| {
                             let (from_point, from_snap) = self.stop_walk_endpoint(from_stop)?;
                             let (to_point, to_snap) = self.stop_walk_endpoint(to_stop)?;
-                            self.walk_wkb(py, from_point, &from_snap, to_point, &to_snap)
+                            self.walk_wkb_edges(py, from_point, &from_snap, to_point, &to_snap)
                         })
                         .flatten();
-                    entry.set_item("geometry", geometry)?;
+                    match walked {
+                        Some((geometry, edges, walk_meters)) => {
+                            entry.set_item("geometry", geometry)?;
+                            entry.set_item("street_edges", edges)?;
+                            entry.set_item("street_meters", walk_meters)?;
+                        }
+                        None => entry.set_item("geometry", py.None())?,
+                    }
                 }
                 Leg::Egress {
                     from_stop,
@@ -508,11 +547,24 @@ impl TransportNetwork {
                             .copied(),
                     )?;
                     entry.set_item("distance_provenance", py.None())?;
-                    let geometry = ends.filter(|_| geometries).and_then(|ends| {
+                    let walked = ends.filter(|_| geometries).and_then(|ends| {
                         let (point, snap) = self.stop_walk_endpoint(from_stop)?;
-                        self.walk_wkb(py, point, &snap, ends.destination, &ends.destination_snap)
+                        self.walk_wkb_edges(
+                            py,
+                            point,
+                            &snap,
+                            ends.destination,
+                            &ends.destination_snap,
+                        )
                     });
-                    entry.set_item("geometry", geometry)?;
+                    match walked {
+                        Some((geometry, edges, walk_meters)) => {
+                            entry.set_item("geometry", geometry)?;
+                            entry.set_item("street_edges", edges)?;
+                            entry.set_item("street_meters", walk_meters)?;
+                        }
+                        None => entry.set_item("geometry", py.None())?,
+                    }
                 }
             }
             legs.append(entry)?;

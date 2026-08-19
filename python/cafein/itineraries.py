@@ -67,9 +67,10 @@ class DetailedItineraries(gpd.GeoDataFrame):
     (the OD pair), ``option`` (the journey alternative, numbered per OD
     pair), ``segment`` (the leg's position in that journey), and the leg
     itself — ``leg_type`` (``access``, ``transit``, ``transfer``,
-    ``egress``, ``walk`` for a walking-only door-to-door journey, or
+    ``egress``, ``walk`` for a walking-only door-to-door journey,
     ``park`` for a carried vehicle left at a stop — a zero-length
-    event under a carriage street policy),
+    event under a carriage street policy — or ``wait`` for a
+    stationary gap at a stop, synthesized only with ``exposure=``),
     ``departure_s`` and ``arrival_s`` (clock seconds past the service
     day's start) and ``travel_time`` (whole minutes rounded to the
     nearest by default; exact seconds with
@@ -175,6 +176,20 @@ class DetailedItineraries(gpd.GeoDataFrame):
         ``street`` tariffs, as in ``cafein.fares.annotate_fares``.
         A ``StreetNetwork`` rejects it with the other timetable-only
         arguments.
+    exposure : Exposure (optional)
+        Report exposure along the journeys (``cafein.Exposure``, built
+        on this network — a different network, or one whose street
+        graph was replaced since, is rejected). Adds per layer a
+        ``{layer}_mean``, ``{layer}_max``, ``{layer}_coverage``, and
+        one ``{layer}_minutes_above_{X}`` per declared threshold to
+        every walk-based leg (``NaN`` on in-vehicle legs), and
+        synthesizes ``wait`` rows — the layers sampled at the stop —
+        for every stationary gap, including a first boarding after the
+        option's departure; segments renumber to include them.
+        Journey-level totals via ``exposure_totals()``. Reporting is
+        independent of ``geometries=``. Street-mode journeys (a
+        ``StreetNetwork`` or a ``street_policy``) gain reporting with
+        the exposure objective and reject it for now.
     candidates : {"time", "pareto", "relaxed", "diverse"} (default: "time")
         Which alternatives to return per OD pair. ``"time"`` draws the
         time-optimal (arrival, rides) journeys of the RAPTOR engine;
@@ -335,6 +350,64 @@ class DetailedItineraries(gpd.GeoDataFrame):
         ignored.
     """
 
+    def exposure_totals(self):
+        """Journey-level exposure totals, one row per
+        ``(from_id, to_id, option)``: the time-weighted mean over the
+        legs that carry values (street legs and waits), the maximum,
+        the covered-time share, and each ``minutes_above`` summed."""
+        if getattr(self, "_exposure", None) is None:
+            raise ValueError(
+                "exposure_totals needs a frame built with exposure=; "
+                "pass an Exposure to DetailedItineraries first"
+            )
+        import numpy as np
+
+        exposure = self._exposure
+        # Exact seconds — the public travel_time column rounds to whole
+        # minutes by default, which would distort the weights.
+        seconds = self["arrival_s"] - self["departure_s"]
+        records = []
+        grouped = self.assign(_seconds=seconds).groupby(
+            ["from_id", "to_id", "option"], sort=False, dropna=False
+        )
+        for (from_id, to_id, option), journey in grouped:
+            record = {"from_id": from_id, "to_id": to_id, "option": option}
+            for name in exposure.layers:
+                covered = journey[f"{name}_coverage"].notna()
+                weights = journey.loc[covered, "_seconds"].to_numpy(dtype=float)
+                total = weights.sum()
+                means = journey.loc[covered, f"{name}_mean"].to_numpy(dtype=float)
+                coverages = journey.loc[covered, f"{name}_coverage"].to_numpy(
+                    dtype=float
+                )
+                record[f"{name}_mean"] = (
+                    float((means * weights).sum() / total) if total > 0 else np.nan
+                )
+                maxima = journey.loc[covered, f"{name}_max"].to_numpy(dtype=float)
+                record[f"{name}_max"] = (
+                    float(np.nanmax(maxima))
+                    if len(maxima) and np.isfinite(maxima).any()
+                    else np.nan
+                )
+                record[f"{name}_coverage"] = (
+                    float((coverages * weights).sum() / total) if total > 0 else np.nan
+                )
+                for threshold in exposure.thresholds(name):
+                    from cafein.exposure import _threshold_suffix
+
+                    column = f"{name}_minutes_above_{_threshold_suffix(threshold)}"
+                    record[column] = float(journey[column].fillna(0).sum())
+            records.append(record)
+        import pandas as pd
+
+        # Explicit columns keep the totals schema on an empty frame,
+        # and the identifier columns keep the frame's exact dtypes.
+        columns = ["from_id", "to_id", "option"] + exposure.column_names()
+        totals = pd.DataFrame(records, columns=columns)
+        for column in ("from_id", "to_id", "option"):
+            totals[column] = totals[column].astype(self[column].dtype)
+        return totals
+
     @property
     def _constructor(self):
         return gpd.GeoDataFrame
@@ -367,6 +440,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         max_walking_time=None,
         snap_distance=None,
         transport_mode=None,
+        exposure=None,
         max_street_time=None,
         street_policy=None,
         intersection_delays=False,
@@ -453,6 +527,12 @@ class DetailedItineraries(gpd.GeoDataFrame):
         # Before the reconstruction guard below: a StreetNetwork has no
         # `route_between_stops` either, so it would be mistaken for frame data.
         if _is_street_network(network):
+            if exposure is not None:
+                raise ValueError(
+                    "exposure= reporting covers transit and walking "
+                    "journeys for now; street-mode journeys gain it with "
+                    "the exposure objective"
+                )
             if street_policy is not None:
                 raise ValueError(
                     "street_policy shapes a TransportNetwork's access and "
@@ -554,6 +634,14 @@ class DetailedItineraries(gpd.GeoDataFrame):
             )
         if departure is None and not arrive_by:
             raise ValueError("give exactly one of departure= or arrival=")
+        if exposure is not None:
+            exposure._check_network(network)
+            if street_policy is not None:
+                raise ValueError(
+                    "exposure= reporting covers transit and walking "
+                    "journeys for now; street_policy journeys gain it "
+                    "with the exposure objective"
+                )
         frame = _itineraries_frame(
             network,
             origins,
@@ -575,12 +663,30 @@ class DetailedItineraries(gpd.GeoDataFrame):
             exclude_routes=exclude_routes,
             exclude_trips=exclude_trips,
             exclude_stops=exclude_stops,
-            geometries=geometries,
+            # Reporting rides the walk reconstruction; edge provenance
+            # is built regardless of the geometry ask.
+            geometries=geometries or exposure is not None,
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
             street_policy=street_policy,
+            street_edges=exposure is not None,
         )
+        if exposure is not None:
+            # Re-verify the binding after the (long) routing loop, so a
+            # street graph replaced mid-build cannot pair fresh edge
+            # indices with the stale cached arrays.
+            exposure._check_network(network)
+            frame = _exposed_frame(frame, exposure)
+            if not geometries:
+                frame["geometry"] = None
+        dropped = [
+            column
+            for column in ("street_edges", "street_meters", "journey_departure_s")
+            if column in frame.columns
+        ]
+        if dropped:
+            frame = frame.drop(columns=dropped)
         if "travel_time_s" in frame.columns:
             from cafein._units import travel_time_output
 
@@ -592,6 +698,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         super().__init__(
             restore_id_dtypes(frame, _id_dtypes), geometry="geometry", crs="EPSG:4326"
         )
+        self._exposure = exposure
 
 
 def _itineraries_frame(
@@ -621,6 +728,7 @@ def _itineraries_frame(
     max_walking_time,
     max_snap_distance,
     street_policy=None,
+    street_edges=False,
 ):
     import copy
 
@@ -770,11 +878,21 @@ def _itineraries_frame(
                         # A fare prices the whole journey (tickets span
                         # legs); every row of the option repeats it.
                         record["fare"] = journey["fare"]
+                    if street_edges:
+                        # The option's own departure — a first boarding
+                        # after it is a wait the reporting synthesizes.
+                        record["journey_departure_s"] = journey["departure_s"]
                     records.append(record)
     columns = _COLUMNS if street_policy is None else _POLICY_COLUMNS
     if fares is not None:
         columns = list(columns)
         columns.insert(columns.index("emissions") + 1, "fare")
+    if street_edges:
+        columns = list(columns) + [
+            "street_edges",
+            "street_meters",
+            "journey_departure_s",
+        ]
     return _to_geodataframe(records, columns)
 
 
@@ -1042,6 +1160,82 @@ def _route_diverse(
     return _diverse_rounds(search, annotate, k, diversity, penalty)
 
 
+def _exposed_frame(frame, exposure):
+    """Per-leg exposure columns, plus synthesized ``wait`` rows for the
+    stationary gaps — between consecutive legs, and before a first
+    boarding that follows the option's departure (sampled at the
+    boarding stop). Transit legs carry NaN — outdoor-measured layers do
+    not apply inside a vehicle — and segments renumber to include
+    waits."""
+    import numpy as np
+    import pandas as pd
+
+    columns = exposure.column_names()
+    if frame.empty:
+        exposed = frame.copy()
+        for column in columns:
+            exposed[column] = np.nan
+        return exposed
+    rows = []
+    grouped = frame.groupby(["from_id", "to_id", "option"], sort=False, dropna=False)
+    for _, journey in grouped:
+        previous = None
+        for _, row in journey.iterrows():
+            record = row.to_dict()
+            if previous is None:
+                # A stop-origin journey may board its first vehicle
+                # after the departure the option reports.
+                start = record["journey_departure_s"]
+                gap = record["departure_s"] - start if start is not None else 0
+                stop = (
+                    record.get("from_stop") if record["leg_type"] == "transit" else None
+                )
+            else:
+                start = previous["arrival_s"]
+                gap = record["departure_s"] - start
+                stop = record.get("from_stop") or previous.get("to_stop")
+            if gap > 0 and stop is not None:
+                wait = {key: None for key in record}
+                # Option-level columns repeat on every row of the
+                # journey, waits included.
+                for column in ("fare", "journey_departure_s"):
+                    if column in record:
+                        wait[column] = record[column]
+                wait.update(
+                    {
+                        "from_id": record["from_id"],
+                        "to_id": record["to_id"],
+                        "option": record["option"],
+                        "leg_type": "wait",
+                        "from_stop": stop,
+                        "to_stop": stop,
+                        "departure_s": start,
+                        "arrival_s": record["departure_s"],
+                        "travel_time_s": gap,
+                        "geometry": None,
+                    }
+                )
+                wait.update(exposure.wait_columns(stop, gap))
+                rows.append(wait)
+            edges = record.get("street_edges")
+            if record["leg_type"] in ("transit", "park") or edges is None:
+                for column in columns:
+                    record[column] = np.nan
+            else:
+                record.update(
+                    exposure.leg_columns(
+                        edges, record["travel_time_s"], record.get("street_meters")
+                    )
+                )
+            rows.append(record)
+            previous = record
+    exposed = pd.DataFrame(rows)
+    exposed["segment"] = exposed.groupby(
+        ["from_id", "to_id", "option"], sort=False, dropna=False
+    ).cumcount()
+    return exposed
+
+
 def _leg_record(from_id, to_id, option, segment, leg, mode=False):
     """One leg as a flat record, with its endpoints normalised."""
     leg_type = leg["type"]
@@ -1077,6 +1271,8 @@ def _leg_record(from_id, to_id, option, segment, leg, mode=False):
         "distance_m": leg.get("distance_m"),
         "distance_provenance": leg.get("distance_provenance"),
         "emissions": leg.get("emissions"),
+        "street_edges": leg.get("street_edges"),
+        "street_meters": leg.get("street_meters"),
         "geometry": shapely.from_wkb(wkb) if wkb is not None else None,
     }
     if mode:

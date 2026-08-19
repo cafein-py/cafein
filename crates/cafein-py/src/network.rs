@@ -173,6 +173,7 @@ impl TransportNetwork {
             stops_by_qualified_id,
             trips_by_public_id,
             streets_bytes_read: 0,
+            streets_generation: 0,
             multimodal: None,
             multimodal_elevation: None,
             multimodal_modes: None,
@@ -749,6 +750,31 @@ impl TransportNetwork {
         }
     }
 
+    /// Per-edge rows of the WALKING graph — the graph whose edge
+    /// indices the walk searches and ``street_edges`` leg provenance
+    /// speak — even when a multimodal union graph is installed.
+    /// Internal: exposure reporting aligns its arrays to these rows.
+    #[allow(clippy::type_complexity)]
+    fn _walking_edge_layer(
+        &self,
+    ) -> PyResult<Vec<(Vec<f64>, Vec<f64>, f64, Option<u8>, Option<(u8, u8)>)>> {
+        Ok(self.installed_streets()?.edge_layer())
+    }
+
+    /// The WALKING graph's edge count, without building the layer.
+    /// Internal: exposure reporting checks its array alignment here.
+    #[getter]
+    fn _walking_edge_count(&self) -> PyResult<u32> {
+        Ok(self.installed_streets()?.edge_count())
+    }
+
+    /// Bumps on every walking street-network install. Internal:
+    /// exposure reporting pins its cached arrays to the generation.
+    #[getter]
+    fn _streets_generation(&self) -> u64 {
+        self.streets_generation
+    }
+
     /// Per-stop GTFS ``wheelchair_boarding`` as ``(stop_id, flag)``
     /// tuples: ``True`` = accessible, ``False`` = not accessible,
     /// ``None`` = the feed says nothing. A stop without a value
@@ -1029,6 +1055,10 @@ impl TransportNetwork {
             )
             .map_err(|error| PyValueError::new_err(error.to_string()))?,
         );
+        // Only a successful install advances the generation — a failed
+        // replacement leaves the installed graph, and anything pinned
+        // to it, valid.
+        self.streets_generation += 1;
         // ULTRA and McULTRA shortcuts are derived from the street network; a new
         // one invalidates them.
         self.ultra_transfers = None;

@@ -287,13 +287,29 @@ class Exposure:
             return cache["points"]
 
         self._network = network
+        self._streets_frame = edges
+        self._streets_generation = network._core._streets_generation
         self._edge_count = len(edges)
         # Every layer ingests into staging first; the frame is written
         # only after the whole constructor succeeded, so a failing
         # later layer leaves streets_gdf exactly as it was.
         staged = {}
+        specs = {}
+        import geopandas
+
         for name, spec in layers.items():
             source, value = _validated_spec(name, spec)
+            if not isinstance(source, geopandas.GeoDataFrame):
+                # Materialize the band once; the walking-graph and stop
+                # passes below read this snapshot instead of reopening
+                # (and re-reading) the source.
+                source = _FrozenBand(*_open_band(name, source, value))
+            else:
+                # One frozen snapshot serves every pass (union edges,
+                # walking edges, stops) — a caller mutating their frame
+                # mid-construction cannot desynchronize them.
+                source = source.copy()
+            specs[name] = (source, value)
             layer_thresholds = self._thresholds.get(name, ())
             products = _ingest(
                 name,
@@ -312,6 +328,80 @@ class Exposure:
             _validate_products(name, products)
             staged[name] = products
         self._layers = staged
+
+        # Reporting alignment: walk searches (and the street_edges leg
+        # provenance) speak the WALKING graph's edge indices, which on
+        # multimodal builds differ from streets_gdf's union-graph rows.
+        # Ingest a second, walking-aligned array set there; on
+        # walk-only builds the graphs coincide and the arrays are
+        # shared.
+        if network.has_multimodal_streets:
+            rows = network._core._walking_edge_layer()
+            import geopandas
+            from shapely.geometry import LineString
+
+            walking = geopandas.GeoSeries(
+                [LineString(list(zip(lons, lats))) for lons, lats, _, _, _ in rows],
+                crs="EPSG:4326",
+            )
+            walking_projected = walking.to_crs(metric_crs)
+            walk_cache = {}
+
+            def walk_samples():
+                if "points" not in walk_cache:
+                    walk_cache["points"] = _edge_samples(walking_projected)
+                return walk_cache["points"]
+
+            self._report = {}
+            for name, (source, value) in specs.items():
+                products = _ingest(
+                    name,
+                    source,
+                    value,
+                    walking_projected,
+                    metric_crs,
+                    walk_samples,
+                    self._thresholds.get(name, ()),
+                    rasterize,
+                )
+                _validate_products(name, products)
+                self._report[name] = products
+            self._report_lengths = np.asarray(
+                [meters for _, _, meters, _, _ in rows], dtype=float
+            )
+        else:
+            self._report = staged
+            # An owned copy — a view of the public column would let a
+            # later streets_gdf edit silently change leg weights.
+            self._report_lengths = np.array(edges["length_m"], dtype=float, copy=True)
+
+        # Stop-point values for wait-leg sampling: raster lookups,
+        # point-in-polygon maxima, nearest lines within the tolerance.
+        stop_points = [
+            (stop, lat, lon)
+            for stop, lat, lon in network.stops
+            if lat is not None and lon is not None
+        ]
+        self._stop_values = {}
+        if stop_points:
+            import geopandas
+            from shapely.geometry import Point
+
+            points = geopandas.GeoSeries(
+                [Point(lon, lat) for _, lat, lon in stop_points], crs="EPSG:4326"
+            ).to_crs(metric_crs)
+            for name, (source, value) in specs.items():
+                values = _stop_values(name, source, value, points, metric_crs)
+                self._stop_values[name] = {
+                    stop: float(sample)
+                    for (stop, _, _), sample in zip(stop_points, values)
+                }
+
+        # All products exist; only now does the frame gain its columns,
+        # so any failure above leaves streets_gdf exactly as it was.
+        # The ingestion passes above take a while — refuse to commit if
+        # the street graph was replaced under them.
+        self._check_network(network)
         for name, products in staged.items():
             edges[name] = products["mean"]
             edges[f"{name}_coverage"] = products["coverage"]
@@ -319,6 +409,32 @@ class Exposure:
             for threshold, share in products["shares"].items():
                 suffix = _threshold_suffix(threshold)
                 edges[f"{name}_share_above_{suffix}"] = share
+
+    def _check_network(self, network):
+        """Refuse reporting against a network this Exposure was not
+        built on, or whose street graph was replaced since — the cached
+        per-edge arrays speak that build's edge indices only. Beyond
+        the frame-identity token, the WALKING graph (which backs the
+        reporting arrays) must still be the ingested install: the
+        core's generation counter bumps on every street-network
+        install, and the edge count guards the array alignment."""
+        stale = network is not self._network or (
+            getattr(network, "_streets_gdf_cache", None) is not self._streets_frame
+        )
+        if not stale:
+            try:
+                core = network._core
+                stale = core._streets_generation != self._streets_generation or (
+                    core._walking_edge_count != len(self._report_lengths)
+                )
+            except Exception:
+                stale = True
+        if stale:
+            raise ValueError(
+                "this Exposure was not built on the network being routed "
+                "(or the network's street graph was replaced since); "
+                "build Exposure(network, ...) on the current network"
+            )
 
     @property
     def layers(self):
@@ -328,6 +444,149 @@ class Exposure:
     def thresholds(self, name):
         """The declared thresholds of a layer (possibly empty)."""
         return tuple(self._thresholds.get(name, ()))
+
+    def column_names(self):
+        """The reporting columns, in emission order: per layer the
+        length-weighted ``{layer}_mean``, maximum, coverage, and one
+        ``minutes_above`` per declared threshold."""
+        names = []
+        for name in self._layers:
+            names.extend([f"{name}_mean", f"{name}_max", f"{name}_coverage"])
+            for threshold in self._thresholds.get(name, ()):
+                suffix = _threshold_suffix(threshold)
+                names.append(f"{name}_minutes_above_{suffix}")
+        return names
+
+    def leg_columns(self, street_edges, travel_seconds, walk_meters=None):
+        """Reporting columns for one moving leg from its traversed
+        ``(edge, fraction)`` provenance. Length-weighting equals
+        time-weighting within a leg (constant speed); the mean is
+        normalized by the traversed street length, matching the
+        zero-filled per-edge dose contract. Snap connectors — the
+        off-graph tails of a walk — carry no edge data, so only the
+        on-street share of ``travel_seconds`` (traversed street length
+        over ``walk_meters``, the SAME reconstruction's total walked
+        meters) enters the threshold minutes."""
+        columns = {}
+        if not street_edges:
+            for name in self.column_names():
+                columns[name] = np.nan
+            return columns
+        indices = np.asarray([edge for edge, _ in street_edges], dtype=int)
+        weights = (
+            np.asarray([fraction for _, fraction in street_edges], dtype=float)
+            * self._report_lengths[indices]
+        )
+        # An endpoint snap contributes a zero-fraction end edge; it is
+        # not traversed and must not enter the products (the maximum
+        # would otherwise leak from an untouched edge).
+        traversed = weights > 0
+        indices = indices[traversed]
+        weights = weights[traversed]
+        total = weights.sum()
+        seconds = travel_seconds
+        if walk_meters is not None and np.isfinite(walk_meters) and walk_meters > 0:
+            seconds = travel_seconds * min(1.0, total / walk_meters)
+        minutes = seconds / 60.0
+        for name, products in self._report.items():
+            if total > 0:
+                share = weights / total
+                columns[f"{name}_mean"] = float(
+                    (products["mean"][indices] * share).sum()
+                )
+                maxima = products["max"][indices]
+                columns[f"{name}_max"] = (
+                    float(np.nanmax(maxima)) if np.isfinite(maxima).any() else np.nan
+                )
+                columns[f"{name}_coverage"] = float(
+                    (products["coverage"][indices] * share).sum()
+                )
+                for threshold, shares in products["shares"].items():
+                    suffix = _threshold_suffix(threshold)
+                    columns[f"{name}_minutes_above_{suffix}"] = float(
+                        minutes * (shares[indices] * share).sum()
+                    )
+            else:
+                columns[f"{name}_mean"] = np.nan
+                columns[f"{name}_max"] = np.nan
+                columns[f"{name}_coverage"] = np.nan
+                for threshold in self._thresholds.get(name, ()):
+                    suffix = _threshold_suffix(threshold)
+                    columns[f"{name}_minutes_above_{suffix}"] = np.nan
+        return columns
+
+    def wait_columns(self, stop_id, wait_seconds):
+        """Reporting columns for a stationary wait at a stop: the
+        layer's sampled value with coverage 1, or coverage 0 when the
+        stop is unsampleable; ``minutes_above`` counts the full wait
+        when the sampled value meets the bar."""
+        columns = {}
+        minutes = wait_seconds / 60.0
+        for name in self._layers:
+            value = self._stop_values.get(name, {}).get(stop_id, np.nan)
+            covered = np.isfinite(value)
+            columns[f"{name}_mean"] = float(value) if covered else 0.0
+            columns[f"{name}_max"] = float(value) if covered else np.nan
+            columns[f"{name}_coverage"] = 1.0 if covered else 0.0
+            for threshold in self._thresholds.get(name, ()):
+                suffix = _threshold_suffix(threshold)
+                above = covered and value >= threshold
+                columns[f"{name}_minutes_above_{suffix}"] = minutes if above else 0.0
+        return columns
+
+
+def _stop_values(name, source, value, points, metric_crs):
+    """One sampled value per stop point (NaN = uncovered): raster
+    lookups, point-in-polygon maxima, nearest lines in tolerance."""
+    import geopandas
+
+    n = len(points)
+    if isinstance(source, geopandas.GeoDataFrame):
+        kinds = set(source.geometry.geom_type.unique())
+        frame = geopandas.GeoDataFrame(
+            {_VALUE: np.asarray(source[value], dtype=float)},
+            geometry=source.geometry.values,
+            crs=source.crs,
+        ).to_crs(metric_crs)
+        left = geopandas.GeoDataFrame(geometry=points.values, crs=metric_crs)
+        if kinds <= {"Polygon", "MultiPolygon"}:
+            from shapely import make_valid
+
+            frame = frame.set_geometry(
+                [_polygonal(g) for g in make_valid(frame.geometry.values)]
+            )
+            joined = geopandas.sjoin(
+                left, frame.reset_index(drop=True), predicate="within"
+            )
+        else:
+            joined = geopandas.sjoin_nearest(
+                left,
+                frame.reset_index(drop=True),
+                max_distance=LINE_MATCH_TOLERANCE_M,
+                how="inner",
+            )
+        best = joined.groupby(level=0)[_VALUE].max()
+        values = np.full(n, np.nan)
+        values[best.index.to_numpy(dtype=int)] = best.to_numpy(dtype=float)
+        return values
+    band, transform, crs, nodata = _open_band(name, source, value)
+    from pyproj import Transformer
+
+    import shapely
+
+    xs = shapely.get_x(np.asarray(points.values))
+    ys = shapely.get_y(np.asarray(points.values))
+    to_raster = Transformer.from_crs(metric_crs, crs, always_xy=True)
+    rx, ry = to_raster.transform(xs, ys)
+    cols, rows = (~transform) * (np.asarray(rx), np.asarray(ry))
+    cols = np.floor(cols).astype(int)
+    rows = np.floor(rows).astype(int)
+    inside = (rows >= 0) & (rows < band.shape[0]) & (cols >= 0) & (cols < band.shape[1])
+    values = np.full(n, np.nan)
+    values[inside] = band[rows[inside], cols[inside]]
+    if nodata is not None:
+        values[values == nodata] = np.nan
+    return values
 
 
 def _validate_products(name, products):
@@ -802,23 +1061,46 @@ def _sampled_products(values, owners, thresholds, n):
     zero_filled = np.where(valid, values, 0.0)
     mean = np.bincount(owners, weights=zero_filled * weight, minlength=n)
     coverage = np.bincount(owners, weights=valid.astype(float) * weight, minlength=n)
+    # The pre-divided weights can accumulate one ulp past 1; the
+    # coverage and share invariants are hard, so clamp.
+    np.minimum(coverage, 1.0, out=coverage)
     maximum = np.full(n, -np.inf)
     if valid.any():
         np.fmax.at(maximum, owners[valid], values[valid])
     maximum[~np.isfinite(maximum)] = np.nan
     shares = {
-        x: np.bincount(
-            owners,
-            weights=(valid & (values >= x)).astype(float) * weight,
-            minlength=n,
+        x: np.minimum(
+            np.bincount(
+                owners,
+                weights=(valid & (values >= x)).astype(float) * weight,
+                minlength=n,
+            ),
+            1.0,
         )
         for x in thresholds
     }
     return {"mean": mean, "coverage": coverage, "max": maximum, "shares": shares}
 
 
+class _FrozenBand:
+    """A raster band materialized once at construction; every later
+    pass reads this snapshot instead of reopening the source."""
+
+    __slots__ = ("band", "transform", "crs", "nodata")
+
+    def __init__(self, band, transform, crs, nodata):
+        # An owned copy — an already-open float64 source would otherwise
+        # alias the caller's buffer instead of freezing it.
+        self.band = np.array(band, dtype=float, copy=True)
+        self.transform = transform
+        self.crs = crs
+        self.nodata = nodata
+
+
 def _open_band(name, source, value):
     """A raster band as ``(array, affine transform, crs, nodata)``."""
+    if isinstance(source, _FrozenBand):
+        return source.band, source.transform, source.crs, source.nodata
     try:
         import rioxarray
     except ImportError as error:

@@ -143,6 +143,9 @@ struct TransportNetwork {
     /// STREETS-section bytes the load explicitly read — 0 for a lazy
     /// mapped load; the laziness tests assert on it.
     streets_bytes_read: u64,
+    /// Monotonic count of walking street-network installs; exposure
+    /// reporting pins its cached per-edge arrays to it.
+    streets_generation: u64,
 }
 
 /// Resolution of a raw GTFS stop_id, which merged feeds can duplicate.

@@ -950,3 +950,535 @@ def _drop_layer_columns(edges, name, thresholds):
     for column in exposure._derived_columns(name, tuple(float(x) for x in thresholds)):
         if column in edges.columns:
             del edges[column]
+
+
+# --- reporting: exposure= on itineraries -------------------------------------
+
+
+@pytest.fixture(scope="module")
+def reporting_exposure(street_network):
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+    west, south, east, north = _extent(street_network)
+    zones = geopandas.GeoDataFrame(
+        {"level": [61.0]},
+        geometry=[box(west - 0.01, south - 0.01, east + 0.01, north + 0.01)],
+        crs="EPSG:4326",
+    )
+    edges = street_network.streets_gdf
+    exposure_object = Exposure(
+        street_network, noise=(zones, "level"), thresholds={"noise": (55, 65)}
+    )
+    yield exposure_object
+    _drop_layer_columns(edges, "noise", (55, 65))
+
+
+@pytest.fixture(scope="module")
+def reported_frame(street_network, reporting_exposure):
+    geopandas = pytest.importorskip("geopandas")
+    from shapely.geometry import Point
+
+    from cafein import DetailedItineraries
+
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
+    )
+    return DetailedItineraries(
+        street_network,
+        origins,
+        destinations,
+        departure="2022-02-22 08:30",
+        exposure=reporting_exposure,
+    )
+
+
+def test_walk_based_legs_report_the_constant_layer(reported_frame):
+    moving = reported_frame[
+        reported_frame["leg_type"].isin(["walk", "access", "egress", "transfer"])
+    ]
+    assert len(moving) > 0
+    assert moving["noise_mean"].values == pytest.approx(61.0)
+    assert moving["noise_max"].values == pytest.approx(61.0)
+    assert moving["noise_coverage"].values == pytest.approx(1.0)
+    # the on-street share of each leg sits at or above 55 (snap
+    # connectors carry no edge data, so the minutes never exceed the
+    # exact leg duration), none of it at or above 65
+    travel_minutes = (moving["arrival_s"] - moving["departure_s"]).values / 60.0
+    above = moving["noise_minutes_above_55"].values
+    assert (above > 0).all()
+    assert (above <= travel_minutes * (1 + 1e-9)).all()
+    assert moving["noise_minutes_above_65"].values == pytest.approx(0.0)
+
+
+def test_transit_legs_carry_nan_exposure(reported_frame):
+    transit = reported_frame[reported_frame["leg_type"] == "transit"]
+    assert len(transit) > 0
+    assert transit["noise_mean"].isna().all()
+    assert transit["noise_coverage"].isna().all()
+
+
+def test_waits_materialize_as_sampled_rows(reported_frame):
+    waits = reported_frame[reported_frame["leg_type"] == "wait"]
+    assert len(waits) > 0
+    assert waits["noise_mean"].values == pytest.approx(61.0)
+    assert waits["noise_coverage"].values == pytest.approx(1.0)
+    assert (waits["from_stop"] == waits["to_stop"]).all()
+    assert waits["geometry"].isna().all()
+    # wait time counts fully toward the 55 dB minutes
+    exact_minutes = (waits["arrival_s"] - waits["departure_s"]).values / 60.0
+    assert waits["noise_minutes_above_55"].values == pytest.approx(
+        exact_minutes, rel=1e-6
+    )
+
+
+def test_segments_renumber_with_waits(reported_frame):
+    for _, journey in reported_frame.groupby(["from_id", "to_id", "option"]):
+        assert list(journey["segment"]) == list(range(len(journey)))
+
+
+def test_exposure_totals_aggregate_per_journey(reported_frame):
+    totals = reported_frame.exposure_totals()
+    assert set(totals.columns) >= {
+        "from_id",
+        "to_id",
+        "option",
+        "noise_mean",
+        "noise_max",
+        "noise_coverage",
+        "noise_minutes_above_55",
+        "noise_minutes_above_65",
+    }
+    merged = totals.set_index(["from_id", "to_id", "option"])
+    for key, journey in reported_frame.groupby(["from_id", "to_id", "option"]):
+        expected = journey["noise_minutes_above_55"].fillna(0).sum()
+        assert merged.loc[key, "noise_minutes_above_55"] == pytest.approx(
+            expected, rel=1e-9
+        )
+        assert merged.loc[key, "noise_mean"] == pytest.approx(61.0)
+
+
+def test_the_plain_frame_contract_is_untouched(street_network):
+    geopandas = pytest.importorskip("geopandas")
+    from shapely.geometry import Point
+
+    from cafein import DetailedItineraries
+
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
+    )
+    frame = DetailedItineraries(
+        street_network,
+        origins,
+        destinations,
+        departure="2022-02-22 08:30",
+    )
+    assert "street_edges" not in frame.columns
+    assert "wait" not in set(frame["leg_type"])
+    assert not any(column.startswith("noise") for column in frame.columns)
+    with pytest.raises(ValueError, match="exposure_totals needs"):
+        frame.exposure_totals()
+
+
+def test_street_mode_journeys_refuse_exposure_for_now(
+    street_network, reporting_exposure
+):
+    geopandas = pytest.importorskip("geopandas")
+    from shapely.geometry import Point
+
+    from cafein import DetailedItineraries, StreetNetwork
+
+    streets = StreetNetwork.from_osm("tests/data/kantakaupunki.osm.pbf")
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
+    )
+    with pytest.raises(ValueError, match="street-mode journeys gain it"):
+        DetailedItineraries(
+            streets,
+            origins,
+            destinations,
+            departure="2022-02-22 08:30",
+            transport_mode="bicycle",
+            exposure=reporting_exposure,
+        )
+
+
+def test_connector_time_stays_out_of_threshold_minutes(reporting_exposure):
+    length = float(reporting_exposure._report_lengths[0])
+    # half the walked meters are off-graph connector: half the minutes
+    on_street = reporting_exposure.leg_columns([(0, 1.0)], 60.0, walk_meters=2 * length)
+    assert on_street["noise_minutes_above_55"] == pytest.approx(0.5)
+    assert on_street["noise_mean"] == pytest.approx(61.0)
+    # no walked meters: the whole duration counts
+    whole = reporting_exposure.leg_columns([(0, 1.0)], 60.0)
+    assert whole["noise_minutes_above_55"] == pytest.approx(1.0)
+    # walked meters below the traversed length cap at the full duration
+    capped = reporting_exposure.leg_columns([(0, 1.0)], 60.0, walk_meters=length / 2)
+    assert capped["noise_minutes_above_55"] == pytest.approx(1.0)
+
+
+def test_reporting_is_independent_of_geometries(street_network, reporting_exposure):
+    geopandas = pytest.importorskip("geopandas")
+    from shapely.geometry import Point
+
+    from cafein import DetailedItineraries
+
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
+    )
+    frame = DetailedItineraries(
+        street_network,
+        origins,
+        destinations,
+        departure="2022-02-22 08:30",
+        geometries=False,
+        exposure=reporting_exposure,
+    )
+    moving = frame[frame["leg_type"].isin(["walk", "access", "egress", "transfer"])]
+    assert len(moving) > 0
+    assert moving["noise_mean"].values == pytest.approx(61.0)
+    assert frame["geometry"].isna().all()
+
+
+def test_a_foreign_or_replaced_network_is_refused(street_network, reporting_exposure):
+    with pytest.raises(ValueError, match="not built on the network"):
+        reporting_exposure._check_network(object())
+    snapshot = street_network._streets_gdf_cache
+    try:
+        street_network._streets_gdf_cache = snapshot.copy()
+        with pytest.raises(ValueError, match="not built on the network"):
+            reporting_exposure._check_network(street_network)
+    finally:
+        street_network._streets_gdf_cache = snapshot
+    reporting_exposure._check_network(street_network)
+
+
+def test_an_empty_result_keeps_the_exposure_schema(
+    street_network, reporting_exposure, reported_frame
+):
+    from cafein import DetailedItineraries
+
+    transit = reported_frame[reported_frame["leg_type"] == "transit"]
+    board = transit.iloc[0]["from_stop"]
+    alight = transit.iloc[0]["to_stop"]
+    frame = DetailedItineraries(
+        street_network,
+        [board],
+        [alight],
+        departure="2022-02-22 08:30",
+        exclude_stops=[alight],
+        exposure=reporting_exposure,
+    )
+    assert len(frame) == 0
+    assert "noise_mean" in frame.columns
+    assert "street_edges" not in frame.columns
+    totals = frame.exposure_totals()
+    assert totals.empty
+    assert (
+        list(totals.columns)
+        == [
+            "from_id",
+            "to_id",
+            "option",
+        ]
+        + reporting_exposure.column_names()
+    )
+    assert totals["from_id"].dtype == frame["from_id"].dtype
+
+
+def test_stop_origin_journeys_account_for_all_time(
+    street_network, reporting_exposure, reported_frame
+):
+    from cafein import DetailedItineraries
+
+    transit = reported_frame[reported_frame["leg_type"] == "transit"]
+    board = transit.iloc[0]["from_stop"]
+    alight = transit.iloc[0]["to_stop"]
+    frame = DetailedItineraries(
+        street_network,
+        [board],
+        [alight],
+        departure="2022-02-22 08:30",
+        exposure=reporting_exposure,
+    )
+    assert len(frame) > 0
+    departure_s = 8 * 3600 + 30 * 60
+    for _, journey in frame.groupby(["from_id", "to_id", "option"]):
+        # waits fill every stationary gap, the first boarding included,
+        # so each option's rows tile its departure→arrival span exactly
+        assert journey.iloc[0]["departure_s"] == departure_s
+        starts = journey["departure_s"].to_numpy()
+        ends = journey["arrival_s"].to_numpy()
+        assert (starts[1:] == ends[:-1]).all()
+    waits = frame[frame["leg_type"] == "wait"]
+    assert len(waits) > 0
+    assert waits["noise_mean"].values == pytest.approx(61.0)
+
+
+def test_partial_coverage_reports_the_zero_filled_identity(street_network):
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+    from shapely.geometry import Point
+
+    from cafein import DetailedItineraries
+
+    west, south, east, north = _extent(street_network)
+    # a half-plane: south of the split is 61 dB, north is uncovered
+    zones = geopandas.GeoDataFrame(
+        {"level": [61.0]},
+        geometry=[box(west - 0.01, south - 0.01, east + 0.01, 60.180)],
+        crs="EPSG:4326",
+    )
+    edges = street_network.streets_gdf
+    partial = Exposure(street_network, din=(zones, "level"), thresholds={"din": (55,)})
+    try:
+        origins = geopandas.GeoDataFrame(
+            {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
+        )
+        destinations = geopandas.GeoDataFrame(
+            {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
+        )
+        frame = DetailedItineraries(
+            street_network,
+            origins,
+            destinations,
+            departure="2022-02-22 08:30",
+            exposure=partial,
+        )
+        moving = frame[frame["leg_type"].isin(["walk", "access", "egress", "transfer"])]
+        assert len(moving) > 0
+        # constant-value layer: the zero-filled mean is the value times
+        # the covered share, everywhere and at every partial coverage
+        assert moving["din_mean"].values == pytest.approx(
+            61.0 * moving["din_coverage"].values, rel=1e-6, abs=1e-9
+        )
+        covered = moving[moving["din_coverage"] > 0]
+        assert len(covered) > 0
+        assert covered["din_max"].values == pytest.approx(61.0)
+        # the origin walks sit fully inside the zone, the destination
+        # walks fully outside it (zero-filled mean, NaN-free zero row)
+        south_legs = moving[moving["din_coverage"] > 0.99]
+        north_legs = moving[moving["din_coverage"] == 0.0]
+        assert len(south_legs) > 0
+        assert len(north_legs) > 0
+        assert north_legs["din_mean"].values == pytest.approx(0.0)
+        assert north_legs["din_max"].isna().all()
+        assert north_legs["din_minutes_above_55"].values == pytest.approx(0.0)
+        totals = frame.exposure_totals()
+        assert totals["din_mean"].values == pytest.approx(
+            61.0 * totals["din_coverage"].values, rel=1e-6, abs=1e-9
+        )
+        # an endpoint snap yields a zero-fraction end edge: its covered
+        # maximum must not leak into a leg that never traversed it
+        products = partial._report["din"]
+        lengths = partial._report_lengths
+        uncovered = int(
+            np.flatnonzero((products["coverage"] == 0.0) & (lengths > 0))[0]
+        )
+        covered_edge = int(np.flatnonzero(products["coverage"] == 1.0)[0])
+        columns = partial.leg_columns([(uncovered, 1.0), (covered_edge, 0.0)], 60.0)
+        assert np.isnan(columns["din_max"])
+        assert columns["din_mean"] == 0.0
+        assert columns["din_coverage"] == 0.0
+    finally:
+        _drop_layer_columns(edges, "din", (55,))
+
+
+def test_wait_rows_repeat_the_option_fare(
+    street_network, reporting_exposure, reported_frame, helsinki_gtfs
+):
+    from cafein import DetailedItineraries, fares
+
+    structure = fares.zone_fare_structure(helsinki_gtfs, rules="zones")
+    transit = reported_frame[reported_frame["leg_type"] == "transit"]
+    board = transit.iloc[0]["from_stop"]
+    alight = transit.iloc[0]["to_stop"]
+    frame = DetailedItineraries(
+        street_network,
+        [board],
+        [alight],
+        departure="2022-02-22 08:30",
+        fares=structure,
+        exposure=reporting_exposure,
+    )
+    waits = frame[frame["leg_type"] == "wait"]
+    assert len(waits) > 0
+    for _, journey in frame.groupby(["from_id", "to_id", "option"]):
+        # one fare per option, repeated on every row — waits included
+        assert journey["fare"].nunique(dropna=False) == 1
+    assert waits["fare"].notna().any()
+
+
+def test_multimodal_builds_align_reporting_to_the_walking_graph(multimodal_network):
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+    from shapely.geometry import Point
+
+    from cafein import DetailedItineraries
+
+    west, south, east, north = _extent(multimodal_network)
+    zones = geopandas.GeoDataFrame(
+        {"level": [61.0]},
+        geometry=[box(west - 0.01, south - 0.01, east + 0.01, north + 0.01)],
+        crs="EPSG:4326",
+    )
+    edges = multimodal_network.streets_gdf
+    ex = Exposure(
+        multimodal_network, noise=(zones, "level"), thresholds={"noise": (55,)}
+    )
+    try:
+        assert multimodal_network.has_multimodal_streets
+        # the walk searches speak the walking graph, whose rows differ
+        # from the union frame's; the reporting arrays follow the former
+        assert len(ex._report_lengths) != len(edges)
+        products = ex._report["noise"]
+        assert len(products["mean"]) == len(ex._report_lengths)
+        assert np.isfinite(products["mean"]).all()
+        assert products["coverage"].min() >= 0 and products["coverage"].max() <= 1
+        assert np.allclose(products["mean"], 61.0 * products["coverage"])
+        origins = geopandas.GeoDataFrame(
+            {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
+        )
+        destinations = geopandas.GeoDataFrame(
+            {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
+        )
+        frame = DetailedItineraries(
+            multimodal_network,
+            origins,
+            destinations,
+            departure="2022-02-22 08:30",
+            exposure=ex,
+        )
+        moving = frame[frame["leg_type"].isin(["walk", "access", "egress", "transfer"])]
+        assert len(moving) > 0
+        assert moving["noise_mean"].values == pytest.approx(61.0)
+        assert moving["noise_coverage"].values == pytest.approx(1.0)
+    finally:
+        _drop_layer_columns(edges, "noise", (55,))
+
+
+def test_a_failed_street_replacement_leaves_an_exposure_valid(
+    fresh_footpaths_network,
+):
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+
+    west, south, east, north = _extent(fresh_footpaths_network)
+    zones = geopandas.GeoDataFrame(
+        {"level": [61.0]},
+        geometry=[box(west - 0.01, south - 0.01, east + 0.01, north + 0.01)],
+        crs="EPSG:4326",
+    )
+    ex = Exposure(fresh_footpaths_network, noise=(zones, "level"))
+    with pytest.raises(Exception, match="NO_SUCH_STOP"):
+        fresh_footpaths_network.set_street_network(
+            1, [], [0, 0], [24.9], [60.2], [("NO_SUCH_STOP", 0, 0.0, 0.0)]
+        )
+    # the failed install changed nothing: the exposure stays bound
+    ex._check_network(fresh_footpaths_network)
+
+
+def test_totals_keep_the_id_dtypes(street_network, reporting_exposure):
+    geopandas = pytest.importorskip("geopandas")
+    from shapely.geometry import Point
+
+    from cafein import DetailedItineraries
+
+    origins = geopandas.GeoDataFrame(
+        {"id": np.asarray([7], dtype="int32")},
+        geometry=[Point(24.938, 60.169)],
+        crs="EPSG:4326",
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": np.asarray([9], dtype="int32")},
+        geometry=[Point(24.96, 60.20)],
+        crs="EPSG:4326",
+    )
+    frame = DetailedItineraries(
+        street_network,
+        origins,
+        destinations,
+        departure="2022-02-22 08:30",
+        exposure=reporting_exposure,
+    )
+    totals = frame.exposure_totals()
+    assert frame["from_id"].dtype == np.dtype("int32")
+    assert totals["from_id"].dtype == frame["from_id"].dtype
+    assert totals["to_id"].dtype == frame["to_id"].dtype
+    assert totals["option"].dtype == frame["option"].dtype
+
+
+def test_leg_means_match_an_independent_geometry_integration(street_network, tmp_path):
+    rasterio = pytest.importorskip("rasterio")
+    pytest.importorskip("rioxarray")
+    geopandas = pytest.importorskip("geopandas")
+    from rasterio.transform import from_bounds
+    from shapely.geometry import Point
+
+    from cafein import DetailedItineraries
+
+    west, south, east, north = _extent(street_network)
+
+    def field(lon):
+        return (lon - west) * 1000.0
+
+    n = 400
+    path = tmp_path / "gradient.tif"
+    centers = np.linspace(west, east, n, endpoint=False) + (east - west) / (2 * n)
+    grid = np.tile(field(centers), (n, 1)).astype("float32")
+    with rasterio.open(
+        str(path),
+        "w",
+        driver="GTiff",
+        width=n,
+        height=n,
+        count=1,
+        dtype="float32",
+        crs="EPSG:4326",
+        transform=from_bounds(west, south, east, north, n, n),
+    ) as sink:
+        sink.write(grid[None, ...])
+        sink.descriptions = ("Gradient [x]",)
+    edges = street_network.streets_gdf
+    ex = Exposure(street_network, grad=(str(path), "Gradient"))
+    try:
+        origins = geopandas.GeoDataFrame(
+            {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
+        )
+        destinations = geopandas.GeoDataFrame(
+            {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
+        )
+        frame = DetailedItineraries(
+            street_network,
+            origins,
+            destinations,
+            departure="2022-02-22 08:30",
+            exposure=ex,
+        )
+        moving = frame[
+            frame["leg_type"].isin(["walk", "access", "egress", "transfer"])
+            & frame["geometry"].notna()
+        ]
+        assert len(moving) >= 2
+        for _, leg in moving.iterrows():
+            line = leg["geometry"]
+            points = [
+                line.interpolate(f, normalized=True) for f in np.linspace(0.0, 1.0, 200)
+            ]
+            independent = float(np.mean([field(p.x) for p in points]))
+            # a wrong edge index or traversal fraction would pull the
+            # reported mean toward another part of the gradient
+            assert leg["grad_mean"] == pytest.approx(independent, rel=0.05, abs=2.0)
+    finally:
+        _drop_layer_columns(edges, "grad", ())
