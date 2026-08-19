@@ -8,6 +8,7 @@ __path__ = __import__("pkgutil").extend_path(__path__, __name__)
 __all__ = [
     "TransportNetwork",
     "StreetNetwork",
+    "Exposure",
     "StreetLegPolicy",
     "VehiclePolicy",
     "TravelerProfile",
@@ -42,6 +43,10 @@ def __getattr__(name):
         from cafein.street_network import StreetNetwork
 
         return StreetNetwork
+    if name == "Exposure":
+        from cafein.exposure import Exposure
+
+        return Exposure
     if name in ("StreetLegPolicy", "VehiclePolicy"):
         from cafein import policy
 

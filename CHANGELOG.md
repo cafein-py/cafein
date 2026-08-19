@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `Exposure`: user-named environmental layers (raster bands or
+  polygon/line value columns — noise zones, air-quality grids, green
+  view segments) ingested onto the street network's edges as dose
+  means, covered maxima, coverage shares, and per-threshold
+  at-or-above shares, inspectable through `streets_gdf`.
+  ([#284](https://github.com/cafein-py/cafein/pull/284))
+
 - Matrix and product id columns carry the input's dtype: an axis
   supplied with uniform integer ids (numpy widths and pandas nullable
   integers alike) gets its `from_id`/`to_id`/`destination_id` column
