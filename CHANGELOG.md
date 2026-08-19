@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Exposure at matrix scale: `TravelCostMatrix(..., exposure=)` on a
+  `StreetNetwork` adds each cell's per-layer exposure columns
+  (`{layer}_mean`, maxima, coverage, `minutes_above`) — exact from
+  the traversed edges' true times, computed off the metres-only
+  search with no geometry assembled — and the streamed
+  `to_parquet` form carries them into its shards.
+  ([#287](https://github.com/cafein-py/cafein/pull/287))
+
 - The exposure objective: `DetailedItineraries(..., optimize=)` on a
   `StreetNetwork` scales each edge's cost by `1 + Σ weight × value`
   over the layers of `exposure=`, so chosen routes trade time against

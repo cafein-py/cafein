@@ -73,8 +73,9 @@ struct CostCell {
     connector_meters: f64,
     /// The leg's shape in (longitude, latitude); `None` without geometries.
     geometry: Option<Vec<(f64, f64)>>,
-    /// The traversed ``(edge, fraction, true seconds)`` provenance;
-    /// populated only by the reconstructed-legs search.
+    /// The traversed ``(edge, fraction, true seconds)`` provenance —
+    /// from the reconstructed legs, or off the metres path's winning
+    /// chain when asked without geometries.
     edges: Vec<(u32, f64, f64)>,
 }
 
@@ -404,8 +405,9 @@ impl StreetNetwork {
     /// route choice run the weighted costs, while every reported second
     /// stays the chosen route's TRUE time; `max_seconds` then bounds the
     /// weighted (perceived) cost, which the true time can never exceed.
-    /// `street_edges` attaches each cell's traversed ``(edge, fraction)``
-    /// provenance (reconstructed legs only, so it needs `geometries`).
+    /// `street_edges` attaches each cell's traversed ``(edge, fraction,
+    /// true seconds)`` provenance — from the reconstructed legs with
+    /// `geometries`, off the metres path's winning chain without.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (origins, destinations, mode, max_seconds, max_snap_distance,
                         geometries, car_model = None, multipliers = None,
@@ -423,11 +425,6 @@ impl StreetNetwork {
         multipliers: Option<Vec<f64>>,
         street_edges: bool,
     ) -> PyResult<Py<PyDict>> {
-        if street_edges && !geometries {
-            return Err(PyValueError::new_err(
-                "street_edges provenance rides the reconstructed legs; pass geometries=True",
-            ));
-        }
         let index = self.compiled(mode, car_model.as_ref())?;
         let (_, profile) = &self.profiles[index];
         let weighted = match &multipliers {
@@ -482,6 +479,42 @@ impl StreetNetwork {
                             .into_iter()
                             .map(|leg| leg.map(CostCell::from_leg))
                             .collect()
+                        } else if street_edges {
+                            // The metres path serves street_edges too: the
+                            // provenance reads off the winning chain the
+                            // metres already walk, no shape assembled.
+                            match &weighted {
+                                Some(search) => self.inner.directed_meters_edges_to_snaps_weighted(
+                                    from,
+                                    &target_snaps,
+                                    search,
+                                    profile,
+                                    max_seconds,
+                                ),
+                                None => self.inner.directed_meters_edges_to_snaps(
+                                    from,
+                                    &target_snaps,
+                                    profile,
+                                    max_seconds,
+                                ),
+                            }
+                            .into_iter()
+                            .zip(&target_snaps)
+                            .map(|(cell, target)| {
+                                let (seconds, network_meters, edges) = cell?;
+                                // A cell settles only against a snapped
+                                // destination, so the connectors at both
+                                // ends are the snaps' own.
+                                let to = target.as_ref()?;
+                                Some(CostCell {
+                                    seconds,
+                                    network_meters,
+                                    connector_meters: from.connector + to.connector,
+                                    geometry: None,
+                                    edges,
+                                })
+                            })
+                            .collect()
                         } else {
                             match &weighted {
                                 Some(search) => self.inner.directed_meters_to_snaps_weighted(
@@ -502,9 +535,6 @@ impl StreetNetwork {
                             .zip(&target_snaps)
                             .map(|(cell, target)| {
                                 let (seconds, network_meters) = cell?;
-                                // A cell settles only against a snapped
-                                // destination, so the connectors at both
-                                // ends are the snaps' own.
                                 let to = target.as_ref()?;
                                 Some(CostCell {
                                     seconds,
