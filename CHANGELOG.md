@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `cafein.equity` gains `alkire_foster`: the multidimensional M0 over
+  user-declared dimensions (a dict of column → cutoff, bare numbers
+  depriving below and `(op, number)` tuples stating the direction)
+  with the dual cutoff `k`, reported as `m0`/`headcount`/`intensity`
+  and a `detail=True` deprivation matrix — as a function and an
+  `Accessibility` method.
+  ([#293](https://github.com/cafein-py/cafein/pull/293))
+
 - `cafein.equity` gains the transport-poverty measures: `fgt_poverty`
   (both deprivation tails, absolute or `"60% of median"` lines),
   `cost_burden` (the 10 % rule), `residual_income`, and `lihc` (the

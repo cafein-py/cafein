@@ -1235,3 +1235,116 @@ def test_the_burden_family_weighting_and_missing_data():
             population="pop",
         ),
     )
+
+
+def test_alkire_foster_hand_goldens():
+    # Two dimensions: low access (below 10) and a heavy cost share
+    # (above 0.1). A fails both, B and C one each, D none.
+    frame = pd.DataFrame(
+        {
+            "accessibility": [5.0, 5.0, 20.0, 20.0],
+            "cost_share": [0.3, 0.05, 0.3, 0.05],
+        }
+    )
+    dimensions = {"accessibility": 10.0, "cost_share": (">", 0.1)}
+    union = equity.alkire_foster(frame, dimensions=dimensions, k=1)
+    assert union["headcount"][0] == pytest.approx(0.75)
+    assert union["intensity"][0] == pytest.approx((1.0 + 0.5 + 0.5) / 3.0)
+    assert union["m0"][0] == pytest.approx(0.5)
+    intersection = equity.alkire_foster(frame, dimensions=dimensions, k=2)
+    assert intersection["headcount"][0] == pytest.approx(0.25)
+    assert intersection["intensity"][0] == pytest.approx(1.0)
+    assert intersection["m0"][0] == pytest.approx(0.25)
+    # A float k is a share of dimensions: 0.5 of 2 equals k=1.
+    pd.testing.assert_frame_equal(
+        equity.alkire_foster(frame, dimensions=dimensions, k=0.5), union
+    )
+    # m0 = headcount * intensity by construction.
+    assert union["m0"][0] == pytest.approx(
+        union["headcount"][0] * union["intensity"][0], rel=1e-12
+    )
+
+
+def test_alkire_foster_directions_boundaries_and_edge_cases():
+    frame = _frame([1.0, 2.0, 3.0])
+    # A bare number deprives strictly below; the boundary is not poor.
+    below = equity.alkire_foster(frame, dimensions={"accessibility": 2.0}, k=1)
+    assert below["headcount"][0] == pytest.approx(1 / 3)
+    at_most = equity.alkire_foster(
+        frame, dimensions={"accessibility": ("<=", 2.0)}, k=1
+    )
+    assert at_most["headcount"][0] == pytest.approx(2 / 3)
+    # Explicit directions are well-defined on negative values — a
+    # difference dimension deprives on loss.
+    losses = pd.DataFrame({"change": [-5.0, 0.0, 3.0]})
+    lost = equity.alkire_foster(losses, dimensions={"change": ("<", 0.0)}, k=1)
+    assert lost["headcount"][0] == pytest.approx(1 / 3)
+    # Nobody poor: m0 and headcount are zero, intensity has no mean.
+    none = equity.alkire_foster(frame, dimensions={"accessibility": 0.5}, k=1)
+    assert none["m0"][0] == 0.0 and none["headcount"][0] == 0.0
+    assert np.isnan(none["intensity"][0])
+    # FGT0 is Alkire-Foster with one dimension and k=1.
+    line = 2.5
+    assert equity.alkire_foster(frame, dimensions={"accessibility": line}, k=1)[
+        "headcount"
+    ][0] == pytest.approx(equity.fgt_poverty(frame, poverty_line=line))
+
+
+def test_alkire_foster_contract():
+    frame = pd.DataFrame(
+        {
+            "from_id": ["a", "b", "c"],
+            "accessibility": [5.0, 20.0, np.nan],
+            "cost_share": [0.3, 0.05, 0.2],
+            "pop": [1.0, 2.0, 1.0],
+        }
+    )
+    dimensions = {"accessibility": 10.0, "cost_share": (">", 0.1)}
+    # The NaN dimension row leaves entirely, weight included.
+    result = equity.alkire_foster(frame, dimensions=dimensions, k=1, population="pop")
+    assert result["headcount"][0] == pytest.approx(1 / 3)
+    detail = equity.alkire_foster(frame, dimensions=dimensions, k=2, detail=True)
+    assert detail["from_id"].tolist() == ["a", "b"]
+    assert detail["accessibility_deprived"].tolist() == [True, False]
+    assert detail["cost_share_deprived"].tolist() == [True, False]
+    assert detail["deprivation_count"].tolist() == [2, 0]
+    assert detail["censored_count"].tolist() == [2, 0]
+    assert detail["censored_share"].tolist() == pytest.approx([1.0, 0.0])
+    # Non-string column labels ride the whole pipeline.
+    numbered = pd.DataFrame({1: [5.0, 20.0]})
+    assert equity.alkire_foster(numbered, dimensions={1: 10.0}, k=1)["headcount"][
+        0
+    ] == pytest.approx(0.5)
+    assert equity.gini_index(numbered, value=1) > 0.0
+    # Duplication invariance for the whole summary frame.
+    weighted = pd.DataFrame(
+        {"accessibility": [5.0, 20.0], "cost_share": [0.3, 0.05], "pop": [2.0, 1.0]}
+    )
+    duplicated = pd.DataFrame(
+        {"accessibility": [5.0, 5.0, 20.0], "cost_share": [0.3, 0.3, 0.05]}
+    )
+    pd.testing.assert_frame_equal(
+        equity.alkire_foster(weighted, dimensions=dimensions, k=1, population="pop"),
+        equity.alkire_foster(duplicated, dimensions=dimensions, k=1),
+    )
+    with pytest.raises(ValueError, match="non-empty dict"):
+        equity.alkire_foster(frame, dimensions={}, k=1)
+    with pytest.raises(ValueError, match="op, number"):
+        equity.alkire_foster(frame, dimensions={"accessibility": ("!=", 1.0)}, k=1)
+    with pytest.raises(ValueError, match="between 1 and 2"):
+        equity.alkire_foster(frame, dimensions=dimensions, k=3)
+    with pytest.raises(ValueError, match="share of dimensions"):
+        equity.alkire_foster(frame, dimensions=dimensions, k=1.5)
+    with pytest.raises(ValueError, match="count or a share"):
+        equity.alkire_foster(frame, dimensions=dimensions, k=True)
+    with pytest.raises(ValueError, match="finite number inside"):
+        equity.alkire_foster(frame, dimensions={"accessibility": 1e300}, k=1)
+    # Distinct labels that stringify identically refuse instead of
+    # silently sharing one detail column.
+    mixed = pd.DataFrame({1: [5.0, 20.0], "1": [0.3, 0.05]})
+    with pytest.raises(ValueError, match="colliding detail names"):
+        equity.alkire_foster(mixed, dimensions={1: 10.0, "1": (">", 0.1)}, k=1)
+    with pytest.raises(ValueError, match="must not be None"):
+        equity.alkire_foster(
+            pd.DataFrame({None: [1.0, 2.0]}), dimensions={None: 1.5}, k=1
+        )

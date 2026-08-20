@@ -366,6 +366,16 @@ def test_equity_indices_over_a_metro_accessibility_run(
     assert np.isfinite(
         hardship[["lihc", "high_costs", "low_residual"]].to_numpy()
     ).all()
+    multidim = reachable.alkire_foster(
+        dimensions={
+            "accessibility": float(np.median(reachable["accessibility"])),
+            "transport_cost": (">", 200.0),
+        },
+        k=1,
+        **kwargs,
+    )
+    assert {"m0", "headcount", "intensity"} <= set(multidim.columns)
+    assert np.isfinite(multidim[["m0", "headcount", "intensity"]].to_numpy()).all()
     poverty = reachable.fgt_poverty(poverty_line="60% of median", **kwargs)
     assert isinstance(poverty, pd.DataFrame)
     assert identifiers <= set(poverty.columns) and len(poverty) == 1

@@ -1882,6 +1882,31 @@ class Accessibility(pd.DataFrame):
             dropna=dropna,
         )
 
+    def alkire_foster(
+        self,
+        *,
+        dimensions,
+        k,
+        detail=False,
+        sociodemographic_data=None,
+        population=None,
+        group_columns=None,
+        dropna=False,
+    ):
+        """``cafein.equity.alkire_foster`` over this frame."""
+        from cafein import equity
+
+        return equity.alkire_foster(
+            self,
+            dimensions=dimensions,
+            k=k,
+            detail=detail,
+            sociodemographic_data=sociodemographic_data,
+            population=population,
+            group_columns=group_columns,
+            dropna=dropna,
+        )
+
 
 class NearestDestinations(pd.DataFrame):
     """The ``k`` nearest destinations per origin on a cost axis.
