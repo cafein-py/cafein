@@ -803,3 +803,205 @@ def hoover(
         return {"hoover": float(spread / (2.0 * np.dot(weights, values)))}
 
     return _fan_out(frame, groups, compute, ["hoover"])
+
+
+def concentration_index(
+    data,
+    *,
+    income,
+    variant="standard",
+    bounds=None,
+    value="accessibility",
+    sociodemographic_data=None,
+    population=None,
+    group_columns=None,
+    dropna=False,
+):
+    """The concentration index of the value distribution over the
+    income ranking — positive when access concentrates among the
+    rich, negative among the poor.
+
+    ``variant`` selects the normalization: ``"standard"`` (the
+    relative index, the trapezoidal integral of the same polyline
+    :func:`concentration_curve` returns), ``"erreygers"`` and
+    ``"wagstaff"`` (the corrected indices for bounded outcomes — both
+    REQUIRE ``bounds=(lower, upper)``, the outcome's theoretical
+    range, never inferred from the data), and ``"absolute"`` (the
+    generalized index, twice the weighted covariance of value and
+    fractional rank — defined on any real values, difference frames
+    included, and takes no bounds).
+    """
+    if variant not in ("standard", "erreygers", "wagstaff", "absolute"):
+        raise ValueError("variant must be standard, erreygers, wagstaff, or absolute")
+    if income is None:
+        raise ValueError("concentration_index requires income=")
+    corrected = variant in ("erreygers", "wagstaff")
+    if corrected:
+        try:
+            lower, upper = (float(edge) for edge in bounds)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f"the {variant} variant requires bounds=(lower, upper), "
+                "the outcome's theoretical range"
+            ) from None
+        if not (np.isfinite(lower) and np.isfinite(upper)) or lower >= upper:
+            raise ValueError("bounds must be finite with lower < upper")
+        if max(abs(lower), abs(upper)) > 1e75:
+            raise ValueError(
+                "bounds must sit inside the supported numeric range "
+                "(magnitudes at most 1e75)"
+            )
+    elif bounds is not None:
+        raise ValueError("bounds= serves the erreygers and wagstaff variants")
+    frame, groups, weight = _prepared(
+        "concentration_index",
+        data,
+        value,
+        sociodemographic_data,
+        population,
+        group_columns,
+        dropna,
+        consumed=(income,),
+    )
+
+    def compute(part):
+        values, weights = _values_weights(part, value, weight)
+        ranking = part[income].to_numpy(dtype=float)
+        share = weights / weights.sum()
+        mean = np.dot(share, values)
+        if variant == "absolute":
+            ranks = _distribution.fractional_ranks(weights, ranking)
+            centered = ranks - np.dot(share, ranks)
+            return {
+                "concentration_index": float(
+                    2.0 * np.dot(share, (values - mean) * centered)
+                )
+            }
+        _require_non_negative("concentration_index", values, weights)
+        if corrected and ((values < lower) | (values > upper)).any():
+            raise ValueError(
+                "concentration_index found values outside bounds=; the "
+                "bounds must cover the outcome's whole range"
+            )
+        rescaled = _rescaled(values)
+        population_share, mass = _distribution.concentration_vertices(
+            rescaled, weights, ranking
+        )
+        standard = 1.0 - 2.0 * _distribution.polyline_area(population_share, mass)
+        if variant == "standard":
+            return {"concentration_index": float(standard)}
+        if variant == "erreygers":
+            corrected_value = 4.0 * mean * standard / (upper - lower)
+            return {"concentration_index": float(corrected_value)}
+        if mean == lower or mean == upper:
+            raise ValueError(
+                "the wagstaff variant is undefined when the weighted mean "
+                "equals a bound"
+            )
+        corrected_value = (
+            standard * mean * (upper - lower) / ((upper - mean) * (mean - lower))
+        )
+        return {"concentration_index": float(corrected_value)}
+
+    return _fan_out(frame, groups, compute, ["concentration_index"])
+
+
+def concentration_curve(
+    data,
+    *,
+    income,
+    value="accessibility",
+    sociodemographic_data=None,
+    population=None,
+    group_columns=None,
+    dropna=False,
+):
+    """The concentration curve as a plottable frame —
+    ``population_share`` (income-ranked) against ``value_share``, one
+    vertex per tied-income block plus the origin, per identifier
+    group. ``concentration_index(variant="standard")`` integrates
+    exactly this polyline."""
+    if income is None:
+        raise ValueError("concentration_curve requires income=")
+    frame, groups, weight = _prepared(
+        "concentration_curve",
+        data,
+        value,
+        sociodemographic_data,
+        population,
+        group_columns,
+        dropna,
+        consumed=(income,),
+    )
+    collisions = set(groups) & {"population_share", "value_share"}
+    if collisions:
+        raise ValueError(
+            "group_columns collide with the result column(s): "
+            + ", ".join(sorted(collisions))
+        )
+    parts = []
+    grouped = (
+        frame.groupby(groups, dropna=False, observed=True, sort=True)
+        if groups
+        else [((), frame)]
+    )
+    for keys, part in grouped:
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        values, weights = _values_weights(part, value, weight)
+        values = _rescaled(values)
+        _require_non_negative("concentration_curve", values, weights)
+        ranking = part[income].to_numpy(dtype=float)
+        shares, mass = _distribution.concentration_vertices(values, weights, ranking)
+        vertex = pd.DataFrame(dict(zip(groups, keys)), index=range(len(shares)))
+        vertex["population_share"] = shares
+        vertex["value_share"] = mass
+        parts.append(vertex)
+    return pd.concat(parts, ignore_index=True)
+
+
+def suits(
+    data,
+    *,
+    income,
+    value="accessibility",
+    sociodemographic_data=None,
+    population=None,
+    group_columns=None,
+    dropna=False,
+):
+    """The Suits index — cumulative accessibility share integrated
+    against cumulative INCOME share, positive when access
+    concentrates among the rich. Requires finite non-negative incomes
+    with a strictly positive weighted total (a negative income would
+    make the accumulation axis non-monotonic); tied incomes collapse
+    to one chord, so the index is order-invariant within ties."""
+    if income is None:
+        raise ValueError("suits requires income=")
+    frame, groups, weight = _prepared(
+        "suits",
+        data,
+        value,
+        sociodemographic_data,
+        population,
+        group_columns,
+        dropna,
+        consumed=(income,),
+    )
+
+    def compute(part):
+        values, weights = _values_weights(part, value, weight)
+        values = _rescaled(values)
+        _require_non_negative("suits", values, weights)
+        ranking = part[income].to_numpy(dtype=float)
+        if (ranking < 0).any():
+            raise ValueError(
+                "suits needs non-negative incomes: its accumulation axis "
+                "is cumulative income share"
+            )
+        if np.dot(weights, ranking) <= 0:
+            raise ValueError("suits needs a strictly positive weighted income total")
+        axis, mass = _distribution.suits_vertices(values, weights, ranking)
+        return {"suits": float(1.0 - 2.0 * _distribution.polyline_area(axis, mass))}
+
+    return _fan_out(frame, groups, compute, ["suits"])

@@ -1705,6 +1705,79 @@ class Accessibility(pd.DataFrame):
             dropna=dropna,
         )
 
+    def concentration_index(
+        self,
+        *,
+        income,
+        variant="standard",
+        bounds=None,
+        value="accessibility",
+        sociodemographic_data=None,
+        population=None,
+        group_columns=None,
+        dropna=False,
+    ):
+        """``cafein.equity.concentration_index`` over this frame."""
+        from cafein import equity
+
+        return equity.concentration_index(
+            self,
+            income=income,
+            variant=variant,
+            bounds=bounds,
+            value=value,
+            sociodemographic_data=sociodemographic_data,
+            population=population,
+            group_columns=group_columns,
+            dropna=dropna,
+        )
+
+    def concentration_curve(
+        self,
+        *,
+        income,
+        value="accessibility",
+        sociodemographic_data=None,
+        population=None,
+        group_columns=None,
+        dropna=False,
+    ):
+        """``cafein.equity.concentration_curve`` over this frame."""
+        from cafein import equity
+
+        return equity.concentration_curve(
+            self,
+            income=income,
+            value=value,
+            sociodemographic_data=sociodemographic_data,
+            population=population,
+            group_columns=group_columns,
+            dropna=dropna,
+        )
+
+    def suits(
+        self,
+        *,
+        income,
+        value="accessibility",
+        sociodemographic_data=None,
+        population=None,
+        group_columns=None,
+        dropna=False,
+    ):
+        """``cafein.equity.suits`` over this frame."""
+        from cafein import equity
+
+        return equity.suits(
+            self,
+            income=income,
+            value=value,
+            sociodemographic_data=sociodemographic_data,
+            population=population,
+            group_columns=group_columns,
+            dropna=dropna,
+        )
+
 
 class NearestDestinations(pd.DataFrame):
     """The ``k`` nearest destinations per origin on a cost axis.
