@@ -75,3 +75,53 @@ def lorenz_vertices(values, weights):
 def polyline_area(x, y):
     """Trapezoidal area under a vertex polyline."""
     return float(np.sum(np.diff(x) * (y[1:] + y[:-1])) / 2.0)
+
+
+def _ranked(weights, values, ranking):
+    """Rows sorted ascending by the ranking key, with the maximal
+    tied-key block starts."""
+    order = np.argsort(ranking, kind="stable")
+    starts = _blocks(ranking[order])
+    return weights[order], values[order], ranking[order], starts
+
+
+def fractional_ranks(weights, ranking):
+    """Lerman–Yitzhaki weighted fractional ranks, per row: cumulative
+    weight before the row's TIED block plus half the block's weight,
+    over the total — tied ranking values share their block mid-rank."""
+    order = np.argsort(ranking, kind="stable")
+    starts = _blocks(ranking[order])
+    block_weight = np.add.reduceat(weights[order], starts)
+    before = np.concatenate(([0.0], np.cumsum(block_weight)[:-1]))
+    counts = np.diff(np.concatenate((starts, [len(order)])))
+    mid = np.repeat(before + block_weight / 2.0, counts) / weights.sum()
+    ranks = np.empty(len(order))
+    ranks[order] = mid
+    return ranks
+
+
+def concentration_vertices(values, weights, ranking):
+    """The concentration polyline: rows ascending by the ranking key,
+    ONE vertex per tied-ranking block (the block chord is the only
+    tie-invariant shape), plus the origin, as (population share,
+    value share) arrays."""
+    sorted_weights, sorted_values, _, starts = _ranked(weights, values, ranking)
+    block_weight = np.add.reduceat(sorted_weights, starts)
+    block_mass = np.add.reduceat(sorted_weights * sorted_values, starts)
+    population = np.concatenate(([0.0], np.cumsum(block_weight)))
+    mass = np.concatenate(([0.0], np.cumsum(block_mass)))
+    return population / population[-1], mass / mass[-1]
+
+
+def suits_vertices(values, weights, income):
+    """The Suits polyline: cumulative accessibility share against
+    cumulative INCOME share, one vertex per tied-income block plus
+    the origin."""
+    sorted_weights, sorted_values, sorted_income, starts = _ranked(
+        weights, values, income
+    )
+    block_income = np.add.reduceat(sorted_weights * sorted_income, starts)
+    block_mass = np.add.reduceat(sorted_weights * sorted_values, starts)
+    axis = np.concatenate(([0.0], np.cumsum(block_income)))
+    mass = np.concatenate(([0.0], np.cumsum(block_mass)))
+    return axis / axis[-1], mass / mass[-1]

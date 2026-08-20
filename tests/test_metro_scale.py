@@ -349,6 +349,11 @@ def test_equity_indices_over_a_metro_accessibility_run(
         else:
             values = [result]
         assert np.isfinite(values).all(), name
+    concentration = reachable.concentration_index(income="income", **kwargs)
+    progressivity = reachable.suits(income="income", **kwargs)
+    for extra in (concentration, progressivity):
+        column = extra.columns[-1]
+        assert np.isfinite(extra[column].to_numpy()).all()
     parts = reachable.theil_t(groups="zone", **kwargs)
     last = parts[["total", "between", "within"]].iloc[-1]
     assert last["total"] == pytest.approx(last["between"] + last["within"])

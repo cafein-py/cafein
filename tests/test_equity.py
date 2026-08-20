@@ -384,6 +384,17 @@ def test_the_accessibility_methods_delegate(network):
         assert method == pytest.approx(function)
     curve = frame.lorenz_curve(sociodemographic_data=people, population="pop")
     assert {"population_share", "value_share"} <= set(curve.columns)
+    people = people.assign(income=np.linspace(20000, 60000, len(people)))
+    ci_method = frame.concentration_index(
+        income="income", sociodemographic_data=people, population="pop"
+    )
+    ci_function = equity.concentration_index(
+        frame, income="income", sociodemographic_data=people, population="pop"
+    )
+    if isinstance(ci_method, pd.DataFrame):
+        pd.testing.assert_frame_equal(ci_method, ci_function)
+    else:
+        assert ci_method == pytest.approx(ci_function)
 
 
 def test_dropna_never_silently_loses_a_group():
@@ -806,3 +817,183 @@ def test_an_underflowed_factor_keeps_its_within_contribution():
         assert parts["total"][0] == pytest.approx(
             parts["between"][0] + parts["within"][0], rel=1e-9
         )
+
+
+def test_concentration_index_goldens_and_identities():
+    frame = _frame([1.0, 2.0, 3.0, 4.0], income=[10, 20, 30, 40])
+    # Perfect rank correlation: hand value and the covariance form.
+    ranks = np.array([1 / 8, 3 / 8, 5 / 8, 7 / 8])
+    mean = 2.5
+    covariance = float(
+        np.dot(np.full(4, 0.25), (np.arange(1, 5) - mean) * (ranks - 0.5))
+    )
+    standard = equity.concentration_index(frame, income="income")
+    assert standard == pytest.approx(0.25, rel=1e-12)
+    assert standard == pytest.approx(2.0 * covariance / mean, rel=1e-12)
+    absolute = equity.concentration_index(frame, income="income", variant="absolute")
+    assert absolute == pytest.approx(2.0 * covariance, rel=1e-12)
+    assert absolute / mean == pytest.approx(standard, rel=1e-12)
+    # The scalar integrates its own curve.
+    curve = equity.concentration_curve(frame, income="income")
+    area = _distribution.polyline_area(
+        curve["population_share"].to_numpy(), curve["value_share"].to_numpy()
+    )
+    assert standard == pytest.approx(1.0 - 2.0 * area, rel=1e-12)
+    # Pro-poor concentration flips the sign.
+    reverse = _frame([4.0, 3.0, 2.0, 1.0], income=[10, 20, 30, 40])
+    assert equity.concentration_index(reverse, income="income") == pytest.approx(
+        -0.25, rel=1e-12
+    )
+    # The absolute variant is linear in the values and delta-safe.
+    tripled = _frame([3.0, 6.0, 9.0, 12.0], income=[10, 20, 30, 40])
+    assert equity.concentration_index(
+        tripled, income="income", variant="absolute"
+    ) == pytest.approx(3.0 * absolute, rel=1e-12)
+    delta = _frame([-1.0, 2.0, -3.0, 4.0], income=[10, 20, 30, 40])
+    assert np.isfinite(
+        equity.concentration_index(delta, income="income", variant="absolute")
+    )
+    with pytest.raises(ValueError, match="absolute"):
+        equity.concentration_index(delta, income="income")
+
+
+def test_concentration_ties_collapse_to_one_chord():
+    frame = _frame([10.0, 20.0, 30.0, 40.0], income=[1, 1, 1, 2])
+    baseline = equity.concentration_index(frame, income="income")
+    baseline_curve = equity.concentration_curve(frame, income="income")
+    # One vertex per tied block: origin + tie block + the rich row.
+    assert len(baseline_curve) == 3
+    for order in ([1, 0, 2, 3], [2, 1, 0, 3]):
+        permuted = frame.iloc[order].reset_index(drop=True)
+        assert equity.concentration_index(permuted, income="income") == pytest.approx(
+            baseline, rel=1e-12
+        )
+        pd.testing.assert_frame_equal(
+            equity.concentration_curve(permuted, income="income"),
+            baseline_curve,
+        )
+
+
+def test_corrected_concentration_variants():
+    frame = _frame([1.0, 2.0, 3.0, 4.0], income=[10, 20, 30, 40])
+    standard = 0.25
+    mean = 2.5
+    erreygers = equity.concentration_index(
+        frame, income="income", variant="erreygers", bounds=(0, 10)
+    )
+    assert erreygers == pytest.approx(4.0 * mean * standard / 10.0, rel=1e-12)
+    wagstaff = equity.concentration_index(
+        frame, income="income", variant="wagstaff", bounds=(0, 10)
+    )
+    assert wagstaff == pytest.approx(
+        standard * mean * 10.0 / ((10.0 - mean) * mean), rel=1e-12
+    )
+    # One global bounds serves groups with different observed extrema.
+    grouped = pd.DataFrame(
+        {
+            "opportunity": ["a"] * 4 + ["b"] * 4,
+            "accessibility": [1.0, 2.0, 3.0, 4.0, 2.0, 4.0, 6.0, 8.0],
+            "income": [10, 20, 30, 40] * 2,
+        }
+    )
+    result = equity.concentration_index(
+        grouped, income="income", variant="erreygers", bounds=(0, 10)
+    )
+    by_group = dict(zip(result["opportunity"], result["concentration_index"]))
+    assert by_group["a"] == pytest.approx(4.0 * 2.5 * 0.25 / 10.0, rel=1e-12)
+    assert by_group["b"] == pytest.approx(4.0 * 5.0 * 0.25 / 10.0, rel=1e-12)
+
+
+def test_concentration_refusals():
+    frame = _frame([1.0, 2.0], income=[1.0, 2.0])
+    with pytest.raises(ValueError, match="requires bounds="):
+        equity.concentration_index(frame, income="income", variant="erreygers")
+    with pytest.raises(ValueError, match="serves the erreygers"):
+        equity.concentration_index(frame, income="income", bounds=(0, 10))
+    with pytest.raises(ValueError, match="lower < upper"):
+        equity.concentration_index(
+            frame, income="income", variant="wagstaff", bounds=(10, 0)
+        )
+    with pytest.raises(ValueError, match="outside bounds="):
+        equity.concentration_index(
+            frame, income="income", variant="erreygers", bounds=(0, 1.5)
+        )
+    saturated = _frame([5.0, 5.0], income=[1.0, 2.0])
+    with pytest.raises(ValueError, match="wagstaff.*undefined"):
+        equity.concentration_index(
+            saturated, income="income", variant="wagstaff", bounds=(0, 5)
+        )
+    with pytest.raises(ValueError, match="supported numeric range"):
+        equity.concentration_index(
+            frame, income="income", variant="wagstaff", bounds=(-1e308, 1e308)
+        )
+    with pytest.raises(ValueError, match="must be standard"):
+        equity.concentration_index(frame, income="income", variant="nope")
+    with pytest.raises(ValueError, match="requires income="):
+        equity.concentration_index(frame, income=None)
+
+
+def test_suits_goldens_and_domain():
+    # Access proportional to income integrates to zero.
+    proportional = _frame([1.0, 2.0, 3.0, 4.0], income=[10, 20, 30, 40])
+    assert equity.suits(proportional, income="income") == pytest.approx(0.0, abs=1e-12)
+    # Equal access against unequal income is pro-poor: hand trapezoid.
+    equal = _frame([1.0, 1.0, 1.0, 1.0], income=[10, 20, 30, 40])
+    axis = np.array([0.0, 0.1, 0.3, 0.6, 1.0])
+    mass = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+    expected = 1.0 - 2.0 * _distribution.polyline_area(axis, mass)
+    assert equity.suits(equal, income="income") == pytest.approx(expected, rel=1e-12)
+    assert expected < 0
+    # Within-tie permutation invariance (income ties, distinct values).
+    tied = _frame([10.0, 20.0, 30.0], income=[1, 1, 2])
+    baseline = equity.suits(tied, income="income")
+    permuted = tied.iloc[[1, 0, 2]].reset_index(drop=True)
+    assert equity.suits(permuted, income="income") == pytest.approx(baseline, rel=1e-12)
+    with pytest.raises(ValueError, match="non-negative incomes"):
+        equity.suits(_frame([1.0, 2.0], income=[-1.0, 2.0]), income="income")
+    with pytest.raises(ValueError, match="positive weighted income total"):
+        equity.suits(_frame([1.0, 2.0], income=[0.0, 0.0]), income="income")
+
+
+def test_concentration_family_shares_the_calling_convention():
+    weighted = _frame([1.0, 2.0, 5.0], [1.0, 2.0, 1.0], income=[3.0, 2.0, 1.0])
+    duplicated = _frame([1.0, 2.0, 2.0, 5.0], income=[3.0, 2.0, 2.0, 1.0])
+    for call in (
+        lambda f, **kw: equity.concentration_index(f, income="income", **kw),
+        lambda f, **kw: equity.concentration_index(
+            f, income="income", variant="absolute", **kw
+        ),
+        lambda f, **kw: equity.concentration_index(
+            f, income="income", variant="erreygers", bounds=(0, 10), **kw
+        ),
+        lambda f, **kw: equity.concentration_index(
+            f, income="income", variant="wagstaff", bounds=(0, 10), **kw
+        ),
+        lambda f, **kw: equity.suits(f, income="income", **kw),
+    ):
+        assert call(weighted, population="pop") == pytest.approx(
+            call(duplicated), rel=1e-12
+        )
+    # The duplicated row shares its income, so it merges into the same
+    # tied block: the curve FRAMES are exactly equal.
+    pd.testing.assert_frame_equal(
+        equity.concentration_curve(weighted, income="income", population="pop"),
+        equity.concentration_curve(duplicated, income="income"),
+    )
+    # NaN income drops its row, weight included.
+    with_nan = _frame([1.0, 2.0, 9.0], income=[1.0, 2.0, np.nan])
+    assert equity.concentration_index(with_nan, income="income") == pytest.approx(
+        equity.concentration_index(
+            _frame([1.0, 2.0], income=[1.0, 2.0]), income="income"
+        )
+    )
+    # Grouped fan-out carries the identifier columns.
+    grouped = pd.DataFrame(
+        {
+            "budget": [30.0, 30.0, 60.0, 60.0],
+            "accessibility": [1.0, 2.0, 3.0, 4.0],
+            "income": [1.0, 2.0, 1.0, 2.0],
+        }
+    )
+    result = equity.suits(grouped, income="income")
+    assert list(result.columns) == ["budget", "suits"]

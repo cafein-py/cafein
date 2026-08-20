@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `cafein.equity` gains the concentration family:
+  `concentration_index` (`standard`, the bounded-outcome corrections
+  `erreygers`/`wagstaff` via a required `bounds=`, and the
+  difference-frame-safe `absolute`), the `suits` progressivity
+  index, and `concentration_curve` — as functions and
+  `Accessibility` methods.
+  ([#291](https://github.com/cafein-py/cafein/pull/291))
+
 - `cafein.equity`: population-weighted inequality indices over
   accessibility distributions, IPEA-style — `gini_index`,
   `share_ratio` (with the `palma_ratio` preset), `generalized_entropy`
