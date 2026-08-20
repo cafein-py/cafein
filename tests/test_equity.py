@@ -395,6 +395,21 @@ def test_the_accessibility_methods_delegate(network):
         pd.testing.assert_frame_equal(ci_method, ci_function)
     else:
         assert ci_method == pytest.approx(ci_function)
+    fgt_method = frame.fgt_poverty(
+        poverty_line="60% of median",
+        sociodemographic_data=people,
+        population="pop",
+    )
+    fgt_function = equity.fgt_poverty(
+        frame,
+        poverty_line="60% of median",
+        sociodemographic_data=people,
+        population="pop",
+    )
+    if isinstance(fgt_method, pd.DataFrame):
+        pd.testing.assert_frame_equal(fgt_method, fgt_function)
+    else:
+        assert fgt_method == pytest.approx(fgt_function)
 
 
 def test_dropna_never_silently_loses_a_group():
@@ -997,3 +1012,226 @@ def test_concentration_family_shares_the_calling_convention():
     )
     result = equity.suits(grouped, income="income")
     assert list(result.columns) == ["budget", "suits"]
+
+
+def test_fgt_goldens_on_both_tails():
+    frame = _frame([1.0, 2.0, 3.0, 4.0])
+    assert equity.fgt_poverty(frame, poverty_line=2.5) == pytest.approx(0.5)
+    assert equity.fgt_poverty(frame, poverty_line=2.5, alpha=1) == pytest.approx(
+        (1.5 / 2.5 + 0.5 / 2.5) / 4.0, rel=1e-12
+    )
+    assert equity.fgt_poverty(frame, poverty_line=2.5, alpha=2) == pytest.approx(
+        ((1.5 / 2.5) ** 2 + (0.5 / 2.5) ** 2) / 4.0, rel=1e-12
+    )
+    above = equity.fgt_poverty(frame, poverty_line=2.5, deprived="above", alpha=1)
+    assert above == pytest.approx((0.5 / 2.5 + 1.5 / 2.5) / 4.0, rel=1e-12)
+    # A value exactly on the line is not poor, on either tail.
+    boundary = _frame([2.5, 4.0])
+    assert equity.fgt_poverty(boundary, poverty_line=2.5) == 0.0
+    assert (
+        equity.fgt_poverty(_frame([1.0, 2.5]), poverty_line=2.5, deprived="above")
+        == 0.0
+    )
+
+
+def test_relative_poverty_lines_use_the_weighted_median_per_group():
+    frame = _frame([1.0, 2.0, 3.0, 4.0])
+    # The type-1 weighted median is 2, so the line is 1.2: one poor row.
+    assert equity.fgt_poverty(frame, poverty_line="60% of median") == pytest.approx(
+        0.25
+    )
+    grouped = pd.DataFrame(
+        {
+            "opportunity": ["a"] * 4 + ["b"] * 4,
+            "accessibility": [1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0],
+        }
+    )
+    result = equity.fgt_poverty(grouped, poverty_line="60% of median")
+    # Each group draws its own line, so the scaled group matches.
+    assert result["fgt_poverty"].tolist() == pytest.approx([0.25, 0.25])
+    with pytest.raises(ValueError, match="60% of median"):
+        equity.fgt_poverty(frame, poverty_line="median times 0.6")
+    with pytest.raises(ValueError, match="strictly positive poverty line"):
+        equity.fgt_poverty(frame, poverty_line=-1.0)
+    with pytest.raises(ValueError, match="at most 1e6"):
+        equity.fgt_poverty(frame, poverty_line=1.0, alpha=-1)
+    with pytest.raises(ValueError, match='"below" or "above"'):
+        equity.fgt_poverty(frame, poverty_line=1.0, deprived="under")
+
+
+def test_cost_burden_golden_and_detail():
+    frame = pd.DataFrame(
+        {
+            "from_id": ["a", "b"],
+            "spend": [10.0, 30.0],
+            "earnings": [100.0, 100.0],
+        }
+    )
+    result = equity.cost_burden(frame, cost="spend", income="earnings")
+    assert isinstance(result, pd.DataFrame) and len(result) == 1
+    # Strictly above the 10 % rule: the 0.1 burden is not burdened.
+    assert result["cost_burden"][0] == pytest.approx(0.5)
+    assert result["mean_burden"][0] == pytest.approx(0.2)
+    detail = equity.cost_burden(frame, cost="spend", income="earnings", detail=True)
+    assert detail["burden"].tolist() == pytest.approx([0.1, 0.3])
+    assert detail["cost_burdened"].tolist() == [False, True]
+    assert detail["from_id"].tolist() == ["a", "b"]
+    with pytest.raises(ValueError, match="strictly positive incomes.*b"):
+        equity.cost_burden(
+            frame.assign(earnings=[100.0, 0.0]), cost="spend", income="earnings"
+        )
+    with pytest.raises(ValueError, match="non-negative costs"):
+        equity.cost_burden(
+            frame.assign(spend=[-1.0, 30.0]), cost="spend", income="earnings"
+        )
+
+
+def test_residual_income_is_per_origin():
+    frame = pd.DataFrame(
+        {
+            "from_id": ["a", "b"],
+            "spend": [10.0, 130.0],
+            "earnings": [100.0, 100.0],
+        }
+    )
+    result = equity.residual_income(frame, cost="spend", income="earnings")
+    assert result["residual_income"].tolist() == pytest.approx([90.0, -30.0])
+    assert result["from_id"].tolist() == ["a", "b"]
+    # A negative cost — a subsidy — is legal here (only the burden
+    # ratios require non-negative costs) and raises the residual.
+    subsidised = equity.residual_income(
+        frame.assign(spend=[-10.0, 130.0]), cost="spend", income="earnings"
+    )
+    assert subsidised["residual_income"].tolist() == pytest.approx([110.0, -30.0])
+    # Grouping by from_id itself never duplicates the carried column.
+    keyed = equity.residual_income(
+        frame, cost="spend", income="earnings", group_columns=["from_id"]
+    )
+    assert list(keyed.columns) == ["from_id", "residual_income"]
+
+
+def test_lihc_goldens():
+    frame = pd.DataFrame(
+        {
+            "spend": [10.0, 30.0, 20.0, 40.0],
+            "earnings": [100.0, 50.0, 100.0, 60.0],
+        }
+    )
+    result = equity.lihc(frame, cost="spend", income="earnings", poverty_line=25.0)
+    # Median cost (type-1) is 20; residuals [90, 20, 80, 20].
+    assert result["lihc"][0] == pytest.approx(0.5)
+    assert result["high_costs"][0] == pytest.approx(0.5)
+    assert result["low_residual"][0] == pytest.approx(0.5)
+    relative = equity.lihc(
+        frame, cost="spend", income="earnings", poverty_line="60% of median"
+    )
+    # 60 % of the median residual (20) is 12: nobody sits below it.
+    assert relative["lihc"][0] == 0.0
+    assert relative["low_residual"][0] == 0.0
+    detail = equity.lihc(
+        frame, cost="spend", income="earnings", poverty_line=25.0, detail=True
+    )
+    assert detail["lihc"].tolist() == [False, True, False, True]
+    assert detail["costs_above_median"].tolist() == [False, True, False, True]
+    # A relative line against a negative median residual refuses.
+    broke = frame.assign(earnings=[15.0, 25.0, 15.0, 30.0])
+    with pytest.raises(ValueError, match="inherits the sign"):
+        equity.lihc(
+            broke, cost="spend", income="earnings", poverty_line="60% of median"
+        )
+
+
+def test_poverty_family_shares_the_calling_convention():
+    weighted = _frame([1.0, 2.0, 5.0], [1.0, 2.0, 1.0])
+    duplicated = _frame([1.0, 2.0, 2.0, 5.0])
+    for kwargs in ({"alpha": 0}, {"alpha": 1}, {"alpha": 2}):
+        assert equity.fgt_poverty(
+            weighted, poverty_line=2.5, population="pop", **kwargs
+        ) == pytest.approx(
+            equity.fgt_poverty(duplicated, poverty_line=2.5, **kwargs), rel=1e-12
+        )
+    burdened = pd.DataFrame(
+        {
+            "budget": [30.0, 30.0, 60.0, 60.0],
+            "spend": [10.0, 30.0, 10.0, 30.0],
+            "earnings": [100.0, 100.0, 50.0, 50.0],
+        }
+    )
+    result = equity.cost_burden(burdened, cost="spend", income="earnings")
+    assert list(result.columns) == ["budget", "cost_burden", "mean_burden"]
+    assert len(result) == 2
+    # Negative accessibility values refuse with the delta guidance.
+    with pytest.raises(ValueError, match="kolm"):
+        equity.fgt_poverty(_frame([-1.0, 2.0]), poverty_line=1.0)
+
+
+def test_the_burden_family_weighting_and_missing_data():
+    weighted = pd.DataFrame(
+        {
+            "spend": [10.0, 30.0, 40.0],
+            "earnings": [100.0, 100.0, 50.0],
+            "pop": [1.0, 2.0, 1.0],
+        }
+    )
+    duplicated = pd.DataFrame(
+        {
+            "spend": [10.0, 30.0, 30.0, 40.0],
+            "earnings": [100.0, 100.0, 100.0, 50.0],
+        }
+    )
+    pd.testing.assert_frame_equal(
+        equity.cost_burden(weighted, cost="spend", income="earnings", population="pop"),
+        equity.cost_burden(duplicated, cost="spend", income="earnings"),
+    )
+    pd.testing.assert_frame_equal(
+        equity.lihc(
+            weighted,
+            cost="spend",
+            income="earnings",
+            poverty_line=65.0,
+            population="pop",
+        ),
+        equity.lihc(duplicated, cost="spend", income="earnings", poverty_line=65.0),
+    )
+    # Hand-checked weighted summary: burdens [0.1, 0.3, 0.8] with
+    # weights [1, 2, 1] -> strict-10% headcount 3/4, mean 0.375.
+    summary = equity.cost_burden(
+        weighted, cost="spend", income="earnings", population="pop"
+    )
+    assert summary["cost_burden"][0] == pytest.approx(0.75)
+    assert summary["mean_burden"][0] == pytest.approx(
+        (0.1 + 2 * 0.3 + 0.8) / 4.0, rel=1e-12
+    )
+    # A NaN cost or income drops its row, weight included, from every
+    # burden computation.
+    with_nan_cost = weighted.assign(spend=[10.0, np.nan, 40.0])
+    trimmed = pd.DataFrame(
+        {"spend": [10.0, 40.0], "earnings": [100.0, 50.0], "pop": [1.0, 1.0]}
+    )
+    pd.testing.assert_frame_equal(
+        equity.cost_burden(
+            with_nan_cost, cost="spend", income="earnings", population="pop"
+        ),
+        equity.cost_burden(trimmed, cost="spend", income="earnings", population="pop"),
+    )
+    with_nan_income = weighted.assign(earnings=[100.0, np.nan, 50.0])
+    assert (
+        len(equity.residual_income(with_nan_income, cost="spend", income="earnings"))
+        == 2
+    )
+    pd.testing.assert_frame_equal(
+        equity.lihc(
+            with_nan_income,
+            cost="spend",
+            income="earnings",
+            poverty_line=65.0,
+            population="pop",
+        ),
+        equity.lihc(
+            trimmed,
+            cost="spend",
+            income="earnings",
+            poverty_line=65.0,
+            population="pop",
+        ),
+    )

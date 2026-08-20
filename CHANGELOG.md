@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `cafein.equity` gains the transport-poverty measures: `fgt_poverty`
+  (both deprivation tails, absolute or `"60% of median"` lines),
+  `cost_burden` (the 10 % rule), `residual_income`, and `lihc` (the
+  Low Income, High Costs adaptation) — as functions and
+  `Accessibility` methods, with `detail=True` per-origin frames.
+  ([#292](https://github.com/cafein-py/cafein/pull/292))
+
 - `cafein.equity` gains the concentration family:
   `concentration_index` (`standard`, the bounded-outcome corrections
   `erreygers`/`wagstaff` via a required `bounds=`, and the

@@ -349,6 +349,27 @@ def test_equity_indices_over_a_metro_accessibility_run(
         else:
             values = [result]
         assert np.isfinite(values).all(), name
+    people["transport_cost"] = rng.uniform(50, 400, len(people))
+    identifiers = {"opportunity", "budget"}
+    burden = reachable.cost_burden(cost="transport_cost", income="income", **kwargs)
+    assert identifiers <= set(burden.columns) and len(burden) == 1
+    assert np.isfinite(burden[["cost_burden", "mean_burden"]].to_numpy()).all()
+    residual = reachable.residual_income(
+        cost="transport_cost", income="income", **kwargs
+    )
+    assert len(residual) == len(reachable)
+    assert np.isfinite(residual["residual_income"].to_numpy()).all()
+    hardship = reachable.lihc(
+        cost="transport_cost", income="income", poverty_line=10000.0, **kwargs
+    )
+    assert identifiers <= set(hardship.columns) and len(hardship) == 1
+    assert np.isfinite(
+        hardship[["lihc", "high_costs", "low_residual"]].to_numpy()
+    ).all()
+    poverty = reachable.fgt_poverty(poverty_line="60% of median", **kwargs)
+    assert isinstance(poverty, pd.DataFrame)
+    assert identifiers <= set(poverty.columns) and len(poverty) == 1
+    assert np.isfinite(poverty["fgt_poverty"].to_numpy()).all()
     concentration = reachable.concentration_index(income="income", **kwargs)
     progressivity = reachable.suits(income="income", **kwargs)
     for extra in (concentration, progressivity):
