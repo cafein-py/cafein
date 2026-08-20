@@ -1778,6 +1778,110 @@ class Accessibility(pd.DataFrame):
             dropna=dropna,
         )
 
+    def fgt_poverty(
+        self,
+        *,
+        poverty_line,
+        alpha=0,
+        deprived="below",
+        value="accessibility",
+        sociodemographic_data=None,
+        population=None,
+        group_columns=None,
+        dropna=False,
+    ):
+        """``cafein.equity.fgt_poverty`` over this frame."""
+        from cafein import equity
+
+        return equity.fgt_poverty(
+            self,
+            poverty_line=poverty_line,
+            alpha=alpha,
+            deprived=deprived,
+            value=value,
+            sociodemographic_data=sociodemographic_data,
+            population=population,
+            group_columns=group_columns,
+            dropna=dropna,
+        )
+
+    def cost_burden(
+        self,
+        *,
+        cost,
+        income,
+        threshold=0.10,
+        detail=False,
+        sociodemographic_data=None,
+        population=None,
+        group_columns=None,
+        dropna=False,
+    ):
+        """``cafein.equity.cost_burden`` over this frame."""
+        from cafein import equity
+
+        return equity.cost_burden(
+            self,
+            cost=cost,
+            income=income,
+            threshold=threshold,
+            detail=detail,
+            sociodemographic_data=sociodemographic_data,
+            population=population,
+            group_columns=group_columns,
+            dropna=dropna,
+        )
+
+    def residual_income(
+        self,
+        *,
+        cost,
+        income,
+        sociodemographic_data=None,
+        population=None,
+        group_columns=None,
+        dropna=False,
+    ):
+        """``cafein.equity.residual_income`` over this frame."""
+        from cafein import equity
+
+        return equity.residual_income(
+            self,
+            cost=cost,
+            income=income,
+            sociodemographic_data=sociodemographic_data,
+            population=population,
+            group_columns=group_columns,
+            dropna=dropna,
+        )
+
+    def lihc(
+        self,
+        *,
+        cost,
+        income,
+        poverty_line,
+        detail=False,
+        sociodemographic_data=None,
+        population=None,
+        group_columns=None,
+        dropna=False,
+    ):
+        """``cafein.equity.lihc`` over this frame."""
+        from cafein import equity
+
+        return equity.lihc(
+            self,
+            cost=cost,
+            income=income,
+            poverty_line=poverty_line,
+            detail=detail,
+            sociodemographic_data=sociodemographic_data,
+            population=population,
+            group_columns=group_columns,
+            dropna=dropna,
+        )
+
 
 class NearestDestinations(pd.DataFrame):
     """The ``k`` nearest destinations per origin on a cost axis.

@@ -40,6 +40,8 @@ and refuse; ``kolm`` (translation-invariant) and
 ``concentration_index(variant="absolute")`` are the Δ-safe readings.
 """
 
+import re
+
 import numpy as np
 import pandas as pd
 
@@ -1005,3 +1007,293 @@ def suits(
         return {"suits": float(1.0 - 2.0 * _distribution.polyline_area(axis, mass))}
 
     return _fan_out(frame, groups, compute, ["suits"])
+
+
+_RELATIVE_LINE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*%\s*of\s*median\s*$", re.I)
+
+
+def _resolved_poverty_line(name, specification, values, weights):
+    """A poverty line as a number, or the relative convention
+    ``"60% of median"`` against the population-weighted (type-1)
+    median of THIS distribution — per identifier group, so a grouped
+    call draws each group's own relative line."""
+    if isinstance(specification, str):
+        match = _RELATIVE_LINE.match(specification)
+        if match is None:
+            raise ValueError(
+                f'{name} poverty_line strings take the form "60% of median"'
+            )
+        line = (
+            float(match.group(1))
+            / 100.0
+            * _distribution.weighted_median(values, weights)
+        )
+    else:
+        try:
+            line = float(specification)
+        except (TypeError, ValueError, OverflowError):
+            line = float("nan")
+    if not np.isfinite(line) or line <= 0 or line > 1e75:
+        raise ValueError(
+            f"{name} needs a strictly positive poverty line inside the "
+            "supported numeric range; a relative line inherits the sign "
+            "of its median"
+        )
+    return line
+
+
+def fgt_poverty(
+    data,
+    *,
+    poverty_line,
+    alpha=0,
+    deprived="below",
+    value="accessibility",
+    sociodemographic_data=None,
+    population=None,
+    group_columns=None,
+    dropna=False,
+):
+    """The Foster–Greer–Thorbecke poverty measure FGT(α) — ``alpha=0``
+    the headcount ratio, ``1`` the poverty gap, ``2`` its severity.
+
+    ``deprived`` states the tail: ``"below"`` (poor when the value
+    falls short of the line, normalized gap ``(line − value)/line``)
+    or ``"above"`` (poor when the value exceeds it, gap
+    ``(value − line)/line``), both censored at zero — a value exactly
+    on the line is not poor. ``poverty_line`` is absolute in the
+    value's own units, or relative as ``"60% of median"``."""
+    try:
+        alpha = float(alpha)
+    except (OverflowError, TypeError):
+        alpha = float("inf")
+    if not np.isfinite(alpha) or alpha < 0 or alpha > 1e6:
+        raise ValueError("alpha must be a non-negative number at most 1e6")
+    if deprived not in ("below", "above"):
+        raise ValueError('deprived must be "below" or "above"')
+    frame, groups, weight = _prepared(
+        "fgt_poverty",
+        data,
+        value,
+        sociodemographic_data,
+        population,
+        group_columns,
+        dropna,
+    )
+
+    def compute(part):
+        values, weights = _values_weights(part, value, weight)
+        if (values < 0).any():
+            raise ValueError(_NEGATIVE_MESSAGE.format(name="fgt_poverty"))
+        line = _resolved_poverty_line("fgt_poverty", poverty_line, values, weights)
+        signed = line - values if deprived == "below" else values - line
+        gap = np.maximum(signed / line, 0.0)
+        share = weights / weights.sum()
+        if alpha == 0:
+            return {"fgt_poverty": float(np.dot(share, gap > 0))}
+        return {"fgt_poverty": float(np.dot(share, gap**alpha))}
+
+    return _fan_out(frame, groups, compute, ["fgt_poverty"])
+
+
+def _burden_inputs(name, part, cost, income, weight, non_negative_costs=True):
+    costs = part[cost].to_numpy(dtype=float)
+    incomes = part[income].to_numpy(dtype=float)
+    weights = part[weight].to_numpy(dtype=float)
+    weights = weights / weights.max()
+    if (weights == 0).any():
+        raise ValueError("population weights span too wide a range to compute together")
+    if non_negative_costs and (costs < 0).any():
+        raise ValueError(f"{name} needs non-negative costs in {cost!r}")
+    bad = incomes <= 0
+    if bad.any():
+        rows = (
+            part.loc[bad, "from_id"].unique()[:5]
+            if "from_id" in part.columns
+            else part.index[bad][:5]
+        )
+        shown = ", ".join(map(str, rows))
+        raise ValueError(
+            f"{name} needs strictly positive incomes in {income!r}; "
+            f"{int(bad.sum())} row(s) violate that (e.g. {shown}) — "
+            "bottom-coding or excluding them is a pre-processing decision"
+        )
+    return costs, incomes, weights
+
+
+def _per_origin(part, groups, computed):
+    """A per-origin result frame: the origin ids and identifier
+    columns beside the computed columns."""
+    carried = list(
+        dict.fromkeys([c for c in ("from_id",) if c in part.columns] + list(groups))
+    )
+    collisions = set(carried) & set(computed)
+    if collisions:
+        raise ValueError(
+            "group_columns collide with the result column(s): "
+            + ", ".join(sorted(collisions))
+        )
+    frame = part[carried].reset_index(drop=True)
+    for column, values in computed.items():
+        frame[column] = values
+    return frame
+
+
+def cost_burden(
+    data,
+    *,
+    cost,
+    income,
+    threshold=0.10,
+    detail=False,
+    sociodemographic_data=None,
+    population=None,
+    group_columns=None,
+    dropna=False,
+):
+    """The transport cost burden — each origin's cost as a share of
+    its income. Returns the population-weighted headcount STRICTLY
+    above ``threshold`` (the classic 10 % rule) and the weighted mean
+    burden per identifier group; ``detail=True`` returns the
+    per-origin frame (``burden``, ``cost_burdened``) instead."""
+    try:
+        threshold = float(threshold)
+    except (OverflowError, TypeError):
+        threshold = float("inf")
+    if not np.isfinite(threshold) or threshold <= 0 or threshold > 1e6:
+        raise ValueError("threshold must be a positive share at most 1e6")
+    frame, groups, weight = _prepared(
+        "cost_burden",
+        data,
+        cost,
+        sociodemographic_data,
+        population,
+        group_columns,
+        dropna,
+        consumed=(income,),
+    )
+    if detail:
+        costs, incomes, _ = _burden_inputs("cost_burden", frame, cost, income, weight)
+        burden = costs / incomes
+        return _per_origin(
+            frame,
+            groups,
+            {"burden": burden, "cost_burdened": burden > threshold},
+        )
+
+    def compute(part):
+        costs, incomes, weights = _burden_inputs(
+            "cost_burden", part, cost, income, weight
+        )
+        burden = costs / incomes
+        share = weights / weights.sum()
+        return {
+            "cost_burden": float(np.dot(share, burden > threshold)),
+            "mean_burden": float(np.dot(share, burden)),
+        }
+
+    return _fan_out(frame, groups, compute, ["cost_burden", "mean_burden"])
+
+
+def residual_income(
+    data,
+    *,
+    cost,
+    income,
+    sociodemographic_data=None,
+    population=None,
+    group_columns=None,
+    dropna=False,
+):
+    """Income left after required transport costs, per origin — the
+    continuous companion to :func:`lihc`. Inherently a per-origin
+    frame; residuals may legitimately be negative."""
+    frame, groups, weight = _prepared(
+        "residual_income",
+        data,
+        cost,
+        sociodemographic_data,
+        population,
+        group_columns,
+        dropna,
+        consumed=(income,),
+    )
+    # A negative cost (a subsidy) is a legal residual-income input;
+    # only the burden ratios require non-negative costs.
+    costs, incomes, _ = _burden_inputs(
+        "residual_income", frame, cost, income, weight, non_negative_costs=False
+    )
+    return _per_origin(frame, groups, {"residual_income": incomes - costs})
+
+
+def lihc(
+    data,
+    *,
+    cost,
+    income,
+    poverty_line,
+    detail=False,
+    sociodemographic_data=None,
+    population=None,
+    group_columns=None,
+    dropna=False,
+):
+    """The Low Income, High Costs indicator in its transport
+    adaptation: an origin is transport-poor only if its required
+    costs sit STRICTLY above the population-weighted median cost AND
+    its residual income after them falls strictly below
+    ``poverty_line`` (a number, or ``"60% of median"`` of the
+    residual-income distribution). Returns the weighted headcount and
+    the two marginal rates per identifier group; ``detail=True``
+    returns the per-origin quadrant classification instead."""
+    frame, groups, weight = _prepared(
+        "lihc",
+        data,
+        cost,
+        sociodemographic_data,
+        population,
+        group_columns,
+        dropna,
+        consumed=(income,),
+    )
+
+    def classify(part):
+        costs, incomes, weights = _burden_inputs("lihc", part, cost, income, weight)
+        residual = incomes - costs
+        line = _resolved_poverty_line("lihc", poverty_line, residual, weights)
+        high = costs > _distribution.weighted_median(costs, weights)
+        low = residual < line
+        return high, low, weights
+
+    if detail:
+        grouped = (
+            frame.groupby(groups, dropna=False, observed=True, sort=True)
+            if groups
+            else [((), frame)]
+        )
+        parts = []
+        for _, part in grouped:
+            high, low, _ = classify(part)
+            parts.append(
+                _per_origin(
+                    part,
+                    groups,
+                    {
+                        "costs_above_median": high,
+                        "residual_below_line": low,
+                        "lihc": high & low,
+                    },
+                )
+            )
+        return pd.concat(parts, ignore_index=True)
+
+    def compute(part):
+        high, low, weights = classify(part)
+        share = weights / weights.sum()
+        return {
+            "lihc": float(np.dot(share, high & low)),
+            "high_costs": float(np.dot(share, high)),
+            "low_residual": float(np.dot(share, low)),
+        }
+
+    return _fan_out(frame, groups, compute, ["lihc", "high_costs", "low_residual"])
