@@ -1,0 +1,805 @@
+"""Equity indices over accessibility distributions.
+
+Frame-in functions following the IPEA ``{accessibility}`` package's
+inequality-and-poverty toolbox: pass an :class:`~cafein.Accessibility`
+frame (or any frame with a per-origin value column), optionally a
+sociodemographic table joined on the origin ids, and read the
+population-weighted index back — a plain float, or a tidy frame with
+one row per identifier group (``opportunity``, ``budget``,
+``percentile``) when the input carries several distributions at once.
+The same functions are exposed as methods on ``Accessibility``.
+
+The indices are descriptive: they state how access is distributed,
+not whether that distribution is just — the normative judgment enters
+through the parameters (the Atkinson ``epsilon``, poverty lines,
+cutoffs). For choosing them, see the transport-justice literature
+(Martens 2016; Pereira, Schwanen & Banister 2017).
+
+Scenario differences ride the same functions. Build the Δ frame with
+a keyed merge — never positional subtraction, which misaligns rows
+and corrupts identifier columns::
+
+    keys = ["from_id", "opportunity", "budget"]  # + "percentile" when windowed
+    merged = before.merge(
+        after,
+        on=keys,
+        suffixes=("_before", "_after"),
+        how="outer",
+        indicator=True,
+        validate="one_to_one",
+    )
+    if (merged["_merge"] != "both").any():
+        raise ValueError("the scenarios cover different origins")
+    delta = merged[keys].copy()
+    delta["accessibility"] = (
+        merged["accessibility_after"] - merged["accessibility_before"]
+    )
+
+Most indices are undefined on the negative values a Δ frame carries
+and refuse; ``kolm`` (translation-invariant) and
+``concentration_index(variant="absolute")`` are the Δ-safe readings.
+"""
+
+import numpy as np
+import pandas as pd
+
+from cafein import _distribution
+
+_IDENTIFIER_COLUMNS = ("opportunity", "budget", "percentile")
+
+_NEGATIVE_MESSAGE = (
+    "{name} needs non-negative values; for difference frames use the "
+    "delta-safe readings, kolm or concentration_index(variant='absolute')"
+)
+_ZERO_MESSAGE = (
+    "{name} needs strictly positive values and the distribution "
+    "contains zeros; gini_index tolerates zeros"
+)
+
+
+def _column_list(frame, columns, label):
+    if isinstance(columns, str):
+        raise TypeError(
+            f"{label} takes a list of column names, not the bare " f"string {columns!r}"
+        )
+    columns = list(columns)
+    for column in columns:
+        if column not in frame.columns:
+            raise ValueError(f"{label} names a missing column: {column!r}")
+    return columns
+
+
+def _joined(data, sociodemographic_data):
+    """The left join onto ``from_id`` and its matched mask; dropping
+    the unmatched rows is the caller's decision, taken only after the
+    expected identifier groups are captured."""
+    if not isinstance(data, pd.DataFrame):
+        raise TypeError("data must be a DataFrame")
+    if sociodemographic_data is None:
+        return data, np.ones(len(data), dtype=bool)
+    if not isinstance(sociodemographic_data, pd.DataFrame):
+        raise TypeError("sociodemographic_data must be a DataFrame")
+    key = "id" if "id" in sociodemographic_data.columns else "from_id"
+    if key not in sociodemographic_data.columns:
+        raise ValueError("sociodemographic_data needs an id or from_id column")
+    if "from_id" not in data.columns:
+        raise ValueError("data needs a from_id column to join sociodemographic_data")
+    payload = sociodemographic_data.columns.difference([key])
+    overlap = payload.intersection(data.columns)
+    if len(overlap):
+        raise ValueError(
+            "sociodemographic_data columns already exist in data: "
+            + ", ".join(map(str, overlap))
+        )
+    table = sociodemographic_data.rename(columns={key: "from_id"})
+    joined = data.merge(table, on="from_id", how="left", validate="m:1")
+    matched = data["from_id"].isin(table["from_id"]).to_numpy()
+    return joined, matched
+
+
+def _as_float(name, column, series):
+    """Loss-aware float conversion: an object payload (Decimal, big
+    int) beyond float64 either raises on conversion or collapses a
+    nonzero to zero — both are the envelope refusal, never silence."""
+    try:
+        array = series.to_numpy(dtype=float, na_value=np.nan)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"{name} needs the nonzero magnitudes in {column!r} inside "
+            "the supported numeric range (1e-75 to 1e75)"
+        ) from error
+    if series.dtype == object:
+        collapsed = (array == 0) & series.notna().to_numpy()
+        if collapsed.any() and (series[collapsed] != 0).any():
+            raise ValueError(
+                f"{name} needs the nonzero magnitudes in {column!r} inside "
+                "the supported numeric range (1e-75 to 1e75)"
+            )
+    return array
+
+
+def _prepared(
+    name,
+    data,
+    value,
+    sociodemographic_data,
+    population,
+    group_columns,
+    dropna,
+    consumed=(),
+    labels=(),
+):
+    """Join, validate, and complete-case filter the input.
+
+    Returns ``(frame, group columns, weight column)``: the frame
+    carries the consumed columns plus a collision-proof float weight
+    column, rescaled by its maximum so arbitrarily large legal
+    weights never overflow a reduction. A row with NaN in ANY
+    consumed column is dropped, its weight leaving every denominator
+    with it; an infinite value in a numeric column refuses. No
+    identifier group may end empty, whatever removed its rows.
+    """
+    frame, matched = _joined(data, sociodemographic_data)
+    if group_columns is None:
+        # Identifiers come from the VALUE frame: an unrelated
+        # sociodemographic column named like one must not regroup.
+        groups = [c for c in _IDENTIFIER_COLUMNS if c in data.columns]
+    else:
+        groups = _column_list(frame, group_columns, "group_columns")
+    numeric = [value]
+    if population is not None:
+        numeric.append(population)
+    numeric += [c for c in consumed if c is not None]
+    label_columns = [c for c in labels if c is not None]
+    for column in dict.fromkeys(numeric + label_columns):
+        if column not in frame.columns:
+            raise ValueError(f"{name} needs the column {column!r}")
+    if not matched.all() and not dropna:
+        missing = frame.loc[~matched, "from_id"].unique()
+        shown = ", ".join(map(str, missing[:5]))
+        raise ValueError(
+            f"sociodemographic_data misses {len(missing)} origin "
+            f"id(s): {shown}"
+            + ("…" if len(missing) > 5 else "")
+            + "; pass dropna=True to drop them"
+        )
+    if not matched.all():
+        frame = frame[matched]
+    # Groups named by the VALUE frame are protected across a dropna
+    # join-drop (their expected set enumerates from the value frame
+    # itself); groups living in the joined payload are meaningless on
+    # unmatched rows and enumerate after the sanctioned drop. A NaN
+    # group label is missing data — excluded like every other
+    # missing consumed column, never an implicit group.
+    expected = None
+    if groups:
+        source = data if all(c in data.columns for c in groups) else frame
+        labeled = source
+        for column in groups:
+            labeled = labeled[labeled[column].notna()]
+        expected = list(
+            labeled.groupby(groups, dropna=False, observed=True, sort=True).groups
+        )
+    weight_column = "__cafein_weight__"
+    while weight_column in frame.columns:
+        weight_column += "_"
+    for column in dict.fromkeys(numeric):
+        if pd.api.types.is_complex_dtype(frame[column]):
+            raise ValueError(f"{name} needs real values in {column!r}")
+    if population is None:
+        weight = np.ones(len(frame))
+    else:
+        weight = _as_float(name, population, frame[population])
+        finite = weight[~np.isnan(weight)]
+        if ((finite < 0) | np.isinf(finite)).any():
+            raise ValueError(
+                "population weights must be finite and non-negative; "
+                "a NaN weight is missing data and drops its row"
+            )
+    frame = frame.assign(**{weight_column: weight})
+    kept = frame[weight_column] > 0
+    for column in dict.fromkeys(numeric + label_columns + groups):
+        kept &= frame[column].notna().to_numpy()
+    filtered = frame[kept]
+    converted = {}
+    for column in dict.fromkeys(numeric):
+        converted[column] = _as_float(name, column, filtered[column])
+        magnitudes = np.abs(converted[column])
+        if np.isinf(magnitudes).any():
+            raise ValueError(f"{name} needs finite values in {column!r}")
+        nonzero = magnitudes[magnitudes > 0]
+        if len(nonzero) and (nonzero.min() < 1e-75 or nonzero.max() > 1e75):
+            raise ValueError(
+                f"{name} needs the nonzero magnitudes in {column!r} inside "
+                "the supported numeric range (1e-75 to 1e75)"
+            )
+    filtered = filtered.assign(**converted)
+    if not len(filtered):
+        raise ValueError(
+            f"{name} has no usable rows left after excluding missing "
+            "and zero-weight rows"
+        )
+    if groups:
+        left = set(
+            filtered.groupby(groups, dropna=False, observed=True, sort=True).groups
+        )
+        lost = [key for key in expected if key not in left]
+        if lost:
+            raise ValueError(
+                f"{name} has no usable rows left in the group "
+                f"{lost[0]!r} after excluding missing and zero-weight rows"
+            )
+    return filtered, groups, weight_column
+
+
+def _fan_out(frame, groups, compute, columns):
+    """Run ``compute`` per identifier group.
+
+    Single-result measures (one column) return a float for an
+    ungrouped frame; every multi-result summary returns a one-row
+    frame instead. Grouped inputs return one row per group.
+    """
+    collisions = set(groups) & set(columns)
+    if collisions:
+        raise ValueError(
+            "group_columns collide with the result column(s): "
+            + ", ".join(sorted(collisions))
+        )
+    if not groups:
+        result = compute(frame)
+        if len(columns) == 1:
+            return result[columns[0]]
+        return pd.DataFrame([result], columns=columns)
+    rows = []
+    for keys, part in frame.groupby(groups, dropna=False, observed=True, sort=True):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        rows.append({**dict(zip(groups, keys)), **compute(part)})
+    return pd.DataFrame(rows, columns=groups + columns)
+
+
+def _values_weights(frame, value, weight_column):
+    """The part's value and weight arrays, weights rescaled by their
+    own peak: every measure is weight-scale invariant, raw sums of
+    legal huge weights would overflow, and one group's scale must not
+    leak into another's. A positive weight the rescale underflows is
+    a dynamic range float64 cannot honor."""
+    values = frame[value].to_numpy(dtype=float)
+    weights = frame[weight_column].to_numpy(dtype=float)
+    weights = weights / weights.max()
+    if (weights == 0).any():
+        raise ValueError("population weights span too wide a range to compute together")
+    return values, weights
+
+
+def _rescaled(values):
+    """Scale-invariant measures divide by the peak magnitude up front
+    so legal huge values never overflow a reduction; a nonzero value
+    the rescale underflows is a dynamic range float64 cannot honor."""
+    peak = np.abs(values).max()
+    if peak == 0:
+        return values
+    rescaled = values / peak
+    if ((rescaled == 0) & (values != 0)).any():
+        raise ValueError("values span too wide a range to compute together")
+    return rescaled
+
+
+def _require_non_negative(name, values, weights):
+    if (values < 0).any():
+        raise ValueError(_NEGATIVE_MESSAGE.format(name=name))
+    if np.dot(values, weights) <= 0:
+        raise ValueError(f"{name} needs a strictly positive weighted value total")
+
+
+def _require_positive(name, values):
+    if (values < 0).any():
+        raise ValueError(_NEGATIVE_MESSAGE.format(name=name))
+    if (values == 0).any():
+        raise ValueError(_ZERO_MESSAGE.format(name=name))
+
+
+def gini_index(
+    data,
+    *,
+    value="accessibility",
+    sociodemographic_data=None,
+    population=None,
+    group_columns=None,
+    dropna=False,
+):
+    """The population-weighted Gini index of the value distribution,
+    0 (perfect equality) to 1 — the trapezoidal integral of the same
+    vertex polyline :func:`lorenz_curve` returns."""
+    frame, groups, weight = _prepared(
+        "gini_index",
+        data,
+        value,
+        sociodemographic_data,
+        population,
+        group_columns,
+        dropna,
+    )
+
+    def compute(part):
+        values, weights = _values_weights(part, value, weight)
+        values = _rescaled(values)
+        _require_non_negative("gini_index", values, weights)
+        shares, mass = _distribution.lorenz_vertices(values, weights)
+        area = _distribution.polyline_area(shares, mass)
+        return {"gini_index": 1.0 - 2.0 * area}
+
+    return _fan_out(frame, groups, compute, ["gini_index"])
+
+
+def lorenz_curve(
+    data,
+    *,
+    value="accessibility",
+    sociodemographic_data=None,
+    population=None,
+    group_columns=None,
+    dropna=False,
+):
+    """The Lorenz curve as a plottable frame — ``population_share``
+    against ``value_share``, one vertex per row plus the origin, per
+    identifier group. :func:`gini_index` integrates exactly this
+    polyline."""
+    frame, groups, weight = _prepared(
+        "lorenz_curve",
+        data,
+        value,
+        sociodemographic_data,
+        population,
+        group_columns,
+        dropna,
+    )
+    collisions = set(groups) & {"population_share", "value_share"}
+    if collisions:
+        raise ValueError(
+            "group_columns collide with the result column(s): "
+            + ", ".join(sorted(collisions))
+        )
+    parts = []
+    grouped = (
+        frame.groupby(groups, dropna=False, observed=True, sort=True)
+        if groups
+        else [((), frame)]
+    )
+    for keys, part in grouped:
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        values, weights = _values_weights(part, value, weight)
+        values = _rescaled(values)
+        _require_non_negative("lorenz_curve", values, weights)
+        shares, mass = _distribution.lorenz_vertices(values, weights)
+        vertex = pd.DataFrame(dict(zip(groups, keys)), index=range(len(shares)))
+        vertex["population_share"] = shares
+        vertex["value_share"] = mass
+        parts.append(vertex)
+    return pd.concat(parts, ignore_index=True)
+
+
+def share_ratio(
+    data,
+    *,
+    top=0.10,
+    bottom=0.40,
+    income=None,
+    value="accessibility",
+    sociodemographic_data=None,
+    population=None,
+    group_columns=None,
+    dropna=False,
+):
+    """The mean accessibility of the top ``top`` population share over
+    the bottom ``bottom`` share's, ranked by ``income=`` when given
+    and by the value itself otherwise. The boundary of a cut is split
+    fractionally — allocated evenly across a whole block of tied
+    ranking values — so the ratio is exact at any cut and independent
+    of input order."""
+    return _quantile_share_ratio(
+        "share_ratio",
+        data,
+        top=top,
+        bottom=bottom,
+        income=income,
+        value=value,
+        sociodemographic_data=sociodemographic_data,
+        population=population,
+        group_columns=group_columns,
+        dropna=dropna,
+    )
+
+
+def _quantile_share_ratio(
+    name,
+    data,
+    *,
+    top,
+    bottom,
+    income,
+    value,
+    sociodemographic_data,
+    population,
+    group_columns,
+    dropna,
+):
+    for label, share in (("top", top), ("bottom", bottom)):
+        if not np.isfinite(share) or not 0 < share < 1:
+            raise ValueError(f"{label} must be a share in (0, 1)")
+    frame, groups, weight = _prepared(
+        name,
+        data,
+        value,
+        sociodemographic_data,
+        population,
+        group_columns,
+        dropna,
+        consumed=(income,),
+    )
+
+    def compute(part):
+        values, weights = _values_weights(part, value, weight)
+        values = _rescaled(values)
+        _require_non_negative(name, values, weights)
+        ranking = part[income].to_numpy(dtype=float) if income is not None else values
+        rich = _distribution.tail_mean(values, weights, ranking, top, "top")
+        poor = _distribution.tail_mean(values, weights, ranking, bottom, "bottom")
+        if poor == 0 and rich == 0:
+            raise ValueError(f"{name} is 0/0 here: both tail means are zero")
+        if poor == 0:
+            return {name: float("inf")}
+        return {name: rich / poor}
+
+    return _fan_out(frame, groups, compute, [name])
+
+
+def palma_ratio(
+    data,
+    *,
+    income,
+    value="accessibility",
+    sociodemographic_data=None,
+    population=None,
+    group_columns=None,
+    dropna=False,
+):
+    """The Palma ratio — the income-ranked richest 10 %'s mean
+    accessibility over the poorest 40 %'s;
+    ``share_ratio(top=0.10, bottom=0.40)`` with ``income=`` required
+    (without an income ranking the cut would silently change
+    meaning)."""
+    if income is None:
+        raise ValueError(
+            "palma_ratio requires income=; share_ratio serves value-ranked cuts"
+        )
+    return _quantile_share_ratio(
+        "palma_ratio",
+        data,
+        top=0.10,
+        bottom=0.40,
+        income=income,
+        value=value,
+        sociodemographic_data=sociodemographic_data,
+        population=population,
+        group_columns=group_columns,
+        dropna=dropna,
+    )
+
+
+def generalized_entropy(
+    data,
+    *,
+    alpha=1,
+    groups=None,
+    value="accessibility",
+    sociodemographic_data=None,
+    population=None,
+    group_columns=None,
+    dropna=False,
+):
+    """The generalized entropy index GE(α) — ``alpha=1`` is Theil T,
+    ``alpha=0`` the mean log deviation, ``alpha=2`` half the squared
+    coefficient of variation. With ``groups=`` (a sociodemographic
+    grouping column) the return decomposes into ``total``,
+    ``between``, and ``within`` columns; ``total = between + within``
+    exactly."""
+    try:
+        alpha = float(alpha)
+    except (OverflowError, TypeError):
+        alpha = float("inf")
+    if not np.isfinite(alpha) or abs(alpha) > 1e6:
+        raise ValueError("alpha must be a finite number with magnitude at most 1e6")
+    frame, identifier, weight = _prepared(
+        "generalized_entropy",
+        data,
+        value,
+        sociodemographic_data,
+        population,
+        group_columns,
+        dropna,
+        labels=(groups,),
+    )
+
+    def measured(values, weights):
+        # Entirely in the log domain: a value/mean ratio can overflow
+        # — and a materialized subnormal share round to zero — while
+        # their logarithms, and the index, stay exact. Returns the
+        # index beside the general branch's log power sum, so the
+        # decomposition can resolve joint extremes in log space.
+        _require_positive("generalized_entropy", values)
+        total = weights.sum()
+        share = weights / total
+        log_share = np.log(weights) - np.log(total)
+        mean = np.dot(values, weights) / total
+        deviation = np.log(values) - np.log(mean)
+        # Alphas within an ulp-scale band of the limits ride the
+        # exact limit formulas: the general form cancels there.
+        if abs(alpha) <= 1e-9:
+            return float(-np.dot(share, deviation)), None
+        if abs(alpha - 1.0) <= 1e-9:
+            # Each share_i * v_i / mean is at most 1, so the Theil
+            # terms are safe once formed in the log domain.
+            weighted_ratio = np.exp(log_share + deviation)
+            return float(np.sum(weighted_ratio * deviation)), None
+        # The power sum with expm1, so neither a large alpha
+        # overflows nor a small one cancels.
+        exponent = alpha * deviation + log_share
+        peak = exponent.max()
+        if not np.isfinite(peak):
+            return float("inf"), float("inf")
+        log_power = peak + np.log(np.exp(exponent - peak).sum())
+        numerator = np.expm1(log_power)
+        denominator = alpha * (alpha - 1.0)
+        if np.isinf(numerator) and np.isinf(denominator):
+            # Both overflow while their ratio is plain: resolve it in
+            # the log domain (expm1 is exp to within an ulp up here).
+            value_ = np.exp(log_power - np.log(abs(alpha)) - np.log(abs(alpha - 1.0)))
+            return float(value_), float(log_power)
+        return float(numerator / denominator), float(log_power)
+
+    def index(values, weights):
+        return measured(values, weights)[0]
+
+    def compute(part):
+        values, weights = _values_weights(part, value, weight)
+        values = _rescaled(values)
+        total = index(values, weights)
+        if groups is None:
+            return {"generalized_entropy": total}
+        mean = np.dot(values, weights) / weights.sum()
+        positions = part.groupby(groups, dropna=False, observed=True, sort=True).indices
+        blocks = [(values[rows], weights[rows]) for rows in positions.values()]
+        means = np.array([np.dot(v, w) / w.sum() for v, w in blocks])
+        sizes = np.array([w.sum() for _, w in blocks])
+        between = index(means, sizes)
+        log_factor = np.log(sizes) - np.log(sizes.sum())
+        log_factor += alpha * (np.log(means) - np.log(mean))
+        measures = [measured(v, w) for v, w in blocks]
+        log_denominator = (
+            np.log(abs(alpha)) + np.log(abs(alpha - 1.0))
+            if abs(alpha) > 1e-9 and abs(alpha - 1.0) > 1e-9
+            else None
+        )
+        within = 0.0
+        for factor_log, (part, log_power) in zip(log_factor, measures):
+            if part == 0.0:
+                continue
+            plain = np.exp(factor_log) * part
+            if np.isfinite(plain) and plain != 0.0:
+                within += plain
+            elif np.isfinite(part):
+                # The factor underflowed while the block index is an
+                # ordinary float: their joint magnitude resolves as
+                # one exponent.
+                within += np.exp(factor_log + np.log(part))
+            elif log_power is not None:
+                # An underflowed factor against an overflowed block.
+                within += np.exp(factor_log + log_power - log_denominator)
+        within = float(within)
+        return {"total": total, "between": between, "within": within}
+
+    columns = (
+        ["generalized_entropy"] if groups is None else ["total", "between", "within"]
+    )
+    return _fan_out(frame, identifier, compute, columns)
+
+
+def theil_t(
+    data,
+    *,
+    groups=None,
+    value="accessibility",
+    sociodemographic_data=None,
+    population=None,
+    group_columns=None,
+    dropna=False,
+):
+    """Theil T — ``generalized_entropy(alpha=1)`` exactly, every
+    shared argument (``groups=`` included) forwarded."""
+    return generalized_entropy(
+        data,
+        alpha=1,
+        groups=groups,
+        value=value,
+        sociodemographic_data=sociodemographic_data,
+        population=population,
+        group_columns=group_columns,
+        dropna=dropna,
+    )
+
+
+def mld(
+    data,
+    *,
+    groups=None,
+    value="accessibility",
+    sociodemographic_data=None,
+    population=None,
+    group_columns=None,
+    dropna=False,
+):
+    """The mean log deviation (Theil L) —
+    ``generalized_entropy(alpha=0)`` exactly, every shared argument
+    forwarded."""
+    return generalized_entropy(
+        data,
+        alpha=0,
+        groups=groups,
+        value=value,
+        sociodemographic_data=sociodemographic_data,
+        population=population,
+        group_columns=group_columns,
+        dropna=dropna,
+    )
+
+
+def atkinson(
+    data,
+    *,
+    epsilon=1,
+    value="accessibility",
+    sociodemographic_data=None,
+    population=None,
+    group_columns=None,
+    dropna=False,
+):
+    """The Atkinson index with inequality aversion ``epsilon`` > 0 —
+    the welfare share lost to inequality under the analyst's own
+    weighting of the worst-off."""
+    try:
+        epsilon = float(epsilon)
+    except (OverflowError, TypeError):
+        epsilon = float("inf")
+    if not np.isfinite(epsilon) or epsilon <= 0 or epsilon > 1e6:
+        raise ValueError("epsilon must be a positive number at most 1e6")
+    frame, groups, weight = _prepared(
+        "atkinson",
+        data,
+        value,
+        sociodemographic_data,
+        population,
+        group_columns,
+        dropna,
+    )
+
+    def compute(part):
+        values, weights = _values_weights(part, value, weight)
+        values = _rescaled(values)
+        _require_positive("atkinson", values)
+        share = weights / weights.sum()
+        mean = np.dot(share, values)
+        if abs(epsilon - 1.0) <= 1e-9:
+            log_equivalent = np.dot(share, np.log(values))
+        else:
+            # The generalized mean anchored at its dominating value:
+            # the exponent forms as a log DIFFERENCE (a plain ratio
+            # can overflow first) and stays non-positive, so no
+            # aversion parameter overflows a bounded index.
+            sign = 1.0 - epsilon
+            anchor = values.min() if sign < 0 else values.max()
+            exponent = sign * (np.log(values) - np.log(anchor))
+            log_terms = np.log(weights) - np.log(weights.sum()) + exponent
+            peak = log_terms.max()
+            log_mean_term = peak + np.log(np.exp(log_terms - peak).sum())
+            log_equivalent = np.log(anchor) + log_mean_term / sign
+        return {"atkinson": float(1.0 - np.exp(log_equivalent - np.log(mean)))}
+
+    return _fan_out(frame, groups, compute, ["atkinson"])
+
+
+def kolm(
+    data,
+    *,
+    kappa=1,
+    value="accessibility",
+    sociodemographic_data=None,
+    population=None,
+    group_columns=None,
+    dropna=False,
+):
+    """The Kolm index with absolute inequality aversion ``kappa`` > 0
+    — translation-invariant: a uniform absolute gain leaves it
+    unchanged, the absolute reading the relative indices cannot give.
+    Defined on any real values (difference frames included)."""
+    try:
+        kappa = float(kappa)
+    except (OverflowError, TypeError):
+        kappa = float("inf")
+    if not np.isfinite(kappa) or kappa <= 0 or kappa > 1e6:
+        raise ValueError("kappa must be a positive number at most 1e6")
+    frame, groups, weight = _prepared(
+        "kolm",
+        data,
+        value,
+        sociodemographic_data,
+        population,
+        group_columns,
+        dropna,
+    )
+
+    def compute(part):
+        values, weights = _values_weights(part, value, weight)
+        share = weights / weights.sum()
+        # Computed on unit-normalized values: K_kappa(v) is exactly
+        # scale * K_(kappa*scale)(v/scale), and on [-1, 1] no
+        # centering, exponent, or mean can overflow. expm1/log1p keep
+        # tiny effective kappas exact; an effective kappa beyond the
+        # float ceiling pins the log term to its zero limit.
+        scale = np.abs(values).max()
+        if scale == 0:
+            return {"kolm": 0.0}
+        unit = values / scale
+        low = unit.min()
+        gap = np.dot(share, unit - low)
+        effective = kappa * scale
+        if np.isinf(effective):
+            log_term = 0.0
+        elif effective < 1e-8:
+            # First order cancels the gap exactly; the index IS the
+            # second cumulant down here.
+            center = np.dot(share, unit)
+            variance = np.dot(share, (unit - center) ** 2)
+            return {"kolm": float(scale * effective * variance / 2.0)}
+        else:
+            log_terms = (
+                np.log(weights) - np.log(weights.sum()) - effective * (unit - low)
+            )
+            peak = log_terms.max()
+            log_term = (peak + np.log(np.exp(log_terms - peak).sum())) / effective
+        return {"kolm": float(scale * (gap + log_term))}
+
+    return _fan_out(frame, groups, compute, ["kolm"])
+
+
+def hoover(
+    data,
+    *,
+    value="accessibility",
+    sociodemographic_data=None,
+    population=None,
+    group_columns=None,
+    dropna=False,
+):
+    """The Hoover (Pietra) index — the share of total accessibility
+    that would have to be redistributed for perfect equality."""
+    frame, groups, weight = _prepared(
+        "hoover",
+        data,
+        value,
+        sociodemographic_data,
+        population,
+        group_columns,
+        dropna,
+    )
+
+    def compute(part):
+        values, weights = _values_weights(part, value, weight)
+        values = _rescaled(values)
+        _require_non_negative("hoover", values, weights)
+        mean = np.dot(values, weights) / weights.sum()
+        spread = np.dot(weights, np.abs(values - mean))
+        return {"hoover": float(spread / (2.0 * np.dot(weights, values)))}
+
+    return _fan_out(frame, groups, compute, ["hoover"])

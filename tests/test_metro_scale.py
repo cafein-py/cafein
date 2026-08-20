@@ -293,3 +293,65 @@ def test_accessibility_products_ride_the_sampledata_pois(
     catchment = Catchment(metro_network, origins.iloc[:1], departure, budgets=(15.0,))
     assert len(catchment) == 1
     assert catchment.geometry.iloc[0].area > 0
+
+
+def test_equity_indices_over_a_metro_accessibility_run(
+    metro_network, helsinki_metro_data
+):
+    # The inequality set on a real metro-scale accessibility frame
+    # joined to synthetic sociodemographics: every index finite, the
+    # tidy shapes right.
+    import geopandas
+    import numpy as np
+    import pandas as pd
+
+    from cafein import Accessibility, equity
+    from cafein.sampledata.helsinki import pois
+
+    date = _service_date(helsinki_metro_data.gtfs)
+    libraries = geopandas.read_file(pois.library).rename(columns={"osm_id": "id"})
+    origins = geopandas.GeoDataFrame(
+        {"id": ["kamppi", "espoo", "tikkurila", "malmi"]},
+        geometry=geopandas.points_from_xy(
+            [24.9384, 24.6559, 25.0378, 25.0110],
+            [60.1699, 60.2055, 60.2934, 60.2500],
+        ),
+        crs="EPSG:4326",
+    )
+    reachable = Accessibility(
+        metro_network, origins, libraries, f"{date} 08:30:00", budgets=(30.0,)
+    )
+    rng = np.random.default_rng(11)
+    people = pd.DataFrame(
+        {
+            "id": origins["id"],
+            "pop": rng.integers(1000, 9000, len(origins)).astype(float),
+            "income": rng.integers(20000, 60000, len(origins)).astype(float),
+        }
+    )
+    people["zone"] = ["west", "west", "east", "east"]
+    kwargs = {"sociodemographic_data": people, "population": "pop"}
+    results = {
+        "gini_index": reachable.gini_index(**kwargs),
+        "share_ratio": reachable.share_ratio(top=0.2, bottom=0.2, **kwargs),
+        "palma_ratio": reachable.palma_ratio(income="income", **kwargs),
+        "generalized_entropy": reachable.generalized_entropy(alpha=2, **kwargs),
+        "theil_t": reachable.theil_t(**kwargs),
+        "mld": reachable.mld(**kwargs),
+        "atkinson": reachable.atkinson(epsilon=0.5, **kwargs),
+        "kolm": reachable.kolm(**kwargs),
+        "hoover": reachable.hoover(**kwargs),
+    }
+    for name, result in results.items():
+        if isinstance(result, pd.DataFrame):
+            assert {"opportunity", "budget"} <= set(result.columns), name
+            values = result.iloc[:, -1].to_numpy()
+        else:
+            values = [result]
+        assert np.isfinite(values).all(), name
+    parts = reachable.theil_t(groups="zone", **kwargs)
+    last = parts[["total", "between", "within"]].iloc[-1]
+    assert last["total"] == pytest.approx(last["between"] + last["within"])
+    curve = reachable.lorenz_curve(**kwargs)
+    assert {"population_share", "value_share"} <= set(curve.columns)
+    assert curve["value_share"].iloc[-1] == 1.0

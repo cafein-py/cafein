@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- `cafein.equity`: population-weighted inequality indices over
+  accessibility distributions, IPEA-style — `gini_index`,
+  `share_ratio` (with the `palma_ratio` preset), `generalized_entropy`
+  (`theil_t`/`mld`, between/within decomposition via `groups=`),
+  `atkinson`, `kolm`, `hoover`, and `lorenz_curve` — as frame-in
+  functions and as `Accessibility` methods.
+  ([#290](https://github.com/cafein-py/cafein/pull/290))
+
 ## 0.14.0 — 2026-08-19
 
 - Transit matrices report exposure: `TravelCostMatrix(..., exposure=)`

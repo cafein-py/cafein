@@ -1475,6 +1475,236 @@ class Accessibility(pd.DataFrame):
             dictionary_columns=("from_id",),
         )
 
+    def gini_index(
+        self,
+        *,
+        value="accessibility",
+        sociodemographic_data=None,
+        population=None,
+        group_columns=None,
+        dropna=False,
+    ):
+        """``cafein.equity.gini_index`` over this frame."""
+        from cafein import equity
+
+        return equity.gini_index(
+            self,
+            value=value,
+            sociodemographic_data=sociodemographic_data,
+            population=population,
+            group_columns=group_columns,
+            dropna=dropna,
+        )
+
+    def lorenz_curve(
+        self,
+        *,
+        value="accessibility",
+        sociodemographic_data=None,
+        population=None,
+        group_columns=None,
+        dropna=False,
+    ):
+        """``cafein.equity.lorenz_curve`` over this frame."""
+        from cafein import equity
+
+        return equity.lorenz_curve(
+            self,
+            value=value,
+            sociodemographic_data=sociodemographic_data,
+            population=population,
+            group_columns=group_columns,
+            dropna=dropna,
+        )
+
+    def share_ratio(
+        self,
+        *,
+        top=0.10,
+        bottom=0.40,
+        income=None,
+        value="accessibility",
+        sociodemographic_data=None,
+        population=None,
+        group_columns=None,
+        dropna=False,
+    ):
+        """``cafein.equity.share_ratio`` over this frame."""
+        from cafein import equity
+
+        return equity.share_ratio(
+            self,
+            top=top,
+            bottom=bottom,
+            income=income,
+            value=value,
+            sociodemographic_data=sociodemographic_data,
+            population=population,
+            group_columns=group_columns,
+            dropna=dropna,
+        )
+
+    def palma_ratio(
+        self,
+        *,
+        income,
+        value="accessibility",
+        sociodemographic_data=None,
+        population=None,
+        group_columns=None,
+        dropna=False,
+    ):
+        """``cafein.equity.palma_ratio`` over this frame."""
+        from cafein import equity
+
+        return equity.palma_ratio(
+            self,
+            income=income,
+            value=value,
+            sociodemographic_data=sociodemographic_data,
+            population=population,
+            group_columns=group_columns,
+            dropna=dropna,
+        )
+
+    def generalized_entropy(
+        self,
+        *,
+        alpha=1,
+        groups=None,
+        value="accessibility",
+        sociodemographic_data=None,
+        population=None,
+        group_columns=None,
+        dropna=False,
+    ):
+        """``cafein.equity.generalized_entropy`` over this frame."""
+        from cafein import equity
+
+        return equity.generalized_entropy(
+            self,
+            alpha=alpha,
+            groups=groups,
+            value=value,
+            sociodemographic_data=sociodemographic_data,
+            population=population,
+            group_columns=group_columns,
+            dropna=dropna,
+        )
+
+    def theil_t(
+        self,
+        *,
+        groups=None,
+        value="accessibility",
+        sociodemographic_data=None,
+        population=None,
+        group_columns=None,
+        dropna=False,
+    ):
+        """``cafein.equity.theil_t`` over this frame."""
+        from cafein import equity
+
+        return equity.theil_t(
+            self,
+            groups=groups,
+            value=value,
+            sociodemographic_data=sociodemographic_data,
+            population=population,
+            group_columns=group_columns,
+            dropna=dropna,
+        )
+
+    def mld(
+        self,
+        *,
+        groups=None,
+        value="accessibility",
+        sociodemographic_data=None,
+        population=None,
+        group_columns=None,
+        dropna=False,
+    ):
+        """``cafein.equity.mld`` over this frame."""
+        from cafein import equity
+
+        return equity.mld(
+            self,
+            groups=groups,
+            value=value,
+            sociodemographic_data=sociodemographic_data,
+            population=population,
+            group_columns=group_columns,
+            dropna=dropna,
+        )
+
+    def atkinson(
+        self,
+        *,
+        epsilon=1,
+        value="accessibility",
+        sociodemographic_data=None,
+        population=None,
+        group_columns=None,
+        dropna=False,
+    ):
+        """``cafein.equity.atkinson`` over this frame."""
+        from cafein import equity
+
+        return equity.atkinson(
+            self,
+            epsilon=epsilon,
+            value=value,
+            sociodemographic_data=sociodemographic_data,
+            population=population,
+            group_columns=group_columns,
+            dropna=dropna,
+        )
+
+    def kolm(
+        self,
+        *,
+        kappa=1,
+        value="accessibility",
+        sociodemographic_data=None,
+        population=None,
+        group_columns=None,
+        dropna=False,
+    ):
+        """``cafein.equity.kolm`` over this frame."""
+        from cafein import equity
+
+        return equity.kolm(
+            self,
+            kappa=kappa,
+            value=value,
+            sociodemographic_data=sociodemographic_data,
+            population=population,
+            group_columns=group_columns,
+            dropna=dropna,
+        )
+
+    def hoover(
+        self,
+        *,
+        value="accessibility",
+        sociodemographic_data=None,
+        population=None,
+        group_columns=None,
+        dropna=False,
+    ):
+        """``cafein.equity.hoover`` over this frame."""
+        from cafein import equity
+
+        return equity.hoover(
+            self,
+            value=value,
+            sociodemographic_data=sociodemographic_data,
+            population=population,
+            group_columns=group_columns,
+            dropna=dropna,
+        )
+
 
 class NearestDestinations(pd.DataFrame):
     """The ``k`` nearest destinations per origin on a cost axis.
