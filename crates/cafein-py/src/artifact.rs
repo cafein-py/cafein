@@ -1227,16 +1227,20 @@ pub(super) fn decode_optional_street_arrays(
     let read_u16 = |array| {
         find(array).map(|d| {
             slice(section, d)
-                .chunks_exact(2)
-                .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|chunk| u16::from_le_bytes(*chunk))
                 .collect::<Vec<u16>>()
         })
     };
     let read_f32 = |array| {
         find(array).map(|d| {
             slice(section, d)
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
                 .collect::<Vec<f32>>()
         })
     };
@@ -1415,7 +1419,7 @@ pub(super) fn decode_streets(
     // coordinate pair once, none missing or repeated — or snapping would
     // silently skip streets.
     let mut seen = vec![false; coordinates];
-    for payload in parts.index_payload.chunks_exact(2) {
+    for payload in parts.index_payload.as_chunks::<2>().0 {
         let (edge, segment) = (payload[0] as usize, payload[1] as usize);
         if edge >= edges
             || (segment as u64) < u64::from(parts.coordinate_offsets[edge])
