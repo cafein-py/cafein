@@ -38,6 +38,44 @@ and corrupts identifier columns::
 Most indices are undefined on the negative values a Δ frame carries
 and refuse; ``kolm`` (translation-invariant) and
 ``concentration_index(variant="absolute")`` are the Δ-safe readings.
+
+A typical analysis follows the IPEA vignette's flow — compute
+accessibility, join the sociodemographics, then read the indices off
+one frame::
+
+    reachable = cafein.Accessibility(
+        network, zones, jobs, "2022-02-22 08:30", budgets=(30.0,)
+    )
+    demo = ...  # id, pop, income, region — one row per origin zone
+
+    reachable.gini_index(sociodemographic_data=demo, population="pop")
+    reachable.palma_ratio(
+        income="income", sociodemographic_data=demo, population="pop"
+    )
+    reachable.theil_t(
+        groups="region", sociodemographic_data=demo, population="pop"
+    )
+    reachable.concentration_index(
+        income="income", sociodemographic_data=demo, population="pop"
+    )
+    reachable.fgt_poverty(
+        poverty_line="60% of median",
+        sociodemographic_data=demo,
+        population="pop",
+    )
+    reachable.lihc(
+        cost="transport_cost",
+        income="income",
+        poverty_line="60% of median",
+        sociodemographic_data=demo,
+        population="pop",
+    )
+    reachable.alkire_foster(
+        dimensions={"accessibility": 10000, "transport_cost": (">", 250)},
+        k=2,
+        sociodemographic_data=demo,
+        population="pop",
+    )
 """
 
 import re
@@ -215,7 +253,11 @@ def _prepared(
                 f"{name} needs the nonzero magnitudes in {column!r} inside "
                 "the supported numeric range (1e-75 to 1e75)"
             )
-    filtered = filtered.assign(**converted)
+    # Assigned by label, not **kwargs: a column label need not be a
+    # string.
+    filtered = filtered.copy()
+    for column, array in converted.items():
+        filtered[column] = array
     if not len(filtered):
         raise ValueError(
             f"{name} has no usable rows left after excluding missing "
@@ -1297,3 +1339,154 @@ def lihc(
         }
 
     return _fan_out(frame, groups, compute, ["lihc", "high_costs", "low_residual"])
+
+
+_CUTOFF_OPS = {
+    "<": np.less,
+    "<=": np.less_equal,
+    ">": np.greater,
+    ">=": np.greater_equal,
+}
+
+
+def _deprivation_specs(dimensions):
+    """The Alkire–Foster dimension dict, validated: column → (op,
+    cutoff), a bare number meaning deprived BELOW the cutoff."""
+    if not isinstance(dimensions, dict) or not dimensions:
+        raise ValueError("dimensions must be a non-empty dict of column → cutoff")
+    if None in dimensions:
+        # None marks an absent optional column internally; a real
+        # column labeled None cannot ride the validation pipeline.
+        raise ValueError("a dimension column label must not be None")
+    specs = {}
+    for column, cutoff in dimensions.items():
+        if isinstance(cutoff, tuple):
+            try:
+                operator, edge = cutoff
+            except ValueError:
+                operator, edge = None, None
+            if operator not in _CUTOFF_OPS:
+                raise ValueError(
+                    f"the cutoff for {column!r} must be a number or an "
+                    '(op, number) tuple with op in "<", "<=", ">", ">="'
+                )
+        else:
+            operator, edge = "<", cutoff
+        try:
+            edge = float(edge)
+        except (TypeError, ValueError, OverflowError):
+            edge = float("nan")
+        if not np.isfinite(edge) or abs(edge) > 1e75:
+            raise ValueError(
+                f"the cutoff for {column!r} must be a finite number inside "
+                "the supported numeric range"
+            )
+        specs[column] = (operator, edge)
+    names = [f"{column}_deprived" for column in specs]
+    if len(set(names)) != len(names):
+        raise ValueError(
+            "dimension columns stringify to colliding detail names; "
+            "rename them so each column keeps its own _deprived column"
+        )
+    return specs
+
+
+def alkire_foster(
+    data,
+    *,
+    dimensions,
+    k,
+    detail=False,
+    sociodemographic_data=None,
+    population=None,
+    group_columns=None,
+    dropna=False,
+):
+    """The Alkire–Foster multidimensional poverty measure M0 over
+    user-declared dimensions with equal weights.
+
+    ``dimensions`` maps a column to its deprivation cutoff: a bare
+    number means deprived BELOW the cutoff (the accessibility
+    reading); an ``(op, number)`` tuple with op in ``"<"``, ``"<="``,
+    ``">"``, ``">="`` states the direction explicitly (cost and time
+    burdens deprive above). ``k`` is the dual cutoff — an int counts
+    dimensions, a float in (0, 1] a share of them — and an origin is
+    multidimensionally poor when it is deprived in at least ``k``
+    dimensions. Returns ``m0`` (= headcount × intensity),
+    ``headcount``, and ``intensity`` (the average deprivation share
+    among the poor; NaN when nobody is poor) per identifier group;
+    ``detail=True`` returns the per-origin deprivation matrix with
+    the deprivation and censored counts beside their shares instead."""
+    specs = _deprivation_specs(dimensions)
+    columns = list(specs)
+    count = len(columns)
+    if isinstance(k, bool) or not isinstance(k, (int, float)):
+        raise ValueError("k must be a dimension count or a share in (0, 1]")
+    if isinstance(k, int):
+        if not 1 <= k <= count:
+            raise ValueError(
+                f"an integer k counts dimensions: it must be between 1 " f"and {count}"
+            )
+        threshold = k / count
+    else:
+        if not np.isfinite(k) or not 0 < k <= 1:
+            raise ValueError("a float k is a share of dimensions in (0, 1]")
+        threshold = k
+    frame, groups, weight = _prepared(
+        "alkire_foster",
+        data,
+        columns[0],
+        sociodemographic_data,
+        population,
+        group_columns,
+        dropna,
+        consumed=tuple(columns[1:]),
+    )
+
+    def deprivations(part):
+        matrix = np.column_stack(
+            [
+                _CUTOFF_OPS[operator](part[column].to_numpy(dtype=float), edge)
+                for column, (operator, edge) in specs.items()
+            ]
+        )
+        shares = matrix.mean(axis=1)
+        poor = shares >= threshold
+        return matrix, shares, poor
+
+    if detail:
+        grouped = (
+            frame.groupby(groups, dropna=False, observed=True, sort=True)
+            if groups
+            else [((), frame)]
+        )
+        parts = []
+        for _, part in grouped:
+            matrix, shares, poor = deprivations(part)
+            computed = {
+                f"{column}_deprived": matrix[:, position]
+                for position, column in enumerate(columns)
+            }
+            computed["deprivation_count"] = matrix.sum(axis=1)
+            computed["deprivation_share"] = shares
+            computed["poor"] = poor
+            computed["censored_count"] = np.where(poor, matrix.sum(axis=1), 0)
+            computed["censored_share"] = np.where(poor, shares, 0.0)
+            parts.append(_per_origin(part, groups, computed))
+        return pd.concat(parts, ignore_index=True)
+
+    def compute(part):
+        _, shares, poor = deprivations(part)
+        weights = part[weight].to_numpy(dtype=float)
+        weights = weights / weights.max()
+        if (weights == 0).any():
+            raise ValueError(
+                "population weights span too wide a range to compute together"
+            )
+        share = weights / weights.sum()
+        headcount = float(np.dot(share, poor))
+        m0 = float(np.dot(share, np.where(poor, shares, 0.0)))
+        intensity = m0 / headcount if headcount > 0 else float("nan")
+        return {"m0": m0, "headcount": headcount, "intensity": intensity}
+
+    return _fan_out(frame, groups, compute, ["m0", "headcount", "intensity"])
