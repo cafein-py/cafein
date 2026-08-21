@@ -1161,11 +1161,7 @@ impl StreetNetwork {
                     lons: parts.lons,
                     lats: parts.lats,
                     cumulative: parts.cumulative,
-                    index_boxes: parts
-                        .index_boxes
-                        .chunks_exact(4)
-                        .map(|chunk| [chunk[0], chunk[1], chunk[2], chunk[3]])
-                        .collect(),
+                    index_boxes: parts.index_boxes.as_chunks::<4>().0.to_vec(),
                     index_payload: parts.index_payload,
                 }),
                 level_starts: parts.index_level_starts,
