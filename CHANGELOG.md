@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.15.0 — 2026-08-20
 
 - `cafein.equity` gains `alkire_foster`: the multidimensional M0 over
   user-declared dimensions (a dict of column → cutoff, bare numbers
