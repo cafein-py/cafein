@@ -404,3 +404,45 @@ def test_transfers_never_chain_two_bounded_walks(tmp_path, router):
     # departure to E; a single bounded walk never does.
     assert matrix[0][3] == unreachable
     assert matrix[0][4] == unreachable
+
+
+def test_multimodal_payload_tolerates_a_zero_length_edge(
+    kantakaupunki_pbf, monkeypatch
+):
+    """A zero-length way must not break the DEM densification.
+
+    OSM legally carries ways whose consecutive nodes sit at one
+    position; their edge geometry is a two-point LineString of
+    identical coordinates, which GEOS's segmentize refuses ("point
+    array must contain 0 or >1 elements"). One such cycleway in the
+    2026-08-20 Finland extract failed every DEM-enabled street build.
+    """
+    import geopandas
+    import numpy
+    import pandas
+    from shapely.geometry import LineString
+
+    from cafein import _osm, street_network
+
+    real_union = _osm.union_network
+
+    def union_with_degenerate_edge(osm_pbf, bounding_box=None, car=False):
+        nodes, edges = real_union(osm_pbf, bounding_box=bounding_box, car=car)
+        clone = edges.iloc[[0]].copy()
+        point = clone.geometry.iloc[0].coords[0]
+        clone.geometry = geopandas.GeoSeries(
+            [LineString([point, point])], crs=edges.crs
+        ).values
+        clone["length"] = 0.0
+        return nodes, pandas.concat([edges, clone], ignore_index=True)
+
+    monkeypatch.setattr(_osm, "union_network", union_with_degenerate_edge)
+
+    # Any dem enables the densification that used to crash; a flat
+    # elevation callable keeps the test off the optional raster stack.
+    payload = street_network.multimodal_payload(
+        str(kantakaupunki_pbf),
+        bounding_box=[24.93, 60.16, 24.96, 60.18],
+        dem=lambda longitudes, latitudes: numpy.zeros(len(longitudes)),
+    )
+    assert payload is not None

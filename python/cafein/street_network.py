@@ -439,8 +439,15 @@ def multimodal_payload(
         # dividing by that ceiling bounds every direction: no segment
         # exceeds the interval, and east-west ones oversample (harmless).
         # Extracts are contiguous and never cross the antimeridian, per
-        # the street network's documented contract.
-        geometry = shapely.segmentize(geometry, dem_interval / 111_700.0)
+        # the street network's documented contract. OSM legally carries
+        # zero-length ways (consecutive nodes mapped at one position),
+        # which GEOS refuses to densify: only edges with real length are
+        # segmentized, and degenerate ones keep their stored coordinates.
+        measurable = shapely.length(geometry) > 0.0
+        geometry = geometry.copy()
+        geometry[measurable] = shapely.segmentize(
+            geometry[measurable], dem_interval / 111_700.0
+        )
     offsets = np.concatenate([[0], np.cumsum(shapely.get_num_coordinates(geometry))])
     coordinates = shapely.get_coordinates(geometry)
 
