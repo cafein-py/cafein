@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.16.0 — 2026-08-23
 
 - `CarParkPolicy` arrive-by: `arrival=` now serves park-and-ride on
   `route_between_coordinates`, `DetailedItineraries`, both matrix
