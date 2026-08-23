@@ -167,13 +167,22 @@ def walking_footpaths(
         meters)`` tuples.
     """
     from cafein._units import duration_seconds
+    from cafein._validate import (
+        non_negative_finite,
+        positive_finite,
+        validated_bounding_box,
+    )
 
+    # The whole parameter set validates before the extract is read: a
+    # bad knob fails in milliseconds, never after the PBF parse.
+    walking_speed_kmph = positive_finite("walking_speed_kmph", walking_speed_kmph)
     max_walking_time = (
         MAX_WALKING_TIME
         if max_walking_time is None
         else duration_seconds("max_walking_time", max_walking_time)
     )
-    max_snap_distance = snap_distance
+    max_snap_distance = non_negative_finite("snap_distance", snap_distance)
+    bounding_box = validated_bounding_box(bounding_box)
     nodes, edges = _walking_network(osm_pbf, bounding_box)
     return _network_footpaths(
         stops,
@@ -211,13 +220,22 @@ def walking_streets(
         records.
     """
     from cafein._units import duration_seconds
+    from cafein._validate import (
+        non_negative_finite,
+        positive_finite,
+        validated_bounding_box,
+    )
 
+    # The whole parameter set validates before the extract is read: a
+    # bad knob fails in milliseconds, never after the PBF parse.
+    walking_speed_kmph = positive_finite("walking_speed_kmph", walking_speed_kmph)
     max_walking_time = (
         MAX_WALKING_TIME
         if max_walking_time is None
         else duration_seconds("max_walking_time", max_walking_time)
     )
-    max_snap_distance = snap_distance
+    max_snap_distance = non_negative_finite("snap_distance", snap_distance)
+    bounding_box = validated_bounding_box(bounding_box)
     nodes, edges = _walking_network(osm_pbf, bounding_box)
     return _network_streets(
         stops,
@@ -608,6 +626,9 @@ def park_and_ride_facilities(osm_pbf, bounding_box=None):
     the data's own quality judgment, which is why this is a separate,
     deliberate call.
     """
+    from cafein._validate import validated_bounding_box
+
+    bounding_box = validated_bounding_box(bounding_box)
     osm = pyrosm.OSM(str(osm_pbf), bounding_box=bounding_box)
     found = osm.get_data_by_custom_criteria(
         custom_filter={"park_ride": True},

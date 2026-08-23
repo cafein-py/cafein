@@ -22,7 +22,12 @@ def duration_seconds(name, value):
     elif isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{name} takes minutes (a number) or a datetime.timedelta")
     else:
-        seconds = float(value) * 60.0
+        try:
+            seconds = float(value) * 60.0
+        except OverflowError:
+            # An integer beyond float range is a legal number that
+            # cannot be finite; refuse it as such.
+            seconds = math.inf
     if not math.isfinite(seconds) or seconds < 0:
         raise ValueError(f"{name} must be a non-negative, finite duration")
     if seconds > 4_294_967_295:

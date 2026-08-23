@@ -374,7 +374,7 @@ def test_access_stops_reject_out_of_range_parameters(network_with_footpaths):
         network_with_footpaths.access_stops(lat, lon, walking_speed_kmph=0.0)
     with pytest.raises(ValueError, match="max_walking_time"):
         network_with_footpaths.access_stops(lat, lon, max_walking_time=float("nan"))
-    with pytest.raises(ValueError, match="max_snap_distance"):
+    with pytest.raises(ValueError, match="snap_distance must be a non-negative"):
         network_with_footpaths.access_stops(lat, lon, snap_distance=-1.0)
 
 

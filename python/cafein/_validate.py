@@ -1,13 +1,19 @@
-"""Shared eager validation of user-passed collections.
+"""Shared eager validation of user-passed parameters.
 
 ``str`` is iterable, so a bare string passed where a collection of ids
 is expected silently dissolves into one-character items — for
 exclusions those match nothing and queries return confidently wrong
 results. Every public entry point funnels such parameters through
-these helpers before any work runs.
+these helpers before any work runs. The scalar predicates carry the
+house messages, so an entry point fails in milliseconds with the
+same words the deeper checks would eventually use. This module
+imports nothing from cafein: the build-path modules use it without
+the compiled core.
 """
 
 from __future__ import annotations
+
+import math
 
 
 def id_sequence(name, values):
@@ -78,6 +84,113 @@ def sequence_not_string(name, values):
             f"pass [{values!r}]"
         )
     return values
+
+
+def _number(name, value):
+    """`value` as a float; the wrong kind is a TypeError. Strings are
+    the wrong kind even when ``float()`` would parse them — "3.6" and
+    "nan" stay refusals, never quietly become numbers."""
+    if isinstance(value, (bool, str, bytes, bytearray)):
+        raise TypeError(f"{name} must be a number, not {value!r}")
+    try:
+        return float(value)
+    except OverflowError:
+        # An integer beyond float range is a legal number that cannot
+        # be finite; the range checks refuse it as such.
+        return math.inf
+    except (TypeError, ValueError):
+        raise TypeError(f"{name} must be a number, not {value!r}") from None
+
+
+def positive_finite(name, value):
+    """`value` as a positive, finite float."""
+    number = _number(name, value)
+    if not math.isfinite(number) or number <= 0.0:
+        raise ValueError(f"{name} must be a positive, finite number")
+    return number
+
+
+def non_negative_finite(name, value):
+    """`value` as a non-negative, finite float."""
+    number = _number(name, value)
+    if not math.isfinite(number) or number < 0.0:
+        raise ValueError(f"{name} must be a non-negative, finite number")
+    return number
+
+
+def positive_int(name, value):
+    """`value` as a positive integer; bools are the wrong kind."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer, not {value!r}")
+    if value < 1:
+        raise ValueError(f"{name} must be at least 1")
+    return value
+
+
+def choice(name, value, options):
+    """`value` when it is one of `options`, refused by name otherwise."""
+    if value not in options:
+        listed = ", ".join(repr(option) for option in options)
+        raise ValueError(f"{name} must be one of {listed}, not {value!r}")
+    return value
+
+
+def validated_bounding_box(value):
+    """A bounding box in the shapes the extract readers take: ``None``,
+    a geometry (anything carrying ``bounds``), or four finite numbers
+    ``(minx, miny, maxx, maxy)`` with each minimum below its maximum."""
+    if value is None:
+        return None
+    if hasattr(value, "bounds") and not isinstance(value, (str, bytes, bytearray)):
+        # A geometry passes through, but its bounds must be a real
+        # box: an empty geometry's NaN bounds would otherwise reach
+        # the extract reader.
+        corners = tuple(value.bounds)
+        if (
+            len(corners) != 4
+            or not all(isinstance(c, (int, float)) for c in corners)
+            or not all(math.isfinite(float(c)) for c in corners)
+            or not (corners[0] < corners[2] and corners[1] < corners[3])
+        ):
+            raise ValueError(
+                "bounding_box geometry must have four finite bounds with "
+                "each minimum below its maximum"
+            )
+        return value
+    if isinstance(value, (str, bytes, bytearray)):
+        raise TypeError(
+            f"bounding_box must be four numbers or a geometry, not the "
+            f"string {value!r}"
+        )
+    try:
+        # At most five draws: an endless iterable refuses by length
+        # instead of consuming unbounded memory.
+        import itertools
+
+        corners = [
+            _number("bounding_box", corner)
+            for corner in itertools.islice(iter(value), 5)
+        ]
+    except TypeError:
+        raise TypeError(
+            f"bounding_box must be four numbers (minx, miny, maxx, maxy) "
+            f"or a geometry, not {value!r}"
+        ) from None
+    if len(corners) != 4 or not all(math.isfinite(corner) for corner in corners):
+        raise ValueError(
+            "bounding_box must be four finite numbers (minx, miny, maxx, maxy)"
+        )
+    minx, miny, maxx, maxy = corners
+    if not (minx < maxx and miny < maxy):
+        raise ValueError(
+            "bounding_box must order its corners (minx, miny, maxx, maxy) "
+            "with each minimum below its maximum"
+        )
+    # The validated snapshot, not the caller's object: a one-shot
+    # iterable was consumed above, and the caller's sequence must not
+    # drift between validation and the extract read. A fresh list —
+    # the shape the extract reader takes — is equally drift-safe.
+    return [float(corner) for corner in corners]
 
 
 def component_selection(components):

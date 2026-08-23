@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Eager validation of the walking knobs and bounding boxes:
+  `walking_speed_kmph`, `max_walking_time`, `snap_distance`, and
+  `bounding_box` now refuse bad values in milliseconds at every
+  entry — `from_gtfs` and the `cafein.streets` builders included,
+  where they used to fail only after the GTFS ingest and the whole
+  PBF parse — and the query paths name the public `snap_distance`
+  instead of leaking the internal parameter name.
+  ([#303](https://github.com/cafein-py/cafein/pull/303))
+
 ## 0.16.0 — 2026-08-23
 
 - `CarParkPolicy` arrive-by: `arrival=` now serves park-and-ride on

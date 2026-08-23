@@ -446,3 +446,120 @@ def test_multimodal_payload_tolerates_a_zero_length_edge(
         dem=lambda longitudes, latitudes: numpy.zeros(len(longitudes)),
     )
     assert payload is not None
+
+
+def test_walking_knobs_validate_before_any_file_is_read():
+    # The walking triple used to survive to the street build and only
+    # fail after the whole GTFS ingest and PBF parse (issue #237). The
+    # paths here do not exist: reaching a file error would mean lazy
+    # validation.
+    pytest.importorskip("cafein._cafein")
+    from cafein import TransportNetwork
+    from cafein.streets import walking_footpaths, walking_streets
+
+    with pytest.raises(ValueError, match="walking_speed_kmph must be a positive"):
+        TransportNetwork.from_gtfs(
+            ["no-such-feed.zip"], osm_pbf="no-such.osm.pbf", walking_speed_kmph=0
+        )
+    with pytest.raises(ValueError, match="snap_distance must be a non-negative"):
+        TransportNetwork.from_gtfs(
+            ["no-such-feed.zip"], osm_pbf="no-such.osm.pbf", snap_distance=-1
+        )
+    with pytest.raises(TypeError, match="walking_speed_kmph must be a number"):
+        TransportNetwork.from_gtfs(
+            ["no-such-feed.zip"], osm_pbf="no-such.osm.pbf", walking_speed_kmph="fast"
+        )
+    with pytest.raises(ValueError, match="four finite numbers"):
+        TransportNetwork.from_gtfs(
+            ["no-such-feed.zip"],
+            osm_pbf="no-such.osm.pbf",
+            bounding_box=(24.9, 60.1, 25.0),
+        )
+    with pytest.raises(ValueError, match="each minimum below its maximum"):
+        TransportNetwork.from_gtfs(
+            ["no-such-feed.zip"],
+            osm_pbf="no-such.osm.pbf",
+            bounding_box=(25.0, 60.1, 24.9, 60.2),
+        )
+    for build in (walking_footpaths, walking_streets):
+        with pytest.raises(ValueError, match="walking_speed_kmph must be a positive"):
+            build("no-such.osm.pbf", [], walking_speed_kmph=-3.6)
+        with pytest.raises(ValueError, match="snap_distance must be a non-negative"):
+            build("no-such.osm.pbf", [], snap_distance=float("nan"))
+        with pytest.raises(TypeError, match="bounding_box must be four numbers"):
+            build("no-such.osm.pbf", [], bounding_box="helsinki")
+    # Numeric-looking strings are the wrong KIND, never quietly parsed.
+    with pytest.raises(TypeError, match="walking_speed_kmph must be a number"):
+        walking_footpaths("no-such.osm.pbf", [], walking_speed_kmph="3.6")
+    # The extractor validates its bounding box before the PBF read too.
+    from cafein.streets import park_and_ride_facilities
+
+    with pytest.raises(ValueError, match="each minimum below its maximum"):
+        park_and_ride_facilities(
+            "no-such.osm.pbf", bounding_box=(25.0, 60.1, 24.9, 60.2)
+        )
+    # A one-shot iterable bounding box validates AND survives: the
+    # returned snapshot replaces the exhausted iterator.
+    from cafein._validate import validated_bounding_box
+
+    assert validated_bounding_box(iter((24.9, 60.1, 25.0, 60.2))) == [
+        24.9,
+        60.1,
+        25.0,
+        60.2,
+    ]
+    # An endless iterable refuses by length rather than hanging, and
+    # an integer beyond float range refuses as non-finite everywhere —
+    # never a raw OverflowError.
+    import itertools
+
+    with pytest.raises(ValueError, match="four finite numbers"):
+        validated_bounding_box(itertools.count())
+    # An empty geometry's NaN bounds refuse instead of reaching the
+    # extract reader.
+    from shapely.geometry import Polygon
+
+    with pytest.raises(ValueError, match="geometry must have four finite bounds"):
+        validated_bounding_box(Polygon())
+    with pytest.raises(ValueError, match="walking_speed_kmph must be a positive"):
+        walking_footpaths("no-such.osm.pbf", [], walking_speed_kmph=10**400)
+    with pytest.raises(ValueError, match="non-negative, finite duration"):
+        walking_footpaths("no-such.osm.pbf", [], max_walking_time=10**400)
+
+
+def test_query_walking_knobs_fail_by_their_public_names(network):
+    # The query gate names the public parameter (snap_distance), not
+    # the internal Rust name it used to leak (issue #237).
+    with pytest.raises(ValueError, match="snap_distance must be a non-negative"):
+        network.route_between_coordinates(
+            (60.1690, 24.9320),
+            (60.1795, 24.9520),
+            "2022-02-22 08:30:00",
+            snap_distance=-5,
+        )
+    with pytest.raises(ValueError, match="walking_speed_kmph must be a positive"):
+        network.travel_times_from_coordinate(
+            (60.1690, 24.9320), "2022-02-22 08:30:00", walking_speed_kmph=0
+        )
+    # The stop-matrix branches that ignore the knobs still refuse
+    # garbage — the reverse stop axis and the windowed form included.
+    from cafein import TravelTimeMatrix
+
+    with pytest.raises(ValueError, match="snap_distance must be a non-negative"):
+        TravelTimeMatrix(
+            network,
+            ["1000202"],
+            None,
+            arrival="2022-02-22 09:30:00",
+            snap_distance=-1,
+        )
+    with pytest.raises(ValueError, match="walking_speed_kmph must be a positive"):
+        TravelTimeMatrix(
+            network,
+            ["1000202"],
+            None,
+            "2022-02-22 08:30:00",
+            departure_time_window=10,
+            percentiles=(50,),
+            walking_speed_kmph=-1,
+        )
