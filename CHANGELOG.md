@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `CarParkPolicy` arrive-by: `arrival=` now serves park-and-ride on
+  `route_between_coordinates`, `DetailedItineraries`, both matrix
+  computers, and `Accessibility` — the composed table rides the
+  reverse engine, journeys latest-departure-first with the walk
+  placed at the deadline. Also fixes a reverse-engine panic when a
+  stop served both the access and egress tables.
+  ([#301](https://github.com/cafein-py/cafein/pull/301))
+
 - `CarParkPolicy` matrices and accessibility: `TravelTimeMatrix` and
   `TravelCostMatrix` seed from the composed park-and-ride table
   (the walk competing, the walking knobs active; the cost frame

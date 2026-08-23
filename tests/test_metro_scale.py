@@ -445,3 +445,17 @@ def test_park_and_ride_serves_the_metro_region(helsinki_metro_data):
     values = scores["accessibility"].to_numpy()
     assert len(values) == 2 and (values >= 0).all()
     assert values.max() > 0.0
+    # The same pair under the arrival axis.
+    deadline = f"{_service_date(str(helsinki_metro_data.gtfs))} 09:30:00"
+    arrived = Accessibility(
+        network,
+        origins,
+        destinations,
+        arrival=deadline,
+        opportunities="jobs",
+        budgets=(90.0,),
+        street_policy=policy,
+    )
+    arrived_values = arrived["accessibility"].to_numpy()
+    assert len(arrived_values) == 2 and (arrived_values >= 0).all()
+    assert arrived_values.max() > 0.0

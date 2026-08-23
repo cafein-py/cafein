@@ -188,6 +188,7 @@ impl TransportNetwork {
             trips_by_public_id,
             streets_bytes_read: 0,
             streets_generation: 0,
+            transfers_generation: 0,
             multimodal: None,
             multimodal_elevation: None,
             multimodal_modes: None,
@@ -789,6 +790,14 @@ impl TransportNetwork {
         self.streets_generation
     }
 
+    /// The transfer-set generation: bumps on every footpath install,
+    /// so a computation spanning several engine calls can prove they
+    /// all read the same closure.
+    #[getter]
+    fn _transfers_generation(&self) -> u64 {
+        self.transfers_generation
+    }
+
     /// The facility→stop walking leg's shape for park-and-ride
     /// reconstruction: ``(network_m, connector_m, wkb)`` over the
     /// installed walking streets, ``None`` when either end has no
@@ -1033,6 +1042,7 @@ impl TransportNetwork {
         }
         self.transfers = Transfers::from_edges(self.build.timetable.stop_count(), &edges)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        self.transfers_generation += 1;
         // The walking set is bounded, not transitively closed: the
         // engines relax it with the exact transfer phase.
         self.transfers.mark_unclosed();
@@ -1100,6 +1110,7 @@ impl TransportNetwork {
         }
         self.transfers = Transfers::from_edges(self.build.timetable.stop_count(), &edges)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        self.transfers_generation += 1;
         // The walking set is bounded, not transitively closed: the
         // engines relax it with the exact transfer phase.
         self.transfers.mark_unclosed();

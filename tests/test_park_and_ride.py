@@ -134,7 +134,7 @@ def test_the_matrix_and_accessibility_refusals(network, tmp_path):
         )
     stop_ids = list(network.stops_gdf["id"].iloc[:1])
     # The combination contract, each by name.
-    with pytest.raises(NotImplementedError, match="arrive-by stage"):
+    with pytest.raises(ValueError, match="multimodal car side"):
         TravelTimeMatrix(
             network,
             origins,
@@ -206,7 +206,7 @@ def test_the_matrix_and_accessibility_refusals(network, tmp_path):
             departure_time_window=10,
             street_policy=policy,
         )
-    with pytest.raises(NotImplementedError, match="arrive-by stage"):
+    with pytest.raises(ValueError, match="multimodal car side"):
         Accessibility(
             network,
             origins,
@@ -618,7 +618,7 @@ def test_facility_semantics_and_refusals(car_park_network):
             street_policy=CarParkPolicy(facilities=at_sea),
         )
     policy = _pasila_policy()
-    with pytest.raises(ValueError, match="departure window"):
+    with pytest.raises(ValueError, match="departure or arrival window"):
         car_park_network.route_between_coordinates(
             FAR_ORIGIN,
             (60.1795, 24.9520),
@@ -634,10 +634,19 @@ def test_facility_semantics_and_refusals(car_park_network):
             street_policy=policy,
             exclude_stops=["1000202"],
         )
-    with pytest.raises(NotImplementedError, match="arrive-by stage"):
+    with pytest.raises(ValueError, match="departure or arrival window"):
         car_park_network.route_between_coordinates(
             FAR_ORIGIN,
             (60.1795, 24.9520),
+            arrival="2022-02-22 09:30:00",
+            arrival_time_window=30,
+            street_policy=policy,
+        )
+    # The arrive-by travel-times form has stop origins, so the
+    # access-only car plane has no origin to drive from.
+    with pytest.raises(ValueError, match="origins are the stops"):
+        car_park_network.travel_times_from_coordinate(
+            FAR_ORIGIN,
             arrival="2022-02-22 09:30:00",
             street_policy=policy,
         )
@@ -935,3 +944,359 @@ def test_an_undrivable_origin_is_omitted_with_a_warning(car_park_network):
             DEPARTURE_TIME,
             street_policy=policy,
         )
+
+
+ARRIVAL_TIME = "2022-02-22 09:30:00"
+DEADLINE_S = 9 * 3600 + 30 * 60
+
+
+def _clock(seconds):
+    return f"2022-02-22 {seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def test_arrive_by_journeys_ride_the_car_plane(car_park_network):
+    policy = _pasila_policy()
+    journeys = car_park_network.route_between_coordinates(
+        FAR_ORIGIN,
+        (60.1795, 24.9520),
+        arrival=ARRIVAL_TIME,
+        street_policy=policy,
+        max_walking_time=8,
+    )
+    assert journeys
+    best = journeys[0]
+    # The winner arrives by the deadline through the full car chain.
+    assert best["arrival_s"] <= DEADLINE_S
+    assert best["legs"][0]["mode"] == "car_park"
+    assert best["legs"][0]["facility_id"] == "pasila"
+    assert best["legs"][1]["type"] == "park"
+    assert best["legs"][2]["mode"] == "walk"
+    # Latest departure first, and each journey is a genuine departure
+    # answer: re-routed forward at its own departure, it appears
+    # unchanged — the reverse inversion contract.
+    departures = [journey["departure_s"] for journey in journeys]
+    assert departures == sorted(departures, reverse=True)
+    for journey in journeys:
+        forward = car_park_network.route_between_coordinates(
+            FAR_ORIGIN,
+            (60.1795, 24.9520),
+            _clock(journey["departure_s"]),
+            street_policy=policy,
+            max_walking_time=8,
+        )
+        matched = [
+            candidate
+            for candidate in forward
+            if candidate["departure_s"] == journey["departure_s"]
+            and candidate["arrival_s"] == journey["arrival_s"]
+            and candidate["rides"] == journey["rides"]
+        ]
+        assert matched, "the arrive-by journey is not a departure answer"
+
+
+def test_the_walk_still_wins_nearby_under_the_deadline(car_park_network):
+    policy = _pasila_policy()
+    journeys = car_park_network.route_between_coordinates(
+        (60.1690, 24.9320),
+        (60.1688, 24.9316),
+        arrival=ARRIVAL_TIME,
+        street_policy=policy,
+    )
+    best = journeys[0]
+    # A few metres away, walking wins the latest departure and is
+    # placed to arrive exactly at the deadline.
+    assert best["rides"] == 0
+    assert best["legs"][0]["mode"] == "walk"
+    assert best["arrival_s"] == DEADLINE_S
+
+
+def test_the_arrive_by_matrix_cells_are_the_route_answers(car_park_network):
+    from cafein import TravelTimeMatrix
+
+    policy = _pasila_policy()
+    origins = geopandas.GeoDataFrame(
+        {"id": ["far", "near"]},
+        geometry=[Point(FAR_ORIGIN[1], FAR_ORIGIN[0]), Point(24.9320, 60.1690)],
+        crs="EPSG:4326",
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["d1", "d2"]},
+        geometry=[Point(24.9520, 60.1795), Point(24.9500, 60.1841)],
+        crs="EPSG:4326",
+    )
+    frame = TravelTimeMatrix(
+        car_park_network,
+        origins,
+        destinations,
+        arrival=ARRIVAL_TIME,
+        street_policy=policy,
+        max_walking_time=8,
+        output_time_units="seconds",
+    )
+    cells = {(row.from_id, row.to_id): row.travel_time for row in frame.itertuples()}
+    coordinates = {"far": FAR_ORIGIN, "near": (60.1690, 24.9320)}
+    targets = {"d1": (60.1795, 24.9520), "d2": (60.1841, 24.9500)}
+    for from_id, origin in coordinates.items():
+        for to_id, destination in targets.items():
+            journeys = car_park_network.route_between_coordinates(
+                origin,
+                destination,
+                arrival=ARRIVAL_TIME,
+                street_policy=policy,
+                max_walking_time=8,
+            )
+            best = journeys[0]
+            cell = cells[(from_id, to_id)]
+            if from_id == "far":
+                # Walking cannot serve within the budget: purely the
+                # reverse election on both sides, exactly equal.
+                assert cell == best["arrival_s"] - best["departure_s"]
+            else:
+                assert abs(cell - (best["arrival_s"] - best["departure_s"])) <= 1
+
+
+def test_the_arrive_by_cost_matrix_carries_the_car_chain(car_park_network):
+    from cafein import DetailedItineraries, TravelCostMatrix
+
+    # Two viable facilities with distinct fees: the cell must carry
+    # the fee of the facility the ELECTED journey drove to.
+    facilities = geopandas.GeoDataFrame(
+        {"id": ["pasila", "haka"], "search_seconds": [240.0, 60.0], "fee": [3.0, 1.5]},
+        geometry=[Point(PASILA[1], PASILA[0]), Point(24.9420, 60.2010)],
+        crs="EPSG:4326",
+    )
+    policy = CarParkPolicy(facilities=facilities, vehicle_class="ICE", occupancy=2.0)
+    origins = geopandas.GeoDataFrame(
+        {"id": ["o"]}, geometry=[Point(FAR_ORIGIN[1], FAR_ORIGIN[0])], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["d"]}, geometry=[Point(24.9520, 60.1795)], crs="EPSG:4326"
+    )
+    frame = TravelCostMatrix(
+        car_park_network,
+        origins,
+        destinations,
+        arrival=ARRIVAL_TIME,
+        street_policy=policy,
+        max_walking_time=8,
+        output_time_units="seconds",
+    )
+    assert list(frame["from_id"]) == ["o"] and list(frame["to_id"]) == ["d"]
+    itinerary = DetailedItineraries(
+        car_park_network,
+        origins,
+        destinations,
+        arrival=ARRIVAL_TIME,
+        street_policy=policy,
+        max_walking_time=8,
+    )
+    # The cell is the complete-journey winner — the LATEST departure,
+    # the itineraries' leading option — never a faster-but-earlier or
+    # more-ridden substitution.
+    starts = itinerary.groupby("option")["departure_s"].min()
+    journey = itinerary[itinerary["option"] == starts.idxmax()]
+    drive = journey[journey["mode"] == "car_park"]
+    fees = {"pasila": 3.0, "haka": 1.5}
+    assert frame["fee"].iloc[0] == pytest.approx(fees[drive["facility_id"].iloc[0]])
+    assert frame["street_distance_m"].iloc[0] == pytest.approx(
+        drive["distance_m"].iloc[0], rel=1e-6
+    )
+    assert frame["emissions"].iloc[0] == pytest.approx(
+        float(journey["emissions"].sum()), rel=1e-9
+    )
+    duration = int(journey["arrival_s"].max() - journey["departure_s"].min())
+    assert frame["travel_time"].iloc[0] == duration
+
+
+def test_arrive_by_accessibility_scores_through_the_car_plane(car_park_network):
+    from cafein import Accessibility
+
+    policy = _pasila_policy()
+    origins = geopandas.GeoDataFrame(
+        {"id": ["far"]}, geometry=[Point(FAR_ORIGIN[1], FAR_ORIGIN[0])], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["a", "b"], "jobs": [100.0, 40.0]},
+        geometry=[Point(24.9520, 60.1795), Point(24.9316, 60.1688)],
+        crs="EPSG:4326",
+    )
+    walked = Accessibility(
+        car_park_network,
+        origins,
+        destinations,
+        arrival=ARRIVAL_TIME,
+        opportunities="jobs",
+        budgets=(45.0,),
+        max_walking_time=8,
+    )
+    assert float(walked["accessibility"].sum()) == 0.0
+    driven = Accessibility(
+        car_park_network,
+        origins,
+        destinations,
+        arrival=ARRIVAL_TIME,
+        opportunities="jobs",
+        budgets=(45.0,),
+        max_walking_time=8,
+        street_policy=policy,
+    )
+    assert float(driven["accessibility"].sum()) > 0.0
+
+
+def test_a_tied_walk_beats_the_through_stop_car_cell(car_park_network):
+    from cafein import TravelCostMatrix
+    from cafein.street_network import _resolved_delays
+
+    core = car_park_network._core
+    destination = (60.1975, 24.9350)
+    # Engineer an exact tie from the fixture's own measured pieces:
+    # drive + park + best through-stop walks == the direct walk.
+    walk_seconds = int(
+        core._walk_matrix([FAR_ORIGIN], [destination], 3.6, 7200.0, 1600.0)[0][0][0]
+    )
+    model = _resolved_delays("car", True, None, None)
+    drive_s = int(
+        core._car_park_drive_seconds(
+            FAR_ORIGIN[0], FAR_ORIGIN[1], [PASILA], model, 1800.0, 500.0, False
+        )[0][0]
+    )
+    access = core.access_stops(PASILA[0], PASILA[1], 3.6, 600.0, 1600.0)
+    egress = core.access_stops(destination[0], destination[1], 3.6, 7200.0, 1600.0)
+    through = min(
+        int(access[stop]) + int(egress[stop]) for stop in access if stop in egress
+    )
+    park = walk_seconds - drive_s - through
+    assert park >= 2, "the fixture geometry no longer forms a tie"
+    all_routes = [route for route, _agency, _kind in car_park_network.routes]
+    origins = geopandas.GeoDataFrame(
+        {"id": ["far"]}, geometry=[Point(FAR_ORIGIN[1], FAR_ORIGIN[0])], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["d"]},
+        geometry=[Point(destination[1], destination[0])],
+        crs="EPSG:4326",
+    )
+
+    def cell(search_seconds):
+        facilities = geopandas.GeoDataFrame(
+            {"id": ["pasila"], "search_seconds": [float(search_seconds)], "fee": [5.0]},
+            geometry=[Point(PASILA[1], PASILA[0])],
+            crs="EPSG:4326",
+        )
+        frame = TravelCostMatrix(
+            car_park_network,
+            origins,
+            destinations,
+            arrival=ARRIVAL_TIME,
+            street_policy=CarParkPolicy(facilities=facilities),
+            exclude_routes=all_routes,
+            output_time_units="seconds",
+        )
+        return frame.iloc[0]
+
+    # An exact tie: the walk wins, as on the route surface — no fee,
+    # no metres, no grams.
+    tied = cell(park)
+    assert tied["travel_time"] == walk_seconds
+    assert tied["fee"] == 0.0
+    assert tied["street_distance_m"] == 0.0
+    assert tied["emissions"] == 0.0
+    # One second less parking departs strictly later: the car
+    # through-chain wins the cell, carrying its fee and grams.
+    later = cell(park - 1)
+    assert later["travel_time"] == walk_seconds - 1
+    assert later["fee"] == pytest.approx(5.0)
+    assert later["street_distance_m"] > 0.0
+    assert later["emissions"] > 0.0
+
+
+def test_facility_ties_break_in_declared_order(car_park_network):
+    from cafein.network import _car_park_offsets, _walk_options
+
+    # Two facilities at one coordinate with equal search times compose
+    # to equal totals at every stop: the declared-first facility wins.
+    frame = geopandas.GeoDataFrame(
+        {"id": ["first", "second"], "search_seconds": [240.0, 240.0]},
+        geometry=[Point(PASILA[1], PASILA[0]), Point(PASILA[1], PASILA[0])],
+        crs="EPSG:4326",
+    )
+    best = _car_park_offsets(
+        car_park_network._core,
+        FAR_ORIGIN,
+        CarParkPolicy(facilities=frame),
+        _walk_options(None, None, None),
+        False,
+    )
+    assert best
+    assert {token[0] for _total, token in best.values()} == {0}
+
+
+def test_the_zero_ride_car_chain_serves_the_route(car_park_network):
+    from cafein import TravelTimeMatrix
+
+    policy = _pasila_policy()
+    destination = (60.1975, 24.9350)
+    all_routes = [route for route, _agency, _kind in car_park_network.routes]
+    origins = geopandas.GeoDataFrame(
+        {"id": ["far"]}, geometry=[Point(FAR_ORIGIN[1], FAR_ORIGIN[0])], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["d"]},
+        geometry=[Point(destination[1], destination[0])],
+        crs="EPSG:4326",
+    )
+    # With transit excluded and walking beyond its budget, the
+    # zero-ride car chain — drive, park, walk in, walk out — is the
+    # journey, and the matrix cell matches it.
+    journeys = car_park_network.route_between_coordinates(
+        FAR_ORIGIN,
+        destination,
+        DEPARTURE_TIME,
+        street_policy=policy,
+        exclude_routes=all_routes,
+        max_walking_time=8,
+    )
+    assert len(journeys) == 1
+    chain = journeys[0]
+    assert chain["rides"] == 0
+    assert [leg.get("mode") for leg in chain["legs"]] == [
+        "car_park",
+        None,
+        "walk",
+        "walk",
+    ]
+    duration = chain["arrival_s"] - chain["departure_s"]
+    frame = TravelTimeMatrix(
+        car_park_network,
+        origins,
+        destinations,
+        DEPARTURE_TIME,
+        street_policy=policy,
+        exclude_routes=all_routes,
+        max_walking_time=8,
+        output_time_units="seconds",
+    )
+    assert int(frame["travel_time"].iloc[0]) == duration
+    # The same chain under the deadline, departing as late as it can.
+    reverse = car_park_network.route_between_coordinates(
+        FAR_ORIGIN,
+        destination,
+        arrival=ARRIVAL_TIME,
+        street_policy=policy,
+        exclude_routes=all_routes,
+        max_walking_time=8,
+    )
+    assert reverse[0]["rides"] == 0
+    assert reverse[0]["arrival_s"] == DEADLINE_S
+    assert reverse[0]["arrival_s"] - reverse[0]["departure_s"] == duration
+    back = TravelTimeMatrix(
+        car_park_network,
+        origins,
+        destinations,
+        arrival=ARRIVAL_TIME,
+        street_policy=policy,
+        exclude_routes=all_routes,
+        max_walking_time=8,
+        output_time_units="seconds",
+    )
+    assert int(back["travel_time"].iloc[0]) == duration

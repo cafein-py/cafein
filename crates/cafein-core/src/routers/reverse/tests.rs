@@ -838,3 +838,39 @@ fn shared_trip_destinations_both_survive_a_tagged_run() {
     assert_eq!(nearer.2 - nearer.1, 100);
     assert_eq!(farther.2 - farther.1, 200);
 }
+
+#[test]
+fn a_shared_access_egress_stop_never_elects_an_out_and_back() {
+    // Stop 1 serves both tables; riding out (1→3) and back (3→1)
+    // reaches the destination later than walking straight through,
+    // and the forward engine prunes the chain against its own
+    // walk-through bound at the shared stop. The replay drops the
+    // candidate rather than panicking — the walking alternative is
+    // the callers' to place.
+    let mut builder = TimetableBuilder::new(4);
+    let out = builder.add_pattern(&[StopIdx(1), StopIdx(3)], 0).unwrap();
+    let back = builder.add_pattern(&[StopIdx(3), StopIdx(1)], 1).unwrap();
+    builder
+        .add_trip(out, vec![time(250), time(400)], 0, 0)
+        .unwrap();
+    builder
+        .add_trip(back, vec![time(450), time(600)], 1, 0)
+        .unwrap();
+    let timetable = builder.finish();
+    let transfers = Transfers::from_edges(4, &[]).unwrap();
+    let reversed = ReversedTransfers::build(&transfers);
+    let request = Request {
+        departure: 1000,
+        access: vec![(StopIdx(1), 30)],
+        egress: vec![(StopIdx(1), 20)],
+        active_services: vec![true; 2],
+        active_services_previous: Vec::new(),
+        max_transfers: 3,
+        exclusions: None,
+    };
+    let journeys = reverse_route(&timetable, &transfers, &reversed, &request);
+    assert!(
+        journeys.is_empty(),
+        "an out-and-back chain is not a journey: {journeys:?}"
+    );
+}

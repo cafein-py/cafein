@@ -147,8 +147,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
         always, each row's ``travel_time`` is its own leg's duration —
         a journey's duration spans its first departure to its final
         arrival, never the span to the deadline. The
-        departure-window parameters, ``router="tbtr"``, and
-        ``street_policy`` do not combine with it. On a
+        departure-window parameters, ``router="tbtr"``, and the
+        street-leg policies do not combine with it — a
+        ``CarParkPolicy`` serves it, windowless. On a
         ``StreetNetwork`` the deadline is pure clock placement:
         durations are unchanged and every leg's ``arrival_s`` is the
         deadline.
@@ -531,10 +532,13 @@ class DetailedItineraries(gpd.GeoDataFrame):
                     "search rides RAPTOR"
                 )
             if street_policy is not None:
-                raise ValueError(
-                    "street_policy= (a traveler's street bridge included) "
-                    "does not combine with arrival= yet"
-                )
+                from cafein.policy import CarParkPolicy as _CarParkArrival
+
+                if not isinstance(street_policy, _CarParkArrival):
+                    raise ValueError(
+                        "street_policy= (a traveler's street bridge included) "
+                        "does not combine with arrival= yet"
+                    )
             date, departure = arrival_parts(arrival)
         else:
             date, departure = (

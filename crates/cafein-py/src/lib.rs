@@ -148,6 +148,10 @@ struct TransportNetwork {
     /// Monotonic count of walking street-network installs; exposure
     /// reporting pins its cached per-edge arrays to it.
     streets_generation: u64,
+    /// Monotonic count of footpath (transfer-set) installs; a
+    /// computation spanning several engine calls pins it to prove
+    /// they all read the same closure.
+    transfers_generation: u64,
 }
 
 /// Resolution of a raw GTFS stop_id, which merged feeds can duplicate.
