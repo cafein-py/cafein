@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.15.1 — 2026-08-23
+
+- Street builds with a DEM no longer crash on zero-length OSM ways
+  (consecutive nodes mapped at one position): only edges with real
+  length are densified for elevation sampling.
+  ([#296](https://github.com/cafein-py/cafein/pull/296))
+
 ## 0.15.0 — 2026-08-20
 
 - `cafein.equity` gains `alkire_foster`: the multidimensional M0 over
