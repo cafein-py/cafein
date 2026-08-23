@@ -1948,6 +1948,7 @@ pub(super) fn assemble(
         trips_by_public_id,
         streets_bytes_read,
         streets_generation: 0,
+        transfers_generation: 0,
         source: Some(source),
     }
 }

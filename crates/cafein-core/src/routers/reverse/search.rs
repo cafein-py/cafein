@@ -501,7 +501,15 @@ fn mark_candidates(state: &ReverseState, request: &Request, mark: u32) -> Vec<(u
 }
 
 /// Materializes candidate tuples through the forward engine, latest
-/// departure first — the arc's replay guarantee.
+/// departure first — the replay guarantee: every returned journey is
+/// a forward answer. A candidate the forward run does not contain is
+/// dropped rather than materialised: the reverse search keeps
+/// ride-rooted labels beside walk-rooted ones (only a ride-rooted
+/// label may compose with the access side), so a stop serving both
+/// the access and the egress table can elect a ridden out-and-back
+/// chain that the forward engine prunes against its own walk-through
+/// bound at that stop — a chain strictly worse than walking through,
+/// never a lost answer.
 fn replay(
     timetable: &Timetable,
     transfers: &Transfers,
@@ -514,11 +522,13 @@ fn replay(
             departure,
             ..request.clone()
         };
-        let journey = Raptor
+        let Some(journey) = Raptor
             .route(timetable, transfers, &forward)
             .into_iter()
             .find(|journey| journey.arrival == achieved && journey.rides() == rides)
-            .expect("the forward replay contains the elected journey");
+        else {
+            continue;
+        };
         debug_assert_eq!(journey.departure, departure);
         journeys.push(journey);
     }

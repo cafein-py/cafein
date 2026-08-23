@@ -113,8 +113,9 @@ class TravelCostMatrix(pd.DataFrame):
         whole-window zone search (and its implicit 120-minute cap)
         stays on the departure axis. One reverse run serves each
         destination, so ``chunk`` slices the destination axis;
-        ``router="tbtr"``, ``candidates="pareto"``, and
-        ``street_policy`` do not combine with it.
+        ``router="tbtr"``, ``candidates="pareto"``, and the street-leg
+        policies do not combine with it — a ``CarParkPolicy`` serves
+        it, windowless.
     arrival_time_window : float or datetime.timedelta (optional)
         The arrival window in minutes beside ``arrival=``: deadlines
         profile at every minute mark within it. Required with the
@@ -345,7 +346,10 @@ class TravelCostMatrix(pd.DataFrame):
     facility column is surfaced — the winner is visible on
     ``DetailedItineraries``. Transit fares stay unpriced; the same
     knobs are rejected as under a street-leg policy except the walking
-    knobs, and stop exclusions are rejected too.
+    knobs, and stop exclusions are rejected too. With ``arrival=`` the
+    reverse election picks each cell's latest departure and winning
+    facility, and the cell prices that chain at its own departure —
+    the fee, metres, and grams belong to the elected facility.
 
     ``output_time_units=`` selects the ``travel_time`` unit:
     ``"minutes"`` (the default; whole minutes rounded to the nearest)
@@ -458,10 +462,13 @@ class TravelCostMatrix(pd.DataFrame):
                         "search rides RAPTOR"
                     )
                 if street_policy is not None:
-                    raise ValueError(
-                        "street_policy= (a traveler's street bridge included) "
-                        "does not combine with arrival= yet"
-                    )
+                    from cafein.policy import CarParkPolicy
+
+                    if not isinstance(street_policy, CarParkPolicy):
+                        raise ValueError(
+                            "street_policy= (a traveler's street bridge "
+                            "included) does not combine with arrival= yet"
+                        )
             date, departure = arrival_parts(arrival)
         else:
             date, departure = (
@@ -562,7 +569,14 @@ class TravelCostMatrix(pd.DataFrame):
                         name
                         for name, value in (
                             ("optimize", None if optimize == "time" else optimize),
-                            ("departure_time_window", window),
+                            (
+                                (
+                                    "arrival_time_window"
+                                    if arrive_by
+                                    else "departure_time_window"
+                                ),
+                                window,
+                            ),
                             ("max_travel_time", within),
                             ("fares", fares),
                             (
@@ -586,7 +600,12 @@ class TravelCostMatrix(pd.DataFrame):
                         "CarParkPolicy does not combine with stop "
                         "exclusions in this stage"
                     )
-                data = _car_park_cost_columns(
+                arm = (
+                    _car_park_arrive_by_cost_columns
+                    if arrive_by
+                    else _car_park_cost_columns
+                )
+                data = arm(
                     network,
                     origins,
                     destinations,
@@ -1122,7 +1141,8 @@ class TravelTimeMatrix(pd.DataFrame):
         chunked frames still concatenate to full coverage. The reverse
         rides the closure (a whole-day ULTRA set is never claimed);
         the departure-window parameters, ``router="tbtr"``, and
-        ``street_policy`` do not combine with it, and a
+        the street-leg policies do not combine with it (a
+        ``CarParkPolicy`` serves it, windowless), and a
         ``StreetNetwork`` matrix has no timetable axis at all.
     max_rides : int (optional, default: 8)
         Maximum number of boarded vehicles per journey (rides, not
@@ -1201,7 +1221,10 @@ class TravelTimeMatrix(pd.DataFrame):
     percentiles, ``router=`` overrides, and stop exclusions are
     rejected by name; an origin that cannot reach any facility by car
     has its cells omitted with a warning, never a silent walking-only
-    row.
+    row. With ``arrival=`` the same composed tables ride the reverse
+    engine: per cell the latest departure arriving by the deadline,
+    the walk placed to arrive exactly at it, and chunking slicing the
+    destination axis as on every arrive-by matrix.
     """
 
     @property
@@ -1294,15 +1317,11 @@ class TravelTimeMatrix(pd.DataFrame):
             if street_policy is not None:
                 from cafein.policy import CarParkPolicy
 
-                if isinstance(street_policy, CarParkPolicy):
-                    raise NotImplementedError(
-                        "CarParkPolicy serves the departure axis for now; "
-                        "arrival= arrives with the arrive-by stage"
+                if not isinstance(street_policy, CarParkPolicy):
+                    raise ValueError(
+                        "street_policy= (a traveler's street bridge included) "
+                        "does not combine with arrival= yet"
                     )
-                raise ValueError(
-                    "street_policy= (a traveler's street bridge included) "
-                    "does not combine with arrival= yet"
-                )
         else:
             date, departure = (
                 (None, None) if departure is None else departure_parts(departure)
@@ -1374,7 +1393,14 @@ class TravelTimeMatrix(pd.DataFrame):
                 named = [
                     name
                     for name, value in (
-                        ("departure_time_window", window),
+                        (
+                            (
+                                "arrival_time_window"
+                                if arrive_by
+                                else "departure_time_window"
+                            ),
+                            window,
+                        ),
                         ("percentiles", percentiles),
                         ("confidence", confidence),
                     )
@@ -1391,7 +1417,12 @@ class TravelTimeMatrix(pd.DataFrame):
                         "CarParkPolicy does not combine with stop "
                         "exclusions in this stage"
                     )
-                data = _car_park_time_columns(
+                arm = (
+                    _car_park_arrive_by_time_columns
+                    if arrive_by
+                    else _car_park_time_columns
+                )
+                data = arm(
                     network,
                     origins,
                     destinations,
@@ -1639,15 +1670,11 @@ class TravelTimeMatrix(pd.DataFrame):
             if street_policy is not None:
                 from cafein.policy import CarParkPolicy
 
-                if isinstance(street_policy, CarParkPolicy):
-                    raise NotImplementedError(
-                        "CarParkPolicy serves the departure axis for now; "
-                        "arrival= arrives with the arrive-by stage"
+                if not isinstance(street_policy, CarParkPolicy):
+                    raise ValueError(
+                        "street_policy= (a traveler's street bridge included) "
+                        "does not combine with arrival= yet"
                     )
-                raise ValueError(
-                    "street_policy= (a traveler's street bridge included) "
-                    "does not combine with arrival= yet"
-                )
             date, departure = arrival_parts(arrival)
         if not arrive_by:
             date, departure = (
@@ -5206,6 +5233,605 @@ def _car_park_cost_columns(
         "street_distance_m": [columns["street_distance"][at] for at in order],
         "emissions": [columns["emissions"][at] for at in order],
         "fee": [fee_column[at] for at in order],
+    }
+    if geometries:
+        data["geometry"] = shapely.from_wkb(
+            np.array([shapes[at] for at in order], dtype=object)
+        )
+    return data
+
+
+def _arrive_by_clock(seconds):
+    """A seconds-of-day value back in the ``HH:MM:SS`` engine form."""
+    return f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
+
+
+def _car_park_arrive_by_winner(held, candidate):
+    """The complete-journey order between arrive-by candidates
+    ``(departure, rounds, achieved)``: latest departure, then fewest
+    rounds, then earliest arrival — the reverse engine's own rule."""
+    if held is None:
+        return True
+    return (
+        candidate[0] > held[0]
+        or (candidate[0] == held[0] and candidate[1] < held[1])
+        or (
+            candidate[0] == held[0]
+            and candidate[1] == held[1]
+            and candidate[2] < held[2]
+        )
+    )
+
+
+def _car_park_arrive_by_time_matrix(
+    network,
+    origins,
+    destinations,
+    date,
+    deadline,
+    policy,
+    max_transfers,
+    chunk,
+    walk_options,
+    exclude_routes=(),
+    exclude_trips=(),
+):
+    """The dense CarParkPolicy arrive-by matrices with their id axes.
+
+    One reverse run per destination at the deadline over the composed
+    access tables; per cell the complete-journey winner's own duration,
+    departure clock, and winning access-stop index (the uint32 maximum
+    where unreachable or where the walk won), the direct walking
+    alternative folded in by the same latest-departure rule — placed to
+    arrive exactly at the deadline. Chunking slices the destination
+    axis, the arrive-by convention. An origin that cannot reach any
+    facility by car keeps its cells unreachable, with a warning naming
+    it. Returns ``(durations, departures, access_stops, from_ids,
+    to_ids)``."""
+    import copy
+
+    from cafein.network import _car_park_table, _departure_seconds, _walk_options
+
+    core = network._core
+    network._require_car_side()
+    if not _is_point_frame(origins):
+        raise ValueError(
+            "CarParkPolicy matrices take point-set origins and "
+            "destinations; the facilities plane needs coordinates"
+        )
+    policy = copy.deepcopy(policy)
+    exclude_routes = id_sequence("exclude_routes", exclude_routes)
+    exclude_trips = id_sequence("exclude_trips", exclude_trips)
+    from_ids, origin_points = _point_list(origins, "origins")
+    if destinations is None:
+        to_ids, destination_points = from_ids, origin_points
+    else:
+        to_ids, destination_points = _point_list(destinations, "destinations")
+    # One reverse run fills a column, so chunking slices the
+    # destination axis — the arrive-by convention.
+    columns = _chunk_slice(len(to_ids), chunk)
+    to_ids = to_ids[columns]
+    destination_points = destination_points[columns]
+    walk_options = _walk_options(*walk_options)
+    walking_speed, walk_budget, snap_distance = walk_options
+    # One pinned generation for the whole matrix, as on the departure
+    # axis: composition, egress linking, and the walk fold must read
+    # the same street graph.
+    generation = core._streets_generation
+    access_rows, undriven = [], []
+    for index, point in enumerate(origin_points):
+        try:
+            offsets, _tokens, _walking = _car_park_table(
+                core, tuple(point), policy, walk_options, False
+            )
+        except ValueError as error:
+            message = str(error)
+            if (
+                "no facility is reachable by car" not in message
+                and "too far from the car streets" not in message
+            ):
+                raise
+            access_rows.append([])
+            undriven.append(index)
+            continue
+        access_rows.append(offsets)
+    egress_linked = core._link_walking_stops(
+        list(destination_points), walking_speed, walk_budget, snap_distance
+    )
+    egress_rows = [
+        (
+            []
+            if linked is None
+            else [(stop, int(seconds)) for stop, seconds, _meters in linked]
+        )
+        for linked in egress_linked
+    ]
+    table = core._arrive_by_time_matrix_with_access(
+        access_rows,
+        egress_rows,
+        date,
+        deadline,
+        max_transfers,
+        exclude_routes=list(exclude_routes),
+        exclude_trips=list(exclude_trips),
+        exclude_stops=[],
+    )
+    walk = core._walk_matrix(
+        list(origin_points),
+        list(destination_points),
+        walking_speed,
+        walk_budget,
+        snap_distance,
+    )
+    if core._streets_generation != generation:
+        raise RuntimeError(
+            "the street network was replaced while the park-and-ride "
+            "matrix was being computed; rerun the query"
+        )
+    if undriven:
+        named = ", ".join(str(from_ids[index]) for index in undriven[:5])
+        suffix = ", …" if len(undriven) > 5 else ""
+        warnings.warn(
+            f"{len(undriven)} origin point(s) cannot reach any facility "
+            f"by car and are omitted ({named}{suffix})",
+            stacklevel=3,
+        )
+    _warn_unsnapped(
+        {
+            "unsnapped_to": [
+                index for index, linked in enumerate(egress_linked) if linked is None
+            ]
+        },
+        from_ids,
+        to_ids,
+    )
+    unreachable = 2**32 - 1
+    durations = np.array(table["matrix"], dtype=np.int64)
+    departures = np.array(table["departure"], dtype=np.int64)
+    rounds = np.array(table["rounds"], dtype=np.int64)
+    access_stops = np.array(table["access_stop"], dtype=np.int64)
+    deadline_s = _departure_seconds(deadline)
+    undriven_rows = set(undriven)
+    for i in range(len(from_ids)):
+        if i in undriven_rows:
+            continue
+        for j in range(len(to_ids)):
+            cell = walk[i][j]
+            if cell is None:
+                continue
+            walk_seconds = int(cell[0])
+            placed = deadline_s - walk_seconds
+            if placed < 0:
+                continue
+            held = (
+                None
+                if durations[i, j] == unreachable
+                else (
+                    int(departures[i, j]),
+                    int(rounds[i, j]),
+                    int(departures[i, j] + durations[i, j]),
+                )
+            )
+            # The walk wins exact ties, as on the route surface.
+            walk_candidate = (placed, 0, deadline_s)
+            if held is None or not _car_park_arrive_by_winner(walk_candidate, held):
+                durations[i, j] = walk_seconds
+                departures[i, j] = placed
+                rounds[i, j] = 0
+                access_stops[i, j] = unreachable
+    return durations.astype(np.uint32), departures, access_stops, from_ids, to_ids
+
+
+def _car_park_arrive_by_time_columns(
+    network,
+    origins,
+    destinations,
+    date,
+    deadline,
+    policy,
+    max_transfers,
+    chunk,
+    walk_options,
+    exclude_routes=(),
+    exclude_trips=(),
+):
+    """The CarParkPolicy arrive-by travel-time matrix in the long
+    shape the frame takes: unreachable pairs omitted."""
+    durations, _departures, _stops, from_ids, to_ids = _car_park_arrive_by_time_matrix(
+        network,
+        origins,
+        destinations,
+        date,
+        deadline,
+        policy,
+        max_transfers,
+        chunk,
+        walk_options,
+        exclude_routes,
+        exclude_trips,
+    )
+    unreachable = 2**32 - 1
+    data = {"from_id": [], "to_id": [], "travel_time_s": []}
+    for i, from_id in enumerate(from_ids):
+        for j, to_id in enumerate(to_ids):
+            if durations[i, j] == unreachable:
+                continue
+            data["from_id"].append(from_id)
+            data["to_id"].append(to_id)
+            data["travel_time_s"].append(int(durations[i, j]))
+    return data
+
+
+def _car_park_arrive_by_cost_columns(
+    network,
+    origins,
+    destinations,
+    date,
+    deadline,
+    policy,
+    *,
+    max_transfers,
+    factors,
+    components,
+    geometries,
+    chunk,
+    walk_options,
+    exclude_routes=(),
+    exclude_trips=(),
+):
+    """The CarParkPolicy arrive-by cost-matrix columns.
+
+    The reverse election picks each cell's latest departure and its
+    winning access stop; the cell then prices with a forward run at
+    that departure seeded with exactly that access row, so the
+    attribution — drive metres, grams, and the ``fee`` — belongs to the
+    facility the election chose. Walking-won cells price as walks, the
+    walk placed to arrive exactly at the deadline. Chunking slices the
+    destination axis. Transit fares stay unpriced and no facility
+    column is surfaced, as on the departure axis."""
+    import copy
+
+    from cafein import emissions
+    from cafein.network import _car_park_table, _departure_seconds, _walk_options
+
+    components = component_selection(components)
+    core = network._core
+    network._require_car_side()
+    if not _is_point_frame(origins):
+        raise ValueError(
+            "CarParkPolicy matrices take point-set origins and "
+            "destinations; the facilities plane needs coordinates"
+        )
+    policy = copy.deepcopy(policy)
+    exclude_routes = id_sequence("exclude_routes", exclude_routes)
+    exclude_trips = id_sequence("exclude_trips", exclude_trips)
+    from_ids, origin_points = _point_list(origins, "origins")
+    if destinations is None:
+        to_ids, destination_points = from_ids, origin_points
+    else:
+        to_ids, destination_points = _point_list(destinations, "destinations")
+    columns_slice = _chunk_slice(len(to_ids), chunk)
+    to_ids = to_ids[columns_slice]
+    destination_points = destination_points[columns_slice]
+    walk_options = _walk_options(*walk_options)
+    walking_speed, walk_budget, snap_distance = walk_options
+    transit_factors, street_factors = _factor_tables(factors)
+    trip_factors = emissions.trip_factors(network, transit_factors, components)
+    value = emissions.street_factor(
+        "car", street_factors, components, vehicle_class=policy.vehicle_class
+    )
+    car_factor = (
+        float("nan") if pd.isna(value) else float(value) / float(policy.occupancy)
+    )
+    fees = [float(fee) for fee in policy.facilities["fee"]]
+    generation = core._streets_generation
+    # The election and the per-group repricing are separate engine
+    # calls; pinning the transfer generation proves they all read the
+    # same closure.
+    transfers_generation = core._transfers_generation
+    access_offsets, rows_by_stop, fee_by_stop, undriven = [], [], [], []
+    for index, point in enumerate(origin_points):
+        try:
+            offsets, tokens, walking = _car_park_table(
+                core, tuple(point), policy, walk_options, False
+            )
+        except ValueError as error:
+            message = str(error)
+            if (
+                "no facility is reachable by car" not in message
+                and "too far from the car streets" not in message
+            ):
+                raise
+            access_offsets.append([])
+            rows_by_stop.append({})
+            fee_by_stop.append({})
+            undriven.append(index)
+            continue
+        by_stop, stop_fees = {}, {}
+        for stop, total in offsets:
+            token = tokens.get(stop)
+            if token is None:
+                by_stop[stop] = (
+                    stop,
+                    total,
+                    0.0,
+                    0.0,
+                    walking[stop][1],
+                    0.0,
+                    0.0,
+                    0.0,
+                    False,
+                )
+                continue
+            position, _d, _p, _w, network_m, connector_m, walk_m, _shape = token
+            by_stop[stop] = (
+                stop,
+                total,
+                network_m,
+                connector_m,
+                walk_m,
+                car_factor,
+                0.0,
+                0.0,
+                True,
+            )
+            stop_fees[stop] = fees[position]
+        access_offsets.append(offsets)
+        rows_by_stop.append(by_stop)
+        fee_by_stop.append(stop_fees)
+    egress_linked = core._link_walking_stops(
+        list(destination_points), walking_speed, walk_budget, snap_distance
+    )
+    egress_offsets = [
+        (
+            []
+            if linked is None
+            else [(stop, int(seconds)) for stop, seconds, _meters in linked]
+        )
+        for linked in egress_linked
+    ]
+    egress_rows = [
+        (
+            []
+            if linked is None
+            else [
+                (stop, int(seconds), 0.0, 0.0, meters, 0.0, 0.0, 0.0, False)
+                for stop, seconds, meters in linked
+            ]
+        )
+        for linked in egress_linked
+    ]
+    table = core._arrive_by_time_matrix_with_access(
+        access_offsets,
+        egress_offsets,
+        date,
+        deadline,
+        max_transfers,
+        exclude_routes=list(exclude_routes),
+        exclude_trips=list(exclude_trips),
+        exclude_stops=[],
+    )
+    walk = core._walk_matrix(
+        list(origin_points),
+        list(destination_points),
+        walking_speed,
+        walk_budget,
+        snap_distance,
+    )
+    if undriven:
+        named = ", ".join(str(from_ids[index]) for index in undriven[:5])
+        suffix = ", …" if len(undriven) > 5 else ""
+        warnings.warn(
+            f"{len(undriven)} origin point(s) cannot reach any facility "
+            f"by car and are omitted ({named}{suffix})",
+            stacklevel=3,
+        )
+    _warn_unsnapped(
+        {
+            "unsnapped_to": [
+                index for index, linked in enumerate(egress_linked) if linked is None
+            ]
+        },
+        from_ids,
+        to_ids,
+    )
+    unreachable = 2**32 - 1
+    durations = np.array(table["matrix"], dtype=np.int64)
+    departures_at = np.array(table["departure"], dtype=np.int64)
+    rounds = np.array(table["rounds"], dtype=np.int64)
+    elected_stops = np.array(table["access_stop"], dtype=np.int64)
+    deadline_s = _departure_seconds(deadline)
+    stops_by_index = [stop for stop, _lat, _lon in core.stops]
+    undriven_rows = set(undriven)
+    # Per cell: the walking alternative competes by the same
+    # latest-departure rule; surviving ridden cells group by their
+    # elected (origin, departure, access stop, rides) for the forward
+    # pricing, and zero-ride through-stop cells synthesize directly —
+    # the forward engine never emits them.
+    walk_cells, through_cells, groups = [], [], {}
+    for i in range(len(from_ids)):
+        if i in undriven_rows:
+            continue
+        for j in range(len(to_ids)):
+            transit = durations[i, j] != unreachable
+            cell = walk[i][j]
+            placed = None if cell is None else deadline_s - int(cell[0])
+            if placed is not None and placed >= 0:
+                held = (
+                    None
+                    if not transit
+                    else (
+                        int(departures_at[i, j]),
+                        int(rounds[i, j]),
+                        int(departures_at[i, j] + durations[i, j]),
+                    )
+                )
+                # The walk wins exact ties, as on the route surface.
+                walk_candidate = (placed, 0, deadline_s)
+                if held is None or not _car_park_arrive_by_winner(walk_candidate, held):
+                    walk_cells.append((i, j, placed, int(cell[0]), float(cell[1])))
+                    continue
+            if not transit:
+                continue
+            if rounds[i, j] == 0:
+                through_cells.append((i, j))
+                continue
+            key = (
+                i,
+                int(departures_at[i, j]),
+                int(elected_stops[i, j]),
+                int(rounds[i, j]),
+            )
+            groups.setdefault(key, []).append(j)
+    columns = {
+        "from": [],
+        "to": [],
+        "travel_time_s": [],
+        "rides": [],
+        "transit_distance": [],
+        "walk_distance": [],
+        "street_distance": [],
+        "emissions": [],
+        "fee": [],
+    }
+    shapes = [] if geometries else None
+    for (i, departure_s, stop_index, rides), cells in sorted(groups.items()):
+        stop = stops_by_index[stop_index]
+        seed = rows_by_stop[i][stop]
+        fee = fee_by_stop[i].get(stop, 0.0)
+        # Capped at the elected ride count, the forward time-best
+        # through the elected seed IS the complete-journey winner: a
+        # faster same-departure chain with more rides cannot displace
+        # it, so the cell provably prices the elected journey.
+        priced = core._cost_matrix_with_access(
+            [[seed]],
+            [egress_rows[j] for j in cells],
+            [tuple(origin_points[i])],
+            [tuple(destination_points[j]) for j in cells],
+            date,
+            _arrive_by_clock(departure_s),
+            trip_factors,
+            float(walk_budget),
+            rides - 1,
+            exclude_routes=list(exclude_routes),
+            exclude_trips=list(exclude_trips),
+            exclude_stops=[],
+            geometries=bool(geometries),
+            transfer_mode=None,
+            direct_mode=None,
+        )
+        found = set()
+        for at in range(len(priced["travel_time_s"])):
+            j = cells[int(priced["to"][at])]
+            found.add(j)
+            if (
+                int(priced["travel_time_s"][at]) != int(durations[i, j])
+                or int(priced["rides"][at]) != rides
+            ):
+                raise RuntimeError(
+                    "an elected arrive-by cell re-priced as a different "
+                    "journey; rerun the query"
+                )
+            columns["from"].append(i)
+            columns["to"].append(j)
+            columns["travel_time_s"].append(int(priced["travel_time_s"][at]))
+            columns["rides"].append(int(priced["rides"][at]))
+            columns["transit_distance"].append(float(priced["transit_distance"][at]))
+            columns["walk_distance"].append(float(priced["walk_distance"][at]))
+            columns["street_distance"].append(float(priced["street_distance"][at]))
+            columns["emissions"].append(float(priced["emissions"][at]))
+            columns["fee"].append(fee)
+            if shapes is not None:
+                shapes.append(priced["geometry"][at])
+        missing = [j for j in cells if j not in found]
+        if missing:
+            # The election proved these cells reachable through this
+            # very access row; an empty forward answer means the two
+            # engines drifted apart.
+            raise RuntimeError(
+                "an elected arrive-by cell could not be re-priced by "
+                "the forward engine; rerun the query"
+            )
+    for i, j in through_cells:
+        # The through-stop zero-ride cell: the composed chain to the
+        # elected stop, then the egress walk straight out — priced
+        # from the same sidecars the composition carries.
+        stop = stops_by_index[int(elected_stops[i, j])]
+        row = rows_by_stop[i][stop]
+        _stop, _s, network_m, connector_m, walk_m, factor, _tn, _tt, used = row
+        egress_m = next(
+            (meters for s, _sec, meters in (egress_linked[j] or []) if s == stop),
+            0.0,
+        )
+        grams = network_m / 1000.0 * factor if used and network_m > 0.0 else 0.0
+        columns["from"].append(i)
+        columns["to"].append(j)
+        columns["travel_time_s"].append(int(durations[i, j]))
+        columns["rides"].append(0)
+        columns["transit_distance"].append(0.0)
+        columns["walk_distance"].append(walk_m + egress_m)
+        columns["street_distance"].append(network_m + connector_m if used else 0.0)
+        columns["emissions"].append(grams)
+        columns["fee"].append(fee_by_stop[i].get(stop, 0.0))
+        if shapes is not None:
+            shapes.append(None)
+
+    def walk_shape(i, j):
+        if not geometries:
+            return None
+        direct = core._walk_between(
+            origin_points[i][0],
+            origin_points[i][1],
+            destination_points[j][0],
+            destination_points[j][1],
+            snap_distance,
+            True,
+        )
+        if direct is None or direct[2] is None:
+            return None
+        geometry = shapely.from_wkb(direct[2])
+        if geometry.geom_type == "LineString":
+            geometry = shapely.MultiLineString([geometry])
+        return shapely.to_wkb(geometry)
+
+    for i, j, _placed, walk_seconds, meters in walk_cells:
+        columns["from"].append(i)
+        columns["to"].append(j)
+        columns["travel_time_s"].append(walk_seconds)
+        columns["rides"].append(0)
+        columns["transit_distance"].append(0.0)
+        columns["walk_distance"].append(meters)
+        columns["street_distance"].append(0.0)
+        columns["emissions"].append(0.0)
+        columns["fee"].append(0.0)
+        if shapes is not None:
+            shapes.append(walk_shape(i, j))
+    if core._streets_generation != generation:
+        raise RuntimeError(
+            "the street network was replaced while the park-and-ride "
+            "matrix was being computed; rerun the query"
+        )
+    if core._transfers_generation != transfers_generation:
+        raise RuntimeError(
+            "the transfer set was replaced while the park-and-ride "
+            "matrix was being computed; rerun the query"
+        )
+    order = sorted(
+        range(len(columns["from"])),
+        key=lambda at: (columns["from"][at], columns["to"][at]),
+    )
+    data = {
+        "from_id": np.array(from_ids, dtype=object)[
+            [columns["from"][at] for at in order]
+        ],
+        "to_id": np.array(to_ids, dtype=object)[[columns["to"][at] for at in order]],
+        "travel_time_s": [columns["travel_time_s"][at] for at in order],
+        "transfers": np.maximum([columns["rides"][at] for at in order], 1) - 1,
+        "transit_distance_m": [columns["transit_distance"][at] for at in order],
+        "walk_distance_m": [columns["walk_distance"][at] for at in order],
+        "street_distance_m": [columns["street_distance"][at] for at in order],
+        "emissions": [columns["emissions"][at] for at in order],
+        "fee": [columns["fee"][at] for at in order],
     }
     if geometries:
         data["geometry"] = shapely.from_wkb(

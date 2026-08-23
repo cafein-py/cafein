@@ -464,7 +464,7 @@ def _validated_car_park_policy(
     surface,
 ):
     """The eager CarParkPolicy gate for the accessibility pillar: the
-    car-park policy only, on the departure-axis time cost with
+    car-park policy only, on the time cost of either axis with
     point-set origins and destinations."""
     if street_policy is None:
         return None
@@ -481,11 +481,6 @@ def _validated_car_park_policy(
             "CarParkPolicy shapes transit access; a StreetNetwork query "
             "has no transit side"
         )
-    if arrive_by:
-        raise NotImplementedError(
-            "CarParkPolicy serves the departure axis for now; arrival= "
-            "arrives with the arrive-by stage"
-        )
     if cost != "time":
         raise ValueError(
             f"CarParkPolicy accessibility serves cost='time', not {cost!r}"
@@ -493,7 +488,10 @@ def _validated_car_park_policy(
     named = [
         name
         for name, value in (
-            ("departure_time_window", window),
+            (
+                "arrival_time_window" if arrive_by else "departure_time_window",
+                window,
+            ),
             ("percentiles", percentiles),
             ("confidence", confidence),
         )
@@ -683,8 +681,33 @@ def _resolved_cost_matrix(
                 # The composed car-and-walking access table seeds the
                 # same engine fan-out the policy matrices ride; the
                 # gate validated the axis and the point frames.
-                from cafein.matrices import _car_park_time_matrix
+                from cafein.matrices import (
+                    _car_park_arrive_by_time_matrix,
+                    _car_park_time_matrix,
+                )
 
+                walk_knobs = (walking_speed_kmph, max_walking_time, max_snap_distance)
+                if arrive_by:
+                    # A product's chunk stays on the origins — its
+                    # scores need every destination — so the matrix
+                    # layer's destination chunking is bypassed.
+                    origins = origins.iloc[_chunk_slice(len(origins), chunk)]
+                    matrix, _departures, _stops, from_ids, to_ids = (
+                        _car_park_arrive_by_time_matrix(
+                            network,
+                            origins,
+                            destinations,
+                            date,
+                            departure,
+                            street_policy,
+                            max_transfers,
+                            None,
+                            walk_knobs,
+                            exclude_routes,
+                            exclude_trips,
+                        )
+                    )
+                    return matrix, from_ids, to_ids, None
                 matrix, from_ids, to_ids = _car_park_time_matrix(
                     network,
                     origins,
@@ -694,7 +717,7 @@ def _resolved_cost_matrix(
                     street_policy,
                     max_transfers,
                     chunk,
-                    (walking_speed_kmph, max_walking_time, max_snap_distance),
+                    walk_knobs,
                     exclude_routes,
                     exclude_trips,
                 )
@@ -981,10 +1004,12 @@ class Accessibility(pd.DataFrame):
     and winning ties; egress is ordinary walking and transfers ride
     the installed transfer set, as on every query. The query's
     walking knobs stay active. The policy serves ``cost="time"`` on
-    the departure axis with point-set origins and destinations;
-    windows, percentiles, ``router=`` overrides, and stop exclusions
-    are rejected by name, and the street-leg policies stay on the
-    matrix and itinerary surfaces.
+    either time axis with point-set origins and destinations — with
+    ``arrival=`` each cost is the latest-departure journey's own
+    duration through the composed table; windows, percentiles,
+    ``router=`` overrides, and stop exclusions are rejected by name,
+    and the street-leg policies stay on the matrix and itinerary
+    surfaces.
     """
 
     @property

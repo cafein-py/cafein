@@ -334,6 +334,7 @@ def _car_park_journeys(
     exclusions,
     geometries,
     walk_options,
+    arrive_by=False,
 ):
     """Door-to-door journeys under a ``CarParkPolicy``.
 
@@ -341,7 +342,10 @@ def _car_park_journeys(
     and the ordinary walk; egress is ordinary walking and transfers
     ride the installed transfer set. The engine sees ``(stop,
     seconds)`` rows only; the winning chain rebuilds from the tokens
-    at reconstruction.
+    at reconstruction. With ``arrive_by`` the same tables ride the
+    reverse engine at the deadline, latest departure first, and the
+    direct walking alternative is placed to arrive exactly at the
+    deadline.
     """
     import copy
 
@@ -368,18 +372,31 @@ def _car_park_journeys(
         destination[0], destination[1], walking_speed, walk_budget, snap_distance
     )
     egress = [(stop, int(seconds)) for stop, seconds in egress_walks.items()]
-    journeys = core._route_with_access(
-        offsets,
-        egress,
-        date,
-        departure,
-        max_transfers,
-        list(exclude_routes),
-        list(exclude_trips),
-        list(exclude_stops),
-        geometries,
-        transfer_mode=None,
-    )
+    if arrive_by:
+        journeys = core._reverse_route_with_access(
+            offsets,
+            egress,
+            date,
+            departure,
+            max_transfers,
+            list(exclude_routes),
+            list(exclude_trips),
+            list(exclude_stops),
+            geometries,
+        )
+    else:
+        journeys = core._route_with_access(
+            offsets,
+            egress,
+            date,
+            departure,
+            max_transfers,
+            list(exclude_routes),
+            list(exclude_trips),
+            list(exclude_stops),
+            geometries,
+            transfer_mode=None,
+        )
     facilities = policy.facilities
 
     def walk_leg_dict(leg_type, point, stop, departure_s, arrival_s, ends):
@@ -497,6 +514,104 @@ def _car_park_journeys(
                 leg["mode"] = "walk" if leg["type"] == "transfer" else None
                 legs.append(leg)
         journey["legs"] = legs
+    anchored = _departure_seconds(departure)
+    # The zero-ride car chain — drive, park, walk in, walk straight
+    # out through one stop. The engines never emit it, but the
+    # matrices' composed cells include it, and it beats every ridden
+    # journey when a facility sits beside the destination.
+    seeded = dict(offsets)
+    # Equal totals break on the core stop index — the matrix
+    # election's own tie-break, so both surfaces name one facility.
+    order = {stop: at for at, (stop, _lat, _lon) in enumerate(core.stops)}
+    through = None
+    through_key = None
+    for stop in tokens:
+        out = egress_walks.get(stop)
+        if out is None:
+            continue
+        total = int(seeded[stop]) + int(out)
+        key = (total, order.get(stop, len(order)))
+        if through_key is None or key < through_key:
+            through_key = key
+            through = (stop, total)
+    if through is not None:
+        stop, total = through
+        start = anchored - total if arrive_by else anchored
+        if arrive_by and start < 0:
+            through = None
+        else:
+            (
+                position,
+                drive_s,
+                park_s,
+                walk_s,
+                network_m,
+                connector_m,
+                _walk_m,
+                drive_wkb,
+            ) = tokens[stop]
+            facility_id = facilities["id"].iloc[position]
+            latitude = facilities.geometry.iloc[position].y
+            longitude = facilities.geometry.iloc[position].x
+            parked = start + drive_s
+            waited = parked + park_s
+            at_stop = waited + walk_s
+            chain = {
+                "departure_s": start,
+                "arrival_s": start + total,
+                "rides": 0,
+                "legs": [
+                    {
+                        "type": "access",
+                        "mode": "car_park",
+                        "facility_id": facility_id,
+                        "to_stop": None,
+                        "departure_s": start,
+                        "arrival_s": parked,
+                        "distance_m": network_m + connector_m,
+                        "network_distance_m": network_m,
+                        "connector_distance_m": connector_m,
+                        "distance_provenance": STREET_DISTANCE_PROVENANCE,
+                        "geometry": drive_wkb,
+                    },
+                    {
+                        "type": "park",
+                        "mode": None,
+                        "facility_id": facility_id,
+                        "stop": stop,
+                        "departure_s": parked,
+                        "arrival_s": waited,
+                    },
+                    walk_leg_dict(
+                        "access",
+                        (latitude, longitude),
+                        stop,
+                        waited,
+                        at_stop,
+                        {"to_stop": stop},
+                    ),
+                    walk_leg_dict(
+                        "egress",
+                        destination,
+                        stop,
+                        at_stop,
+                        at_stop + int(egress_walks[stop]),
+                        {"from_stop": stop},
+                    ),
+                ],
+            }
+            # The chain competes exactly as a zero-ride journey: it
+            # prunes ridden journeys it dominates in the axis's order.
+            if arrive_by:
+                journeys = [
+                    journey for journey in journeys if journey["departure_s"] > start
+                ] + [chain]
+            else:
+                journeys = [
+                    journey
+                    for journey in journeys
+                    if journey["arrival_s"] < chain["arrival_s"]
+                ] + [chain]
     # The direct walking alternative, at the query's walking speed.
     direct = core._walk_between(
         origin[0],
@@ -511,7 +626,6 @@ def _car_park_journeys(
             "the street network was replaced mid-query; the rebuilt "
             "walking legs would not match the searched access table"
         )
-    departed = _departure_seconds(departure)
     if direct is None:
         return journeys
     network_m, connector_m, shape = direct
@@ -519,23 +633,36 @@ def _car_park_journeys(
     walk_seconds = int(round((network_m + connector_m) / meters_per_second))
     if walk_budget is not None and walk_seconds > walk_budget:
         return journeys
-    kept = [
-        journey
-        for journey in journeys
-        if journey["arrival_s"] - journey["departure_s"] < walk_seconds
-    ]
+    if arrive_by:
+        if walk_seconds > anchored:
+            # A walk longer than the deadline's clock cannot be placed
+            # — the matrix arm treats the same walk as infeasible.
+            return journeys
+        # The walk arrives exactly at the deadline; a journey survives
+        # only by letting the traveler leave strictly later.
+        walk_departed = anchored - walk_seconds
+        kept = [
+            journey for journey in journeys if journey["departure_s"] > walk_departed
+        ]
+    else:
+        walk_departed = anchored
+        kept = [
+            journey
+            for journey in journeys
+            if journey["arrival_s"] - journey["departure_s"] < walk_seconds
+        ]
     if any(journey["rides"] == 0 for journey in kept):
         return kept
     walk = {
-        "departure_s": departed,
-        "arrival_s": departed + walk_seconds,
+        "departure_s": walk_departed,
+        "arrival_s": walk_departed + walk_seconds,
         "rides": 0,
         "legs": [
             {
                 "type": "walk",
                 "mode": "walk",
-                "departure_s": departed,
-                "arrival_s": departed + walk_seconds,
+                "departure_s": walk_departed,
+                "arrival_s": walk_departed + walk_seconds,
                 "distance_m": network_m + connector_m,
                 "network_distance_m": network_m,
                 "connector_distance_m": connector_m,
@@ -544,6 +671,13 @@ def _car_park_journeys(
             }
         ],
     }
+    if arrive_by:
+        # Latest departure first, ties to fewer rides — the reverse
+        # engine's own order, the walk taking its place in it.
+        return sorted(
+            [walk] + kept,
+            key=lambda journey: (-journey["departure_s"], journey["rides"]),
+        )
     return [walk] + kept
 
 
@@ -2344,8 +2478,9 @@ class TransportNetwork:
             (under ``arrival_time_window`` the walk competes inside
             every mark's Pareto selection, so the result is exactly
             the union of the marks' answers, walks included).
-            ``street_policy`` (a traveler's street bridge
-            included) does not combine with it; the window twin is
+            The street-leg policies (a traveler's street bridge
+            included) do not combine with it; a ``CarParkPolicy``
+            serves it, windowless. The window twin is
             ``arrival_time_window``.
         arrival_time_window : float or datetime.timedelta (optional)
             Arrival window in minutes, beside ``arrival=`` only, as in
@@ -2394,12 +2529,16 @@ class TransportNetwork:
             The direct door-to-door alternative rides the policy's
             walking class: the wheelchair under a wheelchair-only
             policy, else walking. A ``CarParkPolicy`` here serves
-            park-and-ride instead: the drive-park-walk chain competes
-            beside ordinary walking, and — unlike the street-leg
-            policies — the query's walking knobs stay active, timing
-            the walking access, the egress, and the direct-walk
-            alternative; transfers ride the installed transfer set,
-            as on every query.
+            park-and-ride instead, on either time axis: the
+            drive-park-walk chain competes beside ordinary walking,
+            and — unlike the street-leg policies — the query's walking
+            knobs stay active, timing the walking access, the egress,
+            and the direct-walk alternative; transfers ride the
+            installed transfer set, as on every query. With
+            ``arrival=`` the same composed tables ride the reverse
+            engine, journeys latest-departure-first, the walk placed
+            to arrive exactly at the deadline; time windows are
+            rejected beside the policy on both axes.
             Conflicts with the walking knobs above and with
             ``departure_time_window``, which are rejected rather than
             silently ignored.
@@ -2488,7 +2627,8 @@ class TransportNetwork:
         ``departure`` strings, ``max_transfers``, and every duration
         in seconds — the form internal callers use to avoid double
         conversion. With ``arrive_by`` the time is the arrival deadline
-        (the public wrapper rejects a policy beside it)."""
+        (the public wrapper rejects a street-leg policy beside it; the
+        car-park policy serves both axes)."""
         if street_policy is not None:
             from cafein.matrices import _walking_only_policy
             from cafein.policy import CarParkPolicy
@@ -2498,14 +2638,10 @@ class TransportNetwork:
                 # competing walking access, the egress, and the direct
                 # walk; transfers ride the installed transfer set —
                 # the policy owns only the car chain.
-                if arrive_by:
-                    raise NotImplementedError(
-                        "CarParkPolicy serves the departure axis for now; "
-                        "arrival= arrives with the arrive-by stage"
-                    )
                 if window is not None:
                     raise ValueError(
-                        "CarParkPolicy does not combine with a departure " "window"
+                        "CarParkPolicy does not combine with a departure "
+                        "or arrival window in this stage"
                     )
                 exclude_stops = id_sequence("exclude_stops", exclude_stops)
                 if exclude_stops:
@@ -2527,6 +2663,7 @@ class TransportNetwork:
                     _walk_options(
                         walking_speed_kmph, max_walking_time, max_snap_distance
                     ),
+                    arrive_by=arrive_by,
                 )
             if any(
                 option is not None
@@ -2753,7 +2890,11 @@ class TransportNetwork:
             silently ignored. A ``CarParkPolicy`` here serves
             park-and-ride instead: the drive-park-walk chain competes
             beside ordinary walking, and the query's walking knobs
-            stay active, timing the walking access.
+            stay active, timing the walking access. It serves the
+            departure axis only — the arrive-by form's origins are the
+            stops and the coordinate is the destination, so the
+            access-only car plane has no origin to drive from; route
+            and matrix queries serve the arrival axis.
 
         Returns
         -------
@@ -2783,6 +2924,18 @@ class TransportNetwork:
 
         date, departure, arrive_by = time_axis(departure, arrival)
         if arrive_by and street_policy is not None:
+            from cafein.policy import CarParkPolicy as _CarParkPolicy
+
+            if isinstance(street_policy, _CarParkPolicy):
+                # The arrive-by form's origins are the stops and the
+                # coordinate is the destination, so the access-only car
+                # plane has no origin to drive from.
+                raise ValueError(
+                    "CarParkPolicy does not serve "
+                    "travel_times_from_coordinate(arrival=): the reverse "
+                    "form's origins are the stops; route or matrix "
+                    "queries serve the arrival axis"
+                )
             raise ValueError(
                 "street_policy= (a traveler's street bridge included) "
                 "does not combine with arrival= yet"

@@ -579,6 +579,45 @@ impl TransportNetwork {
         Ok(result.unbind())
     }
 
+    /// The arrive-by twin of `_route_with_access`: caller-supplied
+    /// access and egress tables through the reverse engine at a single
+    /// deadline — journeys latest-departure-first, the forward replay
+    /// re-riding the exact same tables. The walking alternative and
+    /// every street leg stay the caller's to place and rebuild.
+    /// Internal until the policy surface stabilises.
+    #[pyo3(signature = (access, egress, date, deadline, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], geometries = false))]
+    #[allow(clippy::too_many_arguments)]
+    fn _reverse_route_with_access(
+        &self,
+        py: Python<'_>,
+        access: Vec<(String, u32)>,
+        egress: Vec<(String, u32)>,
+        date: &str,
+        deadline: &str,
+        max_transfers: u8,
+        exclude_routes: Vec<String>,
+        exclude_trips: Vec<String>,
+        exclude_stops: Vec<String>,
+        geometries: bool,
+    ) -> PyResult<Py<PyList>> {
+        let resolve = |offsets: &[(String, u32)]| {
+            offsets
+                .iter()
+                .map(|(stop, seconds)| Ok((self.resolve_stop(stop)?, *seconds)))
+                .collect::<PyResult<Vec<_>>>()
+        };
+        let request = Request {
+            departure: parse_time(deadline)?,
+            access: resolve(&access)?,
+            egress: resolve(&egress)?,
+            active_services: self.active_services(date)?,
+            active_services_previous: self.active_services_previous(date)?,
+            max_transfers,
+            exclusions: self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?,
+        };
+        self.reverse_route_request(py, &request, None, geometries)
+    }
+
     /// Earliest arrivals from pre-reduced street access offsets — the
     /// street-policy path. The offsets arrive from the time-only reduction
     /// (`_reduced_street_offsets`), and the run relaxes the full transfer
