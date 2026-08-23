@@ -508,11 +508,13 @@ impl TransportNetwork {
     /// winning journey's access and egress stops — genuine walking into
     /// ``walk_distance``, vehicle meters into ``street_distance``, and
     /// the vehicle emissions (factor × network meters, NaN when
-    /// unresolved) into ``emissions``. The direct walking alternative
-    /// over the multimodal walk subgraph folds in per cell exactly as
-    /// the legacy matrix folds its own: a strictly faster walk wins, an
-    /// equal-time walk beats a ridden row, and pairs only walking
-    /// reaches gain walking-only rows. Row geometry stays the ridden
+    /// unresolved) into ``emissions``. With a ``direct_mode``, the
+    /// direct walking alternative over the multimodal walk subgraph
+    /// folds in per cell exactly as the legacy matrix folds its own: a
+    /// strictly faster walk wins, an equal-time walk beats a ridden
+    /// row, and pairs only walking reaches gain walking-only rows;
+    /// ``None`` skips the fold (and returns empty unsnapped arrays),
+    /// leaving the walking alternative to the caller. Row geometry stays the ridden
     /// transit legs' (walking rows their walked path), exactly as in the
     /// legacy matrix — street and walking end legs' shapes ride the
     /// itineraries product, which rebuilds every leg. Fares stay NaN —
@@ -521,7 +523,7 @@ impl TransportNetwork {
     #[pyo3(signature = (access_rows, egress_rows, origins, destinations, date, departure,
                         factors, walk_budget, max_transfers,
                         exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![],
-                        geometries = false, transfer_mode = None, direct_mode = "walk"))]
+                        geometries = false, transfer_mode = None, direct_mode = None))]
     #[allow(clippy::too_many_arguments)]
     fn _cost_matrix_with_access(
         &self,
@@ -540,7 +542,7 @@ impl TransportNetwork {
         exclude_stops: Vec<String>,
         geometries: bool,
         transfer_mode: Option<(String, f64, f64)>,
-        direct_mode: &str,
+        direct_mode: Option<&str>,
     ) -> PyResult<Py<PyDict>> {
         if access_rows.len() != origins.len() || egress_rows.len() != destinations.len() {
             return Err(PyValueError::new_err(
@@ -677,12 +679,20 @@ impl TransportNetwork {
             rental,
             with_pieces: false,
         };
-        let walk_profile = self.multimodal_profile(direct_mode)?;
-        let multimodal = self.multimodal.as_ref().ok_or_else(|| {
-            PyValueError::new_err(
-                "no multimodal street graph is installed; build with street_modes=",
-            )
-        })?;
+        // The direct fold rides the multimodal walk subgraph; ``None``
+        // skips it, and the caller folds its own walking alternative.
+        let direct = match direct_mode {
+            Some(mode) => {
+                let profile = self.multimodal_profile(mode)?;
+                let graph = self.multimodal.as_ref().ok_or_else(|| {
+                    PyValueError::new_err(
+                        "no multimodal street graph is installed; build with street_modes=",
+                    )
+                })?;
+                Some((profile, graph))
+            }
+            None => None,
+        };
         let (rows, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
             let engine_rows = Raptor.cost_matrix_to_points(
                 &self.build.timetable,
@@ -747,134 +757,141 @@ impl TransportNetwork {
                 .collect();
             // The direct walking alternative over the multimodal walk
             // subgraph, folded exactly as the legacy matrix folds its own.
-            let snap_all = |points: &[(f64, f64)]| -> Vec<Option<Snap>> {
-                points
-                    .iter()
-                    .map(|&(lat, lon)| {
-                        multimodal.snap_for_profile(lat, lon, MULTIMODAL_STOP_SNAP, &walk_profile)
-                    })
-                    .collect()
-            };
-            let origin_snaps = snap_all(&origins);
-            let destination_snaps = snap_all(&destinations);
-            let unsnapped = |snaps: &[Option<Snap>]| -> Vec<u32> {
-                snaps
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, snap)| snap.is_none())
-                    .map(|(index, _)| index as u32)
-                    .collect()
-            };
-            for (origin, origin_rows) in rows.iter_mut().enumerate() {
-                let walk_row: Vec<Option<(u32, f64)>> = match &origin_snaps[origin] {
-                    Some(snap) => multimodal.directed_meters_to_snaps(
-                        snap,
-                        &destination_snaps,
-                        &walk_profile,
-                        walk_budget,
-                    ),
-                    None => vec![None; destinations.len()],
-                };
-                let cell = |point: usize| -> Option<(u32, f64)> {
-                    // A destination at the origin's exact coordinate is a
-                    // zero walk — snap arithmetic would charge the
-                    // connector twice — but an unsnapped point still
-                    // yields no rows, coincident or not.
-                    let from = origin_snaps[origin].as_ref()?;
-                    let to = destination_snaps[point].as_ref()?;
-                    if origins[origin] == destinations[point] {
-                        return Some((0, 0.0));
-                    }
-                    let (seconds, network) = walk_row[point]?;
-                    Some((seconds, network + from.connector + to.connector))
-                };
-                let walk_geometry = |point: usize| -> Option<Vec<u8>> {
-                    if !geometries {
-                        return None;
-                    }
-                    let from_point = origins[origin];
-                    let to_point = destinations[point];
-                    if from_point == to_point {
-                        let at = (from_point.1, from_point.0);
-                        return Some(wkb_multi_line_string(&[vec![at, at]]));
-                    }
-                    let from = origin_snaps[origin]?;
-                    let to = destination_snaps[point]?;
-                    let leg = multimodal.directed_leg(
-                        from_point,
-                        &from,
-                        to_point,
-                        &to,
-                        &walk_profile,
-                        walk_budget,
-                    )?;
-                    Some(wkb_multi_line_string(&[leg.geometry]))
-                };
-                let mut reached = vec![false; destinations.len()];
-                for policy_row in origin_rows.iter_mut() {
-                    let point = policy_row.row.to as usize;
-                    reached[point] = true;
-                    if let Some((walk_seconds, meters)) = cell(point) {
-                        // Ties resolve toward fewer rides, as the matrix
-                        // contract promises: an equal-time walk beats a
-                        // ridden row — transit and street vehicles alike.
-                        if walk_seconds < policy_row.row.seconds
-                            || (walk_seconds == policy_row.row.seconds
-                                && (policy_row.row.rides > 0 || policy_row.street_used))
-                        {
-                            policy_row.row = CostRow {
-                                to: point as u32,
-                                access_stop: NO_STOP,
-                                egress_stop: NO_STOP,
-                                seconds: walk_seconds,
-                                rides: 0,
-                                transit_meters: 0.0,
-                                walk_meters: meters,
-                                street_meters: 0.0,
-                                rental_transfers: 0,
-                                emission_grams: 0.0,
-                                fare: f64::NAN,
-                                geometry: walk_geometry(point),
-                                pieces: None,
-                            };
-                            policy_row.street_meters = 0.0;
-                            policy_row.street_used = false;
+            let (unsnapped_from, unsnapped_to) =
+                if let Some((walk_profile, multimodal)) = direct.as_ref() {
+                    let snap_all = |points: &[(f64, f64)]| -> Vec<Option<Snap>> {
+                        points
+                            .iter()
+                            .map(|&(lat, lon)| {
+                                multimodal.snap_for_profile(
+                                    lat,
+                                    lon,
+                                    MULTIMODAL_STOP_SNAP,
+                                    walk_profile,
+                                )
+                            })
+                            .collect()
+                    };
+                    let origin_snaps = snap_all(&origins);
+                    let destination_snaps = snap_all(&destinations);
+                    let unsnapped = |snaps: &[Option<Snap>]| -> Vec<u32> {
+                        snaps
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, snap)| snap.is_none())
+                            .map(|(index, _)| index as u32)
+                            .collect()
+                    };
+                    for (origin, origin_rows) in rows.iter_mut().enumerate() {
+                        let walk_row: Vec<Option<(u32, f64)>> = match &origin_snaps[origin] {
+                            Some(snap) => multimodal.directed_meters_to_snaps(
+                                snap,
+                                &destination_snaps,
+                                walk_profile,
+                                walk_budget,
+                            ),
+                            None => vec![None; destinations.len()],
+                        };
+                        let cell = |point: usize| -> Option<(u32, f64)> {
+                            // A destination at the origin's exact coordinate is a
+                            // zero walk — snap arithmetic would charge the
+                            // connector twice — but an unsnapped point still
+                            // yields no rows, coincident or not.
+                            let from = origin_snaps[origin].as_ref()?;
+                            let to = destination_snaps[point].as_ref()?;
+                            if origins[origin] == destinations[point] {
+                                return Some((0, 0.0));
+                            }
+                            let (seconds, network) = walk_row[point]?;
+                            Some((seconds, network + from.connector + to.connector))
+                        };
+                        let walk_geometry = |point: usize| -> Option<Vec<u8>> {
+                            if !geometries {
+                                return None;
+                            }
+                            let from_point = origins[origin];
+                            let to_point = destinations[point];
+                            if from_point == to_point {
+                                let at = (from_point.1, from_point.0);
+                                return Some(wkb_multi_line_string(&[vec![at, at]]));
+                            }
+                            let from = origin_snaps[origin]?;
+                            let to = destination_snaps[point]?;
+                            let leg = multimodal.directed_leg(
+                                from_point,
+                                &from,
+                                to_point,
+                                &to,
+                                walk_profile,
+                                walk_budget,
+                            )?;
+                            Some(wkb_multi_line_string(&[leg.geometry]))
+                        };
+                        let mut reached = vec![false; destinations.len()];
+                        for policy_row in origin_rows.iter_mut() {
+                            let point = policy_row.row.to as usize;
+                            reached[point] = true;
+                            if let Some((walk_seconds, meters)) = cell(point) {
+                                // Ties resolve toward fewer rides, as the matrix
+                                // contract promises: an equal-time walk beats a
+                                // ridden row — transit and street vehicles alike.
+                                if walk_seconds < policy_row.row.seconds
+                                    || (walk_seconds == policy_row.row.seconds
+                                        && (policy_row.row.rides > 0 || policy_row.street_used))
+                                {
+                                    policy_row.row = CostRow {
+                                        to: point as u32,
+                                        access_stop: NO_STOP,
+                                        egress_stop: NO_STOP,
+                                        seconds: walk_seconds,
+                                        rides: 0,
+                                        transit_meters: 0.0,
+                                        walk_meters: meters,
+                                        street_meters: 0.0,
+                                        rental_transfers: 0,
+                                        emission_grams: 0.0,
+                                        fare: f64::NAN,
+                                        geometry: walk_geometry(point),
+                                        pieces: None,
+                                    };
+                                    policy_row.street_meters = 0.0;
+                                    policy_row.street_used = false;
+                                }
+                            }
                         }
+                        for (point, reached) in reached.iter().enumerate() {
+                            if *reached {
+                                continue;
+                            }
+                            if let Some((walk_seconds, meters)) = cell(point) {
+                                origin_rows.push(PolicyCostRow {
+                                    row: CostRow {
+                                        to: point as u32,
+                                        access_stop: NO_STOP,
+                                        egress_stop: NO_STOP,
+                                        seconds: walk_seconds,
+                                        rides: 0,
+                                        transit_meters: 0.0,
+                                        walk_meters: meters,
+                                        street_meters: 0.0,
+                                        rental_transfers: 0,
+                                        emission_grams: 0.0,
+                                        fare: f64::NAN,
+                                        geometry: walk_geometry(point),
+                                        pieces: None,
+                                    },
+                                    street_meters: 0.0,
+                                    street_used: false,
+                                });
+                            }
+                        }
+                        origin_rows.sort_unstable_by_key(|policy_row| policy_row.row.to);
                     }
-                }
-                for (point, reached) in reached.iter().enumerate() {
-                    if *reached {
-                        continue;
-                    }
-                    if let Some((walk_seconds, meters)) = cell(point) {
-                        origin_rows.push(PolicyCostRow {
-                            row: CostRow {
-                                to: point as u32,
-                                access_stop: NO_STOP,
-                                egress_stop: NO_STOP,
-                                seconds: walk_seconds,
-                                rides: 0,
-                                transit_meters: 0.0,
-                                walk_meters: meters,
-                                street_meters: 0.0,
-                                rental_transfers: 0,
-                                emission_grams: 0.0,
-                                fare: f64::NAN,
-                                geometry: walk_geometry(point),
-                                pieces: None,
-                            },
-                            street_meters: 0.0,
-                            street_used: false,
-                        });
-                    }
-                }
-                origin_rows.sort_unstable_by_key(|policy_row| policy_row.row.to);
-            }
-            (
-                rows,
-                unsnapped(&origin_snaps),
-                unsnapped(&destination_snaps),
-            )
+                    (unsnapped(&origin_snaps), unsnapped(&destination_snaps))
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+            (rows, unsnapped_from, unsnapped_to)
         });
         let result = policy_cost_rows_dict(py, rows, geometries)?;
         result
@@ -2334,7 +2351,11 @@ fn policy_cost_rows_dict(
     rows: Vec<Vec<PolicyCostRow>>,
     geometries: bool,
 ) -> PyResult<Py<PyDict>> {
-    let mut street = Vec::with_capacity(rows.iter().map(Vec::len).sum());
+    let total: usize = rows.iter().map(Vec::len).sum();
+    let mut street = Vec::with_capacity(total);
+    // The winning access stop per row (`u32::MAX` on walking rows) lets
+    // the caller attribute per-access sidecar quantities.
+    let mut access = Vec::with_capacity(total);
     let plain = rows
         .into_iter()
         .map(|origin_rows| {
@@ -2342,6 +2363,7 @@ fn policy_cost_rows_dict(
                 .into_iter()
                 .map(|policy_row| {
                     street.push(policy_row.street_meters);
+                    access.push(policy_row.row.access_stop);
                     policy_row.row
                 })
                 .collect()
@@ -2351,6 +2373,9 @@ fn policy_cost_rows_dict(
     result
         .bind(py)
         .set_item("street_distance", street.into_pyarray(py))?;
+    result
+        .bind(py)
+        .set_item("access_stop", access.into_pyarray(py))?;
     Ok(result)
 }
 

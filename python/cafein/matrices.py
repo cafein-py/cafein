@@ -331,6 +331,22 @@ class TravelCostMatrix(pd.DataFrame):
     walking knobs are rejected beside a policy rather than silently
     ignored.
 
+    ``street_policy=`` also takes a ``cafein.CarParkPolicy`` (a network
+    built with ``"car"`` in ``street_modes=``): per origin the access
+    composes drive-to-facility, parking search, and the facility walk,
+    with the ordinary walking access competing beside the car plane and
+    winning ties. Egress is ordinary walking; transfers ride the
+    installed transfer set, as on every query; the query's walking
+    knobs stay active. The drive's metres join
+    ``street_distance_m``, its grams (the policy's ``vehicle_class``
+    GEMMAT row over its ``occupancy``) join ``emissions``, and a
+    ``fee`` column carries the winning facility's parking fee in the
+    ``cafein.costs`` currency (EUR2017), zero on rows the walk won. No
+    facility column is surfaced — the winner is visible on
+    ``DetailedItineraries``. Transit fares stay unpriced; the same
+    knobs are rejected as under a street-leg policy except the walking
+    knobs, and stop exclusions are rejected too.
+
     ``output_time_units=`` selects the ``travel_time`` unit:
     ``"minutes"`` (the default; whole minutes rounded to the nearest)
     or ``"seconds"`` (the engine's exact values).
@@ -400,16 +416,10 @@ class TravelCostMatrix(pd.DataFrame):
                 walking_speed_kmph,
                 max_walking_time,
             )
-        from cafein.policy import reject_car_park
-
-        # Unconditional: stop-id and omitted origins skip the fold
-        # below but must refuse a CarParkPolicy by name too.
-        reject_car_park(street_policy, "the matrix computers")
         if not _is_street_network(network) and _is_point_frame(origins):
             street_policy, max_walking_time = folded_street_policy(
                 traveler, network, street_policy, walking_speed_kmph, max_walking_time
             )
-            reject_car_park(street_policy, "the matrix computers")
         origins, _origin_dtype = freeze_ids(origins)
         destinations, _destination_dtype = freeze_ids(destinations)
         if destinations is None and _is_point_frame(origins):
@@ -542,6 +552,67 @@ class TravelCostMatrix(pd.DataFrame):
                     "StreetNetwork computations; street_policy matrices "
                     "gain it with a later stage"
                 )
+            from cafein.policy import CarParkPolicy
+
+            if isinstance(street_policy, CarParkPolicy):
+                # The query's walking knobs stay ACTIVE beside the car
+                # plane, unlike under a StreetLegPolicy.
+                offending = next(
+                    (
+                        name
+                        for name, value in (
+                            ("optimize", None if optimize == "time" else optimize),
+                            ("departure_time_window", window),
+                            ("max_travel_time", within),
+                            ("fares", fares),
+                            (
+                                "candidates",
+                                None if candidates == "time" else candidates,
+                            ),
+                            ("router", None if router == "auto" else router),
+                        )
+                        if value is not None
+                    ),
+                    None,
+                )
+                if offending is not None:
+                    raise ValueError(
+                        f"CarParkPolicy does not combine with {offending}; "
+                        "the policy cost matrix runs the time-fastest "
+                        "engine arm and transit fares stay unpriced"
+                    )
+                if id_sequence("exclude_stops", exclude_stops):
+                    raise ValueError(
+                        "CarParkPolicy does not combine with stop "
+                        "exclusions in this stage"
+                    )
+                data = _car_park_cost_columns(
+                    network,
+                    origins,
+                    destinations,
+                    date,
+                    departure,
+                    street_policy,
+                    max_transfers=max_transfers,
+                    factors=factors,
+                    components=components,
+                    geometries=geometries,
+                    chunk=chunk,
+                    walk_options=(
+                        walking_speed_kmph,
+                        max_walking_time,
+                        max_snap_distance,
+                    ),
+                    exclude_routes=exclude_routes,
+                    exclude_trips=exclude_trips,
+                )
+                super().__init__(
+                    restore_id_dtypes(
+                        pd.DataFrame(_humanize_time_columns(data, output_time_units)),
+                        _id_dtypes,
+                    )
+                )
+                return
             offending = next(
                 (
                     name
@@ -795,16 +866,10 @@ class TravelCostMatrix(pd.DataFrame):
                 walking_speed_kmph,
                 max_walking_time,
             )
-        from cafein.policy import reject_car_park
-
-        # Unconditional: stop-id and omitted origins skip the fold
-        # below but must refuse a CarParkPolicy by name too.
-        reject_car_park(street_policy, "the matrix computers")
         if not _is_street_network(network) and _is_point_frame(origins):
             street_policy, max_walking_time = folded_street_policy(
                 traveler, network, street_policy, walking_speed_kmph, max_walking_time
             )
-            reject_car_park(street_policy, "the matrix computers")
         import pyarrow
 
         from cafein._units import (
@@ -1123,6 +1188,20 @@ class TravelTimeMatrix(pd.DataFrame):
     exclusions are rejected beside a carried vehicle. It conflicts with
     the walking knobs, ``router``, and the departure-window parameters,
     which are rejected rather than silently ignored.
+
+    ``street_policy=`` also takes a ``cafein.CarParkPolicy`` (a network
+    built with ``"car"`` in ``street_modes=``): per origin the access
+    composes drive-to-facility, parking search, and the facility walk,
+    with the ordinary walking access competing beside the car plane and
+    winning ties; egress is ordinary walking, transfers ride the
+    installed transfer set as on every query, and the direct walking
+    alternative folds in per cell. Unlike the street-leg policies, the
+    query's walking knobs stay active — they time every ordinary walk
+    while the policy's budgets bound the car chain. Departure windows,
+    percentiles, ``router=`` overrides, and stop exclusions are
+    rejected by name; an origin that cannot reach any facility by car
+    has its cells omitted with a warning, never a silent walking-only
+    row.
     """
 
     @property
@@ -1176,16 +1255,10 @@ class TravelTimeMatrix(pd.DataFrame):
                 walking_speed_kmph,
                 max_walking_time,
             )
-        from cafein.policy import reject_car_park
-
-        # Unconditional: stop-id and omitted origins skip the fold
-        # below but must refuse a CarParkPolicy by name too.
-        reject_car_park(street_policy, "the matrix computers")
         if not _is_street_network(network) and _is_point_frame(origins):
             street_policy, max_walking_time = folded_street_policy(
                 traveler, network, street_policy, walking_speed_kmph, max_walking_time
             )
-            reject_car_park(street_policy, "the matrix computers")
         origins, _origin_dtype = freeze_ids(origins)
         destinations, _destination_dtype = freeze_ids(destinations)
         if destinations is None and _is_point_frame(origins):
@@ -1219,6 +1292,13 @@ class TravelTimeMatrix(pd.DataFrame):
                     "search rides RAPTOR"
                 )
             if street_policy is not None:
+                from cafein.policy import CarParkPolicy
+
+                if isinstance(street_policy, CarParkPolicy):
+                    raise NotImplementedError(
+                        "CarParkPolicy serves the departure axis for now; "
+                        "arrival= arrives with the arrive-by stage"
+                    )
                 raise ValueError(
                     "street_policy= (a traveler's street bridge included) "
                     "does not combine with arrival= yet"
@@ -1286,6 +1366,51 @@ class TravelTimeMatrix(pd.DataFrame):
             parking,
         )
         if street_policy is not None:
+            from cafein.policy import CarParkPolicy
+
+            if isinstance(street_policy, CarParkPolicy):
+                # The query's walking knobs stay ACTIVE beside the car
+                # plane, unlike under a StreetLegPolicy.
+                named = [
+                    name
+                    for name, value in (
+                        ("departure_time_window", window),
+                        ("percentiles", percentiles),
+                        ("confidence", confidence),
+                    )
+                    if value is not None
+                ]
+                if named or router != "auto":
+                    offending = ", ".join(named) or f"router={router!r}"
+                    raise ValueError(
+                        f"CarParkPolicy does not combine with {offending}; "
+                        "the policy matrix runs the earliest-arrival engine"
+                    )
+                if id_sequence("exclude_stops", exclude_stops):
+                    raise ValueError(
+                        "CarParkPolicy does not combine with stop "
+                        "exclusions in this stage"
+                    )
+                data = _car_park_time_columns(
+                    network,
+                    origins,
+                    destinations,
+                    date,
+                    departure,
+                    street_policy,
+                    max_transfers,
+                    chunk,
+                    (walking_speed_kmph, max_walking_time, max_snap_distance),
+                    exclude_routes,
+                    exclude_trips,
+                )
+                super().__init__(
+                    restore_id_dtypes(
+                        pd.DataFrame(_humanize_time_columns(data, output_time_units)),
+                        _id_dtypes,
+                    )
+                )
+                return
             rejected = {
                 "window": window,
                 "percentiles": percentiles,
@@ -1479,16 +1604,10 @@ class TravelTimeMatrix(pd.DataFrame):
                 walking_speed_kmph,
                 max_walking_time,
             )
-        from cafein.policy import reject_car_park
-
-        # Unconditional: stop-id and omitted origins skip the fold
-        # below but must refuse a CarParkPolicy by name too.
-        reject_car_park(street_policy, "the matrix computers")
         if not _is_street_network(network) and _is_point_frame(origins):
             street_policy, max_walking_time = folded_street_policy(
                 traveler, network, street_policy, walking_speed_kmph, max_walking_time
             )
-            reject_car_park(street_policy, "the matrix computers")
         import pyarrow
 
         from cafein._units import (
@@ -1518,6 +1637,13 @@ class TravelTimeMatrix(pd.DataFrame):
                     "search rides RAPTOR"
                 )
             if street_policy is not None:
+                from cafein.policy import CarParkPolicy
+
+                if isinstance(street_policy, CarParkPolicy):
+                    raise NotImplementedError(
+                        "CarParkPolicy serves the departure axis for now; "
+                        "arrival= arrives with the arrive-by stage"
+                    )
                 raise ValueError(
                     "street_policy= (a traveler's street bridge included) "
                     "does not combine with arrival= yet"
@@ -4267,6 +4393,182 @@ def _policy_time_columns(
     return data
 
 
+def _car_park_time_matrix(
+    network,
+    origins,
+    destinations,
+    date,
+    departure,
+    policy,
+    max_transfers,
+    chunk,
+    walk_options,
+    exclude_routes=(),
+    exclude_trips=(),
+):
+    """The dense CarParkPolicy travel-time matrix with its id axes.
+
+    Per origin the composed car-and-walking access table, ordinary
+    walking egress, the engine fan-out, and the direct walking
+    alternative folded in over the installed walking streets at the
+    query's walking knobs. Seconds; the uint32 maximum where
+    unreachable. An origin that cannot reach any facility by car keeps
+    the route surface's refusal semantics: its cells stay unreachable
+    and a warning names it, never a silent walking-only row."""
+    import copy
+
+    from cafein.network import _car_park_table, _walk_options
+
+    core = network._core
+    network._require_car_side()
+    if not _is_point_frame(origins):
+        raise ValueError(
+            "CarParkPolicy matrices take point-set origins and "
+            "destinations; the facilities plane needs coordinates"
+        )
+    policy = copy.deepcopy(policy)
+    exclude_routes = id_sequence("exclude_routes", exclude_routes)
+    exclude_trips = id_sequence("exclude_trips", exclude_trips)
+    from_ids, origin_points = _point_list(origins, "origins")
+    if destinations is None:
+        to_ids, destination_points = from_ids, origin_points
+    else:
+        to_ids, destination_points = _point_list(destinations, "destinations")
+    rows_slice = _chunk_slice(len(from_ids), chunk)
+    from_ids = from_ids[rows_slice]
+    origin_points = origin_points[rows_slice]
+    walk_options = _walk_options(*walk_options)
+    walking_speed, walk_budget, snap_distance = walk_options
+    # One pinned generation for the WHOLE matrix: every origin's
+    # composition, the egress linking, and the direct-walk fold must
+    # read the same street graph; an install mid-computation refuses.
+    generation = core._streets_generation
+    access_rows, undriven = [], []
+    for index, point in enumerate(origin_points):
+        try:
+            offsets, _tokens, _walking = _car_park_table(
+                core, tuple(point), policy, walk_options, False
+            )
+        except ValueError as error:
+            message = str(error)
+            if (
+                "no facility is reachable by car" not in message
+                and "too far from the car streets" not in message
+            ):
+                raise
+            access_rows.append([])
+            undriven.append(index)
+            continue
+        access_rows.append(offsets)
+    egress_linked = core._link_walking_stops(
+        list(destination_points), walking_speed, walk_budget, snap_distance
+    )
+    egress_rows = [
+        (
+            []
+            if linked is None
+            else [(stop, int(seconds)) for stop, seconds, _meters in linked]
+        )
+        for linked in egress_linked
+    ]
+    matrix = core._time_matrix_with_access(
+        access_rows,
+        egress_rows,
+        date,
+        departure,
+        max_transfers,
+        exclude_routes=list(exclude_routes),
+        exclude_trips=list(exclude_trips),
+        exclude_stops=[],
+        transfer_mode=None,
+    )
+    # The direct walking alternative rides the installed walking
+    # streets — the same walk the route surface offers beside the car
+    # chain. An omitted origin stays omitted.
+    walk = core._walk_matrix(
+        list(origin_points),
+        list(destination_points),
+        walking_speed,
+        walk_budget,
+        snap_distance,
+    )
+    if core._streets_generation != generation:
+        raise RuntimeError(
+            "the street network was replaced while the park-and-ride "
+            "matrix was being computed; rerun the query"
+        )
+    if undriven:
+        named = ", ".join(str(from_ids[index]) for index in undriven[:5])
+        suffix = ", …" if len(undriven) > 5 else ""
+        warnings.warn(
+            f"{len(undriven)} origin point(s) cannot reach any facility "
+            f"by car and are omitted ({named}{suffix})",
+            stacklevel=3,
+        )
+    _warn_unsnapped(
+        {
+            "unsnapped_to": [
+                index for index, linked in enumerate(egress_linked) if linked is None
+            ]
+        },
+        from_ids,
+        to_ids,
+    )
+    undriven_rows = set(undriven)
+    unreachable = 2**32 - 1
+    dense = np.full((len(from_ids), len(to_ids)), unreachable, dtype=np.uint32)
+    for i in range(len(from_ids)):
+        for j in range(len(to_ids)):
+            best = matrix[i][j]
+            if i not in undriven_rows and walk[i][j] is not None:
+                seconds = int(walk[i][j][0])
+                best = seconds if best is None else min(int(best), seconds)
+            if best is not None:
+                dense[i, j] = int(best)
+    return dense, from_ids, to_ids
+
+
+def _car_park_time_columns(
+    network,
+    origins,
+    destinations,
+    date,
+    departure,
+    policy,
+    max_transfers,
+    chunk,
+    walk_options,
+    exclude_routes=(),
+    exclude_trips=(),
+):
+    """The CarParkPolicy travel-time matrix in the long shape the
+    frame takes: unreachable pairs omitted, as the matrix contract
+    promises."""
+    dense, from_ids, to_ids = _car_park_time_matrix(
+        network,
+        origins,
+        destinations,
+        date,
+        departure,
+        policy,
+        max_transfers,
+        chunk,
+        walk_options,
+        exclude_routes,
+        exclude_trips,
+    )
+    unreachable = 2**32 - 1
+    data = {"from_id": [], "to_id": [], "travel_time_s": []}
+    for i, from_id in enumerate(from_ids):
+        for j, to_id in enumerate(to_ids):
+            if dense[i, j] == unreachable:
+                continue
+            data["from_id"].append(from_id)
+            data["to_id"].append(to_id)
+            data["travel_time_s"].append(int(dense[i, j]))
+    return data
+
+
 def _carriage_time_columns(
     network,
     origins,
@@ -4622,3 +4924,291 @@ def _policy_cost_columns(
         to_ids,
     )
     return table, from_ids, to_ids
+
+
+def _car_park_cost_columns(
+    network,
+    origins,
+    destinations,
+    date,
+    departure,
+    policy,
+    *,
+    max_transfers,
+    factors,
+    components,
+    geometries,
+    chunk,
+    walk_options,
+    exclude_routes=(),
+    exclude_trips=(),
+):
+    """The CarParkPolicy cost-matrix columns.
+
+    The composed access rows carry the drive metres and the car's
+    resolved per-km factor for the engine's sidecar attribution, the
+    walking plane and the ordinary walking egress their walked metres,
+    and the winning facility's fee joins per row from the returned
+    access stop — a ``fee`` column in the ``cafein.costs`` currency,
+    zero on rows the walk won. The direct walking alternative folds in
+    over the installed walking streets, as on the route surface.
+    Transit fares stay unpriced, as on every policy cost matrix, and
+    no facility column is surfaced. An origin that cannot reach any
+    facility by car keeps the route surface's refusal semantics: its
+    cells are omitted and a warning names it."""
+    import copy
+
+    from cafein import emissions
+    from cafein.network import _car_park_table, _walk_options
+
+    components = component_selection(components)
+    core = network._core
+    network._require_car_side()
+    if not _is_point_frame(origins):
+        raise ValueError(
+            "CarParkPolicy matrices take point-set origins and "
+            "destinations; the facilities plane needs coordinates"
+        )
+    policy = copy.deepcopy(policy)
+    exclude_routes = id_sequence("exclude_routes", exclude_routes)
+    exclude_trips = id_sequence("exclude_trips", exclude_trips)
+    from_ids, origin_points = _point_list(origins, "origins")
+    if destinations is None:
+        to_ids, destination_points = from_ids, origin_points
+    else:
+        to_ids, destination_points = _point_list(destinations, "destinations")
+    rows_slice = _chunk_slice(len(from_ids), chunk)
+    from_ids = from_ids[rows_slice]
+    origin_points = origin_points[rows_slice]
+    walk_options = _walk_options(*walk_options)
+    walking_speed, walk_budget, snap_distance = walk_options
+    transit_factors, street_factors = _factor_tables(factors)
+    trip_factors = emissions.trip_factors(network, transit_factors, components)
+    # The drive prices as the car — the policy's class row divided by
+    # its occupancy; NaN keeps an unresolved factor poisoning rather
+    # than zeroing its rows.
+    value = emissions.street_factor(
+        "car", street_factors, components, vehicle_class=policy.vehicle_class
+    )
+    car_factor = (
+        float("nan") if pd.isna(value) else float(value) / float(policy.occupancy)
+    )
+    fees = [float(fee) for fee in policy.facilities["fee"]]
+    # One pinned generation for the WHOLE matrix: every origin's
+    # composition, the egress linking, and the direct-walk fold must
+    # read the same street graph; an install mid-computation refuses.
+    generation = core._streets_generation
+    access_rows, fee_by_stop, undriven = [], [], []
+    for index, point in enumerate(origin_points):
+        try:
+            offsets, tokens, walking = _car_park_table(
+                core, tuple(point), policy, walk_options, False
+            )
+        except ValueError as error:
+            message = str(error)
+            if (
+                "no facility is reachable by car" not in message
+                and "too far from the car streets" not in message
+            ):
+                raise
+            access_rows.append([])
+            fee_by_stop.append({})
+            undriven.append(index)
+            continue
+        row, stop_fees = [], {}
+        for stop, total in offsets:
+            token = tokens.get(stop)
+            if token is None:
+                row.append(
+                    (stop, total, 0.0, 0.0, walking[stop][1], 0.0, 0.0, 0.0, False)
+                )
+                continue
+            position, _d, _p, _w, network_m, connector_m, walk_m, _shape = token
+            row.append(
+                (
+                    stop,
+                    total,
+                    network_m,
+                    connector_m,
+                    walk_m,
+                    car_factor,
+                    0.0,
+                    0.0,
+                    True,
+                )
+            )
+            stop_fees[stop] = fees[position]
+        access_rows.append(row)
+        fee_by_stop.append(stop_fees)
+    egress_linked = core._link_walking_stops(
+        list(destination_points), walking_speed, walk_budget, snap_distance
+    )
+    egress_rows = [
+        (
+            []
+            if linked is None
+            else [
+                (stop, int(seconds), 0.0, 0.0, meters, 0.0, 0.0, 0.0, False)
+                for stop, seconds, meters in linked
+            ]
+        )
+        for linked in egress_linked
+    ]
+    table = core._cost_matrix_with_access(
+        access_rows,
+        egress_rows,
+        list(origin_points),
+        list(destination_points),
+        date,
+        departure,
+        trip_factors,
+        float(walk_budget),
+        max_transfers,
+        exclude_routes=list(exclude_routes),
+        exclude_trips=list(exclude_trips),
+        exclude_stops=[],
+        geometries=bool(geometries),
+        transfer_mode=None,
+        direct_mode=None,
+    )
+    no_stop = 2**32 - 1
+    columns = {
+        "from": [int(v) for v in table["from"]],
+        "to": [int(v) for v in table["to"]],
+        "travel_time_s": [int(v) for v in table["travel_time_s"]],
+        "rides": [int(v) for v in table["rides"]],
+        "transit_distance": [float(v) for v in table["transit_distance"]],
+        "walk_distance": [float(v) for v in table["walk_distance"]],
+        "street_distance": [float(v) for v in table["street_distance"]],
+        "emissions": [float(v) for v in table["emissions"]],
+        "access_stop": [int(v) for v in table["access_stop"]],
+    }
+    shapes = list(table["geometry"]) if geometries else None
+    stops_by_index = [stop for stop, _lat, _lon in core.stops]
+    # The direct walking alternative, folded per cell exactly as the
+    # engine folds the multimodal one: a strictly faster walk wins, an
+    # equal-time walk beats a ridden or driven row, and pairs only
+    # walking reaches gain walking-only rows.
+    position = {
+        (i, j): at for at, (i, j) in enumerate(zip(columns["from"], columns["to"]))
+    }
+    walk = core._walk_matrix(
+        list(origin_points),
+        list(destination_points),
+        walking_speed,
+        walk_budget,
+        snap_distance,
+    )
+    undriven_rows = set(undriven)
+
+    def walk_shape(i, j):
+        if not geometries:
+            return None
+        direct = core._walk_between(
+            origin_points[i][0],
+            origin_points[i][1],
+            destination_points[j][0],
+            destination_points[j][1],
+            snap_distance,
+            True,
+        )
+        if direct is None or direct[2] is None:
+            return None
+        # The cost rows' geometry contract is MultiLineString; the
+        # rebuilt walk arrives as a bare LineString.
+        geometry = shapely.from_wkb(direct[2])
+        if geometry.geom_type == "LineString":
+            geometry = shapely.MultiLineString([geometry])
+        return shapely.to_wkb(geometry)
+
+    for i in range(len(from_ids)):
+        if i in undriven_rows:
+            continue
+        for j in range(len(to_ids)):
+            cell = walk[i][j]
+            if cell is None:
+                continue
+            seconds, meters = int(cell[0]), float(cell[1])
+            at = position.get((i, j))
+            if at is None:
+                columns["from"].append(i)
+                columns["to"].append(j)
+                columns["travel_time_s"].append(seconds)
+                columns["rides"].append(0)
+                columns["transit_distance"].append(0.0)
+                columns["walk_distance"].append(meters)
+                columns["street_distance"].append(0.0)
+                columns["emissions"].append(0.0)
+                columns["access_stop"].append(no_stop)
+                if shapes is not None:
+                    shapes.append(walk_shape(i, j))
+                continue
+            stop_index = columns["access_stop"][at]
+            car_used = (
+                stop_index != no_stop and stops_by_index[stop_index] in fee_by_stop[i]
+            )
+            if seconds < columns["travel_time_s"][at] or (
+                seconds == columns["travel_time_s"][at]
+                and (columns["rides"][at] > 0 or car_used)
+            ):
+                columns["travel_time_s"][at] = seconds
+                columns["rides"][at] = 0
+                columns["transit_distance"][at] = 0.0
+                columns["walk_distance"][at] = meters
+                columns["street_distance"][at] = 0.0
+                columns["emissions"][at] = 0.0
+                columns["access_stop"][at] = no_stop
+                if shapes is not None:
+                    shapes[at] = walk_shape(i, j)
+    if core._streets_generation != generation:
+        raise RuntimeError(
+            "the street network was replaced while the park-and-ride "
+            "matrix was being computed; rerun the query"
+        )
+    if undriven:
+        named = ", ".join(str(from_ids[index]) for index in undriven[:5])
+        suffix = ", …" if len(undriven) > 5 else ""
+        warnings.warn(
+            f"{len(undriven)} origin point(s) cannot reach any facility "
+            f"by car and are omitted ({named}{suffix})",
+            stacklevel=3,
+        )
+    _warn_unsnapped(
+        {
+            "unsnapped_to": [
+                index for index, linked in enumerate(egress_linked) if linked is None
+            ]
+        },
+        from_ids,
+        to_ids,
+    )
+    fee_column = [
+        (
+            fee_by_stop[i].get(stops_by_index[stop_index], 0.0)
+            if stop_index != no_stop
+            else 0.0
+        )
+        for i, stop_index in zip(columns["from"], columns["access_stop"])
+    ]
+    order = sorted(
+        range(len(columns["from"])),
+        key=lambda at: (columns["from"][at], columns["to"][at]),
+    )
+    data = {
+        "from_id": np.array(from_ids, dtype=object)[
+            [columns["from"][at] for at in order]
+        ],
+        "to_id": np.array(to_ids, dtype=object)[[columns["to"][at] for at in order]],
+        "travel_time_s": [columns["travel_time_s"][at] for at in order],
+        "transfers": np.maximum([columns["rides"][at] for at in order], 1) - 1,
+        "transit_distance_m": [columns["transit_distance"][at] for at in order],
+        "walk_distance_m": [columns["walk_distance"][at] for at in order],
+        "street_distance_m": [columns["street_distance"][at] for at in order],
+        "emissions": [columns["emissions"][at] for at in order],
+        "fee": [fee_column[at] for at in order],
+    }
+    if geometries:
+        data["geometry"] = shapely.from_wkb(
+            np.array([shapes[at] for at in order], dtype=object)
+        )
+    return data

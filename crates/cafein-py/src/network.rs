@@ -19,6 +19,13 @@ type DriveRow = (u32, f64, f64, Option<Py<PyBytes>>);
 /// A rebuilt walking shape: network metres, connector metres, WKB.
 type WalkShape = (f64, f64, Option<Py<PyBytes>>);
 
+/// A point's walkable stops: `(stop_id, seconds, meters)` rows, `None`
+/// where the point does not snap.
+type LinkedStops = Option<Vec<(String, u32, f64)>>;
+
+/// A direct-walk cell: `(seconds, meters)`, `None` where unreachable.
+type WalkCell = Option<(u32, f64)>;
+
 /// A mode's raw per-stop times beside the mode-masked links they used.
 type ModeRow = (Vec<Option<u32>>, Vec<Option<Snap>>);
 
@@ -2554,6 +2561,70 @@ impl TransportNetwork {
             result.set_item(self.public_stop_id(walk.stop), walk.seconds)?;
         }
         Ok(result.unbind())
+    }
+
+    /// Walkable stops for many coordinates at once: per point,
+    /// `(stop_id, seconds, meters)` rows — the batched, metres-carrying
+    /// sibling of `access_stops` — or `None` where a point does not
+    /// snap. Runs in parallel with the GIL released.
+    #[pyo3(signature = (points, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    fn _link_walking_stops(
+        &self,
+        py: Python<'_>,
+        points: Vec<(f64, f64)>,
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+    ) -> PyResult<Vec<LinkedStops>> {
+        let streets = self.installed_streets()?;
+        let speed =
+            validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
+        validate_points(&points)?;
+        let linked = py.allow_threads(|| {
+            streets.link_many(&points, speed, max_walking_time, max_snap_distance)
+        });
+        Ok(linked
+            .into_iter()
+            .map(|links| {
+                links.map(|walks| {
+                    walks
+                        .into_iter()
+                        .map(|walk| (self.public_stop_id(walk.stop), walk.seconds, walk.meters))
+                        .collect()
+                })
+            })
+            .collect())
+    }
+
+    /// Direct walking times and distances between coordinate sets over
+    /// the installed walking streets: per origin, per destination,
+    /// `(seconds, meters)` or `None` where either point does not snap
+    /// or the walk exceeds the cutoff. Runs in parallel with the GIL
+    /// released.
+    #[pyo3(signature = (origins, destinations, walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    fn _walk_matrix(
+        &self,
+        py: Python<'_>,
+        origins: Vec<(f64, f64)>,
+        destinations: Vec<(f64, f64)>,
+        walking_speed_kmph: f64,
+        max_walking_time: f64,
+        max_snap_distance: f64,
+    ) -> PyResult<Vec<Vec<WalkCell>>> {
+        let streets = self.installed_streets()?;
+        let speed =
+            validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
+        validate_points(&origins)?;
+        validate_points(&destinations)?;
+        Ok(py.allow_threads(|| {
+            streets.walk_matrix(
+                &origins,
+                &destinations,
+                speed,
+                max_walking_time,
+                max_snap_distance,
+            )
+        }))
     }
 
     /// The public identifiers of the network's routable trips.
