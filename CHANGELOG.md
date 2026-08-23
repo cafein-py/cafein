@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `CarParkPolicy` matrices and accessibility: `TravelTimeMatrix` and
+  `TravelCostMatrix` seed from the composed park-and-ride table
+  (the walk competing, the walking knobs active; the cost frame
+  carries the drive's metres and grams and a `fee` column), and
+  `Accessibility` gains `street_policy=` on the departure-axis time
+  cost — an origin beyond walking reach scores through the car plane.
+  ([#300](https://github.com/cafein-py/cafein/pull/300))
+
 - `CarParkPolicy` routes: `route_between_coordinates`,
   `travel_times_from_coordinate`, and `DetailedItineraries` serve
   park-and-ride journeys — drive to a facility, park, walk, ride —

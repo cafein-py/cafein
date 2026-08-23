@@ -391,3 +391,57 @@ def test_equity_indices_over_a_metro_accessibility_run(
     curve = reachable.lorenz_curve(**kwargs)
     assert {"population_share", "value_share"} <= set(curve.columns)
     assert curve["value_share"].iloc[-1] == 1.0
+
+
+def test_park_and_ride_serves_the_metro_region(helsinki_metro_data):
+    geopandas = pytest.importorskip("geopandas")
+    from shapely.geometry import Point
+
+    from cafein import Accessibility
+    from cafein.policy import CarParkPolicy
+    from cafein.streets import park_and_ride_facilities
+
+    # A real facility frame from the region's own park_ride tagging.
+    facilities = park_and_ride_facilities(str(helsinki_metro_data.osm_pbf))
+    assert len(facilities) >= 1
+    policy = CarParkPolicy(facilities=facilities)
+    network = TransportNetwork.from_gtfs(
+        [str(helsinki_metro_data.gtfs)],
+        osm_pbf=str(helsinki_metro_data.osm_pbf),
+        street_modes=("walk", "car"),
+        country="FI",
+    )
+    departure = f"{_service_date(str(helsinki_metro_data.gtfs))} 08:30:00"
+    origins = geopandas.GeoDataFrame(
+        {"id": ["espoo", "vantaa"]},
+        geometry=[Point(24.6559, 60.2055), Point(25.0378, 60.2934)],
+        crs="EPSG:4326",
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["centre"], "jobs": [1000.0]},
+        geometry=[Point(24.9414, 60.1719)],
+        crs="EPSG:4326",
+    )
+    frame = TravelTimeMatrix(
+        network,
+        origins,
+        destinations,
+        departure,
+        street_policy=policy,
+        output_time_units="seconds",
+    )
+    # Every suburb reaches the centre through some facility, finitely.
+    assert set(frame["from_id"]) == {"espoo", "vantaa"}
+    assert (frame["travel_time"] > 0).all()
+    scores = Accessibility(
+        network,
+        origins,
+        destinations,
+        departure,
+        opportunities="jobs",
+        budgets=(90.0,),
+        street_policy=policy,
+    )
+    values = scores["accessibility"].to_numpy()
+    assert len(values) == 2 and (values >= 0).all()
+    assert values.max() > 0.0

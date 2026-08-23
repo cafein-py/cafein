@@ -449,6 +449,77 @@ def _transit_cost_surface(
     return surface, from_ids, to_ids
 
 
+def _validated_car_park_policy(
+    street_policy,
+    network,
+    origins,
+    destinations,
+    cost,
+    arrive_by,
+    window,
+    percentiles,
+    confidence,
+    router,
+    exclude_stops,
+    surface,
+):
+    """The eager CarParkPolicy gate for the accessibility pillar: the
+    car-park policy only, on the departure-axis time cost with
+    point-set origins and destinations."""
+    if street_policy is None:
+        return None
+    from cafein.matrices import _is_point_frame, _is_street_network
+    from cafein.policy import CarParkPolicy
+
+    if not isinstance(street_policy, CarParkPolicy):
+        raise ValueError(
+            f"{surface} serves street_policy=CarParkPolicy(...); the "
+            "street-leg policies stay on the matrix and itinerary surfaces"
+        )
+    if _is_street_network(network):
+        raise ValueError(
+            "CarParkPolicy shapes transit access; a StreetNetwork query "
+            "has no transit side"
+        )
+    if arrive_by:
+        raise NotImplementedError(
+            "CarParkPolicy serves the departure axis for now; arrival= "
+            "arrives with the arrive-by stage"
+        )
+    if cost != "time":
+        raise ValueError(
+            f"CarParkPolicy accessibility serves cost='time', not {cost!r}"
+        )
+    named = [
+        name
+        for name, value in (
+            ("departure_time_window", window),
+            ("percentiles", percentiles),
+            ("confidence", confidence),
+        )
+        if value is not None
+    ]
+    if named or router != "auto":
+        offending = ", ".join(named) or f"router={router!r}"
+        raise ValueError(
+            f"CarParkPolicy does not combine with {offending}; the "
+            "policy runs the earliest-arrival engine"
+        )
+    if exclude_stops:
+        raise ValueError(
+            "CarParkPolicy does not combine with stop exclusions in this stage"
+        )
+    # The construction contract outranks the input shape, as on the
+    # matrix arms: a missing car side is named first.
+    network._require_car_side()
+    if not _is_point_frame(origins) or not _is_point_frame(destinations):
+        raise ValueError(
+            "CarParkPolicy accessibility takes point-set origins and "
+            "destinations; the facilities plane needs coordinates"
+        )
+    return street_policy
+
+
 def _resolved_cost_matrix(
     network,
     origins,
@@ -475,6 +546,7 @@ def _resolved_cost_matrix(
     walking_speed_kmph,
     max_walking_time,
     label,
+    street_policy=None,
     _resolved_costs=None,
     arrive_by=False,
 ):
@@ -607,6 +679,26 @@ def _resolved_cost_matrix(
             )
             resolved_percentiles = None
         elif _is_geo(origins):
+            if street_policy is not None:
+                # The composed car-and-walking access table seeds the
+                # same engine fan-out the policy matrices ride; the
+                # gate validated the axis and the point frames.
+                from cafein.matrices import _car_park_time_matrix
+
+                matrix, from_ids, to_ids = _car_park_time_matrix(
+                    network,
+                    origins,
+                    destinations,
+                    date,
+                    departure,
+                    street_policy,
+                    max_transfers,
+                    chunk,
+                    (walking_speed_kmph, max_walking_time, max_snap_distance),
+                    exclude_routes,
+                    exclude_trips,
+                )
+                return matrix, from_ids, to_ids, None
             if arrive_by:
                 # A product's chunk stays on the origins — its scores
                 # need every destination — so the matrix layer's
@@ -730,6 +822,7 @@ def _accessibility_columns(
     decay,
     decay_param,
     label,
+    street_policy=None,
     _resolved_costs=None,
     arrive_by=False,
     _surface=None,
@@ -771,6 +864,7 @@ def _accessibility_columns(
             walking_speed_kmph,
             max_walking_time,
             label=label,
+            street_policy=street_policy,
             _resolved_costs=_resolved_costs,
             arrive_by=arrive_by,
         )
@@ -879,6 +973,18 @@ class Accessibility(pd.DataFrame):
     on the departure axis, as on the cost matrices (the arrival axis
     prices pre-enumerated candidates and takes no implicit cap), and
     the time axis rejects it — the budgets already bound time.
+
+    ``street_policy=`` takes a ``cafein.CarParkPolicy`` (a network
+    built with ``"car"`` in ``street_modes=``): each origin's access
+    composes drive-to-facility, parking search, and the facility walk,
+    with the ordinary walking access competing beside the car plane
+    and winning ties; egress is ordinary walking and transfers ride
+    the installed transfer set, as on every query. The query's
+    walking knobs stay active. The policy serves ``cost="time"`` on
+    the departure axis with point-set origins and destinations;
+    windows, percentiles, ``router=`` overrides, and stop exclusions
+    are rejected by name, and the street-leg policies stay on the
+    matrix and itinerary surfaces.
     """
 
     @property
@@ -918,6 +1024,7 @@ class Accessibility(pd.DataFrame):
         walking_speed_kmph=None,
         max_walking_time=None,
         snap_distance=None,
+        street_policy=None,
     ):
         if hasattr(network, "route_between_stops"):
             (
@@ -1038,6 +1145,20 @@ class Accessibility(pd.DataFrame):
                     f"cost={cost!r} yields the window's single optimum per "
                     "destination; percentiles apply to cost='time'"
                 )
+        street_policy = _validated_car_park_policy(
+            street_policy,
+            network,
+            origins,
+            destinations,
+            cost,
+            arrive_by,
+            window,
+            percentiles,
+            confidence,
+            router,
+            exclude_stops,
+            "Accessibility",
+        )
 
         frame = _accessibility_columns(
             network,
@@ -1071,6 +1192,7 @@ class Accessibility(pd.DataFrame):
             decay,
             decay_param,
             label="Accessibility",
+            street_policy=street_policy,
             arrive_by=arrive_by,
         )
         super().__init__(restore_id_dtypes(frame, _id_dtypes))
@@ -1109,6 +1231,7 @@ class Accessibility(pd.DataFrame):
         walking_speed_kmph=None,
         max_walking_time=None,
         snap_distance=None,
+        street_policy=None,
         output,
         batch_size=None,
         resume=False,
@@ -1131,6 +1254,11 @@ class Accessibility(pd.DataFrame):
         complete time query, refusing a resume that differs in axis,
         moment, window, or percentiles.
         """
+        if street_policy is not None:
+            raise NotImplementedError(
+                "street_policy accessibility does not stream yet; "
+                "compute Accessibility with the constructor instead"
+            )
         if hasattr(network, "route_between_stops"):
             (
                 exclude_routes,

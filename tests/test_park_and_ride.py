@@ -107,23 +107,17 @@ def test_parameter_validation_refusals():
         CarParkPolicy(facilities=facilities, vehicle_class=3)
 
 
-def test_the_unwired_surfaces_still_refuse(network):
-    from cafein import TravelCostMatrix, TravelTimeMatrix
+def test_the_matrix_and_accessibility_refusals(network, tmp_path):
+    from cafein import Accessibility, TravelCostMatrix, TravelTimeMatrix
+    from cafein.policy import StreetLegPolicy
 
     policy = CarParkPolicy(facilities=_facilities())
     origins = geopandas.GeoDataFrame({"id": ["a"]}, geometry=[KAMPPI], crs="EPSG:4326")
     destinations = geopandas.GeoDataFrame(
         {"id": ["b"]}, geometry=[HAKANIEMI], crs="EPSG:4326"
     )
-    with pytest.raises(NotImplementedError, match="the matrix computers"):
-        TravelCostMatrix(
-            network,
-            origins,
-            destinations,
-            "2022-02-22 08:30:00",
-            street_policy=policy,
-        )
-    with pytest.raises(NotImplementedError, match="the matrix computers"):
+    # The surfaces demand the car side by name on a network without it.
+    with pytest.raises(ValueError, match="multimodal car side"):
         TravelTimeMatrix(
             network,
             origins,
@@ -131,19 +125,6 @@ def test_the_unwired_surfaces_still_refuse(network):
             "2022-02-22 08:30:00",
             street_policy=policy,
         )
-    # Stop-id origins skip the point-frame policy fold; the refusal
-    # must fire by name there too.
-    stop_ids = list(network.stops_gdf["id"].iloc[:1])
-    with pytest.raises(NotImplementedError, match="the matrix computers"):
-        TravelTimeMatrix(
-            network,
-            stop_ids,
-            stop_ids,
-            "2022-02-22 08:30:00",
-            street_policy=policy,
-        )
-    # The wired surfaces demand the car side by name on a network
-    # without it.
     with pytest.raises(ValueError, match="multimodal car side"):
         network.route_between_coordinates(
             (60.1690, 24.9320),
@@ -151,9 +132,106 @@ def test_the_unwired_surfaces_still_refuse(network):
             "2022-02-22 08:30:00",
             street_policy=policy,
         )
+    stop_ids = list(network.stops_gdf["id"].iloc[:1])
+    # The combination contract, each by name.
+    with pytest.raises(NotImplementedError, match="arrive-by stage"):
+        TravelTimeMatrix(
+            network,
+            origins,
+            destinations,
+            arrival="2022-02-22 09:30:00",
+            street_policy=policy,
+        )
+    with pytest.raises(ValueError, match="departure_time_window"):
+        TravelTimeMatrix(
+            network,
+            origins,
+            destinations,
+            "2022-02-22 08:30:00",
+            departure_time_window=10,
+            street_policy=policy,
+        )
+    with pytest.raises(ValueError, match="stop exclusions"):
+        TravelTimeMatrix(
+            network,
+            origins,
+            destinations,
+            "2022-02-22 08:30:00",
+            exclude_stops=stop_ids,
+            street_policy=policy,
+        )
+    with pytest.raises(ValueError, match="fares"):
+        TravelCostMatrix(
+            network,
+            origins,
+            destinations,
+            "2022-02-22 08:30:00",
+            fares="hsl",
+            street_policy=policy,
+        )
+    with pytest.raises(ValueError, match="router"):
+        TravelCostMatrix(
+            network,
+            origins,
+            destinations,
+            "2022-02-22 08:30:00",
+            router="tbtr",
+            street_policy=policy,
+        )
+    with pytest.raises(NotImplementedError, match="do not stream"):
+        TravelTimeMatrix.to_parquet(
+            network,
+            origins,
+            destinations,
+            "2022-02-22 08:30:00",
+            street_policy=policy,
+            output=str(tmp_path / "refused.parquet"),
+        )
+    # Accessibility's gate, each by name.
+    with pytest.raises(ValueError, match="serves street_policy=CarParkPolicy"):
+        Accessibility(
+            network,
+            origins,
+            destinations,
+            "2022-02-22 08:30:00",
+            street_policy=StreetLegPolicy(access={"walk": 600}),
+        )
+    with pytest.raises(ValueError, match="cost='time'"):
+        Accessibility(
+            network,
+            origins,
+            destinations,
+            "2022-02-22 08:30:00",
+            cost="emissions",
+            departure_time_window=10,
+            street_policy=policy,
+        )
+    with pytest.raises(NotImplementedError, match="arrive-by stage"):
+        Accessibility(
+            network,
+            origins,
+            destinations,
+            arrival="2022-02-22 09:30:00",
+            street_policy=policy,
+        )
+    # The construction contract outranks the input shape: on a network
+    # without the car side, stop-id inputs name the missing car side.
     with pytest.raises(ValueError, match="multimodal car side"):
-        network.travel_times_from_coordinate(
-            (60.1690, 24.9320), "2022-02-22 08:30:00", street_policy=policy
+        Accessibility(
+            network,
+            stop_ids,
+            stop_ids,
+            "2022-02-22 08:30:00",
+            street_policy=policy,
+        )
+    with pytest.raises(NotImplementedError, match="does not stream"):
+        Accessibility.to_parquet(
+            network,
+            origins,
+            destinations,
+            "2022-02-22 08:30:00",
+            street_policy=policy,
+            output=str(tmp_path / "refused-scores.parquet"),
         )
 
 
@@ -395,7 +473,7 @@ def test_travel_times_seed_from_the_same_table(car_park_network):
         FAR_ORIGIN, DEPARTURE_TIME, street_policy=policy, max_walking_time=8
     )
     assert times
-    offsets, tokens = _car_park_table(
+    offsets, tokens, _walking = _car_park_table(
         car_park_network._core,
         FAR_ORIGIN,
         policy,
@@ -588,4 +666,272 @@ def test_facility_semantics_and_refusals(car_park_network):
             DEPARTURE_TIME,
             street_policy=policy,
             router="raptor",
+        )
+
+
+def test_the_time_matrix_cells_reconcile_with_the_route(car_park_network):
+    from cafein import TravelTimeMatrix
+
+    policy = _pasila_policy()
+    origins = geopandas.GeoDataFrame(
+        {"id": ["far", "near"]},
+        geometry=[Point(FAR_ORIGIN[1], FAR_ORIGIN[0]), Point(24.9320, 60.1690)],
+        crs="EPSG:4326",
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["d1", "d2"]},
+        geometry=[Point(24.9520, 60.1795), Point(24.9500, 60.1841)],
+        crs="EPSG:4326",
+    )
+    frame = TravelTimeMatrix(
+        car_park_network,
+        origins,
+        destinations,
+        DEPARTURE_TIME,
+        street_policy=policy,
+        max_walking_time=8,
+        output_time_units="seconds",
+    )
+    cells = {(row.from_id, row.to_id): row.travel_time for row in frame.itertuples()}
+    coordinates = {"far": FAR_ORIGIN, "near": (60.1690, 24.9320)}
+    targets = {"d1": (60.1795, 24.9520), "d2": (60.1841, 24.9500)}
+    for from_id, origin in coordinates.items():
+        for to_id, destination in targets.items():
+            journeys = car_park_network.route_between_coordinates(
+                origin,
+                destination,
+                DEPARTURE_TIME,
+                street_policy=policy,
+                max_walking_time=8,
+            )
+            best = min(j["arrival_s"] - j["departure_s"] for j in journeys)
+            cell = cells[(from_id, to_id)]
+            if from_id == "far":
+                # Walking cannot serve within the budget: purely the
+                # engine run on both sides, so the cell matches exactly.
+                assert cell == best
+            else:
+                # A walking-won cell may differ by the two folds'
+                # rounding conventions.
+                assert abs(cell - best) <= 1
+
+
+def test_the_cost_matrix_carries_the_car_chain(car_park_network):
+    from cafein import DetailedItineraries, TravelCostMatrix
+
+    policy = _pasila_policy(vehicle_class="ICE", occupancy=2.0)
+    origins = geopandas.GeoDataFrame(
+        {"id": ["o"]}, geometry=[Point(FAR_ORIGIN[1], FAR_ORIGIN[0])], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["d"]}, geometry=[Point(24.9520, 60.1795)], crs="EPSG:4326"
+    )
+    frame = TravelCostMatrix(
+        car_park_network,
+        origins,
+        destinations,
+        DEPARTURE_TIME,
+        street_policy=policy,
+        max_walking_time=8,
+        output_time_units="seconds",
+    )
+    assert list(frame["from_id"]) == ["o"] and list(frame["to_id"]) == ["d"]
+    assert "facility_id" not in frame.columns
+    itinerary = DetailedItineraries(
+        car_park_network,
+        origins,
+        destinations,
+        DEPARTURE_TIME,
+        street_policy=policy,
+        max_walking_time=8,
+    )
+    # The itineraries enumerate ride-count options; the matrix cell is
+    # the time-fastest of them.
+    durations = (
+        itinerary.groupby("option")["arrival_s"].max()
+        - itinerary.groupby("option")["departure_s"].min()
+    )
+    journey = itinerary[itinerary["option"] == durations.idxmin()]
+    drive = journey[journey["mode"] == "car_park"]
+    kilometres = drive["network_distance_m"].iloc[0] / 1000.0
+    # The cell's grams are the whole journey's — the transit legs plus
+    # the drive priced as ICE per-vehicle over the occupancy — exactly
+    # as the itineraries price them.
+    assert frame["emissions"].iloc[0] == pytest.approx(
+        float(journey["emissions"].sum()), rel=1e-9
+    )
+    assert float(journey["emissions"].sum()) > kilometres * 162.0 / 2.0
+    assert frame["street_distance_m"].iloc[0] == pytest.approx(
+        drive["distance_m"].iloc[0], rel=1e-6
+    )
+    assert frame["fee"].iloc[0] == pytest.approx(3.0)
+    walks = journey[journey["mode"] == "walk"]
+    assert frame["walk_distance_m"].iloc[0] == pytest.approx(
+        walks["distance_m"].sum(), rel=1e-6
+    )
+    assert frame["travel_time"].iloc[0] == int(durations.min())
+
+
+def test_a_walk_won_cell_prices_zero(car_park_network):
+    from cafein import TravelCostMatrix
+
+    policy = _pasila_policy()
+    origins = geopandas.GeoDataFrame(
+        {"id": ["near"]}, geometry=[Point(24.9320, 60.1690)], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["close"]}, geometry=[Point(24.9316, 60.1688)], crs="EPSG:4326"
+    )
+    frame = TravelCostMatrix(
+        car_park_network,
+        origins,
+        destinations,
+        DEPARTURE_TIME,
+        street_policy=policy,
+        output_time_units="seconds",
+    )
+    row = frame.iloc[0]
+    assert row["transfers"] == 0
+    assert row["emissions"] == 0.0
+    assert row["street_distance_m"] == 0.0
+    assert row["fee"] == 0.0
+    assert row["walk_distance_m"] > 0.0
+
+
+def test_accessibility_scores_through_the_car_plane(car_park_network):
+    from cafein import Accessibility
+
+    policy = _pasila_policy()
+    origins = geopandas.GeoDataFrame(
+        {"id": ["far"]}, geometry=[Point(FAR_ORIGIN[1], FAR_ORIGIN[0])], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["a", "b"], "jobs": [100.0, 40.0]},
+        geometry=[Point(24.9520, 60.1795), Point(24.9316, 60.1688)],
+        crs="EPSG:4326",
+    )
+    walked = Accessibility(
+        car_park_network,
+        origins,
+        destinations,
+        DEPARTURE_TIME,
+        opportunities="jobs",
+        budgets=(45.0,),
+        max_walking_time=8,
+    )
+    # Beyond every stop's walking reach, the origin scores nothing.
+    assert float(walked["accessibility"].sum()) == 0.0
+    driven = Accessibility(
+        car_park_network,
+        origins,
+        destinations,
+        DEPARTURE_TIME,
+        opportunities="jobs",
+        budgets=(45.0,),
+        max_walking_time=8,
+        street_policy=policy,
+    )
+    # The composed car table demonstrably feeds the score.
+    assert float(driven["accessibility"].sum()) > 0.0
+    # A walking-reachable origin can only gain from the second plane.
+    near = geopandas.GeoDataFrame(
+        {"id": ["near"]}, geometry=[Point(24.9320, 60.1690)], crs="EPSG:4326"
+    )
+    base = Accessibility(
+        car_park_network,
+        near,
+        destinations,
+        DEPARTURE_TIME,
+        opportunities="jobs",
+        budgets=(45.0,),
+    )
+    with_policy = Accessibility(
+        car_park_network,
+        near,
+        destinations,
+        DEPARTURE_TIME,
+        opportunities="jobs",
+        budgets=(45.0,),
+        street_policy=policy,
+    )
+    assert float(with_policy["accessibility"].sum()) >= float(
+        base["accessibility"].sum()
+    )
+    # With the car side present, stop-id inputs refuse on their shape.
+    from cafein import Accessibility as _Accessibility
+
+    with pytest.raises(ValueError, match="point-set origins"):
+        _Accessibility(
+            car_park_network,
+            list(car_park_network.stops_gdf["id"].iloc[:1]),
+            list(car_park_network.stops_gdf["id"].iloc[:1]),
+            DEPARTURE_TIME,
+            street_policy=policy,
+        )
+
+
+def test_cost_geometry_stays_multiline_when_the_walk_wins(car_park_network):
+    from cafein import TravelCostMatrix
+
+    policy = _pasila_policy()
+    origins = geopandas.GeoDataFrame(
+        {"id": ["far", "near"]},
+        geometry=[Point(FAR_ORIGIN[1], FAR_ORIGIN[0]), Point(24.9320, 60.1690)],
+        crs="EPSG:4326",
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["close"]}, geometry=[Point(24.9316, 60.1688)], crs="EPSG:4326"
+    )
+    frame = TravelCostMatrix(
+        car_park_network,
+        origins,
+        destinations,
+        DEPARTURE_TIME,
+        street_policy=policy,
+        geometries=True,
+        output_time_units="seconds",
+    )
+    # Ridden and walking-won rows alike keep the cost matrix's
+    # MultiLineString contract.
+    kinds = {
+        geometry.geom_type for geometry in frame["geometry"] if geometry is not None
+    }
+    assert kinds == {"MultiLineString"}
+    walked = frame[(frame["from_id"] == "near") & (frame["transfers"] == 0)]
+    assert len(walked) and walked["geometry"].iloc[0] is not None
+
+
+def test_an_undrivable_origin_is_omitted_with_a_warning(car_park_network):
+    from cafein import TravelTimeMatrix
+
+    policy = _pasila_policy()
+    origins = geopandas.GeoDataFrame(
+        {"id": ["sea", "far"]},
+        geometry=[Point(24.8000, 60.1200), Point(FAR_ORIGIN[1], FAR_ORIGIN[0])],
+        crs="EPSG:4326",
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["d"]}, geometry=[Point(24.9520, 60.1795)], crs="EPSG:4326"
+    )
+    with pytest.warns(UserWarning, match="cannot reach any facility by car"):
+        frame = TravelTimeMatrix(
+            car_park_network,
+            origins,
+            destinations,
+            DEPARTURE_TIME,
+            street_policy=policy,
+            max_walking_time=8,
+            output_time_units="seconds",
+        )
+    # The undrivable origin's cells are omitted, never silently walked;
+    # the drivable origin still serves.
+    assert set(frame["from_id"]) == {"far"}
+    # Stop-id forms refuse: the facilities plane needs coordinates.
+    with pytest.raises(ValueError, match="point-set origins"):
+        TravelTimeMatrix(
+            car_park_network,
+            list(car_park_network.stops_gdf["id"].iloc[:1]),
+            None,
+            DEPARTURE_TIME,
+            street_policy=policy,
         )

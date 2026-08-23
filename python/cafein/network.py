@@ -222,7 +222,7 @@ def _car_park_offsets(core, origin, policy, walk_options, geometries):
     time every ordinary walk, the policy's budgets bound the car
     chain. The token records the winning chain for reconstruction:
     ``(facility_position, drive_s, park_s, walk_s, drive_network_m,
-    drive_connector_m, drive_wkb)``.
+    drive_connector_m, walk_m, drive_wkb)``.
     """
     from cafein.street_network import _resolved_delays
 
@@ -246,28 +246,24 @@ def _car_park_offsets(core, origin, policy, walk_options, geometries):
             "no facility is reachable by car: each is beyond max_car_time "
             "or too far from the drivable streets"
         )
+    linked = core._link_walking_stops(
+        coordinates,
+        walking_speed,
+        float(policy.max_facility_walk_seconds),
+        snap_distance,
+    )
     best = {}
     for position, drive in enumerate(drives):
         if drive is None:
             continue
         drive_s, network_m, connector_m, shape = drive
         park_s = int(round(float(facilities["search_seconds"].iloc[position])))
-        latitude, longitude = coordinates[position]
-        try:
-            walks = core.access_stops(
-                latitude,
-                longitude,
-                walking_speed,
-                float(policy.max_facility_walk_seconds),
-                snap_distance,
-            )
-        except ValueError as error:
-            if "too far" not in str(error):
-                raise
+        walks = linked[position]
+        if walks is None:
             # Drivable but unwalkable: this facility cannot hand over
             # to the platforms; the others still serve.
             continue
-        for stop, walk_s in walks.items():
+        for stop, walk_s, walk_m in walks:
             total = int(drive_s) + park_s + int(walk_s)
             known = best.get(stop)
             if known is None or total < known[0]:
@@ -280,6 +276,7 @@ def _car_park_offsets(core, origin, policy, walk_options, geometries):
                         int(walk_s),
                         network_m,
                         connector_m,
+                        walk_m,
                         shape,
                     ),
                 )
@@ -289,22 +286,23 @@ def _car_park_offsets(core, origin, policy, walk_options, geometries):
 def _car_park_table(core, origin, policy, walk_options, geometries):
     """The merged access table: per stop, the better of the composed
     car chain and the ordinary walk (ties to the walk), with tokens
-    for the stops the car carries."""
+    for the stops the car carries and the walking plane's
+    ``{stop: (seconds, meters)}`` rows for sidecar attribution."""
     walking_speed, walk_budget, snap_distance = walk_options
     # A street install bumps the core's generation; pinning it proves
     # the car rows and the walking rows read the same graph.
     generation = core._streets_generation
     best = _car_park_offsets(core, origin, policy, walk_options, geometries)
-    try:
-        walking = core.access_stops(
-            origin[0], origin[1], walking_speed, walk_budget, snap_distance
-        )
-    except ValueError as error:
-        if "too far" not in str(error):
-            raise
-        # The origin drives but does not walk: the car plane alone
-        # seeds the engine.
-        walking = {}
+    linked = core._link_walking_stops(
+        [tuple(origin)], walking_speed, walk_budget, snap_distance
+    )[0]
+    # An origin that drives but does not walk: the car plane alone
+    # seeds the engine.
+    walking = (
+        {}
+        if linked is None
+        else {stop: (int(seconds), meters) for stop, seconds, meters in linked}
+    )
     if core._streets_generation != generation:
         raise RuntimeError(
             "the street network was replaced while the park-and-ride "
@@ -313,16 +311,16 @@ def _car_park_table(core, origin, policy, walk_options, geometries):
     offsets, tokens = [], {}
     for stop, (total, token) in best.items():
         walked = walking.get(stop)
-        if walked is not None and int(walked) <= total:
+        if walked is not None and walked[0] <= total:
             continue
         offsets.append((stop, total))
         tokens[stop] = token
-    for stop, walked in walking.items():
+    for stop, (walked, _meters) in walking.items():
         kept = best.get(stop)
-        if kept is not None and kept[0] < int(walked):
+        if kept is not None and kept[0] < walked:
             continue
-        offsets.append((stop, int(walked)))
-    return offsets, tokens
+        offsets.append((stop, walked))
+    return offsets, tokens, walking
 
 
 def _car_park_journeys(
@@ -363,7 +361,9 @@ def _car_park_journeys(
     origin = tuple(origin)
     destination = tuple(destination)
     walking_speed, walk_budget, snap_distance = walk_options
-    offsets, tokens = _car_park_table(core, origin, policy, walk_options, geometries)
+    offsets, tokens, _walking = _car_park_table(
+        core, origin, policy, walk_options, geometries
+    )
     egress_walks = core.access_stops(
         destination[0], destination[1], walking_speed, walk_budget, snap_distance
     )
@@ -426,6 +426,7 @@ def _car_park_journeys(
                     walk_s,
                     network_m,
                     connector_m,
+                    _walk_m,
                     drive_wkb,
                 ) = tokens[stop]
                 facility_id = facilities["id"].iloc[position]
@@ -2811,7 +2812,7 @@ class TransportNetwork:
                 import copy
 
                 street_policy = copy.deepcopy(street_policy)
-                offsets, _tokens = _car_park_table(
+                offsets, _tokens, _walking = _car_park_table(
                     self._core,
                     tuple(origin),
                     street_policy,
