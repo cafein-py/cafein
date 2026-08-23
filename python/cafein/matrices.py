@@ -400,10 +400,16 @@ class TravelCostMatrix(pd.DataFrame):
                 walking_speed_kmph,
                 max_walking_time,
             )
+        from cafein.policy import reject_car_park
+
+        # Unconditional: stop-id and omitted origins skip the fold
+        # below but must refuse a CarParkPolicy by name too.
+        reject_car_park(street_policy, "the matrix computers")
         if not _is_street_network(network) and _is_point_frame(origins):
             street_policy, max_walking_time = folded_street_policy(
                 traveler, network, street_policy, walking_speed_kmph, max_walking_time
             )
+            reject_car_park(street_policy, "the matrix computers")
         origins, _origin_dtype = freeze_ids(origins)
         destinations, _destination_dtype = freeze_ids(destinations)
         if destinations is None and _is_point_frame(origins):
@@ -789,10 +795,16 @@ class TravelCostMatrix(pd.DataFrame):
                 walking_speed_kmph,
                 max_walking_time,
             )
+        from cafein.policy import reject_car_park
+
+        # Unconditional: stop-id and omitted origins skip the fold
+        # below but must refuse a CarParkPolicy by name too.
+        reject_car_park(street_policy, "the matrix computers")
         if not _is_street_network(network) and _is_point_frame(origins):
             street_policy, max_walking_time = folded_street_policy(
                 traveler, network, street_policy, walking_speed_kmph, max_walking_time
             )
+            reject_car_park(street_policy, "the matrix computers")
         import pyarrow
 
         from cafein._units import (
@@ -1164,10 +1176,16 @@ class TravelTimeMatrix(pd.DataFrame):
                 walking_speed_kmph,
                 max_walking_time,
             )
+        from cafein.policy import reject_car_park
+
+        # Unconditional: stop-id and omitted origins skip the fold
+        # below but must refuse a CarParkPolicy by name too.
+        reject_car_park(street_policy, "the matrix computers")
         if not _is_street_network(network) and _is_point_frame(origins):
             street_policy, max_walking_time = folded_street_policy(
                 traveler, network, street_policy, walking_speed_kmph, max_walking_time
             )
+            reject_car_park(street_policy, "the matrix computers")
         origins, _origin_dtype = freeze_ids(origins)
         destinations, _destination_dtype = freeze_ids(destinations)
         if destinations is None and _is_point_frame(origins):
@@ -1461,10 +1479,16 @@ class TravelTimeMatrix(pd.DataFrame):
                 walking_speed_kmph,
                 max_walking_time,
             )
+        from cafein.policy import reject_car_park
+
+        # Unconditional: stop-id and omitted origins skip the fold
+        # below but must refuse a CarParkPolicy by name too.
+        reject_car_park(street_policy, "the matrix computers")
         if not _is_street_network(network) and _is_point_frame(origins):
             street_policy, max_walking_time = folded_street_policy(
                 traveler, network, street_policy, walking_speed_kmph, max_walking_time
             )
+            reject_car_park(street_policy, "the matrix computers")
         import pyarrow
 
         from cafein._units import (

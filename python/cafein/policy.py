@@ -562,6 +562,7 @@ def reject_car_park(policy, surface):
     """Refuse a CarParkPolicy on a surface it does not serve yet."""
     if isinstance(policy, CarParkPolicy):
         raise NotImplementedError(
-            f"CarParkPolicy is not wired into {surface} yet; the routing "
-            "surfaces arrive with the next stage"
+            f"CarParkPolicy is not wired into {surface} yet; "
+            "route_between_coordinates, travel_times_from_coordinate, "
+            "and DetailedItineraries serve it"
         )

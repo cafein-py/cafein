@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `CarParkPolicy` routes: `route_between_coordinates`,
+  `travel_times_from_coordinate`, and `DetailedItineraries` serve
+  park-and-ride journeys — drive to a facility, park, walk, ride —
+  with the ordinary walk competing beside the car, split legs
+  (`car_park`, `park`, walk) with the facility id and drive
+  geometry, and the car chain priced end to end: GEMMAT CO₂e with
+  `vehicle_class`/`occupancy`, per-kilometre euros and the facility
+  fee under `perspectives=`.
+  ([#299](https://github.com/cafein-py/cafein/pull/299))
+
 - `CarParkPolicy` and `cafein.streets.park_and_ride_facilities`: the
   park-and-ride policy object (facility frame with search-time and
   fee defaults, drive and facility-walk budgets, car pricing knobs)

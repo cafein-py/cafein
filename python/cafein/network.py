@@ -208,6 +208,344 @@ def _transfer_leg_dicts(
     return legs
 
 
+# The standalone car surfaces' snap ceiling: a car query starting
+# farther than this from a drivable street refuses.
+_CAR_PARK_SNAP_METERS = 500.0
+
+
+def _car_park_offsets(core, origin, policy, walk_options, geometries):
+    """The composed park-and-ride access table and its tokens.
+
+    Per stop, the best of (drive to a facility + its parking search +
+    the facility walk) over every facility, with the ordinary walking
+    access competing beside the car plane — the query's walking knobs
+    time every ordinary walk, the policy's budgets bound the car
+    chain. The token records the winning chain for reconstruction:
+    ``(facility_position, drive_s, park_s, walk_s, drive_network_m,
+    drive_connector_m, drive_wkb)``.
+    """
+    from cafein.street_network import _resolved_delays
+
+    walking_speed, _walk_budget, snap_distance = walk_options
+    car_model = _resolved_delays(
+        "car", policy.intersection_delays, None, policy.delay_model
+    )
+    facilities = policy.facilities
+    coordinates = [(point.y, point.x) for point in facilities.geometry]
+    drives = core._car_park_drive_seconds(
+        origin[0],
+        origin[1],
+        coordinates,
+        car_model,
+        float(policy.max_car_seconds),
+        _CAR_PARK_SNAP_METERS,
+        geometries,
+    )
+    if all(drive is None for drive in drives):
+        raise ValueError(
+            "no facility is reachable by car: each is beyond max_car_time "
+            "or too far from the drivable streets"
+        )
+    best = {}
+    for position, drive in enumerate(drives):
+        if drive is None:
+            continue
+        drive_s, network_m, connector_m, shape = drive
+        park_s = int(round(float(facilities["search_seconds"].iloc[position])))
+        latitude, longitude = coordinates[position]
+        try:
+            walks = core.access_stops(
+                latitude,
+                longitude,
+                walking_speed,
+                float(policy.max_facility_walk_seconds),
+                snap_distance,
+            )
+        except ValueError as error:
+            if "too far" not in str(error):
+                raise
+            # Drivable but unwalkable: this facility cannot hand over
+            # to the platforms; the others still serve.
+            continue
+        for stop, walk_s in walks.items():
+            total = int(drive_s) + park_s + int(walk_s)
+            known = best.get(stop)
+            if known is None or total < known[0]:
+                best[stop] = (
+                    total,
+                    (
+                        position,
+                        int(drive_s),
+                        park_s,
+                        int(walk_s),
+                        network_m,
+                        connector_m,
+                        shape,
+                    ),
+                )
+    return best
+
+
+def _car_park_table(core, origin, policy, walk_options, geometries):
+    """The merged access table: per stop, the better of the composed
+    car chain and the ordinary walk (ties to the walk), with tokens
+    for the stops the car carries."""
+    walking_speed, walk_budget, snap_distance = walk_options
+    # A street install bumps the core's generation; pinning it proves
+    # the car rows and the walking rows read the same graph.
+    generation = core._streets_generation
+    best = _car_park_offsets(core, origin, policy, walk_options, geometries)
+    try:
+        walking = core.access_stops(
+            origin[0], origin[1], walking_speed, walk_budget, snap_distance
+        )
+    except ValueError as error:
+        if "too far" not in str(error):
+            raise
+        # The origin drives but does not walk: the car plane alone
+        # seeds the engine.
+        walking = {}
+    if core._streets_generation != generation:
+        raise RuntimeError(
+            "the street network was replaced while the park-and-ride "
+            "access table was being composed; rerun the query"
+        )
+    offsets, tokens = [], {}
+    for stop, (total, token) in best.items():
+        walked = walking.get(stop)
+        if walked is not None and int(walked) <= total:
+            continue
+        offsets.append((stop, total))
+        tokens[stop] = token
+    for stop, walked in walking.items():
+        kept = best.get(stop)
+        if kept is not None and kept[0] < int(walked):
+            continue
+        offsets.append((stop, int(walked)))
+    return offsets, tokens
+
+
+def _car_park_journeys(
+    network,
+    origin,
+    destination,
+    date,
+    departure,
+    max_transfers,
+    policy,
+    exclusions,
+    geometries,
+    walk_options,
+):
+    """Door-to-door journeys under a ``CarParkPolicy``.
+
+    The access table is the per-stop minimum of the composed car chain
+    and the ordinary walk; egress is ordinary walking and transfers
+    ride the installed transfer set. The engine sees ``(stop,
+    seconds)`` rows only; the winning chain rebuilds from the tokens
+    at reconstruction.
+    """
+    import copy
+
+    from cafein._cafein import STREET_DISTANCE_PROVENANCE
+
+    core = network._core
+    # The rebuilt legs must read the graph the access table searched;
+    # a street install mid-query bumps the pinned generation.
+    generation = core._streets_generation
+    # One frozen policy for the whole query: the composition, the
+    # GIL-releasing searches, and the reconstruction all read the
+    # same snapshot even if the caller mutates theirs mid-query.
+    policy = copy.deepcopy(policy)
+    exclude_routes = id_sequence("exclude_routes", exclusions[0])
+    exclude_trips = id_sequence("exclude_trips", exclusions[1])
+    exclude_stops = id_sequence("exclude_stops", exclusions[2])
+    origin = tuple(origin)
+    destination = tuple(destination)
+    walking_speed, walk_budget, snap_distance = walk_options
+    offsets, tokens = _car_park_table(core, origin, policy, walk_options, geometries)
+    egress_walks = core.access_stops(
+        destination[0], destination[1], walking_speed, walk_budget, snap_distance
+    )
+    egress = [(stop, int(seconds)) for stop, seconds in egress_walks.items()]
+    journeys = core._route_with_access(
+        offsets,
+        egress,
+        date,
+        departure,
+        max_transfers,
+        list(exclude_routes),
+        list(exclude_trips),
+        list(exclude_stops),
+        geometries,
+        transfer_mode=None,
+    )
+    facilities = policy.facilities
+
+    def walk_leg_dict(leg_type, point, stop, departure_s, arrival_s, ends):
+        shape = core._car_park_walk_leg(
+            point[0], point[1], stop, snap_distance, geometries
+        )
+        if shape is None:
+            # The access table proved this walk reachable; a missing
+            # rebuild means the searches drifted apart.
+            raise RuntimeError(
+                f"the walking leg serving stop {stop!r} could not be "
+                "rebuilt from its access row"
+            )
+        network_m, connector_m, wkb = shape
+        if wkb is not None and leg_type == "egress":
+            # The helper draws coordinate -> stop; the egress walks
+            # the other way.
+            import shapely
+
+            wkb = shapely.to_wkb(shapely.reverse(shapely.from_wkb(wkb)))
+        leg = {
+            "type": leg_type,
+            "mode": "walk",
+            "departure_s": departure_s,
+            "arrival_s": arrival_s,
+            "distance_m": network_m + connector_m,
+            "network_distance_m": network_m,
+            "connector_distance_m": connector_m,
+            "distance_provenance": STREET_DISTANCE_PROVENANCE,
+            "geometry": wkb,
+        }
+        leg.update(ends)
+        return leg
+
+    for journey in journeys:
+        legs = []
+        for leg in journey["legs"]:
+            if leg["type"] == "access" and leg["to_stop"] in tokens:
+                stop = leg["to_stop"]
+                (
+                    position,
+                    drive_s,
+                    park_s,
+                    walk_s,
+                    network_m,
+                    connector_m,
+                    drive_wkb,
+                ) = tokens[stop]
+                facility_id = facilities["id"].iloc[position]
+                latitude = facilities.geometry.iloc[position].y
+                longitude = facilities.geometry.iloc[position].x
+                start = leg["departure_s"]
+                parked = start + drive_s
+                walked = parked + park_s
+                legs.append(
+                    {
+                        "type": "access",
+                        "mode": "car_park",
+                        "facility_id": facility_id,
+                        # The drive ends at the facility, not a stop.
+                        "to_stop": None,
+                        "departure_s": start,
+                        "arrival_s": parked,
+                        "distance_m": network_m + connector_m,
+                        "network_distance_m": network_m,
+                        "connector_distance_m": connector_m,
+                        "distance_provenance": STREET_DISTANCE_PROVENANCE,
+                        "geometry": drive_wkb,
+                    }
+                )
+                legs.append(
+                    {
+                        "type": "park",
+                        "mode": None,
+                        "facility_id": facility_id,
+                        "stop": stop,
+                        "departure_s": parked,
+                        "arrival_s": walked,
+                    }
+                )
+                legs.append(
+                    walk_leg_dict(
+                        "access",
+                        (latitude, longitude),
+                        stop,
+                        walked,
+                        leg["arrival_s"],
+                        {"to_stop": stop},
+                    )
+                )
+            elif leg["type"] == "access":
+                legs.append(
+                    walk_leg_dict(
+                        "access",
+                        origin,
+                        leg["to_stop"],
+                        leg["departure_s"],
+                        leg["arrival_s"],
+                        {"to_stop": leg["to_stop"]},
+                    )
+                )
+            elif leg["type"] == "egress":
+                legs.append(
+                    walk_leg_dict(
+                        "egress",
+                        destination,
+                        leg["from_stop"],
+                        leg["departure_s"],
+                        leg["arrival_s"],
+                        {"from_stop": leg["from_stop"]},
+                    )
+                )
+            else:
+                leg["mode"] = "walk" if leg["type"] == "transfer" else None
+                legs.append(leg)
+        journey["legs"] = legs
+    # The direct walking alternative, at the query's walking speed.
+    direct = core._walk_between(
+        origin[0],
+        origin[1],
+        destination[0],
+        destination[1],
+        snap_distance,
+        geometries,
+    )
+    if core._streets_generation != generation:
+        raise RuntimeError(
+            "the street network was replaced mid-query; the rebuilt "
+            "walking legs would not match the searched access table"
+        )
+    departed = _departure_seconds(departure)
+    if direct is None:
+        return journeys
+    network_m, connector_m, shape = direct
+    meters_per_second = float(walking_speed or 3.6) * (1000.0 / 3600.0)
+    walk_seconds = int(round((network_m + connector_m) / meters_per_second))
+    if walk_budget is not None and walk_seconds > walk_budget:
+        return journeys
+    kept = [
+        journey
+        for journey in journeys
+        if journey["arrival_s"] - journey["departure_s"] < walk_seconds
+    ]
+    if any(journey["rides"] == 0 for journey in kept):
+        return kept
+    walk = {
+        "departure_s": departed,
+        "arrival_s": departed + walk_seconds,
+        "rides": 0,
+        "legs": [
+            {
+                "type": "walk",
+                "mode": "walk",
+                "departure_s": departed,
+                "arrival_s": departed + walk_seconds,
+                "distance_m": network_m + connector_m,
+                "network_distance_m": network_m,
+                "connector_distance_m": connector_m,
+                "distance_provenance": STREET_DISTANCE_PROVENANCE,
+                "geometry": shape,
+            }
+        ],
+    }
+    return [walk] + kept
+
+
 def _policy_street_legs(
     core, leg, point, tokens, budgets, egress, geometries, transfer_mode=None
 ):
@@ -2054,7 +2392,13 @@ class TransportNetwork:
             edge rode a rental splits into its walk--ride--walk legs.
             The direct door-to-door alternative rides the policy's
             walking class: the wheelchair under a wheelchair-only
-            policy, else walking.
+            policy, else walking. A ``CarParkPolicy`` here serves
+            park-and-ride instead: the drive-park-walk chain competes
+            beside ordinary walking, and — unlike the street-leg
+            policies — the query's walking knobs stay active, timing
+            the walking access, the egress, and the direct-walk
+            alternative; transfers ride the installed transfer set,
+            as on every query.
             Conflicts with the walking knobs above and with
             ``departure_time_window``, which are rejected rather than
             silently ignored.
@@ -2088,10 +2432,15 @@ class TransportNetwork:
         date, departure, arrive_by = time_axis(departure, arrival)
         window = window_axis(arrive_by, departure_time_window, arrival_time_window)
         if arrive_by and street_policy is not None:
-            raise ValueError(
-                "street_policy= (a traveler's street bridge included) "
-                "does not combine with arrival= yet"
-            )
+            from cafein.policy import CarParkPolicy
+
+            if not isinstance(street_policy, CarParkPolicy):
+                # The CarParkPolicy branch below raises its own staged
+                # message.
+                raise ValueError(
+                    "street_policy= (a traveler's street bridge included) "
+                    "does not combine with arrival= yet"
+                )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         return self._route_between_coordinates(
@@ -2141,7 +2490,43 @@ class TransportNetwork:
         (the public wrapper rejects a policy beside it)."""
         if street_policy is not None:
             from cafein.matrices import _walking_only_policy
+            from cafein.policy import CarParkPolicy
 
+            if isinstance(street_policy, CarParkPolicy):
+                # The query's walking knobs stay ACTIVE: they time the
+                # competing walking access, the egress, and the direct
+                # walk; transfers ride the installed transfer set —
+                # the policy owns only the car chain.
+                if arrive_by:
+                    raise NotImplementedError(
+                        "CarParkPolicy serves the departure axis for now; "
+                        "arrival= arrives with the arrive-by stage"
+                    )
+                if window is not None:
+                    raise ValueError(
+                        "CarParkPolicy does not combine with a departure " "window"
+                    )
+                exclude_stops = id_sequence("exclude_stops", exclude_stops)
+                if exclude_stops:
+                    raise ValueError(
+                        "CarParkPolicy does not combine with stop "
+                        "exclusions in this stage"
+                    )
+                self._require_car_side()
+                return _car_park_journeys(
+                    self,
+                    origin,
+                    destination,
+                    date,
+                    departure,
+                    max_transfers,
+                    street_policy,
+                    (exclude_routes, exclude_trips, exclude_stops),
+                    geometries,
+                    _walk_options(
+                        walking_speed_kmph, max_walking_time, max_snap_distance
+                    ),
+                )
             if any(
                 option is not None
                 for option in (walking_speed_kmph, max_walking_time, max_snap_distance)
@@ -2222,6 +2607,14 @@ class TransportNetwork:
             geometries,
             arrive_by,
         )
+
+    def _require_car_side(self):
+        modes = self._core.street_modes or ()
+        if not self._core.has_multimodal_streets or "car" not in modes:
+            raise ValueError(
+                "CarParkPolicy needs the multimodal car side; build with "
+                "street_modes=(..., 'car')"
+            )
 
     def compute_carriage_transfers(self, mode, max_transfer_time):
         """Compute the carriage transfer set for a carried ``mode``.
@@ -2356,7 +2749,10 @@ class TransportNetwork:
             :meth:`compute_mode_transfers`, which must be computed with
             exactly that binding. Conflicts with the walking knobs above
             and with exclusions, which are rejected rather than
-            silently ignored.
+            silently ignored. A ``CarParkPolicy`` here serves
+            park-and-ride instead: the drive-park-walk chain competes
+            beside ordinary walking, and the query's walking knobs
+            stay active, timing the walking access.
 
         Returns
         -------
@@ -2397,8 +2793,43 @@ class TransportNetwork:
         max_snap_distance = snap_distance
         if street_policy is not None:
             from cafein import streets as _streets
-            from cafein.policy import reduction_modes
+            from cafein.policy import CarParkPolicy, reduction_modes
 
+            exclude_routes = id_sequence("exclude_routes", exclude_routes)
+            exclude_trips = id_sequence("exclude_trips", exclude_trips)
+            exclude_stops = id_sequence("exclude_stops", exclude_stops)
+            if isinstance(street_policy, CarParkPolicy):
+                # The walking knobs stay active: they time the
+                # competing walking access; the policy owns the car
+                # chain's budgets.
+                if exclude_stops:
+                    raise ValueError(
+                        "CarParkPolicy does not combine with stop "
+                        "exclusions in this stage"
+                    )
+                self._require_car_side()
+                import copy
+
+                street_policy = copy.deepcopy(street_policy)
+                offsets, _tokens = _car_park_table(
+                    self._core,
+                    tuple(origin),
+                    street_policy,
+                    _walk_options(
+                        walking_speed_kmph, max_walking_time, max_snap_distance
+                    ),
+                    False,
+                )
+                return self._core._travel_times_with_access(
+                    offsets,
+                    date,
+                    departure,
+                    max_transfers,
+                    transfer_mode=None,
+                    exclude_routes=list(exclude_routes),
+                    exclude_trips=list(exclude_trips),
+                    exclude_stops=list(exclude_stops),
+                )
             if any(
                 option is not None
                 for option in (walking_speed_kmph, max_walking_time, max_snap_distance)
@@ -2408,9 +2839,6 @@ class TransportNetwork:
                     "walking_speed_kmph, max_walking_time, or "
                     "snap_distance beside it is a conflict"
                 )
-            exclude_routes = id_sequence("exclude_routes", exclude_routes)
-            exclude_trips = id_sequence("exclude_trips", exclude_trips)
-            exclude_stops = id_sequence("exclude_stops", exclude_stops)
             from cafein.network import _policy_transfer_mode
             from cafein.policy import carriage_terms
 
