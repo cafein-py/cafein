@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- `CarParkPolicy` and `cafein.streets.park_and_ride_facilities`: the
+  park-and-ride policy object (facility frame with search-time and
+  fee defaults, drive and facility-walk budgets, car pricing knobs)
+  and the OSM `park_ride` extractor. The routing surfaces refuse the
+  policy for now.
+  ([#298](https://github.com/cafein-py/cafein/pull/298))
+
 ## 0.15.1 — 2026-08-23
 
 - Street builds with a DEM no longer crash on zero-length OSM ways

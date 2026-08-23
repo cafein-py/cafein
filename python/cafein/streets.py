@@ -586,3 +586,60 @@ def _edge_list(stop_ids, durations, speed, max_walking_time=None):
         )
     meters = durations[i, j] * speed
     return Footpaths(stop_ids.tolist(), i, j, seconds, meters)
+
+
+def park_and_ride_facilities(osm_pbf, bounding_box=None):
+    """Park-and-ride facilities from OSM, as ``CarParkPolicy`` input.
+
+    A facility is any element carrying a ``park_ride`` tag with a
+    value other than ``no`` — ``yes`` and the mode-specific values
+    (``bus``, ``train``, ``tram``, ``metro``, ``ferry``, ``hov``)
+    alike, standalone or beside ``amenity=parking``; plain parking
+    without a qualifying ``park_ride`` value is not a facility. Area
+    geometries collapse to ``representative_point()`` (a point
+    guaranteed inside), so the frame is point-only by construction.
+
+    Returns a GeoDataFrame in EPSG:4326 with ``id`` (the qualified
+    OSM id, ``type/number`` — raw ids are unique per element type
+    only),
+    ``park_ride`` (the tag value), and point ``geometry`` — ready to
+    pass to ``CarParkPolicy(facilities=...)``, which fills the
+    ``search_seconds`` and ``fee`` defaults. Tagging completeness is
+    the data's own quality judgment, which is why this is a separate,
+    deliberate call.
+    """
+    osm = pyrosm.OSM(str(osm_pbf), bounding_box=bounding_box)
+    found = osm.get_data_by_custom_criteria(
+        custom_filter={"park_ride": True},
+        filter_type="keep",
+        keep_nodes=True,
+        keep_ways=True,
+        keep_relations=True,
+    )
+    columns = ["id", "park_ride", "geometry"]
+    if found is None or len(found) == 0:
+        return gpd.GeoDataFrame(
+            {"id": pd.Series(dtype=object), "park_ride": pd.Series(dtype=object)},
+            geometry=gpd.GeoSeries(dtype=object),
+            crs="EPSG:4326",
+        )
+    values = found["park_ride"].astype(str).str.lower()
+    found = found[found["park_ride"].notna() & (values != "no")]
+    points = found.geometry.representative_point()
+    # OSM ids are unique per element type only; the qualified
+    # "type/id" form keeps nodes, ways, and relations apart.
+    if "osm_type" in found.columns:
+        ids = (found["osm_type"].astype(str) + "/" + found["id"].astype(str)).to_numpy(
+            dtype=object
+        )
+    else:
+        ids = found["id"].to_numpy(dtype=object)
+    frame = gpd.GeoDataFrame(
+        {
+            "id": ids,
+            "park_ride": found["park_ride"].astype(str).to_numpy(dtype=object),
+        },
+        geometry=points.to_numpy(),
+        crs=found.crs or "EPSG:4326",
+    ).reset_index(drop=True)
+    return frame.to_crs(epsg=4326)[columns]

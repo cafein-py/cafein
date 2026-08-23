@@ -406,3 +406,162 @@ def pareto_reduction_modes(policy, side, walking_budget, factors=None, component
             )
         modes.append((mode, seconds, rental, eligible, float(value)))
     return modes
+
+
+class CarParkPolicy:
+    """Park-and-ride access: drive to a facility, park, ride transit.
+
+    Parameters
+    ----------
+    facilities : GeoDataFrame
+        The park-and-ride facilities as point geometry (a CRS is
+        required; any is reprojected to EPSG:4326). Optional columns:
+        ``id`` (defaults to the positional index), ``search_seconds``
+        (the parking search time, defaulting to the shipped 300 s
+        where absent or NaN), and ``fee`` (a parking charge in the
+        ``cafein.costs`` currency, EUR2017, defaulting to 0).
+        ``cafein.streets.park_and_ride_facilities`` builds a frame
+        from OSM ``park_ride`` tagging.
+    max_car_time : number or datetime.timedelta
+        The drive budget, in minutes (default 30).
+    max_facility_walk_time : number or datetime.timedelta
+        The facility-to-platform walking budget, in minutes
+        (default 10). The walk converts at the query's walking
+        speed — the policy owns this walk's time budget, never its
+        speed.
+    occupancy : float
+        Persons in the car; divides the per-vehicle emission factors
+        (money rates stay per vehicle, as on the standalone car
+        surfaces). At least 1.
+    vehicle_class : str, optional
+        The emission-factor row: one of the shipped GEMMAT classes
+        (``ICE``, ``HEV``, ``PHEV``, ``BEV``, ``FCEV``) or a class
+        provided through ``factors=``.
+    intersection_delays : bool
+        Apply the car intersection-delay model to the drive, as on
+        the standalone car surfaces.
+    delay_model : optional
+        The delay model override the standalone car surfaces take.
+
+    The car serves access only: the parked car stays at the facility
+    and the rest of the journey is transit and walking. Ordinary
+    walking access competes beside the drive — enabling the car
+    never forces it.
+    """
+
+    def __init__(
+        self,
+        *,
+        facilities,
+        max_car_time=30,
+        max_facility_walk_time=10,
+        occupancy=1.0,
+        vehicle_class=None,
+        intersection_delays=True,
+        delay_model=None,
+    ):
+        self.facilities = _validated_facilities(facilities)
+        self.max_car_seconds = _positive_duration("max_car_time", max_car_time)
+        self.max_facility_walk_seconds = _positive_duration(
+            "max_facility_walk_time", max_facility_walk_time
+        )
+        occupancy = float(occupancy)
+        if not (math.isfinite(occupancy) and occupancy >= 1.0):
+            raise ValueError("occupancy must be at least 1")
+        self.occupancy = occupancy
+        if vehicle_class is not None and not isinstance(vehicle_class, str):
+            raise ValueError("vehicle_class names an emission-factor row")
+        self.vehicle_class = vehicle_class
+        self.intersection_delays = bool(intersection_delays)
+        self.delay_model = delay_model
+
+    def __repr__(self):
+        return (
+            f"CarParkPolicy({len(self.facilities)} facilities, "
+            f"max_car_time={self.max_car_seconds / 60:g} min)"
+        )
+
+
+def _positive_duration(name, value):
+    from cafein._units import duration_seconds
+
+    seconds = duration_seconds(name, value)
+    if seconds <= 0:
+        raise ValueError(f"{name} must be a positive time budget")
+    return seconds
+
+
+def _validated_facilities(facilities):
+    """The policy's facility frame, validated and snapshotted:
+    point geometry in EPSG:4326 beside ``id``, ``search_seconds``,
+    and ``fee`` columns with their documented defaults filled."""
+    import geopandas
+    import numpy as np
+    import pandas as pd
+
+    if not isinstance(facilities, geopandas.GeoDataFrame):
+        raise ValueError(
+            "facilities must be a GeoDataFrame of park-and-ride points; "
+            "cafein.streets.park_and_ride_facilities builds one from OSM"
+        )
+    if len(facilities) == 0:
+        raise ValueError("facilities names no park-and-ride locations")
+    if facilities.crs is None:
+        raise ValueError("the facilities frame must carry a CRS")
+    frame = facilities.to_crs(epsg=4326).copy()
+    if not (frame.geometry.geom_type == "Point").all():
+        raise ValueError(
+            "facilities must be point geometry; collapse areas with "
+            "representative_point() (the extractor already does)"
+        )
+    if frame.geometry.isna().any() or frame.geometry.is_empty.any():
+        raise ValueError("facilities carries an empty geometry")
+    if "id" in frame.columns:
+        ids = frame["id"].astype(object)
+        if ids.isna().any():
+            raise ValueError("the facilities id column carries missing values")
+        if ids.duplicated().any():
+            raise ValueError("the facilities id column carries duplicates")
+    else:
+        ids = pd.Series(range(len(frame)), index=frame.index, dtype=object)
+
+    def numeric_column(name, default):
+        if name not in frame.columns:
+            return pd.Series(default, index=frame.index, dtype=float)
+        raw = frame[name]
+        converted = pd.to_numeric(raw, errors="coerce")
+        corrupt = raw.notna() & converted.isna()
+        if corrupt.any():
+            raise ValueError(
+                f"{name} carries non-numeric values; only absent or "
+                "missing entries take the default"
+            )
+        return converted.fillna(default).astype(float)
+
+    from cafein._parking import PARKING_SECONDS
+
+    search = numeric_column("search_seconds", PARKING_SECONDS)
+    if ((search < 0) | ~np.isfinite(search)).any():
+        raise ValueError("search_seconds must be finite and non-negative")
+    fee = numeric_column("fee", 0.0)
+    if ((fee < 0) | ~np.isfinite(fee)).any():
+        raise ValueError("fee must be finite and non-negative (EUR2017)")
+    snapshot = geopandas.GeoDataFrame(
+        {
+            "id": ids.to_numpy(),
+            "search_seconds": search.to_numpy(),
+            "fee": fee.to_numpy(),
+        },
+        geometry=frame.geometry.to_numpy(),
+        crs="EPSG:4326",
+    ).reset_index(drop=True)
+    return snapshot
+
+
+def reject_car_park(policy, surface):
+    """Refuse a CarParkPolicy on a surface it does not serve yet."""
+    if isinstance(policy, CarParkPolicy):
+        raise NotImplementedError(
+            f"CarParkPolicy is not wired into {surface} yet; the routing "
+            "surfaces arrive with the next stage"
+        )
