@@ -146,6 +146,9 @@ def folded_street_policy(
     Returns ``(street_policy, max_walking_time)`` with the walking
     budget consumed into the synthesized policy.
     """
+    from cafein.policy import reject_car_park
+
+    reject_car_park(street_policy, "the routing surfaces")
     if traveler is None or not traveler.wheelchair:
         return street_policy, max_walking_time
     if street_policy is not None:
