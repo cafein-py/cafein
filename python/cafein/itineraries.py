@@ -650,7 +650,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
                 "occupancy, and vehicle_class apply to a StreetNetwork "
                 "car query"
             )
-        if (
+        from cafein.policy import CarParkPolicy as _CarParkPolicy
+
+        if not isinstance(street_policy, _CarParkPolicy) and (
             perspectives is not None
             or costs is not None
             or currency is not None
@@ -705,6 +707,10 @@ class DetailedItineraries(gpd.GeoDataFrame):
             max_snap_distance=max_snap_distance,
             street_policy=street_policy,
             street_edges=exposure is not None,
+            perspectives=perspectives,
+            costs=costs,
+            currency=currency,
+            cost_components=cost_components,
         )
         if exposure is not None:
             # Re-verify the binding after the (long) routing loop, so a
@@ -763,6 +769,10 @@ def _itineraries_frame(
     max_snap_distance,
     street_policy=None,
     street_edges=False,
+    perspectives=None,
+    costs=None,
+    currency=None,
+    cost_components=None,
 ):
     import copy
 
@@ -785,9 +795,21 @@ def _itineraries_frame(
         raise ValueError("candidates must be 'time', 'pareto', 'relaxed', or 'diverse'")
     if router not in ("auto", "raptor", "tbtr"):
         raise ValueError("router must be 'auto', 'raptor', or 'tbtr'")
+    from cafein.policy import CarParkPolicy
+
+    car_park = isinstance(street_policy, CarParkPolicy)
     if street_policy is not None:
         if kind != "points":
             raise ValueError("street_policy applies to point origins and destinations")
+        if car_park and candidates != "time":
+            raise ValueError(
+                f"CarParkPolicy does not combine with candidates={candidates!r}; "
+                "the policy rides the time-optimal arm"
+            )
+        if car_park and router != "auto":
+            raise ValueError(
+                "CarParkPolicy resolves its own engine; router= stays 'auto'"
+            )
         if candidates == "diverse":
             raise ValueError(
                 "street_policy does not support candidates='diverse' yet; "
@@ -798,7 +820,10 @@ def _itineraries_frame(
                 "street_policy time queries run the RAPTOR arm; "
                 "router='tbtr' serves candidates='pareto'"
             )
-        if any(option is not None for option in walk):
+        if not car_park and any(option is not None for option in walk):
+            # A CarParkPolicy keeps the query's walking knobs active —
+            # they time the competing walking access, the egress, and
+            # the direct walk; the policy owns only the car chain.
             raise ValueError(
                 "street_policy carries its own budgets; passing "
                 "walking_speed_kmph, max_walking_time, or max_snap_distance "
@@ -828,10 +853,36 @@ def _itineraries_frame(
         # if the caller mutates theirs mid-build.
         street_policy = copy.deepcopy(street_policy)
         transit_factors, street_factors = _factor_tables(factors)
-        shared_modes = frozenset(
-            name
-            for name, terms in (street_policy.vehicles or {}).items()
-            if terms.source == "shared"
+        shared_modes = (
+            frozenset()
+            if car_park
+            else frozenset(
+                name
+                for name, terms in (street_policy.vehicles or {}).items()
+                if terms.source == "shared"
+            )
+        )
+    car_costs = None
+    if car_park:
+        from cafein import costs as _costs
+
+        if currency is not None and float(street_policy.facilities["fee"].max()) > 0:
+            raise ValueError(
+                "the facility fee is EUR2017 and no conversion exists; "
+                "currency= cannot relabel it — drop currency= or zero "
+                "the fees"
+            )
+        car_costs = _costs.resolve_query(
+            "car", perspectives, costs, currency, cost_components
+        )
+    elif any(
+        option is not None
+        for option in (perspectives, costs, currency, cost_components)
+    ):
+        raise ValueError(
+            "perspectives, costs, currency, and cost_components price "
+            "street kilometres; on a TransportNetwork they serve "
+            "street_policy=CarParkPolicy(...) journeys only"
         )
     # The multicriteria (McRAPTOR) candidates need the per-trip factor vector;
     # the time candidates get their emissions from the post-hoc annotation only.
@@ -894,8 +945,18 @@ def _itineraries_frame(
             network.annotate_emissions(journeys, transit_factors, components)
             if street_policy is not None:
                 _street_leg_emissions(
-                    journeys, street_factors, components, shared_modes
+                    journeys,
+                    street_factors,
+                    components,
+                    shared_modes,
+                    car_terms=(
+                        (street_policy.vehicle_class, street_policy.occupancy)
+                        if car_park
+                        else None
+                    ),
                 )
+            if car_costs is not None:
+                _car_park_leg_costs(journeys, car_costs, street_policy)
             if fares is not None:
                 annotate_fares(journeys, fares, shared_modes=shared_modes)
             for option, journey in enumerate(journeys):
@@ -912,12 +973,34 @@ def _itineraries_frame(
                         # A fare prices the whole journey (tickets span
                         # legs); every row of the option repeats it.
                         record["fare"] = journey["fare"]
+                    if car_costs is not None:
+                        totals, breakdown, label = car_costs
+                        for perspective in totals:
+                            key = f"cost_{perspective}"
+                            record[key] = leg.get(key)
+                        for perspective, component in breakdown:
+                            key = f"cost_{perspective}_{component}"
+                            record[key] = leg.get(key)
+                        record["currency"] = leg.get("currency")
                     if street_edges:
                         # The option's own departure — a first boarding
                         # after it is a wait the reporting synthesizes.
                         record["journey_departure_s"] = journey["departure_s"]
                     records.append(record)
     columns = _COLUMNS if street_policy is None else _POLICY_COLUMNS
+    if car_park:
+        columns = list(columns)
+        columns.insert(columns.index("mode") + 1, "facility_id")
+        # A parked car is never a carried bicycle.
+        columns.remove("bike_aboard")
+    if car_costs is not None:
+        totals, breakdown, label = car_costs
+        columns = list(columns)
+        for perspective in totals:
+            columns.append(f"cost_{perspective}")
+        for perspective, component in breakdown:
+            columns.append(f"cost_{perspective}_{component}")
+        columns.append("currency")
     if fares is not None:
         columns = list(columns)
         columns.insert(columns.index("emissions") + 1, "fare")
@@ -927,7 +1010,15 @@ def _itineraries_frame(
             "street_meters",
             "journey_departure_s",
         ]
-    return _to_geodataframe(records, columns)
+    frame = _to_geodataframe(records, columns)
+    if "facility_id" in frame.columns and len(frame):
+        # The id column keeps the input's values verbatim: the frame
+        # constructor coerces integer ids beside NaN rows to floats,
+        # so the column rebuilds from the records directly.
+        frame["facility_id"] = pd.array(
+            [record.get("facility_id") for record in records], dtype=object
+        )
+    return frame
 
 
 def _endpoints(value, role):
@@ -1320,6 +1411,7 @@ def _leg_record(from_id, to_id, option, segment, leg, mode=False):
         record["network_distance_m"] = leg.get("network_distance_m")
         record["connector_distance_m"] = leg.get("connector_distance_m")
         record["bike_aboard"] = bool(leg.get("bike_aboard", False))
+        record["facility_id"] = leg.get("facility_id")
     return record
 
 
@@ -1506,15 +1598,20 @@ def _street_itineraries_frame(
     return gpd.GeoDataFrame(frame, geometry=geometry, crs="EPSG:4326")
 
 
-def _street_leg_emissions(journeys, factors, components, shared_modes=frozenset()):
+def _street_leg_emissions(
+    journeys, factors, components, shared_modes=frozenset(), car_terms=None
+):
     """Street emissions on the rebuilt vehicle legs, in place.
 
     Network meters times the mode's resolved per-km factor — a mode in
     ``shared_modes`` (snapshotted from the policy before routing)
     resolves its shared-fleet factors — and the connectors are the walk
-    to the vehicle, not vehicle-kilometres. Walking legs keep the
-    annotation's zero; an unresolved factor leaves NA, never a silent
-    zero. Journey totals grow accordingly.
+    to the vehicle, not vehicle-kilometres. A ``car_park`` drive
+    prices as the car with ``car_terms = (vehicle_class, occupancy)``:
+    the per-vehicle GEMMAT factor for the class, divided by the
+    occupancy. Walking legs keep the annotation's zero; an unresolved
+    factor leaves NA, never a silent zero. Journey totals grow
+    accordingly.
     """
     from cafein import emissions
 
@@ -1525,17 +1622,54 @@ def _street_leg_emissions(journeys, factors, components, shared_modes=frozenset(
             if mode in (None, "walk"):
                 continue
             if mode not in resolved:
-                shared = mode in shared_modes
-                resolved[mode] = emissions.street_factor(
-                    mode,
-                    factors,
-                    components,
-                    service_model="shared" if shared else None,
-                )
+                if mode == "car_park":
+                    vehicle_class, occupancy = car_terms or (None, 1.0)
+                    resolved[mode] = (
+                        emissions.street_factor(
+                            "car",
+                            factors,
+                            components,
+                            vehicle_class=vehicle_class,
+                        )
+                        / occupancy
+                    )
+                else:
+                    shared = mode in shared_modes
+                    resolved[mode] = emissions.street_factor(
+                        mode,
+                        factors,
+                        components,
+                        service_model="shared" if shared else None,
+                    )
             leg["emissions"] = leg["network_distance_m"] / 1000.0 * resolved[mode]
             total = journey.get("emissions")
             if total is not None:
                 journey["emissions"] = total + leg["emissions"]
+
+
+def _car_park_leg_costs(journeys, resolved, policy):
+    """Money on the car chain, in place: the drive's kilometres at the
+    per-vehicle-km rates per perspective, and the facility fee on the
+    ``park`` leg under the PRIVATE perspective only — a parking charge
+    is a payment by the traveler, not a resource cost."""
+    totals, breakdown, label = resolved
+    fees = dict(
+        zip(policy.facilities["id"].tolist(), policy.facilities["fee"].tolist())
+    )
+    for journey in journeys:
+        for leg in journey["legs"]:
+            mode = leg.get("mode")
+            if mode == "car_park":
+                kilometres = leg["network_distance_m"] / 1000.0
+                for perspective, rate in totals.items():
+                    leg[f"cost_{perspective}"] = kilometres * rate
+                for (perspective, component), rate in breakdown.items():
+                    leg[f"cost_{perspective}_{component}"] = kilometres * rate
+                leg["currency"] = label
+            elif leg["type"] == "park" and "private" in totals:
+                fee = float(fees.get(leg.get("facility_id"), 0.0))
+                leg["cost_private"] = fee
+                leg["currency"] = label
 
 
 def _to_geodataframe(records, columns=None):

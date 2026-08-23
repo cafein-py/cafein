@@ -12,6 +12,13 @@ type StreetAttributeArrays = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u
 /// `StreetChoice` token the 12c reduction keeps beside the duration.
 type StreetRow = (String, u32, u32, f64, f64);
 
+/// One park-and-ride drive row: seconds, network metres, connector
+/// metres, and the optional WKB shape.
+type DriveRow = (u32, f64, f64, Option<Py<PyBytes>>);
+
+/// A rebuilt walking shape: network metres, connector metres, WKB.
+type WalkShape = (f64, f64, Option<Py<PyBytes>>);
+
 /// A mode's raw per-stop times beside the mode-masked links they used.
 type ModeRow = (Vec<Option<u32>>, Vec<Option<Snap>>);
 
@@ -775,6 +782,105 @@ impl TransportNetwork {
         self.streets_generation
     }
 
+    /// The facility→stop walking leg's shape for park-and-ride
+    /// reconstruction: ``(network_m, connector_m, wkb)`` over the
+    /// installed walking streets, ``None`` when either end has no
+    /// walking endpoint or no path stands. The SECONDS come from the
+    /// access table's own search and are not recomputed here — this
+    /// returns the route's metres and shape only.
+    #[pyo3(signature = (latitude, longitude, stop, max_snap_distance, geometries))]
+    fn _car_park_walk_leg(
+        &self,
+        py: Python<'_>,
+        latitude: f64,
+        longitude: f64,
+        stop: &str,
+        max_snap_distance: f64,
+        geometries: bool,
+    ) -> PyResult<Option<WalkShape>> {
+        let streets = self.installed_streets()?;
+        let index = self.resolve_stop(stop)?;
+        let feed_stop = &self.feed.stops[index.0 as usize];
+        let (Some(stop_lat), Some(stop_lon)) = (feed_stop.latitude, feed_stop.longitude) else {
+            return Ok(None);
+        };
+        let Some(snap) = streets.snap(latitude, longitude, max_snap_distance) else {
+            return Ok(None);
+        };
+        // The access search reaches a stop through whichever of its
+        // links is best (`link_join` keeps the per-stop minimum), so
+        // the rebuild minimizes over the same link set — one canonical
+        // link could draw a longer path than the seconds imply.
+        let best = streets
+            .stop_snaps(index)
+            .into_iter()
+            .filter_map(|stop_snap| {
+                streets
+                    .walk_path(
+                        (latitude, longitude),
+                        &snap,
+                        (stop_lat, stop_lon),
+                        &stop_snap,
+                    )
+                    .map(|(path, meters)| (path, meters, stop_snap.connector))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        Ok(best.map(|(path, meters, stop_connector)| {
+            let connectors = snap.connector + stop_connector;
+            let shape = geometries.then(|| crate::points::wkb_line_string(py, &path).unbind());
+            ((meters - connectors).max(0.0), connectors, shape)
+        }))
+    }
+
+    /// The direct coordinate-to-coordinate walking route over the
+    /// installed streets: ``(network_m, connector_m, wkb)`` — the
+    /// park-and-ride path's direct-walk alternative, timed by the
+    /// caller at the query's walking speed.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (from_latitude, from_longitude, to_latitude, to_longitude, max_snap_distance, geometries))]
+    fn _walk_between(
+        &self,
+        py: Python<'_>,
+        from_latitude: f64,
+        from_longitude: f64,
+        to_latitude: f64,
+        to_longitude: f64,
+        max_snap_distance: f64,
+        geometries: bool,
+    ) -> PyResult<Option<WalkShape>> {
+        let streets = self.installed_streets()?;
+        let Some(from_snap) = streets.snap(from_latitude, from_longitude, max_snap_distance) else {
+            return Ok(None);
+        };
+        let Some(to_snap) = streets.snap(to_latitude, to_longitude, max_snap_distance) else {
+            return Ok(None);
+        };
+        // A destination at the origin's own coordinate is zero away —
+        // routing it would charge the snap connector at both ends.
+        if from_latitude == to_latitude && from_longitude == to_longitude {
+            let shape = geometries.then(|| {
+                crate::points::wkb_line_string(
+                    py,
+                    &[(from_longitude, from_latitude), (to_longitude, to_latitude)],
+                )
+                .unbind()
+            });
+            return Ok(Some((0.0, 0.0, shape)));
+        }
+        Ok(streets
+            .walk_path(
+                (from_latitude, from_longitude),
+                &from_snap,
+                (to_latitude, to_longitude),
+                &to_snap,
+            )
+            .map(|(path, meters)| {
+                let connectors = from_snap.connector + to_snap.connector;
+                let shape = geometries.then(|| crate::points::wkb_line_string(py, &path).unbind());
+                ((meters - connectors).max(0.0), connectors, shape)
+            }))
+    }
+
     /// A transfer's query-time direct walk between two stops, as its
     /// traversed ``(edge, fraction)`` provenance plus the SAME
     /// reconstruction's total walked meters — the matrix exposure
@@ -1254,6 +1360,88 @@ impl TransportNetwork {
             .as_ref()
             .map(|meta| crate::streets::elevation_dict(py, meta))
             .transpose()
+    }
+
+    /// Per-facility drive rows for the park-and-ride access plane:
+    /// ``(seconds, network_m, connector_m, wkb)`` per facility
+    /// coordinate, ``None`` where the facility is beyond the budget or
+    /// off the car subgraph. Runs the car profile WITH the resolved
+    /// delay payload on the multimodal graph — the internal
+    /// park-and-ride entry; the public street_policy channel still
+    /// refuses the car mode outright.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (latitude, longitude, facilities, car_model, max_seconds, max_snap_distance, geometries))]
+    fn _car_park_drive_seconds(
+        &self,
+        py: Python<'_>,
+        latitude: f64,
+        longitude: f64,
+        facilities: Vec<(f64, f64)>,
+        car_model: Option<crate::streets::CarModelPayload>,
+        max_seconds: f64,
+        max_snap_distance: f64,
+        geometries: bool,
+    ) -> PyResult<Vec<Option<DriveRow>>> {
+        let missing_car = || {
+            PyValueError::new_err(
+                "CarParkPolicy needs the multimodal car side; build with \
+                 street_modes=(..., 'car')",
+            )
+        };
+        let network = self.multimodal.as_ref().ok_or_else(missing_car)?;
+        if network.car_attributes().is_none() {
+            return Err(missing_car());
+        }
+        let mut definition = crate::streets::profile_definition("car")?;
+        if let Some(payload) = car_model.as_ref() {
+            definition.car = Some(crate::streets::car_cost_model(payload)?);
+        }
+        let profile = self.compiled_multimodal(network, definition)?;
+        let origin = network
+            .snap_for_profile(latitude, longitude, max_snap_distance, &profile)
+            .ok_or_else(|| {
+                PyValueError::new_err(
+                    "coordinate too far from the car streets for \
+                     park-and-ride access",
+                )
+            })?;
+        let targets: Vec<((f64, f64), Option<Snap>)> = facilities
+            .iter()
+            .map(|&(lat, lon)| {
+                (
+                    (lat, lon),
+                    network.snap_for_profile(lat, lon, max_snap_distance, &profile),
+                )
+            })
+            .collect();
+        let legs = py.allow_threads(|| {
+            network.directed_legs_to_snaps(
+                (latitude, longitude),
+                &origin,
+                &targets,
+                &profile,
+                max_seconds,
+            )
+        });
+        Ok(legs
+            .into_iter()
+            .zip(facilities.iter())
+            .map(|(leg, &(flat, flon))| {
+                // A facility at the origin's own coordinate is zero
+                // away — routing it would charge both connectors.
+                if flat == latitude && flon == longitude {
+                    let shape = geometries.then(|| {
+                        crate::points::wkb_line_string(py, &[(longitude, latitude); 2]).unbind()
+                    });
+                    return Some((0, 0.0, 0.0, shape));
+                }
+                leg.map(|leg| {
+                    let shape = geometries
+                        .then(|| crate::points::wkb_line_string(py, &leg.geometry).unbind());
+                    (leg.seconds, leg.network_meters, leg.connector_meters, shape)
+                })
+            })
+            .collect())
     }
 
     /// Per-stop street access times from a coordinate over the multimodal
@@ -2648,14 +2836,27 @@ impl TransportNetwork {
                 "no multimodal street graph is installed; build with street_modes=",
             )
         })?;
-        // Car legs never join transit journeys (park-and-ride is out of
-        // scope); the car routes through the standalone street queries.
+        // The generic policy channel never grants the car; the
+        // sanctioned car access is the park-and-ride policy, whose
+        // internal entry compiles the car profile itself.
         if mode == "car" {
             return Err(PyValueError::new_err(
-                "the car is a street-only mode; it cannot serve transit access or egress",
+                "the car is a street-only mode; it cannot serve transit access \
+                 or egress — park-and-ride rides street_policy=CarParkPolicy(...)",
             ));
         }
         let definition = crate::streets::profile_definition(mode)?;
+        self.compiled_multimodal(network, definition)
+    }
+
+    /// The cached compile of a profile definition on the multimodal
+    /// graph — the body `multimodal_profile` and the internal
+    /// park-and-ride car entry share.
+    pub(super) fn compiled_multimodal(
+        &self,
+        network: &StreetNetwork,
+        definition: cafein_core::streets::StreetProfileDefinition,
+    ) -> PyResult<CompiledStreetProfile> {
         let mut cache = self
             .multimodal_profiles
             .lock()

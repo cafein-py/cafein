@@ -49,7 +49,7 @@ pub(super) fn profile_definition(mode: &str) -> PyResult<StreetProfileDefinition
 /// `StreetProfileDefinition::validate`.
 pub(super) type CarModelPayload = (Vec<f64>, Vec<u8>, f64, f64, f64, f64);
 
-fn car_cost_model(payload: &CarModelPayload) -> PyResult<CarCostModel> {
+pub(super) fn car_cost_model(payload: &CarModelPayload) -> PyResult<CarCostModel> {
     let (seconds, groups, share_high, share_low, ramp_multiplier, congestion_multiplier) = payload;
     let group_seconds: [f64; 3] = seconds.as_slice().try_into().map_err(|_| {
         PyValueError::new_err("the car delay model carries one value per road-class group (3)")
