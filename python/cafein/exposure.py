@@ -271,7 +271,10 @@ class Exposure:
             raise ValueError(
                 "Exposure needs at least one layer, e.g. " "noise=(zones_gdf, 'db_low')"
             )
-        edges = network.streets_gdf
+        # The whole parameter set validates BEFORE the street frame
+        # materializes and before any layer ingests: a malformed later
+        # layer cannot waste an earlier layer's rasterization, and a
+        # bad knob cannot waste the edge-frame build.
         if rasterize is not None:
             rasterize = float(rasterize)
             if not (math.isfinite(rasterize) and rasterize > 0):
@@ -280,6 +283,12 @@ class Exposure:
                     "or None for the exact polygon overlay"
                 )
         self._thresholds = _validated_thresholds(thresholds, layers)
+        # The frame-free name checks (identifiers, the cost/travel_time
+        # families, cross-layer duplicates) run now; the collision
+        # check against the frame's own columns reruns below.
+        _validate_names(layers, self._thresholds, ())
+        validated = {name: _validated_spec(name, spec) for name, spec in layers.items()}
+        edges = network.streets_gdf
         _validate_names(layers, self._thresholds, edges.columns)
 
         metric_crs = edges.estimate_utm_crs()
@@ -307,8 +316,7 @@ class Exposure:
         specs = {}
         import geopandas
 
-        for name, spec in layers.items():
-            source, value = _validated_spec(name, spec)
+        for name, (source, value) in validated.items():
             if not isinstance(source, geopandas.GeoDataFrame):
                 # Materialize the band once; the walking-graph and stop
                 # passes below read this snapshot instead of reopening

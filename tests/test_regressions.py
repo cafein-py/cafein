@@ -652,3 +652,35 @@ def test_multimodal_options_validate_before_any_file_is_read():
             street_modes=("walk",),
             speed_limits={"warp_drive": 300.0},
         )
+
+
+def test_exposure_validates_before_the_street_frame_builds():
+    # rasterize, thresholds, layer names, and every layer's spec used
+    # to validate only after the lazy street-frame materialization —
+    # and a malformed later layer failed only after the earlier layers
+    # had fully ingested (issue #237). The network here explodes on
+    # frame access: reaching it would prove lazy validation.
+    from cafein.exposure import Exposure
+
+    class _Untouchable:
+        @property
+        def streets_gdf(self):
+            raise AssertionError("the street frame was built before validation")
+
+    with pytest.raises(ValueError, match="rasterize must be a positive"):
+        Exposure(_Untouchable(), noise=("no-such.tif", "band"), rasterize=-1.0)
+    with pytest.raises(ValueError, match="must be a .source, value. pair"):
+        Exposure(_Untouchable(), noise="no-such.tif")
+    with pytest.raises(ValueError, match="thresholds name unknown layer"):
+        Exposure(_Untouchable(), noise=("no-such.tif", "band"), thresholds={"other": 5})
+    with pytest.raises(ValueError, match="collides with the cost"):
+        Exposure(_Untouchable(), cost_noise=("no-such.tif", "band"))
+    # A malformed LATER layer refuses before any earlier layer opens:
+    # the first layer's raster does not exist, so touching it would
+    # raise its own error instead of the spec refusal.
+    with pytest.raises(ValueError, match="must be a .source, value. pair"):
+        Exposure(
+            _Untouchable(),
+            aa=("no-such-raster.tif", "band"),
+            zz="not-a-pair",
+        )
