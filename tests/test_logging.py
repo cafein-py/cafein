@@ -311,23 +311,45 @@ def test_manual_child_override_arms_the_rust_bridge(network, tmp_path):
     assert "encoded the artifact payload in" in buffer.getvalue()
 
 
-def test_an_explicit_notset_root_is_harmless(network, tmp_path):
+def _artifact_stream(network, tmp_path, name="net.cafein"):
+    """A save's cafein.artifact output under the current configuration."""
+    buffer = io.StringIO()
+    handler = logging.StreamHandler(buffer)
+    emitting = logging.getLogger("cafein.artifact")
+    emitting.addHandler(handler)
+    try:
+        _saved(network, tmp_path, name=name)
+    finally:
+        emitting.removeHandler(handler)
+    return buffer.getvalue()
+
+
+def test_an_explicit_notset_root_still_arms_the_bridge(network, tmp_path):
+    # Effective level 0 means "emit everything", not "disarmed".
     plain_root = logging.getLogger()
     prior = plain_root.level
     plain_root.setLevel(logging.NOTSET)
     try:
-        path = _saved(network, tmp_path)
+        output = _artifact_stream(network, tmp_path)
     finally:
         plain_root.setLevel(prior)
-    assert path.exists()
+    assert "encoded the artifact payload in" in output
 
 
-def test_an_oversized_custom_level_is_clamped(network, tmp_path):
+def test_a_negative_custom_level_arms_the_bridge(network, tmp_path):
+    logging.getLogger("cafein").setLevel(-5)
+    assert "encoded the artifact payload in" in _artifact_stream(network, tmp_path)
+
+
+def test_an_oversized_custom_level_suppresses_without_wrapping(network, tmp_path):
+    # Armed first, so suppression afterwards is the clamp's doing.
+    logging.getLogger("cafein").setLevel(logging.INFO)
+    assert "encoded the artifact payload in" in _artifact_stream(network, tmp_path)
     logging.getLogger("cafein").setLevel(10**10)
-    path = _saved(network, tmp_path)
-    assert path.exists()
+    assert _artifact_stream(network, tmp_path, name="again.cafein") == ""
+    # A collector still captures: its arming is independent of levels.
     with cafein.collect_timings() as report:
-        _saved(network, tmp_path, name="again.cafein")
+        _saved(network, tmp_path, name="collected.cafein")
     assert [entry["phase"] for entry in report.phases] == [
         "artifact.save.encode",
         "artifact.save",

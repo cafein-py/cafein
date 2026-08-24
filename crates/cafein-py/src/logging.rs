@@ -37,15 +37,21 @@ pub fn enabled(level: u32) -> bool {
     level >= THRESHOLD.load(Ordering::Relaxed)
 }
 
-/// Deliver one record to Python, re-acquiring the GIL. Callers on
-/// worker threads may only emit inside `allow_threads` sections.
-pub fn emit(target: &str, level: u32, message: String, phase: Option<&str>, seconds: Option<f64>) {
+/// Deliver one record to Python, re-acquiring the GIL. The message is
+/// built lazily so a disarmed bridge costs one atomic load and no
+/// allocation. Callers on worker threads may only emit inside
+/// `allow_threads` sections.
+pub fn emit<F>(target: &str, level: u32, message: F, phase: Option<&str>, seconds: Option<f64>)
+where
+    F: FnOnce() -> String,
+{
     if !enabled(level) {
         return;
     }
     let Some(dispatch) = DISPATCH.get() else {
         return;
     };
+    let message = message();
     Python::with_gil(|py| {
         let _ = dispatch.call1(py, (target, level, message, phase, seconds));
     });
@@ -69,7 +75,7 @@ impl PhaseTimer {
         doing: &'static str,
         done: &'static str,
     ) -> Self {
-        emit(target, DEBUG, doing.to_string(), None, None);
+        emit(target, DEBUG, || doing.to_string(), None, None);
         PhaseTimer {
             target,
             phase,
@@ -80,7 +86,13 @@ impl PhaseTimer {
 
     pub fn finish(self) {
         let seconds = self.started.elapsed().as_secs_f64();
-        let message = format!("{} in {:.1} s", self.done, seconds);
-        emit(self.target, INFO, message, Some(self.phase), Some(seconds));
+        let done = self.done;
+        emit(
+            self.target,
+            INFO,
+            || format!("{done} in {seconds:.1} s"),
+            Some(self.phase),
+            Some(seconds),
+        );
     }
 }
