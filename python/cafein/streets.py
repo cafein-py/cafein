@@ -20,6 +20,8 @@ different components simply get no footpath between them.
 import math
 import warnings
 
+from cafein import _log
+
 import geopandas as gpd
 import numpy as np
 import pandas as pd
@@ -166,6 +168,7 @@ def walking_footpaths(
         iterating yields the legacy ``(from_stop, to_stop, seconds,
         meters)`` tuples.
     """
+    _log.sync()
     from cafein._units import duration_seconds
     from cafein._validate import (
         non_negative_finite,
@@ -219,6 +222,7 @@ def walking_streets(
         links as ``(stop_id, edge, fraction, connector_meters)`` snap
         records.
     """
+    _log.sync()
     from cafein._units import duration_seconds
     from cafein._validate import (
         non_negative_finite,
@@ -278,21 +282,37 @@ def _walking_network(osm_pbf, bounding_box=None):
     """
     # The out-of-core engine streams the PBF instead of loading it into
     # memory, so country-scale extracts parse within bounded RAM.
-    osm = pyrosm.OSM(
-        str(osm_pbf),
-        bounding_box=bounding_box,
-        engine="out_of_core",
-        workers="auto",
-    )
-    network = osm.get_network(
-        network_type="walking",
-        custom_filter=_UNWALKABLE_FILTER,
-        filter_type="exclude",
-        nodes=True,
-    )
-    if network is None:
-        raise ValueError(f"no walkable ways in '{osm_pbf}'")
-    nodes, edges = _prune_islands(*network)
+    with _log.phase(
+        "build.streets.read",
+        _log.build,
+        "reading the OSM walking network",
+        "read the OSM walking network",
+    ) as ph:
+        osm = pyrosm.OSM(
+            str(osm_pbf),
+            bounding_box=bounding_box,
+            engine="out_of_core",
+            workers="auto",
+        )
+        network = osm.get_network(
+            network_type="walking",
+            custom_filter=_UNWALKABLE_FILTER,
+            filter_type="exclude",
+            nodes=True,
+        )
+        if network is None:
+            raise ValueError(f"no walkable ways in '{osm_pbf}'")
+        ph.note = f"{len(network[1]):,} edges"
+        ph.details["edges"] = len(network[1])
+    with _log.phase(
+        "build.streets.prune",
+        _log.build,
+        "pruning disconnected street components",
+        "pruned disconnected street components",
+    ) as ph:
+        nodes, edges = _prune_islands(*network)
+        ph.note = f"{len(edges):,} edges kept"
+        ph.details["edges"] = len(edges)
     if edges.empty:
         raise ValueError(f"no walkable ways in '{osm_pbf}'")
     return nodes, edges
@@ -368,11 +388,27 @@ def _network_streets(
         )
     footpaths = Footpaths([], [], [], [], [])
     if not snapped.empty:
-        graph, stop_vertices = _routing_graph(nodes, edges, snapped, speed)
-        durations = _stop_durations(graph, stop_vertices, max_walking_time)
-        footpaths = _edge_list(
-            snapped["stop_id"].to_numpy(), durations, speed, max_walking_time
-        )
+        with _log.phase(
+            "build.streets.graph",
+            _log.build,
+            "building the walking street graph",
+            "built the walking street graph",
+        ) as ph:
+            graph, stop_vertices = _routing_graph(nodes, edges, snapped, speed)
+            ph.note = f"{len(edges):,} edges, {len(snapped):,} stops"
+            ph.details.update(edges=len(edges), stops=len(snapped))
+        with _log.phase(
+            "build.streets.footpaths",
+            _log.build,
+            "computing stop-to-stop footpaths",
+            "computed stop-to-stop footpaths",
+        ) as ph:
+            durations = _stop_durations(graph, stop_vertices, max_walking_time)
+            footpaths = _edge_list(
+                snapped["stop_id"].to_numpy(), durations, speed, max_walking_time
+            )
+            ph.note = f"{len(footpaths.seconds):,} footpaths"
+            ph.details["footpaths"] = len(footpaths.seconds)
     return footpaths, _street_payload(nodes, edges, snapped)
 
 

@@ -3,6 +3,7 @@
 import math
 import os
 
+from cafein import _log
 from cafein._validate import component_selection, id_sequence, sequence_not_string
 from cafein.travelers import (
     folded_constraints,
@@ -1507,6 +1508,7 @@ class TransportNetwork:
         pass over `osm_pbf` for the multimodal graph); they must not
         change underneath it.
         """
+        _log.sync()
         from cafein._units import duration_seconds
         from cafein._validate import (
             non_negative_finite,
@@ -1560,7 +1562,17 @@ class TransportNetwork:
                 speed_limits=speed_limits,
             )
         )
-        core = _TransportNetwork.from_gtfs(paths)
+        with _log.phase(
+            "build.gtfs",
+            _log.build,
+            "building the transit core from GTFS",
+            "built the transit core from GTFS",
+        ) as ph:
+            core = _TransportNetwork.from_gtfs(paths)
+            ph.note = f"{core.stop_count:,} stops, {core.trip_count:,} trips"
+            ph.details.update(
+                feeds=len(paths), stops=core.stop_count, trips=core.trip_count
+            )
         if trip_distances:
             from cafein import geometry
 
@@ -1604,19 +1616,27 @@ class TransportNetwork:
             )
             core.set_street_network(*street_network)
             if street_modes:
-                core.set_multimodal_streets(
-                    list(street_modes),
-                    *_street_network.multimodal_payload(
-                        osm_pbf,
-                        modes=street_modes,
-                        bounding_box=bounding_box,
-                        dem=dem,
-                        dem_interval=dem_interval,
-                        country=country,
-                        urban_areas=urban_areas,
-                        speed_limits=speed_limits,
-                    ),
-                )
+                with _log.phase(
+                    "build.multimodal",
+                    _log.build,
+                    "building the multimodal street graph",
+                    "built the multimodal street graph",
+                ) as ph:
+                    ph.note = ", ".join(street_modes)
+                    ph.details["modes"] = list(street_modes)
+                    core.set_multimodal_streets(
+                        list(street_modes),
+                        *_street_network.multimodal_payload(
+                            osm_pbf,
+                            modes=street_modes,
+                            bounding_box=bounding_box,
+                            dem=dem,
+                            dem_interval=dem_interval,
+                            country=country,
+                            urban_areas=urban_areas,
+                            speed_limits=speed_limits,
+                        ),
+                    )
             if ultra:
                 core.compute_ultra_shortcuts(walking_speed_kmph)
         return cls(core)
@@ -1656,7 +1676,16 @@ class TransportNetwork:
         path : path
             Destination file, conventionally ``*.cafein``.
         """
-        self._core.save(os.fspath(path))
+        _log.sync()
+        target = os.fspath(path)
+        with _log.phase(
+            "artifact.save",
+            _log.artifact,
+            "saving the network artifact",
+            "saved the network artifact",
+        ) as ph:
+            ph.details["path"] = target
+            self._core.save(target)
 
     @classmethod
     def load(cls, path, *, mmap=False, verify=None):
@@ -1694,12 +1723,20 @@ class TransportNetwork:
             ``False`` for mapped loads, where the check would page the
             whole street section in and defeat the lazy load.
         """
+        _log.sync()
         modes = {False: "off", True: "auto", "require": "require"}
         if mmap not in modes:
             raise ValueError(f"mmap must be False, True, or 'require', not {mmap!r}")
-        return cls(
-            _TransportNetwork.load(os.fspath(path), mmap=modes[mmap], verify=verify)
-        )
+        source = os.fspath(path)
+        with _log.phase(
+            "artifact.load",
+            _log.artifact,
+            "loading the network artifact",
+            "loaded the network artifact",
+        ) as ph:
+            ph.details["path"] = source
+            core = _TransportNetwork.load(source, mmap=modes[mmap], verify=verify)
+        return cls(core)
 
     @property
     def mapped(self):

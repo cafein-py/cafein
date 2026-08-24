@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Logging: `cafein.enable_logging(stream=, level=)` streams cafein's
+  build, artifact, and emissions phases with wall times to a chosen
+  stream (quiet by default, stdlib `logging` under the `"cafein"`
+  logger), and `cafein.collect_timings()` collects the same phases as
+  structured data independently of the stream configuration.
+  ([#308](https://github.com/cafein-py/cafein/pull/308))
+
 ## 0.16.1 — 2026-08-24
 
 - The street-query knobs refuse instead of silently emptying: a

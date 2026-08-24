@@ -1,0 +1,266 @@
+"""The logging surface: quiet default, enable/disable, phases, timings."""
+
+import io
+import logging
+
+import pandas as pd
+import pytest
+
+import cafein
+from cafein import _log
+
+
+@pytest.fixture(autouse=True)
+def _pristine_logging():
+    """Snapshot and restore the cafein logger and module state."""
+    root = logging.getLogger("cafein")
+    handlers = list(root.handlers)
+    level = root.level
+    propagate = root.propagate
+    child_levels = {
+        name: logging.getLogger(name).level
+        for name in ("cafein.build", "cafein.matrix", "cafein.artifact")
+    }
+    yield
+    root.handlers[:] = handlers
+    root.setLevel(level)
+    root.propagate = propagate
+    for name, child_level in child_levels.items():
+        logging.getLogger(name).setLevel(child_level)
+    _log._handler = None
+    _log._prior_level = None
+    del _log._collectors[:]
+
+
+def _saved(network, tmp_path, name="net.cafein"):
+    path = tmp_path / name
+    network.save(path)
+    return path
+
+
+def test_quiet_by_default(network, tmp_path, capsys):
+    path = _saved(network, tmp_path)
+    cafein.TransportNetwork.load(path)
+    assert capsys.readouterr().err == ""
+    handlers = logging.getLogger("cafein").handlers
+    assert all(isinstance(h, logging.NullHandler) for h in handlers)
+
+
+def test_enable_logging_streams_phase_lines(network, tmp_path):
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    path = _saved(network, tmp_path)
+    cafein.TransportNetwork.load(path)
+    output = buffer.getvalue()
+    assert "saved the network artifact in" in output
+    assert "loaded the network artifact in" in output
+
+
+def test_enable_logging_twice_does_not_duplicate(network, tmp_path):
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    cafein.enable_logging(stream=buffer)
+    _saved(network, tmp_path)
+    lines = [line for line in buffer.getvalue().splitlines() if "saved" in line]
+    assert len(lines) == 1
+
+
+def test_disable_logging_restores_silence(network, tmp_path):
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    cafein.disable_logging()
+    _saved(network, tmp_path)
+    assert buffer.getvalue() == ""
+
+
+def test_enable_logging_validates_eagerly():
+    with pytest.raises(TypeError, match="stream must be a writable text stream"):
+        cafein.enable_logging(stream=42)
+    with pytest.raises(TypeError, match="level must be an int or one of"):
+        cafein.enable_logging(stream=io.StringIO(), level=True)
+    with pytest.raises(TypeError, match="level must be an int or one of"):
+        cafein.enable_logging(stream=io.StringIO(), level=b"info")
+    with pytest.raises(ValueError, match="level must be one of"):
+        cafein.enable_logging(stream=io.StringIO(), level="loud")
+
+
+def test_disable_logging_restores_manual_configuration(network, tmp_path):
+    root = logging.getLogger("cafein")
+    root.setLevel(logging.DEBUG)
+    mine = logging.StreamHandler(io.StringIO())
+    root.addHandler(mine)
+    try:
+        cafein.enable_logging(stream=io.StringIO(), level="info")
+        assert root.level == logging.INFO
+        cafein.disable_logging()
+        assert root.level == logging.DEBUG
+        assert mine in root.handlers
+        assert not any(
+            isinstance(h, logging.StreamHandler) and h is not mine
+            for h in root.handlers
+        )
+    finally:
+        root.removeHandler(mine)
+
+
+def test_disable_logging_is_a_noop_without_enable():
+    before = list(logging.getLogger("cafein").handlers)
+    cafein.disable_logging()
+    assert logging.getLogger("cafein").handlers == before
+
+
+def test_artifact_phases_carry_structured_attributes(network, tmp_path, caplog):
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        path = _saved(network, tmp_path)
+        cafein.TransportNetwork.load(path)
+    phases = {
+        record.cafein_phase: record
+        for record in caplog.records
+        if hasattr(record, "cafein_phase")
+    }
+    assert set(phases) == {"artifact.save", "artifact.load"}
+    for record in phases.values():
+        assert record.cafein_seconds > 0
+        assert record.cafein_details["path"] == str(path)
+
+
+def test_from_gtfs_emits_build_phases(helsinki_gtfs, kantakaupunki_pbf, caplog):
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        cafein.TransportNetwork.from_gtfs(helsinki_gtfs, osm_pbf=kantakaupunki_pbf)
+    phases = [
+        record.cafein_phase
+        for record in caplog.records
+        if hasattr(record, "cafein_phase")
+    ]
+    assert phases == [
+        "build.gtfs",
+        "build.streets.read",
+        "build.streets.prune",
+        "build.streets.graph",
+        "build.streets.footpaths",
+        "build.multimodal",
+    ]
+    build = next(
+        record
+        for record in caplog.records
+        if getattr(record, "cafein_phase", None) == "build.gtfs"
+    )
+    assert build.cafein_details["stops"] > 0
+    assert build.cafein_details["trips"] > 0
+    multimodal = next(
+        record
+        for record in caplog.records
+        if getattr(record, "cafein_phase", None) == "build.multimodal"
+    )
+    assert multimodal.cafein_details["modes"] == ["walk"]
+    assert all(
+        record.cafein_seconds > 0
+        for record in caplog.records
+        if hasattr(record, "cafein_phase")
+    )
+
+
+def test_gtfs_only_build_emits_no_street_phases(helsinki_gtfs, caplog):
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        cafein.TransportNetwork.from_gtfs(helsinki_gtfs)
+    phases = [
+        record.cafein_phase
+        for record in caplog.records
+        if hasattr(record, "cafein_phase")
+    ]
+    assert phases == ["build.gtfs"]
+
+
+def test_annotate_emits_its_phase(network, caplog):
+    journeys = network.route_between_stops("4810551", "1250551", "2022-02-22 08:30:00")
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        network.annotate_emissions([journeys[0]])
+    records = [record for record in caplog.records if hasattr(record, "cafein_phase")]
+    assert [record.cafein_phase for record in records] == ["emissions.annotate"]
+    assert all(record.cafein_seconds > 0 for record in records)
+
+
+def test_collect_timings_reports_phases(network, tmp_path):
+    with cafein.collect_timings() as report:
+        path = _saved(network, tmp_path)
+        cafein.TransportNetwork.load(path)
+    assert [entry["phase"] for entry in report.phases] == [
+        "artifact.save",
+        "artifact.load",
+    ]
+    for entry in report.phases:
+        assert isinstance(entry["seconds"], float) and entry["seconds"] > 0
+        assert entry["details"]["path"] == str(path)
+    frame = report.frame()
+    assert list(frame.columns) == ["phase", "seconds", "details"]
+    assert len(frame) == 2
+    assert pd.api.types.is_string_dtype(frame["phase"])
+    assert pd.api.types.is_float_dtype(frame["seconds"])
+    assert frame["details"].dtype == object
+
+
+def test_collect_timings_is_independent_of_the_stream_level(network, tmp_path):
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer, level="warning")
+    with cafein.collect_timings() as report:
+        _saved(network, tmp_path)
+    assert buffer.getvalue() == ""
+    assert [entry["phase"] for entry in report.phases] == ["artifact.save"]
+
+
+def test_collect_timings_survives_a_child_logger_override(network, tmp_path):
+    logging.getLogger("cafein.artifact").setLevel(logging.WARNING)
+    with cafein.collect_timings() as report:
+        _saved(network, tmp_path)
+    assert [entry["phase"] for entry in report.phases] == ["artifact.save"]
+
+
+def test_collect_timings_leaves_root_handlers_to_their_own_config(
+    network, tmp_path, caplog
+):
+    with caplog.at_level(logging.WARNING):
+        with cafein.collect_timings() as report:
+            _saved(network, tmp_path)
+    assert [entry["phase"] for entry in report.phases] == ["artifact.save"]
+    assert not [r for r in caplog.records if r.name.startswith("cafein")]
+
+
+def test_raising_handler_cannot_break_a_computation(network, tmp_path):
+    class Exploding(logging.Handler):
+        def emit(self, record):
+            raise RuntimeError("boom")
+
+        def handle(self, record):
+            raise RuntimeError("boom")
+
+    handler = Exploding(level=logging.DEBUG)
+    root = logging.getLogger("cafein")
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG)
+    try:
+        path = _saved(network, tmp_path)
+    finally:
+        root.removeHandler(handler)
+    assert path.exists()
+
+
+def test_raising_filter_cannot_break_a_computation(network, tmp_path):
+    calls = []
+
+    class Exploding(logging.Filter):
+        def filter(self, record):
+            calls.append(record)
+            raise RuntimeError("boom")
+
+    # Ancestor filters are not applied to propagated records, so the
+    # filter goes on the emitting logger itself.
+    exploding = Exploding()
+    emitting = logging.getLogger("cafein.artifact")
+    emitting.addFilter(exploding)
+    logging.getLogger("cafein").setLevel(logging.DEBUG)
+    try:
+        path = _saved(network, tmp_path)
+    finally:
+        emitting.removeFilter(exploding)
+    assert calls
+    assert path.exists()
