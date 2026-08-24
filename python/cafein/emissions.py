@@ -304,12 +304,17 @@ def _car_query_options(transport_mode, occupancy, vehicle_class):
         effective = 1.0
     else:
         if isinstance(occupancy, bool) or not isinstance(occupancy, numbers.Real):
-            raise ValueError("occupancy must be a number")
-        effective = float(occupancy)
+            raise TypeError("occupancy must be a number")
+        try:
+            effective = float(occupancy)
+        except OverflowError:
+            # An integer beyond float range is a number that cannot be
+            # finite; the check below refuses it as such.
+            effective = math.inf
         if not math.isfinite(effective) or effective < 1.0:
             raise ValueError("occupancy must be a finite number of at least 1")
     if vehicle_class is not None and not isinstance(vehicle_class, str):
-        raise ValueError("vehicle_class must be a string")
+        raise TypeError("vehicle_class must be a string")
     return effective, vehicle_class
 
 

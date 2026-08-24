@@ -684,3 +684,83 @@ def test_exposure_validates_before_the_street_frame_builds():
             aa=("no-such-raster.tif", "band"),
             zz="not-a-pair",
         )
+
+
+def test_street_query_knobs_refuse_instead_of_emptying(network):
+    # A negative snap_distance on the street matrices used to unroute
+    # every point Rust-side and return an EMPTY matrix with only an
+    # off-the-streets warning — a silent wrong answer (issue #237).
+    geopandas = pytest.importorskip("geopandas")
+    from shapely.geometry import Point
+
+    from cafein import StreetNetwork, TravelTimeMatrix
+
+    street = StreetNetwork.from_osm("tests/data/kantakaupunki.osm.pbf", modes=("walk",))
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a"]},
+        geometry=[Point(24.9320, 60.1690)],
+        crs="EPSG:4326",
+    )
+    with pytest.raises(ValueError, match="snap_distance must be a non-negative"):
+        TravelTimeMatrix(
+            street, origins, origins, transport_mode="walk", snap_distance=-5
+        )
+    with pytest.raises(ValueError, match="max_street_time must be a non-negative"):
+        TravelTimeMatrix(
+            street,
+            origins,
+            origins,
+            transport_mode="walk",
+            max_street_time=float("nan"),
+        )
+    with pytest.raises(ValueError, match="snap_distance must be a non-negative"):
+        street.travel_time(
+            (60.1690, 24.9320), (60.1795, 24.9520), mode="walk", snap_distance=-5
+        )
+    # Percentile ranks refuse by name in Python, before any snapping.
+    with pytest.raises(ValueError, match="within \\[0, 100\\]"):
+        network.travel_time_matrix(
+            ["1000202"],
+            "2022-02-22 08:30:00",
+            departure_time_window=10,
+            percentiles=(150,),
+        )
+    with pytest.raises(ValueError, match="within \\[0, 100\\]"):
+        network.travel_time_matrix(
+            ["1000202"],
+            "2022-02-22 08:30:00",
+            departure_time_window=10,
+            percentiles=(10**400,),
+        )
+    # A bare string would dissolve into digits: "50" is not [5.0, 0.0].
+    with pytest.raises(TypeError, match="percentiles must be a collection"):
+        network.travel_time_matrix(
+            ["1000202"],
+            "2022-02-22 08:30:00",
+            departure_time_window=10,
+            percentiles="50",
+        )
+    # Street-policy budgets refuse oversized integers by name too.
+    from cafein.policy import StreetLegPolicy
+
+    with pytest.raises(ValueError, match="positive, finite time budget"):
+        StreetLegPolicy(access={"walk": 10**400})
+    # The wrong KIND on the car options is a TypeError now, matching
+    # the house discipline; the value refusals are unchanged.
+    from cafein.emissions import _car_query_options
+
+    with pytest.raises(TypeError, match="occupancy must be a number"):
+        _car_query_options("car", "two", None)
+    with pytest.raises(ValueError, match="at least 1"):
+        _car_query_options("car", 0.5, None)
+    with pytest.raises(ValueError, match="finite number of at least 1"):
+        _car_query_options("car", 10**400, None)
+    from cafein.policy import CarParkPolicy as _Policy
+
+    with pytest.raises(ValueError, match="at least 1"):
+        _Policy(
+            facilities=geopandas.GeoDataFrame(
+                {"id": ["f"]}, geometry=[Point(24.9330, 60.1990)], crs="EPSG:4326"
+            ),
+            occupancy=10**400,
+        )

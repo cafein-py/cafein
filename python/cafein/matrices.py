@@ -11,6 +11,7 @@ from cafein._validate import (
     component_selection,
     freeze_ids,
     id_sequence,
+    non_negative_finite,
     restore_id_dtypes,
     sequence_not_string,
 )
@@ -1967,12 +1968,15 @@ def _street_query(
         float(
             street_network.MAX_STREET_TIME
             if max_street_time is None
-            else max_street_time
+            else non_negative_finite("max_street_time", max_street_time)
         ),
+        # A negative or non-finite snap silently unroutes every point
+        # Rust-side — an empty matrix, not an error — so it refuses
+        # here by its public name.
         float(
             streets.MAX_SNAP_DISTANCE
             if max_snap_distance is None
-            else max_snap_distance
+            else non_negative_finite("snap_distance", max_snap_distance)
         ),
     )
 

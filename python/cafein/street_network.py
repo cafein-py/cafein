@@ -7,6 +7,7 @@ import numpy as np
 import shapely
 
 from . import _osm, elevation, streets
+from ._validate import non_negative_finite
 from ._cafein import STREET_MAX_SEGMENT_METERS
 from ._cafein import StreetNetwork as _CoreStreetNetwork
 
@@ -417,7 +418,7 @@ class StreetNetwork:
             destination,
             mode,
             float(max_time),
-            float(max_snap_distance),
+            non_negative_finite("snap_distance", max_snap_distance),
             car_model=_resolved_delays(mode, intersection_delays, profile, delay_model),
         )
         if seconds is None or resolved is None:

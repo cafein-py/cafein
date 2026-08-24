@@ -103,7 +103,7 @@ def test_parameter_validation_refusals():
         CarParkPolicy(facilities=facilities, max_car_time="30")
     with pytest.raises(ValueError, match="at least 1"):
         CarParkPolicy(facilities=facilities, occupancy=0.5)
-    with pytest.raises(ValueError, match="emission-factor row"):
+    with pytest.raises(TypeError, match="emission-factor row"):
         CarParkPolicy(facilities=facilities, vehicle_class=3)
 
 
