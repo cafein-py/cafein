@@ -12,6 +12,7 @@ Logging must never break a computation: every record is delivered
 through the exception-guarded :func:`_emit`.
 """
 
+import copy
 import logging
 import sys
 import threading
@@ -67,27 +68,29 @@ class TimingReport:
 def _emit(logger, level, message, *, phase=None, seconds=None, details=None):
     """Deliver one record; logging must never break a computation."""
     try:
-        if phase is not None:
-            for report in tuple(_collectors):
-                report.phases.append(
-                    {
-                        "phase": phase,
-                        "seconds": seconds,
-                        "details": dict(details or {}),
-                    }
-                )
         if phase is None:
             logger.log(level, message)
-        else:
-            logger.log(
-                level,
-                message,
-                extra={
-                    "cafein_phase": phase,
-                    "cafein_seconds": seconds,
-                    "cafein_details": dict(details or {}),
-                },
+            return
+        # Every delivery gets a recursively independent snapshot, so a
+        # handler mutating its record — or a consumer mutating a report
+        # entry — cannot reach the caller's dict or another delivery.
+        for report in tuple(_collectors):
+            report.phases.append(
+                {
+                    "phase": phase,
+                    "seconds": seconds,
+                    "details": copy.deepcopy(dict(details or {})),
+                }
             )
+        logger.log(
+            level,
+            message,
+            extra={
+                "cafein_phase": phase,
+                "cafein_seconds": seconds,
+                "cafein_details": copy.deepcopy(dict(details or {})),
+            },
+        )
     except Exception:
         pass
 
@@ -194,17 +197,18 @@ def enable_logging(stream=None, level="info"):
             "stream must be a writable text stream (an object with a write method)"
         )
     levelno = _validated_level(level)
-    if _handler is None:
-        _prior_level = root.level
-    else:
-        root.removeHandler(_handler)
-    handler = logging.StreamHandler(stream)
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(name)s: %(message)s", datefmt="%H:%M:%S")
-    )
-    root.addHandler(handler)
-    root.setLevel(levelno)
-    _handler = handler
+    with _lock:
+        if _handler is None:
+            _prior_level = root.level
+        else:
+            root.removeHandler(_handler)
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(name)s: %(message)s", datefmt="%H:%M:%S")
+        )
+        root.addHandler(handler)
+        root.setLevel(levelno)
+        _handler = handler
     sync()
 
 
@@ -214,12 +218,13 @@ def disable_logging():
     ``enable_logging`` call. Handlers the user attached are left
     alone; a no-op when ``enable_logging`` was never called."""
     global _handler, _prior_level
-    if _handler is None:
-        return
-    root.removeHandler(_handler)
-    root.setLevel(_prior_level)
-    _handler = None
-    _prior_level = None
+    with _lock:
+        if _handler is None:
+            return
+        root.removeHandler(_handler)
+        root.setLevel(_prior_level)
+        _handler = None
+        _prior_level = None
     sync()
 
 

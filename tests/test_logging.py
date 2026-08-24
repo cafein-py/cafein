@@ -3,6 +3,7 @@
 import io
 import logging
 
+import pandas as pd
 import pytest
 
 import cafein
@@ -152,6 +153,11 @@ def test_from_gtfs_emits_build_phases(helsinki_gtfs, kantakaupunki_pbf, caplog):
         if getattr(record, "cafein_phase", None) == "build.multimodal"
     )
     assert multimodal.cafein_details["modes"] == ["walk"]
+    assert all(
+        record.cafein_seconds > 0
+        for record in caplog.records
+        if hasattr(record, "cafein_phase")
+    )
 
 
 def test_gtfs_only_build_emits_no_street_phases(helsinki_gtfs, caplog):
@@ -169,12 +175,9 @@ def test_annotate_emits_its_phase(network, caplog):
     journeys = network.route_between_stops("4810551", "1250551", "2022-02-22 08:30:00")
     with caplog.at_level(logging.INFO, logger="cafein"):
         network.annotate_emissions([journeys[0]])
-    phases = [
-        record.cafein_phase
-        for record in caplog.records
-        if hasattr(record, "cafein_phase")
-    ]
-    assert phases == ["emissions.annotate"]
+    records = [record for record in caplog.records if hasattr(record, "cafein_phase")]
+    assert [record.cafein_phase for record in records] == ["emissions.annotate"]
+    assert all(record.cafein_seconds > 0 for record in records)
 
 
 def test_collect_timings_reports_phases(network, tmp_path):
@@ -191,6 +194,9 @@ def test_collect_timings_reports_phases(network, tmp_path):
     frame = report.frame()
     assert list(frame.columns) == ["phase", "seconds", "details"]
     assert len(frame) == 2
+    assert pd.api.types.is_string_dtype(frame["phase"])
+    assert pd.api.types.is_float_dtype(frame["seconds"])
+    assert frame["details"].dtype == object
 
 
 def test_collect_timings_is_independent_of_the_stream_level(network, tmp_path):
@@ -239,16 +245,22 @@ def test_raising_handler_cannot_break_a_computation(network, tmp_path):
 
 
 def test_raising_filter_cannot_break_a_computation(network, tmp_path):
+    calls = []
+
     class Exploding(logging.Filter):
         def filter(self, record):
+            calls.append(record)
             raise RuntimeError("boom")
 
+    # Ancestor filters are not applied to propagated records, so the
+    # filter goes on the emitting logger itself.
     exploding = Exploding()
-    root = logging.getLogger("cafein")
-    root.addFilter(exploding)
-    root.setLevel(logging.DEBUG)
+    emitting = logging.getLogger("cafein.artifact")
+    emitting.addFilter(exploding)
+    logging.getLogger("cafein").setLevel(logging.DEBUG)
     try:
         path = _saved(network, tmp_path)
     finally:
-        root.removeFilter(exploding)
+        emitting.removeFilter(exploding)
+    assert calls
     assert path.exists()
