@@ -1531,6 +1531,19 @@ class TransportNetwork:
                 "country, urban_areas, and speed_limits configure car speeds; "
                 "pass street_modes= including 'car'"
             )
+        # The multimodal options refuse here too — validating them
+        # only at the street build would still waste the whole GTFS
+        # ingest that runs first.
+        street_modes, dem, country, urban_areas, speed_limits = (
+            _street_network.validate_street_options(
+                street_modes,
+                dem=dem,
+                dem_interval=dem_interval,
+                country=country,
+                urban_areas=urban_areas,
+                speed_limits=speed_limits,
+            )
+        )
         core = _TransportNetwork.from_gtfs(paths)
         if trip_distances:
             from cafein import geometry

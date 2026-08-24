@@ -548,6 +548,22 @@ def parse_maxspeed(value):
     return parsed * factor
 
 
+def validated_country(country):
+    """The country selector's syntax checked, warning-free: ``None``
+    passes through, anything else must normalise to an ISO 3166-1
+    alpha-2 or ISO 3166-2 code. The unknown-code fallback (a warning,
+    never an error) stays in ``speed_limit_row``."""
+    if country is None:
+        return None
+    code = str(country).strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}(-[A-Z0-9]{1,3})?", code):
+        raise ValueError(
+            f"country must be an ISO 3166-1 alpha-2 or ISO 3166-2 code, "
+            f"not {country!r}"
+        )
+    return code
+
+
 def speed_limit_row(country=None):
     """The legal-default speed row for a `country` selector.
 
@@ -568,12 +584,7 @@ def speed_limit_row(country=None):
             stacklevel=3,
         )
         return SPEED_LIMITS[""]
-    code = str(country).strip().upper()
-    if not re.fullmatch(r"[A-Z]{2}(-[A-Z0-9]{1,3})?", code):
-        raise ValueError(
-            f"country must be an ISO 3166-1 alpha-2 or ISO 3166-2 code, "
-            f"not {country!r}"
-        )
+    code = validated_country(country)
     for key in (code, code.split("-")[0]):
         if key in SPEED_LIMITS:
             return SPEED_LIMITS[key]
@@ -613,7 +624,10 @@ def _inside_urban_areas(edges, urban_areas):
     if urban_areas.crs is None:
         raise ValueError("urban_areas must carry a CRS")
     frame = gpd.GeoDataFrame(geometry=edges.geometry.reset_index(drop=True), crs=crs)
-    joined = frame.sjoin(urban_areas[["geometry"]].to_crs(crs), how="left")
+    # The ACTIVE geometry, whatever its column name — a literal
+    # "geometry" lookup could silently read an inactive column.
+    areas = gpd.GeoDataFrame(geometry=urban_areas.geometry, crs=urban_areas.crs)
+    joined = frame.sjoin(areas.to_crs(crs), how="left")
     inside = joined.groupby(level=0)["index_right"].first().notna()
     return inside.reindex(range(len(frame)), fill_value=False).to_numpy()
 
@@ -632,12 +646,17 @@ def _validated_speed_limits(speed_limits):
             "unknown speed_limits classes: " + ", ".join(map(str, unknown))
         )
     for key, value in overrides.items():
-        if (
-            not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or value <= 0
-        ):
+        if not isinstance(value, (int, float)):
             raise ValueError(f"speed_limits[{key!r}] must be a positive km/h number")
+        try:
+            number = float(value)
+        except OverflowError:
+            # An integer beyond float range is a number that cannot be
+            # finite; refuse it as such.
+            number = math.inf
+        if not math.isfinite(number) or number <= 0:
+            raise ValueError(f"speed_limits[{key!r}] must be a positive km/h number")
+        overrides[key] = number
     return overrides
 
 

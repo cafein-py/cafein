@@ -46,6 +46,112 @@ def validate_build_modes(modes):
     return modes
 
 
+def validate_street_options(
+    modes,
+    *,
+    dem=None,
+    dem_interval=25.0,
+    country=None,
+    urban_areas=None,
+    speed_limits=None,
+):
+    """The multimodal build options validated eagerly.
+
+    Types, values, and the optional-dependency check, with no file
+    reads or parsing — a DEM path existence stat is the one filesystem
+    touch — so a bad option refuses in milliseconds, before any GTFS
+    ingest or OSM extraction begins. Returns the validated snapshots
+    ``(modes, dem, country, urban_areas, speed_limits)``: the mode
+    tuple, the DEM with paths materialized once (a one-shot iterable
+    of tiles survives), the normalised country code, the urban-areas
+    snapshot (a copied frame or a materialized one-dimensional
+    boolean mask), and the materialized speed-limit overrides — the
+    build reads THESE, so a caller's mutable object cannot drift
+    between validation and use. A
+    malformed country code refuses here; an unknown-but-well-formed
+    one keeps warning and falling back at build time."""
+    from cafein._validate import positive_finite
+
+    modes = validate_build_modes(modes)
+    country = _osm.validated_country(country)
+    if dem is not None:
+        positive_finite("dem_interval", dem_interval)
+        if callable(dem):
+            # A callable provably unable to take (lons, lats) refuses
+            # now; an uninspectable one (a ufunc, a builtin) passes —
+            # the sample-time shape check remains its contract.
+            import inspect
+
+            try:
+                signature = inspect.signature(dem)
+            except (TypeError, ValueError):
+                signature = None
+            if signature is not None:
+                try:
+                    signature.bind(None, None)
+                except TypeError:
+                    raise TypeError(
+                        "dem callable must accept two positional "
+                        "arguments (lons, lats)"
+                    ) from None
+        if not callable(dem):
+            if isinstance(dem, (str, os.PathLike)):
+                dem = os.fspath(dem)
+                paths = [dem]
+            else:
+                dem = tuple(os.fspath(tile) for tile in dem)
+                paths = list(dem)
+            if not paths:
+                raise ValueError("dem names no raster tiles")
+            for path in paths:
+                if not os.path.exists(path):
+                    raise ValueError(f"dem raster {path!r} does not exist")
+            # The optional dependency refuses here, not after the
+            # extraction and densification have run.
+            try:
+                import rioxarray  # noqa: F401
+                import xarray  # noqa: F401
+            except ImportError as error:
+                raise ImportError(
+                    "sampling a DEM needs the optional rioxarray "
+                    "dependency; install cafein[dem] or pass an "
+                    "elevation callable"
+                ) from error
+    if speed_limits is not None:
+        speed_limits = _osm._validated_speed_limits(speed_limits)
+    if urban_areas is not None:
+        if hasattr(urban_areas, "geometry"):
+            if getattr(urban_areas, "crs", None) is None:
+                raise ValueError("urban_areas must carry a CRS")
+            # The snapshot the build reads: a caller's frame cannot
+            # drift during the long ingest, and the ACTIVE geometry
+            # lands under the canonical column name whatever the
+            # caller called it.
+            import geopandas as gpd
+
+            urban_areas = gpd.GeoDataFrame(
+                geometry=urban_areas.geometry.copy().reset_index(drop=True),
+                crs=urban_areas.crs,
+            )
+        else:
+            try:
+                mask = np.asarray(urban_areas, dtype=bool)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "urban_areas must be a polygon GeoDataFrame or a "
+                    "one-dimensional boolean mask"
+                ) from None
+            if mask.ndim != 1:
+                raise ValueError(
+                    "urban_areas must be a polygon GeoDataFrame or a "
+                    "one-dimensional boolean mask"
+                )
+            # The materialized mask is the snapshot; its per-edge
+            # length can only be checked after extraction.
+            urban_areas = np.array(mask, copy=True)
+    return modes, dem, country, urban_areas, speed_limits
+
+
 MAX_STREET_TIME = 7200.0
 """Default routing cutoff in seconds, matching the street-time ceiling the
 transit path already applies to access and egress
@@ -128,7 +234,9 @@ class StreetNetwork:
             (e.g. ``{"residential_inside": 30}``); unknown classes and
             non-positive values are rejected. Car builds only.
         """
-        modes = validate_build_modes(modes)
+        from cafein._validate import validated_bounding_box
+
+        bounding_box = validated_bounding_box(bounding_box)
         return cls(
             _CoreStreetNetwork(
                 *multimodal_payload(
@@ -397,7 +505,7 @@ def multimodal_payload(
     Shared by ``StreetNetwork.from_osm`` and the ``TransportNetwork`` build,
     so both install the identical multimodal graph from the same inputs.
     """
-    modes = tuple(modes)
+    modes = validate_build_modes(modes)
     if "car" not in modes and any(
         option is not None for option in (country, urban_areas, speed_limits)
     ):
@@ -405,6 +513,14 @@ def multimodal_payload(
             "country, urban_areas, and speed_limits configure car speeds; "
             "add 'car' to modes to use them"
         )
+    modes, dem, country, urban_areas, speed_limits = validate_street_options(
+        modes,
+        dem=dem,
+        dem_interval=dem_interval,
+        country=country,
+        urban_areas=urban_areas,
+        speed_limits=speed_limits,
+    )
     nodes, edges = _osm.union_network(
         osm_pbf, bounding_box=bounding_box, car="car" in modes
     )
