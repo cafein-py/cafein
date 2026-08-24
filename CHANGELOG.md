@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `Exposure` validates eagerly: `rasterize`, `thresholds`, the layer
+  names, and every layer's spec now refuse before the street frame
+  materializes and before any layer ingests — a malformed later
+  layer no longer wastes the earlier layers' rasterization.
+  ([#305](https://github.com/cafein-py/cafein/pull/305))
+
 - Eager validation of the multimodal build options: `speed_limits`,
   `urban_areas`, `dem`, and `dem_interval` now refuse bad values —
   unknown classes, missing CRS, a missing raster or the absent
