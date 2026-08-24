@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Eager validation of the multimodal build options: `speed_limits`,
+  `urban_areas`, `dem`, and `dem_interval` now refuse bad values —
+  unknown classes, missing CRS, a missing raster or the absent
+  rioxarray extra — before any GTFS ingest or OSM extraction, on
+  `from_gtfs` and `StreetNetwork.from_osm` alike, through one shared
+  `validate_street_options` gate.
+  ([#304](https://github.com/cafein-py/cafein/pull/304))
+
 - Eager validation of the walking knobs and bounding boxes:
   `walking_speed_kmph`, `max_walking_time`, `snap_distance`, and
   `bounding_box` now refuse bad values in milliseconds at every

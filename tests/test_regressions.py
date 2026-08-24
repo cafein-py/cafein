@@ -563,3 +563,92 @@ def test_query_walking_knobs_fail_by_their_public_names(network):
             percentiles=(50,),
             walking_speed_kmph=-1,
         )
+
+
+def test_multimodal_options_validate_before_any_file_is_read():
+    # speed_limits, urban_areas, dem, and dem_interval used to fail
+    # only after the full extraction — and on from_gtfs, after the
+    # whole GTFS ingest too (issue #237). The paths here do not exist:
+    # reaching a file error would mean lazy validation.
+    pytest.importorskip("cafein._cafein")
+    geopandas = pytest.importorskip("geopandas")
+    from shapely.geometry import Polygon
+
+    from cafein import StreetNetwork, TransportNetwork
+
+    def gtfs(**options):
+        return TransportNetwork.from_gtfs(
+            ["no-such-feed.zip"],
+            osm_pbf="no-such.osm.pbf",
+            street_modes=("walk", "car"),
+            **options,
+        )
+
+    def osm(**options):
+        return StreetNetwork.from_osm(
+            "no-such.osm.pbf", modes=("walk", "car"), **options
+        )
+
+    for build in (gtfs, osm):
+        with pytest.raises(ValueError, match="unknown speed_limits classes"):
+            build(speed_limits={"warp_drive": 300.0})
+        with pytest.raises(ValueError, match="must be a positive km/h number"):
+            build(speed_limits={"motorway_inside": -80.0})
+        with pytest.raises(ValueError, match="dem_interval must be a positive"):
+            build(dem="no-such-dem.tif", dem_interval=0)
+        with pytest.raises(ValueError, match="does not exist"):
+            build(dem="no-such-dem.tif")
+        bare = geopandas.GeoDataFrame(
+            geometry=[Polygon([(24.9, 60.1), (24.9, 60.2), (25.0, 60.2)])]
+        )
+        with pytest.raises(ValueError, match="urban_areas must carry a CRS"):
+            build(urban_areas=bare)
+        with pytest.raises(ValueError, match="ISO 3166"):
+            build(country="finland")
+        with pytest.raises(ValueError, match="positive km/h number"):
+            build(speed_limits={"motorway_inside": 10**400})
+        with pytest.raises(ValueError, match="one-dimensional boolean mask"):
+            build(urban_areas=True)
+        with pytest.raises(ValueError, match="one-dimensional boolean mask"):
+            build(urban_areas=[[True, False], [False, True]])
+        with pytest.raises(TypeError, match="two positional arguments"):
+            build(dem=lambda: None)
+    # The validated snapshots are the build's inputs: mutating the
+    # caller's objects afterwards changes nothing.
+    import numpy as np
+
+    from cafein.street_network import validate_street_options
+
+    mask = np.array([True, True, False])
+    limits = {"motorway_inside": 100.0}
+    _modes, _dem, _country, held_mask, held_limits = validate_street_options(
+        ("walk", "car"), urban_areas=mask, speed_limits=limits
+    )
+    mask[:] = False
+    limits["motorway_inside"] = -1.0
+    assert held_mask.sum() == 2
+    assert held_limits["motorway_inside"] == 100.0
+    # A frame whose active geometry has another name normalizes to the
+    # canonical column, so the build's spatial join reads the shapes
+    # the caller meant.
+    from shapely.geometry import Polygon as _Polygon
+
+    renamed = geopandas.GeoDataFrame(
+        {"footprint": [_Polygon([(24.9, 60.1), (24.9, 60.2), (25.0, 60.2)])]},
+        geometry="footprint",
+        crs="EPSG:4326",
+    )
+    _m, _d, _c, held_areas, _l = validate_street_options(
+        ("walk", "car"), urban_areas=renamed
+    )
+    assert list(held_areas.columns) == ["geometry"]
+    assert held_areas.crs is not None
+    # The coherence refusal keeps its priority: options without the
+    # car mode name the missing mode, not their own contents.
+    with pytest.raises(ValueError, match="configure car speeds"):
+        TransportNetwork.from_gtfs(
+            ["no-such-feed.zip"],
+            osm_pbf="no-such.osm.pbf",
+            street_modes=("walk",),
+            speed_limits={"warp_drive": 300.0},
+        )
