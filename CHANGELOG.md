@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.16.1 — 2026-08-24
 
 - The street-query knobs refuse instead of silently emptying: a
   negative or non-finite `snap_distance` or `max_street_time` on the
