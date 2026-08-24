@@ -84,8 +84,8 @@ impl TransportNetwork {
                 )))
             }
         };
+        let timer = decode_timer();
         if mode != MmapMode::Off {
-            let timer = decode_timer();
             match py.allow_threads(|| load_mapped(path, verify))? {
                 Ok(loaded) => {
                     timer.finish();
@@ -100,7 +100,6 @@ impl TransportNetwork {
                 Err(_) => {}
             }
         }
-        let timer = decode_timer();
         let loaded = py.allow_threads(|| load_owned(path, verify))?;
         timer.finish();
         Ok(rebuilt(loaded))
