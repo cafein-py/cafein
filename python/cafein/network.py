@@ -43,15 +43,24 @@ def _window_percentiles(window, percentiles, confidence):
 
 
 def _walk_options(walking_speed_kmph, max_walking_time, max_snap_distance):
-    """Street-query options with the shared defaults filled in."""
+    """Street-query options validated, with the shared defaults filled
+    in — the one gate every walking query passes, so a bad knob fails
+    here in milliseconds and the Rust checks stay a backstop."""
     from cafein import streets
+    from cafein._validate import non_negative_finite, positive_finite
 
     if walking_speed_kmph is None:
         walking_speed_kmph = streets.WALKING_SPEED_KMPH
+    else:
+        walking_speed_kmph = positive_finite("walking_speed_kmph", walking_speed_kmph)
     if max_walking_time is None:
         max_walking_time = streets.MAX_ACCESS_EGRESS_TIME
+    else:
+        max_walking_time = non_negative_finite("max_walking_time", max_walking_time)
     if max_snap_distance is None:
         max_snap_distance = streets.MAX_SNAP_DISTANCE
+    else:
+        max_snap_distance = non_negative_finite("snap_distance", max_snap_distance)
     return walking_speed_kmph, max_walking_time, max_snap_distance
 
 
@@ -1483,13 +1492,27 @@ class TransportNetwork:
         change underneath it.
         """
         from cafein._units import duration_seconds
+        from cafein._validate import (
+            non_negative_finite,
+            positive_finite,
+            validated_bounding_box,
+        )
 
+        # Every parameter problem surfaces here, before any file is
+        # read — not minutes later, once the timetable is built.
         max_walking_time = duration_seconds("max_walking_time", max_walking_time)
-        max_snap_distance = snap_distance
+        if walking_speed_kmph is not None:
+            walking_speed_kmph = positive_finite(
+                "walking_speed_kmph", walking_speed_kmph
+            )
+        max_snap_distance = (
+            None
+            if snap_distance is None
+            else non_negative_finite("snap_distance", snap_distance)
+        )
+        bounding_box = validated_bounding_box(bounding_box)
         from cafein import street_network as _street_network
 
-        # Every street_modes problem surfaces here, before any file is
-        # read — not minutes later, once the timetable is built.
         if street_modes is None:
             street_modes = ("walk",) if osm_pbf is not None else ()
         else:
@@ -3448,6 +3471,10 @@ class TransportNetwork:
                 f"router must be 'auto', 'raptor', or 'tbtr', not {router!r}"
             )
         percentiles = _window_percentiles(window, percentiles, confidence)
+        # One validated resolution serves every branch: the knobs
+        # bound the door-to-door paths and are ignored on the closure
+        # and reverse stop paths, but garbage refuses everywhere.
+        walk = _walk_options(walking_speed_kmph, max_walking_time, max_snap_distance)
         # Stop-id sequences normalise to the engines' string ids here;
         # integer inputs round-trip back to their dtype at the frame
         # boundary.
@@ -3468,9 +3495,6 @@ class TransportNetwork:
                 columns = _chunk_slice(len(to_ids), chunk)
                 to_ids = to_ids[columns]
                 destination_points = destination_points[columns]
-                walk = _walk_options(
-                    walking_speed_kmph, max_walking_time, max_snap_distance
-                )
                 if percentiles is None:
                     table = self._core._arrive_by_time_matrix_from_points(
                         origin_points,
@@ -3502,9 +3526,6 @@ class TransportNetwork:
             rows = _chunk_slice(len(from_ids), chunk)
             from_ids = from_ids[rows]
             origin_points = origin_points[rows]
-            walk = _walk_options(
-                walking_speed_kmph, max_walking_time, max_snap_distance
-            )
             if percentiles is None:
                 table = self._core.travel_time_matrix_from_points(
                     origin_points,
@@ -3581,7 +3602,7 @@ class TransportNetwork:
                 list(id_sequence("exclude_routes", exclude_routes)),
                 list(id_sequence("exclude_trips", exclude_trips)),
                 list(id_sequence("exclude_stops", exclude_stops)),
-                *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
+                *walk,
             )
         else:
             matrix = self._core.travel_time_percentiles(
