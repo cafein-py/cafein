@@ -20,6 +20,9 @@ __all__ = [
     "DetailedItineraries",
     "travel_cost_table",
     "StreamingResult",
+    "enable_logging",
+    "disable_logging",
+    "collect_timings",
     "to_minutes",
     "exhaustive_frontier",
     "journey_frontier",
@@ -111,6 +114,10 @@ def __getattr__(name):
         from cafein.frontier import least_fare
 
         return least_fare
+    if name in ("enable_logging", "disable_logging", "collect_timings"):
+        from cafein import _log
+
+        return getattr(_log, name)
     if name == "__version__":
         from cafein._cafein import __version__
 

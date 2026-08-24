@@ -25,6 +25,8 @@ import warnings
 import numpy as np
 import pandas as pd
 
+from cafein import _log
+
 KEY_COLUMNS = ["trip_id", "route_id", "agency_id", "route_type"]
 COMPONENT_COLUMNS = ["vehicle", "fuel", "infrastructure", "operations"]
 
@@ -547,6 +549,20 @@ def annotate(journeys, network, factors=None, components=None):
         components = [column for column in COMPONENT_COLUMNS if column in chosen]
         if not components:
             raise ValueError("components must name at least one component column")
+    _log.sync()
+    with _log.phase(
+        "emissions.annotate",
+        _log.emissions,
+        "annotating journeys with emissions",
+        "annotated journeys with emissions",
+    ) as ph:
+        if hasattr(journeys, "__len__"):
+            ph.note = f"{len(journeys)} journey(s)"
+            ph.details["journeys"] = len(journeys)
+        return _annotated(journeys, network, factors, components)
+
+
+def _annotated(journeys, network, factors, components):
     table = default_factors()
     if factors is not None:
         table = pd.concat([table, load_factors(factors)], ignore_index=True)

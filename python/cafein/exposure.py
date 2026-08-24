@@ -28,6 +28,8 @@ import re
 
 import numpy as np
 
+from cafein import _log
+
 SAMPLE_STEP_M = 25.0
 """Along-edge sampling step for raster and line layers, metres."""
 
@@ -267,6 +269,7 @@ class Exposure:
     """
 
     def __init__(self, network, *, thresholds=None, rasterize=1.0, **layers):
+        _log.sync()
         if not layers:
             raise ValueError(
                 "Exposure needs at least one layer, e.g. " "noise=(zones_gdf, 'db_low')"
@@ -288,6 +291,17 @@ class Exposure:
         # check against the frame's own columns reruns below.
         _validate_names(layers, self._thresholds, ())
         validated = {name: _validated_spec(name, spec) for name, spec in layers.items()}
+        with _log.phase(
+            "exposure.build",
+            _log.exposure,
+            "building the exposure layers",
+            "built the exposure layers",
+        ) as ph:
+            self._build(network, rasterize, layers, validated)
+            ph.note = f"{len(self._layers)} layer(s) over {self._edge_count:,} edges"
+            ph.details.update(layers=sorted(self._layers), edges=self._edge_count)
+
+    def _build(self, network, rasterize, layers, validated):
         edges = network.streets_gdf
         _validate_names(layers, self._thresholds, edges.columns)
 
