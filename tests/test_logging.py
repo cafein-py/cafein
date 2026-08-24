@@ -30,6 +30,7 @@ def _pristine_logging():
     _log._handler = None
     _log._prior_level = None
     del _log._collectors[:]
+    _log.sync()
 
 
 def _saved(network, tmp_path, name="net.cafein"):
@@ -118,10 +119,17 @@ def test_artifact_phases_carry_structured_attributes(network, tmp_path, caplog):
         for record in caplog.records
         if hasattr(record, "cafein_phase")
     }
-    assert set(phases) == {"artifact.save", "artifact.load"}
+    assert set(phases) == {
+        "artifact.save.encode",
+        "artifact.save",
+        "artifact.load.decode",
+        "artifact.load.rebuild",
+        "artifact.load",
+    }
     for record in phases.values():
         assert record.cafein_seconds > 0
-        assert record.cafein_details["path"] == str(path)
+    for parent in ("artifact.save", "artifact.load"):
+        assert phases[parent].cafein_details["path"] == str(path)
 
 
 def test_from_gtfs_emits_build_phases(helsinki_gtfs, kantakaupunki_pbf, caplog):
@@ -133,6 +141,9 @@ def test_from_gtfs_emits_build_phases(helsinki_gtfs, kantakaupunki_pbf, caplog):
         if hasattr(record, "cafein_phase")
     ]
     assert phases == [
+        "build.gtfs.read",
+        "build.gtfs.timetable",
+        "build.gtfs.indexes",
         "build.gtfs",
         "build.streets.read",
         "build.streets.prune",
@@ -168,7 +179,12 @@ def test_gtfs_only_build_emits_no_street_phases(helsinki_gtfs, caplog):
         for record in caplog.records
         if hasattr(record, "cafein_phase")
     ]
-    assert phases == ["build.gtfs"]
+    assert phases == [
+        "build.gtfs.read",
+        "build.gtfs.timetable",
+        "build.gtfs.indexes",
+        "build.gtfs",
+    ]
 
 
 def test_annotate_emits_its_phase(network, caplog):
@@ -185,15 +201,20 @@ def test_collect_timings_reports_phases(network, tmp_path):
         path = _saved(network, tmp_path)
         cafein.TransportNetwork.load(path)
     assert [entry["phase"] for entry in report.phases] == [
+        "artifact.save.encode",
         "artifact.save",
+        "artifact.load.decode",
+        "artifact.load.rebuild",
         "artifact.load",
     ]
     for entry in report.phases:
         assert isinstance(entry["seconds"], float) and entry["seconds"] > 0
-        assert entry["details"]["path"] == str(path)
+    for entry in report.phases:
+        if entry["phase"] in ("artifact.save", "artifact.load"):
+            assert entry["details"]["path"] == str(path)
     frame = report.frame()
     assert list(frame.columns) == ["phase", "seconds", "details"]
-    assert len(frame) == 2
+    assert len(frame) == 5
     assert pd.api.types.is_string_dtype(frame["phase"])
     assert pd.api.types.is_float_dtype(frame["seconds"])
     assert frame["details"].dtype == object
@@ -205,14 +226,20 @@ def test_collect_timings_is_independent_of_the_stream_level(network, tmp_path):
     with cafein.collect_timings() as report:
         _saved(network, tmp_path)
     assert buffer.getvalue() == ""
-    assert [entry["phase"] for entry in report.phases] == ["artifact.save"]
+    assert [entry["phase"] for entry in report.phases] == [
+        "artifact.save.encode",
+        "artifact.save",
+    ]
 
 
 def test_collect_timings_survives_a_child_logger_override(network, tmp_path):
     logging.getLogger("cafein.artifact").setLevel(logging.WARNING)
     with cafein.collect_timings() as report:
         _saved(network, tmp_path)
-    assert [entry["phase"] for entry in report.phases] == ["artifact.save"]
+    assert [entry["phase"] for entry in report.phases] == [
+        "artifact.save.encode",
+        "artifact.save",
+    ]
 
 
 def test_collect_timings_leaves_root_handlers_to_their_own_config(
@@ -221,7 +248,10 @@ def test_collect_timings_leaves_root_handlers_to_their_own_config(
     with caplog.at_level(logging.WARNING):
         with cafein.collect_timings() as report:
             _saved(network, tmp_path)
-    assert [entry["phase"] for entry in report.phases] == ["artifact.save"]
+    assert [entry["phase"] for entry in report.phases] == [
+        "artifact.save.encode",
+        "artifact.save",
+    ]
     assert not [r for r in caplog.records if r.name.startswith("cafein")]
 
 
@@ -264,3 +294,41 @@ def test_raising_filter_cannot_break_a_computation(network, tmp_path):
         emitting.removeFilter(exploding)
     assert calls
     assert path.exists()
+
+
+def test_manual_child_override_arms_the_rust_bridge(network, tmp_path):
+    buffer = io.StringIO()
+    handler = logging.StreamHandler(buffer)
+    root = logging.getLogger("cafein")
+    emitting = logging.getLogger("cafein.artifact")
+    root.setLevel(logging.WARNING)
+    emitting.setLevel(logging.INFO)
+    emitting.addHandler(handler)
+    try:
+        _saved(network, tmp_path)
+    finally:
+        emitting.removeHandler(handler)
+    assert "encoded the artifact payload in" in buffer.getvalue()
+
+
+def test_an_explicit_notset_root_is_harmless(network, tmp_path):
+    plain_root = logging.getLogger()
+    prior = plain_root.level
+    plain_root.setLevel(logging.NOTSET)
+    try:
+        path = _saved(network, tmp_path)
+    finally:
+        plain_root.setLevel(prior)
+    assert path.exists()
+
+
+def test_an_oversized_custom_level_is_clamped(network, tmp_path):
+    logging.getLogger("cafein").setLevel(10**10)
+    path = _saved(network, tmp_path)
+    assert path.exists()
+    with cafein.collect_timings() as report:
+        _saved(network, tmp_path, name="again.cafein")
+    assert [entry["phase"] for entry in report.phases] == [
+        "artifact.save.encode",
+        "artifact.save",
+    ]

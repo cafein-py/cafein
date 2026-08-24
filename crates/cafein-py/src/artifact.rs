@@ -22,7 +22,14 @@ impl TransportNetwork {
         let parts = self.streets.as_ref().map(StreetNetwork::to_parts);
         let multimodal_parts = self.multimodal.as_ref().map(StreetNetwork::to_parts);
         py.allow_threads(|| {
+            let timer = crate::logging::PhaseTimer::start(
+                "cafein.artifact",
+                "artifact.save.encode",
+                "encoding the artifact payload",
+                "encoded the artifact payload",
+            );
             let (meta, streets_bytes) = self.encode_artifact(&parts, &multimodal_parts)?;
+            timer.finish();
             write_container(path, ARTIFACT_MAGIC, ARTIFACT_FORMAT, &meta, &streets_bytes)
         })
     }
@@ -78,8 +85,12 @@ impl TransportNetwork {
             }
         };
         if mode != MmapMode::Off {
+            let timer = decode_timer();
             match py.allow_threads(|| load_mapped(path, verify))? {
-                Ok(loaded) => return Ok(assemble(loaded)),
+                Ok(loaded) => {
+                    timer.finish();
+                    return Ok(rebuilt(loaded));
+                }
                 Err(reason) if mode == MmapMode::Require => {
                     return Err(PyValueError::new_err(format!(
                         "'{path}' cannot be memory-mapped ({reason}) and \
@@ -89,8 +100,10 @@ impl TransportNetwork {
                 Err(_) => {}
             }
         }
+        let timer = decode_timer();
         let loaded = py.allow_threads(|| load_owned(path, verify))?;
-        Ok(assemble(loaded))
+        timer.finish();
+        Ok(rebuilt(loaded))
     }
 
     /// Whether the street arrays are memory-mapped views of the loaded
@@ -1839,6 +1852,28 @@ pub(super) fn load_mapped(
             layout.streets_crc,
         ),
     )))
+}
+
+fn decode_timer() -> crate::logging::PhaseTimer {
+    crate::logging::PhaseTimer::start(
+        "cafein.artifact",
+        "artifact.load.decode",
+        "decoding the artifact payload",
+        "decoded the artifact payload",
+    )
+}
+
+/// `assemble` with the rebuild phase timed around it.
+fn rebuilt(loaded: LoadedArtifact) -> TransportNetwork {
+    let timer = crate::logging::PhaseTimer::start(
+        "cafein.artifact",
+        "artifact.load.rebuild",
+        "rebuilding the derived structures",
+        "rebuilt the derived structures",
+    );
+    let network = assemble(loaded);
+    timer.finish();
+    network
 }
 
 /// Assembles a network from a loaded artifact, rebuilding the derived
