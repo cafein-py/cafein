@@ -290,7 +290,12 @@ def _validated_budgets(name, budgets):
                 f"{name} names an unknown street mode {mode!r}; expected one "
                 f"of {', '.join(STREET_POLICY_MODES)}"
             )
-        seconds = float(seconds)
+        try:
+            seconds = float(seconds)
+        except OverflowError:
+            # An integer beyond float range is a number that cannot be
+            # finite; refuse it as such.
+            seconds = math.inf
         if not (math.isfinite(seconds) and seconds > 0.0):
             raise ValueError(f"{name}[{mode!r}] must be a positive, finite time budget")
         budgets[mode] = seconds
@@ -465,12 +470,17 @@ class CarParkPolicy:
         self.max_facility_walk_seconds = _positive_duration(
             "max_facility_walk_time", max_facility_walk_time
         )
-        occupancy = float(occupancy)
+        try:
+            occupancy = float(occupancy)
+        except OverflowError:
+            # An integer beyond float range is a number that cannot be
+            # finite; refuse it as such.
+            occupancy = math.inf
         if not (math.isfinite(occupancy) and occupancy >= 1.0):
             raise ValueError("occupancy must be at least 1")
         self.occupancy = occupancy
         if vehicle_class is not None and not isinstance(vehicle_class, str):
-            raise ValueError("vehicle_class names an emission-factor row")
+            raise TypeError("vehicle_class names an emission-factor row")
         self.vehicle_class = vehicle_class
         self.intersection_delays = bool(intersection_delays)
         self.delay_model = delay_model

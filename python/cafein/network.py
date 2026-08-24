@@ -1,5 +1,6 @@
 """The user-facing transport network."""
 
+import math
 import os
 
 from cafein._validate import component_selection, id_sequence, sequence_not_string
@@ -39,7 +40,22 @@ def _window_percentiles(window, percentiles, confidence):
         return [half, 50.0, round(100 - half, 9)]
     if percentiles is None:
         return [50.0]
-    return [float(percentile) for percentile in percentiles]
+    from cafein._validate import sequence_not_string
+
+    sequence_not_string("percentiles", percentiles)
+    ranks = []
+    for percentile in percentiles:
+        try:
+            ranks.append(float(percentile))
+        except OverflowError:
+            # An integer beyond float range is a number that cannot be
+            # in range; the check below refuses it as such.
+            ranks.append(math.inf)
+    # Checked here, not only at the Rust boundary: the message names
+    # the fault before any endpoint snapping runs.
+    if any(not math.isfinite(rank) or not 0 <= rank <= 100 for rank in ranks):
+        raise ValueError("percentiles must be finite and within [0, 100]")
+    return ranks
 
 
 def _walk_options(walking_speed_kmph, max_walking_time, max_snap_distance):

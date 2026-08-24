@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- The street-query knobs refuse instead of silently emptying: a
+  negative or non-finite `snap_distance` or `max_street_time` on the
+  street matrices and `StreetNetwork.travel_time` used to unroute
+  every point and return an empty result; percentile ranks outside
+  [0, 100] now refuse before any snapping, and the wrong KIND on
+  `occupancy`/`vehicle_class` is a TypeError, closing the eager
+  validation arc. ([#306](https://github.com/cafein-py/cafein/pull/306),
+  closes [#237](https://github.com/cafein-py/cafein/issues/237))
+
 - `Exposure` validates eagerly: `rasterize`, `thresholds`, the layer
   names, and every layer's spec now refuse before the street frame
   materializes and before any layer ingests — a malformed later
