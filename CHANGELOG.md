@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Docstring fixes: `CarParkPolicy` cross-references now use the
+  working import path (`cafein.policy.CarParkPolicy`), and prose
+  stranded inside Parameters field lists (`Catchment`,
+  `NearestDestinations`, `CarParkPolicy`) moved under Notes headers
+  so Sphinx renders without warnings.
+  ([#314](https://github.com/cafein-py/cafein/pull/314))
+
 ## 0.17.0 — 2026-08-25
 
 - `enable_logging` gains `progress=`: `"lines"` (the default, as

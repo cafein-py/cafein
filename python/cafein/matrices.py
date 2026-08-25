@@ -354,7 +354,7 @@ class TravelCostMatrix(pd.DataFrame):
     walking knobs are rejected beside a policy rather than silently
     ignored.
 
-    ``street_policy=`` also takes a ``cafein.CarParkPolicy`` (a network
+    ``street_policy=`` also takes a ``cafein.policy.CarParkPolicy`` (a network
     built with ``"car"`` in ``street_modes=``): per origin the access
     composes drive-to-facility, parking search, and the facility walk,
     with the ordinary walking access competing beside the car plane and
@@ -1242,7 +1242,7 @@ class TravelTimeMatrix(pd.DataFrame):
     the walking knobs, ``router``, and the departure-window parameters,
     which are rejected rather than silently ignored.
 
-    ``street_policy=`` also takes a ``cafein.CarParkPolicy`` (a network
+    ``street_policy=`` also takes a ``cafein.policy.CarParkPolicy`` (a network
     built with ``"car"`` in ``street_modes=``): per origin the access
     composes drive-to-facility, parking search, and the facility walk,
     with the ordinary walking access competing beside the car plane and
