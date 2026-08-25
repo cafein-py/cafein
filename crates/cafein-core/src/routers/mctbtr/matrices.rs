@@ -14,6 +14,9 @@ impl<'a> McTbtrEngine<'a> {
     /// build (one transfer set) serves every origin, fanned out with
     /// rayon.
     #[allow(clippy::too_many_arguments)]
+    /// [`McTbtrEngine::frontier_matrix_with_progress`] without
+    /// progress reporting.
+    #[allow(clippy::too_many_arguments)]
     pub fn frontier_matrix(
         &self,
         requests: &[Request],
@@ -24,6 +27,32 @@ impl<'a> McTbtrEngine<'a> {
         window: u32,
         bucket: f64,
         max_slower: Option<u32>,
+    ) -> Vec<Vec<Vec<Journey>>> {
+        self.frontier_matrix_with_progress(
+            requests,
+            destinations,
+            egress,
+            egress_active,
+            slot_count,
+            window,
+            bucket,
+            max_slower,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn frontier_matrix_with_progress(
+        &self,
+        requests: &[Request],
+        destinations: &[StopIdx],
+        egress: &[Vec<(u32, u32, f64)>],
+        egress_active: bool,
+        slot_count: usize,
+        window: u32,
+        bucket: f64,
+        max_slower: Option<u32>,
+        progress: crate::progress::Progress<'_>,
     ) -> Vec<Vec<Vec<Journey>>> {
         if egress_active {
             assert_eq!(
@@ -102,6 +131,11 @@ impl<'a> McTbtrEngine<'a> {
                                 slot_floors[slot] = slot_floors[slot].min(bound);
                             }
                             slot_floors
+                        })
+                        .inspect(|_run| {
+                            if let Some(tick) = progress {
+                                tick();
+                            }
                         })
                         .collect();
                     for (per_stop, slot_floors) in cutoffs.iter_mut().zip(&floors) {

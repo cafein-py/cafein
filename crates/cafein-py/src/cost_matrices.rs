@@ -1211,7 +1211,10 @@ impl TransportNetwork {
                     &active_services,
                     &active_services_previous,
                 );
-                let mut rows = mcraptor::least_emissions_matrix(
+                let ticker =
+                    crate::logging::ProgressTicker::new("travel_cost_matrix", requests.len());
+                let tick = || ticker.tick();
+                let mut rows = mcraptor::least_emissions_matrix_with_progress(
                     &view,
                     &self.build.timetable,
                     matrix_transfers,
@@ -1224,6 +1227,7 @@ impl TransportNetwork {
                     window,
                     budget,
                     bucket,
+                    crate::logging::progress_hook(&ticker, &tick),
                 );
                 if matrix_mcultra && snappable.iter().any(|&located| !located) {
                     // Re-route the unsnappable origins over the closure (board at

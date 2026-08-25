@@ -42,7 +42,8 @@ pub(crate) use super::mc_bounds::resolved_bounds;
 use bag::*;
 pub(crate) use bag::{Bag, InsertProbes};
 pub use products::{
-    frontier_matrix, least_emissions_matrix, route, route_range, route_with_policy,
+    frontier_matrix, frontier_matrix_with_progress, least_emissions_matrix,
+    least_emissions_matrix_with_progress, route, route_range, route_with_policy,
 };
 use search::*;
 pub(crate) use stats::McRaptorStats;

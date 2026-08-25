@@ -115,17 +115,7 @@ pub fn route_range(
     )
 }
 
-/// The least-emissions cost matrix over McRAPTOR's candidate set: per
-/// origin–destination cell, the cleanest journey (ties toward the
-/// shorter travel time) among the (departure, arrival, emissions
-/// bucket) Pareto candidates of the departure window — the same
-/// widened set `journey_frontier`'s pareto candidates draw from, so a
-/// cell can be strictly cleaner than the interim objective's, which
-/// only sees time-optimal journeys. Candidates fold per pass at label
-/// creation, so a `budget` (travel-time cap in seconds) is applied
-/// against each label's own departure. Requests fan out over origins
-/// with rayon; the access seeds are the zero-ride floor of the
-/// origin's own cell.
+/// [`least_emissions_matrix`] without progress reporting.
 #[allow(clippy::too_many_arguments)]
 pub fn least_emissions_matrix(
     view: &DayView,
@@ -140,6 +130,50 @@ pub fn least_emissions_matrix(
     window: u32,
     budget: Option<u32>,
     bucket: f64,
+) -> Vec<Vec<CostRow>> {
+    least_emissions_matrix_with_progress(
+        view,
+        timetable,
+        footpaths,
+        inputs,
+        requests,
+        destinations,
+        egress,
+        access_meters,
+        egress_active,
+        window,
+        budget,
+        bucket,
+        None,
+    )
+}
+
+/// The least-emissions cost matrix over McRAPTOR's candidate set: per
+/// origin–destination cell, the cleanest journey (ties toward the
+/// shorter travel time) among the (departure, arrival, emissions
+/// bucket) Pareto candidates of the departure window — the same
+/// widened set `journey_frontier`'s pareto candidates draw from, so a
+/// cell can be strictly cleaner than the interim objective's, which
+/// only sees time-optimal journeys. Candidates fold per pass at label
+/// creation, so a `budget` (travel-time cap in seconds) is applied
+/// against each label's own departure. Requests fan out over origins
+/// with rayon; the access seeds are the zero-ride floor of the
+/// origin's own cell.
+#[allow(clippy::too_many_arguments)]
+pub fn least_emissions_matrix_with_progress(
+    view: &DayView,
+    timetable: &Timetable,
+    footpaths: &Transfers,
+    inputs: &CostInputs<'_>,
+    requests: &[Request],
+    destinations: &[StopIdx],
+    egress: &[Vec<(u32, u32, f64)>],
+    access_meters: &[Vec<(StopIdx, f64)>],
+    egress_active: bool,
+    window: u32,
+    budget: Option<u32>,
+    bucket: f64,
+    progress: crate::progress::Progress<'_>,
 ) -> Vec<Vec<CostRow>> {
     assert!(
         bucket.is_finite() && bucket > 0.0,
@@ -228,6 +262,11 @@ pub fn least_emissions_matrix(
             };
             (rows, search.stats)
         })
+        .inspect(|_run| {
+            if let Some(tick) = progress {
+                tick();
+            }
+        })
         .collect();
     if std::env::var_os("CAFEIN_MCRAPTOR_PROF").is_some() {
         let mut reduced = McRaptorStats::default();
@@ -239,15 +278,7 @@ pub fn least_emissions_matrix(
     runs.into_iter().map(|run| run.0).collect()
 }
 
-/// The batched Pareto frontiers: per request × destination slot, the
-/// (departure, arrival, emissions bucket) Pareto journeys of the
-/// departure window — each cell exactly the single-pair `route_range`
-/// set (strict frontier: no slack, no cap, no penalties). Stop mode
-/// takes the destination stops; door-to-door mode (`egress_active`)
-/// takes a per-stop final-egress map over `slot_count` destination
-/// points, the walking-only journey being the caller's overlay as in
-/// the one-pair coordinate route. One window profile per request
-/// serves every slot; requests fan out with rayon.
+/// [`frontier_matrix`] without progress reporting.
 #[allow(clippy::too_many_arguments)]
 pub fn frontier_matrix(
     view: &DayView,
@@ -263,6 +294,50 @@ pub fn frontier_matrix(
     window: u32,
     bucket: f64,
     max_slower: Option<u32>,
+) -> Vec<Vec<Vec<Journey>>> {
+    frontier_matrix_with_progress(
+        view,
+        timetable,
+        footpaths,
+        geometry,
+        factors,
+        requests,
+        destinations,
+        egress,
+        egress_active,
+        slot_count,
+        window,
+        bucket,
+        max_slower,
+        None,
+    )
+}
+
+/// The batched Pareto frontiers: per request × destination slot, the
+/// (departure, arrival, emissions bucket) Pareto journeys of the
+/// departure window — each cell exactly the single-pair `route_range`
+/// set (strict frontier: no slack, no cap, no penalties). Stop mode
+/// takes the destination stops; door-to-door mode (`egress_active`)
+/// takes a per-stop final-egress map over `slot_count` destination
+/// points, the walking-only journey being the caller's overlay as in
+/// the one-pair coordinate route. One window profile per request
+/// serves every slot; requests fan out with rayon.
+#[allow(clippy::too_many_arguments)]
+pub fn frontier_matrix_with_progress(
+    view: &DayView,
+    timetable: &Timetable,
+    footpaths: &Transfers,
+    geometry: &TripGeometry,
+    factors: &[f64],
+    requests: &[Request],
+    destinations: &[StopIdx],
+    egress: &[Vec<(u32, u32, f64)>],
+    egress_active: bool,
+    slot_count: usize,
+    window: u32,
+    bucket: f64,
+    max_slower: Option<u32>,
+    progress: crate::progress::Progress<'_>,
 ) -> Vec<Vec<Vec<Journey>>> {
     assert!(
         bucket.is_finite() && bucket > 0.0,
@@ -340,6 +415,11 @@ pub fn frontier_matrix(
                             slot_floors[slot] = slot_floors[slot].min(bound);
                         }
                         slot_floors
+                    })
+                    .inspect(|_run| {
+                        if let Some(tick) = progress {
+                            tick();
+                        }
                     })
                     .collect();
                 (band, bounds, floors)
