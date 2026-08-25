@@ -759,3 +759,99 @@ def test_a_bare_mode_string_still_refuses_before_any_read(tmp_path):
 
     with pytest.raises(TypeError, match="pass"):
         StreetNetwork.from_osm(str(tmp_path / "missing.osm.pbf"), modes="walk")
+
+
+class _FakeBar:
+    def __init__(self, label, total):
+        self.label = label
+        self.total = total
+        self.n = 0
+        self.refreshes = 0
+        self.closed = False
+
+    def refresh(self):
+        self.refreshes += 1
+
+    def close(self):
+        self.closed = True
+
+
+def test_progress_false_logs_only_phases(network, caplog):
+    from cafein import TravelTimeMatrix
+
+    origins = _served_stops(network, 40)
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer, progress=False)
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        TravelTimeMatrix(network, origins, departure=DEPARTURE)
+    output = buffer.getvalue()
+    assert "computed the travel time matrix in" in output
+    assert not [line for line in output.splitlines() if "% (" in line]
+    # The records themselves still carry every tick for other handlers.
+    ticks = [r for r in caplog.records if hasattr(r, "cafein_progress")]
+    assert len(ticks) == 20
+
+
+def test_progress_bar_drives_one_bar_per_label(network, monkeypatch):
+    from cafein import TravelTimeMatrix
+
+    bars = []
+
+    def factory(label, total):
+        bar = _FakeBar(label, total)
+        bars.append(bar)
+        return bar
+
+    monkeypatch.setattr(_log, "_bar_factory", factory)
+    origins = _served_stops(network, 40)
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer, progress="bar")
+    TravelTimeMatrix(network, origins, departure=DEPARTURE)
+    assert len(bars) == 1
+    bar = bars[0]
+    assert bar.label == "travel_time_matrix"
+    assert bar.total == 40
+    assert bar.n == 40
+    assert bar.closed
+    output = buffer.getvalue()
+    assert "computed the travel time matrix in" in output
+    assert not [line for line in output.splitlines() if "% (" in line]
+
+
+def test_progress_bar_without_tqdm_falls_back_to_lines(network, monkeypatch):
+    from cafein import TravelTimeMatrix
+
+    monkeypatch.setattr(_log, "_bar_factory", lambda label, total: None)
+    origins = _served_stops(network, 40)
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer, progress="bar")
+    with pytest.warns(UserWarning, match="tqdm is not installed"):
+        TravelTimeMatrix(network, origins, departure=DEPARTURE)
+    assert len([line for line in buffer.getvalue().splitlines() if "% (" in line]) == 20
+
+
+def test_progress_validates_eagerly():
+    with pytest.raises(TypeError, match="progress must be"):
+        cafein.enable_logging(stream=io.StringIO(), progress=True)
+    with pytest.raises(TypeError, match="progress must be"):
+        cafein.enable_logging(stream=io.StringIO(), progress=3)
+    with pytest.raises(ValueError, match="progress must be"):
+        cafein.enable_logging(stream=io.StringIO(), progress="spinner")
+
+
+def test_tick_records_carry_structured_progress(network, caplog):
+    from cafein import TravelTimeMatrix
+
+    origins = _served_stops(network, 40)
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        TravelTimeMatrix(network, origins, departure=DEPARTURE)
+    ticks = [r for r in caplog.records if hasattr(r, "cafein_progress")]
+    assert len(ticks) == 20
+    for record in ticks:
+        info = record.cafein_progress
+        assert info["label"] == "travel_time_matrix"
+        assert 0 < info["done"] <= info["total"] == 40
+        assert not hasattr(record, "cafein_phase")
+    assert [r.cafein_progress["done"] for r in ticks] == sorted(
+        r.cafein_progress["done"] for r in ticks
+    )

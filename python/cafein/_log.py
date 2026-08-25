@@ -67,11 +67,27 @@ class TimingReport:
         )
 
 
-def _emit(logger, level, message, *, phase=None, seconds=None, details=None):
+def _emit(
+    logger, level, message, *, phase=None, seconds=None, details=None, progress=None
+):
     """Deliver one record; logging must never break a computation."""
     try:
         if phase is None:
-            logger.log(level, message)
+            if progress is not None:
+                label, done, total = progress
+                logger.log(
+                    level,
+                    message,
+                    extra={
+                        "cafein_progress": {
+                            "label": label,
+                            "done": done,
+                            "total": total,
+                        }
+                    },
+                )
+            else:
+                logger.log(level, message)
             return
         # Every delivery gets a recursively independent snapshot, so a
         # handler mutating its record — or a consumer mutating a report
@@ -219,11 +235,11 @@ def sync():
         pass
 
 
-def _from_rust(target, levelno, message, phase=None, seconds=None):
+def _from_rust(target, levelno, message, phase=None, seconds=None, progress=None):
     """The dispatch the PyO3 bridge calls for every Rust-side record."""
     logger = logging.getLogger(target)
     if phase is None:
-        _emit(logger, levelno, message)
+        _emit(logger, levelno, message, progress=progress)
     else:
         _emit(logger, levelno, message, phase=phase, seconds=seconds, details={})
 
@@ -243,6 +259,94 @@ def _install_bridge():
 _install_bridge()
 
 
+def _default_bar_factory(label, total):
+    """One live bar, or None when tqdm is unavailable."""
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:
+        return None
+    return tqdm(total=total, desc=label, leave=False)
+
+
+_bar_factory = _default_bar_factory
+
+
+class _CafeinHandler(logging.StreamHandler):
+    """The handler ``enable_logging`` installs: phase and message
+    lines to the stream; tick records shaped by the progress mode
+    ("lines" prints them, "bar" drives one live bar per fan-out
+    label, False drops them). Only cafein's own handler is shaped —
+    the records reach every other handler identically."""
+
+    def __init__(self, stream, progress):
+        super().__init__(stream)
+        self._progress = progress
+        self._bars = {}
+        self._warned = False
+
+    def emit(self, record):
+        info = getattr(record, "cafein_progress", None)
+        if info is None:
+            super().emit(record)
+            return
+        if self._progress is False:
+            return
+        if self._progress == "bar" and self._bar(info):
+            return
+        super().emit(record)
+
+    def _bar(self, info):
+        try:
+            label, done, total = info["label"], info["done"], info["total"]
+            bar = self._bars.get(label)
+            if bar is not None and done < getattr(bar, "n", 0):
+                bar.close()
+                self._bars.pop(label, None)
+                bar = None
+            if bar is None:
+                bar = _bar_factory(label, total)
+                if bar is None:
+                    if not self._warned:
+                        self._warned = True
+                        import warnings
+
+                        warnings.warn(
+                            "tqdm is not installed; progress='bar' falls back "
+                            "to line output (pip install tqdm)",
+                            stacklevel=2,
+                        )
+                    return False
+                self._bars[label] = bar
+            bar.n = done
+            bar.refresh()
+            step = max(1, -(-total // 20))
+            if done + step > total:
+                bar.close()
+                self._bars.pop(label, None)
+            return True
+        except Exception:
+            return True
+
+    def close(self):
+        for bar in list(self._bars.values()):
+            try:
+                bar.close()
+            except Exception:
+                pass
+        self._bars.clear()
+        super().close()
+
+
+def _validated_progress(progress):
+    if progress is False:
+        return False
+    if isinstance(progress, str) and not isinstance(progress, bool):
+        if progress in ("lines", "bar"):
+            return progress
+        raise ValueError("progress must be 'lines', 'bar', or False")
+    raise TypeError("progress must be 'lines', 'bar', or False")
+
+
 def _validated_level(level):
     if isinstance(level, bool) or not isinstance(level, (int, str)):
         raise TypeError("level must be an int or one of 'debug', 'info', 'warning'")
@@ -254,7 +358,7 @@ def _validated_level(level):
     return _LEVELS[name]
 
 
-def enable_logging(stream=None, level="info"):
+def enable_logging(stream=None, level="info", progress="lines"):
     """Log cafein's phases and timings to a stream.
 
     Installs a handler on the ``"cafein"`` logger writing to
@@ -273,6 +377,17 @@ def enable_logging(stream=None, level="info"):
     level : int or {"debug", "info", "warning"}
         "info" (default) shows phases and progress; "debug" adds
         phase starting lines.
+    progress : {"lines", "bar", False}
+        How cafein's own handler presents fan-out progress ticks:
+        "lines" (default) prints them, "bar" drives one live bar
+        per fan-out (``tqdm.auto``: a widget inside Jupyter, a
+        carriage-return line in terminals; falls back to lines
+        with a warning when tqdm is not installed), and ``False``
+        drops them — phase completions only, for pipeline logs.
+        Ticks are emitted identically in every mode, so handlers
+        you attach yourself always see them (they carry a
+        ``cafein_progress`` attribute with ``label``/``done``/
+        ``total``).
     """
     global _handler, _prior_level
     if stream is None:
@@ -282,12 +397,14 @@ def enable_logging(stream=None, level="info"):
             "stream must be a writable text stream (an object with a write method)"
         )
     levelno = _validated_level(level)
+    progress = _validated_progress(progress)
     with _lock:
         if _handler is None:
             _prior_level = root.level
         else:
             root.removeHandler(_handler)
-        handler = logging.StreamHandler(stream)
+            _handler.close()
+        handler = _CafeinHandler(stream, progress)
         handler.setFormatter(
             logging.Formatter("%(asctime)s %(name)s: %(message)s", datefmt="%H:%M:%S")
         )
@@ -307,6 +424,7 @@ def disable_logging():
         if _handler is None:
             return
         root.removeHandler(_handler)
+        _handler.close()
         root.setLevel(_prior_level)
         _handler = None
         _prior_level = None

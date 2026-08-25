@@ -45,6 +45,7 @@ arrow = ["pyarrow"]
 dem = ["rioxarray"]
 h3 = ["h3>=4"]
 yaml = ["pyyaml"]
+progress = ["tqdm"]
 
 [project.urls]
 Repository = "https://github.com/cafein-py/cafein"

@@ -47,6 +47,21 @@ pub fn emit<F>(target: &str, level: u32, message: F, phase: Option<&str>, second
 where
     F: FnOnce() -> String,
 {
+    emit_full(target, level, message, phase, seconds, None)
+}
+
+/// [`emit`] with the progress triple ticks carry: `(label, done,
+/// total)`, `None` on every non-tick record.
+pub fn emit_full<F>(
+    target: &str,
+    level: u32,
+    message: F,
+    phase: Option<&str>,
+    seconds: Option<f64>,
+    progress: Option<(&str, usize, usize)>,
+) where
+    F: FnOnce() -> String,
+{
     if !enabled(level) {
         return;
     }
@@ -55,7 +70,7 @@ where
     };
     let message = message();
     Python::with_gil(|py| {
-        let _ = dispatch.call1(py, (target, level, message, phase, seconds));
+        let _ = dispatch.call1(py, (target, level, message, phase, seconds, progress));
     });
 }
 
@@ -151,12 +166,13 @@ impl ProgressTicker {
             let (label, total) = (self.label, self.total);
             let percent = at * 100 / total;
             let seconds = self.started.elapsed().as_secs_f64();
-            emit(
+            emit_full(
                 "cafein.matrix",
                 INFO,
                 || format!("{label} {percent}% ({at}/{total} origins, {seconds:.1} s elapsed)"),
                 None,
                 None,
+                Some((label, at, total)),
             );
         }
     }
