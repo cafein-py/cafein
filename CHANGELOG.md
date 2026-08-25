@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Matrix computers report through the logging surface: one `matrix.*`
+  phase per computer (`travel_times`, `travel_costs`, `cost_table`,
+  `itineraries`, `accessibility`, and `streets` for the street-network
+  forms), throttled fan-out progress ticks at ~5% steps during long
+  matrix runs, and `build.tbtr`/`build.mctbtr` precompute phases.
+  ([#310](https://github.com/cafein-py/cafein/pull/310))
+
 - The Rust-side build and artifact stages report through the logging
   surface: `build.gtfs.read`/`.timetable`/`.indexes` and the artifact
   `save.encode`/`load.decode`/`load.rebuild` halves emit timed phases

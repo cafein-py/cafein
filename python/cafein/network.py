@@ -2199,6 +2199,7 @@ class TransportNetwork:
         date : str
             Service date as ``YYYY-MM-DD``.
         """
+        _log.sync()
         return self._core.compute_tbtr_transfers(date)
 
     def compute_mctbtr_transfers(self, date, factors=None, components=None):
@@ -2225,6 +2226,7 @@ class TransportNetwork:
             LCA components to include, as in ``emissions.annotate`` — the
             same arguments the queries will use.
         """
+        _log.sync()
         components = component_selection(components)
         from cafein import emissions
 
@@ -2908,6 +2910,12 @@ class TransportNetwork:
         seconds = duration_seconds("max_transfer_time", max_transfer_time)
         return self._core._compute_mode_transfers(mode, float(seconds))
 
+    @_log.timed_computer(
+        "matrix.travel_times",
+        _log.matrix,
+        "computing travel times from a coordinate",
+        "computed travel times from a coordinate",
+    )
     def travel_times_from_coordinate(
         self,
         origin,
@@ -3205,6 +3213,12 @@ class TransportNetwork:
             arrive_by,
         )
 
+    @_log.timed_computer(
+        "matrix.travel_times",
+        _log.matrix,
+        "computing travel times from a stop",
+        "computed travel times from a stop",
+    )
     def travel_times_from_stop(
         self,
         origin,
@@ -3310,6 +3324,12 @@ class TransportNetwork:
             arrive_by,
         )
 
+    @_log.timed_computer(
+        "matrix.travel_times",
+        _log.matrix,
+        "computing the travel time matrix",
+        "computed the travel time matrix",
+    )
     def travel_time_matrix(
         self,
         origins,

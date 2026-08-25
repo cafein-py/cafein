@@ -13,6 +13,7 @@ through the exception-guarded :func:`_emit`.
 """
 
 import copy
+import functools
 import logging
 import sys
 import threading
@@ -124,6 +125,68 @@ def phase(identifier, logger, doing, done):
         seconds=seconds,
         details=handle.details,
     )
+
+
+def sized(value):
+    """``len(value)`` where it exists, else None — best-effort counts
+    for phase details."""
+    try:
+        return len(value)
+    except TypeError:
+        return None
+
+
+def timed_computer(
+    identifier,
+    logger,
+    doing,
+    done,
+    *,
+    network_position=1,
+    street_identifier=None,
+    street_doing=None,
+    street_done=None,
+    is_street=None,
+    details=None,
+):
+    """Wrap a computer entry point in its ``matrix.*`` phase.
+
+    Works on frame-building ``__init__`` methods (the row count is
+    read off ``self``) and on frame-returning functions alike. With
+    ``street_identifier`` and ``is_street``, a street-network call
+    swaps to the street identifier and phrases. ``details`` is an
+    optional ``(args, kwargs) -> dict`` read before the computation.
+    """
+
+    def wrap(fn):
+        @functools.wraps(fn)
+        def timed(*args, **kwargs):
+            ident, doing_now, done_now = identifier, doing, done
+            if street_identifier is not None and is_street is not None:
+                network = kwargs.get("network")
+                if network is None and len(args) > network_position:
+                    network = args[network_position]
+                if is_street(network):
+                    ident = street_identifier
+                    doing_now = street_doing or doing
+                    done_now = street_done or done
+            sync()
+            with phase(ident, logger, doing_now, done_now) as handle:
+                if details is not None:
+                    try:
+                        handle.details.update(details(args, kwargs))
+                    except Exception:
+                        pass
+                result = fn(*args, **kwargs)
+                rows = sized(result if result is not None else args[0])
+                if rows is not None:
+                    handle.details["rows"] = rows
+                    handle.note = f"{rows:,} rows"
+                return result
+
+        return timed
+
+    return wrap
 
 
 def sync():
@@ -264,8 +327,18 @@ def collect_timings():
     ``build.multimodal`` (the multimodal street graph);
     ``artifact.save`` with ``artifact.save.encode``;
     ``artifact.load`` with ``artifact.load.decode`` and
-    ``artifact.load.rebuild``; ``emissions.annotate``; and
-    ``exposure.build``.
+    ``artifact.load.rebuild``; ``emissions.annotate``;
+    ``exposure.build``; ``build.tbtr`` and ``build.mctbtr`` (the
+    cached engine precomputes); and one identifier per computer,
+    shared by its related entry points — ``matrix.travel_times``
+    (``TravelTimeMatrix`` and the ``travel_times_*`` surfaces),
+    ``matrix.travel_costs`` (``TravelCostMatrix``),
+    ``matrix.cost_table`` (``travel_cost_table``),
+    ``matrix.itineraries`` (``DetailedItineraries``),
+    ``matrix.accessibility`` (``Accessibility``), and
+    ``matrix.streets`` (the matrix surfaces over a street network).
+    Progress ticks emitted during matrix fan-outs are plain INFO
+    lines, not phases, and never enter a report.
     """
     report = TimingReport()
     with _lock:
