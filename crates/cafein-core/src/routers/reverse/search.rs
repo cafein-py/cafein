@@ -680,6 +680,21 @@ where
     T: Send,
     F: Fn(usize, &[Vec<(u16, u32, u32)>]) -> T + Sync,
 {
+    reverse_one_to_all_fold_with_progress(timetable, reversed, requests, fold, None)
+}
+
+/// [`reverse_one_to_all_fold`] reporting each completed destination.
+pub fn reverse_one_to_all_fold_with_progress<T, F>(
+    timetable: &Timetable,
+    reversed: &ReversedTransfers,
+    requests: &[Request],
+    fold: F,
+    progress: crate::progress::Progress<'_>,
+) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize, &[Vec<(u16, u32, u32)>]) -> T + Sync,
+{
     use rayon::prelude::*;
     requests
         .par_iter()
@@ -687,7 +702,11 @@ where
         .map_init(ReverseState::new, |state, (index, request)| {
             let search = ReverseSearch::new(timetable, reversed, request);
             search.run(state);
-            fold(index, &collect_states(timetable, state))
+            let row = fold(index, &collect_states(timetable, state));
+            if let Some(tick) = progress {
+                tick();
+            }
+            row
         })
         .collect()
 }

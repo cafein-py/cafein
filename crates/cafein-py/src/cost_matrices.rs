@@ -1760,35 +1760,44 @@ impl TransportNetwork {
             // Each destination's run folds to its origins' candidate
             // tuples; the self cell rides the forward fold's zero-ride
             // round through an injected (deadline, deadline, 0) tuple.
-            let columns: Vec<Vec<Vec<(u32, u32, u16)>>> = reverse::reverse_one_to_all_fold(
-                &self.build.timetable,
-                &reversed,
-                &reverse_requests,
-                |column, states| {
-                    let destination = destinations[column];
-                    let excluded = exclusions
-                        .as_deref()
-                        .is_some_and(|excluded| excluded.excludes_stop(destination));
-                    origins
-                        .iter()
-                        .map(|&origin| {
-                            let profile =
-                                reverse::reverse_profile_states(&states[origin.0 as usize], &marks);
-                            let mut allowed: Vec<(u32, u32, u16)> =
-                                reverse::profile_union(&[(0, profile)], &marks, None)
-                                    .into_iter()
-                                    .map(|(departure, rides, achieved)| {
-                                        (departure, achieved, rides as u16)
-                                    })
-                                    .collect();
-                            if origin == destination && !excluded {
-                                allowed.push((deadline, deadline, 0));
-                            }
-                            allowed
-                        })
-                        .collect()
-                },
+            let ticker = crate::logging::ProgressTicker::new(
+                "travel_cost_matrix (arrive-by fold)",
+                reverse_requests.len(),
             );
+            let tick = || ticker.tick();
+            let columns: Vec<Vec<Vec<(u32, u32, u16)>>> =
+                reverse::reverse_one_to_all_fold_with_progress(
+                    &self.build.timetable,
+                    &reversed,
+                    &reverse_requests,
+                    |column, states| {
+                        let destination = destinations[column];
+                        let excluded = exclusions
+                            .as_deref()
+                            .is_some_and(|excluded| excluded.excludes_stop(destination));
+                        origins
+                            .iter()
+                            .map(|&origin| {
+                                let profile = reverse::reverse_profile_states(
+                                    &states[origin.0 as usize],
+                                    &marks,
+                                );
+                                let mut allowed: Vec<(u32, u32, u16)> =
+                                    reverse::profile_union(&[(0, profile)], &marks, None)
+                                        .into_iter()
+                                        .map(|(departure, rides, achieved)| {
+                                            (departure, achieved, rides as u16)
+                                        })
+                                        .collect();
+                                if origin == destination && !excluded {
+                                    allowed.push((deadline, deadline, 0));
+                                }
+                                allowed
+                            })
+                            .collect()
+                    },
+                    crate::logging::progress_hook(&ticker, &tick),
+                );
             let mut allowed: Vec<Vec<Vec<(u32, u32, u16)>>> =
                 vec![Vec::with_capacity(destinations.len()); origins.len()];
             for column in columns {
@@ -1962,39 +1971,46 @@ impl TransportNetwork {
                     exclusions: exclusions.clone(),
                 })
                 .collect();
-            let columns: Vec<Vec<Vec<(u32, u32, u16)>>> = reverse::reverse_one_to_all_fold(
-                &self.build.timetable,
-                &reversed,
-                &reverse_requests,
-                |column, states| {
-                    access
-                        .iter()
-                        .enumerate()
-                        .map(|(row, links)| {
-                            let profiles: Vec<(u32, reverse::MarkWinners)> = links
-                                .iter()
-                                .map(|&(stop, seconds, _)| {
-                                    (
-                                        seconds,
-                                        reverse::reverse_profile_states(
-                                            &states[stop.0 as usize],
-                                            &marks,
-                                        ),
-                                    )
-                                })
-                                .collect();
-                            let walk_seconds = walk[row][column].map(|(seconds, _)| seconds);
-                            reverse::profile_union(&profiles, &marks, walk_seconds)
-                                .into_iter()
-                                .filter(|&(_, rides, _)| rides > 0)
-                                .map(|(departure, rides, achieved)| {
-                                    (departure, achieved, rides as u16)
-                                })
-                                .collect()
-                        })
-                        .collect()
-                },
+            let ticker = crate::logging::ProgressTicker::new(
+                "travel_cost_matrix (arrive-by fold)",
+                reverse_requests.len(),
             );
+            let tick = || ticker.tick();
+            let columns: Vec<Vec<Vec<(u32, u32, u16)>>> =
+                reverse::reverse_one_to_all_fold_with_progress(
+                    &self.build.timetable,
+                    &reversed,
+                    &reverse_requests,
+                    |column, states| {
+                        access
+                            .iter()
+                            .enumerate()
+                            .map(|(row, links)| {
+                                let profiles: Vec<(u32, reverse::MarkWinners)> = links
+                                    .iter()
+                                    .map(|&(stop, seconds, _)| {
+                                        (
+                                            seconds,
+                                            reverse::reverse_profile_states(
+                                                &states[stop.0 as usize],
+                                                &marks,
+                                            ),
+                                        )
+                                    })
+                                    .collect();
+                                let walk_seconds = walk[row][column].map(|(seconds, _)| seconds);
+                                reverse::profile_union(&profiles, &marks, walk_seconds)
+                                    .into_iter()
+                                    .filter(|&(_, rides, _)| rides > 0)
+                                    .map(|(departure, rides, achieved)| {
+                                        (departure, achieved, rides as u16)
+                                    })
+                                    .collect()
+                            })
+                            .collect()
+                    },
+                    crate::logging::progress_hook(&ticker, &tick),
+                );
             let mut allowed: Vec<Vec<Vec<(u32, u32, u16)>>> =
                 vec![Vec::with_capacity(egress.len()); origins.len()];
             for column in columns {
@@ -2143,6 +2159,8 @@ impl TransportNetwork {
         max_walking_time: f64,
         max_snap_distance: f64,
     ) -> Vec<Vec<CostRow>> {
+        let ticker = crate::logging::ProgressTicker::new("travel_cost_matrix", origins.len());
+        let tick = || ticker.tick();
         let mut usable: Vec<(usize, (f64, f64))> = Vec::new();
         let mut fallback: Vec<(usize, StopIdx)> = Vec::new();
         for (index, &origin) in origins.iter().enumerate() {
@@ -2222,8 +2240,6 @@ impl TransportNetwork {
                         .collect::<HashMap<_, _>>(),
                 );
             }
-            let ticker = crate::logging::ProgressTicker::new("travel_cost_matrix", requests.len());
-            let tick = || ticker.tick();
             let mut usable_rows = Raptor.cost_matrix_to_points_with_progress(
                 &self.build.timetable,
                 self.time_transfers(),
@@ -2255,8 +2271,6 @@ impl TransportNetwork {
                     exclusions: None,
                 })
                 .collect();
-            let ticker = crate::logging::ProgressTicker::new("travel_cost_matrix", requests.len());
-            let tick = || ticker.tick();
             let fallback_rows = Raptor.cost_matrix_with_progress(
                 &self.build.timetable,
                 &self.transfers,

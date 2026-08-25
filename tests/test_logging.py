@@ -610,3 +610,48 @@ def test_multimodal_build_children_report(helsinki_gtfs, kantakaupunki_pbf, capl
     )
     assert streets.cafein_details["modes"] == ["walk"]
     assert streets.cafein_details["edges"] > 0
+
+
+def test_arrive_by_matrix_ticks(network):
+    import re
+
+    from cafein import TravelTimeMatrix
+
+    origins = _served_stops(network, 2)
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    # The arrive-by stop matrix fans out over destinations; one chunk
+    # keeps the run small while staying above the tick floor.
+    TravelTimeMatrix(network, origins, arrival=DEPARTURE, chunk=(0, 100))
+    ticks = [line for line in buffer.getvalue().splitlines() if "% (" in line]
+    assert ticks and all("arrive-by fold" in line for line in ticks)
+    counts = [int(re.search(r"\((\d+)/", line).group(1)) for line in ticks]
+    assert counts == sorted(counts) and len(counts) == len(set(counts))
+
+
+def test_mixed_partitions_share_one_counter(ultra_network):
+    from cafein import TravelTimeMatrix
+
+    central = _served_stops(ultra_network, 20)
+    # The farthest stops sit outside the central street extract, so
+    # they get no street access and take the fallback partition.
+    far = [
+        stop
+        for stop, _ in sorted(
+            (
+                (stop, (lat - 60.17) ** 2 + (lon - 24.94) ** 2)
+                for stop, lat, lon in ultra_network.stops
+                if lat is not None
+            ),
+            key=lambda pair: pair[1],
+            reverse=True,
+        )[:20]
+    ]
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    TravelTimeMatrix(ultra_network, central + far, departure=DEPARTURE)
+    ticks = [line for line in buffer.getvalue().splitlines() if "% (" in line]
+    # A 20/20 usable/fallback split still advances one 40-origin
+    # counter: per-partition tickers would emit nothing here.
+    assert len(ticks) == 20
+    assert all("/40 origins" in line for line in ticks)

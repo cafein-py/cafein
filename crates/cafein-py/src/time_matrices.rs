@@ -708,7 +708,12 @@ impl TransportNetwork {
             let reversed = ReversedTransfers::build(&self.transfers);
             // Each run folds into its dense column inside the worker;
             // per-stop frontiers never accumulate across destinations.
-            let columns: Vec<Vec<u32>> = reverse::reverse_one_to_all_fold(
+            let ticker = crate::logging::ProgressTicker::new(
+                "travel_time_matrix (arrive-by fold)",
+                requests.len(),
+            );
+            let tick = || ticker.tick();
+            let columns: Vec<Vec<u32>> = reverse::reverse_one_to_all_fold_with_progress(
                 &self.build.timetable,
                 &reversed,
                 &requests,
@@ -737,6 +742,7 @@ impl TransportNetwork {
                         })
                         .collect()
                 },
+                crate::logging::progress_hook(&ticker, &tick),
             );
             let mut flat = vec![u32::MAX; origins.len() * destination_count];
             for (column, cells) in columns.iter().enumerate() {
@@ -805,7 +811,12 @@ impl TransportNetwork {
         let planes = percentiles.len();
         let flat: Vec<u32> = py.allow_threads(|| {
             let reversed = ReversedTransfers::build(&self.transfers);
-            let columns: Vec<Vec<u32>> = reverse::reverse_one_to_all_fold(
+            let ticker = crate::logging::ProgressTicker::new(
+                "travel_time_matrix (arrive-by fold)",
+                requests.len(),
+            );
+            let tick = || ticker.tick();
+            let columns: Vec<Vec<u32>> = reverse::reverse_one_to_all_fold_with_progress(
                 &self.build.timetable,
                 &reversed,
                 &requests,
@@ -844,6 +855,7 @@ impl TransportNetwork {
                     }
                     cells
                 },
+                crate::logging::progress_hook(&ticker, &tick),
             );
             let mut flat = vec![u32::MAX; origins.len() * destination_count * planes];
             for (column, cells) in columns.iter().enumerate() {
@@ -929,7 +941,12 @@ impl TransportNetwork {
                 max_walking_time,
                 max_snap_distance,
             );
-            let columns: Vec<Vec<u32>> = reverse::reverse_one_to_all_fold(
+            let ticker = crate::logging::ProgressTicker::new(
+                "travel_time_matrix (arrive-by fold)",
+                requests.len(),
+            );
+            let tick = || ticker.tick();
+            let columns: Vec<Vec<u32>> = reverse::reverse_one_to_all_fold_with_progress(
                 &self.build.timetable,
                 &reversed,
                 &requests,
@@ -985,6 +1002,7 @@ impl TransportNetwork {
                     }
                     cells
                 },
+                crate::logging::progress_hook(&ticker, &tick),
             );
             let mut flat = vec![u32::MAX; origins.len() * destination_count * planes];
             for (column, cells) in columns.iter().enumerate() {
@@ -1074,7 +1092,12 @@ impl TransportNetwork {
             );
             // Each run folds into its dense column inside the worker;
             // per-stop frontiers never accumulate across destinations.
-            let columns: Vec<Vec<u32>> = reverse::reverse_one_to_all_fold(
+            let ticker = crate::logging::ProgressTicker::new(
+                "travel_time_matrix (arrive-by fold)",
+                requests.len(),
+            );
+            let tick = || ticker.tick();
+            let columns: Vec<Vec<u32>> = reverse::reverse_one_to_all_fold_with_progress(
                 &self.build.timetable,
                 &reversed,
                 &requests,
@@ -1107,6 +1130,7 @@ impl TransportNetwork {
                         })
                         .collect()
                 },
+                crate::logging::progress_hook(&ticker, &tick),
             );
             let mut flat = vec![u32::MAX; origins.len() * destination_count];
             for (column, cells) in columns.iter().enumerate() {
@@ -1189,7 +1213,12 @@ impl TransportNetwork {
                 .collect();
             // Each run folds into its dense column inside the worker;
             // per-stop frontiers never accumulate across destinations.
-            let columns: Vec<Vec<ArriveByCell>> = reverse::reverse_one_to_all_fold(
+            let ticker = crate::logging::ProgressTicker::new(
+                "travel_time_matrix (arrive-by fold)",
+                requests.len(),
+            );
+            let tick = || ticker.tick();
+            let columns: Vec<Vec<ArriveByCell>> = reverse::reverse_one_to_all_fold_with_progress(
                 &self.build.timetable,
                 &reversed,
                 &requests,
@@ -1246,6 +1275,7 @@ impl TransportNetwork {
                         })
                         .collect()
                 },
+                crate::logging::progress_hook(&ticker, &tick),
             );
             let cells = origin_count * destination_count;
             let mut departures = vec![u32::MAX; cells];
@@ -1340,6 +1370,8 @@ impl TransportNetwork {
         max_walking_time: f64,
         max_snap_distance: f64,
     ) -> Vec<Vec<Option<u32>>> {
+        let ticker = crate::logging::ProgressTicker::new("travel_time_matrix", origins.len());
+        let tick = || ticker.tick();
         use rayon::prelude::*;
         // Partition into door-to-door usable (snappable coordinate) and closure
         // fallback, keeping each origin's input index for the merge.
@@ -1384,8 +1416,6 @@ impl TransportNetwork {
                     request(request_offsets(&access))
                 })
                 .collect();
-            let ticker = crate::logging::ProgressTicker::new("travel_time_matrix", requests.len());
-            let tick = || ticker.tick();
             let mut usable_rows = Raptor.one_to_all_many_with_progress(
                 &self.build.timetable,
                 self.time_transfers(),
@@ -1407,8 +1437,6 @@ impl TransportNetwork {
                 .iter()
                 .map(|&(_, origin)| request(vec![(origin, 0)]))
                 .collect();
-            let ticker = crate::logging::ProgressTicker::new("travel_time_matrix", requests.len());
-            let tick = || ticker.tick();
             let fallback_rows = Raptor.one_to_all_many_with_progress(
                 &self.build.timetable,
                 &self.transfers,
