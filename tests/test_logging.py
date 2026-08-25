@@ -866,3 +866,19 @@ def test_tick_records_carry_structured_progress(network, caplog):
     assert [r.cafein_progress["done"] for r in ticks] == sorted(
         r.cafein_progress["done"] for r in ticks
     )
+
+
+def test_missing_tqdm_fallback_survives_warnings_as_errors(network, monkeypatch):
+    import sys
+    import warnings
+
+    from cafein import TravelTimeMatrix
+
+    monkeypatch.setitem(sys.modules, "tqdm.auto", None)
+    origins = _served_stops(network, 40)
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer, progress="bar")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        TravelTimeMatrix(network, origins, departure=DEPARTURE)
+    assert len([line for line in buffer.getvalue().splitlines() if "% (" in line]) == 20

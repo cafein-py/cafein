@@ -286,8 +286,14 @@ class _CafeinHandler(logging.StreamHandler):
         self._progress = progress
         self._bars = {}
         self._warned = False
+        self._closed = False
 
     def emit(self, record):
+        # ``handle`` holds the handler lock here and ``close`` sets the
+        # flag under the same lock, so a tick already past the logger's
+        # handler list cannot recreate a bar after ``disable_logging``.
+        if self._closed:
+            return
         info = getattr(record, "cafein_progress", None)
         if info is None:
             super().emit(record)
@@ -317,13 +323,18 @@ class _CafeinHandler(logging.StreamHandler):
                 if bar is None:
                     if not self._warned:
                         self._warned = True
-                        import warnings
+                        try:
+                            import warnings
 
-                        warnings.warn(
-                            "tqdm is not installed; progress='bar' falls back "
-                            "to line output (pip install tqdm)",
-                            stacklevel=2,
-                        )
+                            warnings.warn(
+                                "tqdm is not installed; progress='bar' falls "
+                                "back to line output (pip install tqdm)",
+                                stacklevel=2,
+                            )
+                        except Exception:
+                            # Warnings promoted to errors must not eat
+                            # the tick: it still renders as a line.
+                            pass
                     return False
                 self._bars[label] = bar
             bar.n = done
@@ -337,12 +348,14 @@ class _CafeinHandler(logging.StreamHandler):
             return True
 
     def close(self):
-        for bar in list(self._bars.values()):
-            try:
-                bar.close()
-            except Exception:
-                pass
-        self._bars.clear()
+        with self.lock:
+            self._closed = True
+            for bar in list(self._bars.values()):
+                try:
+                    bar.close()
+                except Exception:
+                    pass
+            self._bars.clear()
         super().close()
 
 
