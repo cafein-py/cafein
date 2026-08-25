@@ -56,7 +56,7 @@ impl TransportNetwork {
     ///     times in seconds; row order follows `from_stops`, column
     ///     order follows ``stops``. Unreachable pairs hold the maximum
     ///     uint32 value (4294967295).
-    #[pyo3(signature = (from_stops, date, departure, max_transfers = 7, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    #[pyo3(signature = (from_stops, date, departure, max_transfers = 7, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn travel_time_matrix<'py>(
         &self,
@@ -72,6 +72,7 @@ impl TransportNetwork {
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
+        workers: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray2<u32>>> {
         let (rows, departure) = self.resolved_time_rows(
             py,
@@ -86,6 +87,7 @@ impl TransportNetwork {
             walking_speed_kmph,
             max_walking_time,
             max_snap_distance,
+            workers,
         )?;
         let stop_count = self.build.timetable.stop_count() as usize;
         let count = rows.len();
@@ -123,6 +125,7 @@ impl TransportNetwork {
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
+        workers: Option<usize>,
     ) -> PyResult<(Vec<Vec<Option<u32>>>, u32)> {
         if !matches!(router, "auto" | "raptor" | "tbtr") {
             return Err(invalid_router(router));
@@ -169,59 +172,62 @@ impl TransportNetwork {
             self.resolve_time_router(router, date, exclusions.is_some())?
         };
         let rows = py.allow_threads(|| {
-            let ticker = crate::logging::ProgressTicker::new("travel_time_matrix", origins.len());
-            let tick = || ticker.tick();
-            if router == "tbtr" {
-                let engine = self.tbtr_engine(
-                    &self.transfers,
-                    date,
-                    &active_services,
-                    &active_services_previous,
-                );
-                let accesses: Vec<Vec<(StopIdx, u32)>> =
-                    origins.iter().map(|&origin| vec![(origin, 0)]).collect();
-                engine.one_to_all_many_with_progress(
-                    departure,
-                    &accesses,
-                    max_transfers,
-                    crate::logging::progress_hook(&ticker, &tick),
-                )
-            } else if let Some(speed) = ultra_speed {
-                let streets = self
-                    .streets
-                    .as_ref()
-                    .expect("ultra_speed is set only when a street network is installed");
-                self.ultra_matrix_rows(
-                    streets,
-                    &origins,
-                    departure,
-                    &active_services,
-                    &active_services_previous,
-                    max_transfers,
-                    speed,
-                    max_walking_time,
-                    max_snap_distance,
-                )
-            } else {
-                let requests: Vec<Request> = origins
-                    .iter()
-                    .map(|&origin| Request {
+            crate::workers::with_workers("travel_time_matrix", workers, || {
+                let ticker =
+                    crate::logging::ProgressTicker::new("travel_time_matrix", origins.len());
+                let tick = || ticker.tick();
+                if router == "tbtr" {
+                    let engine = self.tbtr_engine(
+                        &self.transfers,
+                        date,
+                        &active_services,
+                        &active_services_previous,
+                    );
+                    let accesses: Vec<Vec<(StopIdx, u32)>> =
+                        origins.iter().map(|&origin| vec![(origin, 0)]).collect();
+                    engine.one_to_all_many_with_progress(
                         departure,
-                        access: vec![(origin, 0)],
-                        egress: Vec::new(),
-                        active_services: active_services.clone(),
-                        active_services_previous: active_services_previous.clone(),
+                        &accesses,
                         max_transfers,
-                        exclusions: exclusions.clone(),
-                    })
-                    .collect();
-                Raptor.one_to_all_many_with_progress(
-                    &self.build.timetable,
-                    &self.transfers,
-                    &requests,
-                    crate::logging::progress_hook(&ticker, &tick),
-                )
-            }
+                        crate::logging::progress_hook(&ticker, &tick),
+                    )
+                } else if let Some(speed) = ultra_speed {
+                    let streets = self
+                        .streets
+                        .as_ref()
+                        .expect("ultra_speed is set only when a street network is installed");
+                    self.ultra_matrix_rows(
+                        streets,
+                        &origins,
+                        departure,
+                        &active_services,
+                        &active_services_previous,
+                        max_transfers,
+                        speed,
+                        max_walking_time,
+                        max_snap_distance,
+                    )
+                } else {
+                    let requests: Vec<Request> = origins
+                        .iter()
+                        .map(|&origin| Request {
+                            departure,
+                            access: vec![(origin, 0)],
+                            egress: Vec::new(),
+                            active_services: active_services.clone(),
+                            active_services_previous: active_services_previous.clone(),
+                            max_transfers,
+                            exclusions: exclusions.clone(),
+                        })
+                        .collect();
+                    Raptor.one_to_all_many_with_progress(
+                        &self.build.timetable,
+                        &self.transfers,
+                        &requests,
+                        crate::logging::progress_hook(&ticker, &tick),
+                    )
+                }
+            })
         });
         Ok((rows, departure))
     }
@@ -265,7 +271,7 @@ impl TransportNetwork {
     ///     A ``(len(from_stops), stop_count, len(percentiles))`` uint32
     ///     array of travel times in seconds; unreachable percentiles
     ///     hold the maximum uint32 value (4294967295).
-    #[pyo3(signature = (from_stops, date, departure, window, percentiles, max_transfers = 7, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![]))]
+    #[pyo3(signature = (from_stops, date, departure, window, percentiles, max_transfers = 7, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn travel_time_percentiles<'py>(
         &self,
@@ -280,6 +286,7 @@ impl TransportNetwork {
         exclude_routes: Vec<String>,
         exclude_trips: Vec<String>,
         exclude_stops: Vec<String>,
+        workers: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray3<u32>>> {
         validate_window(window, &percentiles)?;
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
@@ -305,35 +312,38 @@ impl TransportNetwork {
             .collect();
         let stop_count = self.build.timetable.stop_count() as usize;
         let flat: Vec<u32> = py.allow_threads(|| {
-            let ticker = crate::logging::ProgressTicker::new("travel_time_matrix", requests.len());
-            let tick = || ticker.tick();
-            if router == "tbtr" {
-                let engine = self.tbtr_engine(
-                    &self.transfers,
-                    date,
-                    &active_services,
-                    &active_services_previous,
-                );
-                engine
-                    .percentile_matrix_with_progress(
-                        &requests,
-                        window,
-                        &percentiles,
-                        crate::logging::progress_hook(&ticker, &tick),
-                    )
-                    .concat()
-            } else {
-                Raptor
-                    .percentile_matrix_with_progress(
-                        &self.build.timetable,
+            crate::workers::with_workers("travel_time_percentiles", workers, || {
+                let ticker =
+                    crate::logging::ProgressTicker::new("travel_time_matrix", requests.len());
+                let tick = || ticker.tick();
+                if router == "tbtr" {
+                    let engine = self.tbtr_engine(
                         &self.transfers,
-                        &requests,
-                        window,
-                        &percentiles,
-                        crate::logging::progress_hook(&ticker, &tick),
-                    )
-                    .concat()
-            }
+                        date,
+                        &active_services,
+                        &active_services_previous,
+                    );
+                    engine
+                        .percentile_matrix_with_progress(
+                            &requests,
+                            window,
+                            &percentiles,
+                            crate::logging::progress_hook(&ticker, &tick),
+                        )
+                        .concat()
+                } else {
+                    Raptor
+                        .percentile_matrix_with_progress(
+                            &self.build.timetable,
+                            &self.transfers,
+                            &requests,
+                            window,
+                            &percentiles,
+                            crate::logging::progress_hook(&ticker, &tick),
+                        )
+                        .concat()
+                }
+            })
         });
         let rows = requests.len();
         flat.into_pyarray(py)
@@ -356,7 +366,7 @@ impl TransportNetwork {
     /// ``router="auto"`` (the default) runs on TBTR when the cached time
     /// transfer set (``compute_tbtr_transfers``) matches the date, else on
     /// RAPTOR; explicit values pick the engine directly.
-    #[pyo3(signature = (origins, destinations, date, departure, window, percentiles, max_transfers = 7, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    #[pyo3(signature = (origins, destinations, date, departure, window, percentiles, max_transfers = 7, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn travel_time_percentiles_from_points(
         &self,
@@ -375,6 +385,7 @@ impl TransportNetwork {
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
+        workers: Option<usize>,
     ) -> PyResult<Py<PyDict>> {
         if !matches!(router, "auto" | "raptor" | "tbtr") {
             return Err(invalid_router(router));
@@ -392,83 +403,86 @@ impl TransportNetwork {
         let active_services_previous = self.active_services_previous(date)?;
         let destination_count = destinations.len();
         let (flat, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
-            // One stop-search pass links both the origins (access) and the
-            // destinations (egress); see StreetNetwork::link_pointsets.
-            let mut linked = streets.link_pointsets(
-                &[&origins[..], &destinations[..]],
-                speed,
-                max_walking_time,
-                max_snap_distance,
-            );
-            let destination_links = linked.pop().unwrap();
-            let origin_links = linked.pop().unwrap();
-            let unsnapped_from = unsnapped(&origin_links);
-            let unsnapped_to = unsnapped(&destination_links);
-            let requests: Vec<Request> = origin_links
-                .iter()
-                .map(|links| Request {
-                    departure,
-                    access: request_offsets(links.as_deref().unwrap_or(&[])),
-                    egress: Vec::new(),
-                    active_services: active_services.clone(),
-                    active_services_previous: active_services_previous.clone(),
-                    max_transfers,
-                    exclusions: exclusions.clone(),
-                })
-                .collect();
-            let egress = egress_tables(&destination_links);
-            let ticker = crate::logging::ProgressTicker::new("travel_time_matrix", requests.len());
-            let tick = || ticker.tick();
-            let mut flat = if router == "tbtr" {
-                let engine = self.tbtr_engine(
-                    self.exclusion_transfers(&exclusions),
-                    date,
-                    &active_services,
-                    &active_services_previous,
+            crate::workers::with_workers("travel_time_percentiles_from_points", workers, || {
+                // One stop-search pass links both the origins (access) and the
+                // destinations (egress); see StreetNetwork::link_pointsets.
+                let mut linked = streets.link_pointsets(
+                    &[&origins[..], &destinations[..]],
+                    speed,
+                    max_walking_time,
+                    max_snap_distance,
                 );
-                engine
-                    .percentile_matrix_to_points_with_progress(
-                        &requests,
-                        &egress,
-                        window,
-                        &percentiles,
-                        crate::logging::progress_hook(&ticker, &tick),
-                    )
-                    .concat()
-            } else {
-                Raptor
-                    .percentile_matrix_to_points_with_progress(
-                        &self.build.timetable,
+                let destination_links = linked.pop().unwrap();
+                let origin_links = linked.pop().unwrap();
+                let unsnapped_from = unsnapped(&origin_links);
+                let unsnapped_to = unsnapped(&destination_links);
+                let requests: Vec<Request> = origin_links
+                    .iter()
+                    .map(|links| Request {
+                        departure,
+                        access: request_offsets(links.as_deref().unwrap_or(&[])),
+                        egress: Vec::new(),
+                        active_services: active_services.clone(),
+                        active_services_previous: active_services_previous.clone(),
+                        max_transfers,
+                        exclusions: exclusions.clone(),
+                    })
+                    .collect();
+                let egress = egress_tables(&destination_links);
+                let ticker =
+                    crate::logging::ProgressTicker::new("travel_time_matrix", requests.len());
+                let tick = || ticker.tick();
+                let mut flat = if router == "tbtr" {
+                    let engine = self.tbtr_engine(
                         self.exclusion_transfers(&exclusions),
-                        &requests,
-                        &egress,
-                        window,
-                        &percentiles,
-                        crate::logging::progress_hook(&ticker, &tick),
-                    )
-                    .concat()
-            };
-            // A direct walk is departure-independent, so it caps every
-            // percentile of a cell's distribution alike.
-            let walk = streets.walk_matrix(
-                &origins,
-                &destinations,
-                speed,
-                max_walking_time,
-                max_snap_distance,
-            );
-            let planes = percentiles.len();
-            for (origin, row) in walk.iter().enumerate() {
-                for (point, cell) in row.iter().enumerate() {
-                    if let Some((walk_seconds, _)) = cell {
-                        let base = (origin * destination_count + point) * planes;
-                        for value in &mut flat[base..base + planes] {
-                            *value = (*value).min(*walk_seconds);
+                        date,
+                        &active_services,
+                        &active_services_previous,
+                    );
+                    engine
+                        .percentile_matrix_to_points_with_progress(
+                            &requests,
+                            &egress,
+                            window,
+                            &percentiles,
+                            crate::logging::progress_hook(&ticker, &tick),
+                        )
+                        .concat()
+                } else {
+                    Raptor
+                        .percentile_matrix_to_points_with_progress(
+                            &self.build.timetable,
+                            self.exclusion_transfers(&exclusions),
+                            &requests,
+                            &egress,
+                            window,
+                            &percentiles,
+                            crate::logging::progress_hook(&ticker, &tick),
+                        )
+                        .concat()
+                };
+                // A direct walk is departure-independent, so it caps every
+                // percentile of a cell's distribution alike.
+                let walk = streets.walk_matrix(
+                    &origins,
+                    &destinations,
+                    speed,
+                    max_walking_time,
+                    max_snap_distance,
+                );
+                let planes = percentiles.len();
+                for (origin, row) in walk.iter().enumerate() {
+                    for (point, cell) in row.iter().enumerate() {
+                        if let Some((walk_seconds, _)) = cell {
+                            let base = (origin * destination_count + point) * planes;
+                            for value in &mut flat[base..base + planes] {
+                                *value = (*value).min(*walk_seconds);
+                            }
                         }
                     }
                 }
-            }
-            (flat, unsnapped_from, unsnapped_to)
+                (flat, unsnapped_from, unsnapped_to)
+            })
         });
         let result = PyDict::new(py);
         result.set_item(
@@ -516,7 +530,7 @@ impl TransportNetwork {
     /// ``router="auto"`` (the default) runs on TBTR when the cached time
     /// transfer set (``compute_tbtr_transfers``) matches the date, else on
     /// RAPTOR; explicit values pick the engine directly.
-    #[pyo3(signature = (origins, destinations, date, departure, max_transfers = 7, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    #[pyo3(signature = (origins, destinations, date, departure, max_transfers = 7, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn travel_time_matrix_from_points(
         &self,
@@ -533,6 +547,7 @@ impl TransportNetwork {
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
+        workers: Option<usize>,
     ) -> PyResult<Py<PyDict>> {
         if !matches!(router, "auto" | "raptor" | "tbtr") {
             return Err(invalid_router(router));
@@ -550,97 +565,100 @@ impl TransportNetwork {
         let stop_count = self.build.timetable.stop_count() as usize;
         let destination_count = destinations.len();
         let (flat, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
-            // One stop-search pass links both the origins (access) and the
-            // destinations (egress); see StreetNetwork::link_pointsets.
-            let mut linked = streets.link_pointsets(
-                &[&origins[..], &destinations[..]],
-                speed,
-                max_walking_time,
-                max_snap_distance,
-            );
-            let destination_links = linked.pop().unwrap();
-            let origin_links = linked.pop().unwrap();
-            let unsnapped_from = unsnapped(&origin_links);
-            let unsnapped_to = unsnapped(&destination_links);
-            let requests: Vec<Request> = origin_links
-                .iter()
-                .map(|links| Request {
-                    departure,
-                    access: request_offsets(links.as_deref().unwrap_or(&[])),
-                    egress: Vec::new(),
-                    active_services: active_services.clone(),
-                    active_services_previous: active_services_previous.clone(),
-                    max_transfers,
-                    exclusions: exclusions.clone(),
-                })
-                .collect();
-            let egress = egress_tables(&destination_links);
-            let ticker = crate::logging::ProgressTicker::new("travel_time_matrix", requests.len());
-            let tick = || ticker.tick();
-            let rows: Vec<Vec<Option<u32>>> = if router == "tbtr" {
-                let engine = self.tbtr_engine(
-                    self.exclusion_transfers(&exclusions),
-                    date,
-                    &active_services,
-                    &active_services_previous,
+            crate::workers::with_workers("travel_time_matrix_from_points", workers, || {
+                // One stop-search pass links both the origins (access) and the
+                // destinations (egress); see StreetNetwork::link_pointsets.
+                let mut linked = streets.link_pointsets(
+                    &[&origins[..], &destinations[..]],
+                    speed,
+                    max_walking_time,
+                    max_snap_distance,
                 );
-                let accesses: Vec<Vec<(StopIdx, u32)>> = requests
+                let destination_links = linked.pop().unwrap();
+                let origin_links = linked.pop().unwrap();
+                let unsnapped_from = unsnapped(&origin_links);
+                let unsnapped_to = unsnapped(&destination_links);
+                let requests: Vec<Request> = origin_links
                     .iter()
-                    .map(|request| request.access.clone())
+                    .map(|links| Request {
+                        departure,
+                        access: request_offsets(links.as_deref().unwrap_or(&[])),
+                        egress: Vec::new(),
+                        active_services: active_services.clone(),
+                        active_services_previous: active_services_previous.clone(),
+                        max_transfers,
+                        exclusions: exclusions.clone(),
+                    })
                     .collect();
-                engine.one_to_all_many_with_progress(
-                    departure,
-                    &accesses,
-                    max_transfers,
-                    crate::logging::progress_hook(&ticker, &tick),
-                )
-            } else {
-                Raptor.one_to_all_many_with_progress(
-                    &self.build.timetable,
-                    self.exclusion_transfers(&exclusions),
-                    &requests,
-                    crate::logging::progress_hook(&ticker, &tick),
-                )
-            };
-            let mut flat = vec![u32::MAX; requests.len() * destination_count];
-            for (origin, arrivals) in rows.iter().enumerate() {
-                debug_assert_eq!(arrivals.len(), stop_count);
-                for (point, links) in egress.iter().enumerate() {
-                    let mut best = u32::MAX;
-                    for &(stop, seconds, _) in links {
-                        let Some(at_stop) = arrivals[stop.0 as usize] else {
-                            continue;
-                        };
-                        let Some(arrival) =
-                            at_stop.checked_add(seconds).filter(|&at| at != u32::MAX)
-                        else {
-                            continue;
-                        };
-                        best = best.min(arrival);
-                    }
-                    if best != u32::MAX {
-                        flat[origin * destination_count + point] = best - departure;
+                let egress = egress_tables(&destination_links);
+                let ticker =
+                    crate::logging::ProgressTicker::new("travel_time_matrix", requests.len());
+                let tick = || ticker.tick();
+                let rows: Vec<Vec<Option<u32>>> = if router == "tbtr" {
+                    let engine = self.tbtr_engine(
+                        self.exclusion_transfers(&exclusions),
+                        date,
+                        &active_services,
+                        &active_services_previous,
+                    );
+                    let accesses: Vec<Vec<(StopIdx, u32)>> = requests
+                        .iter()
+                        .map(|request| request.access.clone())
+                        .collect();
+                    engine.one_to_all_many_with_progress(
+                        departure,
+                        &accesses,
+                        max_transfers,
+                        crate::logging::progress_hook(&ticker, &tick),
+                    )
+                } else {
+                    Raptor.one_to_all_many_with_progress(
+                        &self.build.timetable,
+                        self.exclusion_transfers(&exclusions),
+                        &requests,
+                        crate::logging::progress_hook(&ticker, &tick),
+                    )
+                };
+                let mut flat = vec![u32::MAX; requests.len() * destination_count];
+                for (origin, arrivals) in rows.iter().enumerate() {
+                    debug_assert_eq!(arrivals.len(), stop_count);
+                    for (point, links) in egress.iter().enumerate() {
+                        let mut best = u32::MAX;
+                        for &(stop, seconds, _) in links {
+                            let Some(at_stop) = arrivals[stop.0 as usize] else {
+                                continue;
+                            };
+                            let Some(arrival) =
+                                at_stop.checked_add(seconds).filter(|&at| at != u32::MAX)
+                            else {
+                                continue;
+                            };
+                            best = best.min(arrival);
+                        }
+                        if best != u32::MAX {
+                            flat[origin * destination_count + point] = best - departure;
+                        }
                     }
                 }
-            }
-            // Walking directly can beat transit; each cell keeps the
-            // faster of the two (one street search per origin).
-            let walk = streets.walk_matrix(
-                &origins,
-                &destinations,
-                speed,
-                max_walking_time,
-                max_snap_distance,
-            );
-            for (origin, row) in walk.iter().enumerate() {
-                for (point, cell) in row.iter().enumerate() {
-                    if let Some((walk_seconds, _)) = cell {
-                        let at = origin * destination_count + point;
-                        flat[at] = flat[at].min(*walk_seconds);
+                // Walking directly can beat transit; each cell keeps the
+                // faster of the two (one street search per origin).
+                let walk = streets.walk_matrix(
+                    &origins,
+                    &destinations,
+                    speed,
+                    max_walking_time,
+                    max_snap_distance,
+                );
+                for (origin, row) in walk.iter().enumerate() {
+                    for (point, cell) in row.iter().enumerate() {
+                        if let Some((walk_seconds, _)) = cell {
+                            let at = origin * destination_count + point;
+                            flat[at] = flat[at].min(*walk_seconds);
+                        }
                     }
                 }
-            }
-            (flat, unsnapped_from, unsnapped_to)
+                (flat, unsnapped_from, unsnapped_to)
+            })
         });
         let result = PyDict::new(py);
         result.set_item(
@@ -665,7 +683,7 @@ impl TransportNetwork {
     /// whole-day ULTRA set is never claimed — and the Python wrapper
     /// owns axis validation and destination chunking. Internal until
     /// the arrive-by surface stabilises.
-    #[pyo3(signature = (from_stops, to_stops, date, deadline, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![]))]
+    #[pyo3(signature = (from_stops, to_stops, date, deadline, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn _arrive_by_time_matrix<'py>(
         &self,
@@ -678,6 +696,7 @@ impl TransportNetwork {
         exclude_routes: Vec<String>,
         exclude_trips: Vec<String>,
         exclude_stops: Vec<String>,
+        workers: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray2<u32>>> {
         let origins: Vec<StopIdx> = from_stops
             .iter()
@@ -705,52 +724,56 @@ impl TransportNetwork {
             .collect();
         let destination_count = destinations.len();
         let flat: Vec<u32> = py.allow_threads(|| {
-            let reversed = ReversedTransfers::build(&self.transfers);
-            // Each run folds into its dense column inside the worker;
-            // per-stop frontiers never accumulate across destinations.
-            let ticker = crate::logging::ProgressTicker::new(
-                "travel_time_matrix (arrive-by fold)",
-                requests.len(),
-            );
-            let tick = || ticker.tick();
-            let columns: Vec<Vec<u32>> = reverse::reverse_one_to_all_fold_with_progress(
-                &self.build.timetable,
-                &reversed,
-                &requests,
-                |column, states| {
-                    let destination = destinations[column];
-                    let excluded = exclusions
-                        .as_deref()
-                        .is_some_and(|excluded| excluded.excludes_stop(destination));
-                    origins
-                        .iter()
-                        .map(|&origin| {
-                            let mut best: Option<(u32, u32, u32)> = None;
-                            for &(round, departure, achieved) in &states[origin.0 as usize] {
-                                crate::options::arrive_by_winner(
-                                    &mut best,
-                                    (departure, round as u32, achieved),
-                                );
-                            }
-                            if origin == destination && !excluded {
-                                crate::options::arrive_by_winner(
-                                    &mut best,
-                                    (deadline, 0, deadline),
-                                );
-                            }
-                            best.map_or(u32::MAX, |(departure, _, achieved)| achieved - departure)
-                        })
-                        .collect()
-                },
-                crate::logging::progress_hook(&ticker, &tick),
-            );
-            let mut flat = vec![u32::MAX; origins.len() * destination_count];
-            for (column, cells) in columns.iter().enumerate() {
-                for (row, &cell) in cells.iter().enumerate() {
-                    flat[row * destination_count + column] = cell;
+            crate::workers::with_workers("arrive_by_time_matrix", workers, || {
+                let reversed = ReversedTransfers::build(&self.transfers);
+                // Each run folds into its dense column inside the worker;
+                // per-stop frontiers never accumulate across destinations.
+                let ticker = crate::logging::ProgressTicker::new(
+                    "travel_time_matrix (arrive-by fold)",
+                    requests.len(),
+                );
+                let tick = || ticker.tick();
+                let columns: Vec<Vec<u32>> = reverse::reverse_one_to_all_fold_with_progress(
+                    &self.build.timetable,
+                    &reversed,
+                    &requests,
+                    |column, states| {
+                        let destination = destinations[column];
+                        let excluded = exclusions
+                            .as_deref()
+                            .is_some_and(|excluded| excluded.excludes_stop(destination));
+                        origins
+                            .iter()
+                            .map(|&origin| {
+                                let mut best: Option<(u32, u32, u32)> = None;
+                                for &(round, departure, achieved) in &states[origin.0 as usize] {
+                                    crate::options::arrive_by_winner(
+                                        &mut best,
+                                        (departure, round as u32, achieved),
+                                    );
+                                }
+                                if origin == destination && !excluded {
+                                    crate::options::arrive_by_winner(
+                                        &mut best,
+                                        (deadline, 0, deadline),
+                                    );
+                                }
+                                best.map_or(u32::MAX, |(departure, _, achieved)| {
+                                    achieved - departure
+                                })
+                            })
+                            .collect()
+                    },
+                    crate::logging::progress_hook(&ticker, &tick),
+                );
+                let mut flat = vec![u32::MAX; origins.len() * destination_count];
+                for (column, cells) in columns.iter().enumerate() {
+                    for (row, &cell) in cells.iter().enumerate() {
+                        flat[row * destination_count + column] = cell;
+                    }
                 }
-            }
-            flat
+                flat
+            })
         });
         flat.into_pyarray(py)
             .reshape([origins.len(), destination_count])
@@ -764,7 +787,7 @@ impl TransportNetwork {
     /// percentiles of its per-mark durations (each mark's
     /// latest-departure journey's own duration; `u32::MAX` where a
     /// mark is unreachable). Internal.
-    #[pyo3(signature = (from_stops, to_stops, date, arrival, window, percentiles, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![]))]
+    #[pyo3(signature = (from_stops, to_stops, date, arrival, window, percentiles, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn _arrive_by_time_percentiles<'py>(
         &self,
@@ -779,6 +802,7 @@ impl TransportNetwork {
         exclude_routes: Vec<String>,
         exclude_trips: Vec<String>,
         exclude_stops: Vec<String>,
+        workers: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray3<u32>>> {
         validate_window(window, &percentiles)?;
         let origins: Vec<StopIdx> = from_stops
@@ -810,61 +834,68 @@ impl TransportNetwork {
         let destination_count = destinations.len();
         let planes = percentiles.len();
         let flat: Vec<u32> = py.allow_threads(|| {
-            let reversed = ReversedTransfers::build(&self.transfers);
-            let ticker = crate::logging::ProgressTicker::new(
-                "travel_time_matrix (arrive-by fold)",
-                requests.len(),
-            );
-            let tick = || ticker.tick();
-            let columns: Vec<Vec<u32>> = reverse::reverse_one_to_all_fold_with_progress(
-                &self.build.timetable,
-                &reversed,
-                &requests,
-                |column, states| {
-                    let destination = destinations[column];
-                    let excluded = exclusions
-                        .as_deref()
-                        .is_some_and(|excluded| excluded.excludes_stop(destination));
-                    let mut cells = Vec::with_capacity(origins.len() * planes);
-                    for &origin in &origins {
-                        let profile =
-                            reverse::reverse_profile_states(&states[origin.0 as usize], &marks);
-                        let mut durations: Vec<u32> = profile
-                            .iter()
-                            .zip(&marks)
-                            .map(|(winners, &mark)| {
-                                let mut best: Option<(u32, u32, u32)> = None;
-                                for &(round, departure, achieved) in winners {
-                                    crate::options::arrive_by_winner(
-                                        &mut best,
-                                        (departure, round as u32, achieved),
-                                    );
-                                }
-                                if origin == destination && !excluded {
-                                    crate::options::arrive_by_winner(&mut best, (mark, 0, mark));
-                                }
-                                best.map_or(u32::MAX, |(departure, _, achieved)| {
-                                    achieved - departure
+            crate::workers::with_workers("arrive_by_time_percentiles", workers, || {
+                let reversed = ReversedTransfers::build(&self.transfers);
+                let ticker = crate::logging::ProgressTicker::new(
+                    "travel_time_matrix (arrive-by fold)",
+                    requests.len(),
+                );
+                let tick = || ticker.tick();
+                let columns: Vec<Vec<u32>> = reverse::reverse_one_to_all_fold_with_progress(
+                    &self.build.timetable,
+                    &reversed,
+                    &requests,
+                    |column, states| {
+                        let destination = destinations[column];
+                        let excluded = exclusions
+                            .as_deref()
+                            .is_some_and(|excluded| excluded.excludes_stop(destination));
+                        let mut cells = Vec::with_capacity(origins.len() * planes);
+                        for &origin in &origins {
+                            let profile =
+                                reverse::reverse_profile_states(&states[origin.0 as usize], &marks);
+                            let mut durations: Vec<u32> = profile
+                                .iter()
+                                .zip(&marks)
+                                .map(|(winners, &mark)| {
+                                    let mut best: Option<(u32, u32, u32)> = None;
+                                    for &(round, departure, achieved) in winners {
+                                        crate::options::arrive_by_winner(
+                                            &mut best,
+                                            (departure, round as u32, achieved),
+                                        );
+                                    }
+                                    if origin == destination && !excluded {
+                                        crate::options::arrive_by_winner(
+                                            &mut best,
+                                            (mark, 0, mark),
+                                        );
+                                    }
+                                    best.map_or(u32::MAX, |(departure, _, achieved)| {
+                                        achieved - departure
+                                    })
                                 })
-                            })
-                            .collect();
-                        durations.sort_unstable();
-                        for &percentile in &percentiles {
-                            cells.push(cafein_core::raptor::nearest_rank(&durations, percentile));
+                                .collect();
+                            durations.sort_unstable();
+                            for &percentile in &percentiles {
+                                cells.push(cafein_core::raptor::nearest_rank(
+                                    &durations, percentile,
+                                ));
+                            }
                         }
+                        cells
+                    },
+                    crate::logging::progress_hook(&ticker, &tick),
+                );
+                let mut flat = vec![u32::MAX; origins.len() * destination_count * planes];
+                for (column, cells) in columns.iter().enumerate() {
+                    for (row, values) in cells.chunks(planes).enumerate() {
+                        let base = (row * destination_count + column) * planes;
+                        flat[base..base + planes].copy_from_slice(values);
                     }
-                    cells
-                },
-                crate::logging::progress_hook(&ticker, &tick),
-            );
-            let mut flat = vec![u32::MAX; origins.len() * destination_count * planes];
-            for (column, cells) in columns.iter().enumerate() {
-                for (row, values) in cells.chunks(planes).enumerate() {
-                    let base = (row * destination_count + column) * planes;
-                    flat[base..base + planes].copy_from_slice(values);
                 }
-            }
-            flat
+                flat
+            })
         });
         flat.into_pyarray(py)
             .reshape([origins.len(), destination_count, planes])
@@ -876,7 +907,7 @@ impl TransportNetwork {
     /// origin's access links over the per-mark profile winners beside
     /// the per-mark direct-walk candidate, and holds nearest-rank
     /// percentiles of the winners' own durations. Internal.
-    #[pyo3(signature = (origins, destinations, date, arrival, window, percentiles, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    #[pyo3(signature = (origins, destinations, date, arrival, window, percentiles, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn _arrive_by_time_percentiles_from_points(
         &self,
@@ -894,6 +925,7 @@ impl TransportNetwork {
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
+        workers: Option<usize>,
     ) -> PyResult<Py<PyDict>> {
         validate_window(window, &percentiles)?;
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
@@ -910,108 +942,113 @@ impl TransportNetwork {
         let destination_count = destinations.len();
         let planes = percentiles.len();
         let (flat, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
-            let mut linked = streets.link_pointsets(
-                &[&origins[..], &destinations[..]],
-                speed,
-                max_walking_time,
-                max_snap_distance,
-            );
-            let destination_links = linked.pop().unwrap();
-            let origin_links = linked.pop().unwrap();
-            let unsnapped_from = unsnapped(&origin_links);
-            let unsnapped_to = unsnapped(&destination_links);
-            let requests: Vec<Request> = destination_links
-                .iter()
-                .map(|links| Request {
-                    departure: deadline,
-                    access: Vec::new(),
-                    egress: request_offsets(links.as_deref().unwrap_or(&[])),
-                    active_services: active_services.clone(),
-                    active_services_previous: active_services_previous.clone(),
-                    max_transfers,
-                    exclusions: exclusions.clone(),
-                })
-                .collect();
-            let access = egress_tables(&origin_links);
-            let reversed = ReversedTransfers::build(&self.transfers);
-            let walk = streets.walk_matrix(
-                &origins,
-                &destinations,
-                speed,
-                max_walking_time,
-                max_snap_distance,
-            );
-            let ticker = crate::logging::ProgressTicker::new(
-                "travel_time_matrix (arrive-by fold)",
-                requests.len(),
-            );
-            let tick = || ticker.tick();
-            let columns: Vec<Vec<u32>> = reverse::reverse_one_to_all_fold_with_progress(
-                &self.build.timetable,
-                &reversed,
-                &requests,
-                |column, states| {
-                    let mut cells = Vec::with_capacity(access.len() * planes);
-                    for (row, links) in access.iter().enumerate() {
-                        type MarkWinners = Vec<Vec<(u16, u32, u32)>>;
-                        let profiles: Vec<(u32, MarkWinners)> = links
-                            .iter()
-                            .map(|&(stop, seconds, _)| {
-                                (
-                                    seconds,
-                                    reverse::reverse_profile_states(
-                                        &states[stop.0 as usize],
-                                        &marks,
-                                    ),
-                                )
-                            })
-                            .collect();
-                        let mut durations: Vec<u32> = marks
-                            .iter()
-                            .enumerate()
-                            .map(|(at, &mark)| {
-                                let mut best: Option<(u32, u32, u32)> = None;
-                                for (seconds, profile) in &profiles {
-                                    for &(round, departure, achieved) in &profile[at] {
-                                        let Some(composed) = departure.checked_sub(*seconds) else {
-                                            continue;
-                                        };
-                                        crate::options::arrive_by_winner(
-                                            &mut best,
-                                            (composed, round as u32, achieved),
-                                        );
-                                    }
-                                }
-                                if let Some((walk_seconds, _)) = walk[row][column] {
-                                    if let Some(placed) = mark.checked_sub(walk_seconds) {
-                                        crate::options::arrive_by_winner(
-                                            &mut best,
-                                            (placed, 0, mark),
-                                        );
-                                    }
-                                }
-                                best.map_or(u32::MAX, |(departure, _, achieved)| {
-                                    achieved - departure
+            crate::workers::with_workers("arrive_by_time_percentiles_from_points", workers, || {
+                let mut linked = streets.link_pointsets(
+                    &[&origins[..], &destinations[..]],
+                    speed,
+                    max_walking_time,
+                    max_snap_distance,
+                );
+                let destination_links = linked.pop().unwrap();
+                let origin_links = linked.pop().unwrap();
+                let unsnapped_from = unsnapped(&origin_links);
+                let unsnapped_to = unsnapped(&destination_links);
+                let requests: Vec<Request> = destination_links
+                    .iter()
+                    .map(|links| Request {
+                        departure: deadline,
+                        access: Vec::new(),
+                        egress: request_offsets(links.as_deref().unwrap_or(&[])),
+                        active_services: active_services.clone(),
+                        active_services_previous: active_services_previous.clone(),
+                        max_transfers,
+                        exclusions: exclusions.clone(),
+                    })
+                    .collect();
+                let access = egress_tables(&origin_links);
+                let reversed = ReversedTransfers::build(&self.transfers);
+                let walk = streets.walk_matrix(
+                    &origins,
+                    &destinations,
+                    speed,
+                    max_walking_time,
+                    max_snap_distance,
+                );
+                let ticker = crate::logging::ProgressTicker::new(
+                    "travel_time_matrix (arrive-by fold)",
+                    requests.len(),
+                );
+                let tick = || ticker.tick();
+                let columns: Vec<Vec<u32>> = reverse::reverse_one_to_all_fold_with_progress(
+                    &self.build.timetable,
+                    &reversed,
+                    &requests,
+                    |column, states| {
+                        let mut cells = Vec::with_capacity(access.len() * planes);
+                        for (row, links) in access.iter().enumerate() {
+                            type MarkWinners = Vec<Vec<(u16, u32, u32)>>;
+                            let profiles: Vec<(u32, MarkWinners)> = links
+                                .iter()
+                                .map(|&(stop, seconds, _)| {
+                                    (
+                                        seconds,
+                                        reverse::reverse_profile_states(
+                                            &states[stop.0 as usize],
+                                            &marks,
+                                        ),
+                                    )
                                 })
-                            })
-                            .collect();
-                        durations.sort_unstable();
-                        for &percentile in &percentiles {
-                            cells.push(cafein_core::raptor::nearest_rank(&durations, percentile));
+                                .collect();
+                            let mut durations: Vec<u32> = marks
+                                .iter()
+                                .enumerate()
+                                .map(|(at, &mark)| {
+                                    let mut best: Option<(u32, u32, u32)> = None;
+                                    for (seconds, profile) in &profiles {
+                                        for &(round, departure, achieved) in &profile[at] {
+                                            let Some(composed) = departure.checked_sub(*seconds)
+                                            else {
+                                                continue;
+                                            };
+                                            crate::options::arrive_by_winner(
+                                                &mut best,
+                                                (composed, round as u32, achieved),
+                                            );
+                                        }
+                                    }
+                                    if let Some((walk_seconds, _)) = walk[row][column] {
+                                        if let Some(placed) = mark.checked_sub(walk_seconds) {
+                                            crate::options::arrive_by_winner(
+                                                &mut best,
+                                                (placed, 0, mark),
+                                            );
+                                        }
+                                    }
+                                    best.map_or(u32::MAX, |(departure, _, achieved)| {
+                                        achieved - departure
+                                    })
+                                })
+                                .collect();
+                            durations.sort_unstable();
+                            for &percentile in &percentiles {
+                                cells.push(cafein_core::raptor::nearest_rank(
+                                    &durations, percentile,
+                                ));
+                            }
                         }
+                        cells
+                    },
+                    crate::logging::progress_hook(&ticker, &tick),
+                );
+                let mut flat = vec![u32::MAX; origins.len() * destination_count * planes];
+                for (column, cells) in columns.iter().enumerate() {
+                    for (row, values) in cells.chunks(planes).enumerate() {
+                        let base = (row * destination_count + column) * planes;
+                        flat[base..base + planes].copy_from_slice(values);
                     }
-                    cells
-                },
-                crate::logging::progress_hook(&ticker, &tick),
-            );
-            let mut flat = vec![u32::MAX; origins.len() * destination_count * planes];
-            for (column, cells) in columns.iter().enumerate() {
-                for (row, values) in cells.chunks(planes).enumerate() {
-                    let base = (row * destination_count + column) * planes;
-                    flat[base..base + planes].copy_from_slice(values);
                 }
-            }
-            (flat, unsnapped_from, unsnapped_to)
+                (flat, unsnapped_from, unsnapped_to)
+            })
         });
         let result = PyDict::new(py);
         result.set_item(
@@ -1031,7 +1068,7 @@ impl TransportNetwork {
     /// placed to arrive exactly at the deadline, and holds the
     /// complete-journey order winner's own duration. Internal until
     /// the arrive-by surface stabilises.
-    #[pyo3(signature = (origins, destinations, date, deadline, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0))]
+    #[pyo3(signature = (origins, destinations, date, deadline, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn _arrive_by_time_matrix_from_points(
         &self,
@@ -1047,6 +1084,7 @@ impl TransportNetwork {
         walking_speed_kmph: f64,
         max_walking_time: f64,
         max_snap_distance: f64,
+        workers: Option<usize>,
     ) -> PyResult<Py<PyDict>> {
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         let streets = self.installed_streets()?;
@@ -1059,86 +1097,90 @@ impl TransportNetwork {
         let active_services_previous = self.active_services_previous(date)?;
         let destination_count = destinations.len();
         let (flat, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
-            let mut linked = streets.link_pointsets(
-                &[&origins[..], &destinations[..]],
-                speed,
-                max_walking_time,
-                max_snap_distance,
-            );
-            let destination_links = linked.pop().unwrap();
-            let origin_links = linked.pop().unwrap();
-            let unsnapped_from = unsnapped(&origin_links);
-            let unsnapped_to = unsnapped(&destination_links);
-            let requests: Vec<Request> = destination_links
-                .iter()
-                .map(|links| Request {
-                    departure: deadline,
-                    access: Vec::new(),
-                    egress: request_offsets(links.as_deref().unwrap_or(&[])),
-                    active_services: active_services.clone(),
-                    active_services_previous: active_services_previous.clone(),
-                    max_transfers,
-                    exclusions: exclusions.clone(),
-                })
-                .collect();
-            let access = egress_tables(&origin_links);
-            let reversed = ReversedTransfers::build(&self.transfers);
-            let walk = streets.walk_matrix(
-                &origins,
-                &destinations,
-                speed,
-                max_walking_time,
-                max_snap_distance,
-            );
-            // Each run folds into its dense column inside the worker;
-            // per-stop frontiers never accumulate across destinations.
-            let ticker = crate::logging::ProgressTicker::new(
-                "travel_time_matrix (arrive-by fold)",
-                requests.len(),
-            );
-            let tick = || ticker.tick();
-            let columns: Vec<Vec<u32>> = reverse::reverse_one_to_all_fold_with_progress(
-                &self.build.timetable,
-                &reversed,
-                &requests,
-                |column, states| {
-                    access
-                        .iter()
-                        .enumerate()
-                        .map(|(row, links)| {
-                            let mut best: Option<(u32, u32, u32)> = None;
-                            for &(stop, seconds, _) in links {
-                                for &(round, departure, achieved) in &states[stop.0 as usize] {
-                                    let Some(composed) = departure.checked_sub(seconds) else {
-                                        continue;
-                                    };
-                                    crate::options::arrive_by_winner(
-                                        &mut best,
-                                        (composed, round as u32, achieved),
-                                    );
+            crate::workers::with_workers("arrive_by_time_matrix_from_points", workers, || {
+                let mut linked = streets.link_pointsets(
+                    &[&origins[..], &destinations[..]],
+                    speed,
+                    max_walking_time,
+                    max_snap_distance,
+                );
+                let destination_links = linked.pop().unwrap();
+                let origin_links = linked.pop().unwrap();
+                let unsnapped_from = unsnapped(&origin_links);
+                let unsnapped_to = unsnapped(&destination_links);
+                let requests: Vec<Request> = destination_links
+                    .iter()
+                    .map(|links| Request {
+                        departure: deadline,
+                        access: Vec::new(),
+                        egress: request_offsets(links.as_deref().unwrap_or(&[])),
+                        active_services: active_services.clone(),
+                        active_services_previous: active_services_previous.clone(),
+                        max_transfers,
+                        exclusions: exclusions.clone(),
+                    })
+                    .collect();
+                let access = egress_tables(&origin_links);
+                let reversed = ReversedTransfers::build(&self.transfers);
+                let walk = streets.walk_matrix(
+                    &origins,
+                    &destinations,
+                    speed,
+                    max_walking_time,
+                    max_snap_distance,
+                );
+                // Each run folds into its dense column inside the worker;
+                // per-stop frontiers never accumulate across destinations.
+                let ticker = crate::logging::ProgressTicker::new(
+                    "travel_time_matrix (arrive-by fold)",
+                    requests.len(),
+                );
+                let tick = || ticker.tick();
+                let columns: Vec<Vec<u32>> = reverse::reverse_one_to_all_fold_with_progress(
+                    &self.build.timetable,
+                    &reversed,
+                    &requests,
+                    |column, states| {
+                        access
+                            .iter()
+                            .enumerate()
+                            .map(|(row, links)| {
+                                let mut best: Option<(u32, u32, u32)> = None;
+                                for &(stop, seconds, _) in links {
+                                    for &(round, departure, achieved) in &states[stop.0 as usize] {
+                                        let Some(composed) = departure.checked_sub(seconds) else {
+                                            continue;
+                                        };
+                                        crate::options::arrive_by_winner(
+                                            &mut best,
+                                            (composed, round as u32, achieved),
+                                        );
+                                    }
                                 }
-                            }
-                            if let Some((walk_seconds, _)) = walk[row][column] {
-                                if let Some(placed) = deadline.checked_sub(walk_seconds) {
-                                    crate::options::arrive_by_winner(
-                                        &mut best,
-                                        (placed, 0, deadline),
-                                    );
+                                if let Some((walk_seconds, _)) = walk[row][column] {
+                                    if let Some(placed) = deadline.checked_sub(walk_seconds) {
+                                        crate::options::arrive_by_winner(
+                                            &mut best,
+                                            (placed, 0, deadline),
+                                        );
+                                    }
                                 }
-                            }
-                            best.map_or(u32::MAX, |(departure, _, achieved)| achieved - departure)
-                        })
-                        .collect()
-                },
-                crate::logging::progress_hook(&ticker, &tick),
-            );
-            let mut flat = vec![u32::MAX; origins.len() * destination_count];
-            for (column, cells) in columns.iter().enumerate() {
-                for (row, &cell) in cells.iter().enumerate() {
-                    flat[row * destination_count + column] = cell;
+                                best.map_or(u32::MAX, |(departure, _, achieved)| {
+                                    achieved - departure
+                                })
+                            })
+                            .collect()
+                    },
+                    crate::logging::progress_hook(&ticker, &tick),
+                );
+                let mut flat = vec![u32::MAX; origins.len() * destination_count];
+                for (column, cells) in columns.iter().enumerate() {
+                    for (row, &cell) in cells.iter().enumerate() {
+                        flat[row * destination_count + column] = cell;
+                    }
                 }
-            }
-            (flat, unsnapped_from, unsnapped_to)
+                (flat, unsnapped_from, unsnapped_to)
+            })
         });
         let result = PyDict::new(py);
         result.set_item(

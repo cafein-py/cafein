@@ -198,6 +198,7 @@ mod points;
 mod routes;
 mod streets;
 mod time_matrices;
+pub mod workers;
 
 use artifact::*;
 use cost_matrices::*;
@@ -215,6 +216,7 @@ fn _cafein(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(access::aggregate_nearest_f64, m)?)?;
     m.add_function(wrap_pyfunction!(logging::set_log_level, m)?)?;
     m.add_function(wrap_pyfunction!(logging::install_log_dispatch, m)?)?;
+    m.add_function(wrap_pyfunction!(workers::_probe_workers, m)?)?;
     m.add(
         "STREET_MAX_SEGMENT_METERS",
         cafein_core::streets::MAX_SEGMENT_METERS,

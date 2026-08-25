@@ -101,7 +101,7 @@ impl TransportNetwork {
     /// plane (Carrying from the policy reduction, Free from the
     /// walking-only reduction — carriage is optional). Internal.
     #[pyo3(signature = (carrying_access, free_access, date, departure, max_transfers,
-                        unknown_rule, park_stops = None, transfer_mode = None))]
+                        unknown_rule, park_stops = None, transfer_mode = None, workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn _carriage_travel_times(
         &self,
@@ -114,6 +114,7 @@ impl TransportNetwork {
         unknown_rule: &str,
         park_stops: Option<Vec<String>>,
         transfer_mode: Option<(String, f64)>,
+        workers: Option<usize>,
     ) -> PyResult<Py<PyDict>> {
         let departure = parse_time(departure)?;
         let resolve = |offsets: &[(String, u32)]| {
@@ -147,7 +148,11 @@ impl TransportNetwork {
         inputs.park_mask = &park_mask;
         inputs.active_services = &active_services;
         inputs.active_services_previous = &active_services_previous;
-        let result = py.allow_threads(|| search(&inputs, &request));
+        let result = py.allow_threads(|| {
+            crate::workers::with_workers("carriage_travel_times", workers, || {
+                search(&inputs, &request)
+            })
+        });
         let carrying = result.arrivals(CARRYING);
         let free = result.arrivals(FREE);
         let dict = PyDict::new(py);
