@@ -40,8 +40,11 @@ def _saved(network, tmp_path, name="net.cafein"):
 
 
 def test_quiet_by_default(network, tmp_path, capsys):
+    from cafein import TravelTimeMatrix
+
     path = _saved(network, tmp_path)
     cafein.TransportNetwork.load(path)
+    TravelTimeMatrix(network, _served_stops(network, 40), departure=DEPARTURE)
     assert capsys.readouterr().err == ""
     handlers = logging.getLogger("cafein").handlers
     assert all(isinstance(h, logging.NullHandler) for h in handlers)
@@ -422,20 +425,29 @@ def test_street_matrices_swap_to_the_street_identifier(helsinki_streets, caplog)
     assert phases == ["matrix.streets"]
 
 
-def test_fanout_ticks_above_the_threshold(network):
+def test_fanout_ticks_above_the_threshold(network, caplog):
     from cafein import TravelTimeMatrix
 
     origins = _served_stops(network, 40)
     buffer = io.StringIO()
     cafein.enable_logging(stream=buffer)
-    with cafein.collect_timings() as report:
-        TravelTimeMatrix(network, origins, departure=DEPARTURE)
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        with cafein.collect_timings() as report:
+            TravelTimeMatrix(network, origins, departure=DEPARTURE)
     ticks = [line for line in buffer.getvalue().splitlines() if "% (" in line]
     assert len(ticks) == 20
     assert all("travel_time_matrix" in line for line in ticks)
     assert all("origins" in line and "elapsed" in line for line in ticks)
-    # Ticks are plain lines, not phases: the report holds only the
-    # computer's completion.
+    # Ticks are plain INFO records, not phases: no structured
+    # attributes, and the report holds only the computer's completion.
+    tick_records = [record for record in caplog.records if "% (" in record.getMessage()]
+    assert len(tick_records) == 20
+    assert all(record.levelno == logging.INFO for record in tick_records)
+    assert not any(
+        hasattr(record, attribute)
+        for record in tick_records
+        for attribute in ("cafein_phase", "cafein_seconds", "cafein_details")
+    )
     assert [entry["phase"] for entry in report.phases] == ["matrix.travel_times"]
 
 
@@ -727,3 +739,16 @@ def test_standalone_street_build_has_the_multimodal_parent(kantakaupunki_pbf, ca
         if getattr(record, "cafein_phase", None) == "build.multimodal"
     )
     assert "walk" in parent.cafein_details["modes"]
+
+
+def test_a_generator_of_modes_reports_exact_details(kantakaupunki_pbf, caplog):
+    from cafein import StreetNetwork
+
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        StreetNetwork.from_osm(str(kantakaupunki_pbf), modes=(m for m in ["walk"]))
+    parent = next(
+        record
+        for record in caplog.records
+        if getattr(record, "cafein_phase", None) == "build.multimodal"
+    )
+    assert parent.cafein_details["modes"] == ["walk"]

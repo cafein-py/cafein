@@ -241,6 +241,16 @@ class StreetNetwork:
 
         _log.sync()
         bounding_box = validated_bounding_box(bounding_box)
+        # One snapshot serves the build and the phase details alike, so
+        # a one-shot iterable cannot be consumed twice; a non-iterable
+        # falls through to the validator's own refusal.
+        if isinstance(modes, str):
+            modes = (modes,)
+        else:
+            try:
+                modes = tuple(modes)
+            except TypeError:
+                pass
         with _log.phase(
             "build.multimodal",
             _log.build,
@@ -261,7 +271,7 @@ class StreetNetwork:
                     )
                 )
             )
-            resolved = [modes] if isinstance(modes, str) else list(modes)
+            resolved = list(modes)
             ph.note = ", ".join(resolved)
             ph.details["modes"] = resolved
         return network
