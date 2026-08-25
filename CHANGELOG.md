@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `enable_logging` gains `progress=`: `"lines"` (the default, as
+  before), `"bar"` for one live progress bar per matrix fan-out
+  (`tqdm.auto` — a widget in Jupyter, a carriage-return line in
+  terminals; tqdm ships as the optional `progress` extra), and
+  `False` for phase completions only — pipeline logs without tick
+  lines. Tick records now carry a structured `cafein_progress`
+  attribute (`label`/`done`/`total`) for custom handlers.
+  ([#312](https://github.com/cafein-py/cafein/pull/312))
+
 - The logging sweep: the multimodal build reports its extraction,
   elevation, and car-speed sub-phases; the windowed, least-cost,
   arrive-by, fare-frontier, and carriage fan-outs tick progress like
