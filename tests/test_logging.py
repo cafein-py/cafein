@@ -693,3 +693,37 @@ def test_restricted_frontier_ticks_once_per_origin(network):
     # The restriction pass must not inflate the count past the origins.
     assert len(ticks) == 20
     assert all("/40 origins" in line for line in ticks)
+
+
+def test_street_artifact_phases(helsinki_streets, tmp_path):
+    from cafein import StreetNetwork
+
+    with cafein.collect_timings() as report:
+        path = tmp_path / "streets.cafein"
+        helsinki_streets.save(path)
+        StreetNetwork.load(path)
+    assert [entry["phase"] for entry in report.phases] == [
+        "artifact.save",
+        "artifact.load",
+    ]
+    for entry in report.phases:
+        assert entry["details"]["path"] == str(path)
+
+
+def test_standalone_street_build_has_the_multimodal_parent(kantakaupunki_pbf, caplog):
+    from cafein import StreetNetwork
+
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        StreetNetwork.from_osm(str(kantakaupunki_pbf))
+    phases = [
+        record.cafein_phase
+        for record in caplog.records
+        if hasattr(record, "cafein_phase")
+    ]
+    assert phases.index("build.multimodal.streets") < phases.index("build.multimodal")
+    parent = next(
+        record
+        for record in caplog.records
+        if getattr(record, "cafein_phase", None) == "build.multimodal"
+    )
+    assert "walk" in parent.cafein_details["modes"]

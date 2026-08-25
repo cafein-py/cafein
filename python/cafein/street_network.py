@@ -239,21 +239,32 @@ class StreetNetwork:
         """
         from cafein._validate import validated_bounding_box
 
+        _log.sync()
         bounding_box = validated_bounding_box(bounding_box)
-        return cls(
-            _CoreStreetNetwork(
-                *multimodal_payload(
-                    osm_pbf,
-                    modes=modes,
-                    bounding_box=bounding_box,
-                    dem=dem,
-                    dem_interval=dem_interval,
-                    country=country,
-                    urban_areas=urban_areas,
-                    speed_limits=speed_limits,
+        with _log.phase(
+            "build.multimodal",
+            _log.build,
+            "building the multimodal street graph",
+            "built the multimodal street graph",
+        ) as ph:
+            network = cls(
+                _CoreStreetNetwork(
+                    *multimodal_payload(
+                        osm_pbf,
+                        modes=modes,
+                        bounding_box=bounding_box,
+                        dem=dem,
+                        dem_interval=dem_interval,
+                        country=country,
+                        urban_areas=urban_areas,
+                        speed_limits=speed_limits,
+                    )
                 )
             )
-        )
+            resolved = [modes] if isinstance(modes, str) else list(modes)
+            ph.note = ", ".join(resolved)
+            ph.details["modes"] = resolved
+        return network
 
     @property
     def elevation_metadata(self):
@@ -283,7 +294,16 @@ class StreetNetwork:
         and attribute arrays behind a versioned, checksummed header, so batch
         jobs can ``load`` the file instead of re-running the OSM extraction.
         """
-        self._core.save(os.fspath(path))
+        _log.sync()
+        target = os.fspath(path)
+        with _log.phase(
+            "artifact.save",
+            _log.artifact,
+            "saving the street artifact",
+            "saved the street artifact",
+        ) as ph:
+            ph.details["path"] = target
+            self._core.save(target)
 
     @classmethod
     def load(cls, path, *, mmap=False, verify=None):
@@ -306,7 +326,17 @@ class StreetNetwork:
         modes = {False: "off", True: "auto", "require": "require"}
         if mmap not in modes:
             raise ValueError(f"mmap must be False, True, or 'require', not {mmap!r}")
-        return cls(_CoreStreetNetwork.load(os.fspath(path), modes[mmap], verify))
+        _log.sync()
+        source = os.fspath(path)
+        with _log.phase(
+            "artifact.load",
+            _log.artifact,
+            "loading the street artifact",
+            "loaded the street artifact",
+        ) as ph:
+            ph.details["path"] = source
+            core = _CoreStreetNetwork.load(source, modes[mmap], verify)
+        return cls(core)
 
     @property
     def mapped(self):
