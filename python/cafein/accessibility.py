@@ -999,7 +999,7 @@ class Accessibility(pd.DataFrame):
     prices pre-enumerated candidates and takes no implicit cap), and
     the time axis rejects it — the budgets already bound time.
 
-    ``street_policy=`` takes a ``cafein.CarParkPolicy`` (a network
+    ``street_policy=`` takes a ``cafein.policy.CarParkPolicy`` (a network
     built with ``"car"`` in ``street_modes=``): each origin's access
     composes drive-to-facility, parking search, and the facility walk,
     with the ordinary walking access competing beside the car plane
@@ -2113,6 +2113,8 @@ class NearestDestinations(pd.DataFrame):
         exact engine values). Other axes always report their native
         unit.
 
+    Notes
+    -----
     The routing knobs (``departure``, ``max_rides``, ``router``, the
     exclusions, and the walking options) follow ``Accessibility``.
     """
@@ -2484,6 +2486,8 @@ class Catchment(gpd.GeoDataFrame):
         the per-departure arrival distribution fits the budget. The
         output carries no percentile dimension.
 
+    Notes
+    -----
     ``cost``, ``departure``, ``departure_time_window``, ``max_rides``,
     ``router``, ``factors``/``components``/``fares``,
     ``transport_mode``, the exclusions, and the walking options follow

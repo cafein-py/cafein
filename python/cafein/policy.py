@@ -448,6 +448,8 @@ class CarParkPolicy:
     delay_model : optional
         The delay model override the standalone car surfaces take.
 
+    Notes
+    -----
     The car serves access only: the parked car stays at the facility
     and the rest of the journey is transit and walking. Ordinary
     walking access competes beside the drive — enabling the car
