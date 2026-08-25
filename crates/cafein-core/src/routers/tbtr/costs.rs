@@ -3,6 +3,8 @@
 
 use super::*;
 
+use crate::progress::Progress;
+
 impl<'a> TbtrEngine<'a> {
     /// The fastest journey's aggregated costs to `stop`, mirroring
     /// `Search::costs_to`: rounds scan ascending, only a strictly
@@ -238,6 +240,17 @@ impl<'a> TbtrEngine<'a> {
         requests: &[Request],
         destinations: &[StopIdx],
     ) -> Vec<Vec<CostRow>> {
+        self.cost_matrix_with_progress(inputs, requests, destinations, None)
+    }
+
+    /// [`TbtrEngine::cost_matrix`] reporting each completed origin.
+    pub fn cost_matrix_with_progress(
+        &self,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        destinations: &[StopIdx],
+        progress: Progress<'_>,
+    ) -> Vec<Vec<CostRow>> {
         requests
             .par_iter()
             .map_init(
@@ -251,12 +264,16 @@ impl<'a> TbtrEngine<'a> {
                         _ => pooled.insert(MatrixState::new(self, request.max_transfers)),
                     };
                     self.matrix_pass(request.departure, &request.access, state);
-                    destinations
+                    let row = destinations
                         .iter()
                         .filter_map(|&stop| {
                             self.matrix_costs_to(state, stop, request.departure, inputs, None)
                         })
-                        .collect()
+                        .collect();
+                    if let Some(tick) = progress {
+                        tick();
+                    }
+                    row
                 },
             )
             .collect()
@@ -363,6 +380,19 @@ impl<'a> TbtrEngine<'a> {
         access_meters: &[HashMap<StopIdx, f64>],
         egress: &[Vec<(StopIdx, u32, f64)>],
     ) -> Vec<Vec<CostRow>> {
+        self.cost_matrix_to_points_with_progress(inputs, requests, access_meters, egress, None)
+    }
+
+    /// [`TbtrEngine::cost_matrix_to_points`] reporting each completed
+    /// origin.
+    pub fn cost_matrix_to_points_with_progress(
+        &self,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        access_meters: &[HashMap<StopIdx, f64>],
+        egress: &[Vec<(StopIdx, u32, f64)>],
+        progress: Progress<'_>,
+    ) -> Vec<Vec<CostRow>> {
         assert_eq!(requests.len(), access_meters.len());
         requests
             .par_iter()
@@ -378,7 +408,7 @@ impl<'a> TbtrEngine<'a> {
                         _ => pooled.insert(MatrixState::new(self, request.max_transfers)),
                     };
                     self.matrix_pass(request.departure, &request.access, state);
-                    egress
+                    let row = egress
                         .iter()
                         .enumerate()
                         .filter_map(|(point, links)| {
@@ -391,7 +421,11 @@ impl<'a> TbtrEngine<'a> {
                                 access,
                             )
                         })
-                        .collect()
+                        .collect();
+                    if let Some(tick) = progress {
+                        tick();
+                    }
+                    row
                 },
             )
             .collect()

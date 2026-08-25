@@ -1,13 +1,15 @@
 //! The bridge that carries log records to Python's `logging`.
 //!
-//! Python arms the bridge by syncing the `"cafein"` logger's effective
-//! level into an atomic threshold; a record below the threshold costs
-//! one relaxed load and no GIL activity. Armed records are delivered
+//! Python arms the bridge by syncing the minimum effective level over
+//! the `cafein.build`/`cafein.matrix`/`cafein.artifact` loggers (capped
+//! at INFO while a timing collector is active) into an atomic
+//! threshold; a record below the threshold costs one relaxed load and
+//! no GIL activity. Armed records are delivered
 //! through the dispatch callable `cafein._log` registers at import,
 //! and errors are swallowed — logging must never break a computation.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 use pyo3::prelude::*;
@@ -94,5 +96,81 @@ impl PhaseTimer {
             Some(self.phase),
             Some(seconds),
         );
+    }
+}
+
+/// Emits throttled INFO progress lines from an origin fan-out: one
+/// `tick` per completed origin, a line at each ~5% boundary (at most
+/// ~20 GIL acquisitions per run). Constructed disarmed when logging is
+/// off or the run is small; disarmed call sites pass the core `None`
+/// so the fan-out runs exactly as before.
+pub struct ProgressTicker {
+    label: &'static str,
+    total: usize,
+    step: usize,
+    completed: AtomicUsize,
+    /// The last boundary reported; boundary holders emit every
+    /// pending boundary in order under this lock, so lines never
+    /// regress however the workers interleave.
+    emitted: Mutex<usize>,
+    started: Instant,
+    armed: bool,
+}
+
+impl ProgressTicker {
+    /// Runs below this many origins never tick; their phase
+    /// completion is report enough.
+    const MIN_TOTAL: usize = 40;
+
+    pub fn new(label: &'static str, total: usize) -> Self {
+        let armed = total >= Self::MIN_TOTAL && enabled(INFO) && DISPATCH.get().is_some();
+        ProgressTicker {
+            label,
+            total,
+            step: total.div_ceil(20).max(1),
+            completed: AtomicUsize::new(0),
+            emitted: Mutex::new(0),
+            started: Instant::now(),
+            armed,
+        }
+    }
+
+    /// One completed origin. Call only where the GIL is released.
+    pub fn tick(&self) {
+        if !self.armed {
+            return;
+        }
+        let done = self.completed.fetch_add(1, Ordering::Relaxed) + 1;
+        if !done.is_multiple_of(self.step) {
+            return;
+        }
+        let mut emitted = self.emitted.lock().unwrap_or_else(PoisonError::into_inner);
+        while *emitted + self.step <= done {
+            *emitted += self.step;
+            let at = *emitted;
+            let (label, total) = (self.label, self.total);
+            let percent = at * 100 / total;
+            let seconds = self.started.elapsed().as_secs_f64();
+            emit(
+                "cafein.matrix",
+                INFO,
+                || format!("{label} {percent}% ({at}/{total} origins, {seconds:.1} s elapsed)"),
+                None,
+                None,
+            );
+        }
+    }
+}
+
+/// The core-facing hook for a ticker: `None` when disarmed, so the
+/// fan-out's hot path carries no counter at all.
+pub fn progress_hook<'a>(
+    ticker: &ProgressTicker,
+    tick: &'a (dyn Fn() + Sync),
+) -> cafein_core::progress::Progress<'a> {
+    if ticker.armed {
+        Some(tick)
+    } else {
+        None
     }
 }

@@ -354,3 +354,220 @@ def test_an_oversized_custom_level_suppresses_without_wrapping(network, tmp_path
         "artifact.save.encode",
         "artifact.save",
     ]
+
+
+DEPARTURE = "2022-02-22 08:30:00"
+
+
+def _served_stops(network, count):
+    stops = [stop for stop, lat, lon in network.stops if lat is not None]
+    return stops[1000 : 1000 + count]
+
+
+def test_matrix_computers_emit_their_phases(network, caplog):
+    from cafein import Accessibility, TravelCostMatrix, TravelTimeMatrix
+
+    origins = _served_stops(network, 5)
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        TravelTimeMatrix(network, origins=origins, departure=DEPARTURE)
+        TravelCostMatrix(network, origins, origins, DEPARTURE)
+        Accessibility(network, origins, _served_stops(network, 30), DEPARTURE)
+    records = {
+        record.cafein_phase: record
+        for record in caplog.records
+        if hasattr(record, "cafein_phase")
+    }
+    assert {
+        "matrix.travel_times",
+        "matrix.travel_costs",
+        "matrix.accessibility",
+    } <= set(records)
+    assert records["matrix.travel_times"].cafein_details["rows"] > 0
+    assert records["matrix.travel_times"].cafein_details["origins"] == 5
+    assert records["matrix.travel_times"].cafein_seconds > 0
+
+
+def test_itineraries_emit_their_phase(network, caplog):
+    from cafein import DetailedItineraries
+
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        DetailedItineraries(network, ["4810551"], ["1250551"], DEPARTURE)
+    phases = [
+        record.cafein_phase
+        for record in caplog.records
+        if hasattr(record, "cafein_phase")
+    ]
+    assert "matrix.itineraries" in phases
+
+
+def test_street_matrices_swap_to_the_street_identifier(helsinki_streets, caplog):
+    import geopandas
+    from shapely.geometry import Point
+
+    from cafein import TravelTimeMatrix
+
+    points = geopandas.GeoDataFrame(
+        {"id": ["a", "b"]},
+        geometry=[Point(24.94, 60.17), Point(24.95, 60.18)],
+        crs="EPSG:4326",
+    )
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        TravelTimeMatrix(helsinki_streets, points, transport_mode="walk")
+    phases = [
+        record.cafein_phase
+        for record in caplog.records
+        if hasattr(record, "cafein_phase")
+    ]
+    assert phases == ["matrix.streets"]
+
+
+def test_fanout_ticks_above_the_threshold(network):
+    from cafein import TravelTimeMatrix
+
+    origins = _served_stops(network, 40)
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    with cafein.collect_timings() as report:
+        TravelTimeMatrix(network, origins, departure=DEPARTURE)
+    ticks = [line for line in buffer.getvalue().splitlines() if "% (" in line]
+    assert len(ticks) == 20
+    assert all("travel_time_matrix" in line for line in ticks)
+    assert all("origins" in line and "elapsed" in line for line in ticks)
+    # Ticks are plain lines, not phases: the report holds only the
+    # computer's completion.
+    assert [entry["phase"] for entry in report.phases] == ["matrix.travel_times"]
+
+
+def test_no_ticks_below_the_threshold(network):
+    from cafein import TravelTimeMatrix
+
+    origins = _served_stops(network, 10)
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    TravelTimeMatrix(network, origins, departure=DEPARTURE)
+    output = buffer.getvalue()
+    assert not [line for line in output.splitlines() if "% (" in line]
+    assert "computed the travel time matrix in" in output
+
+
+def test_results_are_identical_with_logging_on(network):
+    import pandas
+
+    from cafein import TravelTimeMatrix
+
+    origins = _served_stops(network, 40)
+    quiet = TravelTimeMatrix(network, origins, departure=DEPARTURE)
+    cafein.enable_logging(stream=io.StringIO(), level="debug")
+    with cafein.collect_timings():
+        loud = TravelTimeMatrix(network, origins, departure=DEPARTURE)
+    pandas.testing.assert_frame_equal(pandas.DataFrame(quiet), pandas.DataFrame(loud))
+
+
+def test_tbtr_precompute_emits_its_phase(network, tmp_path, caplog):
+    # A loaded copy, so the shared session fixture is not mutated.
+    path = _saved(network, tmp_path)
+    copy = cafein.TransportNetwork.load(path)
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        copy.compute_tbtr_transfers("2022-02-22")
+    phases = [
+        record.cafein_phase
+        for record in caplog.records
+        if hasattr(record, "cafein_phase")
+    ]
+    assert phases == ["build.tbtr"]
+
+
+def _scattered_points(count, seed=1, centre=(60.170, 24.940)):
+    import math
+
+    import geopandas
+    from shapely.geometry import Point
+
+    latitude, longitude = centre
+    records = []
+    for index in range(count):
+        angle = (seed + index) * 2.399963  # the golden angle
+        radius = 100 + (seed * 37 + index * 211) % 900
+        records.append(
+            Point(
+                longitude + radius * math.sin(angle) / 56_000,
+                latitude + radius * math.cos(angle) / 111_320,
+            )
+        )
+    return geopandas.GeoDataFrame(
+        {"id": [f"point-{seed}-{index}" for index in range(count)]},
+        geometry=records,
+        crs="EPSG:4326",
+    )
+
+
+def test_tick_percentages_never_regress(network):
+    import re
+
+    from cafein import TravelTimeMatrix
+
+    origins = _served_stops(network, 40)
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    TravelTimeMatrix(network, origins, departure=DEPARTURE)
+    counts = [
+        int(re.search(r"\((\d+)/40 origins", line).group(1))
+        for line in buffer.getvalue().splitlines()
+        if "% (" in line
+    ]
+    assert counts == sorted(counts) and len(counts) == len(set(counts))
+
+
+def test_street_cost_matrix_ticks(helsinki_streets):
+    from cafein import TravelCostMatrix
+
+    points = _scattered_points(40)
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    TravelCostMatrix(helsinki_streets, points, points[:5], transport_mode="walk")
+    output = buffer.getvalue()
+    ticks = [line for line in output.splitlines() if "% (" in line]
+    assert ticks and all("street matrix" in line for line in ticks)
+    assert "computed the street cost matrix in" in output
+
+
+def test_policy_cost_matrix_ticks(network_with_footpaths):
+    from cafein import StreetLegPolicy, TravelCostMatrix
+
+    points = _scattered_points(60, seed=2)
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    TravelCostMatrix(
+        network_with_footpaths,
+        points,
+        points[:3],
+        DEPARTURE,
+        street_policy=StreetLegPolicy(access={"walk": 1800}, egress={"walk": 1800}),
+    )
+    ticks = [line for line in buffer.getvalue().splitlines() if "% (" in line]
+    assert ticks and all("travel_cost_matrix" in line for line in ticks)
+
+
+def test_details_bind_positional_and_keyword_forms(network, caplog):
+    import datetime
+
+    from cafein import TravelTimeMatrix
+
+    origins = _served_stops(network, 5)
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        TravelTimeMatrix(
+            network,
+            origins,
+            None,
+            DEPARTURE,
+            departure_time_window=datetime.timedelta(minutes=10),
+            chunk=(0, 2),
+        )
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "cafein_phase", None) == "matrix.travel_times"
+    )
+    assert record.cafein_details["origins"] == 5
+    assert record.cafein_details["window"] == datetime.timedelta(minutes=10)
+    assert record.cafein_details["chunk"] == (0, 2)

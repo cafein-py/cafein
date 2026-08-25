@@ -1468,6 +1468,26 @@ impl StreetNetwork {
         max_seconds: f64,
         max_snap_distance: f64,
     ) -> (Vec<Vec<Option<u32>>>, Vec<u32>, Vec<u32>) {
+        self.directed_matrix_with_progress(
+            origins,
+            destinations,
+            profile,
+            max_seconds,
+            max_snap_distance,
+            None,
+        )
+    }
+
+    /// [`Self::directed_matrix`] reporting each completed origin.
+    pub fn directed_matrix_with_progress(
+        &self,
+        origins: &[(f64, f64)],
+        destinations: &[(f64, f64)],
+        profile: &CompiledStreetProfile,
+        max_seconds: f64,
+        max_snap_distance: f64,
+        progress: crate::progress::Progress<'_>,
+    ) -> (Vec<Vec<Option<u32>>>, Vec<u32>, Vec<u32>) {
         let snap = |&(latitude, longitude): &(f64, f64)| {
             self.snap_for_profile(latitude, longitude, max_snap_distance, profile)
         };
@@ -1480,22 +1500,28 @@ impl StreetNetwork {
         let rows: Vec<Vec<Option<u32>>> = origin_snaps
             .par_iter()
             .zip(origins)
-            .map(|(origin, &coordinate)| match origin {
-                None => vec![None; destinations.len()],
-                Some(from) => {
-                    let mut row =
-                        self.directed_times_to_snaps(from, &target_snaps, profile, max_seconds);
-                    if routable {
-                        for ((cell, &destination), target) in
-                            row.iter_mut().zip(destinations).zip(&target_snaps)
-                        {
-                            if destination == coordinate && target.is_some() {
-                                *cell = Some(0);
+            .map(|(origin, &coordinate)| {
+                let row = match origin {
+                    None => vec![None; destinations.len()],
+                    Some(from) => {
+                        let mut row =
+                            self.directed_times_to_snaps(from, &target_snaps, profile, max_seconds);
+                        if routable {
+                            for ((cell, &destination), target) in
+                                row.iter_mut().zip(destinations).zip(&target_snaps)
+                            {
+                                if destination == coordinate && target.is_some() {
+                                    *cell = Some(0);
+                                }
                             }
                         }
+                        row
                     }
-                    row
+                };
+                if let Some(tick) = progress {
+                    tick();
                 }
+                row
             })
             .collect();
         let unsnapped = |snaps: &[Option<Snap>]| -> Vec<u32> {

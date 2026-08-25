@@ -169,6 +169,8 @@ impl TransportNetwork {
             self.resolve_time_router(router, date, exclusions.is_some())?
         };
         let rows = py.allow_threads(|| {
+            let ticker = crate::logging::ProgressTicker::new("travel_time_matrix", origins.len());
+            let tick = || ticker.tick();
             if router == "tbtr" {
                 let engine = self.tbtr_engine(
                     &self.transfers,
@@ -178,7 +180,12 @@ impl TransportNetwork {
                 );
                 let accesses: Vec<Vec<(StopIdx, u32)>> =
                     origins.iter().map(|&origin| vec![(origin, 0)]).collect();
-                engine.one_to_all_many(departure, &accesses, max_transfers)
+                engine.one_to_all_many_with_progress(
+                    departure,
+                    &accesses,
+                    max_transfers,
+                    crate::logging::progress_hook(&ticker, &tick),
+                )
             } else if let Some(speed) = ultra_speed {
                 let streets = self
                     .streets
@@ -208,7 +215,12 @@ impl TransportNetwork {
                         exclusions: exclusions.clone(),
                     })
                     .collect();
-                Raptor.one_to_all_many(&self.build.timetable, &self.transfers, &requests)
+                Raptor.one_to_all_many_with_progress(
+                    &self.build.timetable,
+                    &self.transfers,
+                    &requests,
+                    crate::logging::progress_hook(&ticker, &tick),
+                )
             }
         });
         Ok((rows, departure))
@@ -546,6 +558,8 @@ impl TransportNetwork {
                 })
                 .collect();
             let egress = egress_tables(&destination_links);
+            let ticker = crate::logging::ProgressTicker::new("travel_time_matrix", requests.len());
+            let tick = || ticker.tick();
             let rows: Vec<Vec<Option<u32>>> = if router == "tbtr" {
                 let engine = self.tbtr_engine(
                     self.exclusion_transfers(&exclusions),
@@ -557,12 +571,18 @@ impl TransportNetwork {
                     .iter()
                     .map(|request| request.access.clone())
                     .collect();
-                engine.one_to_all_many(departure, &accesses, max_transfers)
+                engine.one_to_all_many_with_progress(
+                    departure,
+                    &accesses,
+                    max_transfers,
+                    crate::logging::progress_hook(&ticker, &tick),
+                )
             } else {
-                Raptor.one_to_all_many(
+                Raptor.one_to_all_many_with_progress(
                     &self.build.timetable,
                     self.exclusion_transfers(&exclusions),
                     &requests,
+                    crate::logging::progress_hook(&ticker, &tick),
                 )
             };
             let mut flat = vec![u32::MAX; requests.len() * destination_count];
@@ -1347,8 +1367,14 @@ impl TransportNetwork {
                     request(request_offsets(&access))
                 })
                 .collect();
-            let mut usable_rows =
-                Raptor.one_to_all_many(&self.build.timetable, self.time_transfers(), &requests);
+            let ticker = crate::logging::ProgressTicker::new("travel_time_matrix", requests.len());
+            let tick = || ticker.tick();
+            let mut usable_rows = Raptor.one_to_all_many_with_progress(
+                &self.build.timetable,
+                self.time_transfers(),
+                &requests,
+                crate::logging::progress_hook(&ticker, &tick),
+            );
             // The bounded final-walk egress is origin-independent — build it
             // once and fold it into every usable origin's arrivals.
             let egress = self.final_egress(streets, speed, max_walking_time, max_snap_distance);

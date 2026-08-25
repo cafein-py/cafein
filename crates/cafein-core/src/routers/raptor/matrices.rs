@@ -3,6 +3,8 @@
 
 use super::*;
 
+use crate::progress::Progress;
+
 impl TransitRouter for Raptor {
     fn route(
         &self,
@@ -45,6 +47,19 @@ impl Raptor {
         requests: &[Request],
         destinations: &[StopIdx],
     ) -> Vec<Vec<CostRow>> {
+        self.cost_matrix_with_progress(timetable, transfers, inputs, requests, destinations, None)
+    }
+
+    /// [`Raptor::cost_matrix`] reporting each completed origin.
+    pub fn cost_matrix_with_progress(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        destinations: &[StopIdx],
+        progress: Progress<'_>,
+    ) -> Vec<Vec<CostRow>> {
         requests
             .par_iter()
             .map_init(
@@ -58,10 +73,14 @@ impl Raptor {
                         _ => pooled.insert(Search::new(timetable, transfers, request)),
                     };
                     search.run(request.departure);
-                    destinations
+                    let row = destinations
                         .iter()
                         .filter_map(|&stop| search.costs_to(stop, request.departure, inputs, None))
-                        .collect()
+                        .collect();
+                    if let Some(tick) = progress {
+                        tick();
+                    }
+                    row
                 },
             )
             .collect()
@@ -86,6 +105,29 @@ impl Raptor {
         access_meters: &[HashMap<StopIdx, f64>],
         egress: &[Vec<(StopIdx, u32, f64)>],
     ) -> Vec<Vec<CostRow>> {
+        self.cost_matrix_to_points_with_progress(
+            timetable,
+            transfers,
+            inputs,
+            requests,
+            access_meters,
+            egress,
+            None,
+        )
+    }
+
+    /// [`Raptor::cost_matrix_to_points`] reporting each completed origin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cost_matrix_to_points_with_progress(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        access_meters: &[HashMap<StopIdx, f64>],
+        egress: &[Vec<(StopIdx, u32, f64)>],
+        progress: Progress<'_>,
+    ) -> Vec<Vec<CostRow>> {
         assert_eq!(requests.len(), access_meters.len());
         requests
             .par_iter()
@@ -101,7 +143,7 @@ impl Raptor {
                         _ => pooled.insert(Search::new(timetable, transfers, request)),
                     };
                     search.run(request.departure);
-                    egress
+                    let row = egress
                         .iter()
                         .enumerate()
                         .filter_map(|(point, links)| {
@@ -113,7 +155,11 @@ impl Raptor {
                                 access,
                             )
                         })
-                        .collect()
+                        .collect();
+                    if let Some(tick) = progress {
+                        tick();
+                    }
+                    row
                 },
             )
             .collect()
@@ -133,6 +179,17 @@ impl Raptor {
         transfers: &Transfers,
         requests: &[Request],
     ) -> Vec<Vec<Option<u32>>> {
+        self.one_to_all_many_with_progress(timetable, transfers, requests, None)
+    }
+
+    /// [`Raptor::one_to_all_many`] reporting each completed origin.
+    pub fn one_to_all_many_with_progress(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        requests: &[Request],
+        progress: Progress<'_>,
+    ) -> Vec<Vec<Option<u32>>> {
         requests
             .par_iter()
             .map_init(
@@ -146,7 +203,11 @@ impl Raptor {
                         _ => pooled.insert(Search::new(timetable, transfers, request)),
                     };
                     search.run(request.departure);
-                    search.arrivals()
+                    let row = search.arrivals();
+                    if let Some(tick) = progress {
+                        tick();
+                    }
+                    row
                 },
             )
             .collect()

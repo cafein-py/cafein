@@ -5,6 +5,8 @@ import warnings
 
 import numpy as np
 import pandas as pd
+
+from cafein import _log
 import shapely
 
 from cafein._validate import (
@@ -20,6 +22,25 @@ from cafein.travelers import (
     folded_street_policy,
     refuse_wheelchair_streets,
 )
+
+
+def _query_details(arguments):
+    """Best-effort shape facts for a matrix phase."""
+    details = {}
+    for key in ("origins", "destinations"):
+        count = _log.sized(arguments.get(key))
+        if count is not None:
+            details[key] = count
+    for key in ("departure_time_window", "arrival_time_window"):
+        if arguments.get(key) is not None:
+            details["window"] = arguments[key]
+    chunk = arguments.get("chunk")
+    if chunk is not None:
+        try:
+            details["chunk"] = tuple(int(part) for part in chunk)
+        except Exception:
+            pass
+    return details
 
 
 class TravelCostMatrix(pd.DataFrame):
@@ -361,6 +382,17 @@ class TravelCostMatrix(pd.DataFrame):
     def _constructor(self):
         return pd.DataFrame
 
+    @_log.timed_computer(
+        "matrix.travel_costs",
+        _log.matrix,
+        "computing the travel cost matrix",
+        "computed the travel cost matrix",
+        street_identifier="matrix.streets",
+        street_doing="computing the street cost matrix",
+        street_done="computed the street cost matrix",
+        is_street=lambda network: _is_street_network(network),
+        details=_query_details,
+    )
     def __init__(
         self,
         network,
@@ -1232,6 +1264,17 @@ class TravelTimeMatrix(pd.DataFrame):
     def _constructor(self):
         return pd.DataFrame
 
+    @_log.timed_computer(
+        "matrix.travel_times",
+        _log.matrix,
+        "computing the travel time matrix",
+        "computed the travel time matrix",
+        street_identifier="matrix.streets",
+        street_doing="computing the street time matrix",
+        street_done="computed the street time matrix",
+        is_street=lambda network: _is_street_network(network),
+        details=_query_details,
+    )
     def __init__(
         self,
         network,
@@ -2398,6 +2441,17 @@ def _time_columns(
     return data
 
 
+@_log.timed_computer(
+    "matrix.cost_table",
+    _log.matrix,
+    "computing the travel cost table",
+    "computed the travel cost table",
+    street_identifier="matrix.streets",
+    street_doing="computing the street cost table",
+    street_done="computed the street cost table",
+    is_street=lambda network: _is_street_network(network),
+    details=_query_details,
+)
 def travel_cost_table(
     network,
     origins=None,

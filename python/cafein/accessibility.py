@@ -18,6 +18,8 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 
+from cafein import _log
+
 from cafein._validate import (
     freeze_ids,
     id_sequence,
@@ -1016,6 +1018,12 @@ class Accessibility(pd.DataFrame):
     def _constructor(self):
         return pd.DataFrame
 
+    @_log.timed_computer(
+        "matrix.accessibility",
+        _log.matrix,
+        "computing accessibility",
+        "computed accessibility",
+    )
     def __init__(
         self,
         network,

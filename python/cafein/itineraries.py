@@ -9,6 +9,8 @@ from cafein._validate import (
 )
 
 import geopandas as gpd
+
+from cafein import _log
 import numpy as np
 import pandas as pd
 import shapely
@@ -435,6 +437,12 @@ class DetailedItineraries(gpd.GeoDataFrame):
     def _constructor(self):
         return gpd.GeoDataFrame
 
+    @_log.timed_computer(
+        "matrix.itineraries",
+        _log.matrix,
+        "computing detailed itineraries",
+        "computed detailed itineraries",
+    )
     def __init__(
         self,
         network=None,
