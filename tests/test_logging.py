@@ -438,8 +438,9 @@ def test_fanout_ticks_above_the_threshold(network, caplog):
     assert len(ticks) == 20
     assert all("travel_time_matrix" in line for line in ticks)
     assert all("origins" in line and "elapsed" in line for line in ticks)
-    # Ticks are plain INFO records, not phases: no structured
-    # attributes, and the report holds only the computer's completion.
+    # Ticks are plain INFO records, not phases: they carry the
+    # structured progress triple but none of the phase attributes,
+    # and the report holds only the computer's completion.
     tick_records = [record for record in caplog.records if "% (" in record.getMessage()]
     assert len(tick_records) == 20
     assert all(record.levelno == logging.INFO for record in tick_records)
@@ -766,11 +767,11 @@ class _FakeBar:
         self.label = label
         self.total = total
         self.n = 0
-        self.refreshes = 0
+        self.seen = []
         self.closed = False
 
     def refresh(self):
-        self.refreshes += 1
+        self.seen.append(self.n)
 
     def close(self):
         self.closed = True
@@ -797,14 +798,15 @@ def test_progress_bar_drives_one_bar_per_label(network, monkeypatch):
 
     bars = []
 
-    def factory(label, total):
+    def factory(label, total, stream):
+        assert stream is buffer
         bar = _FakeBar(label, total)
         bars.append(bar)
         return bar
 
-    monkeypatch.setattr(_log, "_bar_factory", factory)
     origins = _served_stops(network, 40)
     buffer = io.StringIO()
+    monkeypatch.setattr(_log, "_bar_factory", factory)
     cafein.enable_logging(stream=buffer, progress="bar")
     TravelTimeMatrix(network, origins, departure=DEPARTURE)
     assert len(bars) == 1
@@ -813,20 +815,29 @@ def test_progress_bar_drives_one_bar_per_label(network, monkeypatch):
     assert bar.total == 40
     assert bar.n == 40
     assert bar.closed
+    assert bar.seen == list(range(2, 41, 2))
     output = buffer.getvalue()
     assert "computed the travel time matrix in" in output
     assert not [line for line in output.splitlines() if "% (" in line]
 
 
 def test_progress_bar_without_tqdm_falls_back_to_lines(network, monkeypatch):
+    import sys
+
     from cafein import TravelTimeMatrix
 
-    monkeypatch.setattr(_log, "_bar_factory", lambda label, total: None)
+    # The real import path: a poisoned module entry makes
+    # ``from tqdm.auto import tqdm`` raise inside the default factory.
+    monkeypatch.setitem(sys.modules, "tqdm.auto", None)
     origins = _served_stops(network, 40)
     buffer = io.StringIO()
     cafein.enable_logging(stream=buffer, progress="bar")
-    with pytest.warns(UserWarning, match="tqdm is not installed"):
+    with pytest.warns(UserWarning) as caught:
         TravelTimeMatrix(network, origins, departure=DEPARTURE)
+    missing = [
+        warning for warning in caught if "tqdm is not installed" in str(warning.message)
+    ]
+    assert len(missing) == 1
     assert len([line for line in buffer.getvalue().splitlines() if "% (" in line]) == 20
 
 

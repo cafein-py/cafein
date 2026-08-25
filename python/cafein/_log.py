@@ -259,13 +259,16 @@ def _install_bridge():
 _install_bridge()
 
 
-def _default_bar_factory(label, total):
-    """One live bar, or None when tqdm is unavailable."""
+def _default_bar_factory(label, total, stream):
+    """One live bar on the chosen stream, or None when tqdm is
+    unavailable. Inside Jupyter ``tqdm.auto`` renders a widget and
+    the stream is moot; in terminals the bar writes where the log
+    lines go."""
     try:
         from tqdm.auto import tqdm
     except ImportError:
         return None
-    return tqdm(total=total, desc=label, leave=False)
+    return tqdm(total=total, desc=label, leave=False, file=stream)
 
 
 _bar_factory = _default_bar_factory
@@ -299,12 +302,18 @@ class _CafeinHandler(logging.StreamHandler):
         try:
             label, done, total = info["label"], info["done"], info["total"]
             bar = self._bars.get(label)
-            if bar is not None and done < getattr(bar, "n", 0):
+            # A non-advancing done or a changed total means a new run
+            # reused the label: retire the stale bar. (Sequential
+            # same-label runs with identical totals share one bar —
+            # the triple alone cannot tell them apart.)
+            if bar is not None and (
+                done <= getattr(bar, "n", 0) or getattr(bar, "total", total) != total
+            ):
                 bar.close()
                 self._bars.pop(label, None)
                 bar = None
             if bar is None:
-                bar = _bar_factory(label, total)
+                bar = _bar_factory(label, total, self.stream)
                 if bar is None:
                     if not self._warned:
                         self._warned = True
