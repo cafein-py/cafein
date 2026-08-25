@@ -1551,6 +1551,7 @@ impl TransportNetwork {
     /// whole seconds under ``mode`` (``None`` beyond ``max_seconds``), plus
     /// the unsnapped origin and destination indices — snap facts, not
     /// reachability inferences. Internal.
+    #[pyo3(signature = (origins, destinations, mode, max_seconds, workers=None))]
     fn _multimodal_direct_matrix(
         &self,
         py: Python<'_>,
