@@ -720,6 +720,7 @@ def _resolved_cost_matrix(
                             walk_knobs,
                             exclude_routes,
                             exclude_trips,
+                            workers=workers,
                         )
                     )
                     return matrix, from_ids, to_ids, None
@@ -735,6 +736,7 @@ def _resolved_cost_matrix(
                     walk_knobs,
                     exclude_routes,
                     exclude_trips,
+                    workers=workers,
                 )
                 return matrix, from_ids, to_ids, None
             if arrive_by:
@@ -925,6 +927,7 @@ def _accessibility_columns(
                 budgets,
                 decay,
                 decay_param,
+                workers=workers,
             )
         return _cafein.aggregate_opportunity_sums(
             np.ascontiguousarray(cost_slice, dtype="uint32"),
@@ -933,6 +936,7 @@ def _accessibility_columns(
             budgets,
             decay,
             decay_param,
+            workers=workers,
         )
 
     per_origin = len(budgets) * len(labels)
@@ -1311,6 +1315,9 @@ class Accessibility(pd.DataFrame):
         complete time query, refusing a resume that differs in axis,
         moment, window, or percentiles.
         """
+        _log.sync()
+        if workers is not None:
+            workers = positive_int("workers", workers)
         if street_policy is not None:
             raise NotImplementedError(
                 "street_policy accessibility does not stream yet; "
@@ -2376,11 +2383,17 @@ class NearestDestinations(pd.DataFrame):
             matrix = matrix[:, :, 0]
         if matrix.dtype.kind == "f":
             indices, costs = _cafein.aggregate_nearest_f64(
-                np.ascontiguousarray(matrix, dtype="float64"), k, horizon
+                np.ascontiguousarray(matrix, dtype="float64"),
+                k,
+                horizon,
+                workers=workers,
             )
         else:
             indices, costs = _cafein.aggregate_nearest(
-                np.ascontiguousarray(matrix, dtype="uint32"), k, horizon
+                np.ascontiguousarray(matrix, dtype="uint32"),
+                k,
+                horizon,
+                workers=workers,
             )
         indices = np.asarray(indices)
         costs = np.asarray(costs)

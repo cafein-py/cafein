@@ -105,16 +105,19 @@ fn aggregated_rows<'py>(
     budgets: Vec<f64>,
     decay: &str,
     decay_param: Option<f64>,
+    workers: Option<usize>,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let decay = parse_decay(decay, decay_param)?;
     validated_aggregation(destinations, &opportunities, fields, &budgets)?;
     let width = budgets.len() * fields;
     let flat: Vec<f64> = py.allow_threads(|| {
-        rows.par_iter()
-            .flat_map_iter(|costs| {
-                opportunity_sums(costs, &opportunities, fields, &budgets, &decay)
-            })
-            .collect()
+        crate::workers::with_workers("accessibility aggregation", workers, || {
+            rows.par_iter()
+                .flat_map_iter(|costs| {
+                    opportunity_sums(costs, &opportunities, fields, &budgets, &decay)
+                })
+                .collect()
+        })
     });
     flat.into_pyarray(py)
         .reshape([count, width])
@@ -126,7 +129,8 @@ fn aggregated_rows<'py>(
 /// `[origin][budget * fields]`. Serves every resolution path that
 /// produces a cost matrix, so the weight formulas exist once.
 #[pyfunction]
-#[pyo3(signature = (matrix, opportunities, fields, budgets, decay, decay_param))]
+#[pyo3(signature = (matrix, opportunities, fields, budgets, decay, decay_param, workers=None))]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn aggregate_opportunity_sums<'py>(
     py: Python<'py>,
     matrix: PyReadonlyArray2<'py, u32>,
@@ -135,6 +139,7 @@ pub(super) fn aggregate_opportunity_sums<'py>(
     budgets: Vec<f64>,
     decay: &str,
     decay_param: Option<f64>,
+    workers: Option<usize>,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let matrix = matrix.as_array().to_owned();
     let (count, destinations) = matrix.dim();
@@ -156,13 +161,15 @@ pub(super) fn aggregate_opportunity_sums<'py>(
         budgets,
         decay,
         decay_param,
+        workers,
     )
 }
 
 /// The float twin for cost axes whose cells are `f64` (grams CO2e,
 /// currency units, metres): a non-finite cell is unreached.
 #[pyfunction]
-#[pyo3(signature = (matrix, opportunities, fields, budgets, decay, decay_param))]
+#[pyo3(signature = (matrix, opportunities, fields, budgets, decay, decay_param, workers=None))]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn aggregate_opportunity_sums_f64<'py>(
     py: Python<'py>,
     matrix: PyReadonlyArray2<'py, f64>,
@@ -171,6 +178,7 @@ pub(super) fn aggregate_opportunity_sums_f64<'py>(
     budgets: Vec<f64>,
     decay: &str,
     decay_param: Option<f64>,
+    workers: Option<usize>,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let matrix = matrix.as_array().to_owned();
     let (count, destinations) = matrix.dim();
@@ -192,6 +200,7 @@ pub(super) fn aggregate_opportunity_sums_f64<'py>(
         budgets,
         decay,
         decay_param,
+        workers,
     )
 }
 
@@ -206,6 +215,7 @@ fn nearest_rows<'py>(
     columns: usize,
     k: usize,
     max_cost: Option<f64>,
+    workers: Option<usize>,
 ) -> PyResult<NearestArrays<'py>> {
     if k == 0 {
         return Err(PyValueError::new_err("k must be at least 1"));
@@ -238,9 +248,11 @@ fn nearest_rows<'py>(
         }
     };
     let ranked: Vec<Vec<(usize, f64)>> = py.allow_threads(|| {
-        rows.par_iter()
-            .map(|costs| nearest(costs, k, max_cost))
-            .collect()
+        crate::workers::with_workers("nearest aggregation", workers, || {
+            rows.par_iter()
+                .map(|costs| nearest(costs, k, max_cost))
+                .collect()
+        })
     });
     // Padded [count, k] twins: index -1 / cost NaN mark an absent rank.
     let mut indices = vec![-1_i64; count * k];
@@ -268,12 +280,13 @@ fn nearest_rows<'py>(
 /// column indices (`-1` = absent rank) and costs (`NaN` = absent).
 /// Ties break deterministically by (cost, column index).
 #[pyfunction]
-#[pyo3(signature = (matrix, k, max_cost=None))]
+#[pyo3(signature = (matrix, k, max_cost=None, workers=None))]
 pub(super) fn aggregate_nearest<'py>(
     py: Python<'py>,
     matrix: PyReadonlyArray2<'py, u32>,
     k: usize,
     max_cost: Option<f64>,
+    workers: Option<usize>,
 ) -> PyResult<NearestArrays<'py>> {
     let matrix = matrix.as_array().to_owned();
     let (count, columns) = matrix.dim();
@@ -285,18 +298,19 @@ pub(super) fn aggregate_nearest<'py>(
                 .collect()
         })
         .collect();
-    nearest_rows(py, rows, count, columns, k, max_cost)
+    nearest_rows(py, rows, count, columns, k, max_cost, workers)
 }
 
 /// The float twin for cost axes whose cells are `f64` (grams CO2e,
 /// currency units, metres): a non-finite cell is unreached.
 #[pyfunction]
-#[pyo3(signature = (matrix, k, max_cost=None))]
+#[pyo3(signature = (matrix, k, max_cost=None, workers=None))]
 pub(super) fn aggregate_nearest_f64<'py>(
     py: Python<'py>,
     matrix: PyReadonlyArray2<'py, f64>,
     k: usize,
     max_cost: Option<f64>,
+    workers: Option<usize>,
 ) -> PyResult<NearestArrays<'py>> {
     let matrix = matrix.as_array().to_owned();
     let (count, columns) = matrix.dim();
@@ -308,7 +322,7 @@ pub(super) fn aggregate_nearest_f64<'py>(
                 .collect()
         })
         .collect();
-    nearest_rows(py, rows, count, columns, k, max_cost)
+    nearest_rows(py, rows, count, columns, k, max_cost, workers)
 }
 
 /// A catchment field as `(latitudes, longitudes, values)` arrays.
@@ -949,17 +963,19 @@ impl TransportNetwork {
         let count = rows.len();
         let width = budgets.len() * fields;
         let flat: Vec<f64> = py.allow_threads(|| {
-            rows.par_iter()
-                .flat_map_iter(|row| {
-                    let costs: Vec<Option<f64>> = targets
-                        .iter()
-                        .map(|&target| {
-                            row[target.0 as usize].map(|arrival| (arrival - departure) as f64)
-                        })
-                        .collect();
-                    opportunity_sums(&costs, &opportunities, fields, &budgets, &decay)
-                })
-                .collect()
+            crate::workers::with_workers("accessibility", workers, || {
+                rows.par_iter()
+                    .flat_map_iter(|row| {
+                        let costs: Vec<Option<f64>> = targets
+                            .iter()
+                            .map(|&target| {
+                                row[target.0 as usize].map(|arrival| (arrival - departure) as f64)
+                            })
+                            .collect();
+                        opportunity_sums(&costs, &opportunities, fields, &budgets, &decay)
+                    })
+                    .collect()
+            })
         });
         flat.into_pyarray(py)
             .reshape([count, width])

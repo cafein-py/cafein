@@ -99,3 +99,35 @@ def test_workers_validates_eagerly(network):
         TravelTimeMatrix(network, origins, departure=DEPARTURE, workers="4")
     with pytest.raises(ValueError, match="workers must be at least 1"):
         TravelTimeMatrix(network, origins, departure=DEPARTURE, workers=0)
+
+
+def test_streamed_matrix_rides_the_requested_pool(network, tmp_path, caplog):
+    from cafein import TravelTimeMatrix
+
+    requested = _distinct_width()
+    origins = _served_stops(network, 40)
+    with caplog.at_level(logging.DEBUG, logger="cafein"):
+        TravelTimeMatrix.to_parquet(
+            network,
+            origins,
+            departure=DEPARTURE,
+            output=tmp_path / "stream",
+            workers=requested,
+        )
+    assert any(
+        f"on {requested} workers" in record.getMessage() for record in caplog.records
+    )
+
+
+def test_streaming_to_parquet_validates_workers_eagerly(network, tmp_path):
+    from cafein import Accessibility
+
+    with pytest.raises(ValueError, match="workers must be at least 1"):
+        Accessibility.to_parquet(
+            network,
+            _served_stops(network, 2),
+            _served_stops(network, 5),
+            DEPARTURE,
+            output=tmp_path / "acc",
+            workers=0,
+        )

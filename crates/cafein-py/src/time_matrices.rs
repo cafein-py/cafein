@@ -1204,7 +1204,7 @@ impl TransportNetwork {
     /// alternative is the caller's to fold, with the same
     /// latest-departure rule. Internal until the policy surface
     /// stabilises.
-    #[pyo3(signature = (access_rows, egress_rows, date, deadline, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![]))]
+    #[pyo3(signature = (access_rows, egress_rows, date, deadline, max_transfers = 7, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn _arrive_by_time_matrix_with_access(
         &self,
@@ -1217,6 +1217,7 @@ impl TransportNetwork {
         exclude_routes: Vec<String>,
         exclude_trips: Vec<String>,
         exclude_stops: Vec<String>,
+        workers: Option<usize>,
     ) -> PyResult<Py<PyDict>> {
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         let deadline = parse_time(deadline)?;
@@ -1236,106 +1237,113 @@ impl TransportNetwork {
         let origin_count = access.len();
         let destination_count = egress.len();
         let (departures, durations, rounds, access_stops) = py.allow_threads(|| {
-            let requests: Vec<Request> = egress
-                .iter()
-                .map(|links| Request {
-                    departure: deadline,
-                    access: Vec::new(),
-                    egress: links.clone(),
-                    active_services: active_services.clone(),
-                    active_services_previous: active_services_previous.clone(),
-                    max_transfers,
-                    exclusions: exclusions.clone(),
-                })
-                .collect();
-            let reversed = ReversedTransfers::build(&self.transfers);
-            let egress_by_stop: Vec<std::collections::HashMap<u32, u32>> = egress
-                .iter()
-                .map(|links| links.iter().map(|&(stop, walk)| (stop.0, walk)).collect())
-                .collect();
-            // Each run folds into its dense column inside the worker;
-            // per-stop frontiers never accumulate across destinations.
-            let ticker = crate::logging::ProgressTicker::new(
-                "travel_time_matrix (arrive-by fold)",
-                requests.len(),
-            );
-            let tick = || ticker.tick();
-            let columns: Vec<Vec<ArriveByCell>> = reverse::reverse_one_to_all_fold_with_progress(
-                &self.build.timetable,
-                &reversed,
-                &requests,
-                |column, states| {
-                    access
-                        .iter()
-                        .map(|links| {
-                            // The complete-journey winner beside the
-                            // access stop it composed through.
-                            let mut best: ArriveByCell = None;
-                            let mut fold = |candidate: (u32, u32, u32, u32)| {
-                                // Full-tuple ties break on the stop
-                                // index, so the elected access stop —
-                                // and the facility priced through it —
-                                // is deterministic.
-                                let wins = match best {
-                                    None => true,
-                                    Some(held) => {
-                                        candidate.0 > held.0
-                                            || (candidate.0 == held.0 && candidate.1 < held.1)
-                                            || (candidate.0 == held.0
-                                                && candidate.1 == held.1
-                                                && candidate.2 < held.2)
-                                            || (candidate.0 == held.0
-                                                && candidate.1 == held.1
-                                                && candidate.2 == held.2
-                                                && candidate.3 < held.3)
-                                    }
-                                };
-                                if wins {
-                                    best = Some(candidate);
-                                }
-                            };
-                            for &(stop, seconds) in links {
-                                for &(round, departure, achieved) in &states[stop.0 as usize] {
-                                    let Some(composed) = departure.checked_sub(seconds) else {
-                                        continue;
+            crate::workers::with_workers("arrive_by_time_matrix_with_access", workers, || {
+                let requests: Vec<Request> = egress
+                    .iter()
+                    .map(|links| Request {
+                        departure: deadline,
+                        access: Vec::new(),
+                        egress: links.clone(),
+                        active_services: active_services.clone(),
+                        active_services_previous: active_services_previous.clone(),
+                        max_transfers,
+                        exclusions: exclusions.clone(),
+                    })
+                    .collect();
+                let reversed = ReversedTransfers::build(&self.transfers);
+                let egress_by_stop: Vec<std::collections::HashMap<u32, u32>> = egress
+                    .iter()
+                    .map(|links| links.iter().map(|&(stop, walk)| (stop.0, walk)).collect())
+                    .collect();
+                // Each run folds into its dense column inside the worker;
+                // per-stop frontiers never accumulate across destinations.
+                let ticker = crate::logging::ProgressTicker::new(
+                    "travel_time_matrix (arrive-by fold)",
+                    requests.len(),
+                );
+                let tick = || ticker.tick();
+                let columns: Vec<Vec<ArriveByCell>> =
+                    reverse::reverse_one_to_all_fold_with_progress(
+                        &self.build.timetable,
+                        &reversed,
+                        &requests,
+                        |column, states| {
+                            access
+                                .iter()
+                                .map(|links| {
+                                    // The complete-journey winner beside the
+                                    // access stop it composed through.
+                                    let mut best: ArriveByCell = None;
+                                    let mut fold = |candidate: (u32, u32, u32, u32)| {
+                                        // Full-tuple ties break on the stop
+                                        // index, so the elected access stop —
+                                        // and the facility priced through it —
+                                        // is deterministic.
+                                        let wins = match best {
+                                            None => true,
+                                            Some(held) => {
+                                                candidate.0 > held.0
+                                                    || (candidate.0 == held.0
+                                                        && candidate.1 < held.1)
+                                                    || (candidate.0 == held.0
+                                                        && candidate.1 == held.1
+                                                        && candidate.2 < held.2)
+                                                    || (candidate.0 == held.0
+                                                        && candidate.1 == held.1
+                                                        && candidate.2 == held.2
+                                                        && candidate.3 < held.3)
+                                            }
+                                        };
+                                        if wins {
+                                            best = Some(candidate);
+                                        }
                                     };
-                                    fold((composed, round as u32, achieved, stop.0));
-                                }
-                                // A stop on both tables walks straight
-                                // through: the zero-ride cell the forward
-                                // matrix keeps too.
-                                if let Some(&out) = egress_by_stop[column].get(&stop.0) {
-                                    if let Some(through) = seconds
-                                        .checked_add(out)
-                                        .and_then(|total| deadline.checked_sub(total))
-                                    {
-                                        fold((through, 0, deadline, stop.0));
+                                    for &(stop, seconds) in links {
+                                        for &(round, departure, achieved) in
+                                            &states[stop.0 as usize]
+                                        {
+                                            let Some(composed) = departure.checked_sub(seconds)
+                                            else {
+                                                continue;
+                                            };
+                                            fold((composed, round as u32, achieved, stop.0));
+                                        }
+                                        // A stop on both tables walks straight
+                                        // through: the zero-ride cell the forward
+                                        // matrix keeps too.
+                                        if let Some(&out) = egress_by_stop[column].get(&stop.0) {
+                                            if let Some(through) = seconds
+                                                .checked_add(out)
+                                                .and_then(|total| deadline.checked_sub(total))
+                                            {
+                                                fold((through, 0, deadline, stop.0));
+                                            }
+                                        }
                                     }
-                                }
-                            }
-                            best
-                        })
-                        .collect()
-                },
-                crate::logging::progress_hook(&ticker, &tick),
-            );
-            let cells = origin_count * destination_count;
-            let mut departures = vec![u32::MAX; cells];
-            let mut durations = vec![u32::MAX; cells];
-            let mut rounds = vec![u32::MAX; cells];
-            let mut access_stops = vec![u32::MAX; cells];
-            for (column, column_cells) in columns.iter().enumerate() {
-                for (row, cell) in column_cells.iter().enumerate() {
-                    if let Some((departure, round, achieved, stop)) = cell {
-                        let at = row * destination_count + column;
-                        departures[at] = *departure;
-                        durations[at] = achieved - departure;
-                        rounds[at] = *round;
-                        access_stops[at] = *stop;
+                                    best
+                                })
+                                .collect()
+                        },
+                        crate::logging::progress_hook(&ticker, &tick),
+                    );
+                let cells = origin_count * destination_count;
+                let mut departures = vec![u32::MAX; cells];
+                let mut durations = vec![u32::MAX; cells];
+                let mut rounds = vec![u32::MAX; cells];
+                let mut access_stops = vec![u32::MAX; cells];
+                for (column, column_cells) in columns.iter().enumerate() {
+                    for (row, cell) in column_cells.iter().enumerate() {
+                        if let Some((departure, round, achieved, stop)) = cell {
+                            let at = row * destination_count + column;
+                            departures[at] = *departure;
+                            durations[at] = achieved - departure;
+                            rounds[at] = *round;
+                            access_stops[at] = *stop;
+                        }
                     }
                 }
-            }
-            (departures, durations, rounds, access_stops)
+                (departures, durations, rounds, access_stops)
+            })
         });
         let result = PyDict::new(py);
         result.set_item(

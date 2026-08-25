@@ -662,6 +662,7 @@ class TravelCostMatrix(pd.DataFrame):
                     ),
                     exclude_routes=exclude_routes,
                     exclude_trips=exclude_trips,
+                    workers=workers,
                 )
                 super().__init__(
                     restore_id_dtypes(
@@ -911,6 +912,7 @@ class TravelCostMatrix(pd.DataFrame):
         rejected. ``resume=True`` continues a matching partial
         directory run exactly as ``travel_cost_table`` does.
         """
+        _log.sync()
         if workers is not None:
             workers = positive_int("workers", workers)
         if not _is_street_network(network):
@@ -1042,6 +1044,7 @@ class TravelCostMatrix(pd.DataFrame):
                 pyarrow,
                 resume=resume,
                 output_time_units=output_time_units,
+                workers=workers,
             )
         exposure_snapshot = None
         if exposure is not None:
@@ -1103,6 +1106,7 @@ class TravelCostMatrix(pd.DataFrame):
             resume=resume,
             output_time_units=output_time_units,
             exposure=exposure_snapshot,
+            workers=workers,
         )
 
 
@@ -1493,6 +1497,7 @@ class TravelTimeMatrix(pd.DataFrame):
                     (walking_speed_kmph, max_walking_time, max_snap_distance),
                     exclude_routes,
                     exclude_trips,
+                    workers=workers,
                 )
                 super().__init__(
                     restore_id_dtypes(
@@ -1683,6 +1688,7 @@ class TravelTimeMatrix(pd.DataFrame):
         continues a matching partial directory run exactly as
         ``travel_cost_table`` does.
         """
+        _log.sync()
         if workers is not None:
             workers = positive_int("workers", workers)
         if not _is_street_network(network):
@@ -1805,6 +1811,7 @@ class TravelTimeMatrix(pd.DataFrame):
                 pyarrow,
                 resume=resume,
                 output_time_units=output_time_units,
+                workers=workers,
             )
         _reject_time_street_args(
             transport_mode,
@@ -1839,6 +1846,7 @@ class TravelTimeMatrix(pd.DataFrame):
             resume=resume,
             output_time_units=output_time_units,
             arrive_by=arrive_by,
+            workers=workers,
         )
 
 
@@ -2850,6 +2858,7 @@ def _stream_transit_cost(
     resume=False,
     output_time_units="minutes",
     exposure=None,
+    workers=None,
 ):
     """The transit cost matrix streamed in sliced-axis batches — the
     origins on the departure axis, the destinations (the reverse
@@ -2992,6 +3001,7 @@ def _stream_transit_cost(
             max_snap_distance=max_snap_distance,
             exposure=exposure,
             _resolved=(trip_factors, fare_tables, endpoints),
+            workers=workers,
         )
         return _arrow_table(
             table,
@@ -3443,6 +3453,7 @@ def _stream_street_cost(
     pa,
     resume=False,
     output_time_units="minutes",
+    workers=None,
 ):
     """The street cost matrix streamed in origin batches over a frozen
     resolution — `TravelCostMatrix.to_parquet`'s street arm."""
@@ -3500,7 +3511,11 @@ def _stream_street_cost(
             query.max_snap_distance,
         )
         from_index, to_index, numeric, wkb = _street_cost_cells(
-            network, batch, geometries=geometries, resolved=resolved
+            network,
+            batch,
+            geometries=geometries,
+            resolved=resolved,
+            workers=workers,
         )
         count = len(from_index)
         data = {
@@ -3558,6 +3573,7 @@ def _stream_street_time(
     pa,
     resume=False,
     output_time_units="minutes",
+    workers=None,
 ):
     """The street time matrix streamed in origin batches over a frozen
     resolution — `TravelTimeMatrix.to_parquet`'s street arm."""
@@ -3584,7 +3600,10 @@ def _stream_street_time(
             query.max_snap_distance,
         )
         cell_rows, cell_columns, travel_time_s = _street_time_cells(
-            network, batch, resolved
+            network,
+            batch,
+            resolved,
+            workers=workers,
         )
         return pa.table(
             {
@@ -3643,6 +3662,7 @@ def _stream_transit_time(
     resume=False,
     output_time_units="minutes",
     arrive_by=False,
+    workers=None,
 ):
     """The transit time matrix streamed in sliced-axis batches — the
     origins on the departure axis, the destinations (the fan-out axis)
@@ -3732,6 +3752,7 @@ def _stream_transit_time(
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
+            workers=workers,
         )
         if batch_percentiles != resolved_percentiles:
             raise ValueError(
@@ -3818,6 +3839,7 @@ def _stream_transit_time(
                 max_walking_time=max_walking_time,
                 max_snap_distance=max_snap_distance,
                 arrive_by=True,
+                workers=workers,
             )
             if batch_percentiles != resolved_percentiles:
                 raise ValueError(
@@ -4537,6 +4559,7 @@ def _car_park_time_matrix(
     walk_options,
     exclude_routes=(),
     exclude_trips=(),
+    workers=None,
 ):
     """The dense CarParkPolicy travel-time matrix with its id axes.
 
@@ -4613,6 +4636,7 @@ def _car_park_time_matrix(
         exclude_trips=list(exclude_trips),
         exclude_stops=[],
         transfer_mode=None,
+        workers=workers,
     )
     # The direct walking alternative rides the installed walking
     # streets — the same walk the route surface offers beside the car
@@ -4672,6 +4696,7 @@ def _car_park_time_columns(
     walk_options,
     exclude_routes=(),
     exclude_trips=(),
+    workers=None,
 ):
     """The CarParkPolicy travel-time matrix in the long shape the
     frame takes: unreachable pairs omitted, as the matrix contract
@@ -4817,7 +4842,11 @@ def _carriage_time_columns(
     # vehicle — at the policy's walking access budget when it names one,
     # else the usual door-to-door cutoff.
     direct, walk_unsnapped_from, walk_unsnapped_to = core._multimodal_direct_matrix(
-        list(origin_points), list(destination_points), "walk", float(walk_budget)
+        list(origin_points),
+        list(destination_points),
+        "walk",
+        float(walk_budget),
+        workers=workers,
     )
     _warn_unsnapped(
         {
@@ -5078,6 +5107,7 @@ def _car_park_cost_columns(
     walk_options,
     exclude_routes=(),
     exclude_trips=(),
+    workers=None,
 ):
     """The CarParkPolicy cost-matrix columns.
 
@@ -5206,6 +5236,7 @@ def _car_park_cost_columns(
         geometries=bool(geometries),
         transfer_mode=None,
         direct_mode=None,
+        workers=workers,
     )
     no_stop = 2**32 - 1
     columns = {
@@ -5384,6 +5415,7 @@ def _car_park_arrive_by_time_matrix(
     walk_options,
     exclude_routes=(),
     exclude_trips=(),
+    workers=None,
 ):
     """The dense CarParkPolicy arrive-by matrices with their id axes.
 
@@ -5464,6 +5496,7 @@ def _car_park_arrive_by_time_matrix(
         exclude_routes=list(exclude_routes),
         exclude_trips=list(exclude_trips),
         exclude_stops=[],
+        workers=workers,
     )
     walk = core._walk_matrix(
         list(origin_points),
@@ -5543,6 +5576,7 @@ def _car_park_arrive_by_time_columns(
     walk_options,
     exclude_routes=(),
     exclude_trips=(),
+    workers=None,
 ):
     """The CarParkPolicy arrive-by travel-time matrix in the long
     shape the frame takes: unreachable pairs omitted."""
@@ -5558,6 +5592,7 @@ def _car_park_arrive_by_time_columns(
         walk_options,
         exclude_routes,
         exclude_trips,
+        workers=workers,
     )
     unreachable = 2**32 - 1
     data = {"from_id": [], "to_id": [], "travel_time_s": []}
@@ -5587,6 +5622,7 @@ def _car_park_arrive_by_cost_columns(
     walk_options,
     exclude_routes=(),
     exclude_trips=(),
+    workers=None,
 ):
     """The CarParkPolicy arrive-by cost-matrix columns.
 
@@ -5719,6 +5755,7 @@ def _car_park_arrive_by_cost_columns(
         exclude_routes=list(exclude_routes),
         exclude_trips=list(exclude_trips),
         exclude_stops=[],
+        workers=workers,
     )
     walk = core._walk_matrix(
         list(origin_points),
@@ -5828,6 +5865,7 @@ def _car_park_arrive_by_cost_columns(
             geometries=bool(geometries),
             transfer_mode=None,
             direct_mode=None,
+            workers=workers,
         )
         found = set()
         for at in range(len(priced["travel_time_s"])):
