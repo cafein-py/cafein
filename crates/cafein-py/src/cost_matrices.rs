@@ -1192,13 +1192,17 @@ impl TransportNetwork {
                     &active_services,
                     &active_services_previous,
                 );
-                return engine.least_emissions_matrix(
+                let ticker =
+                    crate::logging::ProgressTicker::new("travel_cost_matrix", requests.len());
+                let tick = || ticker.tick();
+                return engine.least_emissions_matrix_with_progress(
                     &inputs,
                     &requests,
                     &destinations,
                     window,
                     budget,
                     bucket,
+                    crate::logging::progress_hook(&ticker, &tick),
                 );
             }
             if candidates == "pareto" {
@@ -1293,16 +1297,23 @@ impl TransportNetwork {
                     &active_services,
                     &active_services_previous,
                 );
-                engine.least_cost_matrix(
+                let ticker =
+                    crate::logging::ProgressTicker::new("travel_cost_matrix", requests.len());
+                let tick = || ticker.tick();
+                engine.least_cost_matrix_with_progress(
                     &inputs,
                     &requests,
                     &destinations,
                     window,
                     budget,
                     objective,
+                    crate::logging::progress_hook(&ticker, &tick),
                 )
             } else {
-                let mut rows = Raptor.least_cost_matrix(
+                let ticker =
+                    crate::logging::ProgressTicker::new("travel_cost_matrix", requests.len());
+                let tick = || ticker.tick();
+                let mut rows = Raptor.least_cost_matrix_with_progress(
                     &self.build.timetable,
                     &self.transfers,
                     &inputs,
@@ -1311,6 +1322,7 @@ impl TransportNetwork {
                     window,
                     budget,
                     objective,
+                    crate::logging::progress_hook(&ticker, &tick),
                 );
                 if let (true, Some(FareTables::Zone(zones))) = (zone_fare, tables.as_ref()) {
                     let slots: Vec<Vec<(StopIdx, u32, f64)>> = destinations
@@ -1492,7 +1504,10 @@ impl TransportNetwork {
                     &active_services,
                     &active_services_previous,
                 );
-                engine.least_cost_matrix_to_points(
+                let ticker =
+                    crate::logging::ProgressTicker::new("travel_cost_matrix", requests.len());
+                let tick = || ticker.tick();
+                engine.least_cost_matrix_to_points_with_progress(
                     &inputs,
                     &requests,
                     &access_meters,
@@ -1500,9 +1515,13 @@ impl TransportNetwork {
                     window,
                     budget,
                     objective,
+                    crate::logging::progress_hook(&ticker, &tick),
                 )
             } else {
-                Raptor.least_cost_matrix_to_points(
+                let ticker =
+                    crate::logging::ProgressTicker::new("travel_cost_matrix", requests.len());
+                let tick = || ticker.tick();
+                Raptor.least_cost_matrix_to_points_with_progress(
                     &self.build.timetable,
                     &self.transfers,
                     &inputs,
@@ -1512,6 +1531,7 @@ impl TransportNetwork {
                     window,
                     budget,
                     objective,
+                    crate::logging::progress_hook(&ticker, &tick),
                 )
             };
             // The walking-only alternative: zero grams and zero fare,
@@ -1788,7 +1808,9 @@ impl TransportNetwork {
                     exclusions: exclusions.clone(),
                 })
                 .collect();
-            Raptor.arrive_by_least_cost_matrix(
+            let ticker = crate::logging::ProgressTicker::new("travel_cost_matrix", requests.len());
+            let tick = || ticker.tick();
+            Raptor.arrive_by_least_cost_matrix_with_progress(
                 &self.build.timetable,
                 &self.transfers,
                 &inputs,
@@ -1798,6 +1820,7 @@ impl TransportNetwork {
                 deadline,
                 budget,
                 objective,
+                crate::logging::progress_hook(&ticker, &tick),
             )
         });
         cost_rows_dict(py, rows, geometries, false)
@@ -1979,7 +2002,9 @@ impl TransportNetwork {
                     allowed[row].push(cell);
                 }
             }
-            let mut rows = Raptor.arrive_by_least_cost_matrix_to_points(
+            let ticker = crate::logging::ProgressTicker::new("travel_cost_matrix", requests.len());
+            let tick = || ticker.tick();
+            let mut rows = Raptor.arrive_by_least_cost_matrix_to_points_with_progress(
                 &self.build.timetable,
                 &self.transfers,
                 &inputs,
@@ -1990,6 +2015,7 @@ impl TransportNetwork {
                 deadline,
                 budget,
                 objective,
+                crate::logging::progress_hook(&ticker, &tick),
             );
             // The walking-only alternative: zero grams and zero fare,
             // so within the budget it wins any cell (equal-key cells
@@ -2229,12 +2255,15 @@ impl TransportNetwork {
                     exclusions: None,
                 })
                 .collect();
-            let fallback_rows = Raptor.cost_matrix(
+            let ticker = crate::logging::ProgressTicker::new("travel_cost_matrix", requests.len());
+            let tick = || ticker.tick();
+            let fallback_rows = Raptor.cost_matrix_with_progress(
                 &self.build.timetable,
                 &self.transfers,
                 inputs,
                 &requests,
                 destinations,
+                crate::logging::progress_hook(&ticker, &tick),
             );
             for (origin_rows, &(index, _)) in fallback_rows.into_iter().zip(&fallback) {
                 rows[index] = origin_rows;

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- The logging sweep: the multimodal build reports its extraction,
+  elevation, and car-speed sub-phases; the windowed, least-cost,
+  arrive-by, fare-frontier, and carriage fan-outs tick progress like
+  the plain matrices; `route_between_*` emits DEBUG timing lines; and
+  the Windows CI pyrosm-cache race is fixed with per-worker caches.
+  ([#311](https://github.com/cafein-py/cafein/pull/311))
+
 - Matrix computers report through the logging surface: one `matrix.*`
   phase per computer (`travel_times`, `travel_costs`, `cost_table`,
   `itineraries`, `accessibility`, and `streets` for the street-network

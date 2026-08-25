@@ -305,6 +305,8 @@ impl TransportNetwork {
             .collect();
         let stop_count = self.build.timetable.stop_count() as usize;
         let flat: Vec<u32> = py.allow_threads(|| {
+            let ticker = crate::logging::ProgressTicker::new("travel_time_matrix", requests.len());
+            let tick = || ticker.tick();
             if router == "tbtr" {
                 let engine = self.tbtr_engine(
                     &self.transfers,
@@ -313,16 +315,22 @@ impl TransportNetwork {
                     &active_services_previous,
                 );
                 engine
-                    .percentile_matrix(&requests, window, &percentiles)
+                    .percentile_matrix_with_progress(
+                        &requests,
+                        window,
+                        &percentiles,
+                        crate::logging::progress_hook(&ticker, &tick),
+                    )
                     .concat()
             } else {
                 Raptor
-                    .percentile_matrix(
+                    .percentile_matrix_with_progress(
                         &self.build.timetable,
                         &self.transfers,
                         &requests,
                         window,
                         &percentiles,
+                        crate::logging::progress_hook(&ticker, &tick),
                     )
                     .concat()
             }
@@ -409,6 +417,8 @@ impl TransportNetwork {
                 })
                 .collect();
             let egress = egress_tables(&destination_links);
+            let ticker = crate::logging::ProgressTicker::new("travel_time_matrix", requests.len());
+            let tick = || ticker.tick();
             let mut flat = if router == "tbtr" {
                 let engine = self.tbtr_engine(
                     self.exclusion_transfers(&exclusions),
@@ -417,17 +427,24 @@ impl TransportNetwork {
                     &active_services_previous,
                 );
                 engine
-                    .percentile_matrix_to_points(&requests, &egress, window, &percentiles)
+                    .percentile_matrix_to_points_with_progress(
+                        &requests,
+                        &egress,
+                        window,
+                        &percentiles,
+                        crate::logging::progress_hook(&ticker, &tick),
+                    )
                     .concat()
             } else {
                 Raptor
-                    .percentile_matrix_to_points(
+                    .percentile_matrix_to_points_with_progress(
                         &self.build.timetable,
                         self.exclusion_transfers(&exclusions),
                         &requests,
                         &egress,
                         window,
                         &percentiles,
+                        crate::logging::progress_hook(&ticker, &tick),
                     )
                     .concat()
             };
@@ -1390,8 +1407,14 @@ impl TransportNetwork {
                 .iter()
                 .map(|&(_, origin)| request(vec![(origin, 0)]))
                 .collect();
-            let fallback_rows =
-                Raptor.one_to_all_many(&self.build.timetable, &self.transfers, &requests);
+            let ticker = crate::logging::ProgressTicker::new("travel_time_matrix", requests.len());
+            let tick = || ticker.tick();
+            let fallback_rows = Raptor.one_to_all_many_with_progress(
+                &self.build.timetable,
+                &self.transfers,
+                &requests,
+                crate::logging::progress_hook(&ticker, &tick),
+            );
             for (row, &(index, _)) in fallback_rows.into_iter().zip(&fallback) {
                 rows[index] = row;
             }

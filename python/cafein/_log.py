@@ -331,7 +331,9 @@ def collect_timings():
     and ``build.gtfs.indexes``; ``build.streets.read``,
     ``build.streets.prune``, ``build.streets.graph``,
     ``build.streets.footpaths`` (the OSM walking structures);
-    ``build.multimodal`` (the multimodal street graph);
+    ``build.multimodal`` (the multimodal street graph) with its
+    children ``build.multimodal.streets``,
+    ``build.multimodal.elevation``, and ``build.multimodal.speeds``;
     ``artifact.save`` with ``artifact.save.encode``;
     ``artifact.load`` with ``artifact.load.decode`` and
     ``artifact.load.rebuild``; ``emissions.annotate``;

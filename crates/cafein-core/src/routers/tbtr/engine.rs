@@ -746,6 +746,18 @@ impl<'a> TbtrEngine<'a> {
         window: u32,
         percentiles: &[f64],
     ) -> Vec<Vec<u32>> {
+        self.percentile_matrix_with_progress(requests, window, percentiles, None)
+    }
+
+    /// [`TbtrEngine::percentile_matrix`] reporting each completed origin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn percentile_matrix_with_progress(
+        &self,
+        requests: &[Request],
+        window: u32,
+        percentiles: &[f64],
+        progress: crate::progress::Progress<'_>,
+    ) -> Vec<Vec<u32>> {
         let stop_count = self.timetable.stop_count() as usize;
         requests
             .par_iter()
@@ -766,6 +778,12 @@ impl<'a> TbtrEngine<'a> {
                 }
                 out
             })
+            .map(|row| {
+                if let Some(tick) = progress {
+                    tick();
+                }
+                row
+            })
             .collect()
     }
 
@@ -781,6 +799,19 @@ impl<'a> TbtrEngine<'a> {
         window: u32,
         percentiles: &[f64],
     ) -> Vec<Vec<u32>> {
+        self.percentile_matrix_to_points_with_progress(requests, egress, window, percentiles, None)
+    }
+
+    /// [`TbtrEngine::percentile_matrix_to_points`] reporting each completed origin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn percentile_matrix_to_points_with_progress(
+        &self,
+        requests: &[Request],
+        egress: &[Vec<(StopIdx, u32, f64)>],
+        window: u32,
+        percentiles: &[f64],
+        progress: crate::progress::Progress<'_>,
+    ) -> Vec<Vec<u32>> {
         let stop_count = self.timetable.stop_count() as usize;
         requests
             .par_iter()
@@ -794,6 +825,12 @@ impl<'a> TbtrEngine<'a> {
                     egress,
                     percentiles,
                 )
+            })
+            .map(|row| {
+                if let Some(tick) = progress {
+                    tick();
+                }
+                row
             })
             .collect()
     }

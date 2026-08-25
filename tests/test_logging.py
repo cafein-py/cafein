@@ -149,6 +149,7 @@ def test_from_gtfs_emits_build_phases(helsinki_gtfs, kantakaupunki_pbf, caplog):
         "build.streets.prune",
         "build.streets.graph",
         "build.streets.footpaths",
+        "build.multimodal.streets",
         "build.multimodal",
     ]
     build = next(
@@ -571,3 +572,41 @@ def test_details_bind_positional_and_keyword_forms(network, caplog):
     assert record.cafein_details["origins"] == 5
     assert record.cafein_details["window"] == datetime.timedelta(minutes=10)
     assert record.cafein_details["chunk"] == (0, 2)
+
+
+def test_windowed_matrix_ticks(network):
+    import datetime
+
+    from cafein import TravelTimeMatrix
+
+    origins = _served_stops(network, 40)
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    TravelTimeMatrix(
+        network,
+        origins,
+        departure=DEPARTURE,
+        departure_time_window=datetime.timedelta(minutes=10),
+    )
+    ticks = [line for line in buffer.getvalue().splitlines() if "% (" in line]
+    assert len(ticks) == 20
+    assert all("travel_time_matrix" in line for line in ticks)
+
+
+def test_multimodal_build_children_report(helsinki_gtfs, kantakaupunki_pbf, caplog):
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        cafein.TransportNetwork.from_gtfs(helsinki_gtfs, osm_pbf=kantakaupunki_pbf)
+    phases = [
+        record.cafein_phase
+        for record in caplog.records
+        if hasattr(record, "cafein_phase")
+    ]
+    assert phases.index("build.multimodal.streets") < phases.index("build.multimodal")
+    assert "build.multimodal.elevation" not in phases  # no DEM in this build
+    streets = next(
+        record
+        for record in caplog.records
+        if getattr(record, "cafein_phase", None) == "build.multimodal.streets"
+    )
+    assert streets.cafein_details["modes"] == ["walk"]
+    assert streets.cafein_details["edges"] > 0

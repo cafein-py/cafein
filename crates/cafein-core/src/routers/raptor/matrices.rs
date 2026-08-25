@@ -235,6 +235,33 @@ impl Raptor {
         budget: Option<u32>,
         objective: Objective,
     ) -> Vec<Vec<CostRow>> {
+        self.least_cost_matrix_with_progress(
+            timetable,
+            transfers,
+            inputs,
+            requests,
+            destinations,
+            window,
+            budget,
+            objective,
+            None,
+        )
+    }
+
+    /// [`Raptor::least_cost_matrix`] reporting each completed origin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn least_cost_matrix_with_progress(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        destinations: &[StopIdx],
+        window: u32,
+        budget: Option<u32>,
+        objective: Objective,
+        progress: Progress<'_>,
+    ) -> Vec<Vec<CostRow>> {
         requests
             .par_iter()
             .map_init(
@@ -267,6 +294,12 @@ impl Raptor {
                     best.into_iter().flatten().collect()
                 },
             )
+            .map(|row| {
+                if let Some(tick) = progress {
+                    tick();
+                }
+                row
+            })
             .collect()
     }
 
@@ -285,6 +318,35 @@ impl Raptor {
         window: u32,
         budget: Option<u32>,
         objective: Objective,
+    ) -> Vec<Vec<CostRow>> {
+        self.least_cost_matrix_to_points_with_progress(
+            timetable,
+            transfers,
+            inputs,
+            requests,
+            access_meters,
+            egress,
+            window,
+            budget,
+            objective,
+            None,
+        )
+    }
+
+    /// [`Raptor::least_cost_matrix_to_points`] reporting each completed origin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn least_cost_matrix_to_points_with_progress(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        access_meters: &[HashMap<StopIdx, f64>],
+        egress: &[Vec<(StopIdx, u32, f64)>],
+        window: u32,
+        budget: Option<u32>,
+        objective: Objective,
+        progress: Progress<'_>,
     ) -> Vec<Vec<CostRow>> {
         assert_eq!(requests.len(), access_meters.len());
         requests
@@ -320,6 +382,12 @@ impl Raptor {
                     best.into_iter().flatten().collect()
                 },
             )
+            .map(|row| {
+                if let Some(tick) = progress {
+                    tick();
+                }
+                row
+            })
             .collect()
     }
 
@@ -346,6 +414,35 @@ impl Raptor {
         ceiling: u32,
         budget: Option<u32>,
         objective: Objective,
+    ) -> Vec<Vec<CostRow>> {
+        self.arrive_by_least_cost_matrix_with_progress(
+            timetable,
+            transfers,
+            inputs,
+            requests,
+            destinations,
+            candidates,
+            ceiling,
+            budget,
+            objective,
+            None,
+        )
+    }
+
+    /// [`Raptor::arrive_by_least_cost_matrix`] reporting each completed origin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn arrive_by_least_cost_matrix_with_progress(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        destinations: &[StopIdx],
+        candidates: &[Vec<CandidateTuples>],
+        ceiling: u32,
+        budget: Option<u32>,
+        objective: Objective,
+        progress: Progress<'_>,
     ) -> Vec<Vec<CostRow>> {
         assert_eq!(requests.len(), candidates.len());
         requests
@@ -386,6 +483,12 @@ impl Raptor {
                     best.into_iter().flatten().collect()
                 },
             )
+            .map(|row| {
+                if let Some(tick) = progress {
+                    tick();
+                }
+                row
+            })
             .collect()
     }
 
@@ -407,6 +510,37 @@ impl Raptor {
         ceiling: u32,
         budget: Option<u32>,
         objective: Objective,
+    ) -> Vec<Vec<CostRow>> {
+        self.arrive_by_least_cost_matrix_to_points_with_progress(
+            timetable,
+            transfers,
+            inputs,
+            requests,
+            access_meters,
+            egress,
+            candidates,
+            ceiling,
+            budget,
+            objective,
+            None,
+        )
+    }
+
+    /// [`Raptor::arrive_by_least_cost_matrix_to_points`] reporting each completed origin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn arrive_by_least_cost_matrix_to_points_with_progress(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        access_meters: &[HashMap<StopIdx, f64>],
+        egress: &[Vec<(StopIdx, u32, f64)>],
+        candidates: &[Vec<CandidateTuples>],
+        ceiling: u32,
+        budget: Option<u32>,
+        objective: Objective,
+        progress: Progress<'_>,
     ) -> Vec<Vec<CostRow>> {
         assert_eq!(requests.len(), access_meters.len());
         assert_eq!(requests.len(), candidates.len());
@@ -449,6 +583,12 @@ impl Raptor {
                     best.into_iter().flatten().collect()
                 },
             )
+            .map(|row| {
+                if let Some(tick) = progress {
+                    tick();
+                }
+                row
+            })
             .collect()
     }
 
@@ -474,6 +614,27 @@ impl Raptor {
         window: u32,
         percentiles: &[f64],
     ) -> Vec<Vec<u32>> {
+        self.percentile_matrix_with_progress(
+            timetable,
+            transfers,
+            requests,
+            window,
+            percentiles,
+            None,
+        )
+    }
+
+    /// [`Raptor::percentile_matrix`] reporting each completed origin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn percentile_matrix_with_progress(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        requests: &[Request],
+        window: u32,
+        percentiles: &[f64],
+        progress: Progress<'_>,
+    ) -> Vec<Vec<u32>> {
         let stop_count = timetable.stop_count() as usize;
         requests
             .par_iter()
@@ -496,6 +657,12 @@ impl Raptor {
                     out
                 },
             )
+            .map(|row| {
+                if let Some(tick) = progress {
+                    tick();
+                }
+                row
+            })
             .collect()
     }
 
@@ -517,6 +684,29 @@ impl Raptor {
         window: u32,
         percentiles: &[f64],
     ) -> Vec<Vec<u32>> {
+        self.percentile_matrix_to_points_with_progress(
+            timetable,
+            transfers,
+            requests,
+            egress,
+            window,
+            percentiles,
+            None,
+        )
+    }
+
+    /// [`Raptor::percentile_matrix_to_points`] reporting each completed origin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn percentile_matrix_to_points_with_progress(
+        &self,
+        timetable: &Timetable,
+        transfers: &Transfers,
+        requests: &[Request],
+        egress: &[Vec<(StopIdx, u32, f64)>],
+        window: u32,
+        percentiles: &[f64],
+        progress: Progress<'_>,
+    ) -> Vec<Vec<u32>> {
         let stop_count = timetable.stop_count() as usize;
         requests
             .par_iter()
@@ -534,6 +724,12 @@ impl Raptor {
                     )
                 },
             )
+            .map(|row| {
+                if let Some(tick) = progress {
+                    tick();
+                }
+                row
+            })
             .collect()
     }
 
