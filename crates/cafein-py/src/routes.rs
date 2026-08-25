@@ -415,7 +415,7 @@ impl TransportNetwork {
     /// policy surface stabilises.
     #[pyo3(signature = (access_rows, egress_rows, date, departure, max_transfers,
                         exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![],
-                        transfer_mode = None, router = "auto"))]
+                        transfer_mode = None, router = "auto", workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn _time_matrix_with_access(
         &self,
@@ -430,6 +430,7 @@ impl TransportNetwork {
         exclude_stops: Vec<String>,
         transfer_mode: Option<(String, f64)>,
         router: &str,
+        workers: Option<usize>,
     ) -> PyResult<Vec<Vec<Option<u32>>>> {
         if transfer_mode
             .as_ref()
@@ -477,39 +478,45 @@ impl TransportNetwork {
         let relaxed = self.policy_transfers(transfer_mode.as_ref())?;
         let router = self.resolve_time_router(router, date, exclusions.is_some())?;
         let matrix = py.allow_threads(|| {
-            let rows = if router == "tbtr" {
-                let engine =
-                    self.tbtr_engine(relaxed, date, &active_services, &active_services_previous);
-                let accesses: Vec<Vec<(StopIdx, u32)>> = requests
-                    .iter()
-                    .map(|request| request.access.clone())
-                    .collect();
-                engine.one_to_all_many(departure, &accesses, max_transfers)
-            } else {
-                Raptor.one_to_all_many(&self.build.timetable, relaxed, &requests)
-            };
-            rows.iter()
-                .map(|arrivals| {
-                    egress
+            crate::workers::with_workers("time_matrix_with_access", workers, || {
+                let rows = if router == "tbtr" {
+                    let engine = self.tbtr_engine(
+                        relaxed,
+                        date,
+                        &active_services,
+                        &active_services_previous,
+                    );
+                    let accesses: Vec<Vec<(StopIdx, u32)>> = requests
                         .iter()
-                        .map(|links| {
-                            let mut best = u32::MAX;
-                            for &(stop, seconds) in links {
-                                let Some(at_stop) = arrivals[stop.0 as usize] else {
-                                    continue;
-                                };
-                                let Some(arrival) =
-                                    at_stop.checked_add(seconds).filter(|&at| at != u32::MAX)
-                                else {
-                                    continue;
-                                };
-                                best = best.min(arrival);
-                            }
-                            (best != u32::MAX).then(|| best - departure)
-                        })
-                        .collect()
-                })
-                .collect()
+                        .map(|request| request.access.clone())
+                        .collect();
+                    engine.one_to_all_many(departure, &accesses, max_transfers)
+                } else {
+                    Raptor.one_to_all_many(&self.build.timetable, relaxed, &requests)
+                };
+                rows.iter()
+                    .map(|arrivals| {
+                        egress
+                            .iter()
+                            .map(|links| {
+                                let mut best = u32::MAX;
+                                for &(stop, seconds) in links {
+                                    let Some(at_stop) = arrivals[stop.0 as usize] else {
+                                        continue;
+                                    };
+                                    let Some(arrival) =
+                                        at_stop.checked_add(seconds).filter(|&at| at != u32::MAX)
+                                    else {
+                                        continue;
+                                    };
+                                    best = best.min(arrival);
+                                }
+                                (best != u32::MAX).then(|| best - departure)
+                            })
+                            .collect()
+                    })
+                    .collect()
+            })
         });
         Ok(matrix)
     }

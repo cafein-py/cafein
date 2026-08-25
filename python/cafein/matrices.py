@@ -10,6 +10,7 @@ from cafein import _log
 import shapely
 
 from cafein._validate import (
+    positive_int,
     component_selection,
     freeze_ids,
     id_sequence,
@@ -436,6 +437,7 @@ class TravelCostMatrix(pd.DataFrame):
         cost_components=None,
         exposure=None,
         output_time_units="minutes",
+        workers=None,
     ):
         if not _is_street_network(network):
             (
@@ -902,6 +904,8 @@ class TravelCostMatrix(pd.DataFrame):
         rejected. ``resume=True`` continues a matching partial
         directory run exactly as ``travel_cost_table`` does.
         """
+        if workers is not None:
+            workers = positive_int("workers", workers)
         if not _is_street_network(network):
             (
                 exclude_routes,
@@ -1305,6 +1309,7 @@ class TravelTimeMatrix(pd.DataFrame):
         delay_model=None,
         parking=None,
         output_time_units="minutes",
+        workers=None,
     ):
         if not _is_street_network(network):
             (
@@ -1663,6 +1668,8 @@ class TravelTimeMatrix(pd.DataFrame):
         continues a matching partial directory run exactly as
         ``travel_cost_table`` does.
         """
+        if workers is not None:
+            workers = positive_int("workers", workers)
         if not _is_street_network(network):
             (
                 exclude_routes,
@@ -2184,7 +2191,7 @@ def _street_cost_resolution(
     }
 
 
-def _street_cost_cells(network, query, *, geometries, resolved):
+def _street_cost_cells(network, query, *, geometries, resolved, workers=None):
     """One street-cost batch: origin/destination indices, the numeric
     columns, and the WKB geometries (``None`` without ``geometries``)."""
     transport_mode = resolved["transport_mode"]
@@ -2198,6 +2205,7 @@ def _street_cost_cells(network, query, *, geometries, resolved):
         bool(geometries),
         car_model=resolved["car_model"],
         street_edges=exposure is not None,
+        workers=workers,
     )
     _warn_unsnapped(
         table,
@@ -2352,7 +2360,7 @@ def _street_time_resolution(
     }
 
 
-def _street_time_cells(network, query, resolved):
+def _street_time_cells(network, query, resolved, workers=None):
     """One street-time batch: cell indices and their travel times."""
     transport_mode = resolved["transport_mode"]
     table = network._core.travel_time_matrix(
@@ -2362,6 +2370,7 @@ def _street_time_cells(network, query, resolved):
         query.max_seconds,
         query.max_snap_distance,
         car_model=resolved["car_model"],
+        workers=workers,
     )
     _warn_unsnapped(
         table,
@@ -2399,6 +2408,7 @@ def _time_columns(
     exclude_trips=(),
     exclude_stops=(),
     arrive_by=False,
+    workers=None,
 ):
     """The reachable cells of the travel-time matrix, in long format."""
     if date is None or departure is None:
@@ -2421,6 +2431,7 @@ def _time_columns(
         max_walking_time=max_walking_time,
         max_snap_distance=max_snap_distance,
         arrive_by=arrive_by,
+        workers=workers,
     )
     from_ids = np.asarray(from_ids, dtype=object)
     to_ids = np.asarray(to_ids, dtype=object)
@@ -4057,6 +4068,7 @@ def _cost_columns(
                 *exclusions,
                 *walk,
                 geometries,
+                workers=workers,
             )
         elif optimize != "time":
             table = network._core.least_cost_matrix_from_points(
@@ -4074,6 +4086,7 @@ def _cost_columns(
                 *exclusions,
                 *walk,
                 geometries,
+                workers=workers,
             )
         else:
             table = network._core.travel_cost_matrix_from_points(
@@ -4089,6 +4102,7 @@ def _cost_columns(
                 geometries,
                 fare_tables,
                 pieces=exposure is not None,
+                workers=workers,
             )
             if exposure is not None:
                 table.update(
@@ -4139,6 +4153,7 @@ def _cost_columns(
                 to_stops,
                 *exclusions,
                 geometries,
+                workers=workers,
             )
         elif optimize != "time":
             # The emissions (McRAPTOR) stop matrix relaxes a matching whole-day
@@ -4162,6 +4177,7 @@ def _cost_columns(
                 *exclusions,
                 *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
                 geometries,
+                workers=workers,
             )
         else:
             # The walking options bound the door-to-door cost matrix under a
@@ -4179,6 +4195,7 @@ def _cost_columns(
                 geometries,
                 fare_tables,
                 pieces=exposure is not None,
+                workers=workers,
             )
             if exposure is not None:
                 table.update(
