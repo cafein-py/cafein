@@ -21,6 +21,7 @@ import pandas as pd
 from cafein import _log
 
 from cafein._validate import (
+    positive_int,
     freeze_ids,
     id_sequence,
     restore_id_dtypes,
@@ -175,6 +176,7 @@ def _nearest_of_set(
     walk_options,
     travel_time_output,
     output_time_units,
+    workers=None,
 ):
     """The k=1 arrive-by frame from one tagged reverse run."""
     import numpy as np
@@ -207,6 +209,7 @@ def _nearest_of_set(
             list(exclude_trips),
             list(exclude_stops),
             *_walk_options(walking_speed_kmph, max_walking_time, snap_distance),
+            workers=workers,
         )
         _warn_unsnapped(table, from_ids, to_ids)
         unreachable = np.iinfo(np.uint32).max
@@ -232,6 +235,7 @@ def _nearest_of_set(
             list(exclude_routes),
             list(exclude_trips),
             list(exclude_stops),
+            workers=workers,
         )
         for identifier, winner in zip(from_ids, winners):
             if winner is None:
@@ -292,6 +296,7 @@ def _transit_cost_surface(
     walk,
     _resolved=None,
     arrive_by=False,
+    workers=None,
 ):
     """The dense per-destination optimum surface for an emissions or
     money axis: NaN marks pairs the engines emitted no row for —
@@ -362,6 +367,7 @@ def _transit_cost_surface(
                 *exclusions,
                 *walk,
                 False,
+                workers=workers,
             )
         else:
             table = network._core.least_cost_matrix_from_points(
@@ -379,6 +385,7 @@ def _transit_cost_surface(
                 *exclusions,
                 *walk,
                 False,
+                workers=workers,
             )
         _warn_unsnapped(table, from_ids, to_ids)
         columns = np.asarray(table["to"], dtype="int64")
@@ -410,6 +417,7 @@ def _transit_cost_surface(
                 unique_ids,
                 *exclusions,
                 False,
+                workers=workers,
             )
         else:
             table = network._core.least_cost_matrix(
@@ -429,6 +437,7 @@ def _transit_cost_surface(
                 *exclusions,
                 *walk,
                 False,
+                workers=workers,
             )
         # The stop path reports destinations as global stop indices;
         # densify over the deduped columns, then expand back so
@@ -549,6 +558,7 @@ def _resolved_cost_matrix(
     street_policy=None,
     _resolved_costs=None,
     arrive_by=False,
+    workers=None,
 ):
     """The per-origin cost matrix on the chosen axis, dispatched by
     network kind exactly as the matrix computers dispatch: (matrix,
@@ -618,6 +628,7 @@ def _resolved_cost_matrix(
                 street_snap,
                 False,
                 None,
+                workers=workers,
             )
             _warn_unsnapped(table, from_ids, to_ids, network="the street network")
             matrix = np.full((len(from_ids), len(to_ids)), np.nan, dtype="float64")
@@ -632,6 +643,7 @@ def _resolved_cost_matrix(
                 street_seconds,
                 street_snap,
                 None,
+                workers=workers,
             )
             _warn_unsnapped(table, from_ids, to_ids, network="the street network")
             matrix = table["matrix"]
@@ -676,6 +688,7 @@ def _resolved_cost_matrix(
                 (walking_speed_kmph, max_walking_time, max_snap_distance),
                 _resolved=_resolved_costs,
                 arrive_by=arrive_by,
+                workers=workers,
             )
             resolved_percentiles = None
         elif _is_geo(origins):
@@ -748,6 +761,7 @@ def _resolved_cost_matrix(
                     exclude_trips=exclude_trips,
                     exclude_stops=exclude_stops,
                     arrive_by=arrive_by,
+                    workers=workers,
                 )
             )
         elif arrive_by:
@@ -769,6 +783,7 @@ def _resolved_cost_matrix(
                     list(exclude_routes),
                     list(exclude_trips),
                     list(exclude_stops),
+                    workers=workers,
                 )
             else:
                 matrix = network._core._arrive_by_time_percentiles(
@@ -782,6 +797,7 @@ def _resolved_cost_matrix(
                     list(exclude_routes),
                     list(exclude_trips),
                     list(exclude_stops),
+                    workers=workers,
                 )
             from_ids = origin_ids
             to_ids = destination_ids
@@ -805,6 +821,7 @@ def _resolved_cost_matrix(
                     exclude_routes=exclude_routes,
                     exclude_trips=exclude_trips,
                     exclude_stops=exclude_stops,
+                    workers=workers,
                 )
             )
             # The all-stops matrix is globally indexed, so the
@@ -851,6 +868,7 @@ def _accessibility_columns(
     _resolved_costs=None,
     arrive_by=False,
     _surface=None,
+    workers=None,
 ):
     """The long accessibility frame for `origins` — the computation
     the constructor and the streaming classmethod share, inputs
@@ -892,6 +910,7 @@ def _accessibility_columns(
             street_policy=street_policy,
             _resolved_costs=_resolved_costs,
             arrive_by=arrive_by,
+            workers=workers,
         )
 
     flat_values = [float(value) for value in values.ravel()]
@@ -1058,7 +1077,10 @@ class Accessibility(pd.DataFrame):
         max_walking_time=None,
         snap_distance=None,
         street_policy=None,
+        workers=None,
     ):
+        if workers is not None:
+            workers = positive_int("workers", workers)
         if hasattr(network, "route_between_stops"):
             (
                 exclude_routes,
@@ -1227,6 +1249,7 @@ class Accessibility(pd.DataFrame):
             label="Accessibility",
             street_policy=street_policy,
             arrive_by=arrive_by,
+            workers=workers,
         )
         super().__init__(restore_id_dtypes(frame, _id_dtypes))
 
@@ -1268,6 +1291,7 @@ class Accessibility(pd.DataFrame):
         output,
         batch_size=None,
         resume=False,
+        workers=None,
     ):
         """The accessibility table streamed to Parquet — the
         constructor's semantics with ``travel_cost_table``'s
@@ -1538,6 +1562,7 @@ class Accessibility(pd.DataFrame):
                 label="Accessibility.to_parquet",
                 _resolved_costs=resolved_costs,
                 arrive_by=True,
+                workers=workers,
             )
 
         def make_batch(rows, shared_from, shared_to):
@@ -1593,6 +1618,7 @@ class Accessibility(pd.DataFrame):
                 _resolved_costs=resolved_costs,
                 arrive_by=arrive_by,
                 _surface=batch_surface,
+                workers=workers,
             )
             block = np.repeat(np.arange(rows.start, rows.stop), per_origin)
             planes = 1 if resolved_percentiles is None else len(resolved_percentiles)
@@ -2154,7 +2180,10 @@ class NearestDestinations(pd.DataFrame):
         max_walking_time=None,
         snap_distance=None,
         output_time_units="minutes",
+        workers=None,
     ):
+        if workers is not None:
+            workers = positive_int("workers", workers)
         if hasattr(network, "route_between_stops"):
             (
                 exclude_routes,
@@ -2309,6 +2338,7 @@ class NearestDestinations(pd.DataFrame):
                 (walking_speed_kmph, max_walking_time, snap_distance),
                 travel_time_output,
                 output_time_units,
+                workers=workers,
             )
             super().__init__(restore_id_dtypes(frame, _id_dtypes))
             return
@@ -2339,6 +2369,7 @@ class NearestDestinations(pd.DataFrame):
             max_walking_time,
             label="NearestDestinations",
             arrive_by=arrive_by,
+            workers=workers,
         )
         matrix = np.asarray(matrix)
         if resolved_percentiles is not None:
@@ -2541,7 +2572,10 @@ class Catchment(gpd.GeoDataFrame):
         walking_speed_kmph=None,
         max_walking_time=None,
         snap_distance=None,
+        workers=None,
     ):
+        if workers is not None:
+            workers = positive_int("workers", workers)
         if hasattr(network, "route_between_stops"):
             (
                 exclude_routes,
@@ -2865,6 +2899,7 @@ class Catchment(gpd.GeoDataFrame):
                             list(exclude_routes),
                             list(exclude_trips),
                             list(exclude_stops),
+                            workers=workers,
                         )
                     else:
                         # Deadlines profile over the arrival window and
@@ -2879,6 +2914,7 @@ class Catchment(gpd.GeoDataFrame):
                             list(exclude_routes),
                             list(exclude_trips),
                             list(exclude_stops),
+                            workers=workers,
                         )
                     seeds = []
                     max_slack = 0.0
@@ -2889,7 +2925,12 @@ class Catchment(gpd.GeoDataFrame):
                         seeds.append((stop, float(deadline_s - latest), _rides, slack))
                         max_slack = max(max_slack, slack)
                     lats, lons, costs = network._core._arrive_by_catchment_walk_field(
-                        point, seeds, speed_ms, horizon + max_slack, snap
+                        point,
+                        seeds,
+                        speed_ms,
+                        horizon + max_slack,
+                        snap,
+                        workers=workers,
                     )
                     rows.extend(
                         _cell_rows(
@@ -2938,6 +2979,7 @@ class Catchment(gpd.GeoDataFrame):
                 stop_ids,
                 wheeled,
                 arrive_by=arrive_by,
+                workers=workers,
             )
             speed_ms = speed_kmph / 3.6
             for identifier, point, stop_costs in zip(from_ids, points, surfaces):
@@ -3067,6 +3109,7 @@ def _catchment_stop_costs(
     stop_ids,
     wheeled=False,
     arrive_by=False,
+    workers=None,
 ):
     """Per origin, the ``(global stop index, cost)`` pairs of every
     reached stop on the chosen axis — the walking field's seeds. With
@@ -3133,6 +3176,7 @@ def _catchment_stop_costs(
                 [list(ids) for ids in exclusions],
                 walk,
                 arrive_by=True,
+                workers=workers,
             )
             columns = np.asarray(list(network._core._stop_indices(surface_stops)))
             surface = np.asarray(surface)
@@ -3161,6 +3205,7 @@ def _catchment_stop_costs(
             chunk,
             [list(ids) for ids in exclusions],
             walk,
+            workers=workers,
         )
         columns = np.asarray(list(network._core._stop_indices(surface_stops)))
         return [
@@ -3215,6 +3260,7 @@ def _catchment_stop_costs(
                     exclude_routes=list(exclude_routes),
                     exclude_trips=list(exclude_trips),
                     exclude_stops=list(exclude_stops),
+                    workers=workers,
                 )
             else:
                 arrivals = network._core.travel_times_from_coordinate(
@@ -3250,6 +3296,7 @@ def _catchment_stop_costs(
             list(exclude_routes),
             list(exclude_trips),
             list(exclude_stops),
+            workers=workers,
         )
         matrix = np.asarray(matrix)[:, :, 0]
     else:
@@ -3270,6 +3317,7 @@ def _catchment_stop_costs(
             walking_speed_kmph=walk[0],
             max_walking_time=walk[1],
             max_snap_distance=walk[2],
+            workers=workers,
         )
         matrix = np.asarray(matrix)
     unreached = np.iinfo(np.uint32).max
