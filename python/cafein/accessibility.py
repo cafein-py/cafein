@@ -1007,6 +1007,22 @@ class Accessibility(pd.DataFrame):
       connector metres); on transit it is not an optimizable axis and
       raises.
 
+    ``decay`` weights each reached destination's opportunities by its
+    cost ``t`` under the budget ``b`` (every family is 0 beyond the
+    budget), and ``decay_params`` carries the one parameter the family
+    takes:
+
+    - ``"step"`` — 1 (the default; no parameter).
+    - ``"linear"`` — R5's ramp, ``{"width": w}``: 1 up to ``b − w/2``,
+      falling linearly through 0.5 at the budget, cut there.
+    - ``"exponential"`` — ``{"half_life": h}``: ``exp(−ln2·t/h)``.
+    - ``"logistic"`` — ``{"scale": s}``: ``1/(1 + exp((t − b)/s))``.
+
+    On the time axis the parameter is minutes (or a timedelta) like the
+    budgets, converted to seconds exactly — a half-life of ``ln2/0.1``
+    minutes is 415.888 s, not 416; the other axes take it in their own
+    unit (grams, currency units, metres).
+
     ``Accessibility.to_parquet(...)`` streams the same table to disk
     in origin batches with the matrices' resume manifest, so a
     country-scale run never materialises the whole frame; its streamed
@@ -1149,9 +1165,11 @@ class Accessibility(pd.DataFrame):
         exclude_stops = id_sequence("exclude_stops", exclude_stops)
         if cost == "time" and isinstance(decay_params, dict):
             # Time-axis decay parameters are durations like the
-            # budgets: minutes (or timedeltas) in, seconds to the core.
+            # budgets: minutes (or timedeltas) in, seconds to the core —
+            # exact seconds, since a half-life or scale is a parameter of
+            # a continuous function, not a clock reading.
             decay_params = {
-                name: duration_seconds("decay_params", value)
+                name: duration_seconds("decay_params", value, whole=False)
                 for name, value in decay_params.items()
             }
         decay_param = _decay_parameter(decay, decay_params)
@@ -1385,9 +1403,11 @@ class Accessibility(pd.DataFrame):
         exclude_stops = id_sequence("exclude_stops", exclude_stops)
         if cost == "time" and isinstance(decay_params, dict):
             # Time-axis decay parameters are durations like the
-            # budgets: minutes (or timedeltas) in, seconds to the core.
+            # budgets: minutes (or timedeltas) in, seconds to the core —
+            # exact seconds, since a half-life or scale is a parameter of
+            # a continuous function, not a clock reading.
             decay_params = {
-                name: duration_seconds("decay_params", value)
+                name: duration_seconds("decay_params", value, whole=False)
                 for name, value in decay_params.items()
             }
         decay_param = _decay_parameter(decay, decay_params)

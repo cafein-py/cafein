@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Fixed: `Accessibility` passes time-axis decay parameters
+  (`half_life`, `scale`, `width`) to the core as exact seconds; they
+  were rounded to whole seconds, so fractional values such as a
+  half-life of `ln2/0.1` minutes drifted the weights by up to a few
+  percent.
+
 - `scripts/compare_vs_ipea_accessibility.py` compares cafein's
   `Accessibility`, `NearestDestinations`, and `cafein.equity` results
   against IPEA's R `accessibility` package on identical inputs, and
