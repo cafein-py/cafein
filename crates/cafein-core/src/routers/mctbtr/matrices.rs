@@ -132,11 +132,6 @@ impl<'a> McTbtrEngine<'a> {
                             }
                             slot_floors
                         })
-                        .inspect(|_run| {
-                            if let Some(tick) = progress {
-                                tick();
-                            }
-                        })
                         .collect();
                     for (per_stop, slot_floors) in cutoffs.iter_mut().zip(&floors) {
                         let global_floor = slot_floors
@@ -207,6 +202,11 @@ impl<'a> McTbtrEngine<'a> {
                     cell_of.iter().map(|&cell| cells[cell].clone()).collect()
                 };
                 (cells, stats)
+            })
+            .inspect(|_run| {
+                if let Some(tick) = progress {
+                    tick();
+                }
             })
             .collect();
         let mut reduced = SearchStats::default();

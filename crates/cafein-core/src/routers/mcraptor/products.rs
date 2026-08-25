@@ -416,11 +416,6 @@ pub fn frontier_matrix_with_progress(
                         }
                         slot_floors
                     })
-                    .inspect(|_run| {
-                        if let Some(tick) = progress {
-                            tick();
-                        }
-                    })
                     .collect();
                 (band, bounds, floors)
             });
@@ -490,6 +485,11 @@ pub fn frontier_matrix_with_progress(
                 search.stats,
                 origin_started.elapsed().as_nanos() as u64,
             )
+        })
+        .inspect(|_run| {
+            if let Some(tick) = progress {
+                tick();
+            }
         })
         .collect();
     if std::env::var_os("CAFEIN_MCRAPTOR_PROF").is_some() && !runs.is_empty() {

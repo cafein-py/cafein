@@ -655,3 +655,41 @@ def test_mixed_partitions_share_one_counter(ultra_network):
     # counter: per-partition tickers would emit nothing here.
     assert len(ticks) == 20
     assert all("/40 origins" in line for line in ticks)
+
+
+def test_frontier_fanout_ticks_once_per_origin(network):
+    import re
+
+    from cafein import journey_frontiers
+
+    origins = _served_stops(network, 40)
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    journey_frontiers(
+        network, origins, origins[:2], DEPARTURE, departure_time_window=10
+    )
+    ticks = [line for line in buffer.getvalue().splitlines() if "% (" in line]
+    assert len(ticks) == 20
+    assert all("journey frontiers" in line and "/40 origins" in line for line in ticks)
+    counts = [int(re.search(r"\((\d+)/40", line).group(1)) for line in ticks]
+    assert counts == sorted(counts) and len(counts) == len(set(counts))
+
+
+def test_restricted_frontier_ticks_once_per_origin(network):
+    from cafein import journey_frontiers
+
+    origins = _served_stops(network, 40)
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    journey_frontiers(
+        network,
+        origins,
+        origins[:2],
+        DEPARTURE,
+        departure_time_window=10,
+        max_slower=10,
+    )
+    ticks = [line for line in buffer.getvalue().splitlines() if "% (" in line]
+    # The restriction pass must not inflate the count past the origins.
+    assert len(ticks) == 20
+    assert all("/40 origins" in line for line in ticks)
