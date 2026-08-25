@@ -242,11 +242,10 @@ class StreetNetwork:
         _log.sync()
         bounding_box = validated_bounding_box(bounding_box)
         # One snapshot serves the build and the phase details alike, so
-        # a one-shot iterable cannot be consumed twice; a non-iterable
-        # falls through to the validator's own refusal.
-        if isinstance(modes, str):
-            modes = (modes,)
-        else:
+        # a one-shot iterable cannot be consumed twice. Strings and
+        # non-iterables pass through untouched to the validator's own
+        # refusals.
+        if not isinstance(modes, str):
             try:
                 modes = tuple(modes)
             except TypeError:

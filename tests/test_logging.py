@@ -752,3 +752,10 @@ def test_a_generator_of_modes_reports_exact_details(kantakaupunki_pbf, caplog):
         if getattr(record, "cafein_phase", None) == "build.multimodal"
     )
     assert parent.cafein_details["modes"] == ["walk"]
+
+
+def test_a_bare_mode_string_still_refuses_before_any_read(tmp_path):
+    from cafein import StreetNetwork
+
+    with pytest.raises(TypeError, match="pass"):
+        StreetNetwork.from_osm(str(tmp_path / "missing.osm.pbf"), modes="walk")
