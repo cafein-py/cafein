@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Per-call `workers=` on the matrix and accessibility computers
+  (their streamed `to_parquet` forms included): a rayon local pool
+  for one computation, `None` keeping today's global-pool behavior,
+  results identical at any width. The effective width is reported as
+  a DEBUG line through the logging surface.
+  ([#315](https://github.com/cafein-py/cafein/pull/315))
+
+## Unreleased
+
 - Docstring fixes: `CarParkPolicy` cross-references now use the
   working import path (`cafein.policy.CarParkPolicy`), and prose
   stranded inside Parameters field lists (`Catchment`,

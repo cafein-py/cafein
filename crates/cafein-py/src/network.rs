@@ -1551,6 +1551,7 @@ impl TransportNetwork {
     /// whole seconds under ``mode`` (``None`` beyond ``max_seconds``), plus
     /// the unsnapped origin and destination indices — snap facts, not
     /// reachability inferences. Internal.
+    #[pyo3(signature = (origins, destinations, mode, max_seconds, workers=None))]
     fn _multimodal_direct_matrix(
         &self,
         py: Python<'_>,
@@ -1558,17 +1559,20 @@ impl TransportNetwork {
         destinations: Vec<(f64, f64)>,
         mode: &str,
         max_seconds: f64,
+        workers: Option<usize>,
     ) -> PyResult<DirectMatrix> {
         let profile = self.multimodal_profile(mode)?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
         Ok(py.allow_threads(|| {
-            network.directed_matrix(
-                &origins,
-                &destinations,
-                &profile,
-                max_seconds,
-                MULTIMODAL_STOP_SNAP,
-            )
+            crate::workers::with_workers("multimodal_direct_matrix", workers, || {
+                network.directed_matrix(
+                    &origins,
+                    &destinations,
+                    &profile,
+                    max_seconds,
+                    MULTIMODAL_STOP_SNAP,
+                )
+            })
         }))
     }
 

@@ -7,7 +7,12 @@ import os
 import time
 
 from cafein import _log
-from cafein._validate import component_selection, id_sequence, sequence_not_string
+from cafein._validate import (
+    component_selection,
+    id_sequence,
+    positive_int,
+    sequence_not_string,
+)
 from cafein.travelers import (
     folded_constraints,
     folded_street_policy,
@@ -3378,6 +3383,7 @@ class TransportNetwork:
         walking_speed_kmph=None,
         max_walking_time=None,
         snap_distance=None,
+        workers=None,
     ):
         """Travel times as a matrix, from stops or from points.
 
@@ -3483,6 +3489,8 @@ class TransportNetwork:
             Unreachable pairs hold the maximum uint32 value
             (4294967295).
         """
+        if workers is not None:
+            workers = positive_int("workers", workers)
         (
             exclude_routes,
             exclude_trips,
@@ -3542,6 +3550,7 @@ class TransportNetwork:
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
             arrive_by=arrive_by,
+            workers=workers,
         )
         return matrix
 
@@ -3565,6 +3574,7 @@ class TransportNetwork:
         exclude_trips=(),
         exclude_stops=(),
         arrive_by=False,
+        workers=None,
     ):
         """The travel-time matrix with its origin and destination id
         axes and the resolved percentile list (``None`` without a
@@ -3619,6 +3629,7 @@ class TransportNetwork:
                         list(id_sequence("exclude_trips", exclude_trips)),
                         list(id_sequence("exclude_stops", exclude_stops)),
                         *walk,
+                        workers=workers,
                     )
                 else:
                     table = self._core._arrive_by_time_percentiles_from_points(
@@ -3633,6 +3644,7 @@ class TransportNetwork:
                         list(id_sequence("exclude_trips", exclude_trips)),
                         list(id_sequence("exclude_stops", exclude_stops)),
                         *walk,
+                        workers=workers,
                     )
                 _warn_unsnapped(table, from_ids, to_ids)
                 return table["matrix"], from_ids, to_ids, percentiles
@@ -3651,6 +3663,7 @@ class TransportNetwork:
                     list(id_sequence("exclude_trips", exclude_trips)),
                     list(id_sequence("exclude_stops", exclude_stops)),
                     *walk,
+                    workers=workers,
                 )
             else:
                 table = self._core.travel_time_percentiles_from_points(
@@ -3666,6 +3679,7 @@ class TransportNetwork:
                     list(id_sequence("exclude_trips", exclude_trips)),
                     list(id_sequence("exclude_stops", exclude_stops)),
                     *walk,
+                    workers=workers,
                 )
             _warn_unsnapped(table, from_ids, to_ids)
             return table["matrix"], from_ids, to_ids, percentiles
@@ -3687,6 +3701,7 @@ class TransportNetwork:
                     list(id_sequence("exclude_routes", exclude_routes)),
                     list(id_sequence("exclude_trips", exclude_trips)),
                     list(id_sequence("exclude_stops", exclude_stops)),
+                    workers=workers,
                 )
             else:
                 matrix = self._core._arrive_by_time_percentiles(
@@ -3700,6 +3715,7 @@ class TransportNetwork:
                     list(id_sequence("exclude_routes", exclude_routes)),
                     list(id_sequence("exclude_trips", exclude_trips)),
                     list(id_sequence("exclude_stops", exclude_stops)),
+                    workers=workers,
                 )
             return matrix, from_stops, to_ids, percentiles
         from_stops = from_stops[_chunk_slice(len(from_stops), chunk)]
@@ -3716,6 +3732,7 @@ class TransportNetwork:
                 list(id_sequence("exclude_trips", exclude_trips)),
                 list(id_sequence("exclude_stops", exclude_stops)),
                 *walk,
+                workers=workers,
             )
         else:
             matrix = self._core.travel_time_percentiles(
@@ -3729,5 +3746,6 @@ class TransportNetwork:
                 list(id_sequence("exclude_routes", exclude_routes)),
                 list(id_sequence("exclude_trips", exclude_trips)),
                 list(id_sequence("exclude_stops", exclude_stops)),
+                workers=workers,
             )
         return matrix, from_stops, to_ids, percentiles
