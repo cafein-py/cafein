@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.17.0 — 2026-08-25
 
 - `enable_logging` gains `progress=`: `"lines"` (the default, as
   before), `"bar"` for one live progress bar per matrix fan-out
