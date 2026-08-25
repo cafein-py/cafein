@@ -131,3 +131,70 @@ def test_streaming_to_parquet_validates_workers_eagerly(network, tmp_path):
             output=tmp_path / "acc",
             workers=0,
         )
+
+
+@pytest.fixture(scope="module")
+def car_park_network(helsinki_gtfs, kantakaupunki_pbf):
+    import warnings
+
+    from cafein import TransportNetwork
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return TransportNetwork.from_gtfs(
+            [str(helsinki_gtfs)],
+            osm_pbf=str(kantakaupunki_pbf),
+            street_modes=("walk", "car"),
+            country="FI",
+        )
+
+
+def test_car_park_arm_rides_the_requested_pool(car_park_network, caplog):
+    import geopandas
+    from shapely.geometry import Point
+
+    from cafein import TravelTimeMatrix
+    from cafein.policy import CarParkPolicy
+
+    requested = _distinct_width()
+    facilities = geopandas.GeoDataFrame(
+        {"id": ["pasila"], "search_seconds": [240.0]},
+        geometry=[Point(24.9330, 60.1990)],
+        crs="EPSG:4326",
+    )
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(24.9130, 60.1980)], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["b"]}, geometry=[Point(24.9520, 60.1795)], crs="EPSG:4326"
+    )
+    with caplog.at_level(logging.DEBUG, logger="cafein"):
+        TravelTimeMatrix(
+            car_park_network,
+            origins,
+            destinations,
+            DEPARTURE,
+            street_policy=CarParkPolicy(facilities=facilities),
+            workers=requested,
+        )
+    assert any(
+        f"on {requested} workers" in record.getMessage() for record in caplog.records
+    )
+
+
+def test_streamed_arrive_by_matrix_rides_the_requested_pool(network, tmp_path, caplog):
+    from cafein import TravelTimeMatrix
+
+    requested = _distinct_width()
+    origins = _served_stops(network, 40)
+    with caplog.at_level(logging.DEBUG, logger="cafein"):
+        TravelTimeMatrix.to_parquet(
+            network,
+            origins,
+            arrival=DEPARTURE,
+            output=tmp_path / "arrive",
+            workers=requested,
+        )
+    assert any(
+        f"on {requested} workers" in record.getMessage() for record in caplog.records
+    )

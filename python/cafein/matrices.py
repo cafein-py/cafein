@@ -3805,6 +3805,7 @@ def _stream_transit_time(
                     exclude_routes,
                     exclude_trips,
                     exclude_stops,
+                    workers=workers,
                 )
             else:
                 matrix = network._core._arrive_by_time_percentiles(
@@ -3818,6 +3819,7 @@ def _stream_transit_time(
                     exclude_routes,
                     exclude_trips,
                     exclude_stops,
+                    workers=workers,
                 )
         else:
             origin_points, destination_points = points
@@ -4713,6 +4715,7 @@ def _car_park_time_columns(
         walk_options,
         exclude_routes,
         exclude_trips,
+        workers=workers,
     )
     unreachable = 2**32 - 1
     data = {"from_id": [], "to_id": [], "travel_time_s": []}
