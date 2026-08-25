@@ -1,7 +1,10 @@
 """The user-facing transport network."""
 
+import functools
+import logging
 import math
 import os
+import time
 
 from cafein import _log
 from cafein._validate import component_selection, id_sequence, sequence_not_string
@@ -11,6 +14,28 @@ from cafein.travelers import (
     refuse_wheelchair_streets,
 )
 from cafein._cafein import TransportNetwork as _TransportNetwork
+
+
+def _debug_routed(phrase):
+    """A plain DEBUG line after a route call — a message, not a phase,
+    so loops over routes cannot flood a timing report."""
+
+    def wrap(fn):
+        @functools.wraps(fn)
+        def timed(*args, **kwargs):
+            started = time.perf_counter()
+            journeys = fn(*args, **kwargs)
+            _log._emit(
+                _log.root,
+                logging.DEBUG,
+                f"{phrase} in {(time.perf_counter() - started) * 1000.0:.0f} ms "
+                f"({len(journeys)} option(s))",
+            )
+            return journeys
+
+        return timed
+
+    return wrap
 
 
 def _gtfs_paths(paths):
@@ -2324,6 +2349,7 @@ class TransportNetwork:
         trip distances are installed)."""
         return self._core.distance_provenance_counts
 
+    @_debug_routed("routed between stops")
     def route_between_stops(
         self,
         origin,
@@ -2516,6 +2542,7 @@ class TransportNetwork:
             arrive_by,
         )
 
+    @_debug_routed("routed between coordinates")
     def route_between_coordinates(
         self,
         origin,
