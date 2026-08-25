@@ -2,6 +2,7 @@
 
 import os
 import pathlib
+import sys
 import time
 
 import pytest
@@ -339,3 +340,34 @@ def helsinki_metro_data():
         if not _registry.RELEASE:
             pytest.skip("cafein.sampledata pins no data release yet")
     return helsinki
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _pyrosm_worker_cache(tmp_path_factory):
+    """A per-worker pyrosm result cache on Windows.
+
+    pyrosm's out-of-core engine caches extraction results under one
+    shared ``<tempdir>/pyrosm/cache``; two xdist workers extracting the
+    same PBF then race the final rename, which Windows refuses with
+    ``WinError 5`` while the destination is being replaced. POSIX
+    renames are atomic, so the shared cache stays (it saves repeated
+    extractions); each Windows worker gets its own directory instead.
+    """
+    if sys.platform != "win32":
+        yield
+        return
+    try:
+        from pyrosm.engine import cache
+    except ImportError:
+        yield
+        return
+    worker_dir = tmp_path_factory.mktemp("pyrosm-cache")
+    original = cache.cache_dir
+
+    def per_worker():
+        worker_dir.mkdir(parents=True, exist_ok=True)
+        return worker_dir
+
+    cache.cache_dir = per_worker
+    yield
+    cache.cache_dir = original

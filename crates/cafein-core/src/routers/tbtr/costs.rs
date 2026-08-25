@@ -294,6 +294,29 @@ impl<'a> TbtrEngine<'a> {
         budget: Option<u32>,
         objective: crate::raptor::Objective,
     ) -> Vec<Vec<CostRow>> {
+        self.least_cost_matrix_with_progress(
+            inputs,
+            requests,
+            destinations,
+            window,
+            budget,
+            objective,
+            None,
+        )
+    }
+
+    /// [`TbtrEngine::least_cost_matrix`] reporting each completed origin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn least_cost_matrix_with_progress(
+        &self,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        destinations: &[StopIdx],
+        window: u32,
+        budget: Option<u32>,
+        objective: crate::raptor::Objective,
+        progress: Progress<'_>,
+    ) -> Vec<Vec<CostRow>> {
         requests
             .par_iter()
             .map_init(
@@ -327,6 +350,12 @@ impl<'a> TbtrEngine<'a> {
                     best.into_iter().flatten().collect()
                 },
             )
+            .map(|row| {
+                if let Some(tick) = progress {
+                    tick();
+                }
+                row
+            })
             .collect()
     }
 
@@ -478,6 +507,31 @@ impl<'a> TbtrEngine<'a> {
         budget: Option<u32>,
         objective: crate::raptor::Objective,
     ) -> Vec<Vec<CostRow>> {
+        self.least_cost_matrix_to_points_with_progress(
+            inputs,
+            requests,
+            access_meters,
+            egress,
+            window,
+            budget,
+            objective,
+            None,
+        )
+    }
+
+    /// [`TbtrEngine::least_cost_matrix_to_points`] reporting each completed origin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn least_cost_matrix_to_points_with_progress(
+        &self,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        access_meters: &[HashMap<StopIdx, f64>],
+        egress: &[Vec<(StopIdx, u32, f64)>],
+        window: u32,
+        budget: Option<u32>,
+        objective: crate::raptor::Objective,
+        progress: Progress<'_>,
+    ) -> Vec<Vec<CostRow>> {
         assert_eq!(requests.len(), access_meters.len());
         requests
             .par_iter()
@@ -513,6 +567,12 @@ impl<'a> TbtrEngine<'a> {
                     best.into_iter().flatten().collect()
                 },
             )
+            .map(|row| {
+                if let Some(tick) = progress {
+                    tick();
+                }
+                row
+            })
             .collect()
     }
 

@@ -14,6 +14,9 @@ impl<'a> McTbtrEngine<'a> {
     /// build (one transfer set) serves every origin, fanned out with
     /// rayon.
     #[allow(clippy::too_many_arguments)]
+    /// [`McTbtrEngine::frontier_matrix_with_progress`] without
+    /// progress reporting.
+    #[allow(clippy::too_many_arguments)]
     pub fn frontier_matrix(
         &self,
         requests: &[Request],
@@ -24,6 +27,32 @@ impl<'a> McTbtrEngine<'a> {
         window: u32,
         bucket: f64,
         max_slower: Option<u32>,
+    ) -> Vec<Vec<Vec<Journey>>> {
+        self.frontier_matrix_with_progress(
+            requests,
+            destinations,
+            egress,
+            egress_active,
+            slot_count,
+            window,
+            bucket,
+            max_slower,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn frontier_matrix_with_progress(
+        &self,
+        requests: &[Request],
+        destinations: &[StopIdx],
+        egress: &[Vec<(u32, u32, f64)>],
+        egress_active: bool,
+        slot_count: usize,
+        window: u32,
+        bucket: f64,
+        max_slower: Option<u32>,
+        progress: crate::progress::Progress<'_>,
     ) -> Vec<Vec<Vec<Journey>>> {
         if egress_active {
             assert_eq!(
@@ -174,6 +203,11 @@ impl<'a> McTbtrEngine<'a> {
                 };
                 (cells, stats)
             })
+            .inspect(|_run| {
+                if let Some(tick) = progress {
+                    tick();
+                }
+            })
             .collect();
         let mut reduced = SearchStats::default();
         let mut result = Vec::with_capacity(collected.len());
@@ -200,6 +234,29 @@ impl<'a> McTbtrEngine<'a> {
         window: u32,
         budget: Option<u32>,
         bucket: f64,
+    ) -> Vec<Vec<CostRow>> {
+        self.least_emissions_matrix_with_progress(
+            inputs,
+            requests,
+            destinations,
+            window,
+            budget,
+            bucket,
+            None,
+        )
+    }
+
+    /// [`McTbtrEngine::least_emissions_matrix`] reporting each completed origin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn least_emissions_matrix_with_progress(
+        &self,
+        inputs: &CostInputs<'_>,
+        requests: &[Request],
+        destinations: &[StopIdx],
+        window: u32,
+        budget: Option<u32>,
+        bucket: f64,
+        progress: crate::progress::Progress<'_>,
     ) -> Vec<Vec<CostRow>> {
         // A stop holds one slot, so repeated destination stops share the
         // first occurrence's slot and their rows are re-expanded to the
@@ -243,6 +300,12 @@ impl<'a> McTbtrEngine<'a> {
                         best[cell].map(|winner| self.cost_row(inputs, &winner, &arena_out, stop))
                     })
                     .collect()
+            })
+            .map(|row| {
+                if let Some(tick) = progress {
+                    tick();
+                }
+                row
             })
             .collect()
     }

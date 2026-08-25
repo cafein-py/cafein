@@ -151,6 +151,7 @@ impl TransportNetwork {
             exact,
         };
         let cells: Vec<Vec<Vec<Option<_>>>> = py.allow_threads(|| {
+            let ticker = crate::logging::ProgressTicker::new("fare frontiers", origins.len());
             origins
                 .par_iter()
                 .map(|&origin| {
@@ -187,6 +188,10 @@ impl TransportNetwork {
                         }
                     }
                     rows
+                })
+                .map(|row| {
+                    ticker.tick();
+                    row
                 })
                 .collect()
         });
@@ -261,6 +266,7 @@ impl TransportNetwork {
             seed_walks: true,
         };
         let cells: Vec<Vec<Vec<Option<_>>>> = py.allow_threads(|| {
+            let ticker = crate::logging::ProgressTicker::new("fare frontiers", origins.len());
             origins
                 .par_iter()
                 .map(|&origin| {
@@ -296,6 +302,10 @@ impl TransportNetwork {
                         }
                     }
                     rows
+                })
+                .map(|row| {
+                    ticker.tick();
+                    row
                 })
                 .collect()
         });
@@ -393,6 +403,7 @@ impl TransportNetwork {
                 max_walking_time,
                 max_snap_distance,
             );
+            let ticker = crate::logging::ProgressTicker::new("fare frontiers", origin_links.len());
             let cells: Vec<Vec<Vec<Option<FrontierRow>>>> = origin_links
                 .par_iter()
                 .enumerate()
@@ -416,6 +427,10 @@ impl TransportNetwork {
                         }
                     }
                     rows
+                })
+                .map(|row| {
+                    ticker.tick();
+                    row
                 })
                 .collect();
             (cells, unsnapped_from, unsnapped_to)
@@ -519,6 +534,7 @@ impl TransportNetwork {
                 max_walking_time,
                 max_snap_distance,
             );
+            let ticker = crate::logging::ProgressTicker::new("fare frontiers", origin_links.len());
             let cells: Vec<Vec<Vec<Option<FrontierRow>>>> = origin_links
                 .par_iter()
                 .enumerate()
@@ -541,6 +557,10 @@ impl TransportNetwork {
                         }
                     }
                     rows
+                })
+                .map(|row| {
+                    ticker.tick();
+                    row
                 })
                 .collect();
             (cells, unsnapped_from, unsnapped_to)

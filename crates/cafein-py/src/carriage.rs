@@ -456,6 +456,7 @@ impl TransportNetwork {
         let matrix = py.allow_threads(|| {
             use rayon::prelude::*;
 
+            let ticker = crate::logging::ProgressTicker::new("carriage matrix", requests.len());
             requests
                 .par_iter()
                 .map(|request| {
@@ -481,6 +482,10 @@ impl TransportNetwork {
                             (best != u32::MAX).then(|| best - departure)
                         })
                         .collect()
+                })
+                .map(|row| {
+                    ticker.tick();
+                    row
                 })
                 .collect()
         });

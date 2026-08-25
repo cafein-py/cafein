@@ -867,6 +867,8 @@ impl TransportNetwork {
             })
             .collect();
         let rows = py.allow_threads(|| {
+            let ticker = crate::logging::ProgressTicker::new("journey frontiers", requests.len());
+            let tick = || ticker.tick();
             if router == "tbtr" {
                 let engine = self.mctbtr_engine(
                     &self.transfers,
@@ -876,7 +878,7 @@ impl TransportNetwork {
                     &active_services,
                     &active_services_previous,
                 );
-                return engine.frontier_matrix(
+                return engine.frontier_matrix_with_progress(
                     &requests,
                     &destinations,
                     &[],
@@ -885,6 +887,7 @@ impl TransportNetwork {
                     window,
                     bucket,
                     max_slower,
+                    crate::logging::progress_hook(&ticker, &tick),
                 );
             }
             let view = DayView::for_date(
@@ -892,7 +895,7 @@ impl TransportNetwork {
                 &active_services,
                 &active_services_previous,
             );
-            mcraptor::frontier_matrix(
+            mcraptor::frontier_matrix_with_progress(
                 &view,
                 &self.build.timetable,
                 &self.transfers,
@@ -906,6 +909,7 @@ impl TransportNetwork {
                 window,
                 bucket,
                 max_slower,
+                crate::logging::progress_hook(&ticker, &tick),
             )
         });
         let result = PyList::empty(py);
@@ -1206,6 +1210,8 @@ impl TransportNetwork {
             })
             .collect();
         let rows = py.allow_threads(|| {
+            let ticker = crate::logging::ProgressTicker::new("journey frontiers", requests.len());
+            let tick = || ticker.tick();
             if router == "tbtr" {
                 let engine = self.mctbtr_engine(
                     &self.transfers,
@@ -1215,7 +1221,7 @@ impl TransportNetwork {
                     &active_services,
                     &active_services_previous,
                 );
-                return engine.frontier_matrix(
+                return engine.frontier_matrix_with_progress(
                     &requests,
                     &destinations,
                     &[],
@@ -1224,6 +1230,7 @@ impl TransportNetwork {
                     window,
                     bucket,
                     max_slower,
+                    crate::logging::progress_hook(&ticker, &tick),
                 );
             }
             let view = DayView::for_date(
@@ -1231,7 +1238,7 @@ impl TransportNetwork {
                 &active_services,
                 &active_services_previous,
             );
-            mcraptor::frontier_matrix(
+            mcraptor::frontier_matrix_with_progress(
                 &view,
                 &self.build.timetable,
                 &self.transfers,
@@ -1245,6 +1252,7 @@ impl TransportNetwork {
                 window,
                 bucket,
                 max_slower,
+                crate::logging::progress_hook(&ticker, &tick),
             )
         });
         let mut columns = FrontierColumns::default();
@@ -1476,6 +1484,8 @@ impl TransportNetwork {
                     egress_map[link.stop.0 as usize].push((slot as u32, link.seconds, link.meters));
                 }
             }
+            let ticker = crate::logging::ProgressTicker::new("journey frontiers", requests.len());
+            let tick = || ticker.tick();
             let rows = if router == "tbtr" {
                 let engine = self.mctbtr_engine(
                     intermediate,
@@ -1485,7 +1495,7 @@ impl TransportNetwork {
                     active_services,
                     active_services_previous,
                 );
-                engine.frontier_matrix(
+                engine.frontier_matrix_with_progress(
                     &requests,
                     &[],
                     &egress_map,
@@ -1494,6 +1504,7 @@ impl TransportNetwork {
                     window,
                     bucket,
                     max_slower,
+                    crate::logging::progress_hook(&ticker, &tick),
                 )
             } else {
                 let view = DayView::for_date(
@@ -1501,7 +1512,7 @@ impl TransportNetwork {
                     active_services,
                     active_services_previous,
                 );
-                mcraptor::frontier_matrix(
+                mcraptor::frontier_matrix_with_progress(
                     &view,
                     &self.build.timetable,
                     intermediate,
@@ -1515,6 +1526,7 @@ impl TransportNetwork {
                     window,
                     bucket,
                     max_slower,
+                    crate::logging::progress_hook(&ticker, &tick),
                 )
             };
             let walk = streets.walk_matrix(

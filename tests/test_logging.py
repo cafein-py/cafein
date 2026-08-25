@@ -40,8 +40,11 @@ def _saved(network, tmp_path, name="net.cafein"):
 
 
 def test_quiet_by_default(network, tmp_path, capsys):
+    from cafein import TravelTimeMatrix
+
     path = _saved(network, tmp_path)
     cafein.TransportNetwork.load(path)
+    TravelTimeMatrix(network, _served_stops(network, 40), departure=DEPARTURE)
     assert capsys.readouterr().err == ""
     handlers = logging.getLogger("cafein").handlers
     assert all(isinstance(h, logging.NullHandler) for h in handlers)
@@ -149,6 +152,7 @@ def test_from_gtfs_emits_build_phases(helsinki_gtfs, kantakaupunki_pbf, caplog):
         "build.streets.prune",
         "build.streets.graph",
         "build.streets.footpaths",
+        "build.multimodal.streets",
         "build.multimodal",
     ]
     build = next(
@@ -421,20 +425,29 @@ def test_street_matrices_swap_to_the_street_identifier(helsinki_streets, caplog)
     assert phases == ["matrix.streets"]
 
 
-def test_fanout_ticks_above_the_threshold(network):
+def test_fanout_ticks_above_the_threshold(network, caplog):
     from cafein import TravelTimeMatrix
 
     origins = _served_stops(network, 40)
     buffer = io.StringIO()
     cafein.enable_logging(stream=buffer)
-    with cafein.collect_timings() as report:
-        TravelTimeMatrix(network, origins, departure=DEPARTURE)
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        with cafein.collect_timings() as report:
+            TravelTimeMatrix(network, origins, departure=DEPARTURE)
     ticks = [line for line in buffer.getvalue().splitlines() if "% (" in line]
     assert len(ticks) == 20
     assert all("travel_time_matrix" in line for line in ticks)
     assert all("origins" in line and "elapsed" in line for line in ticks)
-    # Ticks are plain lines, not phases: the report holds only the
-    # computer's completion.
+    # Ticks are plain INFO records, not phases: no structured
+    # attributes, and the report holds only the computer's completion.
+    tick_records = [record for record in caplog.records if "% (" in record.getMessage()]
+    assert len(tick_records) == 20
+    assert all(record.levelno == logging.INFO for record in tick_records)
+    assert not any(
+        hasattr(record, attribute)
+        for record in tick_records
+        for attribute in ("cafein_phase", "cafein_seconds", "cafein_details")
+    )
     assert [entry["phase"] for entry in report.phases] == ["matrix.travel_times"]
 
 
@@ -571,3 +584,178 @@ def test_details_bind_positional_and_keyword_forms(network, caplog):
     assert record.cafein_details["origins"] == 5
     assert record.cafein_details["window"] == datetime.timedelta(minutes=10)
     assert record.cafein_details["chunk"] == (0, 2)
+
+
+def test_windowed_matrix_ticks(network):
+    import datetime
+
+    from cafein import TravelTimeMatrix
+
+    origins = _served_stops(network, 40)
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    TravelTimeMatrix(
+        network,
+        origins,
+        departure=DEPARTURE,
+        departure_time_window=datetime.timedelta(minutes=10),
+    )
+    ticks = [line for line in buffer.getvalue().splitlines() if "% (" in line]
+    assert len(ticks) == 20
+    assert all("travel_time_matrix" in line for line in ticks)
+
+
+def test_multimodal_build_children_report(helsinki_gtfs, kantakaupunki_pbf, caplog):
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        cafein.TransportNetwork.from_gtfs(helsinki_gtfs, osm_pbf=kantakaupunki_pbf)
+    phases = [
+        record.cafein_phase
+        for record in caplog.records
+        if hasattr(record, "cafein_phase")
+    ]
+    assert phases.index("build.multimodal.streets") < phases.index("build.multimodal")
+    assert "build.multimodal.elevation" not in phases  # no DEM in this build
+    streets = next(
+        record
+        for record in caplog.records
+        if getattr(record, "cafein_phase", None) == "build.multimodal.streets"
+    )
+    assert streets.cafein_details["modes"] == ["walk"]
+    assert streets.cafein_details["edges"] > 0
+
+
+def test_arrive_by_matrix_ticks(network):
+    import re
+
+    from cafein import TravelTimeMatrix
+
+    origins = _served_stops(network, 2)
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    # The arrive-by stop matrix fans out over destinations; one chunk
+    # keeps the run small while staying above the tick floor.
+    TravelTimeMatrix(network, origins, arrival=DEPARTURE, chunk=(0, 100))
+    ticks = [line for line in buffer.getvalue().splitlines() if "% (" in line]
+    assert ticks and all("arrive-by fold" in line for line in ticks)
+    counts = [int(re.search(r"\((\d+)/", line).group(1)) for line in ticks]
+    assert counts == sorted(counts) and len(counts) == len(set(counts))
+
+
+def test_mixed_partitions_share_one_counter(ultra_network):
+    from cafein import TravelTimeMatrix
+
+    central = _served_stops(ultra_network, 20)
+    # The farthest stops sit outside the central street extract, so
+    # they get no street access and take the fallback partition.
+    far = [
+        stop
+        for stop, _ in sorted(
+            (
+                (stop, (lat - 60.17) ** 2 + (lon - 24.94) ** 2)
+                for stop, lat, lon in ultra_network.stops
+                if lat is not None
+            ),
+            key=lambda pair: pair[1],
+            reverse=True,
+        )[:20]
+    ]
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    TravelTimeMatrix(ultra_network, central + far, departure=DEPARTURE)
+    ticks = [line for line in buffer.getvalue().splitlines() if "% (" in line]
+    # A 20/20 usable/fallback split still advances one 40-origin
+    # counter: per-partition tickers would emit nothing here.
+    assert len(ticks) == 20
+    assert all("/40 origins" in line for line in ticks)
+
+
+def test_frontier_fanout_ticks_once_per_origin(network):
+    import re
+
+    from cafein import journey_frontiers
+
+    origins = _served_stops(network, 40)
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    journey_frontiers(
+        network, origins, origins[:2], DEPARTURE, departure_time_window=10
+    )
+    ticks = [line for line in buffer.getvalue().splitlines() if "% (" in line]
+    assert len(ticks) == 20
+    assert all("journey frontiers" in line and "/40 origins" in line for line in ticks)
+    counts = [int(re.search(r"\((\d+)/40", line).group(1)) for line in ticks]
+    assert counts == sorted(counts) and len(counts) == len(set(counts))
+
+
+def test_restricted_frontier_ticks_once_per_origin(network):
+    from cafein import journey_frontiers
+
+    origins = _served_stops(network, 40)
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    journey_frontiers(
+        network,
+        origins,
+        origins[:2],
+        DEPARTURE,
+        departure_time_window=10,
+        max_slower=10,
+    )
+    ticks = [line for line in buffer.getvalue().splitlines() if "% (" in line]
+    # The restriction pass must not inflate the count past the origins.
+    assert len(ticks) == 20
+    assert all("/40 origins" in line for line in ticks)
+
+
+def test_street_artifact_phases(helsinki_streets, tmp_path):
+    from cafein import StreetNetwork
+
+    with cafein.collect_timings() as report:
+        path = tmp_path / "streets.cafein"
+        helsinki_streets.save(path)
+        StreetNetwork.load(path)
+    assert [entry["phase"] for entry in report.phases] == [
+        "artifact.save",
+        "artifact.load",
+    ]
+    for entry in report.phases:
+        assert entry["details"]["path"] == str(path)
+
+
+def test_standalone_street_build_has_the_multimodal_parent(kantakaupunki_pbf, caplog):
+    from cafein import StreetNetwork
+
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        StreetNetwork.from_osm(str(kantakaupunki_pbf))
+    phases = [
+        record.cafein_phase
+        for record in caplog.records
+        if hasattr(record, "cafein_phase")
+    ]
+    assert phases.index("build.multimodal.streets") < phases.index("build.multimodal")
+    parent = next(
+        record
+        for record in caplog.records
+        if getattr(record, "cafein_phase", None) == "build.multimodal"
+    )
+    assert "walk" in parent.cafein_details["modes"]
+
+
+def test_a_generator_of_modes_reports_exact_details(kantakaupunki_pbf, caplog):
+    from cafein import StreetNetwork
+
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        StreetNetwork.from_osm(str(kantakaupunki_pbf), modes=(m for m in ["walk"]))
+    parent = next(
+        record
+        for record in caplog.records
+        if getattr(record, "cafein_phase", None) == "build.multimodal"
+    )
+    assert parent.cafein_details["modes"] == ["walk"]
+
+
+def test_a_bare_mode_string_still_refuses_before_any_read(tmp_path):
+    from cafein import StreetNetwork
+
+    with pytest.raises(TypeError, match="pass"):
+        StreetNetwork.from_osm(str(tmp_path / "missing.osm.pbf"), modes="walk")

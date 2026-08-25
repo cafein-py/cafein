@@ -4,6 +4,8 @@ import math
 import os
 
 import numpy as np
+
+from cafein import _log
 import shapely
 
 from . import _osm, elevation, streets
@@ -237,21 +239,41 @@ class StreetNetwork:
         """
         from cafein._validate import validated_bounding_box
 
+        _log.sync()
         bounding_box = validated_bounding_box(bounding_box)
-        return cls(
-            _CoreStreetNetwork(
-                *multimodal_payload(
-                    osm_pbf,
-                    modes=modes,
-                    bounding_box=bounding_box,
-                    dem=dem,
-                    dem_interval=dem_interval,
-                    country=country,
-                    urban_areas=urban_areas,
-                    speed_limits=speed_limits,
+        # One snapshot serves the build and the phase details alike, so
+        # a one-shot iterable cannot be consumed twice. Strings and
+        # non-iterables pass through untouched to the validator's own
+        # refusals.
+        if not isinstance(modes, str):
+            try:
+                modes = tuple(modes)
+            except TypeError:
+                pass
+        with _log.phase(
+            "build.multimodal",
+            _log.build,
+            "building the multimodal street graph",
+            "built the multimodal street graph",
+        ) as ph:
+            network = cls(
+                _CoreStreetNetwork(
+                    *multimodal_payload(
+                        osm_pbf,
+                        modes=modes,
+                        bounding_box=bounding_box,
+                        dem=dem,
+                        dem_interval=dem_interval,
+                        country=country,
+                        urban_areas=urban_areas,
+                        speed_limits=speed_limits,
+                    )
                 )
             )
-        )
+            resolved = list(modes)
+            ph.note = ", ".join(resolved)
+            ph.details["modes"] = resolved
+        return network
 
     @property
     def elevation_metadata(self):
@@ -281,7 +303,16 @@ class StreetNetwork:
         and attribute arrays behind a versioned, checksummed header, so batch
         jobs can ``load`` the file instead of re-running the OSM extraction.
         """
-        self._core.save(os.fspath(path))
+        _log.sync()
+        target = os.fspath(path)
+        with _log.phase(
+            "artifact.save",
+            _log.artifact,
+            "saving the street artifact",
+            "saved the street artifact",
+        ) as ph:
+            ph.details["path"] = target
+            self._core.save(target)
 
     @classmethod
     def load(cls, path, *, mmap=False, verify=None):
@@ -304,7 +335,17 @@ class StreetNetwork:
         modes = {False: "off", True: "auto", "require": "require"}
         if mmap not in modes:
             raise ValueError(f"mmap must be False, True, or 'require', not {mmap!r}")
-        return cls(_CoreStreetNetwork.load(os.fspath(path), modes[mmap], verify))
+        _log.sync()
+        source = os.fspath(path)
+        with _log.phase(
+            "artifact.load",
+            _log.artifact,
+            "loading the street artifact",
+            "loaded the street artifact",
+        ) as ph:
+            ph.details["path"] = source
+            core = _CoreStreetNetwork.load(source, modes[mmap], verify)
+        return cls(core)
 
     @property
     def mapped(self):
@@ -522,21 +563,29 @@ def multimodal_payload(
         urban_areas=urban_areas,
         speed_limits=speed_limits,
     )
-    nodes, edges = _osm.union_network(
-        osm_pbf, bounding_box=bounding_box, car="car" in modes
-    )
-    if edges.empty:
-        raise ValueError(f"no routable ways in '{osm_pbf}'")
-    nodes = nodes.reset_index(drop=True)
-    edges = edges.reset_index(drop=True)
+    with _log.phase(
+        "build.multimodal.streets",
+        _log.build,
+        "extracting the multimodal street union",
+        "extracted the multimodal street union",
+    ) as ph:
+        nodes, edges = _osm.union_network(
+            osm_pbf, bounding_box=bounding_box, car="car" in modes
+        )
+        if edges.empty:
+            raise ValueError(f"no routable ways in '{osm_pbf}'")
+        nodes = nodes.reset_index(drop=True)
+        edges = edges.reset_index(drop=True)
 
-    u, v = streets._vertex_endpoints(nodes, edges)
-    highway, surface, smoothness, class_flags = _osm.normalise_codes(edges)
-    access_forward, access_reverse, access_flags, _ = _osm.edge_permissions(edges)
-    flags = class_flags | access_flags
-    access_forward, access_reverse = _osm.prune_components_per_profile(
-        u, v, len(nodes), access_forward, access_reverse, modes=modes
-    )
+        u, v = streets._vertex_endpoints(nodes, edges)
+        highway, surface, smoothness, class_flags = _osm.normalise_codes(edges)
+        access_forward, access_reverse, access_flags, _ = _osm.edge_permissions(edges)
+        flags = class_flags | access_flags
+        access_forward, access_reverse = _osm.prune_components_per_profile(
+            u, v, len(nodes), access_forward, access_reverse, modes=modes
+        )
+        ph.note = f"{len(edges):,} edges"
+        ph.details.update(edges=len(edges), modes=list(modes))
 
     lengths = edges["length"].to_numpy(dtype=float)
     geometry = edges.geometry.to_numpy()
@@ -571,62 +620,77 @@ def multimodal_payload(
     elevations = None
     metadata = None
     if dem is not None:
-        # Snapshot path inputs up front: they are consumed for sampling
-        # and again for the source identifier, so a one-shot iterable or
-        # a stateful PathLike must not make the two disagree.
-        if not callable(dem):
-            dem = (
-                os.fspath(dem)
-                if isinstance(dem, (str, os.PathLike))
-                else tuple(os.fspath(tile) for tile in dem)
+        with _log.phase(
+            "build.multimodal.elevation",
+            _log.build,
+            "applying the elevation model",
+            "applied the elevation model",
+        ) as ph:
+            # Snapshot path inputs up front: they are consumed for sampling
+            # and again for the source identifier, so a one-shot iterable or
+            # a stateful PathLike must not make the two disagree.
+            if not callable(dem):
+                dem = (
+                    os.fspath(dem)
+                    if isinstance(dem, (str, os.PathLike))
+                    else tuple(os.fspath(tile) for tile in dem)
+                )
+            values = elevation.sample_dem(coordinates[:, 0], coordinates[:, 1], dem)
+            # The promised finite share of DEM samples — taken before
+            # structure inference rewrites bridge and tunnel interiors.
+            sampled_coverage = elevation.coverage(values)
+            structures = np.nonzero(
+                (flags & (_osm.FLAG_BRIDGE | _osm.FLAG_TUNNEL)).astype(bool)
+            )[0]
+            inferred = elevation.infer_structures(
+                offsets, coordinates[:, 0], coordinates[:, 1], values, structures
             )
-        values = elevation.sample_dem(coordinates[:, 0], coordinates[:, 1], dem)
-        # The promised finite share of DEM samples — taken before
-        # structure inference rewrites bridge and tunnel interiors.
-        sampled_coverage = elevation.coverage(values)
-        structures = np.nonzero(
-            (flags & (_osm.FLAG_BRIDGE | _osm.FLAG_TUNNEL)).astype(bool)
-        )[0]
-        inferred = elevation.infer_structures(
-            offsets, coordinates[:, 0], coordinates[:, 1], values, structures
-        )
-        if callable(dem):
-            source = "callable"
-        elif isinstance(dem, str):
-            source = dem
-        else:
-            source = ";".join(dem)
-        elevations = values.tolist()
-        metadata = (
-            source,
-            float(dem_interval),
-            elevation.NODATA_POLICY,
-            sampled_coverage,
-            int(inferred),
-        )
+            if callable(dem):
+                source = "callable"
+            elif isinstance(dem, str):
+                source = dem
+            else:
+                source = ";".join(dem)
+            elevations = values.tolist()
+            metadata = (
+                source,
+                float(dem_interval),
+                elevation.NODATA_POLICY,
+                sampled_coverage,
+                int(inferred),
+            )
+            ph.details["coverage"] = sampled_coverage
+            ph.note = f"{sampled_coverage:.0%} DEM coverage"
     car_attributes = None
     if "car" in modes:
-        # Speeds and junction classes read the pruned permissions: the
-        # drivable graph the routing engine will actually see.
-        speed_forward, speed_reverse = _osm.car_speeds(
-            edges, country=country, urban=urban_areas, speed_limits=speed_limits
-        )
-        junction_forward, junction_reverse = _osm.junction_delay_classes(
-            _osm.node_delay_tags(nodes),
-            u,
-            v,
-            edges["id"].to_numpy(),
-            _osm._column(edges, "highway"),
-            access_forward,
-            access_reverse,
-            len(nodes),
-        )
-        car_attributes = (
-            speed_forward.tolist(),
-            speed_reverse.tolist(),
-            junction_forward.tolist(),
-            junction_reverse.tolist(),
-        )
+        with _log.phase(
+            "build.multimodal.speeds",
+            _log.build,
+            "attributing car speeds and junction delays",
+            "attributed car speeds and junction delays",
+        ) as ph:
+            # Speeds and junction classes read the pruned permissions: the
+            # drivable graph the routing engine will actually see.
+            speed_forward, speed_reverse = _osm.car_speeds(
+                edges, country=country, urban=urban_areas, speed_limits=speed_limits
+            )
+            junction_forward, junction_reverse = _osm.junction_delay_classes(
+                _osm.node_delay_tags(nodes),
+                u,
+                v,
+                edges["id"].to_numpy(),
+                _osm._column(edges, "highway"),
+                access_forward,
+                access_reverse,
+                len(nodes),
+            )
+            car_attributes = (
+                speed_forward.tolist(),
+                speed_reverse.tolist(),
+                junction_forward.tolist(),
+                junction_reverse.tolist(),
+            )
+            ph.details["edges"] = len(edges)
     # `adj_facility` is reserved: no profile reads it yet (the compiler
     # routes on the access bits and the per-edge flags).
     facility = np.zeros(len(edges), dtype=np.uint8)
