@@ -437,6 +437,7 @@ impl TransportNetwork {
     /// departure, rides, achieved arrival)`, seconds past the service
     /// day's start. Internal.
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (egress, date, deadline, max_transfers, exclude_routes, exclude_trips, exclude_stops, workers=None))]
     fn _arrive_by_reaches(
         &self,
         py: Python<'_>,
@@ -496,6 +497,7 @@ impl TransportNetwork {
     /// the incumbent, so attribution is deterministic. Internal.
     #[allow(clippy::type_complexity)]
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (from_stops, to_stops, date, deadline, max_transfers, exclude_routes, exclude_trips, exclude_stops, workers=None))]
     fn _arrive_by_nearest(
         &self,
         py: Python<'_>,
@@ -734,6 +736,7 @@ impl TransportNetwork {
     /// final-mark reverse run. Stops unreachable at the percentile
     /// are absent. Internal.
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (egress, date, arrival, window, percentile, max_transfers, exclude_routes, exclude_trips, exclude_stops, workers=None))]
     fn _arrive_by_percentile_reaches(
         &self,
         py: Python<'_>,
@@ -829,6 +832,7 @@ impl TransportNetwork {
     /// per vertex is its winning label's own duration (key − slack),
     /// which the caller judges against the budgets. Internal.
     #[pyo3(signature = (origin, stop_seeds, walking_speed, cutoff_seconds, max_snap_distance, workers=None))]
+    #[allow(clippy::too_many_arguments)]
     fn _arrive_by_catchment_walk_field<'py>(
         &self,
         py: Python<'py>,
