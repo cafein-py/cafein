@@ -234,6 +234,9 @@ impl TransportNetwork {
                         exclusions: exclusions.clone(),
                     })
                     .collect();
+                let ticker =
+                    crate::logging::ProgressTicker::new("travel_cost_matrix", requests.len());
+                let tick = || ticker.tick();
                 if router == "tbtr" {
                     let engine = self.tbtr_engine(
                         &self.transfers,
@@ -241,14 +244,20 @@ impl TransportNetwork {
                         &active_services,
                         &active_services_previous,
                     );
-                    engine.cost_matrix(&inputs, &requests, &destinations)
+                    engine.cost_matrix_with_progress(
+                        &inputs,
+                        &requests,
+                        &destinations,
+                        crate::logging::progress_hook(&ticker, &tick),
+                    )
                 } else {
-                    Raptor.cost_matrix(
+                    Raptor.cost_matrix_with_progress(
                         &self.build.timetable,
                         &self.transfers,
                         &inputs,
                         &requests,
                         &destinations,
+                        crate::logging::progress_hook(&ticker, &tick),
                     )
                 }
             }
@@ -387,6 +396,8 @@ impl TransportNetwork {
                 );
             }
             let egress = egress_tables(&destination_links);
+            let ticker = crate::logging::ProgressTicker::new("travel_cost_matrix", requests.len());
+            let tick = || ticker.tick();
             let mut rows = if router == "tbtr" {
                 let engine = self.tbtr_engine(
                     self.exclusion_transfers(&exclusions),
@@ -394,15 +405,22 @@ impl TransportNetwork {
                     &active_services,
                     &active_services_previous,
                 );
-                engine.cost_matrix_to_points(&inputs, &requests, &access_meters, &egress)
+                engine.cost_matrix_to_points_with_progress(
+                    &inputs,
+                    &requests,
+                    &access_meters,
+                    &egress,
+                    crate::logging::progress_hook(&ticker, &tick),
+                )
             } else {
-                Raptor.cost_matrix_to_points(
+                Raptor.cost_matrix_to_points_with_progress(
                     &self.build.timetable,
                     self.exclusion_transfers(&exclusions),
                     &inputs,
                     &requests,
                     &access_meters,
                     &egress,
+                    crate::logging::progress_hook(&ticker, &tick),
                 )
             };
             // Walking directly can beat transit: such cells become
@@ -2175,13 +2193,16 @@ impl TransportNetwork {
                         .collect::<HashMap<_, _>>(),
                 );
             }
-            let mut usable_rows = Raptor.cost_matrix_to_points(
+            let ticker = crate::logging::ProgressTicker::new("travel_cost_matrix", requests.len());
+            let tick = || ticker.tick();
+            let mut usable_rows = Raptor.cost_matrix_to_points_with_progress(
                 &self.build.timetable,
                 self.time_transfers(),
                 inputs,
                 &requests,
                 &access_meters,
                 &egress,
+                crate::logging::progress_hook(&ticker, &tick),
             );
             for origin_rows in usable_rows.iter_mut() {
                 for row in origin_rows.iter_mut() {

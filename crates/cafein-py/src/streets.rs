@@ -366,12 +366,15 @@ impl StreetNetwork {
         let (_, profile) = &self.profiles[index];
         let destination_count = destinations.len();
         let (rows, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
-            self.inner.directed_matrix(
+            let ticker = crate::logging::ProgressTicker::new("street matrix", origins.len());
+            let tick = || ticker.tick();
+            self.inner.directed_matrix_with_progress(
                 &origins,
                 &destinations,
                 profile,
                 max_seconds,
                 max_snap_distance,
+                crate::logging::progress_hook(&ticker, &tick),
             )
         });
         let mut flat = Vec::with_capacity(rows.len() * destination_count);
@@ -1091,12 +1094,15 @@ impl StreetNetwork {
         let (_, profile) = &self.profiles[index];
         let width = budgets.len() * fields;
         let (flat, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
-            let (rows, unsnapped_from, unsnapped_to) = self.inner.directed_matrix(
+            let ticker = crate::logging::ProgressTicker::new("street matrix", origins.len());
+            let tick = || ticker.tick();
+            let (rows, unsnapped_from, unsnapped_to) = self.inner.directed_matrix_with_progress(
                 &origins,
                 &destinations,
                 profile,
                 max_seconds,
                 max_snap_distance,
+                crate::logging::progress_hook(&ticker, &tick),
             );
             let flat: Vec<f64> = rows
                 .par_iter()

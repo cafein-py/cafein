@@ -712,9 +712,26 @@ impl<'a> TbtrEngine<'a> {
         accesses: &[Vec<(StopIdx, u32)>],
         max_transfers: u8,
     ) -> Vec<Vec<Option<u32>>> {
+        self.one_to_all_many_with_progress(departure, accesses, max_transfers, None)
+    }
+
+    /// [`TbtrEngine::one_to_all_many`] reporting each completed origin.
+    pub fn one_to_all_many_with_progress(
+        &self,
+        departure: u32,
+        accesses: &[Vec<(StopIdx, u32)>],
+        max_transfers: u8,
+        progress: crate::progress::Progress<'_>,
+    ) -> Vec<Vec<Option<u32>>> {
         accesses
             .par_iter()
-            .map(|access| self.one_to_all(departure, access, max_transfers))
+            .map(|access| {
+                let row = self.one_to_all(departure, access, max_transfers);
+                if let Some(tick) = progress {
+                    tick();
+                }
+                row
+            })
             .collect()
     }
 

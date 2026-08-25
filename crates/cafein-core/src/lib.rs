@@ -11,6 +11,7 @@ pub mod geometry;
 pub mod journey;
 pub mod mcultra;
 pub mod mode_transfers;
+pub mod progress;
 pub mod routers;
 pub use routers::mcraptor;
 pub use routers::mctbtr;

@@ -319,8 +319,15 @@ impl TransportNetwork {
         let active = self.active_services(date)?;
         let previous = self.active_services_previous(date)?;
         let timetable = &self.build.timetable;
+        let timer = crate::logging::PhaseTimer::start(
+            "cafein.build",
+            "build.tbtr",
+            "precomputing the TBTR transfer set",
+            "precomputed the TBTR transfer set",
+        );
         let set =
             py.allow_threads(|| TbtrEngine::transfers_for_date(timetable, &active, &previous));
+        timer.finish();
         self.tbtr_time_transfers = Some((date.to_string(), set));
         Ok(())
     }
@@ -370,9 +377,16 @@ impl TransportNetwork {
             }
         }
         let timetable = &self.build.timetable;
+        let timer = crate::logging::PhaseTimer::start(
+            "cafein.build",
+            "build.mctbtr",
+            "precomputing the McTBTR transfer set",
+            "precomputed the McTBTR transfer set",
+        );
         let set = py.allow_threads(|| {
             McTbtrEngine::transfers_for_date(timetable, geometry, &per_trip, &active, &previous)
         });
+        timer.finish();
         self.mctbtr_transfers = Some((date.to_string(), per_trip, set));
         Ok(())
     }
