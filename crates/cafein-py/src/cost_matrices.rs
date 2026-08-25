@@ -712,13 +712,16 @@ impl TransportNetwork {
             None => None,
         };
         let (rows, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
-            let engine_rows = Raptor.cost_matrix_to_points(
+            let ticker = crate::logging::ProgressTicker::new("travel_cost_matrix", requests.len());
+            let tick = || ticker.tick();
+            let engine_rows = Raptor.cost_matrix_to_points_with_progress(
                 &self.build.timetable,
                 relaxed,
                 &inputs,
                 &requests,
                 &zero_meters,
                 &egress_links,
+                crate::logging::progress_hook(&ticker, &tick),
             );
             let mut rows: Vec<Vec<PolicyCostRow>> = engine_rows
                 .into_iter()

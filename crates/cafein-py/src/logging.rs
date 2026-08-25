@@ -1,13 +1,15 @@
 //! The bridge that carries log records to Python's `logging`.
 //!
-//! Python arms the bridge by syncing the `"cafein"` logger's effective
-//! level into an atomic threshold; a record below the threshold costs
-//! one relaxed load and no GIL activity. Armed records are delivered
+//! Python arms the bridge by syncing the minimum effective level over
+//! the `cafein.build`/`cafein.matrix`/`cafein.artifact` loggers (capped
+//! at INFO while a timing collector is active) into an atomic
+//! threshold; a record below the threshold costs one relaxed load and
+//! no GIL activity. Armed records are delivered
 //! through the dispatch callable `cafein._log` registers at import,
 //! and errors are swallowed — logging must never break a computation.
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 use pyo3::prelude::*;
@@ -107,6 +109,10 @@ pub struct ProgressTicker {
     total: usize,
     step: usize,
     completed: AtomicUsize,
+    /// The last boundary reported; boundary holders emit every
+    /// pending boundary in order under this lock, so lines never
+    /// regress however the workers interleave.
+    emitted: Mutex<usize>,
     started: Instant,
     armed: bool,
 }
@@ -123,6 +129,7 @@ impl ProgressTicker {
             total,
             step: total.div_ceil(20).max(1),
             completed: AtomicUsize::new(0),
+            emitted: Mutex::new(0),
             started: Instant::now(),
             armed,
         }
@@ -137,16 +144,21 @@ impl ProgressTicker {
         if !done.is_multiple_of(self.step) {
             return;
         }
-        let (label, total) = (self.label, self.total);
-        let percent = done * 100 / total;
-        let seconds = self.started.elapsed().as_secs_f64();
-        emit(
-            "cafein.matrix",
-            INFO,
-            || format!("{label} {percent}% ({done}/{total} origins, {seconds:.1} s elapsed)"),
-            None,
-            None,
-        );
+        let mut emitted = self.emitted.lock().unwrap_or_else(PoisonError::into_inner);
+        while *emitted + self.step <= done {
+            *emitted += self.step;
+            let at = *emitted;
+            let (label, total) = (self.label, self.total);
+            let percent = at * 100 / total;
+            let seconds = self.started.elapsed().as_secs_f64();
+            emit(
+                "cafein.matrix",
+                INFO,
+                || format!("{label} {percent}% ({at}/{total} origins, {seconds:.1} s elapsed)"),
+                None,
+                None,
+            );
+        }
     }
 }
 

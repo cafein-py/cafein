@@ -455,119 +455,127 @@ impl StreetNetwork {
             // admit, so a cutoff admitting nothing leaves the cell unreachable
             // — matching the single route and the time matrix.
             let routable = max_seconds.is_finite() && max_seconds >= 0.0;
+            let ticker = crate::logging::ProgressTicker::new("street matrix", origins.len());
             let cells: Vec<Vec<Option<CostCell>>> = origin_snaps
                 .par_iter()
                 .zip(&origins)
-                .map(|(origin, &point)| match origin {
-                    None => vec![None; destinations.len()],
-                    Some(from) => {
-                        let mut row: Vec<Option<CostCell>> = if geometries {
-                            match &weighted {
-                                Some(search) => self.inner.directed_legs_to_snaps_weighted(
-                                    point,
-                                    from,
-                                    &targets,
-                                    search,
-                                    profile,
-                                    max_seconds,
-                                ),
-                                None => self.inner.directed_legs_to_snaps(
-                                    point,
-                                    from,
-                                    &targets,
-                                    profile,
-                                    max_seconds,
-                                ),
-                            }
-                            .into_iter()
-                            .map(|leg| leg.map(CostCell::from_leg))
-                            .collect()
-                        } else if street_edges {
-                            // The metres path serves street_edges too: the
-                            // provenance reads off the winning chain the
-                            // metres already walk, no shape assembled.
-                            match &weighted {
-                                Some(search) => self.inner.directed_meters_edges_to_snaps_weighted(
-                                    from,
-                                    &target_snaps,
-                                    search,
-                                    profile,
-                                    max_seconds,
-                                ),
-                                None => self.inner.directed_meters_edges_to_snaps(
-                                    from,
-                                    &target_snaps,
-                                    profile,
-                                    max_seconds,
-                                ),
-                            }
-                            .into_iter()
-                            .zip(&target_snaps)
-                            .map(|(cell, target)| {
-                                let (seconds, network_meters, edges) = cell?;
-                                // A cell settles only against a snapped
-                                // destination, so the connectors at both
-                                // ends are the snaps' own.
-                                let to = target.as_ref()?;
-                                Some(CostCell {
-                                    seconds,
-                                    network_meters,
-                                    connector_meters: from.connector + to.connector,
-                                    geometry: None,
-                                    edges,
+                .map(|(origin, &point)| {
+                    let row = match origin {
+                        None => vec![None; destinations.len()],
+                        Some(from) => {
+                            let mut row: Vec<Option<CostCell>> = if geometries {
+                                match &weighted {
+                                    Some(search) => self.inner.directed_legs_to_snaps_weighted(
+                                        point,
+                                        from,
+                                        &targets,
+                                        search,
+                                        profile,
+                                        max_seconds,
+                                    ),
+                                    None => self.inner.directed_legs_to_snaps(
+                                        point,
+                                        from,
+                                        &targets,
+                                        profile,
+                                        max_seconds,
+                                    ),
+                                }
+                                .into_iter()
+                                .map(|leg| leg.map(CostCell::from_leg))
+                                .collect()
+                            } else if street_edges {
+                                // The metres path serves street_edges too: the
+                                // provenance reads off the winning chain the
+                                // metres already walk, no shape assembled.
+                                match &weighted {
+                                    Some(search) => {
+                                        self.inner.directed_meters_edges_to_snaps_weighted(
+                                            from,
+                                            &target_snaps,
+                                            search,
+                                            profile,
+                                            max_seconds,
+                                        )
+                                    }
+                                    None => self.inner.directed_meters_edges_to_snaps(
+                                        from,
+                                        &target_snaps,
+                                        profile,
+                                        max_seconds,
+                                    ),
+                                }
+                                .into_iter()
+                                .zip(&target_snaps)
+                                .map(|(cell, target)| {
+                                    let (seconds, network_meters, edges) = cell?;
+                                    // A cell settles only against a snapped
+                                    // destination, so the connectors at both
+                                    // ends are the snaps' own.
+                                    let to = target.as_ref()?;
+                                    Some(CostCell {
+                                        seconds,
+                                        network_meters,
+                                        connector_meters: from.connector + to.connector,
+                                        geometry: None,
+                                        edges,
+                                    })
                                 })
-                            })
-                            .collect()
-                        } else {
-                            match &weighted {
-                                Some(search) => self.inner.directed_meters_to_snaps_weighted(
-                                    from,
-                                    &target_snaps,
-                                    search,
-                                    profile,
-                                    max_seconds,
-                                ),
-                                None => self.inner.directed_meters_to_snaps(
-                                    from,
-                                    &target_snaps,
-                                    profile,
-                                    max_seconds,
-                                ),
-                            }
-                            .into_iter()
-                            .zip(&target_snaps)
-                            .map(|(cell, target)| {
-                                let (seconds, network_meters) = cell?;
-                                let to = target.as_ref()?;
-                                Some(CostCell {
-                                    seconds,
-                                    network_meters,
-                                    connector_meters: from.connector + to.connector,
-                                    geometry: None,
-                                    edges: Vec::new(),
-                                })
-                            })
-                            .collect()
-                        };
-                        if routable {
-                            // A coordinate is no distance and no time from
-                            // itself. Its shape is the degenerate two-point
-                            // line, so it stays a valid LineString.
-                            for (cell, (destination, target)) in row.iter_mut().zip(&targets) {
-                                if *destination == point && target.is_some() {
-                                    *cell = Some(CostCell {
-                                        seconds: 0,
-                                        network_meters: 0.0,
-                                        connector_meters: 0.0,
-                                        geometry: geometries
-                                            .then(|| vec![(point.1, point.0), (point.1, point.0)]),
+                                .collect()
+                            } else {
+                                match &weighted {
+                                    Some(search) => self.inner.directed_meters_to_snaps_weighted(
+                                        from,
+                                        &target_snaps,
+                                        search,
+                                        profile,
+                                        max_seconds,
+                                    ),
+                                    None => self.inner.directed_meters_to_snaps(
+                                        from,
+                                        &target_snaps,
+                                        profile,
+                                        max_seconds,
+                                    ),
+                                }
+                                .into_iter()
+                                .zip(&target_snaps)
+                                .map(|(cell, target)| {
+                                    let (seconds, network_meters) = cell?;
+                                    let to = target.as_ref()?;
+                                    Some(CostCell {
+                                        seconds,
+                                        network_meters,
+                                        connector_meters: from.connector + to.connector,
+                                        geometry: None,
                                         edges: Vec::new(),
-                                    });
+                                    })
+                                })
+                                .collect()
+                            };
+                            if routable {
+                                // A coordinate is no distance and no time from
+                                // itself. Its shape is the degenerate two-point
+                                // line, so it stays a valid LineString.
+                                for (cell, (destination, target)) in row.iter_mut().zip(&targets) {
+                                    if *destination == point && target.is_some() {
+                                        *cell = Some(CostCell {
+                                            seconds: 0,
+                                            network_meters: 0.0,
+                                            connector_meters: 0.0,
+                                            geometry: geometries.then(|| {
+                                                vec![(point.1, point.0), (point.1, point.0)]
+                                            }),
+                                            edges: Vec::new(),
+                                        });
+                                    }
                                 }
                             }
+                            row
                         }
-                        row
-                    }
+                    };
+                    ticker.tick();
+                    row
                 })
                 .collect();
             (cells, origin_snaps, target_snaps)

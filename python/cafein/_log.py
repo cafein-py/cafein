@@ -14,6 +14,7 @@ through the exception-guarded :func:`_emit`.
 
 import copy
 import functools
+import inspect
 import logging
 import sys
 import threading
@@ -142,7 +143,6 @@ def timed_computer(
     doing,
     done,
     *,
-    network_position=1,
     street_identifier=None,
     street_doing=None,
     street_done=None,
@@ -155,18 +155,25 @@ def timed_computer(
     read off ``self``) and on frame-returning functions alike. With
     ``street_identifier`` and ``is_street``, a street-network call
     swaps to the street identifier and phrases. ``details`` is an
-    optional ``(args, kwargs) -> dict`` read before the computation.
+    optional ``(arguments) -> dict`` over the call's bound arguments
+    (positional and keyword forms alike), read before the computation.
     """
 
     def wrap(fn):
+        signature = inspect.signature(fn)
+
+        def bound(args, kwargs):
+            try:
+                return signature.bind_partial(*args, **kwargs).arguments
+            except TypeError:
+                return {}
+
         @functools.wraps(fn)
         def timed(*args, **kwargs):
             ident, doing_now, done_now = identifier, doing, done
+            arguments = bound(args, kwargs)
             if street_identifier is not None and is_street is not None:
-                network = kwargs.get("network")
-                if network is None and len(args) > network_position:
-                    network = args[network_position]
-                if is_street(network):
+                if is_street(arguments.get("network")):
                     ident = street_identifier
                     doing_now = street_doing or doing
                     done_now = street_done or done
@@ -174,7 +181,7 @@ def timed_computer(
             with phase(ident, logger, doing_now, done_now) as handle:
                 if details is not None:
                     try:
-                        handle.details.update(details(args, kwargs))
+                        handle.details.update(details(arguments))
                     except Exception:
                         pass
                 result = fn(*args, **kwargs)

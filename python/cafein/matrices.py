@@ -24,14 +24,17 @@ from cafein.travelers import (
 )
 
 
-def _query_details(args, kwargs):
+def _query_details(arguments):
     """Best-effort shape facts for a matrix phase."""
     details = {}
     for key in ("origins", "destinations"):
-        count = _log.sized(kwargs.get(key))
+        count = _log.sized(arguments.get(key))
         if count is not None:
             details[key] = count
-    chunk = kwargs.get("chunk")
+    for key in ("departure_time_window", "arrival_time_window"):
+        if arguments.get(key) is not None:
+            details["window"] = arguments[key]
+    chunk = arguments.get("chunk")
     if chunk is not None:
         try:
             details["chunk"] = tuple(int(part) for part in chunk)
@@ -2443,7 +2446,6 @@ def _time_columns(
     _log.matrix,
     "computing the travel cost table",
     "computed the travel cost table",
-    network_position=0,
     street_identifier="matrix.streets",
     street_doing="computing the street cost table",
     street_done="computed the street cost table",
