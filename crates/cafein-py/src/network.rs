@@ -141,8 +141,22 @@ impl TransportNetwork {
     ///     input order.
     #[staticmethod]
     fn from_gtfs(py: Python<'_>, paths: Vec<String>) -> PyResult<TransportNetwork> {
+        let timer = crate::logging::PhaseTimer::start(
+            "cafein.build",
+            "build.gtfs.read",
+            "reading the GTFS feed",
+            "read the GTFS feed",
+        );
         let feed = Feed::from_paths(&paths).map_err(to_py_error)?;
+        timer.finish();
+        let timer = crate::logging::PhaseTimer::start(
+            "cafein.build",
+            "build.gtfs.timetable",
+            "building the timetable",
+            "built the timetable",
+        );
         let build = build_timetable(&feed).map_err(to_py_error)?;
+        timer.finish();
         if !build.quarantined.is_empty() {
             let message = format!(
                 "quarantined {} trip(s) with data-quality problems; routing excludes them",
@@ -166,8 +180,15 @@ impl TransportNetwork {
             )?;
         }
         let transfers = Transfers::empty(build.timetable.stop_count());
+        let timer = crate::logging::PhaseTimer::start(
+            "cafein.build",
+            "build.gtfs.indexes",
+            "deriving the routing indexes",
+            "derived the routing indexes",
+        );
         let (stops_by_id, stops_by_qualified_id, trips_by_public_id) =
             derived_indexes(&feed, &build.timetable);
+        timer.finish();
         Ok(TransportNetwork {
             feed,
             build,

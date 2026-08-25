@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- The Rust-side build and artifact stages report through the logging
+  surface: `build.gtfs.read`/`.timetable`/`.indexes` and the artifact
+  `save.encode`/`load.decode`/`load.rebuild` halves emit timed phases
+  across the PyO3 boundary, armed from the Python logging
+  configuration — one atomic check when logging is off.
+  ([#309](https://github.com/cafein-py/cafein/pull/309))
+
 - Logging: `cafein.enable_logging(stream=, level=)` streams cafein's
   build, artifact, and emissions phases with wall times to a chosen
   stream (quiet by default, stdlib `logging` under the `"cafein"`

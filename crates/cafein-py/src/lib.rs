@@ -191,6 +191,7 @@ mod carriage;
 mod cost_matrices;
 mod fare_frontiers;
 mod frontiers;
+mod logging;
 mod network;
 mod options;
 mod points;
@@ -212,6 +213,8 @@ fn _cafein(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(access::aggregate_opportunity_sums_f64, m)?)?;
     m.add_function(wrap_pyfunction!(access::aggregate_nearest, m)?)?;
     m.add_function(wrap_pyfunction!(access::aggregate_nearest_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(logging::set_log_level, m)?)?;
+    m.add_function(wrap_pyfunction!(logging::install_log_dispatch, m)?)?;
     m.add(
         "STREET_MAX_SEGMENT_METERS",
         cafein_core::streets::MAX_SEGMENT_METERS,

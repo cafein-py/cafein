@@ -158,6 +158,21 @@ def _from_rust(target, levelno, message, phase=None, seconds=None):
         _emit(logger, levelno, message, phase=phase, seconds=seconds, details={})
 
 
+def _install_bridge():
+    """Register the dispatch with the compiled bridge, if present."""
+    try:
+        from cafein import _cafein
+
+        install = getattr(_cafein, "install_log_dispatch", None)
+        if install is not None:
+            install(_from_rust)
+    except Exception:
+        pass
+
+
+_install_bridge()
+
+
 def _validated_level(level):
     if isinstance(level, bool) or not isinstance(level, (int, str)):
         raise TypeError("level must be an int or one of 'debug', 'info', 'warning'")
@@ -241,12 +256,16 @@ def collect_timings():
 
     Phase identifiers are dotted paths; a parent phase is an
     aggregate that coexists with its dotted children. The current
-    vocabulary: ``build.gtfs`` (the transit core built from GTFS),
-    ``build.streets.read``, ``build.streets.prune``,
-    ``build.streets.graph``, ``build.streets.footpaths`` (the OSM
-    walking structures), ``build.multimodal`` (the multimodal street
-    graph), ``artifact.save`` / ``artifact.load``,
-    ``emissions.annotate``, and ``exposure.build``.
+    vocabulary: ``build.gtfs`` (the transit core built from GTFS)
+    with its children ``build.gtfs.read``, ``build.gtfs.timetable``,
+    and ``build.gtfs.indexes``; ``build.streets.read``,
+    ``build.streets.prune``, ``build.streets.graph``,
+    ``build.streets.footpaths`` (the OSM walking structures);
+    ``build.multimodal`` (the multimodal street graph);
+    ``artifact.save`` with ``artifact.save.encode``;
+    ``artifact.load`` with ``artifact.load.decode`` and
+    ``artifact.load.rebuild``; ``emissions.annotate``; and
+    ``exposure.build``.
     """
     report = TimingReport()
     with _lock:
