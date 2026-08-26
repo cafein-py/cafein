@@ -9,9 +9,11 @@ import datetime
 import math
 
 
-def duration_seconds(name, value):
-    """``value`` in minutes (a number) or as a timedelta → whole seconds.
+def duration_seconds(name, value, whole=True):
+    """``value`` in minutes (a number) or as a timedelta → seconds.
 
+    Whole seconds by default (the router clock's unit); ``whole=False``
+    keeps the exact float for parameters of continuous functions.
     ``None`` passes through (an unset limit stays unset). Fractional
     minutes are allowed (0.5 is 30 seconds); negatives are refused.
     """
@@ -32,7 +34,7 @@ def duration_seconds(name, value):
         raise ValueError(f"{name} must be a non-negative, finite duration")
     if seconds > 4_294_967_295:
         raise ValueError(f"{name} overflows the router clock; narrow it")
-    return int(round(seconds))
+    return int(round(seconds)) if whole else seconds
 
 
 def clock_time(name, value):

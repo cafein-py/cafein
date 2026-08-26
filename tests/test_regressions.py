@@ -764,3 +764,62 @@ def test_street_query_knobs_refuse_instead_of_emptying(network):
             ),
             occupancy=10**400,
         )
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+def test_decay_parameters_keep_their_fractional_seconds(network, tmp_path, streamed):
+    """Time-axis decay parameters must reach the core as exact seconds
+    on both execution paths — the constructor and the streamed
+    ``to_parquet``, which converts them separately.
+
+    Before the fix `decay_params` went through the whole-second rounding
+    of the router-clock inputs, so a half-life of ``ln2/0.1`` minutes
+    (415.888 s) ran as 416 s and every exponential weight drifted by
+    ``exp((x − x')·t)`` — 2.4 % on the farthest destinations.
+    """
+    import math
+
+    import numpy as np
+    import pandas as pd
+
+    from cafein.accessibility import Accessibility, NearestDestinations
+
+    departure = "2022-02-22 08:30"
+    stops = [stop for stop, _, _ in network.stops]
+    rng = np.random.default_rng(3)
+    origins = list(rng.choice(stops, 8, replace=False))
+    table = pd.DataFrame({"id": rng.choice(stops, 40, replace=False), "jobs": 1.0})
+    costs = NearestDestinations(
+        network,
+        origins,
+        list(table["id"]),
+        departure,
+        k=len(table),
+        output_time_units="seconds",
+    )
+    half_life = math.log(2) / 0.1  # minutes: 415.888 s, not a whole number
+    call = dict(
+        opportunities="jobs",
+        budgets=(float(costs["cost"].max()) / 60 + 1,),
+        decay="exponential",
+        decay_params={"half_life": half_life},
+    )
+    if streamed:
+        parquet = pytest.importorskip("pyarrow.parquet")
+        Accessibility.to_parquet(
+            network,
+            origins,
+            table,
+            departure,
+            output=tmp_path / "decay.parquet",
+            batch_size=3,
+            **call,
+        )
+        result = parquet.read_table(tmp_path / "decay.parquet").to_pandas()
+        result = result.astype({"from_id": str}).set_index("from_id")["accessibility"]
+    else:
+        result = Accessibility(network, origins, table, departure, **call)
+        result = result.set_index("from_id")["accessibility"]
+    weights = np.exp(-math.log(2) * costs["cost"] / (half_life * 60))
+    expected = weights.groupby(costs["from_id"]).sum().reindex(origins, fill_value=0)
+    assert np.allclose(result.reindex(origins), expected, rtol=1e-12)
