@@ -34,6 +34,14 @@ pub(super) fn parse_decay(decay: &str, decay_param: Option<f64>) -> PyResult<Dec
         "linear" => Ok(Decay::Linear {
             width: parameter("width")?,
         }),
+        "linear_cutoff" => {
+            if decay_param.is_some() {
+                return Err(PyValueError::new_err(
+                    "decay='linear_cutoff' takes no decay_param",
+                ));
+            }
+            Ok(Decay::LinearCutoff)
+        }
         "exponential" => Ok(Decay::Exponential {
             half_life: parameter("half_life")?,
         }),
@@ -42,7 +50,7 @@ pub(super) fn parse_decay(decay: &str, decay_param: Option<f64>) -> PyResult<Dec
         }),
         unknown => Err(PyValueError::new_err(format!(
             "unknown decay {unknown:?}: the decay functions are step, linear, \
-             exponential, logistic"
+             linear_cutoff, exponential, logistic"
         ))),
     }
 }

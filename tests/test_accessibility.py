@@ -74,23 +74,32 @@ def test_decay_weights_match_the_formulas(network):
     opportunities = numpy.arange(1.0, len(destinations) + 1)
     times = _oracle_times(network, origins, destinations)
 
-    def masked(weights):
+    def masked(weights, support):
         return numpy.nansum(
-            numpy.where(times <= 1800.0, weights, 0.0) * opportunities,
+            numpy.where(times <= support, weights, 0.0) * opportunities,
             axis=1,
             keepdims=True,
         )
 
+    # (decay, parameter): (weights, the support — the ramp keeps its
+    # weight to budget + width/2, every other family ends at the budget).
     cases = {
-        ("linear", 600.0): numpy.clip((1800.0 + 300.0 - times) / 600.0, 0.0, 1.0),
-        ("exponential", 600.0): numpy.exp(-numpy.log(2.0) * times / 600.0),
-        ("logistic", 120.0): 1.0 / (1.0 + numpy.exp((times - 1800.0) / 120.0)),
+        ("linear", 600.0): (
+            numpy.clip((1800.0 + 300.0 - times) / 600.0, 0.0, 1.0),
+            2100.0,
+        ),
+        ("linear_cutoff", None): (numpy.clip(1.0 - times / 1800.0, 0.0, 1.0), 1800.0),
+        ("exponential", 600.0): (numpy.exp(-numpy.log(2.0) * times / 600.0), 1800.0),
+        ("logistic", 120.0): (
+            1.0 / (1.0 + numpy.exp((times - 1800.0) / 120.0)),
+            1800.0,
+        ),
     }
-    for (decay, param), weights in cases.items():
+    for (decay, param), (weights, support) in cases.items():
         values = _sums(
             network, origins, destinations, opportunities, (1800.0,), decay, param
         )
-        assert numpy.allclose(values, masked(weights)), decay
+        assert numpy.allclose(values, masked(weights, support)), decay
 
 
 def test_a_generous_budget_counts_the_reachable_mass(network):
@@ -1265,3 +1274,236 @@ def test_products_carry_the_inputs_id_dtypes(network):
     )
     assert str(legs["from_id"].dtype) == "int64"
     assert str(legs["to_id"].dtype) == "int64"
+
+
+def _ramp_sums(surface, opportunities, budget, width):
+    """Closed forms over a cost surface (NaN unreached): the ramp with
+    ``width`` around ``budget``, the cutoff-anchored linear decay, and
+    the mass the ramp carries strictly past the budget — the part a
+    search clipped at the budget would lose."""
+    costs = numpy.nan_to_num(surface, nan=numpy.inf)
+    ramp = numpy.clip((budget + width / 2 - costs) / width, 0.0, 1.0)
+    beyond = numpy.where(costs > budget, ramp, 0.0)
+    cutoff = numpy.clip(1.0 - costs / budget, 0.0, 1.0)
+    return (
+        (ramp * opportunities).sum(axis=1),
+        (cutoff * opportunities).sum(axis=1),
+        (beyond * opportunities).sum(axis=1),
+    )
+
+
+def _median_budget(surface):
+    finite = surface[numpy.isfinite(surface)]
+    assert finite.size, "no reached destination — fixture drift"
+    return float(numpy.median(finite))
+
+
+def _whole_second_budget(surface):
+    """A time budget in whole seconds: budgets are clock inputs and
+    round to the second, so a fractional median would shift the ramp."""
+    return float(numpy.floor(_median_budget(surface)))
+
+
+def test_linear_ramp_keeps_its_weight_past_the_budget_on_stop_origins(network):
+    from cafein import Accessibility
+
+    origins, destinations = _stop_sets(network)
+    seconds = _oracle_times(network, origins, destinations)
+    budget = _whole_second_budget(seconds)
+    width = budget  # the ramp reaches 0 at 1.5 × budget
+    ramp, cutoff, beyond = _ramp_sums(seconds, 1.0, budget, width)
+    assert beyond.sum() > 0, "no destination between the budget and the ramp's end"
+    minutes = {"budgets": (budget / 60,)}
+    linear = Accessibility(
+        network,
+        origins,
+        destinations,
+        DEPARTURE,
+        decay="linear",
+        decay_params={"width": width / 60},
+        **minutes,
+    )
+    assert numpy.allclose(linear["accessibility"].to_numpy(), ramp, rtol=1e-12)
+    anchored = Accessibility(
+        network, origins, destinations, DEPARTURE, decay="linear_cutoff", **minutes
+    )
+    assert numpy.allclose(anchored["accessibility"].to_numpy(), cutoff, rtol=1e-12)
+    with pytest.raises(ValueError, match="takes no decay_params"):
+        Accessibility(
+            network,
+            origins,
+            destinations,
+            DEPARTURE,
+            decay="linear_cutoff",
+            decay_params={"width": 1.0},
+            **minutes,
+        )
+    with pytest.raises(ValueError, match="linear_cutoff"):
+        Accessibility(network, origins, destinations, DEPARTURE, decay="ramp")
+
+
+def test_linear_ramp_keeps_its_weight_past_the_budget_across_a_window(network):
+    from cafein import Accessibility, TravelTimeMatrix
+
+    origins, destinations = _stop_sets(network)
+    matrix = TravelTimeMatrix(
+        network,
+        origins,
+        departure=DEPARTURE,
+        departure_time_window=10,
+        percentiles=(25, 75),
+        output_time_units="seconds",
+    )
+    matrix = matrix[matrix["to_id"].isin(destinations)]
+    at_origin = {origin: at for at, origin in enumerate(origins)}
+    at_dest = {dest: at for at, dest in enumerate(destinations)}
+    surfaces = {}
+    for percentile in (25, 75):
+        surface = numpy.full((len(origins), len(destinations)), numpy.nan)
+        for _, row in matrix.iterrows():
+            value = row[f"travel_time_p{percentile}"]
+            if numpy.isfinite(value):
+                surface[at_origin[row["from_id"]], at_dest[row["to_id"]]] = value
+        surfaces[percentile] = surface
+    budget = _whole_second_budget(surfaces[25])
+    width = budget
+    frame = Accessibility(
+        network,
+        origins,
+        destinations,
+        DEPARTURE,
+        departure_time_window=10,
+        percentiles=(25, 75),
+        budgets=(budget / 60,),
+        decay="linear",
+        decay_params={"width": width / 60},
+    )
+    for percentile, surface in surfaces.items():
+        ramp, _, beyond = _ramp_sums(surface, 1.0, budget, width)
+        assert beyond.sum() > 0
+        got = frame[frame["percentile"] == percentile]["accessibility"].to_numpy()
+        assert numpy.allclose(got, ramp, rtol=1e-12), percentile
+
+
+@pytest.mark.parametrize("axis", ["emissions", "money"])
+def test_linear_ramp_keeps_its_weight_past_the_budget_on_cost_axes(
+    network, helsinki_gtfs, axis
+):
+    from cafein import Accessibility
+    from cafein import fares as fare_module
+
+    origins, destinations = _stop_sets(network)
+    structure = (
+        fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
+        if axis == "money"
+        else None
+    )
+    surface = _cost_surface(
+        network, origins, destinations, "fare" if axis == "money" else axis, structure
+    )
+    # The fixture prices these pairs at one or two fare levels: a budget
+    # at half the median puts every dearer cost in the ramp's extension.
+    finite = surface[numpy.isfinite(surface)]
+    budget = 0.5 * _median_budget(surface)
+    width = 4.0 * (float(finite.max()) - budget)
+    assert budget > 0
+    ramp, cutoff, beyond = _ramp_sums(surface, 1.0, budget, width)
+    assert beyond.sum() > 0
+    shared = dict(
+        cost=axis, departure_time_window=10, budgets=(budget,), fares=structure
+    )
+    linear = Accessibility(
+        network,
+        origins,
+        destinations,
+        DEPARTURE,
+        decay="linear",
+        decay_params={"width": width},  # the axis's own unit, unconverted
+        **shared,
+    )
+    assert numpy.allclose(linear["accessibility"].to_numpy(), ramp, rtol=1e-12)
+    anchored = Accessibility(
+        network, origins, destinations, DEPARTURE, decay="linear_cutoff", **shared
+    )
+    assert numpy.allclose(anchored["accessibility"].to_numpy(), cutoff, rtol=1e-12)
+
+
+def test_linear_ramp_keeps_its_weight_past_the_budget_door_to_door(
+    network_with_footpaths,
+):
+    geopandas = pytest.importorskip("geopandas")
+    from cafein import Accessibility, NearestDestinations
+
+    origins = geopandas.GeoDataFrame(
+        {"id": ["kamppi", "kallio"]},
+        geometry=geopandas.points_from_xy([24.9316, 24.9500], [60.1688, 60.1841]),
+        crs="EPSG:4326",
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["a", "b", "c"], "seats": [10.0, 20.0, 40.0]},
+        geometry=geopandas.points_from_xy(
+            [24.9414, 24.9210, 24.9700], [60.1725, 60.1580, 60.2000]
+        ),
+        crs="EPSG:4326",
+    )
+    # The accessibility dispatch's own per-pair costs (door-to-door
+    # walking keeps fractional seconds the matrix rounds away).
+    costs = NearestDestinations(
+        network_with_footpaths,
+        origins,
+        destinations,
+        DEPARTURE,
+        k=3,
+        output_time_units="seconds",
+    )
+    surface = numpy.full((2, 3), numpy.nan)
+    at_origin = {"kamppi": 0, "kallio": 1}
+    at_dest = {"a": 0, "b": 1, "c": 2}
+    for _, row in costs.iterrows():
+        surface[at_origin[row["from_id"]], at_dest[row["destination_id"]]] = row["cost"]
+    budget = _whole_second_budget(surface)
+    width = budget
+    seats = destinations["seats"].to_numpy()
+    ramp, _, beyond = _ramp_sums(surface, seats, budget, width)
+    assert beyond.sum() > 0
+    frame = Accessibility(
+        network_with_footpaths,
+        origins,
+        destinations,
+        DEPARTURE,
+        opportunities="seats",
+        budgets=(budget / 60,),
+        decay="linear",
+        decay_params={"width": width / 60},
+    )
+    got = dict(zip(frame["from_id"], frame["accessibility"]))
+    assert numpy.allclose([got["kamppi"], got["kallio"]], ramp, rtol=1e-12)
+
+
+def test_linear_ramp_streams_identically(network, tmp_path):
+    from cafein import Accessibility
+
+    parquet = pytest.importorskip("pyarrow.parquet")
+    origins, destinations = _stop_sets(network)
+    seconds = _oracle_times(network, origins, destinations)
+    budget = _whole_second_budget(seconds)
+    ramp, _, beyond = _ramp_sums(seconds, 1.0, budget, budget)
+    assert beyond.sum() > 0
+    call = dict(
+        budgets=(budget / 60,), decay="linear", decay_params={"width": budget / 60}
+    )
+    frame = Accessibility(network, origins, destinations, DEPARTURE, **call)
+    Accessibility.to_parquet(
+        network,
+        origins,
+        destinations,
+        DEPARTURE,
+        output=tmp_path / "ramp.parquet",
+        batch_size=2,
+        **call,
+    )
+    read = parquet.read_table(tmp_path / "ramp.parquet").to_pandas()
+    read = read.astype({"from_id": str}).sort_values("from_id").reset_index(drop=True)
+    expected = frame.astype({"from_id": str}).sort_values("from_id")
+    assert numpy.allclose(read["accessibility"], expected["accessibility"], rtol=1e-12)
+    assert numpy.allclose(expected["accessibility"], ramp, rtol=1e-12)

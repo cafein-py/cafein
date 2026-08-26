@@ -49,8 +49,8 @@ DEPARTURE = "2022-02-22 08:30"
 EQUITY_CUTOFF = 30
 POVERTY_LINE = 50000
 CUTOFFS_MIN = (15.0, 30.0, 45.0)
-# Decay parameters: one whole-second value per family (cafein rounds time
-# parameters to whole seconds) and the fractional literature value.
+# Decay parameters: a whole-second value and the fractional literature
+# value per family; both must agree.
 HALF_LIVES_MIN = {"whole": 7.0, "fractional": math.log(2) / 0.1}
 SCALES_MIN = {"whole": 5.0, "fractional": 10.0 * math.sqrt(3) / math.pi}
 LOGISTIC_BUDGET_MIN = 30.0
@@ -656,7 +656,7 @@ def accessibility_part(rscript, staging, comparison, count_origins, count_dests,
             f"exponential {kind} (half_life {half_life * 60:.3f} s)",
             theirs(gravity[gravity["variant"] == f"exp_{kind}"], "jobs", 0),
             ours.set_index("from_id")["accessibility"].reindex(origins),
-            "identical" if kind == "whole" else "differs",
+            "identical",
         )
     for kind, scale in SCALES_MIN.items():
         ours = Accessibility(
@@ -676,7 +676,7 @@ def accessibility_part(rscript, staging, comparison, count_origins, count_dests,
             f"logistic {kind} (scale {scale * 60:.3f} s, rescaled)",
             theirs(gravity[gravity["variant"] == f"logistic_{kind}"], "jobs", 0),
             ours.set_index("from_id")["accessibility"].reindex(origins) * factor,
-            "identical" if kind == "whole" else "differs",
+            "identical",
         )
     ours = Accessibility(
         network,
@@ -695,6 +695,24 @@ def accessibility_part(rscript, staging, comparison, count_origins, count_dests,
         theirs(gravity[gravity["variant"] == "linear"], "jobs", 0),
         ours.set_index("from_id")["accessibility"].reindex(origins),
         "differs",
+    )
+
+    ours = Accessibility(
+        network,
+        origins,
+        table,
+        DEPARTURE,
+        opportunities="jobs",
+        budgets=(LOGISTIC_BUDGET_MIN,),
+        decay="linear_cutoff",
+    )
+    comparison.add_series(
+        "accessibility",
+        "gravity",
+        "linear_cutoff (vs 1 - t/cutoff)",
+        theirs(gravity[gravity["variant"] == "linear"], "jobs", 0),
+        ours.set_index("from_id")["accessibility"].reindex(origins),
+        "identical",
     )
 
     nearest = NearestDestinations(
