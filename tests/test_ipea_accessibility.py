@@ -46,11 +46,15 @@ INCOME = "income_per_capita"
 EXPORT = "python scripts/compare_vs_ipea_accessibility.py --export-fixtures"
 
 
-def _fixture(name, recovery=EXPORT):
+def _fixture(name, recovery=EXPORT, fetched=False):
+    """A test-data path, or a skip naming how to produce it. Only the
+    fetched fixtures (``scripts/fetch_test_data.py``) honour
+    ``CAFEIN_REQUIRE_TEST_DATA``; the CSVs exported from the R package
+    need an R environment, which the CI runners do not have."""
     path = DATA / name
     if not path.exists():
         message = f"{path} missing; run `{recovery}`"
-        if os.environ.get("CAFEIN_REQUIRE_TEST_DATA"):
+        if fetched and os.environ.get("CAFEIN_REQUIRE_TEST_DATA"):
             pytest.fail(message)
         pytest.skip(message)
     return path
@@ -308,7 +312,7 @@ def _rscript():
 
 
 def test_the_comparison_script_agrees_with_the_package(tmp_path):
-    _fixture("helsinki_gtfs.zip", "python scripts/fetch_test_data.py")
+    _fixture("helsinki_gtfs.zip", "python scripts/fetch_test_data.py", fetched=True)
     rscript = _rscript()
     output = tmp_path / "rows.csv"
     completed = subprocess.run(
