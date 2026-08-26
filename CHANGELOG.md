@@ -2,14 +2,18 @@
 
 ## Unreleased
 
+- `scripts/compare_vs_ipea_accessibility.py` compares cafein's
+  `Accessibility`, `NearestDestinations`, and `cafein.equity` results
+  against IPEA's R `accessibility` package on identical inputs, and
+  `tests/test_ipea_accessibility.py` pins the package's reference
+  numbers on its sample data.
+
 - Per-call `workers=` on the matrix and accessibility computers
   (their streamed `to_parquet` forms included): a rayon local pool
   for one computation, `None` keeping today's global-pool behavior,
   results identical at any width. The effective width is reported as
   a DEBUG line through the logging surface.
   ([#315](https://github.com/cafein-py/cafein/pull/315))
-
-## Unreleased
 
 - Docstring fixes: `CarParkPolicy` cross-references now use the
   working import path (`cafein.policy.CarParkPolicy`), and prose
