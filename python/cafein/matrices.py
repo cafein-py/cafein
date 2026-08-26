@@ -376,7 +376,10 @@ class TravelCostMatrix(pd.DataFrame):
 
     ``output_time_units=`` selects the ``travel_time`` unit:
     ``"minutes"`` (the default; whole minutes rounded to the nearest)
-    or ``"seconds"`` (the engine's exact values).
+    or ``"seconds"`` (the engine's exact values). Anything computed
+    downstream from the costs themselves — a decay-weighted measure,
+    say — needs ``"seconds"``; the rounded minutes do not reproduce
+    ``Accessibility``'s weights.
     """
 
     @property
@@ -1125,6 +1128,11 @@ class TravelTimeMatrix(pd.DataFrame):
     tables. Where travel times only are needed, this is lighter than
     ``TravelCostMatrix``, which also aggregates transfers, distances, and
     emissions.
+
+    The default minutes are rounded to the nearest whole minute:
+    anything computed downstream from the costs themselves — a
+    decay-weighted measure, say — needs ``output_time_units="seconds"``;
+    the rounded minutes do not reproduce ``Accessibility``'s weights.
 
     With ``departure_time_window``, every minute mark within the
     window is profiled and the ``travel_time`` column is replaced by
