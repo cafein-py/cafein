@@ -10,11 +10,13 @@
 //! the callers; nothing here allocates per destination beyond the
 //! requested output.
 
-/// A decay weight function over cost, hard truncated at the budget:
-/// `weight(c, b) = 0` for `c > b`, and within budget:
+/// A decay weight function over cost, hard truncated at the budget —
+/// `weight(c, b) = 0` for `c > b` — except `Linear`, the ramp, which
+/// keeps its weight to `b + width/2`. Within the support:
 ///
 /// - `Step`: 1
 /// - `Linear { width }`: `clip((b + width/2 - c) / width, 0, 1)`
+/// - `LinearCutoff`: `1 - c / b`
 /// - `Exponential { half_life }`: `exp(-ln(2) * c / half_life)`
 /// - `Logistic { scale }`: `1 / (1 + exp((c - b) / scale))`
 ///
@@ -24,21 +26,31 @@
 pub enum Decay {
     Step,
     Linear { width: f64 },
+    LinearCutoff,
     Exponential { half_life: f64 },
     Logistic { scale: f64 },
 }
 
 impl Decay {
+    /// The cost beyond which the family weighs nothing under `budget`.
+    pub fn support(&self, budget: f64) -> f64 {
+        match *self {
+            Decay::Linear { width } => budget + width / 2.0,
+            _ => budget,
+        }
+    }
+
     /// The weight of a destination at `cost` under `budget`; a
     /// non-finite cost weighs nothing (it cannot lie within a finite
-    /// budget).
+    /// support).
     pub fn weight(&self, cost: f64, budget: f64) -> f64 {
-        if !cost.is_finite() || cost > budget {
+        if !cost.is_finite() || cost > self.support(budget) {
             return 0.0;
         }
         match *self {
             Decay::Step => 1.0,
             Decay::Linear { width } => ((budget - cost) / width + 0.5).clamp(0.0, 1.0),
+            Decay::LinearCutoff => (1.0 - cost / budget).clamp(0.0, 1.0),
             Decay::Exponential { half_life } => (-std::f64::consts::LN_2 * cost / half_life).exp(),
             Decay::Logistic { scale } => 1.0 / (1.0 + ((cost - budget) / scale).exp()),
         }

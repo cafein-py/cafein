@@ -355,7 +355,10 @@ def test_the_comparison_script_agrees_with_the_package(tmp_path):
     gravity = {variant for measure, variant in covered.index if measure == "gravity"}
     assert {variant.split(" (")[0] for variant in gravity} == {
         "exponential whole",
+        "exponential fractional",
         "logistic whole",
+        "logistic fractional",
+        "linear_cutoff",
     }
     for variant in gravity:
         assert covered[("gravity", variant)] == origins

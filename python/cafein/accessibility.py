@@ -33,6 +33,7 @@ from cafein.travelers import folded_constraints, refuse_wheelchair_streets
 DECAY_PARAMETERS = {
     "step": None,
     "linear": "width",
+    "linear_cutoff": None,
     "exponential": "half_life",
     "logistic": "scale",
 }
@@ -1009,13 +1010,16 @@ class Accessibility(pd.DataFrame):
 
     ``decay`` weights each reached destination's opportunities by its
     cost ``t`` under the budget ``b`` (every family is 0 beyond the
-    budget), and ``decay_params`` carries the one parameter the family
-    takes:
+    budget except the linear ramp), and ``decay_params`` carries the
+    one parameter the family takes:
 
     - ``"step"`` — 1 (the default; no parameter).
     - ``"linear"`` — a ramp of ``{"width": w}`` around the budget: 1 up
-      to ``b − w/2``, falling linearly through 0.5 at the budget, cut
-      there.
+      to ``b − w/2``, falling linearly through 0.5 at the budget to 0
+      at ``b + w/2`` — the one family that keeps weight past the
+      budget.
+    - ``"linear_cutoff"`` — ``1 − t/b`` (no parameter): 1 at zero cost,
+      0 at the budget.
     - ``"exponential"`` — ``{"half_life": h}``: ``exp(−ln2·t/h)``.
     - ``"logistic"`` — ``{"scale": s}``: ``1/(1 + exp((t − b)/s))``.
 

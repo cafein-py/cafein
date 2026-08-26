@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Changed: `Accessibility(decay="linear")` keeps its ramp past the
+  budget — the weight now falls to 0 at `budget + width/2` instead of
+  being cut at the budget (where it was 0.5). Results near the budget
+  change for existing `linear` users.
+
+- Added: `decay="linear_cutoff"` — weight `1 − t/budget`, 0 beyond it,
+  no parameter.
+
 - Docstring notes: the share-ratio and Palma boundary rule, the
   concentration index's tie ranking, zero values in the entropy
   family, and the rounded default minutes of the matrices.

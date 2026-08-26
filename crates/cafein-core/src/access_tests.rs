@@ -13,13 +13,27 @@ fn step_weight_is_one_inside_and_zero_beyond_the_budget() {
 }
 
 #[test]
-fn linear_weight_ramps_around_the_budget() {
+fn linear_weight_ramps_symmetrically_around_the_budget() {
     let decay = Decay::Linear { width: 600.0 };
-    // Ramp spans [b - width/2, b + width/2] but is truncated at b.
+    // The ramp: 1 up to b - width/2, 0 from b + width/2, 0.5 at b.
+    assert_eq!(decay.support(1800.0), 2100.0);
     assert_eq!(decay.weight(0.0, 1800.0), 1.0);
     assert_eq!(decay.weight(1500.0, 1800.0), 1.0);
     assert!((decay.weight(1650.0, 1800.0) - 0.75).abs() < 1e-12);
     assert!((decay.weight(1800.0, 1800.0) - 0.5).abs() < 1e-12);
+    assert!((decay.weight(1950.0, 1800.0) - 0.25).abs() < 1e-12);
+    assert_eq!(decay.weight(2100.0, 1800.0), 0.0);
+    assert_eq!(decay.weight(2101.0, 1800.0), 0.0);
+}
+
+#[test]
+fn linear_cutoff_weight_falls_to_zero_at_the_budget() {
+    let decay = Decay::LinearCutoff;
+    assert_eq!(decay.support(1800.0), 1800.0);
+    assert_eq!(decay.weight(0.0, 1800.0), 1.0);
+    assert!((decay.weight(450.0, 1800.0) - 0.75).abs() < 1e-12);
+    assert!((decay.weight(900.0, 1800.0) - 0.5).abs() < 1e-12);
+    assert_eq!(decay.weight(1800.0, 1800.0), 0.0);
     assert_eq!(decay.weight(1801.0, 1800.0), 0.0);
 }
 
