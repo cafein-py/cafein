@@ -441,7 +441,8 @@ def share_ratio(
     and by the value itself otherwise. The boundary of a cut is split
     fractionally — allocated evenly across a whole block of tied
     ranking values — so the ratio is exact at any cut and independent
-    of input order."""
+    of input order.
+    """
     return _quantile_share_ratio(
         "share_ratio",
         data,
@@ -513,7 +514,8 @@ def palma_ratio(
     accessibility over the poorest 40 %'s;
     ``share_ratio(top=0.10, bottom=0.40)`` with ``income=`` required
     (without an income ranking the cut would silently change
-    meaning)."""
+    meaning). The boundary rows are split so the groups hold exactly
+    10 % and 40 % of the population."""
     if income is None:
         raise ValueError(
             "palma_ratio requires income=; share_ratio serves value-ranked cuts"
@@ -548,7 +550,10 @@ def generalized_entropy(
     coefficient of variation. With ``groups=`` (a sociodemographic
     grouping column) the return decomposes into ``total``,
     ``between``, and ``within`` columns; ``total = between + within``
-    exactly."""
+    exactly.
+
+    Zero values are refused (the logarithm is undefined there);
+    filter ``value > 0`` first, and the decomposition follows suit."""
     try:
         alpha = float(alpha)
     except (OverflowError, TypeError):
@@ -661,7 +666,9 @@ def theil_t(
     dropna=False,
 ):
     """Theil T — ``generalized_entropy(alpha=1)`` exactly, every
-    shared argument (``groups=`` included) forwarded."""
+    shared argument (``groups=`` included) forwarded. Zero values are
+    refused (the logarithm is undefined there); filter ``value > 0``
+    first."""
     return generalized_entropy(
         data,
         alpha=1,
@@ -874,6 +881,9 @@ def concentration_index(
     generalized index, twice the weighted covariance of value and
     fractional rank — defined on any real values, difference frames
     included, and takes no bounds).
+
+    Tied incomes share one fractional rank, the midpoint of their
+    block, so the index is independent of input order.
     """
     if variant not in ("standard", "erreygers", "wagstaff", "absolute"):
         raise ValueError("variant must be standard, erreygers, wagstaff, or absolute")

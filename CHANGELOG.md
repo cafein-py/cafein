@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Docstring notes: the share-ratio and Palma boundary rule, the
+  concentration index's tie ranking, zero values in the entropy
+  family, and the rounded default minutes of the matrices.
+
 - Fixed: `Accessibility` passes time-axis decay parameters
   (`half_life`, `scale`, `width`) to the core as exact seconds; they
   were rounded to whole seconds, so fractional values such as a
