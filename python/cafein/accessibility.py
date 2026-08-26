@@ -1013,8 +1013,9 @@ class Accessibility(pd.DataFrame):
     takes:
 
     - ``"step"`` — 1 (the default; no parameter).
-    - ``"linear"`` — R5's ramp, ``{"width": w}``: 1 up to ``b − w/2``,
-      falling linearly through 0.5 at the budget, cut there.
+    - ``"linear"`` — a ramp of ``{"width": w}`` around the budget: 1 up
+      to ``b − w/2``, falling linearly through 0.5 at the budget, cut
+      there.
     - ``"exponential"`` — ``{"half_life": h}``: ``exp(−ln2·t/h)``.
     - ``"logistic"`` — ``{"scale": s}``: ``1/(1 + exp((t − b)/s))``.
 
