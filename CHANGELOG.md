@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.18.0 — 2026-08-26
 
 - Changed: `Accessibility(decay="linear")` keeps its ramp past the
   budget — the weight now falls to 0 at `budget + width/2` instead of
