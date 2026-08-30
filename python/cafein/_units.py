@@ -5,6 +5,7 @@ speaks seconds and split date/time strings. Everything converts here,
 once, on the way in — and result frames convert on the way out.
 """
 
+import collections.abc
 import datetime
 import math
 
@@ -72,7 +73,7 @@ def moment_parts(name, value):
         text = value.strip().replace("T", " ")
         date_part, _, time_part = text.partition(" ")
         try:
-            datetime.date.fromisoformat(date_part)
+            date_part = datetime.date.fromisoformat(date_part).isoformat()
         except ValueError:
             raise ValueError(
                 f"{name} takes a datetime or an ISO-style string like "
@@ -88,6 +89,39 @@ def moment_parts(name, value):
 def departure_parts(value):
     """One ``departure`` → the core's (date, time-of-day) string pair."""
     return moment_parts("departure", value)
+
+
+def moments(name, value):
+    """``value`` as time-axis slots: ``(slots, labeled)`` with ``slots``
+    a list of ``(label, date, clock)``.
+
+    A single moment is one unlabeled slot; a list or tuple gives
+    unlabeled slots in order; a mapping gives slots labeled by its
+    string keys. The list and mapping forms need dated moments (a
+    bare time of day cannot name a slot across days) and refuse an
+    empty collection or a repeated moment.
+    """
+    if isinstance(value, collections.abc.Mapping):
+        items = list(value.items())
+        if any(not isinstance(label, str) for label, _ in items):
+            raise TypeError(f"{name} slot labels must be strings")
+        labeled = True
+    elif isinstance(value, (list, tuple)):
+        items = [(None, moment) for moment in value]
+        labeled = False
+    else:
+        return [(None, *moment_parts(name, value))], False
+    if not items:
+        raise ValueError(f"{name} names no slots")
+    slots = []
+    for label, moment in items:
+        date, clock = moment_parts(name, moment)
+        if date is None:
+            raise ValueError(f"{name} slots need dated moments, not a bare time of day")
+        if any(date == d and clock == c for _, d, c in slots):
+            raise ValueError(f"{name} names the moment {date} {clock} twice")
+        slots.append((label, date, clock))
+    return slots, labeled
 
 
 def arrival_parts(value):
