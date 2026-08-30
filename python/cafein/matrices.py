@@ -1455,164 +1455,13 @@ class TravelTimeMatrix(pd.DataFrame):
             delay_model,
             parking,
         )
-        if street_policy is not None:
-            from cafein.policy import CarParkPolicy
-
-            if isinstance(street_policy, CarParkPolicy):
-                # The query's walking knobs stay ACTIVE beside the car
-                # plane, unlike under a StreetLegPolicy.
-                named = [
-                    name
-                    for name, value in (
-                        (
-                            (
-                                "arrival_time_window"
-                                if arrive_by
-                                else "departure_time_window"
-                            ),
-                            window,
-                        ),
-                        ("percentiles", percentiles),
-                        ("confidence", confidence),
-                    )
-                    if value is not None
-                ]
-                if named or router != "auto":
-                    offending = ", ".join(named) or f"router={router!r}"
-                    raise ValueError(
-                        f"CarParkPolicy does not combine with {offending}; "
-                        "the policy matrix runs the earliest-arrival engine"
-                    )
-                if id_sequence("exclude_stops", exclude_stops):
-                    raise ValueError(
-                        "CarParkPolicy does not combine with stop "
-                        "exclusions in this stage"
-                    )
-                arm = (
-                    _car_park_arrive_by_time_columns
-                    if arrive_by
-                    else _car_park_time_columns
-                )
-                data = arm(
-                    network,
-                    origins,
-                    destinations,
-                    date,
-                    departure,
-                    street_policy,
-                    max_transfers,
-                    chunk,
-                    (walking_speed_kmph, max_walking_time, max_snap_distance),
-                    exclude_routes,
-                    exclude_trips,
-                    workers=workers,
-                )
-                super().__init__(
-                    restore_id_dtypes(
-                        pd.DataFrame(_humanize_time_columns(data, output_time_units)),
-                        _id_dtypes,
-                    )
-                )
-                return
-            rejected = {
-                "window": window,
-                "percentiles": percentiles,
-                "confidence": confidence,
-                "walking_speed_kmph": walking_speed_kmph,
-                "max_walking_time": max_walking_time,
-                "max_snap_distance": max_snap_distance,
-            }
-            named = [name for name, value in rejected.items() if value is not None]
-            if named or router != "auto":
-                offending = ", ".join(named) or f"router={router!r}"
-                raise ValueError(
-                    f"street_policy does not combine with {offending}; the "
-                    "policy carries its own budgets and runs the "
-                    "earliest-arrival engine"
-                )
-            from cafein.policy import carriage_terms as _carriage_terms
-
-            if _carriage_terms(street_policy) is not None:
-                data = _carriage_time_columns(
-                    network,
-                    origins,
-                    destinations,
-                    date,
-                    departure,
-                    street_policy,
-                    max_transfers,
-                    chunk,
-                    exclude_routes,
-                    exclude_trips,
-                    exclude_stops,
-                    workers=workers,
-                )
-                super().__init__(
-                    restore_id_dtypes(
-                        pd.DataFrame(_humanize_time_columns(data, output_time_units)),
-                        _id_dtypes,
-                    )
-                )
-                return
-            walk_only, walk_budget = _walking_only_policy(street_policy)
-            if walk_only:
-                # A walking-only policy IS the legacy walking matrix, at the
-                # policy's one walking budget.
-                data = _time_columns(
-                    network,
-                    origins,
-                    date,
-                    departure,
-                    max_transfers,
-                    destinations=destinations,
-                    window=None,
-                    percentiles=None,
-                    confidence=None,
-                    chunk=chunk,
-                    router="auto",
-                    exclude_routes=exclude_routes,
-                    exclude_trips=exclude_trips,
-                    exclude_stops=exclude_stops,
-                    walking_speed_kmph=None,
-                    max_walking_time=walk_budget,
-                    max_snap_distance=None,
-                    workers=workers,
-                )
-                super().__init__(
-                    restore_id_dtypes(
-                        pd.DataFrame(_humanize_time_columns(data, output_time_units)),
-                        _id_dtypes,
-                    )
-                )
-                return
-            data = _policy_time_columns(
-                network,
-                origins,
-                destinations,
-                date,
-                departure,
-                street_policy,
-                max_transfers,
-                chunk,
-                exclude_routes,
-                exclude_trips,
-                exclude_stops,
-                workers=workers,
-            )
-            super().__init__(
-                restore_id_dtypes(
-                    pd.DataFrame(_humanize_time_columns(data, output_time_units)),
-                    _id_dtypes,
-                )
-            )
-            return
-        data = _time_columns(
+        data = _time_matrix_data(
             network,
             origins,
+            destinations,
             date,
             departure,
-            max_transfers,
-            destinations=destinations,
+            arrive_by=arrive_by,
             window=window,
             percentiles=percentiles,
             confidence=confidence,
@@ -1624,7 +1473,8 @@ class TravelTimeMatrix(pd.DataFrame):
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
-            arrive_by=arrive_by,
+            street_policy=street_policy,
+            max_transfers=max_transfers,
             workers=workers,
         )
         super().__init__(
@@ -2425,6 +2275,177 @@ def _street_time_cells(network, query, resolved, workers=None):
         seconds = resolved["parking_seconds"]
         travel_time_s = travel_time_s + np.rint(seconds[columns]).astype(np.int64)
     return rows, columns, travel_time_s
+
+
+def _time_matrix_data(
+    network,
+    origins,
+    destinations,
+    date,
+    departure,
+    *,
+    arrive_by,
+    window,
+    percentiles,
+    confidence,
+    chunk,
+    router,
+    exclude_routes,
+    exclude_trips,
+    exclude_stops,
+    walking_speed_kmph,
+    max_walking_time,
+    max_snap_distance,
+    street_policy,
+    max_transfers,
+    workers,
+):
+    """The long-format columns of one moment's transit time matrix,
+    dispatched by street policy exactly as the constructor did."""
+    if street_policy is not None:
+        from cafein.policy import CarParkPolicy
+
+        if isinstance(street_policy, CarParkPolicy):
+            # The query's walking knobs stay ACTIVE beside the car
+            # plane, unlike under a StreetLegPolicy.
+            named = [
+                name
+                for name, value in (
+                    (
+                        (
+                            "arrival_time_window"
+                            if arrive_by
+                            else "departure_time_window"
+                        ),
+                        window,
+                    ),
+                    ("percentiles", percentiles),
+                    ("confidence", confidence),
+                )
+                if value is not None
+            ]
+            if named or router != "auto":
+                offending = ", ".join(named) or f"router={router!r}"
+                raise ValueError(
+                    f"CarParkPolicy does not combine with {offending}; "
+                    "the policy matrix runs the earliest-arrival engine"
+                )
+            if id_sequence("exclude_stops", exclude_stops):
+                raise ValueError(
+                    "CarParkPolicy does not combine with stop "
+                    "exclusions in this stage"
+                )
+            arm = (
+                _car_park_arrive_by_time_columns
+                if arrive_by
+                else _car_park_time_columns
+            )
+            return arm(
+                network,
+                origins,
+                destinations,
+                date,
+                departure,
+                street_policy,
+                max_transfers,
+                chunk,
+                (walking_speed_kmph, max_walking_time, max_snap_distance),
+                exclude_routes,
+                exclude_trips,
+                workers=workers,
+            )
+        rejected = {
+            "window": window,
+            "percentiles": percentiles,
+            "confidence": confidence,
+            "walking_speed_kmph": walking_speed_kmph,
+            "max_walking_time": max_walking_time,
+            "max_snap_distance": max_snap_distance,
+        }
+        named = [name for name, value in rejected.items() if value is not None]
+        if named or router != "auto":
+            offending = ", ".join(named) or f"router={router!r}"
+            raise ValueError(
+                f"street_policy does not combine with {offending}; the "
+                "policy carries its own budgets and runs the "
+                "earliest-arrival engine"
+            )
+        from cafein.policy import carriage_terms as _carriage_terms
+
+        if _carriage_terms(street_policy) is not None:
+            return _carriage_time_columns(
+                network,
+                origins,
+                destinations,
+                date,
+                departure,
+                street_policy,
+                max_transfers,
+                chunk,
+                exclude_routes,
+                exclude_trips,
+                exclude_stops,
+                workers=workers,
+            )
+        walk_only, walk_budget = _walking_only_policy(street_policy)
+        if walk_only:
+            # A walking-only policy IS the legacy walking matrix, at the
+            # policy's one walking budget.
+            return _time_columns(
+                network,
+                origins,
+                date,
+                departure,
+                max_transfers,
+                destinations=destinations,
+                window=None,
+                percentiles=None,
+                confidence=None,
+                chunk=chunk,
+                router="auto",
+                exclude_routes=exclude_routes,
+                exclude_trips=exclude_trips,
+                exclude_stops=exclude_stops,
+                walking_speed_kmph=None,
+                max_walking_time=walk_budget,
+                max_snap_distance=None,
+                workers=workers,
+            )
+        return _policy_time_columns(
+            network,
+            origins,
+            destinations,
+            date,
+            departure,
+            street_policy,
+            max_transfers,
+            chunk,
+            exclude_routes,
+            exclude_trips,
+            exclude_stops,
+            workers=workers,
+        )
+    return _time_columns(
+        network,
+        origins,
+        date,
+        departure,
+        max_transfers,
+        destinations=destinations,
+        window=window,
+        percentiles=percentiles,
+        confidence=confidence,
+        chunk=chunk,
+        router=router,
+        exclude_routes=exclude_routes,
+        exclude_trips=exclude_trips,
+        exclude_stops=exclude_stops,
+        walking_speed_kmph=walking_speed_kmph,
+        max_walking_time=max_walking_time,
+        max_snap_distance=max_snap_distance,
+        arrive_by=arrive_by,
+        workers=workers,
+    )
 
 
 def _time_columns(
