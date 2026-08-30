@@ -1638,9 +1638,9 @@ def test_departure_slots_share_one_frozen_query(network):
             block.reset_index(drop=True), pd.DataFrame(single)
         )
     # Any mapping labels slots, and dates are canonical ISO.
-    proxy = types.MappingProxyType({"peak": "20220222 08:00", "late": slots[1]})
+    proxy = types.MappingProxyType({"peak": "2022-02-22T08:00", "late": slots[1]})
     labeled = TravelTimeMatrix(network, origins, departure=proxy)
     assert list(labeled["slot"].unique()) == ["peak", "late"]
     assert set(labeled["departure_time"]) == set(slots)
     with pytest.raises(ValueError, match="twice"):
-        TravelTimeMatrix(network, origins, departure=["20220222 08:00", slots[0]])
+        TravelTimeMatrix(network, origins, departure=["2022-02-22T08:00", slots[0]])
