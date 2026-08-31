@@ -583,267 +583,48 @@ class TravelCostMatrix(pd.DataFrame):
                 )
             )
             return
-        _reject_cost_street_args(
-            transport_mode,
-            max_street_time,
-            intersection_delays,
-            profile,
-            delay_model,
-            parking,
-            occupancy,
-            vehicle_class,
-            perspectives,
-            costs,
-            currency,
-            cost_components,
-        )
-        if street_policy is not None:
-            if exposure is not None:
-                raise ValueError(
-                    "exposure= reporting covers transit, walking, and "
-                    "StreetNetwork computations; street_policy matrices "
-                    "gain it with a later stage"
-                )
-            from cafein.policy import CarParkPolicy
-
-            if isinstance(street_policy, CarParkPolicy):
-                # The query's walking knobs stay ACTIVE beside the car
-                # plane, unlike under a StreetLegPolicy.
-                offending = next(
-                    (
-                        name
-                        for name, value in (
-                            ("optimize", None if optimize == "time" else optimize),
-                            (
-                                (
-                                    "arrival_time_window"
-                                    if arrive_by
-                                    else "departure_time_window"
-                                ),
-                                window,
-                            ),
-                            ("max_travel_time", within),
-                            ("fares", fares),
-                            (
-                                "candidates",
-                                None if candidates == "time" else candidates,
-                            ),
-                            ("router", None if router == "auto" else router),
-                        )
-                        if value is not None
-                    ),
-                    None,
-                )
-                if offending is not None:
-                    raise ValueError(
-                        f"CarParkPolicy does not combine with {offending}; "
-                        "the policy cost matrix runs the time-fastest "
-                        "engine arm and transit fares stay unpriced"
-                    )
-                if id_sequence("exclude_stops", exclude_stops):
-                    raise ValueError(
-                        "CarParkPolicy does not combine with stop "
-                        "exclusions in this stage"
-                    )
-                arm = (
-                    _car_park_arrive_by_cost_columns
-                    if arrive_by
-                    else _car_park_cost_columns
-                )
-                data = arm(
-                    network,
-                    origins,
-                    destinations,
-                    date,
-                    departure,
-                    street_policy,
-                    max_transfers=max_transfers,
-                    factors=factors,
-                    components=components,
-                    geometries=geometries,
-                    chunk=chunk,
-                    walk_options=(
-                        walking_speed_kmph,
-                        max_walking_time,
-                        max_snap_distance,
-                    ),
-                    exclude_routes=exclude_routes,
-                    exclude_trips=exclude_trips,
-                    workers=workers,
-                )
-                super().__init__(
-                    restore_id_dtypes(
-                        pd.DataFrame(_humanize_time_columns(data, output_time_units)),
-                        _id_dtypes,
-                    )
-                )
-                return
-            offending = next(
-                (
-                    name
-                    for name, value in (
-                        ("optimize", None if optimize == "time" else optimize),
-                        ("departure_time_window", window),
-                        ("max_travel_time", within),
-                        ("fares", fares),
-                        ("candidates", None if candidates == "time" else candidates),
-                        ("router", None if router == "auto" else router),
-                        ("walking_speed_kmph", walking_speed_kmph),
-                        ("max_walking_time", max_walking_time),
-                        ("snap_distance", max_snap_distance),
-                    )
-                    if value is not None
-                ),
-                None,
-            )
-            if offending is not None:
-                raise ValueError(
-                    f"street_policy does not combine with {offending}; the "
-                    "policy carries its own budgets and the policy cost "
-                    "matrix runs the time-fastest engine arm, unpriced"
-                )
-            from cafein.policy import reject_carriage as _reject_carriage
-
-            _reject_carriage(street_policy, "matrix computation")
-            walk_only, walk_budget = _walking_only_policy(street_policy)
-            if walk_only:
-                # A walking-only policy IS the legacy cost matrix, at the
-                # policy's one walking budget. A street-mode factor table
-                # configures street vehicles only, so it never reaches the
-                # transit resolver — and walking rides none of them.
-                transit_factors, _ = _factor_tables(factors)
-                table, from_ids, to_ids = _cost_columns(
-                    network,
-                    origins,
-                    destinations,
-                    date,
-                    departure,
-                    max_transfers=max_transfers,
-                    optimize="time",
-                    window=None,
-                    within=None,
-                    factors=transit_factors,
-                    components=components,
-                    fares=None,
-                    candidates="time",
-                    bucket=bucket,
-                    router="auto",
-                    exclude_routes=exclude_routes,
-                    exclude_trips=exclude_trips,
-                    exclude_stops=exclude_stops,
-                    geometries=geometries,
-                    chunk=chunk,
-                    walking_speed_kmph=None,
-                    max_walking_time=walk_budget,
-                    max_snap_distance=None,
-                    workers=workers,
-                )
-            else:
-                table, from_ids, to_ids = _policy_cost_columns(
-                    network,
-                    origins,
-                    destinations,
-                    date,
-                    departure,
-                    street_policy,
-                    max_transfers=max_transfers,
-                    factors=factors,
-                    components=components,
-                    geometries=geometries,
-                    chunk=chunk,
-                    exclude_routes=exclude_routes,
-                    exclude_trips=exclude_trips,
-                    exclude_stops=exclude_stops,
-                    workers=workers,
-                )
-            data = {
-                "from_id": np.array(from_ids, dtype=object)[table["from"]],
-                "to_id": np.array(to_ids, dtype=object)[table["to"]],
-                "travel_time_s": table["travel_time_s"],
-                "transfers": np.maximum(table["rides"], 1) - 1,
-                "transit_distance_m": table["transit_distance"],
-                "walk_distance_m": table["walk_distance"],
-                # The legacy fast path has no street vehicles, so its
-                # street meters are identically zero.
-                "street_distance_m": table.get(
-                    "street_distance", np.zeros(len(table["travel_time_s"]))
-                ),
-                "emissions": table["emissions"],
-            }
-            if geometries:
-                data["geometry"] = shapely.from_wkb(
-                    np.array(table["geometry"], dtype=object)
-                )
-            super().__init__(
-                restore_id_dtypes(
-                    pd.DataFrame(_humanize_time_columns(data, output_time_units)),
-                    _id_dtypes,
-                )
-            )
-            return
-        if exposure is not None:
-            router = _validate_transit_exposure(
-                exposure,
-                network,
-                optimize=optimize,
-                window=window,
-                within=within,
-                candidates=candidates,
-                arrival=arrival,
-                arrive_by=arrive_by,
-                router=router,
-            )
-        table, from_ids, to_ids = _cost_columns(
+        data = _cost_matrix_data(
             network,
             origins,
             destinations,
             date,
             departure,
+            geometries=geometries,
+            transport_mode=transport_mode,
+            max_street_time=max_street_time,
+            intersection_delays=intersection_delays,
+            profile=profile,
+            delay_model=delay_model,
+            parking=parking,
+            occupancy=occupancy,
+            vehicle_class=vehicle_class,
+            perspectives=perspectives,
+            costs=costs,
+            currency=currency,
+            cost_components=cost_components,
+            street_policy=street_policy,
+            exposure=exposure,
+            fares=fares,
             max_transfers=max_transfers,
             optimize=optimize,
             window=window,
             within=within,
             factors=factors,
             components=components,
-            fares=fares,
             candidates=candidates,
             bucket=bucket,
             router=router,
             exclude_routes=exclude_routes,
             exclude_trips=exclude_trips,
             exclude_stops=exclude_stops,
-            geometries=geometries,
             chunk=chunk,
             arrive_by=arrive_by,
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
-            exposure=None if exposure is None else exposure._reporting_snapshot(),
             workers=workers,
+            arrival=arrival,
         )
-        if exposure is not None:
-            # Re-verify the binding after the routing (the itineraries
-            # precedent): a street graph replaced mid-computation must
-            # not pair fresh edge indices with the stale snapshot.
-            exposure._check_network(network)
-        data = {
-            "from_id": np.array(from_ids, dtype=object)[table["from"]],
-            "to_id": np.array(to_ids, dtype=object)[table["to"]],
-            "travel_time_s": table["travel_time_s"],
-            "transfers": np.maximum(table["rides"], 1) - 1,
-            "transit_distance_m": table["transit_distance"],
-            "walk_distance_m": table["walk_distance"],
-            "emissions": table["emissions"],
-        }
-        if fares is not None:
-            data["fare"] = table["fare"]
-        if exposure is not None:
-            for column in exposure.column_names():
-                data[column] = table[column]
-        if geometries:
-            data["geometry"] = shapely.from_wkb(
-                np.array(table["geometry"], dtype=object)
-            )
         super().__init__(
             restore_id_dtypes(
                 pd.DataFrame(_humanize_time_columns(data, output_time_units)),
@@ -4067,6 +3848,300 @@ def _cost_endpoints(network, origins, destinations, chunk):
         else list(id_sequence("destinations", destinations))
     )
     return from_ids[_chunk_slice(len(from_ids), chunk)], stop_ids, None, to_stops
+
+
+def _cost_matrix_data(
+    network,
+    origins,
+    destinations,
+    date,
+    departure,
+    *,
+    geometries,
+    transport_mode,
+    max_street_time,
+    intersection_delays,
+    profile,
+    delay_model,
+    parking,
+    occupancy,
+    vehicle_class,
+    perspectives,
+    costs,
+    currency,
+    cost_components,
+    street_policy,
+    exposure,
+    fares,
+    max_transfers,
+    optimize,
+    window,
+    within,
+    factors,
+    components,
+    candidates,
+    bucket,
+    router,
+    exclude_routes,
+    exclude_trips,
+    exclude_stops,
+    chunk,
+    arrive_by,
+    walking_speed_kmph,
+    max_walking_time,
+    max_snap_distance,
+    workers,
+    arrival,
+):
+    """The long-format columns of one moment's transit cost matrix,
+    dispatched by street policy exactly as the constructor did."""
+    _reject_cost_street_args(
+        transport_mode,
+        max_street_time,
+        intersection_delays,
+        profile,
+        delay_model,
+        parking,
+        occupancy,
+        vehicle_class,
+        perspectives,
+        costs,
+        currency,
+        cost_components,
+    )
+    if street_policy is not None:
+        if exposure is not None:
+            raise ValueError(
+                "exposure= reporting covers transit, walking, and "
+                "StreetNetwork computations; street_policy matrices "
+                "gain it with a later stage"
+            )
+        from cafein.policy import CarParkPolicy
+
+        if isinstance(street_policy, CarParkPolicy):
+            # The query's walking knobs stay ACTIVE beside the car
+            # plane, unlike under a StreetLegPolicy.
+            offending = next(
+                (
+                    name
+                    for name, value in (
+                        ("optimize", None if optimize == "time" else optimize),
+                        (
+                            (
+                                "arrival_time_window"
+                                if arrive_by
+                                else "departure_time_window"
+                            ),
+                            window,
+                        ),
+                        ("max_travel_time", within),
+                        ("fares", fares),
+                        (
+                            "candidates",
+                            None if candidates == "time" else candidates,
+                        ),
+                        ("router", None if router == "auto" else router),
+                    )
+                    if value is not None
+                ),
+                None,
+            )
+            if offending is not None:
+                raise ValueError(
+                    f"CarParkPolicy does not combine with {offending}; "
+                    "the policy cost matrix runs the time-fastest "
+                    "engine arm and transit fares stay unpriced"
+                )
+            if id_sequence("exclude_stops", exclude_stops):
+                raise ValueError(
+                    "CarParkPolicy does not combine with stop "
+                    "exclusions in this stage"
+                )
+            arm = (
+                _car_park_arrive_by_cost_columns
+                if arrive_by
+                else _car_park_cost_columns
+            )
+            return arm(
+                network,
+                origins,
+                destinations,
+                date,
+                departure,
+                street_policy,
+                max_transfers=max_transfers,
+                factors=factors,
+                components=components,
+                geometries=geometries,
+                chunk=chunk,
+                walk_options=(
+                    walking_speed_kmph,
+                    max_walking_time,
+                    max_snap_distance,
+                ),
+                exclude_routes=exclude_routes,
+                exclude_trips=exclude_trips,
+                workers=workers,
+            )
+        offending = next(
+            (
+                name
+                for name, value in (
+                    ("optimize", None if optimize == "time" else optimize),
+                    ("departure_time_window", window),
+                    ("max_travel_time", within),
+                    ("fares", fares),
+                    ("candidates", None if candidates == "time" else candidates),
+                    ("router", None if router == "auto" else router),
+                    ("walking_speed_kmph", walking_speed_kmph),
+                    ("max_walking_time", max_walking_time),
+                    ("snap_distance", max_snap_distance),
+                )
+                if value is not None
+            ),
+            None,
+        )
+        if offending is not None:
+            raise ValueError(
+                f"street_policy does not combine with {offending}; the "
+                "policy carries its own budgets and the policy cost "
+                "matrix runs the time-fastest engine arm, unpriced"
+            )
+        from cafein.policy import reject_carriage as _reject_carriage
+
+        _reject_carriage(street_policy, "matrix computation")
+        walk_only, walk_budget = _walking_only_policy(street_policy)
+        if walk_only:
+            # A walking-only policy IS the legacy cost matrix, at the
+            # policy's one walking budget. A street-mode factor table
+            # configures street vehicles only, so it never reaches the
+            # transit resolver — and walking rides none of them.
+            transit_factors, _ = _factor_tables(factors)
+            table, from_ids, to_ids = _cost_columns(
+                network,
+                origins,
+                destinations,
+                date,
+                departure,
+                max_transfers=max_transfers,
+                optimize="time",
+                window=None,
+                within=None,
+                factors=transit_factors,
+                components=components,
+                fares=None,
+                candidates="time",
+                bucket=bucket,
+                router="auto",
+                exclude_routes=exclude_routes,
+                exclude_trips=exclude_trips,
+                exclude_stops=exclude_stops,
+                geometries=geometries,
+                chunk=chunk,
+                walking_speed_kmph=None,
+                max_walking_time=walk_budget,
+                max_snap_distance=None,
+                workers=workers,
+            )
+        else:
+            table, from_ids, to_ids = _policy_cost_columns(
+                network,
+                origins,
+                destinations,
+                date,
+                departure,
+                street_policy,
+                max_transfers=max_transfers,
+                factors=factors,
+                components=components,
+                geometries=geometries,
+                chunk=chunk,
+                exclude_routes=exclude_routes,
+                exclude_trips=exclude_trips,
+                exclude_stops=exclude_stops,
+                workers=workers,
+            )
+        data = {
+            "from_id": np.array(from_ids, dtype=object)[table["from"]],
+            "to_id": np.array(to_ids, dtype=object)[table["to"]],
+            "travel_time_s": table["travel_time_s"],
+            "transfers": np.maximum(table["rides"], 1) - 1,
+            "transit_distance_m": table["transit_distance"],
+            "walk_distance_m": table["walk_distance"],
+            # The legacy fast path has no street vehicles, so its
+            # street meters are identically zero.
+            "street_distance_m": table.get(
+                "street_distance", np.zeros(len(table["travel_time_s"]))
+            ),
+            "emissions": table["emissions"],
+        }
+        if geometries:
+            data["geometry"] = shapely.from_wkb(
+                np.array(table["geometry"], dtype=object)
+            )
+        return data
+    if exposure is not None:
+        router = _validate_transit_exposure(
+            exposure,
+            network,
+            optimize=optimize,
+            window=window,
+            within=within,
+            candidates=candidates,
+            arrival=arrival,
+            arrive_by=arrive_by,
+            router=router,
+        )
+    table, from_ids, to_ids = _cost_columns(
+        network,
+        origins,
+        destinations,
+        date,
+        departure,
+        max_transfers=max_transfers,
+        optimize=optimize,
+        window=window,
+        within=within,
+        factors=factors,
+        components=components,
+        fares=fares,
+        candidates=candidates,
+        bucket=bucket,
+        router=router,
+        exclude_routes=exclude_routes,
+        exclude_trips=exclude_trips,
+        exclude_stops=exclude_stops,
+        geometries=geometries,
+        chunk=chunk,
+        arrive_by=arrive_by,
+        walking_speed_kmph=walking_speed_kmph,
+        max_walking_time=max_walking_time,
+        max_snap_distance=max_snap_distance,
+        exposure=None if exposure is None else exposure._reporting_snapshot(),
+        workers=workers,
+    )
+    if exposure is not None:
+        # Re-verify the binding after the routing (the itineraries
+        # precedent): a street graph replaced mid-computation must
+        # not pair fresh edge indices with the stale snapshot.
+        exposure._check_network(network)
+    data = {
+        "from_id": np.array(from_ids, dtype=object)[table["from"]],
+        "to_id": np.array(to_ids, dtype=object)[table["to"]],
+        "travel_time_s": table["travel_time_s"],
+        "transfers": np.maximum(table["rides"], 1) - 1,
+        "transit_distance_m": table["transit_distance"],
+        "walk_distance_m": table["walk_distance"],
+        "emissions": table["emissions"],
+    }
+    if fares is not None:
+        data["fare"] = table["fare"]
+    if exposure is not None:
+        for column in exposure.column_names():
+            data[column] = table[column]
+    if geometries:
+        data["geometry"] = shapely.from_wkb(np.array(table["geometry"], dtype=object))
+    return data
 
 
 def _cost_columns(
