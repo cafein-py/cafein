@@ -43,14 +43,46 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["310", "311", "312", "313", "314"]
+        # macOS runners are few and queue behind a low concurrency cap,
+        # so they cover only the boundary Pythons; ubuntu and windows
+        # keep the full version axis.
+        exclude:
+          - os: macos-latest
+            python: "311"
+          - os: macos-latest
+            python: "312"
+          - os: macos-latest
+            python: "313"
     steps:
       - uses: actions/checkout@v4
       - uses: mamba-org/setup-micromamba@v2
         with:
           environment-file: ci/py${{ matrix.python }}-conda.yaml
           environment-name: test
+          cache-environment: true
           condarc: |
             channel_priority: strict
+      # The Rust workspace and the crate registry rebuild identically
+      # across the Python matrix (the extension is abi3), so one warm
+      # cache per OS serves every cell.
+      - name: Cache Rust builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-
+      - name: Cache pip wheels
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/Library/Caches/pip
+            ~\AppData\Local\pip\Cache
+          key: pip-${{ runner.os }}-py${{ matrix.python }}-${{ hashFiles('ci/py*-conda.yaml') }}
       - name: Cache test data
         uses: actions/cache@v4
         with:
@@ -84,6 +116,10 @@ jobs:
         # test failure.
         env:
           RAYON_NUM_THREADS: 2
+        # Coverage is informational (term-missing, no upload), so one
+        # cell collects it; the rest skip the instrumentation overhead.
         run: >-
           pytest -n ${{ runner.os == 'Linux' && '3' || 'auto' }}
-          --dist load --cov=cafein --cov-report=term-missing
+          --dist load --durations=20
+          ${{ matrix.os == 'ubuntu-latest' && matrix.python == '312'
+              && '--cov=cafein --cov-report=term-missing' || '' }}
