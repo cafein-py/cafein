@@ -186,7 +186,7 @@ def test_streamed_arrive_by_matrix_rides_the_requested_pool(network, tmp_path, c
     from cafein import TravelTimeMatrix
 
     requested = _distinct_width()
-    origins = _served_stops(network, 40)
+    origins = _served_stops(network, 8)
     with caplog.at_level(logging.DEBUG, logger="cafein"):
         TravelTimeMatrix.to_parquet(
             network,

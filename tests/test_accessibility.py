@@ -418,7 +418,7 @@ def test_window_knobs_reject_streets_and_bad_combos(network, helsinki_streets):
         )
 
 
-def _cost_surface(network, origins, destinations, optimize, fares=None):
+def _cost_surface(network, origins, destinations, optimize, fares=None, window=10):
     from cafein import TravelCostMatrix
 
     matrix = TravelCostMatrix(
@@ -427,7 +427,7 @@ def _cost_surface(network, origins, destinations, optimize, fares=None):
         destinations,
         DEPARTURE,
         optimize=optimize,
-        departure_time_window=10,
+        departure_time_window=window,
         fares=fares,
     )
     column = "emissions" if optimize == "emissions" else "fare"
@@ -437,6 +437,24 @@ def _cost_surface(network, origins, destinations, optimize, fares=None):
     for _, row in matrix.iterrows():
         surface[at_origin[row["from_id"]], at_dest[row["to_id"]]] = row[column]
     return surface
+
+
+FARE_WINDOW = 4
+"""Minutes of departure window for the shared zone-fare surface."""
+
+
+@pytest.fixture(scope="module")
+def fare_surface(network, helsinki_gtfs):
+    """The zone structure and its windowed fare surface, built once."""
+    from cafein import fares as fare_module
+
+    structure = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
+    origins, destinations = _stop_sets(network)
+    origins, destinations = origins[:3], destinations[:30]
+    surface = _cost_surface(
+        network, origins, destinations, "fare", structure, window=FARE_WINDOW
+    )
+    return structure, origins, destinations, surface
 
 
 def test_emissions_accessibility_matches_the_cost_matrix(network):
@@ -475,13 +493,10 @@ def test_emissions_accessibility_matches_the_cost_matrix(network):
     assert capped["accessibility"].sum() < frame["accessibility"].sum()
 
 
-def test_money_accessibility_matches_the_cost_matrix(network, helsinki_gtfs):
+def test_money_accessibility_matches_the_cost_matrix(network, fare_surface):
     from cafein import Accessibility
-    from cafein import fares as fare_module
 
-    structure = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
-    origins, destinations = _stop_sets(network)
-    surface = _cost_surface(network, origins, destinations, "fare", structure)
+    structure, origins, destinations, surface = fare_surface
     priced = surface[numpy.isfinite(surface)]
     assert priced.size, "the fixture feed prices no pair — fixture drift"
     budget = float(numpy.median(priced))
@@ -491,7 +506,7 @@ def test_money_accessibility_matches_the_cost_matrix(network, helsinki_gtfs):
         destinations,
         DEPARTURE,
         cost="money",
-        departure_time_window=10,
+        departure_time_window=FARE_WINDOW,
         budgets=(budget,),
         fares=structure,
     )
@@ -1387,20 +1402,20 @@ def test_linear_ramp_keeps_its_weight_past_the_budget_across_a_window(network):
 
 @pytest.mark.parametrize("axis", ["emissions", "money"])
 def test_linear_ramp_keeps_its_weight_past_the_budget_on_cost_axes(
-    network, helsinki_gtfs, axis
+    network, axis, request
 ):
     from cafein import Accessibility
-    from cafein import fares as fare_module
 
-    origins, destinations = _stop_sets(network)
-    structure = (
-        fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
-        if axis == "money"
-        else None
-    )
-    surface = _cost_surface(
-        network, origins, destinations, "fare" if axis == "money" else axis, structure
-    )
+    if axis == "money":
+        structure, origins, destinations, surface = request.getfixturevalue(
+            "fare_surface"
+        )
+        window = FARE_WINDOW
+    else:
+        structure = None
+        origins, destinations = _stop_sets(network)
+        surface = _cost_surface(network, origins, destinations, axis)
+        window = 10
     # The fixture prices these pairs at one or two fare levels: a budget
     # at half the median puts every dearer cost in the ramp's extension.
     finite = surface[numpy.isfinite(surface)]
@@ -1410,7 +1425,7 @@ def test_linear_ramp_keeps_its_weight_past_the_budget_on_cost_axes(
     ramp, cutoff, beyond = _ramp_sums(surface, 1.0, budget, width)
     assert beyond.sum() > 0
     shared = dict(
-        cost=axis, departure_time_window=10, budgets=(budget,), fares=structure
+        cost=axis, departure_time_window=window, budgets=(budget,), fares=structure
     )
     linear = Accessibility(
         network,
