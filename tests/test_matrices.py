@@ -1644,3 +1644,150 @@ def test_departure_slots_share_one_frozen_query(network):
     assert set(labeled["departure_time"]) == set(slots)
     with pytest.raises(ValueError, match="twice"):
         TravelTimeMatrix(network, origins, departure=["2022-02-22T08:00", slots[0]])
+
+
+def _cost_slot_frame(network, origins, departure, **kwargs):
+    with pytest.warns(UserWarning, match="route_type"):
+        return TravelCostMatrix(network, origins, departure=departure, **kwargs)
+
+
+def test_cost_departure_slots_concatenate_the_scalar_frames(network):
+    origins = ["4810551", "1250551"]
+    slots = ["2022-02-22 08:30:00", "2022-02-22 12:00:00"]
+    frame = _cost_slot_frame(network, origins, slots)
+    assert list(frame.columns)[:4] == [
+        "from_id",
+        "to_id",
+        "departure_time",
+        "travel_time",
+    ]
+    expected = pd.concat(
+        [
+            _cost_slot_frame(network, origins, slot).assign(departure_time=slot)
+            for slot in slots
+        ],
+        ignore_index=True,
+    )[list(frame.columns)]
+    pd.testing.assert_frame_equal(pd.DataFrame(frame), expected)
+    labeled = _cost_slot_frame(network, origins, dict(zip(["peak", "midday"], slots)))
+    assert list(labeled.columns)[:4] == ["from_id", "to_id", "slot", "departure_time"]
+    pd.testing.assert_frame_equal(
+        pd.DataFrame(labeled.drop(columns="slot")), pd.DataFrame(frame)
+    )
+
+
+def test_cost_arrival_slots_mirror_departure_slots(network):
+    # A cost matrix serves arrival= on the emissions axis (with its
+    # window); the time axis rides TravelTimeMatrix.
+    origins = ["4810551"]
+    deadlines = ["2022-02-22 09:30:00", "2022-02-22 13:00:00"]
+    kwargs = dict(optimize="emissions", arrival_time_window=10)
+    with pytest.warns(UserWarning, match="route_type"):
+        frame = TravelCostMatrix(network, origins, arrival=deadlines, **kwargs)
+    assert list(frame.columns)[:3] == ["from_id", "to_id", "arrival_time"]
+    for deadline in deadlines:
+        block = frame[frame["arrival_time"] == deadline].drop(columns="arrival_time")
+        with pytest.warns(UserWarning, match="route_type"):
+            single = TravelCostMatrix(network, origins, arrival=deadline, **kwargs)
+        pd.testing.assert_frame_equal(
+            block.reset_index(drop=True), pd.DataFrame(single)
+        )
+
+
+def test_cost_table_slots_concatenate_the_arrow_tables(network):
+    pytest.importorskip("pyarrow")
+    from cafein.matrices import travel_cost_table
+
+    origins = ["4810551", "1250551"]
+    slots = ["2022-02-22 08:30:00", "2022-02-22 12:00:00"]
+    with pytest.warns(UserWarning, match="route_type"):
+        table = travel_cost_table(network, origins, departure=slots)
+    assert table.column_names[:4] == [
+        "from_id",
+        "to_id",
+        "departure_time",
+        "travel_time",
+    ]
+    parts = []
+    for slot in slots:
+        with pytest.warns(UserWarning, match="route_type"):
+            part = travel_cost_table(network, origins, departure=slot).to_pandas()
+        parts.append(part.assign(departure_time=slot))
+    expected = pd.concat(parts, ignore_index=True)[table.column_names]
+    got = table.to_pandas()
+    pd.testing.assert_frame_equal(
+        got, expected, check_dtype=False, check_categorical=False
+    )
+    with pytest.raises(ValueError, match="output= streams one moment"):
+        travel_cost_table(network, origins, departure=slots, output="slots.parquet")
+
+
+def test_cost_slots_validate_eagerly(network, helsinki_streets):
+    origins = ["4810551"]
+    with pytest.raises(ValueError, match="dated moments"):
+        TravelCostMatrix(network, origins, departure=["08:30:00"])
+    points = gpd.GeoDataFrame(
+        {"id": ["p", "q"]},
+        geometry=gpd.points_from_xy([24.9384, 24.9600], [60.1699, 60.1866]),
+        crs="EPSG:4326",
+    )
+    with pytest.raises(ValueError, match="no meaning for a street matrix"):
+        TravelCostMatrix(
+            helsinki_streets,
+            points,
+            points,
+            departure=["2022-02-22 08:30:00", "2022-02-22 12:00:00"],
+            transport_mode="walk",
+        )
+
+
+def test_walking_only_policy_serves_departure_slots(network_with_footpaths):
+    from cafein import StreetLegPolicy
+
+    policy = StreetLegPolicy(access={"walk": 15}, egress={"walk": 15})
+    origins = point_frame(network_with_footpaths, [("a", "4810551"), ("b", "1250551")])
+    slots = ["2022-02-22 08:30:00", "2022-02-22 12:00:00"]
+    frame = TravelTimeMatrix(
+        network_with_footpaths, origins, origins, departure=slots, street_policy=policy
+    )
+    for slot in slots:
+        block = frame[frame["departure_time"] == slot].drop(columns="departure_time")
+        single = TravelTimeMatrix(
+            network_with_footpaths,
+            origins,
+            origins,
+            departure=slot,
+            street_policy=policy,
+        )
+        pd.testing.assert_frame_equal(
+            block.reset_index(drop=True), pd.DataFrame(single)
+        )
+
+
+def test_walking_only_policy_serves_cost_slots(network_with_footpaths):
+    from cafein import StreetLegPolicy, TravelCostMatrix
+
+    policy = StreetLegPolicy(access={"walk": 15}, egress={"walk": 15})
+    origins = point_frame(network_with_footpaths, [("a", "4810551"), ("b", "1250551")])
+    slots = ["2022-02-22 08:30:00", "2022-02-22 12:00:00"]
+    with pytest.warns(UserWarning, match="route_type"):
+        frame = TravelCostMatrix(
+            network_with_footpaths,
+            origins,
+            origins,
+            departure=slots,
+            street_policy=policy,
+        )
+    for slot in slots:
+        block = frame[frame["departure_time"] == slot].drop(columns="departure_time")
+        with pytest.warns(UserWarning, match="route_type"):
+            single = TravelCostMatrix(
+                network_with_footpaths,
+                origins,
+                origins,
+                departure=slot,
+                street_policy=policy,
+            )
+        pd.testing.assert_frame_equal(
+            block.reset_index(drop=True), pd.DataFrame(single)
+        )

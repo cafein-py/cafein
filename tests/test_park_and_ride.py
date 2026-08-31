@@ -1300,3 +1300,97 @@ def test_the_zero_ride_car_chain_serves_the_route(car_park_network):
         output_time_units="seconds",
     )
     assert int(back["travel_time"].iloc[0]) == duration
+
+
+def test_the_car_park_matrix_serves_slots_on_both_axes(car_park_network):
+    from cafein import TravelTimeMatrix
+
+    policy = _pasila_policy()
+    origins = geopandas.GeoDataFrame(
+        {"id": ["far"]},
+        geometry=[Point(FAR_ORIGIN[1], FAR_ORIGIN[0])],
+        crs="EPSG:4326",
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["d1"]}, geometry=[Point(24.9520, 60.1795)], crs="EPSG:4326"
+    )
+    slots = ["2022-02-22 08:30:00", "2022-02-22 12:00:00"]
+    frame = TravelTimeMatrix(
+        car_park_network,
+        origins,
+        destinations,
+        departure=slots,
+        street_policy=policy,
+        max_walking_time=8,
+    )
+    for slot in slots:
+        block = frame[frame["departure_time"] == slot].drop(columns="departure_time")
+        single = TravelTimeMatrix(
+            car_park_network,
+            origins,
+            destinations,
+            departure=slot,
+            street_policy=policy,
+            max_walking_time=8,
+        )
+        pd.testing.assert_frame_equal(
+            block.reset_index(drop=True), pd.DataFrame(single), check_dtype=False
+        )
+    deadlines = ["2022-02-22 09:30:00", "2022-02-22 13:00:00"]
+    frame = TravelTimeMatrix(
+        car_park_network,
+        origins,
+        destinations,
+        arrival=deadlines,
+        street_policy=policy,
+        max_walking_time=8,
+    )
+    for deadline in deadlines:
+        block = frame[frame["arrival_time"] == deadline].drop(columns="arrival_time")
+        single = TravelTimeMatrix(
+            car_park_network,
+            origins,
+            destinations,
+            arrival=deadline,
+            street_policy=policy,
+            max_walking_time=8,
+        )
+        pd.testing.assert_frame_equal(
+            block.reset_index(drop=True), pd.DataFrame(single), check_dtype=False
+        )
+
+
+def test_the_car_park_cost_matrix_serves_slots_on_both_axes(car_park_network):
+    from cafein import TravelCostMatrix
+
+    policy = _pasila_policy(vehicle_class="ICE", occupancy=2.0)
+    origins = geopandas.GeoDataFrame(
+        {"id": ["o"]}, geometry=[Point(FAR_ORIGIN[1], FAR_ORIGIN[0])], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["d"]}, geometry=[Point(24.9520, 60.1795)], crs="EPSG:4326"
+    )
+    for axis, moments in (
+        ("departure", ["2022-02-22 08:30:00", "2022-02-22 12:00:00"]),
+        ("arrival", ["2022-02-22 09:30:00", "2022-02-22 13:00:00"]),
+    ):
+        column = f"{axis}_time"
+        frame = TravelCostMatrix(
+            car_park_network,
+            origins,
+            destinations,
+            street_policy=policy,
+            **{axis: moments},
+        )
+        for moment in moments:
+            block = frame[frame[column] == moment].drop(columns=column)
+            single = TravelCostMatrix(
+                car_park_network,
+                origins,
+                destinations,
+                street_policy=policy,
+                **{axis: moment},
+            )
+            pd.testing.assert_frame_equal(
+                block.reset_index(drop=True), pd.DataFrame(single), check_dtype=False
+            )

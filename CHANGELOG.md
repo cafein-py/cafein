@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `TravelCostMatrix` and `travel_cost_table` take several departure
+  (or arrival) slots in one call, as `TravelTimeMatrix` does: a list
+  adds `departure_time`/`arrival_time`, a mapping of labels adds
+  `slot` too, and the result is the per-slot results concatenated in
+  slot order. `travel_cost_table(output=)` still streams one moment.
+
 - `TravelTimeMatrix` computes several departure (or arrival) slots in
   one call: `departure=` takes a list of moments — adding a
   `departure_time` column — or a mapping of labels to moments, adding

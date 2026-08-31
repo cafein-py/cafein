@@ -89,6 +89,16 @@ class TravelCostMatrix(pd.DataFrame):
     distances (the default), and with leg geometries for
     ``geometries=True``. Slices and copies degrade to plain DataFrames.
 
+    ``departure=`` (or ``arrival=``) also takes several moments at once:
+    a list adds a ``departure_time`` (``arrival_time``) column holding
+    each row's moment as ``YYYY-MM-DD HH:MM:SS``, a mapping of labels to
+    moments adds a ``slot`` column with the label as well, both placed
+    after ``to_id``. The frame is the single-moment frames concatenated
+    in slot order — every branch, ``street_policy`` included, applies
+    per slot — and the slots must carry dates. A single moment keeps
+    the columns as they are; ``travel_cost_table`` behaves the same,
+    while its ``output=`` streams one moment.
+
     Given a ``StreetNetwork`` instead, the matrix is a standalone street
     computation over the compiled profile of ``transport_mode``, bounded
     by ``max_street_time``. Its columns are ``from_id``, ``to_id``,
@@ -121,11 +131,11 @@ class TravelCostMatrix(pd.DataFrame):
     destinations : list of str, or GeoDataFrame (optional)
         Destination stop_ids (every stop when omitted), or points; with
         point origins the destinations default to the origins.
-    departure : datetime.datetime or str
+    departure : datetime.datetime, str, or a sequence/mapping of them (optional)
         Departure at every origin — a datetime, or an ISO string like
         ``"2022-02-22 08:30"``; the service date is its date part.
         Give exactly one of ``departure`` and ``arrival``.
-    arrival : datetime.datetime or str (optional)
+    arrival : datetime.datetime, str, or a sequence/mapping of them (optional)
         Arrival deadline at every destination, in the same forms, with
         ``arrival_time_window`` beside it — the windowed optimize
         modes are the only arrive-by cost modes (``optimize="time"``
@@ -478,11 +488,7 @@ class TravelCostMatrix(pd.DataFrame):
         _id_dtypes = {"from_id": _origin_dtype, "to_id": _destination_dtype}
         origins = sequence_not_string("origins", origins)
         destinations = sequence_not_string("destinations", destinations)
-        from cafein._units import (
-            departure_parts,
-            duration_seconds,
-            validated_output_time_units,
-        )
+        from cafein._units import duration_seconds, validated_output_time_units
 
         output_time_units = validated_output_time_units(output_time_units)
         if departure is not None and arrival is not None:
@@ -492,8 +498,6 @@ class TravelCostMatrix(pd.DataFrame):
 
         raw_window = window_axis(arrive_by, departure_time_window, arrival_time_window)
         if arrive_by:
-            from cafein._units import arrival_parts
-
             if not _is_street_network(network):
                 if candidates != "time":
                     raise ValueError(
@@ -513,11 +517,6 @@ class TravelCostMatrix(pd.DataFrame):
                             "street_policy= (a traveler's street bridge "
                             "included) does not combine with arrival= yet"
                         )
-            date, departure = arrival_parts(arrival)
-        else:
-            date, departure = (
-                (None, None) if departure is None else departure_parts(departure)
-            )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         max_transfers = max_rides - 1
@@ -583,54 +582,146 @@ class TravelCostMatrix(pd.DataFrame):
                 )
             )
             return
-        data = _cost_matrix_data(
-            network,
-            origins,
-            destinations,
-            date,
-            departure,
-            geometries=geometries,
-            transport_mode=transport_mode,
-            max_street_time=max_street_time,
-            intersection_delays=intersection_delays,
-            profile=profile,
-            delay_model=delay_model,
-            parking=parking,
-            occupancy=occupancy,
-            vehicle_class=vehicle_class,
-            perspectives=perspectives,
-            costs=costs,
-            currency=currency,
-            cost_components=cost_components,
-            street_policy=street_policy,
-            exposure=exposure,
-            fares=fares,
-            max_transfers=max_transfers,
-            optimize=optimize,
-            window=window,
-            within=within,
-            factors=factors,
-            components=components,
-            candidates=candidates,
-            bucket=bucket,
-            router=router,
-            exclude_routes=exclude_routes,
-            exclude_trips=exclude_trips,
-            exclude_stops=exclude_stops,
-            chunk=chunk,
-            arrive_by=arrive_by,
-            walking_speed_kmph=walking_speed_kmph,
-            max_walking_time=max_walking_time,
-            max_snap_distance=max_snap_distance,
-            workers=workers,
-            arrival=arrival,
-        )
-        super().__init__(
-            restore_id_dtypes(
-                pd.DataFrame(_humanize_time_columns(data, output_time_units)),
-                _id_dtypes,
+        # The moment(s): a scalar keeps today's frame; a list or mapping
+        # adds the slot columns, one block of rows per slot.
+        slots, labeled, multi = _time_slots(departure, arrival, arrive_by)
+        exclude_routes = id_sequence("exclude_routes", exclude_routes)
+        exclude_trips = id_sequence("exclude_trips", exclude_trips)
+        exclude_stops = id_sequence("exclude_stops", exclude_stops)
+        if chunk is not None:
+            chunk = tuple(chunk)
+        components = component_selection(components)
+        _resolved = None
+        if street_policy is None:
+            # Every slot reads one snapshot of the mutable inputs —
+            # factors, fares, and the resolved endpoints with the chunk
+            # applied to its axis — as the streaming form does.
+            from cafein import emissions
+
+            _reject_cost_street_args(
+                transport_mode,
+                max_street_time,
+                intersection_delays,
+                profile,
+                delay_model,
+                parking,
+                occupancy,
+                vehicle_class,
+                perspectives,
+                costs,
+                currency,
+                cost_components,
             )
-        )
+            if exposure is not None:
+                _validate_transit_exposure(
+                    exposure,
+                    network,
+                    optimize=optimize,
+                    window=window,
+                    within=within,
+                    candidates=candidates,
+                    arrival=arrival,
+                    arrive_by=arrive_by,
+                    router=router,
+                )
+            _validate_cost_query(
+                slots[0][1],
+                slots[0][2],
+                optimize,
+                window,
+                within,
+                fares,
+                router,
+                arrive_by=arrive_by,
+            )
+            from_ids, to_ids, points, to_stops = _cost_endpoints(
+                network, origins, destinations, None if arrive_by else chunk
+            )
+            if arrive_by and points is None:
+                to_axis = to_stops if to_stops is not None else list(to_ids)
+                if chunk is not None:
+                    to_axis = to_axis[_chunk_slice(len(to_axis), chunk)]
+                endpoints = ("stops", from_ids, to_axis)
+            elif arrive_by:
+                origin_points, destination_points = points
+                if chunk is not None:
+                    keep = _chunk_slice(len(to_ids), chunk)
+                    to_ids = to_ids[keep]
+                    destination_points = destination_points[keep]
+                endpoints = (
+                    "points",
+                    from_ids,
+                    origin_points,
+                    to_ids,
+                    destination_points,
+                )
+            elif points is None:
+                endpoints = ("stops", from_ids, to_stops)
+            else:
+                origin_points, destination_points = points
+                endpoints = (
+                    "points",
+                    from_ids,
+                    origin_points,
+                    to_ids,
+                    destination_points,
+                )
+            _resolved = (
+                emissions.trip_factors(network, factors, components),
+                None if fares is None else fares._flat_tables(network),
+                endpoints,
+            )
+        frames = []
+        for label, date, clock in slots:
+            data = _cost_matrix_data(
+                network,
+                origins,
+                destinations,
+                date,
+                clock,
+                geometries=geometries,
+                transport_mode=transport_mode,
+                max_street_time=max_street_time,
+                intersection_delays=intersection_delays,
+                profile=profile,
+                delay_model=delay_model,
+                parking=parking,
+                occupancy=occupancy,
+                vehicle_class=vehicle_class,
+                perspectives=perspectives,
+                costs=costs,
+                currency=currency,
+                cost_components=cost_components,
+                street_policy=street_policy,
+                exposure=exposure,
+                fares=fares,
+                max_transfers=max_transfers,
+                optimize=optimize,
+                window=window,
+                within=within,
+                factors=factors,
+                components=components,
+                candidates=candidates,
+                bucket=bucket,
+                router=router,
+                exclude_routes=exclude_routes,
+                exclude_trips=exclude_trips,
+                exclude_stops=exclude_stops,
+                chunk=chunk,
+                arrive_by=arrive_by,
+                walking_speed_kmph=walking_speed_kmph,
+                max_walking_time=max_walking_time,
+                max_snap_distance=max_snap_distance,
+                workers=workers,
+                arrival=arrival,
+                _resolved=_resolved,
+            )
+            frame = pd.DataFrame(_humanize_time_columns(data, output_time_units))
+            if multi:
+                _insert_slot_columns(frame, arrive_by, label, labeled, date, clock)
+            frames.append(frame)
+        frame = pd.concat(frames, ignore_index=True) if multi else frames[0]
+        super().__init__(restore_id_dtypes(frame, _id_dtypes))
 
     @classmethod
     def to_parquet(
@@ -1156,11 +1247,7 @@ class TravelTimeMatrix(pd.DataFrame):
         _id_dtypes = {"from_id": _origin_dtype, "to_id": _destination_dtype}
         origins = sequence_not_string("origins", origins)
         destinations = sequence_not_string("destinations", destinations)
-        from cafein._units import (
-            duration_seconds,
-            moments,
-            validated_output_time_units,
-        )
+        from cafein._units import duration_seconds, validated_output_time_units
 
         output_time_units = validated_output_time_units(output_time_units)
         if departure is not None and arrival is not None:
@@ -1244,14 +1331,7 @@ class TravelTimeMatrix(pd.DataFrame):
         )
         # The moment(s): a scalar keeps today's frame; a list or mapping
         # adds the slot columns, one block of rows per slot.
-        if arrive_by:
-            slots, labeled = moments("arrival", arrival)
-            multi = isinstance(arrival, (list, tuple, collections.abc.Mapping))
-        elif departure is None:
-            slots, labeled, multi = [(None, None, None)], False, False
-        else:
-            slots, labeled = moments("departure", departure)
-            multi = isinstance(departure, (list, tuple, collections.abc.Mapping))
+        slots, labeled, multi = _time_slots(departure, arrival, arrive_by)
         # Every slot sees the same query: one-shot iterables are drained
         # by the first slot otherwise.
         if percentiles is not None:
@@ -1514,6 +1594,40 @@ class TravelTimeMatrix(pd.DataFrame):
             arrive_by=arrive_by,
             workers=workers,
         )
+
+
+def _time_slots(departure, arrival, arrive_by):
+    """The query's moments as ``(slots, labeled, multi)``: the parsed
+    ``(label, date, clock)`` triples, whether a mapping labeled them,
+    and whether a list or mapping was given (a single moment keeps the
+    frame's columns as they are)."""
+    from cafein._units import moments
+
+    if arrive_by:
+        slots, labeled = moments("arrival", arrival)
+        return (
+            slots,
+            labeled,
+            isinstance(arrival, (list, tuple, collections.abc.Mapping)),
+        )
+    if departure is None:
+        return [(None, None, None)], False, False
+    slots, labeled = moments("departure", departure)
+    return slots, labeled, isinstance(departure, (list, tuple, collections.abc.Mapping))
+
+
+def _insert_slot_arrow_columns(table, arrive_by, label, labeled, date, clock, pa):
+    """The Arrow twin of ``_insert_slot_columns``."""
+    at = table.schema.get_field_index("to_id") + 1
+    moment = pa.array([f"{date} {clock}"] * table.num_rows, type=pa.string())
+    table = table.add_column(
+        at, "arrival_time" if arrive_by else "departure_time", moment
+    )
+    if labeled:
+        table = table.add_column(
+            at, "slot", pa.array([label] * table.num_rows, type=pa.string())
+        )
+    return table
 
 
 def _insert_slot_columns(frame, arrive_by, label, labeled, date, clock):
@@ -2472,11 +2586,7 @@ def travel_cost_table(
             "Arrow tables need the optional pyarrow dependency; install "
             "cafein[arrow] or pyarrow"
         ) from error
-    from cafein._units import (
-        departure_parts,
-        duration_seconds,
-        validated_output_time_units,
-    )
+    from cafein._units import duration_seconds, validated_output_time_units
 
     output_time_units = validated_output_time_units(output_time_units)
     if departure is not None and arrival is not None:
@@ -2485,19 +2595,16 @@ def travel_cost_table(
     from cafein._units import window_axis
 
     raw_window = window_axis(arrive_by, departure_time_window, arrival_time_window)
-    if arrive_by:
-        from cafein._units import arrival_parts
-
-        if router == "tbtr":
-            raise ValueError(
-                "router='tbtr' does not serve arrival=; the reverse "
-                "search rides RAPTOR"
-            )
-        date, departure = arrival_parts(arrival)
-    else:
-        date, departure = (
-            (None, None) if departure is None else departure_parts(departure)
+    if arrive_by and router == "tbtr":
+        raise ValueError(
+            "router='tbtr' does not serve arrival=; the reverse " "search rides RAPTOR"
         )
+    slots, labeled, multi = _time_slots(departure, arrival, arrive_by)
+    if multi and output is not None:
+        raise ValueError(
+            "output= streams one moment; pass a single departure= or arrival="
+        )
+    date, departure = slots[0][1], slots[0][2]
     if max_rides < 1:
         raise ValueError("max_rides must be at least 1")
     max_transfers = max_rides - 1
@@ -2600,44 +2707,98 @@ def travel_cost_table(
             raise ValueError("batch_size requires output=")
         if resume:
             raise ValueError("resume=True requires output=")
-        table, from_ids, to_ids = _cost_columns(
-            network,
-            origins,
-            destinations,
-            date,
-            departure,
-            max_transfers=max_transfers,
-            optimize=optimize,
-            window=window,
-            within=within,
-            factors=factors,
-            components=components,
-            fares=fares,
-            geometries=geometries,
-            chunk=chunk,
-            router=router,
-            exclude_routes=exclude_routes,
-            exclude_trips=exclude_trips,
-            exclude_stops=exclude_stops,
-            arrive_by=arrive_by,
-            walking_speed_kmph=walking_speed_kmph,
-            max_walking_time=max_walking_time,
-            max_snap_distance=max_snap_distance,
-            exposure=exposure_snapshot,
-        )
-        if exposure is not None:
-            exposure._check_network(network)
-        return _arrow_table(
-            table,
-            pyarrow.array(from_ids, type=pyarrow.string()),
-            pyarrow.array(to_ids, type=pyarrow.string()),
-            0,
+        exclude_routes = id_sequence("exclude_routes", exclude_routes)
+        exclude_trips = id_sequence("exclude_trips", exclude_trips)
+        exclude_stops = id_sequence("exclude_stops", exclude_stops)
+        if chunk is not None:
+            chunk = tuple(chunk)
+        origins = sequence_not_string("origins", origins)
+        destinations = sequence_not_string("destinations", destinations)
+        components = component_selection(components)
+        from cafein import emissions
+
+        _validate_cost_query(
+            slots[0][1],
+            slots[0][2],
+            optimize,
+            window,
+            within,
             fares,
-            geometries,
-            pyarrow,
-            output_time_units,
-            exposure=exposure_snapshot,
+            router,
+            arrive_by=arrive_by,
         )
+        from_ids, to_ids, points, to_stops = _cost_endpoints(
+            network, origins, destinations, None if arrive_by else chunk
+        )
+        if arrive_by and points is None:
+            to_axis = to_stops if to_stops is not None else list(to_ids)
+            if chunk is not None:
+                to_axis = to_axis[_chunk_slice(len(to_axis), chunk)]
+            endpoints = ("stops", from_ids, to_axis)
+        elif arrive_by:
+            origin_points, destination_points = points
+            if chunk is not None:
+                keep = _chunk_slice(len(to_ids), chunk)
+                to_ids = to_ids[keep]
+                destination_points = destination_points[keep]
+            endpoints = ("points", from_ids, origin_points, to_ids, destination_points)
+        elif points is None:
+            endpoints = ("stops", from_ids, to_stops)
+        else:
+            origin_points, destination_points = points
+            endpoints = ("points", from_ids, origin_points, to_ids, destination_points)
+        _resolved = (
+            emissions.trip_factors(network, factors, components),
+            None if fares is None else fares._flat_tables(network),
+            endpoints,
+        )
+        tables = []
+        for label, date, clock in slots:
+            table, from_ids, to_ids = _cost_columns(
+                network,
+                origins,
+                destinations,
+                date,
+                clock,
+                max_transfers=max_transfers,
+                optimize=optimize,
+                window=window,
+                within=within,
+                factors=factors,
+                components=components,
+                fares=fares,
+                geometries=geometries,
+                chunk=chunk,
+                router=router,
+                exclude_routes=exclude_routes,
+                exclude_trips=exclude_trips,
+                exclude_stops=exclude_stops,
+                arrive_by=arrive_by,
+                walking_speed_kmph=walking_speed_kmph,
+                max_walking_time=max_walking_time,
+                max_snap_distance=max_snap_distance,
+                exposure=exposure_snapshot,
+                _resolved=_resolved,
+            )
+            if exposure is not None:
+                exposure._check_network(network)
+            arrow = _arrow_table(
+                table,
+                pyarrow.array(from_ids, type=pyarrow.string()),
+                pyarrow.array(to_ids, type=pyarrow.string()),
+                0,
+                fares,
+                geometries,
+                pyarrow,
+                output_time_units,
+                exposure=exposure_snapshot,
+            )
+            if multi:
+                arrow = _insert_slot_arrow_columns(
+                    arrow, arrive_by, label, labeled, date, clock, pyarrow
+                )
+            tables.append(arrow)
+        return pyarrow.concat_tables(tables) if multi else tables[0]
     size = _stream_size(batch_size, resume)
     return _stream_transit_cost(
         "travel_cost_table",
@@ -3892,6 +4053,7 @@ def _cost_matrix_data(
     max_snap_distance,
     workers,
     arrival,
+    _resolved=None,
 ):
     """The long-format columns of one moment's transit cost matrix,
     dispatched by street policy exactly as the constructor did."""
@@ -4119,6 +4281,7 @@ def _cost_matrix_data(
         max_snap_distance=max_snap_distance,
         exposure=None if exposure is None else exposure._reporting_snapshot(),
         workers=workers,
+        _resolved=_resolved,
     )
     if exposure is not None:
         # Re-verify the binding after the routing (the itineraries
