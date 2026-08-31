@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- `TravelTimeMatrix` computes several departure (or arrival) slots in
+  one call: `departure=` takes a list of moments — adding a
+  `departure_time` column — or a mapping of labels to moments, adding
+  a `slot` column too; `arrival=` mirrors it with `arrival_time`. The
+  frame is the per-slot frames concatenated in slot order; windows,
+  percentiles, and `chunk=` apply per slot.
+
 ## 0.18.0 — 2026-08-26
 
 - Changed: `Accessibility(decay="linear")` keeps its ramp past the

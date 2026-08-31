@@ -1437,3 +1437,210 @@ def test_the_arrow_table_keeps_string_ids(network):
     # surfaces: the ids stay dictionary-encoded strings.
     assert pyarrow.types.is_dictionary(table.schema.field("from_id").type)
     assert pyarrow.types.is_string(table.schema.field("from_id").type.value_type)
+
+
+def _slot_frames(network, origins, slots, **kwargs):
+    """The scalar frames of ``slots`` (moment strings) in order."""
+    return [
+        TravelTimeMatrix(network, origins, departure=slot, **kwargs) for slot in slots
+    ]
+
+
+def test_departure_slots_concatenate_the_scalar_frames(network):
+    origins = ["4810551", "1250551", "4740551"]
+    slots = ["2022-02-22 08:30:00", "2022-02-22 12:00:00"]
+    frame = TravelTimeMatrix(network, origins, departure=slots)
+    assert list(frame.columns) == ["from_id", "to_id", "departure_time", "travel_time"]
+    expected = pd.concat(
+        [
+            single.assign(departure_time=slot)
+            for single, slot in zip(_slot_frames(network, origins, slots), slots)
+        ],
+        ignore_index=True,
+    )[list(frame.columns)]
+    pd.testing.assert_frame_equal(pd.DataFrame(frame), expected)
+    # A one-element list is a list: the slot column stays.
+    one = TravelTimeMatrix(network, origins, departure=slots[:1])
+    assert "departure_time" in one.columns
+    pd.testing.assert_frame_equal(
+        pd.DataFrame(one.drop(columns="departure_time")),
+        pd.DataFrame(TravelTimeMatrix(network, origins, departure=slots[0])),
+    )
+
+
+def test_departure_slot_mapping_labels_the_rows(network):
+    origins = ["4810551", "1250551"]
+    mapping = {"peak": "2022-02-22 08:30:00", "midday": "2022-02-22 12:00:00"}
+    frame = TravelTimeMatrix(network, origins, departure=mapping)
+    assert list(frame.columns) == [
+        "from_id",
+        "to_id",
+        "slot",
+        "departure_time",
+        "travel_time",
+    ]
+    assert list(frame["slot"].unique()) == ["peak", "midday"]
+    by_label = dict(zip(frame["slot"], frame["departure_time"]))
+    assert by_label == mapping
+    unlabeled = TravelTimeMatrix(network, origins, departure=list(mapping.values()))
+    pd.testing.assert_frame_equal(
+        pd.DataFrame(frame.drop(columns="slot")), pd.DataFrame(unlabeled)
+    )
+
+
+def test_departure_slots_carry_windows_and_percentiles_per_slot(network):
+    origins = ["4740551"]
+    slots = ["2022-02-22 08:00:00", "2022-02-22 16:00:00"]
+    kwargs = dict(
+        departure_time_window=20,
+        percentiles=[25, 75],
+        output_time_units="seconds",
+    )
+    frame = TravelTimeMatrix(network, origins, departure=slots, **kwargs)
+    assert list(frame.columns) == [
+        "from_id",
+        "to_id",
+        "departure_time",
+        "travel_time_p25",
+        "travel_time_p75",
+    ]
+    for single, slot in zip(_slot_frames(network, origins, slots, **kwargs), slots):
+        block = frame[frame["departure_time"] == slot].drop(columns="departure_time")
+        pd.testing.assert_frame_equal(
+            block.reset_index(drop=True), pd.DataFrame(single)
+        )
+
+
+def test_departure_slots_route_points_door_to_door(network_with_footpaths):
+    origins = point_frame(network_with_footpaths, [("a", "4810551"), ("b", "1250551")])
+    slots = ["2022-02-22 08:30:00", "2022-02-22 09:30:00"]
+    frame = TravelTimeMatrix(network_with_footpaths, origins, origins, departure=slots)
+    assert list(frame.columns) == ["from_id", "to_id", "departure_time", "travel_time"]
+    for slot in slots:
+        block = frame[frame["departure_time"] == slot].drop(columns="departure_time")
+        single = TravelTimeMatrix(
+            network_with_footpaths, origins, origins, departure=slot
+        )
+        pd.testing.assert_frame_equal(
+            block.reset_index(drop=True), pd.DataFrame(single)
+        )
+
+
+def test_arrival_slots_mirror_departure_slots(network):
+    origins = ["4810551", "1250551"]
+    deadlines = ["2022-02-22 09:30:00", "2022-02-22 13:00:00"]
+    frame = TravelTimeMatrix(network, origins, arrival=deadlines)
+    assert list(frame.columns) == ["from_id", "to_id", "arrival_time", "travel_time"]
+    for deadline in deadlines:
+        block = frame[frame["arrival_time"] == deadline].drop(columns="arrival_time")
+        single = TravelTimeMatrix(network, origins, arrival=deadline)
+        pd.testing.assert_frame_equal(
+            block.reset_index(drop=True), pd.DataFrame(single)
+        )
+
+
+def test_departure_slots_chunk_the_origins(network):
+    origins = ["4810551", "1250551", "4740551"]
+    slots = ["2022-02-22 08:30:00", "2022-02-22 12:00:00"]
+    full = TravelTimeMatrix(network, origins, departure=slots)
+    parts = [
+        TravelTimeMatrix(network, origins, departure=slots, chunk=(k, 3))
+        for k in range(3)
+    ]
+    # Every chunk carries both slots; the chunks partition the origins.
+    for part in parts:
+        assert set(part["departure_time"]) <= set(slots)
+    stitched = pd.concat(parts, ignore_index=True)
+    keys = ["from_id", "to_id", "departure_time"]
+    assert len(stitched) == len(full)
+    assert set(map(tuple, stitched[keys].to_numpy())) == set(
+        map(tuple, full[keys].to_numpy())
+    )
+
+
+def test_departure_slots_validate_eagerly(network, helsinki_streets):
+    origins = ["4810551"]
+    with pytest.raises(ValueError, match="dated moments"):
+        TravelTimeMatrix(network, origins, departure=["08:30:00"])
+    with pytest.raises(ValueError, match="names no slots"):
+        TravelTimeMatrix(network, origins, departure=[])
+    with pytest.raises(ValueError, match="twice"):
+        TravelTimeMatrix(network, origins, departure=["2022-02-22 08:30:00"] * 2)
+    with pytest.raises(TypeError, match="labels must be strings"):
+        TravelTimeMatrix(network, origins, departure={8: "2022-02-22 08:30:00"})
+    with pytest.raises(ValueError, match="give exactly one"):
+        TravelTimeMatrix(
+            network,
+            origins,
+            departure=["2022-02-22 08:30:00"],
+            arrival=["2022-02-22 09:30:00"],
+        )
+    # A street matrix carries no timetable: slots are as meaningless
+    # there as a single departure.
+    points = gpd.GeoDataFrame(
+        {"id": ["p", "q"]},
+        geometry=gpd.points_from_xy([24.9384, 24.9600], [60.1699, 60.1866]),
+        crs="EPSG:4326",
+    )
+    with pytest.raises(ValueError, match="no meaning for a street matrix"):
+        TravelTimeMatrix(
+            helsinki_streets,
+            points,
+            points,
+            departure=["2022-02-22 08:30:00", "2022-02-22 12:00:00"],
+            transport_mode="walk",
+        )
+
+
+def test_matrix_phase_details_count_the_slots():
+    from cafein.matrices import _query_details
+
+    slots = ["2022-02-22 08:30:00", "2022-02-22 12:00:00"]
+    assert _query_details({"departure": slots})["slots"] == 2
+    assert _query_details({"arrival": {"a": slots[0]}})["slots"] == 1
+    assert "slots" not in _query_details({"departure": slots[0]})
+
+
+def test_departure_slots_share_one_frozen_query(network):
+    import types
+
+    origins = ["4810551", "1250551"]
+    slots = ["2022-02-22 08:00:00", "2022-02-22 16:00:00"]
+    # One-shot iterables must feed every slot, not only the first.
+    frame = TravelTimeMatrix(
+        network,
+        origins,
+        departure=slots,
+        departure_time_window=10,
+        percentiles=(p for p in (25, 75)),
+        exclude_routes=(route for route in ["2550"]),
+        output_time_units="seconds",
+    )
+    assert list(frame.columns) == [
+        "from_id",
+        "to_id",
+        "departure_time",
+        "travel_time_p25",
+        "travel_time_p75",
+    ]
+    for slot in slots:
+        block = frame[frame["departure_time"] == slot].drop(columns="departure_time")
+        single = TravelTimeMatrix(
+            network,
+            origins,
+            departure=slot,
+            departure_time_window=10,
+            percentiles=[25, 75],
+            exclude_routes=["2550"],
+            output_time_units="seconds",
+        )
+        pd.testing.assert_frame_equal(
+            block.reset_index(drop=True), pd.DataFrame(single)
+        )
+    # Any mapping labels slots, and dates are canonical ISO.
+    proxy = types.MappingProxyType({"peak": "2022-02-22T08:00", "late": slots[1]})
+    labeled = TravelTimeMatrix(network, origins, departure=proxy)
+    assert list(labeled["slot"].unique()) == ["peak", "late"]
+    assert set(labeled["departure_time"]) == set(slots)
+    with pytest.raises(ValueError, match="twice"):
+        TravelTimeMatrix(network, origins, departure=["2022-02-22T08:00", slots[0]])

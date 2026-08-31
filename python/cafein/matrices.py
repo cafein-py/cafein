@@ -1,5 +1,6 @@
 """Matrix computers over a transport network."""
 
+import collections.abc
 import operator
 import warnings
 
@@ -35,6 +36,9 @@ def _query_details(arguments):
     for key in ("departure_time_window", "arrival_time_window"):
         if arguments.get(key) is not None:
             details["window"] = arguments[key]
+    for key in ("departure", "arrival"):
+        if isinstance(arguments.get(key), (list, tuple, collections.abc.Mapping)):
+            details["slots"] = len(arguments[key])
     chunk = arguments.get("chunk")
     if chunk is not None:
         try:
@@ -1142,6 +1146,15 @@ class TravelTimeMatrix(pd.DataFrame):
     unreachable percentile reads as ``NaN``; a pair appears when at
     least one of its percentiles is reachable.
 
+    ``departure=`` (or ``arrival=``) also takes several moments at once:
+    a list adds a ``departure_time`` (``arrival_time``) column holding
+    each row's moment as ``YYYY-MM-DD HH:MM:SS``, a mapping of labels to
+    moments adds a ``slot`` column with the label as well, both placed
+    after ``to_id``. The frame is the single-moment frames concatenated
+    in slot order — windows, percentiles, and ``chunk=`` apply to every
+    slot alike — and the slots must carry dates. A single moment keeps
+    the columns as they are.
+
     Origins are either stop identifiers or a point GeoDataFrame with an
     ``id`` column; destinations apply to point origins only — stop
     origins always span every stop (the ``stops`` order). Integer ids
@@ -1183,11 +1196,11 @@ class TravelTimeMatrix(pd.DataFrame):
     destinations : GeoDataFrame (optional)
         Destination points; defaults to the origins. Only valid with
         point origins — stop origins always span every stop.
-    departure : datetime.datetime or str (optional)
+    departure : datetime.datetime, str, or a sequence/mapping of them (optional)
         Departure at every origin — a datetime, or an ISO string like
         ``"2022-02-22 08:30"``; the service date is its date part.
         Give exactly one of ``departure`` and ``arrival``.
-    arrival : datetime.datetime or str (optional)
+    arrival : datetime.datetime, str, or a sequence/mapping of them (optional)
         Arrival deadline at every destination, in the same forms. Each
         row's ``travel_time`` is that pair's latest-departure journey
         arriving by the deadline (fewest rides, then earliest arrival,
@@ -1363,8 +1376,8 @@ class TravelTimeMatrix(pd.DataFrame):
         origins = sequence_not_string("origins", origins)
         destinations = sequence_not_string("destinations", destinations)
         from cafein._units import (
-            departure_parts,
             duration_seconds,
+            moments,
             validated_output_time_units,
         )
 
@@ -1376,9 +1389,6 @@ class TravelTimeMatrix(pd.DataFrame):
 
         raw_window = window_axis(arrive_by, departure_time_window, arrival_time_window)
         if arrive_by:
-            from cafein._units import arrival_parts
-
-            date, departure = arrival_parts(arrival)
             if router == "tbtr":
                 raise ValueError(
                     "router='tbtr' does not serve arrival=; the reverse "
@@ -1392,10 +1402,6 @@ class TravelTimeMatrix(pd.DataFrame):
                         "street_policy= (a traveler's street bridge included) "
                         "does not combine with arrival= yet"
                     )
-        else:
-            date, departure = (
-                (None, None) if departure is None else departure_parts(departure)
-            )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         max_transfers = max_rides - 1
@@ -1455,34 +1461,55 @@ class TravelTimeMatrix(pd.DataFrame):
             delay_model,
             parking,
         )
-        data = _time_matrix_data(
-            network,
-            origins,
-            destinations,
-            date,
-            departure,
-            arrive_by=arrive_by,
-            window=window,
-            percentiles=percentiles,
-            confidence=confidence,
-            chunk=chunk,
-            router=router,
-            exclude_routes=exclude_routes,
-            exclude_trips=exclude_trips,
-            exclude_stops=exclude_stops,
-            walking_speed_kmph=walking_speed_kmph,
-            max_walking_time=max_walking_time,
-            max_snap_distance=max_snap_distance,
-            street_policy=street_policy,
-            max_transfers=max_transfers,
-            workers=workers,
-        )
-        super().__init__(
-            restore_id_dtypes(
-                pd.DataFrame(_humanize_time_columns(data, output_time_units)),
-                _id_dtypes,
+        # The moment(s): a scalar keeps today's frame; a list or mapping
+        # adds the slot columns, one block of rows per slot.
+        if arrive_by:
+            slots, labeled = moments("arrival", arrival)
+            multi = isinstance(arrival, (list, tuple, collections.abc.Mapping))
+        elif departure is None:
+            slots, labeled, multi = [(None, None, None)], False, False
+        else:
+            slots, labeled = moments("departure", departure)
+            multi = isinstance(departure, (list, tuple, collections.abc.Mapping))
+        # Every slot sees the same query: one-shot iterables are drained
+        # by the first slot otherwise.
+        if percentiles is not None:
+            percentiles = list(percentiles)
+        if chunk is not None:
+            chunk = tuple(chunk)
+        exclude_routes = id_sequence("exclude_routes", exclude_routes)
+        exclude_trips = id_sequence("exclude_trips", exclude_trips)
+        exclude_stops = id_sequence("exclude_stops", exclude_stops)
+        frames = []
+        for label, date, clock in slots:
+            data = _time_matrix_data(
+                network,
+                origins,
+                destinations,
+                date,
+                clock,
+                arrive_by=arrive_by,
+                window=window,
+                percentiles=percentiles,
+                confidence=confidence,
+                chunk=chunk,
+                router=router,
+                exclude_routes=exclude_routes,
+                exclude_trips=exclude_trips,
+                exclude_stops=exclude_stops,
+                walking_speed_kmph=walking_speed_kmph,
+                max_walking_time=max_walking_time,
+                max_snap_distance=max_snap_distance,
+                street_policy=street_policy,
+                max_transfers=max_transfers,
+                workers=workers,
             )
-        )
+            frame = pd.DataFrame(_humanize_time_columns(data, output_time_units))
+            if multi:
+                _insert_slot_columns(frame, arrive_by, label, labeled, date, clock)
+            frames.append(frame)
+        frame = pd.concat(frames, ignore_index=True) if multi else frames[0]
+        super().__init__(restore_id_dtypes(frame, _id_dtypes))
 
     @classmethod
     def to_parquet(
@@ -1706,6 +1733,18 @@ class TravelTimeMatrix(pd.DataFrame):
             arrive_by=arrive_by,
             workers=workers,
         )
+
+
+def _insert_slot_columns(frame, arrive_by, label, labeled, date, clock):
+    """Add a slot's columns after ``to_id``: ``slot`` (the label, for
+    mapped slots) and ``departure_time``/``arrival_time`` (the moment
+    as ``YYYY-MM-DD HH:MM:SS``)."""
+    at = list(frame.columns).index("to_id") + 1
+    frame.insert(
+        at, "arrival_time" if arrive_by else "departure_time", f"{date} {clock}"
+    )
+    if labeled:
+        frame.insert(at, "slot", label)
 
 
 def _humanize_time_columns(data, output_time_units):
