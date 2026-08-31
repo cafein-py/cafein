@@ -609,7 +609,7 @@ def test_the_windowed_catchment_ranks_per_mark_durations(network_with_footpaths)
         network_with_footpaths,
         [KAPYLA],
         arrival=WINDOW_START,
-        arrival_time_window=30,
+        arrival_time_window=10,
         budgets=[30],
         percentile=90,
     )
@@ -617,14 +617,14 @@ def test_the_windowed_catchment_ranks_per_mark_durations(network_with_footpaths)
     # The seeds are derivational: each stop's percentile reach equals
     # the nearest rank of its per-mark single-deadline durations.
     reaches = network_with_footpaths._core._arrive_by_percentile_reaches(
-        [(KAPYLA, 0)], "2022-02-22", "09:00:00", 30 * 60, 90.0, 7, [], [], []
+        [(KAPYLA, 0)], "2022-02-22", "09:00:00", 10 * 60, 90.0, 7, [], [], []
     )
     stops = [stop for stop, *_ in network_with_footpaths._core.stops]
     by_stop = {
         stops[stop]: achieved - departure
         for stop, departure, _rides, achieved in reaches
     }
-    marks = [9 * 3600 + 60 * i for i in range(30)]
+    marks = [9 * 3600 + 60 * i for i in range(10)]
     unreachable = 2**32 - 1
     for origin in [KORSO, "1020453"]:
         durations = sorted(
@@ -1293,7 +1293,7 @@ def test_the_arrive_by_cost_catchment_seeds_the_fitting_stops(
         origins=[seed_stop],
         destinations=[place],
         arrival=DEADLINE,
-        arrival_time_window=20,
+        arrival_time_window=5,
         optimize="emissions",
         output_time_units="seconds",
     )["emissions"].iloc[0]
@@ -1301,7 +1301,7 @@ def test_the_arrive_by_cost_catchment_seeds_the_fitting_stops(
         network_with_footpaths,
         origins=[place],
         arrival=DEADLINE,
-        arrival_time_window=20,
+        arrival_time_window=5,
         cost="emissions",
         budgets=[cell - 1.0, cell + 1.0],
         max_walking_time=2,

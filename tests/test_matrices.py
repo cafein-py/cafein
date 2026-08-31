@@ -1526,14 +1526,18 @@ def test_departure_slots_route_points_door_to_door(network_with_footpaths):
         )
 
 
-def test_arrival_slots_mirror_departure_slots(network):
-    origins = ["4810551", "1250551"]
+def test_arrival_slots_mirror_departure_slots(network_with_footpaths):
+    # The arrive-by stop arm spans every stop by design, so the slot
+    # identity rides the point arm's small axes.
+    points = point_frame(network_with_footpaths, [("a", "4810551"), ("b", "1250551")])
     deadlines = ["2022-02-22 09:30:00", "2022-02-22 13:00:00"]
-    frame = TravelTimeMatrix(network, origins, arrival=deadlines)
+    frame = TravelTimeMatrix(network_with_footpaths, points, points, arrival=deadlines)
     assert list(frame.columns) == ["from_id", "to_id", "arrival_time", "travel_time"]
     for deadline in deadlines:
         block = frame[frame["arrival_time"] == deadline].drop(columns="arrival_time")
-        single = TravelTimeMatrix(network, origins, arrival=deadline)
+        single = TravelTimeMatrix(
+            network_with_footpaths, points, points, arrival=deadline
+        )
         pd.testing.assert_frame_equal(
             block.reset_index(drop=True), pd.DataFrame(single)
         )
@@ -1680,15 +1684,20 @@ def test_cost_arrival_slots_mirror_departure_slots(network):
     # A cost matrix serves arrival= on the emissions axis (with its
     # window); the time axis rides TravelTimeMatrix.
     origins = ["4810551"]
+    destinations = ["4810551", "1250551", "4740551"]
     deadlines = ["2022-02-22 09:30:00", "2022-02-22 13:00:00"]
     kwargs = dict(optimize="emissions", arrival_time_window=10)
     with pytest.warns(UserWarning, match="route_type"):
-        frame = TravelCostMatrix(network, origins, arrival=deadlines, **kwargs)
+        frame = TravelCostMatrix(
+            network, origins, destinations, arrival=deadlines, **kwargs
+        )
     assert list(frame.columns)[:3] == ["from_id", "to_id", "arrival_time"]
     for deadline in deadlines:
         block = frame[frame["arrival_time"] == deadline].drop(columns="arrival_time")
         with pytest.warns(UserWarning, match="route_type"):
-            single = TravelCostMatrix(network, origins, arrival=deadline, **kwargs)
+            single = TravelCostMatrix(
+                network, origins, destinations, arrival=deadline, **kwargs
+            )
         pd.testing.assert_frame_equal(
             block.reset_index(drop=True), pd.DataFrame(single)
         )
