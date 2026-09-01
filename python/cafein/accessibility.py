@@ -916,6 +916,36 @@ def _accessibility_columns(
             workers=workers,
         )
 
+    return _aggregate_surface(
+        matrix,
+        from_ids,
+        labels,
+        values,
+        budgets,
+        budget_column,
+        decay,
+        decay_param,
+        resolved_percentiles,
+        workers,
+    )
+
+
+def _aggregate_surface(
+    matrix,
+    from_ids,
+    labels,
+    values,
+    budgets,
+    budget_column,
+    decay,
+    decay_param,
+    resolved_percentiles,
+    workers,
+):
+    """The long accessibility frame of a cost surface — shared by the
+    routed computation and ``Accessibility.from_matrix``."""
+    from cafein import _cafein
+
     flat_values = [float(value) for value in values.ravel()]
 
     def aggregated(cost_slice):
@@ -960,6 +990,128 @@ def _accessibility_columns(
         frames.append(frame)
     long = pd.concat(frames, ignore_index=True)
     return long[["from_id", "opportunity", "budget", "percentile", "accessibility"]]
+
+
+_MATRIX_COST_COLUMNS = {
+    "time": "travel_time",
+    "emissions": "emissions",
+    "money": "fare",
+    "distance": ("network_distance_m", "connector_distance_m"),
+}
+
+
+def _universe_ids(name, value):
+    """A universe's ids: a table resolves through its ``id`` column."""
+    if hasattr(value, "columns"):
+        if "id" not in value.columns:
+            raise ValueError(f"{name} is a table without an 'id' column")
+        # The Series keeps its dtype for freeze_ids: a list would
+        # discard extension and width information.
+        value = value["id"]
+    return value
+
+
+def _matrix_percentile(value):
+    """One validated percentile of a matrix's window distribution."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"percentile is one number in [0, 100], not {value!r}")
+    value = float(value)
+    if not 0.0 <= value <= 100.0:
+        raise ValueError(f"percentile must be within [0, 100], not {value}")
+    return value
+
+
+def _matrix_surface(matrix, cost, origins, destinations, time_units, percentiles):
+    """A ``(surface, origin_ids, origin_dtype)`` triple from a long
+    matrix frame — float64 with NaN unreached, one plane per requested
+    percentile, in the (origins x destinations) order given."""
+    if not hasattr(matrix, "columns"):
+        raise ValueError("matrix must be a long matrix frame")
+    for key in ("from_id", "to_id"):
+        if key not in matrix.columns:
+            raise ValueError(f"matrix has no {key} column")
+    for slot in ("slot", "departure_time", "arrival_time"):
+        if slot in matrix.columns and matrix[slot].nunique(dropna=False) > 1:
+            raise ValueError(
+                f"matrix carries several {slot} slots; select one slot "
+                "before aggregating"
+            )
+    if time_units not in ("minutes", "seconds"):
+        raise ValueError(
+            f"time_units must be 'minutes' or 'seconds', not {time_units!r}"
+        )
+    if cost not in _MATRIX_COST_COLUMNS:
+        raise ValueError(
+            f"unknown cost {cost!r}: the axes are time, emissions, " "money, distance"
+        )
+    named = _MATRIX_COST_COLUMNS[cost]
+    if cost == "time" and percentiles is not None:
+        planes = [f"travel_time_p{percentile:g}" for percentile in percentiles]
+    elif cost == "distance":
+        planes = None
+        for column in named:
+            if column not in matrix.columns:
+                raise ValueError(f"matrix has no {column} column")
+    else:
+        planes = [named]
+    if planes is not None:
+        for column in planes:
+            if column not in matrix.columns:
+                raise ValueError(f"matrix has no {column} column")
+    if origins is None:
+        origin_ids, origin_dtype = freeze_ids(pd.unique(matrix["from_id"]))
+    else:
+        origin_ids, origin_dtype = freeze_ids(_universe_ids("origins", origins))
+    origin_ids = sequence_not_string("origins", origin_ids)
+    destination_ids = list(destinations)
+    at_origin = {identifier: at for at, identifier in enumerate(origin_ids)}
+    at_destination = {identifier: at for at, identifier in enumerate(destination_ids)}
+    if len(at_origin) != len(origin_ids):
+        raise ValueError("origins repeats an id")
+    if len(at_destination) != len(destination_ids):
+        raise ValueError("destinations repeats an id")
+    rows = matrix["from_id"].map(at_origin)
+    if rows.isna().any():
+        strays = sorted(map(str, pd.unique(matrix.loc[rows.isna(), "from_id"])))
+        raise ValueError(f"matrix carries rows for origins outside origins=: {strays}")
+    columns = matrix["to_id"].map(at_destination)
+    if columns.isna().any():
+        strays = sorted(map(str, pd.unique(matrix.loc[columns.isna(), "to_id"])))
+        raise ValueError(
+            "matrix carries rows for destinations outside the "
+            f"destination universe: {strays}"
+        )
+    rows = rows.to_numpy(dtype="int64")
+    columns = columns.to_numpy(dtype="int64")
+    if pd.DataFrame({"row": rows, "column": columns}).duplicated().any():
+        raise ValueError(
+            "matrix carries duplicate (from_id, to_id) rows; a matrix "
+            "frame has one row per cell"
+        )
+    shape = (len(origin_ids), len(destination_ids))
+    if cost == "time" and percentiles is not None:
+        # One plane per requested percentile, a single one included:
+        # the aggregation indexes the percentile axis unconditionally.
+        surface = np.full(shape + (len(planes),), np.nan, dtype="float64")
+        for at, column in enumerate(planes):
+            surface[rows, columns, at] = _surface_values(
+                matrix, [column], time_units, cost
+            )
+    else:
+        surface = np.full(shape, np.nan, dtype="float64")
+        source = list(named) if cost == "distance" else planes
+        surface[rows, columns] = _surface_values(matrix, source, time_units, cost)
+    return surface, origin_ids, origin_dtype
+
+
+def _surface_values(matrix, columns, time_units, cost):
+    """One column's costs as float64 seconds (time) or native units."""
+    values = matrix[columns[0]].to_numpy(dtype="float64", na_value=np.nan)
+    for column in columns[1:]:
+        values = values + matrix[column].to_numpy(dtype="float64", na_value=np.nan)
+    if cost == "time" and time_units == "minutes":
+        values = values * 60.0
+    return values
 
 
 class Accessibility(pd.DataFrame):
@@ -1693,6 +1845,105 @@ class Accessibility(pd.DataFrame):
             resume=resume,
             dictionary_columns=("from_id",),
         )
+
+    @classmethod
+    def from_matrix(
+        cls,
+        matrix,
+        destinations,
+        *,
+        cost="time",
+        opportunities=None,
+        budgets=(30.0,),
+        decay="step",
+        decay_params=None,
+        origins=None,
+        time_units="minutes",
+        percentiles=None,
+        workers=None,
+    ):
+        """Accessibility from a precomputed long matrix frame.
+
+        ``matrix`` carries ``from_id``, ``to_id``, and the axis's cost
+        column — ``travel_time`` for ``cost="time"`` (or every
+        requested ``travel_time_p{p}`` column with ``percentiles=``),
+        ``emissions``, ``fare`` for money, or the street distance
+        columns for distance. ``time_units`` states the time column's
+        unit (``"minutes"``, the matrices' default; ``"seconds"``).
+        A minutes matrix is rounded to whole minutes, which moves both
+        step counts and decay weights — identity with the routed
+        constructor holds only from a seconds matrix
+        (``output_time_units="seconds"``).
+
+        A matrix omits unreachable pairs, so an origin that reaches
+        nothing has no rows and would vanish; ``origins=`` (a sequence
+        or a table with ``id``) defines the origin universe and
+        defaults to the matrix's distinct ``from_id`` in first-seen
+        order. Destinations come from ``destinations`` (``id`` plus
+        opportunity columns). Matrix rows outside either universe,
+        duplicate ``(from_id, to_id)`` rows, and a frame holding
+        several slots are refused rather than silently dropped.
+        """
+        from cafein._units import duration_seconds
+
+        if workers is not None:
+            workers = positive_int("workers", workers)
+        if cost == "time" and isinstance(decay_params, dict):
+            decay_params = {
+                name: duration_seconds("decay_params", value, whole=False)
+                for name, value in decay_params.items()
+            }
+        decay_param = _decay_parameter(decay, decay_params)
+        if cost == "time":
+            raw_budgets = sequence_not_string("budgets", budgets)
+            budgets = [
+                float(duration_seconds("budgets", budget)) for budget in raw_budgets
+            ]
+            budget_column = [
+                (
+                    budget.total_seconds() / 60
+                    if isinstance(budget, datetime.timedelta)
+                    else float(budget)
+                )
+                for budget in raw_budgets
+            ]
+        else:
+            budgets = _budget_list(budgets)
+            budget_column = budgets
+        labels, values = _opportunity_columns(destinations, opportunities)
+        resolved_percentiles = None
+        if percentiles is not None:
+            if cost != "time":
+                raise ValueError("percentiles apply to cost='time'")
+            resolved_percentiles = [
+                _matrix_percentile(percentile)
+                for percentile in sequence_not_string("percentiles", percentiles)
+            ]
+            if not resolved_percentiles:
+                raise ValueError("percentiles names no percentiles")
+        destination_ids = list(
+            sequence_not_string(
+                "destinations", _universe_ids("destinations", destinations)
+            )
+        )
+        surface, origin_ids, origin_dtype = _matrix_surface(
+            matrix, cost, origins, destination_ids, time_units, resolved_percentiles
+        )
+        frame = _aggregate_surface(
+            surface,
+            origin_ids,
+            labels,
+            values,
+            budgets,
+            budget_column,
+            decay,
+            decay_param,
+            resolved_percentiles,
+            workers,
+        )
+        out = cls.__new__(cls)
+        pd.DataFrame.__init__(out, restore_id_dtypes(frame, {"from_id": origin_dtype}))
+        return out
 
     def gini_index(
         self,
@@ -2438,6 +2689,113 @@ class NearestDestinations(pd.DataFrame):
             }
         )
         super().__init__(restore_id_dtypes(frame, _id_dtypes))
+
+    @classmethod
+    def from_matrix(
+        cls,
+        matrix,
+        *,
+        cost="time",
+        k=1,
+        max_cost=None,
+        origins=None,
+        destinations=None,
+        time_units="minutes",
+        percentile=None,
+        output_time_units="minutes",
+        workers=None,
+    ):
+        """Nearest destinations from a precomputed long matrix frame.
+
+        ``matrix`` carries ``from_id``, ``to_id``, and the axis's cost
+        column exactly as ``Accessibility.from_matrix`` reads them;
+        ``percentile=`` selects one ``travel_time_p{p}`` column of a
+        windowed matrix instead of ``travel_time``. ``origins=`` and
+        ``destinations=`` define the two universes (sequences or
+        tables with ``id``), defaulting to the matrix's distinct ids
+        in first-seen order; rows outside either universe, duplicate
+        cells, and a frame holding several slots are refused. A
+        minutes matrix ranks whole-minute costs — exact ranking needs
+        a seconds matrix. ``max_cost`` bounds the ranked costs in the
+        time column's unit's axis terms (minutes for time, the axis's
+        own unit otherwise).
+        """
+        from cafein import _cafein
+        from cafein._units import (
+            duration_seconds,
+            travel_time_output,
+            validated_output_time_units,
+        )
+
+        if workers is not None:
+            workers = positive_int("workers", workers)
+        output_time_units = validated_output_time_units(output_time_units)
+        if not isinstance(k, int) or isinstance(k, bool) or k < 1:
+            raise ValueError(f"k must be a positive integer, not {k!r}")
+        if cost == "time":
+            max_cost = duration_seconds("max_cost", max_cost)
+            horizon = None if max_cost is None else float(max_cost)
+        elif max_cost is not None:
+            horizon = float(max_cost)
+            if not math.isfinite(horizon) or horizon <= 0.0:
+                raise ValueError(
+                    f"max_cost must be a positive finite number, not {max_cost!r}"
+                )
+        else:
+            horizon = None
+        planes = None
+        if percentile is not None:
+            if cost != "time":
+                raise ValueError("percentile applies to cost='time'")
+            planes = [_matrix_percentile(percentile)]
+        if destinations is None:
+            destination_ids, destination_dtype = freeze_ids(
+                pd.unique(matrix["to_id"])
+                if hasattr(matrix, "columns") and "to_id" in matrix.columns
+                else []
+            )
+        else:
+            destination_ids, destination_dtype = freeze_ids(
+                _universe_ids("destinations", destinations)
+            )
+        destination_ids = sequence_not_string("destinations", destination_ids)
+        surface, origin_ids, origin_dtype = _matrix_surface(
+            matrix, cost, origins, destination_ids, time_units, planes
+        )
+        if planes is not None:
+            surface = surface[:, :, 0]
+        indices, costs = _cafein.aggregate_nearest_f64(
+            np.ascontiguousarray(surface, dtype="float64"),
+            k,
+            horizon,
+            workers=workers,
+        )
+        indices = np.asarray(indices)
+        costs = np.asarray(costs)
+        origin_rows, ranks = np.nonzero(indices >= 0)
+        kept = indices[origin_rows, ranks]
+        kept_costs = costs[origin_rows, ranks]
+        if cost == "time":
+            kept_costs = travel_time_output(kept_costs, output_time_units)
+        identifiers = np.asarray(list(origin_ids), dtype=object)
+        targets = np.asarray(list(destination_ids), dtype=object)
+        frame = pd.DataFrame(
+            {
+                "from_id": identifiers[origin_rows],
+                "rank": ranks.astype("int64") + 1,
+                "destination_id": targets[kept],
+                "cost": kept_costs,
+            }
+        )
+        out = cls.__new__(cls)
+        pd.DataFrame.__init__(
+            out,
+            restore_id_dtypes(
+                frame,
+                {"from_id": origin_dtype, "destination_id": destination_dtype},
+            ),
+        )
+        return out
 
     def dominance_areas(self, origins):
         """Polygon origins dissolved by their rank-1 destination.

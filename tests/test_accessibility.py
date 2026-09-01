@@ -1458,3 +1458,185 @@ def test_linear_ramp_streams_identically(network, tmp_path):
     expected = frame.astype({"from_id": str}).sort_values("from_id")
     assert numpy.allclose(read["accessibility"], expected["accessibility"], rtol=1e-12)
     assert numpy.allclose(expected["accessibility"], ramp, rtol=1e-12)
+
+
+def test_from_matrix_reproduces_the_routed_computers(network):
+    import pandas as pd
+
+    from cafein import Accessibility, NearestDestinations, TravelTimeMatrix
+
+    origins, destinations = _stop_sets(network)
+    matrix = TravelTimeMatrix(
+        network, origins, departure=DEPARTURE, output_time_units="seconds"
+    )
+    sub = matrix[matrix["to_id"].isin(destinations)]
+    routed = Accessibility(
+        network, origins, destinations, DEPARTURE, budgets=(15.0, 30.0)
+    )
+    framed = Accessibility.from_matrix(
+        sub, destinations, budgets=(15.0, 30.0), origins=origins, time_units="seconds"
+    )
+    pd.testing.assert_frame_equal(pd.DataFrame(framed), pd.DataFrame(routed))
+    # An opportunity table weights identically.
+    table = pd.DataFrame(
+        {"id": destinations, "jobs": numpy.arange(10.0, 10.0 + len(destinations))}
+    )
+    routed_jobs = Accessibility(
+        network, origins, table, DEPARTURE, opportunities="jobs", budgets=(20.0,)
+    )
+    framed_jobs = Accessibility.from_matrix(
+        sub,
+        table,
+        opportunities="jobs",
+        budgets=(20.0,),
+        origins=origins,
+        time_units="seconds",
+    )
+    pd.testing.assert_frame_equal(pd.DataFrame(framed_jobs), pd.DataFrame(routed_jobs))
+    # The percentile planes of a windowed matrix aggregate per plane.
+    windowed = TravelTimeMatrix(
+        network,
+        origins,
+        departure=DEPARTURE,
+        departure_time_window=10,
+        percentiles=[25, 75],
+        output_time_units="seconds",
+    )
+    windowed = windowed[windowed["to_id"].isin(destinations)]
+    routed_p = Accessibility(
+        network,
+        origins,
+        destinations,
+        DEPARTURE,
+        departure_time_window=10,
+        percentiles=(25, 75),
+        budgets=(30.0,),
+    )
+    framed_p = Accessibility.from_matrix(
+        windowed,
+        destinations,
+        budgets=(30.0,),
+        origins=origins,
+        time_units="seconds",
+        percentiles=[25, 75],
+    )
+    pd.testing.assert_frame_equal(pd.DataFrame(framed_p), pd.DataFrame(routed_p))
+    # A single percentile plane aggregates like the pair.
+    routed_one = Accessibility(
+        network,
+        origins,
+        destinations,
+        DEPARTURE,
+        departure_time_window=10,
+        percentiles=(25,),
+        budgets=(30.0,),
+    )
+    framed_one = Accessibility.from_matrix(
+        windowed,
+        destinations,
+        budgets=(30.0,),
+        origins=pd.DataFrame({"id": origins}),
+        time_units="seconds",
+        percentiles=[25],
+    )
+    pd.testing.assert_frame_equal(pd.DataFrame(framed_one), pd.DataFrame(routed_one))
+    # The emissions axis reads the cost matrix's column.
+    from cafein import TravelCostMatrix
+
+    with pytest.warns(UserWarning, match="route_type"):
+        cost = TravelCostMatrix(
+            network,
+            origins,
+            departure=DEPARTURE,
+            optimize="emissions",
+            departure_time_window=10,
+        )
+    cost = cost[cost["to_id"].isin(destinations)]
+    routed_e = Accessibility(
+        network,
+        origins,
+        destinations,
+        DEPARTURE,
+        cost="emissions",
+        departure_time_window=10,
+        budgets=(600.0,),
+    )
+    framed_e = Accessibility.from_matrix(
+        cost, destinations, cost="emissions", budgets=(600.0,), origins=origins
+    )
+    pd.testing.assert_frame_equal(pd.DataFrame(framed_e), pd.DataFrame(routed_e))
+    # NearestDestinations ranks the same frame.
+    routed_n = NearestDestinations(
+        network, origins, destinations, DEPARTURE, k=3, output_time_units="seconds"
+    )
+    framed_n = NearestDestinations.from_matrix(
+        sub,
+        origins=origins,
+        destinations=destinations,
+        k=3,
+        time_units="seconds",
+        output_time_units="seconds",
+    )
+    pd.testing.assert_frame_equal(pd.DataFrame(framed_n), pd.DataFrame(routed_n))
+
+
+def test_from_matrix_refusals():
+    import pandas as pd
+
+    from cafein import Accessibility, NearestDestinations
+
+    def matrix(**overrides):
+        base = {
+            "from_id": ["o1", "o2"],
+            "to_id": ["d1", "d1"],
+            "travel_time": [600.0, 1200.0],
+        }
+        base.update(overrides)
+        return pd.DataFrame(base)
+
+    destinations = ["d1"]
+    for frame, kwargs, match in (
+        (matrix().drop(columns="to_id"), {}, "no to_id"),
+        (matrix(), {"cost": "speed"}, "unknown cost"),
+        (matrix(), {"time_units": "hours"}, "time_units"),
+        (matrix(), {"cost": "emissions"}, "no emissions column"),
+        (matrix(slot=["p", "q"]), {}, "several slot slots"),
+        (matrix(from_id=["o1", "o3"]), {"origins": ["o1", "o2"]}, "outside origins="),
+        (matrix(to_id=["d1", "dX"]), {}, "outside the destination universe"),
+        (
+            matrix(from_id=["o1", "o1"]),
+            {},
+            "duplicate",
+        ),
+        (matrix(), {"percentiles": [25]}, "no travel_time_p25 column"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            Accessibility.from_matrix(frame, destinations, **kwargs)
+    # A one-slot frame passes; NearestDestinations shares the checks.
+    single = matrix(from_id=["o1", "o2"], departure_time="2022-02-22 08:30:00")
+    frame = Accessibility.from_matrix(single, destinations, budgets=(30.0,))
+    assert list(frame["from_id"]) == ["o1", "o2"]
+    with pytest.raises(ValueError, match="k must be"):
+        NearestDestinations.from_matrix(matrix(), k=0)
+    with pytest.raises(ValueError, match="max_cost"):
+        NearestDestinations.from_matrix(matrix(), cost="emissions", max_cost=-1)
+    with pytest.raises(ValueError, match="percentile"):
+        NearestDestinations.from_matrix(matrix(), percentile=101)
+    with pytest.raises(ValueError, match="percentile"):
+        Accessibility.from_matrix(matrix(), destinations, percentiles=[True])
+    with pytest.raises(ValueError, match="'id' column"):
+        Accessibility.from_matrix(
+            matrix(), destinations, origins=pd.DataFrame({"name": ["o1"]})
+        )
+    with pytest.raises(ValueError, match="'id' column"):
+        Accessibility.from_matrix(matrix(), pd.DataFrame({"name": ["d1"]}))
+    with pytest.raises(ValueError, match="names no percentiles"):
+        Accessibility.from_matrix(matrix(), destinations, percentiles=())
+    # An origin table's id dtype survives to the output.
+    typed = matrix(from_id=pd.array([1, 2], dtype="Int32"), to_id=["d1", "d1"])
+    frame = Accessibility.from_matrix(
+        typed,
+        destinations,
+        origins=pd.DataFrame({"id": pd.array([1, 2], dtype="Int32")}),
+    )
+    assert str(frame["from_id"].dtype) == "Int32"
