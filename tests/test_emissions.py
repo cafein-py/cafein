@@ -54,21 +54,25 @@ def test_route_level_rows_from_vehicle_classes():
 
 
 def test_default_factors_apply_per_mode():
-    trip = journey(transit_leg(2000.0), transit_leg(1000.0, route="R-TRAM"))
+    trip = journey(
+        transit_leg(2000.0),
+        transit_leg(1000.0, route="R-TRAM"),
+        transit_leg(1000.0, route="R-EXTENDED"),  # 109: extended, rail base
+    )
     (annotated,) = emissions.annotate([trip], StubNetwork())
-    bus, tram = annotated["legs"][1], annotated["legs"][2]
+    bus, tram, extended = (
+        annotated["legs"][1],
+        annotated["legs"][2],
+        annotated["legs"][3],
+    )
     # ITF life-cycle totals: ICE bus 92, urban rail 25 g CO2e/pkm.
     assert bus["emissions"] == pytest.approx(2.0 * 92)
     assert tram["emissions"] == pytest.approx(1.0 * 25)
-    assert annotated["emissions"] == pytest.approx(184 + 25)
+    # An extended route type falls back to its base mode's factor.
+    assert extended["emissions"] == pytest.approx(25.0)
+    assert annotated["emissions"] == pytest.approx(184 + 25 + 25)
     assert annotated["legs"][0]["emissions"] == 0.0
     assert annotated["legs"][-1]["emissions"] == 0.0
-
-
-def test_extended_route_types_fall_back_to_their_base_mode():
-    trip = journey(transit_leg(1000.0, route="R-EXTENDED"))  # 109: rail
-    (annotated,) = emissions.annotate([trip], StubNetwork())
-    assert annotated["legs"][1]["emissions"] == pytest.approx(25.0)
 
 
 def test_the_resolution_ladder_is_most_specific_wins():
@@ -138,14 +142,6 @@ def test_blank_key_strings_mean_not_applicable(tmp_path):
     assert annotated["legs"][1]["emissions"] == pytest.approx(7.0)
 
 
-def test_numeric_looking_ids_in_csv_tables_still_match(tmp_path):
-    path = tmp_path / "factors.csv"
-    pd.DataFrame([{"route_id": 42, "fuel": 11.0}]).to_csv(path, index=False)
-    trip = journey(transit_leg(1000.0, route="42"))
-    (annotated,) = emissions.annotate([trip], StubNetwork(), path)
-    assert annotated["legs"][1]["emissions"] == pytest.approx(11.0)
-
-
 def test_missing_distances_raise_a_clear_error():
     trip = journey({"type": "transit", "trip_id": "T1", "route_id": "R-BUS"})
     with pytest.raises(ValueError, match="no distances"):
@@ -158,40 +154,57 @@ ROWS = [
 ]
 
 
-def test_factor_tables_load_identically_from_all_formats(tmp_path):
+@pytest.mark.parametrize("fmt", ["csv", "json", "yaml"])
+def test_factor_tables_load_identically_from_all_formats(tmp_path, fmt):
     from_frame = emissions.load_factors(pd.DataFrame(ROWS))
-    csv = tmp_path / "factors.csv"
-    pd.DataFrame(ROWS).to_csv(csv, index=False)
-    json_file = tmp_path / "factors.json"
-    json_file.write_text(json.dumps(ROWS))
-    for loaded in [emissions.load_factors(csv), emissions.load_factors(json_file)]:
-        pd.testing.assert_frame_equal(
-            loaded.fillna(-1), from_frame.fillna(-1), check_dtype=False
-        )
-
-
-def test_factor_tables_load_from_yaml(tmp_path):
-    yaml = pytest.importorskip("yaml")
-    path = tmp_path / "factors.yml"
-    path.write_text(yaml.safe_dump(ROWS))
+    if fmt == "csv":
+        path = tmp_path / "factors.csv"
+        pd.DataFrame(ROWS).to_csv(path, index=False)
+    elif fmt == "json":
+        path = tmp_path / "factors.json"
+        path.write_text(json.dumps(ROWS))
+    else:
+        yaml = pytest.importorskip("yaml")
+        path = tmp_path / "factors.yml"
+        path.write_text(yaml.safe_dump(ROWS))
     loaded = emissions.load_factors(path)
     pd.testing.assert_frame_equal(
-        loaded.fillna(-1),
-        emissions.load_factors(pd.DataFrame(ROWS)).fillna(-1),
-        check_dtype=False,
+        loaded.fillna(-1), from_frame.fillna(-1), check_dtype=False
     )
 
 
-def test_float_coerced_ids_in_mixed_records_still_match(tmp_path):
-    # Mixing keyed and unkeyed records makes pandas coerce numeric ids
-    # to floats; they must still match the string ids legs carry.
-    records = [{"route_id": 42, "fuel": 11.0}, {"route_type": 0, "operations": 5.0}]
-    path = tmp_path / "factors.json"
-    path.write_text(json.dumps(records))
-    trip = journey(transit_leg(1000.0, route="42"))
-    for source in [path, pd.DataFrame.from_records(records)]:
+@pytest.mark.parametrize(
+    "case, route, expected",
+    [
+        # A numeric-looking id in a CSV table still matches the string
+        # route id the legs carry.
+        ("numeric_csv", "42", 11.0),
+        # Mixing keyed and unkeyed records makes pandas coerce numeric
+        # ids to floats; they must still match the string ids legs carry.
+        ("float_coerced_json", "42", 11.0),
+        # "NA" is a legal GTFS identifier, not a missing value.
+        ("na_csv", "NA", 5.0),
+    ],
+)
+def test_coerced_ids_in_factor_tables_still_match(tmp_path, case, route, expected):
+    if case == "numeric_csv":
+        sources = [tmp_path / "factors.csv"]
+        pd.DataFrame([{"route_id": 42, "fuel": 11.0}]).to_csv(sources[0], index=False)
+    elif case == "float_coerced_json":
+        records = [
+            {"route_id": 42, "fuel": 11.0},
+            {"route_type": 0, "operations": 5.0},
+        ]
+        path = tmp_path / "factors.json"
+        path.write_text(json.dumps(records))
+        sources = [path, pd.DataFrame.from_records(records)]
+    else:
+        sources = [tmp_path / "factors.csv"]
+        sources[0].write_text("route_id,fuel\nNA,5.0\n")
+    trip = journey(transit_leg(1000.0, route=route))
+    for source in sources:
         (annotated,) = emissions.annotate([trip], StubNetwork(), source)
-        assert annotated["legs"][1]["emissions"] == pytest.approx(11.0)
+        assert annotated["legs"][1]["emissions"] == pytest.approx(expected)
 
 
 def test_non_ascii_ids_load_from_utf8_files(tmp_path):
@@ -203,37 +216,23 @@ def test_non_ascii_ids_load_from_utf8_files(tmp_path):
     assert loaded["route_id"][0] == "linja-Ä"
 
 
-def test_na_named_ids_in_csv_tables_survive(tmp_path):
-    # "NA" is a legal GTFS identifier, not a missing value.
-    path = tmp_path / "factors.csv"
-    path.write_text("route_id,fuel\nNA,5.0\n")
-    trip = journey(transit_leg(1000.0, route="NA"))
-    (annotated,) = emissions.annotate([trip], StubNetwork(), path)
-    assert annotated["legs"][1]["emissions"] == pytest.approx(5.0)
-
-
-def test_rows_without_component_values_are_rejected():
-    with pytest.raises(ValueError, match="no component values"):
-        emissions.load_factors(
-            pd.DataFrame([{"route_id": "R-BUS", "fuel": None, "vehicle": None}])
-        )
-
-
-def test_route_type_keys_must_be_integers():
-    for bad in [3.5, -1]:
-        with pytest.raises(ValueError, match="non-negative integers"):
-            emissions.load_factors(pd.DataFrame([{"route_type": bad, "fuel": 1.0}]))
-
-
 def test_invalid_factor_tables_are_rejected(tmp_path):
-    with pytest.raises(ValueError, match="unknown factor-table column"):
-        emissions.load_factors(pd.DataFrame([{"route_type": 3, "co2": 1.0}]))
-    with pytest.raises(ValueError, match="at least one component column"):
-        emissions.load_factors(pd.DataFrame([{"route_type": 3}]))
-    with pytest.raises(ValueError, match="negative"):
-        emissions.load_factors(pd.DataFrame([{"route_type": 3, "fuel": -1.0}]))
-    with pytest.raises(ValueError, match="unsupported factor-table format"):
-        emissions.load_factors(tmp_path / "factors.toml")
+    for source, match in (
+        (pd.DataFrame([{"route_type": 3, "co2": 1.0}]), "unknown factor-table column"),
+        (pd.DataFrame([{"route_type": 3}]), "at least one component column"),
+        (pd.DataFrame([{"route_type": 3, "fuel": -1.0}]), "negative"),
+        (tmp_path / "factors.toml", "unsupported factor-table format"),
+        # A row with every component empty carries no factors at all.
+        (
+            pd.DataFrame([{"route_id": "R-BUS", "fuel": None, "vehicle": None}]),
+            "no component values",
+        ),
+        # route_type keys must be non-negative integers.
+        (pd.DataFrame([{"route_type": 3.5, "fuel": 1.0}]), "non-negative integers"),
+        (pd.DataFrame([{"route_type": -1, "fuel": 1.0}]), "non-negative integers"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            emissions.load_factors(source)
     bad = tmp_path / "factors.json"
     bad.write_text('{"fuel": 1.0}')
     with pytest.raises(ValueError, match="list of mappings"):

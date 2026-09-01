@@ -12,15 +12,6 @@ DATE = "2022-02-22"
 DEPARTURE = "2022-02-22 08:30:00"
 
 
-def test_the_multimodal_graph_is_carried_with_its_metadata(multimodal_network):
-    assert multimodal_network.has_multimodal_streets
-    meta = multimodal_network.multimodal_elevation_metadata
-    assert meta["source"] == "callable"
-    assert meta["nodata_policy"] == "nan"
-    assert meta["coverage"] == 1.0
-    assert meta["inferred_edges"] > 0  # central Helsinki has bridges
-
-
 def test_walking_stays_bit_for_bit(multimodal_network, network_with_footpaths):
     # The multimodal graph is a second section beside the walking graph, so
     # every walking query answers exactly what a build without it answers.
@@ -41,6 +32,18 @@ def test_walking_stays_bit_for_bit(multimodal_network, network_with_footpaths):
 def test_the_multimodal_section_round_trips(multimodal_network, tmp_path):
     # The session fixture itself came through one save/load; this pins both
     # load paths explicitly, and that walking queries survive them.
+    assert multimodal_network.has_multimodal_streets
+    assert multimodal_network.street_modes == (
+        "walk",
+        "bicycle",
+        "e_scooter",
+        "wheelchair",
+    )
+    meta = multimodal_network.multimodal_elevation_metadata
+    assert meta["source"] == "callable"
+    assert meta["nodata_policy"] == "nan"
+    assert meta["coverage"] == 1.0
+    assert meta["inferred_edges"] > 0  # central Helsinki has bridges
     reference = multimodal_network.route_between_coordinates(
         KAMPPI, HAKANIEMI, DEPARTURE
     )
@@ -54,47 +57,26 @@ def test_the_multimodal_section_round_trips(multimodal_network, tmp_path):
         # The graph's content — CSR, geometry, attributes, elevations —
         # survives both load paths, not just its presence.
         assert loaded._core._multimodal_checksum == checksum
-        assert (
-            loaded.multimodal_elevation_metadata
-            == multimodal_network.multimodal_elevation_metadata
-        )
+        assert loaded.multimodal_elevation_metadata == meta
+        assert loaded.street_modes == multimodal_network.street_modes
         assert (
             loaded.route_between_coordinates(KAMPPI, HAKANIEMI, DEPARTURE) == reference
         )
+        if mmap:
+            # The mapped load decodes only the optional attribute/elevation
+            # arrays; the two graphs' core CSR and geometry stay in the map.
+            read = loaded._core._streets_bytes_read
+            assert 0 < read < path.stat().st_size / 4
 
 
-def test_the_modes_are_exposed_and_persisted(multimodal_network, tmp_path):
-    assert multimodal_network.street_modes == (
-        "walk",
-        "bicycle",
-        "e_scooter",
-        "wheelchair",
-    )
-    path = tmp_path / "modes.cafein"
-    multimodal_network.save(path)
-    assert TransportNetwork.load(path).street_modes == (
-        "walk",
-        "bicycle",
-        "e_scooter",
-        "wheelchair",
-    )
-
-
-def test_a_mapped_load_keeps_the_multimodal_core_mapped(multimodal_network, tmp_path):
-    # The mapped load decodes only the optional attribute/elevation arrays;
-    # the two graphs' core CSR and geometry stay in the map.
-    path = tmp_path / "lazy.cafein"
-    multimodal_network.save(path)
-    loaded = TransportNetwork.load(path, mmap=True)
-    assert loaded.has_multimodal_streets
-    read = loaded._core._streets_bytes_read
-    assert 0 < read < path.stat().st_size / 4
-
-
-def test_without_street_modes_nothing_is_carried(network):
+def test_without_street_modes_nothing_is_carried(network, opt_out_network):
+    # Neither a build without an extract nor an explicit street_modes=()
+    # opt-out carries the multimodal graph.
     assert not network.has_multimodal_streets
     assert network.multimodal_elevation_metadata is None
     assert network.street_modes is None
+    assert not opt_out_network.has_multimodal_streets
+    assert opt_out_network.street_modes is None
 
 
 def test_a_walk_only_save_is_deterministic(network_with_footpaths, tmp_path):
@@ -145,11 +127,6 @@ def opt_out_network(helsinki_gtfs, kantakaupunki_pbf):
             osm_pbf=str(kantakaupunki_pbf),
             street_modes=(),
         )
-
-
-def test_empty_street_modes_opt_out(opt_out_network):
-    assert not opt_out_network.has_multimodal_streets
-    assert opt_out_network.street_modes is None
 
 
 def test_street_access_and_egress_rows(multimodal_network):

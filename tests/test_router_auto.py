@@ -329,9 +329,6 @@ def test_max_slower_rides_the_trip_based_engine(two_line_network, capfd, monkeyp
 
 
 def test_one_pair_max_slower_accepts_tbtr(two_line_network):
-    from cafein import journey_frontier
-
-    args = (two_line_network, "A", "B", DEPARTURE, 30)
     raptor = frontier_frame(
         two_line_network, candidates="pareto", router="raptor", max_slower=10
     )
@@ -340,6 +337,3 @@ def test_one_pair_max_slower_accepts_tbtr(two_line_network):
         two_line_network, candidates="pareto", router="tbtr", max_slower=10
     )
     assert tbtr.equals(raptor)
-    # The capability contract is unchanged for the widened candidates.
-    with pytest.raises(ValueError, match="requires candidates='pareto'"):
-        journey_frontier(*args, candidates="relaxed", router="tbtr")

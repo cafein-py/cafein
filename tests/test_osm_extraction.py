@@ -429,28 +429,40 @@ def test_prune_clears_small_components_per_mode():
     assert pruned_f[49] == 0 and pruned_r[49] == 0
 
 
-def test_prune_judges_connectivity_per_mode_not_on_the_union():
-    # Two small bike clusters (20 + 20 vertices, each below MIN_ISLAND_VERTICES)
-    # joined only by a single walk-only bridge edge. On the union the whole
-    # thing is one 41-vertex component (above threshold), but for bicycles the
-    # bridge does not connect the clusters, so each bike cluster is a sub-40
-    # component and must be pruned — while walking, connected across the bridge,
-    # is kept. A union-based implementation would wrongly keep the bike arcs.
+@pytest.mark.parametrize(
+    "bit",
+    [
+        # A walk-only bridge edge joining two small bicycle clusters.
+        B,
+        # A stairway joining two wheelchair clusters: walkable, never
+        # wheelable.
+        WC,
+    ],
+    ids=["bicycle", "wheelchair"],
+)
+def test_prune_judges_connectivity_per_mode_not_on_the_union(bit):
+    # Two small clusters (20 + 20 vertices, each below MIN_ISLAND_VERTICES)
+    # joined only by a single walk-only connector edge. On the union the
+    # whole thing is one 40-vertex component (at the keep threshold), but for the
+    # tested mode the connector does not join the clusters, so each cluster
+    # is a sub-40 component and must be pruned — while walking, connected
+    # across the connector, is kept. A union-based implementation would
+    # wrongly keep the pruned mode's arcs.
     left = [(i, i + 1) for i in range(19)]  # vertices 0..19 (20 vertices)
     right = [(i, i + 1) for i in range(20, 39)]  # vertices 20..39 (20 vertices)
-    bridge = [(19, 20)]  # walk-only connector
-    edges = left + right + bridge
+    connector = [(19, 20)]  # walk-only
+    edges = left + right + connector
     u = np.array([a for a, _ in edges])
     v = np.array([b for _, b in edges])
-    wb = W | B
-    forward = np.array([wb] * (len(left) + len(right)) + [W], dtype=np.uint8)
+    both = W | bit
+    forward = np.array([both] * (len(left) + len(right)) + [W], dtype=np.uint8)
     reverse = forward.copy()
     pruned_f, pruned_r = _osm.prune_components_per_profile(u, v, 40, forward, reverse)
-    # Bicycle is cleared everywhere (both clusters are sub-threshold for bikes);
+    # The tested mode is cleared everywhere (both clusters sub-threshold);
     # walking survives on the now-connected 40-vertex component.
-    assert (pruned_f & B == 0).all() and (pruned_r & B == 0).all()
+    assert (pruned_f & bit == 0).all() and (pruned_r & bit == 0).all()
     assert (pruned_f[: len(left) + len(right)] & W != 0).all()
-    assert pruned_f[-1] & W  # the bridge keeps walking
+    assert pruned_f[-1] & W  # the connector keeps walking
 
 
 # --- The union extraction against the pinned Helsinki extract ----------------
@@ -546,14 +558,7 @@ def test_pruning_touches_only_the_named_modes(union_extract):
     for bit in (_osm.WALK, _osm.E_SCOOTER):
         assert np.array_equal(bike_only_f & bit, forward & bit)
         assert np.array_equal(bike_only_r & bit, reverse & bit)
-
-
-def test_pruning_rejects_an_unknown_mode(union_extract):
-    from cafein.streets import _vertex_endpoints
-
-    nodes, edges = union_extract
-    forward, reverse, _, _ = _osm.edge_permissions(edges)
-    u, v = _vertex_endpoints(nodes, edges)
+    # An unknown mode name refuses loudly.
     with pytest.raises(ValueError, match="unknown street mode"):
         _osm.prune_components_per_profile(
             u, v, len(nodes), forward, reverse, modes=["hovercraft"]
@@ -778,22 +783,3 @@ def test_priority_nodes_mark_their_own_way_only():
     )
     assert list(fwd) == [0, 0, 0]
     assert list(rev) == [0, _osm.JUNCTION_PRIORITY, 0]
-
-
-def test_prune_judges_wheelchair_connectivity_across_stairs():
-    # Two clusters joined only by a stairway: one walking component, but
-    # two sub-threshold wheelchair components — both pruned for the
-    # wheelchair while walking survives across the stairs.
-    left = [(i, i + 1) for i in range(19)]
-    right = [(i, i + 1) for i in range(20, 39)]
-    stairs = [(19, 20)]
-    edges = left + right + stairs
-    u = np.array([a for a, _ in edges])
-    v = np.array([b for _, b in edges])
-    wwc = W | WC
-    forward = np.array([wwc] * (len(left) + len(right)) + [W], dtype=np.uint8)
-    reverse = forward.copy()
-    pruned_f, pruned_r = _osm.prune_components_per_profile(u, v, 40, forward, reverse)
-    assert (pruned_f & WC == 0).all() and (pruned_r & WC == 0).all()
-    assert (pruned_f[: len(left) + len(right)] & W != 0).all()
-    assert pruned_f[-1] & W

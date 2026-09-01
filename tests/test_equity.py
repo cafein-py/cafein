@@ -307,6 +307,12 @@ def test_missing_data_excludes_the_row_and_its_weight():
     assert parts["total"][0] == pytest.approx(
         equity.generalized_entropy(_frame([1.0, 2.0]))
     )
+    # An infinite value on a zero-weight row is excluded before the
+    # finiteness validation ever sees it.
+    zero_weight_inf = _frame([1.0, np.inf, 2.0], [1.0, 0.0, 1.0])
+    assert equity.gini_index(zero_weight_inf, population="pop") == pytest.approx(
+        equity.gini_index(_frame([1.0, 2.0]))
+    )
 
 
 def test_empty_effective_distributions_refuse_by_group():
@@ -650,25 +656,6 @@ def test_extreme_aversion_parameters_reach_their_limits():
     assert equity.kolm(equal, kappa=10.0) == 0.0
 
 
-def test_an_infinite_value_on_a_zero_weight_row_is_excluded_first():
-    frame = _frame([1.0, np.inf, 2.0], [1.0, 0.0, 1.0])
-    assert equity.gini_index(frame, population="pop") == pytest.approx(
-        equity.gini_index(_frame([1.0, 2.0]))
-    )
-
-
-def test_a_group_column_named_palma_ratio_refuses():
-    frame = pd.DataFrame(
-        {
-            "palma_ratio": ["a", "a", "b", "b"],
-            "accessibility": [1.0, 2.0, 3.0, 4.0],
-            "income": [1.0, 2.0, 3.0, 4.0],
-        }
-    )
-    with pytest.raises(ValueError, match="collide.*palma_ratio"):
-        equity.palma_ratio(frame, income="income", group_columns=["palma_ratio"])
-
-
 def test_log_domain_forms_survive_subnormal_against_ordinary_values():
     frame = _frame([1e-70, 1.0])
     deviations = [np.log(v / 0.5) for v in (1e-70, 1.0)]
@@ -708,18 +695,30 @@ def test_nan_identifier_labels_are_excluded_not_grouped():
 
 
 def test_palma_group_columns_named_after_either_ratio():
-    frame = pd.DataFrame(
-        {
-            "share_ratio": ["a", "a", "b", "b"],
-            "accessibility": [1.0, 2.0, 3.0, 4.0],
-            "income": [1.0, 2.0, 3.0, 4.0],
-        }
-    )
+    def frame(group_name):
+        return pd.DataFrame(
+            {
+                group_name: ["a", "a", "b", "b"],
+                "accessibility": [1.0, 2.0, 3.0, 4.0],
+                "income": [1.0, 2.0, 3.0, 4.0],
+            }
+        )
+
     # The temporary name never surfaces: grouping by share_ratio works.
-    result = equity.palma_ratio(frame, income="income", group_columns=["share_ratio"])
+    result = equity.palma_ratio(
+        frame("share_ratio"), income="income", group_columns=["share_ratio"]
+    )
     assert list(result.columns) == ["share_ratio", "palma_ratio"]
     with pytest.raises(ValueError, match="collide"):
-        equity.share_ratio(frame, income="income", group_columns=["share_ratio"])
+        equity.share_ratio(
+            frame("share_ratio"), income="income", group_columns=["share_ratio"]
+        )
+    # A group column named after the result column refuses instead of
+    # silently overwriting either.
+    with pytest.raises(ValueError, match="collide.*palma_ratio"):
+        equity.palma_ratio(
+            frame("palma_ratio"), income="income", group_columns=["palma_ratio"]
+        )
 
 
 def test_the_remaining_float_horizons():

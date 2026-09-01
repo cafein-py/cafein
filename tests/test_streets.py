@@ -87,15 +87,53 @@ def assert_footpaths(result, expected):
 STRAIGHT_STREET = {"A": (0, 0), "B": (400, 0)}
 
 
-def test_stops_on_a_shared_edge_walk_along_it():
-    # Both stops split the same 400 m edge; the footpath runs between the
-    # snap points, not around via the endpoints.
+@pytest.mark.parametrize(
+    ("edge_length", "stops", "options", "expected"),
+    [
+        # Both stops split the same 400 m edge; the footpath runs between
+        # the snap points, not around via the endpoints.
+        pytest.param(
+            400,
+            [("s1", 100, 0), ("s2", 300, 0)],
+            {},
+            {("s1", "s2"): 200, ("s2", "s1"): 200},
+            id="shared-edge",
+        ),
+        # A stop on an endpoint reuses the node.
+        pytest.param(
+            400,
+            [("s1", 0, 0), ("s2", 300, 0)],
+            {},
+            {("s1", "s2"): 300, ("s2", "s1"): 300},
+            id="endpoint-node",
+        ),
+        # The edge's `length` says 800 m although its geometry spans 400 m;
+        # split segments must redistribute the 800 m cost proportionally.
+        pytest.param(
+            800,
+            [("s1", 100, 0), ("s2", 300, 0)],
+            {},
+            {("s1", "s2"): 400, ("s2", "s1"): 400},
+            id="length-not-geometry",
+        ),
+        # Faster walking shortens the same footpaths.
+        pytest.param(
+            400,
+            [("s1", 100, 0), ("s2", 300, 0)],
+            {"walking_speed_kmph": 7.2},
+            {("s1", "s2"): 100, ("s2", "s1"): 100},
+            id="faster-walking",
+        ),
+    ],
+)
+def test_stops_on_a_shared_edge_walk_along_it(edge_length, stops, options, expected):
     result = footpaths(
         STRAIGHT_STREET,
-        [("A", "B", 400)],
-        [stop("s1", 100, 0), stop("s2", 300, 0)],
+        [("A", "B", edge_length)],
+        [stop(*record) for record in stops],
+        **options,
     )
-    assert_footpaths(result, {("s1", "s2"): 200, ("s2", "s1"): 200})
+    assert_footpaths(result, expected)
 
 
 def test_offset_stops_connect_over_the_snap_distance():
@@ -105,26 +143,6 @@ def test_offset_stops_connect_over_the_snap_distance():
         [stop("s1", 100, 0), stop("s2", 300, 30)],
     )
     assert 229 <= result[("s1", "s2")] <= 232
-
-
-def test_a_stop_on_an_endpoint_reuses_the_node():
-    result = footpaths(
-        STRAIGHT_STREET,
-        [("A", "B", 400)],
-        [stop("s1", 0, 0), stop("s2", 300, 0)],
-    )
-    assert_footpaths(result, {("s1", "s2"): 300, ("s2", "s1"): 300})
-
-
-def test_the_split_cost_follows_the_edge_length_not_the_geometry():
-    # The edge's `length` says 800 m although its geometry spans 400 m;
-    # split segments must redistribute the 800 m cost proportionally.
-    result = footpaths(
-        STRAIGHT_STREET,
-        [("A", "B", 800)],
-        [stop("s1", 100, 0), stop("s2", 300, 0)],
-    )
-    assert_footpaths(result, {("s1", "s2"): 400, ("s2", "s1"): 400})
 
 
 def test_parallel_edges_keep_the_cheapest():
@@ -137,16 +155,6 @@ def test_parallel_edges_keep_the_cheapest():
     ]
     result = footpaths(nodes, edges, [stop("s1", 0, 0), stop("s2", 400, 0)])
     assert_footpaths(result, {("s1", "s2"): 400, ("s2", "s1"): 400})
-
-
-def test_faster_walking_shortens_footpaths():
-    result = footpaths(
-        STRAIGHT_STREET,
-        [("A", "B", 400)],
-        [stop("s1", 100, 0), stop("s2", 300, 0)],
-        walking_speed_kmph=7.2,
-    )
-    assert_footpaths(result, {("s1", "s2"): 100, ("s2", "s1"): 100})
 
 
 def test_footpaths_never_exceed_the_cutoff():
@@ -179,19 +187,14 @@ def test_a_fractional_cutoff_survives_the_rounding():
     assert len(bounded) == 0
 
 
-def test_durations_round_up_conservatively():
-    # Walking times are feasibility constraints: rounding down could let
-    # routing catch a departure the walk actually misses. Only genuine
-    # floating-point noise is tolerated. Meters stay unrounded.
-    durations = np.array([[0.0, 10.4], [9.9999999, 0.0]])
-    edges = streets._edge_list(np.array(["a", "b"], dtype=object), durations, 1.25)
-    assert {(a, b): s for a, b, s, _ in edges} == {("a", "b"): 11, ("b", "a"): 10}
-
-
 def test_footpaths_are_flat_arrays():
     # The edge list crosses into the core as arrays: stop ids named
     # once, uint32 indexes and seconds, float64 meters — and the
-    # legacy tuple view is the same edges.
+    # legacy tuple view is the same edges. Walking times are feasibility
+    # constraints: rounding down could let routing catch a departure the
+    # walk actually misses, so durations round up conservatively
+    # (10.4 → 11) and only genuine floating-point noise is tolerated
+    # (9.9999999 → 10). Meters stay unrounded.
     durations = np.array([[0.0, 10.4], [9.9999999, 0.0]])
     edges = streets._edge_list(np.array(["a", "b"], dtype=object), durations, 1.25)
     assert isinstance(edges, streets.Footpaths)
@@ -240,22 +243,21 @@ def test_oversized_stop_sets_are_rejected(monkeypatch):
         )
 
 
-def test_distant_stops_are_left_out():
-    with pytest.warns(UserWarning, match="farther than"):
+@pytest.mark.parametrize(
+    ("extra", "warning"),
+    [
+        # A stop farther than the snap distance is warned about and dropped.
+        pytest.param(stop("far", 200, 500), "farther than", id="distant"),
+        # A stop with no coordinates cannot snap either.
+        pytest.param(("missing", None, None), "no coordinates", id="uncoordinated"),
+    ],
+)
+def test_unusable_stops_are_left_out(extra, warning):
+    with pytest.warns(UserWarning, match=warning):
         result = footpaths(
             STRAIGHT_STREET,
             [("A", "B", 400)],
-            [stop("s1", 100, 0), stop("s2", 300, 0), stop("far", 200, 500)],
-        )
-    assert_footpaths(result, {("s1", "s2"): 200, ("s2", "s1"): 200})
-
-
-def test_stops_without_coordinates_are_left_out():
-    with pytest.warns(UserWarning, match="no coordinates"):
-        result = footpaths(
-            STRAIGHT_STREET,
-            [("A", "B", 400)],
-            [stop("s1", 100, 0), stop("s2", 300, 0), ("missing", None, None)],
+            [stop("s1", 100, 0), stop("s2", 300, 0), extra],
         )
     assert_footpaths(result, {("s1", "s2"): 200, ("s2", "s1"): 200})
 
@@ -410,10 +412,7 @@ def test_helsinki_footpaths_pin_known_pairs(helsinki_footpaths):
     meters = {(a, b): m for a, b, _, m in helsinki_footpaths}
     assert 19 <= meters[("1040602", "1040280")] <= 20
     assert 79 <= meters[("1130102", "1130101")] <= 80
-
-
-def test_helsinki_footpaths_are_symmetric(helsinki_footpaths):
-    lookup = {(a, b): seconds for a, b, seconds, _ in helsinki_footpaths}
+    # And every footpath is symmetric at the same seconds.
     assert all(lookup.get((b, a)) == seconds for (a, b), seconds in lookup.items())
 
 

@@ -472,30 +472,56 @@ def test_an_invalid_polygon_straight_into_the_overlay_is_survivable():
     assert 0 <= products["coverage"][0] <= 1
 
 
-def test_an_easting_northing_grid_resolves_and_transposes(tmp_path):
+@pytest.mark.parametrize(
+    "case, expected_shape",
+    [
+        # spatial dims named easting/northing AND ordered (x, y): the rio
+        # accessor identifies them and the array lands as (y, x)
+        ("easting_northing_dataset", (4, 8)),
+        # a named DataArray resolves without band descriptions
+        ("named_dataarray", (4, 8)),
+        # a one-row Dataset grid is accepted as it stands
+        ("one_row_dataset", (1, 8)),
+    ],
+)
+def test_open_band_accepts_grid_variants(case, expected_shape):
     pytest.importorskip("rioxarray")
     numpy = pytest.importorskip("numpy")
     xarray = pytest.importorskip("xarray")
     from cafein.exposure import _open_band
 
-    # spatial dims named easting/northing AND ordered (x, y): the rio
-    # accessor identifies them and the array lands as (y, x)
-    grid = xarray.Dataset(
-        {
-            "X": (
-                ("easting", "northing"),
-                numpy.arange(8 * 4, dtype="float32").reshape(8, 4),
-            )
-        },
-        coords={
-            "easting": numpy.linspace(0.5, 7.5, 8),
-            "northing": numpy.linspace(0.5, 3.5, 4),
-        },
-    )
-    grid = grid.rio.set_spatial_dims(x_dim="easting", y_dim="northing")
+    if case == "easting_northing_dataset":
+        grid = xarray.Dataset(
+            {
+                "X": (
+                    ("easting", "northing"),
+                    numpy.arange(8 * 4, dtype="float32").reshape(8, 4),
+                )
+            },
+            coords={
+                "easting": numpy.linspace(0.5, 7.5, 8),
+                "northing": numpy.linspace(0.5, 3.5, 4),
+            },
+        )
+        grid = grid.rio.set_spatial_dims(x_dim="easting", y_dim="northing")
+    elif case == "named_dataarray":
+        grid = xarray.DataArray(
+            numpy.full((4, 8), 2.5, dtype="float32"),
+            dims=("y", "x"),
+            coords={
+                "y": numpy.linspace(3.5, 0.5, 4),
+                "x": numpy.linspace(0.5, 7.5, 8),
+            },
+            name="X",
+        )
+    else:
+        grid = xarray.Dataset(
+            {"X": (("band", "y", "x"), numpy.full((1, 1, 8), 2.0, dtype="float32"))},
+            coords={"band": [1], "y": [0.5], "x": numpy.linspace(0.5, 7.5, 8)},
+        )
     grid = grid.rio.write_crs("EPSG:32635")
     band, transform, crs, nodata = _open_band("x", grid, "X")
-    assert band.shape == (4, 8)  # (y, x)
+    assert band.shape == expected_shape  # (y, x)
     assert crs is not None
 
 
@@ -529,39 +555,6 @@ def test_a_scaled_masked_raster_decodes_physical_values(street_network, tmp_path
         assert edges["x"].values == pytest.approx(3.5)
     finally:
         _drop_layer_columns(edges, "x", ())
-
-
-def test_a_named_dataarray_without_descriptions_is_accepted(tmp_path):
-    pytest.importorskip("rioxarray")
-    numpy = pytest.importorskip("numpy")
-    xarray = pytest.importorskip("xarray")
-    from cafein.exposure import _open_band
-
-    array = xarray.DataArray(
-        numpy.full((4, 8), 2.5, dtype="float32"),
-        dims=("y", "x"),
-        coords={"y": numpy.linspace(3.5, 0.5, 4), "x": numpy.linspace(0.5, 7.5, 8)},
-        name="X",
-    )
-    array = array.rio.write_crs("EPSG:32635")
-    band, transform, crs, nodata = _open_band("x", array, "X")
-    assert band.shape == (4, 8)
-
-
-def test_a_one_row_dataset_grid_is_accepted(tmp_path):
-    pytest.importorskip("rioxarray")
-    numpy = pytest.importorskip("numpy")
-    xarray = pytest.importorskip("xarray")
-    from cafein.exposure import _open_band
-
-    grid = xarray.Dataset(
-        {"X": (("band", "y", "x"), numpy.full((1, 1, 8), 2.0, dtype="float32"))},
-        coords={"band": [1], "y": [0.5], "x": numpy.linspace(0.5, 7.5, 8)},
-    )
-    grid = grid.rio.write_crs("EPSG:32635")
-    band, transform, crs, nodata = _open_band("x", grid, "X")
-    assert band.shape == (1, 8)
-    assert crs is not None
 
 
 def test_near_identical_thresholds_render_distinct_columns():
@@ -923,49 +916,37 @@ def test_the_helsinki_sampledata_layers_ingest(street_network):
         _drop_layer_columns(edges, "greenery", ())
 
 
-def test_a_crs_less_raster_is_refused(street_network, tmp_path):
+def test_defective_rasters_are_refused(street_network, tmp_path):
     rasterio = pytest.importorskip("rasterio")
     from rasterio.transform import from_bounds
 
     west, south, east, north = _extent(street_network)
-    path = tmp_path / "no_crs.tif"
-    with rasterio.open(
-        path,
-        "w",
-        driver="GTiff",
-        height=4,
-        width=4,
-        count=1,
-        dtype="float32",
-        transform=from_bounds(west, south, east, north, 4, 4),
-    ) as sink:
-        sink.write(np.full((1, 4, 4), 1.0, dtype="float32"))
-        sink.descriptions = ("X [u]",)
+
+    def write(name, crs, description):
+        path = tmp_path / name
+        with rasterio.open(
+            path,
+            "w",
+            driver="GTiff",
+            height=4,
+            width=4,
+            count=1,
+            dtype="float32",
+            crs=crs,
+            transform=from_bounds(west, south, east, north, 4, 4),
+        ) as sink:
+            sink.write(np.full((1, 4, 4), 1.0, dtype="float32"))
+            sink.descriptions = (description,)
+        return str(path)
+
+    # a raster that declares no CRS refuses by name
+    no_crs = write("no_crs.tif", None, "X [u]")
     with pytest.raises(ValueError, match="declares no CRS"):
-        Exposure(street_network, x=(str(path), "X"))
-
-
-def test_unknown_band_lists_the_available_ones(street_network, tmp_path):
-    rasterio = pytest.importorskip("rasterio")
-    from rasterio.transform import from_bounds
-
-    west, south, east, north = _extent(street_network)
-    path = tmp_path / "bands.tif"
-    with rasterio.open(
-        path,
-        "w",
-        driver="GTiff",
-        height=4,
-        width=4,
-        count=1,
-        dtype="float32",
-        crs="EPSG:4326",
-        transform=from_bounds(west, south, east, north, 4, 4),
-    ) as sink:
-        sink.write(np.full((1, 4, 4), 1.0, dtype="float32"))
-        sink.descriptions = ("AQIndex [1]",)
+        Exposure(street_network, x=(no_crs, "X"))
+    # an unknown band refuses, listing the available ones
+    named = write("bands.tif", "EPSG:4326", "AQIndex [1]")
     with pytest.raises(ValueError, match="no band 'Nope'"):
-        Exposure(street_network, x=(str(path), "Nope"))
+        Exposure(street_network, x=(named, "Nope"))
 
 
 def _drop_layer_columns(edges, name, thresholds):
@@ -1082,26 +1063,36 @@ def test_exposure_totals_aggregate_per_journey(reported_frame):
         assert merged.loc[key, "noise_mean"] == pytest.approx(61.0)
 
 
-def test_the_plain_frame_contract_is_untouched(street_network):
+@pytest.mark.parametrize("flavor", ["transit", "street"])
+def test_the_plain_frame_contract_is_untouched(flavor, request):
     geopandas = pytest.importorskip("geopandas")
     from shapely.geometry import Point
 
     from cafein import DetailedItineraries
 
-    origins = geopandas.GeoDataFrame(
-        {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
-    )
-    destinations = geopandas.GeoDataFrame(
-        {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
-    )
-    frame = DetailedItineraries(
-        street_network,
-        origins,
-        destinations,
-        departure="2022-02-22 08:30",
-    )
-    assert "street_edges" not in frame.columns
-    assert "wait" not in set(frame["leg_type"])
+    if flavor == "transit":
+        origins = geopandas.GeoDataFrame(
+            {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
+        )
+        destinations = geopandas.GeoDataFrame(
+            {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
+        )
+        frame = DetailedItineraries(
+            request.getfixturevalue("street_network"),
+            origins,
+            destinations,
+            departure="2022-02-22 08:30",
+        )
+        assert "street_edges" not in frame.columns
+        assert "wait" not in set(frame["leg_type"])
+    else:
+        origins, destinations = _street_points()
+        frame = DetailedItineraries(
+            request.getfixturevalue("helsinki_streets"),
+            origins,
+            destinations,
+            transport_mode="bicycle",
+        )
     assert not any(column.startswith("noise") for column in frame.columns)
     with pytest.raises(ValueError, match="exposure_totals needs"):
         frame.exposure_totals()
@@ -1121,29 +1112,42 @@ def test_connector_time_stays_out_of_threshold_minutes(reporting_exposure):
     assert capped["noise_minutes_above_55"] == pytest.approx(1.0)
 
 
-def test_reporting_is_independent_of_geometries(street_network, reporting_exposure):
+@pytest.mark.parametrize("flavor", ["transit", "street"])
+def test_reporting_is_independent_of_geometries(flavor, request):
     geopandas = pytest.importorskip("geopandas")
     from shapely.geometry import Point
 
     from cafein import DetailedItineraries
 
-    origins = geopandas.GeoDataFrame(
-        {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
-    )
-    destinations = geopandas.GeoDataFrame(
-        {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
-    )
-    frame = DetailedItineraries(
-        street_network,
-        origins,
-        destinations,
-        departure="2022-02-22 08:30",
-        geometries=False,
-        exposure=reporting_exposure,
-    )
-    moving = frame[frame["leg_type"].isin(["walk", "access", "egress", "transfer"])]
-    assert len(moving) > 0
-    assert moving["noise_mean"].values == pytest.approx(61.0)
+    if flavor == "transit":
+        origins = geopandas.GeoDataFrame(
+            {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
+        )
+        destinations = geopandas.GeoDataFrame(
+            {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
+        )
+        frame = DetailedItineraries(
+            request.getfixturevalue("street_network"),
+            origins,
+            destinations,
+            departure="2022-02-22 08:30",
+            geometries=False,
+            exposure=request.getfixturevalue("reporting_exposure"),
+        )
+        moving = frame[frame["leg_type"].isin(["walk", "access", "egress", "transfer"])]
+        assert len(moving) > 0
+        assert moving["noise_mean"].values == pytest.approx(61.0)
+    else:
+        origins, destinations = _street_points()
+        frame = DetailedItineraries(
+            request.getfixturevalue("helsinki_streets"),
+            origins,
+            destinations,
+            transport_mode="bicycle",
+            geometries=False,
+            exposure=request.getfixturevalue("street_exposure"),
+        )
+        assert frame["noise_mean"].iloc[0] == pytest.approx(61.0)
     assert frame["geometry"].isna().all()
 
 
@@ -1543,88 +1547,36 @@ def test_street_legs_report_their_traversed_edges(helsinki_streets, street_expos
     assert totals["noise_minutes_above_55"].iloc[0] == pytest.approx(
         leg["noise_minutes_above_55"]
     )
-
-
-def test_the_standalone_network_gains_the_layer_columns(
-    helsinki_streets, street_exposure
-):
+    # the standalone network itself gains the layer columns
     edges = helsinki_streets.streets_gdf
     assert edges["noise"].values == pytest.approx(61.0)
     assert edges["noise_share_above_55"].values == pytest.approx(1.0)
 
 
-def test_the_plain_street_frame_is_untouched(helsinki_streets):
-    from cafein import DetailedItineraries
-
-    origins, destinations = _street_points()
-    frame = DetailedItineraries(
-        helsinki_streets, origins, destinations, transport_mode="bicycle"
-    )
-    assert not any(column.startswith("noise") for column in frame.columns)
-    with pytest.raises(ValueError, match="exposure_totals needs"):
-        frame.exposure_totals()
-
-
-def test_zero_weights_reproduce_the_unweighted_journeys(
-    helsinki_streets, street_exposure
+@pytest.mark.parametrize("weight", [0.0, 0.05])
+def test_constant_layer_weights_reproduce_the_unweighted_journeys(
+    helsinki_streets, street_exposure, weight
 ):
     from cafein import DetailedItineraries
 
     origins, destinations = _street_points()
     kwargs = dict(transport_mode="bicycle", output_time_units="seconds")
     plain = DetailedItineraries(helsinki_streets, origins, destinations, **kwargs)
-    zero = DetailedItineraries(
+    weighted = DetailedItineraries(
         helsinki_streets,
         origins,
         destinations,
         exposure=street_exposure,
-        optimize={"noise": 0.0},
-        **kwargs,
-    )
-    # the pinned identity: bit-for-bit the unweighted journey
-    assert zero["travel_time"].iloc[0] == plain["travel_time"].iloc[0]
-    assert zero["distance_m"].iloc[0] == plain["distance_m"].iloc[0]
-    assert zero.geometry.iloc[0].equals_exact(plain.geometry.iloc[0], 0)
-
-
-def test_a_uniform_layer_bends_no_choice_and_never_the_clock(
-    helsinki_streets, street_exposure
-):
-    from cafein import DetailedItineraries
-
-    origins, destinations = _street_points()
-    kwargs = dict(transport_mode="bicycle", output_time_units="seconds")
-    plain = DetailedItineraries(helsinki_streets, origins, destinations, **kwargs)
-    heavy = DetailedItineraries(
-        helsinki_streets,
-        origins,
-        destinations,
-        exposure=street_exposure,
-        optimize={"noise": 0.05},
+        optimize={"noise": weight},
         **kwargs,
     )
     # a constant layer scales every edge alike: the route cannot change,
     # and the reported clock stays the TRUE time despite the weighting
-    assert heavy["travel_time"].iloc[0] == plain["travel_time"].iloc[0]
-    assert heavy["distance_m"].iloc[0] == plain["distance_m"].iloc[0]
-
-
-def test_street_reporting_is_independent_of_geometries(
-    helsinki_streets, street_exposure
-):
-    from cafein import DetailedItineraries
-
-    origins, destinations = _street_points()
-    frame = DetailedItineraries(
-        helsinki_streets,
-        origins,
-        destinations,
-        transport_mode="bicycle",
-        geometries=False,
-        exposure=street_exposure,
-    )
-    assert frame["noise_mean"].iloc[0] == pytest.approx(61.0)
-    assert frame.geometry.isna().all()
+    assert weighted["travel_time"].iloc[0] == plain["travel_time"].iloc[0]
+    assert weighted["distance_m"].iloc[0] == plain["distance_m"].iloc[0]
+    if weight == 0.0:
+        # the pinned identity: bit-for-bit the unweighted journey
+        assert weighted.geometry.iloc[0].equals_exact(plain.geometry.iloc[0], 0)
 
 
 def _two_route_network():
@@ -1753,56 +1705,30 @@ def test_objective_refusals(helsinki_streets, street_exposure, street_network):
         )
 
 
-def test_a_negative_valued_layer_refuses_the_objective():
+def test_objective_multiplier_refusals():
     geopandas = pytest.importorskip("geopandas")
     pytest.importorskip("rasterio")
 
-    streets = _two_route_network()
-    zones = geopandas.GeoDataFrame(
-        {"level": [-5.0]},
-        geometry=[box(24.9290, 60.1690, 24.9364, 60.1750)],
-        crs="EPSG:4326",
-    )
-    exposure_object = Exposure(streets, chill=(zones, "level"))
+    everywhere = box(24.9290, 60.1690, 24.9364, 60.1750)
+
+    def zones(level):
+        return geopandas.GeoDataFrame(
+            {"level": [level]}, geometry=[everywhere], crs="EPSG:4326"
+        )
+
+    # a negative-valued layer refuses the objective
+    negative = Exposure(_two_route_network(), chill=(zones(-5.0), "level"))
     with pytest.raises(ValueError, match="deficit"):
-        exposure_object._objective_multipliers({"chill": 1.0})
+        negative._objective_multipliers({"chill": 1.0})
     # a zero weight still names the layer and must still refuse it
     with pytest.raises(ValueError, match="deficit"):
-        exposure_object._objective_multipliers({"chill": 0.0})
-
-
-def test_individually_finite_terms_refuse_a_combined_overflow():
-    geopandas = pytest.importorskip("geopandas")
-    pytest.importorskip("rasterio")
-
-    streets = _two_route_network()
-    everywhere = box(24.9290, 60.1690, 24.9364, 60.1750)
-    zones = geopandas.GeoDataFrame(
-        {"level": [1.0]}, geometry=[everywhere], crs="EPSG:4326"
-    )
-    other = geopandas.GeoDataFrame(
-        {"level": [1.0]}, geometry=[everywhere], crs="EPSG:4326"
-    )
-    exposure_object = Exposure(streets, din=(zones, "level"), dan=(other, "level"))
+        negative._objective_multipliers({"chill": 0.0})
     # each 1e308 × 1.0 term is finite; their sum is not
+    combined = Exposure(
+        _two_route_network(), din=(zones(1.0), "level"), dan=(zones(1.0), "level")
+    )
     with pytest.raises(ValueError, match="combined exposure cost multiplier"):
-        exposure_object._objective_multipliers({"din": 1e308, "dan": 1e308})
-
-
-def test_an_exposure_from_another_network_refuses_street_journeys(
-    helsinki_streets, reporting_exposure
-):
-    from cafein import DetailedItineraries
-
-    origins, destinations = _street_points()
-    with pytest.raises(ValueError, match="not built on the network"):
-        DetailedItineraries(
-            helsinki_streets,
-            origins,
-            destinations,
-            transport_mode="bicycle",
-            exposure=reporting_exposure,
-        )
+        combined._objective_multipliers({"din": 1e308, "dan": 1e308})
 
 
 # --- matrices: exposure= on the street cost matrix ----------------------------
@@ -1939,7 +1865,7 @@ def test_the_synthetic_matrix_cell_is_hand_computable():
 def test_matrix_exposure_refusals(
     street_network, helsinki_streets, street_exposure, reporting_exposure
 ):
-    from cafein import TravelCostMatrix
+    from cafein import DetailedItineraries, TravelCostMatrix
     from cafein.matrices import travel_cost_table
 
     origins, destinations = _matrix_points()
@@ -1962,6 +1888,15 @@ def test_matrix_exposure_refusals(
         )
     with pytest.raises(ValueError, match="not built on the network"):
         TravelCostMatrix(
+            helsinki_streets,
+            origins,
+            destinations,
+            transport_mode="bicycle",
+            exposure=reporting_exposure,
+        )
+    # a transit-built exposure refuses street journeys, too
+    with pytest.raises(ValueError, match="not built on the network"):
+        DetailedItineraries(
             helsinki_streets,
             origins,
             destinations,
@@ -2169,42 +2104,6 @@ def test_transit_matrix_cells_equal_the_itinerary_totals(street_network):
             assert cell[column] == pytest.approx(row[column], rel=1e-9, abs=1e-12)
     finally:
         _drop_layer_columns(edges, "din", (55,))
-
-
-def test_transit_matrix_matches_totals_on_the_constant_layer(
-    street_network, reporting_exposure
-):
-    geopandas = pytest.importorskip("geopandas")
-    from shapely.geometry import Point
-
-    from cafein import DetailedItineraries, TravelCostMatrix
-
-    origins = geopandas.GeoDataFrame(
-        {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
-    )
-    destinations = geopandas.GeoDataFrame(
-        {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
-    )
-    matrix = TravelCostMatrix(
-        street_network,
-        origins,
-        destinations,
-        "2022-02-22 08:30",
-        exposure=reporting_exposure,
-        output_time_units="seconds",
-    )
-    frame = DetailedItineraries(
-        street_network,
-        origins,
-        destinations,
-        "2022-02-22 08:30",
-        exposure=reporting_exposure,
-    )
-    totals = frame.exposure_totals()
-    cell = matrix.iloc[0]
-    row = _matching_option_totals(frame, totals, cell)
-    for column in reporting_exposure.column_names():
-        assert cell[column] == pytest.approx(row[column], rel=1e-9, abs=1e-12)
 
 
 def test_stop_matrix_exposure_folds_waits_and_transfers(street_network, reported_frame):

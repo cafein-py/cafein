@@ -43,21 +43,51 @@ def test_probe_reports_requested_widths():
     assert _probe_workers(3) == 3
 
 
-def test_matrix_fanout_rides_the_requested_pool(network, caplog):
-    from cafein import TravelTimeMatrix
+def test_surfaces_ride_the_requested_pool(network, tmp_path, caplog):
+    from cafein import Accessibility, TravelCostMatrix, TravelTimeMatrix
 
     requested = _distinct_width()
     origins = _served_stops(network, 40)
+    small = _served_stops(network, 5)
+    surfaces = (
+        lambda: TravelTimeMatrix(
+            network, origins, departure=DEPARTURE, workers=requested
+        ),
+        lambda: TravelCostMatrix(network, small, small, DEPARTURE, workers=requested),
+        lambda: Accessibility(
+            network, small, _served_stops(network, 30), DEPARTURE, workers=requested
+        ),
+        lambda: TravelTimeMatrix.to_parquet(
+            network,
+            origins,
+            departure=DEPARTURE,
+            output=tmp_path / "stream",
+            workers=requested,
+        ),
+        lambda: TravelTimeMatrix.to_parquet(
+            network,
+            _served_stops(network, 8),
+            arrival=DEPARTURE,
+            output=tmp_path / "arrive",
+            workers=requested,
+        ),
+    )
+    for surface in surfaces:
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="cafein"):
+            surface()
+        assert any(
+            f"on {requested} workers" in record.getMessage()
+            for record in caplog.records
+        )
+    # An unrequested call rides the ambient width.
+    caplog.clear()
     with caplog.at_level(logging.DEBUG, logger="cafein"):
-        TravelTimeMatrix(network, origins, departure=DEPARTURE, workers=requested)
         TravelTimeMatrix(network, origins, departure=DEPARTURE)
-    widths = [
-        record.getMessage()
+    assert any(
+        f"on {_probe_workers(None)} workers" in record.getMessage()
         for record in caplog.records
-        if " on " in record.getMessage() and "workers" in record.getMessage()
-    ]
-    assert any(f"on {requested} workers" in line for line in widths)
-    assert any(f"on {_probe_workers(None)} workers" in line for line in widths)
+    )
 
 
 def test_results_are_identical_across_widths(network):
@@ -71,61 +101,22 @@ def test_results_are_identical_across_widths(network):
     pd.testing.assert_frame_equal(pd.DataFrame(default), pd.DataFrame(wide))
 
 
-def test_cost_matrix_and_accessibility_ride_the_pool(network, caplog):
-    from cafein import Accessibility, TravelCostMatrix
-
-    requested = _distinct_width()
-    origins = _served_stops(network, 5)
-    with caplog.at_level(logging.DEBUG, logger="cafein"):
-        TravelCostMatrix(network, origins, origins, DEPARTURE, workers=requested)
-        Accessibility(
-            network, origins, _served_stops(network, 30), DEPARTURE, workers=requested
-        )
-    widths = [
-        record.getMessage()
-        for record in caplog.records
-        if f"on {requested} workers" in record.getMessage()
-    ]
-    assert len(widths) >= 2
-
-
-def test_workers_validates_eagerly(network):
-    from cafein import TravelTimeMatrix
+def test_workers_validates_eagerly(network, tmp_path):
+    from cafein import Accessibility, TravelTimeMatrix
 
     origins = _served_stops(network, 2)
-    with pytest.raises(TypeError, match="workers must be an integer"):
-        TravelTimeMatrix(network, origins, departure=DEPARTURE, workers=True)
-    with pytest.raises(TypeError, match="workers must be an integer"):
-        TravelTimeMatrix(network, origins, departure=DEPARTURE, workers="4")
-    with pytest.raises(ValueError, match="workers must be at least 1"):
-        TravelTimeMatrix(network, origins, departure=DEPARTURE, workers=0)
-
-
-def test_streamed_matrix_rides_the_requested_pool(network, tmp_path, caplog):
-    from cafein import TravelTimeMatrix
-
-    requested = _distinct_width()
-    origins = _served_stops(network, 40)
-    with caplog.at_level(logging.DEBUG, logger="cafein"):
-        TravelTimeMatrix.to_parquet(
-            network,
-            origins,
-            departure=DEPARTURE,
-            output=tmp_path / "stream",
-            workers=requested,
-        )
-    assert any(
-        f"on {requested} workers" in record.getMessage() for record in caplog.records
-    )
-
-
-def test_streaming_to_parquet_validates_workers_eagerly(network, tmp_path):
-    from cafein import Accessibility
-
+    for value, exc, match in (
+        (True, TypeError, "workers must be an integer"),
+        ("4", TypeError, "workers must be an integer"),
+        (0, ValueError, "workers must be at least 1"),
+    ):
+        with pytest.raises(exc, match=match):
+            TravelTimeMatrix(network, origins, departure=DEPARTURE, workers=value)
+    # The streaming surfaces validate before writing anything.
     with pytest.raises(ValueError, match="workers must be at least 1"):
         Accessibility.to_parquet(
             network,
-            _served_stops(network, 2),
+            origins,
             _served_stops(network, 5),
             DEPARTURE,
             output=tmp_path / "acc",
@@ -175,24 +166,6 @@ def test_car_park_arm_rides_the_requested_pool(car_park_network, caplog):
             destinations,
             DEPARTURE,
             street_policy=CarParkPolicy(facilities=facilities),
-            workers=requested,
-        )
-    assert any(
-        f"on {requested} workers" in record.getMessage() for record in caplog.records
-    )
-
-
-def test_streamed_arrive_by_matrix_rides_the_requested_pool(network, tmp_path, caplog):
-    from cafein import TravelTimeMatrix
-
-    requested = _distinct_width()
-    origins = _served_stops(network, 8)
-    with caplog.at_level(logging.DEBUG, logger="cafein"):
-        TravelTimeMatrix.to_parquet(
-            network,
-            origins,
-            arrival=DEPARTURE,
-            output=tmp_path / "arrive",
             workers=requested,
         )
     assert any(

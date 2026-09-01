@@ -51,25 +51,67 @@ def test_square_grid_centroids_are_planar_cell_centres():
         assert row.centroid_lon == pytest.approx(lon, abs=1e-9)
 
 
-def test_square_grid_polygon_clip_keeps_intersecting_cells():
+@pytest.mark.parametrize(
+    "generator, size, expected",
+    [
+        pytest.param("square", 1000, 14, id="square"),
+        pytest.param("h3", 8, 23, id="h3"),
+    ],
+)
+def test_polygon_clip_keeps_intersecting_cells(generator, size, expected):
+    if generator == "h3":
+        pytest.importorskip("h3")
+        make = zones.h3_grid
+    else:
+        make = zones.square_grid
     frame = geopandas.GeoDataFrame(geometry=[CLIP_BOX], crs="EPSG:4326")
-    clipped = zones.square_grid(frame, 1000)
-    assert len(clipped) == 14
+    clipped = make(frame, size)
+    assert len(clipped) == expected
     assert clipped.geometry.intersects(CLIP_BOX).all()
-    assert set(clipped["id"]) <= set(zones.square_grid(BBOX, 1000)["id"])
+    assert set(clipped["id"]) <= set(make(BBOX, size)["id"])
 
 
-def test_square_grid_crs_handling():
+def test_square_grid_refusals():
+    lines = geopandas.GeoDataFrame(
+        geometry=[shapely.LineString([(24.9, 60.15), (25.0, 60.2)])],
+        crs="EPSG:4326",
+    )
+    for area, cell_size, kwargs, exc, match in (
+        # An unprojected or non-metre CRS cannot host the lattice, and a
+        # frame without a CRS says so.
+        (BBOX, 1000, dict(crs="EPSG:4326"), ValueError, "projected"),
+        (BBOX, 1000, dict(crs="EPSG:2263"), ValueError, "metre"),
+        (geopandas.GeoDataFrame(geometry=[CLIP_BOX]), 1000, {}, ValueError, "CRS"),
+        # The cell size must be a positive finite number of metres.
+        (BBOX, 0, {}, ValueError, "cell_size"),
+        (BBOX, float("inf"), {}, ValueError, "cell_size"),
+        (BBOX, float("nan"), {}, ValueError, "cell_size"),
+        # Areas across the antimeridian, past the UTM bands, or at a
+        # pole are refused rather than silently distorted.
+        (
+            geopandas.GeoDataFrame(
+                geometry=[shapely.box(179.5, -17.0, 180.0, -16.5)], crs="EPSG:4326"
+            ),
+            1000,
+            {},
+            ValueError,
+            "antimeridian",
+        ),
+        ((0.0, 85.0, 10.0, 86.0), 1000, {}, ValueError, "UTM"),
+        ((0.0, 89.85, 10.0, 89.95), 1000, {}, ValueError, "pole"),
+        # Malformed areas are refused with their own messages.
+        ((25.00, 60.15, 24.90, 60.20), 1000, {}, ValueError, "west < east"),
+        ("everywhere", 1000, {}, TypeError, "bbox"),
+        (lines, 1000, {}, ValueError, "polygons"),
+    ):
+        with pytest.raises(exc, match=match):
+            zones.square_grid(area, cell_size, **kwargs)
+    # An explicit projected CRS overrides the UTM default — at the poles
+    # too, where the default has no band to fall back on.
     override = zones.square_grid(BBOX, 1000, crs="EPSG:3857")
     assert len(override) > 0
-    with pytest.raises(ValueError, match="projected"):
-        zones.square_grid(BBOX, 1000, crs="EPSG:4326")
-    with pytest.raises(ValueError, match="metre"):
-        zones.square_grid(BBOX, 1000, crs="EPSG:2263")
-    with pytest.raises(ValueError, match="CRS"):
-        zones.square_grid(geopandas.GeoDataFrame(geometry=[CLIP_BOX]), 1000)
-    with pytest.raises(ValueError, match="cell_size"):
-        zones.square_grid(BBOX, 0)
+    polar = zones.square_grid((0.0, 85.0, 10.0, 86.0), 100000, crs="EPSG:3413")
+    assert len(polar) > 0
 
 
 def test_square_grid_sparse_multipolygon_stays_small():
@@ -87,30 +129,18 @@ def test_square_grid_sparse_multipolygon_stays_small():
     assert set(grid["id"]) == set().union(*(set(s["id"]) for s in singles))
 
 
-def test_square_grid_rejects_non_finite_cell_size():
-    for bad in (float("inf"), float("nan")):
-        with pytest.raises(ValueError, match="cell_size"):
-            zones.square_grid(BBOX, bad)
-
-
-def test_square_grid_rejects_antimeridian_area():
-    frame = geopandas.GeoDataFrame(
-        geometry=[shapely.box(179.5, -17.0, 180.0, -16.5)], crs="EPSG:4326"
-    )
-    with pytest.raises(ValueError, match="antimeridian"):
-        zones.square_grid(frame, 1000)
-
-
-def test_h3_grid_rejects_non_integral_resolution():
+def test_h3_grid_refusals():
     pytest.importorskip("h3")
     with pytest.raises(TypeError, match="integer"):
         zones.h3_grid(BBOX, 8.9)
-
-
-def test_h3_grid_rejects_antimeridian_area():
-    pytest.importorskip("h3")
-    with pytest.raises(ValueError, match="antimeridian"):
-        zones.h3_grid((178.5, -17.0, 179.9, -16.5), 3)
+    for area, resolution, match in (
+        ((178.5, -17.0, 179.9, -16.5), 3, "antimeridian"),
+        ((0.0, 70.0, 30.0, 75.0), 0, "pole"),
+        (BBOX, -1, "resolution"),
+        (BBOX, 16, "resolution"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            zones.h3_grid(area, resolution)
 
 
 def test_square_grid_lattice_aligned_polygon_keeps_touching_cells():
@@ -141,22 +171,6 @@ def test_square_grid_ignores_null_and_empty_area_members():
         zones.square_grid(hollow, 1000)
 
 
-def test_square_grid_beyond_utm_band_needs_explicit_crs():
-    arctic = (0.0, 85.0, 10.0, 86.0)
-    with pytest.raises(ValueError, match="UTM"):
-        zones.square_grid(arctic, 1000)
-    polar = zones.square_grid(arctic, 100000, crs="EPSG:3413")
-    assert len(polar) > 0
-
-
-def test_grids_reject_polar_areas():
-    with pytest.raises(ValueError, match="pole"):
-        zones.square_grid((0.0, 89.85, 10.0, 89.95), 1000)
-    pytest.importorskip("h3")
-    with pytest.raises(ValueError, match="pole"):
-        zones.h3_grid((0.0, 70.0, 30.0, 75.0), 0)
-
-
 def test_h3_grid_covers_wide_multi_zone_areas():
     h3 = pytest.importorskip("h3")
     bbox = (0.0, 50.0, 40.0, 55.0)
@@ -167,20 +181,9 @@ def test_h3_grid_covers_wide_multi_zone_areas():
     assert set(inside) <= set(hexes["id"])
 
 
-def test_area_validation():
-    with pytest.raises(ValueError, match="west < east"):
-        zones.square_grid((25.00, 60.15, 24.90, 60.20), 1000)
-    with pytest.raises(TypeError, match="bbox"):
-        zones.square_grid("everywhere", 1000)
-    lines = geopandas.GeoDataFrame(
-        geometry=[shapely.LineString([(24.9, 60.15), (25.0, 60.2)])],
-        crs="EPSG:4326",
-    )
-    with pytest.raises(ValueError, match="polygons"):
-        zones.square_grid(lines, 1000)
-
-
-def test_square_grid_from_street_network(helsinki_streets):
+def test_square_grid_from_network_objects(
+    helsinki_streets, network, network_with_footpaths
+):
     bounds = helsinki_streets._core._coordinate_bounds
     assert bounds is not None
     west, south, east, north = bounds
@@ -189,11 +192,9 @@ def test_square_grid_from_street_network(helsinki_streets):
     assert minx <= west and miny <= south
     assert maxx >= east and maxy >= north
     assert len(grid) > 0
-
-
-def test_square_grid_from_transport_network(network, network_with_footpaths):
-    grid = zones.square_grid(network_with_footpaths, 2000)
-    assert len(grid) > 0
+    # A transport network with streets serves the same intake; one
+    # without them says so.
+    assert len(zones.square_grid(network_with_footpaths, 2000)) > 0
     with pytest.raises(ValueError, match="street network"):
         zones.square_grid(network, 2000)
 
@@ -215,30 +216,10 @@ def test_h3_grid_pins():
         latitude, longitude = h3.cell_to_latlng(row.id)
         assert row.centroid_lat == latitude
         assert row.centroid_lon == longitude
-
-
-def test_h3_grid_boundary_geometry():
-    h3 = pytest.importorskip("h3")
-    hexes = zones.h3_grid(BBOX, 8)
+    # The cell geometry is the H3 boundary polygon exactly.
     cell = hexes["id"].iloc[0]
     expected = shapely.Polygon([(lon, lat) for lat, lon in h3.cell_to_boundary(cell)])
     assert hexes.geometry.iloc[0].equals_exact(expected, 1e-12)
-
-
-def test_h3_grid_polygon_clip():
-    pytest.importorskip("h3")
-    frame = geopandas.GeoDataFrame(geometry=[CLIP_BOX], crs="EPSG:4326")
-    clipped = zones.h3_grid(frame, 8)
-    assert len(clipped) == 23
-    assert clipped.geometry.intersects(CLIP_BOX).all()
-    assert set(clipped["id"]) <= set(zones.h3_grid(BBOX, 8)["id"])
-
-
-def test_h3_grid_resolution_validation():
-    pytest.importorskip("h3")
-    for resolution in (-1, 16):
-        with pytest.raises(ValueError, match="resolution"):
-            zones.h3_grid(BBOX, resolution)
 
 
 def test_h3_grid_missing_dependency(monkeypatch):
@@ -252,10 +233,7 @@ def test_polygon_intake_uses_centroid_columns():
     ids, points = _point_list(grid, "origins")
     assert ids == list(grid["id"])
     assert points == list(zip(grid["centroid_lat"], grid["centroid_lon"]))
-
-
-def test_polygon_intake_computes_utm_centroids():
-    grid = zones.square_grid(BBOX, 1000)
+    # Without the centroid columns the UTM centroids are recomputed.
     bare = grid[["id", "geometry"]].copy()
     ids, points = _point_list(bare, "origins")
     assert ids == list(grid["id"])

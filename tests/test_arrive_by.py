@@ -42,7 +42,9 @@ def inverted_profile(journeys, deadline_s):
     return kept
 
 
-def test_exactly_one_time_axis_is_required(network):
+def test_time_axis_arguments_are_validated(network, network_with_footpaths):
+    from cafein import StreetLegPolicy
+
     with pytest.raises(ValueError, match="exactly one of departure= or arrival="):
         network.route_between_stops(KORSO, KAPYLA)
     with pytest.raises(ValueError, match="exactly one of departure= or arrival="):
@@ -53,18 +55,20 @@ def test_exactly_one_time_axis_is_required(network):
         network.travel_times_from_stop(KAPYLA)
     with pytest.raises(ValueError, match="exactly one of departure= or arrival="):
         network.travel_times_from_stop(KAPYLA, "2022-02-22 08:30:00", arrival=DEADLINE)
-
-
-def test_a_window_does_not_combine_with_arrival(network):
+    # The axes reject each other's windows.
     with pytest.raises(ValueError, match="departure_time_window"):
         network.route_between_stops(
             KORSO, KAPYLA, arrival=DEADLINE, departure_time_window=30
         )
-
-
-def test_a_street_policy_does_not_combine_with_arrival(network_with_footpaths):
-    from cafein import StreetLegPolicy
-
+    with pytest.raises(ValueError, match="arrival_time_window"):
+        network.route_between_stops(
+            KORSO, KAPYLA, arrival=DEADLINE, departure_time_window=30
+        )
+    with pytest.raises(ValueError, match="beside arrival="):
+        network.route_between_stops(
+            KORSO, KAPYLA, "2022-02-22 08:30:00", arrival_time_window=30
+        )
+    # A street policy does not combine with arrival=.
     policy = StreetLegPolicy(access={"walk": 1800}, egress={"walk": 1800})
     with pytest.raises(ValueError, match="street_policy"):
         network_with_footpaths.route_between_coordinates(
@@ -86,6 +90,15 @@ def test_the_reverse_answer_inverts_the_forward_window_profile(network):
         KORSO, KAPYLA, "2022-02-22 06:00:00", departure_time_window=210
     )
     assert tuples(reverse) == inverted_profile(profile, DEADLINE_S)
+    # The inversion pins the deadline and the ordering: arrivals fit the
+    # deadline, latest departure first.
+    assert all(j["arrival_s"] <= DEADLINE_S for j in reverse)
+    departures = [j["departure_s"] for j in reverse]
+    assert departures == sorted(departures, reverse=True)
+    # Travel time is each journey's own duration: the latest departure
+    # rides the 16-minute K train, not the span to the deadline.
+    best = reverse[0]
+    assert best["arrival_s"] - best["departure_s"] < 30 * 60
 
 
 def test_the_inversion_holds_over_the_production_closure(network_with_footpaths):
@@ -122,17 +135,6 @@ def test_arrive_by_journeys_are_the_departure_answers(network_with_footpaths):
             and candidate["rides"] == journey["rides"]
         ]
         assert matched == [journey]
-
-
-def test_journeys_arrive_by_the_deadline_latest_departure_first(network):
-    reverse = network.route_between_stops(KORSO, KAPYLA, arrival=DEADLINE)
-    assert all(j["arrival_s"] <= DEADLINE_S for j in reverse)
-    departures = [j["departure_s"] for j in reverse]
-    assert departures == sorted(departures, reverse=True)
-    # Travel time is each journey's own duration: the latest departure
-    # rides the 16-minute K train, not the span to the deadline.
-    best = reverse[0]
-    assert best["arrival_s"] - best["departure_s"] < 30 * 60
 
 
 def test_travel_times_flip_to_the_destination(network):
@@ -177,47 +179,40 @@ def test_the_direct_walk_arrives_exactly_at_the_deadline(network_with_footpaths)
             assert journey["departure_s"] > walk["departure_s"]
 
 
-def test_a_traveler_profile_excludes_on_the_reverse_axis(network):
+def test_exclusions_apply_on_the_reverse_axis(network):
     from cafein import TravelerProfile
 
-    reverse = network.route_between_stops(KORSO, KAPYLA, arrival=DEADLINE)
-    ridden = reverse[0]["legs"][1]["route_id"]
-    profile = TravelerProfile(exclude_routes=[ridden])
-    via_profile = network.route_between_stops(
-        KORSO, KAPYLA, arrival=DEADLINE, traveler=profile
-    )
-    explicit = network.route_between_stops(
-        KORSO, KAPYLA, arrival=DEADLINE, exclude_routes=[ridden]
-    )
-    assert via_profile
-    assert via_profile == explicit
-    assert all(
-        leg.get("route_id") != ridden
-        for journey in via_profile
-        for leg in journey["legs"]
-    )
-
-
-def test_exclusions_apply_on_the_reverse_axis(network):
     reverse = network.route_between_stops(KORSO, KAPYLA, arrival=DEADLINE)
     ridden = reverse[0]["legs"][1]["route_id"]
     without = network.route_between_stops(
         KORSO, KAPYLA, arrival=DEADLINE, exclude_routes=[ridden]
     )
+    assert without
     assert all(
         leg.get("route_id") != ridden for journey in without for leg in journey["legs"]
     )
+    # A traveler profile is the same exclusion, spelled as a profile.
+    profile = TravelerProfile(exclude_routes=[ridden])
+    via_profile = network.route_between_stops(
+        KORSO, KAPYLA, arrival=DEADLINE, traveler=profile
+    )
+    assert via_profile
+    assert via_profile == without
+    assert all(
+        leg.get("route_id") != ridden
+        for journey in via_profile
+        for leg in journey["legs"]
+    )
     # Without the K train the latest alternative leaves before six;
     # the bracket spans the whole early morning.
-    profile = network.route_between_stops(
+    forward = network.route_between_stops(
         KORSO,
         KAPYLA,
         "2022-02-22 04:00:00",
         departure_time_window=330,
         exclude_routes=[ridden],
     )
-    assert without
-    assert tuples(without) == inverted_profile(profile, DEADLINE_S)
+    assert tuples(without) == inverted_profile(forward, DEADLINE_S)
 
 
 def test_the_matrix_cells_are_the_routing_calls_durations(network):
@@ -239,12 +234,10 @@ def test_the_matrix_cells_are_the_routing_calls_durations(network):
         journeys = network.route_between_stops(row.from_id, row.to_id, arrival=DEADLINE)
         best = journeys[0]
         assert row.travel_time == best["arrival_s"] - best["departure_s"]
-
-
-def test_the_wide_matrix_chunks_the_destination_axis(network):
+    # The wide matrix chunks the same destination axis.
     matrix = network.travel_time_matrix([KORSO], arrival=DEADLINE, chunk=(0, 400))
-    stops = network.stop_count
-    expected = stops // 400 + (1 if stops % 400 else 0)
+    stop_total = network.stop_count
+    expected = stop_total // 400 + (1 if stop_total % 400 else 0)
     assert matrix.shape == (1, expected)
 
 
@@ -305,8 +298,18 @@ def test_itinerary_rows_reconcile_with_the_routing_call(network):
     assert departures == sorted(departures, reverse=True)
 
 
-def test_matrix_rejections_on_the_arrival_axis(network):
-    from cafein import TravelTimeMatrix
+def test_computer_rejections_on_the_arrival_axis(network, network_with_footpaths):
+    import pandas as pd
+
+    from cafein import (
+        Accessibility,
+        Catchment,
+        DetailedItineraries,
+        NearestDestinations,
+        TravelCostMatrix,
+        TravelTimeMatrix,
+        travel_cost_table,
+    )
 
     with pytest.raises(ValueError, match="exactly one of departure= or arrival="):
         TravelTimeMatrix(network, origins=[KORSO], departure=DEADLINE, arrival=DEADLINE)
@@ -324,11 +327,6 @@ def test_matrix_rejections_on_the_arrival_axis(network):
             router="tbtr",
             output="/tmp/never.parquet",
         )
-
-
-def test_itinerary_rejections_on_the_arrival_axis(network):
-    from cafein import DetailedItineraries
-
     with pytest.raises(ValueError, match="candidates='pareto'"):
         DetailedItineraries(
             network,
@@ -345,13 +343,120 @@ def test_itinerary_rejections_on_the_arrival_axis(network):
             departure=DEADLINE,
             arrival=DEADLINE,
         )
-
-
-def test_itineraries_require_exactly_one_axis(network):
-    from cafein import DetailedItineraries
-
     with pytest.raises(ValueError, match="exactly one of departure= or arrival="):
         DetailedItineraries(network, origins=[KORSO], destinations=[KAPYLA])
+    with pytest.raises(ValueError, match="arrival_time_window"):
+        Accessibility(network, [KORSO], [KAPYLA], arrival=DEADLINE, cost="emissions")
+    with pytest.raises(ValueError, match="arrival_time_window"):
+        Accessibility(
+            network,
+            [KORSO],
+            [KAPYLA],
+            arrival=DEADLINE,
+            departure_time_window=60,
+        )
+    with pytest.raises(ValueError, match="exactly one of departure= or arrival="):
+        Accessibility(network, [KORSO], [KAPYLA], DEADLINE, arrival=DEADLINE)
+    with pytest.raises(ValueError, match="router must be"):
+        Accessibility(network, [KORSO], [KAPYLA], arrival=DEADLINE, router="bogus")
+    with pytest.raises(ValueError, match="percentiles"):
+        Accessibility(network, [KORSO], [KAPYLA], arrival=DEADLINE, percentiles=[50])
+    # The cost folds carry their own arrival contract.
+    with pytest.raises(ValueError, match="optimize='emissions' or 'fare'"):
+        TravelCostMatrix(
+            network, origins=[KORSO], arrival=DEADLINE, arrival_time_window=20
+        )
+    with pytest.raises(ValueError, match="arrival_time_window"):
+        TravelCostMatrix(
+            network, origins=[KORSO], arrival=DEADLINE, optimize="emissions"
+        )
+    with pytest.raises(ValueError, match="reverse search rides RAPTOR"):
+        TravelCostMatrix(
+            network,
+            origins=[KORSO],
+            arrival=DEADLINE,
+            arrival_time_window=20,
+            optimize="emissions",
+            router="tbtr",
+        )
+    with pytest.raises(ValueError, match="departure_time_window= profiles"):
+        TravelCostMatrix(
+            network,
+            origins=[KORSO],
+            arrival=DEADLINE,
+            departure_time_window=20,
+            optimize="emissions",
+        )
+    with pytest.raises(ValueError, match="multicriteria arrive-by"):
+        TravelCostMatrix(
+            network,
+            origins=[KORSO],
+            arrival=DEADLINE,
+            arrival_time_window=20,
+            optimize="emissions",
+            candidates="pareto",
+        )
+    with pytest.raises(ValueError, match="reverse search rides RAPTOR"):
+        travel_cost_table(
+            network,
+            origins=[KORSO],
+            arrival=DEADLINE,
+            arrival_time_window=20,
+            optimize="emissions",
+            router="tbtr",
+        )
+    destinations = pd.DataFrame({"id": [KAPYLA], "reachable": [1]})
+    for bare in (
+        lambda: Accessibility(
+            network,
+            origins=[KORSO],
+            destinations=destinations,
+            arrival=DEADLINE,
+            cost="emissions",
+            budgets=[100.0],
+        ),
+        lambda: NearestDestinations(
+            network,
+            origins=[KORSO],
+            destinations=[KAPYLA],
+            arrival=DEADLINE,
+            cost="money",
+            k=1,
+        ),
+        lambda: Catchment(
+            network,
+            origins=[KAPYLA],
+            arrival=DEADLINE,
+            cost="emissions",
+            budgets=[100.0],
+        ),
+    ):
+        with pytest.raises(ValueError, match="arrival_time_window"):
+            bare()
+    # The nearest fast path keeps the fan-out's argument rejections.
+    with pytest.raises(ValueError, match="apply to a"):
+        NearestDestinations(
+            network,
+            [KORSO],
+            [KAPYLA],
+            arrival=DEADLINE,
+            k=1,
+            transport_mode="walk",
+        )
+    for k in (1, 2):
+        with pytest.raises(ValueError, match="max_cost"):
+            NearestDestinations(
+                network, [KORSO], [KAPYLA], arrival=DEADLINE, k=k, max_cost=0
+            )
+    # The catchment rejects the departure window on the arrival axis.
+    pytest.importorskip("h3")
+    with pytest.raises(ValueError, match="departure_time_window"):
+        Catchment(
+            network_with_footpaths,
+            [KAPYLA],
+            arrival=DEADLINE,
+            departure_time_window=60,
+        )
 
 
 def test_accessibility_scores_recompute_from_the_reverse_durations(network):
@@ -467,35 +572,6 @@ def test_street_itineraries_place_the_clock_at_the_deadline(helsinki_streets):
     assert list(routes["travel_time"]) == list(departing["travel_time"])
 
 
-def test_product_rejections_on_the_arrival_axis(network, network_with_footpaths):
-    from cafein import Accessibility, Catchment
-
-    with pytest.raises(ValueError, match="arrival_time_window"):
-        Accessibility(network, [KORSO], [KAPYLA], arrival=DEADLINE, cost="emissions")
-    with pytest.raises(ValueError, match="arrival_time_window"):
-        Accessibility(
-            network,
-            [KORSO],
-            [KAPYLA],
-            arrival=DEADLINE,
-            departure_time_window=60,
-        )
-    with pytest.raises(ValueError, match="exactly one of departure= or arrival="):
-        Accessibility(network, [KORSO], [KAPYLA], DEADLINE, arrival=DEADLINE)
-    with pytest.raises(ValueError, match="router must be"):
-        Accessibility(network, [KORSO], [KAPYLA], arrival=DEADLINE, router="bogus")
-    with pytest.raises(ValueError, match="percentiles"):
-        Accessibility(network, [KORSO], [KAPYLA], arrival=DEADLINE, percentiles=[50])
-    pytest.importorskip("h3")
-    with pytest.raises(ValueError, match="departure_time_window"):
-        Catchment(
-            network_with_footpaths,
-            [KAPYLA],
-            arrival=DEADLINE,
-            departure_time_window=60,
-        )
-
-
 def test_the_wheelchair_bridge_rejects_the_arrival_axis(multimodal_network):
     pytest.importorskip("h3")
     from cafein import Catchment, TravelerProfile
@@ -541,7 +617,9 @@ def test_catchment_seeds_derive_from_the_reverse_states(network_with_footpaths):
 WINDOW_START = "2022-02-22 09:00:00"
 
 
-def test_the_arrival_window_unions_the_per_mark_answers(network):
+def test_the_arrival_window_unions_the_per_mark_answers(
+    network, network_with_footpaths
+):
     # The windowed route call returns the deadline profile: the union
     # of each minute mark's latest-departure Pareto set, every member
     # exactly its mark's single-deadline answer.
@@ -560,12 +638,32 @@ def test_the_arrival_window_unions_the_per_mark_answers(network):
     assert windowed == expected
     departures = [j["departure_s"] for j in windowed]
     assert departures == sorted(departures, reverse=True)
+    # The exact per-mark union over coordinates, walks included: the
+    # direct walk competes inside every mark's Pareto selection, so the
+    # windowed result equals the union of single-deadline answers.
+    windowed = network_with_footpaths.route_between_coordinates(
+        KAMPPI, HAKANIEMI, arrival=WINDOW_START, arrival_time_window=10
+    )
+    assert windowed
+    expected = []
+    for i in range(10):
+        single = network_with_footpaths.route_between_coordinates(
+            KAMPPI, HAKANIEMI, arrival=clock(9 * 3600 + 60 * i)
+        )
+        for journey in single:
+            if journey not in expected:
+                expected.append(journey)
+    key = lambda j: (-j["departure_s"], j["rides"], j["arrival_s"])  # noqa: E731
+    assert sorted(windowed, key=key) == sorted(expected, key=key)
 
 
-def test_windowed_percentiles_recompute_from_single_deadlines(network):
-    from cafein import TravelTimeMatrix
-
+def test_windowed_percentiles_recompute_from_single_deadlines(
+    network, network_with_footpaths
+):
+    import geopandas as gpd
     import numpy as np
+
+    from cafein import TravelTimeMatrix
 
     frame = TravelTimeMatrix(
         network,
@@ -593,6 +691,38 @@ def test_windowed_percentiles_recompute_from_single_deadlines(network):
         position = (percentile / 100) * (len(durations) - 1)
         expected = durations[min(int(position + 0.5), len(durations) - 1)]
         assert rows[f"travel_time_p{percentile:g}"].iloc[0] == expected
+    # The point surface recomputes the same way.
+    points = gpd.GeoDataFrame(
+        {"id": ["kamppi", "hakaniemi"]},
+        geometry=gpd.points_from_xy(
+            [KAMPPI[1], HAKANIEMI[1]], [KAMPPI[0], HAKANIEMI[0]]
+        ),
+        crs="EPSG:4326",
+    )
+    frame = TravelTimeMatrix(
+        network_with_footpaths,
+        origins=points,
+        arrival=WINDOW_START,
+        arrival_time_window=10,
+        percentiles=[50],
+        output_time_units="seconds",
+    )
+    row = frame[(frame["from_id"] == "kamppi") & (frame["to_id"] == "hakaniemi")]
+    assert len(row) == 1
+    durations = []
+    for i in range(10):
+        journeys = network_with_footpaths.route_between_coordinates(
+            KAMPPI, HAKANIEMI, arrival=clock(9 * 3600 + 60 * i)
+        )
+        durations.append(
+            journeys[0]["arrival_s"] - journeys[0]["departure_s"]
+            if journeys
+            else np.iinfo(np.uint32).max
+        )
+    durations.sort()
+    position = 0.5 * (len(durations) - 1)
+    expected = durations[min(int(position + 0.5), len(durations) - 1)]
+    assert row["travel_time_p50"].iloc[0] == expected
 
 
 def stop_chunk(network, stop, n):
@@ -641,39 +771,6 @@ def test_the_windowed_catchment_ranks_per_mark_durations(network_with_footpaths)
             assert by_stop[origin] == expected
 
 
-def test_window_axes_reject_each_others_windows(network):
-    with pytest.raises(ValueError, match="arrival_time_window"):
-        network.route_between_stops(
-            KORSO, KAPYLA, arrival=DEADLINE, departure_time_window=30
-        )
-    with pytest.raises(ValueError, match="beside arrival="):
-        network.route_between_stops(
-            KORSO, KAPYLA, "2022-02-22 08:30:00", arrival_time_window=30
-        )
-
-
-def test_the_windowed_coordinate_union_matches_per_mark_answers(
-    network_with_footpaths,
-):
-    # The exact per-mark union, walks included: the direct walk
-    # competes inside every mark's Pareto selection, so the windowed
-    # result equals the union of single-deadline answers.
-    windowed = network_with_footpaths.route_between_coordinates(
-        KAMPPI, HAKANIEMI, arrival=WINDOW_START, arrival_time_window=10
-    )
-    assert windowed
-    expected = []
-    for i in range(10):
-        single = network_with_footpaths.route_between_coordinates(
-            KAMPPI, HAKANIEMI, arrival=clock(9 * 3600 + 60 * i)
-        )
-        for journey in single:
-            if journey not in expected:
-                expected.append(journey)
-    key = lambda j: (-j["departure_s"], j["rides"], j["arrival_s"])  # noqa: E731
-    assert sorted(windowed, key=key) == sorted(expected, key=key)
-
-
 def test_windowed_accessibility_scores_rank_pessimistically(network):
     from cafein import Accessibility
 
@@ -695,47 +792,6 @@ def test_windowed_accessibility_scores_rank_pessimistically(network):
     }
     # Pessimistic durations reach no more than optimistic ones.
     assert scores[90] <= scores[10]
-
-
-def test_windowed_point_percentiles_recompute_from_single_deadlines(
-    network_with_footpaths,
-):
-    import geopandas as gpd
-    import numpy as np
-
-    from cafein import TravelTimeMatrix
-
-    points = gpd.GeoDataFrame(
-        {"id": ["kamppi", "hakaniemi"]},
-        geometry=gpd.points_from_xy(
-            [KAMPPI[1], HAKANIEMI[1]], [KAMPPI[0], HAKANIEMI[0]]
-        ),
-        crs="EPSG:4326",
-    )
-    frame = TravelTimeMatrix(
-        network_with_footpaths,
-        origins=points,
-        arrival=WINDOW_START,
-        arrival_time_window=10,
-        percentiles=[50],
-        output_time_units="seconds",
-    )
-    row = frame[(frame["from_id"] == "kamppi") & (frame["to_id"] == "hakaniemi")]
-    assert len(row) == 1
-    durations = []
-    for i in range(10):
-        journeys = network_with_footpaths.route_between_coordinates(
-            KAMPPI, HAKANIEMI, arrival=clock(9 * 3600 + 60 * i)
-        )
-        durations.append(
-            journeys[0]["arrival_s"] - journeys[0]["departure_s"]
-            if journeys
-            else np.iinfo(np.uint32).max
-        )
-    durations.sort()
-    position = 0.5 * (len(durations) - 1)
-    expected = durations[min(int(position + 0.5), len(durations) - 1)]
-    assert row["travel_time_p50"].iloc[0] == expected
 
 
 def test_confidence_maps_to_the_symmetric_arrival_percentiles(network):
@@ -901,40 +957,35 @@ def test_arrive_by_resume_refuses_a_different_time_query(network, tmp_path):
         )
 
 
-def test_the_nearest_fast_path_matches_the_fan_out(network):
-    import pandas as pd
-
-    from cafein import NearestDestinations
-
-    destinations = [KAPYLA, "1070422", "1020453"]
-    fast = NearestDestinations(
-        network,
-        [KORSO, "1020453"],
-        destinations,
-        arrival=DEADLINE,
-        k=1,
-        output_time_units="seconds",
-    )
-    # k=2 rides the per-destination fan-out; its rank-1 rows are the
-    # same query answered the slow way.
-    fanned = NearestDestinations(
-        network,
-        [KORSO, "1020453"],
-        destinations,
-        arrival=DEADLINE,
-        k=2,
-        output_time_units="seconds",
-    )
-    slow = fanned[fanned["rank"] == 1].reset_index(drop=True)
-    pd.testing.assert_frame_equal(fast.reset_index(drop=True), slow)
-
-
-def test_the_nearest_fast_path_matches_on_points(network_with_footpaths):
+def test_the_nearest_fast_path_matches_the_fan_out(network, network_with_footpaths):
     import geopandas as gpd
     import pandas as pd
 
     from cafein import NearestDestinations
 
+    def rank_one(net, origins, destinations):
+        # k=2 rides the per-destination fan-out; its rank-1 rows are the
+        # same query answered the slow way.
+        fast = NearestDestinations(
+            net,
+            origins,
+            destinations,
+            arrival=DEADLINE,
+            k=1,
+            output_time_units="seconds",
+        )
+        fanned = NearestDestinations(
+            net,
+            origins,
+            destinations,
+            arrival=DEADLINE,
+            k=2,
+            output_time_units="seconds",
+        )
+        slow = fanned[fanned["rank"] == 1].reset_index(drop=True)
+        pd.testing.assert_frame_equal(fast.reset_index(drop=True), slow)
+
+    rank_one(network, [KORSO, "1020453"], [KAPYLA, "1070422", "1020453"])
     origins = gpd.GeoDataFrame(
         {"id": ["kamppi"]},
         geometry=gpd.points_from_xy([KAMPPI[1]], [KAMPPI[0]]),
@@ -945,24 +996,7 @@ def test_the_nearest_fast_path_matches_on_points(network_with_footpaths):
         geometry=gpd.points_from_xy([HAKANIEMI[1], 24.9220], [HAKANIEMI[0], 60.1810]),
         crs="EPSG:4326",
     )
-    fast = NearestDestinations(
-        network_with_footpaths,
-        origins,
-        destinations,
-        arrival=DEADLINE,
-        k=1,
-        output_time_units="seconds",
-    )
-    fanned = NearestDestinations(
-        network_with_footpaths,
-        origins,
-        destinations,
-        arrival=DEADLINE,
-        k=2,
-        output_time_units="seconds",
-    )
-    slow = fanned[fanned["rank"] == 1].reset_index(drop=True)
-    pd.testing.assert_frame_equal(fast.reset_index(drop=True), slow)
+    rank_one(network_with_footpaths, origins, destinations)
 
 
 def test_tied_destinations_attribute_deterministically(network_with_footpaths):
@@ -1023,30 +1057,6 @@ def test_aliased_stop_destinations_tie_to_the_first_listing(network):
     slow = fanned[fanned["rank"] == 1].reset_index(drop=True)
     pd.testing.assert_frame_equal(fast.reset_index(drop=True), slow)
     assert list(fast[fast["from_id"] == KAPYLA]["cost"]) == [0.0]
-
-
-def test_the_fast_path_keeps_the_street_argument_rejections(network):
-    from cafein import NearestDestinations
-
-    with pytest.raises(ValueError, match="apply to a"):
-        NearestDestinations(
-            network,
-            [KORSO],
-            [KAPYLA],
-            arrival=DEADLINE,
-            k=1,
-            transport_mode="walk",
-        )
-
-
-def test_the_fast_path_validates_the_horizon_like_the_fan_out(network):
-    from cafein import NearestDestinations
-
-    for k in (1, 2):
-        with pytest.raises(ValueError, match="max_cost"):
-            NearestDestinations(
-                network, [KORSO], [KAPYLA], arrival=DEADLINE, k=k, max_cost=0
-            )
 
 
 def _profile_emissions(network, origin, destination, window):
@@ -1359,90 +1369,6 @@ def test_the_streamed_cost_table_slices_the_destination_axis(network, tmp_path):
             resume=True,
             **{**query, "arrival": WINDOW_START},
         )
-
-
-def test_cost_rejections_on_the_arrival_axis(network, helsinki_gtfs):
-    import pandas as pd
-
-    from cafein import (
-        Accessibility,
-        Catchment,
-        NearestDestinations,
-        TravelCostMatrix,
-        travel_cost_table,
-    )
-
-    with pytest.raises(ValueError, match="optimize='emissions' or 'fare'"):
-        TravelCostMatrix(
-            network, origins=[KORSO], arrival=DEADLINE, arrival_time_window=20
-        )
-    with pytest.raises(ValueError, match="arrival_time_window"):
-        TravelCostMatrix(
-            network, origins=[KORSO], arrival=DEADLINE, optimize="emissions"
-        )
-    with pytest.raises(ValueError, match="reverse search rides RAPTOR"):
-        TravelCostMatrix(
-            network,
-            origins=[KORSO],
-            arrival=DEADLINE,
-            arrival_time_window=20,
-            optimize="emissions",
-            router="tbtr",
-        )
-    with pytest.raises(ValueError, match="departure_time_window= profiles"):
-        TravelCostMatrix(
-            network,
-            origins=[KORSO],
-            arrival=DEADLINE,
-            departure_time_window=20,
-            optimize="emissions",
-        )
-    with pytest.raises(ValueError, match="multicriteria arrive-by"):
-        TravelCostMatrix(
-            network,
-            origins=[KORSO],
-            arrival=DEADLINE,
-            arrival_time_window=20,
-            optimize="emissions",
-            candidates="pareto",
-        )
-    with pytest.raises(ValueError, match="reverse search rides RAPTOR"):
-        travel_cost_table(
-            network,
-            origins=[KORSO],
-            arrival=DEADLINE,
-            arrival_time_window=20,
-            optimize="emissions",
-            router="tbtr",
-        )
-    destinations = pd.DataFrame({"id": [KAPYLA], "reachable": [1]})
-    for bare in (
-        lambda: Accessibility(
-            network,
-            origins=[KORSO],
-            destinations=destinations,
-            arrival=DEADLINE,
-            cost="emissions",
-            budgets=[100.0],
-        ),
-        lambda: NearestDestinations(
-            network,
-            origins=[KORSO],
-            destinations=[KAPYLA],
-            arrival=DEADLINE,
-            cost="money",
-            k=1,
-        ),
-        lambda: Catchment(
-            network,
-            origins=[KAPYLA],
-            arrival=DEADLINE,
-            cost="emissions",
-            budgets=[100.0],
-        ),
-    ):
-        with pytest.raises(ValueError, match="arrival_time_window"):
-            bare()
 
 
 def test_a_walk_longer_than_every_deadline_is_no_candidate(network_with_footpaths):

@@ -232,15 +232,11 @@ def test_the_computers_honor_the_profile(network):
         exclude_trips=trips,
     )
     pd.testing.assert_frame_equal(table_profiled, table_manual)
-
-
-def test_accessibility_honors_the_profile(network):
+    # Accessibility honors the profile too.
     from cafein import Accessibility
 
-    profile = TravelerProfile(wheelchair=True)
-    _, trips, stops = profile._resolve(network)
     destinations = pd.DataFrame({"id": ["1250551", "1010107"], "jobs": [10.0, 5.0]})
-    profiled = Accessibility(
+    access_profiled = Accessibility(
         network,
         ["4810551"],
         destinations,
@@ -249,7 +245,7 @@ def test_accessibility_honors_the_profile(network):
         budgets=(45.0,),
         traveler=profile,
     )
-    manual = Accessibility(
+    access_manual = Accessibility(
         network,
         ["4810551"],
         destinations,
@@ -259,7 +255,9 @@ def test_accessibility_honors_the_profile(network):
         exclude_stops=stops,
         exclude_trips=trips,
     )
-    pd.testing.assert_frame_equal(pd.DataFrame(profiled), pd.DataFrame(manual))
+    pd.testing.assert_frame_equal(
+        pd.DataFrame(access_profiled), pd.DataFrame(access_manual)
+    )
 
 
 def test_street_surfaces_reject_the_traveler(helsinki_streets):
@@ -394,31 +392,21 @@ def test_the_bridge_serves_the_point_computers(multimodal_network):
     pd.testing.assert_frame_equal(pd.DataFrame(itineraries), pd.DataFrame(hand_built))
     ends = itineraries[itineraries["leg_type"].isin(["access", "egress"])]
     assert not ends.empty and (ends["mode"] == "wheelchair").all()
-
-
-def test_the_bridge_serves_the_one_to_all_surface(multimodal_network):
-    from cafein import StreetLegPolicy
-    from cafein.streets import MAX_ACCESS_EGRESS_TIME
-
-    profile = TravelerProfile(wheelchair=True)
-    bridged = multimodal_network.travel_times_from_coordinate(
+    # The one-to-all surface rides the bridge too.
+    bridged_times = multimodal_network.travel_times_from_coordinate(
         (60.1580, 24.9350), "2022-02-22 08:30:00", traveler=profile
     )
-    assert bridged
-    _, trips, stops = profile._resolve(multimodal_network)
-    explicit = multimodal_network.travel_times_from_coordinate(
+    assert bridged_times
+    explicit_times = multimodal_network.travel_times_from_coordinate(
         (60.1580, 24.9350),
         "2022-02-22 08:30:00",
         exclude_stops=stops,
         exclude_trips=trips,
-        street_policy=StreetLegPolicy(
-            access={"wheelchair": MAX_ACCESS_EGRESS_TIME},
-            egress={"wheelchair": MAX_ACCESS_EGRESS_TIME},
-        ),
+        street_policy=policy,
     )
-    assert bridged == explicit
+    assert bridged_times == explicit_times
     # An explicitly inaccessible stop never appears among the arrivals.
-    assert not set(stops) & set(bridged)
+    assert not set(stops) & set(bridged_times)
 
 
 def test_the_bridge_needs_the_wheelchair_build(network_with_footpaths):

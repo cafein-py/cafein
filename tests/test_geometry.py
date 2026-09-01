@@ -141,66 +141,96 @@ def test_geometries_dedup_polylines_across_trips(tmp_path):
     assert {polyline for _, polyline, _ in trips} == {0}
 
 
-def test_valid_shape_dist_in_meters_is_used_directly(tmp_path):
-    feed = gtfs_zip(tmp_path / "feed.zip", shape_dist=[0, 700, 1400])
-    cumulative, tier = single(geometry.trip_distances(feed))
-    assert tier == geometry.SHAPE_DIST
-    assert cumulative == [0, 700, 1400]
-
-
-def test_kilometer_shape_dist_is_rescaled(tmp_path):
-    feed = gtfs_zip(tmp_path / "feed.zip", shape_dist=[0, 0.7, 1.4])
-    cumulative, tier = single(geometry.trip_distances(feed))
-    assert tier == geometry.SHAPE_DIST
-    assert cumulative == pytest.approx([0, 700, 1400])
-
-
-def test_decreasing_shape_dist_falls_to_linear_referencing(tmp_path):
-    feed = gtfs_zip(
-        tmp_path / "feed.zip", shape_dist=[0, 800, 700], shape_points=DENSE_SHAPE
-    )
-    cumulative, tier = single(geometry.trip_distances(feed))
-    assert tier == geometry.SHAPE_LINREF
-    assert cumulative == pytest.approx([0, 556.6, 1113.2], rel=0.01)
-
-
-def test_non_numeric_shape_dist_fails_the_tier(tmp_path):
-    feed = gtfs_zip(tmp_path / "feed.zip", shape_dist=[0, "junk", 1400])
-    _, tier = single(geometry.trip_distances(feed))
-    assert tier == geometry.CROW_FLY
-
-
-def test_implausible_shape_dist_totals_fail_the_tier(tmp_path):
-    # A total twenty times the crow-fly length is neither meters nor km.
-    feed = gtfs_zip(tmp_path / "feed.zip", shape_dist=[0, 10_000, 22_000])
-    _, tier = single(geometry.trip_distances(feed))
-    assert tier == geometry.CROW_FLY
-
-
-def test_shapes_denser_than_the_stops_are_linear_referenced(tmp_path):
-    feed = gtfs_zip(tmp_path / "feed.zip", shape_points=DENSE_SHAPE)
-    cumulative, tier = single(geometry.trip_distances(feed))
-    assert tier == geometry.SHAPE_LINREF
-    assert cumulative == pytest.approx([0, 556.6, 1113.2], rel=0.01)
-
-
-def test_sparse_shapes_fail_to_crow_fly(tmp_path):
-    # Three shape points for three stops: stop-to-stop straight lines
-    # dressed up as a shape.
-    feed = gtfs_zip(
-        tmp_path / "feed.zip",
-        shape_points=[(lat, lon) for _, lat, lon in STOPS],
-    )
-    _, tier = single(geometry.trip_distances(feed))
-    assert tier == geometry.CROW_FLY
-
-
-def test_stops_far_from_the_shape_fail_to_crow_fly(tmp_path):
-    # The shape runs ~330 m north of the stops.
-    offset = [(lat + 0.003, lon) for lat, lon in DENSE_SHAPE]
-    feed = gtfs_zip(tmp_path / "feed.zip", shape_points=offset)
-    _, tier = single(geometry.trip_distances(feed))
-    assert tier == geometry.CROW_FLY
+@pytest.mark.parametrize(
+    "kwargs, tier, cumulative, rel",
+    [
+        # Valid shape_dist_traveled in meters is used directly (exactly).
+        pytest.param(
+            {"shape_dist": [0, 700, 1400]},
+            geometry.SHAPE_DIST,
+            [0, 700, 1400],
+            None,
+            id="meters-shape-dist",
+        ),
+        # Kilometer-scaled shape_dist is rescaled to meters.
+        pytest.param(
+            {"shape_dist": [0, 0.7, 1.4]},
+            geometry.SHAPE_DIST,
+            [0, 700, 1400],
+            1e-6,
+            id="kilometer-shape-dist",
+        ),
+        # Decreasing shape_dist falls to linear referencing on the shape.
+        pytest.param(
+            {"shape_dist": [0, 800, 700], "shape_points": DENSE_SHAPE},
+            geometry.SHAPE_LINREF,
+            [0, 556.6, 1113.2],
+            0.01,
+            id="decreasing-shape-dist",
+        ),
+        # Non-numeric shape_dist fails the tier.
+        pytest.param(
+            {"shape_dist": [0, "junk", 1400]},
+            geometry.CROW_FLY,
+            None,
+            None,
+            id="non-numeric-shape-dist",
+        ),
+        # A total twenty times the crow-fly length is neither meters nor km.
+        pytest.param(
+            {"shape_dist": [0, 10_000, 22_000]},
+            geometry.CROW_FLY,
+            None,
+            None,
+            id="implausible-shape-dist",
+        ),
+        # Shapes denser than the stops are linear referenced.
+        pytest.param(
+            {"shape_points": DENSE_SHAPE},
+            geometry.SHAPE_LINREF,
+            [0, 556.6, 1113.2],
+            0.01,
+            id="dense-shape",
+        ),
+        # Three shape points for three stops: stop-to-stop straight lines
+        # dressed up as a shape.
+        pytest.param(
+            {"shape_points": [(lat, lon) for _, lat, lon in STOPS]},
+            geometry.CROW_FLY,
+            None,
+            None,
+            id="sparse-shape",
+        ),
+        # The shape runs ~330 m north of the stops.
+        pytest.param(
+            {"shape_points": [(lat + 0.003, lon) for lat, lon in DENSE_SHAPE]},
+            geometry.CROW_FLY,
+            None,
+            None,
+            id="offset-shape",
+        ),
+        # Duplicate stop rows use the first occurrence.
+        pytest.param(
+            {"duplicate_first_stop": True},
+            geometry.CROW_FLY,
+            None,
+            None,
+            id="duplicate-stop-rows",
+        ),
+    ],
+)
+def test_the_distance_tier_ladder(tmp_path, kwargs, tier, cumulative, rel):
+    feed = gtfs_zip(tmp_path / "feed.zip", **kwargs)
+    got, got_tier = single(geometry.trip_distances(feed))
+    assert got_tier == tier
+    if cumulative is None:
+        # Every crow-fly case here rides a bus feed: the total is the
+        # stop chain scaled by the bus detour factor.
+        assert got[-1] == pytest.approx(CROW_TOTAL * 1.4, rel=0.01)
+    elif rel is None:
+        assert got == cumulative
+    else:
+        assert got == pytest.approx(cumulative, rel=rel)
 
 
 def test_crow_fly_scales_by_the_mode_detour(tmp_path):
@@ -232,13 +262,6 @@ def test_stops_without_coordinates_raise_a_clear_error(tmp_path):
     feed = gtfs_zip(tmp_path / "feed.zip", drop_coordinates_of="B")
     with pytest.raises(ValueError, match="without coordinates.*B"):
         geometry.trip_distances(feed)
-
-
-def test_duplicate_stop_rows_use_the_first_occurrence(tmp_path):
-    feed = gtfs_zip(tmp_path / "feed.zip", duplicate_first_stop=True)
-    cumulative, tier = single(geometry.trip_distances(feed))
-    assert tier == geometry.CROW_FLY
-    assert cumulative[-1] == pytest.approx(CROW_TOTAL * 1.4, rel=0.01)
 
 
 def test_unreadable_shapes_degrade_to_crow_fly(tmp_path):

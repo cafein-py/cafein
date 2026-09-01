@@ -61,15 +61,12 @@ def destinations():
     return scattered_points(3, seed=2)
 
 
-def test_the_car_routes_and_beats_walking(car_network):
-    car = car_network.travel_time(KAMPPI, ARABIA, mode="car")
-    walk = car_network.travel_time(KAMPPI, ARABIA, mode="walk")
-    assert car is not None and walk is not None
-    assert car < walk
-
-
 def test_the_default_is_free_flow_and_delays_are_opt_in(car_network):
     free = car_network.travel_time(KAMPPI, ARABIA, mode="car")
+    walk = car_network.travel_time(KAMPPI, ARABIA, mode="walk")
+    assert free is not None and walk is not None
+    # The car routes and beats walking.
+    assert free < walk
     midday = car_network.travel_time(
         KAMPPI, ARABIA, mode="car", intersection_delays=True
     )
@@ -81,27 +78,7 @@ def test_the_default_is_free_flow_and_delays_are_opt_in(car_network):
     )
     assert free < midday <= rush
     assert free < day
-
-
-def test_delay_options_require_the_gate_and_the_car(car_network):
-    with pytest.raises(ValueError, match="intersection_delays=True"):
-        car_network.travel_time(KAMPPI, ARABIA, mode="car", profile="rush")
-    with pytest.raises(ValueError, match="intersection_delays=True"):
-        car_network.travel_time(KAMPPI, ARABIA, mode="car", delay_model={"values": {}})
-    with pytest.raises(ValueError, match="mode='car'"):
-        car_network.travel_time(
-            KAMPPI, ARABIA, mode="bicycle", intersection_delays=True
-        )
-    with pytest.raises(ValueError, match="unknown profile"):
-        car_network.travel_time(
-            KAMPPI, ARABIA, mode="car", intersection_delays=True, profile="night"
-        )
-
-
-def test_a_delay_model_override_changes_the_answer(car_network):
-    midday = car_network.travel_time(
-        KAMPPI, ARABIA, mode="car", intersection_delays=True
-    )
+    # A delay-model override changes the answer.
     slowed = car_network.travel_time(
         KAMPPI,
         ARABIA,
@@ -112,9 +89,38 @@ def test_a_delay_model_override_changes_the_answer(car_network):
     assert slowed > midday
 
 
-def test_a_carless_build_refuses_car_queries(helsinki_streets):
-    with pytest.raises(ValueError):
-        helsinki_streets.travel_time(KAMPPI, ARABIA, mode="car")
+def test_delay_options_require_the_gate_and_the_car(car_network, helsinki_streets):
+    for network, kwargs, match in [
+        (
+            car_network,
+            {"mode": "car", "profile": "rush"},
+            "intersection_delays=True",
+        ),
+        (
+            car_network,
+            {"mode": "car", "delay_model": {"values": {}}},
+            "intersection_delays=True",
+        ),
+        (
+            car_network,
+            {"mode": "bicycle", "intersection_delays": True},
+            "mode='car'",
+        ),
+        (
+            car_network,
+            {"mode": "car", "intersection_delays": True, "profile": "night"},
+            "unknown profile",
+        ),
+        # A build without the car mode refuses car queries outright.
+        (helsinki_streets, {"mode": "car"}, None),
+    ]:
+        raises = (
+            pytest.raises(ValueError, match=match)
+            if match
+            else pytest.raises(ValueError)
+        )
+        with raises:
+            network.travel_time(KAMPPI, ARABIA, **kwargs)
 
 
 def test_speed_limit_overrides_thread_through_the_build(kantakaupunki_pbf, car_network):
@@ -678,6 +684,30 @@ def test_parking_metres_join_distance_and_emissions(car_network, origins, destin
     assert (legs.travel_time.to_numpy() == bare.travel_time.to_numpy() + 60).all()
     assert (legs.arrival_s.to_numpy() == bare.arrival_s.to_numpy() + 60).all()
     assert legs.geometry.iloc[0].equals(bare.geometry.iloc[0])
+    # The monetary cost account rides the same parking metres.
+    plain_costs = TravelCostMatrix(
+        car_network,
+        origins,
+        destinations,
+        transport_mode="car",
+        perspectives="private",
+    )
+    parked_costs = TravelCostMatrix(
+        car_network,
+        origins,
+        destinations,
+        transport_mode="car",
+        perspectives="private",
+        parking=(60, 400.0),
+    )
+    priced = pd.merge(
+        plain_costs, parked_costs, on=["from_id", "to_id"], suffixes=("", "_p")
+    )
+    assert len(priced) == len(plain_costs)
+    assert np.allclose(
+        priced.cost_private_p, priced.network_distance_m_p / 1000.0 * 0.250
+    )
+    assert np.allclose(priced.cost_private_p - priced.cost_private, 0.4 * 0.250)
 
 
 def test_transit_matrices_reject_the_delay_options(network):
@@ -700,27 +730,3 @@ def test_transit_matrices_reject_the_delay_options(network):
 def test_the_car_never_serves_transit_access(multimodal_network):
     with pytest.raises(ValueError, match="street-only"):
         multimodal_network._core._street_access_seconds(60.1690, 24.9320, "car", 900.0)
-
-
-def test_parking_metres_join_the_cost_basis(car_network, origins, destinations):
-    plain = TravelCostMatrix(
-        car_network,
-        origins,
-        destinations,
-        transport_mode="car",
-        perspectives="private",
-    )
-    parked = TravelCostMatrix(
-        car_network,
-        origins,
-        destinations,
-        transport_mode="car",
-        perspectives="private",
-        parking=(60, 400.0),
-    )
-    merged = pd.merge(plain, parked, on=["from_id", "to_id"], suffixes=("", "_p"))
-    assert len(merged) == len(plain)
-    assert np.allclose(
-        merged.cost_private_p, merged.network_distance_m_p / 1000.0 * 0.250
-    )
-    assert np.allclose(merged.cost_private_p - merged.cost_private, 0.4 * 0.250)

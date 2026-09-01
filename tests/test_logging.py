@@ -50,42 +50,47 @@ def test_quiet_by_default(network, tmp_path, capsys):
     assert all(isinstance(h, logging.NullHandler) for h in handlers)
 
 
-def test_enable_logging_streams_phase_lines(network, tmp_path):
+def test_enable_logging_lifecycle(network, tmp_path):
     buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    # Enabling twice does not duplicate handlers (or lines).
     cafein.enable_logging(stream=buffer)
     path = _saved(network, tmp_path)
     cafein.TransportNetwork.load(path)
     output = buffer.getvalue()
     assert "saved the network artifact in" in output
     assert "loaded the network artifact in" in output
-
-
-def test_enable_logging_twice_does_not_duplicate(network, tmp_path):
-    buffer = io.StringIO()
-    cafein.enable_logging(stream=buffer)
-    cafein.enable_logging(stream=buffer)
-    _saved(network, tmp_path)
-    lines = [line for line in buffer.getvalue().splitlines() if "saved" in line]
-    assert len(lines) == 1
-
-
-def test_disable_logging_restores_silence(network, tmp_path):
-    buffer = io.StringIO()
-    cafein.enable_logging(stream=buffer)
+    assert len([line for line in output.splitlines() if "saved" in line]) == 1
+    # Disabling restores silence.
     cafein.disable_logging()
-    _saved(network, tmp_path)
-    assert buffer.getvalue() == ""
+    _saved(network, tmp_path, name="silent.cafein")
+    assert buffer.getvalue() == output
 
 
 def test_enable_logging_validates_eagerly():
-    with pytest.raises(TypeError, match="stream must be a writable text stream"):
-        cafein.enable_logging(stream=42)
-    with pytest.raises(TypeError, match="level must be an int or one of"):
-        cafein.enable_logging(stream=io.StringIO(), level=True)
-    with pytest.raises(TypeError, match="level must be an int or one of"):
-        cafein.enable_logging(stream=io.StringIO(), level=b"info")
-    with pytest.raises(ValueError, match="level must be one of"):
-        cafein.enable_logging(stream=io.StringIO(), level="loud")
+    for kwargs, exc, match in (
+        (dict(stream=42), TypeError, "stream must be a writable text stream"),
+        (
+            dict(stream=io.StringIO(), level=True),
+            TypeError,
+            "level must be an int or one of",
+        ),
+        (
+            dict(stream=io.StringIO(), level=b"info"),
+            TypeError,
+            "level must be an int or one of",
+        ),
+        (dict(stream=io.StringIO(), level="loud"), ValueError, "level must be one of"),
+        (dict(stream=io.StringIO(), progress=True), TypeError, "progress must be"),
+        (dict(stream=io.StringIO(), progress=3), TypeError, "progress must be"),
+        (
+            dict(stream=io.StringIO(), progress="spinner"),
+            ValueError,
+            "progress must be",
+        ),
+    ):
+        with pytest.raises(exc, match=match):
+            cafein.enable_logging(**kwargs)
 
 
 def test_disable_logging_restores_manual_configuration(network, tmp_path):
@@ -143,6 +148,8 @@ def test_from_gtfs_emits_build_phases(helsinki_gtfs, kantakaupunki_pbf, caplog):
         for record in caplog.records
         if hasattr(record, "cafein_phase")
     ]
+    # The exact list also pins the child-before-parent ordering and the
+    # absence of build.multimodal.elevation (no DEM in this build).
     assert phases == [
         "build.gtfs.read",
         "build.gtfs.timetable",
@@ -168,6 +175,13 @@ def test_from_gtfs_emits_build_phases(helsinki_gtfs, kantakaupunki_pbf, caplog):
         if getattr(record, "cafein_phase", None) == "build.multimodal"
     )
     assert multimodal.cafein_details["modes"] == ["walk"]
+    streets = next(
+        record
+        for record in caplog.records
+        if getattr(record, "cafein_phase", None) == "build.multimodal.streets"
+    )
+    assert streets.cafein_details["modes"] == ["walk"]
+    assert streets.cafein_details["edges"] > 0
     assert all(
         record.cafein_seconds > 0
         for record in caplog.records
@@ -224,95 +238,77 @@ def test_collect_timings_reports_phases(network, tmp_path):
     assert frame["details"].dtype == object
 
 
-def test_collect_timings_is_independent_of_the_stream_level(network, tmp_path):
-    buffer = io.StringIO()
-    cafein.enable_logging(stream=buffer, level="warning")
-    with cafein.collect_timings() as report:
-        _saved(network, tmp_path)
-    assert buffer.getvalue() == ""
-    assert [entry["phase"] for entry in report.phases] == [
-        "artifact.save.encode",
-        "artifact.save",
-    ]
-
-
-def test_collect_timings_survives_a_child_logger_override(network, tmp_path):
-    logging.getLogger("cafein.artifact").setLevel(logging.WARNING)
-    with cafein.collect_timings() as report:
-        _saved(network, tmp_path)
-    assert [entry["phase"] for entry in report.phases] == [
-        "artifact.save.encode",
-        "artifact.save",
-    ]
-
-
-def test_collect_timings_leaves_root_handlers_to_their_own_config(
-    network, tmp_path, caplog
+@pytest.mark.parametrize(
+    "environment", ["stream_level", "child_override", "root_handlers"]
+)
+def test_collect_timings_ignores_the_logging_environment(
+    network, tmp_path, caplog, environment
 ):
-    with caplog.at_level(logging.WARNING):
+    # The collector's capture is independent of the stream level, of a
+    # child-logger override, and of the root handler configuration
+    # (which it leaves to its own devices).
+    from contextlib import nullcontext
+
+    buffer = io.StringIO()
+    if environment == "stream_level":
+        cafein.enable_logging(stream=buffer, level="warning")
+    elif environment == "child_override":
+        logging.getLogger("cafein.artifact").setLevel(logging.WARNING)
+    context = (
+        caplog.at_level(logging.WARNING)
+        if environment == "root_handlers"
+        else nullcontext()
+    )
+    with context:
         with cafein.collect_timings() as report:
             _saved(network, tmp_path)
     assert [entry["phase"] for entry in report.phases] == [
         "artifact.save.encode",
         "artifact.save",
     ]
-    assert not [r for r in caplog.records if r.name.startswith("cafein")]
+    if environment == "stream_level":
+        assert buffer.getvalue() == ""
+    if environment == "root_handlers":
+        assert not [r for r in caplog.records if r.name.startswith("cafein")]
 
 
-def test_raising_handler_cannot_break_a_computation(network, tmp_path):
-    class Exploding(logging.Handler):
+@pytest.mark.parametrize("hostile", ["handler", "filter"])
+def test_raising_logging_hooks_cannot_break_a_computation(network, tmp_path, hostile):
+    calls = []
+
+    class ExplodingHandler(logging.Handler):
         def emit(self, record):
             raise RuntimeError("boom")
 
         def handle(self, record):
             raise RuntimeError("boom")
 
-    handler = Exploding(level=logging.DEBUG)
-    root = logging.getLogger("cafein")
-    root.addHandler(handler)
-    root.setLevel(logging.DEBUG)
-    try:
-        path = _saved(network, tmp_path)
-    finally:
-        root.removeHandler(handler)
-    assert path.exists()
-
-
-def test_raising_filter_cannot_break_a_computation(network, tmp_path):
-    calls = []
-
-    class Exploding(logging.Filter):
+    class ExplodingFilter(logging.Filter):
         def filter(self, record):
             calls.append(record)
             raise RuntimeError("boom")
 
-    # Ancestor filters are not applied to propagated records, so the
-    # filter goes on the emitting logger itself.
-    exploding = Exploding()
-    emitting = logging.getLogger("cafein.artifact")
-    emitting.addFilter(exploding)
-    logging.getLogger("cafein").setLevel(logging.DEBUG)
+    if hostile == "handler":
+        exploding = ExplodingHandler(level=logging.DEBUG)
+        target = logging.getLogger("cafein")
+        target.addHandler(exploding)
+        target.setLevel(logging.DEBUG)
+        remove = target.removeHandler
+    else:
+        # Ancestor filters are not applied to propagated records, so the
+        # filter goes on the emitting logger itself.
+        exploding = ExplodingFilter()
+        target = logging.getLogger("cafein.artifact")
+        target.addFilter(exploding)
+        logging.getLogger("cafein").setLevel(logging.DEBUG)
+        remove = target.removeFilter
     try:
         path = _saved(network, tmp_path)
     finally:
-        emitting.removeFilter(exploding)
-    assert calls
+        remove(exploding)
+    if hostile == "filter":
+        assert calls
     assert path.exists()
-
-
-def test_manual_child_override_arms_the_rust_bridge(network, tmp_path):
-    buffer = io.StringIO()
-    handler = logging.StreamHandler(buffer)
-    root = logging.getLogger("cafein")
-    emitting = logging.getLogger("cafein.artifact")
-    root.setLevel(logging.WARNING)
-    emitting.setLevel(logging.INFO)
-    emitting.addHandler(handler)
-    try:
-        _saved(network, tmp_path)
-    finally:
-        emitting.removeHandler(handler)
-    assert "encoded the artifact payload in" in buffer.getvalue()
 
 
 def _artifact_stream(network, tmp_path, name="net.cafein"):
@@ -328,21 +324,32 @@ def _artifact_stream(network, tmp_path, name="net.cafein"):
     return buffer.getvalue()
 
 
-def test_an_explicit_notset_root_still_arms_the_bridge(network, tmp_path):
-    # Effective level 0 means "emit everything", not "disarmed".
-    plain_root = logging.getLogger()
-    prior = plain_root.level
-    plain_root.setLevel(logging.NOTSET)
+@pytest.mark.parametrize(
+    "configuration", ["manual_child_override", "explicit_notset_root", "negative_level"]
+)
+def test_unusual_level_configurations_still_arm_the_bridge(
+    network, tmp_path, configuration
+):
+    restore = None
+    if configuration == "manual_child_override":
+        # A manual child-logger override alone (root at WARNING) arms
+        # the Rust bridge.
+        logging.getLogger("cafein").setLevel(logging.WARNING)
+        logging.getLogger("cafein.artifact").setLevel(logging.INFO)
+    elif configuration == "explicit_notset_root":
+        # Effective level 0 means "emit everything", not "disarmed".
+        plain_root = logging.getLogger()
+        restore = (plain_root, plain_root.level)
+        plain_root.setLevel(logging.NOTSET)
+    else:
+        # A negative custom level arms the bridge too.
+        logging.getLogger("cafein").setLevel(-5)
     try:
         output = _artifact_stream(network, tmp_path)
     finally:
-        plain_root.setLevel(prior)
+        if restore is not None:
+            restore[0].setLevel(restore[1])
     assert "encoded the artifact payload in" in output
-
-
-def test_a_negative_custom_level_arms_the_bridge(network, tmp_path):
-    logging.getLogger("cafein").setLevel(-5)
-    assert "encoded the artifact payload in" in _artifact_stream(network, tmp_path)
 
 
 def test_an_oversized_custom_level_suppresses_without_wrapping(network, tmp_path):
@@ -369,13 +376,19 @@ def _served_stops(network, count):
 
 
 def test_matrix_computers_emit_their_phases(network, caplog):
-    from cafein import Accessibility, TravelCostMatrix, TravelTimeMatrix
+    from cafein import (
+        Accessibility,
+        DetailedItineraries,
+        TravelCostMatrix,
+        TravelTimeMatrix,
+    )
 
     origins = _served_stops(network, 5)
     with caplog.at_level(logging.INFO, logger="cafein"):
         TravelTimeMatrix(network, origins=origins, departure=DEPARTURE)
         TravelCostMatrix(network, origins, origins, DEPARTURE)
         Accessibility(network, origins, _served_stops(network, 30), DEPARTURE)
+        DetailedItineraries(network, ["4810551"], ["1250551"], DEPARTURE)
     records = {
         record.cafein_phase: record
         for record in caplog.records
@@ -385,23 +398,11 @@ def test_matrix_computers_emit_their_phases(network, caplog):
         "matrix.travel_times",
         "matrix.travel_costs",
         "matrix.accessibility",
+        "matrix.itineraries",
     } <= set(records)
     assert records["matrix.travel_times"].cafein_details["rows"] > 0
     assert records["matrix.travel_times"].cafein_details["origins"] == 5
     assert records["matrix.travel_times"].cafein_seconds > 0
-
-
-def test_itineraries_emit_their_phase(network, caplog):
-    from cafein import DetailedItineraries
-
-    with caplog.at_level(logging.INFO, logger="cafein"):
-        DetailedItineraries(network, ["4810551"], ["1250551"], DEPARTURE)
-    phases = [
-        record.cafein_phase
-        for record in caplog.records
-        if hasattr(record, "cafein_phase")
-    ]
-    assert "matrix.itineraries" in phases
 
 
 def test_street_matrices_swap_to_the_street_identifier(helsinki_streets, caplog):
@@ -426,6 +427,8 @@ def test_street_matrices_swap_to_the_street_identifier(helsinki_streets, caplog)
 
 
 def test_fanout_ticks_above_the_threshold(network, caplog):
+    import re
+
     from cafein import TravelTimeMatrix
 
     origins = _served_stops(network, 40)
@@ -438,6 +441,9 @@ def test_fanout_ticks_above_the_threshold(network, caplog):
     assert len(ticks) == 20
     assert all("travel_time_matrix" in line for line in ticks)
     assert all("origins" in line and "elapsed" in line for line in ticks)
+    # Tick percentages never regress: the counts advance strictly.
+    counts = [int(re.search(r"\((\d+)/40 origins", line).group(1)) for line in ticks]
+    assert counts == sorted(counts) and len(counts) == len(set(counts))
     # Ticks are plain INFO records, not phases: they carry the
     # structured progress triple but none of the phase attributes,
     # and the report holds only the computer's completion.
@@ -450,6 +456,18 @@ def test_fanout_ticks_above_the_threshold(network, caplog):
         for attribute in ("cafein_phase", "cafein_seconds", "cafein_details")
     )
     assert [entry["phase"] for entry in report.phases] == ["matrix.travel_times"]
+    # The records carry the structured progress payload for other
+    # handlers, monotone in the done counter.
+    progress = [r for r in caplog.records if hasattr(r, "cafein_progress")]
+    assert len(progress) == 20
+    for record in progress:
+        info = record.cafein_progress
+        assert info["label"] == "travel_time_matrix"
+        assert 0 < info["done"] <= info["total"] == 40
+        assert not hasattr(record, "cafein_phase")
+    assert [r.cafein_progress["done"] for r in progress] == sorted(
+        r.cafein_progress["done"] for r in progress
+    )
 
 
 def test_no_ticks_below_the_threshold(network):
@@ -513,23 +531,6 @@ def _scattered_points(count, seed=1, centre=(60.170, 24.940)):
         geometry=records,
         crs="EPSG:4326",
     )
-
-
-def test_tick_percentages_never_regress(network):
-    import re
-
-    from cafein import TravelTimeMatrix
-
-    origins = _served_stops(network, 40)
-    buffer = io.StringIO()
-    cafein.enable_logging(stream=buffer)
-    TravelTimeMatrix(network, origins, departure=DEPARTURE)
-    counts = [
-        int(re.search(r"\((\d+)/40 origins", line).group(1))
-        for line in buffer.getvalue().splitlines()
-        if "% (" in line
-    ]
-    assert counts == sorted(counts) and len(counts) == len(set(counts))
 
 
 def test_street_cost_matrix_ticks(helsinki_streets):
@@ -606,25 +607,6 @@ def test_windowed_matrix_ticks(network):
     assert all("travel_time_matrix" in line for line in ticks)
 
 
-def test_multimodal_build_children_report(helsinki_gtfs, kantakaupunki_pbf, caplog):
-    with caplog.at_level(logging.INFO, logger="cafein"):
-        cafein.TransportNetwork.from_gtfs(helsinki_gtfs, osm_pbf=kantakaupunki_pbf)
-    phases = [
-        record.cafein_phase
-        for record in caplog.records
-        if hasattr(record, "cafein_phase")
-    ]
-    assert phases.index("build.multimodal.streets") < phases.index("build.multimodal")
-    assert "build.multimodal.elevation" not in phases  # no DEM in this build
-    streets = next(
-        record
-        for record in caplog.records
-        if getattr(record, "cafein_phase", None) == "build.multimodal.streets"
-    )
-    assert streets.cafein_details["modes"] == ["walk"]
-    assert streets.cafein_details["edges"] > 0
-
-
 def test_arrive_by_matrix_ticks(network):
     import re
 
@@ -670,7 +652,8 @@ def test_mixed_partitions_share_one_counter(ultra_network):
     assert all("/40 origins" in line for line in ticks)
 
 
-def test_frontier_fanout_ticks_once_per_origin(network):
+@pytest.mark.parametrize("extra", [{}, {"max_slower": 10}], ids=["plain", "restricted"])
+def test_frontier_fanout_ticks_once_per_origin(network, extra):
     import re
 
     from cafein import journey_frontiers
@@ -679,33 +662,14 @@ def test_frontier_fanout_ticks_once_per_origin(network):
     buffer = io.StringIO()
     cafein.enable_logging(stream=buffer)
     journey_frontiers(
-        network, origins, origins[:2], DEPARTURE, departure_time_window=10
-    )
-    ticks = [line for line in buffer.getvalue().splitlines() if "% (" in line]
-    assert len(ticks) == 20
-    assert all("journey frontiers" in line and "/40 origins" in line for line in ticks)
-    counts = [int(re.search(r"\((\d+)/40", line).group(1)) for line in ticks]
-    assert counts == sorted(counts) and len(counts) == len(set(counts))
-
-
-def test_restricted_frontier_ticks_once_per_origin(network):
-    from cafein import journey_frontiers
-
-    origins = _served_stops(network, 40)
-    buffer = io.StringIO()
-    cafein.enable_logging(stream=buffer)
-    journey_frontiers(
-        network,
-        origins,
-        origins[:2],
-        DEPARTURE,
-        departure_time_window=10,
-        max_slower=10,
+        network, origins, origins[:2], DEPARTURE, departure_time_window=10, **extra
     )
     ticks = [line for line in buffer.getvalue().splitlines() if "% (" in line]
     # The restriction pass must not inflate the count past the origins.
     assert len(ticks) == 20
-    assert all("/40 origins" in line for line in ticks)
+    assert all("journey frontiers" in line and "/40 origins" in line for line in ticks)
+    counts = [int(re.search(r"\((\d+)/40", line).group(1)) for line in ticks]
+    assert counts == sorted(counts) and len(counts) == len(set(counts))
 
 
 def test_street_artifact_phases(helsinki_streets, tmp_path):
@@ -726,6 +690,7 @@ def test_street_artifact_phases(helsinki_streets, tmp_path):
 def test_standalone_street_build_has_the_multimodal_parent(kantakaupunki_pbf, caplog):
     from cafein import StreetNetwork
 
+    # The default-mode build reports the parent phase and its modes.
     with caplog.at_level(logging.INFO, logger="cafein"):
         StreetNetwork.from_osm(str(kantakaupunki_pbf))
     phases = [
@@ -740,11 +705,8 @@ def test_standalone_street_build_has_the_multimodal_parent(kantakaupunki_pbf, ca
         if getattr(record, "cafein_phase", None) == "build.multimodal"
     )
     assert "walk" in parent.cafein_details["modes"]
-
-
-def test_a_generator_of_modes_reports_exact_details(kantakaupunki_pbf, caplog):
-    from cafein import StreetNetwork
-
+    # A generator of modes must still report exact details.
+    caplog.clear()
     with caplog.at_level(logging.INFO, logger="cafein"):
         StreetNetwork.from_osm(str(kantakaupunki_pbf), modes=(m for m in ["walk"]))
     parent = next(
@@ -821,8 +783,10 @@ def test_progress_bar_drives_one_bar_per_label(network, monkeypatch):
     assert not [line for line in output.splitlines() if "% (" in line]
 
 
-def test_progress_bar_without_tqdm_falls_back_to_lines(network, monkeypatch):
+@pytest.mark.parametrize("filters", ["default", "error"])
+def test_progress_bar_without_tqdm_falls_back_to_lines(network, monkeypatch, filters):
     import sys
+    import warnings
 
     from cafein import TravelTimeMatrix
 
@@ -832,53 +796,18 @@ def test_progress_bar_without_tqdm_falls_back_to_lines(network, monkeypatch):
     origins = _served_stops(network, 40)
     buffer = io.StringIO()
     cafein.enable_logging(stream=buffer, progress="bar")
-    with pytest.warns(UserWarning) as caught:
-        TravelTimeMatrix(network, origins, departure=DEPARTURE)
-    missing = [
-        warning for warning in caught if "tqdm is not installed" in str(warning.message)
-    ]
-    assert len(missing) == 1
-    assert len([line for line in buffer.getvalue().splitlines() if "% (" in line]) == 20
-
-
-def test_progress_validates_eagerly():
-    with pytest.raises(TypeError, match="progress must be"):
-        cafein.enable_logging(stream=io.StringIO(), progress=True)
-    with pytest.raises(TypeError, match="progress must be"):
-        cafein.enable_logging(stream=io.StringIO(), progress=3)
-    with pytest.raises(ValueError, match="progress must be"):
-        cafein.enable_logging(stream=io.StringIO(), progress="spinner")
-
-
-def test_tick_records_carry_structured_progress(network, caplog):
-    from cafein import TravelTimeMatrix
-
-    origins = _served_stops(network, 40)
-    with caplog.at_level(logging.INFO, logger="cafein"):
-        TravelTimeMatrix(network, origins, departure=DEPARTURE)
-    ticks = [r for r in caplog.records if hasattr(r, "cafein_progress")]
-    assert len(ticks) == 20
-    for record in ticks:
-        info = record.cafein_progress
-        assert info["label"] == "travel_time_matrix"
-        assert 0 < info["done"] <= info["total"] == 40
-        assert not hasattr(record, "cafein_phase")
-    assert [r.cafein_progress["done"] for r in ticks] == sorted(
-        r.cafein_progress["done"] for r in ticks
-    )
-
-
-def test_missing_tqdm_fallback_survives_warnings_as_errors(network, monkeypatch):
-    import sys
-    import warnings
-
-    from cafein import TravelTimeMatrix
-
-    monkeypatch.setitem(sys.modules, "tqdm.auto", None)
-    origins = _served_stops(network, 40)
-    buffer = io.StringIO()
-    cafein.enable_logging(stream=buffer, progress="bar")
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        TravelTimeMatrix(network, origins, departure=DEPARTURE)
+    if filters == "default":
+        with pytest.warns(UserWarning) as caught:
+            TravelTimeMatrix(network, origins, departure=DEPARTURE)
+        missing = [
+            warning
+            for warning in caught
+            if "tqdm is not installed" in str(warning.message)
+        ]
+        assert len(missing) == 1
+    else:
+        # The missing-tqdm fallback survives warnings-as-errors too.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            TravelTimeMatrix(network, origins, departure=DEPARTURE)
     assert len([line for line in buffer.getvalue().splitlines() if "% (" in line]) == 20
