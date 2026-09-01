@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `Accessibility.from_matrix` and `NearestDestinations.from_matrix`
+  aggregate a precomputed long matrix frame — any cost axis, optional
+  percentile planes, `origins=` defining the origin universe — with
+  rows outside the universes, duplicate cells, and multi-slot frames
+  refused by name. From a seconds matrix the output is identical to
+  the routed constructors'.
+
 - `compare_matrices(a, b, columns=, ratios=)` aligns two matrix
   frames cell by cell on their id and slot keys: a `status` column
   (`both`/`only_a`/`only_b`) and `*_a`/`*_b`/`*_delta` (and `*_ratio`)
