@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Multi-slot matrices route each service date in one core call: the
+  resolved services, the engine's transfer set, the worker pool, and
+  the progress ticker are shared across the date's slots, making
+  departure-axis slot matrices 1.6-2.5x faster. Results are
+  unchanged.
+
 - `Accessibility.from_matrix` and `NearestDestinations.from_matrix`
   also take the path of a completed streamed matrix directory: the
   manifest and every shard verify (operation, completeness, schema,

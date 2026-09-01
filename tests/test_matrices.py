@@ -1858,3 +1858,70 @@ def test_the_matrix_classes_delegate_compare(network):
     assert list(by_status["both"]) == ["2022-02-22 12:00:00"]
     assert list(by_status["only_a"]) == ["2022-02-22 08:30:00"]
     assert list(by_status["only_b"]) == ["2022-02-22 16:00:00"]
+
+
+def test_slots_span_service_dates_on_both_axes(network, network_with_footpaths):
+    # Two service dates group into two core calls on the departure
+    # axis; the arrival axis loops per slot. Both must equal scalars.
+    origins = ["4810551", "1250551", "4740551"]
+    two_dates = [
+        "2022-02-22 08:30:00",
+        "2022-02-22 12:00:00",
+        "2022-02-23 08:30:00",
+    ]
+    resolutions = []
+    original = type(network)._time_matrix_with_ids
+
+    def counting(self, from_stops, date, departure, *args, **kwargs):
+        resolutions.append((date, departure))
+        return original(self, from_stops, date, departure, *args, **kwargs)
+
+    type(network)._time_matrix_with_ids = counting
+    try:
+        frame = TravelTimeMatrix(network, origins, departure=two_dates)
+    finally:
+        type(network)._time_matrix_with_ids = original
+    # One grouped core resolution per service date, each carrying its
+    # date's clock list — not one per slot.
+    assert [(date, clocks) for date, clocks in resolutions] == [
+        ("2022-02-22", ["08:30:00", "12:00:00"]),
+        ("2022-02-23", ["08:30:00"]),
+    ]
+    expected = pd.concat(
+        [
+            pd.DataFrame(TravelTimeMatrix(network, origins, departure=slot)).assign(
+                departure_time=slot
+            )
+            for slot in two_dates
+        ],
+        ignore_index=True,
+    )[list(frame.columns)]
+    pd.testing.assert_frame_equal(pd.DataFrame(frame), expected)
+    with pytest.warns(UserWarning, match="route_type"):
+        cost = TravelCostMatrix(network, origins[:2], departure=two_dates)
+    with pytest.warns(UserWarning, match="route_type"):
+        cost_expected = pd.concat(
+            [
+                pd.DataFrame(
+                    TravelCostMatrix(network, origins[:2], departure=slot)
+                ).assign(departure_time=slot)
+                for slot in two_dates
+            ],
+            ignore_index=True,
+        )[list(cost.columns)]
+    pd.testing.assert_frame_equal(pd.DataFrame(cost), cost_expected)
+    points = point_frame(network_with_footpaths, [("a", "4810551"), ("b", "1250551")])
+    deadlines = ["2022-02-22 09:30:00", "2022-02-23 09:30:00"]
+    reverse = TravelTimeMatrix(
+        network_with_footpaths, points, points, arrival=deadlines
+    )
+    for deadline in deadlines:
+        block = reverse[reverse["arrival_time"] == deadline].drop(
+            columns="arrival_time"
+        )
+        single = TravelTimeMatrix(
+            network_with_footpaths, points, points, arrival=deadline
+        )
+        pd.testing.assert_frame_equal(
+            block.reset_index(drop=True), pd.DataFrame(single)
+        )

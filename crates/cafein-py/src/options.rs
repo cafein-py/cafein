@@ -631,6 +631,31 @@ pub(super) fn parse_time(value: &str) -> PyResult<u32> {
         .ok_or_else(invalid)
 }
 
+/// A departure argument: one ``HH:MM:SS`` clock, or several on the
+/// same service date — the slot form, resolved to seconds up front so
+/// services, engines, and pools are shared across the slots.
+#[derive(FromPyObject)]
+pub(super) enum Departures {
+    #[pyo3(transparent, annotation = "str")]
+    One(String),
+    #[pyo3(transparent, annotation = "list[str]")]
+    Many(Vec<String>),
+}
+
+impl Departures {
+    pub(super) fn parsed(&self) -> PyResult<Vec<u32>> {
+        match self {
+            Departures::One(value) => Ok(vec![parse_time(value)?]),
+            Departures::Many(values) => {
+                if values.is_empty() {
+                    return Err(PyValueError::new_err("departure names no moments"));
+                }
+                values.iter().map(|value| parse_time(value)).collect()
+            }
+        }
+    }
+}
+
 pub(super) fn to_py_error(error: cafein_gtfs::Error) -> PyErr {
     PyValueError::new_err(error.to_string())
 }

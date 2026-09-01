@@ -55,8 +55,11 @@ impl TransportNetwork {
     ///     GTFS stop_ids of the origin stops.
     /// date : str
     ///     Service date as ``YYYY-MM-DD``.
-    /// departure : str
-    ///     Departure time at every origin as ``HH:MM:SS``.
+    /// departure : str or list of str
+    ///     Departure time at every origin as ``HH:MM:SS`` — or several
+    ///     clocks on the service date: the slot form, one grouped run
+    ///     whose rows index requests slot-major (every origin per
+    ///     departure, in order) through ``from``.
     /// factors : list of (str, float)
     ///     Grams CO₂e per passenger-kilometer per trip, resolved by
     ///     ``cafein.emissions.trip_factors``; NaN marks a trip without
@@ -98,7 +101,7 @@ impl TransportNetwork {
         py: Python<'_>,
         from_stops: Vec<String>,
         date: &str,
-        departure: &str,
+        departure: Departures,
         factors: Vec<(String, f64)>,
         max_transfers: u8,
         to_stops: Option<Vec<String>>,
@@ -158,7 +161,7 @@ impl TransportNetwork {
                 per_trip[trip.0 as usize] = *factor;
             }
         }
-        let departure = parse_time(departure)?;
+        let departures = departure.parsed()?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
         let inputs = CostInputs {
@@ -210,23 +213,30 @@ impl TransportNetwork {
                         .streets
                         .as_ref()
                         .expect("ultra_usable implies a street network");
-                    self.ultra_cost_matrix_rows(
-                        streets,
-                        &origins,
-                        &destinations,
-                        departure,
-                        &active_services,
-                        &active_services_previous,
-                        max_transfers,
-                        &inputs,
-                        speed,
-                        max_walking_time,
-                        max_snap_distance,
-                    )
+                    let mut rows = Vec::with_capacity(origins.len() * departures.len());
+                    for &departure in &departures {
+                        rows.extend(self.ultra_cost_matrix_rows(
+                            streets,
+                            &origins,
+                            &destinations,
+                            departure,
+                            &active_services,
+                            &active_services_previous,
+                            max_transfers,
+                            &inputs,
+                            speed,
+                            max_walking_time,
+                            max_snap_distance,
+                        ));
+                    }
+                    rows
                 } else {
-                    let requests: Vec<Request> = origins
+                    let requests: Vec<Request> = departures
                         .iter()
-                        .map(|&origin| Request {
+                        .flat_map(|&departure| {
+                            origins.iter().map(move |&origin| (departure, origin))
+                        })
+                        .map(|(departure, origin)| Request {
                             departure,
                             access: vec![(origin, 0)],
                             egress: Vec::new(),
@@ -298,7 +308,7 @@ impl TransportNetwork {
         origins: Vec<(f64, f64)>,
         destinations: Vec<(f64, f64)>,
         date: &str,
-        departure: &str,
+        departure: Departures,
         factors: Vec<(String, f64)>,
         max_transfers: u8,
         router: &str,
@@ -354,7 +364,7 @@ impl TransportNetwork {
                 per_trip[trip.0 as usize] = *factor;
             }
         }
-        let departure = parse_time(departure)?;
+        let departures = departure.parsed()?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
         let inputs = CostInputs {
@@ -380,25 +390,31 @@ impl TransportNetwork {
                 let origin_links = linked.pop().unwrap();
                 let unsnapped_from = unsnapped(&origin_links);
                 let unsnapped_to = unsnapped(&destination_links);
-                let mut requests = Vec::with_capacity(origin_links.len());
-                let mut access_meters = Vec::with_capacity(origin_links.len());
-                for links in &origin_links {
-                    let links = links.as_deref().unwrap_or(&[]);
-                    requests.push(Request {
-                        departure,
-                        access: request_offsets(links),
-                        egress: Vec::new(),
-                        active_services: active_services.clone(),
-                        active_services_previous: active_services_previous.clone(),
-                        max_transfers,
-                        exclusions: exclusions.clone(),
-                    });
-                    access_meters.push(
-                        links
-                            .iter()
-                            .map(|walk| (walk.stop, walk.meters))
-                            .collect::<HashMap<_, _>>(),
-                    );
+                // Slot-major requests: the links, egress tables, and
+                // the walk matrix below are computed once and serve
+                // every slot.
+                let count = origin_links.len() * departures.len();
+                let mut requests = Vec::with_capacity(count);
+                let mut access_meters = Vec::with_capacity(count);
+                for &departure in &departures {
+                    for links in &origin_links {
+                        let links = links.as_deref().unwrap_or(&[]);
+                        requests.push(Request {
+                            departure,
+                            access: request_offsets(links),
+                            egress: Vec::new(),
+                            active_services: active_services.clone(),
+                            active_services_previous: active_services_previous.clone(),
+                            max_transfers,
+                            exclusions: exclusions.clone(),
+                        });
+                        access_meters.push(
+                            links
+                                .iter()
+                                .map(|walk| (walk.stop, walk.meters))
+                                .collect::<HashMap<_, _>>(),
+                        );
+                    }
                 }
                 let egress = egress_tables(&destination_links);
                 let ticker =
@@ -458,7 +474,8 @@ impl TransportNetwork {
                     let (path, _) = streets.walk_path(from_point, &from, to_point, &to)?;
                     Some(wkb_multi_line_string(&[path]))
                 };
-                for (origin, origin_rows) in rows.iter_mut().enumerate() {
+                for (at, origin_rows) in rows.iter_mut().enumerate() {
+                    let origin = at % origins.len().max(1);
                     let walk_row = &walk[origin];
                     let mut reached = vec![false; destinations.len()];
                     for row in origin_rows.iter_mut() {
