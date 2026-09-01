@@ -953,11 +953,12 @@ impl TransportNetwork {
             .iter()
             .map(|stop| self.resolve_stop(stop))
             .collect::<PyResult<_>>()?;
-        let (rows, departure) = self.resolved_time_rows(
+        let departure = parse_time(departure)?;
+        let rows = self.resolved_time_rows(
             py,
             &from_stops,
             date,
-            departure,
+            &[departure],
             max_transfers,
             router,
             &exclude_routes,

@@ -23,8 +23,11 @@ impl TransportNetwork {
     ///     when an id occurs in several merged feeds.
     /// date : str
     ///     Service date as ``YYYY-MM-DD``.
-    /// departure : str
-    ///     Departure time at every origin as ``HH:MM:SS``.
+    /// departure : str or list of str
+    ///     Departure time at every origin as ``HH:MM:SS`` — or several
+    ///     clocks on the service date: the slot form, one grouped run
+    ///     sharing the resolved services, engine, worker pool, and
+    ///     progress ticker across the slots.
     /// max_transfers : int (optional, default: 7)
     ///     Maximum number of transfers between rides.
     /// router : str (optional, default: "auto")
@@ -54,7 +57,9 @@ impl TransportNetwork {
     /// numpy.ndarray
     ///     A ``(len(from_stops), stop_count)`` uint32 array of travel
     ///     times in seconds; row order follows `from_stops`, column
-    ///     order follows ``stops``. Unreachable pairs hold the maximum
+    ///     order follows ``stops``. With several departures the rows
+    ///     stack slot-major: every origin's row per departure, in
+    ///     order. Unreachable pairs hold the maximum
     ///     uint32 value (4294967295).
     #[pyo3(signature = (from_stops, date, departure, max_transfers = 7, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, workers=None))]
     #[allow(clippy::too_many_arguments)]
@@ -63,7 +68,7 @@ impl TransportNetwork {
         py: Python<'py>,
         from_stops: Vec<String>,
         date: &str,
-        departure: &str,
+        departure: Departures,
         max_transfers: u8,
         router: &str,
         exclude_routes: Vec<String>,
@@ -74,11 +79,12 @@ impl TransportNetwork {
         max_snap_distance: f64,
         workers: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray2<u32>>> {
-        let (rows, departure) = self.resolved_time_rows(
+        let departures = departure.parsed()?;
+        let rows = self.resolved_time_rows(
             py,
             &from_stops,
             date,
-            departure,
+            &departures,
             max_transfers,
             router,
             &exclude_routes,
@@ -91,8 +97,10 @@ impl TransportNetwork {
         )?;
         let stop_count = self.build.timetable.stop_count() as usize;
         let count = rows.len();
+        let per_slot = from_stops.len().max(1);
         let mut flat = Vec::with_capacity(count * stop_count);
-        for row in rows {
+        for (at, row) in rows.into_iter().enumerate() {
+            let departure = departures[at / per_slot];
             flat.extend(row.into_iter().map(|arrival| match arrival {
                 Some(arrival) => arrival - departure,
                 None => u32::MAX,
@@ -108,15 +116,17 @@ impl TransportNetwork {
     /// One-to-all arrival rows for `from_stops` — the shared engine
     /// dispatch behind the time matrix and the accessibility
     /// aggregations, so their costs are identical by construction.
-    /// Returns the rows plus the parsed departure the arrivals are
-    /// relative to.
+    /// ``departures`` holds one or more clocks on the service date;
+    /// the rows come back slot-major (every origin's row per
+    /// departure, in order), with services, engines, the worker pool,
+    /// and one progress ticker shared across the slots.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn resolved_time_rows(
         &self,
         py: Python<'_>,
         from_stops: &[String],
         date: &str,
-        departure: &str,
+        departures: &[u32],
         max_transfers: u8,
         router: &str,
         exclude_routes: &[String],
@@ -126,7 +136,7 @@ impl TransportNetwork {
         max_walking_time: f64,
         max_snap_distance: f64,
         workers: Option<usize>,
-    ) -> PyResult<(Vec<Vec<Option<u32>>>, u32)> {
+    ) -> PyResult<Vec<Vec<Option<u32>>>> {
         if !matches!(router, "auto" | "raptor" | "tbtr") {
             return Err(invalid_router(router));
         }
@@ -134,7 +144,6 @@ impl TransportNetwork {
             .iter()
             .map(|stop| self.resolve_stop(stop))
             .collect::<PyResult<_>>()?;
-        let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
         let exclusions = self.exclusion_masks(exclude_routes, exclude_trips, exclude_stops)?;
@@ -173,10 +182,14 @@ impl TransportNetwork {
         };
         let rows = py.allow_threads(|| {
             crate::workers::with_workers("travel_time_matrix", workers, || {
-                let ticker =
-                    crate::logging::ProgressTicker::new("travel_time_matrix", origins.len());
+                let ticker = crate::logging::ProgressTicker::new(
+                    "travel_time_matrix",
+                    origins.len() * departures.len(),
+                );
                 let tick = || ticker.tick();
                 if router == "tbtr" {
+                    // The date's transfer set resolves once and serves
+                    // every slot.
                     let engine = self.tbtr_engine(
                         &self.transfers,
                         date,
@@ -185,32 +198,43 @@ impl TransportNetwork {
                     );
                     let accesses: Vec<Vec<(StopIdx, u32)>> =
                         origins.iter().map(|&origin| vec![(origin, 0)]).collect();
-                    engine.one_to_all_many_with_progress(
-                        departure,
-                        &accesses,
-                        max_transfers,
-                        crate::logging::progress_hook(&ticker, &tick),
-                    )
+                    let mut rows = Vec::with_capacity(origins.len() * departures.len());
+                    for &departure in departures {
+                        rows.extend(engine.one_to_all_many_with_progress(
+                            departure,
+                            &accesses,
+                            max_transfers,
+                            crate::logging::progress_hook(&ticker, &tick),
+                        ));
+                    }
+                    rows
                 } else if let Some(speed) = ultra_speed {
                     let streets = self
                         .streets
                         .as_ref()
                         .expect("ultra_speed is set only when a street network is installed");
-                    self.ultra_matrix_rows(
-                        streets,
-                        &origins,
-                        departure,
-                        &active_services,
-                        &active_services_previous,
-                        max_transfers,
-                        speed,
-                        max_walking_time,
-                        max_snap_distance,
-                    )
+                    let mut rows = Vec::with_capacity(origins.len() * departures.len());
+                    for &departure in departures {
+                        rows.extend(self.ultra_matrix_rows(
+                            streets,
+                            &origins,
+                            departure,
+                            &active_services,
+                            &active_services_previous,
+                            max_transfers,
+                            speed,
+                            max_walking_time,
+                            max_snap_distance,
+                        ));
+                    }
+                    rows
                 } else {
-                    let requests: Vec<Request> = origins
+                    let requests: Vec<Request> = departures
                         .iter()
-                        .map(|&origin| Request {
+                        .flat_map(|&departure| {
+                            origins.iter().map(move |&origin| (departure, origin))
+                        })
+                        .map(|(departure, origin)| Request {
                             departure,
                             access: vec![(origin, 0)],
                             egress: Vec::new(),
@@ -229,7 +253,7 @@ impl TransportNetwork {
                 }
             })
         });
-        Ok((rows, departure))
+        Ok(rows)
     }
 }
 
@@ -538,7 +562,7 @@ impl TransportNetwork {
         origins: Vec<(f64, f64)>,
         destinations: Vec<(f64, f64)>,
         date: &str,
-        departure: &str,
+        departure: Departures,
         max_transfers: u8,
         router: &str,
         exclude_routes: Vec<String>,
@@ -559,7 +583,7 @@ impl TransportNetwork {
             validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
         validate_points(&origins)?;
         validate_points(&destinations)?;
-        let departure = parse_time(departure)?;
+        let departures = departure.parsed()?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
         let stop_count = self.build.timetable.stop_count() as usize;
@@ -578,9 +602,12 @@ impl TransportNetwork {
                 let origin_links = linked.pop().unwrap();
                 let unsnapped_from = unsnapped(&origin_links);
                 let unsnapped_to = unsnapped(&destination_links);
-                let requests: Vec<Request> = origin_links
+                // Slot-major requests: the links, egress tables, and
+                // walk matrix below serve every slot.
+                let requests: Vec<Request> = departures
                     .iter()
-                    .map(|links| Request {
+                    .flat_map(|&departure| origin_links.iter().map(move |links| (departure, links)))
+                    .map(|(departure, links)| Request {
                         departure,
                         access: request_offsets(links.as_deref().unwrap_or(&[])),
                         egress: Vec::new(),
@@ -595,22 +622,28 @@ impl TransportNetwork {
                     crate::logging::ProgressTicker::new("travel_time_matrix", requests.len());
                 let tick = || ticker.tick();
                 let rows: Vec<Vec<Option<u32>>> = if router == "tbtr" {
+                    // The date's transfer set resolves once and serves
+                    // every slot.
                     let engine = self.tbtr_engine(
                         self.exclusion_transfers(&exclusions),
                         date,
                         &active_services,
                         &active_services_previous,
                     );
-                    let accesses: Vec<Vec<(StopIdx, u32)>> = requests
+                    let accesses: Vec<Vec<(StopIdx, u32)>> = origin_links
                         .iter()
-                        .map(|request| request.access.clone())
+                        .map(|links| request_offsets(links.as_deref().unwrap_or(&[])))
                         .collect();
-                    engine.one_to_all_many_with_progress(
-                        departure,
-                        &accesses,
-                        max_transfers,
-                        crate::logging::progress_hook(&ticker, &tick),
-                    )
+                    let mut rows = Vec::with_capacity(requests.len());
+                    for &departure in &departures {
+                        rows.extend(engine.one_to_all_many_with_progress(
+                            departure,
+                            &accesses,
+                            max_transfers,
+                            crate::logging::progress_hook(&ticker, &tick),
+                        ));
+                    }
+                    rows
                 } else {
                     Raptor.one_to_all_many_with_progress(
                         &self.build.timetable,
@@ -619,9 +652,11 @@ impl TransportNetwork {
                         crate::logging::progress_hook(&ticker, &tick),
                     )
                 };
+                let per_slot = origin_links.len().max(1);
                 let mut flat = vec![u32::MAX; requests.len() * destination_count];
-                for (origin, arrivals) in rows.iter().enumerate() {
+                for (at, arrivals) in rows.iter().enumerate() {
                     debug_assert_eq!(arrivals.len(), stop_count);
+                    let departure = departures[at / per_slot];
                     for (point, links) in egress.iter().enumerate() {
                         let mut best = u32::MAX;
                         for &(stop, seconds, _) in links {
@@ -636,7 +671,7 @@ impl TransportNetwork {
                             best = best.min(arrival);
                         }
                         if best != u32::MAX {
-                            flat[origin * destination_count + point] = best - departure;
+                            flat[at * destination_count + point] = best - departure;
                         }
                     }
                 }
@@ -649,11 +684,13 @@ impl TransportNetwork {
                     max_walking_time,
                     max_snap_distance,
                 );
-                for (origin, row) in walk.iter().enumerate() {
-                    for (point, cell) in row.iter().enumerate() {
-                        if let Some((walk_seconds, _)) = cell {
-                            let at = origin * destination_count + point;
-                            flat[at] = flat[at].min(*walk_seconds);
+                for slot in 0..departures.len() {
+                    for (origin, row) in walk.iter().enumerate() {
+                        for (point, cell) in row.iter().enumerate() {
+                            if let Some((walk_seconds, _)) = cell {
+                                let at = (slot * per_slot + origin) * destination_count + point;
+                                flat[at] = flat[at].min(*walk_seconds);
+                            }
                         }
                     }
                 }
@@ -664,7 +701,7 @@ impl TransportNetwork {
         result.set_item(
             "matrix",
             flat.into_pyarray(py)
-                .reshape([origins.len(), destination_count])
+                .reshape([origins.len() * departures.len(), destination_count])
                 .map_err(|error| PyValueError::new_err(error.to_string()))?,
         )?;
         result.set_item("unsnapped_from", unsnapped_from.into_pyarray(py))?;

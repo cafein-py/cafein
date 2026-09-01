@@ -672,8 +672,72 @@ class TravelCostMatrix(pd.DataFrame):
                 None if fares is None else fares._flat_tables(network),
                 endpoints,
             )
+        # The Rust slot loop: default-arm slots (time objective,
+        # forward axis, no policy, no exposure) group by service date
+        # and route in one core call per date over the frozen
+        # endpoints; each slot then returns its share of the rows.
+        _slot_tables = {}
+        if (
+            multi
+            and street_policy is None
+            and not arrive_by
+            and optimize == "time"
+            and exposure is None
+            and _resolved is not None
+        ):
+            by_date = {}
+            for at, (_, slot_date, slot_clock) in enumerate(slots):
+                by_date.setdefault(slot_date, []).append((at, slot_clock))
+            for slot_date, members in by_date.items():
+                table, from_ids, to_ids = _cost_columns(
+                    network,
+                    origins,
+                    destinations,
+                    slot_date,
+                    [clock for _, clock in members],
+                    max_transfers=max_transfers,
+                    optimize=optimize,
+                    window=window,
+                    within=within,
+                    factors=factors,
+                    components=components,
+                    fares=fares,
+                    candidates=candidates,
+                    bucket=bucket,
+                    geometries=geometries,
+                    chunk=chunk,
+                    router=router,
+                    exclude_routes=exclude_routes,
+                    exclude_trips=exclude_trips,
+                    exclude_stops=exclude_stops,
+                    arrive_by=arrive_by,
+                    walking_speed_kmph=walking_speed_kmph,
+                    max_walking_time=max_walking_time,
+                    max_snap_distance=max_snap_distance,
+                    _resolved=_resolved,
+                    workers=workers,
+                )
+                rows_per_slot = len(from_ids)
+                origin_index = np.asarray(table["from"])
+                slot_of = origin_index // max(rows_per_slot, 1)
+                row_count = len(origin_index)
+                for i, (at, _) in enumerate(members):
+                    keep = slot_of == i
+                    share = {}
+                    for key, values in table.items():
+                        array = np.asarray(values)
+                        if (
+                            array.ndim >= 1
+                            and len(array) == row_count
+                            and not key.startswith("unsnapped_")
+                        ):
+                            share[key] = array[keep]
+                        else:
+                            share[key] = values
+                    share["from"] = origin_index[keep] - i * rows_per_slot
+                    _slot_tables[at] = (share, from_ids, to_ids)
         frames = []
-        for label, date, clock in slots:
+        for at, (label, date, clock) in enumerate(slots):
             data = _cost_matrix_data(
                 network,
                 origins,
@@ -716,6 +780,7 @@ class TravelCostMatrix(pd.DataFrame):
                 workers=workers,
                 arrival=arrival,
                 _resolved=_resolved,
+                _slot_table=_slot_tables.get(at),
             )
             frame = pd.DataFrame(_humanize_time_columns(data, output_time_units))
             if multi:
@@ -1348,14 +1413,57 @@ class TravelTimeMatrix(pd.DataFrame):
         exclude_routes = id_sequence("exclude_routes", exclude_routes)
         exclude_trips = id_sequence("exclude_trips", exclude_trips)
         exclude_stops = id_sequence("exclude_stops", exclude_stops)
+        # The Rust slot loop: stop-origin forward slots group by
+        # service date and route in one core call per date — services,
+        # the engine's transfer set, the worker pool, and the progress
+        # ticker resolve once, and each slot decodes its plane.
+        _slot_planes = {}
+        if (
+            multi
+            and street_policy is None
+            and not arrive_by
+            and window is None
+            and percentiles is None
+            and confidence is None
+            and not _is_street_network(network)
+            and (destinations is None or _is_point_frame(origins))
+        ):
+            by_date = {}
+            for at, (_, slot_date, slot_clock) in enumerate(slots):
+                by_date.setdefault(slot_date, []).append((at, slot_clock))
+            for slot_date, members in by_date.items():
+                matrix, from_ids, to_ids, _ = network._time_matrix_with_ids(
+                    origins,
+                    slot_date,
+                    [clock for _, clock in members],
+                    max_transfers,
+                    destinations=destinations,
+                    window=None,
+                    percentiles=None,
+                    confidence=None,
+                    chunk=chunk,
+                    router=router,
+                    exclude_routes=exclude_routes,
+                    exclude_trips=exclude_trips,
+                    exclude_stops=exclude_stops,
+                    walking_speed_kmph=walking_speed_kmph,
+                    max_walking_time=max_walking_time,
+                    max_snap_distance=max_snap_distance,
+                    workers=workers,
+                )
+                rows_per_slot = len(from_ids)
+                for i, (at, _) in enumerate(members):
+                    plane = matrix[i * rows_per_slot : (i + 1) * rows_per_slot]
+                    _slot_planes[at] = (plane, from_ids, to_ids, None)
         frames = []
-        for label, date, clock in slots:
+        for at, (label, date, clock) in enumerate(slots):
             data = _time_matrix_data(
                 network,
                 origins,
                 destinations,
                 date,
                 clock,
+                _matrix=_slot_planes.get(at),
                 arrive_by=arrive_by,
                 window=window,
                 percentiles=percentiles,
@@ -2233,6 +2341,7 @@ def _time_matrix_data(
     *,
     arrive_by,
     window,
+    _matrix=None,
     percentiles,
     confidence,
     chunk,
@@ -2392,6 +2501,7 @@ def _time_matrix_data(
         max_snap_distance=max_snap_distance,
         arrive_by=arrive_by,
         workers=workers,
+        _matrix=_matrix,
     )
 
 
@@ -2416,10 +2526,18 @@ def _time_columns(
     exclude_stops=(),
     arrive_by=False,
     workers=None,
+    _matrix=None,
 ):
-    """The reachable cells of the travel-time matrix, in long format."""
+    """The reachable cells of the travel-time matrix, in long format.
+
+    ``_matrix`` is one slot's precomputed ``(matrix, from_ids, to_ids,
+    resolved)`` plane — the date-grouped core call computes every
+    slot's rows at once and each slot decodes its own plane here."""
     if date is None or departure is None:
         raise TypeError("TravelTimeMatrix requires departure or arrival")
+    if _matrix is not None:
+        matrix, from_ids, to_ids, resolved = _matrix
+        return _time_cells(matrix, from_ids, to_ids, resolved)
     matrix, from_ids, to_ids, resolved = network._time_matrix_with_ids(
         origins,
         date,
@@ -2440,6 +2558,11 @@ def _time_columns(
         arrive_by=arrive_by,
         workers=workers,
     )
+    return _time_cells(matrix, from_ids, to_ids, resolved)
+
+
+def _time_cells(matrix, from_ids, to_ids, resolved):
+    """One matrix plane decoded into the long-format columns."""
     from_ids = np.asarray(from_ids, dtype=object)
     to_ids = np.asarray(to_ids, dtype=object)
     unreachable = np.iinfo(np.uint32).max
@@ -4313,6 +4436,7 @@ def _cost_matrix_data(
     workers,
     arrival,
     _resolved=None,
+    _slot_table=None,
 ):
     """The long-format columns of one moment's transit cost matrix,
     dispatched by street policy exactly as the constructor did."""
@@ -4541,6 +4665,7 @@ def _cost_matrix_data(
         exposure=None if exposure is None else exposure._reporting_snapshot(),
         workers=workers,
         _resolved=_resolved,
+        _slot_table=_slot_table,
     )
     if exposure is not None:
         # Re-verify the binding after the routing (the itineraries
@@ -4594,9 +4719,14 @@ def _cost_columns(
     arrive_by=False,
     exposure=None,
     _resolved=None,
+    _slot_table=None,
     workers=None,
 ):
     """The core's cost arrays plus the origin and destination ids.
+
+    ``_slot_table`` is one slot's precomputed ``(table, from_ids,
+    to_ids)`` — the date-grouped core call computes every slot's rows
+    at once and each slot returns its own share here.
 
     ``_resolved`` is the streaming form's frozen snapshot: a
     ``(trip_factors, fare_tables, endpoints)`` triple whose endpoints
@@ -4604,6 +4734,8 @@ def _cost_columns(
     to_ids, destination_points)`` or ``("stops", from_ids, to_stops)``
     — replacing the resolution below so mutable inputs are only ever
     read once (`_cost_endpoints` mirrors it and must stay in step)."""
+    if _slot_table is not None:
+        return _slot_table
     components = component_selection(components)
     exclusions = (
         list(id_sequence("exclude_routes", exclude_routes)),
