@@ -53,6 +53,8 @@ def test_columns_and_frame_type(streets, places):
     assert routes.crs == "EPSG:4326"
     assert routes.geometry.name == "geometry"
     assert (routes.distance_provenance == STREET_DISTANCE_PROVENANCE).all()
+    # Slices stay GeoDataFrames.
+    assert isinstance(routes.iloc[:1], gpd.GeoDataFrame)
 
 
 @pytest.mark.parametrize("mode", ["walk", "bicycle", "e_bike", "e_scooter"])
@@ -93,15 +95,14 @@ def test_agrees_with_the_cost_matrix(streets, places):
         assert values == pytest.approx(from_costs[pair])
 
 
-def test_absolute_times_are_absent_without_a_departure(streets, places):
+def test_a_departure_places_the_leg_on_a_clock(streets, places):
+    # Without a departure the absolute clock columns stay absent...
     routes = DetailedItineraries(streets, places, transport_mode="bicycle")
     assert routes.departure_s.isna().all()
     assert routes.arrival_s.isna().all()
     assert (routes.travel_time >= 0).all()
-
-
-def test_a_departure_places_the_leg_on_a_clock(streets, places):
-    routes = DetailedItineraries(
+    # ...and a departure fills them.
+    timed = DetailedItineraries(
         streets,
         places,
         departure="08:30:00",
@@ -109,8 +110,8 @@ def test_a_departure_places_the_leg_on_a_clock(streets, places):
         output_time_units="seconds",
     )
     start = 8 * 3600 + 30 * 60
-    assert (routes.departure_s == start).all()
-    assert (routes.arrival_s == start + routes.travel_time).all()
+    assert (timed.departure_s == start).all()
+    assert (timed.arrival_s == start + timed.travel_time).all()
 
 
 def test_geometry_runs_from_origin_to_destination(streets, places):
@@ -155,11 +156,6 @@ def test_geometries_false_drops_the_shapes(streets, places):
     assert (routes.travel_time >= 0).all()
 
 
-def test_requires_an_explicit_mode(streets, places):
-    with pytest.raises(TypeError, match="explicit transport_mode"):
-        DetailedItineraries(streets, places)
-
-
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -181,22 +177,6 @@ def test_rejects_transit_only_arguments(streets, places, kwargs):
     name = next(iter(kwargs))
     with pytest.raises(ValueError, match=f"{name}.*no meaning for a street matrix"):
         DetailedItineraries(streets, places, transport_mode="bicycle", **kwargs)
-
-
-def test_unsnappable_origin_warns(streets, places):
-    far = gpd.GeoDataFrame(
-        {"id": ["atlantic"]},
-        geometry=gpd.points_from_xy([-30.0], [0.0]),
-        crs="EPSG:4326",
-    )
-    with pytest.warns(UserWarning, match="atlantic"):
-        routes = DetailedItineraries(streets, far, places, transport_mode="bicycle")
-    assert len(routes) == 0
-
-
-def test_slices_stay_geodataframes(streets, places):
-    routes = DetailedItineraries(streets, places, transport_mode="bicycle")
-    assert isinstance(routes.iloc[:1], gpd.GeoDataFrame)
 
 
 @pytest.mark.parametrize("departure", [None, "08:30:00"])
@@ -223,27 +203,6 @@ def test_the_column_dtypes_are_the_same_with_or_without_a_departure(
         assert pd.api.types.is_string_dtype(routes[column])
     assert pd.api.types.is_string_dtype(routes.distance_provenance)
     assert routes.geometry.dtype == "geometry"
-
-
-def test_transit_itineraries_reject_the_street_keywords(network):
-    # They were unknown keywords before, so accepting and ignoring them would
-    # quietly hand back transit itineraries for a street request.
-    with pytest.raises(ValueError, match="is a street mode"):
-        DetailedItineraries(
-            network,
-            ["1010101"],
-            ["1010102"],
-            "2022-02-22 08:30:00",
-            transport_mode="bicycle",
-        )
-    with pytest.raises(ValueError, match="applies to a StreetNetwork"):
-        DetailedItineraries(
-            network,
-            ["1010101"],
-            ["1010102"],
-            "2022-02-22 08:30:00",
-            max_street_time=10,
-        )
 
 
 def test_wheelchair_dispatch_across_the_street_products(streets, places):

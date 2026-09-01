@@ -25,9 +25,6 @@ def test_sample_dem_through_a_callable():
     values = elevation.sample_dem([24.9, 25.0], [60.1, 60.2], ramp)
     assert values.dtype == np.float32
     assert values == pytest.approx([100.0, 200.0])
-
-
-def test_infinities_are_normalised_to_nan():
     # Raster nodata quirks and float32 overflow both surface as inf; the
     # stored array knows only one unavailable sentinel.
     values = elevation.sample_dem(
@@ -58,41 +55,52 @@ def test_a_callable_cannot_mutate_the_geometry():
     assert coordinates[0, 0] == 24.9
 
 
-def test_infer_structures_interpolates_by_distance():
-    # Three uneven segments; the interior vertex sits a quarter of the way
-    # along, so it takes a quarter of the climb — not half, as index-based
-    # interpolation would give.
-    offsets = np.array([0, 4])
-    lons = np.array([24.0, 24.001, 24.002, 24.004])
-    lats = np.array([60.0, 60.0, 60.0, 60.0])
-    values = np.array([0.0, 55.0, 77.0, 100.0], dtype=np.float32)
+@pytest.mark.parametrize(
+    "offsets, lons, values, expected_inferred, expected",
+    [
+        # Three uneven segments; the interior vertex sits a quarter of the
+        # way along, so it takes a quarter of the climb — not half, as
+        # index-based interpolation would give.
+        pytest.param(
+            [0, 4],
+            [24.0, 24.001, 24.002, 24.004],
+            [0.0, 55.0, 77.0, 100.0],
+            1,
+            [0.0, 25.0, 50.0, 100.0],
+            id="interpolates-by-distance",
+        ),
+        # No interior, no rewrite — and no place in the inferred count.
+        pytest.param(
+            [0, 2],
+            [24.0, 24.001],
+            [10.0, 20.0],
+            0,
+            [10.0, 20.0],
+            id="two-coordinate-structure",
+        ),
+        # A structure edge with one unavailable endpoint cannot be
+        # inferred: the interior becomes NaN, and the finite endpoint
+        # keeps its sampled value.
+        pytest.param(
+            [0, 3],
+            [24.0, 24.001, 24.002],
+            [10.0, 55.0, np.nan],
+            1,
+            [10.0, np.nan, np.nan],
+            id="finite-endpoint-next-to-nodata",
+        ),
+    ],
+)
+def test_infer_structures_interpolates_by_distance(
+    offsets, lons, values, expected_inferred, expected
+):
+    offsets = np.array(offsets)
+    lons = np.array(lons)
+    lats = np.full(len(lons), 60.0)
+    values = np.array(values, dtype=np.float32)
     inferred = elevation.infer_structures(offsets, lons, lats, values, [0])
-    assert inferred == 1
-    assert values == pytest.approx([0.0, 25.0, 50.0, 100.0])
-
-
-def test_a_two_coordinate_structure_has_nothing_to_infer():
-    # No interior, no rewrite — and no place in the inferred count.
-    offsets = np.array([0, 2])
-    values = np.array([10.0, 20.0], dtype=np.float32)
-    inferred = elevation.infer_structures(
-        offsets, np.array([24.0, 24.001]), np.array([60.0, 60.0]), values, [0]
-    )
-    assert inferred == 0
-    assert values == pytest.approx([10.0, 20.0])
-
-
-def test_infer_structures_keeps_finite_endpoints_next_to_nodata():
-    # A structure edge with one unavailable endpoint cannot be inferred: the
-    # interior becomes NaN, and the finite endpoint keeps its sampled value.
-    offsets = np.array([0, 3])
-    lons = np.array([24.0, 24.001, 24.002])
-    lats = np.array([60.0, 60.0, 60.0])
-    values = np.array([10.0, 55.0, np.nan], dtype=np.float32)
-    inferred = elevation.infer_structures(offsets, lons, lats, values, [0])
-    assert inferred == 1
-    assert values[0] == 10.0
-    assert np.isnan(values[1]) and np.isnan(values[2])
+    assert inferred == expected_inferred
+    assert values == pytest.approx(expected, nan_ok=True)
 
 
 def test_coverage_counts_the_finite_share():
@@ -183,19 +191,21 @@ def test_a_coarse_dem_interval_is_capped_at_the_stored_segment_limit(
 
 
 @pytest.mark.parametrize(
-    "metadata",
+    "elevations, metadata, match",
     [
-        ("callable", 0.0, "nan", 1.0, 0),
-        ("callable", float("inf"), "nan", 1.0, 0),
-        ("callable", 25.0, "nan", 1.5, 0),
-        ("callable", 25.0, "nan", 1.0, 2),
+        ([5.0, 6.0], ("callable", 0.0, "nan", 1.0, 0), "elevation"),
+        ([5.0, 6.0], ("callable", float("inf"), "nan", 1.0, 0), "elevation"),
+        ([5.0, 6.0], ("callable", 25.0, "nan", 1.5, 0), "elevation"),
+        ([5.0, 6.0], ("callable", 25.0, "nan", 1.0, 2), "elevation"),
+        # Metadata and elevations only travel together.
+        (None, ("callable", 25.0, "nan", 1.0, 0), "together"),
     ],
 )
-def test_bogus_elevation_metadata_is_rejected(metadata):
+def test_bogus_elevation_metadata_is_rejected(elevations, metadata, match):
     from cafein._cafein import StreetNetwork as Core
 
     zeros = [0]
-    with pytest.raises(ValueError, match="elevation"):
+    with pytest.raises(ValueError, match=match):
         Core(
             2,
             [(0, 1, 100.0)],
@@ -210,38 +220,12 @@ def test_bogus_elevation_metadata_is_rejected(metadata):
             [1],
             zeros,
             zeros,
-            [5.0, 6.0],
+            elevations,
             metadata,
         )
 
 
-def test_metadata_and_elevations_only_travel_together():
-    from cafein._cafein import StreetNetwork as Core
-
-    lons = [24.93, 24.932]
-    lats = [60.169, 60.169]
-    zeros = [0]
-    with pytest.raises(ValueError, match="together"):
-        Core(
-            2,
-            [(0, 1, 100.0)],
-            [0, 2],
-            lons,
-            lats,
-            zeros,
-            zeros,
-            zeros,
-            zeros,
-            [1],
-            [1],
-            zeros,
-            zeros,
-            None,
-            ("callable", 25.0, "nan", 1.0, 0),
-        )
-
-
-def test_stored_elevations_round_trip(elevated, tmp_path):
+def test_stored_elevations_and_metadata_round_trip(elevated, tmp_path):
     built = np.asarray(elevated._coordinate_elevations, dtype=np.float32)
     path = tmp_path / "elevated.cafein"
     elevated.save(path)
@@ -249,6 +233,10 @@ def test_stored_elevations_round_trip(elevated, tmp_path):
         loaded = StreetNetwork.load(path, mmap=mmap)
         stored = np.asarray(loaded._coordinate_elevations, dtype=np.float32)
         assert np.array_equal(stored, built, equal_nan=True)
+        assert loaded.elevation_metadata == elevated.elevation_metadata
+        assert loaded.travel_time(KAMPPI, HAKANIEMI, mode="bicycle") == (
+            elevated.travel_time(KAMPPI, HAKANIEMI, mode="bicycle")
+        )
 
 
 def test_without_a_dem_there_is_no_metadata(helsinki_streets):
@@ -271,17 +259,6 @@ def test_nodata_shows_up_in_coverage_and_the_stored_values(kantakaupunki_pbf):
     lons = np.asarray(net._coordinates)[:, 0]
     assert np.isnan(values[lons > 24.96]).all()
     assert np.isfinite(values[lons < 24.94]).mean() > 0.99
-
-
-def test_elevation_metadata_round_trips(elevated, tmp_path):
-    path = tmp_path / "elevated.cafein"
-    elevated.save(path)
-    for mmap in (False, True):
-        loaded = StreetNetwork.load(path, mmap=mmap)
-        assert loaded.elevation_metadata == elevated.elevation_metadata
-        assert loaded.travel_time(KAMPPI, HAKANIEMI, mode="bicycle") == (
-            elevated.travel_time(KAMPPI, HAKANIEMI, mode="bicycle")
-        )
 
 
 def test_dem_interval_is_validated(kantakaupunki_pbf):

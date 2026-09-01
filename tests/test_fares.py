@@ -87,9 +87,7 @@ def test_prices_follow_the_r5r_vignette(poa):
     assert poa.price(journey(ride("1112", 0), ride("1112", 1800))) == pytest.approx(9.6)
     # A route without a fare row cannot be priced.
     assert math.isnan(poa.price(journey(ride("NO_SUCH_ROUTE", 0))))
-
-
-def test_fare_cap_limits_the_total(poa):
+    # A fare cap limits the total.
     capped = fares.FareStructure(
         max_discounted_transfers=poa.max_discounted_transfers,
         transfer_time_allowance=poa.transfer_time_allowance,
@@ -386,7 +384,7 @@ def street_leg(mode, departure, seconds):
     }
 
 
-def test_street_rentals_price_beside_the_transit_fare(hsl):
+def test_street_rentals_price_beside_the_transit_fare(hsl, poa):
     scooter = fares.ZoneFareStructure(
         hsl.fares,
         hsl.fare_zones,
@@ -418,24 +416,21 @@ def test_street_rentals_price_beside_the_transit_fare(hsl):
     unmarked = journey(street_leg("e_scooter", 0, 90))
     fares.annotate_fares([unmarked], scooter)
     assert unmarked["fare"] == 0.0
-
-
-def test_unpriced_rental_modes_are_nan(hsl):
     # A ridden rental mode without a tariff prices NaN, never zero.
-    trip = journey(street_leg("e_bike", 0, 90), ride("any", 120, "1040602", "1040280"))
-    fares.annotate_fares([trip], hsl, shared_modes=("e_bike",))
-    assert math.isnan(trip["fare"])
-
-
-def test_rule_structures_price_street_rentals_too(poa):
-    priced = fares.FareStructure(
+    unpriced = journey(
+        street_leg("e_bike", 0, 90), ride("any", 120, "1040602", "1040280")
+    )
+    fares.annotate_fares([unpriced], hsl, shared_modes=("e_bike",))
+    assert math.isnan(unpriced["fare"])
+    # Rule structures price street rentals too.
+    ruled = fares.FareStructure(
         fares_per_type=poa.fares_per_type,
         fares_per_transfer=poa.fares_per_transfer,
         fares_per_route=poa.fares_per_route,
         street={"e_scooter": {"unlock": 2.0, "per_minute": 0.5}},
     )
     scoot = journey(street_leg("e_scooter", 0, 300))
-    fares.annotate_fares([scoot], priced, shared_modes=("e_scooter",))
+    fares.annotate_fares([scoot], ruled, shared_modes=("e_scooter",))
     assert scoot["fare"] == pytest.approx(2.0 + 5 * 0.5)
 
 
@@ -731,35 +726,16 @@ def test_zone_fare_frontier_routes_the_exact_engine(network, hsl_zones):
         assert frame["fare"].min() <= priced.min() + 1e-9
 
 
-def test_zone_fare_frontier_rejects_the_fast_discipline(network, hsl_zones):
+def test_zone_fare_frontier_refusals(network, hsl_zones, hsl):
     from cafein.frontier import fare_frontier
 
+    args = (network, ["4810551"], ["1250551"], "2022-02-22 08:30:00", 10)
+    # Zone structures route through the exact zone engine; the fast
+    # discipline stays rule-based-only.
     with pytest.raises(ValueError, match="always exact"):
-        fare_frontier(
-            network,
-            ["4810551"],
-            ["1250551"],
-            "2022-02-22 08:30:00",
-            10,
-            hsl_zones,
-            cutoffs=[4.50],
-            exact=False,
-        )
-
-
-def test_zone_fare_frontier_names_the_grant_limitation(network, hsl):
+        fare_frontier(*args, hsl_zones, cutoffs=[4.50], exact=False)
     # The default reading carries route/OD grants the compiled pricer
     # rejects; the frontier must say how to proceed, not fail deep in
     # the core.
-    from cafein.frontier import fare_frontier
-
     with pytest.raises(ValueError, match='rules="zones"'):
-        fare_frontier(
-            network,
-            ["4810551"],
-            ["1250551"],
-            "2022-02-22 08:30:00",
-            10,
-            hsl,
-            cutoffs=[4.10],
-        )
+        fare_frontier(*args, hsl, cutoffs=[4.10])

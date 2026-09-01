@@ -50,11 +50,6 @@ def test_stop_itinerary_pins_the_k_train(network):
     assert (walks["emissions"] == 0.0).all()
     assert walks["trip_id"].isna().all()
 
-
-def test_options_are_a_pareto_set(network):
-    itineraries = DetailedItineraries(
-        network, ["4810551"], ["1250551"], "2022-02-22 08:30:00"
-    )
     # Each option is one journey; later options ride more and arrive
     # earlier, matching the routing Pareto contract.
     arrivals, rides = {}, {}
@@ -189,33 +184,32 @@ def test_pareto_candidates_add_the_cleaner_slower_journey(network):
     assert cleanest(pareto_it) < cleanest(time_it)
 
 
-def test_pareto_and_router_options_are_validated(network):
-    with pytest.raises(ValueError, match="candidates must be"):
-        DetailedItineraries(
-            network,
-            ["4810551"],
-            ["1250551"],
-            "2022-02-22 08:30:00",
-            candidates="nonsense",
-        )
-    with pytest.raises(ValueError, match="requires candidates='pareto'"):
-        DetailedItineraries(
-            network,
-            ["4810551"],
-            ["1250551"],
-            "2022-02-22 08:30:00",
-            candidates="time",
-            router="tbtr",
-        )
-    with pytest.raises(ValueError, match="'auto', 'raptor', or 'tbtr'"):
-        DetailedItineraries(
-            network,
-            ["4810551"],
-            ["1250551"],
-            "2022-02-22 08:30:00",
-            candidates="pareto",
-            router="nonsense",
-        )
+def test_candidate_and_router_options_are_validated(network):
+    stops = (["4810551"], ["1250551"])
+    for kwargs, match in (
+        # The candidates and router values themselves.
+        ({"candidates": "nonsense"}, "candidates must be"),
+        ({"candidates": "time", "router": "tbtr"}, "requires candidates='pareto'"),
+        (
+            {"candidates": "pareto", "router": "nonsense"},
+            "'auto', 'raptor', or 'tbtr'",
+        ),
+        # The relaxed options.
+        ({"candidates": "relaxed", "router": "tbtr"}, "requires candidates='pareto'"),
+        ({"candidates": "relaxed", "tolerance_minutes": -5}, "tolerance"),
+        ({"candidates": "relaxed", "max_options": 0}, "max_options"),
+        # The diverse options.
+        ({"candidates": "diverse", "router": "tbtr"}, "requires candidates='pareto'"),
+        ({"candidates": "diverse", "max_options": 0}, "max_options"),
+        ({"candidates": "diverse", "diversity": "closest"}, "diversity must be"),
+        ({"candidates": "diverse", "tolerance_minutes": -1}, "tolerance_minutes"),
+        ({"candidates": "diverse", "penalty": -5}, "penalty must be"),
+        ({"candidates": "diverse", "penalty": 0}, "penalty must be"),
+        ({"candidates": "diverse", "penalty": "nope"}, "penalty must be"),
+        ({"candidates": "pareto", "penalty": 300}, "penalty applies only"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            DetailedItineraries(network, *stops, "2022-02-22 08:30:00", **kwargs)
 
 
 def _option_summaries(itineraries):
@@ -271,34 +265,6 @@ def test_relaxed_itineraries_widen_the_pareto_options(network):
     assert capped == pareto
 
 
-def test_relaxed_itinerary_options_are_validated(network):
-    stops = (["4810551"], ["1250551"])
-    with pytest.raises(ValueError, match="requires candidates='pareto'"):
-        DetailedItineraries(
-            network,
-            *stops,
-            "2022-02-22 08:30:00",
-            candidates="relaxed",
-            router="tbtr",
-        )
-    with pytest.raises(ValueError, match="tolerance"):
-        DetailedItineraries(
-            network,
-            *stops,
-            "2022-02-22 08:30:00",
-            candidates="relaxed",
-            tolerance_minutes=-5,
-        )
-    with pytest.raises(ValueError, match="max_options"):
-        DetailedItineraries(
-            network,
-            *stops,
-            "2022-02-22 08:30:00",
-            candidates="relaxed",
-            max_options=0,
-        )
-
-
 def _itinerary_corridors(itineraries):
     return [
         frozenset(group.loc[group["leg_type"] == "transit", "route_id"])
@@ -342,59 +308,6 @@ def test_diverse_itineraries_stop_at_a_single_corridor(network):
         max_options=5,
     )
     assert itineraries["option"].nunique() == 1
-
-
-def test_diverse_itinerary_options_are_validated(network):
-    stops = (["4810551"], ["1250551"])
-    with pytest.raises(ValueError, match="requires candidates='pareto'"):
-        DetailedItineraries(
-            network,
-            *stops,
-            "2022-02-22 08:30:00",
-            candidates="diverse",
-            router="tbtr",
-        )
-    with pytest.raises(ValueError, match="max_options"):
-        DetailedItineraries(
-            network,
-            *stops,
-            "2022-02-22 08:30:00",
-            candidates="diverse",
-            max_options=0,
-        )
-    with pytest.raises(ValueError, match="diversity must be"):
-        DetailedItineraries(
-            network,
-            *stops,
-            "2022-02-22 08:30:00",
-            candidates="diverse",
-            diversity="closest",
-        )
-    with pytest.raises(ValueError, match="tolerance_minutes"):
-        DetailedItineraries(
-            network,
-            *stops,
-            "2022-02-22 08:30:00",
-            candidates="diverse",
-            tolerance_minutes=-1,
-        )
-    for bad in (-5, 0, "nope"):
-        with pytest.raises(ValueError, match="penalty must be"):
-            DetailedItineraries(
-                network,
-                *stops,
-                "2022-02-22 08:30:00",
-                candidates="diverse",
-                penalty=bad,
-            )
-    with pytest.raises(ValueError, match="penalty applies only"):
-        DetailedItineraries(
-            network,
-            *stops,
-            "2022-02-22 08:30:00",
-            candidates="pareto",
-            penalty=300,
-        )
 
 
 def test_diverse_itineraries_keep_picking_past_the_walking_journey(

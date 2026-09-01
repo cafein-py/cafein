@@ -28,24 +28,17 @@ def test_from_osm_builds_a_routable_graph(helsinki_network):
     assert "StreetNetwork" in repr(helsinki_network)
 
 
-def test_cycling_is_faster_than_walking(helsinki_network):
-    walk = helsinki_network.travel_time(KAMPPI, HAKANIEMI, mode="walk")
-    bicycle = helsinki_network.travel_time(KAMPPI, HAKANIEMI, mode="bicycle")
-    assert walk is not None and bicycle is not None
-    assert bicycle < walk
-
-
 def test_every_shipped_mode_routes(helsinki_network):
+    times = {}
     for mode in ("walk", "bicycle", "e_bike", "e_scooter", "wheelchair"):
-        assert helsinki_network.travel_time(KAMPPI, HAKANIEMI, mode=mode) is not None
-
-
-def test_repeated_queries_reuse_the_cached_profile(helsinki_network):
+        times[mode] = helsinki_network.travel_time(KAMPPI, HAKANIEMI, mode=mode)
+        assert times[mode] is not None
+    # Cycling is faster than walking over the same pair.
+    assert times["bicycle"] < times["walk"]
     # The compiled profile is cached by exact definition; a second query must
     # return the same answer, not a stale or divergent one.
-    first = helsinki_network.travel_time(KAMPPI, HAKANIEMI, mode="bicycle")
-    second = helsinki_network.travel_time(KAMPPI, HAKANIEMI, mode="bicycle")
-    assert first == second
+    repeated = helsinki_network.travel_time(KAMPPI, HAKANIEMI, mode="bicycle")
+    assert repeated == times["bicycle"]
 
 
 def test_unreachable_within_the_cutoff_is_none(helsinki_network):
@@ -68,14 +61,11 @@ def test_a_coordinate_routes_to_itself_in_zero_seconds(helsinki_network):
         helsinki_network.travel_time(KAMPPI, KAMPPI, mode="walk", max_travel_time=0.0)
         == 0
     )
-    # An off-network coordinate is still an error, not a silent zero.
+    # An off-network coordinate is still an error, not a silent zero — and
+    # unreachable and unsnappable are different answers: one is None, the
+    # other names the offending endpoint.
     with pytest.raises(ValueError, match="origin"):
         helsinki_network.travel_time(NOWHERE, NOWHERE, mode="walk")
-
-
-def test_unsnappable_coordinate_raises_rather_than_returning_none(helsinki_network):
-    # Unreachable and unsnappable are different answers: one is None, the
-    # other names the offending endpoint.
     with pytest.raises(ValueError, match="origin"):
         helsinki_network.travel_time(NOWHERE, HAKANIEMI, mode="walk")
     with pytest.raises(ValueError, match="destination"):
@@ -135,34 +125,23 @@ def _streets_section(path):
     return sections[2]
 
 
-def test_round_trip_preserves_the_graph_and_its_routes(helsinki_network, artifact):
-    loaded = StreetNetwork.load(artifact)
-    assert loaded.vertex_count == helsinki_network.vertex_count
-    assert loaded.edge_count == helsinki_network.edge_count
-    assert not loaded.mapped
+@pytest.mark.parametrize("mmap", [False, True], ids=["owned", "mapped"])
+def test_round_trip_preserves_the_graph_and_its_routes(
+    helsinki_network, artifact, mmap_available, mmap
+):
+    if mmap and not mmap_available:
+        pytest.skip("memory mapping unavailable in this environment")
+    loaded = StreetNetwork.load(artifact, mmap=mmap)
+    assert loaded.mapped == mmap
+    if not mmap:
+        assert loaded.vertex_count == helsinki_network.vertex_count
+        assert loaded.edge_count == helsinki_network.edge_count
+    # The multimodal per-arc permissions survive too: a bicycle route only
+    # works when they do — the profile-aware snap needs them to find a
+    # street bikes may use, and the compiler refuses a non-walk profile on
+    # a graph with no attributes.
     for mode in ("walk", "bicycle", "e_bike", "e_scooter", "wheelchair"):
         assert loaded.travel_time(KAMPPI, HAKANIEMI, mode=mode) == (
-            helsinki_network.travel_time(KAMPPI, HAKANIEMI, mode=mode)
-        )
-
-
-def test_round_trip_preserves_the_multimodal_permissions(helsinki_network, artifact):
-    # A bicycle route only works when the per-arc permissions survive: the
-    # profile-aware snap needs them to find a street bikes may use, and the
-    # compiler refuses a non-walk profile on a graph with no attributes.
-    loaded = StreetNetwork.load(artifact)
-    bicycle = loaded.travel_time(KAMPPI, HAKANIEMI, mode="bicycle")
-    assert bicycle is not None
-    assert bicycle == helsinki_network.travel_time(KAMPPI, HAKANIEMI, mode="bicycle")
-
-
-def test_mapped_load_routes_identically(helsinki_network, artifact, mmap_available):
-    if not mmap_available:
-        pytest.skip("memory mapping unavailable in this environment")
-    mapped = StreetNetwork.load(artifact, mmap=True)
-    assert mapped.mapped
-    for mode in ("walk", "bicycle", "e_bike", "e_scooter", "wheelchair"):
-        assert mapped.travel_time(KAMPPI, HAKANIEMI, mode=mode) == (
             helsinki_network.travel_time(KAMPPI, HAKANIEMI, mode=mode)
         )
 
@@ -195,18 +174,17 @@ def test_mmap_require_errors_when_mapping_is_disabled(artifact, monkeypatch):
     assert not StreetNetwork.load(artifact, mmap=True).mapped
 
 
-def test_rejects_an_artifact_of_the_wrong_kind(artifact, network, tmp_path):
+def test_bad_artifacts_and_load_options_are_refused(artifact, network, tmp_path):
     from cafein import TransportNetwork
 
+    # An artifact of the wrong kind is named as such in both directions.
     network_path = tmp_path / "network.cafein"
     network.save(network_path)
     with pytest.raises(ValueError, match="not a cafein street artifact"):
         StreetNetwork.load(network_path)
     with pytest.raises(ValueError, match="not a cafein network artifact"):
         TransportNetwork.load(artifact)
-
-
-def test_corrupted_payload_fails_its_checksum(artifact, tmp_path):
+    # A corrupted payload fails its checksum.
     damaged = tmp_path / "damaged.cafein"
     payload = bytearray(artifact.read_bytes())
     offset = _streets_section(artifact)[0]
@@ -214,16 +192,12 @@ def test_corrupted_payload_fails_its_checksum(artifact, tmp_path):
     damaged.write_bytes(payload)
     with pytest.raises(ValueError, match="checksum mismatch"):
         StreetNetwork.load(damaged)
-
-
-def test_truncated_artifact_is_refused(artifact, tmp_path):
+    # A truncated artifact is refused.
     truncated = tmp_path / "truncated.cafein"
     truncated.write_bytes(artifact.read_bytes()[:64])
     with pytest.raises(ValueError):
         StreetNetwork.load(truncated)
-
-
-def test_rejects_an_unknown_mmap_mode(artifact):
+    # And so is an unknown mmap mode.
     with pytest.raises(ValueError, match="mmap must be"):
         StreetNetwork.load(artifact, mmap="sometimes")
 

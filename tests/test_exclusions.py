@@ -45,9 +45,7 @@ def test_excluding_used_supply_reroutes(two_line_network):
     assert by_trip
     assert not (used(by_trip, "trip_id") & trips)
     assert used(by_trip, "route_id") & routes
-
-
-def test_excluded_origin_or_destination_is_unreachable(two_line_network):
+    # An excluded origin or destination is unreachable.
     assert (
         two_line_network.route_between_stops("A", "B", DEPARTURE, exclude_stops=["A"])
         == []
@@ -56,10 +54,7 @@ def test_excluded_origin_or_destination_is_unreachable(two_line_network):
         two_line_network.route_between_stops("A", "B", DEPARTURE, exclude_stops=["B"])
         == []
     )
-
-
-def test_unknown_route_and_trip_ids_are_ignored(two_line_network):
-    baseline = two_line_network.route_between_stops("A", "B", DEPARTURE)
+    # Unknown route and trip ids are ignored.
     same = two_line_network.route_between_stops(
         "A",
         "B",
@@ -165,10 +160,14 @@ def filtered_feed(source, target, drop_route):
 
 
 def test_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
-    from cafein import TransportNetwork
+    from cafein import TransportNetwork, journey_frontier
 
     baseline = two_line_network.route_between_stops("A", "B", DEPARTURE)
     excluded = sorted(used(baseline, "route_id"))[0]
+    source = build_two_line_gtfs(tmp_path / "full.zip")
+    rebuilt = TransportNetwork.from_gtfs(
+        [str(filtered_feed(source, tmp_path / "without.zip", excluded))]
+    )
 
     def normalized(journeys):
         return [
@@ -182,27 +181,13 @@ def test_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
     with_exclusions = two_line_network.route_between_stops(
         "A", "B", DEPARTURE, exclude_routes=[excluded]
     )
-    source = build_two_line_gtfs(tmp_path / "full.zip")
-    rebuilt = TransportNetwork.from_gtfs(
-        [str(filtered_feed(source, tmp_path / "without.zip", excluded))]
-    )
     oracle = rebuilt.route_between_stops("A", "B", DEPARTURE)
     assert normalized(with_exclusions) == normalized(oracle)
     assert with_exclusions
-
-
-def test_frontier_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
-    from cafein import TransportNetwork, journey_frontier
-
+    # The frontier families agree with the rebuilt feed too.
     columns = ["departure_s", "arrival_s", "travel_time", "rides", "frontier"]
-    baseline = two_line_network.route_between_stops("A", "B", DEPARTURE)
-    excluded = sorted(used(baseline, "route_id"))[0]
-    source = build_two_line_gtfs(tmp_path / "full.zip")
-    rebuilt = TransportNetwork.from_gtfs(
-        [str(filtered_feed(source, tmp_path / "without.zip", excluded))]
-    )
     for candidates in ("time", "pareto", "relaxed"):
-        with_exclusions = journey_frontier(
+        frame = journey_frontier(
             two_line_network,
             "A",
             "B",
@@ -211,11 +196,11 @@ def test_frontier_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
             candidates=candidates,
             exclude_routes=[excluded],
         )
-        oracle = journey_frontier(
+        oracle_frame = journey_frontier(
             rebuilt, "A", "B", DEPARTURE, 30, candidates=candidates
         )
-        assert len(with_exclusions) > 0, candidates
-        assert with_exclusions[columns].equals(oracle[columns]), candidates
+        assert len(frame) > 0, candidates
+        assert frame[columns].equals(oracle_frame[columns]), candidates
 
 
 def test_unknown_only_ids_leave_the_router_untouched(two_line_network):
@@ -262,8 +247,17 @@ def test_itineraries_take_exclusions(network_with_footpaths):
     assert not (set(rerouted["route_id"].dropna()) & ridden)
 
 
-def test_matrix_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
-    from cafein import TransportNetwork, TravelTimeMatrix
+def test_computer_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
+    import pytest as _pytest
+
+    from cafein import (
+        TransportNetwork,
+        TravelCostMatrix,
+        TravelTimeMatrix,
+        frontier_table,
+        journey_frontiers,
+        travel_cost_table,
+    )
 
     legs = two_line_network.route_between_stops("A", "B", DEPARTURE)
     excluded = sorted(used(legs, "route_id"))[0]
@@ -282,6 +276,47 @@ def test_matrix_exclusions_match_a_rebuilt_feed(two_line_network, tmp_path):
     assert two_line_network.travel_times_from_stop(
         "A", DEPARTURE, exclude_routes=[excluded]
     ) == rebuilt.travel_times_from_stop("A", DEPARTURE)
+    # So do the batched frontier surfaces.
+    args = (["A"], ["B"], DEPARTURE, 30)
+    frame = journey_frontiers(two_line_network, *args, exclude_routes=[excluded])
+    oracle_rows = journey_frontiers(rebuilt, *args)
+    assert len(frame) > 0
+    assert frame.equals(oracle_rows)
+    flat = frontier_table(two_line_network, *args, exclude_routes=[excluded])
+    flat_oracle = frontier_table(rebuilt, *args)
+    assert flat.equals(flat_oracle)
+    # The band composes: its bounds count only the surviving supply —
+    # on the journey and flat-table forms alike.
+    banded = journey_frontiers(
+        two_line_network, *args, exclude_routes=[excluded], max_slower=0
+    )
+    assert banded.equals(journey_frontiers(rebuilt, *args, max_slower=0))
+    banded_flat = frontier_table(
+        two_line_network, *args, exclude_routes=[excluded], max_slower=0
+    )
+    assert banded_flat.equals(frontier_table(rebuilt, *args, max_slower=0))
+    # And the cost surfaces.
+    cost_args = (["A"], None, DEPARTURE)
+    fastest = TravelCostMatrix(two_line_network, *cost_args, exclude_routes=[excluded])
+    assert len(fastest) > 0
+    assert fastest.equals(TravelCostMatrix(rebuilt, *cost_args))
+    windowed = TravelCostMatrix(
+        two_line_network,
+        *cost_args,
+        optimize="emissions",
+        departure_time_window=30,
+        exclude_routes=[excluded],
+    )
+    assert windowed.equals(
+        TravelCostMatrix(
+            rebuilt, *cost_args, optimize="emissions", departure_time_window=30
+        )
+    )
+    _pytest.importorskip("pyarrow")
+    flat_cost = travel_cost_table(
+        two_line_network, *cost_args, exclude_routes=[excluded]
+    )
+    assert flat_cost.equals(travel_cost_table(rebuilt, *cost_args))
 
 
 def test_matrix_exclusions_router_contract(two_line_network):
@@ -311,35 +346,6 @@ def test_matrix_exclusions_router_contract(two_line_network):
     assert empty.empty
 
 
-def test_batched_frontiers_match_a_rebuilt_feed(two_line_network, tmp_path):
-    from cafein import TransportNetwork, frontier_table, journey_frontiers
-
-    legs = two_line_network.route_between_stops("A", "B", DEPARTURE)
-    excluded = sorted(used(legs, "route_id"))[0]
-    source = build_two_line_gtfs(tmp_path / "full.zip")
-    rebuilt = TransportNetwork.from_gtfs(
-        [str(filtered_feed(source, tmp_path / "without.zip", excluded))]
-    )
-    args = (["A"], ["B"], DEPARTURE, 30)
-    frame = journey_frontiers(two_line_network, *args, exclude_routes=[excluded])
-    oracle = journey_frontiers(rebuilt, *args)
-    assert len(frame) > 0
-    assert frame.equals(oracle)
-    flat = frontier_table(two_line_network, *args, exclude_routes=[excluded])
-    flat_oracle = frontier_table(rebuilt, *args)
-    assert flat.equals(flat_oracle)
-    # The band composes: its bounds count only the surviving supply —
-    # on the journey and flat-table forms alike.
-    banded = journey_frontiers(
-        two_line_network, *args, exclude_routes=[excluded], max_slower=0
-    )
-    assert banded.equals(journey_frontiers(rebuilt, *args, max_slower=0))
-    banded_flat = frontier_table(
-        two_line_network, *args, exclude_routes=[excluded], max_slower=0
-    )
-    assert banded_flat.equals(frontier_table(rebuilt, *args, max_slower=0))
-
-
 def test_batched_frontier_router_contract(two_line_network, capfd, monkeypatch):
     from cafein import journey_frontiers
 
@@ -364,11 +370,11 @@ def test_batched_frontier_router_contract(two_line_network, capfd, monkeypatch):
     assert len(unknown) > 0
 
 
-def test_point_frontiers_take_exclusions(network_with_footpaths):
+def test_point_forms_take_exclusions(network_with_footpaths):
     import geopandas as gpd
     from shapely.geometry import Point
 
-    from cafein import frontier_table, journey_frontiers
+    from cafein import TravelCostMatrix, frontier_table, journey_frontiers
 
     origins = gpd.GeoDataFrame(
         {"id": ["origin"]}, geometry=[Point(24.9330, 60.1689)], crs="EPSG:4326"
@@ -398,36 +404,45 @@ def test_point_frontiers_take_exclusions(network_with_footpaths):
         assert not excluded.equals(baseline)
         with pytest.raises(ValueError, match="exclusions require router='raptor'"):
             wrapper(*args, router="tbtr", exclude_routes=ridden)
-
-
-def test_cost_matrices_match_a_rebuilt_feed(two_line_network, tmp_path):
-    import pytest as _pytest
-
-    from cafein import TransportNetwork, TravelCostMatrix, travel_cost_table
-
-    legs = two_line_network.route_between_stops("A", "B", DEPARTURE)
-    excluded = sorted(used(legs, "route_id"))[0]
-    source = build_two_line_gtfs(tmp_path / "full.zip")
-    rebuilt = TransportNetwork.from_gtfs(
-        [str(filtered_feed(source, tmp_path / "without.zip", excluded))]
+    # A long pair (Korso-ish to the centre) where transit wins, so the
+    # walking alternative cannot mask the exclusions on the cost
+    # surfaces.
+    coords = {
+        stop: (lat, lon)
+        for stop, lat, lon in network_with_footpaths.stops
+        if lat is not None
+    }
+    from_lat, from_lon = coords["1100602"]
+    to_lat, to_lon = coords["1040280"]
+    origins = gpd.GeoDataFrame(
+        {"id": ["origin"]}, geometry=[Point(from_lon, from_lat)], crs="EPSG:4326"
     )
-    args = (["A"], None, DEPARTURE)
-    fastest = TravelCostMatrix(two_line_network, *args, exclude_routes=[excluded])
-    assert len(fastest) > 0
-    assert fastest.equals(TravelCostMatrix(rebuilt, *args))
-    windowed = TravelCostMatrix(
-        two_line_network,
-        *args,
-        optimize="emissions",
-        departure_time_window=30,
-        exclude_routes=[excluded],
+    destinations = gpd.GeoDataFrame(
+        {"id": ["destination"]}, geometry=[Point(to_lon, to_lat)], crs="EPSG:4326"
     )
-    assert windowed.equals(
-        TravelCostMatrix(rebuilt, *args, optimize="emissions", departure_time_window=30)
+    legs = network_with_footpaths.route_between_coordinates(
+        (from_lat, from_lon), (to_lat, to_lon), "2022-02-22 08:30:00"
     )
-    _pytest.importorskip("pyarrow")
-    flat = travel_cost_table(two_line_network, *args, exclude_routes=[excluded])
-    assert flat.equals(travel_cost_table(rebuilt, *args))
+    ridden = sorted(used(legs, "route_id"))
+    assert ridden
+    args = (network_with_footpaths, origins, destinations, "2022-02-22 08:30:00")
+    for kwargs in ({}, {"optimize": "emissions", "departure_time_window": 30}):
+        with pytest.warns(UserWarning, match="route_type"):
+            baseline = TravelCostMatrix(*args, **kwargs)
+        with pytest.warns(UserWarning, match="route_type"):
+            excluded = TravelCostMatrix(*args, exclude_routes=ridden, **kwargs)
+        with pytest.warns(UserWarning, match="route_type"):
+            raptor = TravelCostMatrix(
+                *args, router="raptor", exclude_routes=ridden, **kwargs
+            )
+        # The point forms honour the exclusions: auto equals raptor
+        # under them, and the fastest form loses its excluded corridor
+        # (the emissions pick may already avoid it).
+        assert excluded.equals(raptor)
+        if not kwargs:
+            assert not excluded.equals(baseline)
+        with pytest.raises(ValueError, match="exclusions require router='raptor'"):
+            TravelCostMatrix(*args, router="tbtr", exclude_routes=ridden, **kwargs)
 
 
 def test_cost_matrix_router_contract(two_line_network):
@@ -479,49 +494,3 @@ def test_cost_matrix_unknown_ids_keep_the_cache(two_line_network, capfd, monkeyp
     capfd.readouterr()
     TravelCostMatrix(*args, exclude_routes=excluded, **kwargs)
     assert "MCRAPTOR-STATS" in capfd.readouterr().err
-
-
-def test_point_cost_matrices_take_exclusions(network_with_footpaths):
-    import geopandas as gpd
-    from shapely.geometry import Point
-
-    from cafein import TravelCostMatrix
-
-    # A long pair (Korso-ish to the centre) where transit wins, so the
-    # walking alternative cannot mask the exclusions.
-    coords = {
-        stop: (lat, lon)
-        for stop, lat, lon in network_with_footpaths.stops
-        if lat is not None
-    }
-    from_lat, from_lon = coords["1100602"]
-    to_lat, to_lon = coords["1040280"]
-    origins = gpd.GeoDataFrame(
-        {"id": ["origin"]}, geometry=[Point(from_lon, from_lat)], crs="EPSG:4326"
-    )
-    destinations = gpd.GeoDataFrame(
-        {"id": ["destination"]}, geometry=[Point(to_lon, to_lat)], crs="EPSG:4326"
-    )
-    legs = network_with_footpaths.route_between_coordinates(
-        (from_lat, from_lon), (to_lat, to_lon), "2022-02-22 08:30:00"
-    )
-    ridden = sorted(used(legs, "route_id"))
-    assert ridden
-    args = (network_with_footpaths, origins, destinations, "2022-02-22 08:30:00")
-    for kwargs in ({}, {"optimize": "emissions", "departure_time_window": 30}):
-        with pytest.warns(UserWarning, match="route_type"):
-            baseline = TravelCostMatrix(*args, **kwargs)
-        with pytest.warns(UserWarning, match="route_type"):
-            excluded = TravelCostMatrix(*args, exclude_routes=ridden, **kwargs)
-        with pytest.warns(UserWarning, match="route_type"):
-            raptor = TravelCostMatrix(
-                *args, router="raptor", exclude_routes=ridden, **kwargs
-            )
-        # The point forms honour the exclusions: auto equals raptor
-        # under them, and the fastest form loses its excluded corridor
-        # (the emissions pick may already avoid it).
-        assert excluded.equals(raptor)
-        if not kwargs:
-            assert not excluded.equals(baseline)
-        with pytest.raises(ValueError, match="exclusions require router='raptor'"):
-            TravelCostMatrix(*args, router="tbtr", exclude_routes=ridden, **kwargs)

@@ -21,7 +21,8 @@ def frame():
 
 
 def test_converts_every_seconds_column():
-    minutes = to_minutes(frame())
+    original = frame()
+    minutes = to_minutes(original)
     assert list(minutes.columns) == [
         "from_id",
         "travel_time_min",
@@ -32,19 +33,12 @@ def test_converts_every_seconds_column():
     ]
     assert minutes.travel_time_min.tolist() == [1983 / 60, 10.0]
     assert minutes.departure_min.tolist() == [510.0, 510.0]
-
-
-def test_leaves_the_source_frame_untouched():
-    original = frame()
-    to_minutes(original)
-    assert "travel_time_s" in original.columns
-    assert original.travel_time_s.tolist() == [1983, 600]
-
-
-def test_leaves_non_time_columns_alone():
-    minutes = to_minutes(frame())
+    # Non-time columns ride along untouched.
     assert minutes.distance_m.tolist() == [1982.2, 500.0]
     assert "distance_provenance" in minutes.columns
+    # And the source frame itself is left untouched.
+    assert "travel_time_s" in original.columns
+    assert original.travel_time_s.tolist() == [1983, 600]
 
 
 def test_converts_only_the_named_columns():
@@ -53,13 +47,9 @@ def test_converts_only_the_named_columns():
     # The others keep their seconds.
     assert "departure_s" in minutes.columns
     assert "arrival_s" in minutes.columns
-
-
-def test_accepts_a_column_named_with_its_suffix():
+    # A column may be named with its suffix too.
     assert "travel_time_min" in to_minutes(frame(), ["travel_time_s"]).columns
-
-
-def test_unknown_column_raises():
+    # A non-seconds column refuses by name.
     with pytest.raises(KeyError, match="not a seconds column"):
         to_minutes(frame(), ["distance"])
 

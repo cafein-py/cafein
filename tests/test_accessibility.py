@@ -271,91 +271,99 @@ def test_the_computer_routes_point_frames_door_to_door(network_with_footpaths):
     assert got == expected
 
 
-def test_the_computer_serves_street_modes(helsinki_streets):
-    geopandas = pytest.importorskip("geopandas")
-    from cafein import Accessibility
-
-    origins = geopandas.GeoDataFrame(
-        {"id": ["o1", "o2"]},
-        geometry=geopandas.points_from_xy([24.9384, 24.9600], [60.1699, 60.1866]),
-        crs="EPSG:4326",
-    )
-    destinations = geopandas.GeoDataFrame(
-        {"id": ["d1", "d2", "d3"]},
-        geometry=geopandas.points_from_xy(
-            [24.9414, 24.9509, 24.9210], [60.1725, 60.1798, 60.1580]
-        ),
-        crs="EPSG:4326",
-    )
-    frame = Accessibility(
-        helsinki_streets,
-        origins,
-        destinations,
-        transport_mode="walk",
-        budgets=(10.0, 30.0),
-    )
-    assert len(frame) == 4
-    wide = frame.pivot(index="from_id", columns="budget", values="accessibility")
-    assert (wide[10.0] <= wide[30.0]).all()
-    assert (wide[30.0] <= 3.0).all()
-
-
 def test_the_computer_validates_eagerly(network, helsinki_streets):
     import pandas
 
+    geopandas = pytest.importorskip("geopandas")
     from cafein import Accessibility
 
     origins, destinations = _stop_sets(network)
     table = pandas.DataFrame({"id": destinations, "jobs": 1.0})
-
-    with pytest.raises(ValueError, match="unknown decay"):
-        Accessibility(network, origins, table, DEPARTURE, decay="gravity")
-    with pytest.raises(ValueError, match="decay_params"):
-        Accessibility(network, origins, table, DEPARTURE, decay="linear")
-    with pytest.raises(TypeError, match="budgets"):
-        Accessibility(network, origins, table, DEPARTURE, budgets="1800")
-    with pytest.raises(ValueError, match="no column"):
-        Accessibility(network, origins, table, DEPARTURE, opportunities="people")
-    with pytest.raises(ValueError, match="max_travel_time"):
-        Accessibility(network, origins, table, DEPARTURE, max_travel_time=30)
-    with pytest.raises(ValueError, match="null value"):
-        nulled = table.assign(jobs=[None] + [1.0] * (len(table) - 1))
-        Accessibility(network, origins, nulled, DEPARTURE, opportunities="jobs")
-    with pytest.raises(TypeError, match="requires departure"):
-        Accessibility(network, origins, table)
-    with pytest.raises(ValueError, match="transport_mode"):
-        Accessibility(network, origins, table, DEPARTURE, transport_mode="walk")
-    with pytest.raises(ValueError, match="transport_mode"):
-        Accessibility(helsinki_streets, origins, table)
-    with pytest.raises(TypeError, match="exclude_routes"):
-        Accessibility(network, origins, table, DEPARTURE, exclude_routes="1001")
-    with pytest.raises(ValueError, match="complex"):
-        Accessibility(
-            network,
-            origins,
-            table.assign(jobs=1.0 + 1.0j),
-            DEPARTURE,
-            opportunities="jobs",
-        )
-
-
-def test_street_requests_reject_transit_routing_knobs(helsinki_streets):
-    geopandas = pytest.importorskip("geopandas")
-    from cafein import Accessibility
-
+    nulled = table.assign(jobs=[None] + [1.0] * (len(table) - 1))
+    complexed = table.assign(jobs=1.0 + 1.0j)
     points = geopandas.GeoDataFrame(
         {"id": ["p"]},
         geometry=geopandas.points_from_xy([24.9384], [60.1699]),
         crs="EPSG:4326",
     )
-    with pytest.raises(ValueError, match="router"):
-        Accessibility(
-            helsinki_streets, points, points, transport_mode="walk", router="tbtr"
-        )
-    with pytest.raises(ValueError, match="max_rides"):
-        Accessibility(
-            helsinki_streets, points, points, transport_mode="walk", max_rides=4
-        )
+    transit = (network, origins, table, DEPARTURE)
+    stops = (network, origins, destinations, DEPARTURE)
+    street = (helsinki_streets, points, points)
+    for args, kwargs, error, match in (
+        # the aggregation and argument surface
+        (transit, {"decay": "gravity"}, ValueError, "unknown decay"),
+        (transit, {"decay": "linear"}, ValueError, "decay_params"),
+        (transit, {"budgets": "1800"}, TypeError, "budgets"),
+        (transit, {"opportunities": "people"}, ValueError, "no column"),
+        (transit, {"max_travel_time": 30}, ValueError, "max_travel_time"),
+        (
+            (network, origins, nulled, DEPARTURE),
+            {"opportunities": "jobs"},
+            ValueError,
+            "null value",
+        ),
+        ((network, origins, table), {}, TypeError, "requires departure"),
+        (transit, {"transport_mode": "walk"}, ValueError, "transport_mode"),
+        ((helsinki_streets, origins, table), {}, ValueError, "transport_mode"),
+        (transit, {"exclude_routes": "1001"}, TypeError, "exclude_routes"),
+        (
+            (network, origins, complexed, DEPARTURE),
+            {"opportunities": "jobs"},
+            ValueError,
+            "complex",
+        ),
+        # street requests reject the transit routing knobs
+        (street, {"transport_mode": "walk", "router": "tbtr"}, ValueError, "router"),
+        (street, {"transport_mode": "walk", "max_rides": 4}, ValueError, "max_rides"),
+        # window knobs reject streets and bad combos
+        (stops, {"percentiles": (50,)}, ValueError, "window"),
+        (
+            street,
+            {"transport_mode": "walk", "departure_time_window": 10},
+            ValueError,
+            "window",
+        ),
+        # the cost axes
+        (stops, {"cost": "calories"}, ValueError, "unknown cost"),
+        (stops, {"cost": "distance"}, ValueError, "not an optimizable transit axis"),
+        (
+            street,
+            {"transport_mode": "walk", "cost": "emissions"},
+            ValueError,
+            "cost engines",
+        ),
+        (stops, {"cost": "emissions"}, ValueError, "window"),
+        (
+            stops,
+            {
+                "cost": "emissions",
+                "departure_time_window": 10,
+                "percentiles": (25, 75),
+            },
+            ValueError,
+            "percentiles",
+        ),
+        (
+            stops,
+            {"cost": "money", "departure_time_window": 10},
+            ValueError,
+            "fare structure",
+        ),
+        (stops, {"fares": object()}, ValueError, "fares applies"),
+        (
+            stops,
+            {
+                "cost": "money",
+                "departure_time_window": 10,
+                "fares": object(),
+                "factors": object(),
+            },
+            ValueError,
+            "factors and components",
+        ),
+    ):
+        with pytest.raises(error, match=match):
+            Accessibility(*args, **kwargs)
 
 
 def test_percentile_accessibility_matches_the_percentile_matrix(network):
@@ -394,28 +402,6 @@ def test_percentile_accessibility_matches_the_percentile_matrix(network):
     # percentile: accessibility is non-increasing in the percentile.
     wide = frame.pivot(index="from_id", columns="percentile", values="accessibility")
     assert (wide[25] >= wide[75]).all()
-
-
-def test_window_knobs_reject_streets_and_bad_combos(network, helsinki_streets):
-    geopandas = pytest.importorskip("geopandas")
-    from cafein import Accessibility
-
-    origins, destinations = _stop_sets(network)
-    with pytest.raises(ValueError, match="window"):
-        Accessibility(network, origins, destinations, DEPARTURE, percentiles=(50,))
-    points = geopandas.GeoDataFrame(
-        {"id": ["p"]},
-        geometry=geopandas.points_from_xy([24.9384], [60.1699]),
-        crs="EPSG:4326",
-    )
-    with pytest.raises(ValueError, match="window"):
-        Accessibility(
-            helsinki_streets,
-            points,
-            points,
-            transport_mode="walk",
-            departure_time_window=10,
-        )
 
 
 def _cost_surface(network, origins, destinations, optimize, fares=None, window=10):
@@ -457,61 +443,54 @@ def fare_surface(network, helsinki_gtfs):
     return structure, origins, destinations, surface
 
 
-def test_emissions_accessibility_matches_the_cost_matrix(network):
+@pytest.mark.parametrize("axis", ["emissions", "money"])
+def test_cost_axis_accessibility_matches_the_cost_matrix(network, axis, request):
     from cafein import Accessibility
 
-    origins, destinations = _stop_sets(network)
-    surface = _cost_surface(network, origins, destinations, "emissions")
-    budgets = (150.0, 600.0)
+    if axis == "money":
+        structure, origins, destinations, surface = request.getfixturevalue(
+            "fare_surface"
+        )
+        window = FARE_WINDOW
+        priced = surface[numpy.isfinite(surface)]
+        assert priced.size, "the fixture feed prices no pair — fixture drift"
+        budgets = (float(numpy.median(priced)),)
+    else:
+        structure = None
+        origins, destinations = _stop_sets(network)
+        surface = _cost_surface(network, origins, destinations, axis)
+        window = 10
+        budgets = (150.0, 600.0)
     frame = Accessibility(
         network,
         origins,
         destinations,
         DEPARTURE,
-        cost="emissions",
-        departure_time_window=10,
+        cost=axis,
+        departure_time_window=window,
         budgets=budgets,
+        fares=structure,
     )
     assert "percentile" not in frame.columns
     for budget in budgets:
         expected = numpy.nansum(numpy.where(surface <= budget, 1.0, 0.0), axis=1)
         got = frame[frame["budget"] == budget]["accessibility"].to_numpy()
         assert numpy.allclose(got, expected), budget
-    # max_travel_time bounds the optimum's journeys: within one
-    # minute only an origin's own zero-ride floor can qualify.
-    capped = Accessibility(
-        network,
-        origins,
-        destinations,
-        DEPARTURE,
-        cost="emissions",
-        departure_time_window=10,
-        budgets=budgets,
-        max_travel_time=1,
-    )
-    assert (capped["accessibility"] <= 1).all()
-    assert capped["accessibility"].sum() < frame["accessibility"].sum()
-
-
-def test_money_accessibility_matches_the_cost_matrix(network, fare_surface):
-    from cafein import Accessibility
-
-    structure, origins, destinations, surface = fare_surface
-    priced = surface[numpy.isfinite(surface)]
-    assert priced.size, "the fixture feed prices no pair — fixture drift"
-    budget = float(numpy.median(priced))
-    frame = Accessibility(
-        network,
-        origins,
-        destinations,
-        DEPARTURE,
-        cost="money",
-        departure_time_window=FARE_WINDOW,
-        budgets=(budget,),
-        fares=structure,
-    )
-    expected = numpy.nansum(numpy.where(surface <= budget, 1.0, 0.0), axis=1)
-    assert numpy.allclose(frame["accessibility"].to_numpy(), expected)
+    if axis == "emissions":
+        # max_travel_time bounds the optimum's journeys: within one
+        # minute only an origin's own zero-ride floor can qualify.
+        capped = Accessibility(
+            network,
+            origins,
+            destinations,
+            DEPARTURE,
+            cost=axis,
+            departure_time_window=window,
+            budgets=budgets,
+            max_travel_time=1,
+        )
+        assert (capped["accessibility"] <= 1).all()
+        assert capped["accessibility"].sum() < frame["accessibility"].sum()
 
 
 def test_street_distance_accessibility_counts_within_metres(helsinki_streets):
@@ -555,60 +534,19 @@ def test_street_distance_accessibility_counts_within_metres(helsinki_streets):
         expected = numpy.nansum(numpy.where(surface <= budget, 1.0, 0.0), axis=1)
         got = frame[frame["budget"] == budget]["accessibility"].to_numpy()
         assert numpy.allclose(got, expected), budget
-
-
-def test_cost_axes_validate_eagerly(network, helsinki_streets):
-    geopandas = pytest.importorskip("geopandas")
-    from cafein import Accessibility
-
-    origins, destinations = _stop_sets(network)
-    points = geopandas.GeoDataFrame(
-        {"id": ["p"]},
-        geometry=geopandas.points_from_xy([24.9384], [60.1699]),
-        crs="EPSG:4326",
+    # The default time axis serves the same street points: counts are
+    # monotone in the budget and bounded by the destination count.
+    timed = Accessibility(
+        helsinki_streets,
+        origins,
+        destinations,
+        transport_mode="walk",
+        budgets=(10.0, 30.0),
     )
-    with pytest.raises(ValueError, match="unknown cost"):
-        Accessibility(network, origins, destinations, DEPARTURE, cost="calories")
-    with pytest.raises(ValueError, match="not an optimizable transit axis"):
-        Accessibility(network, origins, destinations, DEPARTURE, cost="distance")
-    with pytest.raises(ValueError, match="cost engines"):
-        Accessibility(
-            helsinki_streets, points, points, transport_mode="walk", cost="emissions"
-        )
-    with pytest.raises(ValueError, match="window"):
-        Accessibility(network, origins, destinations, DEPARTURE, cost="emissions")
-    with pytest.raises(ValueError, match="percentiles"):
-        Accessibility(
-            network,
-            origins,
-            destinations,
-            DEPARTURE,
-            cost="emissions",
-            departure_time_window=10,
-            percentiles=(25, 75),
-        )
-    with pytest.raises(ValueError, match="fare structure"):
-        Accessibility(
-            network,
-            origins,
-            destinations,
-            DEPARTURE,
-            cost="money",
-            departure_time_window=10,
-        )
-    with pytest.raises(ValueError, match="fares applies"):
-        Accessibility(network, origins, destinations, DEPARTURE, fares=object())
-    with pytest.raises(ValueError, match="factors and components"):
-        Accessibility(
-            network,
-            origins,
-            destinations,
-            DEPARTURE,
-            cost="money",
-            departure_time_window=10,
-            fares=object(),
-            factors=object(),
-        )
+    assert len(timed) == 4
+    wide = timed.pivot(index="from_id", columns="budget", values="accessibility")
+    assert (wide[10.0] <= wide[30.0]).all()
+    assert (wide[30.0] <= 3.0).all()
 
 
 def test_empty_origins_and_duplicate_destinations_are_served(network):
@@ -702,17 +640,39 @@ def test_nearest_destinations_match_the_matrix_sort(network):
     assert (rounded["cost"] == numpy.rint(frame["cost"] / 60)).all()
 
 
-def test_nearest_ranks_break_ties_deterministically():
+@pytest.mark.parametrize(
+    "matrix, k, expected_indices, expected_costs",
+    [
+        # Ranks break ties deterministically: equal costs keep column
+        # order, and unreached ranks are -1 with NaN costs.
+        pytest.param(
+            [[300, 100, UNREACHED, 100], [50, UNREACHED, UNREACHED, UNREACHED]],
+            3,
+            [[1, 3, 0], [0, -1, -1]],
+            [[100.0, 100.0, 300.0], [50.0, numpy.nan, numpy.nan]],
+            id="tie-break",
+        ),
+        # An oversize k clamps to the columns.
+        pytest.param([[120, 60]], 10**9, [[1, 0]], [[60.0, 120.0]], id="oversize-k"),
+        # Zero destinations yield empty shapes.
+        pytest.param(
+            numpy.zeros((3, 0)),
+            2,
+            [[], [], []],
+            numpy.zeros((3, 0)),
+            id="zero-destinations",
+        ),
+    ],
+)
+def test_nearest_ranks_break_ties_deterministically(
+    matrix, k, expected_indices, expected_costs
+):
     from cafein import _cafein
 
-    matrix = numpy.array(
-        [[300, 100, UNREACHED, 100], [50, UNREACHED, UNREACHED, UNREACHED]],
-        dtype="uint32",
-    )
-    indices, costs = _cafein.aggregate_nearest(matrix, 3, None)
-    assert indices.tolist() == [[1, 3, 0], [0, -1, -1]]
-    assert costs[0].tolist() == [100.0, 100.0, 300.0]
-    assert numpy.isnan(costs[1][1]) and numpy.isnan(costs[1][2])
+    matrix = numpy.asarray(matrix, dtype="uint32")
+    indices, costs = _cafein.aggregate_nearest(matrix, k, None)
+    assert indices.tolist() == expected_indices
+    numpy.testing.assert_array_equal(costs, numpy.asarray(expected_costs))
 
 
 def test_nearest_windowed_percentile_ranks_match_the_percentile_matrix(network):
@@ -804,16 +764,6 @@ def test_nearest_destinations_validate_eagerly(network):
         NearestDestinations(network, origins, destinations)
 
 
-def test_nearest_oversize_k_clamps_to_the_columns():
-    from cafein import _cafein
-
-    matrix = numpy.array([[120, 60]], dtype="uint32")
-    indices, costs = _cafein.aggregate_nearest(matrix, 10**9, None)
-    assert indices.shape[1] == 2
-    assert indices.tolist() == [[1, 0]]
-    assert costs.tolist() == [[60.0, 120.0]]
-
-
 def test_nearest_money_points_keep_their_own_ids(network_with_footpaths, helsinki_gtfs):
     geopandas = pytest.importorskip("geopandas")
 
@@ -891,15 +841,6 @@ def test_dominance_areas_reject_duplicate_origin_ids(network):
     # A renamed geometry column is legal input.
     renamed = doubled.iloc[:1].rename_geometry("shape")
     assert len(frame.dominance_areas(renamed)) <= 2
-
-
-def test_nearest_zero_destinations_yield_empty_shapes():
-    from cafein import _cafein
-
-    matrix = numpy.zeros((3, 0), dtype="uint32")
-    indices, costs = _cafein.aggregate_nearest(matrix, 2, None)
-    assert indices.shape == (3, 0)
-    assert costs.shape == (3, 0)
 
 
 def test_dominance_areas_join_numeric_origin_ids(network_with_footpaths):
@@ -1147,37 +1088,83 @@ def test_catchment_validates_eagerly(network_with_footpaths, helsinki_streets):
     geopandas = pytest.importorskip("geopandas")
     from cafein import Catchment
 
-    with pytest.raises(ValueError, match="resolution"):
-        Catchment(network_with_footpaths, ["1100602"], DEPARTURE, resolution=22)
-    with pytest.raises(ValueError, match="percentile"):
-        Catchment(network_with_footpaths, ["1100602"], DEPARTURE, percentile=75)
-    with pytest.raises(ValueError, match="departure_time_window"):
-        Catchment(network_with_footpaths, ["1100602"], DEPARTURE, cost="emissions")
-    with pytest.raises(TypeError, match="requires departure"):
-        Catchment(network_with_footpaths, ["1100602"])
-    with pytest.raises(ValueError, match="budgets"):
-        Catchment(network_with_footpaths, ["1100602"], DEPARTURE, budgets=())
     points = geopandas.GeoDataFrame(
         {"id": ["p"]},
         geometry=geopandas.points_from_xy([24.9384], [60.1699]),
         crs="EPSG:4326",
     )
-    with pytest.raises(ValueError, match="stop origins"):
-        Catchment(
-            network_with_footpaths,
-            points,
-            DEPARTURE,
-            departure_time_window=10,
-        )
-    with pytest.raises(ValueError, match="transport_mode"):
-        Catchment(helsinki_streets, points)
-    with pytest.raises(ValueError, match="apply to transit"):
-        Catchment(
-            helsinki_streets,
-            points,
-            transport_mode="walk",
-            router="tbtr",
-        )
+    transit = (network_with_footpaths, ["1100602"], DEPARTURE)
+    for args, kwargs, error, match in (
+        (transit, {"resolution": 22}, ValueError, "resolution"),
+        (transit, {"percentile": 75}, ValueError, "percentile"),
+        (transit, {"cost": "emissions"}, ValueError, "departure_time_window"),
+        ((network_with_footpaths, ["1100602"]), {}, TypeError, "requires departure"),
+        (transit, {"budgets": ()}, ValueError, "budgets"),
+        # windowed rules serve stop origins only
+        (
+            (network_with_footpaths, points, DEPARTURE),
+            {"departure_time_window": 10},
+            ValueError,
+            "stop origins",
+        ),
+        ((helsinki_streets, points), {}, ValueError, "transport_mode"),
+        (
+            (helsinki_streets, points),
+            {"transport_mode": "walk", "router": "tbtr"},
+            ValueError,
+            "apply to transit",
+        ),
+        # unusable walking options
+        (
+            transit,
+            {"departure_time_window": 10, "walking_speed_kmph": float("nan")},
+            ValueError,
+            "walking_speed_kmph",
+        ),
+        (transit, {"snap_distance": 0}, ValueError, "snap_distance"),
+        (
+            (network_with_footpaths, ["no-such-stop"], DEPARTURE),
+            {},
+            KeyError,
+            "no-such-stop",
+        ),
+        (transit, {"router": "fastest"}, ValueError, "router"),
+        # the street snap distance validates its whole float envelope
+        (
+            (helsinki_streets, points),
+            {"transport_mode": "walk", "snap_distance": 0},
+            ValueError,
+            "snap_distance",
+        ),
+        (
+            (helsinki_streets, points),
+            {"transport_mode": "walk", "snap_distance": -1},
+            ValueError,
+            "snap_distance",
+        ),
+        (
+            (helsinki_streets, points),
+            {"transport_mode": "walk", "snap_distance": float("nan")},
+            ValueError,
+            "snap_distance",
+        ),
+        (
+            (helsinki_streets, points),
+            {"transport_mode": "walk", "snap_distance": float("inf")},
+            ValueError,
+            "snap_distance",
+        ),
+        # The coordinate one-to-all rides RAPTOR: an explicit tbtr
+        # request is refused, never silently ignored.
+        (
+            (network_with_footpaths, points, DEPARTURE),
+            {"router": "tbtr"},
+            ValueError,
+            "rides RAPTOR",
+        ),
+    ):
+        with pytest.raises(error, match=match):
+            Catchment(*args, **kwargs)
 
 
 def test_catchment_point_origin_serves_the_emissions_axis(network_with_footpaths):
@@ -1206,57 +1193,6 @@ def test_catchment_point_origin_serves_the_emissions_axis(network_with_footpaths
     )
     assert len(frame) == 1
     assert frame.geometry.iloc[0].area > 0
-
-
-def test_catchment_rejects_unusable_walking_options(network_with_footpaths):
-    pytest.importorskip("h3")
-    from cafein import Catchment
-
-    with pytest.raises(ValueError, match="walking_speed_kmph"):
-        Catchment(
-            network_with_footpaths,
-            ["1100602"],
-            DEPARTURE,
-            departure_time_window=10,
-            walking_speed_kmph=float("nan"),
-        )
-    with pytest.raises(ValueError, match="snap_distance"):
-        Catchment(
-            network_with_footpaths,
-            ["1100602"],
-            DEPARTURE,
-            snap_distance=0,
-        )
-    with pytest.raises(KeyError, match="no-such-stop"):
-        Catchment(network_with_footpaths, ["no-such-stop"], DEPARTURE)
-    with pytest.raises(ValueError, match="router"):
-        Catchment(network_with_footpaths, ["1100602"], DEPARTURE, router="fastest")
-
-
-def test_catchment_street_snap_and_point_router_validate(
-    network_with_footpaths, helsinki_streets
-):
-    pytest.importorskip("h3")
-    geopandas = pytest.importorskip("geopandas")
-    from cafein import Catchment
-
-    points = geopandas.GeoDataFrame(
-        {"id": ["p"]},
-        geometry=geopandas.points_from_xy([24.9384], [60.1699]),
-        crs="EPSG:4326",
-    )
-    for bad in (0, -1, float("nan"), float("inf")):
-        with pytest.raises(ValueError, match="snap_distance"):
-            Catchment(
-                helsinki_streets,
-                points,
-                transport_mode="walk",
-                snap_distance=bad,
-            )
-    # The coordinate one-to-all rides RAPTOR: an explicit tbtr request
-    # is refused, never silently ignored.
-    with pytest.raises(ValueError, match="rides RAPTOR"):
-        Catchment(network_with_footpaths, points, DEPARTURE, router="tbtr")
 
 
 def test_products_carry_the_inputs_id_dtypes(network):

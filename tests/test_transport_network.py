@@ -14,10 +14,13 @@ def test_network_statistics(network):
     assert network.trip_count == 195_351
 
 
-def test_routes_the_earliest_direct_k_train(network):
+def test_the_k_train_journey_contract(network):
     # Korso -> Käpylä at 08:30 on 2022-02-22 (r5py's canonical departure):
     # the earliest direct ride leaves 08:36:00 and arrives 08:58:00 on trip
     # 3001K_20220222_S1_2_0831, verified independently from the GTFS tables.
+    import geopandas as gpd
+    import shapely
+
     journeys = network.route_between_stops("4810551", "1250551", "2022-02-22 08:30:00")
     assert journeys
 
@@ -40,28 +43,17 @@ def test_routes_the_earliest_direct_k_train(network):
         assert later["rides"] > earlier["rides"]
         assert later["arrival_s"] < earlier["arrival_s"]
 
-
-def test_transit_legs_carry_distance_and_provenance(network):
     # The K train's Korso -> Käpylä distance is 16.786 km straight from
     # the feed's shape_dist_traveled values (recorded in kilometers).
-    journeys = network.route_between_stops("4810551", "1250551", "2022-02-22 08:30:00")
-    access, transit, egress = journeys[0]["legs"]
     assert transit["distance_m"] == pytest.approx(16_786, abs=1)
     assert transit["distance_provenance"] == "shape_dist"
     assert access["distance_m"] is None
     assert egress["distance_m"] is None
     assert network.distance_provenance_counts == {"shape_dist": 195_351}
 
-
-def test_transit_legs_carry_wkb_geometry(network):
-    # The K train's leg geometry is the HSL shape sliced between Korso
+    # The transit leg's geometry is the HSL shape sliced between Korso
     # and Käpylä: a dense LineString whose projected length agrees with
     # the shape_dist distance and whose ends sit on the stops.
-    import geopandas as gpd
-    import shapely
-
-    journeys = network.route_between_stops("4810551", "1250551", "2022-02-22 08:30:00")
-    access, transit, egress = journeys[0]["legs"]
     line = shapely.from_wkb(transit["geometry"])
     assert line.geom_type == "LineString"
     assert shapely.get_num_coordinates(line) > 10
@@ -76,7 +68,7 @@ def test_transit_legs_carry_wkb_geometry(network):
     assert egress["geometry"] is None
 
 
-def test_crow_fly_legs_draw_the_stop_chain(tmp_path):
+def test_crow_fly_fallback_draws_the_stop_chain_and_prices_it(tmp_path):
     import shapely
 
     feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
@@ -87,6 +79,10 @@ def test_crow_fly_legs_draw_the_stop_chain(tmp_path):
     line = shapely.from_wkb(transit["geometry"])
     # No shape in the feed: the geometry is the straight stop chain.
     assert list(line.coords) == [(24.0, 60.0), (24.01, 60.01)]
+    # The distances fall to crow-fly with the bus detour coefficient
+    # (S1->S2 is ~1243 m crow-fly).
+    assert transit["distance_m"] == pytest.approx(1243 * 1.4, rel=0.01)
+    assert transit["distance_provenance"] == "crow_fly"
 
 
 def test_geometry_output_is_controllable(tmp_path):
@@ -189,30 +185,21 @@ def test_travel_time_matrix_is_deterministic(network):
     assert np.array_equal(first, second)
 
 
-def test_tbtr_router_matches_raptor(network, network_with_footpaths):
+@pytest.mark.parametrize(
+    "common",
+    [{}, dict(departure_time_window=30, percentiles=[10, 50, 90])],
+    ids=["single", "windowed"],
+)
+def test_tbtr_router_matches_raptor(network, network_with_footpaths, common):
     stops = [stop for stop, _, _ in network.stops][:120]
-    raptor = network.travel_time_matrix(stops, "2022-02-22 08:30:00")
-    tbtr = network.travel_time_matrix(stops, "2022-02-22 08:30:00", router="tbtr")
-    assert np.array_equal(raptor, tbtr)
-    # With footpaths installed, the walks relax at query time; the
-    # matrices must still agree cell for cell.
-    raptor = network_with_footpaths.travel_time_matrix(stops, "2022-02-22 08:30:00")
-    tbtr = network_with_footpaths.travel_time_matrix(
-        stops, "2022-02-22 08:30:00", router="tbtr"
-    )
-    assert np.array_equal(raptor, tbtr)
-
-
-def test_tbtr_router_matches_raptor_windowed(network, network_with_footpaths):
-    stops = [stop for stop, _, _ in network.stops][:120]
-    common = dict(departure_time_window=30, percentiles=[10, 50, 90])
     raptor = network.travel_time_matrix(stops, "2022-02-22 08:30:00", **common)
     tbtr = network.travel_time_matrix(
         stops, "2022-02-22 08:30:00", router="tbtr", **common
     )
     assert np.array_equal(raptor, tbtr)
-    # With footpaths installed the walks relax at query time; the
-    # percentile planes must still agree cell for cell.
+    # With footpaths installed, the walks relax at query time; the
+    # matrices (and the windowed percentile planes) must still agree
+    # cell for cell.
     raptor = network_with_footpaths.travel_time_matrix(
         stops, "2022-02-22 08:30:00", **common
     )
@@ -222,22 +209,20 @@ def test_tbtr_router_matches_raptor_windowed(network, network_with_footpaths):
     assert np.array_equal(raptor, tbtr)
 
 
-def test_router_option_is_validated(network):
-    with pytest.raises(ValueError, match="router must be"):
-        network.travel_time_matrix(["4810551"], "2022-02-22 08:30:00", router="fastest")
-    # The windowed path validates the router value too.
-    with pytest.raises(ValueError, match="router must be"):
-        network.travel_time_matrix(
+def test_travel_time_matrix_refusals(network):
+    for origins, kwargs, exc, match in (
+        (["4810551"], dict(router="fastest"), ValueError, "router must be"),
+        # The windowed path validates the router value too.
+        (
             ["4810551"],
-            "2022-02-22 08:30:00",
-            departure_time_window=10,
-            router="fastest",
-        )
-
-
-def test_travel_time_matrix_rejects_unknown_stops(network):
-    with pytest.raises(KeyError, match="no-such-stop"):
-        network.travel_time_matrix(["4810551", "no-such-stop"], "2022-02-22 08:30:00")
+            dict(departure_time_window=10, router="fastest"),
+            ValueError,
+            "router must be",
+        ),
+        (["4810551", "no-such-stop"], {}, KeyError, "no-such-stop"),
+    ):
+        with pytest.raises(exc, match=match):
+            network.travel_time_matrix(origins, "2022-02-22 08:30:00", **kwargs)
 
 
 def test_travel_time_matrix_accepts_no_origins(network):
@@ -250,18 +235,17 @@ def test_no_service_on_a_date_outside_the_feed_window(network):
     assert journeys == []
 
 
-def test_unknown_stop_raises_a_key_error(network):
-    with pytest.raises(KeyError, match="no-such-stop"):
-        network.route_between_stops("no-such-stop", "1250551", "2022-02-22 08:30:00")
-
-
-def test_invalid_date_and_time_raise_value_errors(network):
-    with pytest.raises(ValueError, match="ISO-style"):
-        network.route_between_stops("4810551", "1250551", "22.2.2022 08:30:00")
-    with pytest.raises(ValueError, match='"HH:MM"'):
-        network.route_between_stops("4810551", "1250551", "2022-02-22 8.30")
-    with pytest.raises(ValueError, match="invalid time"):
-        network.route_between_stops("4810551", "1250551", "2022-02-22 1300000:00:00")
+def test_route_between_stops_refusals(network):
+    for origin, when, exc, match in (
+        # Unknown stops raise a KeyError naming the stop.
+        ("no-such-stop", "2022-02-22 08:30:00", KeyError, "no-such-stop"),
+        # Invalid dates and times raise ValueErrors.
+        ("4810551", "22.2.2022 08:30:00", ValueError, "ISO-style"),
+        ("4810551", "2022-02-22 8.30", ValueError, '"HH:MM"'),
+        ("4810551", "2022-02-22 1300000:00:00", ValueError, "invalid time"),
+    ):
+        with pytest.raises(exc, match=match):
+            network.route_between_stops(origin, "1250551", when)
 
 
 def test_merged_feeds_require_qualified_stop_ids(helsinki_gtfs):
@@ -364,27 +348,25 @@ def test_faster_walking_reaches_more_stops(network_with_footpaths):
     assert set(ran) > set(walked)
 
 
-def test_access_stops_reject_out_of_range_parameters(network_with_footpaths):
+def test_access_stops_refusals(network, network_with_footpaths):
+    # Out-of-range parameters are rejected by name.
     lat, lon = stop_coordinates(network_with_footpaths, "1040602")
-    with pytest.raises(ValueError, match="lat and lon"):
-        network_with_footpaths.access_stops(float("nan"), lon)
-    with pytest.raises(ValueError, match="walking_speed_kmph"):
-        network_with_footpaths.access_stops(lat, lon, walking_speed_kmph=float("inf"))
-    with pytest.raises(ValueError, match="walking_speed_kmph"):
-        network_with_footpaths.access_stops(lat, lon, walking_speed_kmph=0.0)
-    with pytest.raises(ValueError, match="max_walking_time"):
-        network_with_footpaths.access_stops(lat, lon, max_walking_time=float("nan"))
-    with pytest.raises(ValueError, match="snap_distance must be a non-negative"):
-        network_with_footpaths.access_stops(lat, lon, snap_distance=-1.0)
-
-
-def test_access_stops_need_a_street_nearby(network_with_footpaths):
-    # Open water south of the extract, far from every walkable way.
-    with pytest.raises(ValueError, match="farther than"):
-        network_with_footpaths.access_stops(60.10, 24.90)
-
-
-def test_access_stops_need_a_street_network(network):
+    for args, kwargs, match in (
+        ((float("nan"), lon), {}, "lat and lon"),
+        ((lat, lon), dict(walking_speed_kmph=float("inf")), "walking_speed_kmph"),
+        ((lat, lon), dict(walking_speed_kmph=0.0), "walking_speed_kmph"),
+        ((lat, lon), dict(max_walking_time=float("nan")), "max_walking_time"),
+        (
+            (lat, lon),
+            dict(snap_distance=-1.0),
+            "snap_distance must be a non-negative",
+        ),
+        # Open water south of the extract, far from every walkable way.
+        ((60.10, 24.90), {}, "farther than"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            network_with_footpaths.access_stops(*args, **kwargs)
+    # Without a street network the query refuses outright.
     with pytest.raises(ValueError, match="no street network"):
         network.access_stops(60.168, 24.931)
 
@@ -717,26 +699,15 @@ def test_qualified_ids_take_precedence_over_colon_raw_ids(tmp_path):
     assert merged.route_between_stops("0:0:S1", "0:S2", "2022-02-22 07:30:00") == []
 
 
-def test_from_gtfs_accepts_a_single_bare_path(tmp_path):
+def test_the_synthetic_feed_surface(tmp_path):
+    # from_gtfs accepts a single bare path, no list wrapping needed.
     feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
     with pytest.warns(UserWarning):
         network = TransportNetwork.from_gtfs(feed)
     assert network.stop_count == 3
-
-
-def test_routes_carry_the_single_agency_when_implicit(tmp_path):
     # The synthetic feed's routes.txt has no agency_id column; its one
     # agency still resolves for the agency-level emission-factor tier.
-    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
-    with pytest.warns(UserWarning):
-        network = TransportNetwork.from_gtfs([str(feed)])
     assert network.routes == [("R1", "A", 3)]
-
-
-def test_stops_are_exposed_with_coordinates(tmp_path):
-    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
-    with pytest.warns(UserWarning):
-        network = TransportNetwork.from_gtfs([str(feed)])
     # Stops come back in the reader's order: sorted by id within a feed.
     assert network.stops == [
         ("0:S1", 60.02, 24.02),
@@ -765,16 +736,6 @@ def test_set_transfers_routes_over_footpaths(tmp_path):
     assert transfer["distance_m"] == 118.5
 
 
-def test_set_transfers_rejects_unknown_stops(tmp_path):
-    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
-    with pytest.warns(UserWarning):
-        network = TransportNetwork.from_gtfs([str(feed)])
-    with pytest.raises(KeyError, match="no-such-stop"):
-        network.set_transfers([("no-such-stop", "S2", 60, 60.0)])
-    with pytest.raises(ValueError, match="non-finite"):
-        network.set_transfers([("S1", "S2", 60, float("nan"))])
-
-
 def test_transfer_arrays_match_the_tuple_form(tmp_path):
     from cafein.streets import Footpaths
 
@@ -796,16 +757,29 @@ def test_transfer_arrays_match_the_tuple_form(tmp_path):
     assert tuples.route_between_stops(*key) == arrays.route_between_stops(*key)
 
 
-def test_transfer_arrays_are_validated(tmp_path):
+def test_set_transfers_refusals(tmp_path):
     from cafein.streets import Footpaths
 
     feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
     with pytest.warns(UserWarning):
         network = TransportNetwork.from_gtfs([str(feed)])
-    with pytest.raises(KeyError, match="no-such-stop"):
-        network.set_transfers(Footpaths(["no-such-stop", "S2"], [0], [1], [60], [60.0]))
-    with pytest.raises(ValueError, match="non-finite"):
-        network.set_transfers(Footpaths(["S1", "S2"], [0], [1], [60], [float("nan")]))
+    # The tuple and array install forms refuse the same bad edges.
+    for footpaths, exc, match in (
+        ([("no-such-stop", "S2", 60, 60.0)], KeyError, "no-such-stop"),
+        ([("S1", "S2", 60, float("nan"))], ValueError, "non-finite"),
+        (
+            Footpaths(["no-such-stop", "S2"], [0], [1], [60], [60.0]),
+            KeyError,
+            "no-such-stop",
+        ),
+        (
+            Footpaths(["S1", "S2"], [0], [1], [60], [float("nan")]),
+            ValueError,
+            "non-finite",
+        ),
+    ):
+        with pytest.raises(exc, match=match):
+            network.set_transfers(footpaths)
     with pytest.raises(ValueError, match="outside stop_ids"):
         network._core.set_transfer_arrays(
             ["S1", "S2"],
@@ -832,18 +806,6 @@ def test_transfer_arrays_are_validated(tmp_path):
         Footpaths(["S1", "S2"], np.array([0.5]), [1], [60], [60.0])
     with pytest.raises(ValueError, match="one-dimensional"):
         Footpaths(["S1", "S2"], np.array([[0]]), [1], [60], [60.0])
-
-
-def test_trip_distances_default_to_the_ladder(tmp_path):
-    # The synthetic feed has no shapes: distances fall to crow-fly with
-    # the bus detour coefficient (S1->S2 is ~1243 m crow-fly).
-    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
-    with pytest.warns(UserWarning):
-        network = TransportNetwork.from_gtfs([str(feed)])
-    journeys = network.route_between_stops("S1", "S2", "2022-02-22 07:30:00")
-    transit = journeys[0]["legs"][1]
-    assert transit["distance_m"] == pytest.approx(1243 * 1.4, rel=0.01)
-    assert transit["distance_provenance"] == "crow_fly"
 
 
 def test_trip_distances_can_be_disabled(tmp_path):
@@ -1199,6 +1161,11 @@ def test_routes_gdf_distinguishes_shapes_from_fallback(tmp_path):
     )
     assert lines[0] == [(24.0, 60.0), (24.01, 60.0)]
     assert lines[1] == [(24.0, 60.0), (24.01, 60.0), (24.02, 60.0)]
+    # Both patterns riding real bent shapes: no drawn line equals its
+    # stop chain, so the pure-shape label applies.
+    both_feed = _two_pattern_feed(tmp_path / "both.zip", shaped=True, both_shaped=True)
+    both = TransportNetwork.from_gtfs([str(both_feed)])
+    assert list(both.routes_gdf["geometry_provenance"]) == ["shape"]
 
 
 def test_routes_gdf_keeps_a_row_when_no_pattern_contributes(tmp_path):
@@ -1244,9 +1211,10 @@ def test_streets_gdf_carries_modes_on_multimodal(multimodal_network):
     assert frame["highway"].isin(["footway", "residential", "path"]).any()
 
 
-def test_streets_gdf_requires_streets(network):
+@pytest.mark.parametrize("layer", ["streets_gdf", "connectors_gdf"])
+def test_geo_layers_require_streets(network, layer):
     with pytest.raises(ValueError, match="street network"):
-        network.streets_gdf
+        getattr(network, layer)
 
 
 def test_streets_gdf_reproduces_an_independent_synthetic_graph(tmp_path):
@@ -1315,15 +1283,6 @@ def test_streets_gdf_recomputes_after_a_street_replacement(tmp_path):
     assert len(network.streets_gdf) == 2
 
 
-def test_routes_gdf_labels_an_all_shape_build(tmp_path):
-    # Both patterns ride real bent shapes: no drawn line equals its
-    # stop chain, so the pure-shape label applies.
-    feed = _two_pattern_feed(tmp_path / "feed.zip", shaped=True, both_shaped=True)
-    network = TransportNetwork.from_gtfs([str(feed)])
-    frame = network.routes_gdf
-    assert list(frame["geometry_provenance"]) == ["shape"]
-
-
 def test_routes_gdf_provenance_ignores_the_distance_tiers(tmp_path):
     feed = _two_pattern_feed(tmp_path / "feed.zip", shaped=False)
     network = TransportNetwork.from_gtfs([str(feed)])
@@ -1388,11 +1347,6 @@ def test_connectors_gdf_interpolates_the_synthetic_snap_point(tmp_path):
     # The line starts at stop B's own coordinate.
     start = snapped.geometry.coords[0]
     assert abs(start[0] - 24.01) < 1e-9 and abs(start[1] - 60.0) < 1e-9
-
-
-def test_connectors_gdf_requires_streets(network):
-    with pytest.raises(ValueError, match="street network"):
-        network.connectors_gdf
 
 
 def test_street_links_reject_coordinate_less_stops(tmp_path):
@@ -1616,12 +1570,10 @@ def test_service_metadata_survives_a_save_load_round_trip(network, tmp_path):
     assert loaded.daily_trip_counts is first_read
 
 
-def test_far_future_calendars_stay_countable(tmp_path):
-    import datetime
+def _single_trip_feed(path, calendar_tables):
+    """One A→B trip whose service is defined by ``calendar_tables``."""
     import zipfile
 
-    # Nanosecond timestamps end at year 2262; a legal GTFS calendar
-    # reaching further must still produce the Series.
     tables = {
         "agency.txt": [
             "agency_id,agency_name,agency_url,agency_timezone",
@@ -1639,16 +1591,31 @@ def test_far_future_calendars_stay_countable(tmp_path):
             "T1,08:00:00,08:00:00,A,1",
             "T1,08:10:00,08:10:00,B,2",
         ],
-        "calendar.txt": [
-            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
-            "sunday,start_date,end_date",
-            "SV,1,1,1,1,1,1,1,25000101,25000107",
-        ],
     }
-    feed = tmp_path / "future.zip"
-    with zipfile.ZipFile(feed, "w") as archive:
+    tables.update(calendar_tables)
+    with zipfile.ZipFile(path, "w") as archive:
         for name, lines in tables.items():
             archive.writestr(name, "\n".join(lines) + "\n")
+    return path
+
+
+def test_calendar_edges_stay_countable(tmp_path):
+    import datetime
+
+    import pandas
+
+    # Nanosecond timestamps end at year 2262; a legal GTFS calendar
+    # reaching further must still produce the Series.
+    feed = _single_trip_feed(
+        tmp_path / "future.zip",
+        {
+            "calendar.txt": [
+                "service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+                "sunday,start_date,end_date",
+                "SV,1,1,1,1,1,1,1,25000101,25000107",
+            ]
+        },
+    )
     network = TransportNetwork.from_gtfs(
         [str(feed)], trip_distances=False, leg_geometries=False
     )
@@ -1660,44 +1627,21 @@ def test_far_future_calendars_stay_countable(tmp_path):
     assert len(series) == 7 and (series == 1).all()
     assert series.idxmax().date() == datetime.date(2500, 1, 1)
 
-
-def test_a_feed_that_never_runs_answers_never(tmp_path):
-    import zipfile
-
-    tables = {
-        "agency.txt": [
-            "agency_id,agency_name,agency_url,agency_timezone",
-            "A,Test,http://example.com,Europe/Helsinki",
-        ],
-        "stops.txt": [
-            "stop_id,stop_name,stop_lat,stop_lon",
-            "A,A,60.0,24.0",
-            "B,B,60.0,24.01",
-        ],
-        "routes.txt": ["route_id,route_short_name,route_type", "R1,1,3"],
-        "trips.txt": ["route_id,service_id,trip_id", "R1,SV,T1"],
-        "stop_times.txt": [
-            "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
-            "T1,08:00:00,08:00:00,A,1",
-            "T1,08:10:00,08:10:00,B,2",
-        ],
-        # No calendar.txt: the service exists only through a REMOVAL
-        # exception, so no date ever runs.
-        "calendar_dates.txt": [
-            "service_id,date,exception_type",
-            "SV,20220222,2",
-        ],
-    }
-    feed = tmp_path / "never.zip"
-    with zipfile.ZipFile(feed, "w") as archive:
-        for name, lines in tables.items():
-            archive.writestr(name, "\n".join(lines) + "\n")
+    # No calendar.txt: the service exists only through a REMOVAL
+    # exception, so no date ever runs and the feed answers never.
+    feed = _single_trip_feed(
+        tmp_path / "never.zip",
+        {
+            "calendar_dates.txt": [
+                "service_id,date,exception_type",
+                "SV,20220222,2",
+            ]
+        },
+    )
     network = TransportNetwork.from_gtfs(
         [str(feed)], trip_distances=False, leg_geometries=False
     )
     assert network.service_window is None
     series = network.daily_trip_counts
-    import pandas
-
     assert len(series) == 0 and str(series.dtype) == "int64"
     assert isinstance(series.index, pandas.DatetimeIndex)

@@ -166,42 +166,68 @@ def test_chunks_partition_origins(streets, origins, destinations):
     assert {(r.from_id, r.to_id) for r in shards.itertuples(index=False)} == pairs
 
 
-def test_unsnappable_origins_warn_and_are_absent(streets, destinations):
-    far = gpd.GeoDataFrame(
-        {"id": ["atlantic"]},
-        geometry=gpd.points_from_xy([-30.0], [0.0]),
-        crs="EPSG:4326",
-    )
-    with pytest.warns(UserWarning, match="atlantic"):
-        matrix = TravelTimeMatrix(streets, far, destinations, transport_mode="bicycle")
-    assert len(matrix) == 0
+def test_street_matrix_mode_and_input_refusals(streets, origins):
+    # The wrong mode names and origin shapes are refused loudly.
+    for build, exception, match in [
+        (
+            lambda: TravelTimeMatrix(
+                streets, origins, transport_mode="public_transport"
+            ),
+            ValueError,
+            "needs a TransportNetwork",
+        ),
+        (
+            lambda: TravelTimeMatrix(streets, origins, transport_mode="hovercraft"),
+            ValueError,
+            "unknown transport_mode",
+        ),
+        (
+            lambda: TravelTimeMatrix(streets, ["1010101"], transport_mode="bicycle"),
+            TypeError,
+            "GeoDataFrame of points",
+        ),
+    ]:
+        with pytest.raises(exception, match=match):
+            build()
 
 
-def test_street_network_requires_an_explicit_mode(streets, origins):
-    with pytest.raises(TypeError, match="explicit transport_mode"):
-        TravelTimeMatrix(streets, origins)
-
-
-def test_public_transport_mode_needs_a_transport_network(streets, origins):
-    with pytest.raises(ValueError, match="needs a TransportNetwork"):
-        TravelTimeMatrix(streets, origins, transport_mode="public_transport")
-
-
-def test_unknown_mode_is_rejected(streets, origins):
-    with pytest.raises(ValueError, match="unknown transport_mode"):
-        TravelTimeMatrix(streets, origins, transport_mode="hovercraft")
-
-
-def test_street_mode_on_a_transport_network_is_rejected(network):
-    with pytest.raises(ValueError, match="is a street mode"):
-        TravelTimeMatrix(
-            network, None, None, "2022-02-22 08:30:00", transport_mode="bicycle"
-        )
-
-
-def test_max_street_time_on_a_transport_network_is_rejected(network):
-    with pytest.raises(ValueError, match="applies to a StreetNetwork"):
-        TravelTimeMatrix(network, None, None, "2022-02-22 08:30:00", max_street_time=10)
+def test_street_keywords_on_a_transport_network_are_rejected(network):
+    # They were unknown keywords before, so accepting and ignoring them would
+    # quietly hand back transit results for a street request.
+    for computer, args, kwargs, match in [
+        (
+            TravelTimeMatrix,
+            (None, None, "2022-02-22 08:30:00"),
+            {"transport_mode": "bicycle"},
+            "is a street mode",
+        ),
+        (
+            TravelTimeMatrix,
+            (None, None, "2022-02-22 08:30:00"),
+            {"max_street_time": 10},
+            "applies to a StreetNetwork",
+        ),
+        (
+            TravelCostMatrix,
+            (None, None, "2022-02-22 08:30:00"),
+            {"transport_mode": "bicycle"},
+            "is a street mode",
+        ),
+        (
+            DetailedItineraries,
+            (["1010101"], ["1010102"], "2022-02-22 08:30:00"),
+            {"transport_mode": "bicycle"},
+            "is a street mode",
+        ),
+        (
+            DetailedItineraries,
+            (["1010101"], ["1010102"], "2022-02-22 08:30:00"),
+            {"max_street_time": 10},
+            "applies to a StreetNetwork",
+        ),
+    ]:
+        with pytest.raises(ValueError, match=match):
+            computer(network, *args, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -226,27 +252,9 @@ def test_transit_only_arguments_are_rejected(streets, origins, kwargs):
         TravelTimeMatrix(streets, origins, transport_mode="bicycle", **kwargs)
 
 
-def test_stop_id_origins_are_rejected(streets):
-    with pytest.raises(TypeError, match="GeoDataFrame of points"):
-        TravelTimeMatrix(streets, ["1010101"], transport_mode="bicycle")
-
-
-@pytest.mark.parametrize("cutoff", [-1.0, float("nan"), float("inf")])
-def test_an_unusable_cutoff_is_refused_loudly(streets, origins, cutoff):
-    # A negative, NaN, or infinite duration is a caller error, not an
-    # empty result.
-    with pytest.raises(ValueError, match="max_street_time"):
-        TravelTimeMatrix(
-            streets, origins, transport_mode="bicycle", max_street_time=cutoff
-        )
-    origin = coordinates(origins)[0]
-    with pytest.raises(ValueError, match="max_travel_time"):
-        streets.travel_time(origin, origin, mode="bicycle", max_travel_time=cutoff)
-
-
 # ---- Cost matrix ----
 
-from cafein import TravelCostMatrix  # noqa: E402
+from cafein import DetailedItineraries, TravelCostMatrix  # noqa: E402
 from cafein._cafein import STREET_DISTANCE_PROVENANCE  # noqa: E402
 
 
@@ -309,14 +317,6 @@ def test_cost_matrix_columns_and_dtypes(streets, origins, destinations):
     assert type(costs.iloc[:1]) is pd.DataFrame
 
 
-def test_cost_matrix_columns_with_geometries(streets, origins, destinations):
-    costs = TravelCostMatrix(
-        streets, origins, destinations, transport_mode="bicycle", geometries=True
-    )
-    assert list(costs.columns) == COST_COLUMNS + ["geometry"]
-    assert costs.geometry.dtype == object
-
-
 @pytest.mark.parametrize("mode", ["walk", "bicycle", "e_scooter"])
 def test_geometries_do_not_change_the_numbers(streets, origins, destinations, mode):
     # Without geometries the rows come from the metres-only search rather than
@@ -353,6 +353,14 @@ def test_geometries_do_not_change_the_diagonal(streets, origins):
         plain[["from_id", "to_id", "travel_time", "distance_m"]],
         shaped[["from_id", "to_id", "travel_time", "distance_m"]],
     )
+    # The diagonal's zero-length route must still be a usable LineString:
+    # degenerate by nature — a route to the same coordinate has no extent —
+    # it must round-trip through WKB as a two-point LineString rather than
+    # the one-point shape shapely refuses to read.
+    for shape in shaped[shaped.from_id == shaped.to_id].geometry:
+        assert shape.geom_type == "LineString"
+        assert len(shape.coords) == 2
+        assert shape.length == 0.0
 
 
 def test_cost_matrix_distance_is_the_sum_of_its_parts(streets, origins, destinations):
@@ -453,7 +461,8 @@ def test_cost_matrix_geometry(streets, origins, destinations):
     costs = TravelCostMatrix(
         streets, origins, destinations, transport_mode="bicycle", geometries=True
     )
-    assert "geometry" in costs.columns
+    assert list(costs.columns) == COST_COLUMNS + ["geometry"]
+    assert costs.geometry.dtype == object
     off_diagonal = costs[costs.from_id != costs.to_id]
     assert len(off_diagonal) > 0
     for shape in off_diagonal.geometry:
@@ -468,13 +477,6 @@ def test_cost_matrix_geometry(streets, origins, destinations):
     assert abs(end[1] - targets[row.to_id][0]) < 1e-6
 
 
-def test_cost_matrix_rejects_a_street_mode_on_a_transport_network(network):
-    with pytest.raises(ValueError, match="is a street mode"):
-        TravelCostMatrix(
-            network, None, None, "2022-02-22 08:30:00", transport_mode="bicycle"
-        )
-
-
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -482,49 +484,6 @@ def test_cost_matrix_rejects_a_street_mode_on_a_transport_network(network):
         {"optimize": "emissions"},
         {"router": "raptor"},
         {"max_rides": 3},
-    ],
-)
-def test_cost_matrix_rejects_transit_only_arguments(streets, origins, kwargs):
-    name = next(iter(kwargs))
-    with pytest.raises(ValueError, match=f"{name}.*no meaning for a street matrix"):
-        TravelCostMatrix(streets, origins, transport_mode="bicycle", **kwargs)
-
-
-def test_cost_matrix_requires_an_explicit_mode(streets, origins):
-    with pytest.raises(TypeError, match="explicit transport_mode"):
-        TravelCostMatrix(streets, origins)
-
-
-@pytest.mark.parametrize("cutoff", [-1.0, float("nan"), float("inf")])
-def test_cost_matrix_refuses_an_unusable_cutoff(streets, origins, cutoff):
-    # A negative, NaN, or infinite duration is a caller error, not an
-    # empty result — matching the time matrix.
-    with pytest.raises(ValueError, match="max_street_time"):
-        TravelCostMatrix(
-            streets, origins, transport_mode="bicycle", max_street_time=cutoff
-        )
-
-
-def test_diagonal_geometry_is_a_valid_line(streets, origins):
-    # Destinations default to the origins, so the diagonal is present; its
-    # zero-length route must still be a usable LineString.
-    costs = TravelCostMatrix(
-        streets, origins, transport_mode="bicycle", geometries=True
-    )
-    diagonal = costs[costs.from_id == costs.to_id]
-    assert len(diagonal) == len(origins)
-    for shape in diagonal.geometry:
-        # Degenerate by nature — a route to the same coordinate has no extent —
-        # but it must still round-trip through WKB as a two-point LineString
-        # rather than the one-point shape shapely refuses to read.
-        assert shape.geom_type == "LineString"
-        assert len(shape.coords) == 2
-        assert shape.length == 0.0
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
         {"departure_time_window": 10},
         {"max_travel_time": 10},
         {"candidates": "pareto"},
@@ -537,21 +496,49 @@ def test_diagonal_geometry_is_a_valid_line(streets, origins):
         {"max_walking_time": 10.0},
     ],
 )
-def test_cost_matrix_rejects_the_remaining_transit_arguments(streets, origins, kwargs):
+def test_cost_matrix_rejects_transit_only_arguments(streets, origins, kwargs):
     name = next(iter(kwargs))
     with pytest.raises(ValueError, match=f"{name}.*no meaning for a street matrix"):
         TravelCostMatrix(streets, origins, transport_mode="bicycle", **kwargs)
 
 
-def test_cost_matrix_warns_on_unsnappable_origins(streets, destinations):
+@pytest.mark.parametrize(
+    "computer", [TravelTimeMatrix, TravelCostMatrix, DetailedItineraries]
+)
+def test_a_street_network_requires_an_explicit_mode(streets, origins, computer):
+    with pytest.raises(TypeError, match="explicit transport_mode"):
+        computer(streets, origins)
+
+
+@pytest.mark.parametrize("cutoff", [-1.0, float("nan"), float("inf")])
+def test_an_unusable_cutoff_is_refused_loudly(streets, origins, cutoff):
+    # A negative, NaN, or infinite duration is a caller error, not an
+    # empty result — on either matrix and on the one-pair query.
+    with pytest.raises(ValueError, match="max_street_time"):
+        TravelTimeMatrix(
+            streets, origins, transport_mode="bicycle", max_street_time=cutoff
+        )
+    with pytest.raises(ValueError, match="max_street_time"):
+        TravelCostMatrix(
+            streets, origins, transport_mode="bicycle", max_street_time=cutoff
+        )
+    origin = coordinates(origins)[0]
+    with pytest.raises(ValueError, match="max_travel_time"):
+        streets.travel_time(origin, origin, mode="bicycle", max_travel_time=cutoff)
+
+
+@pytest.mark.parametrize(
+    "computer", [TravelTimeMatrix, TravelCostMatrix, DetailedItineraries]
+)
+def test_unsnappable_origins_warn_and_are_absent(streets, destinations, computer):
     far = gpd.GeoDataFrame(
         {"id": ["atlantic"]},
         geometry=gpd.points_from_xy([-30.0], [0.0]),
         crs="EPSG:4326",
     )
     with pytest.warns(UserWarning, match="atlantic"):
-        costs = TravelCostMatrix(streets, far, destinations, transport_mode="bicycle")
-    assert len(costs) == 0
+        frame = computer(streets, far, destinations, transport_mode="bicycle")
+    assert len(frame) == 0
 
 
 # ---- Emissions ----
@@ -601,31 +588,29 @@ def test_emission_components_select_a_subset(streets, origins):
 
 
 @pytest.mark.parametrize(
-    ("mode", "per_km"),
-    # The shipped sourced defaults: ITF "Good to Go?" components on the
-    # Finland 2020 mix (via cafein-lca), the conventional bicycle's
-    # dietary 21 g/km on top, walking the zero baseline.
-    [("walk", 0.0), ("bicycle", 37.0), ("e_bike", 25.0), ("e_scooter", 36.0)],
+    ("mode", "components", "per_km"),
+    [
+        # The shipped sourced defaults: ITF "Good to Go?" components on the
+        # Finland 2020 mix (via cafein-lca), the conventional bicycle's
+        # dietary 21 g/km on top, walking the zero baseline.
+        ("walk", None, 0.0),
+        ("bicycle", None, 37.0),
+        ("e_bike", None, 25.0),
+        ("e_scooter", None, 36.0),
+        # Narrowed to the use phase: walking is free; the conventional
+        # bicycle carries the shipped dietary energy factor of 21 g/km;
+        # the battery modes their Finnish-mix charging electricity.
+        ("walk", ["fuel", "operations"], 0.0),
+        ("bicycle", ["fuel", "operations"], 21.0),
+        ("e_bike", ["fuel", "operations"], 3.0),
+        ("e_scooter", ["fuel", "operations"], 1.0),
+    ],
 )
 def test_default_full_lca_resolves_with_the_shipped_sources(
-    streets, origins, mode, per_km
+    streets, origins, mode, components, per_km
 ):
-    costs = TravelCostMatrix(streets, origins, transport_mode=mode)
-    expected = costs.network_distance_m / 1000.0 * per_km
-    assert np.allclose(costs.emissions, expected)
-
-
-@pytest.mark.parametrize(
-    ("mode", "per_km"),
-    [("walk", 0.0), ("bicycle", 21.0), ("e_bike", 3.0), ("e_scooter", 1.0)],
-)
-def test_operational_components_narrow_to_use_phase(streets, origins, mode, per_km):
-    # Walking is free; the conventional bicycle carries the shipped dietary
-    # energy factor of 21 g/km; the battery modes their Finnish-mix
-    # charging electricity.
-    costs = TravelCostMatrix(
-        streets, origins, transport_mode=mode, components=["fuel", "operations"]
-    )
+    kwargs = {} if components is None else {"components": components}
+    costs = TravelCostMatrix(streets, origins, transport_mode=mode, **kwargs)
     expected = costs.network_distance_m / 1000.0 * per_km
     assert np.allclose(costs.emissions, expected)
 
@@ -648,69 +633,61 @@ def test_a_user_row_with_a_missing_selected_component_stays_unresolved(
     assert costs.emissions.isna().all()
 
 
-def test_a_mode_level_user_row_beats_the_shipped_default(streets, origins):
-    # The shipped table carries an exact-triple sourced row for every mode; a
-    # sourced user row at bare street_mode specificity must still win it.
-    factors = pd.DataFrame(
-        [
-            {
-                "street_mode": "bicycle",
-                "vehicle": 10.0,
-                "fuel": 0.0,
-                "infrastructure": 10.0,
-                "operations": 0.0,
-            }
-        ]
-    )
-    costs = TravelCostMatrix(
-        streets, origins, transport_mode="bicycle", factors=factors
-    )
-    off = costs[costs.from_id != costs.to_id]
-    assert len(off) > 0
-    assert np.allclose(off.emissions, off.network_distance_m / 1000.0 * 20.0)
-
-
 def test_empty_components_are_rejected(streets, origins):
     with pytest.raises(ValueError, match="selects nothing"):
         TravelCostMatrix(streets, origins, transport_mode="bicycle", components=[])
 
 
-def test_the_street_ladder_prefers_the_specific_row(streets, origins):
-    # A mode-level row is shadowed by the class-level pair — the middle rung,
-    # with no service_model — which the exact triple shadows in turn.
-    mode_row = {
-        "street_mode": "bicycle",
-        "vehicle": 100.0,
-        "fuel": 0.0,
-        "infrastructure": 0.0,
-        "operations": 0.0,
-    }
-    pair_row = {
-        "street_mode": "bicycle",
-        "vehicle_class": "conventional",
-        "vehicle": 30.0,
-        "fuel": 0.0,
-        "infrastructure": 10.0,
-        "operations": 0.0,
-    }
-    pair = TravelCostMatrix(
-        streets,
-        origins,
-        transport_mode="bicycle",
-        factors=pd.DataFrame([mode_row, pair_row]),
-    )
-    off = pair[pair.from_id != pair.to_id]
-    assert len(off) > 0
-    assert np.allclose(off.emissions, off.network_distance_m / 1000.0 * 40.0)
+MODE_ROW = {
+    "street_mode": "bicycle",
+    "vehicle": 100.0,
+    "fuel": 0.0,
+    "infrastructure": 0.0,
+    "operations": 0.0,
+}
+PAIR_ROW = {
+    "street_mode": "bicycle",
+    "vehicle_class": "conventional",
+    "vehicle": 30.0,
+    "fuel": 0.0,
+    "infrastructure": 10.0,
+    "operations": 0.0,
+}
 
-    triple = TravelCostMatrix(
-        streets,
-        origins,
-        transport_mode="bicycle",
-        factors=pd.DataFrame([mode_row, pair_row, BICYCLE_ROW]),
+
+@pytest.mark.parametrize(
+    ("rows", "per_km"),
+    [
+        # The shipped table carries an exact-triple sourced row for every
+        # mode; a sourced user row at bare street_mode specificity must
+        # still win it.
+        pytest.param(
+            [
+                {
+                    "street_mode": "bicycle",
+                    "vehicle": 10.0,
+                    "fuel": 0.0,
+                    "infrastructure": 10.0,
+                    "operations": 0.0,
+                }
+            ],
+            20.0,
+            id="mode-level-beats-shipped",
+        ),
+        # A mode-level row is shadowed by the class-level pair — the middle
+        # rung, with no service_model...
+        pytest.param([MODE_ROW, PAIR_ROW], 40.0, id="pair-shadows-mode"),
+        # ...which the exact triple shadows in turn.
+        pytest.param([MODE_ROW, PAIR_ROW, BICYCLE_ROW], 20.0, id="triple-shadows-pair"),
+    ],
+)
+def test_the_street_ladder_prefers_the_specific_row(streets, origins, rows, per_km):
+    costs = TravelCostMatrix(
+        streets, origins, transport_mode="bicycle", factors=pd.DataFrame(rows)
     )
-    off = triple[triple.from_id != triple.to_id]
-    assert np.allclose(off.emissions, off.network_distance_m / 1000.0 * 20.0)
+    off = costs[costs.from_id != costs.to_id]
+    assert len(off) > 0
+    assert np.allclose(off.emissions, off.network_distance_m / 1000.0 * per_km)
 
 
 def test_unmatchable_factor_rows_are_rejected(streets, origins):
@@ -751,7 +728,7 @@ def test_itineraries_agree_with_the_cost_matrix_on_emissions(streets, origins):
         assert row.emissions == pytest.approx(by_pair[(row.from_id, row.to_id)])
 
 
-def test_wheelchair_detours_the_stairs(streets):
+def test_wheelchair_detours_the_stairs(streets, origins):
     # The longest stairway in the extract (75 m of highway=steps); walking
     # shortcuts straight over it, the wheelchair profile must go around.
     places = gpd.GeoDataFrame(
@@ -770,9 +747,6 @@ def test_wheelchair_detours_the_stairs(streets):
     # Same speed, stricter permissions: never faster, strictly slower here.
     assert chaired[("top", "bottom")] > walked[("top", "bottom")]
     assert chaired[("bottom", "top")] > walked[("bottom", "top")]
-
-
-def test_wheelchair_is_never_faster_and_snaps_off_the_stairs(streets, origins):
     # Same speed, subset permissions: wheelchair times dominate walking
     # everywhere, and match it away from the stairs.
     walk = TravelTimeMatrix(

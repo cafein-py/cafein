@@ -163,10 +163,8 @@ def test_frontier_trades_time_against_emissions(two_line_frontier):
     assert cleanest["rides"] == 1
     assert cleanest["emissions"] == trams["emissions"].iloc[0]
     assert least_emissions(frame, max_travel_time=1) is None
-
-
-def test_dominated_candidates_leave_the_frontier(two_line_frontier):
-    frame = two_line_frontier
+    # Dominated candidates leave the frontier: every off-frontier row is
+    # dominated by an on-frontier one.
     on_frontier = frame[frame["frontier"]]
     for _, row in frame[~frame["frontier"]].iterrows():
         assert (
@@ -214,14 +212,9 @@ def test_fares_join_the_frontier(tmp_path):
     )
     with pytest.raises(ValueError, match="carries no fares"):
         least_fare(unpriced)
-
-
-def test_unpriceable_candidates_leave_the_frontier(tmp_path):
-    from cafein import TransportNetwork
-
-    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
-    network = TransportNetwork.from_gtfs([str(feed)])
-    frame = journey_frontier(
+    # Unpriceable candidates leave the frontier: without a tram tariff
+    # the tram journeys carry NaN fares and never join it.
+    partial = journey_frontier(
         network,
         "A",
         "B",
@@ -229,10 +222,10 @@ def test_unpriceable_candidates_leave_the_frontier(tmp_path):
         departure_time_window=30,
         fares=two_line_fares(tram_priced=False),
     )
-    trams = frame[frame["rides"] == 1]
+    trams = partial[partial["rides"] == 1]
     assert trams["fare"].isna().all()
     assert not trams["frontier"].any()
-    assert set(frame.loc[frame["frontier"], "travel_time"]) == {15, 23}
+    assert set(partial.loc[partial["frontier"], "travel_time"]) == {15, 23}
 
 
 def test_door_to_door_frontier_anchors_on_walking(network_with_footpaths):
@@ -274,25 +267,12 @@ def test_door_to_door_frontier_anchors_on_walking(network_with_footpaths):
     assert fastest["travel_time"] <= fastest_arrival - (8 * 3600 + 30 * 60)
 
 
-def test_frontier_rejects_mixed_endpoints(network_with_footpaths):
-    with pytest.raises(ValueError, match="both"):
-        journey_frontier(
-            network_with_footpaths,
-            "1100602",
-            (60.17, 24.94),
-            "2022-02-22 08:30:00",
-            departure_time_window=10,
-        )
-
-
-def test_least_fare_survives_unresolved_emissions(network, helsinki_gtfs):
+def test_unmatched_factors_poison_but_do_not_block(network, helsinki_gtfs):
     from cafein import least_fare
     from cafein.fares import zone_fare_structure
 
-    hsl = zone_fare_structure(helsinki_gtfs)
-    # Every journey to Suomenlinna rides the factorless ferry: nothing
-    # reaches the frontier and least_emissions has nothing to pick, yet
-    # the journeys still price and the cheapest one is returned.
+    # The Suomenlinna ferry has no shipped factor: its journeys carry
+    # NaN emissions and never join the frontier.
     with pytest.warns(UserWarning, match="route_type"):
         frame = journey_frontier(
             network,
@@ -300,40 +280,67 @@ def test_least_fare_survives_unresolved_emissions(network, helsinki_gtfs):
             "1520703",
             "2022-02-22 10:00:00",
             departure_time_window=60,
+        )
+    assert len(frame)
+    assert frame["emissions"].isna().any()
+    assert not frame.loc[frame["emissions"].isna(), "frontier"].any()
+    # Every journey to Suomenlinna rides the factorless ferry: nothing
+    # reaches the frontier and least_emissions has nothing to pick, yet
+    # the journeys still price and the cheapest one is returned.
+    hsl = zone_fare_structure(helsinki_gtfs)
+    with pytest.warns(UserWarning, match="route_type"):
+        priced = journey_frontier(
+            network,
+            "1080701",
+            "1520703",
+            "2022-02-22 10:00:00",
+            departure_time_window=60,
             fares=hsl,
         )
-    assert frame["emissions"].isna().all()
-    assert not frame["frontier"].any()
-    assert least_emissions(frame) is None
-    cheapest = least_fare(frame)
+    assert priced["emissions"].isna().all()
+    assert not priced["frontier"].any()
+    assert least_emissions(priced) is None
+    cheapest = least_fare(priced)
     assert cheapest["fare"] == pytest.approx(2.8)
-    assert least_fare(frame, max_travel_time=0.016666666666666666) is None
+    assert least_fare(priced, max_travel_time=0.016666666666666666) is None
 
 
-def test_exhaustive_frontier_agrees_with_hand_checkable_candidates(tmp_path):
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        # On the two-line feed the interim candidates at a single departure
+        # ARE the true frontier: the fast-dirty bus chain and the
+        # slow-clean tram. The oracle must reproduce them exactly.
+        pytest.param({}, id="time"),
+        # With a vanishing bucket the McRAPTOR candidate set is the true
+        # frontier the oracle enumerates.
+        pytest.param(
+            {"max_rides": 5, "candidates": "pareto", "bucket": 1e-6}, id="pareto"
+        ),
+    ],
+)
+def test_candidates_match_the_oracle_on_the_two_line_feed(tmp_path, kwargs):
     from cafein import TransportNetwork, exhaustive_frontier
 
-    # On the two-line feed the interim candidates at a single departure
-    # ARE the true frontier: the fast-dirty bus chain and the
-    # slow-clean tram. The oracle must reproduce them exactly.
     feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
     network = TransportNetwork.from_gtfs([str(feed)])
     true_set = exhaustive_frontier(
         network, "A", "B", "2022-02-22 08:00:00", max_rides=5
     )
-    interim = journey_frontier(
+    frame = journey_frontier(
         network,
         "A",
         "B",
         "2022-02-22 08:00:00",
         departure_time_window=0.016666666666666666,
+        **kwargs,
     )
     assert len(true_set) == 2
-    assert true_set["arrival_s"].tolist() == interim["arrival_s"].tolist()
-    assert true_set["rides"].tolist() == interim["rides"].tolist()
-    assert true_set["emissions"].tolist() == pytest.approx(
-        interim["emissions"].tolist()
-    )
+    if "candidates" in kwargs:
+        assert frame["frontier"].all()
+    assert frame["arrival_s"].tolist() == true_set["arrival_s"].tolist()
+    assert frame["rides"].tolist() == true_set["rides"].tolist()
+    assert frame["emissions"].tolist() == pytest.approx(true_set["emissions"].tolist())
 
 
 def test_exhaustive_frontier_finds_points_the_interim_misses(network):
@@ -383,32 +390,6 @@ def test_exhaustive_frontier_finds_points_the_interim_misses(network):
     ]
     assert len(missing) == 1
     assert missing[0].emissions < resolved["emissions"].min()
-
-
-def test_pareto_candidates_match_the_oracle_on_the_two_line_feed(tmp_path):
-    from cafein import TransportNetwork, exhaustive_frontier
-
-    # With a vanishing bucket the McRAPTOR candidate set is the true
-    # frontier the oracle enumerates.
-    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
-    network = TransportNetwork.from_gtfs([str(feed)])
-    true_set = exhaustive_frontier(
-        network, "A", "B", "2022-02-22 08:00:00", max_rides=5
-    )
-    frame = journey_frontier(
-        network,
-        "A",
-        "B",
-        "2022-02-22 08:00:00",
-        departure_time_window=0.016666666666666666,
-        max_rides=5,
-        candidates="pareto",
-        bucket=1e-6,
-    )
-    assert frame["frontier"].all()
-    assert frame["arrival_s"].tolist() == true_set["arrival_s"].tolist()
-    assert frame["rides"].tolist() == true_set["rides"].tolist()
-    assert frame["emissions"].tolist() == pytest.approx(true_set["emissions"].tolist())
 
 
 def test_pareto_window_candidates_cover_the_time_candidates(tmp_path):
@@ -655,49 +636,39 @@ def test_the_tbtr_pareto_router_matches_mcraptor(network_with_footpaths_mctbtr):
         assert ordered[0][column].tolist() == pytest.approx(ordered[1][column].tolist())
 
 
-def test_pareto_candidate_options_are_validated(tmp_path):
+def test_candidate_options_are_validated(tmp_path):
     from cafein import TransportNetwork
 
     feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
     network = TransportNetwork.from_gtfs([str(feed)])
-    with pytest.raises(ValueError, match="candidates"):
-        journey_frontier(
-            network,
-            "A",
-            "B",
-            "2022-02-22 08:00:00",
-            departure_time_window=0.016666666666666666,
-            candidates="fastest",
-        )
-    with pytest.raises(ValueError, match="bucket"):
-        journey_frontier(
-            network,
-            "A",
-            "B",
-            "2022-02-22 08:00:00",
-            departure_time_window=0.016666666666666666,
-            candidates="pareto",
-            bucket=0.0,
-        )
-    with pytest.raises(ValueError, match="router"):
-        journey_frontier(
-            network,
-            "A",
-            "B",
-            "2022-02-22 08:00:00",
-            departure_time_window=0.016666666666666666,
-            candidates="pareto",
-            router="dijkstra",
-        )
-    with pytest.raises(ValueError, match="candidates='pareto'"):
-        journey_frontier(
-            network,
-            "A",
-            "B",
-            "2022-02-22 08:00:00",
-            departure_time_window=0.016666666666666666,
-            router="tbtr",
-        )
+    for kwargs, match in (
+        ({"candidates": "fastest"}, "candidates"),
+        ({"candidates": "pareto", "bucket": 0.0}, "bucket"),
+        ({"candidates": "pareto", "router": "dijkstra"}, "router"),
+        # The trip-based engine serves only the pareto candidates.
+        ({"router": "tbtr"}, "candidates='pareto'"),
+        ({"candidates": "relaxed", "router": "tbtr"}, "candidates='pareto'"),
+        ({"candidates": "relaxed", "tolerance_minutes": -5}, "tolerance"),
+        ({"candidates": "relaxed", "max_options": 0}, "max_options"),
+        ({"candidates": "relaxed", "max_options": 2.5}, "max_options"),
+        ({"candidates": "diverse", "router": "tbtr"}, "candidates='pareto'"),
+        ({"candidates": "diverse", "max_options": 0}, "max_options"),
+        ({"candidates": "diverse", "diversity": "closest"}, "diversity must be"),
+        ({"candidates": "diverse", "tolerance_minutes": -1}, "tolerance_minutes"),
+        ({"candidates": "diverse", "penalty": -5}, "penalty must be"),
+        ({"candidates": "diverse", "penalty": 0}, "penalty must be"),
+        ({"candidates": "diverse", "penalty": "nope"}, "penalty must be"),
+        ({"candidates": "pareto", "penalty": 300}, "penalty applies only"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            journey_frontier(
+                network,
+                "A",
+                "B",
+                "2022-02-22 08:00:00",
+                departure_time_window=0.016666666666666666,
+                **kwargs,
+            )
 
 
 def _frontier_tuples(frame):
@@ -710,30 +681,6 @@ def _frontier_tuples(frame):
         )
         for row in frame.itertuples()
     )
-
-
-def test_relaxed_candidates_reduce_to_pareto_at_zero_slack(network):
-    # tolerance_minutes=0 reproduces the strict pareto candidate set exactly.
-    origin, destination = "1370104", "4960238"
-    common = dict(departure_time_window=10, max_rides=5)
-    pareto = journey_frontier(
-        network,
-        origin,
-        destination,
-        "2022-02-22 08:30:00",
-        candidates="pareto",
-        **common,
-    )
-    relaxed = journey_frontier(
-        network,
-        origin,
-        destination,
-        "2022-02-22 08:30:00",
-        candidates="relaxed",
-        tolerance_minutes=0,
-        **common,
-    )
-    assert _frontier_tuples(relaxed) == _frontier_tuples(pareto)
 
 
 def test_relaxed_candidates_widen_the_pareto_set(network):
@@ -797,53 +744,6 @@ def test_relaxed_max_options_keeps_the_frontier(network):
     assert _frontier_tuples(relaxed(max_options=len(widened))) == widened
 
 
-def test_relaxed_candidate_options_are_validated(tmp_path):
-    from cafein import TransportNetwork
-
-    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
-    network = TransportNetwork.from_gtfs([str(feed)])
-    with pytest.raises(ValueError, match="candidates='pareto'"):
-        journey_frontier(
-            network,
-            "A",
-            "B",
-            "2022-02-22 08:00:00",
-            departure_time_window=0.016666666666666666,
-            candidates="relaxed",
-            router="tbtr",
-        )
-    with pytest.raises(ValueError, match="tolerance"):
-        journey_frontier(
-            network,
-            "A",
-            "B",
-            "2022-02-22 08:00:00",
-            departure_time_window=0.016666666666666666,
-            candidates="relaxed",
-            tolerance_minutes=-5,
-        )
-    with pytest.raises(ValueError, match="max_options"):
-        journey_frontier(
-            network,
-            "A",
-            "B",
-            "2022-02-22 08:00:00",
-            departure_time_window=0.016666666666666666,
-            candidates="relaxed",
-            max_options=0,
-        )
-    with pytest.raises(ValueError, match="max_options"):
-        journey_frontier(
-            network,
-            "A",
-            "B",
-            "2022-02-22 08:00:00",
-            departure_time_window=0.016666666666666666,
-            candidates="relaxed",
-            max_options=2.5,
-        )
-
-
 def _option_corridors(frame):
     return [
         frozenset(
@@ -868,7 +768,19 @@ def _journey_signatures(frame):
     ]
 
 
-def test_diverse_candidates_split_bus_and_tram(tmp_path):
+@pytest.mark.parametrize(
+    "max_options, expected",
+    [
+        # Two disjoint corridors — the fast bus chain then the tram — even
+        # though a third alternative was asked for: penalization stops when
+        # the routes run out.
+        pytest.param(3, [{"BUS_IN", "BUS_OUT"}, {"TRAM"}], id="exhausts-at-two"),
+        # Just the single fastest corridor — the 900 s bus chain, not the
+        # tram.
+        pytest.param(1, [{"BUS_IN", "BUS_OUT"}], id="fastest-only"),
+    ],
+)
+def test_diverse_candidates_split_bus_and_tram(tmp_path, max_options, expected):
     from cafein import TransportNetwork
 
     feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
@@ -880,34 +792,15 @@ def test_diverse_candidates_split_bus_and_tram(tmp_path):
         "2022-02-22 08:00:00",
         departure_time_window=0.016666666666666666,
         candidates="diverse",
-        max_options=3,
+        max_options=max_options,
     )
-    # Two disjoint corridors — the fast bus chain then the tram — even though
-    # a third alternative was asked for: penalization stops when the routes
-    # run out.
     corridors = _option_corridors(frame)
-    assert corridors == [{"BUS_IN", "BUS_OUT"}, {"TRAM"}]
-    assert corridors[0].isdisjoint(corridors[1])
-
-
-def test_diverse_max_options_one_returns_the_fastest(tmp_path):
-    from cafein import TransportNetwork
-
-    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
-    network = TransportNetwork.from_gtfs([str(feed)])
-    frame = journey_frontier(
-        network,
-        "A",
-        "B",
-        "2022-02-22 08:00:00",
-        departure_time_window=0.016666666666666666,
-        candidates="diverse",
-        max_options=1,
-    )
-    # Just the single fastest corridor — the 900 s bus chain, not the tram.
-    assert len(frame) == 1
-    assert _option_corridors(frame) == [{"BUS_IN", "BUS_OUT"}]
-    assert int(frame["travel_time"].iloc[0]) == 15
+    assert corridors == expected
+    assert len(frame) == len(expected)
+    if max_options == 1:
+        assert int(frame["travel_time"].iloc[0]) == 15
+    else:
+        assert corridors[0].isdisjoint(corridors[1])
 
 
 def test_diverse_candidates_are_route_disjoint(network):
@@ -947,108 +840,62 @@ def test_diverse_candidates_stop_at_a_single_corridor(network):
     assert len(frame) == 1
 
 
-def test_diverse_candidate_options_are_validated(tmp_path):
-    from cafein import TransportNetwork
-
-    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
-    network = TransportNetwork.from_gtfs([str(feed)])
-    with pytest.raises(ValueError, match="candidates='pareto'"):
-        journey_frontier(
-            network,
-            "A",
-            "B",
-            "2022-02-22 08:00:00",
-            departure_time_window=0.016666666666666666,
-            candidates="diverse",
-            router="tbtr",
-        )
-    with pytest.raises(ValueError, match="max_options"):
-        journey_frontier(
-            network,
-            "A",
-            "B",
-            "2022-02-22 08:00:00",
-            departure_time_window=0.016666666666666666,
-            candidates="diverse",
-            max_options=0,
-        )
-    with pytest.raises(ValueError, match="diversity must be"):
-        journey_frontier(
-            network,
-            "A",
-            "B",
-            "2022-02-22 08:00:00",
-            departure_time_window=0.016666666666666666,
-            candidates="diverse",
-            diversity="closest",
-        )
-    with pytest.raises(ValueError, match="tolerance_minutes"):
-        journey_frontier(
-            network,
-            "A",
-            "B",
-            "2022-02-22 08:00:00",
-            departure_time_window=0.016666666666666666,
-            candidates="diverse",
-            tolerance_minutes=-1,
-        )
-    for bad in (-5, 0, "nope"):
-        with pytest.raises(ValueError, match="penalty must be"):
-            journey_frontier(
-                network,
-                "A",
-                "B",
-                "2022-02-22 08:00:00",
-                departure_time_window=0.016666666666666666,
-                candidates="diverse",
-                penalty=bad,
-            )
-    with pytest.raises(ValueError, match="penalty applies only"):
-        journey_frontier(
-            network,
-            "A",
-            "B",
-            "2022-02-22 08:00:00",
-            departure_time_window=0.016666666666666666,
-            candidates="pareto",
-            penalty=300,
-        )
-
-
-def test_tolerance_defaults_are_per_family(network):
-    # The None-sentinel default resolves per family, so existing calls are
-    # unchanged: "relaxed" still defaults to a 300 s band, "diverse" to 0
-    # (strict pareto per round).
-    args = ("1370104", "4960238", "2022-02-22 08:30:00")
-    relaxed_default = journey_frontier(
-        network, *args, departure_time_window=30, candidates="relaxed"
-    )
-    relaxed_300 = journey_frontier(
-        network,
-        *args,
-        departure_time_window=30,
-        candidates="relaxed",
-        tolerance_minutes=5.0,
-    )
-    assert relaxed_default.equals(relaxed_300)
-    diverse_default = journey_frontier(
-        network,
-        *args,
-        departure_time_window=0.016666666666666666,
-        max_rides=7,
-        candidates="diverse",
-        max_options=3,
-    )
-    diverse_0 = journey_frontier(
-        network,
-        *args,
-        departure_time_window=0.016666666666666666,
-        max_rides=7,
-        candidates="diverse",
-        max_options=3,
-        tolerance_minutes=0.0,
-    )
-    assert diverse_default.equals(diverse_0)
+def test_explicit_options_reproduce_the_defaults(network):
+    # The None-sentinel tolerance resolves per family, so existing calls
+    # are unchanged: "relaxed" still defaults to a 300 s band, "diverse"
+    # to 0 (strict pareto per round). diversity="time" is the default
+    # objective, penalty="ban" the default hard-disjoint behaviour, and
+    # tolerance_minutes=0 reproduces the strict pareto candidate set
+    # exactly.
+    gap_pair = ("1370104", "4960238", "2022-02-22 08:30:00")
+    trunk_pair = ("1281160", "1320107", "2022-02-22 08:30:00")
+    single = dict(departure_time_window=0.016666666666666666, max_rides=7)
+    for args, common, left, right, compare in (
+        (
+            gap_pair,
+            dict(departure_time_window=10, max_rides=5),
+            dict(candidates="pareto"),
+            dict(candidates="relaxed", tolerance_minutes=0),
+            "tuples",
+        ),
+        (
+            gap_pair,
+            dict(departure_time_window=30, candidates="relaxed"),
+            {},
+            dict(tolerance_minutes=5.0),
+            "equals",
+        ),
+        (
+            gap_pair,
+            dict(candidates="diverse", max_options=3, **single),
+            {},
+            dict(tolerance_minutes=0.0),
+            "equals",
+        ),
+        (
+            gap_pair,
+            dict(candidates="diverse", max_options=3, **single),
+            {},
+            dict(diversity="time"),
+            "equals",
+        ),
+        (
+            trunk_pair,
+            dict(candidates="diverse", max_options=4, diversity="spread", **single),
+            {},
+            dict(penalty="ban"),
+            "corridors",
+        ),
+    ):
+        default = journey_frontier(network, *args, **common, **left)
+        explicit = journey_frontier(network, *args, **common, **right)
+        if compare == "tuples":
+            assert _frontier_tuples(explicit) == _frontier_tuples(default)
+        elif compare == "equals":
+            assert explicit.equals(default)
+        else:
+            assert _option_corridors(explicit) == _option_corridors(default)
+            assert _frontier_tuples(explicit) == _frontier_tuples(default)
 
 
 def test_relaxed_diverse_widens_the_round_pool(network):
@@ -1120,29 +967,6 @@ def test_relaxed_window_is_the_r5py_equivalent(network):
     assert len(signatures) == len(set(signatures))
 
 
-def test_diverse_time_reproduces_the_default(network):
-    # diversity="time" is the default objective, so it reproduces the diverse
-    # set returned without the argument.
-    common = dict(
-        departure_time_window=0.016666666666666666,
-        max_rides=7,
-        candidates="diverse",
-        max_options=3,
-    )
-    default = journey_frontier(
-        network, "1370104", "4960238", "2022-02-22 08:30:00", **common
-    )
-    explicit = journey_frontier(
-        network,
-        "1370104",
-        "4960238",
-        "2022-02-22 08:30:00",
-        diversity="time",
-        **common,
-    )
-    assert explicit.equals(default)
-
-
 def test_diverse_spread_keeps_picking_past_the_walking_journey(network_with_footpaths):
     # A routeless pick — the walking-only journey, spread's clean-slow corner —
     # bans nothing, so the rounds keep selecting from the same pool instead of
@@ -1208,22 +1032,6 @@ def test_diverse_spread_reaches_across_the_trade_off(network):
     assert spread_slowest["emissions"] < fast_slowest["emissions"]
 
 
-def test_diverse_penalty_ban_matches_the_default(network):
-    # penalty="ban" is the default hard-disjoint behaviour, unchanged.
-    args = ("1281160", "1320107", "2022-02-22 08:30:00")
-    common = dict(
-        departure_time_window=0.016666666666666666,
-        max_rides=7,
-        candidates="diverse",
-        max_options=4,
-        diversity="spread",
-    )
-    default = journey_frontier(network, *args, **common)
-    ban = journey_frontier(network, *args, penalty="ban", **common)
-    assert _option_corridors(default) == _option_corridors(ban)
-    assert _frontier_tuples(default) == _frontier_tuples(ban)
-
-
 def test_diverse_soft_penalty_shares_trunks_and_finds_more(network):
     # A hard ban forces route-disjoint corridors and dries up fast; a soft
     # penalty makes a used route costly-but-usable, so a corridor sharing a
@@ -1250,10 +1058,23 @@ def test_diverse_soft_penalty_shares_trunks_and_finds_more(network):
     assert soft["travel_time"].min() == ban["travel_time"].min()
 
 
-def test_diverse_soft_penalty_reports_true_times(network):
-    # The penalty steers the search through the dominance only; it must never
-    # inflate a reported time. A penalty far larger than any real trip leaves
-    # every reported travel time realistic (nowhere near the penalty).
+@pytest.mark.parametrize(
+    "max_options, penalty, check_times",
+    [
+        # The penalty steers the search through the dominance only; it must
+        # never inflate a reported time. A penalty far larger than any real
+        # trip leaves every reported travel time realistic (nowhere near
+        # the penalty).
+        pytest.param(4, 100000, True, id="true-times"),
+        # A penalty far beyond the engine's 32-bit cap (and the binding's
+        # integer width) is clamped on accumulation rather than overflowing
+        # the boundary conversion, so the call still returns journeys.
+        pytest.param(3, 10**20, False, id="clamped"),
+    ],
+)
+def test_diverse_soft_penalty_reports_true_times(
+    network, max_options, penalty, check_times
+):
     frame = journey_frontier(
         network,
         "1281160",
@@ -1262,65 +1083,28 @@ def test_diverse_soft_penalty_reports_true_times(network):
         departure_time_window=0.016666666666666666,
         max_rides=7,
         candidates="diverse",
-        max_options=4,
+        max_options=max_options,
         diversity="spread",
-        penalty=100000,
+        penalty=penalty,
     )
     assert len(frame) >= 1
-    assert frame["travel_time"].max() < 10000
+    if check_times:
+        assert frame["travel_time"].max() < 10000
 
 
-def test_diverse_soft_penalty_clamps_a_huge_value(network):
-    # A penalty far beyond the engine's 32-bit cap (and the binding's integer
-    # width) is clamped on accumulation rather than overflowing the boundary
-    # conversion, so the call still returns journeys.
-    frame = journey_frontier(
-        network,
-        "1281160",
-        "1320107",
-        "2022-02-22 08:30:00",
-        departure_time_window=0.016666666666666666,
-        max_rides=7,
-        candidates="diverse",
-        max_options=3,
-        diversity="spread",
-        penalty=10**20,
-    )
-    assert len(frame) >= 1
+def test_journey_frontiers_match_the_one_pair_frontier(network, network_with_footpaths):
+    import geopandas as gpd
+    from shapely.geometry import Point
 
-
-def test_unmatched_factors_poison_but_do_not_block(network):
-    # The Suomenlinna ferry has no shipped factor: its journeys carry
-    # NaN emissions and never join the frontier.
-    with pytest.warns(UserWarning, match="route_type"):
-        frame = journey_frontier(
-            network,
-            "1080701",
-            "1520703",
-            "2022-02-22 10:00:00",
-            departure_time_window=60,
-        )
-    assert len(frame)
-    assert frame["emissions"].isna().any()
-    assert not frame.loc[frame["emissions"].isna(), "frontier"].any()
-
-
-def test_journey_frontiers_match_the_one_pair_frontier(network):
     from cafein import journey_frontiers
 
-    origins = ["1370104", "4960238"]
-    destinations = ["4960238", "1370104"]
-    batched = journey_frontiers(
-        network, origins, destinations, "2022-02-22 08:30:00", departure_time_window=10
-    )
-    assert len(batched) > 0
-    for origin in origins:
-        for destination in destinations:
+    def assert_cells_match(batched, net, pairs):
+        for origin_id, destination_id, origin, destination in pairs:
             cell = batched[
-                (batched["from_id"] == origin) & (batched["to_id"] == destination)
+                (batched["from_id"] == origin_id) & (batched["to_id"] == destination_id)
             ].reset_index(drop=True)
             single = journey_frontier(
-                network,
+                net,
                 origin,
                 destination,
                 "2022-02-22 08:30:00",
@@ -1340,13 +1124,16 @@ def test_journey_frontiers_match_the_one_pair_frontier(network):
                 single["emissions"].tolist(), nan_ok=True
             )
 
-
-def test_journey_frontiers_route_door_to_door(network_with_footpaths):
-    import geopandas as gpd
-    from shapely.geometry import Point
-
-    from cafein import journey_frontiers
-
+    origins = ["1370104", "4960238"]
+    destinations = ["4960238", "1370104"]
+    batched = journey_frontiers(
+        network, origins, destinations, "2022-02-22 08:30:00", departure_time_window=10
+    )
+    assert len(batched) > 0
+    assert_cells_match(
+        batched, network, [(o, d, o, d) for o in origins for d in destinations]
+    )
+    # The door-to-door form agrees with the coordinate one-pair call too.
     coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
     ids = ["1100602", "1040280"]
     points = gpd.GeoDataFrame(
@@ -1354,51 +1141,27 @@ def test_journey_frontiers_route_door_to_door(network_with_footpaths):
         geometry=[Point(coordinates[stop][1], coordinates[stop][0]) for stop in ids],
         crs="EPSG:4326",
     )
-    batched = journey_frontiers(
+    door = journey_frontiers(
         network_with_footpaths,
         points,
         points,
         "2022-02-22 08:30:00",
         departure_time_window=10,
     )
-    for origin in ids:
-        for destination in ids:
-            cell = batched[
-                (batched["from_id"] == origin) & (batched["to_id"] == destination)
-            ].reset_index(drop=True)
-            single = journey_frontier(
-                network_with_footpaths,
-                coordinates[origin],
-                coordinates[destination],
-                "2022-02-22 08:30:00",
-                departure_time_window=10,
-                candidates="pareto",
-            )
-            assert len(cell) == len(single)
-            for column in (
-                "departure_s",
-                "arrival_s",
-                "travel_time",
-                "rides",
-                "frontier",
-            ):
-                assert cell[column].tolist() == single[column].tolist()
-            assert cell["emissions"].tolist() == pytest.approx(
-                single["emissions"].tolist(), nan_ok=True
-            )
+    assert_cells_match(
+        door,
+        network_with_footpaths,
+        [(o, d, coordinates[o], coordinates[d]) for o in ids for d in ids],
+    )
     # The pair whose fastest journey is the walking-only one keeps its
     # zero-emission anchor in the batched frame too.
-    walk_cell = batched[
-        (batched["from_id"] == "1100602") & (batched["to_id"] == "1040280")
-    ]
+    walk_cell = door[(door["from_id"] == "1100602") & (door["to_id"] == "1040280")]
     walk = walk_cell[walk_cell["rides"] == 0]
     assert len(walk) == 1
     assert walk.iloc[0]["emissions"] == 0.0
     assert bool(walk.iloc[0]["frontier"])
     # The diagonal is the degenerate zero-second walk.
-    diagonal = batched[
-        (batched["from_id"] == "1100602") & (batched["to_id"] == "1100602")
-    ]
+    diagonal = door[(door["from_id"] == "1100602") & (door["to_id"] == "1100602")]
     assert diagonal["travel_time"].tolist() == [0]
     assert diagonal["rides"].tolist() == [0]
 
@@ -1447,30 +1210,15 @@ def test_journey_frontiers_validate_their_inputs(network_with_footpaths):
             "2022-02-22 08:30:00",
             departure_time_window=10,
         )
-
-
-def test_max_slower_defaults_off_and_a_wide_band_changes_nothing(
-    network_with_footpaths,
-):
-    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
-    origin, destination = coordinates["1100602"], coordinates["1040280"]
-    kwargs = dict(
-        departure_time_window=10,
-        candidates="pareto",
-    )
-    unrestricted = journey_frontier(
-        network_with_footpaths, origin, destination, "2022-02-22 08:30:00", **kwargs
-    )
-    wide = journey_frontier(
-        network_with_footpaths,
-        origin,
-        destination,
-        "2022-02-22 08:30:00",
-        max_slower=100_000,
-        **kwargs,
-    )
-    for column in ("departure_s", "arrival_s", "travel_time", "rides", "frontier"):
-        assert wide[column].tolist() == unrestricted[column].tolist()
+    # The one-pair call rejects mixed endpoints the same way.
+    with pytest.raises(ValueError, match="both"):
+        journey_frontier(
+            network_with_footpaths,
+            "1100602",
+            (60.17, 24.94),
+            "2022-02-22 08:30:00",
+            departure_time_window=10,
+        )
 
 
 def test_max_slower_bands_the_frontier_and_keeps_the_fastest(network_with_footpaths):
@@ -1484,6 +1232,18 @@ def test_max_slower_bands_the_frontier_and_keeps_the_fastest(network_with_footpa
         departure_time_window=10,
         candidates="pareto",
     )
+    # max_slower defaults off, and a wide band changes nothing.
+    unbanded = journey_frontier(
+        network_with_footpaths,
+        origin,
+        destination,
+        "2022-02-22 08:30:00",
+        departure_time_window=10,
+        candidates="pareto",
+        max_slower=100_000,
+    )
+    for column in ("departure_s", "arrival_s", "travel_time", "rides", "frontier"):
+        assert unbanded[column].tolist() == unrestricted[column].tolist()
     band = 120
     banded = journey_frontier(
         network_with_footpaths,

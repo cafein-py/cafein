@@ -18,60 +18,113 @@ def shared(facilities="any_stop"):
     )
 
 
-def test_walking_only_policies_need_no_vehicle_terms():
+def test_policy_construction_refusals():
+    for ctor, kwargs, match in [
+        (StreetLegPolicy, {"access": {"segway": 600}}, "unknown street mode"),
+        (StreetLegPolicy, {"access": {"walk": 0}}, "positive, finite time budget"),
+        (
+            StreetLegPolicy,
+            {"access": {"walk": float("inf")}},
+            "positive, finite time budget",
+        ),
+        # Non-walk modes need vehicle terms.
+        (StreetLegPolicy, {"access": {"bicycle": 1800}}, "vehicle terms"),
+        # An own vehicle serves exactly one declared side, and
+        # side='origin' serves access only.
+        (
+            VehiclePolicy,
+            {"source": "own", "facilities": "any_stop"},
+            "one declared side",
+        ),
+        (
+            StreetLegPolicy,
+            {"egress": {"bicycle": 1800}, "vehicles": {"bicycle": own()}},
+            "serves access only",
+        ),
+        # Eligibility is never silently assumed.
+        (
+            VehiclePolicy,
+            {"source": "own", "side": "origin"},
+            "never silently assumed",
+        ),
+        (
+            VehiclePolicy,
+            {"source": "own", "side": "origin", "facilities": []},
+            "names no stops",
+        ),
+        # Shared vehicles state their availability, and never take a side.
+        (
+            VehiclePolicy,
+            {"source": "shared", "facilities": "any_stop"},
+            "availability stated",
+        ),
+        (
+            VehiclePolicy,
+            {
+                "source": "shared",
+                "side": "origin",
+                "facilities": "any_stop",
+                "availability": "unconstrained",
+            },
+            "own vehicles only",
+        ),
+        (StreetLegPolicy, {"transfers": {"walk": 900}}, "walking transfers"),
+        (
+            VehiclePolicy,
+            {"source": "own", "side": "origin", "facilities": "bicycle_parking"},
+            "not a known selector",
+        ),
+        # Transfer grants take shared modes only, one at a time, with
+        # whole-network eligibility.
+        (StreetLegPolicy, {"transfers": {"e_scooter": 600}}, "vehicle terms"),
+        (
+            StreetLegPolicy,
+            {
+                "transfers": {"e_scooter": 600, "bicycle": 500},
+                "vehicles": {"e_scooter": shared(), "bicycle": shared()},
+            },
+            "one transfer mode at a time",
+        ),
+        (
+            StreetLegPolicy,
+            {
+                "transfers": {"e_scooter": 600},
+                "vehicles": {
+                    "e_scooter": VehiclePolicy(
+                        source="shared",
+                        facilities=("1230109",),
+                        availability="unconstrained",
+                    )
+                },
+            },
+            "any_stop",
+        ),
+    ]:
+        with pytest.raises(ValueError, match=match):
+            ctor(**kwargs)
+
+
+def test_policy_construction_accepts():
+    # A walking-only policy needs no vehicle terms.
     policy = StreetLegPolicy(access={"walk": 1800}, egress={"walk": 1800})
     assert policy.vehicles == {}
-
-
-def test_unknown_modes_and_bad_budgets_are_rejected():
-    with pytest.raises(ValueError, match="unknown street mode"):
-        StreetLegPolicy(access={"segway": 600})
-    with pytest.raises(ValueError, match="positive, finite time budget"):
-        StreetLegPolicy(access={"walk": 0})
-    with pytest.raises(ValueError, match="positive, finite time budget"):
-        StreetLegPolicy(access={"walk": float("inf")})
-
-
-def test_non_walk_modes_need_vehicle_terms():
-    with pytest.raises(ValueError, match="vehicle terms"):
-        StreetLegPolicy(access={"bicycle": 1800})
-
-
-def test_an_own_vehicle_serves_exactly_one_declared_side():
-    with pytest.raises(ValueError, match="one declared side"):
-        VehiclePolicy(source="own", facilities="any_stop")
-    # side='origin' serves access only.
-    with pytest.raises(ValueError, match="serves access only"):
-        StreetLegPolicy(egress={"bicycle": 1800}, vehicles={"bicycle": own()})
+    # An own vehicle's declared side survives construction.
     policy = StreetLegPolicy(access={"bicycle": 1800}, vehicles={"bicycle": own()})
     assert policy.vehicles["bicycle"].side == "origin"
-
-
-def test_eligibility_is_never_silently_assumed():
-    with pytest.raises(ValueError, match="never silently assumed"):
-        VehiclePolicy(source="own", side="origin")
-    with pytest.raises(ValueError, match="names no stops"):
-        VehiclePolicy(source="own", side="origin", facilities=[])
+    # Explicit facilities normalise to a tuple.
     terms = VehiclePolicy(source="own", side="origin", facilities=["A", "B"])
     assert terms.facilities == ("A", "B")
-
-
-def test_shared_vehicles_state_their_availability():
-    with pytest.raises(ValueError, match="availability stated"):
-        VehiclePolicy(source="shared", facilities="any_stop")
-    with pytest.raises(ValueError, match="own vehicles only"):
-        VehiclePolicy(
-            source="shared",
-            side="origin",
-            facilities="any_stop",
-            availability="unconstrained",
-        )
+    # A shared vehicle keeps its stated availability.
     policy = StreetLegPolicy(
         access={"e_scooter": 900},
         egress={"e_scooter": 900},
         vehicles={"e_scooter": shared()},
     )
     assert policy.vehicles["e_scooter"].availability == "unconstrained"
+    # A shared transfer grant builds and shows in the repr.
+    policy = _transfer_policy()
+    assert policy.transfers == {"e_scooter": 600.0}
+    assert "transfers={'e_scooter': 600.0}" in repr(policy)
 
 
 def test_carriage_terms_validate_and_routing_awaits_the_engine():
@@ -267,14 +320,24 @@ def dict_by_stop(rows):
     return {stop: (seconds, mode) for stop, seconds, mode, *_ in rows}
 
 
-def test_a_walking_only_policy_is_the_walking_path(multimodal_network):
+@pytest.mark.parametrize("declared", [True, False], ids=["explicit", "omitted"])
+def test_a_walking_only_policy_is_the_walking_path(multimodal_network, declared):
     pytest.importorskip("cafein._cafein")
-    policy = StreetLegPolicy(access={"walk": 1800})
+    from cafein import streets
+
+    if declared:
+        policy = StreetLegPolicy(access={"walk": 1800})
+        minutes = 30
+    else:
+        # An omitted side means walking at the usual budget.
+        policy = StreetLegPolicy()
+        assert policy.access is None and policy.egress is None
+        minutes = streets.MAX_ACCESS_EGRESS_TIME / 60
     with_policy = multimodal_network.travel_times_from_coordinate(
         ORIGIN, "2022-02-22 08:30:00", street_policy=policy
     )
     legacy = multimodal_network.travel_times_from_coordinate(
-        ORIGIN, "2022-02-22 08:30:00", max_walking_time=30
+        ORIGIN, "2022-02-22 08:30:00", max_walking_time=minutes
     )
     assert with_policy == legacy
 
@@ -366,41 +429,6 @@ def test_hand_seeded_access_matches_the_stop_query(multimodal_network):
     seeded = core._travel_times_with_access([(stop, 0)], "2022-02-22", "08:30:00", 7)
     reference = multimodal_network.travel_times_from_stop(stop, "2022-02-22 08:30:00")
     assert seeded == reference
-
-
-def test_an_omitted_side_means_walking_at_the_usual_budget(multimodal_network):
-    pytest.importorskip("cafein._cafein")
-    from cafein import streets
-
-    empty = StreetLegPolicy()
-    assert empty.access is None and empty.egress is None
-    with_default = multimodal_network.travel_times_from_coordinate(
-        ORIGIN, "2022-02-22 08:30:00", street_policy=empty
-    )
-    legacy = multimodal_network.travel_times_from_coordinate(
-        ORIGIN,
-        "2022-02-22 08:30:00",
-        max_walking_time=streets.MAX_ACCESS_EGRESS_TIME / 60,
-    )
-    assert with_default == legacy
-
-
-def test_policy_and_legacy_walk_knobs_conflict(multimodal_network):
-    pytest.importorskip("cafein._cafein")
-    with pytest.raises(ValueError, match="conflict"):
-        multimodal_network.travel_times_from_coordinate(
-            ORIGIN,
-            "2022-02-22 08:30:00",
-            street_policy=StreetLegPolicy(access={"walk": 900}),
-            max_walking_time=20,
-        )
-
-
-def test_walking_transfers_and_string_selectors_are_rejected():
-    with pytest.raises(ValueError, match="walking transfers"):
-        StreetLegPolicy(transfers={"walk": 900})
-    with pytest.raises(ValueError, match="not a known selector"):
-        VehiclePolicy(source="own", side="origin", facilities="bicycle_parking")
 
 
 def test_reduced_arrays_are_engine_neutral(fresh_footpaths_network):
@@ -584,10 +612,18 @@ def test_policy_matrix_honours_exclusions(multimodal_network):
         assert restricted.travel_time.iloc[0] >= unrestricted.travel_time.iloc[0]
 
 
-def test_policy_matrix_rejects_incompatible_knobs(multimodal_network):
+def test_policy_and_legacy_walk_knobs_conflict(multimodal_network):
     pytest.importorskip("cafein._cafein")
     from cafein import TravelTimeMatrix
 
+    # The same refusal on the single-query and the matrix surface.
+    with pytest.raises(ValueError, match="conflict"):
+        multimodal_network.travel_times_from_coordinate(
+            ORIGIN,
+            "2022-02-22 08:30:00",
+            street_policy=StreetLegPolicy(access={"walk": 900}),
+            max_walking_time=20,
+        )
     with pytest.raises(ValueError, match="does not combine"):
         TravelTimeMatrix(
             multimodal_network,
@@ -1447,22 +1483,6 @@ def test_mc_policy_options_form_a_true_frontier(multimodal_network):
     scooter = frame[frame["mode"] == "e_scooter"]
     assert not scooter.empty
     assert scooter["emissions"].equals(scooter["network_distance_m"] / 1000.0 * 21.0)
-
-
-def test_mc_policy_surfaces_zero_ride_street_compositions(multimodal_network):
-    pytest.importorskip("cafein._cafein")
-    from cafein import DetailedItineraries
-
-    frame = DetailedItineraries(
-        multimodal_network,
-        _points_frame([ORIGIN]),
-        _points_frame([DEST]),
-        "2022-02-22 08:30:00",
-        candidates="pareto",
-        street_policy=_scooter_policy(),
-        factors=_scooter_factor_rows(),
-        geometries=False,
-    )
     # The engine drains its access seeds: at least one Pareto option
     # rides no transit at all yet uses the scooter — the zero-ride
     # street composition on the emissions frontier.
@@ -1646,61 +1666,6 @@ def _transfer_policy(budget=600):
     )
 
 
-def test_transfer_policies_take_shared_modes_only():
-    with pytest.raises(ValueError, match="walking transfers"):
-        StreetLegPolicy(transfers={"walk": 600})
-    with pytest.raises(ValueError, match="possession state"):
-        StreetLegPolicy(
-            transfers={"bicycle": 600},
-            vehicles={"bicycle": own()},
-        )
-    with pytest.raises(ValueError, match="vehicle terms"):
-        StreetLegPolicy(transfers={"e_scooter": 600})
-    with pytest.raises(ValueError, match="one transfer mode at a time"):
-        StreetLegPolicy(
-            transfers={"e_scooter": 600, "bicycle": 500},
-            vehicles={"e_scooter": shared(), "bicycle": shared()},
-        )
-    with pytest.raises(ValueError, match="any_stop"):
-        StreetLegPolicy(
-            transfers={"e_scooter": 600},
-            vehicles={
-                "e_scooter": VehiclePolicy(
-                    source="shared",
-                    facilities=("1230109",),
-                    availability="unconstrained",
-                )
-            },
-        )
-    policy = _transfer_policy()
-    assert policy.transfers == {"e_scooter": 600.0}
-    assert "transfers={'e_scooter': 600.0}" in repr(policy)
-
-
-def test_transfers_need_the_matching_merged_set(multimodal_network):
-    pytest.importorskip("cafein._cafein")
-
-    with pytest.raises(ValueError, match="compute_mode_transfers"):
-        multimodal_network.route_between_coordinates(
-            ORIGIN,
-            DEST,
-            "2022-02-22 08:30:00",
-            street_policy=_transfer_policy(),
-        )
-
-
-def test_a_mismatched_transfer_binding_is_rejected(multimodal_transfers_network):
-    pytest.importorskip("cafein._cafein")
-
-    with pytest.raises(ValueError, match="bound to"):
-        multimodal_transfers_network.route_between_coordinates(
-            ORIGIN,
-            DEST,
-            "2022-02-22 08:30:00",
-            street_policy=_transfer_policy(budget=500),
-        )
-
-
 def test_the_merged_set_preserves_the_walking_closure(multimodal_transfers_network):
     pytest.importorskip("cafein._cafein")
 
@@ -1861,18 +1826,36 @@ def test_the_cost_matrix_attributes_rental_transfers(multimodal_transfers_networ
         )
 
 
-def test_stop_exclusions_do_not_combine_with_transfers(multimodal_transfers_network):
+def test_transfer_binding_refusals(multimodal_network, multimodal_transfers_network):
     pytest.importorskip("cafein._cafein")
     from cafein import TravelTimeMatrix
 
-    with pytest.raises(ValueError, match="exclusion-aware"):
-        multimodal_transfers_network.route_between_coordinates(
-            ORIGIN,
-            DEST,
-            "2022-02-22 08:30:00",
-            street_policy=_transfer_policy(),
-            exclude_stops=["1230109"],
-        )
+    for network, policy, kwargs, match in [
+        # The grant needs the matching merged set computed on the network.
+        (multimodal_network, _transfer_policy(), {}, "compute_mode_transfers"),
+        (
+            multimodal_transfers_network,
+            _transfer_policy(budget=500),
+            {},
+            "bound to",
+        ),
+        # The narrowing is walking-class only: a rental-bearing binding
+        # keeps the exclusion rejection — its tokens hide interior stops.
+        (
+            multimodal_transfers_network,
+            _transfer_policy(),
+            {"exclude_stops": ["1230109"]},
+            "exclusion-aware",
+        ),
+    ]:
+        with pytest.raises(ValueError, match=match):
+            network.route_between_coordinates(
+                ORIGIN,
+                DEST,
+                "2022-02-22 08:30:00",
+                street_policy=policy,
+                **kwargs,
+            )
     with pytest.raises(ValueError, match="exclusion-aware"):
         TravelTimeMatrix(
             multimodal_transfers_network,
@@ -2710,7 +2693,10 @@ def test_a_wheelchair_only_policy_rides_a_wheelchair_direct(multimodal_network):
     # class: under a wheelchair-only policy it cannot be a stairs-capable
     # plain walk.
     pytest.importorskip("cafein._cafein")
+    from cafein import TravelCostMatrix
+
     policy = StreetLegPolicy(access={"wheelchair": 7200}, egress={"wheelchair": 7200})
+    walk_policy = StreetLegPolicy(access={"walk": 7200}, egress={"walk": 7199})
     # The pinned stairway's ends (test_street_matrix): walking crosses
     # the steps directly, the wheelchair profile must detour, so the
     # direct leg is strictly slower than a walk-policy direct.
@@ -2719,10 +2705,7 @@ def test_a_wheelchair_only_policy_rides_a_wheelchair_direct(multimodal_network):
         top, bottom, "2022-02-22 08:30:00", street_policy=policy
     )
     walked = multimodal_network.route_between_coordinates(
-        top,
-        bottom,
-        "2022-02-22 08:30:00",
-        street_policy=StreetLegPolicy(access={"walk": 7200}, egress={"walk": 7199}),
+        top, bottom, "2022-02-22 08:30:00", street_policy=walk_policy
     )
 
     def direct_seconds(journeys):
@@ -2733,37 +2716,29 @@ def test_a_wheelchair_only_policy_rides_a_wheelchair_direct(multimodal_network):
         )
 
     assert direct_seconds(wheeled) > direct_seconds(walked)
-
-
-def test_a_wheelchair_only_cost_matrix_direct_obeys_the_profile(multimodal_network):
     # The cost matrix's direct street candidate rides the policy's
-    # walking class too: across the pinned stairway, the wheelchair cell
+    # walking class too: across the same stairway, the wheelchair cell
     # is strictly slower than the walking cell.
-    pytest.importorskip("cafein._cafein")
-    from cafein import TravelCostMatrix
-
-    top_bottom = _points_frame([(60.168853, 24.931183), (60.1684778, 24.9300526)])
-    wheeled = TravelCostMatrix(
+    top_bottom = _points_frame([top, bottom])
+    wheeled_frame = TravelCostMatrix(
         multimodal_network,
         top_bottom,
         top_bottom,
         "2022-02-22 08:30:00",
-        street_policy=StreetLegPolicy(
-            access={"wheelchair": 7200}, egress={"wheelchair": 7200}
-        ),
+        street_policy=policy,
         output_time_units="seconds",
     )
-    walked = TravelCostMatrix(
+    walked_frame = TravelCostMatrix(
         multimodal_network,
         top_bottom,
         top_bottom,
         "2022-02-22 08:30:00",
-        street_policy=StreetLegPolicy(access={"walk": 7200}, egress={"walk": 7199}),
+        street_policy=walk_policy,
         output_time_units="seconds",
     )
     key = ["from_id", "to_id"]
-    wheeled_cell = wheeled.set_index(key)["travel_time"][("p0", "p1")]
-    walked_cell = walked.set_index(key)["travel_time"][("p0", "p1")]
+    wheeled_cell = wheeled_frame.set_index(key)["travel_time"][("p0", "p1")]
+    walked_cell = walked_frame.set_index(key)["travel_time"][("p0", "p1")]
     assert wheeled_cell > walked_cell
 
 
@@ -2788,26 +2763,6 @@ def test_wheelchair_pareto_access_rides_the_mode(multimodal_network):
     ends = frame[frame["leg_type"].isin(["access", "egress"])]
     assert not ends.empty
     assert (ends["mode"] == "wheelchair").all()
-
-
-def test_rental_transfer_grants_still_reject_exclusions(multimodal_transfers_network):
-    # The narrowing is walking-class only: a rental-bearing binding
-    # keeps the rejection, its tokens hide interior stops.
-    pytest.importorskip("cafein._cafein")
-    policy = StreetLegPolicy(
-        access={"walk": 900},
-        egress={"walk": 899},
-        transfers={"e_scooter": 600.0},
-        vehicles={"e_scooter": shared()},
-    )
-    with pytest.raises(ValueError, match="not exclusion-aware"):
-        multimodal_transfers_network.route_between_coordinates(
-            (60.1580, 24.9350),
-            (60.1870, 24.9610),
-            "2022-02-22 08:30:00",
-            street_policy=policy,
-            exclude_stops=["1020453"],
-        )
 
 
 def test_the_wheelchair_bridge_rides_the_computed_transfer_set(

@@ -275,9 +275,17 @@ def test_save_load_without_an_ultra_set(network, tmp_path):
     assert loaded.ultra_shortcuts is None
 
 
-def test_from_gtfs_ultra_default_off(network_with_footpaths):
+def test_no_set_without_a_compute_and_no_compute_without_streets(
+    network, network_with_footpaths
+):
+    # Before any computation there is no set to inspect.
+    assert network.ultra_shortcut_count is None
+    assert network.ultra_shortcuts is None
     # The flag is opt-in: a plain OSM build computes no shortcuts.
     assert network_with_footpaths.ultra_shortcut_count is None
+    # And computing needs a street network to walk.
+    with pytest.raises(ValueError, match="street network"):
+        network.compute_ultra_shortcuts()
 
 
 def test_from_gtfs_ultra_requires_an_osm_extract(helsinki_gtfs):
@@ -702,16 +710,6 @@ def test_a_new_street_network_clears_the_shortcuts(helsinki_gtfs, kantakaupunki_
     net._core.set_street_network(*street_network)
     assert net.ultra_shortcut_count is None
     assert net.ultra_shortcuts is None
-
-
-def test_count_is_none_before_computation(network):
-    assert network.ultra_shortcut_count is None
-    assert network.ultra_shortcuts is None
-
-
-def test_compute_without_a_street_network_errors(network):
-    with pytest.raises(ValueError, match="street network"):
-        network.compute_ultra_shortcuts()
 
 
 def test_mcultra_wires_into_the_door_to_door_emissions_frontier(

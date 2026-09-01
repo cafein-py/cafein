@@ -64,47 +64,67 @@ def test_the_snapshot_is_isolated_and_reprojected():
     assert policy.facilities["fee"].tolist() == [0.0, 0.0]
 
 
-def test_facilities_validation_refusals():
-    with pytest.raises(ValueError, match="must be a GeoDataFrame"):
-        CarParkPolicy(facilities=pd.DataFrame({"id": [1]}))
-    with pytest.raises(ValueError, match="names no park-and-ride"):
-        CarParkPolicy(facilities=_facilities().iloc[:0])
+def test_policy_validation_refusals():
     bare = _facilities()
     bare.crs = None
-    with pytest.raises(ValueError, match="must carry a CRS"):
-        CarParkPolicy(facilities=bare)
     square = geopandas.GeoDataFrame(
         geometry=[Polygon([(24.9, 60.1), (24.9, 60.2), (25.0, 60.2)])],
         crs="EPSG:4326",
     )
-    with pytest.raises(ValueError, match="representative_point"):
-        CarParkPolicy(facilities=square)
-    with pytest.raises(ValueError, match="duplicates"):
-        CarParkPolicy(facilities=_facilities(id=["p", "p"]))
-    with pytest.raises(ValueError, match="missing values"):
-        CarParkPolicy(facilities=_facilities(id=["p", None]))
-    with pytest.raises(ValueError, match="finite and non-negative"):
-        CarParkPolicy(facilities=_facilities(search_seconds=[-1.0, 10.0]))
-    with pytest.raises(ValueError, match="EUR2017"):
-        CarParkPolicy(facilities=_facilities(fee=[-2.0, 0.0]))
-    with pytest.raises(ValueError, match="non-numeric values"):
-        CarParkPolicy(facilities=_facilities(search_seconds=["fast", 10.0]))
-    with pytest.raises(ValueError, match="non-numeric values"):
-        CarParkPolicy(facilities=_facilities(fee=["free", 0.0]))
-
-
-def test_parameter_validation_refusals():
     facilities = _facilities()
-    with pytest.raises(ValueError, match="positive time budget"):
-        CarParkPolicy(facilities=facilities, max_car_time=0)
-    with pytest.raises(ValueError, match="non-negative, finite duration"):
-        CarParkPolicy(facilities=facilities, max_facility_walk_time=-5)
-    with pytest.raises(TypeError, match="minutes"):
-        CarParkPolicy(facilities=facilities, max_car_time="30")
-    with pytest.raises(ValueError, match="at least 1"):
-        CarParkPolicy(facilities=facilities, occupancy=0.5)
-    with pytest.raises(TypeError, match="emission-factor row"):
-        CarParkPolicy(facilities=facilities, vehicle_class=3)
+    for kwargs, exc, match in (
+        # The facilities frame refusals...
+        (
+            dict(facilities=pd.DataFrame({"id": [1]})),
+            ValueError,
+            "must be a GeoDataFrame",
+        ),
+        (
+            dict(facilities=_facilities().iloc[:0]),
+            ValueError,
+            "names no park-and-ride",
+        ),
+        (dict(facilities=bare), ValueError, "must carry a CRS"),
+        (dict(facilities=square), ValueError, "representative_point"),
+        (dict(facilities=_facilities(id=["p", "p"])), ValueError, "duplicates"),
+        (dict(facilities=_facilities(id=["p", None])), ValueError, "missing values"),
+        (
+            dict(facilities=_facilities(search_seconds=[-1.0, 10.0])),
+            ValueError,
+            "finite and non-negative",
+        ),
+        (dict(facilities=_facilities(fee=[-2.0, 0.0])), ValueError, "EUR2017"),
+        (
+            dict(facilities=_facilities(search_seconds=["fast", 10.0])),
+            ValueError,
+            "non-numeric values",
+        ),
+        (
+            dict(facilities=_facilities(fee=["free", 0.0])),
+            ValueError,
+            "non-numeric values",
+        ),
+        # ...and the policy parameter refusals.
+        (
+            dict(facilities=facilities, max_car_time=0),
+            ValueError,
+            "positive time budget",
+        ),
+        (
+            dict(facilities=facilities, max_facility_walk_time=-5),
+            ValueError,
+            "non-negative, finite duration",
+        ),
+        (dict(facilities=facilities, max_car_time="30"), TypeError, "minutes"),
+        (dict(facilities=facilities, occupancy=0.5), ValueError, "at least 1"),
+        (
+            dict(facilities=facilities, vehicle_class=3),
+            TypeError,
+            "emission-factor row",
+        ),
+    ):
+        with pytest.raises(exc, match=match):
+            CarParkPolicy(**kwargs)
 
 
 def test_the_matrix_and_accessibility_refusals(network, tmp_path):
@@ -678,7 +698,8 @@ def test_facility_semantics_and_refusals(car_park_network):
         )
 
 
-def test_the_time_matrix_cells_reconcile_with_the_route(car_park_network):
+@pytest.mark.parametrize("axis", ["departure", "arrival"])
+def test_the_time_matrix_cells_reconcile_with_the_route(car_park_network, axis):
     from cafein import TravelTimeMatrix
 
     policy = _pasila_policy()
@@ -692,14 +713,19 @@ def test_the_time_matrix_cells_reconcile_with_the_route(car_park_network):
         geometry=[Point(24.9520, 60.1795), Point(24.9500, 60.1841)],
         crs="EPSG:4326",
     )
+    when = (
+        {"departure": DEPARTURE_TIME}
+        if axis == "departure"
+        else {"arrival": "2022-02-22 09:30:00"}
+    )
     frame = TravelTimeMatrix(
         car_park_network,
         origins,
         destinations,
-        DEPARTURE_TIME,
         street_policy=policy,
         max_walking_time=8,
         output_time_units="seconds",
+        **when,
     )
     cells = {(row.from_id, row.to_id): row.travel_time for row in frame.itertuples()}
     coordinates = {"far": FAR_ORIGIN, "near": (60.1690, 24.9320)}
@@ -709,15 +735,21 @@ def test_the_time_matrix_cells_reconcile_with_the_route(car_park_network):
             journeys = car_park_network.route_between_coordinates(
                 origin,
                 destination,
-                DEPARTURE_TIME,
                 street_policy=policy,
                 max_walking_time=8,
+                **when,
             )
-            best = min(j["arrival_s"] - j["departure_s"] for j in journeys)
+            if axis == "departure":
+                best = min(j["arrival_s"] - j["departure_s"] for j in journeys)
+            else:
+                # Arrive-by elects the latest departure: the leading
+                # journey is the cell's answer.
+                best = journeys[0]["arrival_s"] - journeys[0]["departure_s"]
             cell = cells[(from_id, to_id)]
             if from_id == "far":
                 # Walking cannot serve within the budget: purely the
-                # engine run on both sides, so the cell matches exactly.
+                # engine run (the reverse election under a deadline) on
+                # both sides, so the cell matches exactly.
                 assert cell == best
             else:
                 # A walking-won cell may differ by the two folds'
@@ -819,29 +851,34 @@ def test_accessibility_scores_through_the_car_plane(car_park_network):
         geometry=[Point(24.9520, 60.1795), Point(24.9316, 60.1688)],
         crs="EPSG:4326",
     )
-    walked = Accessibility(
-        car_park_network,
-        origins,
-        destinations,
-        DEPARTURE_TIME,
-        opportunities="jobs",
-        budgets=(45.0,),
-        max_walking_time=8,
-    )
-    # Beyond every stop's walking reach, the origin scores nothing.
-    assert float(walked["accessibility"].sum()) == 0.0
-    driven = Accessibility(
-        car_park_network,
-        origins,
-        destinations,
-        DEPARTURE_TIME,
-        opportunities="jobs",
-        budgets=(45.0,),
-        max_walking_time=8,
-        street_policy=policy,
-    )
-    # The composed car table demonstrably feeds the score.
-    assert float(driven["accessibility"].sum()) > 0.0
+    # Both time axes: departure and the arrive-by deadline.
+    for when in (
+        {"departure": DEPARTURE_TIME},
+        {"arrival": "2022-02-22 09:30:00"},
+    ):
+        walked = Accessibility(
+            car_park_network,
+            origins,
+            destinations,
+            opportunities="jobs",
+            budgets=(45.0,),
+            max_walking_time=8,
+            **when,
+        )
+        # Beyond every stop's walking reach, the origin scores nothing.
+        assert float(walked["accessibility"].sum()) == 0.0
+        driven = Accessibility(
+            car_park_network,
+            origins,
+            destinations,
+            opportunities="jobs",
+            budgets=(45.0,),
+            max_walking_time=8,
+            street_policy=policy,
+            **when,
+        )
+        # The composed car table demonstrably feeds the score.
+        assert float(driven["accessibility"].sum()) > 0.0
     # A walking-reachable origin can only gain from the second plane.
     near = geopandas.GeoDataFrame(
         {"id": ["near"]}, geometry=[Point(24.9320, 60.1690)], crs="EPSG:4326"
@@ -1010,51 +1047,6 @@ def test_the_walk_still_wins_nearby_under_the_deadline(car_park_network):
     assert best["arrival_s"] == DEADLINE_S
 
 
-def test_the_arrive_by_matrix_cells_are_the_route_answers(car_park_network):
-    from cafein import TravelTimeMatrix
-
-    policy = _pasila_policy()
-    origins = geopandas.GeoDataFrame(
-        {"id": ["far", "near"]},
-        geometry=[Point(FAR_ORIGIN[1], FAR_ORIGIN[0]), Point(24.9320, 60.1690)],
-        crs="EPSG:4326",
-    )
-    destinations = geopandas.GeoDataFrame(
-        {"id": ["d1", "d2"]},
-        geometry=[Point(24.9520, 60.1795), Point(24.9500, 60.1841)],
-        crs="EPSG:4326",
-    )
-    frame = TravelTimeMatrix(
-        car_park_network,
-        origins,
-        destinations,
-        arrival=ARRIVAL_TIME,
-        street_policy=policy,
-        max_walking_time=8,
-        output_time_units="seconds",
-    )
-    cells = {(row.from_id, row.to_id): row.travel_time for row in frame.itertuples()}
-    coordinates = {"far": FAR_ORIGIN, "near": (60.1690, 24.9320)}
-    targets = {"d1": (60.1795, 24.9520), "d2": (60.1841, 24.9500)}
-    for from_id, origin in coordinates.items():
-        for to_id, destination in targets.items():
-            journeys = car_park_network.route_between_coordinates(
-                origin,
-                destination,
-                arrival=ARRIVAL_TIME,
-                street_policy=policy,
-                max_walking_time=8,
-            )
-            best = journeys[0]
-            cell = cells[(from_id, to_id)]
-            if from_id == "far":
-                # Walking cannot serve within the budget: purely the
-                # reverse election on both sides, exactly equal.
-                assert cell == best["arrival_s"] - best["departure_s"]
-            else:
-                assert abs(cell - (best["arrival_s"] - best["departure_s"])) <= 1
-
-
 def test_the_arrive_by_cost_matrix_carries_the_car_chain(car_park_network):
     from cafein import DetailedItineraries, TravelCostMatrix
 
@@ -1106,41 +1098,6 @@ def test_the_arrive_by_cost_matrix_carries_the_car_chain(car_park_network):
     )
     duration = int(journey["arrival_s"].max() - journey["departure_s"].min())
     assert frame["travel_time"].iloc[0] == duration
-
-
-def test_arrive_by_accessibility_scores_through_the_car_plane(car_park_network):
-    from cafein import Accessibility
-
-    policy = _pasila_policy()
-    origins = geopandas.GeoDataFrame(
-        {"id": ["far"]}, geometry=[Point(FAR_ORIGIN[1], FAR_ORIGIN[0])], crs="EPSG:4326"
-    )
-    destinations = geopandas.GeoDataFrame(
-        {"id": ["a", "b"], "jobs": [100.0, 40.0]},
-        geometry=[Point(24.9520, 60.1795), Point(24.9316, 60.1688)],
-        crs="EPSG:4326",
-    )
-    walked = Accessibility(
-        car_park_network,
-        origins,
-        destinations,
-        arrival=ARRIVAL_TIME,
-        opportunities="jobs",
-        budgets=(45.0,),
-        max_walking_time=8,
-    )
-    assert float(walked["accessibility"].sum()) == 0.0
-    driven = Accessibility(
-        car_park_network,
-        origins,
-        destinations,
-        arrival=ARRIVAL_TIME,
-        opportunities="jobs",
-        budgets=(45.0,),
-        max_walking_time=8,
-        street_policy=policy,
-    )
-    assert float(driven["accessibility"].sum()) > 0.0
 
 
 def test_a_tied_walk_beats_the_through_stop_car_cell(car_park_network):
@@ -1302,94 +1259,50 @@ def test_the_zero_ride_car_chain_serves_the_route(car_park_network):
     assert int(back["travel_time"].iloc[0]) == duration
 
 
-def test_the_car_park_matrix_serves_slots_on_both_axes(car_park_network):
-    from cafein import TravelTimeMatrix
+@pytest.mark.parametrize("computer", ["time", "cost"])
+def test_the_car_park_matrices_serve_slots_on_both_axes(car_park_network, computer):
+    from cafein import TravelCostMatrix, TravelTimeMatrix
 
-    policy = _pasila_policy()
+    if computer == "time":
+        cls = TravelTimeMatrix
+        policy = _pasila_policy()
+        origin_id, destination_id = "far", "d1"
+        extra = {"max_walking_time": 8}
+    else:
+        cls = TravelCostMatrix
+        policy = _pasila_policy(vehicle_class="ICE", occupancy=2.0)
+        origin_id, destination_id = "o", "d"
+        extra = {}
     origins = geopandas.GeoDataFrame(
-        {"id": ["far"]},
+        {"id": [origin_id]},
         geometry=[Point(FAR_ORIGIN[1], FAR_ORIGIN[0])],
         crs="EPSG:4326",
     )
     destinations = geopandas.GeoDataFrame(
-        {"id": ["d1"]}, geometry=[Point(24.9520, 60.1795)], crs="EPSG:4326"
-    )
-    slots = ["2022-02-22 08:30:00", "2022-02-22 12:00:00"]
-    frame = TravelTimeMatrix(
-        car_park_network,
-        origins,
-        destinations,
-        departure=slots,
-        street_policy=policy,
-        max_walking_time=8,
-    )
-    for slot in slots:
-        block = frame[frame["departure_time"] == slot].drop(columns="departure_time")
-        single = TravelTimeMatrix(
-            car_park_network,
-            origins,
-            destinations,
-            departure=slot,
-            street_policy=policy,
-            max_walking_time=8,
-        )
-        pd.testing.assert_frame_equal(
-            block.reset_index(drop=True), pd.DataFrame(single), check_dtype=False
-        )
-    deadlines = ["2022-02-22 09:30:00", "2022-02-22 13:00:00"]
-    frame = TravelTimeMatrix(
-        car_park_network,
-        origins,
-        destinations,
-        arrival=deadlines,
-        street_policy=policy,
-        max_walking_time=8,
-    )
-    for deadline in deadlines:
-        block = frame[frame["arrival_time"] == deadline].drop(columns="arrival_time")
-        single = TravelTimeMatrix(
-            car_park_network,
-            origins,
-            destinations,
-            arrival=deadline,
-            street_policy=policy,
-            max_walking_time=8,
-        )
-        pd.testing.assert_frame_equal(
-            block.reset_index(drop=True), pd.DataFrame(single), check_dtype=False
-        )
-
-
-def test_the_car_park_cost_matrix_serves_slots_on_both_axes(car_park_network):
-    from cafein import TravelCostMatrix
-
-    policy = _pasila_policy(vehicle_class="ICE", occupancy=2.0)
-    origins = geopandas.GeoDataFrame(
-        {"id": ["o"]}, geometry=[Point(FAR_ORIGIN[1], FAR_ORIGIN[0])], crs="EPSG:4326"
-    )
-    destinations = geopandas.GeoDataFrame(
-        {"id": ["d"]}, geometry=[Point(24.9520, 60.1795)], crs="EPSG:4326"
+        {"id": [destination_id]}, geometry=[Point(24.9520, 60.1795)], crs="EPSG:4326"
     )
     for axis, moments in (
         ("departure", ["2022-02-22 08:30:00", "2022-02-22 12:00:00"]),
         ("arrival", ["2022-02-22 09:30:00", "2022-02-22 13:00:00"]),
     ):
         column = f"{axis}_time"
-        frame = TravelCostMatrix(
+        frame = cls(
             car_park_network,
             origins,
             destinations,
             street_policy=policy,
             **{axis: moments},
+            **extra,
         )
         for moment in moments:
             block = frame[frame[column] == moment].drop(columns=column)
-            single = TravelCostMatrix(
+            single = cls(
                 car_park_network,
                 origins,
                 destinations,
                 street_policy=policy,
                 **{axis: moment},
+                **extra,
             )
             pd.testing.assert_frame_equal(
                 block.reset_index(drop=True), pd.DataFrame(single), check_dtype=False

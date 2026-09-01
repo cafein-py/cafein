@@ -71,6 +71,15 @@ def test_round_trip_preserves_the_network(network_with_footpaths, reloaded):
         reloaded.distance_provenance_counts
         == network_with_footpaths.distance_provenance_counts
     )
+    # The wheelchair fields ride the artifact too.
+    assert (
+        reloaded._core.stop_wheelchair_boarding
+        == network_with_footpaths._core.stop_wheelchair_boarding
+    )
+    assert (
+        reloaded._core.trip_wheelchair_accessible
+        == network_with_footpaths._core.trip_wheelchair_accessible
+    )
 
 
 def test_round_trip_preserves_routing(network_with_footpaths, reloaded):
@@ -372,52 +381,55 @@ def test_round_trip_preserves_the_tbtr_transfer_cache(
     assert not TransportNetwork.load(plain_path).has_tbtr_transfers
 
 
-def test_load_refuses_foreign_and_future_files(tmp_path):
-    junk = tmp_path / "junk.cafein"
-    junk.write_bytes(b"definitely not a network artifact")
-    with pytest.raises(ValueError, match="not a cafein network artifact"):
-        TransportNetwork.load(junk)
+def test_load_refuses_foreign_future_and_previous_formats(tmp_path):
+    def header(version, written_by):
+        return (
+            b"CAFEINET"
+            + version.to_bytes(4, "little")
+            + (5).to_bytes(2, "little")
+            + written_by
+        )
 
-    future = tmp_path / "future.cafein"
-    future.write_bytes(
-        b"CAFEINET" + (999).to_bytes(4, "little") + (5).to_bytes(2, "little") + b"9.9.9"
-    )
-    with pytest.raises(ValueError, match="format 999"):
-        TransportNetwork.load(future)
+    for name, blob, match in (
+        (
+            "junk.cafein",
+            b"definitely not a network artifact",
+            "not a cafein network artifact",
+        ),
+        ("future.cafein", header(999, b"9.9.9"), "format 999"),
+        # A version-3 header (the pre-sectioned format) must name the
+        # format and the writing version in its rebuild message.
+        (
+            "v3.cafein",
+            header(3, b"0.2.0"),
+            r"format 3 \(written by cafein 0\.2\.0\)",
+        ),
+        # Format 9 (pre tie-complete TBTR transfer sets) refuses the same
+        # way: a cached set persisted by it lacks the equal-arrival
+        # competitors the cost-row reconstruction contract needs.
+        (
+            "v9.cafein",
+            header(9, b"0.4.0"),
+            r"format 9 \(written by cafein 0\.4\.0\)",
+        ),
+        # Format 11 (pre the optional multimodal street arrays) refuses
+        # too: the current format is 12.
+        (
+            "v11.cafein",
+            header(11, b"0.6.0"),
+            r"format 11 \(written by cafein 0\.6\.0\)",
+        ),
+    ):
+        path = tmp_path / name
+        path.write_bytes(blob)
+        with pytest.raises(ValueError, match=match):
+            TransportNetwork.load(path)
 
     with pytest.raises(ValueError):
         TransportNetwork.load(tmp_path / "missing.cafein")
 
 
-def test_load_refuses_previous_format_versions(tmp_path):
-    # A version-3 header (the pre-sectioned format) must name the format
-    # and the writing version in its rebuild message.
-    old = tmp_path / "v3.cafein"
-    old.write_bytes(
-        b"CAFEINET" + (3).to_bytes(4, "little") + (5).to_bytes(2, "little") + b"0.2.0"
-    )
-    with pytest.raises(ValueError, match=r"format 3 \(written by cafein 0\.2\.0\)"):
-        TransportNetwork.load(old)
-    # Format 9 (pre tie-complete TBTR transfer sets) refuses the same way:
-    # a cached set persisted by it lacks the equal-arrival competitors the
-    # cost-row reconstruction contract needs.
-    nine = tmp_path / "v9.cafein"
-    nine.write_bytes(
-        b"CAFEINET" + (9).to_bytes(4, "little") + (5).to_bytes(2, "little") + b"0.4.0"
-    )
-    with pytest.raises(ValueError, match=r"format 9 \(written by cafein 0\.4\.0\)"):
-        TransportNetwork.load(nine)
-    # Format 11 (pre the optional multimodal street arrays) refuses too: the
-    # current format is 12.
-    eleven = tmp_path / "v11.cafein"
-    eleven.write_bytes(
-        b"CAFEINET" + (11).to_bytes(4, "little") + (5).to_bytes(2, "little") + b"0.6.0"
-    )
-    with pytest.raises(ValueError, match=r"format 11 \(written by cafein 0\.6\.0\)"):
-        TransportNetwork.load(eleven)
-
-
-def test_load_refuses_corrupted_payloads(tmp_path):
+def test_load_refuses_damaged_payloads(tmp_path):
     from test_transport_network import build_synthetic_gtfs
 
     feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
@@ -425,10 +437,16 @@ def test_load_refuses_corrupted_payloads(tmp_path):
         network = TransportNetwork.from_gtfs([str(feed)])
     path = tmp_path / "small.cafein"
     network.save(path)
-    blob = bytearray(path.read_bytes())
-    blob[-10] ^= 0xFF
-    path.write_bytes(bytes(blob))
+    pristine = path.read_bytes()
+    # A flipped payload byte fails the checksum.
+    corrupted = bytearray(pristine)
+    corrupted[-10] ^= 0xFF
+    path.write_bytes(bytes(corrupted))
     with pytest.raises(ValueError, match="checksum mismatch"):
+        TransportNetwork.load(path)
+    # A truncated payload fails the section bounds.
+    path.write_bytes(pristine[: len(pristine) // 2])
+    with pytest.raises(ValueError, match="section bounds"):
         TransportNetwork.load(path)
 
 
@@ -451,20 +469,6 @@ def test_load_refuses_corrupted_street_sections(
     if mmap_available:
         lazy = TransportNetwork.load(path, mmap=True)
         assert lazy.stop_count == network_with_footpaths.stop_count
-
-
-def test_load_refuses_truncated_payloads(tmp_path):
-    from test_transport_network import build_synthetic_gtfs
-
-    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
-    with pytest.warns(UserWarning):
-        network = TransportNetwork.from_gtfs([str(feed)])
-    path = tmp_path / "small.cafein"
-    network.save(path)
-    blob = path.read_bytes()
-    path.write_bytes(blob[: len(blob) // 2])
-    with pytest.raises(ValueError, match="section bounds"):
-        TransportNetwork.load(path)
 
 
 def test_mapped_loads_match_owned(
@@ -659,14 +663,3 @@ def test_round_trip_preserves_the_mctbtr_transfer_cache(
     plain_path = tmp_path / "plain_mc.cafein"
     network.save(plain_path)
     assert not TransportNetwork.load(plain_path).has_mctbtr_transfers
-
-
-def test_round_trip_preserves_the_wheelchair_fields(network_with_footpaths, reloaded):
-    assert (
-        reloaded._core.stop_wheelchair_boarding
-        == network_with_footpaths._core.stop_wheelchair_boarding
-    )
-    assert (
-        reloaded._core.trip_wheelchair_accessible
-        == network_with_footpaths._core.trip_wheelchair_accessible
-    )
