@@ -19,6 +19,7 @@ __all__ = [
     "Catchment",
     "DetailedItineraries",
     "travel_cost_table",
+    "compare_matrices",
     "StreamingResult",
     "enable_logging",
     "disable_logging",
@@ -82,6 +83,10 @@ def __getattr__(name):
         from cafein.matrices import travel_cost_table
 
         return travel_cost_table
+    if name == "compare_matrices":
+        from cafein.matrices import compare_matrices
+
+        return compare_matrices
     if name == "StreamingResult":
         from cafein._streaming import StreamingResult
 

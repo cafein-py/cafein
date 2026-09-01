@@ -1689,3 +1689,172 @@ def test_walking_only_policy_serves_cost_slots(network_with_footpaths):
         pd.testing.assert_frame_equal(
             block.reset_index(drop=True), pd.DataFrame(single)
         )
+
+
+def test_compare_matrices_aligns_cells():
+    import numpy as np
+
+    from cafein.matrices import compare_matrices
+
+    a = pd.DataFrame(
+        {
+            "from_id": pd.Categorical(["o1", "o1", "o2"]),
+            "to_id": ["d1", "d2", "d1"],
+            "travel_time": [10.0, 20.0, 0.0],
+            "note": ["x", "y", "z"],
+        }
+    )
+    b = pd.DataFrame(
+        {
+            "from_id": ["o1", "o2", "o3"],
+            "to_id": ["d1", "d1", "d1"],
+            "travel_time": [12.0, 15.0, 9.0],
+            "note": ["x", "y", "z"],
+        }
+    )
+    out = compare_matrices(a, b, ratios=True)
+    assert list(out.columns) == [
+        "from_id",
+        "to_id",
+        "status",
+        "travel_time_a",
+        "travel_time_b",
+        "travel_time_delta",
+        "travel_time_ratio",
+    ]
+    by_key = {(row.from_id, row.to_id): row for row in out.itertuples(index=False)}
+    assert len(by_key) == 4
+    assert by_key[("o1", "d1")].status == "both"
+    assert by_key[("o1", "d1")].travel_time_delta == 2.0
+    assert by_key[("o1", "d1")].travel_time_ratio == 1.2
+    assert by_key[("o1", "d2")].status == "only_a"
+    assert np.isnan(by_key[("o1", "d2")].travel_time_delta)
+    # A zero on side a: the delta stands, the ratio is NaN.
+    assert by_key[("o2", "d1")].travel_time_delta == 15.0
+    assert np.isnan(by_key[("o2", "d1")].travel_time_ratio)
+    assert by_key[("o3", "d1")].status == "only_b"
+    # Slot columns join the key when both sides carry them.
+    slotted_a = a.assign(departure_time="2022-02-22 08:30:00")
+    slotted_b = b.assign(departure_time="2022-02-22 08:30:00")
+    slotted = compare_matrices(slotted_a, slotted_b)
+    assert list(slotted.columns)[:4] == [
+        "from_id",
+        "to_id",
+        "departure_time",
+        "status",
+    ]
+
+
+def test_compare_matrices_refusals():
+    from cafein.matrices import compare_matrices
+
+    def frame(**overrides):
+        base = {
+            "from_id": ["o1", "o2"],
+            "to_id": ["d1", "d1"],
+            "travel_time": [10.0, 20.0],
+        }
+        base.update(overrides)
+        return pd.DataFrame(base)
+
+    for a, b, kwargs, match in (
+        (frame(slot=["p", "q"]), frame(), {}, "key column on side a"),
+        (frame(), frame(from_id=["o1", "o1"]), {}, "duplicate"),
+        (
+            frame(travel_time_p75=[1.0, 2.0]),
+            frame(travel_time_p50=[1.0, 2.0]),
+            {},
+            "travel_time_p75",
+        ),
+        (frame(emissions=[5.0, 6.0]), frame(), {}, "side a alone carries"),
+        (frame(), frame(), {"columns": ["nope"]}, "no nope column"),
+        (
+            frame(note=["x", "y"]),
+            frame(note=["x", "y"]),
+            {"columns": ["note"]},
+            "not numeric",
+        ),
+        (frame(from_id=[1, 2]), frame(), {}, "integer keys"),
+        (
+            frame(travel_time_p75=[1.0, 2.0]),
+            frame(),
+            {"columns": ["travel_time"]},
+            "percentiles",
+        ),
+        (
+            frame(from_id=pd.to_datetime(["2022-02-22", "2022-02-23"])),
+            frame(from_id=pd.to_datetime(["2022-02-22", "2022-02-23"])),
+            {},
+            "integer keys",
+        ),
+        (frame().drop(columns="from_id"), frame(), {}, "no from_id"),
+        (
+            frame(from_id=pd.array([1, "o2"], dtype=object)),
+            frame(),
+            {},
+            "non-string values",
+        ),
+        (frame(from_id=["o1", None]), frame(), {}, "missing values"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            compare_matrices(a, b, **kwargs)
+    # The columns= escape compares the shared subset.
+    out = compare_matrices(
+        frame(emissions=[5.0, 6.0]), frame(), columns=["travel_time"]
+    )
+    assert list(out["status"]) == ["both", "both"]
+    # Integer keys of different widths merge losslessly as Int64.
+    import numpy as np
+
+    widths = compare_matrices(
+        frame(from_id=np.array([1, 2], dtype="int32")),
+        frame(from_id=np.array([1, 2], dtype="uint64")),
+    )
+    assert list(widths["status"]) == ["both", "both"]
+    assert str(widths["from_id"].dtype) == "Int64"
+    # Two unsigned sides keep the unsigned domain — large ids survive.
+    big = 2**63 + 7
+    unsigned = compare_matrices(
+        frame(from_id=np.array([big, big + 1], dtype="uint64")),
+        frame(from_id=np.array([big, big + 1], dtype="uint64")),
+    )
+    assert str(unsigned["from_id"].dtype) == "UInt64"
+    assert set(unsigned["from_id"]) == {big, big + 1}
+    # Nullable numeric columns compare NA-safely.
+    held = compare_matrices(
+        frame(travel_time=pd.array([10, pd.NA], dtype="Int64")), frame()
+    )
+    assert held["travel_time_delta"].iloc[0] == 0.0
+    assert np.isnan(held["travel_time_delta"].iloc[1])
+
+
+def test_the_matrix_classes_delegate_compare(network):
+    from cafein.matrices import compare_matrices
+
+    origins = ["4810551", "1250551"]
+    peak = TravelTimeMatrix(network, origins, departure="2022-02-22 08:30:00")
+    midday = TravelTimeMatrix(network, origins, departure="2022-02-22 12:00:00")
+    via_method = peak.compare(midday)
+    pd.testing.assert_frame_equal(via_method, compare_matrices(peak, midday))
+    assert (via_method["status"] == "both").any()
+    assert "travel_time_delta" in via_method.columns
+    with pytest.warns(UserWarning, match="route_type"):
+        cost_peak = TravelCostMatrix(network, origins, departure="2022-02-22 08:30:00")
+        cost_midday = TravelCostMatrix(
+            network, origins, departure="2022-02-22 12:00:00"
+        )
+    ratios = cost_peak.compare(cost_midday, ratios=True)
+    assert "emissions_ratio" in ratios.columns
+    # Slotted matrices align on the moment key: the shared slot joins
+    # as both, the disjoint ones as only_a/only_b.
+    early = TravelTimeMatrix(
+        network, origins, departure=["2022-02-22 08:30:00", "2022-02-22 12:00:00"]
+    )
+    late = TravelTimeMatrix(
+        network, origins, departure=["2022-02-22 12:00:00", "2022-02-22 16:00:00"]
+    )
+    slotted = compare_matrices(early, late)
+    by_status = dict(slotted.groupby("status")["departure_time"].unique())
+    assert list(by_status["both"]) == ["2022-02-22 12:00:00"]
+    assert list(by_status["only_a"]) == ["2022-02-22 08:30:00"]
+    assert list(by_status["only_b"]) == ["2022-02-22 16:00:00"]

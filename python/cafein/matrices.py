@@ -724,6 +724,12 @@ class TravelCostMatrix(pd.DataFrame):
         frame = pd.concat(frames, ignore_index=True) if multi else frames[0]
         super().__init__(restore_id_dtypes(frame, _id_dtypes))
 
+    def compare(self, other, *, columns=None, ratios=False):
+        """``cafein.matrices.compare_matrices`` of this frame and
+        ``other`` — the frame-in function is the durable entry point,
+        since a reconstructed frame loses its class."""
+        return compare_matrices(self, other, columns=columns, ratios=ratios)
+
     @classmethod
     def to_parquet(
         cls,
@@ -1372,6 +1378,12 @@ class TravelTimeMatrix(pd.DataFrame):
             frames.append(frame)
         frame = pd.concat(frames, ignore_index=True) if multi else frames[0]
         super().__init__(restore_id_dtypes(frame, _id_dtypes))
+
+    def compare(self, other, *, columns=None, ratios=False):
+        """``cafein.matrices.compare_matrices`` of this frame and
+        ``other`` — the frame-in function is the durable entry point,
+        since a reconstructed frame loses its class."""
+        return compare_matrices(self, other, columns=columns, ratios=ratios)
 
     @classmethod
     def to_parquet(
@@ -2445,6 +2457,195 @@ def _time_columns(
     for index, percentile in enumerate(resolved):
         data[f"travel_time_p{percentile:g}_s"] = values[:, index]
     return data
+
+
+def compare_matrices(a, b, *, columns=None, ratios=False):
+    """Two matrix frames aligned cell by cell: ``a`` beside ``b``.
+
+    ``a`` and ``b`` are long matrix frames (``TravelTimeMatrix``,
+    ``TravelCostMatrix``, or any frame with their columns). Rows align
+    on ``from_id`` and ``to_id`` plus whichever slot columns
+    (``slot``, ``departure_time``, ``arrival_time``) both sides carry;
+    a key column present on one side only, duplicate keys on either
+    side, differing percentile column sets, and — without ``columns=``
+    — a cost column present on one side only are refused by name.
+    Key columns must have compatible dtypes on both sides: both
+    integer kinds (merged losslessly as nullable ``Int64``, or
+    ``UInt64`` when both sides are unsigned), or both
+    string-valued (strings, objects, or a categorical of either,
+    normalized to strings before the merge); anything else is refused
+    rather than silently coerced.
+
+    The result has one row per key in the union with a ``status``
+    column (``both``/``only_a``/``only_b``) and, for every compared
+    numeric column ``c``: ``c_a``, ``c_b``, and ``c_delta = c_b -
+    c_a`` (NaN where a side is missing), plus ``c_ratio = c_b / c_a``
+    with ``ratios=True`` (NaN where ``c_a`` is zero). Non-numeric
+    columns (geometry, provenance strings) never join the comparison.
+    Values are compared as given — the frames must share their
+    ``output_time_units``, which the function cannot know.
+    """
+    frames = {"a": a, "b": b}
+    for name, frame in frames.items():
+        for key in ("from_id", "to_id"):
+            if key not in frame.columns:
+                raise ValueError(f"side {name} has no {key} column")
+    keys = ["from_id", "to_id"]
+    for key in ("slot", "departure_time", "arrival_time"):
+        in_a, in_b = key in a.columns, key in b.columns
+        if in_a != in_b:
+            raise ValueError(
+                f"{key} is a key column on side {'a' if in_a else 'b'} "
+                "only; drop it or compute both sides with the same slots"
+            )
+        if in_a:
+            keys.append(key)
+    spreads = {
+        name: sorted(
+            column for column in frame.columns if column.startswith("travel_time_p")
+        )
+        for name, frame in frames.items()
+    }
+    if spreads["a"] != spreads["b"]:
+        raise ValueError(
+            f"side a carries percentiles {spreads['a']} and side b "
+            f"{spreads['b']}; recompute one side with the other's "
+            "percentiles"
+        )
+
+    def key_kind(dtype):
+        # Only two key families compare: integers, and strings (plain,
+        # object, or a categorical of either). Everything else —
+        # floats, datetimes, booleans — is refused, never coerced.
+        if isinstance(dtype, pd.CategoricalDtype):
+            dtype = dtype.categories.dtype
+        if pd.api.types.is_integer_dtype(dtype):
+            return "integer"
+        if dtype == object or pd.api.types.is_string_dtype(dtype):
+            return "string"
+        return None
+
+    aligned = {}
+    for key in keys:
+        kinds = {name: key_kind(frame[key].dtype) for name, frame in frames.items()}
+        if kinds["a"] != kinds["b"] or kinds["a"] is None:
+            raise ValueError(
+                f"{key} is {a[key].dtype} on side a and {b[key].dtype} on "
+                "side b; compare integer keys with integer keys or "
+                "string-valued keys with string-valued keys"
+            )
+        if kinds["a"] == "string":
+            # An object column is string-valued only if its values are
+            # strings: stringifying 1, None, or a timestamp would let
+            # distinct keys alias ("1" == str(1)).
+            for name, frame in frames.items():
+                dtype = frame[key].dtype
+                held = (
+                    dtype.categories
+                    if isinstance(dtype, pd.CategoricalDtype)
+                    else pd.unique(frame[key].dropna())
+                )
+                if not all(isinstance(value, str) for value in held):
+                    raise ValueError(
+                        f"{key} on side {name} holds non-string values; "
+                        "string-valued keys must hold strings"
+                    )
+        for name, frame in frames.items():
+            if frame[key].isna().any():
+                raise ValueError(
+                    f"{key} on side {name} holds missing values; "
+                    "keys identify cells and cannot be NA"
+                )
+        aligned[key] = kinds["a"]
+    for name, frame in frames.items():
+        if frame.duplicated(subset=keys).any():
+            raise ValueError(
+                f"side {name} carries duplicate ({', '.join(keys)}) keys; "
+                "a matrix frame has one row per cell"
+            )
+
+    def numeric_columns(frame):
+        return [
+            column
+            for column in frame.columns
+            if column not in keys
+            and pd.api.types.is_numeric_dtype(frame[column])
+            and not pd.api.types.is_complex_dtype(frame[column])
+        ]
+
+    if columns is None:
+        columns_a, columns_b = numeric_columns(a), numeric_columns(b)
+        for only, name in (
+            (set(columns_a) - set(columns_b), "a"),
+            (set(columns_b) - set(columns_a), "b"),
+        ):
+            if only:
+                raise ValueError(
+                    f"side {name} alone carries {sorted(only)}; pass "
+                    "columns= to compare a shared subset"
+                )
+        compared = columns_a
+    else:
+        compared = list(columns)
+        for column in compared:
+            for name, frame in frames.items():
+                if column not in frame.columns:
+                    raise ValueError(f"side {name} has no {column} column")
+                if not pd.api.types.is_numeric_dtype(
+                    frame[column]
+                ) or pd.api.types.is_complex_dtype(frame[column]):
+                    raise ValueError(
+                        f"{column} is not numeric on side {name}; only "
+                        "real numeric columns compare"
+                    )
+    left = pd.DataFrame({key: a[key] for key in keys})
+    right = pd.DataFrame({key: b[key] for key in keys})
+    for key, kind in aligned.items():
+        if kind == "string":
+            left[key] = left[key].astype(str)
+            right[key] = right[key].astype(str)
+        else:
+            # One lossless 64-bit representation for the merge:
+            # mixed-width or signed/unsigned pairs otherwise promote to
+            # float64 and can alias large identifiers. Two unsigned
+            # sides keep the unsigned domain.
+            target = (
+                "UInt64"
+                if all(
+                    pd.api.types.is_unsigned_integer_dtype(frame[key].dtype)
+                    for frame in frames.values()
+                )
+                else "Int64"
+            )
+            for side in (left, right):
+                try:
+                    side[key] = side[key].astype(target)
+                except (OverflowError, TypeError, ValueError):
+                    raise ValueError(
+                        f"{key} holds integers outside the signed 64-bit "
+                        "range; cast both sides to strings to compare"
+                    ) from None
+    for column in compared:
+        left[f"{column}_a"] = a[column].to_numpy(dtype="float64", na_value=np.nan)
+        right[f"{column}_b"] = b[column].to_numpy(dtype="float64", na_value=np.nan)
+    merged = left.merge(right, on=keys, how="outer", indicator=True, sort=False)
+    status = merged.pop("_merge").map(
+        {"both": "both", "left_only": "only_a", "right_only": "only_b"}
+    )
+    out = merged[keys].copy()
+    out["status"] = status.astype(str)
+    for column in compared:
+        side_a = merged[f"{column}_a"].to_numpy(dtype=float)
+        side_b = merged[f"{column}_b"].to_numpy(dtype=float)
+        out[f"{column}_a"] = side_a
+        out[f"{column}_b"] = side_b
+        out[f"{column}_delta"] = side_b - side_a
+        if ratios:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ratio = side_b / side_a
+            ratio[side_a == 0] = np.nan
+            out[f"{column}_ratio"] = ratio
+    return out
 
 
 @_log.timed_computer(

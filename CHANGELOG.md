@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `compare_matrices(a, b, columns=, ratios=)` aligns two matrix
+  frames cell by cell on their id and slot keys: a `status` column
+  (`both`/`only_a`/`only_b`) and `*_a`/`*_b`/`*_delta` (and `*_ratio`)
+  per numeric column, with mismatched keys, duplicate cells, and
+  one-sided columns refused by name. `TravelTimeMatrix.compare` and
+  `TravelCostMatrix.compare` delegate to it.
+
 - The streaming surfaces take slots too: `to_parquet` on both matrix
   computers and `travel_cost_table(output=)` accept a list or mapping
   in `departure=`/`arrival=`. Every shard carries all slots with the
