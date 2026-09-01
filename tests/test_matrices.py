@@ -1618,8 +1618,6 @@ def test_cost_table_slots_concatenate_the_arrow_tables(network):
     pd.testing.assert_frame_equal(
         got, expected, check_dtype=False, check_categorical=False
     )
-    with pytest.raises(ValueError, match="output= streams one moment"):
-        travel_cost_table(network, origins, departure=slots, output="slots.parquet")
 
 
 def test_cost_slots_validate_eagerly(network, helsinki_streets):

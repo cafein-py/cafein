@@ -96,8 +96,9 @@ class TravelCostMatrix(pd.DataFrame):
     after ``to_id``. The frame is the single-moment frames concatenated
     in slot order — every branch, ``street_policy`` included, applies
     per slot — and the slots must carry dates. A single moment keeps
-    the columns as they are; ``travel_cost_table`` behaves the same,
-    while its ``output=`` streams one moment.
+    the columns as they are; ``travel_cost_table`` and the streaming
+    ``to_parquet``/``output=`` forms behave the same — shards carry the
+    slot columns and the manifest lists the slots.
 
     Given a ``StreetNetwork`` instead, the matrix is a standalone street
     computation over the compiled profile of ``transport_mode``, bounded
@@ -787,7 +788,13 @@ class TravelCostMatrix(pd.DataFrame):
         input dtype — the streamed surfaces deliberately do not
         round-trip integer ids, keeping every shard's schema
         identical; a street matrix's geometry streams as plain WKB
-        binary. ``street_policy`` matrices do not stream yet and are
+        binary. A sequence or mapping of moments in
+        ``departure=``/``arrival=`` streams every slot: each shard
+        carries all slots with the constructor's slot columns (the
+        ``slot`` label dictionary-encoded), and the manifest lists the
+        slots; streamed rows order batch-major, not the constructor's
+        slot-major — rows align by key, never by position.
+        ``street_policy`` matrices do not stream yet and are
         rejected. ``resume=True`` continues a matching partial
         directory run exactly as ``travel_cost_table`` does.
         """
@@ -817,7 +824,6 @@ class TravelCostMatrix(pd.DataFrame):
         import pyarrow
 
         from cafein._units import (
-            departure_parts,
             duration_seconds,
             validated_output_time_units,
         )
@@ -830,8 +836,6 @@ class TravelCostMatrix(pd.DataFrame):
 
         raw_window = window_axis(arrive_by, departure_time_window, arrival_time_window)
         if arrive_by:
-            from cafein._units import arrival_parts
-
             if not _is_street_network(network):
                 if candidates != "time":
                     raise ValueError(
@@ -843,11 +847,7 @@ class TravelCostMatrix(pd.DataFrame):
                         "router='tbtr' does not serve arrival=; the reverse "
                         "search rides RAPTOR"
                     )
-            date, departure = arrival_parts(arrival)
-        else:
-            date, departure = (
-                (None, None) if departure is None else departure_parts(departure)
-            )
+        slots, labeled, multi = _time_slots(departure, arrival, arrive_by)
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         max_transfers = max_rides - 1
@@ -958,8 +958,9 @@ class TravelCostMatrix(pd.DataFrame):
             network,
             origins,
             destinations,
-            date,
-            departure,
+            slots,
+            labeled,
+            multi,
             max_transfers=max_transfers,
             optimize=optimize,
             window=window,
@@ -1429,7 +1430,13 @@ class TravelTimeMatrix(pd.DataFrame):
         values are strings whatever the input dtype, so integer ids
         deliberately do not round-trip on the streamed surface; a
         windowed
-        matrix streams its percentile columns. ``street_policy``
+        matrix streams its percentile columns. A sequence or mapping
+        of moments in ``departure=``/``arrival=`` streams every slot:
+        each shard carries all slots with the constructor's slot
+        columns (the ``slot`` label dictionary-encoded), and the
+        manifest lists the slots; streamed rows order batch-major, not
+        the constructor's slot-major — rows align by key, never by
+        position. ``street_policy``
         matrices do not stream yet and are rejected. ``resume=True``
         continues a matching partial directory run exactly as
         ``travel_cost_table`` does.
@@ -1460,7 +1467,6 @@ class TravelTimeMatrix(pd.DataFrame):
         import pyarrow
 
         from cafein._units import (
-            departure_parts,
             duration_seconds,
             validated_output_time_units,
         )
@@ -1473,8 +1479,6 @@ class TravelTimeMatrix(pd.DataFrame):
 
         raw_window = window_axis(arrive_by, departure_time_window, arrival_time_window)
         if arrive_by:
-            from cafein._units import arrival_parts
-
             if _is_street_network(network):
                 raise ValueError(
                     "arrival applies to transit; a StreetNetwork matrix "
@@ -1493,11 +1497,7 @@ class TravelTimeMatrix(pd.DataFrame):
                         "street_policy= (a traveler's street bridge included) "
                         "does not combine with arrival= yet"
                     )
-            date, departure = arrival_parts(arrival)
-        if not arrive_by:
-            date, departure = (
-                (None, None) if departure is None else departure_parts(departure)
-            )
+        slots, labeled, multi = _time_slots(departure, arrival, arrive_by)
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
         max_transfers = max_rides - 1
@@ -1572,8 +1572,9 @@ class TravelTimeMatrix(pd.DataFrame):
             network,
             origins,
             destinations,
-            date,
-            departure,
+            slots,
+            labeled,
+            multi,
             max_transfers=max_transfers,
             window=window,
             percentiles=percentiles,
@@ -2506,7 +2507,9 @@ def travel_cost_table(
     windowed optimize modes with their
     ``departure_time_window``/``max_travel_time``, the arrive-by cost
     axes (``arrival=`` beside ``arrival_time_window=``, whose batches
-    slice the destination axis), the ``fares``
+    slice the destination axis), the slot columns of a sequence or
+    mapping of moments (``output=`` streams them too, every shard
+    carrying all slots and the manifest listing them), the ``fares``
     pricing, and the ``router`` engine choice, though always
     over the time candidates
     (no ``candidates``/``bucket``); the output is an
@@ -2546,7 +2549,10 @@ def travel_cost_table(
     origin slice, row count, and completion marker. Existing targets
     are refused, never overwritten. The streamed output concatenates
     bit-for-bit to the unstreamed table (batch-major, the same origin
-    order), with ``from_id``/``to_id`` dictionary-encoded over the same
+    order) for a single moment; with several slots each batch carries
+    all slots, so streamed rows order batch-major rather than the
+    table's slot-major and align by key, never by position. Either
+    way ``from_id``/``to_id`` are dictionary-encoded over the same
     shared domains in every batch. Peak memory holds one batch's rows
     (plus the id domains): flat in the total origin count, linear in
     the destination count — a huge destination set splits across jobs.
@@ -2600,10 +2606,6 @@ def travel_cost_table(
             "router='tbtr' does not serve arrival=; the reverse " "search rides RAPTOR"
         )
     slots, labeled, multi = _time_slots(departure, arrival, arrive_by)
-    if multi and output is not None:
-        raise ValueError(
-            "output= streams one moment; pass a single departure= or arrival="
-        )
     date, departure = slots[0][1], slots[0][2]
     if max_rides < 1:
         raise ValueError("max_rides must be at least 1")
@@ -2805,8 +2807,9 @@ def travel_cost_table(
         network,
         origins,
         destinations,
-        date,
-        departure,
+        slots,
+        labeled,
+        multi,
         max_transfers=max_transfers,
         optimize=optimize,
         window=window,
@@ -2840,8 +2843,9 @@ def _stream_transit_cost(
     network,
     origins,
     destinations,
-    date,
-    departure,
+    slots,
+    labeled,
+    multi,
     *,
     max_transfers,
     optimize,
@@ -2878,6 +2882,7 @@ def _stream_transit_cost(
     # output is claimed: one-shot iterables drain here, later mutation of
     # the input frames cannot desynchronise batches from the fingerprint,
     # and an invalid query never leaves an empty claimed output behind.
+    date, departure = slots[0][1], slots[0][2]
     _validate_cost_query(
         date, departure, optimize, window, within, fares, router, arrive_by=arrive_by
     )
@@ -2931,9 +2936,15 @@ def _stream_transit_cost(
         columns += exposure.column_names()
     if geometries:
         columns.append("geometry")
+    if multi:
+        at = columns.index("to_id") + 1
+        columns[at:at] = (["slot"] if labeled else []) + [
+            "arrival_time" if arrive_by else "departure_time"
+        ]
     parameters = {
         "date": date,
         "departure": departure,
+        "slots": None if not multi else [list(slot) for slot in slots],
         "time_axis": "arrival" if arrive_by else "departure",
         "max_transfers": max_transfers,
         "optimize": optimize,
@@ -2961,7 +2972,7 @@ def _stream_transit_cost(
         "output_time_units": output_time_units,
     }
 
-    def make_batch(rows, shared_from, shared_to):
+    def make_moment(rows, shared_from, shared_to, date, departure):
         if arrive_by and points is None:
             endpoints = ("stops", from_ids, to_axis[rows])
         elif arrive_by:
@@ -3028,6 +3039,7 @@ def _stream_transit_cost(
             exposure=exposure,
         )
 
+    make_batch = _slot_batches(make_moment, slots, labeled, multi, arrive_by, pyarrow)
     return _stream_run(
         operation,
         network,
@@ -3043,7 +3055,38 @@ def _stream_transit_cost(
         resume=resume,
         slice_axis="to" if arrive_by else "from",
         axis_count=len(to_axis) if arrive_by else None,
+        manifest_extra=({"slots": [list(slot) for slot in slots]} if multi else None),
     )
+
+
+def _slot_batches(make_moment, slots, labeled, multi, arrive_by, pyarrow):
+    """Wrap a per-moment batch builder into the slot loop: one table
+    per batch carrying every slot's rows, the slot columns appended as
+    in the constructors (the label dictionary-encoded for shards)."""
+
+    def make_batch(rows, shared_from, shared_to):
+        tables = []
+        for label, date, clock in slots:
+            arrow = make_moment(rows, shared_from, shared_to, date, clock)
+            if multi:
+                arrow = _insert_slot_arrow_columns(
+                    arrow, arrive_by, label, labeled, date, clock, pyarrow
+                )
+                if labeled:
+                    at = arrow.schema.get_field_index("slot")
+                    arrow = arrow.set_column(
+                        at,
+                        "slot",
+                        arrow.column("slot").combine_chunks().dictionary_encode(),
+                    )
+            tables.append(arrow)
+        if not multi:
+            return tables[0]
+        # The writer's contract is one chunk per column over the shared
+        # dictionary domain; concatenation re-chunks, so unify.
+        return pyarrow.concat_tables(tables).combine_chunks()
+
+    return make_batch
 
 
 def _stream_run(
@@ -3062,6 +3105,7 @@ def _stream_run(
     dictionary_columns=("from_id", "to_id"),
     slice_axis="from",
     axis_count=None,
+    manifest_extra=None,
 ):
     """The shared streaming driver: fingerprint, claim, batch, write.
 
@@ -3099,7 +3143,9 @@ def _stream_run(
     manifest = None
     completed = frozenset()
     if resume:
-        manifest, completed = _streaming.prepare_resume(path, fingerprint, size, count)
+        manifest, completed = _streaming.prepare_resume(
+            path, fingerprint, size, count, (manifest_extra or {}).get("slots")
+        )
 
     def produce():
         for index in range(batches):
@@ -3122,6 +3168,8 @@ def _stream_run(
         "origin_count": count,
         "batch_axis": slice_axis,
     }
+    if manifest_extra:
+        manifest_seed.update(manifest_extra)
     shared = {"from_id": shared_from, "to_id": shared_to}
     return _streaming.write_stream(
         mode,
@@ -3651,8 +3699,9 @@ def _stream_transit_time(
     network,
     origins,
     destinations,
-    date,
-    departure,
+    slots,
+    labeled,
+    multi,
     *,
     max_transfers,
     window,
@@ -3681,6 +3730,7 @@ def _stream_transit_time(
     from cafein._units import travel_time_output
     from cafein.network import _window_percentiles
 
+    date, departure = slots[0][1], slots[0][2]
     if date is None or departure is None:
         raise TypeError("TravelTimeMatrix requires departure or arrival")
     if router not in ("auto", "raptor", "tbtr"):
@@ -3717,9 +3767,15 @@ def _stream_transit_time(
         columns = ["from_id", "to_id"] + [
             f"travel_time_p{percentile:g}" for percentile in resolved_percentiles
         ]
+    if multi:
+        at = columns.index("to_id") + 1
+        columns[at:at] = (["slot"] if labeled else []) + [
+            "arrival_time" if arrive_by else "departure_time"
+        ]
     parameters = {
         "date": date,
         "departure": departure,
+        "slots": None if not multi else [list(slot) for slot in slots],
         "time_axis": "arrival" if arrive_by else "departure",
         "max_transfers": max_transfers,
         "window": window,
@@ -3735,9 +3791,9 @@ def _stream_transit_time(
         "output_time_units": output_time_units,
     }
 
-    def make_batch(rows, shared_from, shared_to):
+    def make_moment(rows, shared_from, shared_to, date, departure):
         if arrive_by:
-            return make_arrival_batch(rows, shared_from, shared_to)
+            return make_arrival_moment(rows, shared_from, shared_to, date, departure)
         if points is None:
             origins_batch = list(from_ids[rows])
             destinations_batch = None
@@ -3802,7 +3858,7 @@ def _stream_transit_time(
             }
         )
 
-    def make_arrival_batch(rows, shared_from, shared_to):
+    def make_arrival_moment(rows, shared_from, shared_to, date, departure):
         unreachable = np.iinfo(np.uint32).max
         if points is None:
             if resolved_percentiles is None:
@@ -3893,6 +3949,7 @@ def _stream_transit_time(
             }
         )
 
+    make_batch = _slot_batches(make_moment, slots, labeled, multi, arrive_by, pyarrow)
     return _stream_run(
         operation,
         network,
@@ -3907,6 +3964,7 @@ def _stream_transit_time(
         pyarrow,
         resume=resume,
         slice_axis="to" if arrive_by else "from",
+        manifest_extra=({"slots": [list(slot) for slot in slots]} if multi else None),
     )
 
 

@@ -2,11 +2,17 @@
 
 ## Unreleased
 
+- The streaming surfaces take slots too: `to_parquet` on both matrix
+  computers and `travel_cost_table(output=)` accept a list or mapping
+  in `departure=`/`arrival=`. Every shard carries all slots with the
+  constructors' slot columns, the manifest lists the slots, and the
+  resume fingerprint distinguishes a scalar from a one-slot list.
+
 - `TravelCostMatrix` and `travel_cost_table` take several departure
   (or arrival) slots in one call, as `TravelTimeMatrix` does: a list
   adds `departure_time`/`arrival_time`, a mapping of labels adds
   `slot` too, and the result is the per-slot results concatenated in
-  slot order. `travel_cost_table(output=)` still streams one moment.
+  slot order.
 
 - `TravelTimeMatrix` computes several departure (or arrival) slots in
   one call: `departure=` takes a list of moments — adding a

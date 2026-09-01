@@ -1035,13 +1035,20 @@ def test_sigkilled_run_resumes(network, tmp_path):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
         if (target / "part-00000.parquet").exists():
             break
         if child.poll() is not None:
             raise AssertionError("the child finished before it could be killed")
         time.sleep(0.02)
+    else:
+        child.kill()
+        child.wait()
+        raise AssertionError(
+            "the child produced no shard within the deadline; a loaded "
+            "runner needs longer, not a resume that finds nothing"
+        )
     child.kill()
     child.wait()
     # The kill lands at an arbitrary point: a claim and partial state
@@ -1289,3 +1296,120 @@ def test_accessibility_resume_completes_and_guards_the_query(
     )
     frame = Accessibility(network, stops, destinations, **QUERY, **windowed)
     assert result.rows == len(frame)
+
+
+def test_streamed_slots_match_the_constructor(network, tmp_path):
+    import json
+
+    import pandas as pd
+
+    stops = ["4810551", "1250551", "4740551"]
+    slots = ["2022-02-22 08:30:00", "2022-02-22 12:00:00"]
+    out = tmp_path / "slots"
+    TravelTimeMatrix.to_parquet(
+        network, stops, departure=slots, output=out, batch_size=2
+    )
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["slots"] == [
+        [None, "2022-02-22", "08:30:00"],
+        [None, "2022-02-22", "12:00:00"],
+    ]
+    read = parquet.read_table(sorted(out.glob("*.parquet"))).to_pandas()
+    keys = ["from_id", "to_id", "departure_time"]
+    for name in ("from_id", "to_id"):
+        read[name] = read[name].astype(str)
+    read = read.sort_values(keys).reset_index(drop=True)
+    expected = pd.DataFrame(TravelTimeMatrix(network, stops, departure=slots))
+    expected = expected.sort_values(keys).reset_index(drop=True)
+    pd.testing.assert_frame_equal(
+        read[list(expected.columns)], expected, check_dtype=False
+    )
+    # The labeled cost table streams the slot label dictionary-encoded.
+    target = tmp_path / "cost.parquet"
+    mapping = {"peak": slots[0], "midday": slots[1]}
+    with pytest.warns(UserWarning, match="route_type"):
+        travel_cost_table(network, stops[:2], departure=mapping, output=target)
+    table = parquet.read_table(target)
+    assert table.column_names[:4] == ["from_id", "to_id", "slot", "departure_time"]
+    assert pyarrow.types.is_dictionary(table.schema.field("slot").type)
+    with pytest.warns(UserWarning, match="route_type"):
+        expected = travel_cost_table(network, stops[:2], departure=mapping).to_pandas()
+    got = table.to_pandas()
+    keys = ["from_id", "to_id", "slot"]
+    for name in keys:
+        got[name] = got[name].astype(str)
+        expected[name] = expected[name].astype(str)
+    got = got.sort_values(keys).reset_index(drop=True)
+    expected = expected.sort_values(keys).reset_index(drop=True)
+    pd.testing.assert_frame_equal(
+        got[list(expected.columns)], expected, check_dtype=False
+    )
+
+
+def test_arrive_by_slots_stream_on_points(network_with_footpaths, tmp_path):
+    import geopandas
+    import pandas as pd
+
+    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+    points = geopandas.GeoDataFrame(
+        {"id": ["a", "b"]},
+        geometry=geopandas.points_from_xy(
+            [coordinates["4810551"][1], coordinates["1250551"][1]],
+            [coordinates["4810551"][0], coordinates["1250551"][0]],
+        ),
+        crs="EPSG:4326",
+    )
+    deadlines = ["2022-02-22 09:30:00", "2022-02-22 13:00:00"]
+    out = tmp_path / "arrive"
+    TravelTimeMatrix.to_parquet(
+        network_with_footpaths,
+        points,
+        points,
+        arrival=deadlines,
+        output=out,
+        batch_size=1,
+    )
+    read = parquet.read_table(sorted(out.glob("*.parquet"))).to_pandas()
+    keys = ["from_id", "to_id", "arrival_time"]
+    for name in ("from_id", "to_id"):
+        read[name] = read[name].astype(str)
+    read = read.sort_values(keys).reset_index(drop=True)
+    expected = pd.DataFrame(
+        TravelTimeMatrix(network_with_footpaths, points, points, arrival=deadlines)
+    )
+    expected = expected.sort_values(keys).reset_index(drop=True)
+    pd.testing.assert_frame_equal(
+        read[list(expected.columns)], expected, check_dtype=False
+    )
+
+
+def test_a_scalar_and_a_one_slot_list_never_share_a_fingerprint(network, tmp_path):
+    stops = ["4810551", "1250551"]
+    out = tmp_path / "scalar"
+    TravelTimeMatrix.to_parquet(network, stops, output=out, batch_size=2, **QUERY)
+    with pytest.raises(ValueError, match="fingerprint"):
+        TravelTimeMatrix.to_parquet(
+            network,
+            stops,
+            departure=[QUERY["departure"]],
+            output=out,
+            batch_size=2,
+            resume=True,
+        )
+
+
+def test_resume_refuses_tampered_slot_metadata(network, tmp_path):
+    import json
+
+    stops = ["4810551", "1250551"]
+    slots = ["2022-02-22 08:30:00", "2022-02-22 12:00:00"]
+    out = tmp_path / "slots"
+    TravelTimeMatrix.to_parquet(network, stops, departure=slots, output=out)
+    target = out / "manifest.json"
+    manifest = json.loads(target.read_text())
+    manifest["slots"] = [manifest["slots"][1], manifest["slots"][0]]
+    target.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="records slots"):
+        TravelTimeMatrix.to_parquet(
+            network, stops, departure=slots, output=out, resume=True
+        )
