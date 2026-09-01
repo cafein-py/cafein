@@ -1021,6 +1021,18 @@ def _matrix_percentile(value):
     return value
 
 
+def _matrix_input(matrix):
+    """A matrix argument resolved: a frame stays itself; a path reads
+    a completed streamed shard directory (the whole matrix loads)."""
+    import os
+
+    if isinstance(matrix, (str, os.PathLike)):
+        from cafein import _streaming
+
+        return _streaming.read_shards(matrix)
+    return matrix
+
+
 def _matrix_surface(matrix, cost, origins, destinations, time_units, percentiles):
     """A ``(surface, origin_ids, origin_dtype)`` triple from a long
     matrix frame — float64 with NaN unreached, one plane per requested
@@ -1883,9 +1895,16 @@ class Accessibility(pd.DataFrame):
         opportunity columns). Matrix rows outside either universe,
         duplicate ``(from_id, to_id)`` rows, and a frame holding
         several slots are refused rather than silently dropped.
+
+        ``matrix`` may instead be the path of a completed directory
+        written by ``TravelTimeMatrix.to_parquet``,
+        ``TravelCostMatrix.to_parquet``, or ``travel_cost_table``:
+        the manifest and every shard verify before the shards
+        concatenate, and the whole matrix loads into memory.
         """
         from cafein._units import duration_seconds
 
+        matrix = _matrix_input(matrix)
         if workers is not None:
             workers = positive_int("workers", workers)
         if cost == "time" and isinstance(decay_params, dict):
@@ -2716,9 +2735,11 @@ class NearestDestinations(pd.DataFrame):
         in first-seen order; rows outside either universe, duplicate
         cells, and a frame holding several slots are refused. A
         minutes matrix ranks whole-minute costs — exact ranking needs
-        a seconds matrix. ``max_cost`` bounds the ranked costs in the
-        time column's unit's axis terms (minutes for time, the axis's
-        own unit otherwise).
+        a seconds matrix. ``matrix`` may instead be the path of a
+        completed streamed matrix directory, verified and loaded
+        whole exactly as ``Accessibility.from_matrix`` does.
+        ``max_cost`` bounds the ranked costs in the axis's own unit
+        (minutes for time).
         """
         from cafein import _cafein
         from cafein._units import (
@@ -2727,6 +2748,7 @@ class NearestDestinations(pd.DataFrame):
             validated_output_time_units,
         )
 
+        matrix = _matrix_input(matrix)
         if workers is not None:
             workers = positive_int("workers", workers)
         output_time_units = validated_output_time_units(output_time_units)

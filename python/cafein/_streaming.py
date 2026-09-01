@@ -13,6 +13,7 @@ error, never a silent re-encode.
 import dataclasses
 import hashlib
 import json
+import stat
 import os
 import pathlib
 import tempfile
@@ -280,8 +281,6 @@ def _validate_resume(path, target, fingerprint, size, count, slots=None):
     # canonical name pins each entry inside the directory, the origin
     # slice must match the current batch plan, and the published file
     # must exist with exactly the recorded rows.
-    import pyarrow.parquet
-
     batches = max(1, -(-count // size))
     shards = [shard for shard in manifest["shards"] if shard["completed"]]
     seen = set()
@@ -308,31 +307,9 @@ def _validate_resume(path, target, fingerprint, size, count, slots=None):
                 f"shard {index} that does not match the batch plan; the "
                 "run cannot be resumed"
             )
-        part = path / expected_name
-        if part.is_symlink() or not part.is_file():
-            raise ValueError(
-                f"completed shard {expected_name} is missing or not a "
-                f"regular file in {path}; the run cannot be resumed"
-            )
-        published = pyarrow.parquet.ParquetFile(part)
-        if published.metadata.num_rows != shard["rows"]:
-            raise ValueError(
-                f"completed shard {expected_name} holds different rows "
-                "than the manifest records; the run cannot be resumed"
-            )
-        digest = hashlib.sha256(
-            published.schema_arrow.serialize().to_pybytes()
-        ).hexdigest()
-        if digest != manifest.get("schema_digest"):
-            raise ValueError(
-                f"completed shard {expected_name} holds a different schema "
-                "than the manifest records; the run cannot be resumed"
-            )
-        if _file_sha256(part) != shard.get("sha256"):
-            raise ValueError(
-                f"completed shard {expected_name} holds different content "
-                "than the manifest records; the run cannot be resumed"
-            )
+        _verify_shard_file(
+            path, shard, expected_name, manifest.get("schema_digest"), "resumed"
+        )
     for stray in path.glob("*.tmp"):
         _cleanup(stray)
     manifest["shards"] = shards
@@ -352,6 +329,187 @@ def _validate_resume(path, target, fingerprint, size, count, slots=None):
                 "refusing to resume beside contents this run did not write"
             )
     return manifest, seen
+
+
+def _verify_shard_file(path, shard, name, schema_digest, action, buffered=False):
+    """One completed shard checked against its manifest record: a
+    regular file with the recorded rows, schema, and content hash.
+
+    With ``buffered`` the shard is read once and the returned table is
+    parsed from the very bytes the content hash verified — a
+    concurrent replacement can never slip between the check and the
+    read."""
+    import pyarrow
+    import pyarrow.parquet
+
+    part = path / name
+    if part.is_symlink() or not part.is_file():
+        raise ValueError(
+            f"completed shard {name} is missing or not a "
+            f"regular file in {path}; the run cannot be {action}"
+        )
+    if buffered:
+        try:
+            fd = os.open(
+                part,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+            )
+        except OSError:
+            raise ValueError(
+                f"completed shard {name} is missing or not a "
+                f"regular file in {path}; the run cannot be {action}"
+            ) from None
+        with open(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ValueError(
+                    f"completed shard {name} is missing or not a "
+                    f"regular file in {path}; the run cannot be {action}"
+                )
+            data = handle.read()
+        if hashlib.sha256(data).hexdigest() != shard.get("sha256"):
+            raise ValueError(
+                f"completed shard {name} holds different content "
+                f"than the manifest records; the run cannot be {action}"
+            )
+        table = pyarrow.parquet.read_table(pyarrow.BufferReader(data))
+        if table.num_rows != shard["rows"]:
+            raise ValueError(
+                f"completed shard {name} holds different rows "
+                f"than the manifest records; the run cannot be {action}"
+            )
+        digest = hashlib.sha256(table.schema.serialize().to_pybytes()).hexdigest()
+        if digest != schema_digest:
+            raise ValueError(
+                f"completed shard {name} holds a different schema "
+                f"than the manifest records; the run cannot be {action}"
+            )
+        return table
+    published = pyarrow.parquet.ParquetFile(part)
+    if published.metadata.num_rows != shard["rows"]:
+        raise ValueError(
+            f"completed shard {name} holds different rows "
+            f"than the manifest records; the run cannot be {action}"
+        )
+    digest = hashlib.sha256(published.schema_arrow.serialize().to_pybytes()).hexdigest()
+    if digest != schema_digest:
+        raise ValueError(
+            f"completed shard {name} holds a different schema "
+            f"than the manifest records; the run cannot be {action}"
+        )
+    if _file_sha256(part) != shard.get("sha256"):
+        raise ValueError(
+            f"completed shard {name} holds different content "
+            f"than the manifest records; the run cannot be {action}"
+        )
+    return part
+
+
+#: The streaming operations whose shards form a long matrix frame.
+MATRIX_OPERATIONS = frozenset(
+    {"TravelTimeMatrix.to_parquet", "TravelCostMatrix.to_parquet", "travel_cost_table"}
+)
+
+
+def read_shards(path):
+    """A completed streamed matrix directory as one pandas frame.
+
+    The manifest is verified — format, a matrix-producing operation,
+    every shard completed, and each shard's rows, schema digest, and
+    content hash — before the shards concatenate in index order. The
+    whole matrix loads into memory."""
+    import pathlib
+
+    import pyarrow
+
+    path = pathlib.Path(path)
+    target = path / MANIFEST_NAME
+    if not target.is_file():
+        raise ValueError(
+            f"no {MANIFEST_NAME} at {path}; only directory-form "
+            "streaming runs can be read"
+        )
+    try:
+        manifest = json.loads(target.read_text())
+    except ValueError:
+        raise ValueError(
+            f"the manifest at {target} is not valid JSON; the run " "cannot be read"
+        ) from None
+    if manifest.get("format") != MANIFEST_FORMAT:
+        raise ValueError(
+            f"the manifest at {target} has format "
+            f"{manifest.get('format')}, this cafein reads "
+            f"{MANIFEST_FORMAT}; recompute the run"
+        )
+    operation = manifest.get("operation")
+    if operation not in MATRIX_OPERATIONS:
+        raise ValueError(
+            f"the manifest at {target} records operation {operation!r}, "
+            "not a matrix producer; only matrix shard directories "
+            "aggregate"
+        )
+    slots = manifest.get("slots")
+    if slots is not None and len(slots) > 1:
+        raise ValueError(
+            f"the run at {path} carries {len(slots)} slots; stream one "
+            "moment, or select one slot before aggregating"
+        )
+    size = manifest.get("batch_size")
+    count = manifest.get("origin_count")
+    if (
+        not isinstance(size, int)
+        or not isinstance(count, int)
+        or isinstance(size, bool)
+        or isinstance(count, bool)
+        or size < 1
+        or count < 0
+    ):
+        raise ValueError(
+            f"the manifest at {target} records no usable batch plan; "
+            "the run cannot be read"
+        )
+    batches = max(1, -(-count // size))
+    descriptors = list(manifest.get("shards", ()))
+    if len(descriptors) != batches:
+        raise ValueError(
+            f"the manifest at {target} records {len(descriptors)} shard "
+            f"descriptor(s) for a {batches}-batch plan; the run cannot "
+            "be read"
+        )
+    shards = {}
+    for shard in descriptors:
+        index = shard.get("index")
+        name = f"part-{index:05d}.parquet" if isinstance(index, int) else None
+        if (
+            not isinstance(index, int)
+            or not 0 <= index < batches
+            or index in shards
+            or shard.get("file") != name
+        ):
+            raise ValueError(
+                f"the manifest at {target} records shard descriptor "
+                f"{shard.get('index')!r} outside the batch plan; the run "
+                "cannot be read"
+            )
+        if not shard.get("completed"):
+            raise ValueError(
+                f"the run at {path} is incomplete: shard {index} of "
+                f"{batches} never completed; resume it before aggregating"
+            )
+        shards[index] = shard
+    tables = [
+        _verify_shard_file(
+            path,
+            shards[index],
+            f"part-{index:05d}.parquet",
+            manifest.get("schema_digest"),
+            "read",
+            buffered=True,
+        )
+        for index in range(batches)
+    ]
+    return pyarrow.concat_tables(tables).to_pandas()
 
 
 def claim_run(path):

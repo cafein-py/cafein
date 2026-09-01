@@ -3,6 +3,11 @@
 ## Unreleased
 
 - `Accessibility.from_matrix` and `NearestDestinations.from_matrix`
+  also take the path of a completed streamed matrix directory: the
+  manifest and every shard verify (operation, completeness, schema,
+  content hashes) before the whole matrix loads and aggregates.
+
+- `Accessibility.from_matrix` and `NearestDestinations.from_matrix`
   aggregate a precomputed long matrix frame — any cost axis, optional
   percentile planes, `origins=` defining the origin universe — with
   rows outside the universes, duplicate cells, and multi-slot frames
