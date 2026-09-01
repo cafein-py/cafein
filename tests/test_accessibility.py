@@ -1640,3 +1640,122 @@ def test_from_matrix_refusals():
         origins=pd.DataFrame({"id": pd.array([1, 2], dtype="Int32")}),
     )
     assert str(frame["from_id"].dtype) == "Int32"
+
+
+def test_from_matrix_reads_shard_directories(network_with_footpaths, tmp_path):
+    import json
+
+    import geopandas
+    import pandas as pd
+
+    from cafein import Accessibility, NearestDestinations, TravelTimeMatrix
+
+    coordinates = {stop: (lat, lon) for stop, lat, lon in network_with_footpaths.stops}
+    ids = ["4810551", "1250551", "4740551"]
+    points = geopandas.GeoDataFrame(
+        {"id": ids},
+        geometry=geopandas.points_from_xy(
+            [coordinates[stop][1] for stop in ids],
+            [coordinates[stop][0] for stop in ids],
+        ),
+        crs="EPSG:4326",
+    )
+    out = tmp_path / "matrix"
+    TravelTimeMatrix.to_parquet(
+        network_with_footpaths,
+        points,
+        points,
+        departure=DEPARTURE,
+        output=out,
+        batch_size=2,
+        output_time_units="seconds",
+    )
+    frame = Accessibility.from_matrix(
+        out, ids, budgets=(30.0,), origins=ids, time_units="seconds"
+    )
+    from cafein import _streaming
+
+    loaded = _streaming.read_shards(out)
+    direct = Accessibility.from_matrix(
+        loaded, ids, budgets=(30.0,), origins=ids, time_units="seconds"
+    )
+    pd.testing.assert_frame_equal(pd.DataFrame(frame), pd.DataFrame(direct))
+    nearest = NearestDestinations.from_matrix(
+        out, origins=ids, destinations=ids, k=2, time_units="seconds"
+    )
+    assert set(nearest["from_id"]) <= set(ids)
+    # The cost producers' directories aggregate the same way.
+    from cafein.matrices import TravelCostMatrix, travel_cost_table
+
+    for producer, target in (
+        (TravelCostMatrix.to_parquet, tmp_path / "cost"),
+        (travel_cost_table, tmp_path / "table"),
+    ):
+        with pytest.warns(UserWarning, match="route_type"):
+            producer(
+                network_with_footpaths,
+                points,
+                points,
+                departure=DEPARTURE,
+                output=target,
+                batch_size=2,
+            )
+        streamed = Accessibility.from_matrix(
+            target, ids, cost="emissions", budgets=(600.0,), origins=ids
+        )
+        direct = Accessibility.from_matrix(
+            _streaming.read_shards(target),
+            ids,
+            cost="emissions",
+            budgets=(600.0,),
+            origins=ids,
+        )
+        pd.testing.assert_frame_equal(pd.DataFrame(streamed), pd.DataFrame(direct))
+    # The directory refusals: a tampered shard hash, an incomplete
+    # run, a foreign operation, and a missing manifest.
+    target = out / "manifest.json"
+    pristine = target.read_text()
+    manifest = json.loads(pristine)
+    manifest["shards"][0]["sha256"] = "0" * 64
+    target.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="different content"):
+        Accessibility.from_matrix(out, ids)
+    manifest = json.loads(pristine)
+    manifest["shards"] = manifest["shards"][:1]
+    target.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="batch plan"):
+        Accessibility.from_matrix(out, ids)
+    manifest = json.loads(pristine)
+    manifest["shards"][1]["completed"] = False
+    target.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="incomplete"):
+        Accessibility.from_matrix(out, ids)
+    manifest = json.loads(pristine)
+    manifest["operation"] = "Accessibility.to_parquet"
+    target.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="not a matrix producer"):
+        Accessibility.from_matrix(out, ids)
+    target.write_text(pristine)
+    # A symlinked shard refuses even though its bytes would verify.
+    shard = out / "part-00000.parquet"
+    aside = tmp_path / "aside.parquet"
+    shard.rename(aside)
+    shard.symlink_to(aside)
+    with pytest.raises(ValueError, match="regular file"):
+        Accessibility.from_matrix(out, ids)
+    shard.unlink()
+    aside.rename(shard)
+    # A multi-slot run refuses on the manifest's authoritative slots.
+    slotted = tmp_path / "slotted"
+    TravelTimeMatrix.to_parquet(
+        network_with_footpaths,
+        points,
+        points,
+        departure=[DEPARTURE, "2022-02-22 12:00:00"],
+        output=slotted,
+        batch_size=2,
+    )
+    with pytest.raises(ValueError, match="select one slot"):
+        Accessibility.from_matrix(slotted, ids)
+    with pytest.raises(ValueError, match="no manifest.json"):
+        Accessibility.from_matrix(tmp_path / "nowhere", ids)
