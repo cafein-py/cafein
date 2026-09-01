@@ -1035,13 +1035,20 @@ def test_sigkilled_run_resumes(network, tmp_path):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
         if (target / "part-00000.parquet").exists():
             break
         if child.poll() is not None:
             raise AssertionError("the child finished before it could be killed")
         time.sleep(0.02)
+    else:
+        child.kill()
+        child.wait()
+        raise AssertionError(
+            "the child produced no shard within the deadline; a loaded "
+            "runner needs longer, not a resume that finds nothing"
+        )
     child.kill()
     child.wait()
     # The kill lands at an arbitrary point: a claim and partial state
