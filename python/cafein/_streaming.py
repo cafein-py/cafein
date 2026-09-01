@@ -27,7 +27,9 @@ if False:  # noqa: SIM108 — typing-only import; pyarrow stays optional
 #: 2: candidates/bucket join the transit parameters; the matrix
 #: classmethods' operations and street/time parameter sets arrive.
 #: 3: the network digest becomes the artifact content checksum.
-FINGERPRINT_VERSION = 3
+#: 4: the slot list joins the parameters, so a scalar moment and a
+#: one-slot list never share a fingerprint.
+FINGERPRINT_VERSION = 4
 MANIFEST_FORMAT = 2
 MANIFEST_NAME = "manifest.json"
 DEFAULT_BATCH_SIZE = 500
@@ -213,7 +215,7 @@ def _canonical(value):
     raise TypeError(f"cannot fingerprint a {type(value).__name__}")
 
 
-def prepare_resume(path, fingerprint, size, count):
+def prepare_resume(path, fingerprint, size, count, slots=None):
     """The stored manifest and completed batch indices of the run to
     continue — validated against the resuming query, never trusted
     blindly.
@@ -232,13 +234,13 @@ def prepare_resume(path, fingerprint, size, count):
     # after another resume already finished, destroying its shards.
     claim_run(path)
     try:
-        return _validate_resume(path, target, fingerprint, size, count)
+        return _validate_resume(path, target, fingerprint, size, count, slots)
     except BaseException:
         _cleanup(path / "run.claim")
         raise
 
 
-def _validate_resume(path, target, fingerprint, size, count):
+def _validate_resume(path, target, fingerprint, size, count, slots=None):
     if not target.exists():
         raise ValueError(
             f"nothing to resume at {path}: no manifest.json (only "
@@ -268,6 +270,11 @@ def _validate_resume(path, target, fingerprint, size, count):
             f"the manifest at {target} has format "
             f"{manifest.get('format')}, this cafein writes "
             f"{MANIFEST_FORMAT}; rerun instead of resuming"
+        )
+    if manifest.get("slots") != slots:
+        raise ValueError(
+            f"the manifest at {target} records slots that do not match "
+            "the resuming query; the run cannot be resumed"
         )
     # Completed shard descriptors are validated, never trusted: the
     # canonical name pins each entry inside the directory, the origin
