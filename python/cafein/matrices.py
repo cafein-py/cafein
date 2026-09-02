@@ -1,6 +1,8 @@
 """Matrix computers over a transport network."""
 
 import collections.abc
+import dataclasses
+import functools
 import operator
 import warnings
 
@@ -19,11 +21,30 @@ from cafein._validate import (
     restore_id_dtypes,
     sequence_not_string,
 )
+from cafein import _memory
+from cafein._units import duration_seconds, memory_spec
 from cafein.travelers import (
     folded_constraints,
     folded_street_policy,
     refuse_wheelchair_streets,
 )
+
+#: One long-format cost row (times, transfers, distances, emissions)
+#: and one dense time cell, for the planner's result reservations.
+_COST_ROW_BYTES = 48
+_TIME_CELL_BYTES = 4
+#: The long-format time frame at its peak holds, per cell, the dense
+#: uint32 matrix (4), the row and column indices from nonzero (16),
+#: the two object-id arrays (16), the indexed values (4), and the
+#: frame's own copies of the columns while it is built (~24).
+_TIME_FRAME_CELL_BYTES = 64
+#: Every optional column (a perspective, a component, an exposure
+#: layer) is one float64 per row.
+_OPTIONAL_COLUMN_BYTES = 8
+#: A slot's moment column (a timestamp string per row) and a mapping's
+#: label column, as strings in a frame or an Arrow batch.
+_MOMENT_COLUMN_BYTES = 64
+_SLOT_LABEL_BYTES = 48
 
 
 def _query_details(arguments):
@@ -39,6 +60,8 @@ def _query_details(arguments):
     for key in ("departure", "arrival"):
         if isinstance(arguments.get(key), (list, tuple, collections.abc.Mapping)):
             details["slots"] = len(arguments[key])
+    if arguments.get("max_memory") is not None:
+        details["max_memory"] = arguments["max_memory"]
     chunk = arguments.get("chunk")
     if chunk is not None:
         try:
@@ -46,6 +69,245 @@ def _query_details(arguments):
         except Exception:
             pass
     return details
+
+
+def _slot_shape(departure, arrival):
+    """``(count, moment_column, label_bytes)``: how many slots a
+    departure or arrival argument names, whether the result carries the
+    moment column every list or mapping adds, and the bytes per row of
+    the label column a mapping adds (``0`` without one)."""
+    for value in (departure, arrival):
+        if isinstance(value, collections.abc.Mapping):
+            # A label column: its longest label's bytes plus an offset,
+            # as the plain string column a batch materializes first.
+            longest = max((len(str(key).encode("utf-8")) for key in value), default=0)
+            return max(1, len(value)), True, longest + 8
+        if isinstance(value, (list, tuple)):
+            return max(1, len(value)), True, 0
+    return 1, False, 0
+
+
+def _chunked(count, chunk):
+    """How many of ``count`` a validated ``chunk`` selects."""
+    if chunk is None:
+        return count
+    try:
+        chunk = tuple(int(part) for part in chunk)
+        return len(range(count)[_chunk_slice(count, chunk)])
+    except (TypeError, ValueError):
+        return count  # the body refuses the malformed chunk
+
+
+def _optional_columns(kwargs, exposure_snapshot):
+    """The optional result columns a call selects, for its row estimate."""
+    count = 0
+    for key in ("perspectives", "cost_components", "components"):
+        count += _log.sized(kwargs.get(key)) or 0
+    if exposure_snapshot is not None:
+        count += len(exposure_snapshot.column_names())
+    return count
+
+
+def _exposure_snapshot(exposure):
+    """The reporting snapshot the enclosing call was planned with, so
+    the body reports against the surface the plan sized; a fresh one
+    for a call nobody planned."""
+    active = _memory.active_plan()
+    if active is not None and active.exposure_snapshot is not None:
+        return active.exposure_snapshot
+    return exposure._reporting_snapshot()
+
+
+def _entry_plan(
+    network, origins, destinations, departure, kwargs, *, cost, streamed, dense=False
+):
+    """Plan a public matrix call once: its result (or one batch) and
+    its width, from the engine the objective needs and the network's
+    size. Percentiles resolve here so a one-shot iterable is read once;
+    """
+    from cafein.network import _window_percentiles
+
+    workers = kwargs.get("workers")
+    if workers is not None:
+        workers = positive_int("workers", workers)
+    max_memory = kwargs.get("max_memory")
+    memory_spec("max_memory", max_memory)
+    arrival = kwargs.get("arrival")
+    arrive_by = arrival is not None
+    street = _is_street_network(network)
+    points = street or _is_point_frame(origins)
+    origin_count = _log.sized(origins) if origins is not None else None
+    if origin_count is None:
+        origin_count = 1 if points else network.stop_count
+    destination_count = _log.sized(destinations) if destinations is not None else None
+    if destination_count is None:
+        destination_count = origin_count if points else network.stop_count
+    # The chunk slices the fan-out axis: destinations for an arrive-by
+    # run, origins otherwise.
+    chunk = kwargs.get("chunk")
+    if arrive_by:
+        destination_count = _chunked(destination_count, chunk)
+    else:
+        origin_count = _chunked(origin_count, chunk)
+    slots, moment_column, label_bytes = _slot_shape(departure, arrival)
+    if street:
+        engine, size = "street", network._core.vertex_count
+    elif cost:
+        engine, size = (
+            "time" if kwargs.get("optimize", "time") == "time" else "multicriteria"
+        ), network.stop_count
+    else:
+        engine, size = "time", network.stop_count
+    if cost:
+        row_bytes = _COST_ROW_BYTES + (
+            _memory.GEOMETRY_ROW_BYTES if kwargs.get("geometries") else 0
+        )
+    else:
+        window = kwargs.get(
+            "arrival_time_window" if arrive_by else "departure_time_window"
+        )
+        percentiles = kwargs.get("percentiles")
+        if not street and (window is not None or percentiles is not None):
+            resolved = _window_percentiles(
+                duration_seconds(
+                    "arrival_time_window" if arrive_by else "departure_time_window",
+                    window,
+                ),
+                percentiles,
+                kwargs.get("confidence"),
+            )
+            if percentiles is not None:
+                # A one-shot iterable, read once, reaches the body as a list.
+                kwargs["percentiles"] = resolved
+            planes = len(resolved) if resolved else 1
+        else:
+            planes = 1
+        row_bytes = (_TIME_CELL_BYTES if dense else _TIME_FRAME_CELL_BYTES) * planes
+    exposure = kwargs.get("exposure")
+    # One snapshot per call: the plan sizes its columns and the body
+    # reports against it; the live object still validates the network.
+    snapshot = None if exposure is None else exposure._reporting_snapshot()
+    row_bytes += _OPTIONAL_COLUMN_BYTES * _optional_columns(kwargs, snapshot)
+    if moment_column:
+        row_bytes += _MOMENT_COLUMN_BYTES
+    if label_bytes:
+        row_bytes += max(_SLOT_LABEL_BYTES, label_bytes)
+    kind = "cost" if cost else "time"
+    if streamed:
+        row_bytes += 24  # the streamed row's index and buffer bytes
+        # The batch axis: origins, or destinations for an arrive-by run.
+        columns = origin_count if arrive_by else destination_count
+        batch = kwargs.get("batch_size")
+        if batch is not None:
+            batch = _stream_size(batch, False)
+        plan = _memory.plan_call(
+            engine,
+            size,
+            0,
+            streamed=True,
+            row_bytes=columns * row_bytes * slots,
+            batch_rows=batch,
+            workers=workers,
+            max_memory=max_memory,
+            label=f"travel {kind} stream",
+        )
+    else:
+        plan = _memory.plan_call(
+            engine,
+            size,
+            origin_count * destination_count * row_bytes * slots,
+            workers=workers,
+            max_memory=max_memory,
+            label=f"travel {kind} matrix",
+        )
+    return dataclasses.replace(plan, exposure_snapshot=snapshot)
+
+
+def _frozen_axis(value):
+    """An axis argument read once: a one-shot iterable of ids becomes a
+    list, so the plan and the body see the same ids; frames, sized
+    sequences, strings, and ``None`` pass through."""
+    if value is None or isinstance(value, (str, bytes)) or hasattr(value, "__len__"):
+        return value
+    return list(value)
+
+
+def _planned_entry(*, cost, streamed=False, method=False, function=False):
+    """Plan the decorated public call once and keep its plan active for
+    every dispatch inside it. ``method`` marks a network method, whose
+    ``self`` is the network and whose positional tail is
+    ``(origins, departure, max_rides)``."""
+
+    def decorate(fn):
+        if function:
+
+            @functools.wraps(fn)
+            def wrapper(
+                network, origins=None, destinations=None, departure=None, **kwargs
+            ):
+                origins, destinations = _frozen_axis(origins), _frozen_axis(
+                    destinations
+                )
+                # "auto": streamed exactly when an output is named.
+                streams = (
+                    kwargs.get("output") is not None if streamed == "auto" else streamed
+                )
+                plan = _entry_plan(
+                    network,
+                    origins,
+                    destinations,
+                    departure,
+                    kwargs,
+                    cost=cost,
+                    streamed=streams,
+                )
+                with _memory.use_plan(plan):
+                    return fn(network, origins, destinations, departure, **kwargs)
+
+            return wrapper
+
+        if method:
+
+            @functools.wraps(fn)
+            def wrapper(self, origins, departure=None, max_rides=8, **kwargs):
+                origins = _frozen_axis(origins)
+                if kwargs.get("destinations") is not None:
+                    kwargs["destinations"] = _frozen_axis(kwargs["destinations"])
+                plan = _entry_plan(
+                    self,
+                    origins,
+                    kwargs.get("destinations"),
+                    departure,
+                    kwargs,
+                    cost=cost,
+                    streamed=streamed,
+                    dense=True,
+                )
+                with _memory.use_plan(plan):
+                    return fn(self, origins, departure, max_rides, **kwargs)
+
+            return wrapper
+
+        @functools.wraps(fn)
+        def wrapper(
+            first, network, origins=None, destinations=None, departure=None, **kwargs
+        ):
+            origins, destinations = _frozen_axis(origins), _frozen_axis(destinations)
+            plan = _entry_plan(
+                network,
+                origins,
+                destinations,
+                departure,
+                kwargs,
+                cost=cost,
+                streamed=streamed,
+            )
+            with _memory.use_plan(plan):
+                return fn(first, network, origins, destinations, departure, **kwargs)
+
+        return wrapper
+
+    return decorate
 
 
 class TravelCostMatrix(pd.DataFrame):
@@ -273,6 +535,13 @@ class TravelCostMatrix(pd.DataFrame):
         cell. Single-departure time-optimal mode only: the windowed
         and Pareto modes, ``arrival=``, ``router='tbtr'`` (the engine
         resolves to RAPTOR), and ``street_policy`` refuse it.
+    max_memory : str or int (optional)
+        The memory budget this call plans against, as a percentage or a
+        size with a binary suffix (``"80%"``, ``"6G"``, or bytes); the
+        process default from
+        ``cafein.set_max_memory`` (80 % of physical memory) when omitted.
+        The fan-out width and, when streaming, the batch size follow from
+        it. The budget plans, never caps: hard guarantees stay with the OS.
     chunk : (int, int) (optional)
         Compute only chunk ``k`` of ``n``: a deterministic contiguous
         block of the fan-out axis — the resolved origins with
@@ -412,6 +681,7 @@ class TravelCostMatrix(pd.DataFrame):
         is_street=lambda network: _is_street_network(network),
         details=_query_details,
     )
+    @_planned_entry(cost=True)
     def __init__(
         self,
         network,
@@ -456,9 +726,11 @@ class TravelCostMatrix(pd.DataFrame):
         exposure=None,
         output_time_units="minutes",
         workers=None,
+        max_memory=None,
     ):
         if workers is not None:
             workers = positive_int("workers", workers)
+        memory_spec("max_memory", max_memory)
         if not _is_street_network(network):
             (
                 exclude_routes,
@@ -575,6 +847,7 @@ class TravelCostMatrix(pd.DataFrame):
                     "street_policy": street_policy,
                 },
                 workers=workers,
+                max_memory=max_memory,
             )
             super().__init__(
                 restore_id_dtypes(
@@ -716,6 +989,7 @@ class TravelCostMatrix(pd.DataFrame):
                     max_snap_distance=max_snap_distance,
                     _resolved=_resolved,
                     workers=workers,
+                    max_memory=max_memory,
                 )
                 rows_per_slot = len(from_ids)
                 origin_index = np.asarray(table["from"])
@@ -778,6 +1052,7 @@ class TravelCostMatrix(pd.DataFrame):
                 max_walking_time=max_walking_time,
                 max_snap_distance=max_snap_distance,
                 workers=workers,
+                max_memory=max_memory,
                 arrival=arrival,
                 _resolved=_resolved,
                 _slot_table=_slot_tables.get(at),
@@ -843,6 +1118,7 @@ class TravelCostMatrix(pd.DataFrame):
         exposure=None,
         output_time_units="minutes",
         workers=None,
+        max_memory=None,
     ):
         """The cost matrix streamed to Parquet — the constructor's
         semantics with `travel_cost_table`'s ``output=`` behavior.
@@ -872,6 +1148,7 @@ class TravelCostMatrix(pd.DataFrame):
         _log.sync()
         if workers is not None:
             workers = positive_int("workers", workers)
+        memory_spec("max_memory", max_memory)
         if not _is_street_network(network):
             (
                 exclude_routes,
@@ -995,6 +1272,7 @@ class TravelCostMatrix(pd.DataFrame):
                 resume=resume,
                 output_time_units=output_time_units,
                 workers=workers,
+                max_memory=max_memory,
             )
         exposure_snapshot = None
         if exposure is not None:
@@ -1009,7 +1287,7 @@ class TravelCostMatrix(pd.DataFrame):
                 arrive_by=arrive_by,
                 router=router,
             )
-            exposure_snapshot = exposure._reporting_snapshot()
+            exposure_snapshot = _exposure_snapshot(exposure)
         _reject_cost_street_args(
             transport_mode,
             max_street_time,
@@ -1058,6 +1336,7 @@ class TravelCostMatrix(pd.DataFrame):
             output_time_units=output_time_units,
             exposure=exposure_snapshot,
             workers=workers,
+            max_memory=max_memory,
         )
 
 
@@ -1169,6 +1448,13 @@ class TravelTimeMatrix(pd.DataFrame):
         A level in ``(0, 1)`` mapped to the symmetric percentile
         interval plus the median; requires `departure_time_window` and
         excludes `percentiles`.
+    max_memory : str or int (optional)
+        The memory budget this call plans against, as a percentage or a
+        size with a binary suffix (``"80%"``, ``"6G"``, or bytes); the
+        process default from
+        ``cafein.set_max_memory`` (80 % of physical memory) when omitted.
+        The fan-out width and, when streaming, the batch size follow from
+        it. The budget plans, never caps: hard guarantees stay with the OS.
     chunk : (int, int) (optional)
         Compute only chunk ``k`` of ``n``: a deterministic contiguous
         block of the fan-out axis — the resolved origins with
@@ -1255,6 +1541,7 @@ class TravelTimeMatrix(pd.DataFrame):
         is_street=lambda network: _is_street_network(network),
         details=_query_details,
     )
+    @_planned_entry(cost=False)
     def __init__(
         self,
         network,
@@ -1286,9 +1573,11 @@ class TravelTimeMatrix(pd.DataFrame):
         parking=None,
         output_time_units="minutes",
         workers=None,
+        max_memory=None,
     ):
         if workers is not None:
             workers = positive_int("workers", workers)
+        memory_spec("max_memory", max_memory)
         if not _is_street_network(network):
             (
                 exclude_routes,
@@ -1385,6 +1674,7 @@ class TravelTimeMatrix(pd.DataFrame):
                     "street_policy": street_policy,
                 },
                 workers=workers,
+                max_memory=max_memory,
             )
             super().__init__(
                 restore_id_dtypes(
@@ -1450,6 +1740,7 @@ class TravelTimeMatrix(pd.DataFrame):
                     max_walking_time=max_walking_time,
                     max_snap_distance=max_snap_distance,
                     workers=workers,
+                    max_memory=max_memory,
                 )
                 rows_per_slot = len(from_ids)
                 for i, (at, _) in enumerate(members):
@@ -1479,6 +1770,7 @@ class TravelTimeMatrix(pd.DataFrame):
                 street_policy=street_policy,
                 max_transfers=max_transfers,
                 workers=workers,
+                max_memory=max_memory,
             )
             frame = pd.DataFrame(_humanize_time_columns(data, output_time_units))
             if multi:
@@ -1528,6 +1820,7 @@ class TravelTimeMatrix(pd.DataFrame):
         parking=None,
         output_time_units="minutes",
         workers=None,
+        max_memory=None,
     ):
         """The travel-time matrix streamed to Parquet — the
         constructor's semantics with ``travel_cost_table``'s
@@ -1564,6 +1857,7 @@ class TravelTimeMatrix(pd.DataFrame):
         _log.sync()
         if workers is not None:
             workers = positive_int("workers", workers)
+        memory_spec("max_memory", max_memory)
         if not _is_street_network(network):
             (
                 exclude_routes,
@@ -1678,6 +1972,7 @@ class TravelTimeMatrix(pd.DataFrame):
                 resume=resume,
                 output_time_units=output_time_units,
                 workers=workers,
+                max_memory=max_memory,
             )
         _reject_time_street_args(
             transport_mode,
@@ -1714,6 +2009,7 @@ class TravelTimeMatrix(pd.DataFrame):
             output_time_units=output_time_units,
             arrive_by=arrive_by,
             workers=workers,
+            max_memory=max_memory,
         )
 
 
@@ -1992,6 +2288,7 @@ def _street_cost_columns(
     cost_components=None,
     exposure=None,
     workers=None,
+    max_memory=None,
 ):
     """The reachable cells of a street cost matrix, in long format."""
     components = component_selection(components)
@@ -2027,6 +2324,7 @@ def _street_cost_columns(
         geometries=geometries,
         resolved=resolved,
         workers=workers,
+        max_memory=max_memory,
     )
     from_ids = np.asarray(query.from_ids, dtype=object)
     to_ids = np.asarray(query.to_ids, dtype=object)
@@ -2128,11 +2426,13 @@ def _street_cost_resolution(
         # A frozen copy: the streamed batches and the manifest
         # fingerprint read one state, whatever happens to the caller's
         # Exposure meanwhile — the fare/policy frozen-input pattern.
-        "exposure": None if exposure is None else exposure._reporting_snapshot(),
+        "exposure": None if exposure is None else _exposure_snapshot(exposure),
     }
 
 
-def _street_cost_cells(network, query, *, geometries, resolved, workers=None):
+def _street_cost_cells(
+    network, query, *, geometries, resolved, workers=None, max_memory=None
+):
     """One street-cost batch: origin/destination indices, the numeric
     columns, and the WKB geometries (``None`` without ``geometries``)."""
     transport_mode = resolved["transport_mode"]
@@ -2146,7 +2446,7 @@ def _street_cost_cells(network, query, *, geometries, resolved, workers=None):
         bool(geometries),
         car_model=resolved["car_model"],
         street_edges=exposure is not None,
-        workers=workers,
+        workers=_memory.width_or(workers),
     )
     _warn_unsnapped(
         table,
@@ -2233,6 +2533,7 @@ def _street_time_columns(
     delay_model=None,
     parking=None,
     workers=None,
+    max_memory=None,
 ):
     """The reachable cells of a street travel-time matrix, in long format."""
     resolved = _street_time_resolution(
@@ -2250,7 +2551,7 @@ def _street_time_columns(
     )
     query = resolved["query"]
     rows, columns, travel_time_s = _street_time_cells(
-        network, query, resolved, workers=workers
+        network, query, resolved, workers=workers, max_memory=max_memory
     )
     from_ids = np.asarray(query.from_ids, dtype=object)
     to_ids = np.asarray(query.to_ids, dtype=object)
@@ -2304,7 +2605,7 @@ def _street_time_resolution(
     }
 
 
-def _street_time_cells(network, query, resolved, workers=None):
+def _street_time_cells(network, query, resolved, workers=None, max_memory=None):
     """One street-time batch: cell indices and their travel times."""
     transport_mode = resolved["transport_mode"]
     table = network._core.travel_time_matrix(
@@ -2314,7 +2615,7 @@ def _street_time_cells(network, query, resolved, workers=None):
         query.max_seconds,
         query.max_snap_distance,
         car_model=resolved["car_model"],
-        workers=workers,
+        workers=_memory.width_or(workers),
     )
     _warn_unsnapped(
         table,
@@ -2355,6 +2656,7 @@ def _time_matrix_data(
     street_policy,
     max_transfers,
     workers,
+    max_memory=None,
 ):
     """The long-format columns of one moment's transit time matrix,
     dispatched by street policy exactly as the constructor did."""
@@ -2409,6 +2711,7 @@ def _time_matrix_data(
                 exclude_routes,
                 exclude_trips,
                 workers=workers,
+                max_memory=max_memory,
             )
         rejected = {
             "window": window,
@@ -2442,6 +2745,7 @@ def _time_matrix_data(
                 exclude_trips,
                 exclude_stops,
                 workers=workers,
+                max_memory=max_memory,
             )
         walk_only, walk_budget = _walking_only_policy(street_policy)
         if walk_only:
@@ -2466,6 +2770,7 @@ def _time_matrix_data(
                 max_walking_time=walk_budget,
                 max_snap_distance=None,
                 workers=workers,
+                max_memory=max_memory,
             )
         return _policy_time_columns(
             network,
@@ -2480,6 +2785,7 @@ def _time_matrix_data(
             exclude_trips,
             exclude_stops,
             workers=workers,
+            max_memory=max_memory,
         )
     return _time_columns(
         network,
@@ -2501,6 +2807,7 @@ def _time_matrix_data(
         max_snap_distance=max_snap_distance,
         arrive_by=arrive_by,
         workers=workers,
+        max_memory=max_memory,
         _matrix=_matrix,
     )
 
@@ -2526,6 +2833,7 @@ def _time_columns(
     exclude_stops=(),
     arrive_by=False,
     workers=None,
+    max_memory=None,
     _matrix=None,
 ):
     """The reachable cells of the travel-time matrix, in long format.
@@ -2557,6 +2865,7 @@ def _time_columns(
         max_snap_distance=max_snap_distance,
         arrive_by=arrive_by,
         workers=workers,
+        max_memory=max_memory,
     )
     return _time_cells(matrix, from_ids, to_ids, resolved)
 
@@ -2952,7 +3261,7 @@ def travel_cost_table(
             arrive_by=arrive_by,
             router=router,
         )
-        exposure_snapshot = exposure._reporting_snapshot()
+        exposure_snapshot = _exposure_snapshot(exposure)
     if _is_street_network(network):
         chunk = None if chunk is None else tuple(int(part) for part in chunk)
         resolved = _street_cost_resolution(
@@ -3197,6 +3506,7 @@ def _stream_transit_cost(
     output_time_units="minutes",
     exposure=None,
     workers=None,
+    max_memory=None,
 ):
     """The transit cost matrix streamed in sliced-axis batches — the
     origins on the departure axis, the destinations (the reverse
@@ -3347,6 +3657,7 @@ def _stream_transit_cost(
             exposure=exposure,
             _resolved=(trip_factors, fare_tables, endpoints),
             workers=workers,
+            max_memory=max_memory,
         )
         return _arrow_table(
             table,
@@ -3836,6 +4147,7 @@ def _stream_street_cost(
     resume=False,
     output_time_units="minutes",
     workers=None,
+    max_memory=None,
 ):
     """The street cost matrix streamed in origin batches over a frozen
     resolution — `TravelCostMatrix.to_parquet`'s street arm."""
@@ -3898,6 +4210,7 @@ def _stream_street_cost(
             geometries=geometries,
             resolved=resolved,
             workers=workers,
+            max_memory=max_memory,
         )
         count = len(from_index)
         data = {
@@ -3956,6 +4269,7 @@ def _stream_street_time(
     resume=False,
     output_time_units="minutes",
     workers=None,
+    max_memory=None,
 ):
     """The street time matrix streamed in origin batches over a frozen
     resolution — `TravelTimeMatrix.to_parquet`'s street arm."""
@@ -3986,6 +4300,7 @@ def _stream_street_time(
             batch,
             resolved,
             workers=workers,
+            max_memory=max_memory,
         )
         return pa.table(
             {
@@ -4046,6 +4361,7 @@ def _stream_transit_time(
     output_time_units="minutes",
     arrive_by=False,
     workers=None,
+    max_memory=None,
 ):
     """The transit time matrix streamed in sliced-axis batches — the
     origins on the departure axis, the destinations (the fan-out axis)
@@ -4143,6 +4459,7 @@ def _stream_transit_time(
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
             workers=workers,
+            max_memory=max_memory,
         )
         if batch_percentiles != resolved_percentiles:
             raise ValueError(
@@ -4195,7 +4512,7 @@ def _stream_transit_time(
                     exclude_routes,
                     exclude_trips,
                     exclude_stops,
-                    workers=workers,
+                    workers=_memory.width_or(workers),
                 )
             else:
                 matrix = network._core._arrive_by_time_percentiles(
@@ -4209,7 +4526,7 @@ def _stream_transit_time(
                     exclude_routes,
                     exclude_trips,
                     exclude_stops,
-                    workers=workers,
+                    workers=_memory.width_or(workers),
                 )
         else:
             origin_points, destination_points = points
@@ -4232,6 +4549,7 @@ def _stream_transit_time(
                 max_snap_distance=max_snap_distance,
                 arrive_by=True,
                 workers=workers,
+                max_memory=max_memory,
             )
             if batch_percentiles != resolved_percentiles:
                 raise ValueError(
@@ -4437,6 +4755,7 @@ def _cost_matrix_data(
     arrival,
     _resolved=None,
     _slot_table=None,
+    max_memory=None,
 ):
     """The long-format columns of one moment's transit cost matrix,
     dispatched by street policy exactly as the constructor did."""
@@ -4527,6 +4846,7 @@ def _cost_matrix_data(
                 exclude_routes=exclude_routes,
                 exclude_trips=exclude_trips,
                 workers=workers,
+                max_memory=max_memory,
             )
         offending = next(
             (
@@ -4587,6 +4907,7 @@ def _cost_matrix_data(
                 max_walking_time=walk_budget,
                 max_snap_distance=None,
                 workers=workers,
+                max_memory=max_memory,
             )
         else:
             table, from_ids, to_ids = _policy_cost_columns(
@@ -4605,6 +4926,7 @@ def _cost_matrix_data(
                 exclude_trips=exclude_trips,
                 exclude_stops=exclude_stops,
                 workers=workers,
+                max_memory=max_memory,
             )
         data = {
             "from_id": np.array(from_ids, dtype=object)[table["from"]],
@@ -4662,8 +4984,9 @@ def _cost_matrix_data(
         walking_speed_kmph=walking_speed_kmph,
         max_walking_time=max_walking_time,
         max_snap_distance=max_snap_distance,
-        exposure=None if exposure is None else exposure._reporting_snapshot(),
+        exposure=None if exposure is None else _exposure_snapshot(exposure),
         workers=workers,
+        max_memory=max_memory,
         _resolved=_resolved,
         _slot_table=_slot_table,
     )
@@ -4721,6 +5044,7 @@ def _cost_columns(
     _resolved=None,
     _slot_table=None,
     workers=None,
+    max_memory=None,
 ):
     """The core's cost arrays plus the origin and destination ids.
 
@@ -4767,6 +5091,7 @@ def _cost_columns(
             raise ValueError("candidates='pareto' requires optimize='emissions'")
         if _is_point_frame(origins) or _is_point_frame(destinations):
             raise ValueError("pareto candidates require stop origins and destinations")
+
     if _resolved is not None:
         trip_factors, fare_tables, endpoints = _resolved
     else:
@@ -4813,7 +5138,7 @@ def _cost_columns(
                 *exclusions,
                 *walk,
                 geometries,
-                workers=workers,
+                workers=_memory.width_or(workers),
             )
         elif optimize != "time":
             table = network._core.least_cost_matrix_from_points(
@@ -4831,7 +5156,7 @@ def _cost_columns(
                 *exclusions,
                 *walk,
                 geometries,
-                workers=workers,
+                workers=_memory.width_or(workers),
             )
         else:
             table = network._core.travel_cost_matrix_from_points(
@@ -4847,7 +5172,7 @@ def _cost_columns(
                 geometries,
                 fare_tables,
                 pieces=exposure is not None,
-                workers=workers,
+                workers=_memory.width_or(workers),
             )
             if exposure is not None:
                 table.update(
@@ -4898,7 +5223,7 @@ def _cost_columns(
                 to_stops,
                 *exclusions,
                 geometries,
-                workers=workers,
+                workers=_memory.width_or(workers),
             )
         elif optimize != "time":
             # The emissions (McRAPTOR) stop matrix relaxes a matching whole-day
@@ -4922,7 +5247,7 @@ def _cost_columns(
                 *exclusions,
                 *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
                 geometries,
-                workers=workers,
+                workers=_memory.width_or(workers),
             )
         else:
             # The walking options bound the door-to-door cost matrix under a
@@ -4940,7 +5265,7 @@ def _cost_columns(
                 geometries,
                 fare_tables,
                 pieces=exposure is not None,
-                workers=workers,
+                workers=_memory.width_or(workers),
             )
             if exposure is not None:
                 table.update(
@@ -5114,6 +5439,7 @@ def _policy_time_columns(
     exclude_trips=(),
     exclude_stops=(),
     workers=None,
+    max_memory=None,
 ):
     """The street-policy travel-time matrix columns: per-point reductions
     through the engine fan-out, the direct walking alternative folded in."""
@@ -5188,7 +5514,7 @@ def _policy_time_columns(
         exclude_trips=list(exclude_trips),
         exclude_stops=list(exclude_stops),
         transfer_mode=transfer_mode,
-        workers=workers,
+        workers=_memory.width_or(workers),
     )
     # Walking directly can beat riding, exactly as in the walking matrix;
     # the alternative runs over the same multimodal graph at the policy's
@@ -5214,7 +5540,7 @@ def _policy_time_columns(
         list(destination_points),
         direct_mode,
         float(walk_budget),
-        workers=workers,
+        workers=_memory.width_or(workers),
     )
     # A point is unsnapped only when neither the policy's modes nor the
     # direct walking alternative can snap it — a snap fact from both
@@ -5259,6 +5585,7 @@ def _car_park_time_matrix(
     exclude_routes=(),
     exclude_trips=(),
     workers=None,
+    max_memory=None,
 ):
     """The dense CarParkPolicy travel-time matrix with its id axes.
 
@@ -5335,7 +5662,7 @@ def _car_park_time_matrix(
         exclude_trips=list(exclude_trips),
         exclude_stops=[],
         transfer_mode=None,
-        workers=workers,
+        workers=_memory.width_or(workers),
     )
     # The direct walking alternative rides the installed walking
     # streets — the same walk the route surface offers beside the car
@@ -5396,6 +5723,7 @@ def _car_park_time_columns(
     exclude_routes=(),
     exclude_trips=(),
     workers=None,
+    max_memory=None,
 ):
     """The CarParkPolicy travel-time matrix in the long shape the
     frame takes: unreachable pairs omitted, as the matrix contract
@@ -5413,6 +5741,7 @@ def _car_park_time_columns(
         exclude_routes,
         exclude_trips,
         workers=workers,
+        max_memory=max_memory,
     )
     unreachable = 2**32 - 1
     data = {"from_id": [], "to_id": [], "travel_time_s": []}
@@ -5439,6 +5768,7 @@ def _carriage_time_columns(
     exclude_trips=(),
     exclude_stops=(),
     workers=None,
+    max_memory=None,
 ):
     """The carriage time-matrix columns: per-point per-plane reductions
     through the possession-state fan-out, the cross-plane egress fold
@@ -5536,7 +5866,7 @@ def _carriage_time_columns(
         unknown_rule,
         park_stops=park,
         transfer_mode=transfer_mode,
-        workers=workers,
+        workers=_memory.width_or(workers),
     )
     # The direct walking alternative always applies — walking needs no
     # vehicle — at the policy's walking access budget when it names one,
@@ -5546,7 +5876,7 @@ def _carriage_time_columns(
         list(destination_points),
         "walk",
         float(walk_budget),
-        workers=workers,
+        workers=_memory.width_or(workers),
     )
     _warn_unsnapped(
         {
@@ -5612,6 +5942,7 @@ def _policy_cost_columns(
     exclude_trips=(),
     exclude_stops=(),
     workers=None,
+    max_memory=None,
 ):
     """The street-policy cost matrix columns: per-point meters-carrying
     reductions through the engine fan-out, street distances and emissions
@@ -5769,7 +6100,7 @@ def _policy_cost_columns(
         geometries=bool(geometries),
         transfer_mode=transfer_arg,
         direct_mode=direct_mode,
-        workers=workers,
+        workers=_memory.width_or(workers),
     )
     # A point is unsnapped only when neither the policy's modes nor the
     # direct walking alternative can snap it — a snap fact from both
@@ -5808,6 +6139,7 @@ def _car_park_cost_columns(
     exclude_routes=(),
     exclude_trips=(),
     workers=None,
+    max_memory=None,
 ):
     """The CarParkPolicy cost-matrix columns.
 
@@ -5936,7 +6268,7 @@ def _car_park_cost_columns(
         geometries=bool(geometries),
         transfer_mode=None,
         direct_mode=None,
-        workers=workers,
+        workers=_memory.width_or(workers),
     )
     no_stop = 2**32 - 1
     columns = {
@@ -6116,6 +6448,7 @@ def _car_park_arrive_by_time_matrix(
     exclude_routes=(),
     exclude_trips=(),
     workers=None,
+    max_memory=None,
 ):
     """The dense CarParkPolicy arrive-by matrices with their id axes.
 
@@ -6196,7 +6529,7 @@ def _car_park_arrive_by_time_matrix(
         exclude_routes=list(exclude_routes),
         exclude_trips=list(exclude_trips),
         exclude_stops=[],
-        workers=workers,
+        workers=_memory.width_or(workers),
     )
     walk = core._walk_matrix(
         list(origin_points),
@@ -6277,6 +6610,7 @@ def _car_park_arrive_by_time_columns(
     exclude_routes=(),
     exclude_trips=(),
     workers=None,
+    max_memory=None,
 ):
     """The CarParkPolicy arrive-by travel-time matrix in the long
     shape the frame takes: unreachable pairs omitted."""
@@ -6293,6 +6627,7 @@ def _car_park_arrive_by_time_columns(
         exclude_routes,
         exclude_trips,
         workers=workers,
+        max_memory=max_memory,
     )
     unreachable = 2**32 - 1
     data = {"from_id": [], "to_id": [], "travel_time_s": []}
@@ -6323,6 +6658,7 @@ def _car_park_arrive_by_cost_columns(
     exclude_routes=(),
     exclude_trips=(),
     workers=None,
+    max_memory=None,
 ):
     """The CarParkPolicy arrive-by cost-matrix columns.
 
@@ -6455,7 +6791,7 @@ def _car_park_arrive_by_cost_columns(
         exclude_routes=list(exclude_routes),
         exclude_trips=list(exclude_trips),
         exclude_stops=[],
-        workers=workers,
+        workers=_memory.width_or(workers),
     )
     walk = core._walk_matrix(
         list(origin_points),
@@ -6565,7 +6901,7 @@ def _car_park_arrive_by_cost_columns(
             geometries=bool(geometries),
             transfer_mode=None,
             direct_mode=None,
-            workers=workers,
+            workers=_memory.width_or(workers),
         )
         found = set()
         for at in range(len(priced["travel_time_s"])):

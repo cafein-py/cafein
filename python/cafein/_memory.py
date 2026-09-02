@@ -11,6 +11,7 @@ remains; the only overruns are the documented floors, each warned.
 """
 
 import contextlib
+import contextvars
 import dataclasses
 import logging
 import os
@@ -59,6 +60,8 @@ BYTES_PER_CELL = 10
 GEOMETRY_ROW_BYTES = 11122
 
 _lock = threading.Lock()
+#: The plan of the enclosing public call, for the dispatches inside it.
+_active = contextvars.ContextVar("cafein_active_plan", default=None)
 _default = DEFAULT_SPEC
 
 
@@ -235,12 +238,15 @@ def ambient_workers():
 class Plan:
     """One call's memory plan: the headroom it saw, the batch rows it
     reserved (``None`` for an in-memory result), its fan-out width,
-    and the fare refinement's width when the call has that phase."""
+    the fare refinement's width when the call has that phase, and the
+    exposure reporting snapshot the call was sized with, so the body
+    reports against the same frozen surface."""
 
     headroom: int
     batch_rows: object
     width: int
     refinement_width: object = None
+    exposure_snapshot: object = None
 
 
 def _per_origin(engine, size):
@@ -379,3 +385,24 @@ def plan_call(
     return Plan(
         headroom=headroom, batch_rows=batch, width=width, refinement_width=refinement
     )
+
+
+def active_plan():
+    """The plan the enclosing public call made, or ``None``."""
+    return _active.get()
+
+
+@contextlib.contextmanager
+def use_plan(plan):
+    """Make ``plan`` the active one for the dispatches inside."""
+    token = _active.set(plan)
+    try:
+        yield plan
+    finally:
+        _active.reset(token)
+
+
+def width_or(workers):
+    """The active plan's width, else ``workers`` as given."""
+    plan = _active.get()
+    return workers if plan is None else plan.width

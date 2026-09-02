@@ -1,6 +1,7 @@
 """Per-call ``workers=``: the local-pool mechanism and its surfaces."""
 
 import io
+import dataclasses
 import logging
 
 import pandas as pd
@@ -102,7 +103,7 @@ def test_results_are_identical_across_widths(network):
 
 
 def test_workers_validates_eagerly(network, tmp_path):
-    from cafein import Accessibility, TravelTimeMatrix
+    from cafein import Accessibility, TravelCostMatrix, TravelTimeMatrix
 
     origins = _served_stops(network, 2)
     for value, exc, match in (
@@ -112,6 +113,22 @@ def test_workers_validates_eagerly(network, tmp_path):
     ):
         with pytest.raises(exc, match=match):
             TravelTimeMatrix(network, origins, departure=DEPARTURE, workers=value)
+    for value, exc, match in (
+        ("nope", ValueError, "could not read"),
+        (True, TypeError, "not a bool"),
+        (-1, ValueError, "non-negative"),
+    ):
+        with pytest.raises(exc, match=match):
+            TravelTimeMatrix(network, origins, departure=DEPARTURE, max_memory=value)
+    with pytest.raises(ValueError, match="could not read"):
+        TravelCostMatrix.to_parquet(
+            network,
+            origins,
+            departure=DEPARTURE,
+            output=tmp_path / "cost",
+            max_memory="nope",
+        )
+    assert not (tmp_path / "cost").exists()
     # The streaming surfaces validate before writing anything.
     with pytest.raises(ValueError, match="workers must be at least 1"):
         Accessibility.to_parquet(
@@ -171,3 +188,216 @@ def test_car_park_arm_rides_the_requested_pool(car_park_network, caplog):
     assert any(
         f"on {requested} workers" in record.getMessage() for record in caplog.records
     )
+
+
+@pytest.mark.parametrize(
+    "arm, engine, cells, row_bytes",
+    [
+        ("stop time", "time", "origins x stops", 64),
+        ("stop cost", "time", "origins x stops", 48),
+        ("stop emissions", "multicriteria", "origins x stops", 48),
+        ("two slots", "time", "2 x origins x stops", 64 + 64),
+        ("chunked", "time", "1 x stops", 64),
+        ("network entry", "time", "origins x stops", 4),
+        ("street time", "street", "points x points", 64),
+        ("street cost", "street", "points x points", 48),
+        ("car park", "time", "1", 64),
+        ("point time", "time", "points x points", 64),
+        ("point cost", "time", "points x points", 48),
+    ],
+)
+def test_every_public_call_plans_once(
+    network,
+    network_with_footpaths,
+    helsinki_streets,
+    car_park_network,
+    arm,
+    engine,
+    cells,
+    row_bytes,
+    caplog,
+    monkeypatch,
+    tmp_path,
+):
+    import re
+
+    import geopandas
+    from shapely.geometry import Point
+
+    from cafein import TravelCostMatrix, TravelTimeMatrix, _memory
+    from cafein.policy import CarParkPolicy
+
+    calls = []
+    real = _memory.plan_call
+    distinct = _distinct_width()
+
+    def recording(engine_, size, result_bytes, **kwargs):
+        # A width the ambient pool never has: a dispatch that ignored the
+        # plan would run on the pool instead and fail the seam check below.
+        plan = dataclasses.replace(
+            real(engine_, size, result_bytes, **kwargs), width=distinct
+        )
+        calls.append((engine_, size, result_bytes, kwargs.get("row_bytes"), plan.width))
+        return plan
+
+    monkeypatch.setattr(_memory, "plan_call", recording)
+    origins = _served_stops(network, 2)
+    points = geopandas.GeoDataFrame(
+        {"id": [0, 1]},
+        geometry=[Point(24.94, 60.17), Point(24.95, 60.175)],
+        crs="EPSG:4326",
+    )
+    facilities = geopandas.GeoDataFrame(
+        {"id": ["pasila"], "search_seconds": [240.0]},
+        geometry=[Point(24.9330, 60.1990)],
+        crs="EPSG:4326",
+    )
+    frame = lambda lon, lat: geopandas.GeoDataFrame(  # noqa: E731
+        {"id": ["p"]}, geometry=[Point(lon, lat)], crs="EPSG:4326"
+    )
+    build = {
+        "stop time": lambda: TravelTimeMatrix(network, origins, departure=DEPARTURE),
+        "stop cost": lambda: TravelCostMatrix(network, origins, departure=DEPARTURE),
+        "stop emissions": lambda: TravelCostMatrix(
+            network,
+            origins,
+            departure=DEPARTURE,
+            optimize="emissions",
+            departure_time_window=5,
+        ),
+        "two slots": lambda: TravelTimeMatrix(
+            network, origins, departure=[DEPARTURE, "2022-02-22 09:30"]
+        ),
+        "street time": lambda: TravelTimeMatrix(
+            helsinki_streets, points, points, transport_mode="walk"
+        ),
+        "street cost": lambda: TravelCostMatrix(
+            helsinki_streets, points, points, transport_mode="walk"
+        ),
+        "chunked": lambda: TravelTimeMatrix(
+            network, origins, departure=DEPARTURE, chunk=(0, 2)
+        ),
+        "network entry": lambda: network.travel_time_matrix(origins, DEPARTURE),
+        "point time": lambda: TravelTimeMatrix(
+            network_with_footpaths, points, points, departure=DEPARTURE
+        ),
+        "point cost": lambda: TravelCostMatrix(
+            network_with_footpaths, points, points, departure=DEPARTURE
+        ),
+        "car park": lambda: TravelTimeMatrix(
+            car_park_network,
+            frame(24.9130, 60.1980),
+            frame(24.9520, 60.1795),
+            DEPARTURE,
+            street_policy=CarParkPolicy(facilities=facilities),
+        ),
+    }
+    with caplog.at_level(logging.DEBUG, logger="cafein"):
+        build[arm]()
+    # One plan per public call, sized by the engine's network and the
+    # whole result; every core fan-out runs on its width.
+    assert len(calls) == 1
+    seen_engine, size, result_bytes, batch_row_bytes, width = calls[0]
+    assert seen_engine == engine
+    size_of = {"street": helsinki_streets.vertex_count}
+    assert size == size_of.get(engine, network.stop_count)
+    count = {
+        "origins x stops": 2 * network.stop_count,
+        "2 x origins x stops": 2 * 2 * network.stop_count,
+        "1 x stops": network.stop_count,
+        "points x points": 4,
+        "1": 1,
+        "batch x stops": network.stop_count,
+        "batch x origins": 2,
+        "batch x points": 2,
+    }[cells]
+    if cells.startswith("batch"):
+        assert result_bytes == 0 and batch_row_bytes == count * row_bytes
+    else:
+        assert result_bytes == count * row_bytes
+    widths = {
+        int(m.group(1))
+        for m in (
+            re.search(r"^(?!probe ).* on (\d+) workers$", r.getMessage())
+            for r in caplog.records
+        )
+        if m
+    }
+    assert widths == {width} == {distinct}
+
+
+def test_a_tight_budget_reaches_every_fan_out(
+    network, helsinki_streets, car_park_network, caplog, monkeypatch
+):
+    import re
+
+    import geopandas
+    from shapely.geometry import Point
+
+    from cafein import TravelCostMatrix, TravelTimeMatrix, _memory
+    from cafein.policy import CarParkPolicy
+
+    # One search costs more than any budget: every plan floors to one
+    # worker, and every core seam must run on it.
+    monkeypatch.setattr(_memory, "resident_bytes", lambda: 0)
+    monkeypatch.setattr(
+        _memory, "BYTES_PER_UNIT", {engine: 10**12 for engine in _memory.ENGINES}
+    )
+    origins = _served_stops(network, 2)
+    points = geopandas.GeoDataFrame(
+        {"id": [0, 1]},
+        geometry=[Point(24.94, 60.17), Point(24.95, 60.175)],
+        crs="EPSG:4326",
+    )
+    facilities = geopandas.GeoDataFrame(
+        {"id": ["pasila"], "search_seconds": [240.0]},
+        geometry=[Point(24.9330, 60.1990)],
+        crs="EPSG:4326",
+    )
+    frame = lambda lon, lat: geopandas.GeoDataFrame(  # noqa: E731
+        {"id": ["p"]}, geometry=[Point(lon, lat)], crs="EPSG:4326"
+    )
+    tight = {"max_memory": "200M"}
+    builders = (
+        lambda: TravelTimeMatrix(network, origins, departure=DEPARTURE, **tight),
+        lambda: TravelCostMatrix(
+            network,
+            origins,
+            departure=DEPARTURE,
+            optimize="emissions",
+            departure_time_window=5,
+            **tight,
+        ),
+        lambda: TravelTimeMatrix(
+            helsinki_streets, points, points, transport_mode="walk", **tight
+        ),
+        lambda: TravelTimeMatrix(
+            car_park_network,
+            frame(24.9130, 60.1980),
+            frame(24.9520, 60.1795),
+            DEPARTURE,
+            street_policy=CarParkPolicy(facilities=facilities),
+            **tight,
+        ),
+    )
+    with caplog.at_level(logging.DEBUG, logger="cafein"):
+        for build in builders:
+            with pytest.warns(UserWarning, match="exceeds the memory budget"):
+                build()
+    widths = [
+        int(m.group(1))
+        for m in (
+            re.search(r"^(?!probe ).* on (\d+) workers$", r.getMessage())
+            for r in caplog.records
+        )
+        if m
+    ]
+    assert len(widths) >= len(builders) and set(widths) == {1}
+
+
+def test_the_network_entry_reports_the_budget_in_its_details(network, caplog):
+    origins = _served_stops(network, 2)
+    with caplog.at_level(logging.INFO, logger="cafein"):
+        network.travel_time_matrix(origins, DEPARTURE, max_memory="6G")
+    details = [getattr(r, "cafein_details", None) or {} for r in caplog.records]
+    assert any(d.get("max_memory") == "6G" for d in details)

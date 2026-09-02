@@ -258,3 +258,11 @@ def test_readers_fall_back_when_psutil_cannot_read(monkeypatch):
 
     monkeypatch.setattr(_memory, "_windows_resident", failing)
     assert _memory.resident_bytes() is None
+
+
+def test_the_active_plan_scopes_to_its_call():
+    plan = _memory.Plan(headroom=1, batch_rows=None, width=3)
+    assert _memory.active_plan() is None and _memory.width_or(7) == 7
+    with _memory.use_plan(plan):
+        assert _memory.active_plan() is plan and _memory.width_or(7) == 3
+    assert _memory.active_plan() is None

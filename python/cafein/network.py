@@ -13,6 +13,8 @@ from cafein._validate import (
     positive_int,
     sequence_not_string,
 )
+from cafein._units import memory_spec
+from cafein.matrices import _planned_entry, _query_details
 from cafein.travelers import (
     folded_constraints,
     folded_street_policy,
@@ -3361,7 +3363,9 @@ class TransportNetwork:
         _log.matrix,
         "computing the travel time matrix",
         "computed the travel time matrix",
+        details=_query_details,
     )
+    @_planned_entry(cost=False, method=True)
     def travel_time_matrix(
         self,
         origins,
@@ -3384,6 +3388,7 @@ class TransportNetwork:
         max_walking_time=None,
         snap_distance=None,
         workers=None,
+        max_memory=None,
     ):
         """Travel times as a matrix, from stops or from points.
 
@@ -3451,6 +3456,13 @@ class TransportNetwork:
             A level in ``(0, 1)`` mapped to the symmetric percentile
             interval plus the median; requires `departure_time_window`
             and excludes `percentiles`.
+        max_memory : str or int (optional)
+            The memory budget this call plans against, as a percentage or a
+            size with a binary suffix (``"80%"``, ``"6G"``, or bytes); the
+            process default from
+            ``cafein.set_max_memory`` (80 % of physical memory) when omitted.
+            The fan-out width and, when streaming, the batch size follow from
+            it. The budget plans, never caps: hard guarantees stay with the OS.
         chunk : (int, int) (optional)
             Compute only chunk ``k`` of ``n``: a deterministic
             contiguous block of the fan-out axis — the resolved
@@ -3491,6 +3503,7 @@ class TransportNetwork:
         """
         if workers is not None:
             workers = positive_int("workers", workers)
+        memory_spec("max_memory", max_memory)
         (
             exclude_routes,
             exclude_trips,
@@ -3551,6 +3564,7 @@ class TransportNetwork:
             max_snap_distance=max_snap_distance,
             arrive_by=arrive_by,
             workers=workers,
+            max_memory=max_memory,
         )
         return matrix
 
@@ -3575,6 +3589,7 @@ class TransportNetwork:
         exclude_stops=(),
         arrive_by=False,
         workers=None,
+        max_memory=None,
     ):
         """The travel-time matrix with its origin and destination id
         axes and the resolved percentile list (``None`` without a
@@ -3598,6 +3613,9 @@ class TransportNetwork:
         # bound the door-to-door paths and are ignored on the closure
         # and reverse stop paths, but garbage refuses everywhere.
         walk = _walk_options(walking_speed_kmph, max_walking_time, max_snap_distance)
+
+        from cafein._memory import width_or
+
         # Stop-id sequences normalise to the engines' string ids here;
         # integer inputs round-trip back to their dtype at the frame
         # boundary.
@@ -3629,7 +3647,7 @@ class TransportNetwork:
                         list(id_sequence("exclude_trips", exclude_trips)),
                         list(id_sequence("exclude_stops", exclude_stops)),
                         *walk,
-                        workers=workers,
+                        workers=width_or(workers),
                     )
                 else:
                     table = self._core._arrive_by_time_percentiles_from_points(
@@ -3644,7 +3662,7 @@ class TransportNetwork:
                         list(id_sequence("exclude_trips", exclude_trips)),
                         list(id_sequence("exclude_stops", exclude_stops)),
                         *walk,
-                        workers=workers,
+                        workers=width_or(workers),
                     )
                 _warn_unsnapped(table, from_ids, to_ids)
                 return table["matrix"], from_ids, to_ids, percentiles
@@ -3663,7 +3681,7 @@ class TransportNetwork:
                     list(id_sequence("exclude_trips", exclude_trips)),
                     list(id_sequence("exclude_stops", exclude_stops)),
                     *walk,
-                    workers=workers,
+                    workers=width_or(workers),
                 )
             else:
                 table = self._core.travel_time_percentiles_from_points(
@@ -3679,7 +3697,7 @@ class TransportNetwork:
                     list(id_sequence("exclude_trips", exclude_trips)),
                     list(id_sequence("exclude_stops", exclude_stops)),
                     *walk,
-                    workers=workers,
+                    workers=width_or(workers),
                 )
             _warn_unsnapped(table, from_ids, to_ids)
             return table["matrix"], from_ids, to_ids, percentiles
@@ -3701,7 +3719,7 @@ class TransportNetwork:
                     list(id_sequence("exclude_routes", exclude_routes)),
                     list(id_sequence("exclude_trips", exclude_trips)),
                     list(id_sequence("exclude_stops", exclude_stops)),
-                    workers=workers,
+                    workers=width_or(workers),
                 )
             else:
                 matrix = self._core._arrive_by_time_percentiles(
@@ -3715,7 +3733,7 @@ class TransportNetwork:
                     list(id_sequence("exclude_routes", exclude_routes)),
                     list(id_sequence("exclude_trips", exclude_trips)),
                     list(id_sequence("exclude_stops", exclude_stops)),
-                    workers=workers,
+                    workers=width_or(workers),
                 )
             return matrix, from_stops, to_ids, percentiles
         from_stops = from_stops[_chunk_slice(len(from_stops), chunk)]
@@ -3732,7 +3750,7 @@ class TransportNetwork:
                 list(id_sequence("exclude_trips", exclude_trips)),
                 list(id_sequence("exclude_stops", exclude_stops)),
                 *walk,
-                workers=workers,
+                workers=width_or(workers),
             )
         else:
             matrix = self._core.travel_time_percentiles(
@@ -3746,6 +3764,6 @@ class TransportNetwork:
                 list(id_sequence("exclude_routes", exclude_routes)),
                 list(id_sequence("exclude_trips", exclude_trips)),
                 list(id_sequence("exclude_stops", exclude_stops)),
-                workers=workers,
+                workers=width_or(workers),
             )
         return matrix, from_stops, to_ids, percentiles
