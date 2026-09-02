@@ -508,7 +508,11 @@ def test_a_planning_refusal_follows_the_argument_checks(network, monkeypatch):
     origins = _served_stops(network, 2)
     with pytest.raises(ValueError, match="street mode"):
         TravelTimeMatrix(
-            network, origins, departure=DEPARTURE, transport_mode="car", max_memory="200M"
+            network,
+            origins,
+            departure=DEPARTURE,
+            transport_mode="car",
+            max_memory="200M",
         )
     with pytest.raises(ValueError, match="exceed the memory budget"):
         TravelTimeMatrix(network, departure=DEPARTURE, max_memory="200M")
