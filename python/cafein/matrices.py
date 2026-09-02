@@ -117,6 +117,8 @@ def _exposure_snapshot(exposure):
     the body reports against the surface the plan sized; a fresh one
     for a call nobody planned."""
     active = _memory.active_plan()
+    if isinstance(active, _memory.Refusal):
+        raise active.error
     if active is not None and active.exposure_snapshot is not None:
         return active.exposure_snapshot
     return exposure._reporting_snapshot()
@@ -255,6 +257,15 @@ def _frozen_axis(value):
     return list(value)
 
 
+def _deferred(plan):
+    """The plan, or the refusal it raised, deferred to the first dispatch
+    so the call's own argument checks refuse first."""
+    try:
+        return plan()
+    except ValueError as error:
+        return _memory.Refusal(error)
+
+
 def _planned_entry(*, cost, streamed=False, method=False, function=False):
     """Plan the decorated public call once and keep its plan active for
     every dispatch inside it. ``method`` marks a network method, whose
@@ -275,14 +286,16 @@ def _planned_entry(*, cost, streamed=False, method=False, function=False):
                 streams = (
                     kwargs.get("output") is not None if streamed == "auto" else streamed
                 )
-                plan = _entry_plan(
-                    network,
-                    origins,
-                    destinations,
-                    departure,
-                    kwargs,
-                    cost=cost,
-                    streamed=streams,
+                plan = _deferred(
+                    lambda: _entry_plan(
+                        network,
+                        origins,
+                        destinations,
+                        departure,
+                        kwargs,
+                        cost=cost,
+                        streamed=streams,
+                    )
                 )
                 with _memory.use_plan(plan):
                     return fn(network, origins, destinations, departure, **kwargs)
@@ -296,15 +309,17 @@ def _planned_entry(*, cost, streamed=False, method=False, function=False):
                 origins = _frozen_axis(origins)
                 if kwargs.get("destinations") is not None:
                     kwargs["destinations"] = _frozen_axis(kwargs["destinations"])
-                plan = _entry_plan(
-                    self,
-                    origins,
-                    kwargs.get("destinations"),
-                    departure,
-                    kwargs,
-                    cost=cost,
-                    streamed=streamed,
-                    dense=True,
+                plan = _deferred(
+                    lambda: _entry_plan(
+                        self,
+                        origins,
+                        kwargs.get("destinations"),
+                        departure,
+                        kwargs,
+                        cost=cost,
+                        streamed=streamed,
+                        dense=True,
+                    )
                 )
                 with _memory.use_plan(plan):
                     return fn(self, origins, departure, max_rides, **kwargs)
@@ -316,14 +331,16 @@ def _planned_entry(*, cost, streamed=False, method=False, function=False):
             first, network, origins=None, destinations=None, departure=None, **kwargs
         ):
             origins, destinations = _frozen_axis(origins), _frozen_axis(destinations)
-            plan = _entry_plan(
-                network,
-                origins,
-                destinations,
-                departure,
-                kwargs,
-                cost=cost,
-                streamed=streamed,
+            plan = _deferred(
+                lambda: _entry_plan(
+                    network,
+                    origins,
+                    destinations,
+                    departure,
+                    kwargs,
+                    cost=cost,
+                    streamed=streamed,
+                )
             )
             with _memory.use_plan(plan):
                 return fn(first, network, origins, destinations, departure, **kwargs)

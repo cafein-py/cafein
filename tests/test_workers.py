@@ -496,3 +496,19 @@ def test_the_network_entry_reports_the_budget_in_its_details(
         network.travel_time_matrix(origins, DEPARTURE, max_memory="6G")
     details = [getattr(r, "cafein_details", None) or {} for r in caplog.records]
     assert any(d.get("max_memory") == "6G" for d in details)
+
+
+def test_a_planning_refusal_follows_the_argument_checks(network, monkeypatch):
+    # A budget too small for the result still lets the call's own
+    # argument checks speak first; a sound call refuses at its first
+    # dispatch, before any search allocates.
+    from cafein import TravelTimeMatrix, _memory
+
+    monkeypatch.setattr(_memory, "resident_bytes", lambda: 0)
+    origins = _served_stops(network, 2)
+    with pytest.raises(ValueError, match="street mode"):
+        TravelTimeMatrix(
+            network, origins, departure=DEPARTURE, transport_mode="car", max_memory="200M"
+        )
+    with pytest.raises(ValueError, match="exceed the memory budget"):
+        TravelTimeMatrix(network, departure=DEPARTURE, max_memory="200M")
