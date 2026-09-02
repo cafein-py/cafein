@@ -483,7 +483,14 @@ def test_a_tight_budget_reaches_every_fan_out(
     assert len(widths) >= len(builders) and set(widths) == {1}
 
 
-def test_the_network_entry_reports_the_budget_in_its_details(network, caplog):
+def test_the_network_entry_reports_the_budget_in_its_details(
+    network, caplog, monkeypatch
+):
+    # A zero baseline: a long test session's resident size must not
+    # turn the explicit budget into a refusal.
+    from cafein import _memory
+
+    monkeypatch.setattr(_memory, "resident_bytes", lambda: 0)
     origins = _served_stops(network, 2)
     with caplog.at_level(logging.INFO, logger="cafein"):
         network.travel_time_matrix(origins, DEPARTURE, max_memory="6G")
