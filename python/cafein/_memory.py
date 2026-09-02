@@ -387,6 +387,15 @@ def plan_call(
     )
 
 
+class Refusal:
+    """A plan that could not be made: the call's own argument checks
+    run first, and the refusal fires at the first dispatch, before any
+    search allocates."""
+
+    def __init__(self, error):
+        self.error = error
+
+
 def active_plan():
     """The plan the enclosing public call made, or ``None``."""
     return _active.get()
@@ -403,6 +412,9 @@ def use_plan(plan):
 
 
 def width_or(workers):
-    """The active plan's width, else ``workers`` as given."""
+    """The active plan's width, else ``workers`` as given; a deferred
+    refusal fires here."""
     plan = _active.get()
+    if isinstance(plan, Refusal):
+        raise plan.error
     return workers if plan is None else plan.width
