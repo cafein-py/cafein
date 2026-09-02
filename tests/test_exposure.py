@@ -2354,3 +2354,34 @@ def test_the_fingerprint_covers_the_report_lengths():
     assert stretched._fingerprint() != one._fingerprint()
     # the frozen snapshot digests identically to its source
     assert one._reporting_snapshot()._fingerprint() == one._fingerprint()
+
+
+def test_one_snapshot_serves_the_plan_and_the_report(
+    street_network, reporting_exposure, monkeypatch
+):
+    # The entry snapshots the exposure once; the body reports against
+    # that same frozen surface rather than taking another.
+    import geopandas
+    from shapely.geometry import Point
+
+    from cafein import TravelCostMatrix
+    from cafein.exposure import Exposure
+
+    taken = []
+    real = Exposure._reporting_snapshot
+
+    def counted(self):
+        taken.append(self)
+        return real(self)
+
+    monkeypatch.setattr(Exposure, "_reporting_snapshot", counted)
+    points = geopandas.GeoDataFrame(
+        {"id": ["a", "b"]},
+        geometry=[Point(24.9130, 60.1980), Point(24.9520, 60.1795)],
+        crs="EPSG:4326",
+    )
+    matrix = TravelCostMatrix(
+        street_network, points, points, "2022-02-22 08:30", exposure=reporting_exposure
+    )
+    assert len(taken) == 1
+    assert set(reporting_exposure.column_names()) <= set(matrix.columns)

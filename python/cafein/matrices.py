@@ -3,6 +3,7 @@
 import collections.abc
 import dataclasses
 import functools
+import pathlib
 import operator
 import warnings
 
@@ -38,6 +39,9 @@ _TIME_CELL_BYTES = 4
 #: the two object-id arrays (16), the indexed values (4), and the
 #: frame's own copies of the columns while it is built (~24).
 _TIME_FRAME_CELL_BYTES = 64
+#: A streamed row adds two int32 dictionary indices and, while a batch
+#: materializes, two int64 index buffers.
+_STREAM_ROW_EXTRA_BYTES = 24
 #: Every optional column (a perspective, a component, an exposure
 #: layer) is one float64 per row.
 _OPTIONAL_COLUMN_BYTES = 8
@@ -124,7 +128,7 @@ def _entry_plan(
     """Plan a public matrix call once: its result (or one batch) and
     its width, from the engine the objective needs and the network's
     size. Percentiles resolve here so a one-shot iterable is read once;
-    """
+    a resumed stream's stored batch is read and validated here once."""
     from cafein.network import _window_percentiles
 
     workers = kwargs.get("workers")
@@ -194,12 +198,14 @@ def _entry_plan(
         row_bytes += max(_SLOT_LABEL_BYTES, label_bytes)
     kind = "cost" if cost else "time"
     if streamed:
-        row_bytes += 24  # the streamed row's index and buffer bytes
+        row_bytes += _STREAM_ROW_EXTRA_BYTES
         # The batch axis: origins, or destinations for an arrive-by run.
         columns = origin_count if arrive_by else destination_count
         batch = kwargs.get("batch_size")
         if batch is not None:
             batch = _stream_size(batch, False)
+        elif kwargs.get("resume"):
+            batch = _manifest_batch_size(kwargs.get("output"))
         plan = _memory.plan_call(
             engine,
             size,
@@ -211,6 +217,23 @@ def _entry_plan(
             max_memory=max_memory,
             label=f"travel {kind} stream",
         )
+        # The run's manifest records every batch: a run that would
+        # outgrow the reader's bound is refused before anything is written.
+        from cafein import _streaming
+
+        axis = destination_count if arrive_by else origin_count
+        batches = -(-axis // plan.batch_rows)
+        # The seed lists every slot with its moment and label too.
+        seed_bytes = slots * (label_bytes + 128)
+        if (
+            batches * _streaming.MANIFEST_ENTRY_BYTES + seed_bytes
+            > _streaming.MANIFEST_BYTES_LIMIT
+        ):
+            raise ValueError(
+                f"travel {kind} stream: {batches} batches would outgrow the run's "
+                f"manifest ({_streaming.MANIFEST_BYTES_LIMIT} bytes); raise "
+                "batch_size= or max_memory="
+            )
     else:
         plan = _memory.plan_call(
             engine,
@@ -1071,6 +1094,7 @@ class TravelCostMatrix(pd.DataFrame):
         return compare_matrices(self, other, columns=columns, ratios=ratios)
 
     @classmethod
+    @_planned_entry(cost=True, streamed=True)
     def to_parquet(
         cls,
         network,
@@ -1125,7 +1149,7 @@ class TravelCostMatrix(pd.DataFrame):
 
         The fan-out axis — the origins with ``departure=``, the
         destinations with ``arrival=`` — is processed in
-        ``batch_size`` slices (default 500)
+        ``batch_size`` slices (planned from the budget, at most 500)
         and each batch is written as it completes, so peak memory holds
         one batch — never the whole constructor result. ``output=``
         selects the form by suffix exactly as ``travel_cost_table``
@@ -1207,7 +1231,7 @@ class TravelCostMatrix(pd.DataFrame):
         max_street_time = duration_seconds("max_street_time", max_street_time)
         max_snap_distance = snap_distance
         within = duration_seconds("max_travel_time", max_travel_time)
-        size = _stream_size(batch_size, resume)
+        size = _stream_batch(batch_size, resume, output, _memory.active_plan())
         if street_policy is not None:
             raise NotImplementedError(
                 "street_policy matrices do not stream yet; compute the "
@@ -1786,6 +1810,7 @@ class TravelTimeMatrix(pd.DataFrame):
         return compare_matrices(self, other, columns=columns, ratios=ratios)
 
     @classmethod
+    @_planned_entry(cost=False, streamed=True)
     def to_parquet(
         cls,
         network,
@@ -1826,7 +1851,7 @@ class TravelTimeMatrix(pd.DataFrame):
         constructor's semantics with ``travel_cost_table``'s
         ``output=`` behavior.
 
-        Origins are processed in ``batch_size`` slices (default 500)
+        Origins are processed in ``batch_size`` slices (planned from the budget, at most 500)
         and each batch is written as it completes, so peak memory holds
         one batch — never the whole constructor result. With
         ``arrival=`` the batches slice the **destination axis** instead
@@ -1922,7 +1947,7 @@ class TravelTimeMatrix(pd.DataFrame):
         max_walking_time = duration_seconds("max_walking_time", max_walking_time)
         max_street_time = duration_seconds("max_street_time", max_street_time)
         max_snap_distance = snap_distance
-        size = _stream_size(batch_size, resume)
+        size = _stream_batch(batch_size, resume, output, _memory.active_plan())
         if street_policy is not None:
             raise NotImplementedError(
                 "street_policy matrices do not stream yet; compute the "
@@ -3091,6 +3116,7 @@ def compare_matrices(a, b, *, columns=None, ratios=False):
     is_street=lambda network: _is_street_network(network),
     details=_query_details,
 )
+@_planned_entry(cost=True, streamed="auto", function=True)
 def travel_cost_table(
     network,
     origins=None,
@@ -3133,6 +3159,8 @@ def travel_cost_table(
     batch_size=None,
     resume=False,
     output_time_units="minutes",
+    workers=None,
+    max_memory=None,
 ):
     """The travel-cost matrix as a pyarrow Table — the shard-writing form.
 
@@ -3171,7 +3199,8 @@ def travel_cost_table(
     materialising: the fan-out axis — the origins with ``departure=``,
     the destinations with ``arrival=`` — is processed in
     ``batch_size`` slices
-    (default 500) and the return value is a
+    (planned from the memory budget when omitted, at most 500) and the
+    return value is a
     :class:`cafein.StreamingResult`, not a table. The form is chosen by
     suffix — a path whose final component ends in ``.parquet``
     (case-insensitive) is a single Parquet file written one row group
@@ -3310,7 +3339,7 @@ def travel_cost_table(
             return _street_arrow_table(
                 network, resolved, geometries, pyarrow, output_time_units
             )
-        size = _stream_size(batch_size, resume)
+        size = _stream_batch(batch_size, resume, output, _memory.active_plan())
         return _stream_street_cost(
             "travel_cost_table",
             network,
@@ -3434,7 +3463,7 @@ def travel_cost_table(
                 )
             tables.append(arrow)
         return pyarrow.concat_tables(tables) if multi else tables[0]
-    size = _stream_size(batch_size, resume)
+    size = _stream_batch(batch_size, resume, output, _memory.active_plan())
     return _stream_transit_cost(
         "travel_cost_table",
         network,
@@ -4635,6 +4664,26 @@ def _stream_size(batch_size, resume):
     if size < 1:
         raise ValueError("batch_size must be >= 1")
     return size
+
+
+def _manifest_batch_size(output):
+    """A resumable directory run's stored batch size, else ``None``."""
+    from cafein import _streaming
+
+    try:
+        path = pathlib.Path(output)
+    except TypeError:
+        return None
+    return _streaming.stored_batch_size(path)
+
+
+def _stream_batch(batch_size, resume, output, plan):
+    """The batch rows of a streaming call: the entry's plan (which
+    carries an explicit or stored batch), else the default."""
+    if plan is not None:
+        # The entry read an explicit or stored batch into the plan once.
+        return plan.batch_rows
+    return _stream_size(batch_size, resume)
 
 
 def _arrow_table(

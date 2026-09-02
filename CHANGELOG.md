@@ -8,10 +8,10 @@
   result batches from it. The budget plans, never caps; hard
   guarantees stay with the OS.
 
-- `max_memory=` on the matrix computers: every public call plans its
-  worker width from the budget (or the process default) once, every
-  dispatch inside it runs on that width, and the query details show
-  the spec.
+- `max_memory=` on the matrix computers and their Parquet streams:
+  every dispatch plans its worker width from the budget (or the
+  process default), a stream without an explicit `batch_size=` sizes
+  its batches from it too, and the query details show the spec.
 
 - Multi-slot matrices route each service date in one core call: the
   resolved services, the engine's transfer set, the worker pool, and

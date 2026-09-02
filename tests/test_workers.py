@@ -204,6 +204,14 @@ def test_car_park_arm_rides_the_requested_pool(car_park_network, caplog):
         ("car park", "time", "1", 64),
         ("point time", "time", "points x points", 64),
         ("point cost", "time", "points x points", 48),
+        ("stream stop time", "time", "batch x stops", 88),
+        ("table", "time", "origins x stops", 48),
+        ("stream table", "time", "batch x stops", 72),
+        ("stream stop cost", "time", "batch x stops", 72),
+        ("stream arrive-by cost", "multicriteria", "batch x origins", 72),
+        ("stream street time", "street", "batch x points", 88),
+        ("stream point time", "time", "batch x points", 88),
+        ("stream point cost", "time", "batch x points", 72),
     ],
 )
 def test_every_public_call_plans_once(
@@ -224,7 +232,7 @@ def test_every_public_call_plans_once(
     import geopandas
     from shapely.geometry import Point
 
-    from cafein import TravelCostMatrix, TravelTimeMatrix, _memory
+    from cafein import TravelCostMatrix, TravelTimeMatrix, _memory, travel_cost_table
     from cafein.policy import CarParkPolicy
 
     calls = []
@@ -278,11 +286,51 @@ def test_every_public_call_plans_once(
             network, origins, departure=DEPARTURE, chunk=(0, 2)
         ),
         "network entry": lambda: network.travel_time_matrix(origins, DEPARTURE),
+        "table": lambda: travel_cost_table(network, origins, departure=DEPARTURE),
+        "stream table": lambda: travel_cost_table(
+            network, origins, departure=DEPARTURE, output=tmp_path / "g"
+        ),
+        "stream stop time": lambda: TravelTimeMatrix.to_parquet(
+            network, origins, departure=DEPARTURE, output=tmp_path / "a"
+        ),
+        "stream stop cost": lambda: TravelCostMatrix.to_parquet(
+            network, origins, departure=DEPARTURE, output=tmp_path / "b"
+        ),
+        "stream arrive-by cost": lambda: TravelCostMatrix.to_parquet(
+            network,
+            origins,
+            origins,
+            arrival="2022-02-22 09:30",
+            arrival_time_window=5,
+            optimize="emissions",
+            output=tmp_path / "c",
+        ),
+        "stream street time": lambda: TravelTimeMatrix.to_parquet(
+            helsinki_streets,
+            points,
+            points,
+            transport_mode="walk",
+            output=tmp_path / "d",
+        ),
         "point time": lambda: TravelTimeMatrix(
             network_with_footpaths, points, points, departure=DEPARTURE
         ),
         "point cost": lambda: TravelCostMatrix(
             network_with_footpaths, points, points, departure=DEPARTURE
+        ),
+        "stream point time": lambda: TravelTimeMatrix.to_parquet(
+            network_with_footpaths,
+            points,
+            points,
+            departure=DEPARTURE,
+            output=tmp_path / "e",
+        ),
+        "stream point cost": lambda: TravelCostMatrix.to_parquet(
+            network_with_footpaths,
+            points,
+            points,
+            departure=DEPARTURE,
+            output=tmp_path / "f",
         ),
         "car park": lambda: TravelTimeMatrix(
             car_park_network,
@@ -324,6 +372,46 @@ def test_every_public_call_plans_once(
         if m
     }
     assert widths == {width} == {distinct}
+
+
+def test_stream_batches_follow_the_budget(network, tmp_path, monkeypatch):
+    import json
+
+    from cafein import TravelCostMatrix, _memory
+    from cafein.matrices import _COST_ROW_BYTES, _STREAM_ROW_EXTRA_BYTES, _stream_batch
+
+    # A stream without batch_size= takes the planned batch.
+    monkeypatch.setattr(_memory, "resident_bytes", lambda: 0)
+    origins = _served_stops(network, 2)
+    out = tmp_path / "cost"
+    TravelCostMatrix.to_parquet(
+        network, origins, departure=DEPARTURE, output=out, max_memory="300M"
+    )
+    stored = json.loads((out / "manifest.json").read_text())["batch_size"]
+    oracle = _memory.plan_call(
+        "time",
+        network.stop_count,
+        0,
+        streamed=True,
+        row_bytes=network.stop_count * (_COST_ROW_BYTES + _STREAM_ROW_EXTRA_BYTES),
+        max_memory="300M",
+    )
+    assert stored == oracle.batch_rows < 500
+    # The entry carries an explicit batch through its plan; a caller
+    # that never planned keeps the default.
+    TravelCostMatrix.to_parquet(
+        network,
+        origins,
+        departure=DEPARTURE,
+        output=tmp_path / "seven",
+        batch_size=7,
+        max_memory="300M",
+    )
+    assert (
+        json.loads((tmp_path / "seven" / "manifest.json").read_text())["batch_size"]
+        == 7
+    )
+    assert _stream_batch(None, False, out, None) == 500
 
 
 def test_a_tight_budget_reaches_every_fan_out(
