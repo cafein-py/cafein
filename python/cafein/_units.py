@@ -209,7 +209,7 @@ def memory_spec(name, value):
     """A memory budget spec parsed, not resolved: ``("percent", share)``
     or ``("bytes", count)``.
 
-    The grammar is r5py's: a percentage string (``"80%"``), a size
+    The grammar: a percentage string (``"80%"``), a size
     with one binary suffix K/M/G/T/P/E/Z/Y (``"8G"`` is 8 GiB; case
     insensitive, a trailing ``B``/``iB`` tolerated), or a bare number
     of bytes. ``None`` passes through (an unset budget means the

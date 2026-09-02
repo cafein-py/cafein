@@ -3,8 +3,8 @@
 ## Unreleased
 
 - A memory budget: `cafein.set_max_memory` sets the process default
-  (r5py's grammar, `"80%"` by default) and `cafein.max_memory` reads
-  it back. The budget plans, never caps; hard guarantees stay with
+  (a percentage or a size with a binary suffix, `"80%"` by default)
+  and `cafein.max_memory` reads it back. The budget plans, never caps; hard guarantees stay with
   the OS.
 
 - Multi-slot matrices route each service date in one core call: the
