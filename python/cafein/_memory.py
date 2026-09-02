@@ -1,6 +1,7 @@
 """The memory budget a computation plans against.
 
-The budget is r5py's ``max_memory`` idea for a Rust core: it sizes
+A budget for a Rust core sizes the work up front rather than capping
+the runtime: it sizes
 the work up front — the fan-out width, the result batch, a
 rasterization strip — rather than capping the runtime (Rust has no
 heap ceiling; allocations abort on failure, and hard guarantees stay
@@ -17,7 +18,7 @@ import warnings
 
 from cafein._units import memory_spec
 
-#: r5py's floor: a resolved budget below it is raised to it, with a
+#: The floor: a resolved budget below it is raised to it, with a
 #: warning.
 MINIMUM_BUDGET = 200 * 1024**2
 #: What a percentage leaves for the rest of the system.
@@ -156,7 +157,7 @@ def _windows_resident():
 
 def resolve_budget(spec, stacklevel=3):
     """A spec (``None``: the process default) as bytes, floored at
-    r5py's 200 MiB with a warning."""
+    200 MiB with a warning."""
     return _resolve(spec, stacklevel + 1)[0]
 
 
