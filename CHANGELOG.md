@@ -3,9 +3,10 @@
 ## Unreleased
 
 - A memory budget the engine plans against: `cafein.set_max_memory`
-  sets the process default (r5py's grammar, `"80%"` by default) and
-  the planner sizes fan-out widths and result batches from it. The
-  budget plans, never caps; hard guarantees stay with the OS.
+  sets the process default (a percentage or a size with a binary
+  suffix, `"80%"` by default) and the planner sizes fan-out widths and
+  result batches from it. The budget plans, never caps; hard
+  guarantees stay with the OS.
 
 - Multi-slot matrices route each service date in one core call: the
   resolved services, the engine's transfer set, the worker pool, and
