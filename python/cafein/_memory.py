@@ -273,6 +273,7 @@ def plan_call(
     row_bytes=None,
     batch_rows=None,
     refinement_engine=None,
+    fixed_bytes=0,
     stacklevel=3,
 ):
     """Plan one call against the budget.
@@ -284,7 +285,8 @@ def plan_call(
     streamed call passes ``streamed=True`` with ``row_bytes`` (one
     result row) and ``batch_rows`` (an explicit ``batch_size=``, or
     ``None`` to derive one). ``refinement_engine`` names the fare
-    arm's second, sequential phase. ``workers`` and ``max_memory`` are
+    arm's second, sequential phase; ``fixed_bytes`` is a surface the
+    call holds whole regardless of batching. ``workers`` and ``max_memory`` are
     the call's explicit knobs; the budget spec ``None`` means the
     process default.
     """
@@ -300,7 +302,8 @@ def plan_call(
         )
     headroom = max(0, budget - baseline)
     ambient = ambient_workers()
-    fixed = _call_fixed(engine, size)
+    # ``fixed_bytes``: a surface the call holds whole regardless of batching.
+    fixed = _call_fixed(engine, size) + int(fixed_bytes)
     phases = [(engine, fixed)]
     if refinement_engine is not None:
         phases.append((refinement_engine, _call_fixed(refinement_engine, size)))
@@ -409,6 +412,15 @@ def use_plan(plan):
         yield plan
     finally:
         _active.reset(token)
+
+
+def raise_if_refused():
+    """Fire a deferred refusal: for a dispatch that has no width to ask
+    for, called after the call's own argument checks and before its
+    first search or allocation."""
+    plan = _active.get()
+    if isinstance(plan, Refusal):
+        raise plan.error
 
 
 def width_or(workers):

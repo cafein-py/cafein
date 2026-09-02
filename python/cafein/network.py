@@ -346,6 +346,11 @@ def _car_park_table(core, origin, policy, walk_options, geometries):
     car chain and the ordinary walk (ties to the walk), with tokens
     for the stops the car carries and the walking plane's
     ``{stop: (seconds, meters)}`` rows for sidecar attribution."""
+    from cafein._memory import raise_if_refused
+
+    # Composed per origin under the caller's plan: a deferred refusal
+    # fires before the first composition.
+    raise_if_refused()
     walking_speed, walk_budget, snap_distance = walk_options
     # A street install bumps the core's generation; pinning it proves
     # the car rows and the walking rows read the same graph.

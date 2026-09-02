@@ -13,6 +13,11 @@
   process default), a stream without an explicit `batch_size=` sizes
   its batches from it too, and the query details show the spec.
 
+- `max_memory=` on `Accessibility`, `NearestDestinations`, and
+  `Catchment` (their streams and `from_matrix` forms included): each
+  call plans its width once from the budget and every dispatch inside
+  it runs on that width.
+
 - Multi-slot matrices route each service date in one core call: the
   resolved services, the engine's transfer set, the worker pool, and
   the progress ticker are shared across the date's slots, making

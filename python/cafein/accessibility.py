@@ -27,6 +27,14 @@ from cafein._validate import (
     restore_id_dtypes,
     sequence_not_string,
 )
+from cafein import _memory
+from cafein._units import memory_spec
+from cafein.matrices import (
+    _planned_aggregation,
+    _planned_entry,
+    _query_details,
+    _stream_batch,
+)
 from cafein.travelers import folded_constraints, refuse_wheelchair_streets
 
 #: The parameter each decay family takes (None: no parameter).
@@ -178,6 +186,7 @@ def _nearest_of_set(
     travel_time_output,
     output_time_units,
     workers=None,
+    max_memory=None,
 ):
     """The k=1 arrive-by frame from one tagged reverse run."""
     import numpy as np
@@ -210,7 +219,7 @@ def _nearest_of_set(
             list(exclude_trips),
             list(exclude_stops),
             *_walk_options(walking_speed_kmph, max_walking_time, snap_distance),
-            workers=workers,
+            workers=_memory.width_or(workers),
         )
         _warn_unsnapped(table, from_ids, to_ids)
         unreachable = np.iinfo(np.uint32).max
@@ -236,7 +245,7 @@ def _nearest_of_set(
             list(exclude_routes),
             list(exclude_trips),
             list(exclude_stops),
-            workers=workers,
+            workers=_memory.width_or(workers),
         )
         for identifier, winner in zip(from_ids, winners):
             if winner is None:
@@ -298,6 +307,7 @@ def _transit_cost_surface(
     _resolved=None,
     arrive_by=False,
     workers=None,
+    max_memory=None,
 ):
     """The dense per-destination optimum surface for an emissions or
     money axis: NaN marks pairs the engines emitted no row for —
@@ -368,7 +378,7 @@ def _transit_cost_surface(
                 *exclusions,
                 *walk,
                 False,
-                workers=workers,
+                workers=_memory.width_or(workers),
             )
         else:
             table = network._core.least_cost_matrix_from_points(
@@ -386,7 +396,7 @@ def _transit_cost_surface(
                 *exclusions,
                 *walk,
                 False,
-                workers=workers,
+                workers=_memory.width_or(workers),
             )
         _warn_unsnapped(table, from_ids, to_ids)
         columns = np.asarray(table["to"], dtype="int64")
@@ -418,7 +428,7 @@ def _transit_cost_surface(
                 unique_ids,
                 *exclusions,
                 False,
-                workers=workers,
+                workers=_memory.width_or(workers),
             )
         else:
             table = network._core.least_cost_matrix(
@@ -438,7 +448,7 @@ def _transit_cost_surface(
                 *exclusions,
                 *walk,
                 False,
-                workers=workers,
+                workers=_memory.width_or(workers),
             )
         # The stop path reports destinations as global stop indices;
         # densify over the deduped columns, then expand back so
@@ -560,6 +570,7 @@ def _resolved_cost_matrix(
     _resolved_costs=None,
     arrive_by=False,
     workers=None,
+    max_memory=None,
 ):
     """The per-origin cost matrix on the chosen axis, dispatched by
     network kind exactly as the matrix computers dispatch: (matrix,
@@ -629,7 +640,7 @@ def _resolved_cost_matrix(
                 street_snap,
                 False,
                 None,
-                workers=workers,
+                workers=_memory.width_or(workers),
             )
             _warn_unsnapped(table, from_ids, to_ids, network="the street network")
             matrix = np.full((len(from_ids), len(to_ids)), np.nan, dtype="float64")
@@ -644,7 +655,7 @@ def _resolved_cost_matrix(
                 street_seconds,
                 street_snap,
                 None,
-                workers=workers,
+                workers=_memory.width_or(workers),
             )
             _warn_unsnapped(table, from_ids, to_ids, network="the street network")
             matrix = table["matrix"]
@@ -690,6 +701,7 @@ def _resolved_cost_matrix(
                 _resolved=_resolved_costs,
                 arrive_by=arrive_by,
                 workers=workers,
+                max_memory=max_memory,
             )
             resolved_percentiles = None
         elif _is_geo(origins):
@@ -722,6 +734,7 @@ def _resolved_cost_matrix(
                             exclude_routes,
                             exclude_trips,
                             workers=workers,
+                            max_memory=max_memory,
                         )
                     )
                     return matrix, from_ids, to_ids, None
@@ -738,6 +751,7 @@ def _resolved_cost_matrix(
                     exclude_routes,
                     exclude_trips,
                     workers=workers,
+                    max_memory=max_memory,
                 )
                 return matrix, from_ids, to_ids, None
             if arrive_by:
@@ -765,6 +779,7 @@ def _resolved_cost_matrix(
                     exclude_stops=exclude_stops,
                     arrive_by=arrive_by,
                     workers=workers,
+                    max_memory=max_memory,
                 )
             )
         elif arrive_by:
@@ -786,7 +801,7 @@ def _resolved_cost_matrix(
                     list(exclude_routes),
                     list(exclude_trips),
                     list(exclude_stops),
-                    workers=workers,
+                    workers=_memory.width_or(workers),
                 )
             else:
                 matrix = network._core._arrive_by_time_percentiles(
@@ -800,7 +815,7 @@ def _resolved_cost_matrix(
                     list(exclude_routes),
                     list(exclude_trips),
                     list(exclude_stops),
-                    workers=workers,
+                    workers=_memory.width_or(workers),
                 )
             from_ids = origin_ids
             to_ids = destination_ids
@@ -825,6 +840,7 @@ def _resolved_cost_matrix(
                     exclude_trips=exclude_trips,
                     exclude_stops=exclude_stops,
                     workers=workers,
+                    max_memory=max_memory,
                 )
             )
             # The all-stops matrix is globally indexed, so the
@@ -872,6 +888,7 @@ def _accessibility_columns(
     arrive_by=False,
     _surface=None,
     workers=None,
+    max_memory=None,
 ):
     """The long accessibility frame for `origins` — the computation
     the constructor and the streaming classmethod share, inputs
@@ -914,6 +931,7 @@ def _accessibility_columns(
             _resolved_costs=_resolved_costs,
             arrive_by=arrive_by,
             workers=workers,
+            max_memory=max_memory,
         )
 
     return _aggregate_surface(
@@ -958,7 +976,7 @@ def _aggregate_surface(
                 budgets,
                 decay,
                 decay_param,
-                workers=workers,
+                workers=_memory.width_or(workers),
             )
         return _cafein.aggregate_opportunity_sums(
             np.ascontiguousarray(cost_slice, dtype="uint32"),
@@ -967,7 +985,7 @@ def _aggregate_surface(
             budgets,
             decay,
             decay_param,
-            workers=workers,
+            workers=_memory.width_or(workers),
         )
 
     per_origin = len(budgets) * len(labels)
@@ -1100,6 +1118,9 @@ def _matrix_surface(matrix, cost, origins, destinations, time_units, percentiles
             "matrix carries duplicate (from_id, to_id) rows; a matrix "
             "frame has one row per cell"
         )
+    # The frame is validated: a deferred refusal fires before the surface
+    # is allocated.
+    _memory.raise_if_refused()
     shape = (len(origin_ids), len(destination_ids))
     if cost == "time" and percentiles is not None:
         # One plane per requested percentile, a single one included:
@@ -1220,6 +1241,13 @@ class Accessibility(pd.DataFrame):
     ``router=`` overrides, and stop exclusions are rejected by name,
     and the street-leg policies stay on the matrix and itinerary
     surfaces.
+
+    ``max_memory=`` plans the call against a memory budget, as a
+    percentage or a size with a binary suffix (``"80%"``, ``"6G"``, or
+    bytes); the process default from ``cafein.set_max_memory`` (80 % of
+    physical memory) applies when omitted. The fan-out width and, when
+    streaming, the batch size follow from it. The budget plans, never
+    caps: hard guarantees stay with the OS.
     """
 
     @property
@@ -1231,7 +1259,9 @@ class Accessibility(pd.DataFrame):
         _log.matrix,
         "computing accessibility",
         "computed accessibility",
+        details=_query_details,
     )
+    @_planned_entry(cost=True, product=True)
     def __init__(
         self,
         network,
@@ -1267,9 +1297,11 @@ class Accessibility(pd.DataFrame):
         snap_distance=None,
         street_policy=None,
         workers=None,
+        max_memory=None,
     ):
         if workers is not None:
             workers = positive_int("workers", workers)
+        memory_spec("max_memory", max_memory)
         if hasattr(network, "route_between_stops"):
             (
                 exclude_routes,
@@ -1441,10 +1473,12 @@ class Accessibility(pd.DataFrame):
             street_policy=street_policy,
             arrive_by=arrive_by,
             workers=workers,
+            max_memory=max_memory,
         )
         super().__init__(restore_id_dtypes(frame, _id_dtypes))
 
     @classmethod
+    @_planned_entry(cost=True, streamed=True, product=True)
     def to_parquet(
         cls,
         network,
@@ -1483,12 +1517,15 @@ class Accessibility(pd.DataFrame):
         batch_size=None,
         resume=False,
         workers=None,
+        max_memory=None,
     ):
         """The accessibility table streamed to Parquet — the
         constructor's semantics with ``travel_cost_table``'s
         ``output=`` behavior.
 
-        Origins are processed in ``batch_size`` slices (default 500)
+        Origins are processed in ``batch_size`` slices (planned from the
+        memory budget when omitted, at most 500; the budget plans, never
+        caps)
         and each batch is written as it completes, so a country-scale
         run never materialises the whole frame. ``output=`` selects
         the form by suffix exactly as ``travel_cost_table`` does and
@@ -1505,6 +1542,7 @@ class Accessibility(pd.DataFrame):
         _log.sync()
         if workers is not None:
             workers = positive_int("workers", workers)
+        memory_spec("max_memory", max_memory)
         if street_policy is not None:
             raise NotImplementedError(
                 "street_policy accessibility does not stream yet; "
@@ -1640,7 +1678,6 @@ class Accessibility(pd.DataFrame):
             _stream_size,
         )
 
-        size = _stream_size(batch_size, resume)
         geo = _is_geo(origins)
         if geo:
             from_ids, origin_points = _point_list(origins, "origins")
@@ -1678,6 +1715,9 @@ class Accessibility(pd.DataFrame):
             from cafein.network import _window_percentiles
 
             resolved_percentiles = _window_percentiles(window, percentiles, confidence)
+        # Every argument is resolved: a deferred refusal fires here, before
+        # the run claims its output.
+        size = _stream_batch(batch_size, resume, output, _memory.active_plan())
         columns = ["from_id", "opportunity", "budget", "accessibility"]
         if resolved_percentiles is not None:
             columns = [
@@ -1759,6 +1799,7 @@ class Accessibility(pd.DataFrame):
                 _resolved_costs=resolved_costs,
                 arrive_by=True,
                 workers=workers,
+                max_memory=max_memory,
             )
 
         def make_batch(rows, shared_from, shared_to):
@@ -1815,6 +1856,7 @@ class Accessibility(pd.DataFrame):
                 arrive_by=arrive_by,
                 _surface=batch_surface,
                 workers=workers,
+                max_memory=max_memory,
             )
             block = np.repeat(np.arange(rows.start, rows.stop), per_origin)
             planes = 1 if resolved_percentiles is None else len(resolved_percentiles)
@@ -1859,6 +1901,7 @@ class Accessibility(pd.DataFrame):
         )
 
     @classmethod
+    @_planned_aggregation(_matrix_input)
     def from_matrix(
         cls,
         matrix,
@@ -1873,6 +1916,7 @@ class Accessibility(pd.DataFrame):
         time_units="minutes",
         percentiles=None,
         workers=None,
+        max_memory=None,
     ):
         """Accessibility from a precomputed long matrix frame.
 
@@ -1901,12 +1945,15 @@ class Accessibility(pd.DataFrame):
         ``TravelCostMatrix.to_parquet``, or ``travel_cost_table``:
         the manifest and every shard verify before the shards
         concatenate, and the whole matrix loads into memory.
+        ``max_memory=`` plans the aggregation against the memory budget
+        (the process default when omitted); the budget plans, never caps.
         """
         from cafein._units import duration_seconds
 
         matrix = _matrix_input(matrix)
         if workers is not None:
             workers = positive_int("workers", workers)
+        memory_spec("max_memory", max_memory)
         if cost == "time" and isinstance(decay_params, dict):
             decay_params = {
                 name: duration_seconds("decay_params", value, whole=False)
@@ -2431,6 +2478,12 @@ class NearestDestinations(pd.DataFrame):
         timedelta) on the time axis, grams, currency units, or metres
         on the others; destinations beyond it are unreachable. ``None``
         keeps the engine's natural bound.
+    max_memory : str or int (optional)
+        The memory budget this call plans against, as a percentage or a
+        size with a binary suffix (``"80%"``, ``"6G"``, or bytes); the
+        process default from ``cafein.set_max_memory`` (80 % of physical
+        memory) when omitted. The fan-out width follows from it. The
+        budget plans, never caps: hard guarantees stay with the OS.
     percentile : float (optional, default: 50)
         With ``cost="time"`` and a ``departure_time_window``, rank each
         destination by this single percentile of its per-departure
@@ -2451,6 +2504,7 @@ class NearestDestinations(pd.DataFrame):
     def _constructor(self):
         return pd.DataFrame
 
+    @_planned_entry(cost=True, product=True)
     def __init__(
         self,
         network,
@@ -2483,9 +2537,11 @@ class NearestDestinations(pd.DataFrame):
         snap_distance=None,
         output_time_units="minutes",
         workers=None,
+        max_memory=None,
     ):
         if workers is not None:
             workers = positive_int("workers", workers)
+        memory_spec("max_memory", max_memory)
         if hasattr(network, "route_between_stops"):
             (
                 exclude_routes,
@@ -2641,6 +2697,7 @@ class NearestDestinations(pd.DataFrame):
                 travel_time_output,
                 output_time_units,
                 workers=workers,
+                max_memory=max_memory,
             )
             super().__init__(restore_id_dtypes(frame, _id_dtypes))
             return
@@ -2672,6 +2729,7 @@ class NearestDestinations(pd.DataFrame):
             label="NearestDestinations",
             arrive_by=arrive_by,
             workers=workers,
+            max_memory=max_memory,
         )
         matrix = np.asarray(matrix)
         if resolved_percentiles is not None:
@@ -2681,14 +2739,14 @@ class NearestDestinations(pd.DataFrame):
                 np.ascontiguousarray(matrix, dtype="float64"),
                 k,
                 horizon,
-                workers=workers,
+                workers=_memory.width_or(workers),
             )
         else:
             indices, costs = _cafein.aggregate_nearest(
                 np.ascontiguousarray(matrix, dtype="uint32"),
                 k,
                 horizon,
-                workers=workers,
+                workers=_memory.width_or(workers),
             )
         indices = np.asarray(indices)
         costs = np.asarray(costs)
@@ -2710,6 +2768,7 @@ class NearestDestinations(pd.DataFrame):
         super().__init__(restore_id_dtypes(frame, _id_dtypes))
 
     @classmethod
+    @_planned_aggregation(_matrix_input)
     def from_matrix(
         cls,
         matrix,
@@ -2723,6 +2782,7 @@ class NearestDestinations(pd.DataFrame):
         percentile=None,
         output_time_units="minutes",
         workers=None,
+        max_memory=None,
     ):
         """Nearest destinations from a precomputed long matrix frame.
 
@@ -2740,6 +2800,8 @@ class NearestDestinations(pd.DataFrame):
         whole exactly as ``Accessibility.from_matrix`` does.
         ``max_cost`` bounds the ranked costs in the axis's own unit
         (minutes for time).
+        ``max_memory=`` plans the aggregation against the memory budget
+        (the process default when omitted); the budget plans, never caps.
         """
         from cafein import _cafein
         from cafein._units import (
@@ -2751,6 +2813,7 @@ class NearestDestinations(pd.DataFrame):
         matrix = _matrix_input(matrix)
         if workers is not None:
             workers = positive_int("workers", workers)
+        memory_spec("max_memory", max_memory)
         output_time_units = validated_output_time_units(output_time_units)
         if not isinstance(k, int) or isinstance(k, bool) or k < 1:
             raise ValueError(f"k must be a positive integer, not {k!r}")
@@ -2790,7 +2853,7 @@ class NearestDestinations(pd.DataFrame):
             np.ascontiguousarray(surface, dtype="float64"),
             k,
             horizon,
-            workers=workers,
+            workers=_memory.width_or(workers),
         )
         indices = np.asarray(indices)
         costs = np.asarray(costs)
@@ -2929,6 +2992,12 @@ class Catchment(gpd.GeoDataFrame):
     resolution : int (optional, default: 9)
         The H3 cell resolution of the rendering; it never affects
         reachability.
+    max_memory : str or int (optional)
+        The memory budget this call plans against, as a percentage or a
+        size with a binary suffix (``"80%"``, ``"6G"``, or bytes); the
+        process default from ``cafein.set_max_memory`` (80 % of physical
+        memory) when omitted. The fan-out width follows from it. The
+        budget plans, never caps: hard guarantees stay with the OS.
     percentile : float (optional, default: 50)
         With ``cost="time"``, a ``departure_time_window``, and stop
         origins: a vertex is reached when this single percentile of
@@ -2963,6 +3032,7 @@ class Catchment(gpd.GeoDataFrame):
     def _constructor(self):
         return gpd.GeoDataFrame
 
+    @_planned_entry(cost=True, catchment=True)
     def __init__(
         self,
         network,
@@ -2991,9 +3061,11 @@ class Catchment(gpd.GeoDataFrame):
         max_walking_time=None,
         snap_distance=None,
         workers=None,
+        max_memory=None,
     ):
         if workers is not None:
             workers = positive_int("workers", workers)
+        memory_spec("max_memory", max_memory)
         if hasattr(network, "route_between_stops"):
             (
                 exclude_routes,
@@ -3189,6 +3261,9 @@ class Catchment(gpd.GeoDataFrame):
             keep = _chunk_slice(len(from_ids), chunk)
             from_ids = from_ids[keep]
             points = points[keep]
+            # One origin at a time: no fan-out to size, so a deferred
+            # refusal fires here.
+            _memory.raise_if_refused()
             horizon = max(budget_values)
             for identifier, point in zip(from_ids, points):
                 lats, lons, costs = network._core._reached_vertices(
@@ -3297,6 +3372,9 @@ class Catchment(gpd.GeoDataFrame):
                     deadline_s += 60 * ((int(window) - 1) // 60)
                 speed_ms = speed_kmph / 3.6
                 horizon = max(budget_values)
+                # The seeds are searched one origin at a time: a deferred
+                # refusal fires before the first.
+                _memory.raise_if_refused()
                 for identifier, point in zip(from_ids, points):
                     if geo:
                         walks = network._core.access_stops(
@@ -3317,7 +3395,7 @@ class Catchment(gpd.GeoDataFrame):
                             list(exclude_routes),
                             list(exclude_trips),
                             list(exclude_stops),
-                            workers=workers,
+                            workers=_memory.width_or(workers),
                         )
                     else:
                         # Deadlines profile over the arrival window and
@@ -3332,7 +3410,7 @@ class Catchment(gpd.GeoDataFrame):
                             list(exclude_routes),
                             list(exclude_trips),
                             list(exclude_stops),
-                            workers=workers,
+                            workers=_memory.width_or(workers),
                         )
                     seeds = []
                     max_slack = 0.0
@@ -3348,7 +3426,7 @@ class Catchment(gpd.GeoDataFrame):
                         speed_ms,
                         horizon + max_slack,
                         snap,
-                        workers=workers,
+                        workers=_memory.width_or(workers),
                     )
                     rows.extend(
                         _cell_rows(
@@ -3398,6 +3476,7 @@ class Catchment(gpd.GeoDataFrame):
                 wheeled,
                 arrive_by=arrive_by,
                 workers=workers,
+                max_memory=max_memory,
             )
             speed_ms = speed_kmph / 3.6
             for identifier, point, stop_costs in zip(from_ids, points, surfaces):
@@ -3528,6 +3607,7 @@ def _catchment_stop_costs(
     wheeled=False,
     arrive_by=False,
     workers=None,
+    max_memory=None,
 ):
     """Per origin, the ``(global stop index, cost)`` pairs of every
     reached stop on the chosen axis — the walking field's seeds. With
@@ -3541,13 +3621,16 @@ def _catchment_stop_costs(
     refused rather than silently walked."""
     import numpy as np
 
+    if cost in ("emissions", "money") and geo and wheeled:
+        raise ValueError(
+            "wheelchair point-origin catchments ride the time axis; "
+            f"the {cost} cost surface has no street-policy support "
+            "yet — route from stop origins instead"
+        )
+    # Every catchment branch computes from here: a deferred refusal fires
+    # before the first search.
+    _memory.raise_if_refused()
     if cost in ("emissions", "money"):
-        if geo and wheeled:
-            raise ValueError(
-                "wheelchair point-origin catchments ride the time axis; "
-                f"the {cost} cost surface has no street-policy support "
-                "yet — route from stop origins instead"
-            )
         if geo:
             # Point origins ride the point-form cost surface; the
             # stop side is the coordinate-bearing stops as points, so
@@ -3595,6 +3678,7 @@ def _catchment_stop_costs(
                 walk,
                 arrive_by=True,
                 workers=workers,
+                max_memory=max_memory,
             )
             columns = np.asarray(list(network._core._stop_indices(surface_stops)))
             surface = np.asarray(surface)
@@ -3624,6 +3708,7 @@ def _catchment_stop_costs(
             [list(ids) for ids in exclusions],
             walk,
             workers=workers,
+            max_memory=max_memory,
         )
         columns = np.asarray(list(network._core._stop_indices(surface_stops)))
         return [
@@ -3678,9 +3763,12 @@ def _catchment_stop_costs(
                     exclude_routes=list(exclude_routes),
                     exclude_trips=list(exclude_trips),
                     exclude_stops=list(exclude_stops),
-                    workers=workers,
+                    workers=_memory.width_or(workers),
                 )
             else:
+                # One origin at a time: no fan-out to size, so a deferred
+                # refusal fires here.
+                _memory.raise_if_refused()
                 arrivals = network._core.travel_times_from_coordinate(
                     point,
                     date,
@@ -3714,7 +3802,7 @@ def _catchment_stop_costs(
             list(exclude_routes),
             list(exclude_trips),
             list(exclude_stops),
-            workers=workers,
+            workers=_memory.width_or(workers),
         )
         matrix = np.asarray(matrix)[:, :, 0]
     else:
@@ -3736,6 +3824,7 @@ def _catchment_stop_costs(
             max_walking_time=walk[1],
             max_snap_distance=walk[2],
             workers=workers,
+            max_memory=max_memory,
         )
         matrix = np.asarray(matrix)
     unreached = np.iinfo(np.uint32).max

@@ -39,6 +39,10 @@ _TIME_CELL_BYTES = 4
 #: the two object-id arrays (16), the indexed values (4), and the
 #: frame's own copies of the columns while it is built (~24).
 _TIME_FRAME_CELL_BYTES = 64
+#: One row of a frame an aggregation reads, at its peak: the int64 row
+#: and column indices (16) and the float64 value arrays the cost
+#: conversion holds while the surface fills (16).
+_AGGREGATION_ROW_BYTES = 32
 #: A streamed row adds two int32 dictionary indices and, while a batch
 #: materializes, two int64 index buffers.
 _STREAM_ROW_EXTRA_BYTES = 24
@@ -125,12 +129,25 @@ def _exposure_snapshot(exposure):
 
 
 def _entry_plan(
-    network, origins, destinations, departure, kwargs, *, cost, streamed, dense=False
+    network,
+    origins,
+    destinations,
+    departure,
+    kwargs,
+    *,
+    cost,
+    streamed,
+    dense=False,
+    product=False,
 ):
     """Plan a public matrix call once: its result (or one batch) and
     its width, from the engine the objective needs and the network's
     size. Percentiles resolve here so a one-shot iterable is read once;
-    a resumed stream's stored batch is read and validated here once."""
+    a resumed stream's stored batch is read and validated here once.
+    ``product`` marks an accessibility product: its surface is every
+    destination (or every stop, or every street vertex) per origin at
+    one cell per percentile plane, and its chunks and batches always
+    slice origins."""
     from cafein.network import _window_percentiles
 
     workers = kwargs.get("workers")
@@ -147,47 +164,69 @@ def _entry_plan(
         origin_count = 1 if points else network.stop_count
     destination_count = _log.sized(destinations) if destinations is not None else None
     if destination_count is None:
-        destination_count = origin_count if points else network.stop_count
+        if product:
+            destination_count = (
+                network._core.vertex_count if street else network.stop_count
+            )
+        else:
+            destination_count = origin_count if points else network.stop_count
+    # A transit product with stop origins computes every stop's column
+    # (a forward call selects the requested destinations afterwards, an
+    # arrive-by call holds the whole surface): the surface is the
+    # reservation, the requested width only the output's.
+    surface_columns = destination_count
+    if product and not street and not points:
+        surface_columns = network.stop_count
     # The chunk slices the fan-out axis: destinations for an arrive-by
-    # run, origins otherwise.
+    # matrix, origins otherwise (a product always fans out over origins).
     chunk = kwargs.get("chunk")
-    if arrive_by:
+    if arrive_by and not product:
         destination_count = _chunked(destination_count, chunk)
     else:
         origin_count = _chunked(origin_count, chunk)
     slots, moment_column, label_bytes = _slot_shape(departure, arrival)
+    objective = kwargs.get("optimize", kwargs.get("cost", "time"))
     if street:
         engine, size = "street", network._core.vertex_count
     elif cost:
         engine, size = (
-            "time" if kwargs.get("optimize", "time") == "time" else "multicriteria"
+            "time" if objective == "time" else "multicriteria"
         ), network.stop_count
     else:
         engine, size = "time", network.stop_count
-    if cost:
+    window = kwargs.get("arrival_time_window" if arrive_by else "departure_time_window")
+    percentiles = kwargs.get("percentiles")
+    # A scalar percentile is a plane only under a window; without one the
+    # body accepts the default alone.
+    if (
+        percentiles is None
+        and window is not None
+        and kwargs.get("percentile") is not None
+    ):
+        percentiles = [kwargs["percentile"]]
+    if not street and (window is not None or percentiles is not None):
+        resolved = _window_percentiles(
+            duration_seconds(
+                "arrival_time_window" if arrive_by else "departure_time_window",
+                window,
+            ),
+            percentiles,
+            kwargs.get("confidence"),
+        )
+        if kwargs.get("percentiles") is not None:
+            # A one-shot iterable, read once, reaches the body as a list.
+            kwargs["percentiles"] = resolved
+        planes = len(resolved) if resolved else 1
+    else:
+        planes = 1
+    if product:
+        # One surface cell per plane: uint32 times, float64 cost axes.
+        row_bytes = (4 if objective == "time" else 8) * planes
+    elif cost:
         row_bytes = _COST_ROW_BYTES + (
             _memory.GEOMETRY_ROW_BYTES if kwargs.get("geometries") else 0
         )
     else:
-        window = kwargs.get(
-            "arrival_time_window" if arrive_by else "departure_time_window"
-        )
-        percentiles = kwargs.get("percentiles")
-        if not street and (window is not None or percentiles is not None):
-            resolved = _window_percentiles(
-                duration_seconds(
-                    "arrival_time_window" if arrive_by else "departure_time_window",
-                    window,
-                ),
-                percentiles,
-                kwargs.get("confidence"),
-            )
-            if percentiles is not None:
-                # A one-shot iterable, read once, reaches the body as a list.
-                kwargs["percentiles"] = resolved
-            planes = len(resolved) if resolved else 1
-        else:
-            planes = 1
         row_bytes = (_TIME_CELL_BYTES if dense else _TIME_FRAME_CELL_BYTES) * planes
     exposure = kwargs.get("exposure")
     # One snapshot per call: the plan sizes its columns and the body
@@ -200,9 +239,21 @@ def _entry_plan(
         row_bytes += max(_SLOT_LABEL_BYTES, label_bytes)
     kind = "cost" if cost else "time"
     if streamed:
+        surface_bytes = row_bytes
         row_bytes += _STREAM_ROW_EXTRA_BYTES
-        # The batch axis: origins, or destinations for an arrive-by run.
-        columns = origin_count if arrive_by else destination_count
+        # The batch axis: origins, or destinations for an arrive-by
+        # matrix; a product always batches origins over its surface.
+        if product:
+            columns = surface_columns
+        else:
+            columns = origin_count if arrive_by else destination_count
+        # An arrive-by product materializes every selected origin's
+        # surface before its first batch: reserved whole, beside the batch.
+        fixed_bytes = (
+            origin_count * surface_columns * surface_bytes * slots
+            if product and arrive_by
+            else 0
+        )
         batch = kwargs.get("batch_size")
         if batch is not None:
             batch = _stream_size(batch, False)
@@ -215,6 +266,7 @@ def _entry_plan(
             streamed=True,
             row_bytes=columns * row_bytes * slots,
             batch_rows=batch,
+            fixed_bytes=fixed_bytes,
             workers=workers,
             max_memory=max_memory,
             label=f"travel {kind} stream",
@@ -223,7 +275,7 @@ def _entry_plan(
         # outgrow the reader's bound is refused before anything is written.
         from cafein import _streaming
 
-        axis = destination_count if arrive_by else origin_count
+        axis = destination_count if arrive_by and not product else origin_count
         batches = -(-axis // plan.batch_rows)
         # The seed lists every slot with its moment and label too.
         seed_bytes = slots * (label_bytes + 128)
@@ -240,7 +292,10 @@ def _entry_plan(
         plan = _memory.plan_call(
             engine,
             size,
-            origin_count * destination_count * row_bytes * slots,
+            origin_count
+            * (surface_columns if product else destination_count)
+            * row_bytes
+            * slots,
             workers=workers,
             max_memory=max_memory,
             label=f"travel {kind} matrix",
@@ -252,8 +307,12 @@ def _frozen_axis(value):
     """An axis argument read once: a one-shot iterable of ids becomes a
     list, so the plan and the body see the same ids; frames, sized
     sequences, strings, and ``None`` pass through."""
-    if value is None or isinstance(value, (str, bytes)) or hasattr(value, "__len__"):
+    if value is None or isinstance(value, (str, bytes)):
         return value
+    if isinstance(value, (list, tuple)):
+        return list(value)  # a copy: the caller's list cannot change under the plan
+    if hasattr(value, "__len__"):
+        return value  # frames and other sized inputs are the caller's snapshot
     return list(value)
 
 
@@ -266,13 +325,43 @@ def _deferred(plan):
         return _memory.Refusal(error)
 
 
-def _planned_entry(*, cost, streamed=False, method=False, function=False):
+def _planned_entry(
+    *,
+    cost,
+    streamed=False,
+    method=False,
+    function=False,
+    catchment=False,
+    product=False,
+):
     """Plan the decorated public call once and keep its plan active for
     every dispatch inside it. ``method`` marks a network method, whose
     ``self`` is the network and whose positional tail is
     ``(origins, departure, max_rides)``."""
 
     def decorate(fn):
+        if catchment:
+
+            @functools.wraps(fn)
+            def wrapper(self, network, origins, departure=None, **kwargs):
+                origins = _frozen_axis(origins)
+                plan = _deferred(
+                    lambda: _entry_plan(
+                        network,
+                        origins,
+                        None,
+                        departure,
+                        kwargs,
+                        cost=cost,
+                        product=True,
+                        streamed=streamed,
+                    )
+                )
+                with _memory.use_plan(plan):
+                    return fn(self, network, origins, departure, **kwargs)
+
+            return wrapper
+
         if function:
 
             @functools.wraps(fn)
@@ -294,6 +383,7 @@ def _planned_entry(*, cost, streamed=False, method=False, function=False):
                         departure,
                         kwargs,
                         cost=cost,
+                        product=product,
                         streamed=streams,
                     )
                 )
@@ -317,6 +407,7 @@ def _planned_entry(*, cost, streamed=False, method=False, function=False):
                         departure,
                         kwargs,
                         cost=cost,
+                        product=product,
                         streamed=streamed,
                         dense=True,
                     )
@@ -339,6 +430,7 @@ def _planned_entry(*, cost, streamed=False, method=False, function=False):
                     departure,
                     kwargs,
                     cost=cost,
+                    product=product,
                     streamed=streamed,
                 )
             )
@@ -4671,6 +4763,73 @@ def _point_frame(ids, coordinates):
     )
 
 
+def _planned_aggregation(resolve):
+    """Plan an aggregation over a given frame once: ``resolve`` turns
+    the argument into the frame the body aggregates (a streamed
+    directory loads whole through the loader, which validates it; that
+    load is the loader's, not the budget's), the frame's rows plus the
+    dense origins-by-destinations float64 surface — one plane per
+    percentile — are the reservation, and a refusal is deferred to the
+    first dispatch so the call's own argument checks refuse first. The
+    explicit universes and a percentile iterable are frozen once and
+    handed to the body frozen."""
+
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(cls, matrix, *args, **kwargs):
+            workers = kwargs.get("workers")
+            if workers is not None:
+                workers = positive_int("workers", workers)
+            max_memory = kwargs.get("max_memory")
+            memory_spec("max_memory", max_memory)
+            args = list(args)
+            # Only knobs the caller passed are frozen and written back.
+            for key in ("origins", "destinations", "percentiles"):
+                if key in kwargs:
+                    kwargs[key] = _frozen_axis(kwargs[key])
+            if args:
+                args[0] = _frozen_axis(args[0])
+                destinations = args[0]
+            else:
+                destinations = kwargs.get("destinations")
+            matrix = resolve(matrix)
+            rows = _log.sized(matrix) or 0
+            framed = hasattr(matrix, "columns")
+            axis = rows
+            distinct = 0
+            if framed and "from_id" in matrix.columns:
+                axis = matrix["from_id"].nunique()
+            if framed and "to_id" in matrix.columns:
+                distinct = matrix["to_id"].nunique()
+            if kwargs.get("origins") is not None:
+                origins = _log.sized(kwargs["origins"]) or 0
+            else:
+                origins = axis
+            if destinations is not None:
+                columns = _log.sized(destinations) or 0
+            else:
+                columns = distinct
+            percentiles = kwargs.get("percentiles")
+            planes = (_log.sized(percentiles) or 1) if percentiles is not None else 1
+            surface = origins * columns * 8 * planes
+            plan = _deferred(
+                lambda: _memory.plan_call(
+                    "time",
+                    0,
+                    rows * _AGGREGATION_ROW_BYTES + surface,
+                    workers=workers,
+                    max_memory=max_memory,
+                    label="matrix aggregation",
+                )
+            )
+            with _memory.use_plan(plan):
+                return fn(cls, matrix, *args, **kwargs)
+
+        return wrapper
+
+    return decorate
+
+
 def _stream_size(batch_size, resume):
     """The validated batch size of a streaming call."""
     from cafein import _streaming
@@ -4697,6 +4856,8 @@ def _manifest_batch_size(output):
 def _stream_batch(batch_size, resume, output, plan):
     """The batch rows of a streaming call: the entry's plan (which
     carries an explicit or stored batch), else the default."""
+    if isinstance(plan, _memory.Refusal):
+        raise plan.error
     if plan is not None:
         # The entry read an explicit or stored batch into the plan once.
         return plan.batch_rows

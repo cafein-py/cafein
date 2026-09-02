@@ -102,8 +102,16 @@ def test_results_are_identical_across_widths(network):
     pd.testing.assert_frame_equal(pd.DataFrame(default), pd.DataFrame(wide))
 
 
-def test_workers_validates_eagerly(network, tmp_path):
-    from cafein import Accessibility, TravelCostMatrix, TravelTimeMatrix
+def test_workers_validates_eagerly(network, tmp_path, caplog):
+    import re
+
+    from cafein import (
+        Accessibility,
+        Catchment,
+        NearestDestinations,
+        TravelCostMatrix,
+        TravelTimeMatrix,
+    )
 
     origins = _served_stops(network, 2)
     for value, exc, match in (
@@ -129,6 +137,16 @@ def test_workers_validates_eagerly(network, tmp_path):
             max_memory="nope",
         )
     assert not (tmp_path / "cost").exists()
+    with pytest.raises(ValueError, match="could not read"):
+        Accessibility.to_parquet(
+            network,
+            origins,
+            _served_stops(network, 5),
+            DEPARTURE,
+            output=tmp_path / "acc-budget",
+            max_memory="nope",
+        )
+    assert not (tmp_path / "acc-budget").exists()
     # The streaming surfaces validate before writing anything.
     with pytest.raises(ValueError, match="workers must be at least 1"):
         Accessibility.to_parquet(
@@ -139,6 +157,30 @@ def test_workers_validates_eagerly(network, tmp_path):
             output=tmp_path / "acc",
             workers=0,
         )
+    # Every accessibility entry refuses the budget before any routing (no
+    # core seam runs) or aggregation (an unreadable frame is never reached).
+    unread = pd.DataFrame()
+    destinations = _served_stops(network, 5)
+    for call in (
+        lambda: Accessibility(
+            network, origins, destinations, DEPARTURE, max_memory="nope"
+        ),
+        lambda: NearestDestinations(
+            network, origins, destinations, DEPARTURE, max_memory="nope"
+        ),
+        lambda: Catchment(
+            network, origins, DEPARTURE, budgets=(10, 20), max_memory="nope"
+        ),
+        lambda: Accessibility.from_matrix(unread, destinations, max_memory="nope"),
+        lambda: NearestDestinations.from_matrix(unread, max_memory="nope"),
+    ):
+        with caplog.at_level(logging.DEBUG, logger="cafein"):
+            _log.sync()
+            with pytest.raises(ValueError, match="could not read"):
+                call()
+    assert not any(
+        re.search(r" on \d+ workers$", r.getMessage()) for r in caplog.records
+    )
 
 
 @pytest.fixture(scope="module")
@@ -498,7 +540,14 @@ def test_the_network_entry_reports_the_budget_in_its_details(
     assert any(d.get("max_memory") == "6G" for d in details)
 
 
-def test_a_planning_refusal_follows_the_argument_checks(network, monkeypatch):
+def test_a_planning_refusal_follows_the_argument_checks(
+    network,
+    network_with_footpaths,
+    car_park_network,
+    multimodal_network,
+    monkeypatch,
+    tmp_path,
+):
     # A budget too small for the result still lets the call's own
     # argument checks speak first; a sound call refuses at its first
     # dispatch, before any search allocates.
@@ -508,7 +557,393 @@ def test_a_planning_refusal_follows_the_argument_checks(network, monkeypatch):
     origins = _served_stops(network, 2)
     with pytest.raises(ValueError, match="street mode"):
         TravelTimeMatrix(
-            network, origins, departure=DEPARTURE, transport_mode="car", max_memory="200M"
+            network,
+            origins,
+            departure=DEPARTURE,
+            transport_mode="car",
+            max_memory="200M",
         )
     with pytest.raises(ValueError, match="exceed the memory budget"):
         TravelTimeMatrix(network, departure=DEPARTURE, max_memory="200M")
+    # A refused plan runs no search: with a resident size past any budget,
+    # the arrive-by catchment's access search and the car-park
+    # composition (its inner offsets search stands in for it) both sit
+    # behind the seam.
+    import geopandas
+    from shapely.geometry import Point
+
+    from cafein import Accessibility, Catchment
+    from cafein import network as network_module
+    from cafein.policy import CarParkPolicy
+
+    def no_search(*_args, **_kwargs):
+        raise AssertionError("a search ran under a refused plan")
+
+    core = network_with_footpaths._core
+
+    class NoAccessSearch:
+        def __getattr__(self, name):
+            return no_search if name == "access_stops" else getattr(core, name)
+
+    monkeypatch.setattr(network_with_footpaths, "_core", NoAccessSearch())
+    monkeypatch.setattr(network_module, "_car_park_offsets", no_search)
+    monkeypatch.setattr(_memory, "resident_bytes", lambda: 1 << 40)
+    point = geopandas.GeoDataFrame(
+        {"id": [0]}, geometry=[Point(24.94, 60.17)], crs="EPSG:4326"
+    )
+    facilities = geopandas.GeoDataFrame(
+        {"id": ["pasila"], "search_seconds": [240.0]},
+        geometry=[Point(24.9330, 60.1990)],
+        crs="EPSG:4326",
+    )
+    for build in (
+        lambda: Catchment(
+            network_with_footpaths,
+            point,
+            arrival="2022-02-22 09:30",
+            budgets=(10, 20),
+            max_memory="200M",
+        ),
+        lambda: Accessibility(
+            car_park_network,
+            point,
+            point,
+            DEPARTURE,
+            street_policy=CarParkPolicy(facilities=facilities),
+            max_memory="200M",
+        ),
+    ):
+        with pytest.raises(ValueError, match="exceed the memory budget"):
+            build()
+    # Under the forced refusal, a stream's and a catchment's own argument
+    # checks still speak first.
+    from cafein.travelers import TravelerProfile
+
+    with pytest.raises(ValueError, match="chunk must be"):
+        Accessibility.to_parquet(
+            network,
+            _served_stops(network, 2),
+            _served_stops(network, 5),
+            DEPARTURE,
+            output=tmp_path / "refused",
+            chunk=(3, 2),
+            max_memory="200M",
+        )
+    assert not (tmp_path / "refused").exists()
+    with pytest.raises(ValueError, match="ride the time axis"):
+        Catchment(
+            multimodal_network,
+            point,
+            DEPARTURE,
+            cost="emissions",
+            departure_time_window=10,
+            traveler=TravelerProfile(wheelchair=True),
+            max_memory="200M",
+        )
+
+
+@pytest.mark.parametrize(
+    "arm, engine, size_of, bytes_of",
+    [
+        ("accessibility", "time", "stops", "2 x stops x 4"),
+        ("accessibility emissions", "multicriteria", "stops", "2 x stops x 8"),
+        ("accessibility arrive-by", "multicriteria", "stops", "2 x stops x 8"),
+        ("accessibility points", "time", "footpath stops", "2 x 2 x 4"),
+        ("accessibility street", "street", "vertices", "2 x 2 x 4"),
+        ("nearest", "time", "stops", "2 x stops x 4"),
+        ("catchment", "time", "footpath stops", "1 x stops x 4"),
+        ("accessibility stream", "time", "stops", "batch: stops x 28"),
+        (
+            "accessibility arrive-by stream",
+            "multicriteria",
+            "stops",
+            "fixed: 2 x stops x 8",
+        ),
+        ("accessibility from matrix", "time", "frame", "rows x 32 + 2 x 5 x 8"),
+        ("nearest from matrix", "time", "frame", "rows x 32 + 2 x 5 x 8"),
+        ("nearest arrive-by", "time", "stops", "2 x stops x 4"),
+        ("catchment points", "time", "footpath stops", "2 x footpath stops x 4"),
+        ("catchment cost", "multicriteria", "footpath stops", "1 x stops x 8"),
+        ("catchment street", "street", "vertices", "2 x vertices x 4"),
+        ("accessibility policy", "time", "car park stops", "1 x 1 x 4"),
+        ("nearest points", "time", "footpath stops", "2 x 2 x 4"),
+        ("nearest street", "street", "vertices", "2 x 2 x 4"),
+        ("nearest emissions", "multicriteria", "stops", "2 x stops x 8"),
+        ("catchment arrive-by", "time", "footpath stops", "1 x stops x 4"),
+        ("accessibility stream points", "time", "footpath stops", "batch: 2 x 28"),
+        ("accessibility stream street", "street", "vertices", "batch: 2 x 28"),
+        ("accessibility iterator origins", "time", "stops", "2 x stops x 4"),
+        ("accessibility explicit percentiles", "time", "stops", "2 x stops x 4"),
+        ("accessibility from directory", "time", "frame", "directory"),
+    ],
+)
+def test_accessibility_entries_plan_once(
+    network,
+    network_with_footpaths,
+    helsinki_streets,
+    car_park_network,
+    arm,
+    engine,
+    size_of,
+    bytes_of,
+    caplog,
+    monkeypatch,
+    tmp_path,
+):
+    import re
+
+    import geopandas
+    from shapely.geometry import Point
+
+    from cafein import (
+        Accessibility,
+        Catchment,
+        NearestDestinations,
+        TravelTimeMatrix,
+        _log,
+        _memory,
+    )
+
+    calls = []
+    real = _memory.plan_call
+    distinct = _distinct_width()
+
+    def recording(engine_, size, result_bytes, **kwargs):
+        # A width the pool never has: a dispatch ignoring the plan fails below.
+        plan = dataclasses.replace(
+            real(engine_, size, result_bytes, **kwargs), width=distinct
+        )
+        calls.append(
+            (
+                engine_,
+                size,
+                result_bytes,
+                kwargs.get("row_bytes"),
+                kwargs.get("fixed_bytes"),
+            )
+        )
+        return plan
+
+    origins = _served_stops(network, 2)
+    destinations = _served_stops(network, 5)
+    points = geopandas.GeoDataFrame(
+        {"id": [0, 1]},
+        geometry=[Point(24.94, 60.17), Point(24.95, 60.175)],
+        crs="EPSG:4326",
+    )
+    from cafein.policy import CarParkPolicy
+
+    facilities = geopandas.GeoDataFrame(
+        {"id": ["pasila"], "search_seconds": [240.0]},
+        geometry=[Point(24.9330, 60.1990)],
+        crs="EPSG:4326",
+    )
+
+    def frame_of(lon, lat):
+        return geopandas.GeoDataFrame(
+            {"id": ["p"]}, geometry=[Point(lon, lat)], crs="EPSG:4326"
+        )
+
+    # A stop-origin time matrix covers every stop; built before the
+    # planner is patched so only the arm's own plan is recorded.
+    frame = TravelTimeMatrix(network, origins, departure=DEPARTURE)
+    directory = tmp_path / "streamed"
+    TravelTimeMatrix.to_parquet(network, origins, departure=DEPARTURE, output=directory)
+    directory_rows = len(frame)
+    every_stop = [stop for stop, _latitude, _longitude in network.stops]
+    frame = frame[frame["to_id"].isin(destinations)]
+    monkeypatch.setattr(_memory, "plan_call", recording)
+    # A directory aggregation loads through the loader, then plans.
+    from cafein import _streaming
+
+    loads = []
+    real_read = _streaming.read_shards
+
+    def loading(path):
+        loads.append(len(calls))
+        return real_read(path)
+
+    monkeypatch.setattr(_streaming, "read_shards", loading)
+    build = {
+        "accessibility": lambda: Accessibility(
+            network, origins, destinations, DEPARTURE
+        ),
+        "accessibility emissions": lambda: Accessibility(
+            network,
+            origins,
+            destinations,
+            DEPARTURE,
+            cost="emissions",
+            departure_time_window=10,
+            budgets=(600.0,),
+        ),
+        "accessibility arrive-by": lambda: Accessibility(
+            network,
+            origins,
+            destinations,
+            arrival="2022-02-22 09:30",
+            arrival_time_window=10,
+            cost="emissions",
+            budgets=(600.0,),
+        ),
+        "accessibility points": lambda: Accessibility(
+            network_with_footpaths, points, points, DEPARTURE
+        ),
+        "accessibility street": lambda: Accessibility(
+            helsinki_streets, points, points, transport_mode="walk"
+        ),
+        # The explicit default percentile without a window plans one plane.
+        "nearest": lambda: NearestDestinations(
+            network, origins, destinations, DEPARTURE, percentile=50
+        ),
+        "catchment": lambda: Catchment(
+            network_with_footpaths,
+            ["1100602"],
+            DEPARTURE,
+            budgets=(10, 20),
+            percentile=50,
+        ),
+        "accessibility stream": lambda: Accessibility.to_parquet(
+            network, origins, destinations, DEPARTURE, output=tmp_path / "acc"
+        ),
+        "accessibility arrive-by stream": lambda: Accessibility.to_parquet(
+            network,
+            origins,
+            destinations,
+            arrival="2022-02-22 09:30",
+            arrival_time_window=10,
+            cost="emissions",
+            budgets=(600.0,),
+            output=tmp_path / "acc-arrive",
+        ),
+        "accessibility from matrix": lambda: Accessibility.from_matrix(
+            frame, destinations
+        ),
+        "nearest from matrix": lambda: NearestDestinations.from_matrix(frame),
+        "nearest points": lambda: NearestDestinations(
+            network_with_footpaths, points, points, DEPARTURE
+        ),
+        "nearest street": lambda: NearestDestinations(
+            helsinki_streets, points, points, transport_mode="walk"
+        ),
+        "nearest emissions": lambda: NearestDestinations(
+            network,
+            origins,
+            destinations,
+            DEPARTURE,
+            cost="emissions",
+            departure_time_window=10,
+        ),
+        "catchment arrive-by": lambda: Catchment(
+            network_with_footpaths,
+            ["1100602"],
+            arrival="2022-02-22 09:30",
+            arrival_time_window=10,
+            budgets=(10, 20),
+        ),
+        "accessibility stream points": lambda: Accessibility.to_parquet(
+            network_with_footpaths, points, points, DEPARTURE, output=tmp_path / "acc-p"
+        ),
+        "accessibility stream street": lambda: Accessibility.to_parquet(
+            helsinki_streets,
+            points,
+            points,
+            transport_mode="walk",
+            output=tmp_path / "acc-s",
+        ),
+        "accessibility iterator origins": lambda: Accessibility(
+            network, iter(list(origins)), destinations, DEPARTURE
+        ),
+        "accessibility explicit percentiles": lambda: Accessibility(
+            network,
+            origins,
+            destinations,
+            DEPARTURE,
+            departure_time_window=10,
+            percentiles=[50.0],
+        ),
+        "accessibility from directory": lambda: Accessibility.from_matrix(
+            directory, every_stop
+        ),
+        "nearest arrive-by": lambda: NearestDestinations(
+            network,
+            origins,
+            destinations,
+            arrival="2022-02-22 09:30",
+            arrival_time_window=10,
+        ),
+        "catchment points": lambda: Catchment(
+            network_with_footpaths, points, DEPARTURE, budgets=(10, 20)
+        ),
+        "catchment cost": lambda: Catchment(
+            network_with_footpaths,
+            ["1100602"],
+            DEPARTURE,
+            cost="emissions",
+            departure_time_window=10,
+            budgets=(600.0,),
+        ),
+        "catchment street": lambda: Catchment(
+            helsinki_streets, points, budgets=(10, 20), transport_mode="walk"
+        ),
+        "accessibility policy": lambda: Accessibility(
+            car_park_network,
+            frame_of(24.9130, 60.1980),
+            frame_of(24.9520, 60.1795),
+            DEPARTURE,
+            street_policy=CarParkPolicy(facilities=facilities),
+        ),
+    }
+    calls.clear()
+    with caplog.at_level(logging.DEBUG, logger="cafein"):
+        # The core's seam lines follow the synced level, as a computer syncs.
+        _log.sync()
+        build[arm]()
+    assert len(calls) == 1
+    seen_engine, size, result_bytes, row_bytes, fixed_bytes = calls[0]
+    assert seen_engine == engine
+    sizes = {
+        "stops": network.stop_count,
+        "footpath stops": network_with_footpaths.stop_count,
+        "vertices": helsinki_streets.vertex_count,
+        "car park stops": car_park_network.stop_count,
+        "frame": 0,
+    }
+    assert size == sizes[size_of]
+    stops = network.stop_count
+    expected = {
+        "2 x stops x 4": 2 * stops * 4,
+        "2 x stops x 8": 2 * stops * 8,
+        "2 x 2 x 4": 16,
+        "1 x stops x 4": network_with_footpaths.stop_count * 4,
+        "1 x stops x 8": network_with_footpaths.stop_count * 8,
+        "2 x footpath stops x 4": 2 * network_with_footpaths.stop_count * 4,
+        "2 x vertices x 4": 2 * helsinki_streets.vertex_count * 4,
+        "1 x 1 x 4": 4,
+        "rows x 32 + 2 x 5 x 8": len(frame) * 32 + 2 * 5 * 8,
+    }
+    if bytes_of == "directory":
+        # The directory loads through the loader first; the plan then
+        # covers the loaded frame and the aggregation's surface.
+        assert loads == [0]
+        assert result_bytes == directory_rows * 32 + 2 * len(every_stop) * 8
+    elif bytes_of == "batch: 2 x 28":
+        assert result_bytes == 0 and row_bytes == 2 * 28 and not fixed_bytes
+    elif bytes_of.startswith("batch:"):
+        assert result_bytes == 0 and row_bytes == stops * 28 and not fixed_bytes
+    elif bytes_of.startswith("fixed:"):
+        assert result_bytes == 0 and fixed_bytes == 2 * stops * 8
+    else:
+        assert result_bytes == expected[bytes_of]
+    widths = {
+        int(m.group(1))
+        for m in (
+            re.search(r"^(?!probe ).* on (\d+) workers$", r.getMessage())
+            for r in caplog.records
+        )
+        if m
+    }
+    # Two catchment paths run core calls that carry no seam line; their
+    # width reaches the core through the same active plan.
+    no_seams = {"catchment points", "catchment street"}
+    assert widths == (set() if arm in no_seams else {distinct})
