@@ -135,11 +135,20 @@ def _windows_resident():
             ("PeakPagefileUsage", ctypes.c_size_t),
         ]
 
+    # Typed calls: without them ctypes passes the 64-bit pseudo-handle
+    # as a 32-bit int and the query fails.
+    kernel32, psapi = ctypes.windll.kernel32, ctypes.windll.psapi
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    psapi.GetProcessMemoryInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(Counters),
+        wintypes.DWORD,
+    ]
+    psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
     counters = Counters()
     counters.cb = ctypes.sizeof(Counters)
-    handle = ctypes.windll.kernel32.GetCurrentProcess()
-    if not ctypes.windll.psapi.GetProcessMemoryInfo(
-        handle, ctypes.byref(counters), counters.cb
+    if not psapi.GetProcessMemoryInfo(
+        kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
     ):
         raise OSError("GetProcessMemoryInfo failed")
     return int(counters.WorkingSetSize)
