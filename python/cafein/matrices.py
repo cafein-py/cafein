@@ -4697,6 +4697,8 @@ def _manifest_batch_size(output):
 def _stream_batch(batch_size, resume, output, plan):
     """The batch rows of a streaming call: the entry's plan (which
     carries an explicit or stored batch), else the default."""
+    if isinstance(plan, _memory.Refusal):
+        raise plan.error
     if plan is not None:
         # The entry read an explicit or stored batch into the plan once.
         return plan.batch_rows
