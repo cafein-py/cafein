@@ -375,6 +375,11 @@ def test_factor_validation_precedes_routing(
     # The emission configuration is resolved before the search runs, so a
     # bad table fails fast and a mutable one cannot change mid-query.
     class NoRouting:
+        # The planner reads the graph's size before the body validates;
+        # any other core access is routing.
+        vertex_count = 0
+        stop_count = 0
+
         def __getattr__(self, name):
             raise AssertionError("routing ran before factor validation")
 
