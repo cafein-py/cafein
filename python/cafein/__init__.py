@@ -21,6 +21,8 @@ __all__ = [
     "travel_cost_table",
     "compare_matrices",
     "StreamingResult",
+    "set_max_memory",
+    "max_memory",
     "enable_logging",
     "disable_logging",
     "collect_timings",
@@ -87,6 +89,10 @@ def __getattr__(name):
         from cafein.matrices import compare_matrices
 
         return compare_matrices
+    if name in ("set_max_memory", "max_memory"):
+        from cafein import _memory
+
+        return getattr(_memory, name)
     if name == "StreamingResult":
         from cafein._streaming import StreamingResult
 

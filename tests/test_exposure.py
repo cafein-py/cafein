@@ -2354,3 +2354,97 @@ def test_the_fingerprint_covers_the_report_lengths():
     assert stretched._fingerprint() != one._fingerprint()
     # the frozen snapshot digests identically to its source
     assert one._reporting_snapshot()._fingerprint() == one._fingerprint()
+
+
+def test_one_snapshot_serves_the_plan_and_the_report(
+    street_network, reporting_exposure, monkeypatch
+):
+    # The entry snapshots the exposure once; the body reports against
+    # that same frozen surface rather than taking another.
+    import geopandas
+    from shapely.geometry import Point
+
+    from cafein import TravelCostMatrix
+    from cafein.exposure import Exposure
+
+    taken = []
+    real = Exposure._reporting_snapshot
+
+    def counted(self):
+        taken.append(self)
+        return real(self)
+
+    monkeypatch.setattr(Exposure, "_reporting_snapshot", counted)
+    points = geopandas.GeoDataFrame(
+        {"id": ["a", "b"]},
+        geometry=[Point(24.9130, 60.1980), Point(24.9520, 60.1795)],
+        crs="EPSG:4326",
+    )
+    matrix = TravelCostMatrix(
+        street_network, points, points, "2022-02-22 08:30", exposure=reporting_exposure
+    )
+    assert len(taken) == 1
+    assert set(reporting_exposure.column_names()) <= set(matrix.columns)
+
+
+def test_the_budget_sizes_the_strips_without_changing_the_result(
+    street_network, monkeypatch
+):
+    import geopandas
+    from shapely.geometry import box
+
+    from cafein import _memory
+    from cafein.exposure import Exposure, _StripPlan
+
+    rasterio = pytest.importorskip("rasterio")
+    import rasterio.features
+
+    west, south, east, north = _extent(street_network)
+    midx = (west + east) / 2
+    # Two levels split mid-extent: a strip seam crossing the zones would show.
+    zones = geopandas.GeoDataFrame(
+        {"level": [61.0, 70.0]},
+        geometry=[
+            box(west - 0.01, south - 0.01, midx, north + 0.01),
+            box(midx, south - 0.01, east + 0.01, north + 0.01),
+        ],
+        crs="EPSG:4326",
+    )
+    with pytest.raises(ValueError, match="could not read"):
+        Exposure(street_network, a=(zones, "level"), max_memory="nope")
+    calls = []
+    real_rasterize = rasterio.features.rasterize
+
+    def counting(*args, **kwargs):
+        calls.append(kwargs.get("out_shape"))
+        return real_rasterize(*args, **kwargs)
+
+    monkeypatch.setattr(rasterio.features, "rasterize", counting)
+    monkeypatch.setattr(_memory, "resident_bytes", lambda: 0)
+    # At a thousand bytes per cell a 200 MiB budget plans strips a few
+    # rows tall; a 64 GiB one holds the whole raster.
+    monkeypatch.setattr(_memory, "BYTES_PER_CELL", 1000)
+    assert 1 < _StripPlan("200M").cells < _StripPlan("64G").cells
+    edges = street_network.streets_gdf
+    try:
+        Exposure(street_network, a=(zones, "level"), rasterize=25.0, max_memory="64G")
+        wide = edges["a"].copy()
+        whole = len(calls)
+        calls.clear()
+        _drop_layer_columns(edges, "a", ())
+        Exposure(street_network, a=(zones, "level"), rasterize=25.0, max_memory="200M")
+        assert whole >= 1 and len(calls) > whole
+        assert edges["a"].equals(wide)
+        _drop_layer_columns(edges, "a", ())
+        # A row wider than the share still rasterizes, one row at a time.
+        monkeypatch.setattr(_memory, "BYTES_PER_CELL", 10**9)
+        with pytest.warns(UserWarning, match="one raster row .* bytes per cell"):
+            Exposure(
+                street_network, a=(zones, "level"), rasterize=25.0, max_memory="200M"
+            )
+        _drop_layer_columns(edges, "a", ())
+        # Without a rasterized polygon layer the process's size is never read.
+        monkeypatch.setattr(_memory, "resident_bytes", lambda: None)
+        Exposure(street_network, a=(zones, "level"), rasterize=None, max_memory="200M")
+    finally:
+        _drop_layer_columns(edges, "a", ())

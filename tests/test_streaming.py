@@ -1413,3 +1413,98 @@ def test_resume_refuses_tampered_slot_metadata(network, tmp_path):
         TravelTimeMatrix.to_parquet(
             network, stops, departure=slots, output=out, resume=True
         )
+
+
+def test_resume_keeps_the_planned_batch_under_a_new_budget(
+    network, tmp_path, monkeypatch
+):
+    import json
+
+    from cafein import TravelCostMatrix, _memory
+
+    # Geometry rows are wide enough that the budget plans one-origin
+    # batches; the second batch crashes, the resume completes.
+    stops = _origin_stops(network, 6)
+    plain = TravelCostMatrix(network, stops, **QUERY, geometries=True)
+    target = tmp_path / "run"
+    monkeypatch.setattr(_memory, "resident_bytes", lambda: 0)
+    _interrupt(monkeypatch, at_call=2)
+    with pytest.raises(RuntimeError, match="injected crash"):
+        TravelCostMatrix.to_parquet(
+            network, stops, **QUERY, geometries=True, output=target, max_memory="300M"
+        )
+    stored = json.loads((target / "manifest.json").read_text())["batch_size"]
+    assert stored < len(stops)
+    # A wider budget and a fatter baseline on resume: the stored batch
+    # keeps the fingerprint and the run completes.
+    monkeypatch.setattr(_memory, "resident_bytes", lambda: 4 * 1024**3)
+    TravelCostMatrix.to_parquet(
+        network,
+        stops,
+        **QUERY,
+        geometries=True,
+        output=target,
+        resume=True,
+        max_memory="8G",
+    )
+    assert json.loads((target / "manifest.json").read_text())["batch_size"] == stored
+    joined = pyarrow.concat_tables(
+        parquet.read_table(part) for part in sorted(target.glob("part-*.parquet"))
+    )
+    assert len(joined) == len(plain)
+
+
+def test_a_large_valid_manifest_is_read(tmp_path):
+    # Thousands of one-row shards make a manifest past a megabyte; the
+    # reader's bound must never refuse the writer's own output.
+    import json
+
+    from cafein import _streaming
+
+    shards = [
+        {"index": i, "file": f"part-{i:05d}.parquet", "rows": 1, "sha256": "0" * 64}
+        for i in range(8000)
+    ]
+    (tmp_path / _streaming.MANIFEST_NAME).write_text(
+        json.dumps({"batch_size": 1, "shards": shards})
+    )
+    assert (tmp_path / _streaming.MANIFEST_NAME).stat().st_size > 1 << 20
+    assert _streaming.stored_batch_size(tmp_path) == 1
+
+
+def test_a_run_that_would_outgrow_the_manifest_is_refused(network, tmp_path):
+    # Half a million one-row batches would need a manifest past the
+    # reader's bound: refused at the entry, before any id is validated.
+    from cafein import TravelCostMatrix, _streaming
+    from cafein.matrices import _slot_shape
+
+    from_stops = ["1000001"] * 600_000
+    with pytest.raises(ValueError, match="outgrow the run's manifest"):
+        TravelCostMatrix.to_parquet(
+            network, from_stops, **QUERY, output=tmp_path / "run", batch_size=1
+        )
+    assert not (tmp_path / "run").exists()
+    assert _streaming.MANIFEST_ENTRY_BYTES * 600_000 > _streaming.MANIFEST_BYTES_LIMIT
+    # A mapping's labels are reserved at their actual length.
+    slots, moment, label_bytes = _slot_shape({"x" * 1000: QUERY["departure"]}, None)
+    assert (slots, moment, label_bytes) == (1, True, 1008)
+
+
+def test_the_manifest_bound_holds_at_the_writer_and_the_entry(
+    network, tmp_path, monkeypatch
+):
+    # The writer refuses a manifest past the reader's bound, and a run
+    # whose slot labels alone would fill it is refused at the entry.
+    from cafein import TravelCostMatrix, _streaming
+
+    monkeypatch.setattr(_streaming, "MANIFEST_BYTES_LIMIT", 1024)
+    with pytest.raises(ValueError, match="would exceed"):
+        _streaming.write_manifest(tmp_path, {"slots": ["ä" * 2000]})
+    labels = {"ä" * 2000: QUERY["departure"]}
+    with pytest.raises(ValueError, match="outgrow the run's manifest"):
+        TravelCostMatrix.to_parquet(
+            network,
+            _origin_stops(network, 2),
+            departure=labels,
+            output=tmp_path / "run",
+        )

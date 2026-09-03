@@ -7,6 +7,7 @@ once, on the way in — and result frames convert on the way out.
 
 import collections.abc
 import datetime
+import fractions
 import math
 
 
@@ -198,3 +199,67 @@ def humanize_frame_time(frame, output_time_units):
         converted = travel_time_output(frame.pop("travel_time_s"), output_time_units)
         frame.insert(position, "travel_time", converted)
     return frame
+
+
+#: The binary size suffixes a memory spec accepts, by power of 1024.
+MEMORY_SUFFIXES = "KMGTPEZY"
+
+
+def memory_spec(name, value):
+    """A memory budget spec parsed, not resolved: ``("percent", share)``
+    or ``("bytes", count)``.
+
+    The grammar: a percentage string (``"80%"``), a size
+    with one binary suffix K/M/G/T/P/E/Z/Y (``"8G"`` is 8 GiB; case
+    insensitive, a trailing ``B``/``iB`` tolerated), or a bare number
+    of bytes. ``None`` passes through (an unset budget means the
+    process default). Resolving a percentage against the machine's
+    memory is the planner's job, so a spec validates without reading
+    the machine.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise TypeError(f"{name} takes a memory size or percentage, not a bool")
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"{name} must be a non-negative, finite number of bytes")
+        if value < 0:
+            raise ValueError(f"{name} must be a non-negative, finite number of bytes")
+        return ("bytes", int(value))
+    if not isinstance(value, str):
+        raise TypeError(f"{name} takes a memory size or percentage string")
+    text = value.strip().replace(" ", "")
+    if text.endswith("%"):
+        try:
+            share = float(text[:-1])
+        except ValueError:
+            raise ValueError(
+                f"{name}: could not read a percentage from {value!r}"
+            ) from None
+        if not math.isfinite(share) or not 0 < share <= 100:
+            raise ValueError(
+                f"{name}: a percentage must lie in (0, 100], not {value!r}"
+            )
+        return ("percent", share / 100.0)
+    upper = text.upper()
+    for tail in ("IB", "B"):
+        if upper.endswith(tail) and len(upper) > len(tail):
+            upper = upper[: -len(tail)]
+            break
+    exponent = 0
+    if upper and upper[-1] in MEMORY_SUFFIXES:
+        exponent = MEMORY_SUFFIXES.index(upper[-1]) + 1
+        upper = upper[:-1]
+    # Exact rational arithmetic: a byte count never passes through a
+    # float, so large values keep every digit and nothing overflows.
+    try:
+        number = fractions.Fraction(upper)
+    except (ValueError, ZeroDivisionError):
+        raise ValueError(
+            f"{name}: could not read {value!r}; give a percentage ('80%'), a "
+            "size with a K/M/G/T suffix ('8G'), or bytes"
+        ) from None
+    if number < 0:
+        raise ValueError(f"{name} must be a non-negative, finite size")
+    return ("bytes", int(number * 1024**exponent))

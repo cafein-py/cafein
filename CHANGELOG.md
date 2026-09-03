@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- A memory budget the engine plans against: `cafein.set_max_memory`
+  sets the process default (a percentage or a size with a binary
+  suffix, `"80%"` by default) and the planner sizes fan-out widths and
+  result batches from it. The budget plans, never caps; hard
+  guarantees stay with the OS.
+
+- `max_memory=` on the matrix computers and their Parquet streams:
+  every dispatch plans its worker width from the budget (or the
+  process default), a stream without an explicit `batch_size=` sizes
+  its batches from it too, and the query details show the spec.
+
+- `max_memory=` on `Accessibility`, `NearestDestinations`, and
+  `Catchment` (their streams and `from_matrix` forms included): each
+  call plans its width once from the budget and every dispatch inside
+  it runs on that width.
+
+- The zone-fare refinement pool runs on the width the budget plans for
+  its phase, and an explicit `workers=` caps it; the four-worker
+  constant remains only the fallback of an unplanned call.
+
+- `Exposure(max_memory=)`: the rasterization strip holds what a
+  quarter of the budget's headroom allows at the measured bytes per
+  cell, never past the 32 M-cell ceiling; a smaller budget makes more,
+  smaller strips with the identical result.
+
 - Multi-slot matrices route each service date in one core call: the
   resolved services, the engine's transfer set, the worker pool, and
   the progress ticker are shared across the date's slots, making

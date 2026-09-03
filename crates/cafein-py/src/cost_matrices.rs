@@ -989,7 +989,7 @@ impl TransportNetwork {
     /// date, else on RAPTOR; explicit values pick the engine directly. Route/trip/stop
     /// exclusions run on the RAPTOR engines: ``"auto"`` resolves to
     /// them and explicit ``"tbtr"`` is rejected.
-    #[pyo3(signature = (from_stops, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, to_stops = None, candidates = "time", bucket = 25.0, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, workers=None))]
+    #[pyo3(signature = (from_stops, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, to_stops = None, candidates = "time", bucket = 25.0, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, workers=None, fare_workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn least_cost_matrix(
         &self,
@@ -1015,6 +1015,7 @@ impl TransportNetwork {
         max_snap_distance: f64,
         geometries: bool,
         workers: Option<usize>,
+        fare_workers: Option<usize>,
     ) -> PyResult<Py<PyDict>> {
         if !matches!(router, "auto" | "raptor" | "tbtr") {
             return Err(invalid_router(router));
@@ -1378,6 +1379,7 @@ impl TransportNetwork {
                             window,
                             budget,
                             &mut rows,
+                            fare_workers,
                         );
                     }
                     rows
@@ -1397,7 +1399,7 @@ impl TransportNetwork {
     /// on RAPTOR; explicit values pick the engine directly. Route/trip/stop
     /// exclusions run on the RAPTOR engines: ``"auto"`` resolves to
     /// them and explicit ``"tbtr"`` is rejected.
-    #[pyo3(signature = (origins, destinations, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, workers=None))]
+    #[pyo3(signature = (origins, destinations, date, departure, window, factors, objective = "emissions", fares = None, budget = None, max_transfers = 7, router = "auto", exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], walking_speed_kmph = 3.6, max_walking_time = 7200.0, max_snap_distance = 1600.0, geometries = false, workers=None, fare_workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn least_cost_matrix_from_points(
         &self,
@@ -1421,6 +1423,7 @@ impl TransportNetwork {
         max_snap_distance: f64,
         geometries: bool,
         workers: Option<usize>,
+        fare_workers: Option<usize>,
     ) -> PyResult<Py<PyDict>> {
         if !matches!(router, "auto" | "raptor" | "tbtr") {
             return Err(invalid_router(router));
@@ -1673,6 +1676,7 @@ impl TransportNetwork {
                         window,
                         budget,
                         &mut rows,
+                        fare_workers,
                     );
                 }
                 (rows, unsnapped_from, unsnapped_to)

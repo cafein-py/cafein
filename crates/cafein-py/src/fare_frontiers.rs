@@ -596,6 +596,7 @@ pub(crate) fn refine_zone_fare_rows(
     window: u32,
     budget: Option<u32>,
     rows: &mut [Vec<CostRow>],
+    fare_workers: Option<usize>,
 ) {
     let cheapest = zones
         .products
@@ -690,9 +691,10 @@ pub(crate) fn refine_zone_fare_rows(
         .collect();
     // Each origin's search holds bags and a reconstruction arena;
     // host-wide fan-out multiplies that peak (an unguarded run once
-    // OOM-crashed a workstation). Refinement runs in its own pool,
-    // never wider than four workers or the surrounding pool.
-    let workers = rayon::current_num_threads().clamp(1, 4);
+    // OOM-crashed a workstation). Refinement runs in its own pool at
+    // the planned width, else never wider than four workers or the
+    // surrounding pool.
+    let workers = fare_workers.unwrap_or_else(|| rayon::current_num_threads().clamp(1, 4));
     let pool = rayon::ThreadPoolBuilder::new().num_threads(workers).build();
     let per_origin = |origin: usize, origin_rows: &mut Vec<CostRow>, request: &Request| {
         {
@@ -850,6 +852,18 @@ pub(crate) fn refine_zone_fare_rows(
     };
     match pool {
         Ok(pool) => pool.install(|| {
+            crate::logging::emit(
+                "cafein.matrix",
+                crate::logging::DEBUG,
+                || {
+                    format!(
+                        "fare refinement on {} workers",
+                        rayon::current_num_threads()
+                    )
+                },
+                None,
+                None,
+            );
             rows.par_iter_mut()
                 .zip(requests.par_iter())
                 .enumerate()
@@ -861,6 +875,13 @@ pub(crate) fn refine_zone_fare_rows(
         // surrounding pool's full width for these arena-heavy
         // searches.
         Err(_) => {
+            crate::logging::emit(
+                "cafein.matrix",
+                crate::logging::DEBUG,
+                || "fare refinement on 1 workers".to_string(),
+                None,
+                None,
+            );
             rows.iter_mut().zip(requests.iter()).enumerate().for_each(
                 |(origin, (origin_rows, request))| per_origin(origin, origin_rows, request),
             )

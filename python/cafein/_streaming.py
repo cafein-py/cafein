@@ -216,6 +216,76 @@ def _canonical(value):
     raise TypeError(f"cannot fingerprint a {type(value).__name__}")
 
 
+#: A manifest larger than this is not one this module wrote: the writer
+#: records one small entry per shard, so even a million one-row shards
+#: stay far inside it; the bound only refuses an unbounded or absurd file.
+MANIFEST_BYTES_LIMIT = 256 << 20
+#: A generous bound on one shard's manifest entry (its index, file name,
+#: row count, and digest), for the preflight that keeps a planned run's
+#: manifest inside the limit.
+MANIFEST_ENTRY_BYTES = 512
+
+
+def _read_manifest(target):
+    """The manifest at ``target`` parsed from one descriptor: opened
+    without following a symlink, checked to be a regular file within
+    ``MANIFEST_BYTES_LIMIT``, and read from that same descriptor."""
+    # A link is refused before the open on every platform (O_NOFOLLOW
+    # is not universal), and the opened descriptor must be the very
+    # file lstat saw, so a swap between the two calls is refused too.
+    linked = os.lstat(target)
+    if stat.S_ISLNK(linked.st_mode):
+        raise ValueError(f"{target} is a symbolic link")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    fd = os.open(target, flags)
+    try:
+        status = os.fstat(fd)
+        if (status.st_dev, status.st_ino) != (linked.st_dev, linked.st_ino):
+            raise ValueError(f"{target} changed while it was being opened")
+        if not stat.S_ISREG(status.st_mode):
+            raise ValueError(f"{target} is not a regular file")
+        if status.st_size > MANIFEST_BYTES_LIMIT:
+            raise ValueError(f"{target} is larger than a manifest can be")
+        chunks, total = [], 0
+        while total <= MANIFEST_BYTES_LIMIT:
+            chunk = os.read(fd, MANIFEST_BYTES_LIMIT + 1 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(fd)
+    if len(raw) > MANIFEST_BYTES_LIMIT:
+        raise ValueError(f"{target} is larger than a manifest can be")
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except ValueError as error:
+        raise ValueError(f"{target} is not valid JSON: {error}") from None
+    if not isinstance(manifest, dict):
+        raise ValueError(f"{target} is not valid JSON: not an object")
+    return manifest
+
+
+def stored_batch_size(path):
+    """The batch size a directory run's manifest stores, for planning a
+    resume before the claim: ``None`` without a manifest; a manifest
+    whose ``batch_size`` is not a positive integer is refused. The
+    resume's own validation rereads the file under the claim and
+    refuses one that changed meanwhile, since the planned batch is part
+    of the fingerprint."""
+    target = path / MANIFEST_NAME
+    try:
+        manifest = _read_manifest(target)
+    except FileNotFoundError:
+        return None
+    size = manifest.get("batch_size")
+    if not isinstance(size, int) or isinstance(size, bool) or size < 1:
+        raise ValueError(f"{target}: the stored batch_size is not a positive integer")
+    return size
+
+
 def prepare_resume(path, fingerprint, size, count, slots=None):
     """The stored manifest and completed batch indices of the run to
     continue — validated against the resuming query, never trusted
@@ -248,7 +318,7 @@ def _validate_resume(path, target, fingerprint, size, count, slots=None):
             "directory-form streaming runs can be resumed)"
         )
     try:
-        manifest = json.loads(target.read_text())
+        manifest = _read_manifest(target)
     except ValueError:
         raise ValueError(
             f"the manifest at {target} is not valid JSON; the run cannot "
@@ -431,7 +501,7 @@ def read_shards(path):
             "streaming runs can be read"
         )
     try:
-        manifest = json.loads(target.read_text())
+        manifest = _read_manifest(target)
     except ValueError:
         raise ValueError(
             f"the manifest at {target} is not valid JSON; the run " "cannot be read"
@@ -540,6 +610,12 @@ def write_manifest(directory, manifest, claim=False):
     """
     encoded = json.dumps(manifest, indent=1, sort_keys=True)
     target = directory / MANIFEST_NAME
+    if len(encoded.encode("utf-8")) > MANIFEST_BYTES_LIMIT:
+        # The reader's bound, enforced where the file is made.
+        raise ValueError(
+            f"{target} would exceed {MANIFEST_BYTES_LIMIT} bytes; fewer slots or "
+            "batches, or shorter slot labels"
+        )
     fd, temporary = tempfile.mkstemp(dir=directory, suffix=".tmp")
     with os.fdopen(fd, "w") as stream:
         stream.write(encoded)
