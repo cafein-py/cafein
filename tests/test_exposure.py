@@ -1316,8 +1316,8 @@ def test_wait_rows_repeat_the_option_fare(
     assert len(waits) > 0
     for _, journey in frame.groupby(["from_id", "to_id", "option"]):
         # one fare per option, repeated on every row — waits included
-        assert journey["fare"].nunique(dropna=False) == 1
-    assert waits["fare"].notna().any()
+        assert journey["money"].nunique(dropna=False) == 1
+    assert waits["money"].notna().any()
 
 
 def test_multimodal_builds_align_reporting_to_the_walking_graph(multimodal_network):
@@ -2173,7 +2173,7 @@ def test_transit_matrix_exposure_refusals(street_network, reporting_exposure):
             "does not combine with optimize=",
         ),
         (
-            {"optimize": "fare", "departure_time_window": 3600},
+            {"optimize": "money", "departure_time_window": 3600},
             "does not combine with optimize=",
         ),
         ({"max_travel_time": 90}, "does not combine with max_travel_time="),

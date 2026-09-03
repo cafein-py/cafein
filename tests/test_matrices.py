@@ -263,14 +263,14 @@ def test_point_matrices_from_arbitrary_locations(network_with_footpaths):
     assert times[0, 0] == np.uint32(0xFFFFFFFF)
 
 
-@pytest.mark.parametrize("optimize", ["emissions", "fare"])
+@pytest.mark.parametrize("optimize", ["emissions", "money"])
 def test_least_cost_cells_match_the_frontier(tmp_path, optimize):
     from cafein import TransportNetwork, journey_frontier, least_emissions, least_fare
     from test_frontier import build_two_line_gtfs, two_line_fares
 
     feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
     network = TransportNetwork.from_gtfs([str(feed)])
-    fares = two_line_fares() if optimize == "fare" else None
+    fares = two_line_fares() if optimize == "money" else None
     frontier_kwargs = dict(departure_time_window=30, output_time_units="seconds")
     if fares is not None:
         frontier_kwargs["fares"] = fares
@@ -317,7 +317,7 @@ def test_least_cost_cells_match_the_frontier(tmp_path, optimize):
         for seconds in (None, 1380, 900):
             limit = None if seconds is None else seconds / 60
             row, oracle = cell(limit), least_fare(frontier, max_travel_time=limit)
-            assert row["fare"] == pytest.approx(oracle["fare"])
+            assert row["money"] == pytest.approx(oracle["money"])
             assert row["travel_time"] == oracle["travel_time"]
     assert cell(max_travel_time=1) is None
 
@@ -493,15 +493,15 @@ def test_cost_matrix_options_are_validated(network, helsinki_gtfs):
     plain = cost_matrix(
         network, origins=["4810551"], destinations=["1250551"], departure="08:30:00"
     )
-    assert "fare" not in plain.columns
+    assert "money" not in plain.columns
 
 
-@pytest.mark.parametrize("optimize", ["emissions", "fare"])
+@pytest.mark.parametrize("optimize", ["emissions", "money"])
 def test_point_cells_prefer_walking(network_with_footpaths, helsinki_gtfs, optimize):
     from cafein import fares as fare_module
 
     kwargs = dict(departure_time_window=10)
-    if optimize == "fare":
+    if optimize == "money":
         kwargs["fares"] = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
     matrix = cost_matrix(
         network_with_footpaths,
@@ -517,7 +517,7 @@ def test_point_cells_prefer_walking(network_with_footpaths, helsinki_gtfs, optim
         assert row.emissions == 0.0
         assert 19 <= row.walk_distance_m <= 21
     else:
-        assert row.fare == 0.0
+        assert row.money == 0.0
     assert row.transfers == 0
     assert row.transit_distance_m == 0.0
     assert 19 <= row.travel_time <= 21
@@ -570,11 +570,11 @@ def test_fare_columns_price_the_reported_journeys(network, helsinki_gtfs):
     row = matrix.iloc[0]
     # Korso (C) → Käpylä (A) prices at the ABC ticket, and the matrix
     # price equals the routed journey's python-side price.
-    assert row.fare == pytest.approx(4.1)
+    assert row.money == pytest.approx(4.1)
     journeys = network.route_between_stops("4810551", "1250551", "2022-02-22 08:30:00")
     fare_module.annotate_fares(journeys, hsl)
     fastest = min(journeys, key=lambda journey: journey["arrival_s"])
-    assert row.fare == pytest.approx(fastest["fare"])
+    assert row.money == pytest.approx(fastest["fare"])
     # A seeded rule-based structure prices per boarding: the base fare,
     # one discounted transfer at the pair total (= base), then full
     # fares — so a cell's fare follows its transfer count exactly.
@@ -589,7 +589,7 @@ def test_fare_columns_price_the_reported_journeys(network, helsinki_gtfs):
     expected = np.where(
         bulk["travel_time"] == 0, 0.0, np.maximum(bulk["transfers"], 1) * 3.0
     )
-    assert bulk["fare"].to_numpy() == pytest.approx(expected)
+    assert bulk["money"].to_numpy() == pytest.approx(expected)
 
 
 def test_fare_cells_survive_unresolved_emissions(network, helsinki_gtfs):
@@ -608,7 +608,7 @@ def test_fare_cells_survive_unresolved_emissions(network, helsinki_gtfs):
         departure_time_window=60,
         fares=hsl,
     )
-    assert cheapest.iloc[0].fare == pytest.approx(2.8)
+    assert cheapest.iloc[0].money == pytest.approx(2.8)
     assert np.isnan(cheapest.iloc[0].emissions)
     # The former name of the objective remains an alias.
     aliased = cost_matrix(
@@ -620,7 +620,7 @@ def test_fare_cells_survive_unresolved_emissions(network, helsinki_gtfs):
         departure_time_window=60,
         fares=hsl,
     )
-    assert aliased.iloc[0].fare == pytest.approx(2.8)
+    assert aliased.iloc[0].money == pytest.approx(2.8)
     cleanest = cost_matrix(
         network,
         origins=["1080701"],
@@ -1180,7 +1180,7 @@ def test_zone_fare_matrix_reconstructs_the_exact_journey(network, helsinki_gtfs)
     # reconstruction of a cell the engine strictly improves is pinned
     # at metro scale, where such cells exist.
     cell = matrix[(matrix.from_id == "1040601") & (matrix.to_id == "1121601")].iloc[0]
-    assert cell.fare == pytest.approx(2.80)
+    assert cell.money == pytest.approx(2.80)
     assert cell.travel_time == 300
     assert cell.transfers == 0
     assert cell.transit_distance_m == pytest.approx(3061, abs=1)
@@ -1201,7 +1201,7 @@ def test_zone_fare_matrix_reconstructs_the_exact_journey(network, helsinki_gtfs)
         match = matrix[
             (matrix.from_id == row.from_id) & (matrix.to_id == row.to_id)
         ].iloc[0]
-        assert match.fare == pytest.approx(row.fare)
+        assert match.money == pytest.approx(row.money)
         assert match.travel_time == row.travel_time
 
 
@@ -1231,12 +1231,12 @@ def test_zone_fare_point_matrix_prices_and_walks(network_with_footpaths, helsink
     ride = matrix[
         (matrix.from_id == "near_kamppi") & (matrix.to_id == "near_kapyla")
     ].iloc[0]
-    assert ride.fare == pytest.approx(2.80)
+    assert ride.money == pytest.approx(2.80)
     assert ride.transit_distance_m > 0
     walk = matrix[
         (matrix.from_id == "near_kamppi") & (matrix.to_id == "near_kamppi")
     ].iloc[0]
-    assert walk.fare == pytest.approx(0.0)
+    assert walk.money == pytest.approx(0.0)
     assert walk.transfers == 0
     assert walk.transit_distance_m == pytest.approx(0.0)
 
@@ -1275,7 +1275,7 @@ def test_zone_fare_matrix_prices_zero_fare_products(network, helsinki_gtfs):
         fares=free,
         output_time_units="seconds",
     )
-    assert matrix.iloc[0].fare == pytest.approx(0.0)
+    assert matrix.iloc[0].money == pytest.approx(0.0)
     assert matrix.iloc[0].travel_time == 300
 
 

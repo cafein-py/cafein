@@ -194,18 +194,18 @@ def test_fares_join_the_frontier(tmp_path):
         fares=two_line_fares(),
     )
     by_time = {row["travel_time"]: row for _, row in frame.iterrows()}
-    assert by_time[15]["fare"] == pytest.approx(10.0)
-    assert by_time[23]["fare"] == pytest.approx(8.0)
-    assert by_time[30]["fare"] == pytest.approx(6.0)
+    assert by_time[15]["money"] == pytest.approx(10.0)
+    assert by_time[23]["money"] == pytest.approx(8.0)
+    assert by_time[30]["money"] == pytest.approx(6.0)
     # Cheapness returns the 08:15 bus chain to the frontier: dominated
     # on (time, emissions) — see the base test — but strictly cheaper
     # than the fast chain, whose short transfer pays the pair total.
     assert set(frame.loc[frame["frontier"], "travel_time"]) == {15, 23, 30}
     # The budget view over money: cheapest overall is the tram, the
     # bus chains under tightening time budgets, nothing within a minute.
-    assert least_fare(frame)["fare"] == pytest.approx(6.0)
-    assert least_fare(frame, max_travel_time=23)["fare"] == pytest.approx(8.0)
-    assert least_fare(frame, max_travel_time=15)["fare"] == pytest.approx(10.0)
+    assert least_fare(frame)["money"] == pytest.approx(6.0)
+    assert least_fare(frame, max_travel_time=23)["money"] == pytest.approx(8.0)
+    assert least_fare(frame, max_travel_time=15)["money"] == pytest.approx(10.0)
     assert least_fare(frame, max_travel_time=1) is None
     unpriced = journey_frontier(
         network, "A", "B", "2022-02-22 08:00:00", departure_time_window=30
@@ -223,7 +223,7 @@ def test_fares_join_the_frontier(tmp_path):
         fares=two_line_fares(tram_priced=False),
     )
     trams = partial[partial["rides"] == 1]
-    assert trams["fare"].isna().all()
+    assert trams["money"].isna().all()
     assert not trams["frontier"].any()
     assert set(partial.loc[partial["frontier"], "travel_time"]) == {15, 23}
 
@@ -301,7 +301,7 @@ def test_unmatched_factors_poison_but_do_not_block(network, helsinki_gtfs):
     assert not priced["frontier"].any()
     assert least_emissions(priced) is None
     cheapest = least_fare(priced)
-    assert cheapest["fare"] == pytest.approx(2.8)
+    assert cheapest["money"] == pytest.approx(2.8)
     assert least_fare(priced, max_travel_time=0.016666666666666666) is None
 
 
@@ -1709,7 +1709,7 @@ def test_fare_frontier_prunes_at_the_cutoffs(network):
         cutoffs=[3.0, 6.0, 1e9],
         max_rides=5,
     )
-    assert (rows["fare"] <= rows["cutoff"] + 1e-9).all()
+    assert (rows["money"] <= rows["cutoff"] + 1e-9).all()
     assert (rows.sort_values("cutoff")["travel_time"].diff().dropna() <= 0).all()
     # A duration cap below the fastest journey empties the cell.
     fastest = int(unbounded["travel_time"].iloc[0])
@@ -1802,7 +1802,7 @@ def test_fare_frontier_routes_points_door_to_door(multimodal_network):
         exact_rows.sort_values(key).reset_index(drop=True),
         fast_rows.sort_values(key).reset_index(drop=True),
     )
-    assert (rows["fare"] <= rows["cutoff"] + 1e-9).all()
+    assert (rows["money"] <= rows["cutoff"] + 1e-9).all()
     assert set(rows["from_id"]) == {"o"} and set(rows["to_id"]) == {"d"}
     # Mixing stop ids with the walking options is a conflict.
     with pytest.raises(ValueError, match="board at their stops"):

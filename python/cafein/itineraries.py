@@ -81,7 +81,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
     ``trip_id``/``route_id``/``route_short_name`` on transit legs,
     ``distance_m`` (meters) and its ``distance_provenance``, ``emissions``
     (grams CO₂e; ``0`` on walks, ``NaN`` where a ridden trip has no
-    matching factor), with ``fares=`` a ``fare`` column — the option's
+    matching factor), with ``fares=`` a ``money`` column — the option's
     whole-journey ticket price, repeated on each of its rows — and
     ``geometry`` — the leg's shape in EPSG:4326,
     a transit polyline or a walked street path, absent where a leg has
@@ -167,7 +167,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         The life-cycle components to include (default: all four); see
         ``cafein.emissions.annotate``.
     fares : FareStructure or ZoneFareStructure (optional)
-        A fare model (see ``cafein.fares``); adds a ``fare`` column.
+        A fare model (see ``cafein.fares``); adds a ``money`` column.
         A fare prices the whole journey (tickets span legs), so every
         row of an option repeats the option's fare — group by
         ``["from_id", "to_id", "option"]`` and take ``first()`` for
@@ -984,7 +984,7 @@ def _itineraries_frame(
                     if fares is not None:
                         # A fare prices the whole journey (tickets span
                         # legs); every row of the option repeats it.
-                        record["fare"] = journey["fare"]
+                        record["money"] = journey["fare"]
                     if car_costs is not None:
                         totals, breakdown, label = car_costs
                         for perspective in totals:
@@ -1015,7 +1015,7 @@ def _itineraries_frame(
         columns.append("currency")
     if fares is not None:
         columns = list(columns)
-        columns.insert(columns.index("emissions") + 1, "fare")
+        columns.insert(columns.index("emissions") + 1, "money")
     if street_edges:
         columns = list(columns) + [
             "street_edges",
@@ -1335,7 +1335,7 @@ def _exposed_frame(frame, exposure):
                 wait = {key: None for key in record}
                 # Option-level columns repeat on every row of the
                 # journey, waits included.
-                for column in ("fare", "journey_departure_s"):
+                for column in ("money", "journey_departure_s"):
                     if column in record:
                         wait[column] = record[column]
                 wait.update(

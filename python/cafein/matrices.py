@@ -652,7 +652,7 @@ class TravelCostMatrix(pd.DataFrame):
         The life-cycle components to include (default: all four); see
         ``cafein.emissions.annotate``.
     fares : FareStructure or ZoneFareStructure (optional)
-        A fare model (see ``cafein.fares``); adds a ``fare`` column
+        A fare model (see ``cafein.fares``); adds a ``money`` column
         with each cell's journey priced (NaN where the model cannot
         price it), and is required for ``optimize="money"``.
     geometries : bool (optional, default: False)
@@ -3711,7 +3711,7 @@ def _stream_transit_cost(
         "emissions",
     ]
     if fares is not None:
-        columns.append("fare")
+        columns.append("money")
     if exposure is not None:
         columns += exposure.column_names()
     if geometries:
@@ -4909,7 +4909,7 @@ def _arrow_table(
         "emissions": pa.array(table["emissions"]),
     }
     if fares is not None:
-        columns["fare"] = pa.array(table["fare"])
+        columns["money"] = pa.array(table["fare"])
     if exposure is not None:
         for name in exposure.column_names():
             columns[name] = pa.array(np.asarray(table[name], dtype=float))
@@ -5240,7 +5240,7 @@ def _cost_matrix_data(
         "emissions": table["emissions"],
     }
     if fares is not None:
-        data["fare"] = table["fare"]
+        data["money"] = table["fare"]
     if exposure is not None:
         for column in exposure.column_names():
             data[column] = table[column]

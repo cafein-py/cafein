@@ -416,7 +416,7 @@ def _cost_surface(network, origins, destinations, optimize, fares=None, window=1
         departure_time_window=window,
         fares=fares,
     )
-    column = "emissions" if optimize == "emissions" else "fare"
+    column = "emissions" if optimize == "emissions" else "money"
     surface = numpy.full((len(origins), len(destinations)), numpy.nan)
     at_origin = {origin: at for at, origin in enumerate(origins)}
     at_dest = {dest: at for at, dest in enumerate(destinations)}
@@ -438,7 +438,7 @@ def fare_surface(network, helsinki_gtfs):
     origins, destinations = _stop_sets(network)
     origins, destinations = origins[:3], destinations[:30]
     surface = _cost_surface(
-        network, origins, destinations, "fare", structure, window=FARE_WINDOW
+        network, origins, destinations, "money", structure, window=FARE_WINDOW
     )
     return structure, origins, destinations, surface
 
@@ -1578,6 +1578,36 @@ def test_from_matrix_reproduces_the_routed_computers(network):
         output_time_units="seconds",
     )
     pd.testing.assert_frame_equal(pd.DataFrame(framed_n), pd.DataFrame(routed_n))
+
+
+def test_from_matrix_reads_the_former_priced_column(network, helsinki_gtfs):
+    # A matrix priced before the column took the objective's name aggregates
+    # identically on the money axis.
+    import pandas as pd
+
+    from cafein import Accessibility, TravelCostMatrix, fares as fare_module
+
+    structure = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
+    matrix = TravelCostMatrix(
+        network,
+        ["1040601"],
+        ["1121601"],
+        DEPARTURE,
+        optimize="money",
+        departure_time_window=10,
+        fares=structure,
+    )
+    current = Accessibility.from_matrix(
+        matrix, ["1121601"], cost="money", budgets=(3.0,)
+    )
+    former = Accessibility.from_matrix(
+        matrix.rename(columns={"money": "fare"}),
+        ["1121601"],
+        cost="money",
+        budgets=(3.0,),
+    )
+    pd.testing.assert_frame_equal(pd.DataFrame(former), pd.DataFrame(current))
+    assert pd.DataFrame(current)["accessibility"].iloc[0] == 1.0
 
 
 def test_from_matrix_refusals():

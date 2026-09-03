@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- The priced column of `TravelCostMatrix`, `DetailedItineraries`,
+  `journey_frontier`, and the fare frontier is `money` (was `fare`),
+  the objective's name. The accessibility computers' `from_matrix`
+  reads either name, so a matrix streamed before the rename still
+  aggregates; such a run does not resume under the new column.
+
 - The monetary objective is `optimize="money"` on `TravelCostMatrix`,
   its `to_parquet`, and `travel_cost_table`, the name the accessibility
   computers already use (`cost="money"`); `optimize="fare"` remains
