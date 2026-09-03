@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `DetailedItineraries(candidates="sweep")` on a `StreetNetwork` with
+  `exposure=`: a layer's weight in `optimize=` may be a ladder (a list),
+  searched one layer at a time; the unweighted journey is option 0 and
+  each distinct path found after it one more option, labelled by
+  `sweep_layer` and `sweep_weight` (missing on option 0).
+
 - `TravelCostMatrix` on a `StreetNetwork` takes the exposure objective,
   `optimize={layer: weight}` with `exposure=`, as `DetailedItineraries`
   does: the chosen route trades time against exposure while the
