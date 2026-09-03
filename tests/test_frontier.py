@@ -181,7 +181,7 @@ def test_frontier_trades_time_against_emissions(two_line_frontier):
 
 
 def test_fares_join_the_frontier(tmp_path):
-    from cafein import TransportNetwork, least_fare
+    from cafein import TransportNetwork, least_fare, least_money
 
     feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
     network = TransportNetwork.from_gtfs([str(feed)])
@@ -203,15 +203,15 @@ def test_fares_join_the_frontier(tmp_path):
     assert set(frame.loc[frame["frontier"], "travel_time"]) == {15, 23, 30}
     # The budget view over money: cheapest overall is the tram, the
     # bus chains under tightening time budgets, nothing within a minute.
-    assert least_fare(frame)["money"] == pytest.approx(6.0)
-    assert least_fare(frame, max_travel_time=23)["money"] == pytest.approx(8.0)
-    assert least_fare(frame, max_travel_time=15)["money"] == pytest.approx(10.0)
-    assert least_fare(frame, max_travel_time=1) is None
+    assert least_money(frame)["money"] == pytest.approx(6.0)
+    assert least_money(frame, max_travel_time=23)["money"] == pytest.approx(8.0)
+    assert least_money(frame, max_travel_time=15)["money"] == pytest.approx(10.0)
+    assert least_money(frame, max_travel_time=1) is None
     unpriced = journey_frontier(
         network, "A", "B", "2022-02-22 08:00:00", departure_time_window=30
     )
     with pytest.raises(ValueError, match="carries no fares"):
-        least_fare(unpriced)
+        least_fare(unpriced)  # the former name remains an alias
     # Unpriceable candidates leave the frontier: without a tram tariff
     # the tram journeys carry NaN fares and never join it.
     partial = journey_frontier(
@@ -268,7 +268,7 @@ def test_door_to_door_frontier_anchors_on_walking(network_with_footpaths):
 
 
 def test_unmatched_factors_poison_but_do_not_block(network, helsinki_gtfs):
-    from cafein import least_fare
+    from cafein import least_money
     from cafein.fares import zone_fare_structure
 
     # The Suomenlinna ferry has no shipped factor: its journeys carry
@@ -300,9 +300,9 @@ def test_unmatched_factors_poison_but_do_not_block(network, helsinki_gtfs):
     assert priced["emissions"].isna().all()
     assert not priced["frontier"].any()
     assert least_emissions(priced) is None
-    cheapest = least_fare(priced)
+    cheapest = least_money(priced)
     assert cheapest["money"] == pytest.approx(2.8)
-    assert least_fare(priced, max_travel_time=0.016666666666666666) is None
+    assert least_money(priced, max_travel_time=0.016666666666666666) is None
 
 
 @pytest.mark.parametrize(

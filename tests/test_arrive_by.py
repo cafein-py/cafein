@@ -1183,7 +1183,7 @@ def test_the_money_axis_prices_the_zone_fares(network, helsinki_gtfs):
     )
     priced = fares.annotate_fares(journeys, hsl)
     assert len(frame) == 1
-    assert abs(min(j["fare"] for j in priced) - frame["money"].iloc[0]) < 1e-9
+    assert abs(min(j["money"] for j in priced) - frame["money"].iloc[0]) < 1e-9
 
 
 def test_point_cost_cells_take_the_walk_and_the_budgeted_transit(
