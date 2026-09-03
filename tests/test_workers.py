@@ -947,3 +947,84 @@ def test_accessibility_entries_plan_once(
     # width reaches the core through the same active plan.
     no_seams = {"catchment points", "catchment street"}
     assert widths == (set() if arm in no_seams else {distinct})
+
+
+def test_the_fare_refinement_runs_on_its_planned_width(
+    network, helsinki_gtfs, caplog, monkeypatch
+):
+    import re
+
+    from cafein import TravelCostMatrix, _memory, fares
+
+    structure = fares.zone_fare_structure(helsinki_gtfs, rules="zones")
+    # One priced pair: the refinement's width is the behaviour under test.
+    pair = dict(origins=["1040601"], destinations=["1121601"])
+    plans = []
+    real = _memory.plan_call
+
+    def recording(*args, **kwargs):
+        plan = real(*args, **kwargs)
+        plans.append(plan)
+        return plan
+
+    monkeypatch.setattr(_memory, "plan_call", recording)
+
+    def refinement_seams():
+        return [
+            int(m.group(1))
+            for m in (
+                re.search(r"^fare refinement on (\d+) workers$", r.getMessage())
+                for r in caplog.records
+            )
+            if m
+        ]
+
+    # A wide budget on a wide host: the plan clears the former four-worker
+    # ceiling and the refinement pool follows it.
+    monkeypatch.setattr(_memory, "resident_bytes", lambda: 0)
+    monkeypatch.setattr(_memory, "ambient_workers", lambda: 8)
+    with caplog.at_level(logging.DEBUG, logger="cafein"):
+        TravelCostMatrix(
+            network,
+            departure=DEPARTURE,
+            optimize="fare",
+            fares=structure,
+            departure_time_window=10,
+            max_memory="64G",
+            **pair,
+        )
+    (plan,) = plans
+    assert plan.refinement_width > 4
+    assert refinement_seams() == [plan.refinement_width]
+    # An explicit workers= is the whole call's ceiling, the refinement's too.
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="cafein"):
+        TravelCostMatrix(
+            network,
+            departure=DEPARTURE,
+            optimize="fare",
+            fares=structure,
+            departure_time_window=10,
+            workers=1,
+            **pair,
+        )
+    assert refinement_seams() == [1]
+    # The accessibility computers name the objective money: same phase.
+    from cafein import NearestDestinations
+
+    plans.clear()
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="cafein"):
+        NearestDestinations(
+            network,
+            pair["origins"],
+            pair["destinations"],
+            DEPARTURE,
+            cost="money",
+            fares=structure,
+            departure_time_window=10,
+            max_memory="64G",
+        )
+    (plan,) = plans
+    assert plan.refinement_width > 4
+    assert refinement_seams() == [plan.refinement_width]

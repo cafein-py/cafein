@@ -18,6 +18,10 @@
   call plans its width once from the budget and every dispatch inside
   it runs on that width.
 
+- The zone-fare refinement pool runs on the width the budget plans for
+  its phase, and an explicit `workers=` caps it; the four-worker
+  constant remains only the fallback of an unplanned call.
+
 - Multi-slot matrices route each service date in one core call: the
   resolved services, the engine's transfer set, the worker pool, and
   the progress ticker are shared across the date's slots, making

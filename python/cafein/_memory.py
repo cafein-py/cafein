@@ -430,3 +430,12 @@ def width_or(workers):
     if isinstance(plan, Refusal):
         raise plan.error
     return workers if plan is None else plan.width
+
+
+def refinement_or(default=None):
+    """The active plan's fare-refinement width, else ``default``; a
+    deferred refusal fires here."""
+    plan = _active.get()
+    if isinstance(plan, Refusal):
+        raise plan.error
+    return default if plan is None else plan.refinement_width

@@ -397,6 +397,7 @@ def _transit_cost_surface(
                 *walk,
                 False,
                 workers=_memory.width_or(workers),
+                fare_workers=_memory.refinement_or(),
             )
         _warn_unsnapped(table, from_ids, to_ids)
         columns = np.asarray(table["to"], dtype="int64")
@@ -449,6 +450,7 @@ def _transit_cost_surface(
                 *walk,
                 False,
                 workers=_memory.width_or(workers),
+                fare_workers=_memory.refinement_or(),
             )
         # The stop path reports destinations as global stop indices;
         # densify over the deduped columns, then expand back so

@@ -194,6 +194,11 @@ def _entry_plan(
         ), network.stop_count
     else:
         engine, size = "time", network.stop_count
+    # The fare objective (``money`` on the accessibility computers) refines
+    # its winners in a second, sequential phase.
+    refinement = (
+        "fare" if cost and not street and objective in ("fare", "money") else None
+    )
     window = kwargs.get("arrival_time_window" if arrive_by else "departure_time_window")
     percentiles = kwargs.get("percentiles")
     # A scalar percentile is a plane only under a window; without one the
@@ -270,6 +275,7 @@ def _entry_plan(
             workers=workers,
             max_memory=max_memory,
             label=f"travel {kind} stream",
+            refinement_engine=refinement,
         )
         # The run's manifest records every batch: a run that would
         # outgrow the reader's bound is refused before anything is written.
@@ -299,6 +305,7 @@ def _entry_plan(
             workers=workers,
             max_memory=max_memory,
             label=f"travel {kind} matrix",
+            refinement_engine=refinement,
         )
     return dataclasses.replace(plan, exposure_snapshot=snapshot)
 
@@ -5384,6 +5391,7 @@ def _cost_columns(
                 *walk,
                 geometries,
                 workers=_memory.width_or(workers),
+                fare_workers=_memory.refinement_or(),
             )
         else:
             table = network._core.travel_cost_matrix_from_points(
@@ -5475,6 +5483,7 @@ def _cost_columns(
                 *_walk_options(walking_speed_kmph, max_walking_time, max_snap_distance),
                 geometries,
                 workers=_memory.width_or(workers),
+                fare_workers=_memory.refinement_or(),
             )
         else:
             # The walking options bound the door-to-door cost matrix under a
