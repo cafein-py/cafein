@@ -205,7 +205,7 @@ def test_windowed_cost_matrix_routers_agree(two_line_network):
         # The fastest journey takes exactly 1800 s: the boundary budget.
         dict(optimize="emissions", departure_time_window=30, max_travel_time=30),
         dict(
-            optimize="fare",
+            optimize="money",
             departure_time_window=30,
             fares=two_line_fares(),
             geometries=True,

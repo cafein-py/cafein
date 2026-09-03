@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The monetary objective is `optimize="money"` on `TravelCostMatrix`,
+  its `to_parquet`, and `travel_cost_table`, the name the accessibility
+  computers already use (`cost="money"`); `optimize="fare"` remains
+  accepted as an alias.
+
 - A memory budget the engine plans against: `cafein.set_max_memory`
   sets the process default (a percentage or a size with a binary
   suffix, `"80%"` by default) and the planner sizes fan-out widths and
