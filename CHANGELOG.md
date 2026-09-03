@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.19.0 — 2026-09-03
 
 - `cafein.fares.annotate_fares` attaches `money` to each journey (was
   `fare`), and the frontier's cheapest-row helper is `least_money`;
