@@ -20,6 +20,7 @@ __all__ = [
     "DetailedItineraries",
     "travel_cost_table",
     "compare_matrices",
+    "compare_to_fastest",
     "StreamingResult",
     "set_max_memory",
     "max_memory",
@@ -90,6 +91,10 @@ def __getattr__(name):
         from cafein.matrices import compare_matrices
 
         return compare_matrices
+    if name == "compare_to_fastest":
+        from cafein.matrices import compare_to_fastest
+
+        return compare_to_fastest
     if name in ("set_max_memory", "max_memory"):
         from cafein import _memory
 
