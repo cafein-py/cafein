@@ -396,13 +396,13 @@ def test_street_rentals_price_beside_the_transit_fare(hsl, poa):
         street_leg("e_scooter", 0, 90), ride("any", 120, "1040602", "1040280")
     )
     priced = fares.annotate_fares([trip], scooter, shared_modes=("e_scooter",))
-    assert priced[0]["fare"] == pytest.approx(2.8 + 1.5)
+    assert priced[0]["money"] == pytest.approx(2.8 + 1.5)
     # The minute boundary is exact: 60 s is one minute, 61 s is two.
     exact = journey(street_leg("e_scooter", 0, 60))
     over = journey(street_leg("e_scooter", 0, 61))
     fares.annotate_fares([exact, over], scooter, shared_modes=("e_scooter",))
-    assert exact["fare"] == pytest.approx(1.25)
-    assert over["fare"] == pytest.approx(1.5)
+    assert exact["money"] == pytest.approx(1.25)
+    assert over["money"] == pytest.approx(1.5)
     # Own vehicles and walking are free: a fare is what is paid —
     # walking even when mistakenly marked shared.
     own = journey(
@@ -411,17 +411,17 @@ def test_street_rentals_price_beside_the_transit_fare(hsl, poa):
         ride("any", 400, "1040602", "1040280"),
     )
     fares.annotate_fares([own], scooter, shared_modes=("e_scooter", "walk"))
-    assert own["fare"] == pytest.approx(2.8)
+    assert own["money"] == pytest.approx(2.8)
     # Without shared_modes the scooter leg is treated as owned.
     unmarked = journey(street_leg("e_scooter", 0, 90))
     fares.annotate_fares([unmarked], scooter)
-    assert unmarked["fare"] == 0.0
+    assert unmarked["money"] == 0.0
     # A ridden rental mode without a tariff prices NaN, never zero.
     unpriced = journey(
         street_leg("e_bike", 0, 90), ride("any", 120, "1040602", "1040280")
     )
     fares.annotate_fares([unpriced], hsl, shared_modes=("e_bike",))
-    assert math.isnan(unpriced["fare"])
+    assert math.isnan(unpriced["money"])
     # Rule structures price street rentals too.
     ruled = fares.FareStructure(
         fares_per_type=poa.fares_per_type,
@@ -431,7 +431,7 @@ def test_street_rentals_price_beside_the_transit_fare(hsl, poa):
     )
     scoot = journey(street_leg("e_scooter", 0, 300))
     fares.annotate_fares([scoot], ruled, shared_modes=("e_scooter",))
-    assert scoot["fare"] == pytest.approx(2.0 + 5 * 0.5)
+    assert scoot["money"] == pytest.approx(2.0 + 5 * 0.5)
 
 
 def test_negative_street_tariffs_are_rejected(hsl):

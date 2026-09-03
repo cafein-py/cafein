@@ -925,7 +925,7 @@ def _combined_zone_structure(built):
 
 
 def annotate_fares(journeys, structure, shared_modes=()):
-    """Attach ``fare`` to journeys, in place, and return them.
+    """Attach ``money`` to journeys, in place, and return them.
 
     Parameters
     ----------
@@ -944,7 +944,7 @@ def annotate_fares(journeys, structure, shared_modes=()):
     priced = structure._pricer()
     shared = frozenset(str(mode) for mode in shared_modes)
     for journey in journeys:
-        journey["fare"] = priced(journey) + _street_cost(
+        journey["money"] = priced(journey) + _street_cost(
             journey, structure.street, shared
         )
     return journeys

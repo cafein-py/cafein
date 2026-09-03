@@ -2576,7 +2576,7 @@ def test_policy_itineraries_price_shared_street_tariffs(
     )
     fares.annotate_fares(journeys, structure, shared_modes={"e_scooter"})
     assert list(per_option.first()) == pytest.approx(
-        [journey["fare"] for journey in journeys]
+        [journey["money"] for journey in journeys]
     )
 
 

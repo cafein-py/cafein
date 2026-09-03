@@ -411,7 +411,7 @@ def test_fares_price_each_option(network, helsinki_gtfs):
     # Exactly the annotate_fares prices of the same journeys, by option.
     journeys = network.route_between_stops("4810551", "1250551", "2022-02-22 08:30:00")
     expected = [
-        journey["fare"] for journey in fares.annotate_fares(journeys, structure)
+        journey["money"] for journey in fares.annotate_fares(journeys, structure)
     ]
     assert list(per_option.first()) == pytest.approx(expected)
     # Without a fare model the column does not exist.

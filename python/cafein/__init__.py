@@ -33,6 +33,7 @@ __all__ = [
     "frontier_table",
     "fare_frontier",
     "least_emissions",
+    "least_money",
     "least_fare",
     "__version__",
 ]
@@ -121,10 +122,10 @@ def __getattr__(name):
         from cafein.frontier import least_emissions
 
         return least_emissions
-    if name == "least_fare":
-        from cafein.frontier import least_fare
+    if name in ("least_money", "least_fare"):
+        from cafein.frontier import least_money
 
-        return least_fare
+        return least_money
     if name in ("enable_logging", "disable_logging", "collect_timings"):
         from cafein import _log
 

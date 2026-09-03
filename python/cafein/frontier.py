@@ -432,7 +432,7 @@ def _frontier_frame(journeys, fares):
             "emissions": (
                 math.nan if journey["emissions"] is None else journey["emissions"]
             ),
-            **({"money": journey["fare"]} if fares is not None else {}),
+            **({"money": journey["money"]} if fares is not None else {}),
             "journey": journey,
         }
         for journey in journeys
@@ -1218,14 +1218,14 @@ def least_emissions(frontier, max_travel_time=None):
     return rows.sort_values(["emissions", "_exact_s"]).iloc[0].drop("_exact_s")
 
 
-def least_fare(frontier, max_travel_time=None):
+def least_money(frontier, max_travel_time=None):
     """The cheapest journey of a frontier, as its row.
 
     Selects among the priced candidates — an unpriceable (NaN) fare
     never qualifies, but unresolved emissions do not disqualify a
     journey from being the cheapest — so the pick sits on the frontier
     whenever its emissions also resolve. This is the same rule the
-    matrix computers' fare objective applies per cell.
+    matrix computers' money objective applies per cell.
 
     Parameters
     ----------
@@ -1239,7 +1239,7 @@ def least_fare(frontier, max_travel_time=None):
     Returns
     -------
     pandas.Series or None
-        The qualifying row with the lowest fare (ties resolved toward
+        The qualifying row with the lowest price (ties resolved toward
         the shorter travel time, then the lower emissions), or ``None``
         when no journey qualifies.
     """
@@ -1257,6 +1257,10 @@ def least_fare(frontier, max_travel_time=None):
         return None
     rows = rows.assign(_exact_s=rows["arrival_s"] - rows["departure_s"])
     return rows.sort_values(["money", "_exact_s", "emissions"]).iloc[0].drop("_exact_s")
+
+
+#: The helper's former name.
+least_fare = least_money
 
 
 def _frontier_mask(times, grams, fares=None):

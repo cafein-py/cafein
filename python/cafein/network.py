@@ -2164,7 +2164,7 @@ class TransportNetwork:
         ``travel_time_matrix``, which treat a stop origin as its coordinate and
         add one ``final_transfers`` walk), and the point-set matrices
         (``TravelTimeMatrix``/``TravelCostMatrix`` from point origins and
-        destinations, ``DetailedItineraries``). The **emissions/fare** queries
+        destinations, ``DetailedItineraries``). The **emissions/money** queries
         keep the closure — ULTRA is not emissions-complete. A
         partial-window set (a narrower ``min_departure``/``max_departure``)
         is stored and inspectable but not relaxed by routing, since a

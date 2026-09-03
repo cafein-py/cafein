@@ -265,7 +265,7 @@ def test_point_matrices_from_arbitrary_locations(network_with_footpaths):
 
 @pytest.mark.parametrize("optimize", ["emissions", "money"])
 def test_least_cost_cells_match_the_frontier(tmp_path, optimize):
-    from cafein import TransportNetwork, journey_frontier, least_emissions, least_fare
+    from cafein import TransportNetwork, journey_frontier, least_emissions, least_money
     from test_frontier import build_two_line_gtfs, two_line_fares
 
     feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
@@ -316,7 +316,7 @@ def test_least_cost_cells_match_the_frontier(tmp_path, optimize):
         # Both budgets are minutes, whatever the frame's output units.
         for seconds in (None, 1380, 900):
             limit = None if seconds is None else seconds / 60
-            row, oracle = cell(limit), least_fare(frontier, max_travel_time=limit)
+            row, oracle = cell(limit), least_money(frontier, max_travel_time=limit)
             assert row["money"] == pytest.approx(oracle["money"])
             assert row["travel_time"] == oracle["travel_time"]
     assert cell(max_travel_time=1) is None
@@ -574,7 +574,7 @@ def test_fare_columns_price_the_reported_journeys(network, helsinki_gtfs):
     journeys = network.route_between_stops("4810551", "1250551", "2022-02-22 08:30:00")
     fare_module.annotate_fares(journeys, hsl)
     fastest = min(journeys, key=lambda journey: journey["arrival_s"])
-    assert row.money == pytest.approx(fastest["fare"])
+    assert row.money == pytest.approx(fastest["money"])
     # A seeded rule-based structure prices per boarding: the base fare,
     # one discounted transfer at the pair total (= base), then full
     # fares — so a cell's fare follows its transfer count exactly.
