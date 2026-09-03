@@ -1014,6 +1014,17 @@ def test_walk_based_legs_report_the_constant_layer(reported_frame):
     assert (above > 0).all()
     assert (above <= travel_minutes * (1 + 1e-9)).all()
     assert moving["noise_minutes_above_65"].values == pytest.approx(0.0)
+    # compare_to_fastest joins the exposure totals per journey; the pair's
+    # fastest journey has zero deltas and no journey is faster.
+    from cafein import compare_to_fastest
+
+    out = compare_to_fastest(reported_frame)
+    totals = reported_frame.exposure_totals()
+    assert len(out) == len(totals) and out["fastest"].sum() == 1
+    assert out["noise_mean"].tolist() == totals["noise_mean"].tolist()
+    fastest = out[out["fastest"]].iloc[0]
+    assert fastest["noise_mean_delta"] == 0.0 and fastest["travel_time_delta"] == 0.0
+    assert (out["travel_time_delta"] >= 0).all()
 
 
 def test_transit_legs_carry_nan_exposure(reported_frame):

@@ -3222,6 +3222,134 @@ def compare_matrices(a, b, *, columns=None, ratios=False):
     return out
 
 
+#: Journey columns that never take a delta: clock placement, the frontier
+#: flag, and the structural leg and cutoff numbers.
+_NO_DELTA_COLUMNS = frozenset(
+    {"departure_s", "arrival_s", "journey_departure_s", "cutoff", "segment", "frontier"}
+)
+
+
+def compare_to_fastest(frame):
+    """Each journey of a frame beside the fastest journey of its pair.
+
+    ``frame`` is a ``DetailedItineraries`` frame (one row per leg,
+    ``option`` numbering a pair's journeys), a ``journey_frontier`` or
+    ``fare_frontier`` frame (one row per journey), or a matrix frame
+    with several rows per pair; a plain matrix has one journey per pair
+    and every delta is zero. Journeys group by ``from_id`` and ``to_id``
+    plus the slot columns present (``slot``, ``departure_time``,
+    ``arrival_time``); a frame without ids is one pair.
+
+    The result has one row per journey: the keys and ``option`` when
+    present; the journey's totals — from leg rows, ``travel_time``
+    summed over the journey's rows (waits included), ``emissions`` and
+    ``distance_m`` summed, ``money`` once, and the ``exposure_totals()``
+    columns when the frame was built with ``exposure=``; from journey
+    rows, the numeric columns as they are — a boolean ``fastest``
+    marking the pair's fastest journey (the least ``travel_time``, ties
+    toward fewer ``rides`` when present, then frame order), and
+    ``<column>_delta``, the journey's value minus the fastest journey's,
+    for every numeric total, so ``travel_time_delta`` is never negative.
+    Values keep the frame's own units.
+    """
+    time_column = "travel_time" if "travel_time" in frame.columns else "travel_time_s"
+    if time_column not in frame.columns:
+        raise ValueError(
+            "compare_to_fastest needs a travel_time (or travel_time_s) column"
+        )
+    keys = [
+        key
+        for key in ("from_id", "to_id", "slot", "departure_time", "arrival_time")
+        if key in frame.columns
+    ]
+    if "segment" in frame.columns or "leg_type" in frame.columns:
+        # Leg rows: one journey per (pair, option), its totals over the legs.
+        if "option" not in frame.columns:
+            raise ValueError(
+                "a leg frame needs an option column numbering each pair's " "journeys"
+            )
+        # observed=True: categorical ids or options must not materialize
+        # unused categories as journeys.
+        grouped = frame.groupby(
+            keys + ["option"], sort=False, dropna=False, observed=True
+        )
+        journeys = grouped[time_column].sum(min_count=1).to_frame(time_column)
+        for column in ("emissions", "distance_m"):
+            if column in frame.columns:
+                journeys[column] = grouped[column].sum(min_count=1)
+        if "money" in frame.columns:
+            journeys["money"] = grouped["money"].first()
+        journeys = journeys.reset_index()
+        if getattr(frame, "_exposure", None) is not None:
+            journeys = journeys.merge(
+                frame.exposure_totals(), on=["from_id", "to_id", "option"], how="left"
+            )
+    else:
+        kept = [
+            column
+            for column in frame.columns
+            if column in keys
+            or column == "option"
+            or (
+                column not in _NO_DELTA_COLUMNS
+                and pd.api.types.is_numeric_dtype(frame[column])
+                and not pd.api.types.is_bool_dtype(frame[column])
+                and not pd.api.types.is_complex_dtype(frame[column])
+            )
+        ]
+        journeys = pd.DataFrame(frame[kept]).reset_index(drop=True)
+    values = [
+        column
+        for column in journeys.columns
+        if column not in keys
+        and column != "option"
+        and pd.api.types.is_numeric_dtype(journeys[column])
+        and not pd.api.types.is_bool_dtype(journeys[column])
+    ]
+    order = [time_column] + (["rides"] if "rides" in journeys.columns else [])
+
+    def fastest_of(group):
+        # The least travel time among the journeys that have one.
+        timed = group[group[time_column].notna()]
+        if timed.empty:
+            return None
+        return timed.sort_values(order, kind="stable").index[0]
+
+    if journeys.empty:
+        chosen = []
+    elif keys:
+        chosen = [
+            index
+            for _, group in journeys.groupby(
+                keys, sort=False, dropna=False, observed=True
+            )
+            for index in [fastest_of(group)]
+            if index is not None
+        ]
+    else:
+        index = fastest_of(journeys)
+        chosen = [] if index is None else [index]
+    out = journeys.copy()
+    out["fastest"] = out.index.isin(chosen)
+    best = journeys.loc[chosen, keys + values]
+    if keys:
+        best = out[keys].merge(best, on=keys, how="left", sort=False)
+    elif len(best):
+        best = pd.DataFrame(
+            {column: [best.iloc[0][column]] * len(out) for column in values}
+        )
+    for column in values:
+        base = (
+            best[column].to_numpy(dtype="float64", na_value=np.nan)
+            if len(best)
+            else np.full(len(out), np.nan)
+        )
+        out[f"{column}_delta"] = (
+            out[column].to_numpy(dtype="float64", na_value=np.nan) - base
+        )
+    return out
+
+
 @_log.timed_computer(
     "matrix.cost_table",
     _log.matrix,

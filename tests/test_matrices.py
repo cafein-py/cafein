@@ -1756,6 +1756,102 @@ def test_compare_matrices_aligns_cells():
     ]
 
 
+def test_compare_to_fastest_marks_each_pairs_fastest_journey():
+    import numpy as np
+
+    from cafein import compare_to_fastest
+
+    # Leg rows: option 0 of pair (a, b) is two legs, option 1 one leg;
+    # pair (a, c) has a single journey. money repeats per row.
+    legs = pd.DataFrame(
+        {
+            "from_id": ["a"] * 4,
+            "to_id": ["b", "b", "b", "c"],
+            "option": [0, 0, 1, 0],
+            "segment": [0, 1, 0, 0],
+            "leg_type": ["transit", "walk", "transit", "walk"],
+            "travel_time": [10.0, 5.0, 12.0, 7.0],
+            "emissions": [100.0, np.nan, 50.0, np.nan],
+            "distance_m": [1000.0, 400.0, 900.0, 500.0],
+            "money": [4.1, 4.1, 2.8, 0.0],
+        }
+    )
+    out = compare_to_fastest(legs)
+    assert list(out["option"]) == [0, 1, 0]
+    assert out["travel_time"].tolist() == [15.0, 12.0, 7.0]
+    assert out["fastest"].tolist() == [False, True, True]
+    assert out["travel_time_delta"].tolist() == [3.0, 0.0, 0.0]
+    assert out["emissions_delta"].tolist()[:2] == [50.0, 0.0]
+    assert np.isnan(out["emissions_delta"].iloc[2])  # no emissions to compare
+    assert out["money_delta"].tolist() == pytest.approx([1.3, 0.0, 0.0])
+    # Journey rows (a frontier): ties toward fewer rides; the frontier
+    # flag and the journey objects take no delta.
+    frontier = pd.DataFrame(
+        {
+            "departure_s": [0, 60, 120],
+            "arrival_s": [1200, 1260, 1620],
+            "travel_time": [20.0, 20.0, 25.0],
+            "rides": [2, 1, 1],
+            "emissions": [300.0, 200.0, 100.0],
+            "frontier": [True, True, True],
+            "journey": [{}, {}, {}],
+        }
+    )
+    out = compare_to_fastest(frontier)
+    assert out["fastest"].tolist() == [False, True, False]
+    assert out["emissions_delta"].tolist() == [100.0, 0.0, -100.0]
+    assert "departure_s_delta" not in out.columns and "frontier" not in out.columns
+    # Matrix rows with a slot column: each slot is its own pair.
+    matrix = pd.DataFrame(
+        {
+            "from_id": ["a", "a", "a", "a"],
+            "to_id": ["b", "b", "b", "b"],
+            "slot": ["am", "am", "pm", "pm"],
+            "option": [0, 1, 0, 1],
+            "travel_time": [30.0, 35.0, 40.0, 32.0],
+        }
+    )
+    out = compare_to_fastest(matrix)
+    assert out["fastest"].tolist() == [True, False, False, True]
+    assert out["travel_time_delta"].tolist() == [0.0, 5.0, 8.0, 0.0]
+
+
+def test_compare_to_fastest_refusals():
+    from cafein import compare_to_fastest
+
+    for frame, match in (
+        (pd.DataFrame({"from_id": ["a"], "to_id": ["b"]}), "needs a travel_time"),
+        (
+            pd.DataFrame(
+                {"from_id": ["a"], "to_id": ["b"], "segment": [0], "travel_time": [1.0]}
+            ),
+            "needs an option column",
+        ),
+    ):
+        with pytest.raises(ValueError, match=match):
+            compare_to_fastest(frame)
+    empty = compare_to_fastest(
+        pd.DataFrame({"from_id": [], "to_id": [], "travel_time": [], "emissions": []})
+    )
+    assert empty.empty
+    assert {"fastest", "travel_time_delta", "emissions_delta"} <= set(empty.columns)
+    # Categorical keys with an unused category yield no phantom journeys,
+    # on leg frames and on an empty frame alike.
+    ids = pd.CategoricalDtype(["a", "b", "unused"])
+    legs = pd.DataFrame(
+        {
+            "from_id": pd.Series(["a", "a"], dtype=ids),
+            "to_id": pd.Series(["b", "b"], dtype=ids),
+            "option": pd.Series([0, 1], dtype=pd.CategoricalDtype([0, 1, 2])),
+            "segment": [0, 0],
+            "travel_time": [5.0, 7.0],
+        }
+    )
+    out = compare_to_fastest(legs)
+    assert len(out) == 2 and out["fastest"].tolist() == [True, False]
+    assert compare_to_fastest(legs.iloc[:0]).empty
+
+
 def test_compare_matrices_refusals():
     from cafein.matrices import compare_matrices
 

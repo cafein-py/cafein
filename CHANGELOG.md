@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `compare_to_fastest(frame)` marks each pair's fastest journey and
+  adds `<column>_delta` against it for every numeric total, on
+  itinerary frames (totals over the legs, exposure totals included),
+  frontier frames, and matrix frames with several rows per pair.
+
 ## 0.19.0 — 2026-09-03
 
 - `cafein.fares.annotate_fares` attaches `money` to each journey (was
