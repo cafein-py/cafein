@@ -984,7 +984,7 @@ def _itineraries_frame(
                     if fares is not None:
                         # A fare prices the whole journey (tickets span
                         # legs); every row of the option repeats it.
-                        record["money"] = journey["fare"]
+                        record["money"] = journey["money"]
                     if car_costs is not None:
                         totals, breakdown, label = car_costs
                         for perspective in totals:

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `cafein.fares.annotate_fares` attaches `money` to each journey (was
+  `fare`), and the frontier's cheapest-row helper is `least_money`;
+  `least_fare` remains as an alias.
+
 - The priced column of `TravelCostMatrix`, `DetailedItineraries`,
   `journey_frontier`, and the fare frontier is `money` (was `fare`),
   the objective's name. The accessibility computers' `from_matrix`
