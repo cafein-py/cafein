@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `TravelCostMatrix` on a `StreetNetwork` takes the exposure objective,
+  `optimize={layer: weight}` with `exposure=`, as `DetailedItineraries`
+  does: the chosen route trades time against exposure while the
+  reported time stays the route's true time; the streamed form searches
+  with the same frozen weights.
+
 - `compare_to_fastest(frame)` marks each pair's fastest journey and
   adds `<column>_delta` against it for every numeric total, on
   itinerary frames (totals over the legs, exposure totals included),

@@ -1673,6 +1673,145 @@ def test_raising_the_weight_flips_the_route_at_the_threshold():
     assert above["travel_time"] == pytest.approx(1.5 * plain["travel_time"], abs=1.0)
 
 
+def test_the_street_cost_matrix_takes_the_exposure_objective(tmp_path):
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+    from cafein import DetailedItineraries, TravelCostMatrix, _streaming
+
+    streets = _two_route_network()
+    # value 1.0 over the short corridor only: the choice flips at λ = 0.5
+    zones = geopandas.GeoDataFrame(
+        {"level": [1.0]},
+        geometry=[box(24.9290, 60.1690, 24.9364, 60.17005)],
+        crs="EPSG:4326",
+    )
+    exposure_object = Exposure(
+        streets, noise=(zones, "level"), thresholds={"noise": (0.5,)}
+    )
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(24.9300, 60.1700)], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["b"]}, geometry=[Point(24.9354, 60.1700)], crs="EPSG:4326"
+    )
+    kwargs = dict(transport_mode="walk", output_time_units="seconds")
+
+    def matrix(**more):
+        frame = TravelCostMatrix(
+            streets, origins, destinations, exposure=exposure_object, **kwargs, **more
+        )
+        assert len(frame) == 1
+        return frame
+
+    plain = matrix()
+    below = matrix(optimize={"noise": 0.4}).iloc[0]
+    above = matrix(optimize={"noise": 0.6})
+    cell = above.iloc[0]
+    # the weight moves the cell onto the detour: 1.5x the distance, no
+    # exposure, and the reported clock is the detour's TRUE time
+    assert below["network_distance_m"] == plain["network_distance_m"].iloc[0] == 300.0
+    assert cell["network_distance_m"] == pytest.approx(450.0)
+    assert cell["noise_mean"] == pytest.approx(0.0)
+    assert cell["travel_time"] == pytest.approx(
+        1.5 * plain["travel_time"].iloc[0], abs=1.0
+    )
+    # the same weight on the itinerary agrees with the cell
+    leg = DetailedItineraries(
+        streets,
+        origins,
+        destinations,
+        exposure=exposure_object,
+        optimize={"noise": 0.6},
+        **kwargs,
+    ).iloc[0]
+    assert leg["travel_time"] == cell["travel_time"]
+    assert leg["distance_m"] == pytest.approx(cell["network_distance_m"])
+    # all-zero weights are the unweighted matrix exactly, whole frame
+    import pandas as pd
+
+    pd.testing.assert_frame_equal(matrix(optimize={"noise": 0.0}), plain)
+    # the streamed form searches with the same frozen weights: the same
+    # rows and columns as the eager frame (identifiers compared as text)
+    output = tmp_path / "weighted"
+    TravelCostMatrix.to_parquet(
+        streets,
+        origins,
+        destinations,
+        exposure=exposure_object,
+        optimize={"noise": 0.6},
+        output=output,
+        **kwargs,
+    )
+    streamed = _streaming.read_shards(output)
+    assert set(streamed.columns) == set(above.columns)
+    columns = list(above.columns)
+    ids = {"from_id": str, "to_id": str}
+    pd.testing.assert_frame_equal(
+        streamed[columns].astype(ids).reset_index(drop=True),
+        pd.DataFrame(above[columns]).astype(ids).reset_index(drop=True),
+        check_dtype=False,
+    )
+    # the weights are part of the run's fingerprint: the same weights
+    # resume, changed weights are refused
+    TravelCostMatrix.to_parquet(
+        streets,
+        origins,
+        destinations,
+        exposure=exposure_object,
+        optimize={"noise": 0.6},
+        output=output,
+        resume=True,
+        **kwargs,
+    )
+    with pytest.raises(ValueError, match="fingerprint"):
+        TravelCostMatrix.to_parquet(
+            streets,
+            origins,
+            destinations,
+            exposure=exposure_object,
+            optimize={"noise": 0.4},
+            output=output,
+            resume=True,
+            **kwargs,
+        )
+
+
+def test_the_street_cost_matrix_objective_refusals(
+    helsinki_streets, street_exposure, street_network
+):
+    from cafein import TravelCostMatrix
+
+    origins, destinations = _street_points()
+    for kwargs, message in (
+        (dict(optimize={"noise": 1.0}), "pass the Exposure"),
+        (dict(exposure=street_exposure, optimize={"nope": 1.0}), "unknown layer"),
+        (
+            dict(exposure=street_exposure, optimize={"noise": -1.0}),
+            "finite non-negative",
+        ),
+        (
+            dict(exposure=street_exposure, optimize="emissions"),
+            "no meaning for a street matrix",
+        ),
+    ):
+        with pytest.raises(ValueError, match=message):
+            TravelCostMatrix(
+                helsinki_streets,
+                origins,
+                destinations,
+                transport_mode="bicycle",
+                **kwargs,
+            )
+    with pytest.raises(ValueError, match="Pareto arc"):
+        TravelCostMatrix(
+            street_network,
+            ["x"],
+            ["y"],
+            departure="2022-02-22 08:30",
+            optimize={"noise": 1.0},
+        )
+
+
 def test_objective_refusals(helsinki_streets, street_exposure, street_network):
     from cafein import DetailedItineraries
 

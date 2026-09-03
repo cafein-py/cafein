@@ -70,6 +70,8 @@ def _query_details(arguments):
             details["slots"] = len(arguments[key])
     if arguments.get("max_memory") is not None:
         details["max_memory"] = arguments["max_memory"]
+    if isinstance(arguments.get("optimize"), dict):
+        details["weights"] = dict(arguments["optimize"])
     chunk = arguments.get("chunk")
     if chunk is not None:
         try:
@@ -485,8 +487,10 @@ class TravelCostMatrix(pd.DataFrame):
     pair's costs come from its fastest journey (ties resolved toward
     fewer rides) — or, with ``optimize="emissions"`` or
     ``optimize="money"``, from the cleanest or cheapest journey of a
-    departure window, optionally within a travel-time budget.
-    Unreachable pairs are absent. Requires a network built with trip
+    departure window, optionally within a travel-time budget — or, on a
+    ``StreetNetwork`` under ``optimize={layer: weight}``, from the route
+    the weights select, slower than the fastest when it trades time for
+    less exposure. Unreachable pairs are absent. Requires a network built with trip
     distances (the default), and with leg geometries for
     ``geometries=True``. Slices and copies degrade to plain DataFrames.
 
@@ -562,7 +566,7 @@ class TravelCostMatrix(pd.DataFrame):
     max_rides : int (optional, default: 8)
         Maximum number of boarded vehicles per journey (rides, not
         transfers: 8 rides allow 7 transfers).
-    optimize : str (optional, default: "time")
+    optimize : str or dict (optional, default: "time")
         What each cell's journey minimises. ``"time"`` (the default)
         reports the fastest journey. ``"emissions"`` and ``"money"``
         (``"fare"`` remains accepted) report the lowest-emission or
@@ -596,7 +600,16 @@ class TravelCostMatrix(pd.DataFrame):
         limit for: proving no cheaper journey exists must otherwise
         rule out the whole service day. At metropolitan scale keep a
         bounded ``max_travel_time``; cells whose destinations carry
-        no fare zone cannot price and cost the search most.
+        no fare zone cannot price and cost the search most. On a
+        ``StreetNetwork`` a dict ``{layer name: weight}`` over the
+        layers of ``exposure=`` (required with it) is the exposure
+        objective: each edge's traversal cost scales by ``1 + Σ weight
+        × value``, so the chosen route trades time against exposure
+        while the reported travel time stays the TRUE time of the
+        chosen route, as for ``DetailedItineraries``. Weights must be
+        finite and non-negative, weighted layers' edge values
+        non-negative, and all-zero weights reproduce the unweighted
+        matrix exactly.
     departure_time_window : float or datetime.timedelta (optional)
         Departure window in minutes; required with
         ``optimize="emissions"`` and ``optimize="money"``.
@@ -964,6 +977,7 @@ class TravelCostMatrix(pd.DataFrame):
                 currency=currency,
                 cost_components=cost_components,
                 exposure=exposure,
+                weights=_street_weights(optimize),
                 transit_only={
                     "departure": departure,
                     "arrival": arrival,
@@ -974,7 +988,7 @@ class TravelCostMatrix(pd.DataFrame):
                     "walking_speed_kmph": walking_speed_kmph,
                     "max_walking_time": max_walking_time,
                     "max_rides": None if max_rides == 8 else max_rides,
-                    "optimize": None if optimize == "time" else optimize,
+                    "optimize": _transit_objective(optimize),
                     "candidates": None if candidates == "time" else candidates,
                     "bucket": None if bucket == 25.0 else bucket,
                     "router": None if router == "auto" else router,
@@ -1365,6 +1379,7 @@ class TravelCostMatrix(pd.DataFrame):
                 max_street_time=max_street_time,
                 max_snap_distance=max_snap_distance,
                 chunk=chunk,
+                weights=_street_weights(optimize),
                 transit_only={
                     "departure": departure,
                     "arrival": arrival,
@@ -1375,7 +1390,7 @@ class TravelCostMatrix(pd.DataFrame):
                     "walking_speed_kmph": walking_speed_kmph,
                     "max_walking_time": max_walking_time,
                     "max_rides": None if max_rides == 8 else max_rides,
-                    "optimize": None if optimize == "time" else optimize,
+                    "optimize": _transit_objective(optimize),
                     "candidates": None if candidates == "time" else candidates,
                     "bucket": None if bucket == 25.0 else bucket,
                     "router": None if router == "auto" else router,
@@ -2429,6 +2444,7 @@ def _street_cost_columns(
     currency=None,
     cost_components=None,
     exposure=None,
+    weights=None,
     workers=None,
     max_memory=None,
 ):
@@ -2458,6 +2474,7 @@ def _street_cost_columns(
         currency=currency,
         cost_components=cost_components,
         exposure=exposure,
+        weights=weights,
     )
     query = resolved["query"]
     from_index, to_index, numeric, wkb = _street_cost_cells(
@@ -2518,15 +2535,32 @@ def _street_cost_resolution(
     currency,
     cost_components,
     exposure=None,
+    weights=None,
 ):
     """Every result-affecting street-cost input resolved exactly once —
     validation first, then the frozen snapshot the cells (and the
-    streaming form's batches) compute from."""
+    streaming form's batches) compute from. ``weights`` is the exposure
+    objective, ``{layer: weight}`` over ``exposure``'s layers, frozen
+    into the per-edge multiplier vector every batch searches with."""
     from cafein import _parking, costs as _costs, emissions
     from cafein.street_network import _resolved_delays
 
     if exposure is not None:
         exposure._check_network(network)
+    # The reporting snapshot first: the multiplier vector derives from
+    # the same frozen state the cells report against.
+    snapshot = None if exposure is None else _exposure_snapshot(exposure)
+    multipliers = frozen = None
+    if weights is not None:
+        if exposure is None:
+            raise ValueError(
+                "optimize= weights exposure layers; pass the Exposure "
+                "carrying them as exposure= too"
+            )
+        # One copy of the mapping serves the vector and the manifest.
+        frozen = {name: weights[name] for name in sorted(weights)}
+        multipliers = snapshot._objective_multipliers(frozen)
+        frozen = {name: float(weight) for name, weight in frozen.items()}
     resolved_parking = _parking.resolve(parking, transport_mode)
     occupancy, vehicle_class = emissions._car_query_options(
         transport_mode, occupancy, vehicle_class
@@ -2568,7 +2602,10 @@ def _street_cost_resolution(
         # A frozen copy: the streamed batches and the manifest
         # fingerprint read one state, whatever happens to the caller's
         # Exposure meanwhile — the fare/policy frozen-input pattern.
-        "exposure": None if exposure is None else _exposure_snapshot(exposure),
+        "exposure": snapshot,
+        "multipliers": None if multipliers is None else list(multipliers),
+        # The normalized objective, for the stream's manifest fingerprint.
+        "weights": frozen,
     }
 
 
@@ -2587,6 +2624,7 @@ def _street_cost_cells(
         query.max_snap_distance,
         bool(geometries),
         car_model=resolved["car_model"],
+        multipliers=resolved["multipliers"],
         street_edges=exposure is not None,
         workers=_memory.width_or(workers),
     )
@@ -3542,6 +3580,7 @@ def travel_cost_table(
             network,
             origins,
             destinations,
+            weights=_street_weights(optimize),
             transport_mode=transport_mode,
             max_street_time=duration_seconds("max_street_time", max_street_time),
             max_snap_distance=max_snap_distance,
@@ -3556,7 +3595,7 @@ def travel_cost_table(
                 "walking_speed_kmph": walking_speed_kmph,
                 "max_walking_time": max_walking_time,
                 "max_rides": None if max_rides == 8 else max_rides,
-                "optimize": None if optimize == "time" else optimize,
+                "optimize": _transit_objective(optimize),
                 "router": None if router == "auto" else router,
                 "exclude_routes": id_sequence("exclude_routes", exclude_routes) or None,
                 "exclude_trips": id_sequence("exclude_trips", exclude_trips) or None,
@@ -4108,6 +4147,7 @@ def _validate_transit_exposure(
     skeletons), and verify the binding. Returns the resolved router."""
     if router not in ("auto", "raptor", "tbtr"):
         raise ValueError("router must be 'auto', 'raptor', or 'tbtr'")
+    _refuse_transit_weights(optimize)
     for name, value in (
         ("optimize", None if optimize == "time" else optimize),
         ("arrival", arrival if arrive_by else None),
@@ -4466,6 +4506,7 @@ def _stream_street_cost(
         # The fingerprint hashes the layer data itself, so a resume with
         # a same-named but different exposure can never wrongly match.
         "exposure": None if exposure is None else exposure._fingerprint(),
+        "weights": resolved["weights"],
         "output_time_units": output_time_units,
     }
 
@@ -5647,6 +5688,28 @@ def _cost_columns(
     return table, from_ids, to_ids
 
 
+def _street_weights(optimize):
+    """A street matrix's exposure objective: the ``{layer: weight}``
+    dict, or ``None`` for a token."""
+    return optimize if isinstance(optimize, dict) else None
+
+
+def _transit_objective(optimize):
+    """The ``optimize`` a street matrix hands the transit-only guard:
+    ``None`` for the default token and for the exposure objective."""
+    if optimize == "time" or isinstance(optimize, dict):
+        return None
+    return optimize
+
+
+def _refuse_transit_weights(optimize):
+    if isinstance(optimize, dict):
+        raise ValueError(
+            "optimize={layer: weight} weights a StreetNetwork's exposure "
+            "layers; transit optimization arrives with the Pareto arc"
+        )
+
+
 def _validate_cost_query(
     date, departure, optimize, window, within, fares, router, arrive_by=False
 ):
@@ -5656,6 +5719,7 @@ def _validate_cost_query(
     as ``"fare"``."""
     if date is None or departure is None:
         raise TypeError("TravelCostMatrix requires departure")
+    _refuse_transit_weights(optimize)
     if optimize == "money":
         optimize = "fare"
     if optimize not in ("time", "emissions", "fare"):

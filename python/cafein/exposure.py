@@ -822,6 +822,7 @@ class _ReportingSnapshot:
     street_leg_columns = Exposure.street_leg_columns
     wait_columns = Exposure.wait_columns
     _fingerprint = Exposure._fingerprint
+    _objective_multipliers = Exposure._objective_multipliers
 
 
 def _stop_values(name, source, value, points, metric_crs):
