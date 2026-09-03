@@ -105,7 +105,7 @@ def journey_frontier(
     penalization.
 
     With a fare structure (`fares`), every candidate is also priced,
-    the frame gains a ``fare`` column, and the fare joins the frontier
+    the frame gains a ``money`` column, and the fare joins the frontier
     as a third criterion: a slower or dirtier journey stays on the
     frontier when it is strictly cheaper.
 
@@ -131,7 +131,7 @@ def journey_frontier(
         LCA components to include, as in ``emissions.annotate``.
     fares : FareStructure or ZoneFareStructure (optional)
         A fare model (see ``cafein.fares``); prices every candidate,
-        adds the ``fare`` column, and makes the fare the frontier's
+        adds the ``money`` column, and makes the fare the frontier's
         third criterion. NaN marks journeys the model cannot price —
         like NaN emissions, they never join the frontier.
     candidates : str (optional, default: "time")
@@ -432,23 +432,23 @@ def _frontier_frame(journeys, fares):
             "emissions": (
                 math.nan if journey["emissions"] is None else journey["emissions"]
             ),
-            **({"fare": journey["fare"]} if fares is not None else {}),
+            **({"money": journey["fare"]} if fares is not None else {}),
             "journey": journey,
         }
         for journey in journeys
     ]
     columns = [c for c in _COLUMNS if c != "frontier"]
     if fares is not None:
-        columns.insert(columns.index("journey"), "fare")
+        columns.insert(columns.index("journey"), "money")
     frame = pd.DataFrame(records, columns=columns)
     frame["frontier"] = _frontier_mask(
         frame["travel_time_s"].tolist(),
         frame["emissions"].tolist(),
-        frame["fare"].tolist() if fares is not None else None,
+        frame["money"].tolist() if fares is not None else None,
     )
     ordered = [c for c in _COLUMNS if c != "journey"]
     if fares is not None:
-        ordered.append("fare")
+        ordered.append("money")
     ordered.append("journey")
     return (
         frame[ordered]
@@ -640,7 +640,7 @@ def journey_frontiers(
         )
     columns = ["from_id", "to_id", *(c for c in _COLUMNS if c != "journey")]
     if fares is not None:
-        columns.append("fare")
+        columns.append("money")
     columns.append("journey")
     return humanize_frame_time(pd.DataFrame(columns=columns), output_time_units)
 
@@ -1243,11 +1243,11 @@ def least_fare(frontier, max_travel_time=None):
         the shorter travel time, then the lower emissions), or ``None``
         when no journey qualifies.
     """
-    if "fare" not in frontier.columns:
+    if "money" not in frontier.columns:
         raise ValueError(
             "the frontier carries no fares; pass fares= to journey_frontier"
         )
-    rows = frontier[frontier["fare"].notna()]
+    rows = frontier[frontier["money"].notna()]
     if max_travel_time is not None:
         from cafein._units import duration_seconds
 
@@ -1256,7 +1256,7 @@ def least_fare(frontier, max_travel_time=None):
     if rows.empty:
         return None
     rows = rows.assign(_exact_s=rows["arrival_s"] - rows["departure_s"])
-    return rows.sort_values(["fare", "_exact_s", "emissions"]).iloc[0].drop("_exact_s")
+    return rows.sort_values(["money", "_exact_s", "emissions"]).iloc[0].drop("_exact_s")
 
 
 def _frontier_mask(times, grams, fares=None):
@@ -1383,7 +1383,7 @@ def fare_frontier(
     -------
     pandas.DataFrame
         Columns ``from_id``, ``to_id``, ``cutoff``, ``travel_time``
-        (in ``output_time_units``), ``fare``, and ``rides``; a
+        (in ``output_time_units``), ``money``, and ``rides``; a
         (pair, cutoff) whose cutoff no journey fits is absent.
     """
     from cafein._units import (
@@ -1535,7 +1535,7 @@ def fare_frontier(
             "to_id": [to_ids[j] for j in data["to_index"]],
             "cutoff": data["cutoff"],
             "travel_time_s": data["travel_time_s"],
-            "fare": data["fare"],
+            "money": data["fare"],
             "rides": data["rides"],
         }
     )

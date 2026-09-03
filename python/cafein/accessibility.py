@@ -1015,7 +1015,7 @@ def _aggregate_surface(
 _MATRIX_COST_COLUMNS = {
     "time": "travel_time",
     "emissions": "emissions",
-    "money": "fare",
+    "money": "money",
     "distance": ("network_distance_m", "connector_distance_m"),
 }
 
@@ -1077,6 +1077,9 @@ def _matrix_surface(matrix, cost, origins, destinations, time_units, percentiles
             f"unknown cost {cost!r}: the axes are time, emissions, " "money, distance"
         )
     named = _MATRIX_COST_COLUMNS[cost]
+    if cost == "money" and "money" not in matrix.columns and "fare" in matrix.columns:
+        # A matrix priced before the column took the objective's name.
+        named = "fare"
     if cost == "time" and percentiles is not None:
         planes = [f"travel_time_p{percentile:g}" for percentile in percentiles]
     elif cost == "distance":
@@ -1189,7 +1192,7 @@ class Accessibility(pd.DataFrame):
       destination whose
       optimum is unresolved (an unpriced trip) counts as unreached.
     - ``"money"`` — the fare structure's own currency units (the
-      ``fare`` column's units); requires its axis's window and
+      ``money`` column's units); requires its axis's window and
       `fares`.
     - ``"distance"`` — metres, street networks only (network plus
       connector metres); on transit it is not an optimizable axis and
@@ -1925,7 +1928,7 @@ class Accessibility(pd.DataFrame):
         ``matrix`` carries ``from_id``, ``to_id``, and the axis's cost
         column — ``travel_time`` for ``cost="time"`` (or every
         requested ``travel_time_p{p}`` column with ``percentiles=``),
-        ``emissions``, ``fare`` for money, or the street distance
+        ``emissions``, ``money``, or the street distance
         columns for distance. ``time_units`` states the time column's
         unit (``"minutes"``, the matrices' default; ``"seconds"``).
         A minutes matrix is rounded to whole minutes, which moves both
