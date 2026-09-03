@@ -22,6 +22,7 @@ or retraced edges claim through a dense-sampling fallback).
 
 from __future__ import annotations
 
+import warnings
 import math
 import os
 import re
@@ -29,6 +30,7 @@ import re
 import numpy as np
 
 from cafein import _log
+from cafein._units import memory_spec
 
 SAMPLE_STEP_M = 25.0
 """Along-edge sampling step for raster and line layers, metres."""
@@ -43,9 +45,51 @@ _VALUE = "_cafein_exposure_value"
 names never meet the join machinery."""
 _DERIVED = ("", "_coverage", "_max")
 
+#: The strip ceiling: the most cells one rasterization strip may hold
+#: (float32, ~128 MB); the budget plans the actual strip from the
+#: calibrated bytes per cell.
 BURN_STRIP_CELLS = 32_000_000
-"""Cells per rasterization strip (float32: ~128 MB peak), bounding
-memory at metro scale regardless of region size."""
+
+
+class _StripPlan:
+    """The rasterization strip a build plans once, at its first use, so a
+    build with no rasterized polygons never reads the process's size: a
+    quarter of the budget's headroom at the calibrated bytes per cell,
+    never past the strip ceiling, at least one cell (a row wider than
+    that rasterizes one row at a time, with a warning)."""
+
+    def __init__(self, max_memory=None):
+        self._max_memory = max_memory
+        self.budget = None
+        self.resident = None
+        self._cells = None
+
+    @property
+    def cells(self):
+        if self._cells is None:
+            from cafein import _memory
+
+            # The floor warning lands on the Exposure caller's frame.
+            self.budget = _memory.resolve_budget(self._max_memory, stacklevel=8)
+            self.resident = _memory.resident_bytes()
+            if self.resident is None:
+                raise ValueError(
+                    "the process's resident size cannot be read here, so nothing "
+                    "can be planned against max_memory; install psutil"
+                )
+            share = max(0, self.budget - self.resident) // 4
+            self._cells = max(1, min(BURN_STRIP_CELLS, share // _memory.BYTES_PER_CELL))
+        return self._cells
+
+    def details(self):
+        """The plan's figures for the build's log details, once planned."""
+        if self._cells is None:
+            return {}
+        return {
+            "strip_cells": self._cells,
+            "strip_budget": self.budget,
+            "strip_resident": self.resident,
+        }
 
 
 def _threshold_suffix(value):
@@ -257,6 +301,15 @@ class Exposure:
         ingestion (burned ``all_touched``, max-wins; dilation of up
         to one cell at zone borders is part of the estimate).
         ``None`` selects the exact length-true overlay instead.
+    max_memory : str or int (optional)
+        The memory budget the rasterization strips are planned
+        against, as ``"8G"``, ``"50%"``, or bytes; the process default
+        from ``cafein.set_max_memory`` (80 % of physical memory) when
+        omitted. One strip holds what a quarter of the budget's
+        headroom allows; a smaller budget makes more, smaller strips
+        with the identical result. The budget plans the strips; it
+        does not cap the process — a hard limit is the operating
+        system's to set.
     **layers : tuple
         ``name=(source, value)`` — `source` is a raster path or an
         opened rioxarray object (`value` names the band), or a
@@ -268,8 +321,11 @@ class Exposure:
         if it is to be minimized against (e.g. ``100 - Comb_GVI``).
     """
 
-    def __init__(self, network, *, thresholds=None, rasterize=1.0, **layers):
+    def __init__(
+        self, network, *, thresholds=None, rasterize=1.0, max_memory=None, **layers
+    ):
         _log.sync()
+        memory_spec("max_memory", max_memory)
         if not layers:
             raise ValueError(
                 "Exposure needs at least one layer, e.g. " "noise=(zones_gdf, 'db_low')"
@@ -297,11 +353,14 @@ class Exposure:
             "building the exposure layers",
             "built the exposure layers",
         ) as ph:
-            self._build(network, rasterize, layers, validated)
+            strip = _StripPlan(max_memory)
+            self._build(network, rasterize, layers, validated, strip)
             ph.note = f"{len(self._layers)} layer(s) over {self._edge_count:,} edges"
-            ph.details.update(layers=sorted(self._layers), edges=self._edge_count)
+            ph.details.update(
+                layers=sorted(self._layers), edges=self._edge_count, **strip.details()
+            )
 
-    def _build(self, network, rasterize, layers, validated):
+    def _build(self, network, rasterize, layers, validated, strip):
         edges = network.streets_gdf
         _validate_names(layers, self._thresholds, edges.columns)
 
@@ -352,6 +411,7 @@ class Exposure:
                 samples,
                 layer_thresholds,
                 rasterize,
+                strip=strip,
             )
             if not (np.asarray(products["coverage"]) > 0).any():
                 raise ValueError(
@@ -396,6 +456,7 @@ class Exposure:
                     walk_samples,
                     self._thresholds.get(name, ()),
                     rasterize,
+                    strip=strip,
                 )
                 _validate_products(name, products)
                 self._report[name] = products
@@ -928,12 +989,30 @@ def _edge_samples(projected):
     return points, owners
 
 
-def _ingest(name, source, value, projected, metric_crs, samples, thresholds, rasterize):
+def _ingest(
+    name,
+    source,
+    value,
+    projected,
+    metric_crs,
+    samples,
+    thresholds,
+    rasterize,
+    strip=None,
+):
     import geopandas
 
     if isinstance(source, geopandas.GeoDataFrame):
         return _ingest_vector(
-            name, source, value, projected, metric_crs, samples, thresholds, rasterize
+            name,
+            source,
+            value,
+            projected,
+            metric_crs,
+            samples,
+            thresholds,
+            rasterize,
+            strip,
         )
     return _ingest_raster(
         name,
@@ -947,7 +1026,15 @@ def _ingest(name, source, value, projected, metric_crs, samples, thresholds, ras
 
 
 def _ingest_vector(
-    name, frame, value, projected, metric_crs, samples, thresholds, rasterize
+    name,
+    frame,
+    value,
+    projected,
+    metric_crs,
+    samples,
+    thresholds,
+    rasterize,
+    strip=None,
 ):
     if value not in frame.columns:
         raise ValueError(
@@ -995,7 +1082,7 @@ def _ingest_vector(
         )
         if rasterize is not None:
             return _ingest_polygons_rasterized(
-                sources, projected, thresholds, rasterize, samples()
+                sources, projected, thresholds, rasterize, samples(), strip
             )
         return _ingest_polygons(sources, projected, thresholds)
     if kinds <= linear:
@@ -1027,7 +1114,9 @@ def _polygonal(geometry):
     return shapely.union_all(np.asarray(parts, dtype=object))
 
 
-def _ingest_polygons_rasterized(frame, projected, thresholds, resolution, samples):
+def _ingest_polygons_rasterized(
+    frame, projected, thresholds, resolution, samples, strip=None
+):
     """The default polygon path: burn the zones at `resolution` metres
     (all_touched — center-touch burning silently drops class bands
     thinner than a cell; ascending value order so overlaps resolve
@@ -1073,13 +1162,26 @@ def _ingest_polygons_rasterized(frame, projected, thresholds, resolution, sample
             )
         width = max(1, int(width_cells))
         height = max(1, int(height_cells))
+        cells = BURN_STRIP_CELLS if strip is None else strip.cells
+        if width > cells:
+            from cafein import _memory
+
+            warnings.warn(
+                f"one raster row of {width} cells exceeds the memory budget's "
+                f"strip share of {cells} cells ({strip.budget} bytes, "
+                f"{strip.resident} resident, {_memory.BYTES_PER_CELL} bytes per "
+                "cell); rasterizing one row at a time — raise max_memory= to "
+                "plan wider strips",
+                UserWarning,
+                stacklevel=2,
+            )
         ordered = frame.sort_values(_VALUE)
         shapes = [
             (geometry, value)
             for geometry, value in zip(ordered.geometry.values, ordered[_VALUE].values)
             if not geometry.is_empty
         ]
-        strip_rows = max(1, BURN_STRIP_CELLS // width)
+        strip_rows = max(1, cells // width)
         for row0 in range(0, height, strip_rows):
             rows_here = min(strip_rows, height - row0)
             strip_north = north - row0 * resolution

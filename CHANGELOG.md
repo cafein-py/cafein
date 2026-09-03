@@ -22,6 +22,11 @@
   its phase, and an explicit `workers=` caps it; the four-worker
   constant remains only the fallback of an unplanned call.
 
+- `Exposure(max_memory=)`: the rasterization strip holds what a
+  quarter of the budget's headroom allows at the measured bytes per
+  cell, never past the 32 M-cell ceiling; a smaller budget makes more,
+  smaller strips with the identical result.
+
 - Multi-slot matrices route each service date in one core call: the
   resolved services, the engine's transfer set, the worker pool, and
   the progress ticker are shared across the date's slots, making
