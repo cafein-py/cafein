@@ -2566,7 +2566,7 @@ def test_policy_itineraries_price_shared_street_tariffs(
         geometries=False,
     )
     assert not frame[frame["mode"] == "e_scooter"].empty
-    per_option = frame.groupby("option")["fare"]
+    per_option = frame.groupby("option")["money"]
     assert (per_option.nunique() == 1).all()
     # The frame prices exactly as annotate_fares on the same journeys —
     # the policy's shared modes ride the structure's street tariffs, so

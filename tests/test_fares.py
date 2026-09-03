@@ -365,11 +365,11 @@ def test_frontier_carries_fares(network, hsl):
         departure_time_window=10,
         fares=hsl,
     )
-    assert "fare" in frame.columns
+    assert "money" in frame.columns
     assert len(frame)
     # Every candidate crosses C to A: the ABC ticket prices them all,
     # so the equal fares leave the frontier membership unchanged.
-    assert frame["fare"].tolist() == pytest.approx([4.1] * len(frame))
+    assert frame["money"].tolist() == pytest.approx([4.1] * len(frame))
     assert frame["frontier"].any()
     assert least_emissions(frame) is not None
 
@@ -699,7 +699,7 @@ def test_zone_fare_frontier_routes_the_exact_engine(network, hsl_zones):
     def rows(from_id, to_id):
         cell = frame[(frame["from_id"] == from_id) & (frame["to_id"] == to_id)]
         return sorted(
-            (row["cutoff"], row["travel_time"], row["fare"], row["rides"])
+            (row["cutoff"], row["travel_time"], row["money"], row["rides"])
             for _, row in cell.iterrows()
         )
 
@@ -721,9 +721,9 @@ def test_zone_fare_frontier_routes_the_exact_engine(network, hsl_zones):
         departure_time_window=10,
         fares=hsl_zones,
     )
-    priced = candidates["fare"].dropna()
+    priced = candidates["money"].dropna()
     if len(priced):
-        assert frame["fare"].min() <= priced.min() + 1e-9
+        assert frame["money"].min() <= priced.min() + 1e-9
 
 
 def test_zone_fare_frontier_refusals(network, hsl_zones, hsl):

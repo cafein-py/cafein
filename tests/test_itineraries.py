@@ -403,11 +403,11 @@ def test_fares_price_each_option(network, helsinki_gtfs):
         network, ["4810551"], ["1250551"], "2022-02-22 08:30:00", fares=structure
     )
     columns = list(itineraries.columns)
-    assert columns.index("fare") == columns.index("emissions") + 1
+    assert columns.index("money") == columns.index("emissions") + 1
     # A fare prices the whole journey: every row of an option repeats it.
-    per_option = itineraries.groupby(["from_id", "to_id", "option"])["fare"]
+    per_option = itineraries.groupby(["from_id", "to_id", "option"])["money"]
     assert (per_option.nunique() == 1).all()
-    assert (itineraries["fare"] > 0.0).all()
+    assert (itineraries["money"] > 0.0).all()
     # Exactly the annotate_fares prices of the same journeys, by option.
     journeys = network.route_between_stops("4810551", "1250551", "2022-02-22 08:30:00")
     expected = [
@@ -418,7 +418,7 @@ def test_fares_price_each_option(network, helsinki_gtfs):
     plain = DetailedItineraries(
         network, ["4810551"], ["1250551"], "2022-02-22 08:30:00"
     )
-    assert "fare" not in plain.columns
+    assert "money" not in plain.columns
 
 
 def test_door_to_door_fares_price_the_walk_free(network_with_footpaths, helsinki_gtfs):
@@ -437,8 +437,8 @@ def test_door_to_door_fares_price_the_walk_free(network_with_footpaths, helsinki
     # Option 0 is the walking-only alternative: nothing is paid.
     option0 = itineraries[itineraries["option"] == 0]
     assert list(option0["leg_type"]) == ["walk"]
-    assert (option0["fare"] == 0.0).all()
+    assert (option0["money"] == 0.0).all()
     # A ridden option pays its ticket, on every one of its rows.
     option1 = itineraries[itineraries["option"] == 1]
-    assert (option1["fare"] > 0.0).all()
-    assert option1["fare"].nunique() == 1
+    assert (option1["money"] > 0.0).all()
+    assert option1["money"].nunique() == 1

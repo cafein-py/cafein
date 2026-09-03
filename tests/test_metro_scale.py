@@ -191,7 +191,7 @@ def test_zone_fares_price_the_measured_pairs_exactly(
         rows = frame[frame["from_id"] == origin]
         pinned = {3.30: 3.30, 4.50: 4.50, 5.00: 4.50}
         assert {
-            row["cutoff"]: round(row["fare"], 2) for _, row in rows.iterrows()
+            row["cutoff"]: round(row["money"], 2) for _, row in rows.iterrows()
         } == pinned, origin
     # And the public matrix rides the same exact engine: both cells
     # price at the frontier's 3.30 — the fare-blind fold this call
@@ -210,7 +210,7 @@ def test_zone_fares_price_the_measured_pairs_exactly(
         geometries=True,
         output_time_units="seconds",
     )
-    assert sorted(round(fare, 2) for fare in matrix["fare"]) == [3.30, 3.30]
+    assert sorted(round(fare, 2) for fare in matrix["money"]) == [3.30, 3.30]
     # The fold reported 5.00 here, so both cells were beaten by the
     # exact engine and every cost column below comes from the
     # reconstructed winning chain, not the fold's journey. Values are

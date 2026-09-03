@@ -239,7 +239,7 @@ def test_cost_routers_agree_with_geometry_and_fares(network, helsinki_gtfs):
     with pytest.warns(UserWarning, match="route_type"):
         tbtr = TravelCostMatrix(*args, router="tbtr", **kwargs)
     assert len(raptor) > 0
-    assert raptor.fare.notna().any()
+    assert raptor.money.notna().any()
     assert raptor.geometry.notna().any()
     assert tbtr.equals(raptor)
 
