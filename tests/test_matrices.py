@@ -454,13 +454,13 @@ def test_cost_matrix_options_are_validated(network, helsinki_gtfs):
         (
             ["4810551"],
             None,
-            dict(optimize="fare", departure_time_window=10),
+            dict(optimize="money", departure_time_window=10),
             "requires a fare structure",
         ),
         (
             ["4810551"],
             None,
-            dict(optimize="fare", fares=hsl),
+            dict(optimize="money", fares=hsl),
             "requires departure_time_window",
         ),
         (
@@ -484,7 +484,7 @@ def test_cost_matrix_options_are_validated(network, helsinki_gtfs):
             origins=["1040601"],
             destinations=["1121601"],
             departure="08:30:00",
-            optimize="fare",
+            optimize="money",
             departure_time_window=10,
             fares=hsl,
             exclude_stops=["1121601"],
@@ -604,12 +604,23 @@ def test_fare_cells_survive_unresolved_emissions(network, helsinki_gtfs):
         origins=["1080701"],
         destinations=["1520703"],
         departure="10:00:00",
-        optimize="fare",
+        optimize="money",
         departure_time_window=60,
         fares=hsl,
     )
     assert cheapest.iloc[0].fare == pytest.approx(2.8)
     assert np.isnan(cheapest.iloc[0].emissions)
+    # The former name of the objective remains an alias.
+    aliased = cost_matrix(
+        network,
+        origins=["1080701"],
+        destinations=["1520703"],
+        departure="10:00:00",
+        optimize="fare",
+        departure_time_window=60,
+        fares=hsl,
+    )
+    assert aliased.iloc[0].fare == pytest.approx(2.8)
     cleanest = cost_matrix(
         network,
         origins=["1080701"],
@@ -1157,7 +1168,7 @@ def test_zone_fare_matrix_reconstructs_the_exact_journey(network, helsinki_gtfs)
         origins=["1040601", "4810551"],
         destinations=["1121601", "1250551"],
         departure="08:30:00",
-        optimize="fare",
+        optimize="money",
         departure_time_window=10,
         fares=hsl,
         geometries=True,
@@ -1212,7 +1223,7 @@ def test_zone_fare_point_matrix_prices_and_walks(network_with_footpaths, helsink
         origins=points,
         destinations=points,
         departure="08:30:00",
-        optimize="fare",
+        optimize="money",
         departure_time_window=10,
         max_travel_time=30,
         fares=hsl,
@@ -1259,7 +1270,7 @@ def test_zone_fare_matrix_prices_zero_fare_products(network, helsinki_gtfs):
         origins=["1040601"],
         destinations=["1121601"],
         departure="08:30:00",
-        optimize="fare",
+        optimize="money",
         departure_time_window=10,
         fares=free,
         output_time_units="seconds",

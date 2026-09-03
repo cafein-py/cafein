@@ -987,7 +987,7 @@ def test_the_fare_refinement_runs_on_its_planned_width(
         TravelCostMatrix(
             network,
             departure=DEPARTURE,
-            optimize="fare",
+            optimize="money",
             fares=structure,
             departure_time_window=10,
             max_memory="64G",
@@ -1002,7 +1002,7 @@ def test_the_fare_refinement_runs_on_its_planned_width(
         TravelCostMatrix(
             network,
             departure=DEPARTURE,
-            optimize="fare",
+            optimize="money",
             fares=structure,
             departure_time_window=10,
             workers=1,

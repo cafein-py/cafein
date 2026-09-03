@@ -484,7 +484,7 @@ class TravelCostMatrix(pd.DataFrame):
     origin, fanned out over all cores; each
     pair's costs come from its fastest journey (ties resolved toward
     fewer rides) — or, with ``optimize="emissions"`` or
-    ``optimize="fare"``, from the cleanest or cheapest journey of a
+    ``optimize="money"``, from the cleanest or cheapest journey of a
     departure window, optionally within a travel-time budget.
     Unreachable pairs are absent. Requires a network built with trip
     distances (the default), and with leg geometries for
@@ -564,8 +564,9 @@ class TravelCostMatrix(pd.DataFrame):
         transfers: 8 rides allow 7 transfers).
     optimize : str (optional, default: "time")
         What each cell's journey minimises. ``"time"`` (the default)
-        reports the fastest journey. ``"emissions"`` and ``"fare"``
-        report the lowest-emission or cheapest journey among the
+        reports the fastest journey. ``"emissions"`` and ``"money"``
+        (``"fare"`` remains accepted) report the lowest-emission or
+        cheapest journey among the
         departure window's (departure, arrival, rides)-Pareto
         candidates — the same ride candidates ``journey_frontier``
         sees — optionally within the ``max_travel_time`` budget. A
@@ -574,9 +575,9 @@ class TravelCostMatrix(pd.DataFrame):
         the walking-only alternative, which wins any cell it qualifies
         for. Each objective qualifies candidates by its own key: NaN
         emissions drop a candidate under ``"emissions"``, an
-        unpriceable fare under ``"fare"`` — pairs with no qualifying
+        unpriceable fare under ``"money"`` — pairs with no qualifying
         candidate are absent. On a **rule-based** fare structure,
-        ``optimize="fare"`` returns the lowest-priced journey **among
+        ``optimize="money"`` returns the lowest-priced journey **among
         the candidates the time-and-ride search retains** — it does
         not search all feasible journeys by fare. A cheaper journey
         may be omitted when it arrives no earlier, uses more rides,
@@ -598,12 +599,12 @@ class TravelCostMatrix(pd.DataFrame):
         no fare zone cannot price and cost the search most.
     departure_time_window : float or datetime.timedelta (optional)
         Departure window in minutes; required with
-        ``optimize="emissions"`` and ``optimize="fare"``.
+        ``optimize="emissions"`` and ``optimize="money"``.
     max_travel_time : float or datetime.timedelta (optional)
         Maximum total travel time in minutes for the windowed optimize
         modes: only journeys at most this long qualify. Unset, the
         cleanest (cheapest) reachable journey wins with no time limit —
-        except on a zone fare structure, where ``optimize="fare"``
+        except on a zone fare structure, where ``optimize="money"``
         defaults to 120 minutes: an exact fare search without a
         time limit must rule out cheaper journeys across the whole
         service day, which is far slower and rarely what an analysis
@@ -653,7 +654,7 @@ class TravelCostMatrix(pd.DataFrame):
     fares : FareStructure or ZoneFareStructure (optional)
         A fare model (see ``cafein.fares``); adds a ``fare`` column
         with each cell's journey priced (NaN where the model cannot
-        price it), and is required for ``optimize="fare"``.
+        price it), and is required for ``optimize="money"``.
     geometries : bool (optional, default: False)
         Attach each pair's ridden legs as geometry. Off by default:
         per-pair geometries over large matrices are enormous.
@@ -1037,7 +1038,7 @@ class TravelCostMatrix(pd.DataFrame):
                     arrive_by=arrive_by,
                     router=router,
                 )
-            _validate_cost_query(
+            optimize = _validate_cost_query(
                 slots[0][1],
                 slots[0][2],
                 optimize,
@@ -3497,7 +3498,7 @@ def travel_cost_table(
         components = component_selection(components)
         from cafein import emissions
 
-        _validate_cost_query(
+        optimize = _validate_cost_query(
             slots[0][1],
             slots[0][2],
             optimize,
@@ -3662,7 +3663,7 @@ def _stream_transit_cost(
     # the input frames cannot desynchronise batches from the fingerprint,
     # and an invalid query never leaves an empty claimed output behind.
     date, departure = slots[0][1], slots[0][2]
-    _validate_cost_query(
+    optimize = _validate_cost_query(
         date, departure, optimize, window, within, fares, router, arrive_by=arrive_by
     )
     if candidates not in ("time", "pareto"):
@@ -5304,7 +5305,7 @@ def _cost_columns(
     from cafein.fares import ZoneFareStructure
     from cafein.network import _walk_options
 
-    _validate_cost_query(
+    optimize = _validate_cost_query(
         date, departure, optimize, window, within, fares, router, arrive_by=arrive_by
     )
     # A zone structure's exact fare search needs a time limit to stay
@@ -5522,30 +5523,36 @@ def _validate_cost_query(
     date, departure, optimize, window, within, fares, router, arrive_by=False
 ):
     """The cost-matrix argument contract, shared by `_cost_columns` and
-    the streaming path (which must validate before claiming outputs)."""
+    the streaming path (which must validate before claiming outputs);
+    returns the objective's token, ``"money"`` (its public name) read
+    as ``"fare"``."""
     if date is None or departure is None:
         raise TypeError("TravelCostMatrix requires departure")
+    if optimize == "money":
+        optimize = "fare"
     if optimize not in ("time", "emissions", "fare"):
         raise ValueError(
-            f"optimize must be 'time', 'emissions', or 'fare', not {optimize!r}"
+            f"optimize must be 'time', 'emissions', or 'money', not {optimize!r}"
         )
     if arrive_by and optimize == "time":
         raise ValueError(
-            "arrival= requires optimize='emissions' or 'fare'; the time "
+            "arrival= requires optimize='emissions' or 'money'; the time "
             "axis rides TravelTimeMatrix"
         )
     if optimize != "time" and window is None:
         name = "arrival_time_window" if arrive_by else "departure_time_window"
-        raise ValueError(f"optimize={optimize!r} requires {name}=")
+        public = "money" if optimize == "fare" else optimize
+        raise ValueError(f"optimize={public!r} requires {name}=")
     if optimize == "time" and not (window is None and within is None):
         raise ValueError(
             "departure_time_window and max_travel_time require "
-            "optimize='emissions' or 'fare'"
+            "optimize='emissions' or 'money'"
         )
     if optimize == "fare" and fares is None:
-        raise ValueError("optimize='fare' requires a fare structure (fares=)")
+        raise ValueError("optimize='money' requires a fare structure (fares=)")
     if router not in ("auto", "raptor", "tbtr"):
         raise ValueError("router must be 'auto', 'raptor', or 'tbtr'")
+    return optimize
 
 
 def _chunk_slice(count, chunk):

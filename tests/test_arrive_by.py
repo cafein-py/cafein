@@ -362,7 +362,7 @@ def test_computer_rejections_on_the_arrival_axis(network, network_with_footpaths
     with pytest.raises(ValueError, match="percentiles"):
         Accessibility(network, [KORSO], [KAPYLA], arrival=DEADLINE, percentiles=[50])
     # The cost folds carry their own arrival contract.
-    with pytest.raises(ValueError, match="optimize='emissions' or 'fare'"):
+    with pytest.raises(ValueError, match="optimize='emissions' or 'money'"):
         TravelCostMatrix(
             network, origins=[KORSO], arrival=DEADLINE, arrival_time_window=20
         )
@@ -1174,7 +1174,7 @@ def test_the_money_axis_prices_the_zone_fares(network, helsinki_gtfs):
         destinations=[KAPYLA],
         arrival=DEADLINE,
         arrival_time_window=30,
-        optimize="fare",
+        optimize="money",
         fares=hsl,
         output_time_units="seconds",
     )
