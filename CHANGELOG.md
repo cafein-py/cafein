@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.20.0 — 2026-09-04
 
 - `TravelCostMatrix(candidates="sweep")` on a `StreetNetwork` with
   `exposure=`, the constructor and its `to_parquet` stream: the weight
