@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Time-sliced exposure layers: a layer may give a mapping of clock
+  windows to sources, `noise=({"07:00-19:00": day, "19:00-07:00":
+  night}, "level")`, each window ingesting its own source; the windows
+  must tile the day. A reporting snapshot bound to a moment reads the
+  window holding it and reports it in a `<layer>_slice` column; the
+  live `Exposure` refuses to report a sliced layer without a moment.
+
 ## 0.20.0 — 2026-09-04
 
 - `TravelCostMatrix(candidates="sweep")` on a `StreetNetwork` with
