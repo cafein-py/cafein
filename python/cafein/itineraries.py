@@ -10,7 +10,7 @@ from cafein._validate import (
 
 import geopandas as gpd
 
-from cafein import _log
+from cafein import _log, _sweep
 import numpy as np
 import pandas as pd
 import shapely
@@ -64,8 +64,10 @@ class DetailedItineraries(gpd.GeoDataFrame):
     between each origin and each destination — the time-optimal
     (arrival, rides) set by default, the (arrival, emissions) set with
     ``candidates="pareto"``, that set widened to nearby suboptimal
-    journeys with ``candidates="relaxed"``, or distinct-corridor options
-    with ``candidates="diverse"``: ``from_id`` and ``to_id``
+    journeys with ``candidates="relaxed"``, distinct-corridor options
+    with ``candidates="diverse"``, or, on a ``StreetNetwork``, the
+    exposure-weight sweep's alternatives with ``candidates="sweep"``:
+    ``from_id`` and ``to_id``
     (the OD pair), ``option`` (the journey alternative, numbered per OD
     pair), ``segment`` (the leg's position in that journey), and the leg
     itself — ``leg_type`` (``access``, ``transit``, ``transfer``,
@@ -211,8 +213,11 @@ class DetailedItineraries(gpd.GeoDataFrame):
         (enter more-is-better data as its deficit, e.g.
         ``100 - value``), and all-zero weights reproduce the
         unweighted journeys exactly. Transit journeys reject it —
-        transit optimization arrives with the Pareto arc.
-    candidates : {"time", "pareto", "relaxed", "diverse"} (default: "time")
+        transit optimization arrives with the Pareto arc. Under
+        ``candidates="sweep"`` a layer's weight may be a list, its
+        ladder (finite, non-negative, strictly increasing); ladders
+        are searched one layer at a time.
+    candidates : {"time", "pareto", "relaxed", "diverse", "sweep"} (default: "time")
         Which alternatives to return per OD pair. ``"time"`` draws the
         time-optimal (arrival, rides) journeys of the RAPTOR engine;
         ``"pareto"`` draws the (arrival, emissions) journeys of the
@@ -225,7 +230,15 @@ class DetailedItineraries(gpd.GeoDataFrame):
         penalization — by default (``penalty="ban"``) banning each chosen
         corridor's routes so the options ride disjoint line sets, or with a
         numeric ``penalty`` making a used route costly but still usable so
-        corridors may share a trunk.
+        corridors may share a trunk. ``"sweep"``, on a ``StreetNetwork``
+        with ``exposure=``, re-runs the weighted search once per ladder
+        value in ``optimize=``: the unweighted journey is option 0 and
+        each distinct path found after it one more option, labelled by
+        ``sweep_layer`` and ``sweep_weight`` (the layer and weight of the
+        search that found it, both missing on option 0; other ladder
+        layers sit at zero in that search, scalar weights stay fixed). A weight sweep finds only
+        the supported alternatives — those some weighting makes optimal;
+        trade-offs no single weighting reaches are not among them.
     bucket : float (optional, default: 25.0)
         The emissions bucket width in grams CO₂e for the ``"pareto"``
         search's arrival tie-break; smaller keeps finer emission
@@ -573,55 +586,85 @@ class DetailedItineraries(gpd.GeoDataFrame):
                     "optimize= weights exposure layers; pass the Exposure "
                     "carrying them as exposure= too"
                 )
-            multipliers = None
+            sweep = candidates == "sweep"
+            fixed, ladders = _sweep.split(optimize, sweep)
+            if sweep and exposure is None:
+                raise ValueError(
+                    "candidates='sweep' sweeps exposure weights; pass the "
+                    "Exposure carrying the layers as exposure= too"
+                )
+            frozen = None
             if exposure is not None:
                 exposure._check_network(network)
-                multipliers = exposure._objective_multipliers(optimize)
-            street_frame = _street_itineraries_frame(
-                network,
-                origins,
-                destinations,
-                departure=departure,
-                arrive_by=arrive_by,
-                transport_mode=transport_mode,
-                max_street_time=max_street_time,
-                max_snap_distance=max_snap_distance,
-                geometries=geometries,
-                exposure=exposure,
-                multipliers=multipliers,
-                factors=factors,
-                components=components,
-                intersection_delays=intersection_delays,
-                profile=profile,
-                delay_model=delay_model,
-                parking=parking,
-                occupancy=occupancy,
-                vehicle_class=vehicle_class,
-                perspectives=perspectives,
-                costs=costs,
-                currency=currency,
-                cost_components=cost_components,
-                transit_only={
-                    "fares": fares,
-                    "traveler": traveler,
-                    "tolerance_minutes": slack_seconds,
-                    "max_options": max_options,
-                    "walking_speed_kmph": walking_speed_kmph,
-                    "max_walking_time": max_walking_time,
-                    "max_rides": None if max_rides == 8 else max_rides,
-                    "candidates": None if candidates == "time" else candidates,
-                    "bucket": None if bucket == 25.0 else bucket,
-                    "router": None if router == "auto" else router,
-                    "diversity": None if diversity == "time" else diversity,
-                    "penalty": None if penalty == "ban" else penalty,
-                    "exclude_routes": id_sequence("exclude_routes", exclude_routes)
-                    or None,
-                    "exclude_trips": id_sequence("exclude_trips", exclude_trips)
-                    or None,
-                    "exclude_stops": id_sequence("exclude_stops", exclude_stops)
-                    or None,
-                },
-            )
+                # One snapshot serves every search: the weights that choose
+                # a route and the columns that report it read the same state.
+                frozen = exposure._reporting_snapshot()
+
+            def search(weights, keep_edges=False):
+                return _street_itineraries_frame(
+                    network,
+                    origins,
+                    destinations,
+                    departure=departure,
+                    arrive_by=arrive_by,
+                    transport_mode=transport_mode,
+                    max_street_time=max_street_time,
+                    max_snap_distance=max_snap_distance,
+                    geometries=geometries,
+                    exposure=frozen,
+                    multipliers=(
+                        None
+                        if weights is None
+                        else frozen._objective_multipliers(weights)
+                    ),
+                    keep_edges=keep_edges,
+                    factors=factors,
+                    components=components,
+                    intersection_delays=intersection_delays,
+                    profile=profile,
+                    delay_model=delay_model,
+                    parking=parking,
+                    occupancy=occupancy,
+                    vehicle_class=vehicle_class,
+                    perspectives=perspectives,
+                    costs=costs,
+                    currency=currency,
+                    cost_components=cost_components,
+                    transit_only={
+                        "fares": fares,
+                        "traveler": traveler,
+                        "tolerance_minutes": slack_seconds,
+                        "max_options": max_options,
+                        "walking_speed_kmph": walking_speed_kmph,
+                        "max_walking_time": max_walking_time,
+                        "max_rides": None if max_rides == 8 else max_rides,
+                        "candidates": (
+                            None if candidates in ("time", "sweep") else candidates
+                        ),
+                        "bucket": None if bucket == 25.0 else bucket,
+                        "router": None if router == "auto" else router,
+                        "diversity": None if diversity == "time" else diversity,
+                        "penalty": None if penalty == "ban" else penalty,
+                        "exclude_routes": id_sequence("exclude_routes", exclude_routes)
+                        or None,
+                        "exclude_trips": id_sequence("exclude_trips", exclude_trips)
+                        or None,
+                        "exclude_stops": id_sequence("exclude_stops", exclude_stops)
+                        or None,
+                    },
+                )
+
+            if sweep:
+                # The unweighted baseline, then one search per ladder value:
+                # the same path found twice is one journey.
+                street_frame = _sweep.relabel(
+                    [
+                        (layer, weight, search(weights, keep_edges=True))
+                        for layer, weight, weights in _sweep.vectors(fixed, ladders)
+                    ]
+                )
+            else:
+                street_frame = search(optimize if exposure is not None else None)
             if "travel_time_s" in street_frame.columns:
                 from cafein._units import travel_time_output
 
@@ -646,6 +689,12 @@ class DetailedItineraries(gpd.GeoDataFrame):
             raise ValueError(
                 f"transport_mode={transport_mode!r} is a street mode; pass a "
                 "StreetNetwork to route on it"
+            )
+        if candidates == "sweep":
+            raise ValueError(
+                "candidates='sweep' sweeps a StreetNetwork's exposure weights; "
+                "transit alternatives are candidates='pareto', 'relaxed', or "
+                "'diverse'"
             )
         if max_street_time is not None:
             raise ValueError("max_street_time applies to a StreetNetwork")
@@ -1472,6 +1521,7 @@ def _street_itineraries_frame(
     cost_components=None,
     exposure=None,
     multipliers=None,
+    keep_edges=False,
 ):
     """Street routes as one leg per reachable pair."""
     from cafein import _parking, costs as _costs, emissions
@@ -1601,6 +1651,9 @@ def _street_itineraries_frame(
     if exposure is not None:
         for column in exposure.column_names():
             frame[column] = [row[column] for row in reported]
+    if keep_edges:
+        # The path identity the sweep deduplicates on; dropped after.
+        frame["_edge_key"] = [_sweep.edge_key(edges) for edges in table["street_edges"]]
     if geometries:
         shapes = list(shapely.from_wkb(np.array(table["geometry"], dtype=object)))
     else:

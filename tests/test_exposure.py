@@ -1812,6 +1812,141 @@ def test_the_street_cost_matrix_objective_refusals(
         )
 
 
+def test_the_sweep_labels_each_distinct_alternative():
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+    import math
+
+    from cafein import DetailedItineraries, compare_to_fastest
+
+    streets = _two_route_network()
+    # noise 1.0 over the short corridor (the choice flips at 0.5); calm is
+    # constant everywhere, so its fixed weight scales every edge alike
+    everywhere = box(24.9290, 60.1690, 24.9364, 60.1750)
+    exposure_object = Exposure(
+        streets,
+        noise=(
+            geopandas.GeoDataFrame(
+                {"level": [1.0]},
+                geometry=[box(24.9290, 60.1690, 24.9364, 60.17005)],
+                crs="EPSG:4326",
+            ),
+            "level",
+        ),
+        calm=(
+            geopandas.GeoDataFrame(
+                {"level": [1.0]}, geometry=[everywhere], crs="EPSG:4326"
+            ),
+            "level",
+        ),
+    )
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(24.9300, 60.1700)], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["b"]}, geometry=[Point(24.9354, 60.1700)], crs="EPSG:4326"
+    )
+    frame = DetailedItineraries(
+        streets,
+        origins,
+        destinations,
+        transport_mode="walk",
+        output_time_units="seconds",
+        exposure=exposure_object,
+        candidates="sweep",
+        optimize={"noise": [0.4, 0.6], "calm": 0.1},
+    )
+    # 0.4 keeps the short corridor — the baseline's path — and collapses
+    assert frame["option"].tolist() == [0, 1]
+    assert frame["sweep_layer"].isna().tolist() == [True, False]
+    assert frame["sweep_layer"].iloc[1] == "noise"
+    assert math.isnan(frame["sweep_weight"].iloc[0])
+    assert frame["sweep_weight"].iloc[1] == 0.6
+    assert list(frame.columns[:5]) == [
+        "from_id",
+        "to_id",
+        "option",
+        "sweep_layer",
+        "sweep_weight",
+    ]
+    baseline, detour = frame.iloc[0], frame.iloc[1]
+    assert baseline["distance_m"] == pytest.approx(300.0)
+    assert detour["distance_m"] == pytest.approx(450.0)
+    assert detour["noise_mean"] == pytest.approx(0.0)
+    assert detour["travel_time"] >= baseline["travel_time"]
+    assert len(frame.exposure_totals()) == 2
+    deltas = compare_to_fastest(frame)
+    assert deltas["fastest"].tolist() == [True, False]
+    assert deltas["travel_time_delta"].iloc[0] == 0.0
+    assert deltas["noise_mean_delta"].iloc[1] == pytest.approx(-1.0)
+
+
+def test_the_sweep_searches_one_layer_at_a_time():
+    from cafein import _sweep
+
+    fixed, ladders = _sweep.split({"a": [1.0, 2.0], "b": [3.0], "c": 0.5}, True)
+    assert fixed == {"c": 0.5} and ladders == {"a": [1.0, 2.0], "b": [3.0]}
+    runs = _sweep.vectors(fixed, ladders)
+    assert [(layer, weight) for layer, weight, _ in runs][1:] == [
+        ("a", 1.0),
+        ("a", 2.0),
+        ("b", 3.0),
+    ]
+    assert runs[0][2] is None
+    # one ladder layer varies per search, the other is absent, c stays
+    assert [weights for _, _, weights in runs[1:]] == [
+        {"c": 0.5, "a": 1.0},
+        {"c": 0.5, "a": 2.0},
+        {"c": 0.5, "b": 3.0},
+    ]
+
+
+def test_sweep_refusals(helsinki_streets, street_exposure, street_network):
+    from cafein import DetailedItineraries
+
+    origins, destinations = _street_points()
+    for kwargs, message in (
+        (
+            dict(exposure=street_exposure, optimize={"noise": [0.1, 0.5]}),
+            "needs candidates='sweep'",
+        ),
+        (dict(candidates="sweep", optimize={"noise": [0.1, 0.5]}), "pass the Exposure"),
+        (
+            dict(
+                exposure=street_exposure,
+                candidates="sweep",
+                optimize={"noise": [0.5, 0.1]},
+            ),
+            "strictly increasing",
+        ),
+        (
+            dict(exposure=street_exposure, candidates="sweep", optimize={"noise": 0.5}),
+            "at least one ladder",
+        ),
+        (
+            dict(exposure=street_exposure, candidates="sweep", optimize={"noise": []}),
+            "empty ladder",
+        ),
+    ):
+        with pytest.raises(ValueError, match=message):
+            DetailedItineraries(
+                helsinki_streets,
+                origins,
+                destinations,
+                transport_mode="bicycle",
+                **kwargs,
+            )
+    with pytest.raises(ValueError, match="sweeps a StreetNetwork"):
+        DetailedItineraries(
+            street_network,
+            ["x"],
+            ["y"],
+            departure="2022-02-22 08:30",
+            candidates="sweep",
+            optimize={"noise": [0.1, 0.5]},
+        )
+
+
 def test_objective_refusals(helsinki_streets, street_exposure, street_network):
     from cafein import DetailedItineraries
 
