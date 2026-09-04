@@ -52,6 +52,17 @@ def split(optimize, sweep):
     return fixed, ladders
 
 
+def frozen(optimize):
+    """A copy of an ``optimize`` mapping with its ladders copied, so a
+    plan and the call it plans read the same weights."""
+    if not isinstance(optimize, dict):
+        return optimize
+    return {
+        name: list(weight) if isinstance(weight, (list, tuple)) else weight
+        for name, weight in optimize.items()
+    }
+
+
 def vectors(fixed, ladders):
     """The sweep's searches in order: ``(layer, weight, weights)`` — the
     unweighted baseline first (``None``, NaN, ``None``), then one per
@@ -73,9 +84,9 @@ def relabel(runs):
     """One frame from the sweep's searches: ``runs`` are ``(layer,
     weight, frame)`` in sweep order, each frame carrying ``_edge_key``
     per row. Per pair the first journey of each distinct path is kept,
-    ``option`` renumbers the kept journeys in sweep order, and
-    ``sweep_layer`` and ``sweep_weight`` follow ``option`` (both missing
-    on the baseline)."""
+    ``option`` (added after ``to_id`` when the frames have none) renumbers
+    the kept journeys in sweep order, and ``sweep_layer`` and
+    ``sweep_weight`` follow ``option`` (both missing on the baseline)."""
     labelled = []
     for layer, weight, frame in runs:
         frame = frame.copy()
@@ -85,6 +96,9 @@ def relabel(runs):
     out = pd.concat(labelled, ignore_index=True)
     out = out.drop_duplicates(subset=["from_id", "to_id", "_edge_key"], keep="first")
     out = out.drop(columns="_edge_key").reset_index(drop=True)
+    if "option" not in out.columns:
+        # A matrix frame numbers its alternatives here for the first time.
+        out.insert(list(out.columns).index("to_id") + 1, "option", 0)
     out["option"] = out.groupby(
         ["from_id", "to_id"], sort=False, observed=True
     ).cumcount()

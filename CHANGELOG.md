@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `TravelCostMatrix(candidates="sweep")` on a `StreetNetwork` with
+  `exposure=`, the constructor and its `to_parquet` stream: the weight
+  sweep of the street itineraries as a matrix — the unweighted cell is
+  option 0 and each distinct path one more row per pair, labelled by
+  `sweep_layer` and `sweep_weight`; the memory plan reserves one row set
+  per search and the stream's fingerprint holds the ladders.
+
 - `DetailedItineraries(candidates="sweep")` on a `StreetNetwork` with
   `exposure=`: a layer's weight in `optimize=` may be a ladder (a list),
   searched one layer at a time; the unweighted journey is option 0 and

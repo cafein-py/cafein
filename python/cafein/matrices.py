@@ -22,7 +22,7 @@ from cafein._validate import (
     restore_id_dtypes,
     sequence_not_string,
 )
-from cafein import _memory
+from cafein import _memory, _sweep
 from cafein._units import duration_seconds, memory_spec
 from cafein.travelers import (
     folded_constraints,
@@ -72,6 +72,8 @@ def _query_details(arguments):
         details["max_memory"] = arguments["max_memory"]
     if isinstance(arguments.get("optimize"), dict):
         details["weights"] = dict(arguments["optimize"])
+    if arguments.get("candidates") == "sweep":
+        details["candidates"] = "sweep"
     chunk = arguments.get("chunk")
     if chunk is not None:
         try:
@@ -244,6 +246,13 @@ def _entry_plan(
         row_bytes += _MOMENT_COLUMN_BYTES
     if label_bytes:
         row_bytes += max(_SLOT_LABEL_BYTES, label_bytes)
+    if isinstance(kwargs.get("optimize"), dict):
+        # One frozen mapping for the plan and the call it plans.
+        kwargs["optimize"] = _sweep.frozen(kwargs["optimize"])
+    if street and kwargs.get("candidates") == "sweep":
+        # Every per-row byte repeats for the baseline and each ladder value.
+        _fixed, ladders = _sweep.split(kwargs["optimize"], True)
+        row_bytes *= 1 + sum(len(values) for values in ladders.values())
     kind = "cost" if cost else "time"
     if streamed:
         surface_bytes = row_bytes
@@ -454,7 +463,8 @@ def _planned_entry(
 class TravelCostMatrix(pd.DataFrame):
     """The fastest journey's aggregated costs per OD pair, long format.
 
-    A pandas DataFrame with one row per reachable OD pair: ``from_id``
+    A pandas DataFrame with one row per reachable OD pair (one per
+    distinct swept path under ``candidates="sweep"``): ``from_id``
     and ``to_id``, ``travel_time`` (whole minutes rounded to the
     nearest by default; exact seconds with
     ``output_time_units="seconds"``), ``transfers``,
@@ -624,6 +634,12 @@ class TravelCostMatrix(pd.DataFrame):
         means. Pass ``max_travel_time`` explicitly to change the
         limit.
     candidates : str (optional, default: "time")
+        On a ``StreetNetwork``, ``"sweep"`` re-runs the weighted search
+        once per ladder value in ``optimize=`` (a layer's weight given
+        as a list): the unweighted cell is ``option`` 0 and each
+        distinct path found after it one more row per pair, labelled by
+        ``sweep_layer`` and ``sweep_weight``; a weight sweep finds only
+        the supported alternatives. Otherwise:
         The candidate journey set of the windowed optimize modes.
         ``"pareto"`` (with ``optimize="emissions"``, stop origins and
         destinations) draws each cell's candidates from McRAPTOR's
@@ -978,6 +994,7 @@ class TravelCostMatrix(pd.DataFrame):
                 cost_components=cost_components,
                 exposure=exposure,
                 weights=_street_weights(optimize),
+                sweep=candidates == "sweep",
                 transit_only={
                     "departure": departure,
                     "arrival": arrival,
@@ -989,7 +1006,9 @@ class TravelCostMatrix(pd.DataFrame):
                     "max_walking_time": max_walking_time,
                     "max_rides": None if max_rides == 8 else max_rides,
                     "optimize": _transit_objective(optimize),
-                    "candidates": None if candidates == "time" else candidates,
+                    "candidates": (
+                        None if candidates in ("time", "sweep") else candidates
+                    ),
                     "bucket": None if bucket == 25.0 else bucket,
                     "router": None if router == "auto" else router,
                     "exclude_routes": id_sequence("exclude_routes", exclude_routes)
@@ -1380,6 +1399,7 @@ class TravelCostMatrix(pd.DataFrame):
                 max_snap_distance=max_snap_distance,
                 chunk=chunk,
                 weights=_street_weights(optimize),
+                sweep=candidates == "sweep",
                 transit_only={
                     "departure": departure,
                     "arrival": arrival,
@@ -1391,7 +1411,9 @@ class TravelCostMatrix(pd.DataFrame):
                     "max_walking_time": max_walking_time,
                     "max_rides": None if max_rides == 8 else max_rides,
                     "optimize": _transit_objective(optimize),
-                    "candidates": None if candidates == "time" else candidates,
+                    "candidates": (
+                        None if candidates in ("time", "sweep") else candidates
+                    ),
                     "bucket": None if bucket == 25.0 else bucket,
                     "router": None if router == "auto" else router,
                     "exclude_routes": id_sequence("exclude_routes", exclude_routes)
@@ -2445,6 +2467,7 @@ def _street_cost_columns(
     cost_components=None,
     exposure=None,
     weights=None,
+    sweep=False,
     workers=None,
     max_memory=None,
 ):
@@ -2475,9 +2498,10 @@ def _street_cost_columns(
         cost_components=cost_components,
         exposure=exposure,
         weights=weights,
+        sweep=sweep,
     )
     query = resolved["query"]
-    from_index, to_index, numeric, wkb = _street_cost_cells(
+    from_index, to_index, numeric, wkb = _street_cost_searches(
         network,
         query,
         geometries=geometries,
@@ -2500,7 +2524,10 @@ def _street_cost_columns(
     # The frame orders provenance before the cost block, then the
     # monetary block with its currency, then the exposure block, then
     # geometry — the exact order the streamed shards emit.
-    order = ["from_id", "to_id", "travel_time_s", "distance_m"]
+    order = ["from_id", "to_id"]
+    if resolved["sweep"] is not None:
+        order += ["option", "sweep_layer", "sweep_weight"]
+    order += ["travel_time_s", "distance_m"]
     order += ["network_distance_m", "connector_distance_m", "distance_provenance"]
     order += ["emissions"]
     order += [name for name in data if name.startswith("cost_")]
@@ -2536,12 +2563,15 @@ def _street_cost_resolution(
     cost_components,
     exposure=None,
     weights=None,
+    sweep=False,
 ):
     """Every result-affecting street-cost input resolved exactly once —
     validation first, then the frozen snapshot the cells (and the
     streaming form's batches) compute from. ``weights`` is the exposure
     objective, ``{layer: weight}`` over ``exposure``'s layers, frozen
-    into the per-edge multiplier vector every batch searches with."""
+    into the per-edge multiplier vector every batch searches with; under
+    ``sweep`` its list-valued weights are ladders, each value one more
+    search."""
     from cafein import _parking, costs as _costs, emissions
     from cafein.street_network import _resolved_delays
 
@@ -2550,17 +2580,45 @@ def _street_cost_resolution(
     # The reporting snapshot first: the multiplier vector derives from
     # the same frozen state the cells report against.
     snapshot = None if exposure is None else _exposure_snapshot(exposure)
-    multipliers = frozen = None
+    multipliers = frozen = searches = None
+    fixed, ladders = _sweep.split(weights, sweep)
+    if sweep and exposure is None:
+        raise ValueError(
+            "candidates='sweep' sweeps exposure weights; pass the Exposure "
+            "carrying the layers as exposure= too"
+        )
     if weights is not None:
         if exposure is None:
             raise ValueError(
                 "optimize= weights exposure layers; pass the Exposure "
                 "carrying them as exposure= too"
             )
-        # One copy of the mapping serves the vector and the manifest.
-        frozen = {name: weights[name] for name in sorted(weights)}
-        multipliers = snapshot._objective_multipliers(frozen)
-        frozen = {name: float(weight) for name, weight in frozen.items()}
+        if sweep:
+            # The baseline and one search per ladder value, every vector
+            # frozen from the snapshot; the manifest records the ladders.
+            searches = [
+                (
+                    layer,
+                    weight,
+                    (
+                        None
+                        if vector is None
+                        else list(snapshot._objective_multipliers(vector))
+                    ),
+                )
+                for layer, weight, vector in _sweep.vectors(fixed, ladders)
+            ]
+            # Ladders in execution order: it decides the option numbering
+            # and which label a deduplicated path keeps.
+            frozen = {
+                "fixed": {name: float(fixed[name]) for name in sorted(fixed)},
+                "ladders": [[name, list(values)] for name, values in ladders.items()],
+            }
+        else:
+            # One copy of the mapping serves the vector and the manifest.
+            frozen = {name: weights[name] for name in sorted(weights)}
+            multipliers = snapshot._objective_multipliers(frozen)
+            frozen = {name: float(weight) for name, weight in frozen.items()}
     resolved_parking = _parking.resolve(parking, transport_mode)
     occupancy, vehicle_class = emissions._car_query_options(
         transport_mode, occupancy, vehicle_class
@@ -2606,16 +2664,75 @@ def _street_cost_resolution(
         "multipliers": None if multipliers is None else list(multipliers),
         # The normalized objective, for the stream's manifest fingerprint.
         "weights": frozen,
+        # The sweep's searches: (layer, weight, multiplier vector), or None.
+        "sweep": searches,
     }
 
 
-def _street_cost_cells(
+def _street_cost_searches(
     network, query, *, geometries, resolved, workers=None, max_memory=None
 ):
+    """The cells of one street-cost batch: one search, or under a sweep
+    the baseline and one search per ladder value, each pair keeping the
+    first journey of each distinct path, numbered and labelled."""
+    if resolved["sweep"] is None:
+        return _street_cost_cells(
+            network,
+            query,
+            geometries=geometries,
+            resolved=resolved,
+            workers=workers,
+            max_memory=max_memory,
+        )
+    runs = []
+    for layer, weight, vector in resolved["sweep"]:
+        from_index, to_index, numeric, wkb = _street_cost_cells(
+            network,
+            query,
+            geometries=geometries,
+            resolved=resolved,
+            workers=workers,
+            max_memory=max_memory,
+            multipliers=vector,
+            keep_edges=True,
+        )
+        frame = pd.DataFrame({"from_id": from_index, "to_id": to_index})
+        for name, values in numeric.items():
+            frame[name] = values
+        if geometries:
+            frame["geometry"] = list(wkb)
+        runs.append((layer, weight, frame))
+    out = _sweep.relabel(runs)
+    numeric = {
+        name: out[name].to_numpy()
+        for name in out.columns
+        if name not in ("from_id", "to_id", "geometry", "sweep_layer")
+    }
+    # A list keeps the baseline's None; an object array would turn it NaN.
+    numeric["sweep_layer"] = out["sweep_layer"].tolist()
+    wkb = list(out["geometry"]) if geometries else None
+    return out["from_id"].to_numpy(), out["to_id"].to_numpy(), numeric, wkb
+
+
+def _street_cost_cells(
+    network,
+    query,
+    *,
+    geometries,
+    resolved,
+    workers=None,
+    max_memory=None,
+    multipliers=None,
+    keep_edges=False,
+):
     """One street-cost batch: origin/destination indices, the numeric
-    columns, and the WKB geometries (``None`` without ``geometries``)."""
+    columns, and the WKB geometries (``None`` without ``geometries``).
+    ``multipliers`` overrides the resolution's vector (a sweep's search);
+    ``keep_edges`` adds each cell's path key for deduplication."""
     transport_mode = resolved["transport_mode"]
     exposure = resolved["exposure"]
+    if multipliers is None and resolved["sweep"] is None:
+        multipliers = resolved["multipliers"]
     table = network._core.cost_matrix(
         query.origin_points,
         query.destination_points,
@@ -2624,8 +2741,8 @@ def _street_cost_cells(
         query.max_snap_distance,
         bool(geometries),
         car_model=resolved["car_model"],
-        multipliers=resolved["multipliers"],
-        street_edges=exposure is not None,
+        multipliers=multipliers,
+        street_edges=exposure is not None or keep_edges,
         workers=_memory.width_or(workers),
     )
     _warn_unsnapped(
@@ -2694,6 +2811,11 @@ def _street_cost_cells(
                 # while its mean/max/coverage stay NaN.
                 values = np.nan_to_num(values, nan=0.0)
             numeric[column] = values
+    if keep_edges:
+        # A list, not an array: equal-length tuples would become a matrix.
+        numeric["_edge_key"] = [
+            _sweep.edge_key(edges) for edges in table["street_edges"]
+        ]
     geometry = table["geometry"] if geometries else None
     return table["from"], table["to"], numeric, geometry
 
@@ -3262,6 +3384,8 @@ def compare_matrices(a, b, *, columns=None, ratios=False):
 
 #: Journey columns that never take a delta: clock placement, the frontier
 #: flag, and the structural leg and cutoff numbers.
+#: A sweep's per-journey labels: carried through, never compared.
+_JOURNEY_LABELS = ("sweep_layer", "sweep_weight")
 _NO_DELTA_COLUMNS = frozenset(
     {"departure_s", "arrival_s", "journey_departure_s", "cutoff", "segment", "frontier"}
 )
@@ -3317,6 +3441,9 @@ def compare_to_fastest(frame):
                 journeys[column] = grouped[column].sum(min_count=1)
         if "money" in frame.columns:
             journeys["money"] = grouped["money"].first()
+        for label in _JOURNEY_LABELS:
+            if label in frame.columns:
+                journeys[label] = grouped[label].first()
         journeys = journeys.reset_index()
         if getattr(frame, "_exposure", None) is not None:
             journeys = journeys.merge(
@@ -3328,6 +3455,7 @@ def compare_to_fastest(frame):
             for column in frame.columns
             if column in keys
             or column == "option"
+            or column in _JOURNEY_LABELS
             or (
                 column not in _NO_DELTA_COLUMNS
                 and pd.api.types.is_numeric_dtype(frame[column])
@@ -3341,6 +3469,7 @@ def compare_to_fastest(frame):
         for column in journeys.columns
         if column not in keys
         and column != "option"
+        and column not in _JOURNEY_LABELS
         and pd.api.types.is_numeric_dtype(journeys[column])
         and not pd.api.types.is_bool_dtype(journeys[column])
     ]
@@ -3833,6 +3962,11 @@ def _stream_transit_cost(
     optimize = _validate_cost_query(
         date, departure, optimize, window, within, fares, router, arrive_by=arrive_by
     )
+    if candidates == "sweep":
+        raise ValueError(
+            "candidates='sweep' sweeps a StreetNetwork's exposure weights; a "
+            "transit cost matrix takes candidates='time' or 'pareto'"
+        )
     if candidates not in ("time", "pareto"):
         raise ValueError("candidates must be 'time' or 'pareto'")
     exclude_routes = list(id_sequence("exclude_routes", exclude_routes))
@@ -4471,9 +4605,10 @@ def _stream_street_cost(
     query = resolved["query"]
     account = resolved["account"]
     exposure = resolved["exposure"]
-    columns = [
-        "from_id",
-        "to_id",
+    columns = ["from_id", "to_id"]
+    if resolved["sweep"] is not None:
+        columns += ["option", "sweep_layer", "sweep_weight"]
+    columns += [
         "travel_time",
         "distance_m",
         "network_distance_m",
@@ -4507,6 +4642,7 @@ def _stream_street_cost(
         # a same-named but different exposure can never wrongly match.
         "exposure": None if exposure is None else exposure._fingerprint(),
         "weights": resolved["weights"],
+        "sweep": resolved["sweep"] is not None,
         "output_time_units": output_time_units,
     }
 
@@ -4519,7 +4655,7 @@ def _stream_street_cost(
             query.max_seconds,
             query.max_snap_distance,
         )
-        from_index, to_index, numeric, wkb = _street_cost_cells(
+        from_index, to_index, numeric, wkb = _street_cost_searches(
             network,
             batch,
             geometries=geometries,
@@ -4534,17 +4670,29 @@ def _stream_street_cost(
                 shared_from,
             ),
             "to_id": pa.DictionaryArray.from_arrays(pa.array(to_index), shared_to),
-            "travel_time": pa.array(
-                travel_time_output(numeric["travel_time_s"], output_time_units)
-            ),
-            "distance_m": pa.array(numeric["distance_m"]),
-            "network_distance_m": pa.array(numeric["network_distance_m"]),
-            "connector_distance_m": pa.array(numeric["connector_distance_m"]),
-            "distance_provenance": pa.array(
-                [STREET_DISTANCE_PROVENANCE] * count, type=pa.string()
-            ),
-            "emissions": pa.array(numeric["emissions"]),
         }
+        if resolved["sweep"] is not None:
+            data["option"] = pa.array(numeric["option"], type=pa.int64())
+            # A missing baseline label is a null, whatever pandas held.
+            data["sweep_layer"] = pa.array(
+                [None if pd.isna(label) else label for label in numeric["sweep_layer"]],
+                type=pa.string(),
+            )
+            data["sweep_weight"] = pa.array(numeric["sweep_weight"], type=pa.float64())
+        data.update(
+            {
+                "travel_time": pa.array(
+                    travel_time_output(numeric["travel_time_s"], output_time_units)
+                ),
+                "distance_m": pa.array(numeric["distance_m"]),
+                "network_distance_m": pa.array(numeric["network_distance_m"]),
+                "connector_distance_m": pa.array(numeric["connector_distance_m"]),
+                "distance_provenance": pa.array(
+                    [STREET_DISTANCE_PROVENANCE] * count, type=pa.string()
+                ),
+                "emissions": pa.array(numeric["emissions"]),
+            }
+        )
         for name, values in numeric.items():
             if name.startswith("cost_"):
                 data[name] = pa.array(values)
@@ -5488,6 +5636,11 @@ def _cost_columns(
         and isinstance(fares, ZoneFareStructure)
     ):
         within = 7200
+    if candidates == "sweep":
+        raise ValueError(
+            "candidates='sweep' sweeps a StreetNetwork's exposure weights; a "
+            "transit cost matrix takes candidates='time' or 'pareto'"
+        )
     if candidates not in ("time", "pareto"):
         raise ValueError("candidates must be 'time' or 'pareto'")
     if candidates == "pareto":

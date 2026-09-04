@@ -1881,6 +1881,219 @@ def test_the_sweep_labels_each_distinct_alternative():
     assert deltas["noise_mean_delta"].iloc[1] == pytest.approx(-1.0)
 
 
+def test_the_matrix_sweep_agrees_with_the_itinerary_sweep(tmp_path, monkeypatch):
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+    import pandas as pd
+
+    from cafein import DetailedItineraries, TravelCostMatrix, _memory, _streaming
+
+    streets = _two_route_network()
+    everywhere = box(24.9290, 60.1690, 24.9364, 60.1750)
+    exposure_object = Exposure(
+        streets,
+        noise=(
+            geopandas.GeoDataFrame(
+                {"level": [1.0]},
+                geometry=[box(24.9290, 60.1690, 24.9364, 60.17005)],
+                crs="EPSG:4326",
+            ),
+            "level",
+        ),
+        calm=(
+            geopandas.GeoDataFrame(
+                {"level": [1.0]}, geometry=[everywhere], crs="EPSG:4326"
+            ),
+            "level",
+        ),
+    )
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(24.9300, 60.1700)], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["b"]}, geometry=[Point(24.9354, 60.1700)], crs="EPSG:4326"
+    )
+    kwargs = dict(
+        transport_mode="walk",
+        output_time_units="seconds",
+        exposure=exposure_object,
+        candidates="sweep",
+        optimize={"noise": [0.4, 0.6], "calm": 0.1},
+    )
+    plans = []
+    real = _memory.plan_call
+
+    def recording(*args, **more):
+        plans.append((args, more))
+        return real(*args, **more)
+
+    monkeypatch.setattr(_memory, "plan_call", recording)
+    matrix = TravelCostMatrix(streets, origins, destinations, **kwargs)
+    itinerary = DetailedItineraries(streets, origins, destinations, **kwargs)
+    assert list(matrix.columns[:5]) == [
+        "from_id",
+        "to_id",
+        "option",
+        "sweep_layer",
+        "sweep_weight",
+    ]
+    import numpy as np
+
+    for column in ["option", "travel_time"] + exposure_object.column_names():
+        # NaN-aware: the detour has no exposure to report
+        np.testing.assert_array_equal(
+            matrix[column].to_numpy(dtype=float),
+            itinerary[column].to_numpy(dtype=float),
+            err_msg=column,
+        )
+    assert matrix["sweep_layer"].isna().tolist() == [True, False]
+    assert matrix["sweep_layer"].tolist()[1:] == itinerary["sweep_layer"].tolist()[1:]
+    assert matrix["sweep_weight"].isna().tolist() == [True, False]
+    assert (
+        matrix["sweep_weight"].tolist()[1]
+        == itinerary["sweep_weight"].tolist()[1]
+        == 0.6
+    )
+    # the swept matrix plans once
+    assert len(plans) == 1
+    # compare_to_fastest keeps the labels as metadata and takes no delta on them
+    from cafein import compare_to_fastest
+
+    deltas = compare_to_fastest(matrix)
+    assert deltas["fastest"].tolist() == [True, False]
+    assert deltas["sweep_layer"].tolist()[1] == "noise" and "sweep_weight" in deltas
+    assert "sweep_weight_delta" not in deltas.columns
+    # the plan and the call read one frozen mapping: mutating the caller's
+    # dict from inside the resolution changes nothing
+    from cafein import matrices as matrices_module
+
+    original = {"noise": [0.4, 0.6], "calm": 0.1}
+    real_resolution = matrices_module._street_cost_resolution
+
+    def mutating(*args, **more):
+        original["noise"].append(9.0)
+        original["calm"] = 5.0
+        return real_resolution(*args, **more)
+
+    monkeypatch.setattr(matrices_module, "_street_cost_resolution", mutating)
+    again = TravelCostMatrix(
+        streets, origins, destinations, **{**kwargs, "optimize": original}
+    )
+    monkeypatch.setattr(matrices_module, "_street_cost_resolution", real_resolution)
+    assert again["option"].tolist() == matrix["option"].tolist()
+    assert again["sweep_weight"].tolist()[1] == 0.6
+    assert matrix["network_distance_m"].tolist() == itinerary["distance_m"].tolist()
+    # the plan reserves the baseline plus one row set per ladder value
+    plain = TravelCostMatrix(
+        streets, origins, destinations, transport_mode="walk", exposure=exposure_object
+    )
+    assert len(plain) == 1
+    swept_bytes, plain_bytes = plans[0][0][2], plans[-1][0][2]
+    assert swept_bytes == 3 * plain_bytes
+    # the streamed sweep yields the eager frame; its fingerprint holds the ladders
+    output = tmp_path / "sweep"
+    TravelCostMatrix.to_parquet(streets, origins, destinations, output=output, **kwargs)
+    streamed = _streaming.read_shards(output)
+    assert set(streamed.columns) == set(matrix.columns)
+    # the label column compares by presence (a null on disk, missing in
+    # the frame); every other column value for value
+    assert (
+        streamed["sweep_layer"].isna().tolist() == matrix["sweep_layer"].isna().tolist()
+    )
+    assert (
+        streamed["sweep_layer"].dropna().tolist()
+        == matrix["sweep_layer"].dropna().tolist()
+    )
+    columns = [column for column in matrix.columns if column != "sweep_layer"]
+    ids = {"from_id": str, "to_id": str}
+    pd.testing.assert_frame_equal(
+        streamed[columns].astype(ids).reset_index(drop=True),
+        pd.DataFrame(matrix[columns]).astype(ids).reset_index(drop=True),
+        check_dtype=False,
+    )
+    TravelCostMatrix.to_parquet(
+        streets, origins, destinations, output=output, resume=True, **kwargs
+    )
+    # a changed ladder or a changed fixed weight is another run
+    for optimize in (
+        {"noise": [0.4, 0.7], "calm": 0.1},
+        {"noise": [0.4, 0.6], "calm": 0.2},
+    ):
+        with pytest.raises(ValueError, match="fingerprint"):
+            TravelCostMatrix.to_parquet(
+                streets,
+                origins,
+                destinations,
+                output=output,
+                resume=True,
+                **{**kwargs, "optimize": optimize},
+            )
+    # and so is the plain mode with scalar weights against a swept run
+    with pytest.raises(ValueError, match="fingerprint"):
+        TravelCostMatrix.to_parquet(
+            streets,
+            origins,
+            destinations,
+            output=output,
+            resume=True,
+            **{**kwargs, "candidates": "time", "optimize": {"noise": 0.6, "calm": 0.1}},
+        )
+    # so are the same two ladders in the other order: the order numbers
+    # the options and picks a deduplicated path's label
+    two = tmp_path / "two-ladders"
+    TravelCostMatrix.to_parquet(
+        streets,
+        origins,
+        destinations,
+        output=two,
+        **{**kwargs, "optimize": {"noise": [0.4, 0.6], "calm": [0.05, 0.1]}},
+    )
+    with pytest.raises(ValueError, match="fingerprint"):
+        TravelCostMatrix.to_parquet(
+            streets,
+            origins,
+            destinations,
+            output=two,
+            resume=True,
+            **{**kwargs, "optimize": {"calm": [0.05, 0.1], "noise": [0.4, 0.6]}},
+        )
+
+
+def test_the_matrix_sweep_refusals(helsinki_streets, street_exposure, street_network):
+    from cafein import TravelCostMatrix
+
+    origins, destinations = _street_points()
+    for kwargs, message in (
+        (dict(candidates="sweep", optimize={"noise": [0.1, 0.5]}), "pass the Exposure"),
+        (
+            dict(exposure=street_exposure, candidates="sweep", optimize={"noise": 0.5}),
+            "at least one ladder",
+        ),
+        (
+            dict(exposure=street_exposure, optimize={"noise": [0.1, 0.5]}),
+            "needs candidates='sweep'",
+        ),
+    ):
+        with pytest.raises(ValueError, match=message):
+            TravelCostMatrix(
+                helsinki_streets,
+                origins,
+                destinations,
+                transport_mode="bicycle",
+                **kwargs,
+            )
+    # on transit the weights refusal speaks first; both name the StreetNetwork
+    with pytest.raises(ValueError, match="StreetNetwork"):
+        TravelCostMatrix(
+            street_network,
+            ["x"],
+            ["y"],
+            departure="2022-02-22 08:30",
+            candidates="sweep",
+            optimize={"noise": [0.1, 0.5]},
+        )
+
+
 def test_the_sweep_searches_one_layer_at_a_time():
     from cafein import _sweep
 
