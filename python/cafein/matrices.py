@@ -120,10 +120,23 @@ def _optional_columns(kwargs, exposure_snapshot):
     return count
 
 
+def _refuse_sliced_matrix(exposure):
+    """A time-sliced Exposure has no single moment on a cost matrix;
+    reporting one belongs to DetailedItineraries, which carries the
+    query's departure. A static Exposure reports on a matrix as before."""
+    if exposure is not None and getattr(exposure, "_slices", None):
+        raise ValueError(
+            "a time-sliced Exposure reports on DetailedItineraries, which "
+            "takes the query's departure to pick each window; a cost matrix "
+            "takes a static Exposure"
+        )
+
+
 def _exposure_snapshot(exposure):
     """The reporting snapshot the enclosing call was planned with, so
     the body reports against the surface the plan sized; a fresh one
     for a call nobody planned."""
+    _refuse_sliced_matrix(exposure)
     active = _memory.active_plan()
     if isinstance(active, _memory.Refusal):
         raise active.error
@@ -238,6 +251,7 @@ def _entry_plan(
     else:
         row_bytes = (_TIME_CELL_BYTES if dense else _TIME_FRAME_CELL_BYTES) * planes
     exposure = kwargs.get("exposure")
+    _refuse_sliced_matrix(exposure)
     # One snapshot per call: the plan sizes its columns and the body
     # reports against it; the live object still validates the network.
     snapshot = None if exposure is None else exposure._reporting_snapshot()

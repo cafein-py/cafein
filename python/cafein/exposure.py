@@ -1206,6 +1206,22 @@ def _window_at(windows, moment):
     raise ValueError(f"no window holds {moment}")  # tiling makes this unreachable
 
 
+def _time_of_day(moment):
+    """Seconds of the day for a query moment — a departure/arrival
+    ``datetime`` or timestamp string — so a time-sliced layer's window
+    can be selected. Fractional seconds and any UTC offset are ignored;
+    ``None`` passes through, since a static Exposure needs no moment."""
+    if moment is None:
+        return None
+    import re
+
+    found = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", str(moment))
+    if found is None:
+        raise ValueError(f"cannot read a clock time from {moment!r}")
+    hours, minutes, seconds = found.group(1), found.group(2), found.group(3)
+    return int(hours) * 3600 + int(minutes) * 60 + int(seconds or 0)
+
+
 def _sliced_only(exposure):
     """Refuse reporting on a live Exposure with time-sliced layers: only a
     snapshot bound to the query's moment knows which slice to read."""

@@ -2318,12 +2318,13 @@ def test_time_sliced_layers_report_the_moments_window():
         )
 
 
-def test_time_sliced_layers_refuse_the_live_transit_path(street_network):
+@pytest.fixture(scope="module")
+def sliced_exposure(street_network):
+    """A day/night sliced layer covering the whole extent, on a name no
+    neighbour uses. A sliced layer writes no columns onto the network,
+    so no teardown is needed."""
     geopandas = pytest.importorskip("geopandas")
     pytest.importorskip("rasterio")
-    from shapely.geometry import Point
-
-    from cafein import DetailedItineraries
 
     west, south, east, north = _extent(street_network)
     everywhere = box(west - 0.01, south - 0.01, east + 0.01, north + 0.01)
@@ -2333,26 +2334,107 @@ def test_time_sliced_layers_refuse_the_live_transit_path(street_network):
             {"level": [level]}, geometry=[everywhere], crs="EPSG:4326"
         )
 
-    # A layer name no neighbour uses: the shared network already carries
-    # some layers' columns, and even a slice-only layer's name must be free.
-    sliced = Exposure(
+    return Exposure(
         street_network,
         airslice=({"07:00-19:00": zones(61.0), "19:00-07:00": zones(45.0)}, "level"),
     )
+
+
+def test_time_sliced_layers_report_the_query_window(street_network, sliced_exposure):
+    geopandas = pytest.importorskip("geopandas")
+    from shapely.geometry import Point
+
+    from cafein import DetailedItineraries
+
     origins = geopandas.GeoDataFrame(
         {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
     )
     destinations = geopandas.GeoDataFrame(
         {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
     )
-    with pytest.raises(ValueError, match="query's moment"):
-        DetailedItineraries(
+    # The morning departure picks the 07:00-19:00 window on the transit
+    # door-to-door path; its walk legs read that window's 61.0.
+    frame = DetailedItineraries(
+        street_network,
+        origins,
+        destinations,
+        departure="2022-02-22 08:30",
+        exposure=sliced_exposure,
+    )
+    assert (frame["airslice_slice"] == "07:00-19:00").all()
+    moving = frame[frame["leg_type"].isin(["walk", "access", "egress", "transfer"])]
+    assert len(moving) > 0
+    assert moving["airslice_mean"].values == pytest.approx(61.0)
+    totals = frame.exposure_totals()
+    assert (totals["airslice_slice"] == "07:00-19:00").all()
+
+
+def test_time_sliced_street_itinerary_reads_the_moments_window(helsinki_streets):
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+
+    from cafein import DetailedItineraries
+
+    edges = helsinki_streets.streets_gdf
+    west, south, east, north = edges.total_bounds
+    everywhere = box(west - 0.01, south - 0.01, east + 0.01, north + 0.01)
+
+    def zones(level):
+        return geopandas.GeoDataFrame(
+            {"level": [level]}, geometry=[everywhere], crs="EPSG:4326"
+        )
+
+    sliced = Exposure(
+        helsinki_streets,
+        airslice=({"07:00-19:00": zones(61.0), "19:00-07:00": zones(45.0)}, "level"),
+    )
+    origins, destinations = _street_points()
+    # An evening departure selects the second window: the moment is
+    # threaded through the street branch, not defaulted to the first slice.
+    frame = DetailedItineraries(
+        helsinki_streets,
+        origins,
+        destinations,
+        transport_mode="bicycle",
+        departure="2022-02-22 20:00",
+        exposure=sliced,
+    )
+    leg = frame.iloc[0]
+    assert leg["airslice_slice"] == "19:00-07:00"
+    assert leg["airslice_mean"] == pytest.approx(45.0)
+    assert frame.exposure_totals()["airslice_slice"].iloc[0] == "19:00-07:00"
+
+
+def test_time_sliced_exposure_refused_on_matrices(street_network, sliced_exposure):
+    geopandas = pytest.importorskip("geopandas")
+    from shapely.geometry import Point
+
+    from cafein import TravelCostMatrix, travel_cost_table
+
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
+    )
+    for build in (
+        lambda: TravelCostMatrix(
             street_network,
             origins,
             destinations,
-            departure="2022-02-22 08:30",
-            exposure=sliced,
-        )
+            "2022-02-22 08:30",
+            exposure=sliced_exposure,
+        ),
+        lambda: travel_cost_table(
+            street_network,
+            origins,
+            destinations,
+            "2022-02-22 08:30",
+            exposure=sliced_exposure,
+        ),
+    ):
+        with pytest.raises(ValueError, match="reports on DetailedItineraries"):
+            build()
 
 
 def test_objective_refusals(helsinki_streets, street_exposure, street_network):
