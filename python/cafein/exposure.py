@@ -4,9 +4,11 @@
 value columns, cafein assigns no meaning to the names — to the
 street network's edges: a coverage-adjusted (zero-filled) dose mean,
 a covered maximum, a coverage share, and one at-or-above length
-share per declared threshold, all visible as columns of the
-network's ``streets_gdf`` (a ``TransportNetwork`` or a standalone
-``StreetNetwork`` alike). Ingestion runs once, eagerly, at
+share per declared threshold. A static layer's columns are visible
+on the network's ``streets_gdf`` (a ``TransportNetwork`` or a
+standalone ``StreetNetwork`` alike); a time-sliced layer keeps its
+windows' products inside the ``Exposure``, read through a snapshot
+bound to the query's moment. Ingestion runs once, eagerly, at
 construction; routing never touches geometry or GDAL again.
 
 Raster and line ingestion are sampling estimates: values are read at
@@ -314,7 +316,16 @@ class Exposure:
         ``name=(source, value)`` — `source` is a raster path or an
         opened rioxarray object (`value` names the band), or a
         GeoDataFrame of polygons or lines (`value` names the numeric
-        column). Names inside the ``cost`` or ``travel_time`` column
+        column). A time-sliced layer gives a mapping of clock windows
+        to sources instead of one source, ``noise=({"07:00-19:00":
+        day, "19:00-07:00": night}, "level")``: each window ingests its
+        own source with the same value name; the windows are half-open
+        ``HH:MM-HH:MM`` intervals (``24:00`` may end one, a window may
+        wrap past midnight) that must tile the day; a computation reads
+        the window holding its moment — its departure, or the arrival
+        deadline of an arrive-by query — and reports it in a
+        ``{layer}_slice`` column. A sliced layer writes no columns onto
+        the street frame. Names inside the ``cost`` or ``travel_time`` column
         families — the bare name, or a ``cost_``/``travel_time_``
         prefix — are refused: the result frames classify those
         families by prefix. More-is-better data enters as its deficit
@@ -387,39 +398,77 @@ class Exposure:
         # later layer leaves streets_gdf exactly as it was.
         staged = {}
         specs = {}
+        staged_slices = {}
         import geopandas
 
-        for name, (source, value) in validated.items():
+        def frozen_source(name, source, value):
             if not isinstance(source, geopandas.GeoDataFrame):
                 # Materialize the band once; the walking-graph and stop
                 # passes below read this snapshot instead of reopening
                 # (and re-reading) the source.
-                source = _FrozenBand(*_open_band(name, source, value))
-            else:
-                # One frozen snapshot serves every pass (union edges,
-                # walking edges, stops) — a caller mutating their frame
-                # mid-construction cannot desynchronize them.
-                source = source.copy()
-            specs[name] = (source, value)
-            layer_thresholds = self._thresholds.get(name, ())
+                return _FrozenBand(*_open_band(name, source, value))
+            # One frozen snapshot serves every pass (union edges,
+            # walking edges, stops) — a caller mutating their frame
+            # mid-construction cannot desynchronize them.
+            return source.copy()
+
+        def ingested(name, source, value, geometry, sample_points, what, guard=True):
             products = _ingest(
                 name,
                 source,
                 value,
-                projected,
+                geometry,
                 metric_crs,
-                samples,
-                layer_thresholds,
+                sample_points,
+                self._thresholds.get(name, ()),
                 rasterize,
                 strip=strip,
             )
-            if not (np.asarray(products["coverage"]) > 0).any():
+            # The union pass proves the layer reaches the network; the
+            # walking-aligned pass reuses that verdict (its own coverage
+            # may legitimately differ from the union graph's).
+            if guard and not (np.asarray(products["coverage"]) > 0).any():
                 raise ValueError(
-                    f"layer {name!r} covers no street edge — wrong region " "or CRS?"
+                    f"{what} covers no street edge — wrong region " "or CRS?"
                 )
             _validate_products(name, products)
-            staged[name] = products
+            return products
+
+        for name, (source, value) in validated.items():
+            if isinstance(source, dict):
+                # A time-sliced layer: one ingestion per window; the
+                # windows' arrays live in this Exposure only, never on
+                # the street frame.
+                frozen = {
+                    label: frozen_source(name, window_source, value)
+                    for label, window_source in source.items()
+                }
+                specs[name] = (frozen, value)
+                staged_slices[name] = [
+                    (
+                        label,
+                        start,
+                        end,
+                        ingested(
+                            name,
+                            frozen[label],
+                            value,
+                            projected,
+                            samples,
+                            f"layer {name!r} window {label!r}",
+                        ),
+                    )
+                    for label, start, end in _windows(name, source)
+                ]
+                staged[name] = None
+                continue
+            source = frozen_source(name, source, value)
+            specs[name] = (source, value)
+            staged[name] = ingested(
+                name, source, value, projected, samples, f"layer {name!r}"
+            )
         self._layers = staged
+        self._sliced = set(staged_slices)
 
         # Reporting alignment: walk searches (and the street_edges leg
         # provenance) speak the WALKING graph's edge indices, which on
@@ -430,7 +479,6 @@ class Exposure:
         # graphs coincide and the arrays are shared.
         if getattr(network, "has_multimodal_streets", False):
             rows = network._core._walking_edge_layer()
-            import geopandas
             from shapely.geometry import LineString
 
             walking = geopandas.GeoSeries(
@@ -446,25 +494,46 @@ class Exposure:
                 return walk_cache["points"]
 
             self._report = {}
+            self._slices = {}
             for name, (source, value) in specs.items():
-                products = _ingest(
+                if isinstance(source, dict):
+                    self._slices[name] = [
+                        (
+                            label,
+                            start,
+                            end,
+                            ingested(
+                                name,
+                                source[label],
+                                value,
+                                walking_projected,
+                                walk_samples,
+                                f"layer {name!r} window {label!r}",
+                                guard=False,
+                            ),
+                        )
+                        for label, start, end, _ in staged_slices[name]
+                    ]
+                    continue
+                self._report[name] = ingested(
                     name,
                     source,
                     value,
                     walking_projected,
-                    metric_crs,
                     walk_samples,
-                    self._thresholds.get(name, ()),
-                    rasterize,
-                    strip=strip,
+                    f"layer {name!r}",
+                    guard=False,
                 )
-                _validate_products(name, products)
-                self._report[name] = products
             self._report_lengths = np.asarray(
                 [meters for _, _, meters, _, _ in rows], dtype=float
             )
         else:
-            self._report = staged
+            self._report = {
+                name: products
+                for name, products in staged.items()
+                if products is not None
+            }
+            self._slices = staged_slices
             # An owned copy — a view of the public column would let a
             # later streets_gdf edit silently change leg weights.
             self._report_lengths = np.array(edges["length_m"], dtype=float, copy=True)
@@ -479,6 +548,7 @@ class Exposure:
             if lat is not None and lon is not None
         ]
         self._stop_values = {}
+        self._slice_stop_values = {}
         if stop_points:
             import geopandas
             from shapely.geometry import Point
@@ -487,11 +557,19 @@ class Exposure:
                 [Point(lon, lat) for _, lat, lon in stop_points], crs="EPSG:4326"
             ).to_crs(metric_crs)
             for name, (source, value) in specs.items():
-                values = _stop_values(name, source, value, points, metric_crs)
-                self._stop_values[name] = {
-                    stop: float(sample)
-                    for (stop, _, _), sample in zip(stop_points, values)
-                }
+                windows = source if isinstance(source, dict) else {None: source}
+                for label, window_source in windows.items():
+                    values = _stop_values(
+                        name, window_source, value, points, metric_crs
+                    )
+                    sampled = {
+                        stop: float(sample)
+                        for (stop, _, _), sample in zip(stop_points, values)
+                    }
+                    if label is None:
+                        self._stop_values[name] = sampled
+                    else:
+                        self._slice_stop_values.setdefault(name, {})[label] = sampled
 
         # All products exist; only now does the frame gain its columns,
         # so any failure above leaves streets_gdf exactly as it was.
@@ -499,12 +577,18 @@ class Exposure:
         # the street graph was replaced under them.
         self._check_network(network)
         for name, products in staged.items():
+            if products is None:
+                continue
             edges[name] = products["mean"]
             edges[f"{name}_coverage"] = products["coverage"]
             edges[f"{name}_max"] = products["max"]
             for threshold, share in products["shares"].items():
                 suffix = _threshold_suffix(threshold)
                 edges[f"{name}_share_above_{suffix}"] = share
+        # The whole-layer digest, cached once the build is final so a
+        # snapshot reads one consistent state (arrays and digest from the
+        # same finished construction).
+        self._digest = self._fingerprint()
 
     def _check_network(self, network):
         """Refuse reporting against a network this Exposure was not
@@ -553,32 +637,49 @@ class Exposure:
             digest.update(array.tobytes())
 
         frame("lengths", self._report_lengths)
-        for name in self._layers:
-            digest.update(f"layer|{name}|".encode())
-            digest.update(repr(tuple(self._thresholds.get(name, ()))).encode())
-            products = self._report[name]
+
+        def products_and_stops(products, stops):
             frame("mean", products["mean"])
             frame("coverage", products["coverage"])
             frame("max", products["max"])
             for threshold in sorted(products["shares"]):
                 frame(f"share|{threshold!r}", products["shares"][threshold])
-            for stop, value in sorted(self._stop_values.get(name, {}).items()):
+            for stop, value in sorted(stops.items()):
                 # Length-framed: a stop id may legally contain the
                 # delimiter, and two snapshots must never collide.
                 token = stop.encode()
                 digest.update(f"stop|{len(token)}|".encode())
                 digest.update(token)
                 digest.update(f"|{value!r}|".encode())
+
+        slices = getattr(self, "_slices", {})
+        for name in self._layers:
+            digest.update(f"layer|{name}|".encode())
+            digest.update(repr(tuple(self._thresholds.get(name, ()))).encode())
+            if name in slices:
+                # Every window's arrays and its boundaries: moving a
+                # boundary changes which slice a moment reads.
+                for label, start, end, products in slices[name]:
+                    token = label.encode()
+                    digest.update(f"window|{len(token)}|".encode())
+                    digest.update(token)
+                    digest.update(f"|{start}|{end}|".encode())
+                    products_and_stops(
+                        products, self._slice_stop_values.get(name, {}).get(label, {})
+                    )
+                continue
+            products_and_stops(self._report[name], self._stop_values.get(name, {}))
         return digest.hexdigest()
 
-    def _reporting_snapshot(self):
+    def _reporting_snapshot(self, moment=None):
         """An immutable copy of the reporting surface — the arrays, the
         layer order, and the thresholds — so a long computation (a
         streamed matrix and its manifest fingerprint especially) reads
         one frozen state whatever happens to this Exposure meanwhile.
         The same frozen-input pattern the fare and policy computers
-        follow."""
-        return _ReportingSnapshot(self)
+        follow. ``moment``, seconds of the day, selects each time-sliced
+        layer's window; it is required as soon as a layer is sliced."""
+        return _ReportingSnapshot(self, moment)
 
     def _objective_multipliers(self, optimize):
         """The combined per-edge cost multiplier ``1 + Σ λ·value`` for
@@ -587,6 +688,7 @@ class Exposure:
         non-negative, and every weighted layer's edge values
         non-negative — so the multiplier is provably at least 1 and the
         search's non-negative-cost invariant holds."""
+        _sliced_only(self)
         if not optimize:
             return None
         if not isinstance(optimize, dict):
@@ -648,14 +750,17 @@ class Exposure:
 
     def column_names(self):
         """The reporting columns, in emission order: per layer the
-        length-weighted ``{layer}_mean``, maximum, coverage, and one
-        ``minutes_above`` per declared threshold."""
+        length-weighted ``{layer}_mean``, maximum, coverage, one
+        ``minutes_above`` per declared threshold, and for a time-sliced
+        layer ``{layer}_slice``, the window the query's moment selected."""
         names = []
         for name in self._layers:
             names.extend([f"{name}_mean", f"{name}_max", f"{name}_coverage"])
             for threshold in self._thresholds.get(name, ()):
                 suffix = _threshold_suffix(threshold)
                 names.append(f"{name}_minutes_above_{suffix}")
+            if name in self._sliced:
+                names.append(f"{name}_slice")
         return names
 
     def leg_columns(self, street_edges, travel_seconds, walk_meters=None):
@@ -668,11 +773,12 @@ class Exposure:
         on-street share of ``travel_seconds`` (traversed street length
         over ``walk_meters``, the SAME reconstruction's total walked
         meters) enters the threshold minutes."""
+        _sliced_only(self)
         columns = {}
         if not street_edges:
             for name in self.column_names():
                 columns[name] = np.nan
-            return columns
+            return self._labelled(columns)
         indices = np.asarray([edge for edge, _ in street_edges], dtype=int)
         weights = (
             np.asarray([fraction for _, fraction in street_edges], dtype=float)
@@ -714,7 +820,14 @@ class Exposure:
                 for threshold in self._thresholds.get(name, ()):
                     suffix = _threshold_suffix(threshold)
                     columns[f"{name}_minutes_above_{suffix}"] = np.nan
-        return columns
+        return self._labelled(columns)
+
+    def _labelled(self, columns):
+        """The columns with each time-sliced layer's window label."""
+        for name in self._layers:
+            if name in self._sliced:
+                columns[f"{name}_slice"] = self._slice_labels[name]
+        return {key: columns[key] for key in self.column_names() if key in columns}
 
     def street_leg_columns(self, street_edges):
         """Reporting columns for one street-mode leg from its traversed
@@ -724,11 +837,12 @@ class Exposure:
         ride different speeds per edge, so length shares are not time
         shares there. Connector time never appears: connectors are not
         edges and carry no entry."""
+        _sliced_only(self)
         columns = {}
         if not street_edges:
             for name in self.column_names():
                 columns[name] = np.nan
-            return columns
+            return self._labelled(columns)
         indices = np.asarray([edge for edge, _, _ in street_edges], dtype=int)
         fractions = np.asarray(
             [fraction for _, fraction, _ in street_edges], dtype=float
@@ -766,13 +880,14 @@ class Exposure:
                 for threshold in self._thresholds.get(name, ()):
                     suffix = _threshold_suffix(threshold)
                     columns[f"{name}_minutes_above_{suffix}"] = np.nan
-        return columns
+        return self._labelled(columns)
 
     def wait_columns(self, stop_id, wait_seconds):
         """Reporting columns for a stationary wait at a stop: the
         layer's sampled value with coverage 1, or coverage 0 when the
         stop is unsampleable; ``minutes_above`` counts the full wait
         when the sampled value meets the bar."""
+        _sliced_only(self)
         columns = {}
         minutes = wait_seconds / 60.0
         for name in self._layers:
@@ -785,7 +900,7 @@ class Exposure:
                 suffix = _threshold_suffix(threshold)
                 above = covered and value >= threshold
                 columns[f"{name}_minutes_above_{suffix}"] = minutes if above else 0.0
-        return columns
+        return self._labelled(columns)
 
 
 class _ReportingSnapshot:
@@ -793,13 +908,20 @@ class _ReportingSnapshot:
     reporting methods with ``Exposure`` — they read only the attributes
     copied here."""
 
-    def __init__(self, exposure):
+    def __init__(self, exposure, moment=None):
+        slices = exposure._slices
+        if slices and moment is None:
+            raise ValueError(
+                "this Exposure has time-sliced layers; a snapshot needs the "
+                "query's moment (its departure, or the arrival deadline)"
+            )
         self._layers = {name: None for name in exposure._layers}
         self._thresholds = {
             name: tuple(levels) for name, levels in exposure._thresholds.items()
         }
-        self._report = {
-            name: {
+
+        def copied(products):
+            return {
                 "mean": products["mean"].copy(),
                 "coverage": products["coverage"].copy(),
                 "max": products["max"].copy(),
@@ -808,12 +930,29 @@ class _ReportingSnapshot:
                     for threshold, share in products["shares"].items()
                 },
             }
-            for name, products in exposure._report.items()
+
+        self._report = {
+            name: copied(products) for name, products in exposure._report.items()
         }
         self._report_lengths = exposure._report_lengths.copy()
         self._stop_values = {
             name: dict(values) for name, values in exposure._stop_values.items()
         }
+        # Each sliced layer reads the window holding the moment.
+        self._slice_labels = {}
+        for name, windows in slices.items():
+            label = _window_at(windows, moment)
+            products = next(p for found, _, _, p in windows if found == label)
+            self._report[name] = copied(products)
+            self._stop_values[name] = dict(
+                exposure._slice_stop_values.get(name, {}).get(label, {})
+            )
+            self._slice_labels[name] = label
+        self._sliced = set(slices)
+        # The whole-layer digest of the exposure this snapshot came from:
+        # every window's data, boundaries, and order, not just the
+        # selected slice, so a manifest identifies the full sliced layer.
+        self._digest = exposure._digest
 
     layers = Exposure.layers
     thresholds = Exposure.thresholds
@@ -821,7 +960,11 @@ class _ReportingSnapshot:
     leg_columns = Exposure.leg_columns
     street_leg_columns = Exposure.street_leg_columns
     wait_columns = Exposure.wait_columns
-    _fingerprint = Exposure._fingerprint
+    _labelled = Exposure._labelled
+
+    def _fingerprint(self):
+        return self._digest
+
     _objective_multipliers = Exposure._objective_multipliers
 
 
@@ -966,7 +1109,111 @@ def _validated_spec(name, spec):
             f"layer {name!r}: the value selector must be a "
             "band or column name string"
         )
+    from collections.abc import Mapping
+
+    if isinstance(source, Mapping):
+        # A time-sliced layer: clock windows to sources, tiling the day.
+        # Copy the caller's mapping first, so validation and the (long)
+        # build read one stable set of labels, order, and sources — a
+        # concurrent mutation cannot desync them or reclassify the layer.
+        source = dict(source)
+        windows = _windows(name, source)
+        if len(windows) == 1 and windows[0][1] == 0 and windows[0][2] == _DAY:
+            # A single 00:00-24:00 window is a static layer written the
+            # long way: unwrap it so it ingests and reports statically.
+            source = next(iter(source.values()))
     return source, value
+
+
+#: Seconds in a day: the clock windows of a time-sliced layer live here.
+_DAY = 86400
+
+
+def _clock_seconds(name, text, end=False):
+    """``HH:MM`` or ``HH:MM:SS`` as seconds of the day; ``24:00`` only as
+    a window's end, meaning midnight."""
+    if end and re.fullmatch(r"24:00(:00)?", text):
+        return _DAY
+    if not re.fullmatch(r"([01][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?", text):
+        raise ValueError(
+            f"layer {name!r}: window time {text!r} is not HH:MM or HH:MM:SS"
+        )
+    hours, minutes, *rest = text.split(":")
+    seconds = int(rest[0]) if rest else 0
+    return int(hours) * 3600 + int(minutes) * 60 + seconds
+
+
+def _windows(name, mapping):
+    """A time-sliced layer's windows as ``(label, start, end)`` in
+    seconds of the day, in the mapping's order. A window is the
+    half-open ``[start, end)``; ``24:00`` may end one; a window whose end
+    precedes its start wraps past midnight. The windows must tile the
+    day: a gap or an overlap is refused by name."""
+    if not mapping:
+        raise ValueError(f"layer {name!r}: the window mapping is empty")
+    windows = []
+    for label in mapping:
+        if not isinstance(label, str) or label.count("-") != 1:
+            raise ValueError(f"layer {name!r}: window {label!r} must be 'HH:MM-HH:MM'")
+        first, second = label.split("-")
+        start = _clock_seconds(name, first)
+        end = _clock_seconds(name, second, end=True)
+        if start == end:
+            raise ValueError(f"layer {name!r}: window {label!r} is empty")
+        windows.append((label, start, end))
+    # Wrap-around windows split at midnight; the pieces must then chain
+    # from 00:00 to 24:00 without a gap or an overlap.
+    pieces = []
+    for label, start, end in windows:
+        if start < end:
+            pieces.append((start, end, label))
+        else:
+            pieces.append((start, _DAY, label))
+            pieces.append((0, end, label))
+    pieces.sort()
+    if pieces[0][0] != 0:
+        raise ValueError(
+            f"layer {name!r}: the windows leave a gap from 00:00 to "
+            f"{pieces[0][2]!r}"
+        )
+    for (_, earlier_end, earlier), (later_start, _, later) in zip(pieces, pieces[1:]):
+        if later_start < earlier_end:
+            raise ValueError(
+                f"layer {name!r}: windows {earlier!r} and {later!r} overlap"
+            )
+        if later_start > earlier_end:
+            raise ValueError(
+                f"layer {name!r}: the windows leave a gap between {earlier!r} "
+                f"and {later!r}"
+            )
+    if pieces[-1][1] != _DAY:
+        raise ValueError(
+            f"layer {name!r}: the windows leave a gap from {pieces[-1][2]!r} "
+            "to 24:00"
+        )
+    return windows
+
+
+def _window_at(windows, moment):
+    """The label of the window holding ``moment`` (seconds of the day)."""
+    moment = float(moment) % _DAY
+    for label, start, end, *_ in windows:
+        if start < end:
+            if start <= moment < end:
+                return label
+        elif moment >= start or moment < end:
+            return label
+    raise ValueError(f"no window holds {moment}")  # tiling makes this unreachable
+
+
+def _sliced_only(exposure):
+    """Refuse reporting on a live Exposure with time-sliced layers: only a
+    snapshot bound to the query's moment knows which slice to read."""
+    if getattr(exposure, "_slices", None) and not hasattr(exposure, "_slice_labels"):
+        raise ValueError(
+            "this Exposure has time-sliced layers; reporting reads the "
+            "snapshot bound to the query's moment"
+        )
 
 
 def _edge_samples(projected):

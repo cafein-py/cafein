@@ -2160,6 +2160,201 @@ def test_sweep_refusals(helsinki_streets, street_exposure, street_network):
         )
 
 
+def test_time_windows_tile_the_day():
+    from cafein.exposure import _window_at, _windows
+
+    day = _windows("noise", {"07:00-19:00": 1, "19:00-23:00": 2, "23:00-07:00": 3})
+    assert [label for label, _, _ in day] == [
+        "07:00-19:00",
+        "19:00-23:00",
+        "23:00-07:00",
+    ]
+    # half-open: a boundary belongs to the window starting there; midnight
+    # to the wrap-around window; seconds and 24:00 parse
+    assert _window_at(day, 7 * 3600) == "07:00-19:00"
+    assert _window_at(day, 19 * 3600 - 1) == "07:00-19:00"
+    assert _window_at(day, 19 * 3600) == "19:00-23:00"
+    assert _window_at(day, 0) == "23:00-07:00"
+    assert _window_at(day, 86399) == "23:00-07:00"
+    whole = _windows("noise", {"00:00-24:00": 1})
+    assert _window_at(whole, 12 * 3600) == "00:00-24:00"
+    assert (
+        _windows(
+            "noise",
+            {"06:30:15-06:30:15".replace("15-06", "15-18"): 1, "18:30:15-06:30:15": 2},
+        )[0][1]
+        == 6 * 3600 + 30 * 60 + 15
+    )
+    for mapping, message in (
+        ({"07:00-19:00": 1, "20:00-07:00": 2}, "gap between"),
+        ({"07:00-20:00": 1, "19:00-07:00": 2}, "overlap"),
+        ({"01:00-24:00": 1}, "gap from 00:00"),
+        ({"00:00-23:00": 1}, "gap from '00:00-23:00' to 24:00"),
+        ({"7am-19:00": 1}, "not HH:MM"),
+        ({"7:00-19:00": 1}, "not HH:MM"),
+        ({"+7:00-19:00": 1}, "not HH:MM"),
+        ({"07 :00-19:00": 1}, "not HH:MM"),
+        ({"07:00": 1}, "must be 'HH:MM-HH:MM'"),
+        ({"12:00-12:00": 1}, "is empty"),
+        ({"24:00-06:00": 1, "06:00-24:00": 2}, "not HH:MM"),
+        ({}, "mapping is empty"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            _windows("noise", mapping)
+
+
+def test_time_sliced_layers_report_the_moments_window():
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+
+    streets = _two_route_network()
+    corridor = box(24.9290, 60.1690, 24.9364, 60.17005)
+
+    def zones(level):
+        return geopandas.GeoDataFrame(
+            {"level": [level]}, geometry=[corridor], crs="EPSG:4326"
+        )
+
+    sliced = Exposure(
+        streets,
+        noise=({"07:00-19:00": zones(1.0), "19:00-07:00": zones(0.25)}, "level"),
+        calm=(zones(0.5), "level"),
+        thresholds={"noise": (0.5,)},
+    )
+    # the schema names the slice column after the sliced layer only, and
+    # no window's arrays land on the street frame
+    assert sliced.column_names() == [
+        "noise_mean",
+        "noise_max",
+        "noise_coverage",
+        "noise_minutes_above_0_5",
+        "noise_slice",
+        "calm_mean",
+        "calm_max",
+        "calm_coverage",
+    ]
+    assert "noise" not in streets.streets_gdf.columns
+    assert "calm" in streets.streets_gdf.columns
+    # the live object reports nothing: only a moment-bound snapshot does
+    edges = [(0, 1.0, 60.0)]
+    with pytest.raises(ValueError, match="query's moment"):
+        sliced.street_leg_columns(edges)
+    with pytest.raises(ValueError, match="query's moment"):
+        sliced._objective_multipliers({"noise": 1.0})
+    with pytest.raises(ValueError, match="needs the query's moment"):
+        sliced._reporting_snapshot()
+    morning = sliced._reporting_snapshot(8 * 3600)
+    evening = sliced._reporting_snapshot(20 * 3600)
+    assert morning.street_leg_columns(edges)["noise_mean"] == pytest.approx(1.0)
+    assert evening.street_leg_columns(edges)["noise_mean"] == pytest.approx(0.25)
+    assert morning.street_leg_columns(edges)["noise_slice"] == "07:00-19:00"
+    assert evening.street_leg_columns(edges)["noise_slice"] == "19:00-07:00"
+    assert evening.street_leg_columns([])["noise_slice"] == "19:00-07:00"
+    assert morning.wait_columns("nowhere", 60.0)["noise_slice"] == "07:00-19:00"
+    assert "calm_slice" not in morning.street_leg_columns(edges)
+    # the search's multipliers follow the window too
+    assert morning._objective_multipliers({"noise": 1.0})[0] == pytest.approx(2.0)
+    assert evening._objective_multipliers({"noise": 1.0})[0] == pytest.approx(1.25)
+
+    # the fingerprint covers every window: its data and its boundaries
+    # (each comparison on a fresh, identical network)
+    def build(windows):
+        return Exposure(
+            _two_route_network(),
+            noise=(windows, "level"),
+            calm=(zones(0.5), "level"),
+            thresholds={"noise": (0.5,)},
+        )
+
+    same = build({"07:00-19:00": zones(1.0), "19:00-07:00": zones(0.25)})
+    assert same._fingerprint() == sliced._fingerprint()
+    for windows in (
+        {"07:00-19:00": zones(1.0), "19:00-07:00": zones(0.5)},
+        {"07:00-20:00": zones(1.0), "20:00-07:00": zones(0.25)},
+        {"19:00-07:00": zones(0.25), "07:00-19:00": zones(1.0)},
+    ):
+        assert build(windows)._fingerprint() != sliced._fingerprint()
+    # a non-dict Mapping is accepted as a sliced layer
+    from types import MappingProxyType
+
+    proxied = Exposure(
+        _two_route_network(),
+        noise=(
+            MappingProxyType({"07:00-19:00": zones(1.0), "19:00-07:00": zones(0.25)}),
+            "level",
+        ),
+    )
+    assert "noise_slice" in proxied.column_names()
+    assert (
+        proxied._reporting_snapshot(8 * 3600).street_leg_columns([(0, 1.0, 60.0)])[
+            "noise_slice"
+        ]
+        == "07:00-19:00"
+    )
+    # a single 00:00-24:00 window is a static layer: a frame column, no
+    # slice column, and no moment needed
+    whole_day = Exposure(
+        _two_route_network(),
+        calm=({"00:00-24:00": zones(0.5)}, "level"),
+    )
+    assert whole_day.column_names() == ["calm_mean", "calm_max", "calm_coverage"]
+    assert "calm" in whole_day._network.streets_gdf.columns
+    whole_day._reporting_snapshot()  # no moment required
+    # a window covering no edge is refused by its name
+    with pytest.raises(ValueError, match="window '19:00-07:00' covers no street"):
+        Exposure(
+            streets,
+            noise=(
+                {
+                    "07:00-19:00": zones(1.0),
+                    "19:00-07:00": geopandas.GeoDataFrame(
+                        {"level": [1.0]},
+                        geometry=[box(0.0, 0.0, 0.1, 0.1)],
+                        crs="EPSG:4326",
+                    ),
+                },
+                "level",
+            ),
+        )
+
+
+def test_time_sliced_layers_refuse_the_live_transit_path(street_network):
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("rasterio")
+    from shapely.geometry import Point
+
+    from cafein import DetailedItineraries
+
+    west, south, east, north = _extent(street_network)
+    everywhere = box(west - 0.01, south - 0.01, east + 0.01, north + 0.01)
+
+    def zones(level):
+        return geopandas.GeoDataFrame(
+            {"level": [level]}, geometry=[everywhere], crs="EPSG:4326"
+        )
+
+    # A layer name no neighbour uses: the shared network already carries
+    # some layers' columns, and even a slice-only layer's name must be free.
+    sliced = Exposure(
+        street_network,
+        airslice=({"07:00-19:00": zones(61.0), "19:00-07:00": zones(45.0)}, "level"),
+    )
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
+    )
+    with pytest.raises(ValueError, match="query's moment"):
+        DetailedItineraries(
+            street_network,
+            origins,
+            destinations,
+            departure="2022-02-22 08:30",
+            exposure=sliced,
+        )
+
+
 def test_objective_refusals(helsinki_streets, street_exposure, street_network):
     from cafein import DetailedItineraries
 

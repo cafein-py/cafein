@@ -435,6 +435,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
 
                     column = f"{name}_minutes_above_{_threshold_suffix(threshold)}"
                     record[column] = float(journey[column].fillna(0).sum())
+                if f"{name}_slice" in journey.columns:
+                    labels = journey[f"{name}_slice"].dropna().unique()
+                    record[f"{name}_slice"] = labels[0] if len(labels) else None
             records.append(record)
         import pandas as pd
 
@@ -1356,7 +1359,20 @@ def _exposed_frame(frame, exposure):
     import numpy as np
     import pandas as pd
 
+    from cafein.exposure import _sliced_only
+
+    # A live time-sliced Exposure cannot report here: only a snapshot
+    # bound to the query's moment knows the window. Refuse once, before
+    # the empty-frame return or any per-row branch, so the refusal never
+    # depends on the journey's reachability or shape.
+    _sliced_only(exposure)
     columns = exposure.column_names()
+    # The slice labels are computation-wide: every row carries them,
+    # transit and wait rows included, so a journey never loses its window.
+    slice_labels = {
+        f"{name}_slice": label
+        for name, label in getattr(exposure, "_slice_labels", {}).items()
+    }
     if frame.empty:
         exposed = frame.copy()
         for column in columns:
@@ -1406,7 +1422,7 @@ def _exposed_frame(frame, exposure):
             edges = record.get("street_edges")
             if record["leg_type"] in ("transit", "park") or edges is None:
                 for column in columns:
-                    record[column] = np.nan
+                    record[column] = slice_labels.get(column, np.nan)
             else:
                 record.update(
                     exposure.leg_columns(
