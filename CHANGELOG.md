@@ -2,11 +2,15 @@
 
 ## Unreleased
 
+- A `to_parquet` stream (and `travel_cost_table` with an output) of several
+  departures with a time-sliced `exposure=` binds each departure slot to its
+  own window, so each slot's shards report their own `<layer>_slice`. Per-slot
+  snapshots are built once and shared across batches.
+
 - An eager multi-departure transit cost matrix (`TravelCostMatrix` and
   `travel_cost_table` without an output) with a time-sliced `exposure=`
   binds each departure slot to the window holding it, so each slot reports
-  its own `<layer>_slice`. A `to_parquet` stream of several departures
-  still takes a static `Exposure`.
+  its own `<layer>_slice`.
 
 - A single-departure transit cost matrix (`TravelCostMatrix`, its
   `to_parquet` stream, and `travel_cost_table`) with a time-sliced
