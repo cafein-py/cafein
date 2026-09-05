@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `cafein.recipes.validate(path)` reads a declarative YAML analysis recipe
+  (typed by its `recipe:` field), resolves its `kind:`-tagged file inputs, and
+  validates the schema, parameters, and outputs by name — the foundation for
+  runnable, reproducible recipe files.
+
 ## 0.21.0 — 2026-09-05
 
 - A `to_parquet` stream (and `travel_cost_table` with an output) of several
