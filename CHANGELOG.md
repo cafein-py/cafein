@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `DetailedItineraries` with a time-sliced `exposure=` reports each
+  journey against the window holding the query's departure, filling the
+  `<layer>_slice` column; a cost matrix or `travel_cost_table` takes a
+  static `Exposure`, pointing a sliced one at `DetailedItineraries`.
+
 - Time-sliced exposure layers: a layer may give a mapping of clock
   windows to sources, `noise=({"07:00-19:00": day, "19:00-07:00":
   night}, "level")`, each window ingesting its own source; the windows

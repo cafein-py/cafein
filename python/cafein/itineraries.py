@@ -599,9 +599,14 @@ class DetailedItineraries(gpd.GeoDataFrame):
             frozen = None
             if exposure is not None:
                 exposure._check_network(network)
+                from cafein.exposure import _time_of_day
+
                 # One snapshot serves every search: the weights that choose
-                # a route and the columns that report it read the same state.
-                frozen = exposure._reporting_snapshot()
+                # a route and the columns that report it read the same state,
+                # and the query's moment picks each time-sliced window.
+                frozen = exposure._reporting_snapshot(
+                    _time_of_day(arrival if arrive_by else departure)
+                )
 
             def search(weights, keep_edges=False):
                 return _street_itineraries_frame(
@@ -681,7 +686,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
                 geometry="geometry",
                 crs="EPSG:4326",
             )
-            self._exposure = exposure
+            self._exposure = frozen
             return
         if not hasattr(network, "route_between_stops"):
             # pandas/geopandas reconstruct subclasses by passing data in
@@ -776,12 +781,19 @@ class DetailedItineraries(gpd.GeoDataFrame):
             currency=currency,
             cost_components=cost_components,
         )
+        report = None
         if exposure is not None:
             # Re-verify the binding after the (long) routing loop, so a
             # street graph replaced mid-build cannot pair fresh edge
             # indices with the stale cached arrays.
             exposure._check_network(network)
-            frame = _exposed_frame(frame, exposure)
+            from cafein.exposure import _time_of_day
+
+            # The query's moment selects each time-sliced layer's window.
+            report = exposure._reporting_snapshot(
+                _time_of_day(arrival if arrive_by else departure)
+            )
+            frame = _exposed_frame(frame, report)
             if not geometries:
                 frame["geometry"] = None
         dropped = [
@@ -802,7 +814,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         super().__init__(
             restore_id_dtypes(frame, _id_dtypes), geometry="geometry", crs="EPSG:4326"
         )
-        self._exposure = exposure
+        self._exposure = report
 
 
 def _itineraries_frame(
