@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.21.0 — 2026-09-05
 
 - A `to_parquet` stream (and `travel_cost_table` with an output) of several
   departures with a time-sliced `exposure=` binds each departure slot to its
