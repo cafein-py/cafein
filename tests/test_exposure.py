@@ -1590,12 +1590,15 @@ def test_constant_layer_weights_reproduce_the_unweighted_journeys(
         assert weighted.geometry.iloc[0].equals_exact(plain.geometry.iloc[0], 0)
 
 
-def _two_route_network():
+def _two_route_network(permissions=None):
     """Two corridors between the same endpoints: a short straight street
-    inside the zone below, and a 1.5x longer detour outside it."""
+    inside the zone below, and a 1.5x longer detour outside it. ``permissions``
+    is the per-direction mode mask (walking only by default)."""
     from cafein import StreetNetwork
     from cafein._cafein import StreetNetwork as _CoreStreetNetwork
     from cafein._osm import HIGHWAY_CODES, WALK
+
+    permissions = WALK if permissions is None else permissions
 
     lons = [24.9300, 24.9354, 24.9300, 24.9327, 24.9354]
     lats = [60.1700, 60.1700, 60.1700, 60.1740, 60.1700]
@@ -1609,8 +1612,8 @@ def _two_route_network():
         [0, 0],
         [0, 0],
         [0, 0],
-        [WALK, WALK],
-        [WALK, WALK],
+        [permissions, permissions],
+        [permissions, permissions],
         [0, 0],
         [0, 0],
     )
