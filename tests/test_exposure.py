@@ -2494,8 +2494,51 @@ def test_time_of_day_reads_moment_forms():
     assert _time_of_day(None) is None
 
 
+def test_time_sliced_multi_departure_matrix_binds_each_window(
+    street_network, sliced_exposure
+):
+    geopandas = pytest.importorskip("geopandas")
+    pyarrow = pytest.importorskip("pyarrow")
+    from shapely.geometry import Point
+
+    from cafein import TravelCostMatrix, travel_cost_table
+
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
+    )
+    departures = ["2022-02-22 08:30", "2022-02-22 20:00"]
+    # eager DataFrame: each slot reports the window holding its own departure
+    matrix = TravelCostMatrix(
+        street_network, origins, destinations, departures, exposure=sliced_exposure
+    )
+    dep = matrix["departure_time"].astype(str)
+    morning = matrix[dep.str.contains("08:30")]
+    evening = matrix[dep.str.contains("20:00")]
+    assert len(morning) and len(evening)
+    assert set(morning["airslice_slice"]) == {"07:00-19:00"}
+    assert set(evening["airslice_slice"]) == {"19:00-07:00"}
+    assert morning["airslice_mean"].iloc[0] == pytest.approx(61.0)
+    assert evening["airslice_mean"].iloc[0] == pytest.approx(45.0)
+    # the eager Arrow form binds per slot too, the slice a string column
+    table = travel_cost_table(
+        street_network, origins, destinations, departures, exposure=sliced_exposure
+    )
+    assert pyarrow.types.is_string(table.schema.field("airslice_slice").type)
+    tab = table.to_pandas()
+    tdep = tab["departure_time"].astype(str)
+    tmorning = tab[tdep.str.contains("08:30")]
+    tevening = tab[tdep.str.contains("20:00")]
+    assert set(tmorning["airslice_slice"]) == {"07:00-19:00"}
+    assert set(tevening["airslice_slice"]) == {"19:00-07:00"}
+    assert tmorning["airslice_mean"].iloc[0] == pytest.approx(61.0)
+    assert tevening["airslice_mean"].iloc[0] == pytest.approx(45.0)
+
+
 def test_time_sliced_cost_matrix_refusals(
-    helsinki_streets, sliced_street_exposure, street_network, sliced_exposure
+    helsinki_streets, sliced_street_exposure, street_network, sliced_exposure, tmp_path
 ):
     geopandas = pytest.importorskip("geopandas")
     from shapely.geometry import Point
@@ -2518,14 +2561,15 @@ def test_time_sliced_cost_matrix_refusals(
             transport_mode="bicycle",
             exposure=sliced_street_exposure,
         )
-    # several departures would need a window per slot
-    with pytest.raises(ValueError, match="one window per query moment"):
-        TravelCostMatrix(
+    # a multi-departure stream would need a window per slot
+    with pytest.raises(ValueError, match="multi-departure stream"):
+        TravelCostMatrix.to_parquet(
             street_network,
             points,
             dests,
             ["2022-02-22 08:30", "2022-02-22 20:00"],
             exposure=sliced_exposure,
+            output=tmp_path / "refused",
         )
 
 
