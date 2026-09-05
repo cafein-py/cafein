@@ -949,6 +949,11 @@ class _ReportingSnapshot:
             )
             self._slice_labels[name] = label
         self._sliced = set(slices)
+        # The network identity the reporting arrays speak, so a snapshot
+        # can refuse a graph replaced mid-stream, as the live object does.
+        self._network = exposure._network
+        self._streets_frame = exposure._streets_frame
+        self._streets_generation = exposure._streets_generation
         # The whole-layer digest of the exposure this snapshot came from:
         # every window's data, boundaries, and order, not just the
         # selected slice, so a manifest identifies the full sliced layer.
@@ -961,6 +966,7 @@ class _ReportingSnapshot:
     street_leg_columns = Exposure.street_leg_columns
     wait_columns = Exposure.wait_columns
     _labelled = Exposure._labelled
+    _check_network = Exposure._check_network
 
     def _fingerprint(self):
         return self._digest
@@ -1208,13 +1214,19 @@ def _window_at(windows, moment):
 
 def _time_of_day(moment):
     """Seconds of the day for a query moment — a departure/arrival
-    ``datetime`` or timestamp string — so a time-sliced layer's window
-    can be selected. Fractional seconds and any UTC offset are ignored;
-    ``None`` passes through, since a static Exposure needs no moment."""
-    if moment is None:
-        return None
+    ``datetime`` or timestamp string, or the first of a slot list or
+    mapping — so a time-sliced layer's window can be selected. Fractional
+    seconds and any UTC offset are ignored; ``None`` passes through,
+    since a static Exposure needs no moment."""
+    import collections.abc
     import re
 
+    if isinstance(moment, collections.abc.Mapping):
+        moment = next(iter(moment.values()), None)
+    elif isinstance(moment, (list, tuple)):
+        moment = moment[0] if moment else None
+    if moment is None:
+        return None
     found = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", str(moment))
     if found is None:
         raise ValueError(f"cannot read a clock time from {moment!r}")

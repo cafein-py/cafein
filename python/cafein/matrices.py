@@ -120,23 +120,44 @@ def _optional_columns(kwargs, exposure_snapshot):
     return count
 
 
-def _refuse_sliced_matrix(exposure):
-    """A time-sliced Exposure has no single moment on a cost matrix;
-    reporting one belongs to DetailedItineraries, which carries the
-    query's departure. A static Exposure reports on a matrix as before."""
-    if exposure is not None and getattr(exposure, "_slices", None):
+def _matrix_exposure_snapshot(exposure, *, street, moment, multi_slot):
+    """The reporting snapshot a cost matrix reports against. A static
+    Exposure ignores the moment; a time-sliced one selects the window
+    holding the query's single departure. A street cost matrix (no
+    departure) and a multi-departure matrix (a window per slot) are
+    refused for now — route DetailedItineraries or pass a static
+    Exposure. ``moment`` is the raw departure/arrival, parsed only when a
+    sliced layer needs it, so a plain multi-slot query is untouched."""
+    if exposure is None:
+        return None
+    if not getattr(exposure, "_slices", None):
+        return exposure._reporting_snapshot()
+    if street:
         raise ValueError(
-            "a time-sliced Exposure reports on DetailedItineraries, which "
-            "takes the query's departure to pick each window; a cost matrix "
-            "takes a static Exposure"
+            "a time-sliced Exposure needs a departure to pick each window; "
+            "a street cost matrix carries none — route DetailedItineraries, "
+            "or pass a static Exposure"
         )
+    if multi_slot:
+        raise ValueError(
+            "a time-sliced Exposure binds one window per query moment; a "
+            "multi-departure matrix would need one per slot — query one "
+            "departure at a time, or route DetailedItineraries"
+        )
+    from cafein.exposure import _time_of_day
+
+    seconds = _time_of_day(moment)
+    if seconds is None:
+        raise ValueError(
+            "a time-sliced Exposure needs the query's departure to pick its " "window"
+        )
+    return exposure._reporting_snapshot(seconds)
 
 
 def _exposure_snapshot(exposure):
     """The reporting snapshot the enclosing call was planned with, so
     the body reports against the surface the plan sized; a fresh one
     for a call nobody planned."""
-    _refuse_sliced_matrix(exposure)
     active = _memory.active_plan()
     if isinstance(active, _memory.Refusal):
         raise active.error
@@ -251,11 +272,20 @@ def _entry_plan(
     else:
         row_bytes = (_TIME_CELL_BYTES if dense else _TIME_FRAME_CELL_BYTES) * planes
     exposure = kwargs.get("exposure")
-    _refuse_sliced_matrix(exposure)
     # One snapshot per call: the plan sizes its columns and the body
-    # reports against it; the live object still validates the network.
-    snapshot = None if exposure is None else exposure._reporting_snapshot()
+    # reports against it; the live object still validates the network. A
+    # time-sliced Exposure binds the window holding the query's moment.
+    snapshot = _matrix_exposure_snapshot(
+        exposure,
+        street=street,
+        moment=arrival if arrive_by else departure,
+        multi_slot=slots > 1,
+    )
     row_bytes += _OPTIONAL_COLUMN_BYTES * _optional_columns(kwargs, snapshot)
+    if snapshot is not None:
+        # A sliced layer's <layer>_slice column carries a string label,
+        # wider than the float64 an optional column is charged as.
+        row_bytes += _SLOT_LABEL_BYTES * len(getattr(snapshot, "_slice_labels", ()))
     if moment_column:
         row_bytes += _MOMENT_COLUMN_BYTES
     if label_bytes:
@@ -348,6 +378,17 @@ def _frozen_axis(value):
     return list(value)
 
 
+def _frozen_moment(value):
+    """A departure/arrival read once: a list or mapping of moments is
+    copied so the plan's slice selection and the body's slots read the
+    same value; scalars and ``None`` pass through."""
+    if isinstance(value, collections.abc.Mapping):
+        return dict(value)
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return value
+
+
 def _deferred(plan):
     """The plan, or the refusal it raised, deferred to the first dispatch
     so the call's own argument checks refuse first."""
@@ -403,6 +444,9 @@ def _planned_entry(
                 origins, destinations = _frozen_axis(origins), _frozen_axis(
                     destinations
                 )
+                departure = _frozen_moment(departure)
+                if kwargs.get("arrival") is not None:
+                    kwargs["arrival"] = _frozen_moment(kwargs["arrival"])
                 # "auto": streamed exactly when an output is named.
                 streams = (
                     kwargs.get("output") is not None if streamed == "auto" else streamed
@@ -454,6 +498,9 @@ def _planned_entry(
             first, network, origins=None, destinations=None, departure=None, **kwargs
         ):
             origins, destinations = _frozen_axis(origins), _frozen_axis(destinations)
+            departure = _frozen_moment(departure)
+            if kwargs.get("arrival") is not None:
+                kwargs["arrival"] = _frozen_moment(kwargs["arrival"])
             plan = _deferred(
                 lambda: _entry_plan(
                     network,
@@ -4120,6 +4167,11 @@ def _stream_transit_cost(
             workers=workers,
             max_memory=max_memory,
         )
+        if exposure is not None:
+            # Re-verify the binding per batch (the eager precedent): a
+            # street graph replaced mid-stream must not pair fresh edge
+            # indices with the snapshot's stale arrays.
+            exposure._check_network(network)
         return _arrow_table(
             table,
             shared_from,
@@ -4549,6 +4601,8 @@ def _transit_exposure_columns(
             for threshold in thresholds[name]:
                 column = f"{name}_minutes_above_{_threshold_suffix(threshold)}"
                 out[column] = minutes[(name, threshold)]
+    for name, label in getattr(exposure, "_slice_labels", {}).items():
+        out[f"{name}_slice"] = np.full(cells, label)
     return out
 
 
@@ -5242,8 +5296,14 @@ def _arrow_table(
     if fares is not None:
         columns["money"] = pa.array(table["fare"])
     if exposure is not None:
+        slice_columns = {
+            f"{name}_slice" for name in getattr(exposure, "_slice_labels", {})
+        }
         for name in exposure.column_names():
-            columns[name] = pa.array(np.asarray(table[name], dtype=float))
+            if name in slice_columns:
+                columns[name] = pa.array(np.asarray(table[name]), type=pa.string())
+            else:
+                columns[name] = pa.array(np.asarray(table[name], dtype=float))
     if geometries:
         columns["geometry"] = pa.array(list(table["geometry"]), type=pa.binary())
     return pa.table(columns)
