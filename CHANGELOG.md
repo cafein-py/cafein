@@ -2,10 +2,16 @@
 
 ## Unreleased
 
+- A single-departure transit cost matrix (`TravelCostMatrix`, its
+  `to_parquet` stream, and `travel_cost_table`) with a time-sliced
+  `exposure=` reports each cell against the window holding the departure,
+  filling the `<layer>_slice` column (a string column in the Arrow form).
+  A street cost matrix and a multi-departure matrix still take a static
+  `Exposure`; an arrive-by cost matrix does not take `exposure=` yet.
+
 - `DetailedItineraries` with a time-sliced `exposure=` reports each
   journey against the window holding the query's departure, filling the
-  `<layer>_slice` column; a cost matrix or `travel_cost_table` takes a
-  static `Exposure`, pointing a sliced one at `DetailedItineraries`.
+  `<layer>_slice` column.
 
 - Time-sliced exposure layers: a layer may give a mapping of clock
   windows to sources, `noise=({"07:00-19:00": day, "19:00-07:00":

@@ -2369,11 +2369,12 @@ def test_time_sliced_layers_report_the_query_window(street_network, sliced_expos
     assert (totals["airslice_slice"] == "07:00-19:00").all()
 
 
-def test_time_sliced_street_itinerary_reads_the_moments_window(helsinki_streets):
+@pytest.fixture(scope="module")
+def sliced_street_exposure(helsinki_streets):
+    """A day/night sliced layer over a whole StreetNetwork, on a name no
+    neighbour uses."""
     geopandas = pytest.importorskip("geopandas")
     pytest.importorskip("rasterio")
-
-    from cafein import DetailedItineraries
 
     edges = helsinki_streets.streets_gdf
     west, south, east, north = edges.total_bounds
@@ -2384,10 +2385,17 @@ def test_time_sliced_street_itinerary_reads_the_moments_window(helsinki_streets)
             {"level": [level]}, geometry=[everywhere], crs="EPSG:4326"
         )
 
-    sliced = Exposure(
+    return Exposure(
         helsinki_streets,
         airslice=({"07:00-19:00": zones(61.0), "19:00-07:00": zones(45.0)}, "level"),
     )
+
+
+def test_time_sliced_street_itinerary_reads_the_moments_window(
+    helsinki_streets, sliced_street_exposure
+):
+    from cafein import DetailedItineraries
+
     origins, destinations = _street_points()
     # An evening departure selects the second window: the moment is
     # threaded through the street branch, not defaulted to the first slice.
@@ -2397,7 +2405,7 @@ def test_time_sliced_street_itinerary_reads_the_moments_window(helsinki_streets)
         destinations,
         transport_mode="bicycle",
         departure="2022-02-22 20:00",
-        exposure=sliced,
+        exposure=sliced_street_exposure,
     )
     leg = frame.iloc[0]
     assert leg["airslice_slice"] == "19:00-07:00"
@@ -2405,8 +2413,11 @@ def test_time_sliced_street_itinerary_reads_the_moments_window(helsinki_streets)
     assert frame.exposure_totals()["airslice_slice"].iloc[0] == "19:00-07:00"
 
 
-def test_time_sliced_exposure_refused_on_matrices(street_network, sliced_exposure):
+def test_time_sliced_transit_cost_matrix_reports_the_window(
+    street_network, sliced_exposure
+):
     geopandas = pytest.importorskip("geopandas")
+    pyarrow = pytest.importorskip("pyarrow")
     from shapely.geometry import Point
 
     from cafein import TravelCostMatrix, travel_cost_table
@@ -2417,24 +2428,105 @@ def test_time_sliced_exposure_refused_on_matrices(street_network, sliced_exposur
     destinations = geopandas.GeoDataFrame(
         {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
     )
-    for build in (
-        lambda: TravelCostMatrix(
-            street_network,
+    # A morning departure binds the 07:00-19:00 window across the cells.
+    matrix = TravelCostMatrix(
+        street_network,
+        origins,
+        destinations,
+        "2022-02-22 08:30",
+        exposure=sliced_exposure,
+    )
+    assert (matrix["airslice_slice"] == "07:00-19:00").all()
+    assert matrix["airslice_mean"].iloc[0] == pytest.approx(61.0)
+    # the Arrow form keeps the slice a string column, never float-coerced
+    table = travel_cost_table(
+        street_network,
+        origins,
+        destinations,
+        "2022-02-22 08:30",
+        exposure=sliced_exposure,
+    )
+    assert pyarrow.types.is_string(table.schema.field("airslice_slice").type)
+    assert set(table.column("airslice_slice").to_pylist()) == {"07:00-19:00"}
+
+
+def test_time_sliced_matrix_stream_carries_the_slice(
+    street_network, sliced_exposure, tmp_path
+):
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("pyarrow")
+    from shapely.geometry import Point
+
+    from cafein import TravelCostMatrix, _streaming
+
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
+    )
+    output = tmp_path / "sliced"
+    TravelCostMatrix.to_parquet(
+        street_network,
+        origins,
+        destinations,
+        "2022-02-22 08:30",
+        exposure=sliced_exposure,
+        output=output,
+    )
+    shards = _streaming.read_shards(output)
+    assert set(shards["airslice_slice"]) == {"07:00-19:00"}
+
+
+def test_time_of_day_reads_moment_forms():
+    import datetime
+
+    from cafein.exposure import _time_of_day
+
+    assert _time_of_day("2022-02-22 08:30") == 8 * 3600 + 30 * 60
+    # fractional seconds and a UTC offset are ignored
+    assert _time_of_day("2022-02-22T08:30:15.5+02:00") == 8 * 3600 + 30 * 60 + 15
+    assert _time_of_day(datetime.datetime(2022, 2, 22, 20, 0)) == 20 * 3600
+    # a slot list or mapping reads its first moment (a one-element slot form
+    # is a single-departure query)
+    assert _time_of_day(["2022-02-22 08:30"]) == 8 * 3600 + 30 * 60
+    assert _time_of_day({"m": datetime.datetime(2022, 2, 22, 20, 0)}) == 20 * 3600
+    assert _time_of_day(None) is None
+
+
+def test_time_sliced_cost_matrix_refusals(
+    helsinki_streets, sliced_street_exposure, street_network, sliced_exposure
+):
+    geopandas = pytest.importorskip("geopandas")
+    from shapely.geometry import Point
+
+    from cafein import TravelCostMatrix
+
+    origins, destinations = _street_points()
+    points = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
+    )
+    dests = geopandas.GeoDataFrame(
+        {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
+    )
+    # a street cost matrix has no departure to pick a window
+    with pytest.raises(ValueError, match="street cost matrix carries none"):
+        TravelCostMatrix(
+            helsinki_streets,
             origins,
             destinations,
-            "2022-02-22 08:30",
-            exposure=sliced_exposure,
-        ),
-        lambda: travel_cost_table(
+            transport_mode="bicycle",
+            exposure=sliced_street_exposure,
+        )
+    # several departures would need a window per slot
+    with pytest.raises(ValueError, match="one window per query moment"):
+        TravelCostMatrix(
             street_network,
-            origins,
-            destinations,
-            "2022-02-22 08:30",
+            points,
+            dests,
+            ["2022-02-22 08:30", "2022-02-22 20:00"],
             exposure=sliced_exposure,
-        ),
-    ):
-        with pytest.raises(ValueError, match="reports on DetailedItineraries"):
-            build()
+        )
 
 
 def test_objective_refusals(helsinki_streets, street_exposure, street_network):
@@ -3145,9 +3237,9 @@ def test_one_snapshot_serves_the_plan_and_the_report(
     taken = []
     real = Exposure._reporting_snapshot
 
-    def counted(self):
+    def counted(self, moment=None):
         taken.append(self)
-        return real(self)
+        return real(self, moment)
 
     monkeypatch.setattr(Exposure, "_reporting_snapshot", counted)
     points = geopandas.GeoDataFrame(
