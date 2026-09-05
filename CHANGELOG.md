@@ -2,12 +2,18 @@
 
 ## Unreleased
 
+- An eager multi-departure transit cost matrix (`TravelCostMatrix` and
+  `travel_cost_table` without an output) with a time-sliced `exposure=`
+  binds each departure slot to the window holding it, so each slot reports
+  its own `<layer>_slice`. A `to_parquet` stream of several departures
+  still takes a static `Exposure`.
+
 - A single-departure transit cost matrix (`TravelCostMatrix`, its
   `to_parquet` stream, and `travel_cost_table`) with a time-sliced
   `exposure=` reports each cell against the window holding the departure,
   filling the `<layer>_slice` column (a string column in the Arrow form).
-  A street cost matrix and a multi-departure matrix still take a static
-  `Exposure`; an arrive-by cost matrix does not take `exposure=` yet.
+  A street cost matrix still takes a static `Exposure`, and an arrive-by
+  cost matrix does not take `exposure=` yet.
 
 - `DetailedItineraries` with a time-sliced `exposure=` reports each
   journey against the window holding the query's departure, filling the

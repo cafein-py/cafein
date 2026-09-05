@@ -123,11 +123,12 @@ def _optional_columns(kwargs, exposure_snapshot):
 def _matrix_exposure_snapshot(exposure, *, street, moment, multi_slot):
     """The reporting snapshot a cost matrix reports against. A static
     Exposure ignores the moment; a time-sliced one selects the window
-    holding the query's single departure. A street cost matrix (no
-    departure) and a multi-departure matrix (a window per slot) are
-    refused for now — route DetailedItineraries or pass a static
-    Exposure. ``moment`` is the raw departure/arrival, parsed only when a
-    sliced layer needs it, so a plain multi-slot query is untouched."""
+    holding the query's departure (an eager multi-departure matrix rebinds
+    per slot in `_slot_report`). A street cost matrix (no departure) and a
+    multi-departure stream (a window per slot) are refused — route
+    DetailedItineraries or pass a static Exposure. ``moment`` is the raw
+    departure/arrival, parsed only when a sliced layer needs it, so a plain
+    multi-slot query is untouched."""
     if exposure is None:
         return None
     if not getattr(exposure, "_slices", None):
@@ -141,8 +142,8 @@ def _matrix_exposure_snapshot(exposure, *, street, moment, multi_slot):
     if multi_slot:
         raise ValueError(
             "a time-sliced Exposure binds one window per query moment; a "
-            "multi-departure matrix would need one per slot — query one "
-            "departure at a time, or route DetailedItineraries"
+            "multi-departure stream would need one per slot — stream one "
+            "departure at a time, or build the matrix eagerly"
         )
     from cafein.exposure import _time_of_day
 
@@ -164,6 +165,20 @@ def _exposure_snapshot(exposure):
     if active is not None and active.exposure_snapshot is not None:
         return active.exposure_snapshot
     return exposure._reporting_snapshot()
+
+
+def _slot_report(exposure, clock):
+    """One slot's reporting snapshot: a time-sliced Exposure rebinds to the
+    window holding the slot's clock, so each slot of a multi-departure matrix
+    reports its own window; a static Exposure reuses the call's single planned
+    snapshot."""
+    if exposure is None:
+        return None
+    if getattr(exposure, "_slices", None):
+        from cafein.exposure import _time_of_day
+
+        return exposure._reporting_snapshot(_time_of_day(clock))
+    return _exposure_snapshot(exposure)
 
 
 def _entry_plan(
@@ -272,14 +287,14 @@ def _entry_plan(
     else:
         row_bytes = (_TIME_CELL_BYTES if dense else _TIME_FRAME_CELL_BYTES) * planes
     exposure = kwargs.get("exposure")
-    # One snapshot per call: the plan sizes its columns and the body
-    # reports against it; the live object still validates the network. A
+    # The plan sizes its columns from a snapshot; a static body reports
+    # against this one, a sliced body rebinds per slot (_slot_report). A
     # time-sliced Exposure binds the window holding the query's moment.
     snapshot = _matrix_exposure_snapshot(
         exposure,
         street=street,
         moment=arrival if arrive_by else departure,
-        multi_slot=slots > 1,
+        multi_slot=slots > 1 and streamed,
     )
     row_bytes += _OPTIONAL_COLUMN_BYTES * _optional_columns(kwargs, snapshot)
     if snapshot is not None:
@@ -762,9 +777,11 @@ class TravelCostMatrix(pd.DataFrame):
         egress, and transfer walks at their reconstructed provenance,
         boarding waits sampled at the stops, in-vehicle time excluded
         — with every distinct walk reconstructed once, never per
-        cell. Single-departure time-optimal mode only: the windowed
+        cell. Time-optimal mode only: the windowed
         and Pareto modes, ``arrival=``, ``router='tbtr'`` (the engine
-        resolves to RAPTOR), and ``street_policy`` refuse it.
+        resolves to RAPTOR), and ``street_policy`` refuse it. A
+        time-sliced Exposure reports each departure's window on an eager
+        matrix; a ``to_parquet`` stream of several departures refuses it.
     max_memory : str or int (optional)
         The memory budget this call plans against, as a percentage or a
         size with a binary suffix (``"80%"``, ``"6G"``, or bytes); the
@@ -3892,6 +3909,7 @@ def travel_cost_table(
         )
         tables = []
         for label, date, clock in slots:
+            report = _slot_report(exposure, clock)
             table, from_ids, to_ids = _cost_columns(
                 network,
                 origins,
@@ -3915,7 +3933,7 @@ def travel_cost_table(
                 walking_speed_kmph=walking_speed_kmph,
                 max_walking_time=max_walking_time,
                 max_snap_distance=max_snap_distance,
-                exposure=exposure_snapshot,
+                exposure=report,
                 _resolved=_resolved,
             )
             if exposure is not None:
@@ -3929,7 +3947,7 @@ def travel_cost_table(
                 geometries,
                 pyarrow,
                 output_time_units,
-                exposure=exposure_snapshot,
+                exposure=report,
             )
             if multi:
                 arrow = _insert_slot_arrow_columns(
@@ -5610,7 +5628,7 @@ def _cost_matrix_data(
         walking_speed_kmph=walking_speed_kmph,
         max_walking_time=max_walking_time,
         max_snap_distance=max_snap_distance,
-        exposure=None if exposure is None else _exposure_snapshot(exposure),
+        exposure=_slot_report(exposure, departure),
         workers=workers,
         max_memory=max_memory,
         _resolved=_resolved,
