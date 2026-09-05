@@ -2537,8 +2537,51 @@ def test_time_sliced_multi_departure_matrix_binds_each_window(
     assert tevening["airslice_mean"].iloc[0] == pytest.approx(45.0)
 
 
+def test_time_sliced_multi_departure_stream_binds_each_window(
+    street_network, sliced_exposure, tmp_path
+):
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("pyarrow")
+    from shapely.geometry import Point
+
+    import pandas as pd
+    import pyarrow.parquet as pq
+
+    from cafein import TravelCostMatrix
+
+    origins = geopandas.GeoDataFrame(
+        {"id": ["a"]}, geometry=[Point(24.938, 60.169)], crs="EPSG:4326"
+    )
+    destinations = geopandas.GeoDataFrame(
+        {"id": ["b"]}, geometry=[Point(24.96, 60.20)], crs="EPSG:4326"
+    )
+    output = tmp_path / "multi"
+    TravelCostMatrix.to_parquet(
+        street_network,
+        origins,
+        destinations,
+        ["2022-02-22 08:30", "2022-02-22 20:00"],
+        exposure=sliced_exposure,
+        output=output,
+    )
+    # a multi-slot run is read shard-by-shard (read_shards refuses to
+    # aggregate several slots into one frame)
+    shards = pd.concat(
+        [pq.read_table(f).to_pandas() for f in sorted(output.glob("part-*.parquet"))],
+        ignore_index=True,
+    )
+    dep = shards["departure_time"].astype(str)
+    morning = shards[dep.str.contains("08:30")]
+    evening = shards[dep.str.contains("20:00")]
+    assert len(morning) and len(evening)
+    assert set(morning["airslice_slice"]) == {"07:00-19:00"}
+    assert set(evening["airslice_slice"]) == {"19:00-07:00"}
+    assert morning["airslice_mean"].iloc[0] == pytest.approx(61.0)
+    assert evening["airslice_mean"].iloc[0] == pytest.approx(45.0)
+
+
 def test_time_sliced_cost_matrix_refusals(
-    helsinki_streets, sliced_street_exposure, street_network, sliced_exposure, tmp_path
+    helsinki_streets, sliced_street_exposure, street_network, sliced_exposure
 ):
     geopandas = pytest.importorskip("geopandas")
     from shapely.geometry import Point
@@ -2561,15 +2604,14 @@ def test_time_sliced_cost_matrix_refusals(
             transport_mode="bicycle",
             exposure=sliced_street_exposure,
         )
-    # a multi-departure stream would need a window per slot
-    with pytest.raises(ValueError, match="multi-departure stream"):
-        TravelCostMatrix.to_parquet(
+    # an arrive-by cost matrix does not take exposure yet
+    with pytest.raises(ValueError, match="single-departure time-optimal"):
+        TravelCostMatrix(
             street_network,
             points,
             dests,
-            ["2022-02-22 08:30", "2022-02-22 20:00"],
+            arrival="2022-02-22 08:30",
             exposure=sliced_exposure,
-            output=tmp_path / "refused",
         )
 
 

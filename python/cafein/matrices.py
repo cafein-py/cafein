@@ -120,12 +120,12 @@ def _optional_columns(kwargs, exposure_snapshot):
     return count
 
 
-def _matrix_exposure_snapshot(exposure, *, street, moment, multi_slot):
-    """The reporting snapshot a cost matrix reports against. A static
-    Exposure ignores the moment; a time-sliced one selects the window
-    holding the query's departure (an eager multi-departure matrix rebinds
-    per slot in `_slot_report`). A street cost matrix (no departure) and a
-    multi-departure stream (a window per slot) are refused — route
+def _matrix_exposure_snapshot(exposure, *, street, moment):
+    """The reporting snapshot a cost matrix sizes its columns against. A
+    static Exposure ignores the moment; a time-sliced one selects the
+    window holding the query's departure (each multi-departure slot rebinds
+    to its own window in `_slot_report`, eager or streamed). A street cost
+    matrix has no departure, so a sliced Exposure there is refused — route
     DetailedItineraries or pass a static Exposure. ``moment`` is the raw
     departure/arrival, parsed only when a sliced layer needs it, so a plain
     multi-slot query is untouched."""
@@ -138,12 +138,6 @@ def _matrix_exposure_snapshot(exposure, *, street, moment, multi_slot):
             "a time-sliced Exposure needs a departure to pick each window; "
             "a street cost matrix carries none — route DetailedItineraries, "
             "or pass a static Exposure"
-        )
-    if multi_slot:
-        raise ValueError(
-            "a time-sliced Exposure binds one window per query moment; a "
-            "multi-departure stream would need one per slot — stream one "
-            "departure at a time, or build the matrix eagerly"
         )
     from cafein.exposure import _time_of_day
 
@@ -294,7 +288,6 @@ def _entry_plan(
         exposure,
         street=street,
         moment=arrival if arrive_by else departure,
-        multi_slot=slots > 1 and streamed,
     )
     row_bytes += _OPTIONAL_COLUMN_BYTES * _optional_columns(kwargs, snapshot)
     if snapshot is not None:
@@ -780,8 +773,8 @@ class TravelCostMatrix(pd.DataFrame):
         cell. Time-optimal mode only: the windowed
         and Pareto modes, ``arrival=``, ``router='tbtr'`` (the engine
         resolves to RAPTOR), and ``street_policy`` refuse it. A
-        time-sliced Exposure reports each departure's window on an eager
-        matrix; a ``to_parquet`` stream of several departures refuses it.
+        time-sliced Exposure reports each departure's window on both eager
+        and streamed matrices, binding it per departure slot.
     max_memory : str or int (optional)
         The memory budget this call plans against, as a percentage or a
         size with a binary suffix (``"80%"``, ``"6G"``, or bytes); the
@@ -1530,7 +1523,6 @@ class TravelCostMatrix(pd.DataFrame):
                 workers=workers,
                 max_memory=max_memory,
             )
-        exposure_snapshot = None
         if exposure is not None:
             router = _validate_transit_exposure(
                 exposure,
@@ -1543,7 +1535,6 @@ class TravelCostMatrix(pd.DataFrame):
                 arrive_by=arrive_by,
                 router=router,
             )
-            exposure_snapshot = _exposure_snapshot(exposure)
         _reject_cost_street_args(
             transport_mode,
             max_street_time,
@@ -1590,7 +1581,7 @@ class TravelCostMatrix(pd.DataFrame):
             pyarrow=pyarrow,
             resume=resume,
             output_time_units=output_time_units,
-            exposure=exposure_snapshot,
+            exposure=exposure,
             workers=workers,
             max_memory=max_memory,
         )
@@ -3768,7 +3759,6 @@ def travel_cost_table(
     within = duration_seconds("max_travel_time", max_travel_time)
     max_walking_time = duration_seconds("max_walking_time", max_walking_time)
     max_snap_distance = snap_distance
-    exposure_snapshot = None
     if exposure is not None and not _is_street_network(network):
         router = _validate_transit_exposure(
             exposure,
@@ -3780,7 +3770,6 @@ def travel_cost_table(
             arrive_by=arrive_by,
             router=router,
         )
-        exposure_snapshot = _exposure_snapshot(exposure)
     if _is_street_network(network):
         chunk = None if chunk is None else tuple(int(part) for part in chunk)
         resolved = _street_cost_resolution(
@@ -3988,7 +3977,7 @@ def travel_cost_table(
         pyarrow=pyarrow,
         resume=resume,
         output_time_units=output_time_units,
-        exposure=exposure_snapshot,
+        exposure=exposure,
     )
 
 
@@ -4132,7 +4121,14 @@ def _stream_transit_cost(
         "output_time_units": output_time_units,
     }
 
+    slot_reports = (
+        {}
+        if exposure is None
+        else {clock: _slot_report(exposure, clock) for _, _, clock in slots}
+    )
+
     def make_moment(rows, shared_from, shared_to, date, departure):
+        report = slot_reports.get(departure)
         if arrive_by and points is None:
             endpoints = ("stops", from_ids, to_axis[rows])
         elif arrive_by:
@@ -4180,16 +4176,16 @@ def _stream_transit_cost(
             walking_speed_kmph=walking_speed_kmph,
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
-            exposure=exposure,
+            exposure=report,
             _resolved=(trip_factors, fare_tables, endpoints),
             workers=workers,
             max_memory=max_memory,
         )
-        if exposure is not None:
+        if report is not None:
             # Re-verify the binding per batch (the eager precedent): a
             # street graph replaced mid-stream must not pair fresh edge
             # indices with the snapshot's stale arrays.
-            exposure._check_network(network)
+            report._check_network(network)
         return _arrow_table(
             table,
             shared_from,
@@ -4202,7 +4198,7 @@ def _stream_transit_cost(
             # Point rows key destinations by batch position; stop rows
             # keep their global keys, so only the point form offsets.
             to_offset=rows.start if arrive_by and points is not None else 0,
-            exposure=exposure,
+            exposure=report,
         )
 
     make_batch = _slot_batches(make_moment, slots, labeled, multi, arrive_by, pyarrow)
