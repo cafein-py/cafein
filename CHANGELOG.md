@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- The `cafein` command: `cafein run recipe.yaml [-o DIR]` runs a recipe and
+  prints the published table's path; `cafein validate recipe.yaml` checks one
+  without running it. A refusal exits 1 with its message, a usage error 2; it
+  never prompts, so a recipe drops into a workflow manager as one rule. The
+  recipes guide and a sampledata-based exposure example ship under
+  `examples/recipes/`.
+
 - A second recipe type, `transit_cost_matrix`: a public-transport
   `TravelCostMatrix` over a `gtfs` input (`.zip` file or `helsinki.gtfs`
   sample) and the street network, with `network:` (`from_gtfs`) and `matrix:`

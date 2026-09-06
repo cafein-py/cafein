@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import math
 import pathlib
 import re
 
@@ -37,7 +38,7 @@ def _load_yaml(path):
     except ImportError as error:  # pragma: no cover - trivial guard
         raise ImportError(
             "reading a recipe needs the optional PyYAML dependency "
-            "(pip install cafein[yaml] or pyyaml)"
+            "(pip install cafein[recipes])"
         ) from error
 
     class _StrictLoader(yaml.SafeLoader):
@@ -47,6 +48,8 @@ def _load_yaml(path):
         mapping = {}
         for key_node, value_node in node.value:
             key = loader.construct_object(key_node, deep=deep)
+            if not isinstance(key, (str, int, float, bool)) and key is not None:
+                raise ValueError(f"{path}: mapping keys must be scalars, not {key!r}")
             if key in mapping:
                 raise ValueError(f"{path}: duplicate key '{key}' in the recipe")
             mapping[key] = loader.construct_object(value_node, deep=deep)
@@ -55,7 +58,12 @@ def _load_yaml(path):
     _StrictLoader.add_constructor(
         yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicates
     )
-    document = yaml.load(pathlib.Path(path).read_text(encoding="utf-8"), _StrictLoader)
+    try:
+        document = yaml.load(
+            pathlib.Path(path).read_text(encoding="utf-8"), _StrictLoader
+        )
+    except yaml.YAMLError as error:
+        raise ValueError(f"{path}: not valid YAML: {error}") from None
     if not isinstance(document, dict):
         raise ValueError(f"{path}: a recipe must be a YAML mapping")
     return document
@@ -244,13 +252,16 @@ def _resolve_source(where, spec, recipe_dir, *, keys):
                 )
         elif not named:
             raise ValueError(f"{where}: 'value' must be a column name")
-    if path is not None and (
-        path.suffix.lower() == ".gpkg" and path.with_name(path.name + "-wal").exists()
-    ):
-        raise ValueError(
-            f"{where}: '{path.name}' has a live write-ahead log ({path.name}-wal); "
-            "checkpoint the GeoPackage so the file holds all of its state"
-        )
+    if path is not None and path.suffix.lower() == ".gpkg":
+        # SQLite state outside the file: a write-ahead log or a rollback
+        # journal means the file alone is not the dataset.
+        for sidecar in ("-wal", "-journal"):
+            if path.with_name(path.name + sidecar).exists():
+                raise ValueError(
+                    f"{where}: '{path.name}' has a live SQLite sidecar "
+                    f"({path.name}{sidecar}); checkpoint or recover the GeoPackage "
+                    "so the file holds all of its state"
+                )
     resolved = {"kind": kind, "path": path}
     if kind == "sample":
         resolved["sample"] = sample
@@ -589,7 +600,11 @@ def _resolve_exposure_parameters(parameters, exposure_layers, recipe_dir):
 
 #: Names that fail on Windows even though POSIX accepts them.
 _UNPORTABLE_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
-_WINDOWS_RESERVED = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$", re.I)
+_WINDOWS_RESERVED = re.compile(
+    r"^(con|prn|aux|nul|conin\$|conout\$"
+    r"|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3])(\..*)?$",
+    re.I,
+)
 
 
 def _resolve_outputs(outputs):
@@ -907,6 +922,14 @@ def _run_exposure_tradeoff(resolved):
             **group("matrix"),
         )
     frame = pd.DataFrame(frame)
+    needed = ["travel_time", "network_distance_m", "connector_distance_m"]
+    needed += [f"{name}_mean" for name in inputs["exposure"]]
+    missing = [column for column in needed if column not in frame.columns]
+    if missing:
+        raise ValueError(
+            f"the matrix reports no {', '.join(missing)} column; the exposure "
+            "integral needs each layer's mean and the trip's distances"
+        )
     frame["travel_time"] = frame["travel_time"] / 60.0
     # The layer mean is weighted over traversed street edges only, so the
     # integral takes the on-street share of the trip: the snap connectors at
@@ -1045,9 +1068,13 @@ def _canonical(value, where):
     if isinstance(value, (list, tuple)):
         return [_canonical(v, where) for v in value]
     if isinstance(value, (set, frozenset)):
-        return sorted(_canonical(v, where) for v in value)
+        # Ordered by a type-independent key: a set may mix scalar types.
+        members = (_canonical(v, where) for v in value)
+        return sorted(members, key=lambda v: (type(v).__name__, str(v)))
     if isinstance(value, (pathlib.PurePath, datetime.date, datetime.timedelta)):
         return str(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{where}: {value!r} cannot be recorded in the provenance")
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     raise ValueError(f"{where}: {value!r} cannot be recorded in the provenance")
@@ -1147,12 +1174,20 @@ def run(path, out_dir=None, *, _entry_point="python", _invocation=None):
     directory or rewriting the inputs mid-run. Returns the recipe's result
     frame.
     """
+    recipe_path = pathlib.Path(path).resolve()
+    resolved = validate(recipe_path)
+    frame, _ = _execute(recipe_path, resolved, out_dir, _entry_point, _invocation)
+    return frame
+
+
+def _execute(recipe_path, resolved, out_dir, entry_point, invocation):
+    """Run one validated recipe and publish it; returns the frame and the
+    published table's path. ``run`` and the command share this so a recipe is
+    read once."""
     import os
     import shutil
     import tempfile
 
-    recipe_path = pathlib.Path(path).resolve()
-    resolved = validate(recipe_path)
     # Sample assets are fetched first, so the output guards see their paths.
     recipe = _RECIPES[resolved["recipe"]]
     resolved["inputs"] = _materialise_inputs(resolved["inputs"], recipe.roles)
@@ -1201,8 +1236,8 @@ def run(path, out_dir=None, *, _entry_point="python", _invocation=None):
                 "inputs": checksums,
                 "outputs": {"table": str(target), "sha256": _file_digest(staged_table)},
                 "invocation": {
-                    **(_invocation or {}),
-                    "entry_point": _entry_point,
+                    **(invocation or {}),
+                    "entry_point": entry_point,
                     "recipe": str(recipe_path),
                     "out_dir": str(out_root),
                 },
@@ -1210,7 +1245,12 @@ def run(path, out_dir=None, *, _entry_point="python", _invocation=None):
             }
             staged_record = staging / provenance.name
             staged_record.write_text(
-                json.dumps(_canonical(record, "record"), indent=2, sort_keys=True)
+                json.dumps(
+                    _canonical(record, "record"),
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
             )
             # Record first, table last, recovered from disk state on failure:
             # the new record stays only if the new table landed. Between the
@@ -1240,7 +1280,7 @@ def run(path, out_dir=None, *, _entry_point="python", _invocation=None):
             staging.rmdir()
     finally:
         lock.unlink(missing_ok=True)
-    return frame
+    return frame, target
 
 
 #: The typed-recipe registry: a recipe type resolves its own sections, so a new
@@ -1261,3 +1301,45 @@ _RECIPES = {
         _run_transit_cost_matrix,
     ),
 }
+
+
+def main(argv=None):
+    """The ``cafein`` command: ``run RECIPE [-o DIR]`` and ``validate RECIPE``.
+
+    A pipeline leaf: it reads its arguments, writes the recipe's outputs,
+    prints the published table's path, and exits 0 on success, 1 with the
+    refusal's message on stderr when the recipe or its data is refused, and
+    2 on a usage error. It never prompts.
+    """
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        prog="cafein", description="Run or validate a cafein analysis recipe."
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    runner = commands.add_parser("run", help="run a recipe and publish its outputs")
+    runner.add_argument("recipe", help="the recipe YAML file")
+    runner.add_argument(
+        "-o", "--out", default=None, help="output directory (default: the working one)"
+    )
+    checker = commands.add_parser("validate", help="check a recipe without running it")
+    checker.add_argument("recipe", help="the recipe YAML file")
+    arguments = parser.parse_args(argv)
+    try:
+        resolved = validate(arguments.recipe)
+        if arguments.command == "validate":
+            print(f"{arguments.recipe}: valid {resolved['recipe']} recipe")
+            return 0
+        invocation = {"argv": list(sys.argv[1:] if argv is None else argv)}
+        recipe_path = pathlib.Path(arguments.recipe).resolve()
+        _, target = _execute(recipe_path, resolved, arguments.out, "cli", invocation)
+        print(target)
+        return 0
+    except (ValueError, OSError, ImportError) as error:
+        print(f"cafein: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":  # pragma: no cover - console entry
+    raise SystemExit(main())

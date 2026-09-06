@@ -3,6 +3,7 @@
 import functools
 import hashlib
 import json
+import pathlib
 
 import pytest
 
@@ -170,6 +171,14 @@ def _delete(path_keys):
             _set(["parameters", "matrix"], {"delay_model": {"k": 1}}),
             "does not take a mapping",
         ),
+        (
+            _set(["parameters", "matrix"], {"bucket": float("nan")}),
+            "cannot be recorded",
+        ),
+        (
+            _set(["parameters", "matrix"], {"bucket": float("inf")}),
+            "cannot be recorded",
+        ),
         (_set(["parameters", "matrix"], {"traveler": {"foo": 1}}), "traveler.*foo"),
         (_set(["parameters", "matrix"], {"traveler": "wheelchair"}), "mapping of Trav"),
         (
@@ -192,6 +201,8 @@ def _delete(path_keys):
         (_set(["outputs", "table"], "x" * 240 + ".parquet"), "within 247 bytes"),
         (_set(["outputs", "table"], "ä" * 120 + ".parquet"), "within 247 bytes"),
         (_set(["outputs", "table"], "CON.parquet"), "not a portable file name"),
+        (_set(["outputs", "table"], "CONIN$.parquet"), "not a portable file name"),
+        (_set(["outputs", "table"], "com\u00b9.parquet"), "not a portable file name"),
         (_set(["outputs", "table"], "a?.parquet"), "not a portable file name"),
         (_set(["outputs", "table"], "out./t.parquet"), "not a portable file name"),
         (_set(["outputs", "table"], "d" * 256 + "/t.parquet"), "not a portable"),
@@ -242,6 +253,50 @@ def test_validate_allows_optional_units(tmp_path):
         _write(tmp_path, _delete(["inputs", "exposure", "no2", "units"]))
     )
     assert "units" not in resolved["inputs"]["exposure"]["no2"]
+
+
+def test_load_refuses_malformed_yaml_by_name(tmp_path):
+    from cafein import recipes
+
+    path = tmp_path / "broken.yaml"
+    path.write_text("recipe: [exposure_tradeoff\nversion: 1\n")
+    with pytest.raises(ValueError, match="not valid YAML"):
+        recipes.validate(path)
+    assert recipes.main(["validate", str(path)]) == 1
+
+
+def test_load_refuses_a_complex_mapping_key_by_name(tmp_path):
+    from cafein import recipes
+
+    path = tmp_path / "keys.yaml"
+    path.write_text("recipe: exposure_tradeoff\n? [a, b]\n: 1\n")
+    with pytest.raises(ValueError, match="mapping keys must be scalars"):
+        recipes.validate(path)
+    assert recipes.main(["validate", str(path)]) == 1
+
+
+def test_pipeline_refuses_a_matrix_without_the_layer_mean(tmp_path, monkeypatch):
+    """A frame lacking a declared layer's mean is refused by name before the
+    integral, never a KeyError."""
+    import pandas as pd
+
+    import cafein
+    from cafein import recipes
+
+    resolved = recipes.validate(_two_route_recipe(tmp_path, monkeypatch))
+    monkeypatch.setattr(
+        cafein,
+        "TravelCostMatrix",
+        lambda *a, **k: pd.DataFrame(
+            {
+                "travel_time": [1.0],
+                "network_distance_m": [1.0],
+                "connector_distance_m": [0.0],
+            }
+        ),
+    )
+    with pytest.raises(ValueError, match="no no2_mean column"):
+        recipes._RECIPES["exposure_tradeoff"].run(resolved)
 
 
 def test_load_refuses_duplicate_keys(tmp_path):
@@ -388,7 +443,8 @@ def _two_route_recipe(
     stubbed, both modes permitted): value 1.0 over the short corridor, the 1.5x
     detour outside it. ``inputs`` replaces the file-kind inputs section;
     ``received`` collects the keywords the stubbed loader is called with."""
-    yaml = pytest.importorskip("yaml")
+    import yaml
+
     geopandas = pytest.importorskip("geopandas")
     from shapely.geometry import Point, box
     from test_exposure import _two_route_network
@@ -569,14 +625,15 @@ def test_run_refuses_to_publish_over_a_live_lock(tmp_path, monkeypatch):
     assert not (out / "tradeoff.provenance.json").exists()
 
 
-def test_validate_refuses_a_geopackage_with_a_live_wal(tmp_path):
+@pytest.mark.parametrize("sidecar", ["-wal", "-journal"])
+def test_validate_refuses_a_geopackage_with_live_sqlite_state(tmp_path, sidecar):
     pytest.importorskip("yaml")
     from cafein import recipes
 
     (tmp_path / "od.gpkg").write_bytes(b"\x00")
-    (tmp_path / "od.gpkg-wal").write_bytes(b"\x00")
+    (tmp_path / f"od.gpkg{sidecar}").write_bytes(b"\x00")
     path = _write(tmp_path, _set(["inputs", "origins", "path"], "od.gpkg"))
-    with pytest.raises(ValueError, match="write-ahead log"):
+    with pytest.raises(ValueError, match="live SQLite sidecar"):
         recipes.validate(path)
 
 
@@ -848,6 +905,7 @@ def test_provenance_values_are_canonical():
         "s": [1, 2],
         "n": None,
     }
+    assert recipes._canonical(frozenset({"b", 1}), "t") == [1, "b"]  # mixed types
     with pytest.raises(ValueError, match="t.bad.*cannot be recorded"):
         recipes._canonical({"bad": object()}, "t")
 
@@ -955,7 +1013,8 @@ def _transit_document():
 
 
 def _write_transit(tmp_path, mutate=None):
-    yaml = pytest.importorskip("yaml")
+    import yaml
+
     for name in ("gtfs.zip", "streets.pbf", "origins.geojson", "dests.geojson"):
         (tmp_path / name).write_bytes(b"\x00")
     recipe = _transit_document()
@@ -1021,10 +1080,11 @@ def test_transit_recipe_prices_time_co2_and_money(
     tmp_path, helsinki_gtfs, kantakaupunki_pbf
 ):
     """End to end on the Helsinki fixtures: a shared e-scooter serves both ends,
-    money is the zone fare plus the rental tariff, and the record pins the feed."""
-    yaml = pytest.importorskip("yaml")
-    geopandas = pytest.importorskip("geopandas")
-    pytest.importorskip("pyarrow")
+    money is the zone fare plus the rental tariff, and the record pins the feed.
+    Never skipped: yaml and pyarrow are test dependencies."""
+    import geopandas
+    import pyarrow  # noqa: F401
+    import yaml
     from shapely.geometry import Point
 
     from cafein import recipes
@@ -1042,6 +1102,9 @@ def test_transit_recipe_prices_time_co2_and_money(
     frame = recipes.run(path, out_dir=tmp_path / "out")
 
     assert {"travel_time", "transfers", "emissions", "money"} <= set(frame.columns)
+    distances = {"transit_distance_m", "walk_distance_m", "street_distance_m"}
+    assert distances <= set(frame.columns)
+    assert frame["street_distance_m"].iloc[0] > 0  # the scooter legs
     assert len(frame) == 1 and frame["money"].notna().all()
     assert frame["emissions"].iloc[0] > 0
     # Money carries the rental on top of the ticket: at least the cheapest
@@ -1063,3 +1126,48 @@ def test_transit_recipe_prices_time_co2_and_money(
     assert effective["matrix"]["fares"]["rules"] == "zones"
     assert effective["network"]["street_modes"] == ["walk", "e_scooter"]
     assert effective["matrix"]["max_rides"] == 8  # a default, recorded
+
+
+def test_cli_runs_and_validates_as_a_pipeline_leaf(tmp_path, monkeypatch, capsys):
+    """``cafein run`` publishes the table and prints its path, ``cafein
+    validate`` checks without writing, and a refusal exits 1 with its message
+    on stderr — never a traceback, never a prompt. Never skipped."""
+    import pyarrow  # noqa: F401
+    from cafein import recipes
+
+    path = _two_route_recipe(tmp_path, monkeypatch)
+    assert recipes.main(["validate", str(path)]) == 0
+    assert "valid exposure_tradeoff recipe" in capsys.readouterr().out
+    out = tmp_path / "out"
+    assert recipes.main(["run", str(path), "-o", str(out)]) == 0
+    assert capsys.readouterr().out.strip() == str((out / "tradeoff.parquet").resolve())
+    record = json.loads((out / "tradeoff.provenance.json").read_text())
+    assert record["invocation"]["entry_point"] == "cli"
+    assert record["invocation"]["argv"] == ["run", str(path), "-o", str(out)]
+    broken = _write(tmp_path, _set(["parameters", "mode"], "car"))
+    assert recipes.main(["validate", str(broken)]) == 1
+    captured = capsys.readouterr()
+    assert "mode must be one of" in captured.err and not captured.out
+
+
+def test_the_shipped_examples_validate_against_the_sample_registry():
+    """The sampledata-based example resolves its pins offline; the file-based
+    transit examples parse and name only known keywords (their data is local)."""
+    yaml = pytest.importorskip("yaml")
+    from cafein import recipes
+
+    root = pathlib.Path(recipes.__file__).resolve().parents[2] / "examples" / "recipes"
+    if not root.is_dir():
+        pytest.skip("examples are not part of an installed package")
+    helsinki = pytest.importorskip("cafein.sampledata.helsinki")
+    if "air_quality" not in helsinki.metadata:
+        pytest.skip("this sampledata release carries no air-quality layer")
+    resolved = recipes.validate(root / "helsinki_exposure_tradeoff.yaml")
+    assert (
+        resolved["inputs"]["exposure"]["no2"]["sample"]["asset"]
+        == "helsinki.air_quality"
+    )
+    for name in ("helsinki_transit_escooter_shared", "helsinki_transit_escooter_own"):
+        document = yaml.safe_load((root / f"{name}.yaml").read_text())
+        assert document["recipe"] == "transit_cost_matrix"
+        assert set(document["parameters"]) <= {"network", "matrix"}
