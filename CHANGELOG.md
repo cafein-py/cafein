@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Recipe `matrix:` parameters accept `street_policy` as a mapping of
+  `StreetLegPolicy` keywords, its `vehicles` as `VehiclePolicy` keyword
+  mappings, built at validate so their own checks run before anything is
+  read; a recipe type now declares its own input roles and parameter groups.
+
 - Recipe `parameters:` gain `streets:`, `exposure:`, and `matrix:` groups that
   pass any keyword of `StreetNetwork.from_osm`, `Exposure`, and
   `TravelCostMatrix` through by name (the ones the recipe fixes are refused);

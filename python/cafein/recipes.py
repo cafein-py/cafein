@@ -130,7 +130,12 @@ _FILE_KEYWORDS = {
     ("matrix", "factors"): (_TABLE_SUFFIXES, (), "path"),
     ("matrix", "costs"): (_TABLE_SUFFIXES, (), "path"),
 }
-_OBJECT_KEYWORDS = {("matrix", "traveler"): "TravelerProfile"}
+_OBJECT_KEYWORDS = {
+    ("matrix", "traveler"): "TravelerProfile",
+    ("matrix", "street_policy"): "StreetLegPolicy",
+}
+#: Object keywords whose values are themselves objects, keyed by name.
+_NESTED_OBJECTS = {"StreetLegPolicy": {"vehicles": "VehiclePolicy"}}
 _MAPPING_KEYWORDS = {
     ("exposure", "thresholds"),
     ("streets", "speed_limits"),
@@ -232,56 +237,75 @@ def _resolve_source(where, spec, recipe_dir, *, keys):
     return resolved
 
 
-def _resolve_inputs(inputs, recipe_dir):
-    """Resolve every declared input of the exposure_tradeoff recipe."""
+def _resolve_inputs(inputs, recipe_dir, roles):
+    """Resolve every declared input role, or raise by name: a role takes one
+    ``kind:``-tagged source, or — declared ``("layers", kinds)`` — a non-empty
+    mapping of named sources."""
     if not isinstance(inputs, dict):
         raise ValueError("inputs: must be a mapping")
-    _reject_foreign(
-        inputs, {"streets", "exposure", "origins", "destinations"}, "inputs"
-    )
-    for required in ("streets", "exposure", "origins", "destinations"):
-        if inputs.get(required) is None:
-            raise ValueError(f"inputs: missing '{required}'")
-    resolved = {
-        "streets": _resolve_source(
-            "inputs.streets", inputs["streets"], recipe_dir, keys=_STREET_KEYS
-        )
-    }
-    exposure = inputs["exposure"]
-    if not isinstance(exposure, dict) or not exposure:
-        raise ValueError("inputs.exposure: must be a non-empty mapping of layers")
-    for name in exposure:
-        if not isinstance(name, str) or not name:
-            raise ValueError("inputs.exposure: layer names must be non-empty strings")
+    _reject_foreign(inputs, set(roles), "inputs")
+    resolved = {}
+    for role, keys in roles.items():
+        spec = inputs.get(role)
+        if spec is None:
+            raise ValueError(f"inputs: missing '{role}'")
+        if _is_layers(keys):
+            if not isinstance(spec, dict) or not spec:
+                raise ValueError(
+                    f"inputs.{role}: must be a non-empty mapping of layers"
+                )
+            for name in spec:
+                if not isinstance(name, str) or not name:
+                    raise ValueError(
+                        f"inputs.{role}: layer names must be non-empty strings"
+                    )
+            resolved[role] = {
+                name: _resolve_source(
+                    f"inputs.{role}.{name}", layer, recipe_dir, keys=keys[1]
+                )
+                for name, layer in spec.items()
+            }
+        else:
+            resolved[role] = _resolve_source(
+                f"inputs.{role}", spec, recipe_dir, keys=keys
+            )
+    return resolved
+
+
+def _is_layers(keys):
+    """A role declared as a mapping of named sources."""
+    return isinstance(keys, tuple) and keys[0] == "layers"
+
+
+def _input_sources(inputs, roles):
+    """``(role, source)`` for every input, a mapping of named sources as
+    ``role.name`` — by the roles' declaration, never by a value's shape."""
+    for role, value in inputs.items():
+        if _is_layers(roles[role]):
+            for name, source in value.items():
+                yield f"{role}.{name}", source
+        else:
+            yield role, value
+
+
+def _check_layer_names(names):
+    """Exposure layer names: not one of ``Exposure``'s own keywords, and its
+    naming rule (lowercase identifiers outside the cost / travel_time column
+    families), applied before any data is touched."""
+    for name in names:
         if name in _RESERVED_LAYER_NAMES:
             raise ValueError(
                 f"inputs.exposure: '{name}' is a reserved name, not a layer"
             )
-    # Exposure's own naming rule (lowercase identifiers outside the cost /
-    # travel_time column families), applied before any data is touched.
     from cafein.exposure import _validate_names
 
-    _validate_names(list(exposure), {}, ())
-    resolved["exposure"] = {
-        name: _resolve_source(
-            f"inputs.exposure.{name}", spec, recipe_dir, keys=_EXPOSURE_KEYS
-        )
-        for name, spec in exposure.items()
-    }
-    for role in ("origins", "destinations"):
-        resolved[role] = _resolve_source(
-            f"inputs.{role}", inputs[role], recipe_dir, keys=_OD_KEYS
-        )
-    return resolved
+    _validate_names(list(names), {}, ())
 
 
-#: The ``parameters:`` groups, each configuring one object the recipe builds.
-_GROUPS = ("streets", "exposure", "matrix")
-
-
-def _parameter_groups():
-    """Each group's target callable, with the keywords the recipe fixes itself
-    (its inputs, objective, and sweep) that a recipe may not set."""
+def _exposure_groups():
+    """The exposure_tradeoff recipe's ``parameters:`` groups: each group's
+    target callable, with the keywords the recipe fixes itself (its inputs,
+    objective, and sweep) that a recipe may not set."""
     from cafein import Exposure, StreetNetwork, TravelCostMatrix
 
     return {
@@ -316,16 +340,43 @@ def _group_surface(target, fixed):
     return surface
 
 
-def _build_object(group, key, mapping):
+def _build_object(name, mapping, where):
     """The object a mapping spells, built (and so validated) by its own
-    constructor."""
+    constructor; a nested mapping of objects is built the same way."""
     import cafein
 
-    constructor = getattr(cafein, _OBJECT_KEYWORDS[group, key])
+    kwargs = dict(mapping)
+    for key, nested in _NESTED_OBJECTS.get(name, {}).items():
+        if key in kwargs:
+            items = kwargs[key]
+            if not isinstance(items, dict) or not all(
+                isinstance(v, dict) for v in items.values()
+            ):
+                raise ValueError(
+                    f"{where}.{key}: a mapping of {nested} keyword mappings"
+                )
+            kwargs[key] = {
+                k: _build_object(nested, v, f"{where}.{key}.{k}")
+                for k, v in items.items()
+            }
     try:
-        return constructor(**mapping)
+        return getattr(cafein, name)(**kwargs)
     except (TypeError, ValueError) as error:
-        raise ValueError(f"parameters.{group}.{key}: {error}") from None
+        raise ValueError(f"{where}: {error}") from None
+
+
+def _effective_object(name, mapping):
+    """An object spelling with its constructor's defaults filled in, nested
+    objects too."""
+    import cafein
+
+    values = {**_group_surface(getattr(cafein, name), set()), **mapping}
+    for key, nested in _NESTED_OBJECTS.get(name, {}).items():
+        if isinstance(values.get(key), dict):
+            values[key] = {
+                k: _effective_object(nested, v) for k, v in values[key].items()
+            }
+    return values
 
 
 def _resolve_value(group, key, value, recipe_dir):
@@ -348,7 +399,7 @@ def _resolve_value(group, key, value, recipe_dir):
             raise ValueError(
                 f"{where}: a mapping of {_OBJECT_KEYWORDS[group, key]} keywords"
             )
-        _build_object(group, key, value)
+        _build_object(_OBJECT_KEYWORDS[group, key], value, where)
         return value
     if isinstance(value, dict) and (group, key) not in _MAPPING_KEYWORDS:
         raise ValueError(f"{where}: does not take a mapping")
@@ -358,41 +409,19 @@ def _resolve_value(group, key, value, recipe_dir):
 def _parameter_sources(parameters):
     """``(group, key, source)`` for every file-valued parameter."""
     for group, key in _FILE_KEYWORDS:
-        if key in parameters[group]:
-            yield group, key, parameters[group][key]
+        values = parameters.get(group)
+        if isinstance(values, dict) and key in values:
+            yield group, key, values[key]
 
 
-def _resolve_parameters(parameters, exposure_layers, recipe_dir):
-    """The recipe's own parameters, then each group's keywords for the object
-    it configures: named keywords only, the ones the recipe fixes refused, a
-    data file in the inputs' ``kind:`` spelling, an object as a mapping of its
-    keywords (built here, so its own validation runs eagerly). Other values
-    are checked by the objects when the recipe runs."""
-    if parameters is None:
-        parameters = {}
-    if not isinstance(parameters, dict):
-        raise ValueError("parameters: must be a mapping")
-    _reject_foreign(
-        parameters, {"mode", "objective_layer", "weights", *_GROUPS}, "parameters"
-    )
-    mode = parameters.get("mode", "bicycle")
-    choice("parameters.mode", mode, ("bicycle", "walk"))
-    objective = parameters.get("objective_layer")
-    if objective is None:
-        raise ValueError("parameters: missing 'objective_layer'")
-    if objective not in exposure_layers:
-        raise ValueError(
-            f"parameters.objective_layer '{objective}' is not a declared "
-            f"exposure layer ({', '.join(exposure_layers)})"
-        )
-    weights = parameters.get("weights")
-    if not isinstance(weights, (list, tuple)) or not weights:
-        raise ValueError("parameters.weights: must be a non-empty list of weights")
-    weights = [non_negative_finite("parameters.weights", w) for w in weights]
-    if any(later <= earlier for earlier, later in zip(weights, weights[1:])):
-        raise ValueError("parameters.weights: must be strictly increasing")
-    resolved = {"mode": mode, "objective_layer": objective, "weights": weights}
-    for group, (target, fixed) in _parameter_groups().items():
+def _resolve_groups(parameters, groups, recipe_dir):
+    """Each group's keywords for the object it configures: named keywords only,
+    the ones the recipe fixes refused, a data file in the inputs' ``kind:``
+    spelling, an object as a mapping of its keywords (built here, so its own
+    validation runs eagerly). Other values are checked by the objects when the
+    recipe runs."""
+    resolved = {}
+    for group, (target, fixed) in groups.items():
         given = parameters.get(group)
         if given is None:
             given = {}
@@ -412,6 +441,37 @@ def _resolve_parameters(parameters, exposure_layers, recipe_dir):
                 )
             values[key] = _resolve_value(group, key, value, recipe_dir)
         resolved[group] = values
+    return resolved
+
+
+def _resolve_exposure_parameters(parameters, exposure_layers, recipe_dir):
+    """The exposure_tradeoff recipe's own parameters, then its groups."""
+    if parameters is None:
+        parameters = {}
+    if not isinstance(parameters, dict):
+        raise ValueError("parameters: must be a mapping")
+    groups = _exposure_groups()
+    _reject_foreign(
+        parameters, {"mode", "objective_layer", "weights", *groups}, "parameters"
+    )
+    mode = parameters.get("mode", "bicycle")
+    choice("parameters.mode", mode, ("bicycle", "walk"))
+    objective = parameters.get("objective_layer")
+    if objective is None:
+        raise ValueError("parameters: missing 'objective_layer'")
+    if objective not in exposure_layers:
+        raise ValueError(
+            f"parameters.objective_layer '{objective}' is not a declared "
+            f"exposure layer ({', '.join(exposure_layers)})"
+        )
+    weights = parameters.get("weights")
+    if not isinstance(weights, (list, tuple)) or not weights:
+        raise ValueError("parameters.weights: must be a non-empty list of weights")
+    weights = [non_negative_finite("parameters.weights", w) for w in weights]
+    if any(later <= earlier for earlier, later in zip(weights, weights[1:])):
+        raise ValueError("parameters.weights: must be strictly increasing")
+    resolved = {"mode": mode, "objective_layer": objective, "weights": weights}
+    resolved.update(_resolve_groups(parameters, groups, recipe_dir))
     _canonical(resolved, "parameters")  # every value must be recordable
     return resolved
 
@@ -512,18 +572,32 @@ def validate(path):
 
 
 class _RecipeType:
-    """A registered recipe type: ``resolve`` validates + resolves its sections,
-    ``run`` executes the resolved recipe and returns ``(frame, checksums)``."""
+    """A registered recipe type: its input ``roles`` (role → the kinds it
+    accepts, or ``("layers", kinds)`` for a mapping of named sources), its
+    parameter ``groups`` (a callable giving ``{group: (target, fixed)}``),
+    ``resolve`` (validates + resolves its sections), and ``run`` (executes the
+    resolved recipe, returning ``(frame, checksums)``)."""
 
-    def __init__(self, name, resolve, run):
+    def __init__(self, name, roles, groups, resolve, run):
         self.name = name
+        self.roles = roles
+        self.groups = groups
         self.resolve = resolve
         self.run = run
 
 
+_EXPOSURE_ROLES = {
+    "streets": _STREET_KEYS,
+    "exposure": ("layers", _EXPOSURE_KEYS),
+    "origins": _OD_KEYS,
+    "destinations": _OD_KEYS,
+}
+
+
 def _resolve_exposure_tradeoff(document, recipe_dir):
-    inputs = _resolve_inputs(document.get("inputs"), recipe_dir)
-    parameters = _resolve_parameters(
+    inputs = _resolve_inputs(document.get("inputs"), recipe_dir, _EXPOSURE_ROLES)
+    _check_layer_names(inputs["exposure"])
+    parameters = _resolve_exposure_parameters(
         document.get("parameters"), tuple(inputs["exposure"]), recipe_dir
     )
     outputs = _resolve_outputs(document.get("outputs"))
@@ -637,13 +711,15 @@ def _materialise(source):
     return {**source, "path": fetch(Asset(**pinned), sample["region"])}
 
 
-def _materialise_inputs(inputs):
-    """Every input of the exposure_tradeoff recipe with a local path."""
+def _materialise_inputs(inputs, roles):
+    """Every input with a local path (sample assets fetched)."""
     return {
-        "streets": _materialise(inputs["streets"]),
-        "exposure": {n: _materialise(layer) for n, layer in inputs["exposure"].items()},
-        "origins": _materialise(inputs["origins"]),
-        "destinations": _materialise(inputs["destinations"]),
+        role: (
+            {name: _materialise(source) for name, source in value.items()}
+            if _is_layers(roles[role])
+            else _materialise(value)
+        )
+        for role, value in inputs.items()
     }
 
 
@@ -662,9 +738,7 @@ def _run_exposure_tradeoff(resolved):
     checksums = {}
     with tempfile.TemporaryDirectory(prefix="cafein-recipe-") as run_dir:
         run_dir = pathlib.Path(run_dir)
-        roles = [("streets", inputs["streets"])]
-        roles += [(f"exposure.{n}", spec) for n, spec in inputs["exposure"].items()]
-        roles += [(role, inputs[role]) for role in ("origins", "destinations")]
+        roles = list(_input_sources(inputs, _EXPOSURE_ROLES))
         roles += [
             (f"parameters.{g}.{k}", src) for g, k, src in _parameter_sources(parameters)
         ]
@@ -688,7 +762,8 @@ def _run_exposure_tradeoff(resolved):
                     else:
                         value = str(copy["path"])
                 elif (name, key) in _OBJECT_KEYWORDS:
-                    value = _build_object(name, key, value)
+                    where = f"parameters.{name}.{key}"
+                    value = _build_object(_OBJECT_KEYWORDS[name, key], value, where)
                 values[key] = value
             return values
 
@@ -793,18 +868,15 @@ def _canonical(value, where):
     raise ValueError(f"{where}: {value!r} cannot be recorded in the provenance")
 
 
-def _effective_parameters(parameters):
-    """Every group with its defaults filled in — the complete method — and a
-    file-valued entry as a plain mapping."""
-    import cafein
-
-    effective = {k: v for k, v in parameters.items() if k not in _GROUPS}
-    for group, (target, fixed) in _parameter_groups().items():
+def _effective_parameters(parameters, groups):
+    """Every group with its defaults filled in — the complete method — an
+    object spelling with its constructor's defaults too."""
+    effective = {k: v for k, v in parameters.items() if k not in groups}
+    for group, (target, fixed) in groups.items():
         values = _group_surface(target, fixed)
         for key, value in parameters[group].items():
             if (group, key) in _OBJECT_KEYWORDS:
-                constructor = getattr(cafein, _OBJECT_KEYWORDS[group, key])
-                value = {**_group_surface(constructor, set()), **value}
+                value = _effective_object(_OBJECT_KEYWORDS[group, key], value)
             values[key] = value
         effective[group] = values
     return effective
@@ -813,18 +885,13 @@ def _effective_parameters(parameters):
 def _serialisable(resolved):
     """The resolved recipe with every parameter group's defaults filled in, for
     the provenance record."""
-    inputs = resolved["inputs"]
+    groups = _RECIPES[resolved["recipe"]].groups()
     return {
         "recipe": resolved["recipe"],
         "version": resolved["version"],
         "requires": resolved["requires"],
-        "inputs": {
-            "streets": inputs["streets"],
-            "exposure": {name: layer for name, layer in inputs["exposure"].items()},
-            "origins": inputs["origins"],
-            "destinations": inputs["destinations"],
-        },
-        "parameters": _effective_parameters(resolved["parameters"]),
+        "inputs": resolved["inputs"],
+        "parameters": _effective_parameters(resolved["parameters"], groups),
         "outputs": resolved["outputs"],
     }
 
@@ -901,14 +968,14 @@ def run(path, out_dir=None, *, _entry_point="python", _invocation=None):
     recipe_path = pathlib.Path(path).resolve()
     resolved = validate(recipe_path)
     # Sample assets are fetched first, so the output guards see their paths.
-    resolved["inputs"] = _materialise_inputs(resolved["inputs"])
+    recipe = _RECIPES[resolved["recipe"]]
+    resolved["inputs"] = _materialise_inputs(resolved["inputs"], recipe.roles)
     for group, key, source in list(_parameter_sources(resolved["parameters"])):
         resolved["parameters"][group][key] = _materialise(source)
     out_root = pathlib.Path(out_dir or pathlib.Path.cwd()).resolve()
-    protected = [recipe_path, resolved["inputs"]["streets"]["path"]]
-    protected += [layer["path"] for layer in resolved["inputs"]["exposure"].values()]
+    protected = [recipe_path]
     protected += [
-        resolved["inputs"][role]["path"] for role in ("origins", "destinations")
+        source["path"] for _, source in _input_sources(resolved["inputs"], recipe.roles)
     ]
     protected += [s["path"] for _, _, s in _parameter_sources(resolved["parameters"])]
     unresolved = out_root / resolved["outputs"]["table"]
@@ -917,7 +984,7 @@ def run(path, out_dir=None, *, _entry_point="python", _invocation=None):
     target.parent.mkdir(parents=True, exist_ok=True)
     parent_identity = _identity(target.parent)
 
-    frame, checksums = _RECIPES[resolved["recipe"]].run(resolved)
+    frame, checksums = recipe.run(resolved)
 
     _reject_symlinks(out_root, unresolved, unresolved.with_name(provenance.name))
     if _identity(target.parent) != parent_identity:
@@ -994,6 +1061,10 @@ def run(path, out_dir=None, *, _entry_point="python", _invocation=None):
 #: analysis type is added by registering it here, not by branching in validate().
 _RECIPES = {
     "exposure_tradeoff": _RecipeType(
-        "exposure_tradeoff", _resolve_exposure_tradeoff, _run_exposure_tradeoff
+        "exposure_tradeoff",
+        _EXPOSURE_ROLES,
+        _exposure_groups,
+        _resolve_exposure_tradeoff,
+        _run_exposure_tradeoff,
     )
 }

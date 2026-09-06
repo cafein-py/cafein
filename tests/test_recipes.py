@@ -54,10 +54,22 @@ def _write(tmp_path, mutate=None):
 
 def test_validate_resolves_a_recipe(tmp_path):
     pytest.importorskip("yaml")
-    # an object-valued keyword in its mapping spelling, built eagerly
-    traveler = {"traveler": {"wheelchair": True}}
+    # object-valued keywords in their mapping spelling, built eagerly
+    objects = {
+        "traveler": {"wheelchair": True},
+        "street_policy": {
+            "access": {"e_scooter": 900},
+            "vehicles": {
+                "e_scooter": {
+                    "source": "shared",
+                    "facilities": "any_stop",
+                    "availability": "unconstrained",
+                }
+            },
+        },
+    }
     resolved = recipes.validate(
-        _write(tmp_path, _set(["parameters", "matrix"], traveler))
+        _write(tmp_path, _set(["parameters", "matrix"], objects))
     )
     assert resolved["recipe"] == "exposure_tradeoff"
     # local paths resolve to absolute files beside the recipe
@@ -69,12 +81,14 @@ def test_validate_resolves_a_recipe(tmp_path):
         "weights": [0.5, 1.0],
         "streets": {},
         "exposure": {},
-        "matrix": {"traveler": {"wheelchair": True}},
+        "matrix": objects,
     }
-    # the record's view fills in the object's own defaults too
-    effective = recipes._effective_parameters(resolved["parameters"])["matrix"]
+    # the record's view fills in the objects' own defaults, nested ones too
+    groups = recipes._RECIPES["exposure_tradeoff"].groups()
+    effective = recipes._effective_parameters(resolved["parameters"], groups)["matrix"]
     assert effective["traveler"]["wheelchair"] is True
     assert effective["traveler"]["unknown"] == "usable"
+    assert effective["street_policy"]["vehicles"]["e_scooter"]["take_aboard"] is False
     assert resolved["outputs"]["table"] == "tradeoff.parquet"
 
 
@@ -139,7 +153,21 @@ def _delete(path_keys):
             "does not take a mapping",
         ),
         (
-            _set(["parameters", "matrix"], {"street_policy": {"access": {"walk": 1}}}),
+            _set(
+                ["parameters", "matrix"],
+                {"street_policy": {"access": {"e_scooter": 1}}},
+            ),
+            "vehicle terms",
+        ),
+        (
+            _set(
+                ["parameters", "matrix"],
+                {"street_policy": {"vehicles": {"e_scooter": 1}}},
+            ),
+            "VehiclePolicy keyword mappings",
+        ),
+        (
+            _set(["parameters", "matrix"], {"delay_model": {"k": 1}}),
             "does not take a mapping",
         ),
         (_set(["parameters", "matrix"], {"traveler": {"foo": 1}}), "traveler.*foo"),
@@ -848,3 +876,32 @@ def test_run_reads_a_vector_parameter_by_layer(tmp_path, monkeypatch, layer):
     recipes.run(path, out_dir=tmp_path / "out")
     assert isinstance(received["urban_areas"], geopandas.GeoDataFrame)
     assert len(received["urban_areas"]) == 1
+
+
+def test_run_accepts_a_layer_named_kind(tmp_path, monkeypatch):
+    """Input shapes follow the recipe's role declaration, so a layer that
+    happens to be named ``kind`` is a layer, not a source."""
+    pytest.importorskip("pyarrow")
+    from cafein import recipes
+
+    inputs = {
+        "streets": {"kind": "file", "path": "streets.pbf"},
+        "exposure": {
+            "kind": {"kind": "vector", "path": "no2.geojson", "value": "level"}
+        },
+        "origins": {"kind": "vector", "path": "origins.geojson", "id_column": "id"},
+        "destinations": {
+            "kind": "vector",
+            "path": "destinations.geojson",
+            "id_column": "id",
+        },
+    }
+    path = _two_route_recipe(tmp_path, monkeypatch, inputs=inputs)
+    yaml = pytest.importorskip("yaml")
+    recipe = yaml.safe_load(path.read_text())
+    recipe["parameters"]["objective_layer"] = "kind"
+    path.write_text(yaml.safe_dump(recipe))
+    frame = recipes.run(path, out_dir=tmp_path / "out")
+    assert "kind_exposure" in frame.columns
+    record = json.loads((tmp_path / "out" / "tradeoff.provenance.json").read_text())
+    assert "exposure.kind" in record["inputs"]
