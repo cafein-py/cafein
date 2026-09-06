@@ -196,7 +196,15 @@ def _delete(path_keys):
         (_set(["outputs", "table"], "out./t.parquet"), "not a portable file name"),
         (_set(["outputs", "table"], "d" * 256 + "/t.parquet"), "not a portable"),
         (_set(["inputs", "origins", "id_column"], []), "'id_column' must be a string"),
-        (_set(["inputs", "exposure", "no2", "value"], True), "must be a column name"),
+        (_set(["inputs", "exposure", "no2", "value"], True), "band name or a 1-based"),
+        (_set(["inputs", "exposure", "no2", "value"], 0), "band name or a 1-based"),
+        (
+            _set(
+                ["inputs", "exposure", "no2"],
+                {"kind": "vector", "path": "origins.geojson", "value": 1},
+            ),
+            "must be a column name",
+        ),
         (_set(["inputs", "exposure", ""], {"kind": "raster"}), "non-empty strings"),
         (
             _set(
@@ -905,3 +913,153 @@ def test_run_accepts_a_layer_named_kind(tmp_path, monkeypatch):
     assert "kind_exposure" in frame.columns
     record = json.loads((tmp_path / "out" / "tradeoff.provenance.json").read_text())
     assert "exposure.kind" in record["inputs"]
+
+
+def _transit_document():
+    return {
+        "recipe": "transit_cost_matrix",
+        "inputs": {
+            "gtfs": {"kind": "file", "path": "gtfs.zip"},
+            "streets": {"kind": "file", "path": "streets.pbf"},
+            "origins": {"kind": "vector", "path": "origins.geojson", "id_column": "id"},
+            "destinations": {
+                "kind": "vector",
+                "path": "dests.geojson",
+                "id_column": "id",
+            },
+        },
+        "parameters": {
+            "network": {"street_modes": ["walk", "e_scooter"]},
+            "matrix": {
+                "departure": "2022-02-22 08:30:00",
+                "street_policy": {
+                    "access": {"e_scooter": 900},
+                    "egress": {"e_scooter": 900},
+                    "vehicles": {
+                        "e_scooter": {
+                            "source": "shared",
+                            "facilities": "any_stop",
+                            "availability": "unconstrained",
+                        }
+                    },
+                },
+                "fares": {
+                    "kind": "gtfs_zones",
+                    "rules": "zones",
+                    "street": {"e_scooter": {"unlock": 1.0, "per_minute": 0.25}},
+                },
+            },
+        },
+        "outputs": {"table": "costs.parquet"},
+    }
+
+
+def _write_transit(tmp_path, mutate=None):
+    yaml = pytest.importorskip("yaml")
+    for name in ("gtfs.zip", "streets.pbf", "origins.geojson", "dests.geojson"):
+        (tmp_path / name).write_bytes(b"\x00")
+    recipe = _transit_document()
+    if mutate is not None:
+        mutate(recipe)
+    path = tmp_path / "recipe.yaml"
+    path.write_text(yaml.safe_dump(recipe))
+    return path
+
+
+def test_validate_resolves_a_transit_recipe(tmp_path):
+    from cafein import recipes
+
+    resolved = recipes.validate(_write_transit(tmp_path))
+    assert resolved["inputs"]["gtfs"]["path"] == (tmp_path / "gtfs.zip").resolve()
+    fares = resolved["parameters"]["matrix"]["fares"]
+    assert fares == {
+        "kind": "gtfs_zones",
+        "rules": "zones",
+        "street": {"e_scooter": {"unlock": 1.0, "per_minute": 0.25}},
+    }
+    assert resolved["parameters"]["network"] == {"street_modes": ["walk", "e_scooter"]}
+
+
+@pytest.mark.parametrize(
+    "mutate, match",
+    [
+        (_delete(["inputs", "gtfs"]), "missing 'gtfs'"),
+        (_set(["inputs", "gtfs", "path"], "streets.pbf"), "self-contained .zip"),
+        (_set(["parameters", "network"], {"paths": ["x"]}), "fixed by the recipe"),
+        (_set(["parameters", "mode"], "walk"), "unknown key"),
+        (_set(["parameters", "matrix", "fares"], "zones"), "a fare model"),
+        (_set(["parameters", "matrix", "fares"], {"kind": "nope"}), "kind must be"),
+        (
+            _set(
+                ["parameters", "matrix", "fares"],
+                {"kind": "gtfs_zones", "rules": "all"},
+            ),
+            "rules must be",
+        ),
+        (_set(["parameters", "matrix", "fares"], {"kind": "file"}), "needs 'path'"),
+        (
+            _set(["parameters", "matrix", "fares", "street"], {"e_scooter": 1}),
+            "mode -> ",
+        ),
+        (
+            _set(
+                ["parameters", "matrix", "fares", "street"],
+                {"e_scooter": {"unlock": -1, "per_minute": 0}},
+            ),
+            "negative",
+        ),
+    ],
+)
+def test_validate_refuses_bad_transit_recipes(tmp_path, mutate, match):
+    from cafein import recipes
+
+    with pytest.raises(ValueError, match=match):
+        recipes.validate(_write_transit(tmp_path, mutate))
+
+
+def test_transit_recipe_prices_time_co2_and_money(
+    tmp_path, helsinki_gtfs, kantakaupunki_pbf
+):
+    """End to end on the Helsinki fixtures: a shared e-scooter serves both ends,
+    money is the zone fare plus the rental tariff, and the record pins the feed."""
+    yaml = pytest.importorskip("yaml")
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("pyarrow")
+    from shapely.geometry import Point
+
+    from cafein import recipes
+
+    for name, lon, lat in (("origins", 24.9320, 60.1690), ("dests", 24.9520, 60.1795)):
+        geopandas.GeoDataFrame(
+            {"id": [name[0]]}, geometry=[Point(lon, lat)], crs="EPSG:4326"
+        ).to_file(tmp_path / f"{name}.geojson", driver="GeoJSON")
+    recipe = _transit_document()
+    recipe["inputs"]["gtfs"]["path"] = str(helsinki_gtfs)
+    recipe["inputs"]["streets"]["path"] = str(kantakaupunki_pbf)
+    path = tmp_path / "recipe.yaml"
+    path.write_text(yaml.safe_dump(recipe))
+
+    frame = recipes.run(path, out_dir=tmp_path / "out")
+
+    assert {"travel_time", "transfers", "emissions", "money"} <= set(frame.columns)
+    assert len(frame) == 1 and frame["money"].notna().all()
+    assert frame["emissions"].iloc[0] > 0
+    # Money carries the rental on top of the ticket: at least the cheapest
+    # fare product of the feed plus the scooter's unlock fee.
+    import csv
+    import io as _io
+    import zipfile
+
+    with zipfile.ZipFile(helsinki_gtfs) as feed:
+        rows = csv.DictReader(_io.TextIOWrapper(feed.open("fare_attributes.txt")))
+        cheapest = min(float(row["price"]) for row in rows)
+    assert frame["money"].iloc[0] >= cheapest + 1.0
+    record = json.loads((tmp_path / "out" / "costs.provenance.json").read_text())
+    assert (
+        record["inputs"]["gtfs"]["sha256"]
+        == hashlib.sha256(helsinki_gtfs.read_bytes()).hexdigest()
+    )
+    effective = record["resolved"]["parameters"]
+    assert effective["matrix"]["fares"]["rules"] == "zones"
+    assert effective["network"]["street_modes"] == ["walk", "e_scooter"]
+    assert effective["matrix"]["max_rides"] == 8  # a default, recorded

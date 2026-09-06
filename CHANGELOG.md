@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- A second recipe type, `transit_cost_matrix`: a public-transport
+  `TravelCostMatrix` over a `gtfs` input (`.zip` file or `helsinki.gtfs`
+  sample) and the street network, with `network:` (`from_gtfs`) and `matrix:`
+  parameter groups; `matrix.fares` is spelled `{kind: gtfs_zones, rules,
+  street}` (the feed's zone fares plus a rental tariff for the policy's shared
+  modes) or `{kind: file, path}` (an r5r-format fare zip). Two Helsinki
+  e-scooter examples ship under `examples/recipes/`.
+
 - Recipe `matrix:` parameters accept `street_policy` as a mapping of
   `StreetLegPolicy` keywords, its `vehicles` as `VehiclePolicy` keyword
   mappings, built at validate so their own checks run before anything is

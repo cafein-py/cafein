@@ -23,6 +23,7 @@ _STREET_SUFFIXES = (".pbf",)
 _RASTER_SUFFIXES = (".tif", ".tiff")
 _VECTOR_SUFFIXES = (".gpkg", ".geojson", ".json")
 _TABLE_SUFFIXES = (".csv", ".json", ".yaml", ".yml")
+_GTFS_SUFFIXES = (".zip",)
 
 #: The recipe-schema versions this cafein understands.
 _SCHEMA_VERSIONS = (1,)
@@ -117,6 +118,10 @@ _OD_KEYS = {
     "vector": (("path", "id_column"), ("layer",), _VECTOR_SUFFIXES),
     "sample": (("name", "id_column"), ("layer",), _VECTOR_SUFFIXES),
 }
+_GTFS_KEYS = {
+    "file": (("path",), (), _GTFS_SUFFIXES),
+    "sample": (("name",), (), _GTFS_SUFFIXES),
+}
 #: Parameter keywords with a spelling beyond plain YAML values. A data file is
 #: written in the inputs' ``{kind: file|sample}`` form (never a bare path, so it
 #: is snapshotted and checksummed): its formats, its extra keys, and how the
@@ -127,6 +132,8 @@ _OD_KEYS = {
 _FILE_KEYWORDS = {
     ("streets", "dem"): (_RASTER_SUFFIXES, (), "path"),
     ("streets", "urban_areas"): (_VECTOR_SUFFIXES, ("layer",), "vector"),
+    ("network", "dem"): (_RASTER_SUFFIXES, (), "path"),
+    ("network", "urban_areas"): (_VECTOR_SUFFIXES, ("layer",), "vector"),
     ("matrix", "factors"): (_TABLE_SUFFIXES, (), "path"),
     ("matrix", "costs"): (_TABLE_SUFFIXES, (), "path"),
 }
@@ -139,9 +146,16 @@ _NESTED_OBJECTS = {"StreetLegPolicy": {"vehicles": "VehiclePolicy"}}
 _MAPPING_KEYWORDS = {
     ("exposure", "thresholds"),
     ("streets", "speed_limits"),
+    ("network", "speed_limits"),
     ("matrix", "departure"),
     ("matrix", "arrival"),
 }
+#: Keywords with a spelling of their own: ``fares`` names a fare model —
+#: ``{kind: gtfs_zones, rules: model|zones, street: ...}`` builds it from the
+#: recipe's ``gtfs`` input, ``{kind: file, path: ...}`` loads an r5r-format
+#: fare zip — with an optional ``street`` rental tariff ``{mode: {unlock,
+#: per_minute}}`` for the policy's shared modes.
+_SPELLED_KEYWORDS = {("matrix", "fares")}
 
 #: ``Exposure(network, ..., **layers)`` keywords a layer may not be named after.
 _RESERVED_LAYER_NAMES = frozenset(
@@ -202,10 +216,6 @@ def _resolve_source(where, spec, recipe_dir, *, keys):
     for key in ("id_column", "units", "layer"):
         if key in spec and not isinstance(spec[key], str):
             raise ValueError(f"{where}: '{key}' must be a string")
-    if "value" in spec and (
-        isinstance(spec["value"], bool) or not isinstance(spec["value"], (str, int))
-    ):
-        raise ValueError(f"{where}: 'value' must be a column name or a band")
     if kind == "sample":
         sample = _sample_pin(spec["name"], where)
         path, filename = None, sample["name"]
@@ -221,6 +231,19 @@ def _resolve_source(where, spec, recipe_dir, *, keys):
             f"{where}: '{filename}' is not a self-contained {'/'.join(suffixes)} "
             "file (multi-file formats such as shapefiles are not supported)"
         )
+    if "value" in spec:
+        value = spec["value"]
+        named = isinstance(value, str) and bool(value)
+        if _suffix_ok(pathlib.PurePath(filename), _RASTER_SUFFIXES):
+            indexed = (
+                isinstance(value, int) and not isinstance(value, bool) and value >= 1
+            )
+            if not (named or indexed):
+                raise ValueError(
+                    f"{where}: 'value' must be a band name or a 1-based band index"
+                )
+        elif not named:
+            raise ValueError(f"{where}: 'value' must be a column name")
     if path is not None and (
         path.suffix.lower() == ".gpkg" and path.with_name(path.name + "-wal").exists()
     ):
@@ -327,6 +350,20 @@ def _exposure_groups():
     }
 
 
+def _transit_groups():
+    """The transit_cost_matrix recipe's ``parameters:`` groups: the network
+    build and the matrix, the inputs' keywords fixed."""
+    from cafein import TransportNetwork, TravelCostMatrix
+
+    return {
+        "network": (TransportNetwork.from_gtfs, {"paths", "osm_pbf"}),
+        "matrix": (
+            TravelCostMatrix,
+            {"network", "origins", "destinations", "transport_mode", "exposure"},
+        ),
+    }
+
+
 def _group_surface(target, fixed):
     """``{keyword: default}`` over the keywords a group may set: the target's
     named parameters minus the fixed ones."""
@@ -379,9 +416,82 @@ def _effective_object(name, mapping):
     return values
 
 
+def _resolve_fares(value, where, recipe_dir):
+    """The ``fares`` spelling, validated eagerly: the kind, the zone rules,
+    a fare file's path, and the street tariff (by the structure's own check)."""
+    from cafein.fares import _street_tariffs
+
+    if not isinstance(value, dict) or "kind" not in value:
+        raise ValueError(
+            f"{where}: a fare model, written as {{kind: gtfs_zones}} or "
+            "{kind: file, path: ...}"
+        )
+    kind = value["kind"]
+    choice(f"{where}.kind", kind, ("gtfs_zones", "file"))
+    allowed = (
+        {"kind", "street", "rules"}
+        if kind == "gtfs_zones"
+        else {"kind", "street", "path"}
+    )
+    _reject_foreign(value, allowed, where)
+    resolved = {"kind": kind}
+    if kind == "gtfs_zones":
+        resolved["rules"] = value.get("rules", "model")
+        choice(f"{where}.rules", resolved["rules"], ("model", "zones"))
+    else:
+        source = _resolve_source(
+            where,
+            {"kind": "file", "path": value.get("path")},
+            recipe_dir,
+            keys={"file": (("path",), (), _GTFS_SUFFIXES)},
+        )
+        resolved["path"] = source["path"]
+    if "street" in value:
+        if not isinstance(value["street"], dict) or not all(
+            isinstance(entry, dict) for entry in value["street"].values()
+        ):
+            raise ValueError(
+                f"{where}.street: a mapping of mode -> {{unlock, per_minute}}"
+            )
+        try:
+            _street_tariffs(value["street"])
+        except ValueError as error:
+            raise ValueError(f"{where}.street: {error}") from None
+        resolved["street"] = value["street"]
+    return resolved
+
+
+def _build_fares(spelling, gtfs_path, copies, where):
+    """The fare structure a ``fares`` spelling names, the street tariff
+    attached."""
+    from cafein import fares as _fares
+
+    if spelling["kind"] == "gtfs_zones":
+        if gtfs_path is None:
+            raise ValueError(f"{where}: kind gtfs_zones needs a gtfs input")
+        structure = _fares.zone_fare_structure(str(gtfs_path), rules=spelling["rules"])
+        if "street" in spelling:
+            structure = _fares.ZoneFareStructure(
+                structure.fares,
+                structure.fare_zones,
+                structure.stop_zones,
+                street=spelling["street"],
+                fare_routes=structure.fare_routes,
+                fare_od=structure.fare_od,
+                agency_routes=structure.agency_routes,
+            )
+        return structure
+    structure = _fares.load_fare_structure(str(copies[where]["path"]))
+    if "street" in spelling:
+        structure.street = _fares._street_tariffs(spelling["street"])
+    return structure
+
+
 def _resolve_value(group, key, value, recipe_dir):
     """One group keyword's value in its recipe spelling, or raise by name."""
     where = f"parameters.{group}.{key}"
+    if (group, key) in _SPELLED_KEYWORDS:
+        return _resolve_fares(value, where, recipe_dir)
     if (group, key) in _FILE_KEYWORDS:
         if not (isinstance(value, dict) and "kind" in value):
             raise ValueError(
@@ -407,10 +517,11 @@ def _resolve_value(group, key, value, recipe_dir):
 
 
 def _parameter_sources(parameters):
-    """``(group, key, source)`` for every file-valued parameter."""
-    for group, key in _FILE_KEYWORDS:
+    """``(group, key, source)`` for every file-valued parameter, a fare file
+    spelled under ``fares`` included."""
+    for group, key in (*_FILE_KEYWORDS, *_SPELLED_KEYWORDS):
         values = parameters.get(group)
-        if isinstance(values, dict) and key in values:
+        if isinstance(values, dict) and key in values and "path" in values[key]:
             yield group, key, values[key]
 
 
@@ -592,6 +703,12 @@ _EXPOSURE_ROLES = {
     "origins": _OD_KEYS,
     "destinations": _OD_KEYS,
 }
+_TRANSIT_ROLES = {
+    "gtfs": _GTFS_KEYS,
+    "streets": _STREET_KEYS,
+    "origins": _OD_KEYS,
+    "destinations": _OD_KEYS,
+}
 
 
 def _resolve_exposure_tradeoff(document, recipe_dir):
@@ -602,6 +719,21 @@ def _resolve_exposure_tradeoff(document, recipe_dir):
     )
     outputs = _resolve_outputs(document.get("outputs"))
     return {"inputs": inputs, "parameters": parameters, "outputs": outputs}
+
+
+def _resolve_transit_cost_matrix(document, recipe_dir):
+    inputs = _resolve_inputs(document.get("inputs"), recipe_dir, _TRANSIT_ROLES)
+    parameters = document.get("parameters")
+    if parameters is None:
+        parameters = {}
+    if not isinstance(parameters, dict):
+        raise ValueError("parameters: must be a mapping")
+    groups = _transit_groups()
+    _reject_foreign(parameters, set(groups), "parameters")
+    resolved = _resolve_groups(parameters, groups, recipe_dir)
+    _canonical(resolved, "parameters")  # every value must be recordable
+    outputs = _resolve_outputs(document.get("outputs"))
+    return {"inputs": inputs, "parameters": resolved, "outputs": outputs}
 
 
 def _file_digest(path):
@@ -751,21 +883,7 @@ def _run_exposure_tradeoff(resolved):
         origins_source, destinations_source = copies["origins"], copies["destinations"]
 
         def group(name):
-            """The group's keywords, a file-valued one as its snapshot's path."""
-            values = {}
-            for key, value in parameters[name].items():
-                if (name, key) in _FILE_KEYWORDS:
-                    copy = copies[f"parameters.{name}.{key}"]
-                    if _FILE_KEYWORDS[name, key][2] == "vector":
-                        where = f"parameters.{name}.{key}"
-                        value = _read_vector(copy["path"], copy.get("layer"), where)
-                    else:
-                        value = str(copy["path"])
-                elif (name, key) in _OBJECT_KEYWORDS:
-                    where = f"parameters.{name}.{key}"
-                    value = _build_object(_OBJECT_KEYWORDS[name, key], value, where)
-                values[key] = value
-            return values
+            return _group_values(parameters, name, copies)
 
         streets = StreetNetwork.from_osm(
             streets_source["path"], modes=[mode], **group("streets")
@@ -804,14 +922,81 @@ def _run_exposure_tradeoff(resolved):
     # ridden geometry (``matrix.geometries``) rejoins them as GeoParquet.
     geometry = frame.pop("geometry") if "geometry" in frame.columns else None
     frame = compare_to_fastest(frame)
-    if geometry is not None:
-        import geopandas
+    return _with_geometry(frame, geometry), checksums
 
-        lines = geopandas.GeoSeries(
-            geometry.to_numpy(), index=frame.index, crs="EPSG:4326"
+
+def _group_values(parameters, name, copies, gtfs_path=None):
+    """One group's keywords as its object takes them: a file-valued one as its
+    snapshot's path (or the vector it holds), an object spelling built, a
+    ``fares`` spelling as its structure."""
+    values = {}
+    for key, value in parameters[name].items():
+        where = f"parameters.{name}.{key}"
+        if (name, key) in _SPELLED_KEYWORDS:
+            value = _build_fares(value, gtfs_path, copies, where)
+        elif (name, key) in _FILE_KEYWORDS:
+            copy = copies[where]
+            if _FILE_KEYWORDS[name, key][2] == "vector":
+                value = _read_vector(copy["path"], copy.get("layer"), where)
+            else:
+                value = str(copy["path"])
+        elif (name, key) in _OBJECT_KEYWORDS:
+            value = _build_object(_OBJECT_KEYWORDS[name, key], value, where)
+        values[key] = value
+    return values
+
+
+def _with_geometry(frame, geometry):
+    """The frame as a GeoDataFrame (published as GeoParquet) when the matrix
+    carried ridden geometry, else as it is."""
+    if geometry is None:
+        return frame
+    import geopandas
+
+    lines = geopandas.GeoSeries(geometry.to_numpy(), index=frame.index, crs="EPSG:4326")
+    return geopandas.GeoDataFrame(frame, geometry=lines)
+
+
+def _run_transit_cost_matrix(resolved):
+    """A public-transport cost matrix — travel time, transfers, distances,
+    emissions, and money when a fare model is spelled — over the recipe's
+    GTFS feed and street network. Returns the frame and each input's
+    checksum, taken from the snapshot the pipeline actually read."""
+    import tempfile
+
+    import pandas as pd
+
+    from cafein import TransportNetwork, TravelCostMatrix
+
+    inputs, parameters = resolved["inputs"], resolved["parameters"]
+    checksums = {}
+    with tempfile.TemporaryDirectory(prefix="cafein-recipe-") as run_dir:
+        run_dir = pathlib.Path(run_dir)
+        roles = list(_input_sources(inputs, _TRANSIT_ROLES))
+        roles += [
+            (f"parameters.{g}.{k}", src) for g, k, src in _parameter_sources(parameters)
+        ]
+        copies = {
+            role: _snapshot(index, role, _materialise(source), run_dir, checksums)
+            for index, (role, source) in enumerate(roles)
+        }
+        gtfs_path = copies["gtfs"]["path"]
+        network = TransportNetwork.from_gtfs(
+            [str(gtfs_path)],
+            osm_pbf=str(copies["streets"]["path"]),
+            **_group_values(parameters, "network", copies),
         )
-        frame = geopandas.GeoDataFrame(frame, geometry=lines)
-    return frame, checksums
+        origins = _load_points(copies["origins"], "inputs.origins")
+        destinations = _load_points(copies["destinations"], "inputs.destinations")
+        frame = TravelCostMatrix(
+            network,
+            origins,
+            destinations,
+            **_group_values(parameters, "matrix", copies, gtfs_path=gtfs_path),
+        )
+    frame = pd.DataFrame(frame)
+    geometry = frame.pop("geometry") if "geometry" in frame.columns else None
+    return _with_geometry(frame, geometry), checksums
 
 
 def _dependency_versions():
@@ -959,7 +1144,8 @@ def run(path, out_dir=None, *, _entry_point="python", _invocation=None):
     the table's own SHA-256, the invocation, and a UTC timestamp. These guards
     address accidents, stale state, and clashing runs in a researcher's own
     output directory; they are not a defence against an adversary racing that
-    directory or rewriting the inputs mid-run. Returns the trade-off frame.
+    directory or rewriting the inputs mid-run. Returns the recipe's result
+    frame.
     """
     import os
     import shutil
@@ -1066,5 +1252,12 @@ _RECIPES = {
         _exposure_groups,
         _resolve_exposure_tradeoff,
         _run_exposure_tradeoff,
-    )
+    ),
+    "transit_cost_matrix": _RecipeType(
+        "transit_cost_matrix",
+        _TRANSIT_ROLES,
+        _transit_groups,
+        _resolve_transit_cost_matrix,
+        _run_transit_cost_matrix,
+    ),
 }

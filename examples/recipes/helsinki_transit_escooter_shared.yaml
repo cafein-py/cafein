@@ -1,0 +1,46 @@
+# Public-transport cost matrix for the Helsinki metropolitan area: travel
+# time, CO2e, and money per origin-destination pair, with a shared (rental)
+# e-scooter allowed for the access and egress legs. Money is the HSL zone
+# fare from the GTFS fare files plus the scooter rental: an unlock fee and a
+# per-started-minute rate on every rental leg. File names are placeholders
+# for local data. Run with `cafein.recipes.run("helsinki_transit_escooter_shared.yaml")`.
+recipe: transit_cost_matrix
+version: 1
+inputs:
+  gtfs:
+    kind: file
+    path: data/hsl_gtfs_2026-08-18.zip
+  streets:
+    kind: file
+    path: data/helsinki_metropolitan_area.osm.pbf
+  origins:
+    kind: vector
+    path: data/ykr_grid_250m_centroids.gpkg
+    id_column: ykr_id
+  destinations:
+    kind: vector
+    path: data/workplaces_2026.gpkg
+    layer: workplaces
+    id_column: workplace_id
+parameters:
+  network:                                   # TransportNetwork.from_gtfs(**network)
+    street_modes: [walk, e_scooter]           # build the multimodal street graph
+    walking_speed_kmph: 4.5
+  matrix:                                    # TravelCostMatrix(**matrix)
+    departure: "2026-08-18 08:00:00"
+    max_rides: 4
+    street_policy:                            # StreetLegPolicy
+      access: {e_scooter: 900}                # seconds of scooter riding at each end
+      egress: {e_scooter: 900}
+      vehicles:
+        e_scooter: {source: shared, facilities: any_stop, availability: unconstrained}
+    fares:
+      kind: gtfs_zones                        # zone fares from the feed's fare files
+      rules: zones
+      street:
+        e_scooter: {unlock: 1.00, per_minute: 0.25}   # EUR
+    components: [vehicle, fuel, infrastructure, operations]
+    workers: 8
+    max_memory: 16 GiB
+outputs:
+  table: hma_transit_costs_shared_escooter.parquet
