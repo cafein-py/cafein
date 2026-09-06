@@ -296,10 +296,12 @@ def test_run_refuses_an_output_that_overwrites_an_input(tmp_path):
         recipes.run(path, out_dir=tmp_path)
 
 
-def _two_route_recipe(tmp_path, monkeypatch, weights=(0.6,), mode="walk"):
+def _two_route_recipe(
+    tmp_path, monkeypatch, weights=(0.6,), mode="walk", inputs=None, table=None
+):
     """A recipe on the synthetic two-corridor network (the OSM loader is
     stubbed, both modes permitted): value 1.0 over the short corridor, the 1.5x
-    detour outside it."""
+    detour outside it. ``inputs`` replaces the file-kind inputs section."""
     yaml = pytest.importorskip("yaml")
     geopandas = pytest.importorskip("geopandas")
     from shapely.geometry import Point, box
@@ -325,7 +327,8 @@ def _two_route_recipe(tmp_path, monkeypatch, weights=(0.6,), mode="walk"):
         ).to_file(tmp_path / f"{name}.geojson", driver="GeoJSON")
     recipe = {
         "recipe": "exposure_tradeoff",
-        "inputs": {
+        "inputs": inputs
+        or {
             "streets": {"kind": "file", "path": "streets.pbf"},
             "exposure": {
                 "no2": {"kind": "vector", "path": "no2.geojson", "value": "level"}
@@ -342,7 +345,7 @@ def _two_route_recipe(tmp_path, monkeypatch, weights=(0.6,), mode="walk"):
             "objective_layer": "no2",
             "weights": list(weights),
         },
-        "outputs": {"table": "tradeoff.parquet"},
+        "outputs": {"table": table or "tradeoff.parquet"},
     }
     path = tmp_path / "recipe.yaml"
     path.write_text(yaml.safe_dump(recipe))
@@ -500,3 +503,198 @@ def test_validate_applies_exposures_layer_naming_rule(tmp_path, name, match):
     spec = {"kind": "raster", "path": "no2.tif", "value": "c"}
     with pytest.raises(ValueError, match=match):
         recipes.validate(_write(tmp_path, _set(["inputs", "exposure", name], spec)))
+
+
+_SAMPLE_INPUTS = {
+    "streets": {"kind": "sample", "name": "tworoute.osm_pbf"},
+    "exposure": {"no2": {"kind": "sample", "name": "tworoute.no2", "value": "level"}},
+    "origins": {"kind": "sample", "name": "tworoute.origins", "id_column": "id"},
+    "destinations": {
+        "kind": "sample",
+        "name": "tworoute.destinations",
+        "id_column": "id",
+    },
+}
+
+
+def _fake_sampledata(monkeypatch, tmp_path, tamper=None):
+    """Stand in for ``cafein.sampledata`` with a ``tworoute`` region whose pinned
+    assets are the two-corridor files in ``tmp_path``, served without a network;
+    ``tamper`` names an asset whose pin is made wrong."""
+    import dataclasses
+    import sys
+    import types
+
+    @dataclasses.dataclass
+    class Asset:
+        name: str
+        url: str
+        sha256: str
+        size: int
+        license: str = ""
+        attribution: str = ""
+        source_stamp: str = ""
+        release: str = ""
+
+    parent = types.ModuleType("cafein.sampledata")
+    parent.Asset = Asset
+    parent.fetch = lambda asset, region: tmp_path / asset.name
+    region = types.ModuleType("cafein.sampledata.tworoute")
+    region.REGION = "tworoute"
+    region.metadata = {}
+    files = {"osm_pbf": "streets.pbf", "no2": "no2.geojson"}
+    files.update(origins="origins.geojson", destinations="destinations.geojson")
+    for key, filename in files.items():
+        data = (tmp_path / filename).read_bytes()
+        region.metadata[key] = {
+            "name": filename,
+            "url": "",
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "size": len(data),
+            "license": "",
+            "attribution": "",
+            "source_stamp": "",
+            "release": "tworoute-2026.09",
+        }
+    if tamper is not None:
+        region.metadata[tamper]["sha256"] = "0" * 64
+    monkeypatch.setitem(sys.modules, "cafein.sampledata", parent)
+    monkeypatch.setitem(sys.modules, "cafein.sampledata.tworoute", region)
+    # an importable submodule that is no region (no metadata table)
+    module = types.ModuleType("cafein.sampledata.notaregion")
+    monkeypatch.setitem(sys.modules, "cafein.sampledata.notaregion", module)
+
+
+def test_run_on_sample_inputs_records_the_pins(tmp_path, monkeypatch):
+    """Sample inputs validate offline against the region's pins, fetch through
+    the sampledata client at run time, and land in the record with their
+    release and pinned digest."""
+    pytest.importorskip("pyarrow")
+    from cafein import recipes
+
+    path = _two_route_recipe(tmp_path, monkeypatch, inputs=_SAMPLE_INPUTS)
+    _fake_sampledata(monkeypatch, tmp_path)
+    resolved = recipes.validate(path)
+    assert resolved["inputs"]["streets"]["path"] is None
+    pin = resolved["inputs"]["streets"]["sample"]
+    assert pin["asset"] == "tworoute.osm_pbf" and len(pin["sha256"]) == 64
+
+    frame = recipes.run(path, out_dir=tmp_path / "out")
+
+    assert len(frame) == 2 and frame["fastest"].sum() == 1
+    record = json.loads((tmp_path / "out" / "tradeoff.provenance.json").read_text())
+    for role in ("streets", "exposure.no2", "origins", "destinations"):
+        entry = record["inputs"][role]
+        assert entry["sample"]["release"] == "tworoute-2026.09"
+        assert entry["sha256"] == entry["sample"]["sha256"]
+    # the record's resolved recipe shows where the fetched asset was read from
+    assert record["resolved"]["inputs"]["streets"]["path"].endswith("streets.pbf")
+
+
+def test_run_refuses_an_output_that_overwrites_a_fetched_sample(tmp_path, monkeypatch):
+    """The overwrite guard sees a sample's fetched path: a table hard-linked to
+    the cached asset is refused before the analysis."""
+    import os
+
+    pytest.importorskip("pyarrow")
+    from cafein import recipes
+
+    path = _two_route_recipe(
+        tmp_path, monkeypatch, inputs=_SAMPLE_INPUTS, table="alias.parquet"
+    )
+    _fake_sampledata(monkeypatch, tmp_path)
+    os.link(tmp_path / "streets.pbf", tmp_path / "alias.parquet")
+    with pytest.raises(ValueError, match="would overwrite an input"):
+        recipes.run(path, out_dir=tmp_path)
+
+
+def test_run_refuses_a_sample_that_differs_from_its_pin(tmp_path, monkeypatch):
+    pytest.importorskip("pyarrow")
+    from cafein import recipes
+
+    path = _two_route_recipe(tmp_path, monkeypatch, inputs=_SAMPLE_INPUTS)
+    _fake_sampledata(monkeypatch, tmp_path, tamper="osm_pbf")
+    with pytest.raises(ValueError, match="not its pin"):
+        recipes.run(path, out_dir=tmp_path / "out")
+
+
+@pytest.mark.parametrize(
+    "role, spec, match",
+    [
+        ("streets", {"kind": "sample", "name": "tworoute"}, "'<region>.<asset>'"),
+        (
+            "streets",
+            {"kind": "sample", "name": "nowhere.osm_pbf"},
+            "unknown sample region",
+        ),
+        (
+            "streets",
+            {"kind": "sample", "name": "notaregion.osm_pbf"},
+            "unknown sample region",
+        ),
+        (
+            "streets",
+            {"kind": "sample", "name": "tworoute.nope"},
+            "unknown sample asset",
+        ),
+        ("streets", {"kind": "sample", "name": "tworoute.no2"}, "not a self-contained"),
+        (
+            "origins",
+            {
+                "kind": "sample",
+                "name": "tworoute.origins",
+                "path": "x",
+                "id_column": "id",
+            },
+            "does not take 'path'",
+        ),
+    ],
+)
+def test_validate_refuses_bad_sample_inputs(tmp_path, monkeypatch, role, spec, match):
+    pytest.importorskip("yaml")
+    from cafein import recipes
+
+    inputs = {**_SAMPLE_INPUTS, role: spec}
+    path = _two_route_recipe(tmp_path, monkeypatch, inputs=inputs)
+    _fake_sampledata(monkeypatch, tmp_path)
+    with pytest.raises(ValueError, match=match):
+        recipes.validate(path)
+
+
+def test_validate_resolves_helsinki_sample_pins_offline(tmp_path):
+    """Against the real registry: the pins resolve without a download and
+    reconstruct the client's own asset type."""
+    helsinki = pytest.importorskip("cafein.sampledata.helsinki")
+    pytest.importorskip("yaml")
+    from cafein import recipes
+    from cafein.sampledata import Asset
+
+    if "air_quality" not in helsinki.metadata:
+        pytest.skip("this sampledata release carries no air-quality layer")
+    inputs = {
+        "streets": {"kind": "sample", "name": "helsinki.osm_pbf"},
+        "exposure": {
+            "no2": {
+                "kind": "sample",
+                "name": "helsinki.air_quality",
+                "value": "NO2Concentration",
+                "units": "ug/m3",
+            }
+        },
+        "origins": {
+            "kind": "sample",
+            "name": "helsinki.poi_library",
+            "id_column": "osm_id",
+        },
+        "destinations": {
+            "kind": "sample",
+            "name": "helsinki.poi_university",
+            "id_column": "osm_id",
+        },
+    }
+    resolved = recipes.validate(_write(tmp_path, _set(["inputs"], inputs)))
+    for role, key in (("streets", "osm_pbf"), ("origins", "poi_library")):
+        sample = resolved["inputs"][role]["sample"]
+        assert sample["sha256"] == helsinki.metadata[key]["sha256"]
+        Asset(**{field: sample[field] for field in Asset.__dataclass_fields__})
+    assert resolved["inputs"]["exposure"]["no2"]["value"] == "NO2Concentration"
