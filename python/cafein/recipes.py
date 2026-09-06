@@ -2,14 +2,15 @@
 
 A *recipe* is a user-authored YAML document describing a whole analysis
 pipeline; cafein runs it, so the file is the reproducible method. This module
-is the loader, the typed-recipe registry, input resolution, and eager
-validation. Executing a recipe type (the ``exposure_tradeoff`` pipeline) and
-the provenance record it writes arrive with :func:`run`; this module ships the
-framework and :func:`validate`.
+is the loader, the typed-recipe registry, input resolution, eager validation
+(:func:`validate`), and each recipe type's pipeline, reached through the
+registry's ``run`` slot and returning the result frame with the checksums of
+the inputs it read.
 """
 
 from __future__ import annotations
 
+import hashlib
 import pathlib
 
 from cafein._validate import choice, non_negative_finite
@@ -103,6 +104,11 @@ _EXPOSURE_KEYS = {
 }
 _OD_KEYS = {"vector": (("path", "id_column"), ("layer",), _VECTOR_SUFFIXES)}
 
+#: ``Exposure(network, ..., **layers)`` keywords a layer may not be named after.
+_RESERVED_LAYER_NAMES = frozenset(
+    {"self", "network", "thresholds", "rasterize", "max_memory"}
+)
+
 
 def _resolve_source(role, layer, spec, recipe_dir, *, keys):
     """Validate + resolve one `kind:`-tagged file input, or raise by name.
@@ -141,6 +147,11 @@ def _resolve_source(role, layer, spec, recipe_dir, *, keys):
             f"{where}: '{path.name}' is not a self-contained {'/'.join(suffixes)} "
             "file (multi-file formats such as shapefiles are not supported)"
         )
+    if path.suffix.lower() == ".gpkg" and path.with_name(path.name + "-wal").exists():
+        raise ValueError(
+            f"{where}: '{path.name}' has a live write-ahead log ({path.name}-wal); "
+            "checkpoint the GeoPackage so the file holds all of its state"
+        )
     resolved = {"kind": kind, "path": path}
     for key in (*required, *optional):
         if key != "path" and key in spec:
@@ -169,6 +180,15 @@ def _resolve_inputs(inputs, recipe_dir):
     for name in exposure:
         if not isinstance(name, str) or not name:
             raise ValueError("inputs.exposure: layer names must be non-empty strings")
+        if name in _RESERVED_LAYER_NAMES:
+            raise ValueError(
+                f"inputs.exposure: '{name}' is a reserved name, not a layer"
+            )
+    # Exposure's own naming rule (lowercase identifiers outside the cost /
+    # travel_time column families), applied before any data is touched.
+    from cafein.exposure import _validate_names
+
+    _validate_names(list(exposure), {}, ())
     resolved["exposure"] = {
         name: _resolve_source("exposure", name, spec, recipe_dir, keys=_EXPOSURE_KEYS)
         for name, spec in exposure.items()
@@ -200,6 +220,8 @@ def _resolve_parameters(parameters, exposure_layers):
     if not isinstance(weights, (list, tuple)) or not weights:
         raise ValueError("parameters.weights: must be a non-empty list of weights")
     weights = [non_negative_finite("parameters.weights", w) for w in weights]
+    if any(later <= earlier for earlier, later in zip(weights, weights[1:])):
+        raise ValueError("parameters.weights: must be strictly increasing")
     return {"mode": mode, "objective_layer": objective, "weights": weights}
 
 
@@ -212,6 +234,15 @@ def _resolve_outputs(outputs):
     table = outputs["table"]
     posix = pathlib.PurePosixPath(table)
     windows = pathlib.PureWindowsPath(table)
+    if posix.name in ("", ".", "..") or table.endswith(("/", "\\")):
+        raise ValueError(
+            f"outputs.table '{table}' must name a file inside the output root"
+        )
+    if not posix.name.lower().endswith(".parquet"):
+        raise ValueError(
+            f"outputs.table '{table}' must end with .parquet (the table is written "
+            "as Parquet; its provenance and lock derive from the stem)"
+        )
     if (
         "\\" in table
         or bool(windows.drive)
@@ -268,12 +299,13 @@ def validate(path):
 
 
 class _RecipeType:
-    """A registered recipe type: ``resolve`` validates + resolves its sections;
-    execution is attached when the pipeline ships (PR 1b)."""
+    """A registered recipe type: ``resolve`` validates + resolves its sections,
+    ``run`` executes the resolved recipe and returns ``(frame, checksums)``."""
 
-    def __init__(self, name, resolve):
+    def __init__(self, name, resolve, run):
         self.name = name
         self.resolve = resolve
+        self.run = run
 
 
 def _resolve_exposure_tradeoff(document, recipe_dir):
@@ -285,8 +317,154 @@ def _resolve_exposure_tradeoff(document, recipe_dir):
     return {"inputs": inputs, "parameters": parameters, "outputs": outputs}
 
 
+def _file_digest(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _layer_names(path, where):
+    """The layers of a multi-layer file, or a by-name refusal when they cannot
+    be listed — never a silent default layer."""
+    import geopandas
+
+    try:
+        return geopandas.list_layers(path)["name"].tolist()
+    except Exception:
+        try:
+            import fiona
+
+            return list(fiona.listlayers(path))
+        except Exception as error:
+            raise ValueError(
+                f"{where}: cannot list the layers of '{path.name}'; give 'layer:'"
+            ) from error
+
+
+def _read_vector(path, layer, where):
+    """A vector file as a GeoDataFrame; a multi-layer GeoPackage needs `layer:`
+    (GeoJSON holds one layer by construction)."""
+    import geopandas
+
+    if layer is None and path.suffix.lower() == ".gpkg":
+        layers = _layer_names(path, where)
+        if len(layers) > 1:
+            raise ValueError(
+                f"{where}: '{path.name}' holds several layers "
+                f"({', '.join(layers)}); pick one with 'layer:'"
+            )
+    return geopandas.read_file(path, layer=layer)
+
+
+def _load_points(source, where):
+    """Origins/destinations with the declared id column exposed as ``id``,
+    keeping its dtype (the matrix preserves input id types)."""
+    frame = _read_vector(source["path"], source.get("layer"), where)
+    column = source["id_column"]
+    if column not in frame.columns:
+        raise ValueError(f"{where}: no column '{column}' in {source['path'].name}")
+    ids = frame[column]
+    if ids.isna().any() or not ids.is_unique:
+        raise ValueError(f"{where}: '{column}' values must be non-null and unique")
+    return frame.assign(id=ids)
+
+
+def _load_exposure_sources(exposure):
+    """Each layer's ``(source, value)`` for ``Exposure``: a raster path, or a
+    vector file read into a GeoDataFrame."""
+    layers = {}
+    for name, spec in exposure.items():
+        if spec["kind"] == "raster":
+            layers[name] = (str(spec["path"]), spec["value"])
+        else:
+            frame = _read_vector(
+                spec["path"], spec.get("layer"), f"inputs.exposure.{name}"
+            )
+            if spec["value"] not in frame.columns:
+                raise ValueError(
+                    f"inputs.exposure.{name}: no column '{spec['value']}' in "
+                    f"{spec['path'].name}"
+                )
+            layers[name] = (frame, spec["value"])
+    return layers
+
+
+def _snapshot(index, role, source, run_dir, checksums):
+    """Copy one input into the run's private directory under a collision-free
+    name, hashing the very bytes copied, so the provenance describes exactly
+    what the pipeline reads."""
+    digest = hashlib.sha256()
+    copy = run_dir / f"input-{index:02d}{source['path'].suffix.lower()}"
+    with open(source["path"], "rb") as origin, open(copy, "wb") as target:
+        for block in iter(lambda: origin.read(1 << 20), b""):
+            digest.update(block)
+            target.write(block)
+    checksums[role] = {"path": str(source["path"]), "sha256": digest.hexdigest()}
+    return {**source, "path": copy}
+
+
+def _run_exposure_tradeoff(resolved):
+    """The fastest-vs-lower-exposure pipeline at matrix scale. Returns the
+    trade-off frame and each input's checksum, taken from the snapshot the
+    pipeline actually read."""
+    import tempfile
+
+    import pandas as pd
+
+    from cafein import Exposure, StreetNetwork, TravelCostMatrix, compare_to_fastest
+
+    inputs, parameters = resolved["inputs"], resolved["parameters"]
+    mode, objective = parameters["mode"], parameters["objective_layer"]
+    checksums = {}
+    with tempfile.TemporaryDirectory(prefix="cafein-recipe-") as run_dir:
+        run_dir = pathlib.Path(run_dir)
+        roles = [("streets", inputs["streets"])]
+        roles += [(f"exposure.{n}", spec) for n, spec in inputs["exposure"].items()]
+        roles += [(role, inputs[role]) for role in ("origins", "destinations")]
+        copies = {
+            role: _snapshot(index, role, source, run_dir, checksums)
+            for index, (role, source) in enumerate(roles)
+        }
+        streets_source = copies["streets"]
+        exposure_sources = {n: copies[f"exposure.{n}"] for n in inputs["exposure"]}
+        origins_source, destinations_source = copies["origins"], copies["destinations"]
+        streets = StreetNetwork.from_osm(streets_source["path"], modes=[mode])
+        exposure = Exposure(streets, **_load_exposure_sources(exposure_sources))
+        origins = _load_points(origins_source, "inputs.origins")
+        destinations = _load_points(destinations_source, "inputs.destinations")
+        # Exact seconds from the matrix; the table reports float minutes so the
+        # exposure integral (concentration × minutes) is not built on rounded time.
+        frame = TravelCostMatrix(
+            streets,
+            origins,
+            destinations,
+            transport_mode=mode,
+            output_time_units="seconds",
+            exposure=exposure,
+            candidates="sweep",
+            optimize={objective: parameters["weights"]},
+        )
+    frame = pd.DataFrame(frame)
+    frame["travel_time"] = frame["travel_time"] / 60.0
+    # The layer mean is weighted over traversed street edges only, so the
+    # integral takes the on-street share of the trip: the snap connectors at
+    # each end carry no sampled concentration. One mode, one speed — time
+    # splits as distance does.
+    on_network = frame["network_distance_m"]
+    total = on_network + frame["connector_distance_m"]
+    street_share = (on_network / total).where(total > 0, 0.0)
+    frame["on_street_time"] = frame["travel_time"] * street_share
+    for name in inputs["exposure"]:
+        frame[f"{name}_exposure"] = frame[f"{name}_mean"] * frame["on_street_time"]
+    return compare_to_fastest(frame), checksums
+
+
 #: The typed-recipe registry: a recipe type resolves its own sections, so a new
 #: analysis type is added by registering it here, not by branching in validate().
 _RECIPES = {
-    "exposure_tradeoff": _RecipeType("exposure_tradeoff", _resolve_exposure_tradeoff)
+    "exposure_tradeoff": _RecipeType(
+        "exposure_tradeoff", _resolve_exposure_tradeoff, _run_exposure_tradeoff
+    )
 }

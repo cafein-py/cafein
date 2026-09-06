@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- The `exposure_tradeoff` recipe pipeline: a cycling or walking `StreetNetwork`
+  from the recipe's OSM file, its exposure layers, and a weight-swept
+  `TravelCostMatrix` compared to each pair's fastest route, adding a
+  time-integrated `{layer}_exposure` (mean concentration × on-street minutes)
+  column; every input is snapshotted and checksummed as it is read. Validation
+  also mirrors `Exposure`'s layer-naming rule and the sweep's strictly
+  increasing weights.
+
 - `cafein.recipes.validate(path)` reads a declarative YAML analysis recipe
   (typed by its `recipe:` field), resolves its `kind:`-tagged file inputs, and
   validates the schema, parameters, and outputs by name — the foundation for
