@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Recipe inputs accept `kind: sample` with `name: <region>.<asset>`, a pinned
+  `cafein.sampledata` asset (`helsinki.osm_pbf`, `helsinki.air_quality`,
+  `helsinki.poi_library`, …): validation resolves the pin offline and checks
+  the asset suits its role, `run` fetches it through the sampledata client,
+  and the provenance records the asset's release and pinned digest, refusing
+  bytes that differ from the pin.
+
 - `cafein.recipes.run(path, out_dir=None)` validates a recipe, runs its
   pipeline, and publishes the output table beside a `<stem>.provenance.json`
   record: cafein and dependency versions (the compiled core listed separately),

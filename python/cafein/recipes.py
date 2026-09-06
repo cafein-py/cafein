@@ -99,12 +99,23 @@ def _suffix_ok(path, suffixes):
 
 
 # Per-role kind → (required keys, optional keys, self-contained suffixes).
-_STREET_KEYS = {"file": (("path",), (), _STREET_SUFFIXES)}
+_STREET_KEYS = {
+    "file": (("path",), (), _STREET_SUFFIXES),
+    "sample": (("name",), (), _STREET_SUFFIXES),
+}
 _EXPOSURE_KEYS = {
     "raster": (("path", "value"), ("units",), _RASTER_SUFFIXES),
     "vector": (("path", "value"), ("units", "layer"), _VECTOR_SUFFIXES),
+    "sample": (
+        ("name", "value"),
+        ("units", "layer"),
+        _RASTER_SUFFIXES + _VECTOR_SUFFIXES,
+    ),
 }
-_OD_KEYS = {"vector": (("path", "id_column"), ("layer",), _VECTOR_SUFFIXES)}
+_OD_KEYS = {
+    "vector": (("path", "id_column"), ("layer",), _VECTOR_SUFFIXES),
+    "sample": (("name", "id_column"), ("layer",), _VECTOR_SUFFIXES),
+}
 
 #: ``Exposure(network, ..., **layers)`` keywords a layer may not be named after.
 _RESERVED_LAYER_NAMES = frozenset(
@@ -112,11 +123,42 @@ _RESERVED_LAYER_NAMES = frozenset(
 )
 
 
+def _sample_pin(name, where):
+    """The pinned metadata of the ``cafein.sampledata`` asset ``<region>.<asset>``
+    (a key of the region module's ``metadata`` table), resolved offline."""
+    import importlib
+
+    parts = name.split(".") if isinstance(name, str) else []
+    if len(parts) != 2 or not all(part.isidentifier() for part in parts):
+        raise ValueError(
+            f"{where}: 'name' must be '<region>.<asset>', e.g. helsinki.osm_pbf"
+        )
+    region, asset = parts
+    try:
+        module = importlib.import_module(f"cafein.sampledata.{region}")
+    except ImportError:
+        raise ValueError(
+            f"{where}: unknown sample region '{region}' (is cafein.sampledata "
+            "installed?)"
+        ) from None
+    table = getattr(module, "metadata", None)
+    if not isinstance(table, dict):
+        raise ValueError(f"{where}: unknown sample region '{region}'")
+    if asset not in table:
+        raise ValueError(
+            f"{where}: unknown sample asset '{name}' (one of "
+            f"{', '.join(sorted(table))})"
+        )
+    return {"asset": name, "region": region, **table[asset]}
+
+
 def _resolve_source(role, layer, spec, recipe_dir, *, keys):
-    """Validate + resolve one `kind:`-tagged file input, or raise by name.
+    """Validate + resolve one `kind:`-tagged input, or raise by name.
 
     Local paths resolve relative to the recipe's directory, so a recipe + its
-    data move together; the file must exist and be a self-contained format.
+    data move together; the file must exist and be a self-contained format. A
+    ``sample`` names a pinned ``cafein.sampledata`` asset: its pin is resolved
+    here without downloading, the file is fetched when the recipe runs.
     """
     where = f"inputs.{role}" + (f".{layer}" if layer else "")
     if not isinstance(spec, dict):
@@ -132,8 +174,6 @@ def _resolve_source(role, layer, spec, recipe_dir, *, keys):
     for key in required:
         if spec.get(key) is None:
             raise ValueError(f"{where}: kind '{kind}' needs '{key}'")
-    if not isinstance(spec["path"], str):
-        raise ValueError(f"{where}: 'path' must be a string")
     for key in ("id_column", "units", "layer"):
         if key in spec and not isinstance(spec[key], str):
             raise ValueError(f"{where}: '{key}' must be a string")
@@ -141,20 +181,31 @@ def _resolve_source(role, layer, spec, recipe_dir, *, keys):
         isinstance(spec["value"], bool) or not isinstance(spec["value"], (str, int))
     ):
         raise ValueError(f"{where}: 'value' must be a column name or a band")
-    path = (recipe_dir / spec["path"]).resolve()
-    if not path.is_file():
-        raise ValueError(f"{where}: file not found: {path}")
-    if not _suffix_ok(path, suffixes):
+    if kind == "sample":
+        sample = _sample_pin(spec["name"], where)
+        path, filename = None, sample["name"]
+    else:
+        if not isinstance(spec["path"], str):
+            raise ValueError(f"{where}: 'path' must be a string")
+        path = (recipe_dir / spec["path"]).resolve()
+        if not path.is_file():
+            raise ValueError(f"{where}: file not found: {path}")
+        filename = path.name
+    if not _suffix_ok(pathlib.PurePath(filename), suffixes):
         raise ValueError(
-            f"{where}: '{path.name}' is not a self-contained {'/'.join(suffixes)} "
+            f"{where}: '{filename}' is not a self-contained {'/'.join(suffixes)} "
             "file (multi-file formats such as shapefiles are not supported)"
         )
-    if path.suffix.lower() == ".gpkg" and path.with_name(path.name + "-wal").exists():
+    if path is not None and (
+        path.suffix.lower() == ".gpkg" and path.with_name(path.name + "-wal").exists()
+    ):
         raise ValueError(
             f"{where}: '{path.name}' has a live write-ahead log ({path.name}-wal); "
             "checkpoint the GeoPackage so the file holds all of its state"
         )
     resolved = {"kind": kind, "path": path}
+    if kind == "sample":
+        resolved["sample"] = sample
     for key in (*required, *optional):
         if key != "path" and key in spec:
             resolved[key] = spec[key]
@@ -400,7 +451,7 @@ def _load_exposure_sources(exposure):
     vector file read into a GeoDataFrame."""
     layers = {}
     for name, spec in exposure.items():
-        if spec["kind"] == "raster":
+        if _suffix_ok(spec["path"], _RASTER_SUFFIXES):
             layers[name] = (str(spec["path"]), spec["value"])
         else:
             frame = _read_vector(
@@ -426,7 +477,36 @@ def _snapshot(index, role, source, run_dir, checksums):
             digest.update(block)
             target.write(block)
     checksums[role] = {"path": str(source["path"]), "sha256": digest.hexdigest()}
+    if "sample" in source:
+        if digest.hexdigest() != source["sample"]["sha256"]:
+            raise ValueError(
+                f"{role}: sample asset {source['sample']['asset']} read as "
+                f"{digest.hexdigest()}, not its pin {source['sample']['sha256']}"
+            )
+        checksums[role]["sample"] = source["sample"]
     return {**source, "path": copy}
+
+
+def _materialise(source):
+    """A source with a local path: a file input as declared, a sample asset
+    fetched and verified by ``cafein.sampledata`` (cached after first use)."""
+    if source["path"] is not None:
+        return source
+    from cafein.sampledata import Asset, fetch
+
+    sample = source["sample"]
+    pinned = {field: sample[field] for field in Asset.__dataclass_fields__}
+    return {**source, "path": fetch(Asset(**pinned), sample["region"])}
+
+
+def _materialise_inputs(inputs):
+    """Every input of the exposure_tradeoff recipe with a local path."""
+    return {
+        "streets": _materialise(inputs["streets"]),
+        "exposure": {n: _materialise(layer) for n, layer in inputs["exposure"].items()},
+        "origins": _materialise(inputs["origins"]),
+        "destinations": _materialise(inputs["destinations"]),
+    }
 
 
 def _run_exposure_tradeoff(resolved):
@@ -448,7 +528,7 @@ def _run_exposure_tradeoff(resolved):
         roles += [(f"exposure.{n}", spec) for n, spec in inputs["exposure"].items()]
         roles += [(role, inputs[role]) for role in ("origins", "destinations")]
         copies = {
-            role: _snapshot(index, role, source, run_dir, checksums)
+            role: _snapshot(index, role, _materialise(source), run_dir, checksums)
             for index, (role, source) in enumerate(roles)
         }
         streets_source = copies["streets"]
@@ -504,7 +584,15 @@ def _dependency_versions():
         "cafein": distribution,
         "cafein_core": getattr(_cafein, "__version__", "unavailable"),
     }
-    for package in ("geopandas", "pyrosm", "numpy", "shapely", "pandas", "pyarrow"):
+    for package in (
+        "geopandas",
+        "pyrosm",
+        "numpy",
+        "shapely",
+        "pandas",
+        "pyarrow",
+        "cafein.sampledata",
+    ):
         try:
             versions[package] = metadata.version(package)
         except metadata.PackageNotFoundError:
@@ -613,6 +701,8 @@ def run(path, out_dir=None, *, _entry_point="python", _invocation=None):
 
     recipe_path = pathlib.Path(path).resolve()
     resolved = validate(recipe_path)
+    # Sample assets are fetched first, so the output guards see their paths.
+    resolved["inputs"] = _materialise_inputs(resolved["inputs"])
     out_root = pathlib.Path(out_dir or pathlib.Path.cwd()).resolve()
     protected = [recipe_path, resolved["inputs"]["streets"]["path"]]
     protected += [layer["path"] for layer in resolved["inputs"]["exposure"].values()]
