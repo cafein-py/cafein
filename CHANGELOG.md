@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Recipe `parameters:` gain `streets:`, `exposure:`, and `matrix:` groups that
+  pass any keyword of `StreetNetwork.from_osm`, `Exposure`, and
+  `TravelCostMatrix` through by name (the ones the recipe fixes are refused);
+  a data file (`dem`, `urban_areas`, `factors`, `costs`) is written in the
+  inputs' `{kind: file|sample}` spelling and is resolved, snapshotted, and
+  checksummed like an input; a `traveler` is a mapping of `TravelerProfile`
+  keywords. The provenance record lists every group's effective value,
+  defaults included.
+
 - Recipe inputs accept `kind: sample` with `name: <region>.<asset>`, a pinned
   `cafein.sampledata` asset (`helsinki.osm_pbf`, `helsinki.air_quality`,
   `helsinki.poi_library`, …): validation resolves the pin offline and checks

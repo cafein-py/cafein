@@ -1,5 +1,6 @@
 """Recipe framework: loading, eager validation, input resolution, and running."""
 
+import functools
 import hashlib
 import json
 
@@ -53,7 +54,11 @@ def _write(tmp_path, mutate=None):
 
 def test_validate_resolves_a_recipe(tmp_path):
     pytest.importorskip("yaml")
-    resolved = recipes.validate(_write(tmp_path))
+    # an object-valued keyword in its mapping spelling, built eagerly
+    traveler = {"traveler": {"wheelchair": True}}
+    resolved = recipes.validate(
+        _write(tmp_path, _set(["parameters", "matrix"], traveler))
+    )
     assert resolved["recipe"] == "exposure_tradeoff"
     # local paths resolve to absolute files beside the recipe
     assert resolved["inputs"]["streets"]["path"] == (tmp_path / "streets.pbf").resolve()
@@ -62,7 +67,14 @@ def test_validate_resolves_a_recipe(tmp_path):
         "mode": "bicycle",
         "objective_layer": "no2",
         "weights": [0.5, 1.0],
+        "streets": {},
+        "exposure": {},
+        "matrix": {"traveler": {"wheelchair": True}},
     }
+    # the record's view fills in the object's own defaults too
+    effective = recipes._effective_parameters(resolved["parameters"])["matrix"]
+    assert effective["traveler"]["wheelchair"] is True
+    assert effective["traveler"]["unknown"] == "usable"
     assert resolved["outputs"]["table"] == "tradeoff.parquet"
 
 
@@ -108,6 +120,36 @@ def _delete(path_keys):
         (_set(["outputs", "table"], "C:/out/x.parquet"), "relative path"),
         (_set(["outputs", "table"], "..\\x.parquet"), "relative path"),
         (_set(["parameters", "mod"], "walk"), "unknown key"),
+        (_set(["parameters", "matrix"], {"candidates": "time"}), "fixed by the recipe"),
+        (_set(["parameters", "streets"], {"modes": ["walk"]}), "fixed by the recipe"),
+        (_set(["parameters", "exposure"], {"treshold": 1}), "unknown keyword"),
+        (_set(["parameters", "matrix"], "fast"), "must be a mapping of keywords"),
+        (_set(["parameters", "matrix"], {"factors": "factors.csv"}), "written as"),
+        (
+            _set(
+                ["parameters", "matrix"],
+                {"factors": {"kind": "file", "path": "no2.tif"}},
+            ),
+            "self-contained",
+        ),
+        (
+            _set(
+                ["parameters", "matrix"], {"max_rides": {"kind": "file", "path": "x"}}
+            ),
+            "does not take a mapping",
+        ),
+        (
+            _set(["parameters", "matrix"], {"street_policy": {"access": {"walk": 1}}}),
+            "does not take a mapping",
+        ),
+        (_set(["parameters", "matrix"], {"traveler": {"foo": 1}}), "traveler.*foo"),
+        (_set(["parameters", "matrix"], {"traveler": "wheelchair"}), "mapping of Trav"),
+        (
+            _set(
+                ["parameters", "streets"], {"dem": {"kind": "file", "path": "no.tif"}}
+            ),
+            "file not found",
+        ),
         (
             _set(["inputs", "exposure", "no2", "path"], "origins.geojson"),
             "self-contained",
@@ -297,11 +339,19 @@ def test_run_refuses_an_output_that_overwrites_an_input(tmp_path):
 
 
 def _two_route_recipe(
-    tmp_path, monkeypatch, weights=(0.6,), mode="walk", inputs=None, table=None
+    tmp_path,
+    monkeypatch,
+    weights=(0.6,),
+    mode="walk",
+    inputs=None,
+    table=None,
+    parameters=None,
+    received=None,
 ):
     """A recipe on the synthetic two-corridor network (the OSM loader is
     stubbed, both modes permitted): value 1.0 over the short corridor, the 1.5x
-    detour outside it. ``inputs`` replaces the file-kind inputs section."""
+    detour outside it. ``inputs`` replaces the file-kind inputs section;
+    ``received`` collects the keywords the stubbed loader is called with."""
     yaml = pytest.importorskip("yaml")
     geopandas = pytest.importorskip("geopandas")
     from shapely.geometry import Point, box
@@ -310,11 +360,13 @@ def _two_route_recipe(
     from cafein._osm import BICYCLE, WALK
     from cafein.street_network import StreetNetwork
 
-    monkeypatch.setattr(
-        StreetNetwork,
-        "from_osm",
-        staticmethod(lambda *a, **k: _two_route_network(WALK | BICYCLE)),
-    )
+    @functools.wraps(StreetNetwork.from_osm)  # keeps the real signature
+    def from_osm(*args, **kwargs):
+        if received is not None:
+            received.update(kwargs)
+        return _two_route_network(WALK | BICYCLE)
+
+    monkeypatch.setattr(StreetNetwork, "from_osm", staticmethod(from_osm))
     (tmp_path / "streets.pbf").write_bytes(b"\x00")
     geopandas.GeoDataFrame(
         {"level": [1.0]},
@@ -344,6 +396,7 @@ def _two_route_recipe(
             "mode": mode,
             "objective_layer": "no2",
             "weights": list(weights),
+            **(parameters or {}),
         },
         "outputs": {"table": table or "tradeoff.parquet"},
     }
@@ -698,3 +751,100 @@ def test_validate_resolves_helsinki_sample_pins_offline(tmp_path):
         assert sample["sha256"] == helsinki.metadata[key]["sha256"]
         Asset(**{field: sample[field] for field in Asset.__dataclass_fields__})
     assert resolved["inputs"]["exposure"]["no2"]["value"] == "NO2Concentration"
+
+
+def test_run_applies_grouped_parameters_and_records_defaults(tmp_path, monkeypatch):
+    """Group keywords reach their objects (an exposure threshold adds its
+    column, a file-valued factor table is snapshotted, hashed, and applied),
+    and the record lists every group's effective value, defaults included."""
+    pytest.importorskip("pyarrow")
+    from cafein import recipes
+
+    (tmp_path / "factors.csv").write_text(
+        "street_mode,vehicle_class,service_model,"
+        "vehicle,fuel,infrastructure,operations\n"
+        "bicycle,conventional,private,100,0,0,0\n"
+    )
+    parameters = {
+        "exposure": {"thresholds": {"no2": 0.5}},
+        "matrix": {
+            "factors": {"kind": "file", "path": "factors.csv"},
+            "geometries": True,
+        },
+    }
+    path = _two_route_recipe(
+        tmp_path, monkeypatch, mode="bicycle", parameters=parameters
+    )
+
+    frame = recipes.run(path, out_dir=tmp_path / "out")
+
+    assert any(column.startswith("no2_minutes_above") for column in frame.columns)
+    # geometries publish as GeoParquet that reads back as lines
+    geopandas = pytest.importorskip("geopandas")
+    assert isinstance(frame, geopandas.GeoDataFrame)
+    published = geopandas.read_parquet(tmp_path / "out" / "tradeoff.parquet")
+    assert published.geometry.geom_type.eq("LineString").all()
+    # each row keeps its own line: the detour's is the longer one
+    length = published.geometry.to_crs("EPSG:3067").length
+    assert length[~published["fastest"]].min() > length[published["fastest"]].max()
+    # 100 g/km over the network metres: the file's row, not the shipped one
+    assert frame["emissions"].tolist() == pytest.approx(
+        (frame["network_distance_m"] / 10).tolist()
+    )
+    record = json.loads((tmp_path / "out" / "tradeoff.provenance.json").read_text())
+    assert len(record["inputs"]["parameters.matrix.factors"]["sha256"]) == 64
+    effective = record["resolved"]["parameters"]
+    assert effective["exposure"]["thresholds"] == {"no2": 0.5}
+    assert effective["exposure"]["rasterize"] == 1.0
+    assert effective["matrix"]["max_rides"] == 8
+    assert effective["matrix"]["factors"]["path"].endswith("factors.csv")
+
+
+def test_provenance_values_are_canonical():
+    import pathlib
+
+    from cafein import recipes
+
+    value = {"a": (1, 2), "p": pathlib.Path("x"), "s": frozenset({2, 1}), "n": None}
+    assert recipes._canonical(value, "t") == {
+        "a": [1, 2],
+        "p": "x",
+        "s": [1, 2],
+        "n": None,
+    }
+    with pytest.raises(ValueError, match="t.bad.*cannot be recorded"):
+        recipes._canonical({"bad": object()}, "t")
+
+
+@pytest.mark.parametrize("layer", ["a", None])
+def test_run_reads_a_vector_parameter_by_layer(tmp_path, monkeypatch, layer):
+    """A vector-valued parameter reaches its object as the named GeoPackage
+    layer; a multi-layer file without ``layer:`` is refused by name."""
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("pyarrow")
+    from shapely.geometry import box
+
+    from cafein import recipes
+
+    zones = tmp_path / "zones.gpkg"
+    for name, rows in (("a", 1), ("b", 2)):
+        geopandas.GeoDataFrame(
+            {"n": range(rows)},
+            geometry=[box(24.9, 60.1, 25.0, 60.2)] * rows,
+            crs="EPSG:4326",
+        ).to_file(zones, layer=name, driver="GPKG")
+    spec = {"kind": "file", "path": "zones.gpkg", **({"layer": layer} if layer else {})}
+    received = {}
+    path = _two_route_recipe(
+        tmp_path,
+        monkeypatch,
+        parameters={"streets": {"urban_areas": spec}},
+        received=received,
+    )
+    if layer is None:
+        with pytest.raises(ValueError, match="holds several layers"):
+            recipes.run(path, out_dir=tmp_path / "out")
+        return
+    recipes.run(path, out_dir=tmp_path / "out")
+    assert isinstance(received["urban_areas"], geopandas.GeoDataFrame)
+    assert len(received["urban_areas"]) == 1
