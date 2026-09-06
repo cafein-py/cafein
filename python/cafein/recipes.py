@@ -3,15 +3,17 @@
 A *recipe* is a user-authored YAML document describing a whole analysis
 pipeline; cafein runs it, so the file is the reproducible method. This module
 is the loader, the typed-recipe registry, input resolution, eager validation
-(:func:`validate`), and each recipe type's pipeline, reached through the
-registry's ``run`` slot and returning the result frame with the checksums of
-the inputs it read.
+(:func:`validate`), and execution (:func:`run`), which writes each recipe's
+outputs beside a run-provenance record of versions and input checksums.
 """
 
 from __future__ import annotations
 
+import datetime
 import hashlib
+import json
 import pathlib
+import re
 
 from cafein._validate import choice, non_negative_finite
 
@@ -225,6 +227,11 @@ def _resolve_parameters(parameters, exposure_layers):
     return {"mode": mode, "objective_layer": objective, "weights": weights}
 
 
+#: Names that fail on Windows even though POSIX accepts them.
+_UNPORTABLE_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
+_WINDOWS_RESERVED = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$", re.I)
+
+
 def _resolve_outputs(outputs):
     if not isinstance(outputs, dict) or not outputs.get("table"):
         raise ValueError("outputs: must declare a 'table' path")
@@ -238,10 +245,15 @@ def _resolve_outputs(outputs):
         raise ValueError(
             f"outputs.table '{table}' must name a file inside the output root"
         )
-    if not posix.name.lower().endswith(".parquet"):
+    if not posix.name.endswith(".parquet"):
         raise ValueError(
-            f"outputs.table '{table}' must end with .parquet (the table is written "
-            "as Parquet; its provenance and lock derive from the stem)"
+            f"outputs.table '{table}' must end with .parquet, lowercase (the table "
+            "is written as Parquet; its provenance and lock derive from the name)"
+        )
+    if len(posix.name.encode("utf-8")) > 247:
+        raise ValueError(
+            f"outputs.table name '{posix.name}' must stay within 247 bytes so its "
+            "provenance record and lock fit a 255-byte filename limit"
         )
     if (
         "\\" in table
@@ -255,6 +267,18 @@ def _resolve_outputs(outputs):
             f"outputs.table '{table}' must be a relative path within the output "
             "root (no absolute paths or '..')"
         )
+    for part in posix.parts:
+        if (
+            _UNPORTABLE_CHARS.search(part)
+            or part.endswith((" ", "."))
+            or _WINDOWS_RESERVED.match(part)
+            or len(part.encode("utf-8")) > 255
+        ):
+            raise ValueError(
+                f"outputs.table component '{part}' is not a portable file name "
+                "(reserved on Windows, a forbidden character, a trailing dot/space, "
+                "or over 255 bytes)"
+            )
     return {"table": table}
 
 
@@ -459,6 +483,217 @@ def _run_exposure_tradeoff(resolved):
     for name in inputs["exposure"]:
         frame[f"{name}_exposure"] = frame[f"{name}_mean"] * frame["on_street_time"]
     return compare_to_fastest(frame), checksums
+
+
+def _dependency_versions():
+    """The runtime versions that can change a result: the installed cafein
+    distribution and, separately, the compiled core (a stale build shows as a
+    mismatch), plus the geospatial stack. A missing entry is recorded as
+    "unavailable" rather than dropped, so absence itself is visible."""
+    import importlib
+    from importlib import metadata
+
+    import cafein
+    from cafein import _cafein
+
+    try:
+        distribution = metadata.version("cafein")
+    except metadata.PackageNotFoundError:
+        distribution = cafein.__version__
+    versions = {
+        "cafein": distribution,
+        "cafein_core": getattr(_cafein, "__version__", "unavailable"),
+    }
+    for package in ("geopandas", "pyrosm", "numpy", "shapely", "pandas", "pyarrow"):
+        try:
+            versions[package] = metadata.version(package)
+        except metadata.PackageNotFoundError:
+            try:
+                versions[package] = importlib.import_module(package).__version__
+            except Exception:
+                versions[package] = "unavailable"
+    return versions
+
+
+def _serialisable(resolved):
+    """The resolved recipe with paths as strings, for the provenance record."""
+
+    def plain(source):
+        return {
+            key: (str(v) if isinstance(v, pathlib.Path) else v)
+            for key, v in source.items()
+        }
+
+    inputs = resolved["inputs"]
+    return {
+        "recipe": resolved["recipe"],
+        "version": resolved["version"],
+        "requires": resolved["requires"],
+        "inputs": {
+            "streets": plain(inputs["streets"]),
+            "exposure": {
+                name: plain(layer) for name, layer in inputs["exposure"].items()
+            },
+            "origins": plain(inputs["origins"]),
+            "destinations": plain(inputs["destinations"]),
+        },
+        "parameters": resolved["parameters"],
+        "outputs": resolved["outputs"],
+    }
+
+
+def _reject_symlinks(out_root, *targets):
+    """Refuse a symlinked component below the output root on the table's or
+    the record's path: a link swapped in under the run could redirect where
+    the files land, or what a rollback reads."""
+    for target in targets:
+        for component in (*reversed(target.parents), target):
+            if component == out_root or out_root not in component.parents:
+                continue
+            if component.is_symlink():
+                raise ValueError(f"output path component '{component}' is a symlink")
+
+
+def _output_path(out_root, table, protected):
+    """The output's absolute path, refused if it escapes ``out_root`` or would
+    overwrite the recipe or one of its inputs."""
+    unresolved = out_root / table
+    record = unresolved.with_name(f"{unresolved.stem}.provenance.json")
+    _reject_symlinks(out_root, unresolved, record)
+    target = unresolved.resolve()
+    if out_root not in target.parents:
+        raise ValueError(
+            f"outputs.table '{table}' must be a file inside the output root {out_root}"
+        )
+    provenance = target.with_name(record.name)
+    for candidate in (target, provenance):
+        for path in protected:
+            same = candidate == path or (
+                candidate.exists() and path.exists() and candidate.samefile(path)
+            )
+            if same:
+                raise ValueError(
+                    f"outputs.table '{table}' would overwrite an input or the "
+                    f"recipe itself ({path})"
+                )
+    return target, provenance
+
+
+def _identity(path):
+    """(device, inode) of the file or directory at ``path``."""
+    import os
+
+    info = os.stat(path)
+    return info.st_dev, info.st_ino
+
+
+def run(path, out_dir=None, *, _entry_point="python", _invocation=None):
+    """Validate a recipe, run its pipeline, and write its outputs.
+
+    Output paths resolve relative to ``out_dir`` (the current working directory
+    by default; resolved once and taken as given), must stay within it, may not
+    overwrite the recipe or its inputs, and, below that root, neither the table
+    nor its record may pass through a symlink. The target directory is created
+    and pinned before the analysis and re-verified after it. Publication is
+    serialized per target with a lock file and staged beside the target: the
+    ``<stem>.provenance.json`` is moved in first, then the table, each move
+    atomic on its own; a failed or interrupted run recovers the pair from what
+    is on disk (the previous record returns unless the new table landed), and
+    the record's table SHA-256 is the pairing check should a hard crash land
+    between the two moves. The record carries the cafein and dependency versions, the
+    resolved recipe, every input's SHA-256 (from the bytes the pipeline read),
+    the table's own SHA-256, the invocation, and a UTC timestamp. These guards
+    address accidents, stale state, and clashing runs in a researcher's own
+    output directory; they are not a defence against an adversary racing that
+    directory or rewriting the inputs mid-run. Returns the trade-off frame.
+    """
+    import os
+    import shutil
+    import tempfile
+
+    recipe_path = pathlib.Path(path).resolve()
+    resolved = validate(recipe_path)
+    out_root = pathlib.Path(out_dir or pathlib.Path.cwd()).resolve()
+    protected = [recipe_path, resolved["inputs"]["streets"]["path"]]
+    protected += [layer["path"] for layer in resolved["inputs"]["exposure"].values()]
+    protected += [
+        resolved["inputs"][role]["path"] for role in ("origins", "destinations")
+    ]
+    unresolved = out_root / resolved["outputs"]["table"]
+    target, provenance = _output_path(out_root, resolved["outputs"]["table"], protected)
+    out_root.mkdir(parents=True, exist_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    parent_identity = _identity(target.parent)
+
+    frame, checksums = _RECIPES[resolved["recipe"]].run(resolved)
+
+    _reject_symlinks(out_root, unresolved, unresolved.with_name(provenance.name))
+    if _identity(target.parent) != parent_identity:
+        raise ValueError(
+            f"the output directory {target.parent} changed while the recipe ran; "
+            "refusing to publish"
+        )
+    lock = target.with_name(f".{target.name}.lock")
+    try:
+        os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except FileExistsError:
+        raise ValueError(
+            f"another run is publishing {target.name} ({lock.name} exists); "
+            "wait for it or remove a stale lock"
+        ) from None
+    try:
+        staging = pathlib.Path(
+            tempfile.mkdtemp(dir=target.parent, prefix=".cafein-recipe-")
+        )
+        try:
+            staged_table = staging / target.name
+            frame.to_parquet(staged_table, index=False)
+            record = {
+                "cafein_recipe_provenance": 1,
+                "recipe": resolved["recipe"],
+                "versions": _dependency_versions(),
+                "resolved": _serialisable(resolved),
+                "inputs": checksums,
+                "outputs": {"table": str(target), "sha256": _file_digest(staged_table)},
+                "invocation": {
+                    **(_invocation or {}),
+                    "entry_point": _entry_point,
+                    "recipe": str(recipe_path),
+                    "out_dir": str(out_root),
+                },
+                "written_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+            staged_record = staging / provenance.name
+            staged_record.write_text(json.dumps(record, indent=2, sort_keys=True))
+            # Record first, table last, recovered from disk state on failure:
+            # the new record stays only if the new table landed. Between the
+            # two moves a reader verifies pairing by the record's table SHA.
+            previous = None
+            if provenance.exists():
+                previous = staging / "previous.json"
+                shutil.copy2(provenance, previous)
+            staged_identity = _identity(staged_table)
+            try:
+                os.replace(staged_record, provenance)
+                os.replace(staged_table, target)
+            except BaseException:
+                try:
+                    landed = _identity(target) == staged_identity
+                except FileNotFoundError:
+                    landed = False
+                if not landed:
+                    if previous is not None:
+                        os.replace(previous, provenance)
+                    else:
+                        provenance.unlink(missing_ok=True)
+                raise
+        finally:
+            for leftover in staging.iterdir():
+                leftover.unlink()
+            staging.rmdir()
+    finally:
+        lock.unlink(missing_ok=True)
+    return frame
 
 
 #: The typed-recipe registry: a recipe type resolves its own sections, so a new

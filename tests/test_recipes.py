@@ -1,6 +1,7 @@
 """Recipe framework: loading, eager validation, input resolution, and running."""
 
 import hashlib
+import json
 
 import pytest
 
@@ -117,6 +118,13 @@ def _delete(path_keys):
         (_set(["outputs", "table"], "."), "must name a file"),
         (_set(["outputs", "table"], "out/"), "must name a file"),
         (_set(["outputs", "table"], "tradeoff.arrow"), "must end with .parquet"),
+        (_set(["outputs", "table"], "tradeoff.PARQUET"), "must end with .parquet"),
+        (_set(["outputs", "table"], "x" * 240 + ".parquet"), "within 247 bytes"),
+        (_set(["outputs", "table"], "ä" * 120 + ".parquet"), "within 247 bytes"),
+        (_set(["outputs", "table"], "CON.parquet"), "not a portable file name"),
+        (_set(["outputs", "table"], "a?.parquet"), "not a portable file name"),
+        (_set(["outputs", "table"], "out./t.parquet"), "not a portable file name"),
+        (_set(["outputs", "table"], "d" * 256 + "/t.parquet"), "not a portable"),
         (_set(["inputs", "origins", "id_column"], []), "'id_column' must be a string"),
         (_set(["inputs", "exposure", "no2", "value"], True), "must be a column name"),
         (_set(["inputs", "exposure", ""], {"kind": "raster"}), "non-empty strings"),
@@ -164,6 +172,128 @@ def test_load_refuses_duplicate_keys(tmp_path):
     path.write_text("recipe: exposure_tradeoff\nversion: 1\nversion: 2\n")
     with pytest.raises(ValueError, match="duplicate key"):
         recipes.validate(path)
+
+
+def test_run_writes_the_tradeoff_table_and_provenance(tmp_path, kantakaupunki_pbf):
+    """End to end on the Helsinki streets: the exposure integral, the fastest
+    baseline, and a provenance record that pins the inputs actually loaded."""
+    yaml = pytest.importorskip("yaml")
+    geopandas = pytest.importorskip("geopandas")
+    pytest.importorskip("pyarrow")
+    from shapely.geometry import Point, box
+
+    from cafein import recipes
+
+    # a uniform layer over the corridor, written as a vector file
+    zone = geopandas.GeoDataFrame(
+        {"level": [61.0]}, geometry=[box(24.90, 60.15, 24.99, 60.20)], crs="EPSG:4326"
+    )
+    zone.to_file(tmp_path / "no2.geojson", driver="GeoJSON")
+    for name, lon, lat in (
+        ("origins", 24.9320, 60.1690),
+        ("destinations", 24.9520, 60.1795),
+    ):
+        geopandas.GeoDataFrame(
+            {"pid": [name[0]]}, geometry=[Point(lon, lat)], crs="EPSG:4326"
+        ).to_file(tmp_path / f"{name}.geojson", driver="GeoJSON")
+    recipe = {
+        "recipe": "exposure_tradeoff",
+        "inputs": {
+            "streets": {"kind": "file", "path": str(kantakaupunki_pbf)},
+            "exposure": {
+                "no2": {
+                    "kind": "vector",
+                    "path": "no2.geojson",
+                    "value": "level",
+                    "units": "ug/m3",
+                }
+            },
+            "origins": {
+                "kind": "vector",
+                "path": "origins.geojson",
+                "id_column": "pid",
+            },
+            "destinations": {
+                "kind": "vector",
+                "path": "destinations.geojson",
+                "id_column": "pid",
+            },
+        },
+        "parameters": {
+            "mode": "bicycle",
+            "objective_layer": "no2",
+            "weights": [0.5, 1.0],
+        },
+        "outputs": {"table": "tradeoff.parquet"},
+    }
+    path = tmp_path / "recipe.yaml"
+    path.write_text(yaml.safe_dump(recipe))
+    out = tmp_path / "out"
+
+    frame = recipes.run(path, out_dir=out)
+
+    assert (out / "tradeoff.parquet").is_file()
+    for column in (
+        "no2_mean",
+        "no2_exposure",
+        "travel_time",
+        "fastest",
+        "travel_time_delta",
+        "no2_exposure_delta",
+    ):
+        assert column in frame.columns
+    # option 0 is the true fastest: zero deltas, and no route is faster
+    fastest = frame[frame["fastest"]]
+    assert len(fastest) >= 1
+    assert (fastest["travel_time_delta"] == 0).all()
+    assert (frame["travel_time_delta"] >= 0).all()
+    # the integral identity: exposure = mean concentration × on-street minutes
+    # (snap connectors carry no sampled concentration, so on-street ≤ total)
+    covered = frame["no2_mean"].notna()
+    assert covered.any()
+    assert (frame["on_street_time"] <= frame["travel_time"] + 1e-9).all()
+    assert frame.loc[covered, "no2_exposure"].tolist() == pytest.approx(
+        (frame.loc[covered, "no2_mean"] * frame.loc[covered, "on_street_time"]).tolist()
+    )
+    record = json.loads((out / "tradeoff.provenance.json").read_text())
+    assert record["versions"]["cafein"]
+    # the compiled core is recorded separately, and no promised dependency is
+    # ever silently dropped from the record
+    versions = record["versions"]
+    for name in (
+        "cafein",
+        "cafein_core",
+        "geopandas",
+        "pyrosm",
+        "numpy",
+        "shapely",
+        "pandas",
+        "pyarrow",
+    ):
+        # real version identifiers, never the "unavailable" fallback or empty
+        assert versions[name] and versions[name] != "unavailable"
+        assert versions[name][0].isdigit(), (name, versions[name])
+    assert (
+        record["inputs"]["streets"]["sha256"]
+        == hashlib.sha256(kantakaupunki_pbf.read_bytes()).hexdigest()
+    )
+    assert record["resolved"]["parameters"]["objective_layer"] == "no2"
+    assert record["invocation"]["entry_point"] == "python"
+    assert record["outputs"]["table"].endswith("tradeoff.parquet")
+
+
+def test_run_refuses_an_output_that_overwrites_an_input(tmp_path):
+    """A .parquet target that is the same file as an input (a hard link here)
+    is refused before anything runs."""
+    import os
+
+    pytest.importorskip("yaml")
+    from cafein import recipes
+
+    path = _write(tmp_path, _set(["outputs", "table"], "alias.parquet"))
+    os.link(tmp_path / "no2.tif", tmp_path / "alias.parquet")
+    with pytest.raises(ValueError, match="would overwrite an input"):
+        recipes.run(path, out_dir=tmp_path)
 
 
 def _two_route_recipe(tmp_path, monkeypatch, weights=(0.6,), mode="walk"):
@@ -272,6 +402,79 @@ def test_snapshots_are_collision_free_and_hash_what_they_copy(tmp_path):
         2, "exposure.long", {"path": long_name}, run_dir, checksums
     )
     assert third["path"].name == "input-02.geojson"
+
+
+@pytest.mark.parametrize(
+    "link, points_at, table",
+    [
+        ("link", "", "link/tradeoff.parquet"),
+        ("tradeoff.provenance.json", "record.json", "tradeoff.parquet"),
+    ],
+)
+def test_run_refuses_a_symlinked_output_component(tmp_path, link, points_at, table):
+    """A symlinked directory on the table's path, or a symlinked existing record,
+    is refused before anything runs."""
+    pytest.importorskip("yaml")
+    from cafein import recipes
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "record.json").write_text("{}")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / link).symlink_to(elsewhere / points_at)
+    path = _write(tmp_path, _set(["outputs", "table"], table))
+    with pytest.raises(ValueError, match="is a symlink"):
+        recipes.run(path, out_dir=out)
+
+
+@pytest.mark.parametrize("table_landed", [False, True])
+def test_run_recovers_the_pair_from_disk_state(tmp_path, monkeypatch, table_landed):
+    """An interruption around the table move restores the previous record when
+    the new table did not land and keeps the new record when it did; either way
+    the published record matches the published table."""
+    import os
+
+    pytest.importorskip("pyarrow")
+    from cafein import recipes
+
+    class Interrupt(BaseException):
+        pass
+
+    out = tmp_path / "out"
+    recipes.run(_two_route_recipe(tmp_path, monkeypatch), out_dir=out)
+    record, table = out / "tradeoff.provenance.json", out / "tradeoff.parquet"
+    first = json.loads(record.read_text())
+    real_replace = os.replace
+
+    def interrupted(src, dst):
+        if str(dst) == str(table):
+            if table_landed:
+                real_replace(src, dst)
+            raise Interrupt()
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", interrupted)
+    with pytest.raises(Interrupt):
+        recipes.run(_two_route_recipe(tmp_path, monkeypatch), out_dir=out)
+    after = json.loads(record.read_text())
+    assert (after == first) is not table_landed
+    assert after["outputs"]["sha256"] == hashlib.sha256(table.read_bytes()).hexdigest()
+    assert not list(out.glob(".cafein-recipe-*")) and not list(out.glob(".*.lock"))
+
+
+def test_run_refuses_to_publish_over_a_live_lock(tmp_path, monkeypatch):
+    pytest.importorskip("pyarrow")
+    from cafein import recipes
+
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / ".tradeoff.parquet.lock").write_bytes(b"")
+    with pytest.raises(ValueError, match="another run is publishing"):
+        recipes.run(_two_route_recipe(tmp_path, monkeypatch), out_dir=out)
+    # nothing was published under the lock
+    assert not (out / "tradeoff.parquet").exists()
+    assert not (out / "tradeoff.provenance.json").exists()
 
 
 def test_validate_refuses_a_geopackage_with_a_live_wal(tmp_path):

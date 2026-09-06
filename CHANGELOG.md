@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `cafein.recipes.run(path, out_dir=None)` validates a recipe, runs its
+  pipeline, and publishes the output table beside a `<stem>.provenance.json`
+  record: cafein and dependency versions (the compiled core listed separately),
+  the resolved recipe, each input's SHA-256 as read, the table's SHA-256, the
+  invocation, and a UTC timestamp. Outputs must stay inside the output
+  directory and never overwrite the recipe or an input; publication is
+  serialized by a per-target lock, record first, with the record's table
+  SHA-256 as the pairing check.
+
 - The `exposure_tradeoff` recipe pipeline: a cycling or walking `StreetNetwork`
   from the recipe's OSM file, its exposure layers, and a weight-swept
   `TravelCostMatrix` compared to each pair's fastest route, adding a
