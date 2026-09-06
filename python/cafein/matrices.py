@@ -6748,6 +6748,9 @@ def _policy_cost_columns(
                         transfer_network_m,
                         transfer_total_m,
                         transfer_rental,
+                        _vehicle_seconds,
+                        _transfer_seconds,
+                        _via,
                     ) in cells
                 ]
             )

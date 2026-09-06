@@ -332,6 +332,7 @@ impl<'a> Search<'a> {
         let mut walk_meters = 0.0;
         let mut street_meters = 0.0;
         let mut rental_transfers = 0u32;
+        let mut rental_minutes = 0u32;
         let mut grams = 0.0;
         let mut resolved = true;
         let mut legs: Vec<(TripIdx, u16, u16)> = Vec::new();
@@ -460,6 +461,7 @@ impl<'a> Search<'a> {
                             walk_meters += (edge_meters - token.ride_total_meters).max(0.0);
                             street_meters += token.ride_total_meters;
                             rental_transfers += 1;
+                            rental_minutes += token.ride_seconds.div_ceil(60);
                             grams += token.ride_network_meters * grams_per_meter;
                         }
                         None => walk_meters += edge_meters,
@@ -585,6 +587,7 @@ impl<'a> Search<'a> {
             walk_meters,
             street_meters,
             rental_transfers,
+            rental_minutes,
             emission_grams: if resolved { grams } else { f64::NAN },
             fare,
             geometry,

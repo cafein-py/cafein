@@ -53,10 +53,25 @@ type ReducedChoice = (String, u32, String, u32, f64, f64, Option<String>);
 /// One reduced street choice with its meters: stop, seconds, winning
 /// mode, the vehicle's network and connector meters, the walked
 /// transfer meters of a closure-carried choice, a carried rental
-/// transfer's ride meters (network and street-total), and whether the
-/// carried edge bore a rental — the per-stop street distances and
-/// identities the policy cost matrix attributes.
-type ReducedRow = (String, u32, String, f64, f64, f64, f64, f64, bool);
+/// transfer's ride meters (network and street-total), whether the
+/// carried edge bore a rental, the vehicle leg's own seconds (the seed's
+/// on a carried choice), the carried rental's ride seconds (0 when the
+/// edge was walked), and the seed stop of a carried choice — the
+/// per-stop street facts the policy cost matrix attributes and prices.
+type ReducedRow = (
+    String,
+    u32,
+    String,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    bool,
+    u32,
+    u32,
+    Option<String>,
+);
 
 /// One meters-row cell: whole seconds, network meters, and total street
 /// meters (both connectors included).
@@ -102,6 +117,9 @@ struct ParetoChoice {
 #[derive(Clone, Copy)]
 struct Winner {
     seconds: u32,
+    /// The vehicle leg's own seconds: `seconds` for a direct choice, the
+    /// seed's for a choice carried on by a transfer edge.
+    vehicle_seconds: u32,
     /// Paid rentals along the choice — the vehicle's own (0 or 1) plus
     /// any rental-bearing merged transfer edge the closure folded in;
     /// ties fall to fewer.
@@ -1916,6 +1934,7 @@ impl TransportNetwork {
                 let point = ParetoChoice {
                     winner: Winner {
                         seconds,
+                        vehicle_seconds: seconds,
                         rentals: u8::from(*rental),
                         transfer_rental: false,
                         order,
@@ -2043,12 +2062,16 @@ impl TransportNetwork {
     /// The meters-carrying form of ``_reduced_street_offsets``: the same
     /// reduction over meters-tracking searches, returning ``(stop_id,
     /// seconds, winning_mode, vehicle_network_m, vehicle_connector_m,
-    /// walk_m)`` per reachable stop — the street distances the policy
-    /// cost matrix attributes. A walking choice carries its whole
-    /// distance in ``walk_m`` (vehicle columns zero); a vehicle choice
-    /// splits network and connector meters, and a closure-carried choice
-    /// adds the walked transfer edge to ``walk_m``. Seconds are
-    /// identical to ``_reduced_street_offsets`` cell for cell. Internal.
+    /// walk_m, transfer_network_m, transfer_total_m, transfer_rental,
+    /// vehicle_seconds, transfer_seconds, via)`` per reachable stop — the
+    /// street facts the policy cost matrix attributes and prices. A
+    /// walking choice carries its whole distance in ``walk_m`` (vehicle
+    /// columns zero); a vehicle choice splits network and connector
+    /// meters; a closure-carried choice adds the walked transfer edge to
+    /// ``walk_m`` (a rental-bearing edge's ride meters and seconds in the
+    /// ``transfer_*`` fields instead), names its seed in ``via``, and keeps
+    /// the seed's own leg in ``vehicle_seconds``. Seconds are identical to
+    /// ``_reduced_street_offsets`` cell for cell. Internal.
     #[pyo3(signature = (latitude, longitude, egress, modes, exclude_stops = vec![], transfer_mode = None))]
     #[allow(clippy::type_complexity)]
     #[allow(clippy::too_many_arguments)]
@@ -2090,7 +2113,7 @@ impl TransportNetwork {
                     // A rental-bearing carried transfer: the folded
                     // edge's meters split into the ride's street meters
                     // and the walking rest by its token.
-                    let (transfer_network, transfer_total) = match (
+                    let (transfer_network, transfer_total, transfer_seconds) = match (
                         winner.transfer_rental,
                         winner.via,
                         self.mode_transfers.as_ref(),
@@ -2104,12 +2127,16 @@ impl TransportNetwork {
                             match held.tokens.get(&pair) {
                                 Some(token) => {
                                     walk = (walk - token.ride_total_meters).max(0.0);
-                                    (token.ride_network_meters, token.ride_total_meters)
+                                    (
+                                        token.ride_network_meters,
+                                        token.ride_total_meters,
+                                        token.ride_seconds,
+                                    )
                                 }
-                                None => (0.0, 0.0),
+                                None => (0.0, 0.0, 0),
                             }
                         }
-                        _ => (0.0, 0.0),
+                        _ => (0.0, 0.0, 0),
                     };
                     (
                         self.public_stop_id(StopIdx(stop as u32)),
@@ -2121,6 +2148,9 @@ impl TransportNetwork {
                         transfer_network,
                         transfer_total,
                         winner.transfer_rental,
+                        winner.vehicle_seconds,
+                        transfer_seconds,
+                        winner.via.map(|via| self.public_stop_id(via)),
                     )
                 })
             })
@@ -3163,6 +3193,7 @@ impl TransportNetwork {
                 let Some(snap) = links[stop] else { continue };
                 let candidate = Winner {
                     seconds,
+                    vehicle_seconds: seconds,
                     rentals: u8::from(*rental),
                     transfer_rental: false,
                     order,

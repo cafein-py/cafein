@@ -984,6 +984,29 @@ def test_policy_itineraries_reconcile_with_the_time_matrix(multimodal_network):
     assert int(matrix["travel_time"].iloc[0]) == fastest
 
 
+def test_reduced_rows_carry_vehicle_seconds_and_the_seed(multimodal_network):
+    """The meters-carrying reduction states each choice's vehicle-leg seconds
+    and, for a carried choice, the seed it was carried from: a direct choice
+    is its own vehicle leg; a carried one keeps the seed's leg and adds the
+    walked edge, renting nothing."""
+    pytest.importorskip("cafein._cafein")
+    core = multimodal_network._core
+    unrestricted = core._reduced_street_rows(
+        *DEST, True, [("bicycle", 900.0, False, None)]
+    )
+    hub = min(unrestricted, key=lambda row: row[1])
+    assert hub[11] is None and hub[9] == hub[1]
+    rows = core._reduced_street_rows(*DEST, True, [("bicycle", 900.0, False, [hub[0]])])
+    carried = [row for row in rows if row[11] is not None]
+    assert carried
+    transfers = {(frm, to): seconds for frm, to, seconds in core._transfer_edges()}
+    for row in carried:
+        assert row[11] == hub[0]
+        assert row[9] == hub[1]
+        assert row[1] == row[9] + transfers[(row[0], hub[0])]
+        assert row[10] == 0
+
+
 def test_an_egress_via_choice_walks_the_forward_transfer(multimodal_network):
     pytest.importorskip("cafein._cafein")
     from cafein.network import _policy_street_legs
@@ -1888,6 +1911,41 @@ def test_the_cost_matrix_attributes_rental_transfers(multimodal_transfers_networ
     assert row["emissions"] == pytest.approx(fastest["emissions"].sum(), rel=1e-6)
     assert row["street_distance_m"] == pytest.approx(
         scooter["distance_m"].sum(), rel=1e-6
+    )
+    # The engine table states the rental facts a tariff bills: the rides
+    # and their started minutes, exactly the itineraries' scooter legs.
+    from cafein.matrices import _policy_cost_columns
+
+    def engine_table(destinations):
+        table, _, _ = _policy_cost_columns(
+            multimodal_transfers_network,
+            _points_frame([ORIGIN]),
+            destinations,
+            "2022-02-22",
+            "08:30:00",
+            _transfer_policy(),
+            max_transfers=7,  # the public default of eight rides
+            factors=None,
+            components=None,
+            geometries=False,
+            chunk=None,
+        )
+        return table
+
+    table = engine_table(_points_frame([DEST]))
+    assert int(table["rental_transfers"][0]) == len(scooter)
+    started = -(-(scooter["arrival_s"] - scooter["departure_s"]) // 60)
+    assert int(table["rental_minutes"][0]) == int(started.sum())
+    # The egress stop is the one the fastest itinerary leaves transit at.
+    stops_by_index = [s for s, _lat, _lon in multimodal_transfers_network._core.stops]
+    egress = fastest[fastest["leg_type"] == "egress"]
+    assert stops_by_index[int(table["egress_stop"][0])] == egress["from_stop"].iloc[0]
+    # A pair the walk wins outright rides nothing: sentinel stop, no rentals.
+    walked = engine_table(_points_frame([ORIGIN]))
+    assert int(walked["egress_stop"][0]) == 2**32 - 1
+    assert (
+        int(walked["rental_transfers"][0]) == 0
+        and int(walked["rental_minutes"][0]) == 0
     )
     with pytest.raises(ValueError, match="exclusion-aware"):
         TravelCostMatrix(

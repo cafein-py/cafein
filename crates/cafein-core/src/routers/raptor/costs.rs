@@ -36,6 +36,10 @@ pub struct CostRow {
     /// How many rental-bearing transfers the journey rode — the street
     /// identity the tie-breaks read (meters may legitimately be zero).
     pub rental_transfers: u32,
+    /// The started minutes those rental rides bill, summed ride by ride
+    /// (`ceil(ride_seconds / 60)` each) for a per-minute tariff; 0 when
+    /// none.
+    pub rental_minutes: u32,
     /// Grams CO₂e over the ridden legs; NaN when a ridden trip has no
     /// emission factor.
     pub emission_grams: f64,
