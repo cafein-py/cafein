@@ -873,11 +873,14 @@ class TravelCostMatrix(pd.DataFrame):
     walking alternative folds in at the policy's walking access budget,
     and a walking-only policy at one shared budget rides the legacy
     cost matrix bit for bit (its ``street_distance_m`` is identically
-    zero). Policy cost matrices run the time-fastest engine arm and do
-    not price fares; ``optimize``, ``departure_time_window``,
-    ``max_travel_time``, ``fares``, ``candidates``, ``router``, and the
-    walking knobs are rejected beside a policy rather than silently
-    ignored.
+    zero). Policy cost matrices run the time-fastest engine arm; with
+    ``fares=`` they price each cell's ridden transit legs exactly as
+    the legacy matrix does (walking and own-vehicle street legs are
+    free, a walking-only cell prices zero), while a policy with a
+    shared (rental) mode rejects ``fares`` until its rental legs price;
+    ``optimize``, ``departure_time_window``, ``max_travel_time``,
+    ``candidates``, ``router``, and the walking knobs are rejected
+    beside a policy rather than silently ignored.
 
     ``street_policy=`` also takes a ``cafein.policy.CarParkPolicy`` (a network
     built with ``"car"`` in ``street_modes=``): per origin the access
@@ -5495,7 +5498,6 @@ def _cost_matrix_data(
                     ("optimize", None if optimize == "time" else optimize),
                     ("departure_time_window", window),
                     ("max_travel_time", within),
-                    ("fares", fares),
                     ("candidates", None if candidates == "time" else candidates),
                     ("router", None if router == "auto" else router),
                     ("walking_speed_kmph", walking_speed_kmph),
@@ -5510,7 +5512,14 @@ def _cost_matrix_data(
             raise ValueError(
                 f"street_policy does not combine with {offending}; the "
                 "policy carries its own budgets and the policy cost "
-                "matrix runs the time-fastest engine arm, unpriced"
+                "matrix runs the time-fastest engine arm"
+            )
+        if fares is not None and any(
+            terms.source == "shared" for terms in street_policy.vehicles.values()
+        ):
+            raise ValueError(
+                "street_policy with a shared (rental) mode does not price yet: "
+                "its rental legs would go unpriced, so fares= is rejected"
             )
         from cafein.policy import reject_carriage as _reject_carriage
 
@@ -5534,7 +5543,7 @@ def _cost_matrix_data(
                 within=None,
                 factors=transit_factors,
                 components=components,
-                fares=None,
+                fares=fares,
                 candidates="time",
                 bucket=bucket,
                 router="auto",
@@ -5565,6 +5574,7 @@ def _cost_matrix_data(
                 exclude_routes=exclude_routes,
                 exclude_trips=exclude_trips,
                 exclude_stops=exclude_stops,
+                fares=fares,
                 workers=workers,
                 max_memory=max_memory,
             )
@@ -5582,6 +5592,8 @@ def _cost_matrix_data(
             ),
             "emissions": table["emissions"],
         }
+        if fares is not None:
+            data["money"] = table["fare"]
         if geometries:
             data["geometry"] = shapely.from_wkb(
                 np.array(table["geometry"], dtype=object)
@@ -6617,6 +6629,7 @@ def _policy_cost_columns(
     exclude_routes=(),
     exclude_trips=(),
     exclude_stops=(),
+    fares=None,
     workers=None,
     max_memory=None,
 ):
@@ -6760,6 +6773,7 @@ def _policy_cost_columns(
         else {"walk": _streets.MAX_ACCESS_EGRESS_TIME}
     )
     direct_mode, walk_budget = _direct_walking_mode(access_budgets, egress_budgets)
+    fare_tables = None if fares is None else fares._flat_tables(network)
     table = core._cost_matrix_with_access(
         access_rows,
         egress_rows,
@@ -6776,6 +6790,7 @@ def _policy_cost_columns(
         geometries=bool(geometries),
         transfer_mode=transfer_arg,
         direct_mode=direct_mode,
+        fares=fare_tables,
         workers=_memory.width_or(workers),
     )
     # A point is unsnapped only when neither the policy's modes nor the
@@ -6826,7 +6841,7 @@ def _car_park_cost_columns(
     access stop — a ``fee`` column in the ``cafein.costs`` currency,
     zero on rows the walk won. The direct walking alternative folds in
     over the installed walking streets, as on the route surface.
-    Transit fares stay unpriced, as on every policy cost matrix, and
+    Transit fares stay unpriced on the car-park arms, and
     no facility column is surfaced. An origin that cannot reach any
     facility by car keeps the route surface's refusal semantics: its
     cells are omitted and a warning names it."""

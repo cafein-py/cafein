@@ -559,13 +559,16 @@ impl TransportNetwork {
     /// leaving the walking alternative to the caller. Row geometry stays the ridden
     /// transit legs' (walking rows their walked path), exactly as in the
     /// legacy matrix — street and walking end legs' shapes ride the
-    /// itineraries product, which rebuilds every leg. Fares stay NaN —
-    /// policy queries do not price yet. Internal until the policy
-    /// surface stabilises.
+    /// itineraries product, which rebuilds every leg. With ``fares``
+    /// tables each ridden row prices its transit legs exactly as the
+    /// legacy matrix does and a walking row prices zero; street legs
+    /// are never priced here. Internal until the policy surface
+    /// stabilises.
     #[pyo3(signature = (access_rows, egress_rows, origins, destinations, date, departure,
                         factors, walk_budget, max_transfers,
                         exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![],
-                        geometries = false, transfer_mode = None, direct_mode = None, workers=None))]
+                        geometries = false, transfer_mode = None, direct_mode = None,
+                        fares = None, workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn _cost_matrix_with_access(
         &self,
@@ -585,6 +588,7 @@ impl TransportNetwork {
         geometries: bool,
         transfer_mode: Option<(String, f64, f64)>,
         direct_mode: Option<&str>,
+        fares: Option<Bound<'_, PyDict>>,
         workers: Option<usize>,
     ) -> PyResult<Py<PyDict>> {
         if access_rows.len() != origins.len() || egress_rows.len() != destinations.len() {
@@ -713,12 +717,23 @@ impl TransportNetwork {
             .as_ref()
             .map(|&(_, _, grams_per_meter)| grams_per_meter)
             .unwrap_or(0.0);
+        let tables = fares
+            .map(|spec| {
+                fare_tables(
+                    &spec,
+                    self.feed.routes.len(),
+                    self.build.timetable.stop_count() as usize,
+                )
+            })
+            .transpose()?;
+        // A walking row rides nothing, so under fare tables it costs zero.
+        let walk_fare = if tables.is_some() { 0.0 } else { f64::NAN };
         let inputs = CostInputs {
             geometry,
             factors: &per_trip,
             leg_geometry: self.leg_geometry.as_ref(),
             with_geometry: geometries,
-            fares: None,
+            fares: tables.as_ref(),
             rental,
             with_pieces: false,
         };
@@ -899,7 +914,7 @@ impl TransportNetwork {
                                             street_meters: 0.0,
                                             rental_transfers: 0,
                                             emission_grams: 0.0,
-                                            fare: f64::NAN,
+                                            fare: walk_fare,
                                             geometry: walk_geometry(point),
                                             pieces: None,
                                         };
@@ -925,7 +940,7 @@ impl TransportNetwork {
                                             street_meters: 0.0,
                                             rental_transfers: 0,
                                             emission_grams: 0.0,
-                                            fare: f64::NAN,
+                                            fare: walk_fare,
                                             geometry: walk_geometry(point),
                                             pieces: None,
                                         },

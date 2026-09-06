@@ -15,6 +15,11 @@
   checksummed like an input; a `traveler` is a mapping of `TravelerProfile`
   keywords. The provenance record lists every group's effective value,
   defaults included.
+- `TravelCostMatrix` with `street_policy=` accepts `fares=` for a policy
+  without a shared (rental) mode: each cell's ridden transit legs price
+  exactly as without a policy, walking and own-vehicle street legs are free,
+  and a walking-only cell prices zero, in a `money` column. A policy with a
+  shared mode still rejects `fares=`.
 
 - Recipe inputs accept `kind: sample` with `name: <region>.<asset>`, a pinned
   `cafein.sampledata` asset (`helsinki.osm_pbf`, `helsinki.air_quality`,

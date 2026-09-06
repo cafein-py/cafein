@@ -1133,14 +1133,21 @@ def test_policy_cost_matrix_reconciles_with_the_itineraries(multimodal_network):
             assert total == pytest.approx(float(fastest["distance"].iloc[0]), rel=1e-9)
 
 
-def test_a_walking_only_policy_cost_matrix_is_the_legacy_matrix(multimodal_network):
+def test_a_walking_only_policy_cost_matrix_is_the_legacy_matrix(
+    multimodal_network, helsinki_gtfs
+):
     pytest.importorskip("cafein._cafein")
-    from cafein import TravelCostMatrix
+    from cafein import TravelCostMatrix, fares
 
+    structure = fares.zone_fare_structure(helsinki_gtfs, rules="zones")
     origins = _points_frame(MATRIX_POINTS[:2])
     destinations = _points_frame(MATRIX_POINTS[1:])
     legacy = TravelCostMatrix(
-        multimodal_network, origins, destinations, "2022-02-22 08:30:00"
+        multimodal_network,
+        origins,
+        destinations,
+        "2022-02-22 08:30:00",
+        fares=structure,
     )
     policied = TravelCostMatrix(
         multimodal_network,
@@ -1148,12 +1155,76 @@ def test_a_walking_only_policy_cost_matrix_is_the_legacy_matrix(multimodal_netwo
         destinations,
         "2022-02-22 08:30:00",
         street_policy=StreetLegPolicy(access={"walk": 7200}, egress={"walk": 7200}),
+        fares=structure,
     )
+    assert "money" in policied.columns
     assert (policied["street_distance_m"] == 0.0).all()
     pd.testing.assert_frame_equal(
         policied.drop(columns="street_distance_m").reset_index(drop=True),
         pd.DataFrame(legacy).reset_index(drop=True),
     )
+
+
+def test_policy_cost_matrix_prices_fares_without_rentals(
+    multimodal_network, helsinki_gtfs
+):
+    """With fare tables a policy matrix prices each cell's ridden transit legs
+    as the itineraries do (own-vehicle and walking legs are free, a walking
+    cell prices zero); a policy with a shared mode still rejects fares."""
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries, TravelCostMatrix, fares
+
+    structure = fares.zone_fare_structure(helsinki_gtfs, rules="zones")
+    policy = _bike_walk_policy()
+    origins = _points_frame([ORIGIN, MATRIX_POINTS[1]])
+    destinations = _points_frame([DEST, MATRIX_POINTS[2]])
+    matrix = TravelCostMatrix(
+        multimodal_network,
+        origins,
+        destinations,
+        "2022-02-22 08:30:00",
+        street_policy=policy,
+        fares=structure,
+        output_time_units="seconds",
+    )
+    assert "money" in matrix.columns
+    assert matrix["money"].notna().all()
+    for (from_id, to_id), cell in matrix.groupby(["from_id", "to_id"]):
+        cell = cell.iloc[0]
+        if cell["transfers"] == 0 and cell["transit_distance_m"] == 0:
+            assert cell["money"] == 0.0  # a walking-only cell rides nothing
+            continue
+        itineraries = DetailedItineraries(
+            multimodal_network,
+            origins[origins["id"] == from_id],
+            destinations[destinations["id"] == to_id],
+            "2022-02-22 08:30:00",
+            street_policy=policy,
+            fares=structure,
+            geometries=False,
+        )
+        options = itineraries.groupby("option").agg(
+            departure=("departure_s", "min"),
+            arrival=("arrival_s", "max"),
+            money=("money", "first"),
+        )
+        durations = options["arrival"] - options["departure"]
+        fastest = options[durations == durations.min()]
+        if len(fastest) == 1:
+            assert cell["money"] == pytest.approx(float(fastest["money"].iloc[0]))
+    with pytest.raises(ValueError, match="does not price yet"):
+        TravelCostMatrix(
+            multimodal_network,
+            origins,
+            destinations,
+            "2022-02-22 08:30:00",
+            street_policy=StreetLegPolicy(
+                access={"e_scooter": 900},
+                egress={"walk": 900},
+                vehicles={"e_scooter": shared()},
+            ),
+            fares=structure,
+        )
 
 
 def test_policy_cost_matrix_rejects_incompatible_knobs(multimodal_network):
