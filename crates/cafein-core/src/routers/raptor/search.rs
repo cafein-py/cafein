@@ -462,7 +462,11 @@ impl<'a> Search<'a> {
                             street_meters += token.ride_total_meters;
                             rental_transfers += 1;
                             rental_minutes += token.ride_seconds.div_ceil(60);
-                            grams += token.ride_network_meters * grams_per_meter;
+                            // A zero-meter ride adds nothing, whatever the
+                            // factor: NaN must not poison it.
+                            if token.ride_network_meters > 0.0 {
+                                grams += token.ride_network_meters * grams_per_meter;
+                            }
                         }
                         None => walk_meters += edge_meters,
                     }

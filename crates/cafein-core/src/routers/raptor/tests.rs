@@ -149,7 +149,7 @@ fn window_percentiles_match_per_minute_runs() {
 fn cost_rows_aggregate_the_fastest_journey() {
     // Distances per trip: pattern A trips 1200 m over three stops,
     // B trips 800 m, C 2000 m; factors 10/10/20/20/30 g/pkm.
-    let (timetable, transfers) = network();
+    let (timetable, mut transfers) = network();
     let geometry = TripGeometry::from_trips(
         &timetable,
         vec![
@@ -218,6 +218,47 @@ fn cost_rows_aggregate_the_fastest_journey() {
     );
     assert!(rows[0][0].emission_grams.is_nan());
     assert!((rows[0][1].emission_grams - 12.0).abs() < 1e-9);
+    // The 2→4 footpath as a merged set's rental edge whose ride covers
+    // no network meters (connectors only), under an unresolved fleet
+    // factor: the ride is counted and billed, the grams stay the
+    // transit's. A merged set is unclosed, so its exact phase records
+    // the ride behind each relaxed edge — the label the token branch
+    // reads.
+    transfers.mark_unclosed();
+    let tokens = std::collections::HashMap::from([(
+        (2, 4),
+        crate::mode_transfers::RentalToken {
+            pickup: StopIdx(2),
+            drop: StopIdx(4),
+            ride_seconds: 30,
+            ride_network_meters: 0.0,
+            ride_total_meters: 50.0,
+            pre_seconds: 0,
+            post_seconds: 20,
+        },
+    )]);
+    let inputs = CostInputs {
+        factors: &factors,
+        rental: Some(RentalCostView {
+            tokens: &tokens,
+            grams_per_meter: f64::NAN,
+        }),
+        ..inputs
+    };
+    let rows = Raptor.cost_matrix(
+        &timetable,
+        &transfers,
+        &inputs,
+        std::slice::from_ref(&request),
+        &[StopIdx(3), StopIdx(4)],
+    );
+    let to_4 = &rows[0][1];
+    assert_eq!(
+        (to_4.seconds, to_4.rental_transfers, to_4.rental_minutes),
+        (350, 1, 1)
+    );
+    assert_eq!((to_4.street_meters, to_4.walk_meters), (50.0, 0.0));
+    assert!((to_4.emission_grams - 12.0).abs() < 1e-9);
 }
 
 #[test]

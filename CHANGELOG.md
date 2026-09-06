@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Fixed: `save_fare_structure` / `load_fare_structure` round-trip a
+  `FareStructure`'s `street` tariffs through an extra `street_tariffs.csv`
+  (written only when there are any), and `FareStructure` refuses a negative
+  or fractional `max_discounted_transfers`, a non-finite or negative
+  `transfer_time_allowance`, and a NaN or negative `fare_cap`.
+  ([#374](https://github.com/cafein-py/cafein/pull/374))
+
+- Fixed: a street-policy `TravelCostMatrix` no longer counts `wheelchair`
+  access and egress as a street vehicle (it is walking-class, as on the
+  itineraries), a `wheelchair` transfer set no longer needs a shared-fleet
+  emission factor on the cost matrix or the multicriteria candidates, and a
+  rental ride covering no network metres no longer turns a row's emissions
+  NaN under an unresolved fleet factor.
+  ([#374](https://github.com/cafein-py/cafein/pull/374))
+
 ## 0.22.0 — 2026-09-06
 
 - The `cafein` command: `cafein run recipe.yaml [-o DIR]` runs a recipe and

@@ -6637,7 +6637,7 @@ def _policy_cost_columns(
     from cafein import streets as _streets
     from cafein.policy import reduction_modes
 
-    from cafein.network import _policy_transfer_mode
+    from cafein.network import _policy_transfer_arg, _policy_transfer_mode
     from cafein.policy import reject_carriage
 
     reject_carriage(policy, "the cost matrix")
@@ -6677,26 +6677,17 @@ def _policy_cost_columns(
     egress_modes = reduction_modes(policy, "egress", _streets.MAX_ACCESS_EGRESS_TIME)
     transit_factors, street_factors = _factor_tables(factors)
     trip_factors = emissions.trip_factors(network, transit_factors, components)
-    transfer_arg = None
-    if transfer_mode is not None:
-        # The rental's ride grams join the emissions column, so the
-        # transfer mode's shared-fleet factor must resolve.
-        mode, budget = transfer_mode
-        value = emissions.street_factor(
-            mode, street_factors, components, service_model="shared"
-        )
-        if pd.isna(value):
-            raise ValueError(
-                f"the {mode} emission factor is unresolved; the cost "
-                "matrix attributes rental transfer emissions, so pass "
-                "factors= rows resolving it (see "
-                "cafein.emissions.load_street_factors)"
-            )
-        transfer_arg = (mode, budget, float(value) / 1000.0)
+    # The rental's ride grams join the emissions column.
+    transfer_arg = _policy_transfer_arg(
+        transfer_mode,
+        street_factors,
+        components,
+        "the cost matrix attributes rental transfer emissions",
+    )
     # One resolved per-km factor per granted vehicle mode; NaN keeps an
-    # unresolved factor poisoning rather than zeroing its rows. Walking
-    # rides no vehicle, so its factor is never read.
-    mode_factors = {"walk": 0.0}
+    # unresolved factor poisoning rather than zeroing its rows. The
+    # walking-class modes ride no vehicle, so their factors are never read.
+    mode_factors = {"walk": 0.0, "wheelchair": 0.0}
     for mode, _, rental, *_ in access_modes + egress_modes:
         if mode in mode_factors:
             continue
@@ -6741,7 +6732,7 @@ def _policy_cost_columns(
                         mode_factors[mode],
                         transfer_network_m,
                         transfer_total_m,
-                        mode != "walk" or transfer_rental,
+                        mode not in ("walk", "wheelchair") or transfer_rental,
                     )
                     for (
                         stop,
