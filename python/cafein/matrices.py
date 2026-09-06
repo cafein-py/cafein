@@ -875,10 +875,12 @@ class TravelCostMatrix(pd.DataFrame):
     cost matrix bit for bit (its ``street_distance_m`` is identically
     zero). Policy cost matrices run the time-fastest engine arm; with
     ``fares=`` they price each cell's ridden transit legs exactly as
-    the legacy matrix does (walking and own-vehicle street legs are
-    free, a walking-only cell prices zero), while a policy with a
-    shared (rental) mode rejects ``fares`` until its rental legs price;
-    ``optimize``, ``departure_time_window``, ``max_travel_time``,
+    the legacy matrix does and its shared street legs by the
+    structure's ``street`` tariff (unlock plus started minutes per
+    rental leg, as ``cafein.fares.annotate_fares`` prices them; a
+    rental mode without a tariff prices NaN), while walking and
+    own-vehicle street legs are free and a walking-only cell prices
+    zero; ``optimize``, ``departure_time_window``, ``max_travel_time``,
     ``candidates``, ``router``, and the walking knobs are rejected
     beside a policy rather than silently ignored.
 
@@ -5514,13 +5516,6 @@ def _cost_matrix_data(
                 "policy carries its own budgets and the policy cost "
                 "matrix runs the time-fastest engine arm"
             )
-        if fares is not None and any(
-            terms.source == "shared" for terms in street_policy.vehicles.values()
-        ):
-            raise ValueError(
-                "street_policy with a shared (rental) mode does not price yet: "
-                "its rental legs would go unpriced, so fares= is rejected"
-            )
         from cafein.policy import reject_carriage as _reject_carriage
 
         _reject_carriage(street_policy, "matrix computation")
@@ -6647,6 +6642,13 @@ def _policy_cost_columns(
 
     reject_carriage(policy, "the cost matrix")
     transfer_mode = _policy_transfer_mode(policy)
+    # Frozen at entry: the pricing below reads the policy and tariff the
+    # search was made under. Arguments are read during the call, as every
+    # computer's are; mutating them concurrently is outside the contract.
+    shared_modes = frozenset(
+        mode for mode, terms in policy.vehicles.items() if terms.source == "shared"
+    )
+    street_tariffs = None if fares is None else dict(fares.street)
 
     core = network._core
     if not core.has_multimodal_streets:
@@ -6707,7 +6709,9 @@ def _policy_cost_columns(
         mode_factors[mode] = float("nan") if pd.isna(value) else float(value)
 
     def reduced(points, egress, modes):
-        rows, unsnapped = [], []
+        """The engine's meters rows per point, the unsnapped points, and
+        per point the street facts a tariff bills, by stop."""
+        rows, unsnapped, facts = [], [], []
         for index, (lat, lon) in enumerate(points):
             try:
                 cells = core._reduced_street_rows(
@@ -6723,6 +6727,7 @@ def _policy_cost_columns(
                     raise
                 # An unsnapped point reaches nothing; its cells are omitted.
                 rows.append([])
+                facts.append({})
                 unsnapped.append(index)
                 continue
             rows.append(
@@ -6754,10 +6759,15 @@ def _policy_cost_columns(
                     ) in cells
                 ]
             )
-        return rows, unsnapped
+            facts.append(
+                {cell[0]: (cell[2], cell[9], cell[10], cell[8]) for cell in cells}
+            )
+        return rows, unsnapped, facts
 
-    access_rows, unsnapped_origins = reduced(origin_points, False, access_modes)
-    egress_rows, unsnapped_destinations = reduced(
+    access_rows, unsnapped_origins, access_facts = reduced(
+        origin_points, False, access_modes
+    )
+    egress_rows, unsnapped_destinations, egress_facts = reduced(
         destination_points, True, egress_modes
     )
     # The direct walking alternative always applies — walking needs no
@@ -6813,7 +6823,58 @@ def _policy_cost_columns(
         from_ids,
         to_ids,
     )
+    if fares is not None:
+        rental_mode = None if transfer_mode is None else transfer_mode[0]
+        table["fare"] = _policy_money(
+            table,
+            street_tariffs,
+            shared_modes,
+            rental_mode,
+            access_facts,
+            egress_facts,
+            core,
+        )
     return table, from_ids, to_ids
+
+
+def _policy_money(table, street, shared, rental_mode, access_facts, egress_facts, core):
+    """Each row's money: the engine's transit fare plus the rental legs the
+    journey rode under the structure's street tariff — the access and
+    egress vehicle legs by their own started minutes, a rental-bearing
+    carried edge by its ride, and the mid-journey rental transfers by their
+    count and started minutes. Own-vehicle and walking legs are free; a
+    rental mode without a tariff prices NaN, never a silent zero."""
+    from cafein.fares import _leg_cost
+
+    stops_by_index = [stop for stop, _lat, _lon in core.stops]
+
+    def end_cost(cell):
+        mode, vehicle_seconds, transfer_seconds, rented = cell
+        cost = _leg_cost(street, mode, vehicle_seconds) if mode in shared else 0.0
+        if rented:
+            cost += _leg_cost(street, rental_mode, transfer_seconds)
+        return cost
+
+    def end_costs(stops, points, facts):
+        costs = np.zeros(len(stops))
+        for at, (stop_index, point) in enumerate(zip(stops, points)):
+            if stop_index != _NO_STOP:
+                costs[at] = end_cost(facts[point][stops_by_index[stop_index]])
+        return costs
+
+    money = np.asarray(table["fare"], dtype=float)
+    money = money + end_costs(table["access_stop"], table["from"], access_facts)
+    money = money + end_costs(table["egress_stop"], table["to"], egress_facts)
+    rentals = np.asarray(table["rental_transfers"], dtype=float)
+    if rentals.any():
+        tariff = street.get(rental_mode) if rental_mode in shared else (0.0, 0.0)
+        if tariff is None:
+            money = np.where(rentals > 0, np.nan, money)
+        else:
+            unlock, per_minute = tariff
+            minutes = np.asarray(table["rental_minutes"], dtype=float)
+            money = money + rentals * unlock + minutes * per_minute
+    return money
 
 
 def _car_park_cost_columns(

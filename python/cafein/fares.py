@@ -962,10 +962,22 @@ def _street_tariffs(street):
             )
         unlock = float(entry["unlock"])
         per_minute = float(entry["per_minute"])
-        if unlock < 0 or per_minute < 0:
-            raise ValueError(f"street tariff for {mode!r} must not be negative")
+        if not all(math.isfinite(v) and v >= 0 for v in (unlock, per_minute)):
+            raise ValueError(
+                f"street tariff for {mode!r} must be finite and not negative"
+            )
         tariffs[str(mode)] = (unlock, per_minute)
     return tariffs
+
+
+def _leg_cost(street, mode, seconds):
+    """One rental leg's price under the ``street`` tariffs: the mode's
+    unlock plus its started minutes; ``NaN`` when the mode has no tariff."""
+    tariff = street.get(mode)
+    if tariff is None:
+        return math.nan
+    unlock, per_minute = tariff
+    return unlock + math.ceil(seconds / 60.0) * per_minute
 
 
 def _street_cost(journey, street, shared_modes):
@@ -978,12 +990,10 @@ def _street_cost(journey, street, shared_modes):
         mode = leg.get("mode")
         if mode is None or mode == "walk" or mode not in shared_modes:
             continue
-        tariff = street.get(mode)
-        if tariff is None:
+        cost = _leg_cost(street, mode, leg["arrival_s"] - leg["departure_s"])
+        if math.isnan(cost):
             return math.nan
-        unlock, per_minute = tariff
-        minutes = math.ceil((leg["arrival_s"] - leg["departure_s"]) / 60.0)
-        total += unlock + minutes * per_minute
+        total += cost
     return total
 
 
