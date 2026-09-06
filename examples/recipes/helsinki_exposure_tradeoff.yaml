@@ -1,0 +1,34 @@
+# Fastest versus lower-NO2 cycling routes between Helsinki libraries and
+# universities, on cafein's Helsinki sample data (downloaded and verified on
+# first use; every asset's pinned digest lands in the provenance record).
+# Run with `cafein run helsinki_exposure_tradeoff.yaml -o out/`.
+recipe: exposure_tradeoff
+version: 1
+inputs:
+  streets:
+    kind: sample
+    name: helsinki.osm_pbf
+  exposure:
+    no2:
+      kind: sample
+      name: helsinki.air_quality          # one FMI-ENFUSER hour, eight bands
+      value: NO2Concentration
+      units: ug/m3
+  origins:
+    kind: sample
+    name: helsinki.poi_library
+    id_column: osm_id
+  destinations:
+    kind: sample
+    name: helsinki.poi_university
+    id_column: osm_id
+parameters:
+  mode: bicycle
+  objective_layer: no2
+  weights: [0.5, 1.0, 2.0]                # the swept trade-off searches
+  exposure:
+    thresholds: {no2: 40}                 # adds no2_minutes_above_40
+  matrix:
+    workers: 4
+outputs:
+  table: library_university_no2_tradeoff.parquet

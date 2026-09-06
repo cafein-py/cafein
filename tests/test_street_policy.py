@@ -984,6 +984,29 @@ def test_policy_itineraries_reconcile_with_the_time_matrix(multimodal_network):
     assert int(matrix["travel_time"].iloc[0]) == fastest
 
 
+def test_reduced_rows_carry_vehicle_seconds_and_the_seed(multimodal_network):
+    """The meters-carrying reduction states each choice's vehicle-leg seconds
+    and, for a carried choice, the seed it was carried from: a direct choice
+    is its own vehicle leg; a carried one keeps the seed's leg and adds the
+    walked edge, renting nothing."""
+    pytest.importorskip("cafein._cafein")
+    core = multimodal_network._core
+    unrestricted = core._reduced_street_rows(
+        *DEST, True, [("bicycle", 900.0, False, None)]
+    )
+    hub = min(unrestricted, key=lambda row: row[1])
+    assert hub[11] is None and hub[9] == hub[1]
+    rows = core._reduced_street_rows(*DEST, True, [("bicycle", 900.0, False, [hub[0]])])
+    carried = [row for row in rows if row[11] is not None]
+    assert carried
+    transfers = {(frm, to): seconds for frm, to, seconds in core._transfer_edges()}
+    for row in carried:
+        assert row[11] == hub[0]
+        assert row[9] == hub[1]
+        assert row[1] == row[9] + transfers[(row[0], hub[0])]
+        assert row[10] == 0
+
+
 def test_an_egress_via_choice_walks_the_forward_transfer(multimodal_network):
     pytest.importorskip("cafein._cafein")
     from cafein.network import _policy_street_legs
@@ -1133,14 +1156,21 @@ def test_policy_cost_matrix_reconciles_with_the_itineraries(multimodal_network):
             assert total == pytest.approx(float(fastest["distance"].iloc[0]), rel=1e-9)
 
 
-def test_a_walking_only_policy_cost_matrix_is_the_legacy_matrix(multimodal_network):
+def test_a_walking_only_policy_cost_matrix_is_the_legacy_matrix(
+    multimodal_network, helsinki_gtfs
+):
     pytest.importorskip("cafein._cafein")
-    from cafein import TravelCostMatrix
+    from cafein import TravelCostMatrix, fares
 
+    structure = fares.zone_fare_structure(helsinki_gtfs, rules="zones")
     origins = _points_frame(MATRIX_POINTS[:2])
     destinations = _points_frame(MATRIX_POINTS[1:])
     legacy = TravelCostMatrix(
-        multimodal_network, origins, destinations, "2022-02-22 08:30:00"
+        multimodal_network,
+        origins,
+        destinations,
+        "2022-02-22 08:30:00",
+        fares=structure,
     )
     policied = TravelCostMatrix(
         multimodal_network,
@@ -1148,12 +1178,165 @@ def test_a_walking_only_policy_cost_matrix_is_the_legacy_matrix(multimodal_netwo
         destinations,
         "2022-02-22 08:30:00",
         street_policy=StreetLegPolicy(access={"walk": 7200}, egress={"walk": 7200}),
+        fares=structure,
     )
+    assert "money" in policied.columns
     assert (policied["street_distance_m"] == 0.0).all()
     pd.testing.assert_frame_equal(
         policied.drop(columns="street_distance_m").reset_index(drop=True),
         pd.DataFrame(legacy).reset_index(drop=True),
     )
+
+
+def test_policy_cost_matrix_prices_fares_without_rentals(
+    multimodal_network, helsinki_gtfs
+):
+    """With fare tables a policy matrix prices each cell's ridden transit legs
+    as the itineraries do; a policy without rental charges (own-vehicle and
+    walking legs are free) pays the fare alone, a walking cell zero."""
+    pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries, TravelCostMatrix, fares
+
+    structure = fares.zone_fare_structure(helsinki_gtfs, rules="zones")
+    policy = _bike_walk_policy()
+    origins = _points_frame([ORIGIN, MATRIX_POINTS[1]])
+    destinations = _points_frame([DEST, MATRIX_POINTS[2]])
+    matrix = TravelCostMatrix(
+        multimodal_network,
+        origins,
+        destinations,
+        "2022-02-22 08:30:00",
+        street_policy=policy,
+        fares=structure,
+        output_time_units="seconds",
+    )
+    assert "money" in matrix.columns
+    assert matrix["money"].notna().all()
+    for (from_id, to_id), cell in matrix.groupby(["from_id", "to_id"]):
+        cell = cell.iloc[0]
+        if cell["transfers"] == 0 and cell["transit_distance_m"] == 0:
+            assert cell["money"] == 0.0  # a walking-only cell rides nothing
+            continue
+        itineraries = DetailedItineraries(
+            multimodal_network,
+            origins[origins["id"] == from_id],
+            destinations[destinations["id"] == to_id],
+            "2022-02-22 08:30:00",
+            street_policy=policy,
+            fares=structure,
+            geometries=False,
+        )
+        options = itineraries.groupby("option").agg(
+            departure=("departure_s", "min"),
+            arrival=("arrival_s", "max"),
+            money=("money", "first"),
+        )
+        durations = options["arrival"] - options["departure"]
+        fastest = options[durations == durations.min()]
+        if len(fastest) == 1:
+            assert cell["money"] == pytest.approx(float(fastest["money"].iloc[0]))
+
+
+def _fastest_money(network, origins, destinations, from_id, to_id, **kwargs):
+    """The itineraries' money for a pair's fastest option, or None when the
+    fastest time is shared by several options."""
+    from cafein import DetailedItineraries
+
+    itineraries = DetailedItineraries(
+        network,
+        origins[origins["id"] == from_id],
+        destinations[destinations["id"] == to_id],
+        "2022-02-22 08:30:00",
+        geometries=False,
+        **kwargs,
+    )
+    options = itineraries.groupby("option").agg(
+        departure=("departure_s", "min"),
+        arrival=("arrival_s", "max"),
+        money=("money", "first"),
+    )
+    durations = options["arrival"] - options["departure"]
+    fastest = options[durations == durations.min()]
+    return float(fastest["money"].iloc[0]) if len(fastest) == 1 else None
+
+
+def test_policy_cost_matrix_prices_shared_rentals(
+    multimodal_network, multimodal_transfers_network, helsinki_gtfs
+):
+    """Shared street legs price by the structure's street tariff exactly as
+    the itineraries do — access and egress rides by their own started
+    minutes, mid-journey rental transfers by count and minutes — and a
+    rental mode without a tariff prices NaN, never zero."""
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelCostMatrix, fares
+
+    structure = fares.zone_fare_structure(helsinki_gtfs, rules="zones")
+    structure.street = {"e_scooter": (1.0, 0.25)}
+    policy = StreetLegPolicy(
+        access={"e_scooter": 900, "walk": 900},
+        egress={"e_scooter": 900, "walk": 900},
+        vehicles={"e_scooter": shared()},
+    )
+    origins = _points_frame([ORIGIN, MATRIX_POINTS[1]])
+    destinations = _points_frame([DEST, MATRIX_POINTS[2]])
+    matrix = TravelCostMatrix(
+        multimodal_network,
+        origins,
+        destinations,
+        "2022-02-22 08:30:00",
+        street_policy=policy,
+        factors=_scooter_factor_rows(),
+        fares=structure,
+    )
+    assert matrix["money"].notna().all()
+    priced = 0
+    for (from_id, to_id), cell in matrix.groupby(["from_id", "to_id"]):
+        expected = _fastest_money(
+            multimodal_network,
+            origins,
+            destinations,
+            from_id,
+            to_id,
+            street_policy=policy,
+            factors=_scooter_factor_rows(),
+            fares=structure,
+        )
+        if expected is not None:
+            assert cell["money"].iloc[0] == pytest.approx(expected)
+            priced += 1
+    assert priced
+    # Mid-journey rental transfers price too: count times unlock plus minutes.
+    origin, dest = _points_frame([ORIGIN]), _points_frame([DEST])
+    with_transfers = TravelCostMatrix(
+        multimodal_transfers_network,
+        origin,
+        dest,
+        "2022-02-22 08:30:00",
+        street_policy=_transfer_policy(),
+        fares=structure,
+    )
+    expected = _fastest_money(
+        multimodal_transfers_network,
+        origin,
+        dest,
+        "p0",
+        "p0",
+        street_policy=_transfer_policy(),
+        fares=structure,
+    )
+    assert expected is not None and expected > 0
+    assert with_transfers["money"].iloc[0] == pytest.approx(expected)
+    # No tariff for a ridden rental mode: NaN, never a silent zero.
+    untariffed = fares.zone_fare_structure(helsinki_gtfs, rules="zones")
+    bare = TravelCostMatrix(
+        multimodal_transfers_network,
+        origin,
+        dest,
+        "2022-02-22 08:30:00",
+        street_policy=_transfer_policy(),
+        fares=untariffed,
+    )
+    assert bare["money"].isna().all()
 
 
 def test_policy_cost_matrix_rejects_incompatible_knobs(multimodal_network):
@@ -1817,6 +2000,41 @@ def test_the_cost_matrix_attributes_rental_transfers(multimodal_transfers_networ
     assert row["emissions"] == pytest.approx(fastest["emissions"].sum(), rel=1e-6)
     assert row["street_distance_m"] == pytest.approx(
         scooter["distance_m"].sum(), rel=1e-6
+    )
+    # The engine table states the rental facts a tariff bills: the rides
+    # and their started minutes, exactly the itineraries' scooter legs.
+    from cafein.matrices import _policy_cost_columns
+
+    def engine_table(destinations):
+        table, _, _ = _policy_cost_columns(
+            multimodal_transfers_network,
+            _points_frame([ORIGIN]),
+            destinations,
+            "2022-02-22",
+            "08:30:00",
+            _transfer_policy(),
+            max_transfers=7,  # the public default of eight rides
+            factors=None,
+            components=None,
+            geometries=False,
+            chunk=None,
+        )
+        return table
+
+    table = engine_table(_points_frame([DEST]))
+    assert int(table["rental_transfers"][0]) == len(scooter)
+    started = -(-(scooter["arrival_s"] - scooter["departure_s"]) // 60)
+    assert int(table["rental_minutes"][0]) == int(started.sum())
+    # The egress stop is the one the fastest itinerary leaves transit at.
+    stops_by_index = [s for s, _lat, _lon in multimodal_transfers_network._core.stops]
+    egress = fastest[fastest["leg_type"] == "egress"]
+    assert stops_by_index[int(table["egress_stop"][0])] == egress["from_stop"].iloc[0]
+    # A pair the walk wins outright rides nothing: sentinel stop, no rentals.
+    walked = engine_table(_points_frame([ORIGIN]))
+    assert int(walked["egress_stop"][0]) == 2**32 - 1
+    assert (
+        int(walked["rental_transfers"][0]) == 0
+        and int(walked["rental_minutes"][0]) == 0
     )
     with pytest.raises(ValueError, match="exclusion-aware"):
         TravelCostMatrix(

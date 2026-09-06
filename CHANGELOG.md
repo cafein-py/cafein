@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- The `cafein` command: `cafein run recipe.yaml [-o DIR]` runs a recipe and
+  prints the published table's path; `cafein validate recipe.yaml` checks one
+  without running it. A refusal exits 1 with its message, a usage error 2; it
+  never prompts, so a recipe drops into a workflow manager as one rule. The
+  recipes guide and a sampledata-based exposure example ship under
+  `examples/recipes/`.
+
+- A second recipe type, `transit_cost_matrix`: a public-transport
+  `TravelCostMatrix` over a `gtfs` input (`.zip` file or `helsinki.gtfs`
+  sample) and the street network, with `network:` (`from_gtfs`) and `matrix:`
+  parameter groups; `matrix.fares` is spelled `{kind: gtfs_zones, rules,
+  street}` (the feed's zone fares plus a rental tariff for the policy's shared
+  modes) or `{kind: file, path}` (an r5r-format fare zip). Two Helsinki
+  e-scooter examples ship under `examples/recipes/`.
+
+- Recipe `matrix:` parameters accept `street_policy` as a mapping of
+  `StreetLegPolicy` keywords, its `vehicles` as `VehiclePolicy` keyword
+  mappings, built at validate so their own checks run before anything is
+  read; a recipe type now declares its own input roles and parameter groups.
+
 - Recipe `parameters:` gain `streets:`, `exposure:`, and `matrix:` groups that
   pass any keyword of `StreetNetwork.from_osm`, `Exposure`, and
   `TravelCostMatrix` through by name (the ones the recipe fixes are refused);
@@ -10,6 +30,18 @@
   checksummed like an input; a `traveler` is a mapping of `TravelerProfile`
   keywords. The provenance record lists every group's effective value,
   defaults included.
+- A street-policy `TravelCostMatrix` with `fares=` now prices a shared
+  (rental) mode's legs by the structure's `street` tariff — the access and
+  egress rides by their own started minutes, a rental-bearing carried edge by
+  its ride, mid-journey rental transfers by count and started minutes — as
+  `annotate_fares` prices itineraries; a rental mode without a tariff prices
+  NaN. The shared-mode rejection of `fares=` is gone.
+
+- `TravelCostMatrix` with `street_policy=` accepts `fares=` for a policy
+  without a shared (rental) mode: each cell's ridden transit legs price
+  exactly as without a policy, walking and own-vehicle street legs are free,
+  and a walking-only cell prices zero, in a `money` column. A policy with a
+  shared mode still rejects `fares=`.
 
 - Recipe inputs accept `kind: sample` with `name: <region>.<asset>`, a pinned
   `cafein.sampledata` asset (`helsinki.osm_pbf`, `helsinki.air_quality`,

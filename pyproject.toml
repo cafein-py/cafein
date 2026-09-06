@@ -40,7 +40,11 @@ dependencies = [
     "shapely>=2.0",
 ]
 
+[project.scripts]
+cafein = "cafein.recipes:main"
+
 [project.optional-dependencies]
+recipes = ["pyyaml", "pyarrow"]
 arrow = ["pyarrow"]
 dem = ["rioxarray"]
 h3 = ["h3>=4"]

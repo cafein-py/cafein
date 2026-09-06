@@ -224,6 +224,7 @@ impl<'a> TbtrEngine<'a> {
             walk_meters,
             street_meters: 0.0,
             rental_transfers: 0,
+            rental_minutes: 0,
             emission_grams: if resolved { grams } else { f64::NAN },
             fare,
             geometry,

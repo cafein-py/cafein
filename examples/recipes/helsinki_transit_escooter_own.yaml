@@ -1,0 +1,39 @@
+# The same matrix with the traveller's own e-scooter for the access leg:
+# ridden from the origin to a stop and left there, so it serves one end only
+# (an own vehicle at both ends would have to ride along). Its legs cost
+# nothing; money is the zone fare alone.
+recipe: transit_cost_matrix
+version: 1
+inputs:
+  gtfs:
+    kind: file
+    path: data/hsl_gtfs_2026-08-18.zip
+  streets:
+    kind: file
+    path: data/helsinki_metropolitan_area.osm.pbf
+  origins:
+    kind: vector
+    path: data/ykr_grid_250m_centroids.gpkg
+    id_column: ykr_id
+  destinations:
+    kind: vector
+    path: data/workplaces_2026.gpkg
+    layer: workplaces
+    id_column: workplace_id
+parameters:
+  network:
+    street_modes: [walk, e_scooter]
+  matrix:
+    departure: "2026-08-18 08:00:00"
+    max_rides: 4
+    street_policy:
+      access: {e_scooter: 900, walk: 900}
+      egress: {walk: 900}
+      vehicles:
+        e_scooter: {source: own, side: origin, facilities: any_stop}
+    fares:
+      kind: gtfs_zones
+      rules: zones
+    workers: 8
+outputs:
+  table: hma_transit_costs_own_escooter.parquet

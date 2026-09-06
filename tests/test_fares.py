@@ -435,13 +435,16 @@ def test_street_rentals_price_beside_the_transit_fare(hsl, poa):
 
 
 def test_negative_street_tariffs_are_rejected(hsl):
-    with pytest.raises(ValueError, match="must not be negative"):
-        fares.ZoneFareStructure(
-            hsl.fares,
-            hsl.fare_zones,
-            hsl.stop_zones,
-            street={"e_scooter": {"unlock": -1.0, "per_minute": 0.25}},
-        )
+    # Negative, NaN, and infinite components alike: a tariff must be a
+    # finite, non-negative price, never a value that poisons money quietly.
+    for bad in (-1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="finite and not negative"):
+            fares.ZoneFareStructure(
+                hsl.fares,
+                hsl.fare_zones,
+                hsl.stop_zones,
+                street={"e_scooter": {"unlock": bad, "per_minute": 0.25}},
+            )
     # Both components are stated explicitly; a partial entry could
     # silently undercharge.
     with pytest.raises(ValueError, match="missing"):
