@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.22.0 — 2026-09-06
 
 - The `cafein` command: `cafein run recipe.yaml [-o DIR]` runs a recipe and
   prints the published table's path; `cafein validate recipe.yaml` checks one
