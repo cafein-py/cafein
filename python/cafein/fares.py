@@ -37,6 +37,7 @@ Two fare models are supported:
 """
 
 import math
+from fractions import Fraction
 import zipfile
 
 import pandas as pd
@@ -113,9 +114,21 @@ class FareStructure:
         fares_per_route=None,
         street=None,
     ):
-        self.max_discounted_transfers = int(max_discounted_transfers)
+        # Read exactly (a float or string spelling included) before the
+        # integer conversion: int() would round a negative fraction up
+        # to an accepted zero.
+        count = Fraction(max_discounted_transfers)
+        if count < 0 or count.denominator != 1:
+            raise ValueError(
+                "max_discounted_transfers must be a whole number and not negative"
+            )
+        self.max_discounted_transfers = int(count)
         self.transfer_time_allowance = float(transfer_time_allowance)
         self.fare_cap = float(fare_cap)
+        if not 0.0 <= self.transfer_time_allowance < math.inf:
+            raise ValueError("transfer_time_allowance must be finite and not negative")
+        if not self.fare_cap >= 0.0:
+            raise ValueError("fare_cap must not be negative")
         self.fares_per_type = _framed(fares_per_type, _TYPE_COLUMNS)
         self.fares_per_transfer = _framed(fares_per_transfer, _TRANSFER_COLUMNS)
         self.fares_per_route = _framed(fares_per_route, _ROUTE_COLUMNS)
@@ -608,29 +621,46 @@ def load_fare_structure(path):
 
     Reads the layout ``r5r::write_fare_structure`` produces (and
     `save_fare_structure` mirrors): ``global_settings.csv`` plus the
-    three fare tables. Debug settings are ignored.
+    three fare tables, and the street tariffs from a
+    ``street_tariffs.csv`` when the archive carries one. Debug settings
+    are ignored.
     """
+    street = None
     with zipfile.ZipFile(path) as archive:
-        settings = pd.read_csv(archive.open("global_settings.csv"))
+        settings = pd.read_csv(archive.open("global_settings.csv"), dtype=str)
         settings = dict(zip(settings["setting"], settings["value"]))
         fares_per_type = pd.read_csv(archive.open("fares_per_type.csv"))
         fares_per_transfer = pd.read_csv(archive.open("fares_per_transfer.csv"))
         fares_per_route = pd.read_csv(
             archive.open("fares_per_route.csv"), dtype={"route_id": str}
         )
+        if "street_tariffs.csv" in archive.namelist():
+            tariffs = pd.read_csv(
+                archive.open("street_tariffs.csv"), dtype={"mode": str}
+            )
+            street = {
+                row["mode"]: {"unlock": row["unlock"], "per_minute": row["per_minute"]}
+                for _, row in tariffs.iterrows()
+            }
     cap = str(settings.get("fare_cap", "Inf"))
     return FareStructure(
-        max_discounted_transfers=int(float(settings["max_discounted_transfers"])),
+        max_discounted_transfers=settings["max_discounted_transfers"],
         transfer_time_allowance=float(settings["transfer_time_allowance"]),
         fare_cap=math.inf if cap.lower() in ("inf", "infinity") else float(cap),
         fares_per_type=fares_per_type,
         fares_per_transfer=fares_per_transfer,
         fares_per_route=fares_per_route,
+        street=street,
     )
 
 
 def save_fare_structure(structure, path):
-    """Save a rule-based fare structure as an r5r-format zip."""
+    """Save a rule-based fare structure as an r5r-format zip.
+
+    The structure's street tariffs, when it has any, go to an extra
+    ``street_tariffs.csv`` (``mode``, ``unlock``, ``per_minute``) beside
+    the r5r tables.
+    """
     cap = structure.fare_cap
     settings = pd.DataFrame(
         {
@@ -649,14 +679,21 @@ def save_fare_structure(structure, path):
     debug = pd.DataFrame(
         {"setting": ["output_file", "trip_info"], "value": ['""', "MODE"]}
     )
+    tables = [
+        ("global_settings.csv", settings),
+        ("fares_per_type.csv", structure.fares_per_type),
+        ("fares_per_transfer.csv", structure.fares_per_transfer),
+        ("fares_per_route.csv", structure.fares_per_route),
+        ("debug_settings.csv", debug),
+    ]
+    if structure.street:
+        tariffs = pd.DataFrame(
+            [(mode, *tariff) for mode, tariff in structure.street.items()],
+            columns=["mode", "unlock", "per_minute"],
+        )
+        tables.append(("street_tariffs.csv", tariffs))
     with zipfile.ZipFile(path, "w") as archive:
-        for name, frame in [
-            ("global_settings.csv", settings),
-            ("fares_per_type.csv", structure.fares_per_type),
-            ("fares_per_transfer.csv", structure.fares_per_transfer),
-            ("fares_per_route.csv", structure.fares_per_route),
-            ("debug_settings.csv", debug),
-        ]:
+        for name, frame in tables:
             archive.writestr(name, frame.to_csv(index=False))
 
 

@@ -1993,8 +1993,12 @@ impl TransportNetwork {
             for (index, transfer) in closure.from_stop(StopIdx(stop as u32)).iter().enumerate() {
                 let rented_edge =
                     matches!(rental, Some((_, flags, _)) if flags[range.start + index]);
+                // A zero-meter ride adds nothing, whatever the factor:
+                // NaN must not poison it.
                 let ride_grams = match rental {
-                    Some((meters, _, per_meter)) if rented_edge => {
+                    Some((meters, _, per_meter))
+                        if rented_edge && meters[range.start + index] > 0.0 =>
+                    {
                         meters[range.start + index] * per_meter
                     }
                     _ => 0.0,

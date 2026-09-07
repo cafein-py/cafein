@@ -147,6 +147,31 @@ def _policy_transfer_mode(policy):
     return (mode, float(seconds))
 
 
+def _policy_transfer_arg(transfer_mode, street_factors, components, purpose):
+    """The engine's ``(mode, seconds, grams_per_meter)`` transfer binding
+    for a `_policy_transfer_mode` result, or ``None`` for the walking set.
+    A walking-class set rides no vehicle and carries no factor; a rental's
+    shared-fleet factor must resolve, since its ride grams feed ``purpose``."""
+    import pandas as pd
+
+    from cafein import emissions
+
+    if transfer_mode is None:
+        return None
+    mode, budget = transfer_mode
+    if mode in ("walk", "wheelchair"):
+        return (mode, budget, 0.0)
+    value = emissions.street_factor(
+        mode, street_factors, components, service_model="shared"
+    )
+    if pd.isna(value):
+        raise ValueError(
+            f"the {mode} emission factor is unresolved; {purpose}, so pass "
+            "factors= rows resolving it (see cafein.emissions.load_street_factors)"
+        )
+    return (mode, budget, float(value) / 1000.0)
+
+
 def _policy_reduced(core, point, egress, modes, exclude_stops, transfer_mode=None):
     """One side's reduction: the ``(stop, seconds)`` offsets the engine
     seeds, and the per-stop ``StreetChoice`` tokens the reconstruction
@@ -1277,24 +1302,15 @@ def _policy_mc_journeys(
     from cafein.policy import reject_carriage
 
     reject_carriage(policy, "the multicriteria candidates")
+    # The rental's ride grams enter the dominance, exactly as a granted
+    # access mode's do.
     transfer_mode = _policy_transfer_mode(policy)
-    transfer_arg = None
-    if transfer_mode is not None:
-        mode, budget = transfer_mode
-        # The rental's ride grams enter the dominance, so the transfer
-        # mode's shared-fleet factor must resolve, exactly as a granted
-        # access mode's must.
-        value = emissions.street_factor(
-            mode, street_factors, components, service_model="shared"
-        )
-        if pd.isna(value):
-            raise ValueError(
-                f"the {mode} emission factor is unresolved; the "
-                "multicriteria search ranks street emissions, so pass "
-                "factors= rows resolving it (see "
-                "cafein.emissions.load_street_factors)"
-            )
-        transfer_arg = (mode, budget, float(value) / 1000.0)
+    transfer_arg = _policy_transfer_arg(
+        transfer_mode,
+        street_factors,
+        components,
+        "the multicriteria search ranks street emissions",
+    )
     exclude_routes = id_sequence("exclude_routes", exclusions[0])
     exclude_trips = id_sequence("exclude_trips", exclusions[1])
     exclude_stops = id_sequence("exclude_stops", exclusions[2])

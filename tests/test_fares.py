@@ -2,6 +2,7 @@
 structure and the HSL zone fares bundled in the Helsinki feed."""
 
 import math
+import zipfile
 
 import pytest
 
@@ -101,9 +102,24 @@ def test_prices_follow_the_r5r_vignette(poa):
     ) == pytest.approx(8.0)
 
 
-def test_structures_round_trip_through_disk(poa, tmp_path):
+@pytest.mark.parametrize(
+    "street", [None, {"e_scooter": {"unlock": 1.0, "per_minute": 0.25}}]
+)
+def test_structures_round_trip_through_disk(poa, tmp_path, street):
+    structure = fares.FareStructure(
+        max_discounted_transfers=poa.max_discounted_transfers,
+        transfer_time_allowance=poa.transfer_time_allowance,
+        fare_cap=poa.fare_cap,
+        fares_per_type=poa.fares_per_type,
+        fares_per_transfer=poa.fares_per_transfer,
+        fares_per_route=poa.fares_per_route,
+        street=street,
+    )
     path = tmp_path / "fares.zip"
-    fares.save_fare_structure(poa, path)
+    fares.save_fare_structure(structure, path)
+    # The r5r layout gains the tariff table only when there is one.
+    with zipfile.ZipFile(path) as archive:
+        assert ("street_tariffs.csv" in archive.namelist()) is bool(street)
     again = fares.load_fare_structure(path)
     assert again.max_discounted_transfers == poa.max_discounted_transfers
     assert again.transfer_time_allowance == poa.transfer_time_allowance
@@ -111,6 +127,45 @@ def test_structures_round_trip_through_disk(poa, tmp_path):
     assert again.fares_per_type.equals(poa.fares_per_type)
     assert again.fares_per_transfer.equals(poa.fares_per_transfer)
     assert again.fares_per_route["route_id"].equals(poa.fares_per_route["route_id"])
+    assert again.street == structure.street
+
+
+@pytest.mark.parametrize(
+    "field, value, message",
+    [
+        ("max_discounted_transfers", -0.5, "not negative"),
+        ("max_discounted_transfers", 1.5, "whole number"),
+        ("max_discounted_transfers", "-1e-400", "not negative"),
+        ("max_discounted_transfers", "9007199254740992.5", "whole number"),
+        ("transfer_time_allowance", -1.0, "finite and not negative"),
+        ("transfer_time_allowance", math.nan, "finite and not negative"),
+        ("transfer_time_allowance", math.inf, "finite and not negative"),
+        ("fare_cap", -5.0, "must not be negative"),
+        ("fare_cap", math.nan, "must not be negative"),
+    ],
+)
+def test_structures_refuse_malformed_settings(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        fares.FareStructure(**{field: value})
+
+
+@pytest.mark.parametrize("value, message", [("-0.5", "not negative"), ("1.5", "whole")])
+def test_loading_refuses_a_malformed_archive(poa, tmp_path, value, message):
+    # The archive's count reaches the structure's checks untruncated.
+    fares.save_fare_structure(poa, tmp_path / "fares.zip")
+    tampered = tmp_path / "tampered.zip"
+    with zipfile.ZipFile(tmp_path / "fares.zip") as source:
+        with zipfile.ZipFile(tampered, "w") as target:
+            for name in source.namelist():
+                data = source.read(name)
+                if name == "global_settings.csv":
+                    data = data.replace(
+                        b"max_discounted_transfers,1",
+                        b"max_discounted_transfers," + value.encode(),
+                    )
+                target.writestr(name, data)
+    with pytest.raises(ValueError, match=message):
+        fares.load_fare_structure(tampered)
 
 
 def test_setup_seeds_a_structure_from_the_network(network):

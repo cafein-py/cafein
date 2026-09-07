@@ -2823,6 +2823,8 @@ def test_wheelchair_is_a_walking_class_policy_mode():
 
 def test_wheelchair_access_and_egress_ride_the_mode(multimodal_network):
     pytest.importorskip("cafein._cafein")
+    from cafein import DetailedItineraries, TravelCostMatrix
+
     policy = StreetLegPolicy(access={"wheelchair": 900}, egress={"wheelchair": 900})
     journeys = multimodal_network.route_between_coordinates(
         (60.1580, 24.9350),
@@ -2838,6 +2840,33 @@ def test_wheelchair_access_and_egress_ride_the_mode(multimodal_network):
         for leg in journey["legs"]:
             if leg["type"] in ("access", "egress"):
                 assert leg["mode"] == "wheelchair"
+    # The cost matrix classes the wheelchair as walking too: the transit
+    # cell's wheelchair ends are walking meters, never street-vehicle
+    # meters, and its grams are the transit legs' alone.
+    query = (
+        multimodal_network,
+        _points_frame([(60.1580, 24.9350)]),
+        _points_frame([(60.1870, 24.9610)]),
+        "2022-02-22 08:30:00",
+    )
+    cell = TravelCostMatrix(
+        *query, street_policy=policy, output_time_units="seconds"
+    ).iloc[0]
+    legs = DetailedItineraries(*query, street_policy=policy, geometries=False)
+    options = legs.groupby("option").agg(
+        departure=("departure_s", "min"), arrival=("arrival_s", "max")
+    )
+    durations = options["arrival"] - options["departure"]
+    assert int(cell["travel_time"]) == int(durations.min())
+    fastest = legs[legs["option"].isin(durations.index[durations == durations.min()])]
+    ends = fastest[fastest["leg_type"].isin(["access", "egress"])]
+    assert not ends.empty and (ends["mode"] == "wheelchair").all()
+    transit_grams = (
+        fastest[fastest["leg_type"] == "transit"].groupby("option")["emissions"].sum()
+    )
+    assert cell["street_distance_m"] == 0.0
+    assert cell["walk_distance_m"] > 0.0 and cell["transit_distance_m"] > 0.0
+    assert any(cell["emissions"] == pytest.approx(g, rel=1e-9) for g in transit_grams)
 
 
 def test_a_wheelchair_transfer_set_computes_and_serves_a_policy(
@@ -2869,6 +2898,27 @@ def test_a_wheelchair_transfer_set_computes_and_serves_a_policy(
         if leg["type"] == "transfer" and leg.get("mode") == "wheelchair"
     ]
     assert ridden
+    # The cost matrix and the multicriteria candidates take the walking-
+    # class set without a shared-fleet factor: the cell rides the
+    # itineraries' fastest journey with no street-vehicle meters.
+    from cafein import DetailedItineraries, TravelCostMatrix
+
+    query = (
+        network,
+        _points_frame([(60.1580, 24.9350)]),
+        _points_frame([(60.1870, 24.9610)]),
+        "2022-02-22 08:30:00",
+    )
+    cell = TravelCostMatrix(
+        *query, street_policy=policy, output_time_units="seconds"
+    ).iloc[0]
+    fastest = min(j["arrival_s"] - j["departure_s"] for j in journeys)
+    assert int(cell["travel_time"]) == fastest
+    assert cell["street_distance_m"] == 0.0 and cell["walk_distance_m"] > 0.0
+    pareto = DetailedItineraries(
+        *query, candidates="pareto", street_policy=policy, geometries=False
+    )
+    assert not pareto.empty
     ungranted = network.route_between_coordinates(
         (60.1580, 24.9350),
         (60.1870, 24.9610),
