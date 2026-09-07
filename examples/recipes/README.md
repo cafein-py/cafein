@@ -51,7 +51,9 @@ an input, `{kind: file, path: …}`, so the file is snapshotted and checksummed;
 an object such as `traveler` or `street_policy` is a mapping of its own
 keywords, built at validation so its checks run before any data is touched;
 `fares` names a fare model, `{kind: gtfs_zones, rules: zones, street: {…}}`
-or `{kind: file, path: fares.zip}`.
+or `{kind: file, path: fares.zip}`, whose `street_tariffs.csv` (written by
+`save_fare_structure`) supplies the tariff unless a `street:` beside the path
+overrides it.
 
 **Outputs** stay inside the output directory and never overwrite the recipe
 or an input; each file is replaced atomically, and the record's table

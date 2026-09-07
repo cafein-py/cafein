@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- A recipe's `{kind: file}` fares take the street tariffs the fare zip
+  carries (`street_tariffs.csv`, as `save_fare_structure` writes it); a
+  `street:` beside the path still overrides them.
+  ([#376](https://github.com/cafein-py/cafein/pull/376))
+
 - Fixed: a street-policy `TravelCostMatrix` pins the street-graph and
   transfer-set generations for the whole call, as the park-and-ride matrices
   do, and refuses a result whose reductions and engine fan-out read different

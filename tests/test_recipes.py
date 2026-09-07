@@ -1025,6 +1025,28 @@ def _write_transit(tmp_path, mutate=None):
     return path
 
 
+@pytest.mark.parametrize(
+    "override", [None, {"e_scooter": {"unlock": 2.0, "per_minute": 0.5}}]
+)
+def test_file_fares_take_the_archive_tariffs(fares_poa, tmp_path, override):
+    # A fare zip's street tariffs come with it; a `street:` beside the
+    # path overrides them.
+    from cafein import fares, recipes
+
+    carried = {"e_scooter": {"unlock": 1.0, "per_minute": 0.25}}
+    structure = fares.load_fare_structure(fares_poa)
+    structure.street = fares._street_tariffs(carried)
+    archive = tmp_path / "fares.zip"
+    fares.save_fare_structure(structure, archive)
+    spelling = {"kind": "file", "path": str(archive)}
+    if override is not None:
+        spelling["street"] = override
+    built = recipes._build_fares(
+        spelling, None, {"matrix.fares": {"path": archive}}, "matrix.fares"
+    )
+    assert built.street == fares._street_tariffs(override or carried)
+
+
 def test_validate_resolves_a_transit_recipe(tmp_path):
     from cafein import recipes
 

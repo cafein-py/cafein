@@ -161,8 +161,9 @@ _MAPPING_KEYWORDS = {
 #: Keywords with a spelling of their own: ``fares`` names a fare model —
 #: ``{kind: gtfs_zones, rules: model|zones, street: ...}`` builds it from the
 #: recipe's ``gtfs`` input, ``{kind: file, path: ...}`` loads an r5r-format
-#: fare zip — with an optional ``street`` rental tariff ``{mode: {unlock,
-#: per_minute}}`` for the policy's shared modes.
+#: fare zip (its ``street_tariffs.csv``, as `save_fare_structure` writes it,
+#: supplies the tariff) — with an optional ``street`` rental tariff ``{mode:
+#: {unlock, per_minute}}`` for the policy's shared modes, overriding the file's.
 _SPELLED_KEYWORDS = {("matrix", "fares")}
 
 #: ``Exposure(network, ..., **layers)`` keywords a layer may not be named after.
