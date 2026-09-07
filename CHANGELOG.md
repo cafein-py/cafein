@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `cafein validate` refuses an empty local input file and a binary format
+  (GeoTIFF, GeoPackage, zip, OSM PBF) whose first bytes are not its signature,
+  so an empty or renamed input is refused by name at validation, and again on
+  the run's private copy, instead of failing inside a backend at run.
+  ([#377](https://github.com/cafein-py/cafein/pull/377))
+
 - A recipe's `{kind: file}` fares take the street tariffs the fare zip
   carries (`street_tariffs.csv`, as `save_fare_structure` writes it); a
   `street:` beside the path still overrides them.

@@ -34,7 +34,9 @@ outputs:
 **Inputs** name their kind. A `file`, `raster`, or `vector` input points at a
 local path, resolved relative to the recipe file, so a recipe and its data
 move together; the file must be a self-contained format (GeoTIFF, GeoPackage,
-GeoJSON, a GTFS zip, an OSM PBF). A `sample` input names a pinned asset of
+GeoJSON, a GTFS zip, an OSM PBF); every local file must be non-empty, and a
+binary format must start with its signature, so a renamed file is refused at
+validation (and again on the run's private copy). A `sample` input names a pinned asset of
 `cafein.sampledata` as `<region>.<asset>` (`helsinki.osm_pbf`,
 `helsinki.air_quality`, `helsinki.poi_library`), fetched and verified on first
 use. Validation resolves every input before anything is read; an unknown

@@ -9,6 +9,19 @@ import pytest
 
 from cafein import recipes
 
+#: What a placeholder input must start with to pass validate's signature check.
+_HEADERS = {
+    ".pbf": b"\x00\x00\x00\x0b\x0a\x09OSMHeader",
+    ".tif": b"II*\x00\x08\x00\x00\x00",
+    ".gpkg": b"SQLite format 3\x00",
+    ".zip": b"PK\x03\x04",
+}
+
+
+def _touch(path):
+    """A placeholder input file with a valid header for its format."""
+    path.write_bytes(_HEADERS.get(path.suffix.lower(), b"{}"))
+
 
 def _valid_recipe():
     return {
@@ -44,7 +57,7 @@ def _write(tmp_path, mutate=None):
     """A recipe file beside touched input files; `mutate` tweaks it first."""
     yaml = pytest.importorskip("yaml")
     for name in ("streets.pbf", "no2.tif", "origins.geojson", "dests.geojson"):
-        (tmp_path / name).write_bytes(b"\x00")
+        _touch(tmp_path / name)
     recipe = _valid_recipe()
     if mutate is not None:
         mutate(recipe)
@@ -237,6 +250,45 @@ def test_validate_refuses_by_name(tmp_path, mutate, match):
     pytest.importorskip("yaml")
     with pytest.raises(ValueError, match=match):
         recipes.validate(_write(tmp_path, mutate))
+
+
+@pytest.mark.parametrize(
+    "name, content, message",
+    [
+        ("streets.pbf", b"", "is empty"),
+        ("streets.pbf", b"\x00" * 16, "signature"),
+        # A type field declaring more bytes than its header holds.
+        ("streets.pbf", b"\x00\x00\x00\x0b\x0a\x20OSMHeader", "signature"),
+        # A varint longer than protobuf allows.
+        ("streets.pbf", b"\x00\x00\x00\x0c\x0a" + b"\xff" * 11, "signature"),
+        ("no2.tif", b"PK\x03\x04", "signature"),
+    ],
+)
+def test_validate_refuses_a_file_without_its_signature(
+    tmp_path, name, content, message
+):
+    pytest.importorskip("yaml")
+    path = _write(tmp_path)
+    (tmp_path / name).write_bytes(content)
+    with pytest.raises(ValueError, match=message):
+        recipes.validate(path)
+
+
+def test_validate_reads_the_pbf_type_in_any_field_order(tmp_path):
+    # A blob header serialized with its datasize before its type.
+    pytest.importorskip("yaml")
+    path = _write(tmp_path)
+    (tmp_path / "streets.pbf").write_bytes(b"\x00\x00\x00\x0d\x18\x05\x0a\x09OSMHeader")
+    assert recipes.validate(path)["inputs"]["streets"]["path"].name == "streets.pbf"
+
+
+def test_the_run_snapshot_rechecks_the_copied_bytes(tmp_path):
+    # A source rewritten after validation is refused on the private copy.
+    (tmp_path / "streets.pbf").write_bytes(b"\x00" * 16)
+    (tmp_path / "run").mkdir()
+    source = {"path": tmp_path / "streets.pbf"}
+    with pytest.raises(ValueError, match="signature"):
+        recipes._snapshot(0, "streets", source, tmp_path / "run", {})
 
 
 def test_validate_refuses_multi_file_format(tmp_path):
@@ -459,7 +511,7 @@ def _two_route_recipe(
         return _two_route_network(WALK | BICYCLE)
 
     monkeypatch.setattr(StreetNetwork, "from_osm", staticmethod(from_osm))
-    (tmp_path / "streets.pbf").write_bytes(b"\x00")
+    _touch(tmp_path / "streets.pbf")
     geopandas.GeoDataFrame(
         {"level": [1.0]},
         geometry=[box(24.9290, 60.1690, 24.9364, 60.17005)],
@@ -630,7 +682,7 @@ def test_validate_refuses_a_geopackage_with_live_sqlite_state(tmp_path, sidecar)
     pytest.importorskip("yaml")
     from cafein import recipes
 
-    (tmp_path / "od.gpkg").write_bytes(b"\x00")
+    _touch(tmp_path / "od.gpkg")
     (tmp_path / f"od.gpkg{sidecar}").write_bytes(b"\x00")
     path = _write(tmp_path, _set(["inputs", "origins", "path"], "od.gpkg"))
     with pytest.raises(ValueError, match="live SQLite sidecar"):
@@ -1016,7 +1068,7 @@ def _write_transit(tmp_path, mutate=None):
     import yaml
 
     for name in ("gtfs.zip", "streets.pbf", "origins.geojson", "dests.geojson"):
-        (tmp_path / name).write_bytes(b"\x00")
+        _touch(tmp_path / name)
     recipe = _transit_document()
     if mutate is not None:
         mutate(recipe)

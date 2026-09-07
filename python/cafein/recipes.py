@@ -108,6 +108,95 @@ def _suffix_ok(path, suffixes):
     return any(name.endswith(suffix) for suffix in suffixes)
 
 
+#: The first bytes of each self-contained binary format (TIFF and BigTIFF in
+#: both byte orders; for an OSM PBF, its first blob's type); text formats have
+#: none. An empty or renamed file is refused by name at validation, not by a
+#: backend traceback at run.
+_TIFF_SIGNATURES = (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+")
+_SIGNATURES = {
+    ".pbf": (b"OSMHeader",),
+    ".tif": _TIFF_SIGNATURES,
+    ".tiff": _TIFF_SIGNATURES,
+    ".gpkg": (b"SQLite format 3\x00",),
+    ".zip": (b"PK\x03\x04",),
+}
+
+
+def _pbf_blob_type(path):
+    """The type of an OSM PBF's first blob, read from its BlobHeader (a
+    4-byte big-endian length, then a protobuf message whose field 1 is the
+    type, in any field order), or ``None`` for bytes that are no such
+    header."""
+    with open(path, "rb") as handle:
+        length = int.from_bytes(handle.read(4), "big")
+        if not 0 < length <= 64 * 1024:
+            return None
+        data = handle.read(length)
+    if len(data) != length:
+        return None
+    at = 0
+
+    def varint():
+        nonlocal at
+        value, shift = 0, 0
+        # At most ten bytes encode a protobuf varint.
+        for _ in range(10):
+            if at >= len(data):
+                break
+            byte = data[at]
+            at += 1
+            value |= (byte & 0x7F) << shift
+            if not byte & 0x80:
+                return value
+            shift += 7
+        raise ValueError("malformed varint")
+
+    try:
+        while at < len(data):
+            tag = varint()
+            field, wire = tag >> 3, tag & 7
+            if wire == 0:
+                varint()
+            elif wire == 1:
+                at += 8
+            elif wire == 2:
+                size = varint()
+                if size > len(data) - at:
+                    return None
+                if field == 1:
+                    return data[at : at + size]
+                at += size
+            elif wire == 5:
+                at += 4
+            else:
+                return None
+    except ValueError:
+        return None
+    return None
+
+
+def _check_signature(where, path, filename):
+    """Refuse, by name, an empty local file or a binary format whose first
+    bytes are not its signature."""
+    with open(path, "rb") as handle:
+        head = handle.read(64)
+    if not head:
+        raise ValueError(f"{where}: '{filename}' is empty")
+    suffix = pathlib.PurePath(filename).suffix.lower()
+    signatures = _SIGNATURES.get(suffix)
+    if signatures is None:
+        return
+    if suffix == ".pbf":
+        found = _pbf_blob_type(path) in signatures
+    else:
+        found = head.startswith(signatures)
+    if not found:
+        raise ValueError(
+            f"{where}: '{filename}' does not start with a {suffix} signature "
+            "(a renamed or damaged file?)"
+        )
+
+
 # Per-role kind → (required keys, optional keys, self-contained suffixes).
 _STREET_KEYS = {
     "file": (("path",), (), _STREET_SUFFIXES),
@@ -240,6 +329,8 @@ def _resolve_source(where, spec, recipe_dir, *, keys):
             f"{where}: '{filename}' is not a self-contained {'/'.join(suffixes)} "
             "file (multi-file formats such as shapefiles are not supported)"
         )
+    if path is not None:
+        _check_signature(where, path, filename)
     if "value" in spec:
         value = spec["value"]
         named = isinstance(value, str) and bool(value)
@@ -837,6 +928,10 @@ def _snapshot(index, role, source, run_dir, checksums):
             digest.update(block)
             target.write(block)
     checksums[role] = {"path": str(source["path"]), "sha256": digest.hexdigest()}
+    if "sample" not in source:
+        # The bytes copied are the bytes checked: a source rewritten after
+        # validation is refused here, never handed to a backend.
+        _check_signature(role, copy, source["path"].name)
     if "sample" in source:
         if digest.hexdigest() != source["sample"]["sha256"]:
             raise ValueError(
