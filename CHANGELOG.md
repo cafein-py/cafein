@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Fixed: a street-policy `TravelCostMatrix` pins the street-graph and
+  transfer-set generations for the whole call, as the park-and-ride matrices
+  do, and refuses a result whose reductions and engine fan-out read different
+  ones ("rerun the query") instead of silently mixing them; installing the
+  multimodal street graph now advances the street generation and computing a
+  mode transfer set the transfer generation, as the walking installs do.
+  ([#375](https://github.com/cafein-py/cafein/pull/375))
+
 - Fixed: `save_fare_structure` / `load_fare_structure` round-trip a
   `FareStructure`'s `street` tariffs through an extra `street_tariffs.csv`
   (written only when there are any), and `FareStructure` refuses a negative

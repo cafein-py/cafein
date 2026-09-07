@@ -1339,6 +1339,54 @@ def test_policy_cost_matrix_prices_shared_rentals(
     assert bare["money"].isna().all()
 
 
+@pytest.mark.parametrize(
+    "replaced, message",
+    [
+        ("transfers", "transfer set was replaced"),
+        ("streets", "street network was replaced"),
+    ],
+)
+def test_policy_cost_matrix_refuses_a_graph_swapped_mid_query(
+    multimodal_network,
+    artifact_cache,
+    kantakaupunki_pbf,
+    monkeypatch,
+    replaced,
+    message,
+):
+    # The reductions and the engine fan-out must read one street graph and
+    # one transfer set: a mode set computed, or a multimodal graph
+    # installed, between them (here from inside the factor lookup the
+    # matrix makes after pinning) is refused, never silently mixed in.
+    pytest.importorskip("cafein._cafein")
+    from cafein import TransportNetwork, TravelCostMatrix, emissions
+    from cafein.street_network import multimodal_payload
+
+    network = TransportNetwork.load(artifact_cache / "helsinki-multimodal.cafein")
+    original = emissions.trip_factors
+
+    def swap(*args, **kwargs):
+        if replaced == "transfers":
+            network.compute_mode_transfers("e_scooter", 10)
+        else:
+            modes = ["walk", "bicycle"]
+            network._core.set_multimodal_streets(
+                modes, *multimodal_payload(str(kantakaupunki_pbf), modes=modes)
+            )
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(emissions, "trip_factors", swap)
+    with pytest.raises(RuntimeError, match=message):
+        TravelCostMatrix(
+            network,
+            _points_frame([ORIGIN]),
+            _points_frame([DEST]),
+            "2022-02-22 08:30:00",
+            street_policy=_bike_walk_policy(),
+            factors=_street_factor_rows(),
+        )
+
+
 def test_policy_cost_matrix_rejects_incompatible_knobs(multimodal_network):
     pytest.importorskip("cafein._cafein")
     from cafein import TravelCostMatrix

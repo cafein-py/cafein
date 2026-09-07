@@ -6660,6 +6660,11 @@ def _policy_cost_columns(
         raise ValueError(
             "street_policy matrices take point-set origins and destinations"
         )
+    # One pinned generation for the whole matrix: the reductions, the
+    # engine fan-out, and the pricing must read the same street graph and
+    # the same transfer set.
+    generation = core._streets_generation
+    transfers_generation = core._transfers_generation
     # Materialised once: a one-shot iterable must not exhaust between the
     # per-point reductions, and later mutation must not desynchronise them.
     exclude_routes = id_sequence("exclude_routes", exclude_routes)
@@ -6797,6 +6802,16 @@ def _policy_cost_columns(
         fares=fare_tables,
         workers=_memory.width_or(workers),
     )
+    if core._streets_generation != generation:
+        raise RuntimeError(
+            "the street network was replaced while the street-policy "
+            "matrix was being computed; rerun the query"
+        )
+    if core._transfers_generation != transfers_generation:
+        raise RuntimeError(
+            "the transfer set was replaced while the street-policy "
+            "matrix was being computed; rerun the query"
+        )
     # A point is unsnapped only when neither the policy's modes nor the
     # direct walking alternative can snap it — a snap fact from both
     # searches, never inferred from reachability.

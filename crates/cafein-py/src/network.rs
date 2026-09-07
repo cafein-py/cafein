@@ -836,16 +836,17 @@ impl TransportNetwork {
         Ok(self.installed_streets()?.edge_count())
     }
 
-    /// Bumps on every walking street-network install. Internal:
-    /// exposure reporting pins its cached arrays to the generation.
+    /// Bumps on every street-network install, walking or multimodal.
+    /// Internal: exposure reporting pins its cached arrays to the
+    /// generation, the pinned matrices prove their calls read one graph.
     #[getter]
     fn _streets_generation(&self) -> u64 {
         self.streets_generation
     }
 
-    /// The transfer-set generation: bumps on every footpath install,
-    /// so a computation spanning several engine calls can prove they
-    /// all read the same closure.
+    /// The transfer-set generation: bumps on every footpath or mode-set
+    /// install, so a computation spanning several engine calls can prove
+    /// they all read the same closure and mode set.
     #[getter]
     fn _transfers_generation(&self) -> u64 {
         self.transfers_generation
@@ -1378,6 +1379,9 @@ impl TransportNetwork {
             car_attributes,
         )?;
         self.multimodal = Some(inner);
+        // The policy reductions read this graph: installing one counts
+        // as a street install for every pinned query.
+        self.streets_generation += 1;
         self.multimodal_elevation = elevation;
         self.multimodal_modes = Some(modes);
         self.multimodal_links = std::sync::OnceLock::new();
@@ -2261,6 +2265,9 @@ impl TransportNetwork {
                 }
             }
         }
+        // A mode set is part of what a pinned query reads: installing one
+        // counts as replacing the transfer set.
+        self.transfers_generation += 1;
         self.mode_transfers = Some(ModeTransferSet {
             mode: mode.to_owned(),
             budget: max_seconds,
