@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.23.0 — 2026-09-07
 
 - `cafein validate` refuses an empty local input file and a binary format
   (GeoTIFF, GeoPackage, zip, OSM PBF) whose first bytes are not its signature,
