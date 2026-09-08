@@ -1571,8 +1571,8 @@ def _street_itineraries_frame(
     )
     # Resolved after the argument validation but before the routing call,
     # exactly as the cost matrix does.
-    factor = emissions.street_factor(
-        transport_mode, factors, components, vehicle_class=vehicle_class
+    factor = emissions._per_person_factor(
+        transport_mode, factors, components, occupancy, vehicle_class=vehicle_class
     )
     account = _costs.resolve_query(
         transport_mode, perspectives, costs, currency, cost_components
@@ -1660,9 +1660,9 @@ def _street_itineraries_frame(
             ),
             # Post-reconstruction annotation: network metres only — the
             # connectors are the walk to the vehicle, not vehicle-kilometres.
-            # The car's per-vehicle factor (resolved above) divides
-            # across the persons carried.
-            "emissions": network_distance / 1000.0 * factor / occupancy,
+            # The factor is per person (a per-vehicle row was divided by
+            # the occupancy at resolution).
+            "emissions": network_distance / 1000.0 * factor,
         },
         columns=[column for column in STREET_COLUMNS if column != "geometry"],
     )
@@ -1717,14 +1717,12 @@ def _street_leg_emissions(
             if mode not in resolved:
                 if mode == "car_park":
                     vehicle_class, occupancy = car_terms or (None, 1.0)
-                    resolved[mode] = (
-                        emissions.street_factor(
-                            "car",
-                            factors,
-                            components,
-                            vehicle_class=vehicle_class,
-                        )
-                        / occupancy
+                    resolved[mode] = emissions._per_person_factor(
+                        "car",
+                        factors,
+                        components,
+                        occupancy,
+                        vehicle_class=vehicle_class,
                     )
                 else:
                     shared = mode in shared_modes

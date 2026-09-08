@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Emission-factor tables accept the columns a `cafein.lca` export carries —
+  `mode`, `basis`, `scenario`, `scenario_sha256`, `case`,
+  `cafein_lca_version` — and keep them unchanged; any other unknown column
+  is dropped with a warning instead of refusing the table. A street row's
+  `basis` (`vehicle_km` or `passenger_km`) decides whether `occupancy=`
+  divides it, and a row without one keeps the car convention (car rows per
+  vehicle-km, every other mode per passenger-km); transit rows accept
+  `passenger_km` only. `street_factor_with_basis` returns the resolved
+  factor beside its basis, and the shipped tables state theirs.
+  ([#380](https://github.com/cafein-py/cafein/pull/380))
+
 ## 0.23.0 — 2026-09-07
 
 - `cafein validate` refuses an empty local input file and a binary format

@@ -216,9 +216,48 @@ def test_non_ascii_ids_load_from_utf8_files(tmp_path):
     assert loaded["route_id"][0] == "linja-Ä"
 
 
+@pytest.mark.parametrize(
+    "load, keys",
+    [
+        (emissions.load_factors, {"route_type": 3}),
+        (
+            emissions.load_street_factors,
+            {"street_mode": "car", "vehicle_class": "ICE", "service_model": "private"},
+        ),
+    ],
+)
+def test_provenance_columns_survive_and_unknown_ones_warn(load, keys, tmp_path):
+    # A cafein.lca export's extra columns ride along unchanged — through a
+    # CSV too, where a numeric-looking value must stay text — any other
+    # column (a non-string label included) is dropped with a warning, and
+    # a basis must be a known one.
+    provenance = {
+        "mode": "car_ice",
+        "basis": "passenger_km",
+        "scenario": "001",
+        "scenario_sha256": "ab" * 32,
+        "case": "central",
+        "cafein_lca_version": "0.1.0",
+    }
+    row = {**keys, "vehicle": 1.0, "fuel": 2.0, **provenance, "note": "typed", 7: 0}
+    path = tmp_path / "factors.csv"
+    pd.DataFrame([row]).to_csv(path, index=False)
+    for source in (pd.DataFrame([row]), path):
+        with pytest.warns(UserWarning, match=r"unknown .*column\(s\): 7, note"):
+            loaded = load(source)
+        assert not {"note", 7, "7"} & set(loaded.columns)
+        assert loaded.iloc[0][list(provenance)].to_dict() == provenance
+    with pytest.raises(ValueError, match="basis must be"):
+        load(pd.DataFrame([{**keys, "fuel": 1.0, "basis": "per_trip"}]))
+
+
 def test_invalid_factor_tables_are_rejected(tmp_path):
     for source, match in (
-        (pd.DataFrame([{"route_type": 3, "co2": 1.0}]), "unknown factor-table column"),
+        # Transit legs have no occupancy at query time: passenger-km only.
+        (
+            pd.DataFrame([{"route_type": 3, "fuel": 1.0, "basis": "vehicle_km"}]),
+            "basis must be 'passenger_km'",
+        ),
         (pd.DataFrame([{"route_type": 3}]), "at least one component column"),
         (pd.DataFrame([{"route_type": 3, "fuel": -1.0}]), "negative"),
         (tmp_path / "factors.toml", "unsupported factor-table format"),
