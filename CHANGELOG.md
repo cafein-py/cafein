@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.24.0 — 2026-09-08
 
 - Emission-factor tables accept the columns a `cafein.lca` export carries —
   `mode`, `basis`, `scenario`, `scenario_sha256`, `case`,
