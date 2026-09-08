@@ -2710,8 +2710,8 @@ def _street_cost_resolution(
     # the factor and cost account the query started with are the ones
     # applied, whatever happens to a mutable table while the search holds
     # no GIL — and a bad table fails before the search pays for it.
-    factor = emissions.street_factor(
-        transport_mode, factors, components, vehicle_class=vehicle_class
+    factor = emissions._per_person_factor(
+        transport_mode, factors, components, occupancy, vehicle_class=vehicle_class
     )
     account = _costs.resolve_query(
         transport_mode, perspectives, costs, currency, cost_components
@@ -2845,12 +2845,9 @@ def _street_cost_cells(
         "connector_distance_m": connector_distance,
         # One mode per matrix, so the factor resolved once; the
         # connectors are the walk to the vehicle, not vehicle-kilometres,
-        # so network metres only. The car's per-vehicle factor divides
-        # across the persons carried.
-        "emissions": network_distance
-        / 1000.0
-        * resolved["factor"]
-        / resolved["occupancy"],
+        # so network metres only. The factor is per person (a per-vehicle
+        # row was divided by the occupancy at resolution).
+        "emissions": network_distance / 1000.0 * resolved["factor"],
     }
     if resolved["account"] is not None:
         # Costs ride the same driven kilometres as the emissions —
@@ -6943,15 +6940,17 @@ def _car_park_cost_columns(
     walking_speed, walk_budget, snap_distance = walk_options
     transit_factors, street_factors = _factor_tables(factors)
     trip_factors = emissions.trip_factors(network, transit_factors, components)
-    # The drive prices as the car — the policy's class row divided by
-    # its occupancy; NaN keeps an unresolved factor poisoning rather
-    # than zeroing its rows.
-    value = emissions.street_factor(
-        "car", street_factors, components, vehicle_class=policy.vehicle_class
+    # The drive prices as the car — the policy's class row on the
+    # per-person basis (a per-vehicle row divided by its occupancy); NaN
+    # keeps an unresolved factor poisoning rather than zeroing its rows.
+    value = emissions._per_person_factor(
+        "car",
+        street_factors,
+        components,
+        policy.occupancy,
+        vehicle_class=policy.vehicle_class,
     )
-    car_factor = (
-        float("nan") if pd.isna(value) else float(value) / float(policy.occupancy)
-    )
+    car_factor = float("nan") if pd.isna(value) else float(value)
     fees = [float(fee) for fee in policy.facilities["fee"]]
     # One pinned generation for the WHOLE matrix: every origin's
     # composition, the egress linking, and the direct-walk fold must
@@ -7459,12 +7458,14 @@ def _car_park_arrive_by_cost_columns(
     walking_speed, walk_budget, snap_distance = walk_options
     transit_factors, street_factors = _factor_tables(factors)
     trip_factors = emissions.trip_factors(network, transit_factors, components)
-    value = emissions.street_factor(
-        "car", street_factors, components, vehicle_class=policy.vehicle_class
+    value = emissions._per_person_factor(
+        "car",
+        street_factors,
+        components,
+        policy.occupancy,
+        vehicle_class=policy.vehicle_class,
     )
-    car_factor = (
-        float("nan") if pd.isna(value) else float(value) / float(policy.occupancy)
-    )
+    car_factor = float("nan") if pd.isna(value) else float(value)
     fees = [float(fee) for fee in policy.facilities["fee"]]
     generation = core._streets_generation
     # The election and the per-group repricing are separate engine

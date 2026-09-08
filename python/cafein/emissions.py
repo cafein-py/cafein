@@ -31,6 +31,18 @@ KEY_COLUMNS = ["trip_id", "route_id", "agency_id", "route_type"]
 COMPONENT_COLUMNS = ["vehicle", "fuel", "infrastructure", "operations"]
 
 STREET_KEY_COLUMNS = ["street_mode", "vehicle_class", "service_model"]
+#: The columns a ``cafein.lca`` export carries beside the keys and the
+#: components: its mode slug, the unit basis of the components, and the
+#: scenario provenance. Kept on the normalised table; only ``basis`` is read.
+PROVENANCE_COLUMNS = [
+    "mode",
+    "basis",
+    "scenario",
+    "scenario_sha256",
+    "case",
+    "cafein_lca_version",
+]
+BASES = ("passenger_km", "vehicle_km")
 
 # The public street modes' factor identities (design §8.1): the e-bike is a
 # bicycle-mode vehicle class, not a mode of its own, exactly as it rides the
@@ -68,7 +80,11 @@ def default_factors():
         {"route_type": 1, **urban_rail},
         {"route_type": 2, **urban_rail},
     ]
-    return pd.DataFrame(rows).reindex(columns=KEY_COLUMNS + COMPONENT_COLUMNS)
+    for row in rows:
+        row["basis"] = "passenger_km"
+    return pd.DataFrame(rows).reindex(
+        columns=KEY_COLUMNS + COMPONENT_COLUMNS + ["basis"]
+    )
 
 
 def vehicle_class_factors():
@@ -217,7 +233,11 @@ def street_factors():
                 "operations": 0.0,
             }
         )
-    return pd.DataFrame(rows).reindex(columns=STREET_KEY_COLUMNS + COMPONENT_COLUMNS)
+    for row in rows:
+        row["basis"] = "vehicle_km" if row["street_mode"] == "car" else "passenger_km"
+    return pd.DataFrame(rows).reindex(
+        columns=STREET_KEY_COLUMNS + COMPONENT_COLUMNS + ["basis"]
+    )
 
 
 def load_street_factors(source):
@@ -232,8 +252,13 @@ def load_street_factors(source):
         ``infrastructure``, ``operations`` in g CO₂e per person-km
         (occupancy 1 for private micromobility) — or per vehicle-km for
         ``street_mode="car"`` rows, which queries divide by
-        ``occupancy=``. Paths may point to CSV,
-        JSON, or YAML as in ``load_factors``.
+        ``occupancy=``. A ``basis`` column (``passenger_km`` or
+        ``vehicle_km``) states the unit per row and takes precedence
+        over that car convention; it and the other ``cafein.lca``
+        export columns (``mode``, ``scenario``, ``scenario_sha256``,
+        ``case``, ``cafein_lca_version``) are kept unchanged, any other
+        unknown column is dropped with a warning. Paths may point to
+        CSV, JSON, or YAML as in ``load_factors``.
 
     Returns
     -------
@@ -250,20 +275,7 @@ def load_street_factors(source):
         frame = _read_factor_file(pathlib.Path(source))
     else:
         raise TypeError(f"cannot load emission factors from {type(source).__name__}")
-    unknown = set(frame.columns) - set(STREET_KEY_COLUMNS + COMPONENT_COLUMNS)
-    if unknown:
-        raise ValueError(
-            f"unknown street factor-table column(s): {', '.join(sorted(unknown))}"
-        )
-    components = [column for column in COMPONENT_COLUMNS if column in frame.columns]
-    if not components:
-        raise ValueError(
-            "a factor table needs at least one component column "
-            f"({', '.join(COMPONENT_COLUMNS)})"
-        )
-    frame = frame.reindex(columns=STREET_KEY_COLUMNS + COMPONENT_COLUMNS)
-    for column in frame.columns:
-        frame[column] = frame[column].map(_blank_to_na)
+    frame = _normalised_columns(frame, STREET_KEY_COLUMNS, "street factor-table", BASES)
     for column in COMPONENT_COLUMNS:
         frame[column] = pd.to_numeric(frame[column], errors="raise")
         if (frame[column] < 0).any():
@@ -320,14 +332,19 @@ def _car_query_options(transport_mode, occupancy, vehicle_class):
     return effective, vehicle_class
 
 
-def street_factor(
+def street_factor_with_basis(
     transport_mode,
     factors=None,
     components=None,
     service_model=None,
     vehicle_class=None,
 ):
-    """The resolved g CO₂e per-kilometre factor for one street mode.
+    """`street_factor` beside the basis of the row that resolved it.
+
+    The pair ``(factor, basis)``: ``basis`` is the winning row's
+    ``"passenger_km"`` or ``"vehicle_km"``, or ``None`` when the row
+    states none — the query surfaces then apply the car convention
+    (car rows per vehicle-km, divided by ``occupancy=``).
 
     Person-km for walking and micromobility; **vehicle**-km for the car,
     whose query surfaces divide by ``occupancy=`` afterwards.
@@ -413,7 +430,9 @@ def street_factor(
             "emissions stay unresolved",
             stacklevel=3,
         )
-        return float("nan")
+        return float("nan"), None
+    basis = row.get("basis")
+    basis = None if basis is None or pd.isna(basis) else str(basis)
     value = row[selected].sum(skipna=False)
     if pd.isna(value):
         unresolved = [column for column in selected if pd.isna(row[column])]
@@ -423,8 +442,41 @@ def street_factor(
             "narrow components= to resolve emissions",
             stacklevel=3,
         )
-        return float("nan")
-    return float(value)
+        return float("nan"), basis
+    return float(value), basis
+
+
+def street_factor(
+    transport_mode,
+    factors=None,
+    components=None,
+    service_model=None,
+    vehicle_class=None,
+):
+    """The resolved g CO₂e per-kilometre factor for one street mode: see
+    `street_factor_with_basis`, whose factor this is."""
+    return street_factor_with_basis(
+        transport_mode, factors, components, service_model, vehicle_class
+    )[0]
+
+
+def _per_person_factor(
+    transport_mode,
+    factors,
+    components,
+    occupancy,
+    service_model=None,
+    vehicle_class=None,
+):
+    """The resolved factor on the per-person basis: a per vehicle-km row —
+    by its ``basis``, or by the car convention when it states none —
+    divides by ``occupancy``; a per passenger-km row is used as-is."""
+    value, basis = street_factor_with_basis(
+        transport_mode, factors, components, service_model, vehicle_class
+    )
+    if basis == "vehicle_km" or (basis is None and transport_mode == "car"):
+        return value / float(occupancy)
+    return value
 
 
 def load_factors(source):
@@ -437,9 +489,13 @@ def load_factors(source):
         ``route_id``, ``agency_id``, ``route_type`` (empty where not
         applicable) plus one or more of the component columns
         ``vehicle``, ``fuel``, ``infrastructure``, ``operations`` in
-        g CO₂e per passenger-km. Paths may point to CSV, JSON (a list of
-        mappings), or YAML (the same, via the optional PyYAML
-        dependency).
+        g CO₂e per passenger-km. The ``cafein.lca`` export columns
+        (``mode``, ``basis``, ``scenario``, ``scenario_sha256``, ``case``,
+        ``cafein_lca_version``) are kept unchanged — ``basis`` accepts
+        ``passenger_km`` only, since transit legs have no occupancy at
+        query time — and any other unknown column is dropped with a
+        warning. Paths may point to CSV, JSON (a list of mappings), or
+        YAML (the same, via the optional PyYAML dependency).
 
     Returns
     -------
@@ -454,23 +510,7 @@ def load_factors(source):
     else:
         raise TypeError(f"cannot load emission factors from {type(source).__name__}")
 
-    unknown = set(frame.columns) - set(KEY_COLUMNS + COMPONENT_COLUMNS)
-    if unknown:
-        raise ValueError(
-            f"unknown factor-table column(s): {', '.join(sorted(unknown))}"
-        )
-    components = [column for column in COMPONENT_COLUMNS if column in frame.columns]
-    if not components:
-        raise ValueError(
-            "a factor table needs at least one component column "
-            f"({', '.join(COMPONENT_COLUMNS)})"
-        )
-    frame = frame.reindex(columns=KEY_COLUMNS + COMPONENT_COLUMNS)
-    # Blank cells mean "not given" whatever the input format wrote them
-    # as (CSVs are read without pandas' NA-token guessing, so ids like
-    # "NA" survive as real identifiers).
-    for column in frame.columns:
-        frame[column] = frame[column].map(_blank_to_na)
+    frame = _normalised_columns(frame, KEY_COLUMNS, "factor-table", BASES[:1])
     for column in COMPONENT_COLUMNS:
         frame[column] = pd.to_numeric(frame[column], errors="raise")
         if (frame[column] < 0).any():
@@ -492,6 +532,37 @@ def load_factors(source):
     located = frame["route_type"].dropna()
     if ((located % 1 != 0) | (located < 0)).any():
         raise ValueError("route_type keys must be non-negative integers")
+    return frame
+
+
+def _normalised_columns(frame, key_columns, label, bases):
+    """The loaded frame on its key, component, and provenance columns:
+    an unknown column is dropped with a warning, a ``basis`` outside
+    ``bases`` is refused. Blank cells mean "not given" whatever the input
+    format wrote them as (CSVs are read without pandas' NA-token
+    guessing, so ids like "NA" survive as real identifiers)."""
+    known = key_columns + COMPONENT_COLUMNS + PROVENANCE_COLUMNS
+    unknown = sorted(str(column) for column in set(frame.columns) - set(known))
+    if unknown:
+        warnings.warn(
+            f"ignoring unknown {label} column(s): {', '.join(unknown)}",
+            stacklevel=3,
+        )
+    if not any(column in frame.columns for column in COMPONENT_COLUMNS):
+        raise ValueError(
+            "a factor table needs at least one component column "
+            f"({', '.join(COMPONENT_COLUMNS)})"
+        )
+    provenance = [column for column in PROVENANCE_COLUMNS if column in frame.columns]
+    frame = frame.reindex(columns=key_columns + COMPONENT_COLUMNS + provenance)
+    for column in frame.columns:
+        frame[column] = frame[column].map(_blank_to_na)
+    if "basis" in frame.columns:
+        stated = frame["basis"].dropna()
+        bad = stated[~stated.isin(bases)]
+        if not bad.empty:
+            expected = " or ".join(repr(basis) for basis in bases)
+            raise ValueError(f"{label} basis must be {expected}, not {bad.iloc[0]!r}")
     return frame
 
 
@@ -675,7 +746,12 @@ def _read_factor_file(path):
     if suffix == ".csv":
         return pd.read_csv(
             path,
-            dtype={"trip_id": str, "route_id": str, "agency_id": str},
+            # Identifiers and provenance stay the strings they were typed
+            # as: a scenario named "001" must not come back as 1.
+            dtype={
+                column: str
+                for column in ["trip_id", "route_id", "agency_id", *PROVENANCE_COLUMNS]
+            },
             keep_default_na=False,
         )
     if suffix == ".json":

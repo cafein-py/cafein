@@ -275,8 +275,38 @@ def test_the_shipped_car_factors_are_gemmat_table_4():
     totals = {"ICE": 162.0, "HEV": 133.0, "PHEV": 88.0, "BEV": 70.0, "FCEV": 134.0}
     for vehicle_class, total in totals.items():
         assert emissions.street_factor("car", vehicle_class=vehicle_class) == total
-    # The default class is ICE.
+    # The default class is ICE; the shipped rows state their basis.
     assert emissions.street_factor("car") == 162.0
+    assert emissions.street_factor_with_basis("car") == (162.0, "vehicle_km")
+    assert emissions.street_factor_with_basis("bicycle")[1] == "passenger_km"
+
+
+@pytest.mark.parametrize(
+    "basis, divided", [("vehicle_km", True), ("passenger_km", False), (None, True)]
+)
+def test_car_emissions_honour_the_factor_basis(
+    car_network, origins, destinations, basis, divided
+):
+    # A per vehicle-km row divides by the occupancy, a per passenger-km
+    # row is used as-is, and a row stating no basis keeps the car
+    # convention — the same numbers in every row.
+    row = {"street_mode": "car", "vehicle_class": "ICE", "service_model": "private"}
+    row.update(vehicle=24.0, fuel=126.0, infrastructure=12.0, operations=0.0)
+    if basis is not None:
+        row["basis"] = basis
+    for occupancy in (1.0, 2.0):
+        matrix = TravelCostMatrix(
+            car_network,
+            origins,
+            destinations,
+            transport_mode="car",
+            factors=pd.DataFrame([row]),
+            occupancy=occupancy,
+        )
+        expected = 162.0 / (occupancy if divided else 1.0)
+        assert np.allclose(
+            matrix.emissions, matrix.network_distance_m / 1000.0 * expected
+        )
 
 
 def test_car_cost_matrix_resolves_emissions_by_class_and_occupancy(
