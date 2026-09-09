@@ -1,6 +1,7 @@
 """Emission factors and journey annotation."""
 
 import json
+import warnings
 
 import pandas as pd
 import pytest
@@ -249,6 +250,42 @@ def test_provenance_columns_survive_and_unknown_ones_warn(load, keys, tmp_path):
         assert loaded.iloc[0][list(provenance)].to_dict() == provenance
     with pytest.raises(ValueError, match="basis must be"):
         load(pd.DataFrame([{**keys, "fuel": 1.0, "basis": "per_trip"}]))
+
+
+@pytest.mark.parametrize(
+    "load, keys, resolve",
+    [
+        (
+            emissions.load_factors,
+            {"route_type": 3},
+            lambda table: emissions._Resolver(table).resolve(None, None, None, 3),
+        ),
+        (
+            emissions.load_street_factors,
+            {"street_mode": "car", "vehicle_class": "ICE", "service_model": "private"},
+            lambda table: emissions.street_factor(
+                "car", factors=table, vehicle_class="ICE"
+            ),
+        ),
+    ],
+)
+def test_a_total_column_is_kept_but_never_summed(load, keys, resolve):
+    # cafein.lca writes a human-readable ``total`` column; cafein keeps it
+    # without warning but computes the factor from the components alone.
+    components = {"vehicle": 1.0, "fuel": 2.0, "infrastructure": 3.0, "operations": 4.0}
+    plain = {**keys, **components}
+    # A deliberately wrong total: if it were ever summed the factor would jump.
+    with_total = {**plain, "total": 999.0}
+    for row in (plain, with_total):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            loaded = load(pd.DataFrame([row]))
+        assert not any("unknown" in str(w.message) for w in caught)
+        assert ("total" in loaded.columns) == ("total" in row)
+    plain_factor = resolve(load(pd.DataFrame([plain])))
+    total_factor = resolve(load(pd.DataFrame([with_total])))
+    assert plain_factor == pytest.approx(10.0)
+    assert total_factor == pytest.approx(plain_factor)
 
 
 def test_invalid_factor_tables_are_rejected(tmp_path):
