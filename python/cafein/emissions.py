@@ -43,6 +43,9 @@ PROVENANCE_COLUMNS = [
     "cafein_lca_version",
 ]
 BASES = ("passenger_km", "vehicle_km")
+#: Columns kept on the normalised table but never summed into a factor —
+#: informational only (e.g. a ``total`` the table author wrote for humans).
+DERIVED_COLUMNS = ["total"]
 
 # The public street modes' factor identities (design §8.1): the e-bike is a
 # bicycle-mode vehicle class, not a mode of its own, exactly as it rides the
@@ -541,7 +544,7 @@ def _normalised_columns(frame, key_columns, label, bases):
     ``bases`` is refused. Blank cells mean "not given" whatever the input
     format wrote them as (CSVs are read without pandas' NA-token
     guessing, so ids like "NA" survive as real identifiers)."""
-    known = key_columns + COMPONENT_COLUMNS + PROVENANCE_COLUMNS
+    known = key_columns + COMPONENT_COLUMNS + PROVENANCE_COLUMNS + DERIVED_COLUMNS
     unknown = sorted(str(column) for column in set(frame.columns) - set(known))
     if unknown:
         warnings.warn(
@@ -554,7 +557,10 @@ def _normalised_columns(frame, key_columns, label, bases):
             f"({', '.join(COMPONENT_COLUMNS)})"
         )
     provenance = [column for column in PROVENANCE_COLUMNS if column in frame.columns]
-    frame = frame.reindex(columns=key_columns + COMPONENT_COLUMNS + provenance)
+    derived = [column for column in DERIVED_COLUMNS if column in frame.columns]
+    frame = frame.reindex(
+        columns=key_columns + COMPONENT_COLUMNS + provenance + derived
+    )
     for column in frame.columns:
         frame[column] = frame[column].map(_blank_to_na)
     if "basis" in frame.columns:

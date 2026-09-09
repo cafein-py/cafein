@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Emission-factor tables keep a ``total`` column (the sum of the four
+  life-cycle components a ``cafein.lca`` export writes for human readers)
+  without the unknown-column warning and without ever summing it into a
+  factor; a leg's factor is still the selected components alone.
+  ([#383](https://github.com/cafein-py/cafein/pull/383))
+
 ## 0.24.0 — 2026-09-08
 
 - Emission-factor tables accept the columns a `cafein.lca` export carries —
