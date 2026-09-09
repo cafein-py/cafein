@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="resources/img/cafein-logo.jpg" alt="cafein logo" width="320">
+</p>
+
 # cafein
 
 **cafein** (Cost of Access For Environment and INdividuals) is a Python library
