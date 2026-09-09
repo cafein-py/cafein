@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.25.0 — 2026-09-09
 
 - Emission-factor tables keep a ``total`` column (the sum of the four
   life-cycle components a ``cafein.lca`` export writes for human readers)
