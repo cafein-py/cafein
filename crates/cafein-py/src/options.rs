@@ -277,6 +277,26 @@ impl TransportNetwork {
         self.public_id(stop.feed, &stop.id)
     }
 
+    /// The timetable trips under a public trip id: none for an unknown
+    /// id, several once one GTFS trip describes many runs.
+    pub(super) fn trips_under(&self, trip_id: &str) -> &[cafein_core::timetable::TripIdx] {
+        self.trips_by_public_id
+            .get(trip_id)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// One value per timetable trip from `(trip_id, value)` pairs, `NaN`
+    /// for the trips the pairs do not name.
+    pub(super) fn per_trip_values(&self, pairs: &[(String, f64)]) -> Vec<f64> {
+        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
+        for (trip_id, value) in pairs {
+            for trip in self.trips_under(trip_id) {
+                per_trip[trip.0 as usize] = *value;
+            }
+        }
+        per_trip
+    }
+
     pub(super) fn public_id(&self, feed: cafein_gtfs::FeedIndex, id: &str) -> String {
         if self.feed.feed_count > 1 {
             format!("{feed}:{id}")
@@ -319,7 +339,7 @@ impl TransportNetwork {
         if !exclude_trips.is_empty() {
             trips = vec![false; self.build.timetable.trip_count() as usize];
             for trip_id in exclude_trips {
-                if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
+                for trip in self.trips_under(trip_id) {
                     trips[trip.0 as usize] = true;
                 }
             }

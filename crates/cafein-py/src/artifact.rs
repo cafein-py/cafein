@@ -700,7 +700,7 @@ pub(super) struct ContainerLayout {
 pub(super) type DerivedIndexes = (
     HashMap<String, StopLookup>,
     HashMap<String, StopIdx>,
-    HashMap<String, TripIdx>,
+    HashMap<String, Vec<TripIdx>>,
 );
 
 pub(super) fn derived_indexes(feed: &Feed, timetable: &Timetable) -> DerivedIndexes {
@@ -714,7 +714,8 @@ pub(super) fn derived_indexes(feed: &Feed, timetable: &Timetable) -> DerivedInde
             .and_modify(|entry| *entry = StopLookup::Ambiguous)
             .or_insert(StopLookup::Unique(stop_index));
     }
-    let mut trips_by_public_id = HashMap::with_capacity(timetable.trip_count() as usize);
+    let mut trips_by_public_id: HashMap<String, Vec<TripIdx>> =
+        HashMap::with_capacity(timetable.trip_count() as usize);
     for index in 0..timetable.trip_count() {
         let trip = TripIdx(index);
         let source = &feed.trips[timetable.trip_source(trip) as usize];
@@ -723,7 +724,7 @@ pub(super) fn derived_indexes(feed: &Feed, timetable: &Timetable) -> DerivedInde
         } else {
             source.id.clone()
         };
-        trips_by_public_id.insert(public, trip);
+        trips_by_public_id.entry(public).or_default().push(trip);
     }
     (stops_by_id, stops_by_qualified_id, trips_by_public_id)
 }

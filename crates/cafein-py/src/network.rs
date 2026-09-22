@@ -297,12 +297,7 @@ impl TransportNetwork {
     /// McULTRA set (a whole-day set whose factor vector matches) rather than
     /// the closure. Exposes the `emissions_transfers` gate for inspection/tests.
     fn mcultra_active_for(&self, factors: Vec<(String, f64)>) -> bool {
-        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
-        for (trip_id, factor) in &factors {
-            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
-                per_trip[trip.0 as usize] = *factor;
-            }
-        }
+        let per_trip = self.per_trip_values(&factors);
         !std::ptr::eq(self.emissions_transfers(&per_trip), &self.transfers)
     }
 
@@ -393,12 +388,7 @@ impl TransportNetwork {
         };
         let active = self.active_services(date)?;
         let previous = self.active_services_previous(date)?;
-        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
-        for (trip_id, factor) in &factors {
-            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
-                per_trip[trip.0 as usize] = *factor;
-            }
-        }
+        let per_trip = self.per_trip_values(&factors);
         let timetable = &self.build.timetable;
         let timer = crate::logging::PhaseTimer::start(
             "cafein.build",
@@ -558,12 +548,7 @@ impl TransportNetwork {
                 "no trip distances installed; build the network with trip distances enabled",
             ));
         };
-        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
-        for (trip_id, factor) in &factors {
-            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
-                per_trip[trip.0 as usize] = *factor;
-            }
-        }
+        let per_trip = self.per_trip_values(&factors);
         let speed = walking_speed_kmph / 3.6;
         let stop_count = self.build.timetable.stop_count();
         let timetable = &self.build.timetable;
@@ -1198,11 +1183,15 @@ impl TransportNetwork {
         self.source = None;
         let mut entries = Vec::with_capacity(distances.len());
         for (trip_id, cumulative, provenance) in &distances {
-            let Some(&trip) = self.trips_by_public_id.get(trip_id) else {
+            let trips = self.trips_under(trip_id);
+            if trips.is_empty() {
                 continue;
-            };
+            }
             let cumulative: Vec<f32> = cumulative.iter().map(|&value| value as f32).collect();
-            entries.push((trip, cumulative, parse_provenance(provenance)?));
+            let provenance = parse_provenance(provenance)?;
+            for &trip in trips {
+                entries.push((trip, cumulative.clone(), provenance));
+            }
         }
         self.geometry = Some(
             TripGeometry::from_trips(&self.build.timetable, entries)
@@ -1244,10 +1233,9 @@ impl TransportNetwork {
         self.source = None;
         let mut entries = Vec::with_capacity(trips.len());
         for (trip_id, polyline, positions) in trips {
-            let Some(&trip) = self.trips_by_public_id.get(&trip_id) else {
-                continue;
-            };
-            entries.push((trip, polyline, positions));
+            for &trip in self.trips_under(&trip_id) {
+                entries.push((trip, polyline, positions.clone()));
+            }
         }
         self.leg_geometry = Some(
             LegGeometry::new(&self.build.timetable, &polylines, entries)
@@ -2735,8 +2723,9 @@ impl TransportNetwork {
     fn trips(&self) -> Vec<(String, String)> {
         self.trips_by_public_id
             .iter()
-            .map(|(public, &trip)| {
-                let source = &self.feed.trips[self.build.timetable.trip_source(trip) as usize];
+            .map(|(public, trips)| {
+                // Every run of a template shares its route.
+                let source = &self.feed.trips[self.build.timetable.trip_source(trips[0]) as usize];
                 let route = &self.feed.routes[source.route as usize];
                 (public.clone(), self.public_id(route.feed, &route.id))
             })
