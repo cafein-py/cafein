@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read as _, Write as _};
 use std::path::Path;
 
-use gtfs_structures::{Availability, BikesAllowedType, DirectionType, Gtfs, GtfsReader};
+use gtfs_structures::{Availability, BikesAllowedType, DirectionType, Gtfs, GtfsReader, RawGtfs};
 
 use crate::model::{
-    Agency, Calendar, CalendarDate, Feed, FeedIndex, FeedInfo, Route, RouteIndex, Stop, StopIndex,
-    StopTime, Trip,
+    Agency, Calendar, CalendarDate, Feed, FeedIndex, FeedInfo, Route, RouteIndex, SkippedFile,
+    Stop, StopIndex, StopTime, Trip,
 };
 use crate::Error;
 
@@ -27,47 +27,118 @@ impl Feed {
     pub fn from_paths<P: AsRef<Path>>(paths: &[P]) -> Result<Feed, Error> {
         let mut feed = Feed::default();
         for (feed_index, path) in paths.iter().enumerate() {
-            let gtfs = read_gtfs(path.as_ref())?;
-            append_gtfs(&mut feed, feed_index as FeedIndex, gtfs)?;
+            let feed_index = feed_index as FeedIndex;
+            let gtfs = read_gtfs(path.as_ref(), feed_index, &mut feed.skipped_files)?;
+            append_gtfs(&mut feed, feed_index, gtfs)?;
         }
         feed.feed_count = paths.len() as FeedIndex;
         Ok(feed)
     }
 }
 
-/// Reads one feed, tolerating malformed cosmetic colour values.
+/// Reads one feed, tolerating what routing can do without.
 ///
-/// Colours are irrelevant to routing, but the strict parser rejects a
-/// whole feed over an invalid `route_color`/`route_text_color`. When
-/// routes.txt is the file that failed, retry on an in-memory copy of
-/// the feed with the colour columns dropped; the input itself is never
-/// modified. Any other failure — including a failure to assemble the
-/// copy — surfaces the original error.
-fn read_gtfs(path: &Path) -> Result<Gtfs, Error> {
-    match GtfsReader::default()
-        .read_shapes(false)
-        .read_from_path(path)
-    {
-        Err(error) if failed_on_routes(&error) => {
-            let Ok(sanitized) = archive_without_colours(path) else {
-                return Err(error.into());
-            };
-            GtfsReader::default()
-                .read_shapes(false)
-                .raw()
-                .read_from_reader(Cursor::new(sanitized))
-                .and_then(Gtfs::try_from)
-                .map_err(Into::into)
-        }
-        result => result.map_err(Into::into),
+/// The strict parser rejects a whole feed over one bad value, so the
+/// tables are read raw and repaired before the feed is assembled. A
+/// malformed cosmetic colour in routes.txt is retried on an in-memory
+/// copy with the colour columns dropped (the input itself is never
+/// modified), and the optional tables routing never consults are
+/// dropped, a parse failure among them recorded in `skipped` rather
+/// than failing the read. Any other failure surfaces.
+fn read_gtfs(path: &Path, feed: FeedIndex, skipped: &mut Vec<SkippedFile>) -> Result<Gtfs, Error> {
+    let reader = GtfsReader::default().read_shapes(false).raw();
+    let mut raw = reader.read_from_path(path)?;
+    if let Some(sanitized) = colour_free_copy(&raw, path) {
+        raw = reader.read_from_reader(Cursor::new(sanitized))?;
+    }
+    skip_unused_tables(&mut raw, feed, skipped);
+    Gtfs::try_from(raw).map_err(Into::into)
+}
+
+/// The colour-less archive copy to retry on when routes.txt failed to
+/// parse; `None` when it parsed, or when the copy cannot be assembled
+/// (the original failure then surfaces).
+fn colour_free_copy(raw: &RawGtfs, path: &Path) -> Option<Vec<u8>> {
+    match raw.routes {
+        Err(gtfs_structures::Error::CSVError { .. }) => archive_without_colours(path).ok(),
+        _ => None,
     }
 }
 
-fn failed_on_routes(error: &gtfs_structures::Error) -> bool {
-    matches!(
-        error,
-        gtfs_structures::Error::CSVError { file_name, .. } if file_name.ends_with("routes.txt")
-    )
+/// Drops the optional tables routing never consults. A parse failure
+/// among them is recorded in `skipped`; a clean table goes too, so its
+/// cross-references (a transfer to an unknown stop, say) cannot fail
+/// the feed either. feed_info.txt is kept when it parses and skipped
+/// otherwise. The raw feed is destructured in full, so a table a
+/// parser upgrade adds has to be placed here.
+fn skip_unused_tables(raw: &mut RawGtfs, feed: FeedIndex, skipped: &mut Vec<SkippedFile>) {
+    let RawGtfs {
+        fare_attributes,
+        fare_rules,
+        fare_products,
+        fare_media,
+        rider_categories,
+        frequencies,
+        transfers,
+        pathways,
+        translations,
+        ticketing_deep_links,
+        ticketing_identifiers,
+        feed_info,
+        agencies: _,
+        stops: _,
+        routes: _,
+        trips: _,
+        stop_times: _,
+        calendar: _,
+        calendar_dates: _,
+        shapes: _,
+        files: _,
+        source_format: _,
+        sha256: _,
+        read_duration: _,
+    } = raw;
+    take_table(fare_attributes, "fare_attributes.txt", feed, skipped);
+    take_table(fare_rules, "fare_rules.txt", feed, skipped);
+    take_table(fare_products, "fare_products.txt", feed, skipped);
+    take_table(fare_media, "fare_media.txt", feed, skipped);
+    take_table(rider_categories, "rider_categories.txt", feed, skipped);
+    take_table(frequencies, "frequencies.txt", feed, skipped);
+    take_table(transfers, "transfers.txt", feed, skipped);
+    take_table(pathways, "pathways.txt", feed, skipped);
+    take_table(translations, "translations.txt", feed, skipped);
+    take_table(
+        ticketing_deep_links,
+        "ticketing_deep_links.txt",
+        feed,
+        skipped,
+    );
+    take_table(
+        ticketing_identifiers,
+        "ticketing_identifiers.txt",
+        feed,
+        skipped,
+    );
+    if matches!(feed_info, Some(Err(_))) {
+        take_table(feed_info, "feed_info.txt", feed, skipped);
+    }
+}
+
+/// Removes an optional table from the raw feed, recording it in
+/// `skipped` when it had failed to parse.
+fn take_table<T>(
+    table: &mut Option<Result<Vec<T>, gtfs_structures::Error>>,
+    file_name: &str,
+    feed: FeedIndex,
+    skipped: &mut Vec<SkippedFile>,
+) {
+    if let Some(Err(error)) = table.take() {
+        skipped.push(SkippedFile {
+            feed,
+            file_name: file_name.to_string(),
+            reason: crate::error_chain(&error),
+        });
+    }
 }
 
 type SanitizeError = Box<dyn std::error::Error + Send + Sync>;

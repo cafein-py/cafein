@@ -1,11 +1,16 @@
 use super::*;
 
 /// A one-trip feed whose routes.txt carries the given extra header
-/// columns and row values, as zip bytes.
-fn minimal_feed_zip(extra_columns: &str, extra_values: &str) -> Vec<u8> {
+/// columns and row values, plus `extra_files` (replacing a table of
+/// the same name), as zip bytes.
+fn minimal_feed_zip(
+    extra_columns: &str,
+    extra_values: &str,
+    extra_files: &[(&str, &str)],
+) -> Vec<u8> {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default();
-    let files = [
+    let mut files = vec![
         (
             "agency.txt",
             "agency_id,agency_name,agency_url,agency_timezone\n\
@@ -38,6 +43,12 @@ fn minimal_feed_zip(extra_columns: &str, extra_values: &str) -> Vec<u8> {
                 .to_string(),
         ),
     ];
+    for (name, content) in extra_files {
+        match files.iter_mut().find(|(existing, _)| existing == name) {
+            Some(entry) => entry.1 = content.to_string(),
+            None => files.push((name, content.to_string())),
+        }
+    }
     for (name, content) in files {
         writer.start_file(name, options).unwrap();
         writer.write_all(content.as_bytes()).unwrap();
@@ -60,7 +71,7 @@ fn tolerates_invalid_route_colours() {
     // the colour-less retry recovers the feed intact.
     let feed = read_zip_bytes(
         "colours",
-        &minimal_feed_zip(",route_color,route_text_color", ",FFFFFF,0"),
+        &minimal_feed_zip(",route_color,route_text_color", ",FFFFFF,0", &[]),
     )
     .unwrap();
     assert_eq!(feed.routes.len(), 1);
@@ -83,7 +94,7 @@ fn keeps_routes_errors_that_are_not_colours() {
     assert!(read_zip_bytes("route-type", &bytes).is_err());
     // A ragged row (extra field) fails the sanitizer, so a shape
     // error is never repaired into a loadable feed either.
-    let ragged = minimal_feed_zip(",route_text_color", ",0,i-am-an-extra-field");
+    let ragged = minimal_feed_zip(",route_text_color", ",0,i-am-an-extra-field", &[]);
     assert!(read_zip_bytes("ragged", &ragged).is_err());
 }
 
@@ -176,4 +187,78 @@ fn maps_the_wheelchair_tri_states_and_inherits_the_parent_station() {
     assert_eq!(trip("T_NO"), Some(false));
     assert_eq!(trip("T_BLANK"), None);
     assert_eq!(trip("T_ODD"), None);
+}
+
+#[test]
+fn skips_unused_tables_that_fail_to_parse() {
+    // rider_categories.txt in its pre-2024 draft layout lacks the
+    // column the parser requires; routing never reads the table, so
+    // the feed loads and the skip is reported with its cause. A
+    // transfer to a stop the feed lacks is dropped silently, and a
+    // clean feed_info.txt is kept.
+    let feed = read_zip_bytes(
+        "skip",
+        &minimal_feed_zip(
+            "",
+            "",
+            &[
+                (
+                    "rider_categories.txt",
+                    "rider_category_id,rider_category_name,min_age,max_age\nadult,Adult,,\n",
+                ),
+                (
+                    "transfers.txt",
+                    "from_stop_id,to_stop_id,transfer_type\nS1,NOWHERE,0\n",
+                ),
+                (
+                    "feed_info.txt",
+                    "feed_publisher_name,feed_publisher_url,feed_lang\nPub,http://example.com,fi\n",
+                ),
+            ],
+        ),
+    )
+    .unwrap();
+    assert_eq!(feed.trips.len(), 1);
+    assert_eq!(feed.feed_infos.len(), 1);
+    assert_eq!(feed.skipped_files.len(), 1);
+    let skipped = &feed.skipped_files[0];
+    assert_eq!(skipped.feed, 0);
+    assert_eq!(skipped.file_name, "rider_categories.txt");
+    assert!(
+        skipped.reason.contains("is_default_fare_category") && skipped.reason.contains("line: 2"),
+        "{}",
+        skipped.reason
+    );
+}
+
+#[test]
+fn keeps_errors_in_tables_routing_needs() {
+    // A malformed feed_info.txt is skipped like any unused table, but
+    // a malformed calendar.txt would silently change which trips run:
+    // it stays fatal, and the message states the cause.
+    let feed = read_zip_bytes(
+        "feed-info",
+        &minimal_feed_zip("", "", &[("feed_info.txt", "feed_lang\nfi\n")]),
+    )
+    .unwrap();
+    assert!(feed.feed_infos.is_empty());
+    assert_eq!(feed.skipped_files[0].file_name, "feed_info.txt");
+    let error = read_zip_bytes(
+        "calendar",
+        &minimal_feed_zip(
+            "",
+            "",
+            &[(
+                "calendar.txt",
+                "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,\
+                 start_date,end_date\nSV,1,1,1,1,1,1,1,not-a-date,20221231\n",
+            )],
+        ),
+    )
+    .unwrap_err();
+    let message = crate::error_chain(&error);
+    assert!(
+        message.contains("calendar.txt") && message.contains("line: 2"),
+        "{message}"
+    );
 }

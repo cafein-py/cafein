@@ -30,6 +30,20 @@ pub struct Feed {
     pub feed_infos: Vec<FeedInfo>,
     /// Number of source feeds merged into this one.
     pub feed_count: FeedIndex,
+    /// Optional tables dropped at read time: a diagnostic, never
+    /// persisted.
+    #[serde(skip)]
+    pub skipped_files: Vec<SkippedFile>,
+}
+
+/// An optional GTFS table that failed to parse and was dropped because
+/// routing never consults it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedFile {
+    pub feed: FeedIndex,
+    pub file_name: String,
+    /// The parse error and its causes.
+    pub reason: String,
 }
 
 /// A transit agency (`agency.txt`).

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- A GTFS feed loads even when an optional table routing never uses
+  (`rider_categories.txt`, the `fare_*.txt` tables, `transfers.txt`,
+  `frequencies.txt`, `pathways.txt`, …) fails to parse: the table is
+  skipped with a warning naming the file and the cause instead of the
+  whole feed being refused, and a fatal read error now states its
+  cause down to the offending line.
+  ([#386](https://github.com/cafein-py/cafein/pull/386))
+
 ## 0.25.0 — 2026-09-09
 
 - Emission-factor tables keep a ``total`` column (the sum of the four
