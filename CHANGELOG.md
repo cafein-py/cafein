@@ -9,7 +9,8 @@
   every run; the template itself is never routed. Rows that cannot be
   expanded are skipped with a warning; a `frequencies.txt` that fails
   to parse is a read error.
-  ([#387](https://github.com/cafein-py/cafein/pull/387))
+  ([#387](https://github.com/cafein-py/cafein/pull/387),
+  [#388](https://github.com/cafein-py/cafein/pull/388))
 - A GTFS feed loads even when an optional table routing never uses
   (`rider_categories.txt`, the `fare_*.txt` tables, `transfers.txt`,
   `pathways.txt`, …) fails to parse: the table is
