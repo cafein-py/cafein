@@ -80,7 +80,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
     nearest by default; exact seconds with
     ``output_time_units="seconds"``), ``from_stop`` and ``to_stop`` (the boarding and alighting
     stops; ``None`` at the walked ends of a door-to-door journey),
-    ``trip_id``/``route_id``/``route_short_name`` on transit legs,
+    ``trip_id``/``route_id``/``route_short_name`` on transit legs (every
+    run expanded from a ``frequencies.txt`` template carries the
+    template's ``trip_id``; the times tell the runs apart),
     ``distance_m`` (meters) and its ``distance_provenance``, ``emissions``
     (grams CO₂e; ``0`` on walks, ``NaN`` where a ridden trip has no
     matching factor), with ``fares=`` a ``money`` column — the option's

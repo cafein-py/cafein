@@ -720,6 +720,50 @@ def test_unused_tables_that_fail_to_parse_are_skipped_with_a_warning(tmp_path):
         TransportNetwork.from_gtfs(broken)
 
 
+def test_frequency_templates_expand_into_runs_under_the_template_id(tmp_path):
+    # A frequencies.txt template is replaced by its runs: a departure
+    # every headway inside the window, none at the template's literal
+    # time, every run under the template's trip id so id-keyed
+    # operations reach all of them. A frequencies.txt that fails to
+    # parse fails the feed.
+    import zipfile
+
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with zipfile.ZipFile(feed, "a") as archive:
+        archive.writestr(
+            "frequencies.txt",
+            "trip_id,start_time,end_time,headway_secs,exact_times\n"
+            "T_OK,07:00:00,08:00:00,1800,1\n",
+        )
+    with pytest.warns(UserWarning, match="quarantined 1 trip"):
+        network = TransportNetwork.from_gtfs(feed)
+    # The quarantined backwards trip is not routable; the template is
+    # listed once however many runs it has.
+    assert [trip_id for trip_id, _ in network.trips] == ["T_OK"]
+    # 07:10 misses the 07:00 run; the next departs 07:30, and the
+    # template's literal 08:00 departure does not exist.
+    journeys = network.route_between_stops("S1", "S2", "2022-02-22 07:10:00")
+    transit = [leg for leg in journeys[0]["legs"] if leg["type"] == "transit"]
+    assert transit[0]["departure_s"] == 7 * 3600 + 30 * 60
+    assert transit[0]["trip_id"] == "T_OK"
+    assert transit[0]["distance_m"] > 0
+    assert network.route_between_stops("S1", "S2", "2022-02-22 07:40:00") == []
+    assert (
+        network.route_between_stops(
+            "S1", "S2", "2022-02-22 07:10:00", exclude_trips=["T_OK"]
+        )
+        == []
+    )
+    broken = build_synthetic_gtfs(tmp_path / "broken_frequencies.zip")
+    with zipfile.ZipFile(broken, "a") as archive:
+        archive.writestr(
+            "frequencies.txt",
+            "trip_id,start_time,end_time,headway_secs\nT_OK,07:00:00,08:00:00,soon\n",
+        )
+    with pytest.raises(ValueError, match=r"frequencies\.txt.*line: 2"):
+        TransportNetwork.from_gtfs(broken)
+
+
 def test_qualified_ids_take_precedence_over_colon_raw_ids(tmp_path):
     feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
     with pytest.warns(UserWarning):

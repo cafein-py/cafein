@@ -27,6 +27,7 @@ fn reads_all_tables() {
     assert_eq!(feed.trips.len(), 195_351);
     assert_eq!(feed.calendars.len(), 4068);
     assert_eq!(feed.calendar_dates.len(), 32);
+    assert!(feed.skipped_frequencies.is_empty());
 
     let agency = &feed.agencies[0];
     assert_eq!(agency.name, "Helsingin seudun liikenne");

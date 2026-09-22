@@ -4,11 +4,13 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read as _, Write as _};
 use std::path::Path;
 
-use gtfs_structures::{Availability, BikesAllowedType, DirectionType, Gtfs, GtfsReader, RawGtfs};
+use gtfs_structures::{
+    Availability, BikesAllowedType, DirectionType, Gtfs, GtfsReader, RawFrequency, RawGtfs,
+};
 
 use crate::model::{
     Agency, Calendar, CalendarDate, Feed, FeedIndex, FeedInfo, Route, RouteIndex, SkippedFile,
-    Stop, StopIndex, StopTime, Trip,
+    SkippedFrequency, Stop, StopIndex, StopTime, Trip,
 };
 use crate::Error;
 
@@ -28,8 +30,9 @@ impl Feed {
         let mut feed = Feed::default();
         for (feed_index, path) in paths.iter().enumerate() {
             let feed_index = feed_index as FeedIndex;
-            let gtfs = read_gtfs(path.as_ref(), feed_index, &mut feed.skipped_files)?;
-            append_gtfs(&mut feed, feed_index, gtfs)?;
+            let (gtfs, frequencies) =
+                read_gtfs(path.as_ref(), feed_index, &mut feed.skipped_files)?;
+            append_gtfs(&mut feed, feed_index, gtfs, frequencies)?;
         }
         feed.feed_count = paths.len() as FeedIndex;
         Ok(feed)
@@ -44,15 +47,23 @@ impl Feed {
 /// copy with the colour columns dropped (the input itself is never
 /// modified), and the optional tables routing never consults are
 /// dropped, a parse failure among them recorded in `skipped` rather
-/// than failing the read. Any other failure surfaces.
-fn read_gtfs(path: &Path, feed: FeedIndex, skipped: &mut Vec<SkippedFile>) -> Result<Gtfs, Error> {
+/// than failing the read. frequencies.txt is routing input, so its
+/// parse failure surfaces; its rows are returned beside the feed for
+/// expansion (the parser's own trip assembly never sees them). Any
+/// other failure surfaces.
+fn read_gtfs(
+    path: &Path,
+    feed: FeedIndex,
+    skipped: &mut Vec<SkippedFile>,
+) -> Result<(Gtfs, Vec<RawFrequency>), Error> {
     let reader = GtfsReader::default().read_shapes(false).raw();
     let mut raw = reader.read_from_path(path)?;
     if let Some(sanitized) = colour_free_copy(&raw, path) {
         raw = reader.read_from_reader(Cursor::new(sanitized))?;
     }
+    let frequencies = raw.frequencies.take().transpose()?.unwrap_or_default();
     skip_unused_tables(&mut raw, feed, skipped);
-    Gtfs::try_from(raw).map_err(Into::into)
+    Ok((Gtfs::try_from(raw)?, frequencies))
 }
 
 /// The colour-less archive copy to retry on when routes.txt failed to
@@ -69,8 +80,9 @@ fn colour_free_copy(raw: &RawGtfs, path: &Path) -> Option<Vec<u8>> {
 /// among them is recorded in `skipped`; a clean table goes too, so its
 /// cross-references (a transfer to an unknown stop, say) cannot fail
 /// the feed either. feed_info.txt is kept when it parses and skipped
-/// otherwise. The raw feed is destructured in full, so a table a
-/// parser upgrade adds has to be placed here.
+/// otherwise; frequencies.txt was taken out before this. The raw feed
+/// is destructured in full, so a table a parser upgrade adds has to be
+/// placed here.
 fn skip_unused_tables(raw: &mut RawGtfs, feed: FeedIndex, skipped: &mut Vec<SkippedFile>) {
     let RawGtfs {
         fare_attributes,
@@ -78,7 +90,6 @@ fn skip_unused_tables(raw: &mut RawGtfs, feed: FeedIndex, skipped: &mut Vec<Skip
         fare_products,
         fare_media,
         rider_categories,
-        frequencies,
         transfers,
         pathways,
         translations,
@@ -92,6 +103,7 @@ fn skip_unused_tables(raw: &mut RawGtfs, feed: FeedIndex, skipped: &mut Vec<Skip
         stop_times: _,
         calendar: _,
         calendar_dates: _,
+        frequencies: _,
         shapes: _,
         files: _,
         source_format: _,
@@ -103,7 +115,6 @@ fn skip_unused_tables(raw: &mut RawGtfs, feed: FeedIndex, skipped: &mut Vec<Skip
     take_table(fare_products, "fare_products.txt", feed, skipped);
     take_table(fare_media, "fare_media.txt", feed, skipped);
     take_table(rider_categories, "rider_categories.txt", feed, skipped);
-    take_table(frequencies, "frequencies.txt", feed, skipped);
     take_table(transfers, "transfers.txt", feed, skipped);
     take_table(pathways, "pathways.txt", feed, skipped);
     take_table(translations, "translations.txt", feed, skipped);
@@ -215,7 +226,20 @@ fn availability_flag(availability: Availability) -> Option<bool> {
     }
 }
 
-fn append_gtfs(feed: &mut Feed, feed_index: FeedIndex, gtfs: Gtfs) -> Result<(), Error> {
+fn append_gtfs(
+    feed: &mut Feed,
+    feed_index: FeedIndex,
+    gtfs: Gtfs,
+    frequencies: Vec<RawFrequency>,
+) -> Result<(), Error> {
+    let mut rows_by_trip: HashMap<String, Vec<RawFrequency>> = HashMap::new();
+    for row in frequencies {
+        rows_by_trip
+            .entry(row.trip_id.clone())
+            .or_default()
+            .push(row);
+    }
+    let mut budget = FREQUENCY_STOP_TIME_BUDGET;
     for agency in gtfs.agencies {
         feed.agencies.push(Agency {
             feed: feed_index,
@@ -305,7 +329,8 @@ fn append_gtfs(feed: &mut Feed, feed_index: FeedIndex, gtfs: Gtfs) -> Result<(),
             });
         }
         stop_times.sort_by_key(|stop_time| stop_time.stop_sequence);
-        feed.trips.push(Trip {
+        let rows = rows_by_trip.remove(&id);
+        let trip = Trip {
             feed: feed_index,
             id,
             route,
@@ -324,7 +349,22 @@ fn append_gtfs(feed: &mut Feed, feed_index: FeedIndex, gtfs: Gtfs) -> Result<(),
             },
             wheelchair_accessible: availability_flag(trip.wheelchair_accessible),
             stop_times,
-        });
+        };
+        match rows {
+            None => feed.trips.push(trip),
+            Some(rows) => expand_frequencies(feed, feed_index, trip, rows, &mut budget)?,
+        }
+    }
+    let mut unknown: Vec<_> = rows_by_trip.into_iter().collect();
+    unknown.sort_by(|left, right| left.0.cmp(&right.0));
+    for (trip_id, rows) in unknown {
+        for row in rows {
+            feed.skipped_frequencies.push(SkippedFrequency {
+                feed: feed_index,
+                trip_id: trip_id.clone(),
+                reason: format!("{}: no such trip in trips.txt", describe_window(&row)),
+            });
+        }
     }
 
     let mut calendars: Vec<_> = gtfs.calendar.into_iter().collect();
@@ -369,6 +409,145 @@ fn append_gtfs(feed: &mut Feed, feed_index: FeedIndex, gtfs: Gtfs) -> Result<(),
     }
 
     Ok(())
+}
+
+/// The stop times one feed's frequency expansion may create in total,
+/// far above any real feed: a ceiling against a malformed row (a
+/// one-second headway over a huge window, say) exhausting memory. The
+/// feed is refused past it, since dropping runs silently would distort
+/// the timetable.
+const FREQUENCY_STOP_TIME_BUDGET: u64 = 100_000_000;
+
+/// Replaces a frequencies.txt template with its runs: per row, one copy
+/// of the template departing at `start + k·headway` for every k that
+/// keeps it before `end`, every stop time shifted alike (both
+/// `exact_times` values are treated the same). Rows that cannot be
+/// expanded are reported; a template none of whose rows can is omitted
+/// and reported, so a template is never routed at its literal times.
+/// Every row's cost is charged to `budget` before any run is built.
+fn expand_frequencies(
+    feed: &mut Feed,
+    feed_index: FeedIndex,
+    template: Trip,
+    rows: Vec<RawFrequency>,
+    budget: &mut u64,
+) -> Result<(), Error> {
+    let base = template
+        .stop_times
+        .first()
+        .and_then(|first| first.departure.or(first.arrival));
+    let mut runs: Vec<Trip> = Vec::new();
+    for row in rows {
+        let outcome = match run_count(base, &row) {
+            Err(problem) => Err(problem),
+            Ok(count) => {
+                let cost = count.saturating_mul(template.stop_times.len() as u64);
+                *budget =
+                    budget
+                        .checked_sub(cost)
+                        .ok_or_else(|| Error::FrequencyExpansionTooLarge {
+                            trip_id: template.id.clone(),
+                            limit: FREQUENCY_STOP_TIME_BUDGET,
+                        })?;
+                let expanded = expand_row(&template, base, &row);
+                if expanded.is_err() {
+                    // A rejected row creates nothing, so it costs nothing.
+                    *budget += cost;
+                }
+                expanded
+            }
+        };
+        match outcome {
+            Ok(row_runs) => runs.extend(row_runs),
+            Err(problem) => feed.skipped_frequencies.push(SkippedFrequency {
+                feed: feed_index,
+                trip_id: template.id.clone(),
+                reason: format!("{}: {problem}", describe_window(&row)),
+            }),
+        }
+    }
+    if runs.is_empty() {
+        feed.skipped_frequencies.push(SkippedFrequency {
+            feed: feed_index,
+            trip_id: template.id,
+            reason: "omitted: none of its frequencies.txt rows could be expanded".to_string(),
+        });
+        return Ok(());
+    }
+    runs.sort_by_key(|run| {
+        run.stop_times
+            .first()
+            .and_then(|first| first.departure.or(first.arrival))
+    });
+    feed.trips.extend(runs);
+    Ok(())
+}
+
+/// How many runs a row describes, checked before any run is built, or
+/// why the row cannot be expanded.
+fn run_count(base: Option<u32>, row: &RawFrequency) -> Result<u64, String> {
+    if base.is_none() {
+        return Err("the template's first stop has no time".to_string());
+    }
+    if row.headway_secs == 0 {
+        return Err("headway_secs is 0".to_string());
+    }
+    if row.end_time <= row.start_time {
+        return Err("end_time is not after start_time".to_string());
+    }
+    Ok(u64::from(row.end_time - row.start_time).div_ceil(u64::from(row.headway_secs)))
+}
+
+/// One validated row's runs. A run whose shifted times leave the clock
+/// the timetable represents (0 to `u32::MAX` seconds) rejects the row.
+fn expand_row(template: &Trip, base: Option<u32>, row: &RawFrequency) -> Result<Vec<Trip>, String> {
+    let base = base.expect("validated by run_count");
+    let mut runs = Vec::new();
+    let mut departure = row.start_time;
+    while departure < row.end_time {
+        let shift = i64::from(departure) - i64::from(base);
+        let mut run = template.clone();
+        for stop_time in &mut run.stop_times {
+            stop_time.arrival = shift_time(stop_time.arrival, shift)?;
+            stop_time.departure = shift_time(stop_time.departure, shift)?;
+        }
+        runs.push(run);
+        let Some(next) = departure.checked_add(row.headway_secs) else {
+            break;
+        };
+        departure = next;
+    }
+    Ok(runs)
+}
+
+/// A stop time moved by `shift` seconds; a blank stays blank.
+fn shift_time(time: Option<u32>, shift: i64) -> Result<Option<u32>, String> {
+    time.map(|time| {
+        u32::try_from(i64::from(time) + shift).map_err(|_| {
+            "a run would place a stop outside the clock the timetable represents".to_string()
+        })
+    })
+    .transpose()
+}
+
+/// A frequencies.txt row's window, for diagnostics.
+fn describe_window(row: &RawFrequency) -> String {
+    format!(
+        "row {}–{} every {} s",
+        clock(row.start_time),
+        clock(row.end_time),
+        row.headway_secs
+    )
+}
+
+/// Seconds after midnight as `HH:MM:SS` (hours may exceed 24).
+fn clock(seconds: u32) -> String {
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        seconds % 3600 / 60,
+        seconds % 60
+    )
 }
 
 #[cfg(test)]

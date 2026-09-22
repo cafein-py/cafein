@@ -12,7 +12,7 @@ mod timetable;
 
 pub use model::{
     Agency, Calendar, CalendarDate, Exception, Feed, FeedIndex, FeedInfo, Route, RouteIndex,
-    RouteType, SkippedFile, Stop, StopIndex, StopTime, Trip,
+    RouteType, SkippedFile, SkippedFrequency, Stop, StopIndex, StopTime, Trip,
 };
 pub use qa::{validate_feed, QaFinding};
 pub use service::{ServiceCalendar, ServiceIndex};
@@ -29,6 +29,9 @@ pub enum Error {
     UnknownStop { trip_id: String, stop_id: String },
     /// A stop time has neither an arrival nor a departure time.
     MissingStopTime { trip_id: String },
+    /// Expanding frequencies.txt would create more stop times than the
+    /// feed-wide ceiling allows.
+    FrequencyExpansionTooLarge { trip_id: String, limit: u64 },
     /// The timetable could not be assembled.
     Timetable(cafein_core::timetable::TimetableError),
 }
@@ -49,6 +52,11 @@ impl std::fmt::Display for Error {
                     "trip '{trip_id}' has a stop time without arrival and departure"
                 )
             }
+            Error::FrequencyExpansionTooLarge { trip_id, limit } => write!(
+                f,
+                "expanding frequencies.txt would create more than {limit} stop times \
+                 (reached at trip '{trip_id}')"
+            ),
             Error::Timetable(error) => write!(f, "could not assemble timetable: {error}"),
         }
     }

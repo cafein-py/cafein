@@ -176,6 +176,15 @@ impl TransportNetwork {
                 ),
             )?;
         }
+        for skipped in &feed.skipped_frequencies {
+            crate::logging::build_warning(
+                py,
+                format!(
+                    "{}: frequencies.txt, trip {}: {}",
+                    paths[skipped.feed as usize], skipped.trip_id, skipped.reason
+                ),
+            )?;
+        }
         let timer = crate::logging::PhaseTimer::start(
             "cafein.build",
             "build.gtfs.timetable",

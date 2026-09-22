@@ -16,7 +16,9 @@ pub type RouteIndex = u32;
 /// One or several GTFS feeds merged into flat, index-linked tables.
 ///
 /// Entities keep their original GTFS identifiers together with the index of
-/// the feed they came from; the pair `(feed, id)` is unique across the merge.
+/// the feed they came from; the pair `(feed, id)` is unique across the merge,
+/// except that the runs expanded from one `frequencies.txt` template share
+/// their template's trip id.
 /// Cross-references between tables are resolved to vector indices at read
 /// time, so lookups never go through string identifiers.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -34,6 +36,11 @@ pub struct Feed {
     /// persisted.
     #[serde(skip)]
     pub skipped_files: Vec<SkippedFile>,
+    /// frequencies.txt rows that could not be expanded, and templates
+    /// omitted for lack of an expandable row: a diagnostic, never
+    /// persisted.
+    #[serde(skip)]
+    pub skipped_frequencies: Vec<SkippedFrequency>,
 }
 
 /// An optional GTFS table that failed to parse and was dropped because
@@ -43,6 +50,15 @@ pub struct SkippedFile {
     pub feed: FeedIndex,
     pub file_name: String,
     /// The parse error and its causes.
+    pub reason: String,
+}
+
+/// A frequencies.txt row that could not be expanded into runs, or a
+/// template trip omitted because none of its rows could.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedFrequency {
+    pub feed: FeedIndex,
+    pub trip_id: String,
     pub reason: String,
 }
 
@@ -85,7 +101,7 @@ pub struct Route {
 
 /// A trip (`trips.txt`) with its scheduled calls (`stop_times.txt`),
 /// ordered by `stop_sequence`.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Trip {
     pub feed: FeedIndex,
     pub id: String,
