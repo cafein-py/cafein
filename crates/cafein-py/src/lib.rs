@@ -141,7 +141,9 @@ struct TransportNetwork {
     carriage_transfers: Option<CarriageTransferSet>,
     stops_by_id: HashMap<String, StopLookup>,
     stops_by_qualified_id: HashMap<String, StopIdx>,
-    trips_by_public_id: HashMap<String, TripIdx>,
+    /// The timetable trips under each public trip id: several once one
+    /// GTFS trip describes many runs.
+    trips_by_public_id: HashMap<String, Vec<TripIdx>>,
     /// STREETS-section bytes the load explicitly read — 0 for a lazy
     /// mapped load; the laziness tests assert on it.
     streets_bytes_read: u64,

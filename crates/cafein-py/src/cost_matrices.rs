@@ -155,12 +155,7 @@ impl TransportNetwork {
                 .map(StopIdx)
                 .collect(),
         };
-        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
-        for (trip_id, factor) in &factors {
-            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
-                per_trip[trip.0 as usize] = *factor;
-            }
-        }
+        let per_trip = self.per_trip_values(&factors);
         let departures = departure.parsed()?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
@@ -358,12 +353,7 @@ impl TransportNetwork {
             validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
         validate_points(&origins)?;
         validate_points(&destinations)?;
-        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
-        for (trip_id, factor) in &factors {
-            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
-                per_trip[trip.0 as usize] = *factor;
-            }
-        }
+        let per_trip = self.per_trip_values(&factors);
         let departures = departure.parsed()?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
@@ -625,12 +615,7 @@ impl TransportNetwork {
         }
         validate_points(&origins)?;
         validate_points(&destinations)?;
-        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
-        for (trip_id, factor) in &factors {
-            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
-                per_trip[trip.0 as usize] = *factor;
-            }
-        }
+        let per_trip = self.per_trip_values(&factors);
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
@@ -1093,12 +1078,7 @@ impl TransportNetwork {
                 .map(StopIdx)
                 .collect(),
         };
-        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
-        for (trip_id, factor) in &factors {
-            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
-                per_trip[trip.0 as usize] = *factor;
-            }
-        }
+        let per_trip = self.per_trip_values(&factors);
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
@@ -1498,12 +1478,7 @@ impl TransportNetwork {
             validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
         validate_points(&origins)?;
         validate_points(&destinations)?;
-        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
-        for (trip_id, factor) in &factors {
-            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
-                per_trip[trip.0 as usize] = *factor;
-            }
-        }
+        let per_trip = self.per_trip_values(&factors);
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
@@ -1785,12 +1760,7 @@ impl TransportNetwork {
                 .map(StopIdx)
                 .collect(),
         };
-        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
-        for (trip_id, factor) in &factors {
-            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
-                per_trip[trip.0 as usize] = *factor;
-            }
-        }
+        let per_trip = self.per_trip_values(&factors);
         let start = parse_time(arrival)?;
         let marks = crate::options::arrival_marks(start, window)?;
         let deadline = *marks.last().expect("a validated window holds a mark");
@@ -1965,12 +1935,7 @@ impl TransportNetwork {
             validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
         validate_points(&origins)?;
         validate_points(&destinations)?;
-        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
-        for (trip_id, factor) in &factors {
-            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
-                per_trip[trip.0 as usize] = *factor;
-            }
-        }
+        let per_trip = self.per_trip_values(&factors);
         let start = parse_time(arrival)?;
         let marks = crate::options::arrival_marks(start, window)?;
         let deadline = *marks.last().expect("a validated window holds a mark");

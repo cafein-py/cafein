@@ -40,12 +40,7 @@ impl TransportNetwork {
         };
         let origin = self.resolve_stop(origin)?;
         let destination = self.resolve_stop(destination)?;
-        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
-        for (trip_id, factor) in &factors {
-            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
-                per_trip[trip.0 as usize] = *factor;
-            }
-        }
+        let per_trip = self.per_trip_values(&factors);
         let departure = parse_time(departure)?;
         let active_services = self.active_services(date)?;
         let active_services_previous = self.active_services_previous(date)?;
@@ -180,12 +175,7 @@ impl TransportNetwork {
                 return Ok(PyList::empty(py).unbind());
             }
         }
-        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
-        for (trip_id, factor) in &factors {
-            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
-                per_trip[trip.0 as usize] = *factor;
-            }
-        }
+        let per_trip = self.per_trip_values(&factors);
         // Under a McULTRA set matching this query's factors, route door-to-door
         // between the two stops' coordinates, so the set's unrestricted
         // intermediate walking is paired with a full street-graph initial and
@@ -441,12 +431,7 @@ impl TransportNetwork {
                 .snap(destination.0, destination.1, max_snap_distance)
                 .expect("destination linked above"),
         };
-        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
-        for (trip_id, factor) in &factors {
-            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
-                per_trip[trip.0 as usize] = *factor;
-            }
-        }
+        let per_trip = self.per_trip_values(&factors);
         let request = Request {
             departure: parse_time(departure)?,
             access: request_offsets(&access),
@@ -676,12 +661,7 @@ impl TransportNetwork {
                 "no trip distances installed; build the network with trip distances enabled",
             ));
         };
-        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
-        for (trip_id, factor) in &trip_factors {
-            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
-                per_trip[trip.0 as usize] = *factor;
-            }
-        }
+        let per_trip = self.per_trip_values(&trip_factors);
         let labels = mcraptor::PolicyLabels {
             access: access
                 .iter()
@@ -838,12 +818,7 @@ impl TransportNetwork {
             .iter()
             .map(|stop| self.resolve_stop(stop))
             .collect::<PyResult<_>>()?;
-        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
-        for (trip_id, factor) in &factors {
-            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
-                per_trip[trip.0 as usize] = *factor;
-            }
-        }
+        let per_trip = self.per_trip_values(&factors);
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         if exclusions.is_some() && router == "tbtr" {
             return Err(PyValueError::new_err(
@@ -1003,12 +978,7 @@ impl TransportNetwork {
             validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
         validate_points(&origins)?;
         validate_points(&destinations)?;
-        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
-        for (trip_id, factor) in &factors {
-            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
-                per_trip[trip.0 as usize] = *factor;
-            }
-        }
+        let per_trip = self.per_trip_values(&factors);
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         if exclusions.is_some() && router == "tbtr" {
             return Err(PyValueError::new_err(
@@ -1181,12 +1151,7 @@ impl TransportNetwork {
             .iter()
             .map(|stop| self.resolve_stop(stop))
             .collect::<PyResult<_>>()?;
-        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
-        for (trip_id, factor) in &factors {
-            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
-                per_trip[trip.0 as usize] = *factor;
-            }
-        }
+        let per_trip = self.per_trip_values(&factors);
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         if exclusions.is_some() && router == "tbtr" {
             return Err(PyValueError::new_err(
@@ -1332,12 +1297,7 @@ impl TransportNetwork {
             validated_walking_speed(walking_speed_kmph, max_walking_time, max_snap_distance)?;
         validate_points(&origins)?;
         validate_points(&destinations)?;
-        let mut per_trip = vec![f64::NAN; self.build.timetable.trip_count() as usize];
-        for (trip_id, factor) in &factors {
-            if let Some(&trip) = self.trips_by_public_id.get(trip_id) {
-                per_trip[trip.0 as usize] = *factor;
-            }
-        }
+        let per_trip = self.per_trip_values(&factors);
         let exclusions = self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?;
         if exclusions.is_some() && router == "tbtr" {
             return Err(PyValueError::new_err(
