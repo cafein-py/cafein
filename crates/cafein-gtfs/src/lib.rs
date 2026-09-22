@@ -12,7 +12,7 @@ mod timetable;
 
 pub use model::{
     Agency, Calendar, CalendarDate, Exception, Feed, FeedIndex, FeedInfo, Route, RouteIndex,
-    RouteType, Stop, StopIndex, StopTime, Trip,
+    RouteType, SkippedFile, Stop, StopIndex, StopTime, Trip,
 };
 pub use qa::{validate_feed, QaFinding};
 pub use service::{ServiceCalendar, ServiceIndex};
@@ -62,6 +62,22 @@ impl std::error::Error for Error {
             _ => None,
         }
     }
+}
+
+/// An error's message followed by those of its causes, each added only
+/// when the text so far does not already state it.
+pub fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut cause = error.source();
+    while let Some(error) = cause {
+        let text = error.to_string();
+        if !message.contains(&text) {
+            message.push_str(": ");
+            message.push_str(&text);
+        }
+        cause = error.source();
+    }
+    message
 }
 
 impl From<gtfs_structures::Error> for Error {

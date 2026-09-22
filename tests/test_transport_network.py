@@ -687,6 +687,39 @@ def test_timepoint_feeds_are_repaired_at_ingest(tmp_path):
     assert journeys[0]["arrival_s"] == 8 * 3600 + 10 * 60
 
 
+def test_unused_tables_that_fail_to_parse_are_skipped_with_a_warning(tmp_path):
+    # A rider_categories.txt in its pre-2024 draft layout lacks the
+    # column the parser requires. Routing never reads the table, so the
+    # feed loads and the warning names the file and the cause; a table
+    # routing needs stays fatal, with the cause in the message.
+    import zipfile
+
+    feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    with zipfile.ZipFile(feed, "a") as archive:
+        archive.writestr(
+            "rider_categories.txt",
+            "rider_category_id,rider_category_name,min_age,max_age\nadult,Adult,,\n",
+        )
+    with pytest.warns(
+        UserWarning, match=r"skipped rider_categories\.txt .*is_default_fare_category"
+    ):
+        network = TransportNetwork.from_gtfs(feed)
+    assert network.stop_count == 3
+    broken = tmp_path / "broken_calendar.zip"
+    with zipfile.ZipFile(feed) as source, zipfile.ZipFile(broken, "w") as target:
+        for name in source.namelist():
+            if name == "calendar.txt":
+                target.writestr(
+                    name,
+                    "service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+                    "sunday,start_date,end_date\nSV,1,1,1,1,1,1,1,not-a-date,20221231\n",
+                )
+            elif name != "rider_categories.txt":
+                target.writestr(name, source.read(name))
+    with pytest.raises(ValueError, match=r"calendar\.txt.*line: 2"):
+        TransportNetwork.from_gtfs(broken)
+
+
 def test_qualified_ids_take_precedence_over_colon_raw_ids(tmp_path):
     feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
     with pytest.warns(UserWarning):

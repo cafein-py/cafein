@@ -16,6 +16,7 @@ use pyo3::prelude::*;
 
 pub const DEBUG: u32 = 10;
 pub const INFO: u32 = 20;
+pub const WARNING: u32 = 30;
 
 /// The emission threshold; `u32::MAX` is the disarmed initial state,
 /// above every Python level and never produced by the Python sync.
@@ -72,6 +73,18 @@ pub fn emit_full<F>(
     Python::with_gil(|py| {
         let _ = dispatch.call1(py, (target, level, message, phase, seconds, progress));
     });
+}
+
+/// A build diagnostic: a `UserWarning` attributed to the caller, and
+/// the same text as a WARNING record on the build logger.
+pub fn build_warning(py: Python<'_>, message: String) -> PyResult<()> {
+    emit("cafein.build", WARNING, || message.clone(), None, None);
+    let warnings = py.import("warnings")?;
+    warnings.call_method1(
+        "warn",
+        (message, py.get_type::<pyo3::exceptions::PyUserWarning>(), 2),
+    )?;
+    Ok(())
 }
 
 /// Times one phase: a DEBUG starting line at construction, the INFO

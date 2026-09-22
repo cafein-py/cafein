@@ -657,7 +657,7 @@ impl Departures {
 }
 
 pub(super) fn to_py_error(error: cafein_gtfs::Error) -> PyErr {
-    PyValueError::new_err(error.to_string())
+    PyValueError::new_err(cafein_gtfs::error_chain(&error))
 }
 
 /// The numeric GTFS route_type of a parsed route type; named variants map

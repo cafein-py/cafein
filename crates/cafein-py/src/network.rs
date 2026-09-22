@@ -167,6 +167,15 @@ impl TransportNetwork {
         );
         let feed = Feed::from_paths(&paths).map_err(to_py_error)?;
         timer.finish();
+        for skipped in &feed.skipped_files {
+            crate::logging::build_warning(
+                py,
+                format!(
+                    "{}: skipped {} (routing does not use it): {}",
+                    paths[skipped.feed as usize], skipped.file_name, skipped.reason
+                ),
+            )?;
+        }
         let timer = crate::logging::PhaseTimer::start(
             "cafein.build",
             "build.gtfs.timetable",
@@ -176,25 +185,21 @@ impl TransportNetwork {
         let build = build_timetable(&feed).map_err(to_py_error)?;
         timer.finish();
         if !build.quarantined.is_empty() {
-            let message = format!(
-                "quarantined {} trip(s) with data-quality problems; routing excludes them",
-                build.quarantined.len()
-            );
-            let warnings = py.import("warnings")?;
-            warnings.call_method1(
-                "warn",
-                (message, py.get_type::<pyo3::exceptions::PyUserWarning>(), 2),
+            crate::logging::build_warning(
+                py,
+                format!(
+                    "quarantined {} trip(s) with data-quality problems; routing excludes them",
+                    build.quarantined.len()
+                ),
             )?;
         }
         if !build.interpolated.is_empty() {
-            let message = format!(
-                "interpolated blank stop times on {} trip(s)",
-                build.interpolated.len()
-            );
-            let warnings = py.import("warnings")?;
-            warnings.call_method1(
-                "warn",
-                (message, py.get_type::<pyo3::exceptions::PyUserWarning>(), 2),
+            crate::logging::build_warning(
+                py,
+                format!(
+                    "interpolated blank stop times on {} trip(s)",
+                    build.interpolated.len()
+                ),
             )?;
         }
         let transfers = Transfers::empty(build.timetable.stop_count());
