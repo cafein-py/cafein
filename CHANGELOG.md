@@ -12,7 +12,8 @@
   what was dropped. A table whose rows all fail, a failing row without
   a readable key, or a ragged failing row in a table others depend on
   still fails the read as before.
-  ([#389](https://github.com/cafein-py/cafein/pull/389))
+  ([#389](https://github.com/cafein-py/cafein/pull/389),
+  [#390](https://github.com/cafein-py/cafein/pull/390))
 - Frequency-based trips: `frequencies.txt` is expanded at ingest into
   one scheduled run per departure inside each window (both
   `exact_times` values alike), every run under the template's trip id,
