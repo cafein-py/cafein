@@ -41,8 +41,9 @@ pub struct Feed {
     /// persisted.
     #[serde(skip)]
     pub skipped_frequencies: Vec<SkippedFrequency>,
-    /// Rows of a required table dropped at read time, with the trips
-    /// they took along: a diagnostic, never persisted.
+    /// Rows dropped at read time from the tables routing consumes, with
+    /// the trips or services each drop took along: a diagnostic, never
+    /// persisted.
     #[serde(skip)]
     pub dropped_rows: Vec<DroppedRows>,
 }
@@ -64,7 +65,9 @@ pub struct DroppedRows {
     pub feed: FeedIndex,
     pub file_name: String,
     pub rows: u32,
-    /// The first dropped row's line in the file, and why it failed.
+    /// The first dropped row's line as the CSV reader counts lines
+    /// (blank lines are skipped uncounted, as in the parser's own
+    /// errors), and why it failed.
     pub first_line: u64,
     pub first_reason: String,
     /// Trips removed because a dropped row belonged to them.

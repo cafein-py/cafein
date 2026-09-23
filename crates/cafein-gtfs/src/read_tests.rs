@@ -472,3 +472,136 @@ fn keeps_row_failures_the_cascade_cannot_trust() {
         );
     }
 }
+
+/// Two trips over three stops, two routes and two services, with one
+/// table replaced.
+fn dependent_feed_zip(replaced: (&str, &str)) -> Vec<u8> {
+    let mut files = vec![
+        (
+            "stops.txt",
+            "stop_id,stop_name,stop_lat,stop_lon,parent_station\n\
+             S1,One,60.0,24.0,S3\nS2,Two,60.01,24.01,\nS3,Three,60.02,24.02,\n",
+        ),
+        (
+            "routes.txt",
+            "route_id,route_short_name,route_type\nR1,1,3\nR2,2,3\n",
+        ),
+        (
+            "trips.txt",
+            "route_id,service_id,trip_id\nR1,SV,T1\nR2,SX,T2\n",
+        ),
+        (
+            "stop_times.txt",
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+             T1,08:00:00,08:00:00,S1,1\nT1,08:10:00,08:10:00,S2,2\n\
+             T2,09:00:00,09:00:00,S1,1\nT2,09:10:00,09:10:00,S3,2\n",
+        ),
+        (
+            "calendar.txt",
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,\
+             start_date,end_date\nSV,1,1,1,1,1,1,1,20220101,20221231\n\
+             SX,1,1,1,1,1,1,1,20220101,20221231\n",
+        ),
+    ];
+    match files.iter_mut().find(|(name, _)| *name == replaced.0) {
+        Some(entry) => entry.1 = replaced.1,
+        None => files.push(replaced),
+    }
+    minimal_feed_zip("", "", &files)
+}
+
+#[test]
+fn drops_what_depends_on_a_row_that_fails_in_the_other_tables() {
+    // Per table: the trips left, then (file, rows dropped, trips it
+    // took along, services that lost a row).
+    let cases = [
+        (
+            "stops",
+            (
+                "stops.txt",
+                "stop_id,stop_name,stop_lat,stop_lon,parent_station\n\
+                 S1,One,60.0,24.0,S3\nS2,Two,60.01,24.01,\nS3,Three,sixty,24.02,\n",
+            ),
+            vec!["T1"],
+            ("stops.txt", 1, 1, 0),
+        ),
+        (
+            "routes",
+            (
+                "routes.txt",
+                "route_id,route_short_name,route_type,route_color\nR1,1,3,0\nR3,3,3\n\nR2,2,bus,\n",
+            ),
+            vec!["T1"],
+            ("routes.txt", 1, 1, 0),
+        ),
+        (
+            "calendar",
+            (
+                "calendar.txt",
+                "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,\
+                 start_date,end_date\nSV,1,1,1,1,1,1,1,20220101,20221231\n\
+                 SX,1,1,1,1,1,1,1,not-a-date,20221231\n",
+            ),
+            vec!["T1", "T2"],
+            ("calendar.txt", 1, 0, 1),
+        ),
+        (
+            "calendar-dates",
+            (
+                "calendar_dates.txt",
+                "service_id,date,exception_type\nSV,20220222,1\nSX,2022-02-23,1\n",
+            ),
+            vec!["T1", "T2"],
+            ("calendar_dates.txt", 1, 0, 1),
+        ),
+        (
+            "agency",
+            (
+                "agency.txt",
+                "agency_name,agency_url,agency_timezone\n\
+                 Agency,http://example.com,Europe/Helsinki\nBroken,http://example.com\n",
+            ),
+            vec!["T1", "T2"],
+            ("agency.txt", 1, 0, 0),
+        ),
+    ];
+    for (tag, replaced, trips_left, report) in cases {
+        let feed = read_zip_bytes(tag, &dependent_feed_zip(replaced)).unwrap();
+        let ids: Vec<&str> = feed.trips.iter().map(|trip| trip.id.as_str()).collect();
+        assert_eq!(ids, trips_left, "{tag}");
+        assert_eq!(feed.dropped_rows.len(), 1, "{tag}: {:?}", feed.dropped_rows);
+        let dropped = &feed.dropped_rows[0];
+        assert_eq!(
+            (
+                dropped.file_name.as_str(),
+                dropped.rows,
+                dropped.trips_dropped,
+                dropped.services_affected
+            ),
+            report,
+            "{tag}"
+        );
+        if tag == "stops" {
+            // The dropped stop is nobody's parent station any more.
+            let s1 = feed.stops.iter().find(|stop| stop.id == "S1").unwrap();
+            assert_eq!(s1.parent_station, None);
+            assert_eq!(feed.stops.len(), 2);
+        }
+        if tag == "routes" {
+            // R1's invalid colour and R3's short row are accepted as the
+            // strict parser accepts them; the report's line is the one
+            // the CSV reader counts (a blank line is skipped uncounted),
+            // the same number the parser's own error carries.
+            assert_eq!(feed.routes.len(), 2);
+            assert_eq!(dropped.first_line, 4);
+            assert!(
+                dropped.first_reason.contains("line: 4"),
+                "{}",
+                dropped.first_reason
+            );
+        }
+        if tag == "agency" {
+            assert_eq!(feed.agencies.len(), 1);
+        }
+    }
+}
