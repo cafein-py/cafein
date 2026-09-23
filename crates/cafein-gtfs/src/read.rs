@@ -12,7 +12,7 @@ use serde::de::DeserializeOwned;
 
 use crate::model::{
     Agency, Calendar, CalendarDate, DroppedRows, Feed, FeedIndex, FeedInfo, Route, RouteIndex,
-    SkippedFile, SkippedFrequency, Stop, StopIndex, StopTime, Trip,
+    SkippedFile, SkippedFrequency, SkippedTableKind, Stop, StopIndex, StopTime, Trip,
 };
 use crate::Error;
 
@@ -414,7 +414,8 @@ fn colour_free_copy(raw: &RawGtfs, source: &Source) -> Option<Vec<u8>> {
 }
 
 /// Drops the optional tables routing never consults. A parse failure
-/// among them is recorded in `skipped`; a clean table goes too, so its
+/// among them is recorded in `skipped`, marked by whether the parser
+/// ever assembled the table; a clean table goes too, so its
 /// cross-references (a transfer to an unknown stop, say) cannot fail
 /// the feed either. feed_info.txt is kept when it parses and skipped
 /// otherwise; frequencies.txt was taken out before this. The raw feed
@@ -447,28 +448,84 @@ fn skip_unused_tables(raw: &mut RawGtfs, feed: FeedIndex, skipped: &mut Vec<Skip
         sha256: _,
         read_duration: _,
     } = raw;
-    take_table(fare_attributes, "fare_attributes.txt", feed, skipped);
-    take_table(fare_rules, "fare_rules.txt", feed, skipped);
-    take_table(fare_products, "fare_products.txt", feed, skipped);
-    take_table(fare_media, "fare_media.txt", feed, skipped);
-    take_table(rider_categories, "rider_categories.txt", feed, skipped);
-    take_table(transfers, "transfers.txt", feed, skipped);
-    take_table(pathways, "pathways.txt", feed, skipped);
-    take_table(translations, "translations.txt", feed, skipped);
+    take_table(
+        fare_attributes,
+        "fare_attributes.txt",
+        SkippedTableKind::Assembled,
+        feed,
+        skipped,
+    );
+    take_table(
+        fare_rules,
+        "fare_rules.txt",
+        SkippedTableKind::Assembled,
+        feed,
+        skipped,
+    );
+    take_table(
+        fare_products,
+        "fare_products.txt",
+        SkippedTableKind::Assembled,
+        feed,
+        skipped,
+    );
+    take_table(
+        fare_media,
+        "fare_media.txt",
+        SkippedTableKind::Assembled,
+        feed,
+        skipped,
+    );
+    take_table(
+        rider_categories,
+        "rider_categories.txt",
+        SkippedTableKind::Assembled,
+        feed,
+        skipped,
+    );
+    take_table(
+        transfers,
+        "transfers.txt",
+        SkippedTableKind::Assembled,
+        feed,
+        skipped,
+    );
+    take_table(
+        pathways,
+        "pathways.txt",
+        SkippedTableKind::Assembled,
+        feed,
+        skipped,
+    );
+    take_table(
+        translations,
+        "translations.txt",
+        SkippedTableKind::ParsedOnly,
+        feed,
+        skipped,
+    );
     take_table(
         ticketing_deep_links,
         "ticketing_deep_links.txt",
+        SkippedTableKind::ParsedOnly,
         feed,
         skipped,
     );
     take_table(
         ticketing_identifiers,
         "ticketing_identifiers.txt",
+        SkippedTableKind::ParsedOnly,
         feed,
         skipped,
     );
     if matches!(feed_info, Some(Err(_))) {
-        take_table(feed_info, "feed_info.txt", feed, skipped);
+        take_table(
+            feed_info,
+            "feed_info.txt",
+            SkippedTableKind::Assembled,
+            feed,
+            skipped,
+        );
     }
 }
 
@@ -477,6 +534,7 @@ fn skip_unused_tables(raw: &mut RawGtfs, feed: FeedIndex, skipped: &mut Vec<Skip
 fn take_table<T>(
     table: &mut Option<Result<Vec<T>, gtfs_structures::Error>>,
     file_name: &str,
+    kind: SkippedTableKind,
     feed: FeedIndex,
     skipped: &mut Vec<SkippedFile>,
 ) {
@@ -485,6 +543,7 @@ fn take_table<T>(
             feed,
             file_name: file_name.to_string(),
             reason: crate::error_chain(&error),
+            kind,
         });
     }
 }

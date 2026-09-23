@@ -687,11 +687,14 @@ def test_timepoint_feeds_are_repaired_at_ingest(tmp_path):
     assert journeys[0]["arrival_s"] == 8 * 3600 + 10 * 60
 
 
-def test_unused_tables_that_fail_to_parse_are_skipped_with_a_warning(tmp_path):
+def test_unused_tables_that_fail_to_parse_are_skipped_with_a_warning(tmp_path, caplog):
     # A rider_categories.txt in its pre-2024 draft layout lacks the
     # column the parser requires. Routing never reads the table, so the
-    # feed loads and the warning names the file and the cause; a table
-    # routing needs stays fatal, with the cause in the message.
+    # feed loads and the warning names the file and the cause. A
+    # translations.txt in its pre-2020 layout, a table the parser never
+    # assembled, is only noted on the build log. A table routing needs
+    # stays fatal, with the cause in the message.
+    import logging
     import zipfile
 
     feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
@@ -700,11 +703,20 @@ def test_unused_tables_that_fail_to_parse_are_skipped_with_a_warning(tmp_path):
             "rider_categories.txt",
             "rider_category_id,rider_category_name,min_age,max_age\nadult,Adult,,\n",
         )
-    with pytest.warns(
-        UserWarning, match=r"skipped rider_categories\.txt .*is_default_fare_category"
+        archive.writestr("translations.txt", "trans_id,lang,translation\nOne,sv,Ett\n")
+    with (
+        caplog.at_level(logging.INFO, logger="cafein"),
+        pytest.warns(
+            UserWarning,
+            match=r"skipped rider_categories\.txt .*is_default_fare_category",
+        ) as warned,
     ):
         network = TransportNetwork.from_gtfs(feed)
     assert network.stop_count == 3
+    assert not any("translations" in str(entry.message) for entry in warned)
+    assert any(
+        "skipped translations.txt" in record.getMessage() for record in caplog.records
+    )
     broken = tmp_path / "broken_calendar.zip"
     with zipfile.ZipFile(feed) as source, zipfile.ZipFile(broken, "w") as target:
         for name in source.namelist():

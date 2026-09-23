@@ -199,8 +199,9 @@ fn skips_unused_tables_that_fail_to_parse() {
     // rider_categories.txt in its pre-2024 draft layout lacks the
     // column the parser requires; routing never reads the table, so
     // the feed loads and the skip is reported with its cause. A
-    // transfer to a stop the feed lacks is dropped silently, and a
-    // clean feed_info.txt is kept.
+    // translations.txt in its pre-2020 layout is skipped too, marked
+    // as a table the parser never assembled. A transfer to a stop the
+    // feed lacks is dropped silently, and a clean feed_info.txt is kept.
     let feed = read_zip_bytes(
         "skip",
         &minimal_feed_zip(
@@ -216,6 +217,10 @@ fn skips_unused_tables_that_fail_to_parse() {
                     "from_stop_id,to_stop_id,transfer_type\nS1,NOWHERE,0\n",
                 ),
                 (
+                    "translations.txt",
+                    "trans_id,lang,translation\nOne,sv,Ett\n",
+                ),
+                (
                     "feed_info.txt",
                     "feed_publisher_name,feed_publisher_url,feed_lang\nPub,http://example.com,fi\n",
                 ),
@@ -225,10 +230,13 @@ fn skips_unused_tables_that_fail_to_parse() {
     .unwrap();
     assert_eq!(feed.trips.len(), 1);
     assert_eq!(feed.feed_infos.len(), 1);
-    assert_eq!(feed.skipped_files.len(), 1);
+    assert_eq!(feed.skipped_files.len(), 2);
     let skipped = &feed.skipped_files[0];
     assert_eq!(skipped.feed, 0);
     assert_eq!(skipped.file_name, "rider_categories.txt");
+    assert_eq!(skipped.kind, SkippedTableKind::Assembled);
+    assert_eq!(feed.skipped_files[1].file_name, "translations.txt");
+    assert_eq!(feed.skipped_files[1].kind, SkippedTableKind::ParsedOnly);
     assert!(
         skipped.reason.contains("is_default_fare_category") && skipped.reason.contains("line: 2"),
         "{}",

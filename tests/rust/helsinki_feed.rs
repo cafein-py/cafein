@@ -5,7 +5,7 @@ mod common;
 
 use std::sync::OnceLock;
 
-use cafein_gtfs::{Feed, RouteType};
+use cafein_gtfs::{Feed, RouteType, SkippedTableKind};
 
 const SECONDS_PER_DAY: u32 = 24 * 60 * 60;
 
@@ -28,6 +28,17 @@ fn reads_all_tables() {
     assert_eq!(feed.calendars.len(), 4068);
     assert_eq!(feed.calendar_dates.len(), 32);
     assert!(feed.skipped_frequencies.is_empty());
+    // The sample feed's translations.txt is in the pre-2020 layout: a
+    // table the parser never assembled, skipped without a warning.
+    let skipped: Vec<(&str, SkippedTableKind)> = feed
+        .skipped_files
+        .iter()
+        .map(|skipped| (skipped.file_name.as_str(), skipped.kind))
+        .collect();
+    assert_eq!(
+        skipped,
+        [("translations.txt", SkippedTableKind::ParsedOnly)]
+    );
 
     let agency = &feed.agencies[0];
     assert_eq!(agency.name, "Helsingin seudun liikenne");
