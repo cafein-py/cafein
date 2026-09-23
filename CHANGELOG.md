@@ -2,13 +2,18 @@
 
 ## Unreleased
 
-- A row of `trips.txt` or `stop_times.txt` that fails to parse no longer
-  refuses the feed: the trip it belongs to is dropped whole (its trips
-  row and all its stop times), with a warning naming the file, the
-  first failing line and its cause, and the trips dropped. A table
-  whose rows all fail, a failing row without a readable trip id, or a
-  ragged failing row still fails the read as before.
-  ([#389](https://github.com/cafein-py/cafein/pull/389))
+- A row of a table routing needs (`agency.txt`, `stops.txt`,
+  `routes.txt`, `trips.txt`, `stop_times.txt`, `calendar.txt`,
+  `calendar_dates.txt`) that fails to parse no longer refuses the feed:
+  the row is dropped with what depended on it (a stop or route takes
+  the trips using it, a trip its stop times, a stop time its whole
+  trip; a calendar row leaves its service with less data), with a
+  warning naming the file, the first failing line and its cause, and
+  what was dropped. A table whose rows all fail, a failing row without
+  a readable key, or a ragged failing row in a table others depend on
+  still fails the read as before.
+  ([#389](https://github.com/cafein-py/cafein/pull/389),
+  [#390](https://github.com/cafein-py/cafein/pull/390))
 - Frequency-based trips: `frequencies.txt` is expanded at ingest into
   one scheduled run per departure inside each window (both
   `exact_times` values alike), every run under the template's trip id,

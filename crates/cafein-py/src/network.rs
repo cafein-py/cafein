@@ -177,17 +177,22 @@ impl TransportNetwork {
             )?;
         }
         for dropped in &feed.dropped_rows {
+            let took = if dropped.trips_dropped > 0 {
+                format!(" and the {} trip(s) they belong to", dropped.trips_dropped)
+            } else if dropped.services_affected > 0 {
+                format!("; {} service(s) lost a row", dropped.services_affected)
+            } else {
+                String::new()
+            };
             crate::logging::build_warning(
                 py,
                 format!(
-                    "{}: dropped {} row(s) of {} that failed to parse (first at line {}: {}) \
-                     and the {} trip(s) they belong to",
+                    "{}: dropped {} row(s) of {} that failed to parse (first at line {}: {}){took}",
                     paths[dropped.feed as usize],
                     dropped.rows,
                     dropped.file_name,
                     dropped.first_line,
                     dropped.first_reason,
-                    dropped.trips_dropped
                 ),
             )?;
         }

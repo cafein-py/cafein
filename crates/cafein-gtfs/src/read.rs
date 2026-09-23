@@ -56,9 +56,9 @@ impl Feed {
 /// than failing the read. frequencies.txt is routing input, so its
 /// parse failure surfaces; its rows are returned beside the feed for
 /// expansion (the parser's own trip assembly never sees them). A row
-/// of trips.txt or stop_times.txt that fails to parse drops the trip it
-/// belongs to, recorded in `dropped`, rather than the feed. Any other
-/// failure surfaces.
+/// of a table routing needs that fails to parse is dropped with what
+/// depended on it, recorded in `dropped`, rather than failing the
+/// feed. Any other failure surfaces.
 fn read_gtfs(
     path: &Path,
     feed: FeedIndex,
@@ -76,7 +76,7 @@ fn read_gtfs(
     if let Some(sanitized) = colour_free_copy(&raw, &source) {
         raw = reader.read_from_reader(Cursor::new(sanitized))?;
     }
-    recover_trip_tables(&mut raw, &source, feed, dropped);
+    recover_tables(&mut raw, &source, feed, dropped);
     let frequencies = raw.frequencies.take().transpose()?.unwrap_or_default();
     skip_unused_tables(&mut raw, feed, skipped);
     Ok((Gtfs::try_from(raw)?, frequencies))
@@ -113,39 +113,105 @@ impl Source {
     }
 }
 
-/// Re-reads trips.txt and stop_times.txt leniently when the strict
-/// parse of either failed on a row. A failed row drops the whole trip
-/// it belongs to (its trips.txt row and its every stop_times.txt row),
-/// so no partial trip and no orphan reaches the feed. A pass that
-/// cannot recover safely leaves the table's error in place, and it
-/// surfaces.
-fn recover_trip_tables(
+/// Re-reads the tables routing needs leniently when the strict parse
+/// of one failed on a row. The rows that fail are dropped, and what
+/// depended on them goes too: a stops.txt or routes.txt row takes the
+/// trips using it, a trips.txt row its stop times, a stop_times.txt
+/// row its trip's every row, so no partial trip and no orphan reaches
+/// the feed; a calendar row leaves its service with less data, an
+/// agency row nothing. A pass that cannot recover safely leaves the
+/// table's error in place, and it surfaces.
+fn recover_tables(
     raw: &mut RawGtfs,
     source: &Source,
     feed: FeedIndex,
     dropped: &mut Vec<DroppedRows>,
 ) {
-    let mut reports: Vec<(&str, Vec<DroppedRow>, HashSet<String>)> = Vec::new();
-    if failed_on_a_row(&raw.trips) {
-        if let Some((rows, bad)) = lenient_table::<RawTrip>(source, "trips.txt", Some("trip_id")) {
-            let keys = bad.iter().filter_map(|row| row.key.clone()).collect();
-            reports.push(("trips.txt", bad, keys));
-            raw.trips = Ok(rows);
-        }
-    }
-    if failed_on_a_row(&raw.stop_times) {
-        if let Some((rows, bad)) =
-            lenient_table::<RawStopTime>(source, "stop_times.txt", Some("trip_id"))
-        {
-            let keys = bad.iter().filter_map(|row| row.key.clone()).collect();
-            reports.push(("stop_times.txt", bad, keys));
-            raw.stop_times = Ok(rows);
-        }
-    }
-    if reports.is_empty() {
+    let agencies = recover(&mut raw.agencies, || {
+        lenient_table::<gtfs_structures::Agency>(source, "agency.txt", None, &[])
+    });
+    let stops = recover(&mut raw.stops, || {
+        lenient_table::<gtfs_structures::Stop>(source, "stops.txt", Some("stop_id"), &[])
+    });
+    let routes = recover(&mut raw.routes, || {
+        // Without the colour columns, as the strict retry reads it: an
+        // invalid colour is not a bad row.
+        lenient_table::<gtfs_structures::Route>(
+            source,
+            "routes.txt",
+            Some("route_id"),
+            &COLOUR_COLUMNS,
+        )
+    });
+    let trips = recover(&mut raw.trips, || {
+        lenient_table::<RawTrip>(source, "trips.txt", Some("trip_id"), &[])
+    });
+    let stop_times = recover(&mut raw.stop_times, || {
+        lenient_table::<RawStopTime>(source, "stop_times.txt", Some("trip_id"), &[])
+    });
+    let calendar = raw.calendar.as_mut().and_then(|table| {
+        recover(table, || {
+            lenient_table::<gtfs_structures::Calendar>(
+                source,
+                "calendar.txt",
+                Some("service_id"),
+                &[],
+            )
+        })
+    });
+    let calendar_dates = raw.calendar_dates.as_mut().and_then(|table| {
+        recover(table, || {
+            lenient_table::<gtfs_structures::CalendarDate>(
+                source,
+                "calendar_dates.txt",
+                Some("service_id"),
+                &[],
+            )
+        })
+    });
+    if [
+        &agencies,
+        &stops,
+        &routes,
+        &trips,
+        &stop_times,
+        &calendar,
+        &calendar_dates,
+    ]
+    .iter()
+    .all(|report| report.is_none())
+    {
         return;
     }
-    let doomed: HashSet<&String> = reports.iter().flat_map(|(_, _, keys)| keys).collect();
+
+    let doomed_stops = keys(&stops);
+    let doomed_routes = keys(&routes);
+    let own_trips = keys(&trips);
+    let named_trips = keys(&stop_times);
+    let mut via_stops: HashSet<String> = HashSet::new();
+    if let Ok(stop_times) = &raw.stop_times {
+        via_stops.extend(
+            stop_times
+                .iter()
+                .filter(|stop_time| doomed_stops.contains(&stop_time.stop_id))
+                .map(|stop_time| stop_time.trip_id.clone()),
+        );
+    }
+    let mut via_routes: HashSet<String> = HashSet::new();
+    if let Ok(trips) = &raw.trips {
+        via_routes.extend(
+            trips
+                .iter()
+                .filter(|trip| doomed_routes.contains(&trip.route_id))
+                .map(|trip| trip.id.clone()),
+        );
+    }
+    let doomed_trips: HashSet<&String> = via_stops
+        .iter()
+        .chain(&via_routes)
+        .chain(&own_trips)
+        .chain(&named_trips)
+        .collect();
     // The trips a report may take along: those that parsed, plus a
     // dropped trips.txt row's own trip.
     let mut known: HashSet<String> = raw
@@ -153,28 +219,74 @@ fn recover_trip_tables(
         .as_ref()
         .map(|trips| trips.iter().map(|trip| trip.id.clone()).collect())
         .unwrap_or_default();
-    for (file_name, _, keys) in &reports {
-        if *file_name == "trips.txt" {
-            known.extend(keys.iter().cloned());
-        }
-    }
+    known.extend(own_trips.iter().cloned());
     if let Ok(trips) = &mut raw.trips {
-        trips.retain(|trip| !doomed.contains(&trip.id));
+        trips.retain(|trip| !doomed_trips.contains(&trip.id));
     }
     if let Ok(stop_times) = &mut raw.stop_times {
-        stop_times.retain(|stop_time| !doomed.contains(&stop_time.trip_id));
+        stop_times.retain(|stop_time| !doomed_trips.contains(&stop_time.trip_id));
     }
-    for (file_name, bad, keys) in reports {
+    if let Ok(stops) = &mut raw.stops {
+        for stop in stops.iter_mut() {
+            if stop
+                .parent_station
+                .as_ref()
+                .is_some_and(|parent| doomed_stops.contains(parent))
+            {
+                stop.parent_station = None;
+            }
+        }
+    }
+    let count = |ids: &HashSet<String>| ids.iter().filter(|id| known.contains(*id)).count() as u32;
+    let services = keys(&calendar).len() as u32;
+    let date_services = keys(&calendar_dates).len() as u32;
+    let reports = [
+        ("agency.txt", agencies, 0, 0),
+        ("stops.txt", stops, count(&via_stops), 0),
+        ("routes.txt", routes, count(&via_routes), 0),
+        ("trips.txt", trips, count(&own_trips), 0),
+        ("stop_times.txt", stop_times, count(&named_trips), 0),
+        ("calendar.txt", calendar, 0, services),
+        ("calendar_dates.txt", calendar_dates, 0, date_services),
+    ];
+    for (file_name, bad, trips_dropped, services_affected) in reports {
+        let Some(bad) = bad else {
+            continue;
+        };
         dropped.push(DroppedRows {
             feed,
             file_name: file_name.to_string(),
             rows: bad.len() as u32,
             first_line: bad[0].line,
             first_reason: bad[0].reason.clone(),
-            trips_dropped: keys.iter().filter(|id| known.contains(*id)).count() as u32,
-            services_affected: 0,
+            trips_dropped,
+            services_affected,
         });
     }
+}
+
+/// The keys of a report's dropped rows.
+fn keys(report: &Option<Vec<DroppedRow>>) -> HashSet<String> {
+    report
+        .iter()
+        .flatten()
+        .filter_map(|row| row.key.clone())
+        .collect()
+}
+
+/// Replaces a table that failed on a row with its lenient re-read and
+/// returns the rows dropped; `None` when the table parsed, or when the
+/// pass could not recover it.
+fn recover<T>(
+    table: &mut Result<Vec<T>, gtfs_structures::Error>,
+    pass: impl FnOnce() -> Option<(Vec<T>, Vec<DroppedRow>)>,
+) -> Option<Vec<DroppedRow>> {
+    if !failed_on_a_row(table) {
+        return None;
+    }
+    let (rows, bad) = pass()?;
+    *table = Ok(rows);
+    Some(bad)
 }
 
 fn failed_on_a_row<T>(table: &Result<Vec<T>, gtfs_structures::Error>) -> bool {
@@ -195,27 +307,38 @@ fn lenient_table<T: DeserializeOwned>(
     source: &Source,
     file_name: &str,
     key_column: Option<&str>,
+    drop_columns: &[&str],
 ) -> Option<(Vec<T>, Vec<DroppedRow>)> {
-    lenient_rows(&table_bytes(source, file_name)?, key_column)
+    lenient_rows(&table_bytes(source, file_name)?, key_column, drop_columns)
 }
 
 /// The rows of a table that parse, beside the rows that do not, read
 /// as the strict parser reads them (flexible record lengths, trimmed
-/// fields) so every row it would accept is kept. `None` when the pass
-/// cannot recover safely: the table has no header or, for a cascading
-/// table, no key column; a dropped row's key is blank or unreadable (a
-/// ragged row shifts its columns); the reader itself fails; no row
-/// parses; or none fails.
+/// fields) so every row it would accept is kept; `drop_columns` are
+/// left out of every record, as the strict retry leaves out the colour
+/// columns, with each row's position kept from the file. `None` when
+/// the pass cannot recover safely: the table has no header or, for a
+/// cascading table, no key column; a dropped row's key is blank or
+/// unreadable (a ragged row shifts its columns); the reader itself
+/// fails; no row parses; or none fails.
 fn lenient_rows<T: DeserializeOwned>(
     bytes: &[u8],
     key_column: Option<&str>,
+    drop_columns: &[&str],
 ) -> Option<(Vec<T>, Vec<DroppedRow>)> {
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     let mut reader = csv::ReaderBuilder::new()
         .flexible(true)
         .trim(csv::Trim::All)
         .from_reader(bytes);
-    let headers = reader.headers().ok()?.clone();
+    let all_headers = reader.headers().ok()?.clone();
+    let kept: Vec<usize> = all_headers
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| !drop_columns.contains(&name.trim()))
+        .map(|(index, _)| index)
+        .collect();
+    let headers: csv::StringRecord = kept.iter().map(|&index| &all_headers[index]).collect();
     let key_index = match key_column {
         Some(name) => Some(headers.iter().position(|header| header == name)?),
         None => None,
@@ -224,14 +347,20 @@ fn lenient_rows<T: DeserializeOwned>(
     let mut dropped = Vec::new();
     for record in reader.records() {
         let record = record.ok()?;
-        match record.deserialize::<T>(Some(&headers)) {
+        let ragged = record.len() != all_headers.len();
+        let line = record.position().map_or(0, |position| position.line());
+        let mut fields: csv::StringRecord =
+            kept.iter().filter_map(|&index| record.get(index)).collect();
+        // The parser's error names the row by this position.
+        fields.set_position(record.position().cloned());
+        match fields.deserialize::<T>(Some(&headers)) {
             Ok(row) => rows.push(row),
             Err(error) => {
                 let key = match key_index {
                     None => None,
-                    Some(_) if record.len() != headers.len() => return None,
+                    Some(_) if ragged => return None,
                     Some(index) => {
-                        let key = record.get(index)?;
+                        let key = fields.get(index)?;
                         if key.is_empty() {
                             return None;
                         }
@@ -239,7 +368,7 @@ fn lenient_rows<T: DeserializeOwned>(
                     }
                 };
                 dropped.push(DroppedRow {
-                    line: record.position().map_or(0, |position| position.line()),
+                    line,
                     key,
                     reason: error.to_string(),
                 });
@@ -400,6 +529,9 @@ fn archive_without_colours(source: &Source) -> Result<Vec<u8>, SanitizeError> {
     Ok(writer.finish()?.into_inner())
 }
 
+/// The cosmetic columns routing never reads.
+const COLOUR_COLUMNS: [&str; 2] = ["route_color", "route_text_color"];
+
 /// routes.txt with the `route_color`/`route_text_color` columns removed.
 ///
 /// Record lengths are enforced strictly: a ragged row fails the rewrite
@@ -412,7 +544,7 @@ fn without_colour_columns(bytes: &[u8]) -> Result<Vec<u8>, SanitizeError> {
     let kept: Vec<usize> = headers
         .iter()
         .enumerate()
-        .filter(|(_, name)| !matches!(name.trim(), "route_color" | "route_text_color"))
+        .filter(|(_, name)| !COLOUR_COLUMNS.contains(&name.trim()))
         .map(|(index, _)| index)
         .collect();
     let mut writer = csv::Writer::from_writer(Vec::new());
