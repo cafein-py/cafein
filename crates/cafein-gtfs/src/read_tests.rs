@@ -262,3 +262,104 @@ fn keeps_errors_in_tables_routing_needs() {
         "{message}"
     );
 }
+
+#[test]
+fn expands_frequency_templates_into_runs() {
+    // T1 has two windows (one per exact_times value, adjoining), a row
+    // with a zero headway, and a row whose runs would pass the end of
+    // the representable clock; T2's only row ends before it starts; T9
+    // is not a trip. Runs replace T1 in place, T2 is omitted, and each
+    // problem is reported once.
+    let feed = read_zip_bytes(
+        "frequencies",
+        &minimal_feed_zip(
+            "",
+            "",
+            &[
+                (
+                    "trips.txt",
+                    "route_id,service_id,trip_id\nR1,SV,T1\nR1,SV,T2\n",
+                ),
+                (
+                    "stop_times.txt",
+                    "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+                     T1,08:00:00,08:00:00,S1,1\nT1,08:10:00,08:10:00,S2,2\n\
+                     T2,09:00:00,09:00:00,S1,1\nT2,09:10:00,09:10:00,S2,2\n",
+                ),
+                (
+                    "frequencies.txt",
+                    "trip_id,start_time,end_time,headway_secs,exact_times\n\
+                     T1,06:00:00,07:00:00,1200,1\nT1,07:00:00,07:30:00,900,0\n\
+                     T1,08:00:00,09:00:00,0,1\nT1,1193046:20:00,1193046:28:00,240,1\n\
+                     T2,10:00:00,09:00:00,600,1\nT9,06:00:00,07:00:00,600,1\n",
+                ),
+            ],
+        ),
+    )
+    .unwrap();
+    let departures: Vec<u32> = feed
+        .trips
+        .iter()
+        .map(|trip| trip.stop_times[0].departure.unwrap())
+        .collect();
+    assert_eq!(departures, vec![21600, 22800, 24000, 25200, 26100]);
+    assert!(feed.trips.iter().all(|trip| trip.id == "T1"));
+    let last = feed.trips.last().unwrap();
+    assert_eq!(last.stop_times[1].arrival, Some(26100 + 600));
+    assert_eq!(last.stop_times.len(), 2);
+    let reported: Vec<(&str, &str)> = feed
+        .skipped_frequencies
+        .iter()
+        .map(|skipped| (skipped.trip_id.as_str(), skipped.reason.as_str()))
+        .collect();
+    assert_eq!(reported.len(), 5, "{reported:?}");
+    assert_eq!(reported[0].0, "T1");
+    assert!(reported[0].1.contains("headway_secs is 0"), "{reported:?}");
+    assert!(reported[1].1.contains("outside the clock"), "{reported:?}");
+    assert_eq!(reported[2].0, "T2");
+    assert!(
+        reported[2].1.contains("end_time is not after"),
+        "{reported:?}"
+    );
+    assert_eq!(
+        reported[3],
+        (
+            "T2",
+            "omitted: none of its frequencies.txt rows could be expanded"
+        )
+    );
+    assert_eq!(reported[4].0, "T9");
+    assert!(reported[4].1.contains("no such trip"), "{reported:?}");
+    // A row whose runs would outgrow the feed-wide budget refuses the
+    // feed before any run is built.
+    let error = read_zip_bytes(
+        "frequency-budget",
+        &minimal_feed_zip(
+            "",
+            "",
+            &[(
+                "frequencies.txt",
+                "trip_id,start_time,end_time,headway_secs\nT1,00:00:00,1193046:00:00,1\n",
+            )],
+        ),
+    )
+    .unwrap_err();
+    assert!(
+        crate::error_chain(&error).contains("more than 100000000 stop times"),
+        "{error}"
+    );
+    // A frequencies.txt that fails to parse fails the feed.
+    let error = read_zip_bytes(
+        "bad-frequencies",
+        &minimal_feed_zip(
+            "",
+            "",
+            &[(
+                "frequencies.txt",
+                "trip_id,start_time,end_time,headway_secs\nT1,06:00:00,07:00:00,soon\n",
+            )],
+        ),
+    )
+    .unwrap_err();
+    assert!(crate::error_chain(&error).contains("frequencies.txt"));
+}

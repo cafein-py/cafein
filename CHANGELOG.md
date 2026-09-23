@@ -2,9 +2,18 @@
 
 ## Unreleased
 
+- Frequency-based trips: `frequencies.txt` is expanded at ingest into
+  one scheduled run per departure inside each window (both
+  `exact_times` values alike), every run under the template's trip id,
+  so exclusions, distances and geometries keyed by that id apply to
+  every run; the template itself is never routed. Rows that cannot be
+  expanded are skipped with a warning; a `frequencies.txt` that fails
+  to parse is a read error.
+  ([#387](https://github.com/cafein-py/cafein/pull/387),
+  [#388](https://github.com/cafein-py/cafein/pull/388))
 - A GTFS feed loads even when an optional table routing never uses
   (`rider_categories.txt`, the `fare_*.txt` tables, `transfers.txt`,
-  `frequencies.txt`, `pathways.txt`, …) fails to parse: the table is
+  `pathways.txt`, …) fails to parse: the table is
   skipped with a warning naming the file and the cause instead of the
   whole feed being refused, and a fatal read error now states its
   cause down to the offending line.
