@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.26.0 — 2026-09-23
 
 - A row of a table routing needs (`agency.txt`, `stops.txt`,
   `routes.txt`, `trips.txt`, `stop_times.txt`, `calendar.txt`,
