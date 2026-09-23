@@ -31,7 +31,8 @@
   `translations.txt` or the ticketing tables, is noted on the build log
   instead), and a fatal read error now states its cause down to the
   offending line.
-  ([#386](https://github.com/cafein-py/cafein/pull/386))
+  ([#386](https://github.com/cafein-py/cafein/pull/386),
+  [#391](https://github.com/cafein-py/cafein/pull/391))
 
 ## 0.25.0 — 2026-09-09
 
