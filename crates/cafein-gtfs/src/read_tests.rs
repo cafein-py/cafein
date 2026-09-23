@@ -57,8 +57,13 @@ fn minimal_feed_zip(
 }
 
 fn read_zip_bytes(tag: &str, bytes: &[u8]) -> Result<Feed, Error> {
-    let path =
-        std::env::temp_dir().join(format!("cafein-read-test-{}-{tag}.zip", std::process::id()));
+    // Tests run concurrently: every call gets its own file.
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "cafein-read-test-{}-{tag}-{call}.zip",
+        std::process::id()
+    ));
     std::fs::write(&path, bytes).unwrap();
     let feed = Feed::from_path(&path);
     std::fs::remove_file(&path).ok();
@@ -362,4 +367,108 @@ fn expands_frequency_templates_into_runs() {
     )
     .unwrap_err();
     assert!(crate::error_chain(&error).contains("frequencies.txt"));
+}
+
+/// Two trips over the minimal feed's stops, with the given trips.txt
+/// and stop_times.txt tables.
+fn two_trip_feed_zip(trips: &str, stop_times: &str) -> Vec<u8> {
+    minimal_feed_zip(
+        "",
+        "",
+        &[("trips.txt", trips), ("stop_times.txt", stop_times)],
+    )
+}
+
+#[test]
+fn drops_trips_whose_rows_fail_to_parse() {
+    // A stop_times.txt row with a malformed time drops its trip whole
+    // (both of T2's rows), keeps T1, and is reported with its line.
+    let feed = read_zip_bytes(
+        "bad-stop-time",
+        &two_trip_feed_zip(
+            "route_id,service_id,trip_id\nR1,SV,T1\nR1,SV,T2\n",
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+             T1,08:00:00,08:00:00,S1,1\nT1,08:10:00,08:10:00,S2,2\n\
+             T2,9:00,09:00:00,S1,1\nT2,09:10:00,09:10:00,S2,2\n",
+        ),
+    )
+    .unwrap();
+    let ids: Vec<&str> = feed.trips.iter().map(|trip| trip.id.as_str()).collect();
+    assert_eq!(ids, ["T1"]);
+    assert_eq!(feed.trips[0].stop_times.len(), 2);
+    let report = &feed.dropped_rows[0];
+    assert_eq!(feed.dropped_rows.len(), 1);
+    assert_eq!(
+        (
+            report.file_name.as_str(),
+            report.rows,
+            report.first_line,
+            report.trips_dropped
+        ),
+        ("stop_times.txt", 1, 4, 1)
+    );
+    assert!(
+        report.first_reason.contains("line: 4"),
+        "{}",
+        report.first_reason
+    );
+    // A trips.txt row that fails drops the trip and its stop times, so
+    // the parser never meets an orphan.
+    let feed = read_zip_bytes(
+        "bad-trip",
+        &two_trip_feed_zip(
+            "route_id,service_id,trip_id,direction_id\nR1,SV,T1,0\nR1,SV,T2,x\n",
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+             T1,08:00:00,08:00:00,S1,1\nT1,08:10:00,08:10:00,S2,2\n\
+             T2,09:00:00,09:00:00,S1,1\nT2,09:10:00,09:10:00,S2,2\n",
+        ),
+    )
+    .unwrap();
+    assert_eq!(feed.trips.len(), 1);
+    assert_eq!(feed.dropped_rows[0].file_name, "trips.txt");
+    assert_eq!(feed.dropped_rows[0].trips_dropped, 1);
+}
+
+#[test]
+fn keeps_row_failures_the_cascade_cannot_trust() {
+    // A missing required column fails every row; a failing row whose
+    // trip id is blank, and a ragged failing row (a field short or an
+    // extra one: the key cannot be read by column), keep the strict
+    // error.
+    let tables = [
+        (
+            "no-sequence",
+            "trip_id,arrival_time,departure_time,stop_id\n\
+             T1,08:00:00,08:00:00,S1\nT1,08:10:00,08:10:00,S2\n",
+        ),
+        (
+            "blank-key",
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+             T1,08:00:00,08:00:00,S1,1\nT1,08:10:00,08:10:00,S2,2\n,09:00:00,09:00:00,S1,x\n",
+        ),
+        (
+            "field-short",
+            "arrival_time,departure_time,stop_id,stop_sequence,trip_id\n\
+             08:00:00,08:00:00,S1,1,T1\n08:10:00,08:10:00,S2,2,T1\n09:00:00,S1,1,T2\n",
+        ),
+        (
+            "extra-field",
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+             T1,08:00:00,08:00:00,S1,1\nT1,08:10:00,08:10:00,S2,2\nT2,9:00,09:00:00,S1,1,extra\n",
+        ),
+    ];
+    for (tag, stop_times) in tables {
+        let error = read_zip_bytes(
+            tag,
+            &two_trip_feed_zip(
+                "route_id,service_id,trip_id\nR1,SV,T1\nR1,SV,T2\n",
+                stop_times,
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            crate::error_chain(&error).contains("stop_times.txt"),
+            "{tag}: {error}"
+        );
+    }
 }
