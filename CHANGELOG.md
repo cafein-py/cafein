@@ -8,6 +8,7 @@
   first failing line and its cause, and the trips dropped. A table
   whose rows all fail, a failing row without a readable trip id, or a
   ragged failing row still fails the read as before.
+  ([#389](https://github.com/cafein-py/cafein/pull/389))
 - Frequency-based trips: `frequencies.txt` is expanded at ingest into
   one scheduled run per departure inside each window (both
   `exact_times` values alike), every run under the template's trip id,
