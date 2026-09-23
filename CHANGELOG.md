@@ -27,8 +27,10 @@
   (`rider_categories.txt`, the `fare_*.txt` tables, `transfers.txt`,
   `pathways.txt`, …) fails to parse: the table is
   skipped with a warning naming the file and the cause instead of the
-  whole feed being refused, and a fatal read error now states its
-  cause down to the offending line.
+  whole feed being refused (a table the parser never assembled, such as
+  `translations.txt` or the ticketing tables, is noted on the build log
+  instead), and a fatal read error now states its cause down to the
+  offending line.
   ([#386](https://github.com/cafein-py/cafein/pull/386))
 
 ## 0.25.0 — 2026-09-09

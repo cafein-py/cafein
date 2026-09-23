@@ -168,13 +168,24 @@ impl TransportNetwork {
         let feed = Feed::from_paths(&paths).map_err(to_py_error)?;
         timer.finish();
         for skipped in &feed.skipped_files {
-            crate::logging::build_warning(
-                py,
-                format!(
-                    "{}: skipped {} (routing does not use it): {}",
-                    paths[skipped.feed as usize], skipped.file_name, skipped.reason
+            let message = format!(
+                "{}: skipped {} (routing does not use it): {}",
+                paths[skipped.feed as usize], skipped.file_name, skipped.reason
+            );
+            match skipped.kind {
+                cafein_gtfs::SkippedTableKind::Assembled => {
+                    crate::logging::build_warning(py, message)?
+                }
+                // A table the parser never assembled either: a log
+                // line, not a warning.
+                cafein_gtfs::SkippedTableKind::ParsedOnly => crate::logging::emit(
+                    "cafein.build",
+                    crate::logging::INFO,
+                    || message,
+                    None,
+                    None,
                 ),
-            )?;
+            }
         }
         for dropped in &feed.dropped_rows {
             let took = if dropped.trips_dropped > 0 {

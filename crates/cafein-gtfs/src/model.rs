@@ -56,6 +56,19 @@ pub struct SkippedFile {
     pub file_name: String,
     /// The parse error and its causes.
     pub reason: String,
+    pub kind: SkippedTableKind,
+}
+
+/// How much a skipped table ever mattered to the parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkippedTableKind {
+    /// The parser assembled the table into its feed, so a failure used
+    /// to refuse the whole feed: the user is warned.
+    Assembled,
+    /// The parser only ever parsed the table (translations, ticketing)
+    /// and never assembled it, so a failure never had an effect: the
+    /// build log alone records it.
+    ParsedOnly,
 }
 
 /// The rows of one table that failed to parse and were dropped, with
