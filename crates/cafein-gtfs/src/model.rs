@@ -41,6 +41,10 @@ pub struct Feed {
     /// persisted.
     #[serde(skip)]
     pub skipped_frequencies: Vec<SkippedFrequency>,
+    /// Rows of a required table dropped at read time, with the trips
+    /// they took along: a diagnostic, never persisted.
+    #[serde(skip)]
+    pub dropped_rows: Vec<DroppedRows>,
 }
 
 /// An optional GTFS table that failed to parse and was dropped because
@@ -51,6 +55,22 @@ pub struct SkippedFile {
     pub file_name: String,
     /// The parse error and its causes.
     pub reason: String,
+}
+
+/// The rows of one table that failed to parse and were dropped, with
+/// what the drop took along.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedRows {
+    pub feed: FeedIndex,
+    pub file_name: String,
+    pub rows: u32,
+    /// The first dropped row's line in the file, and why it failed.
+    pub first_line: u64,
+    pub first_reason: String,
+    /// Trips removed because a dropped row belonged to them.
+    pub trips_dropped: u32,
+    /// Services that lost a calendar row.
+    pub services_affected: u32,
 }
 
 /// A frequencies.txt row that could not be expanded into runs, or a

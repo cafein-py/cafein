@@ -1,16 +1,18 @@
 //! Reading GTFS archives or directories into a [`Feed`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read as _, Write as _};
 use std::path::Path;
 
 use gtfs_structures::{
     Availability, BikesAllowedType, DirectionType, Gtfs, GtfsReader, RawFrequency, RawGtfs,
+    RawStopTime, RawTrip,
 };
+use serde::de::DeserializeOwned;
 
 use crate::model::{
-    Agency, Calendar, CalendarDate, Feed, FeedIndex, FeedInfo, Route, RouteIndex, SkippedFile,
-    SkippedFrequency, Stop, StopIndex, StopTime, Trip,
+    Agency, Calendar, CalendarDate, DroppedRows, Feed, FeedIndex, FeedInfo, Route, RouteIndex,
+    SkippedFile, SkippedFrequency, Stop, StopIndex, StopTime, Trip,
 };
 use crate::Error;
 
@@ -30,8 +32,12 @@ impl Feed {
         let mut feed = Feed::default();
         for (feed_index, path) in paths.iter().enumerate() {
             let feed_index = feed_index as FeedIndex;
-            let (gtfs, frequencies) =
-                read_gtfs(path.as_ref(), feed_index, &mut feed.skipped_files)?;
+            let (gtfs, frequencies) = read_gtfs(
+                path.as_ref(),
+                feed_index,
+                &mut feed.skipped_files,
+                &mut feed.dropped_rows,
+            )?;
             append_gtfs(&mut feed, feed_index, gtfs, frequencies)?;
         }
         feed.feed_count = paths.len() as FeedIndex;
@@ -49,29 +55,231 @@ impl Feed {
 /// dropped, a parse failure among them recorded in `skipped` rather
 /// than failing the read. frequencies.txt is routing input, so its
 /// parse failure surfaces; its rows are returned beside the feed for
-/// expansion (the parser's own trip assembly never sees them). Any
-/// other failure surfaces.
+/// expansion (the parser's own trip assembly never sees them). A row
+/// of trips.txt or stop_times.txt that fails to parse drops the trip it
+/// belongs to, recorded in `dropped`, rather than the feed. Any other
+/// failure surfaces.
 fn read_gtfs(
     path: &Path,
     feed: FeedIndex,
     skipped: &mut Vec<SkippedFile>,
+    dropped: &mut Vec<DroppedRows>,
 ) -> Result<(Gtfs, Vec<RawFrequency>), Error> {
     let reader = GtfsReader::default().read_shapes(false).raw();
-    let mut raw = reader.read_from_path(path)?;
-    if let Some(sanitized) = colour_free_copy(&raw, path) {
+    let source = Source::open(path)?;
+    let mut raw = match &source {
+        Source::Archive(file) => {
+            reader.read_from_reader(file.try_clone().map_err(gtfs_structures::Error::IO)?)?
+        }
+        Source::Directory(path) => reader.read_from_path(path)?,
+    };
+    if let Some(sanitized) = colour_free_copy(&raw, &source) {
         raw = reader.read_from_reader(Cursor::new(sanitized))?;
     }
+    recover_trip_tables(&mut raw, &source, feed, dropped);
     let frequencies = raw.frequencies.take().transpose()?.unwrap_or_default();
     skip_unused_tables(&mut raw, feed, skipped);
     Ok((Gtfs::try_from(raw)?, frequencies))
 }
 
+/// The feed's source, opened once so every pass over it (the strict
+/// parse, the colour retry, the lenient re-reads) sees the same bytes:
+/// an archive is one open file, which replacing the path cannot
+/// change; a directory is read table by table.
+enum Source {
+    Archive(std::fs::File),
+    Directory(std::path::PathBuf),
+}
+
+impl Source {
+    fn open(path: &Path) -> Result<Source, gtfs_structures::Error> {
+        if path.is_dir() {
+            Ok(Source::Directory(path.to_path_buf()))
+        } else if path.is_file() {
+            Ok(Source::Archive(std::fs::File::open(path)?))
+        } else {
+            Err(gtfs_structures::Error::NotFileNorDirectory(
+                path.display().to_string(),
+            ))
+        }
+    }
+
+    /// The archive through a fresh handle on the same open file.
+    fn archive(&self) -> std::io::Result<Option<zip::ZipArchive<std::fs::File>>> {
+        match self {
+            Source::Archive(file) => Ok(Some(zip::ZipArchive::new(file.try_clone()?)?)),
+            Source::Directory(_) => Ok(None),
+        }
+    }
+}
+
+/// Re-reads trips.txt and stop_times.txt leniently when the strict
+/// parse of either failed on a row. A failed row drops the whole trip
+/// it belongs to (its trips.txt row and its every stop_times.txt row),
+/// so no partial trip and no orphan reaches the feed. A pass that
+/// cannot recover safely leaves the table's error in place, and it
+/// surfaces.
+fn recover_trip_tables(
+    raw: &mut RawGtfs,
+    source: &Source,
+    feed: FeedIndex,
+    dropped: &mut Vec<DroppedRows>,
+) {
+    let mut reports: Vec<(&str, Vec<DroppedRow>, HashSet<String>)> = Vec::new();
+    if failed_on_a_row(&raw.trips) {
+        if let Some((rows, bad)) = lenient_table::<RawTrip>(source, "trips.txt", Some("trip_id")) {
+            let keys = bad.iter().filter_map(|row| row.key.clone()).collect();
+            reports.push(("trips.txt", bad, keys));
+            raw.trips = Ok(rows);
+        }
+    }
+    if failed_on_a_row(&raw.stop_times) {
+        if let Some((rows, bad)) =
+            lenient_table::<RawStopTime>(source, "stop_times.txt", Some("trip_id"))
+        {
+            let keys = bad.iter().filter_map(|row| row.key.clone()).collect();
+            reports.push(("stop_times.txt", bad, keys));
+            raw.stop_times = Ok(rows);
+        }
+    }
+    if reports.is_empty() {
+        return;
+    }
+    let doomed: HashSet<&String> = reports.iter().flat_map(|(_, _, keys)| keys).collect();
+    // The trips a report may take along: those that parsed, plus a
+    // dropped trips.txt row's own trip.
+    let mut known: HashSet<String> = raw
+        .trips
+        .as_ref()
+        .map(|trips| trips.iter().map(|trip| trip.id.clone()).collect())
+        .unwrap_or_default();
+    for (file_name, _, keys) in &reports {
+        if *file_name == "trips.txt" {
+            known.extend(keys.iter().cloned());
+        }
+    }
+    if let Ok(trips) = &mut raw.trips {
+        trips.retain(|trip| !doomed.contains(&trip.id));
+    }
+    if let Ok(stop_times) = &mut raw.stop_times {
+        stop_times.retain(|stop_time| !doomed.contains(&stop_time.trip_id));
+    }
+    for (file_name, bad, keys) in reports {
+        dropped.push(DroppedRows {
+            feed,
+            file_name: file_name.to_string(),
+            rows: bad.len() as u32,
+            first_line: bad[0].line,
+            first_reason: bad[0].reason.clone(),
+            trips_dropped: keys.iter().filter(|id| known.contains(*id)).count() as u32,
+            services_affected: 0,
+        });
+    }
+}
+
+fn failed_on_a_row<T>(table: &Result<Vec<T>, gtfs_structures::Error>) -> bool {
+    matches!(table, Err(gtfs_structures::Error::CSVError { .. }))
+}
+
+/// A row the lenient re-read dropped.
+struct DroppedRow {
+    line: u64,
+    /// The row's value in the key column, when the table cascades.
+    key: Option<String>,
+    reason: String,
+}
+
+/// One table read again leniently, from the archive or directory at
+/// `path`; see [`lenient_rows`].
+fn lenient_table<T: DeserializeOwned>(
+    source: &Source,
+    file_name: &str,
+    key_column: Option<&str>,
+) -> Option<(Vec<T>, Vec<DroppedRow>)> {
+    lenient_rows(&table_bytes(source, file_name)?, key_column)
+}
+
+/// The rows of a table that parse, beside the rows that do not, read
+/// as the strict parser reads them (flexible record lengths, trimmed
+/// fields) so every row it would accept is kept. `None` when the pass
+/// cannot recover safely: the table has no header or, for a cascading
+/// table, no key column; a dropped row's key is blank or unreadable (a
+/// ragged row shifts its columns); the reader itself fails; no row
+/// parses; or none fails.
+fn lenient_rows<T: DeserializeOwned>(
+    bytes: &[u8],
+    key_column: Option<&str>,
+) -> Option<(Vec<T>, Vec<DroppedRow>)> {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .trim(csv::Trim::All)
+        .from_reader(bytes);
+    let headers = reader.headers().ok()?.clone();
+    let key_index = match key_column {
+        Some(name) => Some(headers.iter().position(|header| header == name)?),
+        None => None,
+    };
+    let mut rows = Vec::new();
+    let mut dropped = Vec::new();
+    for record in reader.records() {
+        let record = record.ok()?;
+        match record.deserialize::<T>(Some(&headers)) {
+            Ok(row) => rows.push(row),
+            Err(error) => {
+                let key = match key_index {
+                    None => None,
+                    Some(_) if record.len() != headers.len() => return None,
+                    Some(index) => {
+                        let key = record.get(index)?;
+                        if key.is_empty() {
+                            return None;
+                        }
+                        Some(key.to_string())
+                    }
+                };
+                dropped.push(DroppedRow {
+                    line: record.position().map_or(0, |position| position.line()),
+                    key,
+                    reason: error.to_string(),
+                });
+            }
+        }
+    }
+    if rows.is_empty() || dropped.is_empty() {
+        return None;
+    }
+    Some((rows, dropped))
+}
+
+/// One table's bytes: the archive entry whose file name matches (as
+/// the parser resolves it) or the file in a directory.
+fn table_bytes(source: &Source, file_name: &str) -> Option<Vec<u8>> {
+    let Some(mut archive) = source.archive().ok()? else {
+        let Source::Directory(path) = source else {
+            unreachable!("a source without an archive is a directory");
+        };
+        return std::fs::read(path.join(file_name)).ok();
+    };
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).ok()?;
+        if entry.is_file()
+            && Path::new(entry.name()).file_name() == Some(std::ffi::OsStr::new(file_name))
+        {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).ok()?;
+            return Some(bytes);
+        }
+    }
+    None
+}
+
 /// The colour-less archive copy to retry on when routes.txt failed to
 /// parse; `None` when it parsed, or when the copy cannot be assembled
 /// (the original failure then surfaces).
-fn colour_free_copy(raw: &RawGtfs, path: &Path) -> Option<Vec<u8>> {
+fn colour_free_copy(raw: &RawGtfs, source: &Source) -> Option<Vec<u8>> {
     match raw.routes {
-        Err(gtfs_structures::Error::CSVError { .. }) => archive_without_colours(path).ok(),
+        Err(gtfs_structures::Error::CSVError { .. }) => archive_without_colours(source).ok(),
         _ => None,
     }
 }
@@ -156,10 +364,10 @@ type SanitizeError = Box<dyn std::error::Error + Send + Sync>;
 
 /// An in-memory zip copy of the feed with the colour columns dropped
 /// from routes.txt.
-fn archive_without_colours(path: &Path) -> Result<Vec<u8>, SanitizeError> {
+fn archive_without_colours(source: &Source) -> Result<Vec<u8>, SanitizeError> {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default();
-    if path.is_dir() {
+    if let Source::Directory(path) = source {
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             if !entry.file_type()?.is_file() {
@@ -174,7 +382,7 @@ fn archive_without_colours(path: &Path) -> Result<Vec<u8>, SanitizeError> {
             writer.write_all(&bytes)?;
         }
     } else {
-        let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+        let mut archive = source.archive()?.expect("an archive source");
         for index in 0..archive.len() {
             let entry = archive.by_index_raw(index)?;
             if entry.is_file() && entry.name().ends_with("routes.txt") {

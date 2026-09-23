@@ -764,6 +764,32 @@ def test_frequency_templates_expand_into_runs_under_the_template_id(tmp_path):
         TransportNetwork.from_gtfs(broken)
 
 
+def test_a_malformed_stop_time_row_drops_its_trip_with_a_warning(tmp_path):
+    # One stop_times.txt row with a malformed time drops the whole trip
+    # it belongs to, warned with the file, line and cause; the rest of
+    # the feed routes as before.
+    import zipfile
+
+    source = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
+    feed = tmp_path / "bad_row_gtfs.zip"
+    with zipfile.ZipFile(source) as reader, zipfile.ZipFile(feed, "w") as writer:
+        for name in reader.namelist():
+            table = reader.read(name).decode()
+            if name == "trips.txt":
+                table += "R1,SV,T_BAD\n"
+            elif name == "stop_times.txt":
+                table += "T_BAD,9:00,09:00:00,S1,1\nT_BAD,09:10:00,09:10:00,S2,2\n"
+            writer.writestr(name, table)
+    with pytest.warns(
+        UserWarning,
+        match=r"dropped 1 row\(s\) of stop_times\.txt .*line 6.* and the 1 trip",
+    ):
+        network = TransportNetwork.from_gtfs(feed)
+    assert [trip_id for trip_id, _ in network.trips] == ["T_OK"]
+    journeys = network.route_between_stops("S1", "S2", "2022-02-22 07:30:00")
+    assert journeys[0]["arrival_s"] == 8 * 3600 + 10 * 60
+
+
 def test_qualified_ids_take_precedence_over_colon_raw_ids(tmp_path):
     feed = build_synthetic_gtfs(tmp_path / "synthetic_gtfs.zip")
     with pytest.warns(UserWarning):

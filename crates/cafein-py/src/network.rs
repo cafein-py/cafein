@@ -176,6 +176,21 @@ impl TransportNetwork {
                 ),
             )?;
         }
+        for dropped in &feed.dropped_rows {
+            crate::logging::build_warning(
+                py,
+                format!(
+                    "{}: dropped {} row(s) of {} that failed to parse (first at line {}: {}) \
+                     and the {} trip(s) they belong to",
+                    paths[dropped.feed as usize],
+                    dropped.rows,
+                    dropped.file_name,
+                    dropped.first_line,
+                    dropped.first_reason,
+                    dropped.trips_dropped
+                ),
+            )?;
+        }
         for skipped in &feed.skipped_frequencies {
             crate::logging::build_warning(
                 py,
