@@ -222,20 +222,31 @@ class StreetNetwork:
             records the interval actually used.
         country : str, optional
             ISO 3166-1 alpha-2 code (or 3166-2 subdivision, e.g.
-            ``"US-CA"``) selecting the legal default speed limits that fill
-            ways with no ``maxspeed`` tag. A subdivision falls back to its
-            country, an unknown or omitted code to the generic row, each
-            fallback with a warning. Car builds only.
+            ``"US-CA"``) selecting the row of legal default speed limits
+            that fills ways with no speed tag. Per direction, a
+            ``maxspeed:forward`` / ``maxspeed:backward`` tag wins, then
+            ``maxspeed``, then the row's default for the way's highway
+            class. A subdivision without a row of its own uses its
+            country's row; an unknown or omitted code uses the generic row
+            with a warning. Car builds only.
         urban_areas : geopandas.GeoDataFrame or array of bool, optional
-            Where the urban (inside built-up area) speed defaults apply: a
-            polygon layer resolved per edge by intersection, or a
-            precomputed per-edge boolean. Omitted, every way counts as
-            urban — the conservative default for city extracts. Car builds
-            only.
+            Which ways take the urban (``<class>_inside``) rather than the
+            rural (``<class>_outside``) legal default; living streets,
+            service roads and tracks have one value either way, and a
+            ``*_link`` class its own where the row carries it. A polygon
+            GeoDataFrame must carry a CRS (it is reprojected onto the
+            street data) and marks a way urban when any of its polygons
+            intersects the way's geometry — a boundary touch counts; there
+            is no centroid or containment rule. A boolean array gives the
+            answer per extracted edge and must have one value per edge.
+            Omitted, every way counts as urban — the conservative default
+            for city extracts. Car builds only.
         speed_limits : mapping, optional
             Per-class km/h overrides layered over the resolved country row
-            (e.g. ``{"residential_inside": 30}``); unknown classes and
-            non-positive values are rejected. Car builds only.
+            before untagged ways are filled (e.g.
+            ``{"residential_inside": 30}``); tagged speeds stay above them.
+            Unknown classes and non-positive values are rejected. Car
+            builds only.
         """
         from cafein._validate import validated_bounding_box
 

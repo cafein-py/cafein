@@ -1543,7 +1543,8 @@ class TransportNetwork:
             ``StreetNetwork.from_osm``; only meaningful with
             `street_modes`.
         country, urban_areas, speed_limits : optional
-            Car speed configuration, exactly as in
+            Car speed configuration — the legal-default row, the
+            urban/rural split, the overrides — exactly as in
             ``StreetNetwork.from_osm``; only meaningful with ``"car"``
             in `street_modes`.
         ultra : bool (optional, default: False)
