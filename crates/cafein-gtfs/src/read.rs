@@ -11,8 +11,8 @@ use gtfs_structures::{
 use serde::de::DeserializeOwned;
 
 use crate::model::{
-    Agency, Calendar, CalendarDate, DroppedRows, Feed, FeedIndex, FeedInfo, Route, RouteIndex,
-    SkippedFile, SkippedFrequency, SkippedTableKind, Stop, StopIndex, StopTime, Trip,
+    Agency, BlankDefaults, Calendar, CalendarDate, DroppedRows, Feed, FeedIndex, FeedInfo, Route,
+    RouteIndex, SkippedFile, SkippedFrequency, SkippedTableKind, Stop, StopIndex, StopTime, Trip,
 };
 use crate::Error;
 
@@ -37,6 +37,7 @@ impl Feed {
                 feed_index,
                 &mut feed.skipped_files,
                 &mut feed.dropped_rows,
+                &mut feed.blank_defaults,
             )?;
             append_gtfs(&mut feed, feed_index, gtfs, frequencies)?;
         }
@@ -64,6 +65,7 @@ fn read_gtfs(
     feed: FeedIndex,
     skipped: &mut Vec<SkippedFile>,
     dropped: &mut Vec<DroppedRows>,
+    blank: &mut Vec<BlankDefaults>,
 ) -> Result<(Gtfs, Vec<RawFrequency>), Error> {
     let reader = GtfsReader::default().read_shapes(false).raw();
     let source = Source::open(path)?;
@@ -76,7 +78,7 @@ fn read_gtfs(
     if let Some(sanitized) = colour_free_copy(&raw, &source) {
         raw = reader.read_from_reader(Cursor::new(sanitized))?;
     }
-    recover_tables(&mut raw, &source, feed, dropped);
+    recover_tables(&mut raw, &source, feed, dropped, blank);
     let frequencies = raw.frequencies.take().transpose()?.unwrap_or_default();
     skip_unused_tables(&mut raw, feed, skipped);
     Ok((Gtfs::try_from(raw)?, frequencies))
@@ -119,13 +121,16 @@ impl Source {
 /// trips using it, a trips.txt row its stop times, a stop_times.txt
 /// row its trip's every row, so no partial trip and no orphan reaches
 /// the feed; a calendar row leaves its service with less data, an
-/// agency row nothing. A pass that cannot recover safely leaves the
-/// table's error in place, and it surfaces.
+/// agency row nothing. A row that fails only on a blank optional field
+/// is kept with the field read as its default, and counted in `blank`.
+/// A pass that cannot recover safely leaves the table's error in
+/// place, and it surfaces.
 fn recover_tables(
     raw: &mut RawGtfs,
     source: &Source,
     feed: FeedIndex,
     dropped: &mut Vec<DroppedRows>,
+    blank: &mut Vec<BlankDefaults>,
 ) {
     let agencies = recover(&mut raw.agencies, || {
         lenient_table::<gtfs_structures::Agency>(source, "agency.txt", None, &[])
@@ -249,44 +254,72 @@ fn recover_tables(
         ("calendar.txt", calendar, 0, services),
         ("calendar_dates.txt", calendar_dates, 0, date_services),
     ];
-    for (file_name, bad, trips_dropped, services_affected) in reports {
-        let Some(bad) = bad else {
+    for (file_name, report, trips_dropped, services_affected) in reports {
+        let Some(report) = report else {
+            continue;
+        };
+        if report.blank_defaults > 0 {
+            blank.push(BlankDefaults {
+                feed,
+                file_name: file_name.to_string(),
+                rows: report.blank_defaults,
+            });
+        }
+        let Some(first) = report.dropped.first() else {
             continue;
         };
         dropped.push(DroppedRows {
             feed,
             file_name: file_name.to_string(),
-            rows: bad.len() as u32,
-            first_line: bad[0].line,
-            first_reason: bad[0].reason.clone(),
+            rows: report.dropped.len() as u32,
+            first_line: first.line,
+            first_reason: first.reason.clone(),
             trips_dropped,
             services_affected,
         });
     }
 }
 
-/// The keys of a report's dropped rows.
-fn keys(report: &Option<Vec<DroppedRow>>) -> HashSet<String> {
+/// The keys of a recovery's dropped rows.
+fn keys(report: &Option<Recovery>) -> HashSet<String> {
     report
         .iter()
-        .flatten()
+        .flat_map(|recovery| &recovery.dropped)
         .filter_map(|row| row.key.clone())
         .collect()
 }
 
 /// Replaces a table that failed on a row with its lenient re-read and
-/// returns the rows dropped; `None` when the table parsed, or when the
-/// pass could not recover it.
+/// returns what the re-read reports; `None` when the table parsed, or
+/// when the pass could not recover it.
 fn recover<T>(
     table: &mut Result<Vec<T>, gtfs_structures::Error>,
-    pass: impl FnOnce() -> Option<(Vec<T>, Vec<DroppedRow>)>,
-) -> Option<Vec<DroppedRow>> {
+    pass: impl FnOnce() -> Option<LenientRead<T>>,
+) -> Option<Recovery> {
     if !failed_on_a_row(table) {
         return None;
     }
-    let (rows, bad) = pass()?;
-    *table = Ok(rows);
-    Some(bad)
+    let read = pass()?;
+    *table = Ok(read.rows);
+    Some(Recovery {
+        dropped: read.dropped,
+        blank_defaults: read.blank_defaults,
+    })
+}
+
+/// What a recovered table reports: the rows dropped and the rows whose
+/// blank optional field was read as its default.
+struct Recovery {
+    dropped: Vec<DroppedRow>,
+    blank_defaults: u32,
+}
+
+/// A table read leniently: its rows, the rows dropped, and how many
+/// rows parsed only once their blank fields were left out.
+struct LenientRead<T> {
+    rows: Vec<T>,
+    dropped: Vec<DroppedRow>,
+    blank_defaults: u32,
 }
 
 fn failed_on_a_row<T>(table: &Result<Vec<T>, gtfs_structures::Error>) -> bool {
@@ -308,7 +341,7 @@ fn lenient_table<T: DeserializeOwned>(
     file_name: &str,
     key_column: Option<&str>,
     drop_columns: &[&str],
-) -> Option<(Vec<T>, Vec<DroppedRow>)> {
+) -> Option<LenientRead<T>> {
     lenient_rows(&table_bytes(source, file_name)?, key_column, drop_columns)
 }
 
@@ -320,12 +353,13 @@ fn lenient_table<T: DeserializeOwned>(
 /// the pass cannot recover safely: the table has no header or, for a
 /// cascading table, no key column; a dropped row's key is blank or
 /// unreadable (a ragged row shifts its columns); the reader itself
-/// fails; no row parses; or none fails.
+/// fails; no row parses; or none fails and no blank was read as a
+/// default.
 fn lenient_rows<T: DeserializeOwned>(
     bytes: &[u8],
     key_column: Option<&str>,
     drop_columns: &[&str],
-) -> Option<(Vec<T>, Vec<DroppedRow>)> {
+) -> Option<LenientRead<T>> {
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     let mut reader = csv::ReaderBuilder::new()
         .flexible(true)
@@ -345,6 +379,7 @@ fn lenient_rows<T: DeserializeOwned>(
     };
     let mut rows = Vec::new();
     let mut dropped = Vec::new();
+    let mut blank_defaults = 0u32;
     for record in reader.records() {
         let record = record.ok()?;
         let ragged = record.len() != all_headers.len();
@@ -353,7 +388,16 @@ fn lenient_rows<T: DeserializeOwned>(
             kept.iter().filter_map(|&index| record.get(index)).collect();
         // The parser's error names the row by this position.
         fields.set_position(record.position().cloned());
-        match fields.deserialize::<T>(Some(&headers)) {
+        // A blank the parser cannot read as the field's default (an
+        // enumeration expects a code) is valid GTFS: the row is read
+        // again without its blank fields, so serde's defaults fill
+        // them, before it counts as failed.
+        let row = fields.deserialize::<T>(Some(&headers)).or_else(|error| {
+            without_blanks::<T>(&headers, &fields)
+                .inspect(|_| blank_defaults += 1)
+                .ok_or(error)
+        });
+        match row {
             Ok(row) => rows.push(row),
             Err(error) => {
                 let key = match key_index {
@@ -375,10 +419,34 @@ fn lenient_rows<T: DeserializeOwned>(
             }
         }
     }
-    if rows.is_empty() || dropped.is_empty() {
+    if rows.is_empty() || (dropped.is_empty() && blank_defaults == 0) {
         return None;
     }
-    Some((rows, dropped))
+    Some(LenientRead {
+        rows,
+        dropped,
+        blank_defaults,
+    })
+}
+
+/// The row read without its blank fields; `None` when it has none or
+/// still fails to parse.
+fn without_blanks<T: DeserializeOwned>(
+    headers: &csv::StringRecord,
+    fields: &csv::StringRecord,
+) -> Option<T> {
+    if !fields.iter().any(str::is_empty) {
+        return None;
+    }
+    let (names, values): (Vec<&str>, Vec<&str>) = headers
+        .iter()
+        .zip(fields.iter())
+        .filter(|(_, value)| !value.is_empty())
+        .unzip();
+    let names: csv::StringRecord = names.into_iter().collect();
+    let mut values: csv::StringRecord = values.into_iter().collect();
+    values.set_position(fields.position().cloned());
+    values.deserialize::<T>(Some(&names)).ok()
 }
 
 /// One table's bytes: the archive entry whose file name matches (as

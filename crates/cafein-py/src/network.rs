@@ -207,6 +207,22 @@ impl TransportNetwork {
                 ),
             )?;
         }
+        // A blank read as its default changes nothing routing sees:
+        // a log line, not a warning.
+        for blank in &feed.blank_defaults {
+            crate::logging::emit(
+                "cafein.build",
+                crate::logging::INFO,
+                || {
+                    format!(
+                        "{}: {} row(s) of {} with a blank optional field read as its default",
+                        paths[blank.feed as usize], blank.rows, blank.file_name
+                    )
+                },
+                None,
+                None,
+            );
+        }
         for skipped in &feed.skipped_frequencies {
             crate::logging::build_warning(
                 py,

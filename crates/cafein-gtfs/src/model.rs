@@ -46,6 +46,10 @@ pub struct Feed {
     /// persisted.
     #[serde(skip)]
     pub dropped_rows: Vec<DroppedRows>,
+    /// Rows that parsed only once a blank optional field was read as
+    /// its default: a diagnostic, never persisted.
+    #[serde(skip)]
+    pub blank_defaults: Vec<BlankDefaults>,
 }
 
 /// An optional GTFS table that failed to parse and was dropped because
@@ -69,6 +73,16 @@ pub enum SkippedTableKind {
     /// and never assembled it, so a failure never had an effect: the
     /// build log alone records it.
     ParsedOnly,
+}
+
+/// The rows of one table that parsed only once a blank optional field
+/// was left out for serde's default to fill (the strict parser rejects
+/// a blank where it expects a code).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlankDefaults {
+    pub feed: FeedIndex,
+    pub file_name: String,
+    pub rows: u32,
 }
 
 /// The rows of one table that failed to parse and were dropped, with

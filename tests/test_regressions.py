@@ -872,3 +872,60 @@ def test_footpath_build_takes_stop_sets_above_the_old_ceiling():
     assert all(
         designed <= walks[pair] <= designed + 1 for pair, designed in expected.items()
     )
+
+
+def test_blank_optional_fields_read_as_their_defaults(tmp_path, caplog):
+    """A blank ``ticketing_type`` in trips.txt used to fail the whole feed
+    (the parser expects a code there), although a blank optional field
+    is valid GTFS meaning the default; a merge of feeds where one carries
+    the column blanks it for every other feed's trips. The blank now
+    reads as the default, and the build logs it instead of warning.
+    """
+    import logging
+    import warnings
+    import zipfile
+
+    from cafein import TransportNetwork
+
+    tables = {
+        "agency.txt": [
+            "agency_id,agency_name,agency_url,agency_timezone",
+            "A,Test Agency,http://example.com,Europe/Helsinki",
+        ],
+        "stops.txt": [
+            "stop_id,stop_name,stop_lat,stop_lon",
+            "S1,First,60.0,24.0",
+            "S2,Second,60.01,24.01",
+        ],
+        "routes.txt": ["route_id,route_short_name,route_type", "R1,1,3"],
+        "trips.txt": [
+            "route_id,service_id,trip_id,ticketing_type",
+            "R1,SV,T_BLANK,",
+            "R1,SV,T_CODED,0",
+        ],
+        "stop_times.txt": [
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+            "T_BLANK,08:00:00,08:00:00,S1,1",
+            "T_BLANK,08:10:00,08:10:00,S2,2",
+            "T_CODED,09:00:00,09:00:00,S1,1",
+            "T_CODED,09:10:00,09:10:00,S2,2",
+        ],
+        "calendar.txt": [
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+            "sunday,start_date,end_date",
+            "SV,1,1,1,1,1,1,1,20220101,20221231",
+        ],
+    }
+    feed = tmp_path / "blank_ticketing_gtfs.zip"
+    with zipfile.ZipFile(feed, "w") as archive:
+        for name, lines in tables.items():
+            archive.writestr(name, "\n".join(lines) + "\n")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with caplog.at_level(logging.INFO, logger="cafein"):
+            network = TransportNetwork.from_gtfs([str(feed)])
+    assert sorted(trip for trip, _ in network.trips) == ["T_BLANK", "T_CODED"]
+    assert any(
+        "1 row(s) of trips.txt with a blank optional field" in record.getMessage()
+        for record in caplog.records
+    )
