@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.27.0 — 2026-09-28
 
 - The walking-footpath build no longer refuses stop sets above 20,000
   and no longer allocates a stop-by-stop matrix: the footpaths come from
