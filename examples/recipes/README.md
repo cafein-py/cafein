@@ -50,7 +50,23 @@ object that receives them: `streets:` for `StreetNetwork.from_osm`,
 here; the ones the recipe fixes itself (its inputs, its objective) are
 refused. A keyword that takes a data file (`dem`, `factors`, …) is written like
 an input, `{kind: file, path: …}`, so the file is snapshotted and checksummed;
-an object such as `traveler` or `street_policy` is a mapping of its own
+a car build's `urban_areas` is such a file, a polygon layer (GeoPackage or
+GeoJSON; `layer:` names the layer of a multi-layer GeoPackage) read into a
+GeoDataFrame, and sits beside a plain `country:` code and a `speed_limits:`
+mapping of class overrides — under `network:` of a `transit_cost_matrix`
+recipe whose `street_modes` include `car`, since the `exposure_tradeoff`
+recipe builds walking or cycling networks only:
+
+```yaml
+parameters:
+  network:
+    street_modes: [walk, car]
+    country: FI
+    urban_areas: {kind: file, path: data/built_up.gpkg, layer: built_up}
+    speed_limits: {residential_inside: 30}
+```
+
+An object such as `traveler` or `street_policy` is a mapping of its own
 keywords, built at validation so its checks run before any data is touched;
 `fares` names a fare model, `{kind: gtfs_zones, rules: zones, street: {…}}`
 or `{kind: file, path: fares.zip}`, whose `street_tariffs.csv` (written by
