@@ -438,6 +438,53 @@ fn drops_trips_whose_rows_fail_to_parse() {
 }
 
 #[test]
+fn reads_blank_optional_fields_as_their_defaults() {
+    // A blank `ticketing_type` (the parser expects a code) is valid
+    // GTFS meaning the default: the row is kept, nothing is dropped,
+    // and the feed says how many rows read that way.
+    let stop_times = "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+         T1,08:00:00,08:00:00,S1,1\nT1,08:10:00,08:10:00,S2,2\n\
+         T2,09:00:00,09:00:00,S1,1\nT2,09:10:00,09:10:00,S2,2\n";
+    let feed = read_zip_bytes(
+        "blank-ticketing",
+        &two_trip_feed_zip(
+            "route_id,service_id,trip_id,ticketing_type\nR1,SV,T1,\nR1,SV,T2,0\n",
+            stop_times,
+        ),
+    )
+    .unwrap();
+    let ids: Vec<&str> = feed.trips.iter().map(|trip| trip.id.as_str()).collect();
+    assert_eq!(ids, ["T1", "T2"]);
+    assert!(feed.dropped_rows.is_empty());
+    assert_eq!(
+        feed.blank_defaults,
+        vec![BlankDefaults {
+            feed: 0,
+            file_name: "trips.txt".to_string(),
+            rows: 1,
+        }]
+    );
+    // A row that still fails without its blanks is dropped as before,
+    // beside the rows the blanks alone had failed.
+    let feed = read_zip_bytes(
+        "blank-and-bad",
+        &two_trip_feed_zip(
+            "route_id,service_id,trip_id,direction_id,ticketing_type\n\
+             R1,SV,T1,0,\nR1,SV,T2,x,\n",
+            stop_times,
+        ),
+    )
+    .unwrap();
+    let ids: Vec<&str> = feed.trips.iter().map(|trip| trip.id.as_str()).collect();
+    assert_eq!(ids, ["T1"]);
+    assert_eq!(feed.blank_defaults[0].rows, 1);
+    assert_eq!(feed.dropped_rows[0].trips_dropped, 1);
+    assert!(feed.dropped_rows[0]
+        .first_reason
+        .contains("unknown variant `x`"));
+}
+
+#[test]
 fn keeps_row_failures_the_cascade_cannot_trust() {
     // A missing required column fails every row; a failing row whose
     // trip id is blank, and a ragged failing row (a field short or an
