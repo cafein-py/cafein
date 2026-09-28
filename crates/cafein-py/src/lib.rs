@@ -216,6 +216,7 @@ fn _cafein(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(access::aggregate_opportunity_sums_f64, m)?)?;
     m.add_function(wrap_pyfunction!(access::aggregate_nearest, m)?)?;
     m.add_function(wrap_pyfunction!(access::aggregate_nearest_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(streets::street_footpaths, m)?)?;
     m.add_function(wrap_pyfunction!(logging::set_log_level, m)?)?;
     m.add_function(wrap_pyfunction!(logging::install_log_dispatch, m)?)?;
     m.add_function(wrap_pyfunction!(workers::_probe_workers, m)?)?;

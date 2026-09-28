@@ -5,7 +5,7 @@
 //! extraction, routable by any compiled profile. Journeys never enter it, so
 //! it holds no timetable, transfers, or stop links.
 
-use numpy::{IntoPyArray, PyArrayMethods};
+use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
@@ -15,8 +15,9 @@ use rayon::prelude::*;
 use cafein_core::geometry::wkb_line_string;
 use cafein_core::streets::{
     Backing, CarCostModel, CarEdgeAttributes, CompiledStreetProfile, EdgeAttributes, MappedStreets,
-    Snap, StreetLeg, StreetNetwork as CoreStreetNetwork, StreetProfileDefinition,
+    Snap, StopLink, StreetLeg, StreetNetwork as CoreStreetNetwork, StreetProfileDefinition,
 };
+use cafein_core::timetable::StopIdx;
 
 use crate::artifact::{
     corrupted, crc32, decode_optional_street_arrays, decode_streets, encode_streets, io_error,
@@ -1140,4 +1141,95 @@ impl StreetNetwork {
         table.set_item("unsnapped_to", unsnapped_to.into_pyarray(py))?;
         Ok(table.into())
     }
+}
+
+/// Footpath edges as `(from_index, to_index, seconds, meters)` arrays.
+type FootpathArrays<'py> = (
+    Bound<'py, PyArray1<u32>>,
+    Bound<'py, PyArray1<u32>>,
+    Bound<'py, PyArray1<u32>>,
+    Bound<'py, PyArray1<f64>>,
+);
+
+/// The walking footpaths of a street payload: every within-cutoff walk
+/// between the linked stops, from the core's bounded street search run in
+/// parallel over stops. `stop_links` are `(position, edge, fraction,
+/// connector)` records whose positions index the caller's stop-id list;
+/// the returned `from_index` / `to_index` are those positions. Seconds
+/// round up, meters are the exact street-path length, self-walks are
+/// dropped, and the edges come sorted by `(from, to)`. The payload is the
+/// `set_street_network` one.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn street_footpaths<'py>(
+    py: Python<'py>,
+    vertex_count: u32,
+    edges: Vec<(u32, u32, f64)>,
+    coordinate_offsets: Vec<u32>,
+    longitudes: Vec<f64>,
+    latitudes: Vec<f64>,
+    stop_links: Vec<(u32, u32, f64, f64)>,
+    walking_speed: f64,
+    max_seconds: f64,
+) -> PyResult<FootpathArrays<'py>> {
+    // The core's search answers out-of-range knobs with an empty set;
+    // the payload build validates them by name up front, so refuse here
+    // too rather than return nothing.
+    if !walking_speed.is_finite() || walking_speed <= 0.0 {
+        return Err(PyValueError::new_err(
+            "walking_speed must be a positive, finite number",
+        ));
+    }
+    if !max_seconds.is_finite() || max_seconds < 0.0 {
+        return Err(PyValueError::new_err(
+            "max_seconds must be a non-negative, finite number",
+        ));
+    }
+    // The cutoff bounds every stored duration, so it must fit the
+    // transfer set's 32-bit seconds.
+    if max_seconds > f64::from(u32::MAX) {
+        return Err(PyValueError::new_err(
+            "max_seconds overflows the router clock; narrow it",
+        ));
+    }
+    let stop_count = match stop_links.iter().map(|&(position, ..)| position).max() {
+        Some(position) => position
+            .checked_add(1)
+            .ok_or_else(|| PyValueError::new_err("stop link position out of range"))?,
+        None => 0,
+    };
+    let links: Vec<StopLink> = stop_links
+        .iter()
+        .map(|&(position, edge, fraction, connector)| StopLink {
+            stop: StopIdx(position),
+            edge,
+            fraction,
+            connector,
+        })
+        .collect();
+    let walks = py
+        .allow_threads(|| {
+            let network = CoreStreetNetwork::new(
+                vertex_count,
+                stop_count,
+                &edges,
+                &coordinate_offsets,
+                &longitudes,
+                &latitudes,
+                links,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok::<_, String>(network.stop_transfers(walking_speed, max_seconds))
+        })
+        .map_err(PyValueError::new_err)?;
+    let from_index: Vec<u32> = walks.iter().map(|walk| walk.0 .0).collect();
+    let to_index: Vec<u32> = walks.iter().map(|walk| walk.1 .0).collect();
+    let seconds: Vec<u32> = walks.iter().map(|walk| walk.2).collect();
+    let meters: Vec<f64> = walks.iter().map(|walk| walk.3).collect();
+    Ok((
+        from_index.into_pyarray(py),
+        to_index.into_pyarray(py),
+        seconds.into_pyarray(py),
+        meters.into_pyarray(py),
+    ))
 }
