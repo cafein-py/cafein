@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.28.0 — 2026-09-28
 
 - A blank optional field the GTFS parser expects a code in (a blank
   `ticketing_type`, which merged feeds produce for every trip of a feed
