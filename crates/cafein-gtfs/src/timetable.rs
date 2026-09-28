@@ -46,7 +46,7 @@ pub struct QuarantinedTrip {
 /// by linear interpolation between the surrounding timed stops, as
 /// timepoint-only feeds expect of their consumers; repaired trips are
 /// reported in [`TimetableBuild::interpolated`]. Trips with data-quality
-/// problems — no stop times, a first or last stop without any time, or
+/// problems — fewer than two stop times, a first or last stop without any time, or
 /// times going backwards — are quarantined rather than failing the build;
 /// they are reported in [`TimetableBuild::quarantined`].
 ///
@@ -61,11 +61,15 @@ pub fn build_timetable(feed: &Feed) -> Result<TimetableBuild, Error> {
     let mut quarantined = Vec::new();
     let mut interpolated = Vec::new();
     for (trip_index, trip) in feed.trips.iter().enumerate() {
-        if trip.stop_times.is_empty() {
+        // A trip is ridden from one stop to another: with fewer than two
+        // stop times it can never be boarded and alighted, and its leg
+        // geometry would be a single point.
+        if trip.stop_times.len() < 2 {
             quarantined.push(QuarantinedTrip {
                 trip: trip_index as u32,
-                reason: Error::MissingStopTime {
+                reason: Error::TooFewStopTimes {
                     trip_id: trip.id.clone(),
+                    count: trip.stop_times.len(),
                 },
             });
             continue;

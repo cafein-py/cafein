@@ -11,9 +11,9 @@ mod service;
 mod timetable;
 
 pub use model::{
-    Agency, Calendar, CalendarDate, DroppedRows, Exception, Feed, FeedIndex, FeedInfo, Route,
-    RouteIndex, RouteType, SkippedFile, SkippedFrequency, SkippedTableKind, Stop, StopIndex,
-    StopTime, Trip,
+    Agency, BlankDefaults, Calendar, CalendarDate, DroppedRows, Exception, Feed, FeedIndex,
+    FeedInfo, Route, RouteIndex, RouteType, SkippedFile, SkippedFrequency, SkippedTableKind, Stop,
+    StopIndex, StopTime, Trip,
 };
 pub use qa::{validate_feed, QaFinding};
 pub use service::{ServiceCalendar, ServiceIndex};
@@ -30,6 +30,8 @@ pub enum Error {
     UnknownStop { trip_id: String, stop_id: String },
     /// A stop time has neither an arrival nor a departure time.
     MissingStopTime { trip_id: String },
+    /// A trip has fewer than two stop times, so it can never be ridden.
+    TooFewStopTimes { trip_id: String, count: usize },
     /// Expanding frequencies.txt would create more stop times than the
     /// feed-wide ceiling allows.
     FrequencyExpansionTooLarge { trip_id: String, limit: u64 },
@@ -53,6 +55,10 @@ impl std::fmt::Display for Error {
                     "trip '{trip_id}' has a stop time without arrival and departure"
                 )
             }
+            Error::TooFewStopTimes { trip_id, count } => write!(
+                f,
+                "trip '{trip_id}' has {count} stop time(s); a trip needs at least two"
+            ),
             Error::FrequencyExpansionTooLarge { trip_id, limit } => write!(
                 f,
                 "expanding frequencies.txt would create more than {limit} stop times \

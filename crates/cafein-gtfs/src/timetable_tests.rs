@@ -117,3 +117,33 @@ fn quarantines_backwards_trips_instead_of_failing() {
     assert_eq!(build.quarantined.len(), 1);
     assert_eq!(build.quarantined[0].trip, 1);
 }
+
+#[test]
+fn quarantines_trips_with_fewer_than_two_stop_times() {
+    // A single stop time cannot be ridden anywhere: the trip is
+    // quarantined with the count instead of reaching the timetable.
+    let feed = Feed {
+        stops: vec![stop(0), stop(1)],
+        routes: vec![Route {
+            feed: 0,
+            id: "r".to_string(),
+            short_name: None,
+            long_name: None,
+            route_type: RouteType::Bus,
+            agency_id: None,
+        }],
+        trips: vec![
+            trip("good", vec![call(0, 0, 0, 1), call(1, 60, 60, 2)]),
+            trip("lone", vec![call(0, 0, 0, 1)]),
+        ],
+        ..Feed::default()
+    };
+    let build = build_timetable(&feed).unwrap();
+    assert_eq!(build.timetable.trip_count(), 1);
+    assert_eq!(build.quarantined.len(), 1);
+    assert_eq!(build.quarantined[0].trip, 1);
+    assert_eq!(
+        build.quarantined[0].reason.to_string(),
+        "trip 'lone' has 1 stop time(s); a trip needs at least two"
+    );
+}

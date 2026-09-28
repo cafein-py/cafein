@@ -872,3 +872,148 @@ def test_footpath_build_takes_stop_sets_above_the_old_ceiling():
     assert all(
         designed <= walks[pair] <= designed + 1 for pair, designed in expected.items()
     )
+
+
+def test_blank_optional_fields_read_as_their_defaults(tmp_path, caplog):
+    """A blank ``ticketing_type`` in trips.txt used to fail the whole feed
+    (the parser expects a code there), although a blank optional field
+    is valid GTFS meaning the default; a merge of feeds where one carries
+    the column blanks it for every other feed's trips. The blank now
+    reads as the default, and the build logs it instead of warning.
+    """
+    import logging
+    import warnings
+    import zipfile
+
+    from cafein import TransportNetwork
+
+    tables = {
+        "agency.txt": [
+            "agency_id,agency_name,agency_url,agency_timezone",
+            "A,Test Agency,http://example.com,Europe/Helsinki",
+        ],
+        "stops.txt": [
+            "stop_id,stop_name,stop_lat,stop_lon",
+            "S1,First,60.0,24.0",
+            "S2,Second,60.01,24.01",
+        ],
+        "routes.txt": ["route_id,route_short_name,route_type", "R1,1,3"],
+        "trips.txt": [
+            "route_id,service_id,trip_id,ticketing_type",
+            "R1,SV,T_BLANK,",
+            "R1,SV,T_CODED,0",
+        ],
+        "stop_times.txt": [
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+            "T_BLANK,08:00:00,08:00:00,S1,1",
+            "T_BLANK,08:10:00,08:10:00,S2,2",
+            "T_CODED,09:00:00,09:00:00,S1,1",
+            "T_CODED,09:10:00,09:10:00,S2,2",
+        ],
+        "calendar.txt": [
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+            "sunday,start_date,end_date",
+            "SV,1,1,1,1,1,1,1,20220101,20221231",
+        ],
+    }
+    feed = tmp_path / "blank_ticketing_gtfs.zip"
+    with zipfile.ZipFile(feed, "w") as archive:
+        for name, lines in tables.items():
+            archive.writestr(name, "\n".join(lines) + "\n")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with caplog.at_level(logging.INFO, logger="cafein"):
+            network = TransportNetwork.from_gtfs([str(feed)])
+    assert sorted(trip for trip, _ in network.trips) == ["T_BLANK", "T_CODED"]
+    assert any(
+        "1 row(s) of trips.txt with a blank optional field" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def _gtfs_zip(path, tables):
+    """A GTFS archive from ``{file_name: [csv lines]}``."""
+    import zipfile
+
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, lines in tables.items():
+            archive.writestr(name, "\n".join(lines) + "\n")
+    return str(path)
+
+
+_TWO_STOP_TABLES = {
+    "agency.txt": [
+        "agency_id,agency_name,agency_url,agency_timezone",
+        "A,Test Agency,http://example.com,Europe/Helsinki",
+    ],
+    "stops.txt": [
+        "stop_id,stop_name,stop_lat,stop_lon",
+        "S1,First,60.0,24.0",
+        "S2,Second,60.01,24.01",
+    ],
+    "routes.txt": ["route_id,route_short_name,route_type", "R1,1,3"],
+    "calendar.txt": [
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+        "sunday,start_date,end_date",
+        "SV,1,1,1,1,1,1,1,20220101,20221231",
+    ],
+}
+
+
+def test_one_stop_trips_are_quarantined_before_geometry(tmp_path):
+    """A trip with a single stop time (a cropped feed's leftover) used to
+    reach the leg-geometry build as a one-point polyline, which the core
+    refuses, so the whole network build failed with "polyline N is
+    malformed". Such a trip cannot be ridden; it is quarantined like the
+    other unridable trips and the build goes on.
+    """
+    from cafein import TransportNetwork
+
+    feed = _gtfs_zip(
+        tmp_path / "one_stop_gtfs.zip",
+        {
+            **_TWO_STOP_TABLES,
+            "trips.txt": ["route_id,service_id,trip_id", "R1,SV,T_OK", "R1,SV,T_LONE"],
+            "stop_times.txt": [
+                "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+                "T_OK,08:00:00,08:00:00,S1,1",
+                "T_OK,08:10:00,08:10:00,S2,2",
+                "T_LONE,09:00:00,09:00:00,S1,1",
+            ],
+        },
+    )
+    with pytest.warns(UserWarning, match="quarantined 1 trip"):
+        network = TransportNetwork.from_gtfs([feed])
+    assert [trip for trip, _ in network.trips] == ["T_OK"]
+
+
+def test_unprojectable_shape_points_do_not_abort_the_build(tmp_path):
+    """A shape point outside the coordinate range projects to infinity
+    and used to fail the whole build at the core's polyline check, with
+    an internal index in the message. The shape is left out with a
+    warning naming it, and its trip's distances come from the next
+    tier.
+    """
+    from cafein import TransportNetwork
+
+    feed = _gtfs_zip(
+        tmp_path / "bad_shape_gtfs.zip",
+        {
+            **_TWO_STOP_TABLES,
+            "trips.txt": ["route_id,service_id,trip_id,shape_id", "R1,SV,T_OK,SH_BAD"],
+            "stop_times.txt": [
+                "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+                "T_OK,08:00:00,08:00:00,S1,1",
+                "T_OK,08:10:00,08:10:00,S2,2",
+            ],
+            "shapes.txt": [
+                "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence",
+                "SH_BAD,60.0,24.0,1",
+                "SH_BAD,95.0,24.005,2",
+                "SH_BAD,60.01,24.01,3",
+            ],
+        },
+    )
+    with pytest.warns(UserWarning, match="cannot be projected.*SH_BAD"):
+        network = TransportNetwork.from_gtfs([feed])
+    assert [trip for trip, _ in network.trips] == ["T_OK"]
