@@ -176,27 +176,33 @@ def test_footpaths_never_exceed_the_cutoff():
 
 def test_a_fractional_cutoff_survives_the_rounding():
     # Rounding a duration up must not carry it past the cutoff: a
-    # 250.4 s path would be stored as 251 s, one second beyond a 250.5 s
+    # 250.4 s walk is stored as 251 s, one second beyond a 250.5 s
     # budget, so the edge is dropped instead.
-    durations = np.array([[0.0, 250.4], [250.4, 0.0]])
-    kept = streets._edge_list(np.array(["a", "b"], dtype=object), durations, 1.25)
-    assert {(a, b): s for a, b, s, _ in kept} == {("a", "b"): 251, ("b", "a"): 251}
-    bounded = streets._edge_list(
-        np.array(["a", "b"], dtype=object), durations, 1.25, 250.5
+    stops = [stop("a", 0, 0), stop("b", 250.4, 0)]
+    kept = footpaths(STRAIGHT_STREET, [("A", "B", 400)], stops, max_walking_time=300)
+    assert kept == {("a", "b"): 251, ("b", "a"): 251}
+    bounded = footpaths(
+        STRAIGHT_STREET, [("A", "B", 400)], stops, max_walking_time=250.5
     )
-    assert len(bounded) == 0
+    assert bounded == {}
 
 
 def test_footpaths_are_flat_arrays():
-    # The edge list crosses into the core as arrays: stop ids named
+    # The edge list crosses into the core as arrays: the stop ids named
     # once, uint32 indexes and seconds, float64 meters — and the
     # legacy tuple view is the same edges. Walking times are feasibility
     # constraints: rounding down could let routing catch a departure the
     # walk actually misses, so durations round up conservatively
-    # (10.4 → 11) and only genuine floating-point noise is tolerated
-    # (9.9999999 → 10). Meters stay unrounded.
-    durations = np.array([[0.0, 10.4], [9.9999999, 0.0]])
-    edges = streets._edge_list(np.array(["a", "b"], dtype=object), durations, 1.25)
+    # (a 10.4 m walk at 1 m/s is 11 s) while meters stay unrounded.
+    node_frame, edge_frame = street_network(STRAIGHT_STREET, [("A", "B", 400)])
+    edges = streets._network_footpaths(
+        [stop("a", 0, 0), stop("b", 10.4, 0)],
+        node_frame,
+        edge_frame,
+        walking_speed_kmph=3.6,
+        max_walking_time=600.0,
+        max_snap_distance=100.0,
+    )
     assert isinstance(edges, streets.Footpaths)
     assert len(edges) == 2
     assert edges.stop_ids == ["a", "b"]
@@ -204,16 +210,25 @@ def test_footpaths_are_flat_arrays():
     assert edges.to_index.dtype == np.uint32
     assert edges.seconds.dtype == np.uint32
     assert edges.meters.dtype == np.float64
-    assert list(edges) == [("a", "b", 11, 13.0), ("b", "a", 10, pytest.approx(12.5))]
-    meters = {(a, b): m for a, b, _, m in edges}
-    assert meters[("a", "b")] == pytest.approx(13.0)
-    assert meters[("b", "a")] == pytest.approx(12.5, rel=1e-6)
+    walk = pytest.approx(10.4, abs=0.05)
+    assert list(edges) == [("a", "b", 11, walk), ("b", "a", 11, walk)]
 
 
 def test_durations_beyond_the_time_range_are_rejected():
-    durations = np.array([[0.0, 5e9], [5e9, 0.0]])
-    with pytest.raises(ValueError, match="32-bit second range"):
-        streets._edge_list(np.array(["a", "b"], dtype=object), durations, 1.0)
+    # The cutoff bounds every stored duration, so it must fit the core's
+    # 32-bit seconds; the knob is refused by name before any snapping,
+    # and the core binding refuses it on its own too.
+    with pytest.raises(ValueError, match="overflows the router clock"):
+        footpaths(
+            STRAIGHT_STREET,
+            [("A", "B", 400)],
+            [stop("s1", 100, 0)],
+            max_walking_time=5e9,
+        )
+    from cafein import _cafein
+
+    with pytest.raises(ValueError, match="overflows the router clock"):
+        _cafein.street_footpaths(0, [], [0], [], [], [], 1.0, 5e9)
 
 
 def test_out_of_range_build_options_are_rejected():
@@ -229,18 +244,6 @@ def test_out_of_range_build_options_are_rejected():
     ]:
         with pytest.raises(ValueError, match="finite"):
             footpaths(STRAIGHT_STREET, [("A", "B", 400)], stops, **options)
-
-
-def test_oversized_stop_sets_are_rejected(monkeypatch):
-    # The dense stop-by-stop matrices grow quadratically; builds beyond
-    # the ceiling fail fast instead of exhausting memory.
-    monkeypatch.setattr(streets, "MAX_FOOTPATH_STOPS", 1)
-    with pytest.raises(ValueError, match="snapped stops exceed"):
-        footpaths(
-            STRAIGHT_STREET,
-            [("A", "B", 400)],
-            [stop("s1", 100, 0), stop("s2", 300, 0)],
-        )
 
 
 @pytest.mark.parametrize(

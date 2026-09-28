@@ -2,8 +2,9 @@
 
 The build turns a PBF extract into the two walking structures the routing
 core consumes. Stop-to-stop footpaths become the transfer edge list: snap
-every stop onto its nearest edge (splitting the edge at the snap point),
-and run a cutoff-bounded one-to-many Dijkstra from every stop. The
+every stop onto its nearest edge, hand the street graph and the snap
+links to the routing core, and let it run its cutoff-bounded street
+search from every stop's snap point, in parallel over stops. The
 cutoff is the walking contract: a transfer between two rides is a
 single street-shortest walk within `max_walking_time`, so the direct
 bounded search is already complete for routing's one-hop-per-round
@@ -58,17 +59,6 @@ Matches R5's ``MIN_SUBGRAPH_SIZE``. Smaller components are mapping
 artifacts or stubs clipped at the extract boundary — snapping into one
 traps the walk on a handful of edges — while genuinely walkable islands
 are far larger."""
-
-MAX_FOOTPATH_STOPS = 20_000
-"""Ceiling on snapped stops in the footpath build.
-
-The stop-to-stop search materializes dense
-stop-by-stop matrices, so memory grows quadratically with the snapped
-stop count; the ceiling keeps the matrices within a few gigabytes.
-Larger stop sets are rejected rather than silently exhausting memory —
-build from smaller extracts instead."""
-
-_DIJKSTRA_CHUNK = 256
 
 
 class Footpaths:
@@ -370,6 +360,8 @@ def _network_streets(
         raise ValueError("max_walking_time must be a non-negative, finite number")
     if not (math.isfinite(max_snap_distance) and max_snap_distance >= 0):
         raise ValueError("snap_distance must be a non-negative, finite number")
+    if max_walking_time > 4_294_967_295:
+        raise ValueError("max_walking_time overflows the router clock; narrow it")
     speed = walking_speed_kmph / 3.6  # m/s
     nodes = nodes.reset_index(drop=True)
     edges = edges.reset_index(drop=True)
@@ -380,36 +372,27 @@ def _network_streets(
         snapped = pd.DataFrame(columns=["stop_id", "edge", "fraction", "snap_distance"])
     else:
         snapped = _snap_to_edges(stop_points, edges, max_snap_distance)
-    if len(snapped) > MAX_FOOTPATH_STOPS:
-        raise ValueError(
-            f"{len(snapped)} snapped stops exceed the dense footpath "
-            f"build's ceiling of {MAX_FOOTPATH_STOPS}; build from smaller "
-            "extracts"
-        )
+    with _log.phase(
+        "build.streets.graph",
+        _log.build,
+        "building the walking street graph",
+        "built the walking street graph",
+    ) as ph:
+        payload = _street_payload(nodes, edges, snapped)
+        ph.note = f"{len(edges):,} edges, {len(snapped):,} stops"
+        ph.details.update(edges=len(edges), stops=len(snapped))
     footpaths = Footpaths([], [], [], [], [])
     if not snapped.empty:
-        with _log.phase(
-            "build.streets.graph",
-            _log.build,
-            "building the walking street graph",
-            "built the walking street graph",
-        ) as ph:
-            graph, stop_vertices = _routing_graph(nodes, edges, snapped, speed)
-            ph.note = f"{len(edges):,} edges, {len(snapped):,} stops"
-            ph.details.update(edges=len(edges), stops=len(snapped))
         with _log.phase(
             "build.streets.footpaths",
             _log.build,
             "computing stop-to-stop footpaths",
             "computed stop-to-stop footpaths",
         ) as ph:
-            durations = _stop_durations(graph, stop_vertices, max_walking_time)
-            footpaths = _edge_list(
-                snapped["stop_id"].to_numpy(), durations, speed, max_walking_time
-            )
+            footpaths = _street_footpaths(payload, snapped, speed, max_walking_time)
             ph.note = f"{len(footpaths.seconds):,} footpaths"
             ph.details["footpaths"] = len(footpaths.seconds)
-    return footpaths, _street_payload(nodes, edges, snapped)
+    return footpaths, payload
 
 
 def _stop_points(stops):
@@ -506,140 +489,51 @@ def _street_payload(nodes, edges, snapped):
     )
 
 
-def _routing_graph(nodes, edges, snapped, speed):
-    """The walking graph with snap points spliced in, plus stop vertices.
+def _street_footpaths(payload, snapped, speed, max_walking_time):
+    """The footpaths of a street payload, from the core's bounded search.
 
-    Vertices are street nodes, then one vertex per distinct interior snap
-    point, then one per snapped stop; weights are traversal seconds. A
-    split edge's cost is redistributed over its segments proportionally to
-    the fraction each segment covers; snap points landing on an endpoint
-    reuse the endpoint vertex. Returns the graph and the stop vertices in
-    `snapped` row order.
+    The core walks a cutoff-bounded search from every snapped stop's link
+    over the payload's graph, in parallel over stops, and returns the
+    within-cutoff walks as sparse edges; memory follows the graph and the
+    footpaths kept, never the stop pairs. Durations are feasibility
+    constraints, so the core rounds them up (with a small tolerance for
+    floating-point noise): understating a walking time could let routing
+    catch a departure the walk actually misses. Rounding up can carry a
+    path past a fractional cutoff, so the kept edges are filtered on the
+    rounded seconds — no stored transfer is longer than the cutoff. The
+    meters stay exact: every walking cost is a street length over the
+    uniform speed.
     """
-    u, v = _vertex_endpoints(nodes, edges)
-    seconds = edges["length"].to_numpy() / speed
+    from cafein import _cafein
 
-    splits = (
-        snapped[["edge", "fraction"]][
-            (snapped["fraction"] > 0) & (snapped["fraction"] < 1)
-        ]
-        .drop_duplicates()
-        .sort_values(["edge", "fraction"])
-        .reset_index(drop=True)
-    )
-    splits["vertex"] = len(nodes) + np.arange(len(splits))
-    edge_ids = splits["edge"].to_numpy()
-    fractions = splits["fraction"].to_numpy()
-    vertices = splits["vertex"].to_numpy()
-
-    # Chain the split vertices along each edge: a segment from the edge
-    # start or the previous snap point into each snap point, and a closing
-    # segment from the last snap point to the edge end.
-    boundary = edge_ids[1:] != edge_ids[:-1]
-    first = np.r_[True, boundary] if len(splits) else np.zeros(0, dtype=bool)
-    last = np.r_[boundary, True] if len(splits) else np.zeros(0, dtype=bool)
-    previous_vertex = np.roll(vertices, 1)
-    previous_fraction = np.roll(fractions, 1)
-    into_from = np.where(first, u[edge_ids], previous_vertex)
-    into_seconds = (fractions - np.where(first, 0, previous_fraction)) * seconds[
-        edge_ids
-    ]
-    closing_seconds = (1 - fractions[last]) * seconds[edge_ids[last]]
-
-    intact = np.ones(len(edges), dtype=bool)
-    intact[edge_ids] = False
-
-    stop_vertices = len(nodes) + len(splits) + np.arange(len(snapped))
-    snap_vertex = _snap_vertices(snapped, splits, u, v)
-
-    graph_from = np.concatenate([u[intact], into_from, vertices[last], stop_vertices])
-    graph_to = np.concatenate([v[intact], vertices, v[edge_ids[last]], snap_vertex])
-    weight = np.concatenate(
-        [
-            seconds[intact],
-            into_seconds,
-            closing_seconds,
-            snapped["snap_distance"].to_numpy() / speed,
-        ]
-    )
-
-    # Walking is undirected, so orient each edge low→high, keep the
-    # cheapest of any parallel edges (duplicate COO entries would sum),
-    # and store both directions explicitly so the graph is symmetric
-    # without relying on how one-sided entries are interpreted.
-    unique = (
-        pd.DataFrame(
-            {
-                "a": np.minimum(graph_from, graph_to),
-                "b": np.maximum(graph_from, graph_to),
-                "weight": weight,
-            }
+    vertex_count, edges, offsets, longitudes, latitudes, _ = payload
+    # One link per snapped stop, in the row order that names `stop_ids`.
+    links = list(
+        zip(
+            range(len(snapped)),
+            snapped["edge"].tolist(),
+            snapped["fraction"].tolist(),
+            snapped["snap_distance"].tolist(),
         )
-        .groupby(["a", "b"], as_index=False)["weight"]
-        .min()
     )
-    size = len(nodes) + len(splits) + len(snapped)
-    graph = sparse.coo_matrix(
-        (
-            np.concatenate([unique["weight"], unique["weight"]]),
-            (
-                np.concatenate([unique["a"], unique["b"]]),
-                np.concatenate([unique["b"], unique["a"]]),
-            ),
-        ),
-        shape=(size, size),
-    ).tocsr()
-    return graph, stop_vertices
-
-
-def _snap_vertices(snapped, splits, u, v):
-    """Each snapped stop's vertex on the street graph."""
-    merged = snapped.merge(splits, on=["edge", "fraction"], how="left")
-    fraction = merged["fraction"].to_numpy()
-    edge = merged["edge"].to_numpy()
-    interior = merged["vertex"].fillna(-1).to_numpy(dtype=np.int64)
-    return np.where(fraction == 0, u[edge], np.where(fraction == 1, v[edge], interior))
-
-
-def _stop_durations(graph, stop_vertices, max_walking_time):
-    """Stop-to-stop walking seconds within the cutoff (`inf` beyond)."""
-    count = len(stop_vertices)
-    durations = np.full((count, count), np.inf)
-    for start in range(0, count, _DIJKSTRA_CHUNK):
-        sources = stop_vertices[start : start + _DIJKSTRA_CHUNK]
-        distances = csgraph.dijkstra(
-            graph, directed=False, indices=sources, limit=max_walking_time
-        )
-        durations[start : start + len(sources)] = distances[:, stop_vertices]
-    return durations
-
-
-def _edge_list(stop_ids, durations, speed, max_walking_time=None):
-    """The finite off-diagonal durations as `Footpaths` arrays.
-
-    Durations are feasibility constraints, so they round up (with a small
-    tolerance for floating-point noise): understating a walking time could
-    let routing catch a departure the walk actually misses. Rounding up
-    can carry a path past a fractional cutoff, so the kept edges are
-    filtered on the rounded seconds — no stored transfer is longer than
-    the cutoff. The meters stay exact: every walking cost is a street
-    length over the uniform speed, so the unrounded duration times the
-    speed is the walked street-path length.
-    """
-    finite = np.isfinite(durations)
-    np.fill_diagonal(finite, False)
-    i, j = np.nonzero(finite)
-    seconds = np.ceil(durations[i, j] - 1e-6).astype(np.int64)
-    if max_walking_time is not None:
-        within = seconds <= max_walking_time
-        i, j, seconds = i[within], j[within], seconds[within]
-    if len(seconds) and seconds.max() > 4_294_967_295:
-        raise ValueError(
-            "footpath durations exceed the routing core's 32-bit second "
-            "range; check the walking network and speed"
-        )
-    meters = durations[i, j] * speed
-    return Footpaths(stop_ids.tolist(), i, j, seconds, meters)
+    from_index, to_index, seconds, meters = _cafein.street_footpaths(
+        vertex_count,
+        edges,
+        offsets,
+        longitudes,
+        latitudes,
+        links,
+        speed,
+        max_walking_time,
+    )
+    within = seconds <= max_walking_time
+    return Footpaths(
+        snapped["stop_id"].tolist(),
+        from_index[within],
+        to_index[within],
+        seconds[within],
+        meters[within],
+    )
 
 
 def park_and_ride_facilities(osm_pbf, bounding_box=None):

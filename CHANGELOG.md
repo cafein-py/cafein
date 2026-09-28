@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- The walking-footpath build no longer refuses stop sets above 20,000
+  and no longer allocates a stop-by-stop matrix: the footpaths come from
+  the routing core's bounded street search, in parallel over stops, so a
+  whole-city feed (Berlin, London, New York) builds with memory
+  proportional to the walking graph and the footpaths kept.
+  ([#393](https://github.com/cafein-py/cafein/pull/393))
+
 ## 0.26.0 — 2026-09-23
 
 - A row of a table routing needs (`agency.txt`, `stops.txt`,

@@ -5,8 +5,9 @@ One test per fixed defect; add new ones here rather than in a new file.
 
 import pytest
 
-from cafein import exhaustive_frontier, journey_frontier, journey_frontiers
+from cafein import exhaustive_frontier, journey_frontier, journey_frontiers, streets
 from cafein.matrices import travel_cost_table
+from test_streets import stop, street_network
 
 
 def test_mcraptor_window_profile_keeps_cleaner_earlier_journeys(network_with_footpaths):
@@ -481,6 +482,10 @@ def test_walking_knobs_validate_before_any_file_is_read():
             osm_pbf="no-such.osm.pbf",
             bounding_box=(25.0, 60.1, 24.9, 60.2),
         )
+    with pytest.raises(ValueError, match="overflows the router clock"):
+        TransportNetwork.from_gtfs(
+            ["no-such-feed.zip"], osm_pbf="no-such.osm.pbf", max_walking_time=10**8
+        )
     for build in (walking_footpaths, walking_streets):
         with pytest.raises(ValueError, match="walking_speed_kmph must be a positive"):
             build("no-such.osm.pbf", [], walking_speed_kmph=-3.6)
@@ -488,6 +493,8 @@ def test_walking_knobs_validate_before_any_file_is_read():
             build("no-such.osm.pbf", [], snap_distance=float("nan"))
         with pytest.raises(TypeError, match="bounding_box must be four numbers"):
             build("no-such.osm.pbf", [], bounding_box="helsinki")
+        with pytest.raises(ValueError, match="overflows the router clock"):
+            build("no-such.osm.pbf", [], max_walking_time=10**8)
     # Numeric-looking strings are the wrong KIND, never quietly parsed.
     with pytest.raises(TypeError, match="walking_speed_kmph must be a number"):
         walking_footpaths("no-such.osm.pbf", [], walking_speed_kmph="3.6")
@@ -823,3 +830,45 @@ def test_decay_parameters_keep_their_fractional_seconds(network, tmp_path, strea
     weights = np.exp(-math.log(2) * costs["cost"] / (half_life * 60))
     expected = weights.groupby(costs["from_id"]).sum().reindex(origins, fill_value=0)
     assert np.allclose(result.reindex(origins), expected, rtol=1e-12)
+
+
+def test_footpath_build_takes_stop_sets_above_the_old_ceiling():
+    """The footpath build used to refuse more than 20,000 snapped stops
+    because a dense stop-by-stop matrix sat behind it; whole-city feeds
+    carry more. Parallel streets 2 km apart keep every walk on its own
+    street, so the expected set is exact.
+    """
+    rows, columns, spacing = 202, 101, 100
+    nodes, edges = {}, []
+    for row in range(rows):
+        for column in range(columns):
+            nodes[(row, column)] = (column * spacing, row * 2_000)
+            if column:
+                edges.append(((row, column - 1), (row, column), spacing))
+    stops = [
+        stop(f"s{row}_{column}", column * spacing, row * 2_000)
+        for row in range(rows)
+        for column in range(columns)
+    ]
+    result = streets._network_footpaths(
+        stops,
+        *street_network(nodes, edges),
+        walking_speed_kmph=3.6,
+        max_walking_time=350.0,
+        max_snap_distance=50.0,
+    )
+    assert len(result.stop_ids) == rows * columns
+    # Three neighbours each way within 350 s at 1 m/s, along the stop's
+    # own street: the whole directed set, no pair more.
+    expected = {
+        (f"s{row}_{column}", f"s{row}_{column + offset}"): spacing * abs(offset)
+        for row in range(rows)
+        for column in range(columns)
+        for offset in (-3, -2, -1, 1, 2, 3)
+        if 0 <= column + offset < columns
+    }
+    walks = {(from_stop, to_stop): seconds for from_stop, to_stop, seconds, _ in result}
+    assert walks.keys() == expected.keys()
+    assert all(
+        designed <= walks[pair] <= designed + 1 for pair, designed in expected.items()
+    )
