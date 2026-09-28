@@ -7,6 +7,13 @@
   without the column) no longer fails the table: the row reads with the
   field at its default, and the build logs how many rows did.
   ([#396](https://github.com/cafein-py/cafein/pull/396))
+- A trip with fewer than two stop times is quarantined like the other
+  trips that cannot be ridden, instead of reaching the leg-geometry
+  build as a one-point polyline that failed the whole network build
+  with "polyline N is malformed"; a shape with a point that cannot be
+  projected is left out with a warning naming it, and its trips take
+  the next distance tier.
+  ([#397](https://github.com/cafein-py/cafein/pull/397))
 
 ## 0.27.0 — 2026-09-28
 

@@ -196,7 +196,9 @@ def _feed_trip_distances(path, include=None, geometries=False):
             )
         cumulative, tier, geometry = cache[key]
         results.append((trip_id, cumulative, tier))
-        if geometry is None:
+        # A trip with one stop has no leg to draw (the timetable
+        # quarantines it), and a one-point polyline is not one.
+        if geometry is None or len(stop_ids) < 2:
             continue
         if geometry[0] == "shape":
             _, used_shape, positions = geometry
@@ -359,6 +361,20 @@ def _shape_lines(path, stops):
         x, y = transformer.transform(
             shapes["shape_pt_lon"].to_numpy(), shapes["shape_pt_lat"].to_numpy()
         )
+        # A point outside the coordinate range projects to infinity;
+        # its shape would fail the core's polyline check, so it is left
+        # out and named, and its trips fall past the shape tier.
+        usable = np.isfinite(x) & np.isfinite(y)
+        if not usable.all():
+            unusable = sorted(set(shapes.loc[~usable, "shape_id"]))
+            warnings.warn(
+                f"{len(unusable)} shape(s) have points that cannot be projected "
+                "and are not used (their trips fall past the shape tier): "
+                + ", ".join(unusable[:5]),
+                stacklevel=2,
+            )
+            keep = ~shapes["shape_id"].isin(unusable).to_numpy()
+            shapes, x, y = shapes[keep], x[keep], y[keep]
         ordered = shapes.assign(x=x, y=y).sort_values(
             ["shape_id", "shape_pt_sequence"], kind="stable"
         )
