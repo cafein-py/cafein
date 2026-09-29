@@ -232,6 +232,22 @@ impl TransportNetwork {
                 ),
             )?;
         }
+        // An adjustment that loses no run and changes no departure: a
+        // log line, not a warning.
+        for note in &feed.frequency_notes {
+            crate::logging::emit(
+                "cafein.build",
+                crate::logging::INFO,
+                || {
+                    format!(
+                        "{}: frequencies.txt, trip {}: {}",
+                        paths[note.feed as usize], note.trip_id, note.note
+                    )
+                },
+                None,
+                None,
+            );
+        }
         let timer = crate::logging::PhaseTimer::start(
             "cafein.build",
             "build.gtfs.timetable",

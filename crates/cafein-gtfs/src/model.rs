@@ -41,6 +41,10 @@ pub struct Feed {
     /// persisted.
     #[serde(skip)]
     pub skipped_frequencies: Vec<SkippedFrequency>,
+    /// frequencies.txt rows whose runs were adjusted to stay on the
+    /// clock, with nothing lost: a diagnostic, never persisted.
+    #[serde(skip)]
+    pub frequency_notes: Vec<FrequencyNote>,
     /// Rows dropped at read time from the tables routing consumes, with
     /// the trips or services each drop took along: a diagnostic, never
     /// persisted.
@@ -110,6 +114,15 @@ pub struct SkippedFrequency {
     pub feed: FeedIndex,
     pub trip_id: String,
     pub reason: String,
+}
+
+/// A frequencies.txt row whose runs were kept with an adjustment that
+/// changes nothing a rider boards by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrequencyNote {
+    pub feed: FeedIndex,
+    pub trip_id: String,
+    pub note: String,
 }
 
 /// A transit agency (`agency.txt`).

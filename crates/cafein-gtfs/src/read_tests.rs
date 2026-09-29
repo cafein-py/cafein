@@ -345,7 +345,12 @@ fn expands_frequency_templates_into_runs() {
     assert_eq!(reported.len(), 5, "{reported:?}");
     assert_eq!(reported[0].0, "T1");
     assert!(reported[0].1.contains("headway_secs is 0"), "{reported:?}");
-    assert!(reported[1].1.contains("outside the clock"), "{reported:?}");
+    assert!(
+        reported[1]
+            .1
+            .contains("all 2 run(s) would place a stop outside the clock"),
+        "{reported:?}"
+    );
     assert_eq!(reported[2].0, "T2");
     assert!(
         reported[2].1.contains("end_time is not after"),
@@ -704,5 +709,79 @@ fn reads_a_feed_without_agency_txt_and_names_the_feed_otherwise() {
     assert!(
         message.contains("no-stops") && message.ends_with("required file stops.txt is missing"),
         "{message}"
+    );
+}
+
+#[test]
+fn keeps_frequency_runs_at_the_edges_of_the_clock() {
+    // A template whose first stop dwells (arrival 00:00:00, departure
+    // 00:00:10) and a row starting at midnight: the midnight run's
+    // first-stop arrival would precede 00:00:00 and is kept at 00:00:00
+    // (its departure is the row's midnight), the other runs shift whole, and the adjustment is noted rather
+    // than rejecting the row and the trip.
+    let feed = read_zip_bytes(
+        "midnight-runs",
+        &minimal_feed_zip(
+            "",
+            "",
+            &[
+                (
+                    "stop_times.txt",
+                    "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+                     T1,00:00:00,00:00:10,S1,1\nT1,00:07:30,00:07:40,S2,2\n",
+                ),
+                (
+                    "frequencies.txt",
+                    "trip_id,start_time,end_time,headway_secs\nT1,00:00:00,00:30:00,600\n",
+                ),
+            ],
+        ),
+    )
+    .unwrap();
+    let first_stops: Vec<(Option<u32>, Option<u32>)> = feed
+        .trips
+        .iter()
+        .map(|trip| (trip.stop_times[0].arrival, trip.stop_times[0].departure))
+        .collect();
+    assert_eq!(
+        first_stops,
+        vec![
+            (Some(0), Some(0)),
+            (Some(590), Some(600)),
+            (Some(1190), Some(1200))
+        ]
+    );
+    assert!(feed.skipped_frequencies.is_empty());
+    assert_eq!(feed.frequency_notes.len(), 1);
+    assert!(
+        feed.frequency_notes[0]
+            .note
+            .contains("1 run(s) start at midnight"),
+        "{}",
+        feed.frequency_notes[0].note
+    );
+    // At the far end of the clock, only the runs with a stop time past
+    // it are dropped, and the drop is counted.
+    let feed = read_zip_bytes(
+        "clock-end-runs",
+        &minimal_feed_zip(
+            "",
+            "",
+            &[(
+                "frequencies.txt",
+                "trip_id,start_time,end_time,headway_secs\n\
+                 T1,1193046:00:00,1193046:28:00,600\n",
+            )],
+        ),
+    )
+    .unwrap();
+    assert_eq!(feed.trips.len(), 2);
+    assert_eq!(feed.skipped_frequencies.len(), 1);
+    assert!(
+        feed.skipped_frequencies[0]
+            .reason
+            .contains("1 run(s) dropped"),
+        "{}",
+        feed.skipped_frequencies[0].reason
     );
 }
