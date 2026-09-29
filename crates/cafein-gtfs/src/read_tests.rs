@@ -8,9 +8,37 @@ fn minimal_feed_zip(
     extra_values: &str,
     extra_files: &[(&str, &str)],
 ) -> Vec<u8> {
+    let mut files = minimal_feed_files(extra_columns, extra_values);
+    for (name, content) in extra_files {
+        match files.iter_mut().find(|(existing, _)| existing == name) {
+            Some(entry) => entry.1 = content.to_string(),
+            None => files.push((name, content.to_string())),
+        }
+    }
+    zip_of(&files)
+}
+
+/// The minimal feed without one of its files.
+fn feed_zip_without(file_name: &str) -> Vec<u8> {
+    let files: Vec<_> = minimal_feed_files("", "")
+        .into_iter()
+        .filter(|(name, _)| *name != file_name)
+        .collect();
+    zip_of(&files)
+}
+
+fn zip_of(files: &[(&str, String)]) -> Vec<u8> {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default();
-    let mut files = vec![
+    for (name, content) in files {
+        writer.start_file(*name, options).unwrap();
+        writer.write_all(content.as_bytes()).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+fn minimal_feed_files(extra_columns: &str, extra_values: &str) -> Vec<(&'static str, String)> {
+    vec![
         (
             "agency.txt",
             "agency_id,agency_name,agency_url,agency_timezone\n\
@@ -42,18 +70,7 @@ fn minimal_feed_zip(
                  start_date,end_date\nSV,1,1,1,1,1,1,1,20220101,20221231\n"
                 .to_string(),
         ),
-    ];
-    for (name, content) in extra_files {
-        match files.iter_mut().find(|(existing, _)| existing == name) {
-            Some(entry) => entry.1 = content.to_string(),
-            None => files.push((name, content.to_string())),
-        }
-    }
-    for (name, content) in files {
-        writer.start_file(name, options).unwrap();
-        writer.write_all(content.as_bytes()).unwrap();
-    }
-    writer.finish().unwrap().into_inner()
+    ]
 }
 
 fn read_zip_bytes(tag: &str, bytes: &[u8]) -> Result<Feed, Error> {
@@ -659,4 +676,33 @@ fn drops_what_depends_on_a_row_that_fails_in_the_other_tables() {
             assert_eq!(feed.agencies.len(), 1);
         }
     }
+}
+
+#[test]
+fn reads_a_feed_without_agency_txt_and_names_the_feed_otherwise() {
+    // agency.txt is required by GTFS but routing never consults it: the
+    // feed reads with no agencies and the skip is reported. Any other
+    // required file missing fails the read, naming the feed and the file.
+    let feed = read_zip_bytes("no-agency", &feed_zip_without("agency.txt")).unwrap();
+    assert!(feed.agencies.is_empty());
+    assert_eq!(feed.trips.len(), 1);
+    let skipped = &feed.skipped_files[0];
+    assert_eq!(
+        (
+            skipped.file_name.as_str(),
+            skipped.reason.as_str(),
+            skipped.kind
+        ),
+        (
+            "agency.txt",
+            "the file is missing",
+            SkippedTableKind::Assembled
+        )
+    );
+    let error = read_zip_bytes("no-stops", &feed_zip_without("stops.txt")).unwrap_err();
+    let message = crate::error_chain(&error);
+    assert!(
+        message.contains("no-stops") && message.ends_with("required file stops.txt is missing"),
+        "{message}"
+    );
 }

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- A feed that cannot be read fails naming the feed's path, and a missing
+  required file is named as such; a feed without `agency.txt`, which
+  routing never consults, is read with no agencies and a warning instead
+  of failing the whole build.
+  ([#399](https://github.com/cafein-py/cafein/pull/399))
+
 ## 0.28.0 — 2026-09-28
 
 - A blank optional field the GTFS parser expects a code in (a blank

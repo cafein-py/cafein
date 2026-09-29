@@ -38,7 +38,14 @@ impl Feed {
                 &mut feed.skipped_files,
                 &mut feed.dropped_rows,
                 &mut feed.blank_defaults,
-            )?;
+            )
+            .map_err(|error| match error {
+                Error::Gtfs(error) => Error::FeedRead {
+                    path: path.as_ref().display().to_string(),
+                    error,
+                },
+                other => other,
+            })?;
             append_gtfs(&mut feed, feed_index, gtfs, frequencies)?;
         }
         feed.feed_count = paths.len() as FeedIndex;
@@ -77,6 +84,17 @@ fn read_gtfs(
     };
     if let Some(sanitized) = colour_free_copy(&raw, &source) {
         raw = reader.read_from_reader(Cursor::new(sanitized))?;
+    }
+    // agency.txt is required by GTFS but routing never consults it: a
+    // feed without one is read with no agencies, and says so.
+    if matches!(raw.agencies, Err(gtfs_structures::Error::MissingFile(_))) {
+        raw.agencies = Ok(Vec::new());
+        skipped.push(SkippedFile {
+            feed,
+            file_name: "agency.txt".to_string(),
+            reason: "the file is missing".to_string(),
+            kind: SkippedTableKind::Assembled,
+        });
     }
     recover_tables(&mut raw, &source, feed, dropped, blank);
     let frequencies = raw.frequencies.take().transpose()?.unwrap_or_default();
