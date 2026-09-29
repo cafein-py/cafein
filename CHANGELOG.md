@@ -7,6 +7,12 @@
   routing never consults, is read with no agencies and a warning instead
   of failing the whole build.
   ([#399](https://github.com/cafein-py/cafein/pull/399))
+- A `frequencies.txt` row no longer loses all its runs, and the trip
+  with them, when one run cannot sit on the timetable's clock: a run
+  departing at midnight whose first-stop arrival would precede 00:00:00
+  keeps it at 00:00:00 (logged), and only a run with a stop time past
+  the clock's end is dropped, counted in a warning.
+  ([#400](https://github.com/cafein-py/cafein/pull/400))
 
 ## 0.28.0 — 2026-09-28
 

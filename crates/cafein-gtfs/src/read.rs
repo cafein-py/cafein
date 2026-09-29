@@ -11,8 +11,9 @@ use gtfs_structures::{
 use serde::de::DeserializeOwned;
 
 use crate::model::{
-    Agency, BlankDefaults, Calendar, CalendarDate, DroppedRows, Feed, FeedIndex, FeedInfo, Route,
-    RouteIndex, SkippedFile, SkippedFrequency, SkippedTableKind, Stop, StopIndex, StopTime, Trip,
+    Agency, BlankDefaults, Calendar, CalendarDate, DroppedRows, Feed, FeedIndex, FeedInfo,
+    FrequencyNote, Route, RouteIndex, SkippedFile, SkippedFrequency, SkippedTableKind, Stop,
+    StopIndex, StopTime, Trip,
 };
 use crate::Error;
 
@@ -906,10 +907,14 @@ const FREQUENCY_STOP_TIME_BUDGET: u64 = 100_000_000;
 /// Replaces a frequencies.txt template with its runs: per row, one copy
 /// of the template departing at `start + k·headway` for every k that
 /// keeps it before `end`, every stop time shifted alike (both
-/// `exact_times` values are treated the same). Rows that cannot be
-/// expanded are reported; a template none of whose rows can is omitted
-/// and reported, so a template is never routed at its literal times.
-/// Every row's cost is charged to `budget` before any run is built.
+/// `exact_times` values are treated the same). A run is dropped only
+/// when one of its stop times would pass the end of the clock, and
+/// counted; a run departing at midnight whose first stop's arrival
+/// would precede 00:00:00 keeps it at 00:00:00, and is noted. Rows that
+/// cannot be expanded are reported; a template none of whose rows can
+/// is omitted and reported, so a template is never routed at its
+/// literal times. Every row's cost is charged to `budget` before any
+/// run is built.
 fn expand_frequencies(
     feed: &mut Feed,
     feed_index: FeedIndex,
@@ -943,7 +948,33 @@ fn expand_frequencies(
             }
         };
         match outcome {
-            Ok(row_runs) => runs.extend(row_runs),
+            Ok(row_runs) => {
+                if row_runs.clamped > 0 {
+                    feed.frequency_notes.push(FrequencyNote {
+                        feed: feed_index,
+                        trip_id: template.id.clone(),
+                        note: format!(
+                            "{}: {} run(s) start at midnight; a first-stop arrival before \
+                             00:00:00 is kept at 00:00:00",
+                            describe_window(&row),
+                            row_runs.clamped
+                        ),
+                    });
+                }
+                if row_runs.dropped > 0 {
+                    feed.skipped_frequencies.push(SkippedFrequency {
+                        feed: feed_index,
+                        trip_id: template.id.clone(),
+                        reason: format!(
+                            "{}: {} run(s) dropped: a stop would fall outside the clock the \
+                             timetable represents",
+                            describe_window(&row),
+                            row_runs.dropped
+                        ),
+                    });
+                }
+                runs.extend(row_runs.runs);
+            }
             Err(problem) => feed.skipped_frequencies.push(SkippedFrequency {
                 feed: feed_index,
                 trip_id: template.id.clone(),
@@ -983,36 +1014,71 @@ fn run_count(base: Option<u32>, row: &RawFrequency) -> Result<u64, String> {
     Ok(u64::from(row.end_time - row.start_time).div_ceil(u64::from(row.headway_secs)))
 }
 
-/// One validated row's runs. A run whose shifted times leave the clock
-/// the timetable represents (0 to `u32::MAX` seconds) rejects the row.
-fn expand_row(template: &Trip, base: Option<u32>, row: &RawFrequency) -> Result<Vec<Trip>, String> {
+/// One row's surviving runs, with how many were kept with a first-stop
+/// arrival raised to 00:00:00 and how many were dropped for a stop
+/// time past the end of the clock.
+struct RowRuns {
+    runs: Vec<Trip>,
+    clamped: u32,
+    dropped: u32,
+}
+
+/// One validated row's runs on the clock the timetable represents (0 to
+/// `u32::MAX` seconds). A run's departure from the first stop is the
+/// row's own time, so a template whose first stop dwells has that
+/// stop's arrival before the departure: for a run departing at
+/// midnight it would precede 00:00:00 and is kept at 00:00:00 instead.
+/// A run with a stop time past the end of the clock is dropped. The row
+/// is rejected only when no run survives.
+fn expand_row(template: &Trip, base: Option<u32>, row: &RawFrequency) -> Result<RowRuns, String> {
     let base = base.expect("validated by run_count");
-    let mut runs = Vec::new();
+    let mut result = RowRuns {
+        runs: Vec::new(),
+        clamped: 0,
+        dropped: 0,
+    };
     let mut departure = row.start_time;
     while departure < row.end_time {
         let shift = i64::from(departure) - i64::from(base);
         let mut run = template.clone();
+        let mut raised = false;
+        let mut past = false;
         for stop_time in &mut run.stop_times {
-            stop_time.arrival = shift_time(stop_time.arrival, shift)?;
-            stop_time.departure = shift_time(stop_time.departure, shift)?;
+            for slot in [&mut stop_time.arrival, &mut stop_time.departure] {
+                let Some(time) = *slot else {
+                    continue;
+                };
+                *slot = Some(match u32::try_from(i64::from(time) + shift) {
+                    Ok(shifted) => shifted,
+                    Err(_) if i64::from(time) + shift < 0 => {
+                        raised = true;
+                        0
+                    }
+                    Err(_) => {
+                        past = true;
+                        0
+                    }
+                });
+            }
         }
-        runs.push(run);
+        if past {
+            result.dropped += 1;
+        } else {
+            result.clamped += u32::from(raised);
+            result.runs.push(run);
+        }
         let Some(next) = departure.checked_add(row.headway_secs) else {
             break;
         };
         departure = next;
     }
-    Ok(runs)
-}
-
-/// A stop time moved by `shift` seconds; a blank stays blank.
-fn shift_time(time: Option<u32>, shift: i64) -> Result<Option<u32>, String> {
-    time.map(|time| {
-        u32::try_from(i64::from(time) + shift).map_err(|_| {
-            "a run would place a stop outside the clock the timetable represents".to_string()
-        })
-    })
-    .transpose()
+    if result.runs.is_empty() {
+        return Err(format!(
+            "all {} run(s) would place a stop outside the clock the timetable represents",
+            result.dropped
+        ));
+    }
+    Ok(result)
 }
 
 /// A frequencies.txt row's window, for diagnostics.

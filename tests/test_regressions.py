@@ -1049,3 +1049,43 @@ def test_feed_read_errors_name_the_feed_and_a_missing_agency_is_tolerated(tmp_pa
     )
     with pytest.raises(ValueError, match="no_stops_gtfs.zip.*required file stops.txt"):
         TransportNetwork.from_gtfs([without_stops])
+
+
+def test_headway_runs_departing_at_midnight_are_kept(tmp_path, caplog):
+    """A frequencies.txt row starting at 00:00:00 on a template whose
+    first stop dwells used to lose the whole row, and with it the trip,
+    because the midnight run's first-stop arrival fell before 00:00:00.
+    That arrival is now kept at 00:00:00, the runs are all there, and
+    the build logs the adjustment instead of warning.
+    """
+    import logging
+    import warnings
+
+    from cafein import TransportNetwork
+
+    feed = _gtfs_zip(
+        tmp_path / "midnight_headway_gtfs.zip",
+        {
+            **_TWO_STOP_TABLES,
+            "trips.txt": ["route_id,service_id,trip_id", "R1,SV,TL-10"],
+            "stop_times.txt": [
+                "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+                "TL-10,00:00:00,00:00:10,S1,1",
+                "TL-10,00:07:30,00:07:40,S2,2",
+            ],
+            "frequencies.txt": [
+                "trip_id,start_time,end_time,headway_secs",
+                "TL-10,00:00:00,23:59:00,422",
+            ],
+        },
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with caplog.at_level(logging.INFO, logger="cafein"):
+            network = TransportNetwork.from_gtfs([feed])
+    assert [trip for trip, _ in network.trips] == ["TL-10"]
+    assert any(
+        "1 run(s) start at midnight" in record.getMessage() for record in caplog.records
+    )
+    times = network.travel_times_from_stop("S1", "2022-02-22 00:00:00")
+    assert 0 < times["S2"] <= 8 * 60
