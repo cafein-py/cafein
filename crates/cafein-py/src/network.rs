@@ -223,12 +223,24 @@ impl TransportNetwork {
                 None,
             );
         }
-        for skipped in &feed.skipped_frequencies {
+        // One warning per trip and problem: a feed can reject dozens
+        // of a trip's rows for one reason.
+        for group in frequency_report_groups(&feed.skipped_frequencies) {
             crate::logging::build_warning(
                 py,
                 format!(
                     "{}: frequencies.txt, trip {}: {}",
-                    paths[skipped.feed as usize], skipped.trip_id, skipped.reason
+                    paths[group.feed as usize], group.trip_id, group.summary
+                ),
+            )?;
+        }
+        for repair in &feed.frequency_repairs {
+            crate::logging::build_warning(
+                py,
+                format!(
+                    "{}: frequencies.txt, trip {}: {} row(s) with end_time equal to \
+                     start_time read as one departure each",
+                    paths[repair.feed as usize], repair.trip_id, repair.rows
                 ),
             )?;
         }
@@ -3626,4 +3638,58 @@ fn pareto_insert(frontier: &mut Vec<ParetoChoice>, candidate: ParetoChoice) {
                 || rank(&candidate) < rank(held)))
     });
     frontier.push(candidate);
+}
+
+/// One warning's worth of rejected frequencies.txt rows: a run of
+/// entries of the same trip rejected for the same problem, summarised
+/// with their count and the first row's window.
+struct FrequencyReportGroup {
+    feed: cafein_gtfs::FeedIndex,
+    trip_id: String,
+    summary: String,
+}
+
+fn frequency_report_groups(skipped: &[cafein_gtfs::SkippedFrequency]) -> Vec<FrequencyReportGroup> {
+    // A row's reason is "row <window>: <problem>"; an omission has no
+    // window and stands alone.
+    let split = |reason: &str| -> (Option<String>, String) {
+        match reason
+            .strip_prefix("row ")
+            .and_then(|rest| rest.split_once(": "))
+        {
+            Some((window, problem)) => (Some(format!("row {window}")), problem.to_string()),
+            None => (None, reason.to_string()),
+        }
+    };
+    let mut groups: Vec<(cafein_gtfs::FeedIndex, String, Option<String>, String, u32)> = Vec::new();
+    for entry in skipped {
+        let (window, problem) = split(&entry.reason);
+        match groups.last_mut() {
+            Some((feed, trip, first, seen, count))
+                if *feed == entry.feed
+                    && *trip == entry.trip_id
+                    && *seen == problem
+                    && first.is_some()
+                    && window.is_some() =>
+            {
+                *count += 1;
+            }
+            _ => groups.push((entry.feed, entry.trip_id.clone(), window, problem, 1)),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(feed, trip_id, window, problem, count)| {
+            let summary = match (window, count) {
+                (Some(window), 1) => format!("{window}: {problem}"),
+                (Some(window), count) => format!("{count} row(s): {problem} (first: {window})"),
+                (None, _) => problem,
+            };
+            FrequencyReportGroup {
+                feed,
+                trip_id,
+                summary,
+            }
+        })
+        .collect()
 }

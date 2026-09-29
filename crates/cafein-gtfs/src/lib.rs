@@ -12,8 +12,8 @@ mod timetable;
 
 pub use model::{
     Agency, BlankDefaults, Calendar, CalendarDate, DroppedRows, Exception, Feed, FeedIndex,
-    FeedInfo, FrequencyNote, Route, RouteIndex, RouteType, SkippedFile, SkippedFrequency,
-    SkippedTableKind, Stop, StopIndex, StopTime, Trip,
+    FeedInfo, FrequencyNote, FrequencyRepair, Route, RouteIndex, RouteType, SkippedFile,
+    SkippedFrequency, SkippedTableKind, Stop, StopIndex, StopTime, Trip,
 };
 pub use qa::{validate_feed, QaFinding};
 pub use service::{ServiceCalendar, ServiceIndex};

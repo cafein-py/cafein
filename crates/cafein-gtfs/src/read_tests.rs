@@ -785,3 +785,65 @@ fn keeps_frequency_runs_at_the_edges_of_the_clock() {
         feed.skipped_frequencies[0].reason
     );
 }
+
+#[test]
+fn reads_a_zero_length_frequency_row_as_one_departure() {
+    // Some feeds encode a single departure as a row whose end equals
+    // its start; it becomes one run, counted per template, while a row
+    // ending before it starts is still rejected.
+    let feed = read_zip_bytes(
+        "single-departures",
+        &minimal_feed_zip(
+            "",
+            "",
+            &[(
+                "frequencies.txt",
+                "trip_id,start_time,end_time,headway_secs\n\
+                 T1,06:30:00,06:30:00,60\nT1,07:30:00,07:30:00,86400\nT1,09:00:00,08:00:00,600\n",
+            )],
+        ),
+    )
+    .unwrap();
+    let departures: Vec<u32> = feed
+        .trips
+        .iter()
+        .map(|trip| trip.stop_times[0].departure.unwrap())
+        .collect();
+    assert_eq!(departures, vec![23400, 27000]);
+    assert_eq!(
+        feed.frequency_repairs,
+        vec![FrequencyRepair {
+            feed: 0,
+            trip_id: "T1".to_string(),
+            rows: 2,
+        }]
+    );
+    assert_eq!(feed.skipped_frequencies.len(), 1);
+    assert!(feed.skipped_frequencies[0]
+        .reason
+        .contains("end_time is not after start_time"));
+    // The departure exists even at the last second of the clock.
+    let feed = read_zip_bytes(
+        "single-departure-at-the-end",
+        &minimal_feed_zip(
+            "",
+            "",
+            &[
+                (
+                    "stop_times.txt",
+                    "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+                     T1,08:00:00,08:00:00,S1,1\nT1,08:00:00,08:00:00,S2,2\n",
+                ),
+                (
+                    "frequencies.txt",
+                    "trip_id,start_time,end_time,headway_secs\n\
+                     T1,1193046:28:15,1193046:28:15,60\n",
+                ),
+            ],
+        ),
+    )
+    .unwrap();
+    assert_eq!(feed.trips.len(), 1);
+    assert_eq!(feed.trips[0].stop_times[0].departure, Some(u32::MAX));
+    assert_eq!(feed.frequency_repairs[0].rows, 1);
+}
