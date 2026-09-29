@@ -24,6 +24,12 @@ pub use timetable::{build_timetable, QuarantinedTrip, TimetableBuild};
 pub enum Error {
     /// The GTFS archive or directory could not be read or parsed.
     Gtfs(gtfs_structures::Error),
+    /// One feed of a read could not be read or parsed: [`Error::Gtfs`]
+    /// with the feed's path.
+    FeedRead {
+        path: String,
+        error: gtfs_structures::Error,
+    },
     /// A trip references a route that is missing from `routes.txt`.
     UnknownRoute { trip_id: String, route_id: String },
     /// A stop time references a stop that is missing from `stops.txt`.
@@ -42,7 +48,14 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Gtfs(error) => write!(f, "could not read GTFS feed: {error}"),
+            Error::Gtfs(error) => write!(f, "could not read GTFS feed: {}", read_problem(error)),
+            Error::FeedRead { path, error } => {
+                write!(
+                    f,
+                    "could not read GTFS feed '{path}': {}",
+                    read_problem(error)
+                )
+            }
             Error::UnknownRoute { trip_id, route_id } => {
                 write!(f, "trip '{trip_id}' references unknown route '{route_id}'")
             }
@@ -69,10 +82,24 @@ impl std::fmt::Display for Error {
     }
 }
 
+/// The parser's error in the reader's words: a missing required file is
+/// named as such.
+fn read_problem(error: &gtfs_structures::Error) -> String {
+    match error {
+        gtfs_structures::Error::MissingFile(name) => format!("required file {name} is missing"),
+        other => other.to_string(),
+    }
+}
+
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Gtfs(error) => Some(error),
+            // A missing file is stated in full above; the parser's own
+            // wording adds nothing as a cause.
+            Error::Gtfs(error) | Error::FeedRead { error, .. } => match error {
+                gtfs_structures::Error::MissingFile(_) => None,
+                other => Some(other),
+            },
             Error::Timetable(error) => Some(error),
             _ => None,
         }

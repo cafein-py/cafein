@@ -1017,3 +1017,35 @@ def test_unprojectable_shape_points_do_not_abort_the_build(tmp_path):
     with pytest.warns(UserWarning, match="cannot be projected.*SH_BAD"):
         network = TransportNetwork.from_gtfs([feed])
     assert [trip for trip, _ in network.trips] == ["T_OK"]
+
+
+def test_feed_read_errors_name_the_feed_and_a_missing_agency_is_tolerated(tmp_path):
+    """A feed without agency.txt used to fail the whole build with the
+    parser's message and no feed named; routing never consults the
+    agency table, so the feed now reads with a warning, and any other
+    missing required file fails naming the feed and the file.
+    """
+    from cafein import TransportNetwork
+
+    tables = {
+        **_TWO_STOP_TABLES,
+        "trips.txt": ["route_id,service_id,trip_id", "R1,SV,T_OK"],
+        "stop_times.txt": [
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+            "T_OK,08:00:00,08:00:00,S1,1",
+            "T_OK,08:10:00,08:10:00,S2,2",
+        ],
+    }
+    without_agency = _gtfs_zip(
+        tmp_path / "no_agency_gtfs.zip",
+        {name: lines for name, lines in tables.items() if name != "agency.txt"},
+    )
+    with pytest.warns(UserWarning, match="skipped agency.txt"):
+        network = TransportNetwork.from_gtfs([without_agency])
+    assert [trip for trip, _ in network.trips] == ["T_OK"]
+    without_stops = _gtfs_zip(
+        tmp_path / "no_stops_gtfs.zip",
+        {name: lines for name, lines in tables.items() if name != "stops.txt"},
+    )
+    with pytest.raises(ValueError, match="no_stops_gtfs.zip.*required file stops.txt"):
+        TransportNetwork.from_gtfs([without_stops])
