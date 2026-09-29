@@ -13,6 +13,12 @@
   keeps it at 00:00:00 (logged), and only a run with a stop time past
   the clock's end is dropped, counted in a warning.
   ([#400](https://github.com/cafein-py/cafein/pull/400))
+- Rejected `frequencies.txt` rows are reported once per trip and
+  problem, with their count and the first row, instead of once per
+  row; a row whose `end_time` equals its `start_time` (a single
+  departure, as some feeds encode one) is read as one run, warned once
+  per trip, instead of being rejected.
+  ([#401](https://github.com/cafein-py/cafein/pull/401))
 
 ## 0.28.0 — 2026-09-28
 

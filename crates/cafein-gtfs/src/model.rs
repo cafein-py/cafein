@@ -45,6 +45,11 @@ pub struct Feed {
     /// clock, with nothing lost: a diagnostic, never persisted.
     #[serde(skip)]
     pub frequency_notes: Vec<FrequencyNote>,
+    /// Templates with frequencies.txt rows read under an assumption
+    /// (an end time equal to the start time as one departure): a
+    /// diagnostic, never persisted.
+    #[serde(skip)]
+    pub frequency_repairs: Vec<FrequencyRepair>,
     /// Rows dropped at read time from the tables routing consumes, with
     /// the trips or services each drop took along: a diagnostic, never
     /// persisted.
@@ -123,6 +128,15 @@ pub struct FrequencyNote {
     pub feed: FeedIndex,
     pub trip_id: String,
     pub note: String,
+}
+
+/// A template whose frequencies.txt rows with `end_time` equal to
+/// `start_time` were each read as one departure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrequencyRepair {
+    pub feed: FeedIndex,
+    pub trip_id: String,
+    pub rows: u32,
 }
 
 /// A transit agency (`agency.txt`).

@@ -12,8 +12,8 @@ use serde::de::DeserializeOwned;
 
 use crate::model::{
     Agency, BlankDefaults, Calendar, CalendarDate, DroppedRows, Feed, FeedIndex, FeedInfo,
-    FrequencyNote, Route, RouteIndex, SkippedFile, SkippedFrequency, SkippedTableKind, Stop,
-    StopIndex, StopTime, Trip,
+    FrequencyNote, FrequencyRepair, Route, RouteIndex, SkippedFile, SkippedFrequency,
+    SkippedTableKind, Stop, StopIndex, StopTime, Trip,
 };
 use crate::Error;
 
@@ -910,8 +910,10 @@ const FREQUENCY_STOP_TIME_BUDGET: u64 = 100_000_000;
 /// `exact_times` values are treated the same). A run is dropped only
 /// when one of its stop times would pass the end of the clock, and
 /// counted; a run departing at midnight whose first stop's arrival
-/// would precede 00:00:00 keeps it at 00:00:00, and is noted. Rows that
-/// cannot be expanded are reported; a template none of whose rows can
+/// would precede 00:00:00 keeps it at 00:00:00, and is noted. A row
+/// whose end equals its start (a single departure, as some feeds encode
+/// one) is one run, counted per template. Rows that cannot be expanded
+/// are reported; a template none of whose rows can
 /// is omitted and reported, so a template is never routed at its
 /// literal times. Every row's cost is charged to `budget` before any
 /// run is built.
@@ -927,6 +929,7 @@ fn expand_frequencies(
         .first()
         .and_then(|first| first.departure.or(first.arrival));
     let mut runs: Vec<Trip> = Vec::new();
+    let mut single_departures = 0u32;
     for row in rows {
         let outcome = match run_count(base, &row) {
             Err(problem) => Err(problem),
@@ -939,7 +942,7 @@ fn expand_frequencies(
                             trip_id: template.id.clone(),
                             limit: FREQUENCY_STOP_TIME_BUDGET,
                         })?;
-                let expanded = expand_row(&template, base, &row);
+                let expanded = expand_row(&template, base, &row, count);
                 if expanded.is_err() {
                     // A rejected row creates nothing, so it costs nothing.
                     *budget += cost;
@@ -949,6 +952,7 @@ fn expand_frequencies(
         };
         match outcome {
             Ok(row_runs) => {
+                single_departures += u32::from(row.end_time == row.start_time);
                 if row_runs.clamped > 0 {
                     feed.frequency_notes.push(FrequencyNote {
                         feed: feed_index,
@@ -982,6 +986,13 @@ fn expand_frequencies(
             }),
         }
     }
+    if single_departures > 0 {
+        feed.frequency_repairs.push(FrequencyRepair {
+            feed: feed_index,
+            trip_id: template.id.clone(),
+            rows: single_departures,
+        });
+    }
     if runs.is_empty() {
         feed.skipped_frequencies.push(SkippedFrequency {
             feed: feed_index,
@@ -1008,8 +1019,12 @@ fn run_count(base: Option<u32>, row: &RawFrequency) -> Result<u64, String> {
     if row.headway_secs == 0 {
         return Err("headway_secs is 0".to_string());
     }
-    if row.end_time <= row.start_time {
+    if row.end_time < row.start_time {
         return Err("end_time is not after start_time".to_string());
+    }
+    // A window of no length is one departure at its start.
+    if row.end_time == row.start_time {
+        return Ok(1);
     }
     Ok(u64::from(row.end_time - row.start_time).div_ceil(u64::from(row.headway_secs)))
 }
@@ -1029,16 +1044,31 @@ struct RowRuns {
 /// stop's arrival before the departure: for a run departing at
 /// midnight it would precede 00:00:00 and is kept at 00:00:00 instead.
 /// A run with a stop time past the end of the clock is dropped. The row
-/// is rejected only when no run survives.
-fn expand_row(template: &Trip, base: Option<u32>, row: &RawFrequency) -> Result<RowRuns, String> {
+/// is rejected only when no run survives. Exactly the runs `run_count`
+/// counted (and the budget paid for) are built, so a window of no
+/// length holds its one departure at its start.
+fn expand_row(
+    template: &Trip,
+    base: Option<u32>,
+    row: &RawFrequency,
+    count: u64,
+) -> Result<RowRuns, String> {
     let base = base.expect("validated by run_count");
     let mut result = RowRuns {
         runs: Vec::new(),
         clamped: 0,
         dropped: 0,
     };
-    let mut departure = row.start_time;
-    while departure < row.end_time {
+    for k in 0..count {
+        let Some(departure) = u64::from(row.headway_secs)
+            .checked_mul(k)
+            .and_then(|offset| u32::try_from(offset).ok())
+            .and_then(|offset| row.start_time.checked_add(offset))
+        else {
+            // A departure itself past the end of the clock.
+            result.dropped += 1;
+            continue;
+        };
         let shift = i64::from(departure) - i64::from(base);
         let mut run = template.clone();
         let mut raised = false;
@@ -1067,10 +1097,6 @@ fn expand_row(template: &Trip, base: Option<u32>, row: &RawFrequency) -> Result<
             result.clamped += u32::from(raised);
             result.runs.push(run);
         }
-        let Some(next) = departure.checked_add(row.headway_secs) else {
-            break;
-        };
-        departure = next;
     }
     if result.runs.is_empty() {
         return Err(format!(

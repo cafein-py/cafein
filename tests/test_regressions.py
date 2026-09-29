@@ -1089,3 +1089,52 @@ def test_headway_runs_departing_at_midnight_are_kept(tmp_path, caplog):
     )
     times = network.travel_times_from_stop("S1", "2022-02-22 00:00:00")
     assert 0 < times["S2"] <= 8 * 60
+
+
+def test_frequency_row_problems_are_reported_once_per_trip(tmp_path):
+    """A feed that rejects dozens of a trip's frequencies.txt rows for
+    one reason used to warn once per row, burying the rest of the log;
+    the rows are now summarised per trip and problem. A row whose end
+    equals its start, which some feeds use for a single departure, is
+    read as one run and warned once per trip instead of being rejected.
+    """
+    import warnings
+
+    from cafein import TransportNetwork
+
+    feed = _gtfs_zip(
+        tmp_path / "frequency_rows_gtfs.zip",
+        {
+            **_TWO_STOP_TABLES,
+            "trips.txt": ["route_id,service_id,trip_id", "R1,SV,FERRY"],
+            "stop_times.txt": [
+                "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+                "FERRY,00:00:00,00:00:00,S1,1",
+                "FERRY,00:10:00,00:10:00,S2,2",
+            ],
+            "frequencies.txt": [
+                "trip_id,start_time,end_time,headway_secs",
+                "FERRY,06:30:00,06:30:00,60",
+                "FERRY,08:30:00,08:30:00,60",
+                "FERRY,10:00:00,11:00:00,0",
+                "FERRY,12:00:00,13:00:00,0",
+                "FERRY,14:00:00,15:00:00,0",
+            ],
+        },
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        network = TransportNetwork.from_gtfs([feed])
+    messages = [str(w.message) for w in caught]
+    assert len(messages) == 2, messages
+    joined = "\n".join(messages)
+    assert (
+        "3 row(s): headway_secs is 0 (first: row 10:00:00–11:00:00 every 0 s)" in joined
+    )
+    assert (
+        "2 row(s) with end_time equal to start_time read as one departure each"
+        in joined
+    )
+    assert [trip for trip, _ in network.trips] == ["FERRY"]
+    times = network.travel_times_from_stop("S1", "2022-02-22 08:00:00")
+    assert 30 * 60 < times["S2"] <= 40 * 60
