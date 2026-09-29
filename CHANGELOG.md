@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.29.0 — 2026-09-30
 
 - A feed that cannot be read fails naming the feed's path, and a missing
   required file is named as such; a feed without `agency.txt`, which
