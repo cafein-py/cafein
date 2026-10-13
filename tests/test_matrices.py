@@ -7,20 +7,9 @@ import pytest
 import shapely
 
 from cafein import TravelCostMatrix, TravelTimeMatrix, emissions
+from conftest import point_frame
 
 UNREACHABLE_POINT = np.uint32(0xFFFFFFFF)
-
-
-def point_frame(network, named_stops):
-    """Points at known stops' coordinates, under fresh ids."""
-    coordinates = {stop: (lat, lon) for stop, lat, lon in network.stops}
-    ids, stops = zip(*named_stops)
-    lats, lons = zip(*(coordinates[stop] for stop in stops))
-    return gpd.GeoDataFrame(
-        {"id": list(ids)},
-        geometry=gpd.points_from_xy(lons, lats),
-        crs="EPSG:4326",
-    )
 
 
 def cost_matrix(network, **kwargs):

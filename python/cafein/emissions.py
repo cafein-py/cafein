@@ -15,6 +15,7 @@ applied factor — operational-only and full life-cycle emissions come
 from the same table by selecting components.
 """
 
+import collections.abc
 import json
 import math
 import numbers
@@ -26,6 +27,7 @@ import numpy as np
 import pandas as pd
 
 from cafein import _log
+from cafein._validate import freeze_ids, positive_finite, positive_int
 
 KEY_COLUMNS = ["trip_id", "route_id", "agency_id", "route_type"]
 COMPONENT_COLUMNS = ["vehicle", "fuel", "infrastructure", "operations"]
@@ -745,6 +747,214 @@ def trip_factors(network, factors=None, components=None):
             stacklevel=2,
         )
     return results
+
+
+def budget(
+    network,
+    origins=None,
+    destinations=None,
+    departure=None,
+    *,
+    budget=1000.0,
+    round_trip=False,
+    return_departure=None,
+    trips=1,
+    **kwargs,
+):
+    """Each OD pair's travel emissions against a carbon budget.
+
+    Routes ``TravelCostMatrix(network, origins, destinations, departure,
+    **kwargs)`` and compares the counted emissions — ``trips`` times the
+    trip's grams CO₂e — with ``budget``. With ``round_trip=True`` a
+    second matrix routes the way back, from the destinations to the
+    origins at ``return_departure``: its own time-optimal journeys,
+    which can differ from the outbound ones, and each trip counts both
+    directions.
+
+    Parameters
+    ----------
+    network : TransportNetwork or StreetNetwork
+        The network to route on.
+    origins, destinations, departure
+        As in `TravelCostMatrix`.
+    budget : float (optional, default: 1000)
+        The carbon budget in grams CO₂e for the period the trips fall
+        in (by default a day).
+    round_trip : bool (optional, default: False)
+        Count the way back too, routed separately at
+        ``return_departure``. A round trip takes one departure moment
+        per direction and refuses ``arrival=`` and
+        ``candidates="sweep"``.
+    return_departure : datetime.datetime or str (optional)
+        The way back's departure from the destinations, in
+        ``departure``'s form; required with a round trip exactly when
+        ``departure`` is given.
+    trips : int (optional, default: 1)
+        How many times the trip — there and back with ``round_trip`` —
+        is made within the budget's period: five workday commutes
+        against a weekly ``budget=7000``, say.
+    **kwargs
+        Every other `TravelCostMatrix` parameter (``factors``,
+        ``components``, ``optimize``, ``departure_time_window``,
+        ``transport_mode``, ``street_policy``, ``traveler``, …), applied
+        to both directions. A round trip applies ``chunk`` to the
+        origins itself, so the way back returns to exactly the chunk's
+        origins.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The outbound matrix; for a round trip, beside it the way back's
+        columns with a ``return_`` prefix (``return_travel_time``,
+        ``return_emissions``, …); then
+
+        - ``budget_share``: the counted grams over ``budget``, the
+          multiple of the budget the travel uses — above 1 it is over
+          budget by ``budget_share − 1`` of the budget;
+        - ``budget_left``: ``budget`` minus the counted grams; a
+          negative value is the overshoot in grams;
+        - ``within_budget``: whether the counted grams are at most
+          ``budget`` (nullable boolean).
+
+        With ``budget=1000``, 400 g counted gives 0.4, 600, True;
+        1000 g gives 1.0, 0, True; 2400 g gives 2.4, −1400, False —
+        2.4 times the budget, 1400 g (140 %) over it.
+
+        ``emissions`` and ``return_emissions`` stay one trip's grams in
+        that direction; ``trips`` enters only the budget columns. Where
+        a direction's emissions are NaN (a ridden trip without a factor
+        row) the budget columns are empty. A round trip keeps the pairs
+        reachable both ways, as a matrix keeps the reachable pairs, and
+        warns with the count of pairs reachable only one way. Stop
+        endpoints pair the same stop ids both ways; where a feed lists
+        each platform as its own stop, the way back may leave from a
+        stop the pair does not name — point origins and destinations
+        route door to door.
+    """
+    from cafein._units import moments
+    from cafein.matrices import (
+        TravelCostMatrix,
+        _chunk_slice,
+        _is_point_frame,
+        _is_street_network,
+    )
+
+    budget = positive_finite("budget", budget)
+    trips = positive_int("trips", trips)
+    if not isinstance(round_trip, bool):
+        raise TypeError(f"round_trip must be True or False, not {round_trip!r}")
+    if not round_trip:
+        if return_departure is not None:
+            raise ValueError("return_departure applies only with round_trip=True")
+        frame = pd.DataFrame(
+            TravelCostMatrix(network, origins, destinations, departure, **kwargs)
+        )
+        counted = trips * frame["emissions"]
+        return frame.assign(**_budget_columns(counted, budget))
+
+    if kwargs.get("arrival") is not None:
+        raise ValueError(
+            "a round trip departs both ways: pass departure= and "
+            "return_departure=, not arrival="
+        )
+    if kwargs.get("candidates") == "sweep":
+        raise ValueError(
+            'a round trip pairs one route per direction; candidates="sweep" '
+            "gives several"
+        )
+    if (departure is None) != (return_departure is None):
+        raise ValueError(
+            "a round trip needs return_departure exactly when departure is given"
+        )
+    for name, moment in (
+        ("departure", departure),
+        ("return_departure", return_departure),
+    ):
+        if isinstance(moment, (list, tuple, collections.abc.Mapping)):
+            raise ValueError(f"a round trip takes one {name} moment, not slots")
+    if return_departure is not None:
+        moments("return_departure", return_departure)
+
+    # Both directions read the same inputs: one-shot iterables are
+    # consumed once, a factor file is read once, and omitted point
+    # destinations are the origins.
+    origins, _ = freeze_ids(origins)
+    destinations, _ = freeze_ids(destinations)
+    if destinations is None and _is_point_frame(origins):
+        destinations = origins
+    kwargs = {
+        key: list(value) if isinstance(value, collections.abc.Iterator) else value
+        for key, value in kwargs.items()
+    }
+    if isinstance(kwargs.get("factors"), (str, os.PathLike)):
+        kwargs["factors"] = _read_factor_file(pathlib.Path(kwargs["factors"]))
+    chunk = kwargs.pop("chunk", None)
+    if chunk is not None:
+        if _is_point_frame(origins):
+            origins = origins.iloc[_chunk_slice(len(origins), chunk)]
+        elif origins is None and not _is_street_network(network):
+            stops = [stop for stop, _, _ in network.stops]
+            origins = stops[_chunk_slice(len(stops), chunk)]
+        elif origins is not None:
+            origins = (
+                origins.iloc[_chunk_slice(len(origins), chunk)]
+                if hasattr(origins, "iloc")
+                else origins[_chunk_slice(len(origins), chunk)]
+            )
+
+    # Each matrix pins the street graph and transfer set it reads; the
+    # pair must read the same ones.
+    core = getattr(network, "_core", None)
+
+    def generations():
+        return (
+            getattr(core, "_streets_generation", None),
+            getattr(core, "_transfers_generation", None),
+        )
+
+    pinned = generations()
+    there = pd.DataFrame(
+        TravelCostMatrix(network, origins, destinations, departure, **kwargs)
+    )
+    back = pd.DataFrame(
+        TravelCostMatrix(network, destinations, origins, return_departure, **kwargs)
+    )
+    if generations() != pinned:
+        raise RuntimeError(
+            "the street network or transfer set was replaced between the "
+            "round trip's two routings; rerun the query"
+        )
+    back = back.rename(
+        columns={
+            column: (
+                {"from_id": "to_id", "to_id": "from_id"}.get(column)
+                or f"return_{column}"
+            )
+            for column in back.columns
+        }
+    )
+    frame = there.merge(back, on=["from_id", "to_id"], how="inner", sort=False)
+    one_way = len(there) + len(back) - 2 * len(frame)
+    if one_way:
+        warnings.warn(
+            f"{one_way} pair(s) reachable only one way are left out of the "
+            "round trip",
+            stacklevel=2,
+        )
+    counted = trips * (frame["emissions"] + frame["return_emissions"])
+    return frame.assign(**_budget_columns(counted, budget))
+
+
+def _budget_columns(counted, budget):
+    """The budget columns for ``counted`` grams CO₂e against ``budget``:
+    NaN grams leave all three empty."""
+    within = (counted <= budget).astype("boolean")
+    within[counted.isna()] = pd.NA
+    return {
+        "budget_share": counted / budget,
+        "budget_left": budget - counted,
+        "within_budget": within,
+    }
 
 
 def _read_factor_file(path):

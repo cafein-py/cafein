@@ -1,4 +1,4 @@
-"""Emission factors and journey annotation."""
+"""Emission factors, journey annotation, and carbon budgets."""
 
 import json
 import warnings
@@ -6,7 +6,10 @@ import warnings
 import pandas as pd
 import pytest
 
-from cafein import emissions
+from cafein import TravelCostMatrix, emissions
+from conftest import point_frame
+
+OUT, BACK = "2022-02-22 08:30", "2022-02-22 16:30"
 
 
 class StubNetwork:
@@ -323,3 +326,123 @@ def test_helsinki_k_train_journey_emissions(network):
     transit = annotated["legs"][1]
     assert transit["emissions"] == pytest.approx(16.786 * 25, rel=0.001)
     assert annotated["emissions"] == pytest.approx(16.786 * 25, rel=0.001)
+
+
+def test_budget_columns_read_as_multiples_of_the_budget():
+    counted = pd.Series([400.0, 1000.0, 2400.0, float("nan")])
+    columns = emissions._budget_columns(counted, 1000.0)
+    assert columns["budget_share"].tolist()[:3] == [0.4, 1.0, 2.4]
+    assert columns["budget_left"].tolist()[:3] == [600.0, 0.0, -1400.0]
+    assert columns["within_budget"].tolist() == [True, True, False, pd.NA]
+    assert columns["budget_share"].isna().tolist() == [False, False, False, True]
+    assert columns["budget_left"].isna().tolist() == [False, False, False, True]
+
+
+@pytest.mark.parametrize(
+    "homes, round_trip, trips, chunk, components",
+    [
+        ([("home", "1100602")], False, 1, None, None),
+        # Passed as a one-shot generator: both directions must see it.
+        ([("home", "1100602")], True, 2, None, ("fuel", "operations")),
+        # Chunk 1 of 2 keeps "home" alone: the way back returns only there.
+        ([("near-work", "1040280"), ("home", "1100602")], True, 1, (1, 2), None),
+    ],
+)
+def test_budget_routes_each_direction(
+    network_with_footpaths, homes, round_trip, trips, chunk, components
+):
+    net = network_with_footpaths
+    home = point_frame(net, [("home", "1100602")])
+    work = point_frame(net, [("work", "1040280")])
+    # The HSL ferries have no shipped factor and warn on every matrix.
+    with pytest.warns(UserWarning, match="route_type"):
+        result = emissions.budget(
+            net,
+            point_frame(net, homes),
+            work,
+            OUT,
+            round_trip=round_trip,
+            return_departure=BACK if round_trip else None,
+            trips=trips,
+            chunk=chunk,
+            components=None if components is None else iter(components),
+        )
+        there = pd.DataFrame(
+            TravelCostMatrix(net, home, work, OUT, components=components)
+        )
+        back = pd.DataFrame(
+            TravelCostMatrix(net, work, home, BACK, components=components)
+        )
+    # The M2 home at 16:30 is its own journey, not the morning's reversed.
+    assert back["travel_time"].tolist() != there["travel_time"].tolist()
+    returned = back.drop(columns=["from_id", "to_id"]).add_prefix("return_")
+    budget = ["budget_share", "budget_left", "within_budget"]
+    pd.testing.assert_frame_equal(result[there.columns], there)
+    if round_trip:
+        assert list(result.columns) == [*there.columns, *returned.columns, *budget]
+        pd.testing.assert_frame_equal(result[returned.columns], returned)
+        counted = trips * (there["emissions"] + back["emissions"])
+    else:
+        assert list(result.columns) == [*there.columns, *budget]
+        counted = trips * there["emissions"]
+    assert result["budget_left"].tolist() == pytest.approx((1000 - counted).tolist())
+
+
+@pytest.mark.filterwarnings("ignore:no emission factor matches")
+def test_round_trip_warns_about_pairs_reachable_one_way(network):
+    # Stop to stop, the K train takes Korso's 4810551 to Käpylä's 1250551,
+    # but nothing leaves 1250551 for 4810551.
+    with pytest.warns(UserWarning, match=r"1 pair\(s\) reachable only one way"):
+        result = emissions.budget(
+            network,
+            ["4810551"],
+            ["1250551"],
+            OUT,
+            round_trip=True,
+            return_departure=BACK,
+        )
+    assert result.empty
+
+
+@pytest.mark.parametrize(
+    "kwargs, error, match",
+    [
+        ({"budget": 0}, ValueError, "budget must be a positive"),
+        ({"trips": 0}, ValueError, "trips must be at least 1"),
+        ({"round_trip": 1}, TypeError, "round_trip must be True or False"),
+        ({"return_departure": BACK}, ValueError, "only with round_trip"),
+        ({"round_trip": True}, ValueError, "exactly when departure"),
+        (
+            {"round_trip": True, "departure": None, "return_departure": BACK},
+            ValueError,
+            "exactly when departure",
+        ),
+        (
+            {"round_trip": True, "return_departure": BACK, "arrival": BACK},
+            ValueError,
+            "not arrival",
+        ),
+        (
+            {"round_trip": True, "return_departure": [BACK]},
+            ValueError,
+            "one return_departure moment",
+        ),
+        (
+            {"round_trip": True, "return_departure": BACK, "candidates": "sweep"},
+            ValueError,
+            "sweep",
+        ),
+        (
+            {"round_trip": True, "return_departure": "evening"},
+            ValueError,
+            "return_departure takes",
+        ),
+    ],
+)
+def test_budget_refuses_before_routing(monkeypatch, kwargs, error, match):
+    def routed(*args, **kwargs):
+        raise AssertionError("routed before refusing")
+
+    monkeypatch.setattr("cafein.matrices.TravelCostMatrix", routed)
+    with pytest.raises(error, match=match):
+        emissions.budget(None, ["a"], ["b"], **{"departure": OUT, **kwargs})
