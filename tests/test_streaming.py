@@ -1327,13 +1327,11 @@ def test_streamed_slots_match_the_constructor(network, tmp_path):
     # The labeled cost table streams the slot label dictionary-encoded.
     target = tmp_path / "cost.parquet"
     mapping = {"peak": slots[0], "midday": slots[1]}
-    with pytest.warns(UserWarning, match="route_type"):
-        travel_cost_table(network, stops[:2], departure=mapping, output=target)
+    travel_cost_table(network, stops[:2], departure=mapping, output=target)
     table = parquet.read_table(target)
     assert table.column_names[:4] == ["from_id", "to_id", "slot", "departure_time"]
     assert pyarrow.types.is_dictionary(table.schema.field("slot").type)
-    with pytest.warns(UserWarning, match="route_type"):
-        expected = travel_cost_table(network, stops[:2], departure=mapping).to_pandas()
+    expected = travel_cost_table(network, stops[:2], departure=mapping).to_pandas()
     got = table.to_pandas()
     keys = ["from_id", "to_id", "slot"]
     for name in keys:

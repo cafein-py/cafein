@@ -267,11 +267,13 @@ def test_door_to_door_frontier_anchors_on_walking(network_with_footpaths):
     assert fastest["travel_time"] <= fastest_arrival - (8 * 3600 + 30 * 60)
 
 
-def test_unmatched_factors_poison_but_do_not_block(network, helsinki_gtfs):
+def test_unmatched_factors_poison_but_do_not_block(
+    network, helsinki_gtfs, without_ferry_factor
+):
     from cafein import least_money
     from cafein.fares import zone_fare_structure
 
-    # The Suomenlinna ferry has no shipped factor: its journeys carry
+    # Without a ferry factor, journeys riding the Suomenlinna ferry carry
     # NaN emissions and never join the frontier.
     with pytest.warns(UserWarning, match="route_type"):
         frame = journey_frontier(

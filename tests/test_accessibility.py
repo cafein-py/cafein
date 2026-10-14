@@ -1543,14 +1543,13 @@ def test_from_matrix_reproduces_the_routed_computers(network):
     # The emissions axis reads the cost matrix's column.
     from cafein import TravelCostMatrix
 
-    with pytest.warns(UserWarning, match="route_type"):
-        cost = TravelCostMatrix(
-            network,
-            origins,
-            departure=DEPARTURE,
-            optimize="emissions",
-            departure_time_window=10,
-        )
+    cost = TravelCostMatrix(
+        network,
+        origins,
+        departure=DEPARTURE,
+        optimize="emissions",
+        departure_time_window=10,
+    )
     cost = cost[cost["to_id"].isin(destinations)]
     routed_e = Accessibility(
         network,
@@ -1721,15 +1720,14 @@ def test_from_matrix_reads_shard_directories(network_with_footpaths, tmp_path):
         (TravelCostMatrix.to_parquet, tmp_path / "cost"),
         (travel_cost_table, tmp_path / "table"),
     ):
-        with pytest.warns(UserWarning, match="route_type"):
-            producer(
-                network_with_footpaths,
-                points,
-                points,
-                departure=DEPARTURE,
-                output=target,
-                batch_size=2,
-            )
+        producer(
+            network_with_footpaths,
+            points,
+            points,
+            departure=DEPARTURE,
+            output=target,
+            batch_size=2,
+        )
         streamed = Accessibility.from_matrix(
             target, ids, cost="emissions", budgets=(600.0,), origins=ids
         )

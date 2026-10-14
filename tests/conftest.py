@@ -22,6 +22,20 @@ def _data_file(name):
     return path
 
 
+def point_frame(network, named_stops):
+    """Points at known stops' coordinates, under fresh ids."""
+    import geopandas as gpd
+
+    coordinates = {stop: (lat, lon) for stop, lat, lon in network.stops}
+    ids, stops = zip(*named_stops)
+    lats, lons = zip(*(coordinates[stop] for stop in stops))
+    return gpd.GeoDataFrame(
+        {"id": list(ids)},
+        geometry=gpd.points_from_xy(lons, lats),
+        crs="EPSG:4326",
+    )
+
+
 @pytest.fixture(scope="session")
 def helsinki_gtfs():
     """Path to the Helsinki GTFS zip shared with r5py's sample data."""
@@ -38,6 +52,20 @@ def kantakaupunki_pbf():
 def fares_poa():
     """Path to r5r's saved Porto Alegre fare structure."""
     return _data_file("fares_poa.zip")
+
+
+@pytest.fixture()
+def without_ferry_factor(monkeypatch):
+    """The shipped factor table without its ferry row, so the HSL
+    Suomenlinna ferry's trips resolve to no factor."""
+    from cafein import emissions
+
+    shipped = emissions.default_factors
+    monkeypatch.setattr(
+        emissions,
+        "default_factors",
+        lambda: shipped().query("route_type != 4").reset_index(drop=True),
+    )
 
 
 @pytest.fixture(scope="session")

@@ -7,30 +7,16 @@ import pytest
 import shapely
 
 from cafein import TravelCostMatrix, TravelTimeMatrix, emissions
+from conftest import point_frame
 
 UNREACHABLE_POINT = np.uint32(0xFFFFFFFF)
 
 
-def point_frame(network, named_stops):
-    """Points at known stops' coordinates, under fresh ids."""
-    coordinates = {stop: (lat, lon) for stop, lat, lon in network.stops}
-    ids, stops = zip(*named_stops)
-    lats, lons = zip(*(coordinates[stop] for stop in stops))
-    return gpd.GeoDataFrame(
-        {"id": list(ids)},
-        geometry=gpd.points_from_xy(lons, lats),
-        crs="EPSG:4326",
-    )
-
-
 def cost_matrix(network, **kwargs):
-    # The HSL feed's ferries have no shipped factor; the warning is part
-    # of the resolution contract and irrelevant to most assertions.
     departure = kwargs.pop("departure", "08:30:00")
     if len(departure) <= len("HH:MM:SS"):
         departure = f"2022-02-22 {departure}"
-    with pytest.warns(UserWarning, match="route_type"):
-        return TravelCostMatrix(network, departure=departure, **kwargs)
+    return TravelCostMatrix(network, departure=departure, **kwargs)
 
 
 def scattered_points(network, count, seed):
@@ -152,8 +138,7 @@ def test_cost_matrix_requires_installed_payloads(helsinki_gtfs):
 
 
 def test_trip_factors_resolve_the_ladder(network):
-    with pytest.warns(UserWarning, match="route_type"):
-        factors = dict(emissions.trip_factors(network))
+    factors = dict(emissions.trip_factors(network))
     assert len(factors) == network.trip_count
     assert factors["3001K_20220222_S1_2_0831"] == pytest.approx(25.0)
 
@@ -592,13 +577,16 @@ def test_fare_columns_price_the_reported_journeys(network, helsinki_gtfs):
     assert bulk["money"].to_numpy() == pytest.approx(expected)
 
 
-def test_fare_cells_survive_unresolved_emissions(network, helsinki_gtfs):
+@pytest.mark.filterwarnings("ignore:no emission factor matches")
+def test_fare_cells_survive_unresolved_emissions(
+    network, helsinki_gtfs, without_ferry_factor
+):
     from cafein import fares as fare_module
 
     hsl = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
-    # Each objective qualifies by its own key: the factorless ferry to
-    # Suomenlinna prices at the zone ticket under the fare objective,
-    # while the emissions objective has no qualifying candidate.
+    # Each objective qualifies by its own key: without a ferry factor, the
+    # ferry to Suomenlinna prices at the zone ticket under the fare
+    # objective, while the emissions objective has no qualifying candidate.
     cheapest = cost_matrix(
         network,
         origins=["1080701"],
@@ -910,14 +898,13 @@ def test_arrow_table_matches_the_dataframe(network, tmp_path):
     import pyarrow.parquet
     from cafein import travel_cost_table
 
-    with pytest.warns(UserWarning, match="route_type"):
-        table = travel_cost_table(
-            network,
-            origins=["4810551"],
-            destinations=["1250551"],
-            departure="2022-02-22 08:30:00",
-            geometries=True,
-        )
+    table = travel_cost_table(
+        network,
+        origins=["4810551"],
+        destinations=["1250551"],
+        departure="2022-02-22 08:30:00",
+        geometries=True,
+    )
     frame = cost_matrix(
         network,
         origins=["4810551"],
@@ -1553,8 +1540,7 @@ def test_departure_slots_share_one_frozen_query(network):
 
 
 def _cost_slot_frame(network, origins, departure, **kwargs):
-    with pytest.warns(UserWarning, match="route_type"):
-        return TravelCostMatrix(network, origins, departure=departure, **kwargs)
+    return TravelCostMatrix(network, origins, departure=departure, **kwargs)
 
 
 def test_cost_departure_slots_concatenate_the_scalar_frames(network):
@@ -1589,17 +1575,15 @@ def test_cost_arrival_slots_mirror_departure_slots(network):
     destinations = ["4810551", "1250551", "4740551"]
     deadlines = ["2022-02-22 09:30:00", "2022-02-22 13:00:00"]
     kwargs = dict(optimize="emissions", arrival_time_window=10)
-    with pytest.warns(UserWarning, match="route_type"):
-        frame = TravelCostMatrix(
-            network, origins, destinations, arrival=deadlines, **kwargs
-        )
+    frame = TravelCostMatrix(
+        network, origins, destinations, arrival=deadlines, **kwargs
+    )
     assert list(frame.columns)[:3] == ["from_id", "to_id", "arrival_time"]
     for deadline in deadlines:
         block = frame[frame["arrival_time"] == deadline].drop(columns="arrival_time")
-        with pytest.warns(UserWarning, match="route_type"):
-            single = TravelCostMatrix(
-                network, origins, destinations, arrival=deadline, **kwargs
-            )
+        single = TravelCostMatrix(
+            network, origins, destinations, arrival=deadline, **kwargs
+        )
         pd.testing.assert_frame_equal(
             block.reset_index(drop=True), pd.DataFrame(single)
         )
@@ -1611,8 +1595,7 @@ def test_cost_table_slots_concatenate_the_arrow_tables(network):
 
     origins = ["4810551", "1250551"]
     slots = ["2022-02-22 08:30:00", "2022-02-22 12:00:00"]
-    with pytest.warns(UserWarning, match="route_type"):
-        table = travel_cost_table(network, origins, departure=slots)
+    table = travel_cost_table(network, origins, departure=slots)
     assert table.column_names[:4] == [
         "from_id",
         "to_id",
@@ -1621,8 +1604,7 @@ def test_cost_table_slots_concatenate_the_arrow_tables(network):
     ]
     parts = []
     for slot in slots:
-        with pytest.warns(UserWarning, match="route_type"):
-            part = travel_cost_table(network, origins, departure=slot).to_pandas()
+        part = travel_cost_table(network, origins, departure=slot).to_pandas()
         parts.append(part.assign(departure_time=slot))
     expected = pd.concat(parts, ignore_index=True)[table.column_names]
     got = table.to_pandas()
@@ -1679,24 +1661,22 @@ def test_walking_only_policy_serves_cost_slots(network_with_footpaths):
     policy = StreetLegPolicy(access={"walk": 15}, egress={"walk": 15})
     origins = point_frame(network_with_footpaths, [("a", "4810551"), ("b", "1250551")])
     slots = ["2022-02-22 08:30:00", "2022-02-22 12:00:00"]
-    with pytest.warns(UserWarning, match="route_type"):
-        frame = TravelCostMatrix(
+    frame = TravelCostMatrix(
+        network_with_footpaths,
+        origins,
+        origins,
+        departure=slots,
+        street_policy=policy,
+    )
+    for slot in slots:
+        block = frame[frame["departure_time"] == slot].drop(columns="departure_time")
+        single = TravelCostMatrix(
             network_with_footpaths,
             origins,
             origins,
-            departure=slots,
+            departure=slot,
             street_policy=policy,
         )
-    for slot in slots:
-        block = frame[frame["departure_time"] == slot].drop(columns="departure_time")
-        with pytest.warns(UserWarning, match="route_type"):
-            single = TravelCostMatrix(
-                network_with_footpaths,
-                origins,
-                origins,
-                departure=slot,
-                street_policy=policy,
-            )
         pd.testing.assert_frame_equal(
             block.reset_index(drop=True), pd.DataFrame(single)
         )
@@ -1945,11 +1925,8 @@ def test_the_matrix_classes_delegate_compare(network):
     pd.testing.assert_frame_equal(via_method, compare_matrices(peak, midday))
     assert (via_method["status"] == "both").any()
     assert "travel_time_delta" in via_method.columns
-    with pytest.warns(UserWarning, match="route_type"):
-        cost_peak = TravelCostMatrix(network, origins, departure="2022-02-22 08:30:00")
-        cost_midday = TravelCostMatrix(
-            network, origins, departure="2022-02-22 12:00:00"
-        )
+    cost_peak = TravelCostMatrix(network, origins, departure="2022-02-22 08:30:00")
+    cost_midday = TravelCostMatrix(network, origins, departure="2022-02-22 12:00:00")
     ratios = cost_peak.compare(cost_midday, ratios=True)
     assert "emissions_ratio" in ratios.columns
     # Slotted matrices align on the moment key: the shared slot joins
@@ -2004,18 +1981,16 @@ def test_slots_span_service_dates_on_both_axes(network, network_with_footpaths):
         ignore_index=True,
     )[list(frame.columns)]
     pd.testing.assert_frame_equal(pd.DataFrame(frame), expected)
-    with pytest.warns(UserWarning, match="route_type"):
-        cost = TravelCostMatrix(network, origins[:2], departure=two_dates)
-    with pytest.warns(UserWarning, match="route_type"):
-        cost_expected = pd.concat(
-            [
-                pd.DataFrame(
-                    TravelCostMatrix(network, origins[:2], departure=slot)
-                ).assign(departure_time=slot)
-                for slot in two_dates
-            ],
-            ignore_index=True,
-        )[list(cost.columns)]
+    cost = TravelCostMatrix(network, origins[:2], departure=two_dates)
+    cost_expected = pd.concat(
+        [
+            pd.DataFrame(TravelCostMatrix(network, origins[:2], departure=slot)).assign(
+                departure_time=slot
+            )
+            for slot in two_dates
+        ],
+        ignore_index=True,
+    )[list(cost.columns)]
     pd.testing.assert_frame_equal(pd.DataFrame(cost), cost_expected)
     points = point_frame(network_with_footpaths, [("a", "4810551"), ("b", "1250551")])
     deadlines = ["2022-02-22 09:30:00", "2022-02-23 09:30:00"]

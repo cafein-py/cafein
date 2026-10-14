@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- `cafein.emissions.budget` routes a cost matrix and reports each
+  pair's share of a carbon budget (1000 g CO₂e by default), the grams
+  left or over, and whether the trip fits; `round_trip=True` routes the
+  way back separately at `return_departure`, and `trips=` counts the
+  trips made within the budget's period.
+  ([#404](https://github.com/cafein-py/cafein/pull/404))
+- Ferries (GTFS route_type 4 and the extended water-transport and ferry
+  codes) carry a default emission factor of 333 g CO₂e per passenger-km,
+  derived from the fuel use of Helsinki's Suomenlinna ferry service,
+  instead of none: ferry legs no longer report NaN emissions or warn.
+  ([#406](https://github.com/cafein-py/cafein/pull/406))
+- `park_and_ride_facilities` states EPSG:4326 on its frame also when
+  pyrosm returns the WGS 84 definition as PROJJSON (pyrosm 0.20).
+  ([#405](https://github.com/cafein-py/cafein/pull/405))
+
 ## 0.29.0 — 2026-09-30
 
 - A feed that cannot be read fails naming the feed's path, and a missing
