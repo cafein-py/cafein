@@ -1138,3 +1138,26 @@ def test_frequency_row_problems_are_reported_once_per_trip(tmp_path):
     assert [trip for trip, _ in network.trips] == ["FERRY"]
     times = network.travel_times_from_stop("S1", "2022-02-22 08:00:00")
     assert 30 * 60 < times["S2"] <= 40 * 60
+
+
+def test_park_and_ride_facilities_state_epsg_4326(monkeypatch):
+    # An extractor handing back WGS 84 as PROJJSON: to_crs keeps that
+    # definition, so the frame's CRS must be restated as EPSG:4326.
+    import geopandas as gpd
+    import pyproj
+
+    class _OSM:
+        def __init__(self, path, bounding_box=None):
+            pass
+
+        def get_data_by_custom_criteria(self, **kwargs):
+            return gpd.GeoDataFrame(
+                {"id": [1], "osm_type": ["node"], "park_ride": ["yes"]},
+                geometry=gpd.points_from_xy([24.94], [60.17]),
+                crs=pyproj.CRS.from_json(pyproj.CRS("EPSG:4326").to_json()),
+            )
+
+    monkeypatch.setattr(streets.pyrosm, "OSM", _OSM)
+    frame = streets.park_and_ride_facilities("unread.osm.pbf")
+    assert str(frame.crs) == "EPSG:4326"
+    assert frame["id"].tolist() == ["node/1"]

@@ -593,4 +593,6 @@ def park_and_ride_facilities(osm_pbf, bounding_box=None):
         geometry=points.to_numpy(),
         crs=found.crs or "EPSG:4326",
     ).reset_index(drop=True)
-    return frame.to_crs(epsg=4326)[columns]
+    # to_crs keeps an equivalent WGS 84 definition as given (pyrosm may
+    # hand back PROJJSON); the frame states EPSG:4326 itself.
+    return frame.to_crs(epsg=4326).set_crs(epsg=4326, allow_override=True)[columns]
