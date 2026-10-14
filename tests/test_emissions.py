@@ -18,6 +18,7 @@ class StubNetwork:
         ("R-TRAM", "HSL", 0),
         ("R-FANCY", "OP2", 3),
         ("R-FERRY", "HSL", 4),
+        ("R-FUNICULAR", "HSL", 7),
         ("R-EXTENDED", "HSL", 109),
         ("42", "HSL", 3),
         ("NA", "HSL", 3),
@@ -62,19 +63,18 @@ def test_default_factors_apply_per_mode():
         transit_leg(2000.0),
         transit_leg(1000.0, route="R-TRAM"),
         transit_leg(1000.0, route="R-EXTENDED"),  # 109: extended, rail base
+        transit_leg(1000.0, route="R-FERRY"),
     )
     (annotated,) = emissions.annotate([trip], StubNetwork())
-    bus, tram, extended = (
-        annotated["legs"][1],
-        annotated["legs"][2],
-        annotated["legs"][3],
-    )
-    # ITF life-cycle totals: ICE bus 92, urban rail 25 g CO2e/pkm.
+    bus, tram, extended, ferry = annotated["legs"][1:5]
+    # ITF life-cycle totals: ICE bus 92, urban rail 25 g CO2e/pkm; the
+    # Suomenlinna-derived ferry 333.
     assert bus["emissions"] == pytest.approx(2.0 * 92)
     assert tram["emissions"] == pytest.approx(1.0 * 25)
     # An extended route type falls back to its base mode's factor.
     assert extended["emissions"] == pytest.approx(25.0)
-    assert annotated["emissions"] == pytest.approx(184 + 25 + 25)
+    assert ferry["emissions"] == pytest.approx(333.0)
+    assert annotated["emissions"] == pytest.approx(184 + 25 + 25 + 333)
     assert annotated["legs"][0]["emissions"] == 0.0
     assert annotated["legs"][-1]["emissions"] == 0.0
 
@@ -108,14 +108,14 @@ def test_user_rows_override_defaults_at_equal_specificity():
 
 def test_an_all_empty_row_is_the_global_default():
     factors = pd.DataFrame([{"vehicle": 7.0}])
-    trip = journey(transit_leg(1000.0, route="R-FERRY"))
+    trip = journey(transit_leg(1000.0, route="R-FUNICULAR"))
     (annotated,) = emissions.annotate([trip], StubNetwork(), factors)
     assert annotated["legs"][1]["emissions"] == pytest.approx(7.0)
 
 
 def test_unmatched_modes_warn_and_stay_unresolved():
-    trip = journey(transit_leg(1000.0, route="R-FERRY"), transit_leg(1000.0))
-    with pytest.warns(UserWarning, match=r"route_type\(s\) \[4\]"):
+    trip = journey(transit_leg(1000.0, route="R-FUNICULAR"), transit_leg(1000.0))
+    with pytest.warns(UserWarning, match=r"route_type\(s\) \[7\]"):
         (annotated,) = emissions.annotate([trip], StubNetwork())
     assert annotated["legs"][1]["emissions"] is None
     assert annotated["legs"][2]["emissions"] == pytest.approx(92.0)
@@ -141,7 +141,7 @@ def test_blank_key_strings_mean_not_applicable(tmp_path):
     loaded = emissions.load_factors(path)
     assert loaded[emissions.KEY_COLUMNS].isna().all().all()
     # A row with no keys at all is the global default.
-    trip = journey(transit_leg(1000.0, route="R-FERRY"))
+    trip = journey(transit_leg(1000.0, route="R-FUNICULAR"))
     (annotated,) = emissions.annotate([trip], StubNetwork(), path)
     assert annotated["legs"][1]["emissions"] == pytest.approx(7.0)
 
@@ -354,25 +354,19 @@ def test_budget_routes_each_direction(
     net = network_with_footpaths
     home = point_frame(net, [("home", "1100602")])
     work = point_frame(net, [("work", "1040280")])
-    # The HSL ferries have no shipped factor and warn on every matrix.
-    with pytest.warns(UserWarning, match="route_type"):
-        result = emissions.budget(
-            net,
-            point_frame(net, homes),
-            work,
-            OUT,
-            round_trip=round_trip,
-            return_departure=BACK if round_trip else None,
-            trips=trips,
-            chunk=chunk,
-            components=None if components is None else iter(components),
-        )
-        there = pd.DataFrame(
-            TravelCostMatrix(net, home, work, OUT, components=components)
-        )
-        back = pd.DataFrame(
-            TravelCostMatrix(net, work, home, BACK, components=components)
-        )
+    result = emissions.budget(
+        net,
+        point_frame(net, homes),
+        work,
+        OUT,
+        round_trip=round_trip,
+        return_departure=BACK if round_trip else None,
+        trips=trips,
+        chunk=chunk,
+        components=None if components is None else iter(components),
+    )
+    there = pd.DataFrame(TravelCostMatrix(net, home, work, OUT, components=components))
+    back = pd.DataFrame(TravelCostMatrix(net, work, home, BACK, components=components))
     # The M2 home at 16:30 is its own journey, not the morning's reversed.
     assert back["travel_time"].tolist() != there["travel_time"].tolist()
     returned = back.drop(columns=["from_id", "to_id"]).add_prefix("return_")
@@ -388,7 +382,6 @@ def test_budget_routes_each_direction(
     assert result["budget_left"].tolist() == pytest.approx((1000 - counted).tolist())
 
 
-@pytest.mark.filterwarnings("ignore:no emission factor matches")
 def test_round_trip_warns_about_pairs_reachable_one_way(network):
     # Stop to stop, the K train takes Korso's 4810551 to Käpylä's 1250551,
     # but nothing leaves 1250551 for 4810551.

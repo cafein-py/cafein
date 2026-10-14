@@ -232,12 +232,8 @@ def test_cost_routers_agree_with_geometry_and_fares(network, helsinki_gtfs):
     hsl = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
     args = (network, ["4810551", "1040602"], ["1250551"], "2022-02-22 08:30:00")
     kwargs = dict(geometries=True, fares=hsl)
-    # The HSL ferries have no shipped factor; the warning is part of the
-    # factor-resolution contract, not of this assertion.
-    with pytest.warns(UserWarning, match="route_type"):
-        raptor = TravelCostMatrix(*args, router="raptor", **kwargs)
-    with pytest.warns(UserWarning, match="route_type"):
-        tbtr = TravelCostMatrix(*args, router="tbtr", **kwargs)
+    raptor = TravelCostMatrix(*args, router="raptor", **kwargs)
+    tbtr = TravelCostMatrix(*args, router="tbtr", **kwargs)
     assert len(raptor) > 0
     assert raptor.money.notna().any()
     assert raptor.geometry.notna().any()
@@ -260,18 +256,14 @@ def test_point_cost_matrices_accept_tbtr(network_with_footpaths, helsinki_gtfs):
         geometries=True,
         fares=fare_module.zone_fare_structure(helsinki_gtfs, rules="zones"),
     )
-    with pytest.warns(UserWarning, match="route_type"):
-        fastest_raptor = TravelCostMatrix(*args, router="raptor", **payload)
-    with pytest.warns(UserWarning, match="route_type"):
-        fastest_tbtr = TravelCostMatrix(*args, router="tbtr", **payload)
+    fastest_raptor = TravelCostMatrix(*args, router="raptor", **payload)
+    fastest_tbtr = TravelCostMatrix(*args, router="tbtr", **payload)
     assert len(fastest_raptor) > 0
     assert fastest_raptor.geometry.notna().any()
     assert fastest_tbtr.equals(fastest_raptor)
     kwargs = dict(optimize="emissions", departure_time_window=30, **payload)
-    with pytest.warns(UserWarning, match="route_type"):
-        least_raptor = TravelCostMatrix(*args, router="raptor", **kwargs)
-    with pytest.warns(UserWarning, match="route_type"):
-        least_tbtr = TravelCostMatrix(*args, router="tbtr", **kwargs)
+    least_raptor = TravelCostMatrix(*args, router="raptor", **kwargs)
+    least_tbtr = TravelCostMatrix(*args, router="tbtr", **kwargs)
     assert len(least_raptor) > 0
     assert least_tbtr.equals(least_raptor)
 

@@ -54,6 +54,20 @@ def fares_poa():
     return _data_file("fares_poa.zip")
 
 
+@pytest.fixture()
+def without_ferry_factor(monkeypatch):
+    """The shipped factor table without its ferry row, so the HSL
+    Suomenlinna ferry's trips resolve to no factor."""
+    from cafein import emissions
+
+    shipped = emissions.default_factors
+    monkeypatch.setattr(
+        emissions,
+        "default_factors",
+        lambda: shipped().query("route_type != 4").reset_index(drop=True),
+    )
+
+
 @pytest.fixture(scope="session")
 def artifact_cache(tmp_path_factory):
     """The directory shared by every worker for cached network artifacts.

@@ -427,14 +427,11 @@ def test_point_forms_take_exclusions(network_with_footpaths):
     assert ridden
     args = (network_with_footpaths, origins, destinations, "2022-02-22 08:30:00")
     for kwargs in ({}, {"optimize": "emissions", "departure_time_window": 30}):
-        with pytest.warns(UserWarning, match="route_type"):
-            baseline = TravelCostMatrix(*args, **kwargs)
-        with pytest.warns(UserWarning, match="route_type"):
-            excluded = TravelCostMatrix(*args, exclude_routes=ridden, **kwargs)
-        with pytest.warns(UserWarning, match="route_type"):
-            raptor = TravelCostMatrix(
-                *args, router="raptor", exclude_routes=ridden, **kwargs
-            )
+        baseline = TravelCostMatrix(*args, **kwargs)
+        excluded = TravelCostMatrix(*args, exclude_routes=ridden, **kwargs)
+        raptor = TravelCostMatrix(
+            *args, router="raptor", exclude_routes=ridden, **kwargs
+        )
         # The point forms honour the exclusions: auto equals raptor
         # under them, and the fastest form loses its excluded corridor
         # (the emissions pick may already avoid it).

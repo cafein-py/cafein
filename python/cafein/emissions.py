@@ -71,19 +71,26 @@ def default_factors():
     Life-cycle estimates from the International Transport Forum's LCA
     tool, calibrated to the Finnish electricity mix (Dey, Marín-Flores &
     Tenkanen 2026, Table 5): buses carry the ICE-bus factors, and tram,
-    metro, and rail share the metro/urban-train factors. Layer your own
-    rows over these through the `factors` argument of `annotate`;
+    metro, and rail share the metro/urban-train factors. Ferries carry a
+    value derived for Helsinki's Suomenlinna service: its 2025 fuel use
+    per passenger-km (HSL) at the UK DESNZ 2025 mineral-diesel factors
+    (265 g combustion, 62 g fuel production), plus 6 g for building the
+    vessel from a life-cycle assessment of a similar passenger ferry
+    (Chalmers, 2024); infrastructure and operations are zero. Layer your
+    own rows over these through the `factors` argument of `annotate`;
     `vehicle_class_factors` lists the per-powertrain values to build
     such rows from.
     """
     classes = vehicle_class_factors()
     bus = classes.loc["bus-ICE"].to_dict()
     urban_rail = classes.loc["metro-urban-train"].to_dict()
+    ferry = {"vehicle": 6.0, "fuel": 327.0, "infrastructure": 0.0, "operations": 0.0}
     rows = [
         {"route_type": 3, **bus},
         {"route_type": 0, **urban_rail},
         {"route_type": 1, **urban_rail},
         {"route_type": 2, **urban_rail},
+        {"route_type": 4, **ferry},
     ]
     for row in rows:
         row["basis"] = "passenger_km"
