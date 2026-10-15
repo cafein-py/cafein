@@ -6,7 +6,8 @@ import warnings
 import pandas as pd
 import pytest
 
-from cafein import TravelCostMatrix, emissions
+from cafein import TravelCostMatrix, costs, emissions
+from cafein.matrices import _factor_tables
 from conftest import point_frame
 
 OUT, BACK = "2022-02-22 08:30", "2022-02-22 16:30"
@@ -158,23 +159,68 @@ ROWS = [
 ]
 
 
-@pytest.mark.parametrize("fmt", ["csv", "json", "yaml"])
+@pytest.mark.parametrize("fmt", ["csv", "json", "yaml", "rows", "columns", "row"])
 def test_factor_tables_load_identically_from_all_formats(tmp_path, fmt):
-    from_frame = emissions.load_factors(pd.DataFrame(ROWS))
+    rows = ROWS[:1] if fmt == "row" else ROWS
+    from_frame = emissions.load_factors(pd.DataFrame(rows))
     if fmt == "csv":
-        path = tmp_path / "factors.csv"
-        pd.DataFrame(ROWS).to_csv(path, index=False)
+        source = tmp_path / "factors.csv"
+        pd.DataFrame(ROWS).to_csv(source, index=False)
     elif fmt == "json":
-        path = tmp_path / "factors.json"
-        path.write_text(json.dumps(ROWS))
-    else:
+        source = tmp_path / "factors.json"
+        source.write_text(json.dumps(ROWS))
+    elif fmt == "yaml":
         yaml = pytest.importorskip("yaml")
-        path = tmp_path / "factors.yml"
-        path.write_text(yaml.safe_dump(ROWS))
-    loaded = emissions.load_factors(path)
+        source = tmp_path / "factors.yml"
+        source.write_text(yaml.safe_dump(ROWS))
+    else:
+        # A list of row mappings, a mapping of columns, one row mapping.
+        source = {
+            "rows": ROWS,
+            "columns": pd.DataFrame(ROWS).to_dict("list"),
+            "row": ROWS[0],
+        }[fmt]
+    loaded = emissions.load_factors(source)
     pd.testing.assert_frame_equal(
         loaded.fillna(-1), from_frame.fillna(-1), check_dtype=False
     )
+
+
+@pytest.mark.parametrize(
+    "load, rows",
+    [
+        (
+            emissions.load_street_factors,
+            [{"street_mode": "car", "vehicle_class": "BEV", "fuel": 16.0}],
+        ),
+        (
+            costs.load_street_costs,
+            [
+                {
+                    "perspective": "private",
+                    "street_mode": "car",
+                    "component": "fuel",
+                    "cost_per_km": 0.1,
+                }
+            ],
+        ),
+        # The street-policy split reads the same forms before routing and
+        # hands either arm the table it read.
+        (
+            lambda source: _factor_tables(source)[1],
+            [{"street_mode": "car", "fuel": 1.0}],
+        ),
+        (
+            lambda source: _factor_tables(source)[0],
+            [{"route_type": 4, "fuel": 1.0}],
+        ),
+    ],
+    ids=["street-factors", "street-costs", "policy-split", "policy-split-transit"],
+)
+def test_street_and_cost_tables_take_mappings(load, rows):
+    expected = load(pd.DataFrame(rows))
+    for source in (rows, rows[0], pd.DataFrame(rows).to_dict("list")):
+        pd.testing.assert_frame_equal(load(source), expected)
 
 
 @pytest.mark.parametrize(
@@ -309,8 +355,20 @@ def test_invalid_factor_tables_are_rejected(tmp_path):
         # route_type keys must be non-negative integers.
         (pd.DataFrame([{"route_type": 3.5, "fuel": 1.0}]), "non-negative integers"),
         (pd.DataFrame([{"route_type": -1, "fuel": 1.0}]), "non-negative integers"),
+        # A mapping is one row or columns, never a guess between them.
+        ({"route_type": [3, 0], "fuel": 1.0}, "not both"),
+        ({"route_type": [3, 0], "fuel": [1.0]}, "equal lengths"),
     ):
         with pytest.raises(ValueError, match=match):
+            emissions.load_factors(source)
+    for source, match in (
+        ([{"route_type": 3, "fuel": 1.0}, 3], "one mapping per row"),
+        (3, "cannot load emission factors from int"),
+        # Columns are ordered: a set has no order, a mapping gives keys.
+        ({"route_type": {3, 0}, "fuel": [1.0, 2.0]}, "ordered sequences, not set"),
+        ({"route_type": {"a": 3}, "fuel": [1.0]}, "ordered sequences, not dict"),
+    ):
+        with pytest.raises(TypeError, match=match):
             emissions.load_factors(source)
     bad = tmp_path / "factors.json"
     bad.write_text('{"fuel": 1.0}')

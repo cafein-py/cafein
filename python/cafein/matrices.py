@@ -741,7 +741,7 @@ class TravelCostMatrix(pd.DataFrame):
         ``"auto"`` requires the cached multicriteria set
         (``compute_mctbtr_transfers``) to match the query's date and
         factors, mirroring ``journey_frontier``.
-    factors : DataFrame or path (optional)
+    factors : DataFrame, mapping, list of mappings, or path (optional)
         Extra emission-factor rows layered over the shipped defaults;
         see ``cafein.emissions.load_factors`` — or, for a
         ``StreetNetwork``, street-mode rows for
@@ -6588,21 +6588,15 @@ def _factor_tables(factors):
     """``factors=`` split by schema for the policy products: a table keyed
     by ``street_mode`` configures the street ladder and leaves the transit
     legs on the shipped defaults; anything else layers over the transit
-    ladder as always."""
-    import pathlib
-
+    ladder as always. The table is read once; both arms carry that read."""
     from cafein import emissions
 
     if factors is None:
         return None, None
-    frame = (
-        factors
-        if isinstance(factors, pd.DataFrame)
-        else emissions._read_factor_file(pathlib.Path(factors))
-    )
+    frame = emissions._table_frame(factors, "emission factors")
     if "street_mode" in frame.columns:
         return None, frame
-    return factors, None
+    return frame, None
 
 
 def _policy_cost_columns(

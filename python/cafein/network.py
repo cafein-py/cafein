@@ -2113,7 +2113,7 @@ class TransportNetwork:
         journeys : list of dict
             Journeys from ``route_between_stops`` (with distances, the
             default build).
-        factors : DataFrame or path (optional)
+        factors : DataFrame, mapping, list of mappings, or path (optional)
             Extra emission-factor rows layered over the shipped
             defaults; see ``cafein.emissions.load_factors``.
         components : list of str (optional)

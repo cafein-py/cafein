@@ -16,6 +16,11 @@
 - `park_and_ride_facilities` states EPSG:4326 on its frame also when
   pyrosm returns the WGS 84 definition as PROJJSON (pyrosm 0.20).
   ([#405](https://github.com/cafein-py/cafein/pull/405))
+- Emission-factor and street-cost tables (`factors=`, `costs=` and their
+  loaders) also take Python mappings: a mapping of scalars is one row, a
+  mapping of lists the columns, and a list of mappings one row each, as
+  in a JSON or YAML factor file; a mapping mixing both is refused.
+  ([#408](https://github.com/cafein-py/cafein/pull/408))
 
 ## 0.29.0 — 2026-09-30
 
