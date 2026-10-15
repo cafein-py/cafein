@@ -5,7 +5,6 @@ import dataclasses
 import functools
 import pathlib
 import operator
-import warnings
 
 import numpy as np
 import pandas as pd
@@ -6075,10 +6074,9 @@ def _warn_unsnapped(table, from_ids, to_ids, network="the walking network"):
             continue
         named = ", ".join(str(ids[index]) for index in missed[:5])
         suffix = ", …" if len(missed) > 5 else ""
-        warnings.warn(
+        _log.warn(
             f"{len(missed)} {side} point(s) are off {network} "
             f"and unreachable ({named}{suffix})",
-            stacklevel=3,
         )
 
 
@@ -6362,10 +6360,9 @@ def _car_park_time_matrix(
     if undriven:
         named = ", ".join(str(from_ids[index]) for index in undriven[:5])
         suffix = ", …" if len(undriven) > 5 else ""
-        warnings.warn(
+        _log.warn(
             f"{len(undriven)} origin point(s) cannot reach any facility "
             f"by car and are omitted ({named}{suffix})",
-            stacklevel=3,
         )
     _warn_unsnapped(
         {
@@ -7121,10 +7118,9 @@ def _car_park_cost_columns(
     if undriven:
         named = ", ".join(str(from_ids[index]) for index in undriven[:5])
         suffix = ", …" if len(undriven) > 5 else ""
-        warnings.warn(
+        _log.warn(
             f"{len(undriven)} origin point(s) cannot reach any facility "
             f"by car and are omitted ({named}{suffix})",
-            stacklevel=3,
         )
     _warn_unsnapped(
         {
@@ -7300,10 +7296,9 @@ def _car_park_arrive_by_time_matrix(
     if undriven:
         named = ", ".join(str(from_ids[index]) for index in undriven[:5])
         suffix = ", …" if len(undriven) > 5 else ""
-        warnings.warn(
+        _log.warn(
             f"{len(undriven)} origin point(s) cannot reach any facility "
             f"by car and are omitted ({named}{suffix})",
-            stacklevel=3,
         )
     _warn_unsnapped(
         {
@@ -7559,10 +7554,9 @@ def _car_park_arrive_by_cost_columns(
     if undriven:
         named = ", ".join(str(from_ids[index]) for index in undriven[:5])
         suffix = ", …" if len(undriven) > 5 else ""
-        warnings.warn(
+        _log.warn(
             f"{len(undriven)} origin point(s) cannot reach any facility "
             f"by car and are omitted ({named}{suffix})",
-            stacklevel=3,
         )
     _warn_unsnapped(
         {
