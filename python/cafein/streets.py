@@ -19,7 +19,6 @@ different components simply get no footpath between them.
 """
 
 import math
-import warnings
 
 from cafein import _log
 
@@ -400,10 +399,9 @@ def _stop_points(stops):
     frame = pd.DataFrame(stops, columns=["stop_id", "lat", "lon"])
     located = frame.dropna(subset=["lat", "lon"])
     if len(located) < len(frame):
-        warnings.warn(
+        _log.warn(
             f"{len(frame) - len(located)} stop(s) have no coordinates "
             "and get no footpaths",
-            stacklevel=2,
         )
     return gpd.GeoDataFrame(
         located[["stop_id"]],
@@ -431,11 +429,10 @@ def _snap_to_edges(stop_points, edges, max_snap_distance):
     matched = matched[~matched.index.duplicated()]
     matched = matched.sort_index(kind="stable")
     if len(matched) < len(stop_points):
-        warnings.warn(
+        _log.warn(
             f"{len(stop_points) - len(matched)} stop(s) are farther than "
             f"{max_snap_distance} m from the walking network and get no "
             "footpaths",
-            stacklevel=2,
         )
     nearest = edge_geometry.to_numpy()[matched["index_right"].to_numpy()]
     along = shapely.line_locate_point(nearest, matched.geometry.to_numpy())

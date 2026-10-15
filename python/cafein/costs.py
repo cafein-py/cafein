@@ -29,10 +29,10 @@ costs are out of scope: the schema is street-only and transit rows are
 rejected loudly.
 """
 
-import warnings
-
 import numpy as np
 import pandas as pd
+
+from cafein import _log
 
 PERSPECTIVES = ("private", "societal")
 
@@ -166,10 +166,9 @@ def _resolved(table, mode, perspective, components):
         )
     rows = table[(table.perspective == perspective) & (table.street_mode == mode)]
     if rows.empty:
-        warnings.warn(
+        _log.warn(
             f"no {perspective} cost row matches street mode '{mode}'; "
             "costs stay unresolved",
-            stacklevel=4,
         )
         nan = float("nan")
         return nan, {component: nan for component in components or ()}

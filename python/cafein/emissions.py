@@ -21,7 +21,6 @@ import math
 import numbers
 import os
 import pathlib
-import warnings
 
 import numpy as np
 import pandas as pd
@@ -432,10 +431,9 @@ def street_factor_with_basis(
     if row is None:
         row = resolve(street_factors())
     if row is None:
-        warnings.warn(
+        _log.warn(
             f"no emission factor matches street mode '{transport_mode}'; "
             "emissions stay unresolved",
-            stacklevel=3,
         )
         return float("nan"), None
     basis = row.get("basis")
@@ -443,11 +441,10 @@ def street_factor_with_basis(
     value = row[selected].sum(skipna=False)
     if pd.isna(value):
         unresolved = [column for column in selected if pd.isna(row[column])]
-        warnings.warn(
+        _log.warn(
             f"emission component(s) {', '.join(unresolved)} are unresolved "
             f"for street mode '{transport_mode}'; supply factors= rows or "
             "narrow components= to resolve emissions",
-            stacklevel=3,
         )
         return float("nan"), basis
     return float(value), basis
@@ -549,9 +546,8 @@ def _normalised_columns(frame, key_columns, label, bases):
     known = key_columns + COMPONENT_COLUMNS + PROVENANCE_COLUMNS + DERIVED_COLUMNS
     unknown = sorted(str(column) for column in set(frame.columns) - set(known))
     if unknown:
-        warnings.warn(
+        _log.warn(
             f"ignoring unknown {label} column(s): {', '.join(unknown)}",
-            stacklevel=3,
         )
     if not any(column in frame.columns for column in COMPONENT_COLUMNS):
         raise ValueError(
@@ -676,10 +672,9 @@ def _annotated(journeys, network, factors, components):
                 total += leg["emissions"]
         journey["emissions"] = total if complete else None
     if unmatched:
-        warnings.warn(
+        _log.warn(
             f"no emission factor matches route_type(s) {sorted(unmatched)}; "
             "the affected legs carry no emissions",
-            stacklevel=2,
         )
     return journeys
 
@@ -741,10 +736,9 @@ def trip_factors(network, factors=None, components=None):
             factor = float("nan")
         results.append((trip_id, factor))
     if unmatched:
-        warnings.warn(
+        _log.warn(
             f"no emission factor matches route_type(s) {sorted(unmatched)}; "
             "journeys riding the affected trips carry no emissions",
-            stacklevel=2,
         )
     return results
 
@@ -936,10 +930,9 @@ def budget(
     frame = there.merge(back, on=["from_id", "to_id"], how="inner", sort=False)
     one_way = len(there) + len(back) - 2 * len(frame)
     if one_way:
-        warnings.warn(
+        _log.warn(
             f"{one_way} pair(s) reachable only one way are left out of the "
             "round trip",
-            stacklevel=2,
         )
     counted = trips * (frame["emissions"] + frame["return_emissions"])
     return frame.assign(**_budget_columns(counted, budget))
