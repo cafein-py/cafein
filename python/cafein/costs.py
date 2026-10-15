@@ -29,7 +29,6 @@ costs are out of scope: the schema is street-only and transit rows are
 rejected loudly.
 """
 
-import pathlib
 import warnings
 
 import numpy as np
@@ -86,15 +85,14 @@ def load_street_costs(source):
     A long-format table with the columns ``perspective`` (``private`` or
     ``societal``), ``street_mode`` (a street mode — transit rows are
     rejected, never ignored), ``component`` (a non-empty name), and
-    ``cost_per_km`` (finite; negative marks a benefit). Paths may point
-    to CSV, JSON (a list of mappings), or YAML, as the factor tables do.
+    ``cost_per_km`` (finite; negative marks a benefit). It may be a
+    DataFrame, a path to CSV, JSON (a list of mappings), or YAML, or the
+    mapping forms the factor tables take (see
+    ``cafein.emissions.load_factors``).
     """
-    from cafein.emissions import _read_factor_file
+    from cafein.emissions import _table_frame
 
-    if isinstance(source, pd.DataFrame):
-        frame = source.copy()
-    else:
-        frame = _read_factor_file(pathlib.Path(source))
+    frame = _table_frame(source, "street costs")
     missing = [
         column
         for column in COST_KEY_COLUMNS + ["cost_per_km"]

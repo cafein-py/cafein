@@ -257,7 +257,7 @@ def load_street_factors(source):
 
     Parameters
     ----------
-    source : DataFrame or path
+    source : DataFrame, mapping, list of mappings, or path
         A long-format table: any of the key columns ``street_mode``,
         ``vehicle_class``, ``service_model`` (empty where not applicable)
         plus one or more component columns ``vehicle``, ``fuel``,
@@ -269,8 +269,8 @@ def load_street_factors(source):
         over that car convention; it and the other ``cafein.lca``
         export columns (``mode``, ``scenario``, ``scenario_sha256``,
         ``case``, ``cafein_lca_version``) are kept unchanged, any other
-        unknown column is dropped with a warning. Paths may point to
-        CSV, JSON, or YAML as in ``load_factors``.
+        unknown column is dropped with a warning. Paths and mappings
+        load as in ``load_factors``.
 
     Returns
     -------
@@ -281,12 +281,7 @@ def load_street_factors(source):
         component it has no source for — the resolver then reports NA,
         never a silent zero.
     """
-    if isinstance(source, pd.DataFrame):
-        frame = source.copy()
-    elif isinstance(source, (str, os.PathLike)):
-        frame = _read_factor_file(pathlib.Path(source))
-    else:
-        raise TypeError(f"cannot load emission factors from {type(source).__name__}")
+    frame = _table_frame(source, "emission factors")
     frame = _normalised_columns(frame, STREET_KEY_COLUMNS, "street factor-table", BASES)
     for column in COMPONENT_COLUMNS:
         frame[column] = pd.to_numeric(frame[column], errors="raise")
@@ -496,7 +491,7 @@ def load_factors(source):
 
     Parameters
     ----------
-    source : DataFrame or path
+    source : DataFrame, mapping, list of mappings, or path
         A long-format table: any of the key columns ``trip_id``,
         ``route_id``, ``agency_id``, ``route_type`` (empty where not
         applicable) plus one or more of the component columns
@@ -507,7 +502,11 @@ def load_factors(source):
         ``passenger_km`` only, since transit legs have no occupancy at
         query time — and any other unknown column is dropped with a
         warning. Paths may point to CSV, JSON (a list of mappings), or
-        YAML (the same, via the optional PyYAML dependency).
+        YAML (the same, via the optional PyYAML dependency). A mapping
+        of scalars is one row, a mapping of sequences is the table's
+        columns, and a list of mappings is one row each — the records a
+        JSON or YAML file holds; a mapping mixing scalars and sequences
+        is refused.
 
     Returns
     -------
@@ -515,13 +514,7 @@ def load_factors(source):
         The normalized table, with every key and component column
         present and components validated as non-negative numbers.
     """
-    if isinstance(source, pd.DataFrame):
-        frame = source.copy()
-    elif isinstance(source, (str, os.PathLike)):
-        frame = _read_factor_file(pathlib.Path(source))
-    else:
-        raise TypeError(f"cannot load emission factors from {type(source).__name__}")
-
+    frame = _table_frame(source, "emission factors")
     frame = _normalised_columns(frame, KEY_COLUMNS, "factor-table", BASES[:1])
     for column in COMPONENT_COLUMNS:
         frame[column] = pd.to_numeric(frame[column], errors="raise")
@@ -604,7 +597,7 @@ def annotate(journeys, network, factors=None, components=None):
     network : TransportNetwork
         The network the journeys were routed on; provides the route
         metadata the factor ladder resolves against.
-    factors : DataFrame or path (optional)
+    factors : DataFrame, mapping, list of mappings, or path (optional)
         Extra factor rows (see `load_factors`), layered over the shipped
         defaults — at equal specificity, later rows win.
     components : list of str (optional)
@@ -702,7 +695,7 @@ def trip_factors(network, factors=None, components=None):
     ----------
     network : TransportNetwork
         The network whose trips to resolve.
-    factors : DataFrame or path (optional)
+    factors : DataFrame, mapping, list of mappings, or path (optional)
         Extra factor rows layered over the shipped defaults, as in
         `annotate`.
     components : list of str (optional)
@@ -993,6 +986,43 @@ def _read_factor_file(path):
     if not isinstance(records, list):
         raise ValueError("a factor file must hold a list of mappings")
     return pd.DataFrame.from_records(records)
+
+
+def _table_frame(source, what):
+    """``source`` as a DataFrame: a DataFrame (copied), a CSV/JSON/YAML
+    path, a mapping of scalars (one row), a mapping of sequences
+    (columns), or a sequence of mappings (one row each); `what` names
+    the table in refusals."""
+    if isinstance(source, pd.DataFrame):
+        return source.copy()
+    if isinstance(source, (str, os.PathLike)):
+        return _read_factor_file(pathlib.Path(source))
+    if isinstance(source, collections.abc.Mapping):
+        for value in source.values():
+            # A column is an ordered sequence: a set has no order and a
+            # mapping would contribute its keys.
+            if isinstance(value, (collections.abc.Mapping, collections.abc.Set)):
+                raise TypeError(
+                    f"{what} columns must be ordered sequences, not "
+                    f"{type(value).__name__}"
+                )
+        listed = [pd.api.types.is_list_like(value) for value in source.values()]
+        if listed and all(listed):
+            columns = {key: list(value) for key, value in source.items()}
+            if len({len(values) for values in columns.values()}) > 1:
+                raise ValueError(f"{what} columns must have equal lengths")
+            return pd.DataFrame(columns)
+        if any(listed):
+            raise ValueError(
+                f"{what} given as a mapping take one row (scalar values) or "
+                "columns (sequence values), not both"
+            )
+        return pd.DataFrame.from_records([dict(source)])
+    if isinstance(source, (list, tuple)):
+        if not all(isinstance(row, collections.abc.Mapping) for row in source):
+            raise TypeError(f"{what} given as a sequence take one mapping per row")
+        return pd.DataFrame.from_records([dict(row) for row in source])
+    raise TypeError(f"cannot load {what} from {type(source).__name__}")
 
 
 class _Resolver:

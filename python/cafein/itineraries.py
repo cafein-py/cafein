@@ -162,7 +162,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
     max_rides : int (optional, default: 8)
         Maximum number of boarded vehicles per journey (rides, not
         transfers: 8 rides allow 7 transfers).
-    factors : DataFrame or path (optional)
+    factors : DataFrame, mapping, list of mappings, or path (optional)
         Extra emission-factor rows layered over the shipped defaults;
         see ``cafein.emissions.load_factors`` — or, for a
         ``StreetNetwork``, street-mode rows for
