@@ -41,7 +41,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # ubuntu-latest (26.04) ends the test jobs with a runner shutdown
+        # mid-suite; the jobs run on 24.04.
+        os: [ubuntu-24.04, macos-latest, windows-latest]
         python: ["310", "311", "312", "313", "314"]
         # macOS runners are few and queue behind a low concurrency cap,
         # so they cover only the boundary Pythons; ubuntu and windows
@@ -121,5 +123,5 @@ jobs:
         run: >-
           pytest -n ${{ runner.os == 'Linux' && '3' || 'auto' }}
           --dist load --durations=20
-          ${{ matrix.os == 'ubuntu-latest' && matrix.python == '312'
+          ${{ matrix.os == 'ubuntu-24.04' && matrix.python == '312'
               && '--cov=cafein --cov-report=term-missing' || '' }}

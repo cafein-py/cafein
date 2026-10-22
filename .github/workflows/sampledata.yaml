@@ -14,7 +14,8 @@ permissions:
 
 jobs:
   installed-package:
-    runs-on: ubuntu-latest
+    # The test suite runs on 24.04, as in tests.yaml.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
