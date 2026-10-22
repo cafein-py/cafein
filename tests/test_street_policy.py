@@ -282,18 +282,9 @@ def test_policy_speed_refusals(multimodal_network):
     from cafein import TravelTimeMatrix
 
     points = _points_frame(MATRIX_POINTS[:2])
-    transfers = StreetLegPolicy(
-        access={"walk": 900, "e_scooter": 900},
-        egress={"walk": 900},
-        transfers={"e_scooter": 600},
-        vehicles={"e_scooter": shared()},
-    )
     for policy, speeds, match in [
         # A mode the policy grants no access or egress.
         (_bike_walk_policy(), {"e_bike": 20.0}, "names 'e_bike'"),
-        # Transfers ride a set precomputed at the shipped speeds.
-        (transfers, {"e_scooter": 20.0}, "precomputed transfer set"),
-        (transfers, {"walk": 5.0}, "precomputed transfer set"),
         (_bike_walk_policy(), {"bicycle": 0}, "positive, finite"),
     ]:
         with pytest.raises(ValueError, match=match):
@@ -305,6 +296,76 @@ def test_policy_speed_refusals(multimodal_network):
                 street_policy=policy,
                 speeds=speeds,
             )
+
+
+def test_a_transfer_set_serves_the_speeds_it_was_computed_at(
+    multimodal_network, artifact_cache, tmp_path
+):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TransportNetwork, TravelTimeMatrix
+
+    network = TransportNetwork.load(artifact_cache / "helsinki-multimodal.cafein")
+    fast = {"e_scooter": 20.0, "walk": 4.0}
+    network.compute_mode_transfers("e_scooter", 10, speeds=fast)
+    recorded = network._core._mode_transfer_speeds
+    assert recorded == [("e_scooter", 20.0 / 3.6), ("walk", 4.0 / 3.6)]
+    # The scooter rides transfers only: its speed is still the query's to set.
+    policy = StreetLegPolicy(
+        access={"walk": 900},
+        egress={"walk": 900},
+        transfers={"e_scooter": 600},
+        vehicles={"e_scooter": shared()},
+    )
+    points = _points_frame(MATRIX_POINTS[:2])
+
+    def query(speeds):
+        return TravelTimeMatrix(
+            network,
+            points,
+            points,
+            "2022-02-22 08:30:00",
+            street_policy=policy,
+            speeds=speeds,
+        )
+
+    assert len(query(fast)) > 0
+    # The journeys, rebuilt leg by leg at the set's speeds, reconcile with
+    # the matrix: the fastest arrival is the cell.
+    riding = StreetLegPolicy(
+        access={"walk": 900, "e_scooter": 900},
+        egress={"walk": 900},
+        transfers={"e_scooter": 600},
+        vehicles={"e_scooter": shared()},
+    )
+    journeys = network.route_between_coordinates(
+        MATRIX_POINTS[0],
+        MATRIX_POINTS[1],
+        "2022-02-22 08:30:00",
+        street_policy=riding,
+        speeds=fast,
+    )
+    cell = TravelTimeMatrix(
+        network,
+        _points_frame(MATRIX_POINTS[:1]),
+        _points_frame(MATRIX_POINTS[1:2]),
+        "2022-02-22 08:30:00",
+        street_policy=riding,
+        speeds=fast,
+        output_time_units="seconds",
+    )
+    fastest = min(journey["arrival_s"] for journey in journeys) - (8 * 3600 + 30 * 60)
+    assert int(cell["travel_time"].iloc[0]) == fastest
+    for speeds in (None, {"e_scooter": 25.0, "walk": 4.0}, {"e_scooter": 20.0}):
+        with pytest.raises(ValueError, match="e_scooter 20 km/h, walk 4 km/h"):
+            query(speeds)
+    # Saved and loaded, the set keeps the speeds it was computed at.
+    network.save(tmp_path / "speeds.cafein")
+    loaded = TransportNetwork.load(tmp_path / "speeds.cafein")
+    assert loaded._core._mode_transfer_speeds == recorded
+    # Speeds compare by effect: a set computed at the shipped speed written
+    # out serves a query that names none.
+    network.compute_mode_transfers("e_scooter", 10, speeds={"e_scooter": 15.0})
+    assert len(query(None)) > 0
 
 
 def test_eligibility_masks_gate_the_vehicle_modes(multimodal_network):
@@ -2776,14 +2837,15 @@ def test_carriage_itineraries_render_the_frame(multimodal_network, artifact_cach
     assert (park["travel_time"] == 0).all()
 
 
+@pytest.mark.parametrize("speeds", [None, {"bicycle": 22.0, "walk": 5.0}])
 def test_carriage_time_matrix_matches_the_route_surface(
-    multimodal_network, artifact_cache
+    multimodal_network, artifact_cache, speeds
 ):
     pytest.importorskip("cafein._cafein")
     from cafein import TransportNetwork, TravelTimeMatrix
 
     network = TransportNetwork.load(artifact_cache / "helsinki-multimodal.cafein")
-    network.compute_carriage_transfers("bicycle", 15)
+    network.compute_carriage_transfers("bicycle", 15, speeds=speeds)
     policy = _carriage_policy(
         _carried(unknown_bike_trips="allow"),
         transfers={"bicycle": 900},
@@ -2792,7 +2854,11 @@ def test_carriage_time_matrix_matches_the_route_surface(
     frames = (_points_frame([ORIGIN]), _points_frame([DEST, PARK_DEST]))
     args = (*frames, "2022-02-22 08:30:00")
     matrix = TravelTimeMatrix(
-        network, *args, street_policy=policy, output_time_units="seconds"
+        network,
+        *args,
+        street_policy=policy,
+        speeds=speeds,
+        output_time_units="seconds",
     )
     departed = 8 * 3600 + 30 * 60
     # Every cell is the route surface's best arrival, door to door.
@@ -2805,6 +2871,7 @@ def test_carriage_time_matrix_matches_the_route_surface(
                     destination,
                     "2022-02-22 08:30:00",
                     street_policy=policy,
+                    speeds=speeds,
                 )
             )
             - departed
@@ -2856,13 +2923,21 @@ def test_carriage_time_matrix_matches_the_route_surface(
     # Exclusions are rejected rather than silently dropped.
     with pytest.raises(ValueError, match="does not combine with exclusions"):
         TravelTimeMatrix(
-            network, *args, street_policy=policy, exclude_stops=["1230109"]
+            network,
+            *args,
+            street_policy=policy,
+            speeds=speeds,
+            exclude_stops=["1230109"],
         )
     # A cached trip-based set never claims the carriage query: the
     # cells are identical with and without it.
     network._core.compute_tbtr_transfers("2022-02-22")
     cached = TravelTimeMatrix(
-        network, *args, street_policy=policy, output_time_units="seconds"
+        network,
+        *args,
+        street_policy=policy,
+        speeds=speeds,
+        output_time_units="seconds",
     )
     pd.testing.assert_frame_equal(pd.DataFrame(cached), pd.DataFrame(matrix))
 

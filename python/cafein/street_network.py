@@ -32,22 +32,27 @@ def frozen_speeds(speeds):
     return dict(speeds) if isinstance(speeds, collections.abc.Mapping) else speeds
 
 
+def profile_keys(mode):
+    """The ``speeds=`` keys `mode`'s street profile takes: the mode itself
+    (its riding speed) and ``"walk"`` (its walking legs: the snap connectors
+    and dismount arcs). The wheelchair takes only its own key and the car
+    only ``"walk"``, its driving speeds being the persisted limits."""
+    if mode == "wheelchair":
+        return ("wheelchair",)
+    if mode in ("walk", "car"):
+        return ("walk",)
+    return (mode, "walk")
+
+
 def profile_speeds(speeds, mode):
-    """The ``speeds=`` overrides `mode`'s street profile takes, as the
-    routing core's ``[(mode, m/s)]`` list. Keys are the mode itself (its
-    riding speed) and ``"walk"`` (its walking legs: the snap connectors and
-    dismount arcs); the wheelchair takes only its own key and the car only
-    ``"walk"``, its driving speeds being the persisted limits. Values are
-    km/h; any other key is refused."""
+    """The ``speeds=`` overrides `mode`'s street profile takes
+    (:func:`profile_keys`, values km/h, any other key refused), as the
+    routing core's ``[(mode, m/s)]`` list."""
     from cafein._validate import mode_mapping, positive_finite
 
-    if mode == "wheelchair":
-        modes = ("wheelchair",)
-    elif mode in ("walk", "car"):
-        modes = ("walk",)
-    else:
-        modes = (mode, "walk")
-    return core_speeds(mode_mapping("speeds", speeds, modes, positive_finite))
+    return core_speeds(
+        mode_mapping("speeds", speeds, profile_keys(mode), positive_finite)
+    )
 
 
 def core_speeds(speeds):

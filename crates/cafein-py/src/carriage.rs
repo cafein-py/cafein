@@ -18,10 +18,18 @@ impl TransportNetwork {
         unknown_rule: &str,
         park_stops: Option<&[String]>,
         empty_flags: &'a mut Vec<bool>,
+        speeds: &[(String, f64)],
     ) -> PyResult<(CarriageInputs<'a>, Vec<bool>, Vec<bool>)> {
         let (carriage_set, ride_edge): (&Transfers, &[bool]) = match transfer_mode {
             Some((mode, budget)) => match &self.carriage_transfers {
                 Some(held) if held.mode == *mode && held.budget == *budget => {
+                    crate::network::rides_set_speeds(
+                        "carriage",
+                        "compute_carriage_transfers",
+                        mode,
+                        &held.speeds,
+                        speeds,
+                    )?;
                     (&held.set, &held.ride_edge)
                 }
                 Some(held) => {
@@ -101,7 +109,8 @@ impl TransportNetwork {
     /// plane (Carrying from the policy reduction, Free from the
     /// walking-only reduction — carriage is optional). Internal.
     #[pyo3(signature = (carrying_access, free_access, date, departure, max_transfers,
-                        unknown_rule, park_stops = None, transfer_mode = None, workers=None))]
+                        unknown_rule, park_stops = None, transfer_mode = None,
+                        speeds = Vec::new(), workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn _carriage_travel_times(
         &self,
@@ -114,6 +123,7 @@ impl TransportNetwork {
         unknown_rule: &str,
         park_stops: Option<Vec<String>>,
         transfer_mode: Option<(String, f64)>,
+        speeds: crate::streets::SpeedOverrides,
         workers: Option<usize>,
     ) -> PyResult<Py<PyDict>> {
         let departure = parse_time(departure)?;
@@ -143,6 +153,7 @@ impl TransportNetwork {
             unknown_rule,
             park_stops.as_deref(),
             &mut empty_flags,
+            &speeds,
         )?;
         inputs.carrying_mask = &carrying_mask;
         inputs.park_mask = &park_mask;
@@ -181,7 +192,7 @@ impl TransportNetwork {
     /// Internal.
     #[pyo3(signature = (carrying_access, free_access, carrying_egress, free_egress,
                         date, departure, max_transfers, unknown_rule, geometries,
-                        park_stops = None, transfer_mode = None))]
+                        park_stops = None, transfer_mode = None, speeds = Vec::new()))]
     #[allow(clippy::too_many_arguments)]
     fn _carriage_route(
         &self,
@@ -197,6 +208,7 @@ impl TransportNetwork {
         geometries: bool,
         park_stops: Option<Vec<String>>,
         transfer_mode: Option<(String, f64)>,
+        speeds: crate::streets::SpeedOverrides,
     ) -> PyResult<Py<PyList>> {
         let departure = parse_time(departure)?;
         let resolve = |offsets: &[(String, u32)]| {
@@ -226,6 +238,7 @@ impl TransportNetwork {
             unknown_rule,
             park_stops.as_deref(),
             &mut empty_flags,
+            &speeds,
         )?;
         inputs.carrying_mask = &carrying_mask;
         inputs.park_mask = &park_mask;
@@ -395,7 +408,8 @@ impl TransportNetwork {
     /// chain lives in Free), a walking egress from Free. Internal.
     #[pyo3(signature = (carrying_rows, free_rows, carrying_egress_rows, free_egress_rows,
                         date, departure, max_transfers, unknown_rule,
-                        park_stops = None, transfer_mode = None, workers=None))]
+                        park_stops = None, transfer_mode = None, speeds = Vec::new(),
+                        workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn _carriage_time_matrix(
         &self,
@@ -410,6 +424,7 @@ impl TransportNetwork {
         unknown_rule: &str,
         park_stops: Option<Vec<String>>,
         transfer_mode: Option<(String, f64)>,
+        speeds: crate::streets::SpeedOverrides,
         workers: Option<usize>,
     ) -> PyResult<Vec<Vec<Option<u32>>>> {
         if carrying_rows.len() != free_rows.len()
@@ -454,6 +469,7 @@ impl TransportNetwork {
             unknown_rule,
             park_stops.as_deref(),
             &mut empty_flags,
+            &speeds,
         )?;
         inputs.carrying_mask = &carrying_mask;
         inputs.park_mask = &park_mask;

@@ -686,7 +686,7 @@ impl TransportNetwork {
         let binding = transfer_mode
             .as_ref()
             .map(|(mode, budget, _)| (mode.clone(), *budget));
-        let relaxed = self.policy_transfers(binding.as_ref())?;
+        let relaxed = self.policy_transfers(binding.as_ref(), &speeds)?;
         // A walking-class transfer set keeps its tokens for itinerary
         // reconstruction only: no rental view, so its meters stay
         // walking meters in the attribution.

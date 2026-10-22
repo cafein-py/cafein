@@ -47,6 +47,9 @@ struct ModeTransferSet {
     /// bit and the tie-breaks derive from; meters and factors may both
     /// legitimately be zero.
     rental_edge: Vec<bool>,
+    /// The caller-set speeds the set was computed at, as the core's
+    /// `(mode, m/s)` profile overrides; empty for the shipped speeds.
+    speeds: Vec<(String, f64)>,
 }
 
 /// The carriage transfer set (stage 17a): per pair the faster of the
@@ -60,6 +63,9 @@ struct CarriageTransferSet {
     set: Transfers,
     ride_edge: Vec<bool>,
     ride_network_meters: Vec<f64>,
+    /// The caller-set speeds the set was computed at, as the core's
+    /// `(mode, m/s)` profile overrides; empty for the shipped speeds.
+    speeds: Vec<(String, f64)>,
 }
 
 /// A routable public-transport network built from GTFS data.

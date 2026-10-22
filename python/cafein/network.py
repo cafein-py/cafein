@@ -16,7 +16,7 @@ from cafein._validate import (
 from cafein._units import memory_spec
 from cafein.matrices import _planned_entry, _query_details, _transit_walking_speed
 from cafein.policy import policy_speeds
-from cafein.street_network import core_speeds
+from cafein.street_network import core_speeds, profile_speeds
 from cafein.streets import walking_speed
 from cafein.travelers import (
     folded_constraints,
@@ -206,7 +206,14 @@ def _carrying_offsets(rows):
 
 
 def _transfer_leg_dicts(
-    core, from_stop, to_stop, departure_s, arrival_s, geometries, transfer_mode
+    core,
+    from_stop,
+    to_stop,
+    departure_s,
+    arrival_s,
+    geometries,
+    transfer_mode,
+    speeds=None,
 ):
     """The leg dicts of one relaxed transfer edge: a single walking leg,
     or — when the merged set's edge rode a rental — the walk-ride-walk
@@ -221,7 +228,11 @@ def _transfer_leg_dicts(
     )
     if token is None:
         walked = core._transfer_leg(
-            from_stop, to_stop, geometries, transfer_mode=transfer_mode
+            from_stop,
+            to_stop,
+            geometries,
+            transfer_mode=transfer_mode,
+            speeds=core_speeds(speeds),
         )
         return [
             {
@@ -847,7 +858,14 @@ def _policy_street_legs(
         # leaves from the seed's link.
         boundary = max(leg["arrival_s"] - leg_seconds, leg["departure_s"])
         transfer_legs = _transfer_leg_dicts(
-            core, stop, seed, leg["departure_s"], boundary, geometries, transfer_mode
+            core,
+            stop,
+            seed,
+            leg["departure_s"],
+            boundary,
+            geometries,
+            transfer_mode,
+            speeds,
         )
         street.update(from_stop=seed, departure_s=boundary, arrival_s=leg["arrival_s"])
         return transfer_legs + [street]
@@ -856,7 +874,7 @@ def _policy_street_legs(
     boundary = min(leg["departure_s"] + leg_seconds, leg["arrival_s"])
     street.update(to_stop=seed, departure_s=leg["departure_s"], arrival_s=boundary)
     transfer_legs = _transfer_leg_dicts(
-        core, seed, stop, boundary, leg["arrival_s"], geometries, transfer_mode
+        core, seed, stop, boundary, leg["arrival_s"], geometries, transfer_mode, speeds
     )
     return [street] + transfer_legs
 
@@ -927,6 +945,7 @@ def _policy_journeys(
         list(exclude_stops),
         geometries,
         transfer_mode=transfer_mode,
+        speeds=core_speeds(speeds),
     )
     access_budgets = {mode: seconds for mode, seconds, *_ in access_modes}
     egress_budgets = {mode: seconds for mode, seconds, *_ in egress_modes}
@@ -1030,6 +1049,7 @@ def _policy_journeys(
                         leg["arrival_s"],
                         geometries,
                         transfer_mode,
+                        speeds,
                     )
                 )
             else:
@@ -1085,12 +1105,21 @@ def _policy_journeys(
 
 
 def _carriage_journeys(
-    core, origin, destination, date, departure, max_transfers, policy, geometries
+    core,
+    origin,
+    destination,
+    date,
+    departure,
+    max_transfers,
+    policy,
+    geometries,
+    speeds=None,
 ):
-    """Door-to-door carriage journeys: the possession-state search per
-    plane-reduced side, the winning chain decorated — street legs from
-    the planes' tokens, ride transfers under the carried mode, park
-    events and ``bike_aboard`` flags passed through."""
+    """Door-to-door carriage journeys at the validated ``speeds``
+    (``{mode: km/h}``): the possession-state search per plane-reduced
+    side, the winning chain decorated — street legs from the planes'
+    tokens, ride transfers under the carried mode, park events and
+    ``bike_aboard`` flags passed through."""
     from cafein import streets as _streets
     from cafein.network import _policy_transfer_mode
     from cafein.policy import carriage_plane_modes, carriage_terms
@@ -1122,7 +1151,7 @@ def _carriage_journeys(
 
     def reduced(point, egress, modes):
         try:
-            return _policy_reduced(core, point, egress, modes, ())
+            return _policy_reduced(core, point, egress, modes, (), speeds=speeds)
         except ValueError as error:
             if "too far from the multimodal street network" not in str(error):
                 raise
@@ -1164,6 +1193,7 @@ def _carriage_journeys(
         geometries,
         park_stops=park,
         transfer_mode=transfer_mode,
+        speeds=core_speeds(speeds),
     )
     acc_budgets = {name: seconds for name, seconds, *_ in acc_modes}
     egr_budgets = {name: seconds for name, seconds, *_ in egr_modes}
@@ -1188,6 +1218,7 @@ def _carriage_journeys(
                         budgets,
                         False,
                         geometries,
+                        speeds=speeds,
                     )
                 )
             elif leg["type"] == "egress":
@@ -1202,6 +1233,7 @@ def _carriage_journeys(
                         budgets,
                         True,
                         geometries,
+                        speeds=speeds,
                     )
                 )
             elif leg["type"] == "transfer" and leg.pop("ride", False):
@@ -1251,7 +1283,12 @@ def _carriage_journeys(
 
     departed = _departure_seconds(departure)
     direct = core._multimodal_direct_leg(
-        origin, destination, "walk", walk_budgets_acc["walk"], geometries
+        origin,
+        destination,
+        "walk",
+        walk_budgets_acc["walk"],
+        geometries,
+        speeds=core_speeds(speeds),
     )
     if direct is None:
         if unsnapped is not None and not journeys:
@@ -1396,6 +1433,7 @@ def _policy_mc_journeys(
         list(exclude_stops),
         geometries,
         transfer_mode=transfer_arg,
+        speeds=core_speeds(speeds),
     )
     access_budgets = {mode: seconds for mode, seconds, *_ in access_modes}
     egress_budgets = {mode: seconds for mode, seconds, *_ in egress_modes}
@@ -1444,6 +1482,7 @@ def _policy_mc_journeys(
                         leg["arrival_s"],
                         geometries,
                         transfer_mode,
+                        speeds,
                     )
                 )
             else:
@@ -2723,8 +2762,9 @@ class TransportNetwork:
             rejected beside the policy on both axes.
             Conflicts with ``max_walking_time``, ``snap_distance`` and
             ``departure_time_window``, which are rejected rather than
-            silently ignored; ``speeds`` sets the policy's modes, except
-            beside its transfers or a carried vehicle.
+            silently ignored; ``speeds`` sets the policy's modes, at the
+            speeds its transfer set was computed at when it grants
+            transfers.
 
         Returns
         -------
@@ -2885,6 +2925,7 @@ class TransportNetwork:
                     max_transfers,
                     street_policy,
                     geometries,
+                    speeds=speeds,
                 )
             walk_only, walk_budget = _walking_only_policy(street_policy)
             if walk_only:
@@ -2943,7 +2984,7 @@ class TransportNetwork:
                 "street_modes=(..., 'car')"
             )
 
-    def compute_carriage_transfers(self, mode, max_transfer_time):
+    def compute_carriage_transfers(self, mode, max_transfer_time, *, speeds=None):
         """Compute the carriage transfer set for a carried ``mode``.
 
         Per stop pair the faster of the walking closure row and the own
@@ -2962,6 +3003,10 @@ class TransportNetwork:
             The carried vehicle's street mode (``"bicycle"``).
         max_transfer_time : float or datetime.timedelta
             The per-movement ride budget, in minutes.
+        speeds : mapping, optional
+            Speeds in km/h the rides are computed at, as in
+            ``StreetNetwork.travel_time``: ``mode`` and ``"walk"``. A query
+            relaxes the set only at the same speeds.
 
         Returns
         -------
@@ -2970,10 +3015,13 @@ class TransportNetwork:
         """
         from cafein._units import duration_seconds
 
+        overrides = profile_speeds(speeds, mode)
         seconds = duration_seconds("max_transfer_time", max_transfer_time)
-        return self._core._compute_carriage_transfers(mode, float(seconds))
+        return self._core._compute_carriage_transfers(
+            mode, float(seconds), speeds=overrides
+        )
 
-    def compute_mode_transfers(self, mode, max_transfer_time):
+    def compute_mode_transfers(self, mode, max_transfer_time, *, speeds=None):
         """Compute the merged shared-vehicle transfer set for ``mode``.
 
         Per stop with a street link for `mode`, one directed search over
@@ -2988,8 +3036,11 @@ class TransportNetwork:
         ``StreetLegPolicy(transfers={mode: budget})`` — the same budget,
         in the policy's seconds — then relax
         this set; a missing or differently bound set is rejected, never
-        silently substituted. Heavy precompute; persisted by ``save``
-        and restored by ``load`` with its exact binding.
+        silently substituted. ``speeds`` (km/h for ``mode`` and
+        ``"walk"``, as in ``StreetNetwork.travel_time``) sets the speeds
+        the rides are computed at, and a query relaxes the set only at
+        the same speeds. Heavy precompute; persisted by ``save`` and
+        restored by ``load`` with its exact binding.
 
         The ``"wheelchair"`` mode builds a walking-class set instead:
         the wheelchair-profile movements alone, with no walking-closure
@@ -3005,8 +3056,11 @@ class TransportNetwork:
         """
         from cafein._units import duration_seconds
 
+        overrides = profile_speeds(speeds, mode)
         seconds = duration_seconds("max_transfer_time", max_transfer_time)
-        return self._core._compute_mode_transfers(mode, float(seconds))
+        return self._core._compute_mode_transfers(
+            mode, float(seconds), speeds=overrides
+        )
 
     @_log.timed_computer(
         "matrix.travel_times",
@@ -3084,8 +3138,9 @@ class TransportNetwork:
             :meth:`compute_mode_transfers`, which must be computed with
             exactly that binding. Conflicts with ``max_walking_time``,
             ``snap_distance`` and exclusions, which are rejected rather
-            than silently ignored; ``speeds`` sets the policy's modes,
-            except beside its transfers or a carried vehicle. A ``CarParkPolicy`` here serves
+            than silently ignored; ``speeds`` sets the policy's modes, at
+            the speeds its transfer set was computed at when it grants
+            transfers. A ``CarParkPolicy`` here serves
             park-and-ride instead: the drive-park-walk chain competes
             beside ordinary walking, and the query's walking knobs
             stay active, timing the walking access. It serves the
@@ -3239,7 +3294,7 @@ class TransportNetwork:
                 def reduced(plane_modes, carrying_plane=False):
                     try:
                         rows = self._core._reduced_street_offsets(
-                            *origin, False, plane_modes
+                            *origin, False, plane_modes, speeds=core_speeds(riding)
                         )
                     except ValueError as error:
                         if "too far from the multimodal street network" not in str(
@@ -3267,6 +3322,7 @@ class TransportNetwork:
                     unknown_rule,
                     park_stops=park,
                     transfer_mode=transfer_mode,
+                    speeds=core_speeds(riding),
                 )
             if transfer_mode is None and all(mode == "walk" for mode, *_ in modes):
                 # A walking-only policy IS the current walking path, at the
@@ -3309,6 +3365,7 @@ class TransportNetwork:
                 exclude_routes=list(exclude_routes),
                 exclude_trips=list(exclude_trips),
                 exclude_stops=list(exclude_stops),
+                speeds=core_speeds(riding),
             )
         return self._core.travel_times_from_coordinate(
             tuple(origin),

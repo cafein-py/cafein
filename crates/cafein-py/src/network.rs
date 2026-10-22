@@ -140,6 +140,35 @@ struct Winner {
     walk_transfer_m: f64,
 }
 
+/// Refuses a transfer set computed at other speeds than the query rides for
+/// its `mode` — compared by the profile definitions the two speed lists
+/// resolve to, so equal effective speeds match however they were written.
+pub(super) fn rides_set_speeds(
+    kind: &str,
+    setter: &str,
+    mode: &str,
+    recorded: &[(String, f64)],
+    query: &[(String, f64)],
+) -> PyResult<()> {
+    let set = crate::streets::profile_definition(mode, recorded)?;
+    if set == crate::streets::profile_definition(mode, query)? {
+        return Ok(());
+    }
+    let speeds = if recorded.is_empty() {
+        "the shipped speeds".to_owned()
+    } else {
+        recorded
+            .iter()
+            .map(|(name, ms)| format!("{name} {} km/h", (ms * 3.6 * 1000.0).round() / 1000.0))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Err(PyValueError::new_err(format!(
+        "the computed {kind} set rides {speeds} for '{mode}', not this query's \
+         speeds; recompute it with {setter}(..., speeds=...)"
+    )))
+}
+
 /// The walking-class street modes: no vehicle, never extended over the
 /// installed walking closure, meters and grams attributed as walking.
 pub(crate) fn walking_class(mode: &str) -> bool {
@@ -1784,7 +1813,8 @@ impl TransportNetwork {
     /// walked path)``, or ``None`` when the closure holds no such edge — the
     /// via leg of a closure-carried street choice. The path draws over the
     /// walking street network, like every transfer leg. Internal.
-    #[pyo3(signature = (from_stop, to_stop, geometries, transfer_mode = None))]
+    #[pyo3(signature = (from_stop, to_stop, geometries, transfer_mode = None,
+                        speeds = Vec::new()))]
     fn _transfer_leg(
         &self,
         py: Python<'_>,
@@ -1792,13 +1822,14 @@ impl TransportNetwork {
         to_stop: &str,
         geometries: bool,
         transfer_mode: Option<(String, f64)>,
+        speeds: crate::streets::SpeedOverrides,
     ) -> PyResult<Option<TransferLegParts>> {
         let from = self.resolve_stop(from_stop)?;
         let to = self.resolve_stop(to_stop)?;
         // Transfers are deduplicated per stop pair at construction
         // (`Transfers::from_edges` keeps the minimum-duration edge), so
         // the one edge found is the one the reduction relaxed.
-        let set = self.policy_transfers(transfer_mode.as_ref())?;
+        let set = self.policy_transfers(transfer_mode.as_ref(), &speeds)?;
         let Some(edge) = set
             .from_stop(from)
             .iter()
@@ -1864,7 +1895,7 @@ impl TransportNetwork {
         let Some(token) = held.tokens.get(&(from.0, to.0)).copied() else {
             return Ok(None);
         };
-        let profile = self.multimodal_profile(&held.mode, &[])?;
+        let profile = self.multimodal_profile(&held.mode, &held.speeds)?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
         let links = self.mode_link_targets(network, profile.definition.mode.bit());
         let (Some(pickup_link), Some(drop_link)) =
@@ -2076,7 +2107,7 @@ impl TransportNetwork {
         let binding = transfer_mode
             .as_ref()
             .map(|(mode, budget, _)| (mode.clone(), *budget));
-        let closure = self.policy_transfers(binding.as_ref())?;
+        let closure = self.policy_transfers(binding.as_ref(), &speeds)?;
         // A rental-bearing merged edge folds its ride grams into the
         // extended point (by the edge's rental identity — meters and
         // factor may both be zero) — the dominance ranks them, the
@@ -2278,11 +2309,13 @@ impl TransportNetwork {
     /// ``transfers=`` matches; persisted with the artifact and
     /// restored on load. Heavy precompute (one directed search per
     /// linked stop). Internal behind the 15b surface.
+    #[pyo3(signature = (mode, max_seconds, speeds = Vec::new()))]
     fn _compute_mode_transfers(
         &mut self,
         py: Python<'_>,
         mode: &str,
         max_seconds: f64,
+        speeds: crate::streets::SpeedOverrides,
     ) -> PyResult<(usize, usize)> {
         self.source = None;
         if mode == "walk" {
@@ -2296,7 +2329,7 @@ impl TransportNetwork {
                 "max_seconds must be a positive, finite transfer budget",
             ));
         }
-        let profile = self.multimodal_profile(mode, &[])?;
+        let profile = self.multimodal_profile(mode, &speeds)?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
         let links = self.mode_link_targets(network, profile.definition.mode.bit());
         let stop_count = self.build.timetable.stop_count();
@@ -2376,6 +2409,7 @@ impl TransportNetwork {
             tokens,
             rental_network_meters,
             rental_edge,
+            speeds,
         });
         Ok(counts)
     }
@@ -2390,11 +2424,13 @@ impl TransportNetwork {
     /// budget)``; a query under any other binding is an error. The
     /// carriage engine (17b) consumes it; persisted with the artifact.
     /// Internal behind the 17b surface.
+    #[pyo3(signature = (mode, max_seconds, speeds = Vec::new()))]
     fn _compute_carriage_transfers(
         &mut self,
         py: Python<'_>,
         mode: &str,
         max_seconds: f64,
+        speeds: crate::streets::SpeedOverrides,
     ) -> PyResult<(usize, usize)> {
         self.source = None;
         if mode == "walk" {
@@ -2408,7 +2444,7 @@ impl TransportNetwork {
                 "max_seconds must be a positive, finite transfer budget",
             ));
         }
-        let profile = self.multimodal_profile(mode, &[])?;
+        let profile = self.multimodal_profile(mode, &speeds)?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
         let links = self.mode_link_targets(network, profile.definition.mode.bit());
         let stop_count = self.build.timetable.stop_count();
@@ -2469,8 +2505,27 @@ impl TransportNetwork {
             set,
             ride_edge,
             ride_network_meters,
+            speeds,
         });
         Ok(counts)
+    }
+
+    /// The speeds the installed carriage set was computed at, as
+    /// ``[(mode, m/s)]`` overrides (empty for the shipped speeds), or
+    /// ``None`` without a set. Internal.
+    #[getter]
+    fn _carriage_transfer_speeds(&self) -> Option<Vec<(String, f64)>> {
+        self.carriage_transfers
+            .as_ref()
+            .map(|held| held.speeds.clone())
+    }
+
+    /// The speeds the installed mode-transfer set was computed at, as
+    /// ``[(mode, m/s)]`` overrides (empty for the shipped speeds), or
+    /// ``None`` without a set. Internal.
+    #[getter]
+    fn _mode_transfer_speeds(&self) -> Option<Vec<(String, f64)>> {
+        self.mode_transfers.as_ref().map(|held| held.speeds.clone())
     }
 
     /// The installed carriage binding as ``(mode, budget, edge_count,
@@ -2532,7 +2587,7 @@ impl TransportNetwork {
         if !geometries {
             return Ok(Some((seconds, network_meters, connector_meters, None)));
         }
-        let profile = self.multimodal_profile(&held.mode, &[])?;
+        let profile = self.multimodal_profile(&held.mode, &held.speeds)?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
         let links = self.mode_link_targets(network, profile.definition.mode.bit());
         let shape = match (links[from.0 as usize], links[to.0 as usize]) {
@@ -3234,12 +3289,16 @@ impl TransportNetwork {
     pub(super) fn policy_transfers(
         &self,
         transfer_mode: Option<&(String, f64)>,
+        speeds: &[(String, f64)],
     ) -> PyResult<&Transfers> {
         let Some((mode, budget)) = transfer_mode else {
             return Ok(&self.transfers);
         };
         match &self.mode_transfers {
-            Some(held) if held.mode == *mode && held.budget == *budget => Ok(&held.set),
+            Some(held) if held.mode == *mode && held.budget == *budget => {
+                rides_set_speeds("mode-transfer", "compute_mode_transfers", mode, &held.speeds, speeds)?;
+                Ok(&held.set)
+            }
             Some(held) => Err(PyValueError::new_err(format!(
                 "the computed mode-transfer set is bound to ('{}', {} s), not                  ('{mode}', {budget} s); recompute with compute_mode_transfers",
                 held.mode, held.budget
@@ -3397,7 +3456,7 @@ impl TransportNetwork {
         // direct vehicle choices, never its own output, so every carried
         // choice is one direct ride plus exactly one transfer, whatever
         // the stop order.
-        let closure = self.policy_transfers(transfer_mode)?;
+        let closure = self.policy_transfers(transfer_mode, speeds)?;
         let rental_flags = transfer_mode.map(|_| {
             let held = self.mode_transfers.as_ref().expect("binding validated");
             held.rental_edge.as_slice()

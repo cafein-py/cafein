@@ -314,7 +314,8 @@ class DetailedItineraries(gpd.GeoDataFrame):
         apply and ``speeds`` sets the routed mode's speed and its
         walking legs, as in ``StreetNetwork.travel_time``.
         Beside a ``StreetLegPolicy``, ``speeds`` takes ``"walk"`` and the
-        modes its access and egress grant.
+        modes its access, egress and transfers grant; a transfer set
+        serves only the speeds it was computed at.
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
         one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
@@ -390,7 +391,8 @@ class DetailedItineraries(gpd.GeoDataFrame):
         products until the vehicle-terms fold arrives. Conflicts with
         ``max_walking_time`` and ``snap_distance``, which are rejected
         rather than silently ignored; ``speeds`` sets the policy's
-        modes, except beside its transfers or a carried vehicle.
+        modes, at the speeds its transfer set was computed at when it
+        grants transfers.
     """
 
     def exposure_totals(self):

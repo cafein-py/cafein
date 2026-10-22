@@ -415,7 +415,8 @@ impl TransportNetwork {
     /// policy surface stabilises.
     #[pyo3(signature = (access_rows, egress_rows, date, departure, max_transfers,
                         exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![],
-                        transfer_mode = None, router = "auto", workers=None))]
+                        transfer_mode = None, router = "auto", speeds = Vec::new(),
+                        workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn _time_matrix_with_access(
         &self,
@@ -430,6 +431,7 @@ impl TransportNetwork {
         exclude_stops: Vec<String>,
         transfer_mode: Option<(String, f64)>,
         router: &str,
+        speeds: crate::streets::SpeedOverrides,
         workers: Option<usize>,
     ) -> PyResult<Vec<Vec<Option<u32>>>> {
         if transfer_mode
@@ -475,7 +477,7 @@ impl TransportNetwork {
                     .collect::<PyResult<Vec<_>>>()?,
             );
         }
-        let relaxed = self.policy_transfers(transfer_mode.as_ref())?;
+        let relaxed = self.policy_transfers(transfer_mode.as_ref(), &speeds)?;
         let router = self.resolve_time_router(router, date, exclusions.is_some())?;
         let matrix = py.allow_threads(|| {
             crate::workers::with_workers("time_matrix_with_access", workers, || {
@@ -531,7 +533,7 @@ impl TransportNetwork {
     /// surface stabilises.
     #[pyo3(signature = (access, egress, date, departure, max_transfers,
                         exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![],
-                        geometries = true, transfer_mode = None))]
+                        geometries = true, transfer_mode = None, speeds = Vec::new()))]
     #[allow(clippy::too_many_arguments)]
     fn _route_with_access(
         &self,
@@ -546,6 +548,7 @@ impl TransportNetwork {
         exclude_stops: Vec<String>,
         geometries: bool,
         transfer_mode: Option<(String, f64)>,
+        speeds: crate::streets::SpeedOverrides,
     ) -> PyResult<Py<PyList>> {
         if transfer_mode
             .as_ref()
@@ -577,7 +580,7 @@ impl TransportNetwork {
             max_transfers,
             exclusions: self.exclusion_masks(&exclude_routes, &exclude_trips, &exclude_stops)?,
         };
-        let relaxed = self.policy_transfers(transfer_mode.as_ref())?;
+        let relaxed = self.policy_transfers(transfer_mode.as_ref(), &speeds)?;
         let journeys = py.allow_threads(|| Raptor.route(&self.build.timetable, relaxed, &request));
         let result = PyList::empty(py);
         for journey in &journeys {
@@ -631,7 +634,7 @@ impl TransportNetwork {
     /// closure: the ULTRA shortcut set models *walking* egress, so policy
     /// queries stay off it until multimodal ULTRA arrives. Internal until
     /// the policy surface stabilises.
-    #[pyo3(signature = (access, date, departure, max_transfers, router = "auto", transfer_mode = None, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], workers=None))]
+    #[pyo3(signature = (access, date, departure, max_transfers, router = "auto", transfer_mode = None, exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![], speeds = Vec::new(), workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn _travel_times_with_access(
         &self,
@@ -645,6 +648,7 @@ impl TransportNetwork {
         exclude_routes: Vec<String>,
         exclude_trips: Vec<String>,
         exclude_stops: Vec<String>,
+        speeds: crate::streets::SpeedOverrides,
         workers: Option<usize>,
     ) -> PyResult<Py<PyDict>> {
         if transfer_mode
@@ -691,7 +695,7 @@ impl TransportNetwork {
                     max_transfers,
                     exclusions,
                 };
-                let relaxed = self.policy_transfers(transfer_mode.as_ref())?;
+                let relaxed = self.policy_transfers(transfer_mode.as_ref(), &speeds)?;
                 py.allow_threads(|| {
                     crate::workers::with_workers("travel_times_with_access", workers, || {
                         Raptor.one_to_all(&self.build.timetable, relaxed, &request)
@@ -703,7 +707,7 @@ impl TransportNetwork {
             // merged (unclosed) sets included, whose shadowed arrivals
             // both engines now relax exactly.
             "tbtr" => {
-                let relaxed = self.policy_transfers(transfer_mode.as_ref())?;
+                let relaxed = self.policy_transfers(transfer_mode.as_ref(), &speeds)?;
                 py.allow_threads(|| {
                     crate::workers::with_workers("travel_times_with_access", workers, || {
                         self.tbtr_engine(relaxed, date, &active_services, &active_services_previous)

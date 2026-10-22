@@ -802,8 +802,9 @@ class TravelCostMatrix(pd.DataFrame):
         ``max_walking_time`` does not apply and ``speeds`` sets the
         routed mode's speed and its walking legs, as in
         ``StreetNetwork.travel_time``. Beside a ``StreetLegPolicy``,
-        ``speeds`` takes ``"walk"`` and the modes its access and egress
-        grant.
+        ``speeds`` takes ``"walk"`` and the modes its access, egress and
+        transfers grant; a transfer set serves only the speeds it was
+        computed at.
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
         one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
@@ -1745,8 +1746,9 @@ class TravelTimeMatrix(pd.DataFrame):
         ``max_walking_time`` does not apply and ``speeds`` sets the
         routed mode's speed and its walking legs, as in
         ``StreetNetwork.travel_time``. Beside a ``StreetLegPolicy``,
-        ``speeds`` takes ``"walk"`` and the modes its access and egress
-        grant.
+        ``speeds`` takes ``"walk"`` and the modes its access, egress and
+        transfers grant; a transfer set serves only the speeds it was
+        computed at.
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
         one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
@@ -3167,6 +3169,7 @@ def _time_matrix_data(
                 exclude_stops,
                 workers=workers,
                 max_memory=max_memory,
+                speeds=speeds,
             )
         walk_only, walk_budget = _walking_only_policy(street_policy)
         if walk_only:
@@ -6253,6 +6256,7 @@ def _policy_time_columns(
         exclude_trips=list(exclude_trips),
         exclude_stops=list(exclude_stops),
         transfer_mode=transfer_mode,
+        speeds=core_speeds(speeds),
         workers=_memory.width_or(workers),
     )
     # Walking directly can beat riding, exactly as in the walking matrix;
@@ -6509,8 +6513,10 @@ def _carriage_time_columns(
     exclude_stops=(),
     workers=None,
     max_memory=None,
+    speeds=None,
 ):
-    """The carriage time-matrix columns: per-point per-plane reductions
+    """The carriage time-matrix columns at the validated ``speeds``
+    (``{mode: km/h}``): per-point per-plane reductions
     through the possession-state fan-out, the cross-plane egress fold
     per cell, and the direct walking alternative folded in over the
     same multimodal graph."""
@@ -6567,7 +6573,7 @@ def _carriage_time_columns(
             for plane, plane_modes in enumerate(planes):
                 try:
                     reduction = core._reduced_street_offsets(
-                        lat, lon, egress, plane_modes
+                        lat, lon, egress, plane_modes, speeds=core_speeds(speeds)
                     )
                 except ValueError as error:
                     if "too far from the multimodal street network" not in str(error):
@@ -6606,6 +6612,7 @@ def _carriage_time_columns(
         unknown_rule,
         park_stops=park,
         transfer_mode=transfer_mode,
+        speeds=core_speeds(speeds),
         workers=_memory.width_or(workers),
     )
     # The direct walking alternative always applies — walking needs no
@@ -6616,6 +6623,7 @@ def _carriage_time_columns(
         list(destination_points),
         "walk",
         float(walk_budget),
+        speeds=core_speeds(speeds),
         workers=_memory.width_or(workers),
     )
     _warn_unsnapped(

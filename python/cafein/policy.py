@@ -331,25 +331,20 @@ def reduction_modes(policy, side, walking_budget):
 def policy_speeds(policy, speeds):
     """The ``speeds=`` a ``StreetLegPolicy`` query rides, as a validated
     ``{mode: km/h}`` mapping (``None`` for any other `policy`): keys are
-    ``"walk"`` and the modes the policy's access and egress grant. A policy
-    whose transfers or carried vehicle ride a precomputed transfer set —
-    computed at the shipped speeds — takes none."""
+    ``"walk"`` and the modes the policy's access, egress and transfers
+    grant. A transfer set serves only the speeds it was computed at for
+    its mode; the routing core refuses it at any other."""
     from cafein._validate import mode_mapping, positive_finite
 
     if not isinstance(policy, StreetLegPolicy):
         return None
     granted = {
-        mode for budgets in (policy.access, policy.egress) for mode in budgets or {}
+        mode
+        for budgets in (policy.access, policy.egress, policy.transfers)
+        for mode in budgets or {}
     }
     modes = ("walk", *sorted(granted - {"walk"}))
-    resolved = mode_mapping("speeds", speeds, modes, positive_finite)
-    if resolved and (policy.transfers or carriage_terms(policy) is not None):
-        raise ValueError(
-            "speeds do not combine with a policy whose transfers or carried "
-            "vehicle ride a precomputed transfer set, which rides the shipped "
-            "speeds"
-        )
-    return resolved
+    return mode_mapping("speeds", speeds, modes, positive_finite)
 
 
 def carriage_terms(policy):
