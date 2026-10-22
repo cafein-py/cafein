@@ -30,7 +30,8 @@ if False:  # noqa: SIM108 — typing-only import; pyarrow stays optional
 #: 3: the network digest becomes the artifact content checksum.
 #: 4: the slot list joins the parameters, so a scalar moment and a
 #: one-slot list never share a fingerprint.
-FINGERPRINT_VERSION = 4
+#: 5: the bicycle and e-bike default speeds change.
+FINGERPRINT_VERSION = 5
 MANIFEST_FORMAT = 2
 MANIFEST_NAME = "manifest.json"
 DEFAULT_BATCH_SIZE = 500

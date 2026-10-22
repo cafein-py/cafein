@@ -1474,16 +1474,22 @@ fn uniform_attributes(network: &StreetNetwork, access: u8, flags: u16) -> Street
     }
 }
 
+/// The built-in bicycle at a round 4 m/s, so hand-computed costs stay exact
+/// whatever the shipped default speed.
+fn bicycle_4ms() -> StreetProfileDefinition {
+    let mut definition = StreetProfileDefinition::bicycle();
+    definition.max_speed *= 4.0 / definition.base_speed;
+    definition.base_speed = 4.0;
+    definition
+}
+
 #[test]
 fn profile_compiles_permitted_arc_costs() {
-    // A permitted arc costs ceil(length / speed * 1000) ms; the bicycle
-    // default is 4 m/s.
+    // A permitted arc costs ceil(length / speed * 1000) ms, here at 4 m/s.
     let mut net = triangle();
     net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
         .unwrap();
-    let bike = net
-        .compile_profile(&StreetProfileDefinition::bicycle())
-        .unwrap();
+    let bike = net.compile_profile(&bicycle_4ms()).unwrap();
     let meters = net.arrays().adj_meters().to_vec();
     assert_eq!(bike.arc_millis().len(), meters.len());
     for (&length, &cost) in meters.iter().zip(bike.arc_millis()) {
@@ -1515,7 +1521,7 @@ fn profile_applies_class_multipliers() {
     let mut net = triangle();
     net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
         .unwrap();
-    let mut slow = StreetProfileDefinition::bicycle();
+    let mut slow = bicycle_4ms();
     slow.highway_multipliers[0] = 0.5;
     let compiled = net.compile_profile(&slow).unwrap();
     let meters = net.arrays().adj_meters().to_vec();
@@ -1571,7 +1577,7 @@ fn compile_rejects_pathological_costs_and_codes() {
     // A dismount speed above max_speed would break the declared upper bound
     // on on-network speeds, so it is rejected by validation.
     let mut fast_dismount = StreetProfileDefinition::bicycle();
-    fast_dismount.dismount_speed = 10.0; // > max_speed 4
+    fast_dismount.dismount_speed = 10.0; // > max_speed ≈ 6.1
     assert_eq!(
         net.compile_profile(&fast_dismount).unwrap_err(),
         ProfileError::MaxSpeedTooLow
@@ -1604,8 +1610,9 @@ fn compile_rejects_pathological_costs_and_codes() {
 #[test]
 fn builtin_profile_speeds_and_modes() {
     assert_eq!(StreetProfileDefinition::walk().base_speed, 1.0);
-    assert_eq!(StreetProfileDefinition::bicycle().base_speed, 4.0);
-    assert_eq!(StreetProfileDefinition::e_bike().base_speed, 4.0);
+    // Bicycle and pedelec mean speeds per trip, Schleinitz et al. (2017).
+    assert_eq!(StreetProfileDefinition::bicycle().base_speed, 15.3 / 3.6);
+    assert_eq!(StreetProfileDefinition::e_bike().base_speed, 17.4 / 3.6);
     assert_eq!(StreetProfileDefinition::e_scooter().base_speed, 15.0 / 3.6);
     assert_eq!(StreetProfileDefinition::walk().mode, StreetMode::Walk);
     assert_eq!(StreetProfileDefinition::bicycle().mode, StreetMode::Bicycle);
@@ -1618,7 +1625,7 @@ fn builtin_profile_speeds_and_modes() {
     // tables match the class-code counts.
     let bike = StreetProfileDefinition::bicycle();
     assert_eq!((bike.slope_uphill, bike.slope_downhill), (1.0, 0.3));
-    assert_eq!(bike.max_speed, 4.0 / (1.0 - 0.3 * MAX_SLOPE));
+    assert_eq!(bike.max_speed, bike.base_speed / (1.0 - 0.3 * MAX_SLOPE));
     assert_eq!(StreetProfileDefinition::e_bike().slope_uphill, 0.0);
     assert_eq!(StreetProfileDefinition::walk().slope_downhill, 0.0);
     assert_eq!(bike.highway_multipliers.len(), HIGHWAY_CODE_COUNT);
@@ -1668,10 +1675,10 @@ fn compile_rejects_invalid_definitions() {
         ProfileError::InvalidMultipliers
     );
     // A max_speed below the greatest attainable speed is rejected.
-    let mut fast = StreetProfileDefinition::bicycle();
+    let mut fast = bicycle_4ms();
     fast.slope_uphill = 0.0;
     fast.slope_downhill = 0.0;
-    fast.highway_multipliers[5] = 2.0; // attainable = 8 m/s > max_speed 4
+    fast.highway_multipliers[5] = 2.0; // attainable 8 m/s > max_speed ≈ 5.7
     assert_eq!(
         net.compile_profile(&fast).unwrap_err(),
         ProfileError::MaxSpeedTooLow
@@ -1715,9 +1722,7 @@ fn dismount_is_a_per_edge_flag_on_both_directions() {
     let mut attributes = uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0);
     attributes.edge_flags[1] = FLAG_DISMOUNT;
     net.install_street_attributes(attributes).unwrap();
-    let bike = net
-        .compile_profile(&StreetProfileDefinition::bicycle())
-        .unwrap();
+    let bike = net.compile_profile(&bicycle_4ms()).unwrap();
     let meters = net.arrays().adj_meters().to_vec();
     let adj_edges = net.arrays().adj_edges().to_vec();
     for ((&length, &edge), &cost) in meters.iter().zip(&adj_edges).zip(bike.arc_millis()) {
@@ -2726,9 +2731,7 @@ fn directed_self_loop_arcs_are_gated_independently() {
             attributes.adj_access[slot] &= !MODE_BICYCLE;
         }
         net.install_street_attributes(attributes).unwrap();
-        let bike = net
-            .compile_profile(&StreetProfileDefinition::bicycle())
-            .unwrap();
+        let bike = net.compile_profile(&bicycle_4ms()).unwrap();
         let on_loop = Snap {
             edge: loop_edge,
             fraction: 0.5,
@@ -2783,9 +2786,7 @@ fn directed_travel_time_respects_a_fractional_cutoff() {
     let mut net = triangle();
     net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
         .unwrap();
-    let bike = net
-        .compile_profile(&StreetProfileDefinition::bicycle())
-        .unwrap();
+    let bike = net.compile_profile(&bicycle_4ms()).unwrap();
     let edge = directed_edge(&net, 0, 1);
     let start = Snap {
         edge,
@@ -4280,9 +4281,7 @@ fn a_ramp_charges_the_climb_and_credits_the_descent() {
     // climb multiplies by 1.1, the descent by 1 − 0.3·0.1 = 0.97.
     let edges: Vec<TestEdge> = vec![(0, 1, 200.0, straight((0.0, 0.0), (200.0, 0.0)))];
     let net = elevated_network(2, &edges, &plain_attrs(1), |x, _| (x / 10.0) as f32);
-    let bike = net
-        .compile_profile(&StreetProfileDefinition::bicycle())
-        .unwrap();
+    let bike = net.compile_profile(&bicycle_4ms()).unwrap();
     let costs = permitted_costs(&bike);
     assert_eq!(costs.len(), 2);
     assert!(near(costs[0], 48_500.0), "downhill arc: {}", costs[0]);
@@ -4306,9 +4305,7 @@ fn a_hill_with_equal_endpoints_costs_both_directions_more_than_flat() {
     let net = elevated_network(2, &edges, &plain_attrs(1), |x, _| {
         ((100.0 - (x - 100.0).abs()) / 10.0) as f32
     });
-    let bike = net
-        .compile_profile(&StreetProfileDefinition::bicycle())
-        .unwrap();
+    let bike = net.compile_profile(&bicycle_4ms()).unwrap();
     let costs = permitted_costs(&bike);
     assert_eq!(costs.len(), 2);
     for &cost in &costs {
@@ -4347,15 +4344,13 @@ fn dem_spikes_clamp_and_extreme_credits_floor() {
     // doubles (×2.0) and the descent credits ×0.7 — never less.
     let edges: Vec<TestEdge> = vec![(0, 1, 200.0, straight((0.0, 0.0), (200.0, 0.0)))];
     let net = elevated_network(2, &edges, &plain_attrs(1), |x, _| (x * 10.0) as f32);
-    let bike = net
-        .compile_profile(&StreetProfileDefinition::bicycle())
-        .unwrap();
+    let bike = net.compile_profile(&bicycle_4ms()).unwrap();
     let costs = permitted_costs(&bike);
     assert!(near(costs[0], 35_000.0), "clamped descent: {}", costs[0]);
     assert!(near(costs[1], 100_000.0), "clamped climb: {}", costs[1]);
     // A pathological downhill factor floors at MIN_SLOPE_MULTIPLIER rather
     // than compiling a vanishing (or negative) cost.
-    let mut greedy = StreetProfileDefinition::bicycle();
+    let mut greedy = bicycle_4ms();
     greedy.slope_downhill = 5.0;
     greedy.max_speed = greedy.base_speed / MIN_SLOPE_MULTIPLIER;
     let floored = permitted_costs(&net.compile_profile(&greedy).unwrap());
@@ -4525,9 +4520,7 @@ fn directed_reached_vertices_bound_the_mode_spread() {
     let mut net = triangle();
     net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
         .unwrap();
-    let bike = net
-        .compile_profile(&StreetProfileDefinition::bicycle())
-        .unwrap();
+    let bike = net.compile_profile(&bicycle_4ms()).unwrap();
     let (lon0, lat0) = lonlat(0.0, 0.0);
     let origin = net.snap(lat0, lon0, 50.0).unwrap();
     let tight: Vec<u32> = net

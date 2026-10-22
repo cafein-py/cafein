@@ -302,25 +302,28 @@ impl StreetProfileDefinition {
         definition
     }
 
-    /// The default bicycle profile, 14.4 km/h (R5's 4 m/s default), with the
-    /// slope model `w = d·(1 + f(s))`: `f(s) = s` uphill, `0.3·s` downhill.
+    /// The default bicycle profile, 15.3 km/h — the conventional bicycle's
+    /// mean speed per trip in Schleinitz et al. (2017), Safety Science 92,
+    /// 290–297, doi:10.1016/j.ssci.2015.07.027 — with the slope model
+    /// `w = d·(1 + f(s))`: `f(s) = s` uphill, `0.3·s` downhill.
     /// The downhill credit can raise an arc's effective speed to
     /// `base / (1 − 0.3·MAX_SLOPE)`, so `max_speed` covers that bound.
     pub fn bicycle() -> StreetProfileDefinition {
         let mut definition =
-            StreetProfileDefinition::flat("bicycle", StreetMode::Bicycle, "bicycle", 4.0);
+            StreetProfileDefinition::flat("bicycle", StreetMode::Bicycle, "bicycle", 15.3 / 3.6);
         definition.slope_uphill = 1.0;
         definition.slope_downhill = 0.3;
         definition.max_speed = definition.base_speed / (1.0 - 0.3 * MAX_SLOPE);
         definition
     }
 
-    /// The default e-bike profile: bicycle permissions and speed for now, but a
-    /// distinct vehicle class (its emissions differ). Slope stays off — the
+    /// The default e-bike (pedelec) profile, 17.4 km/h — the pedelec mean
+    /// speed per trip in the same study — over the bicycle permissions, with
+    /// its own vehicle class (its emissions differ). Slope stays off: the
     /// documented model is for the conventional bicycle, and an
     /// assist-flattened curve would be an invented number.
     pub fn e_bike() -> StreetProfileDefinition {
-        StreetProfileDefinition::flat("e_bike", StreetMode::Bicycle, "e_bike", 4.0)
+        StreetProfileDefinition::flat("e_bike", StreetMode::Bicycle, "e_bike", 17.4 / 3.6)
     }
 
     /// The default e-scooter profile, 15 km/h (a modelling speed, not a legal
