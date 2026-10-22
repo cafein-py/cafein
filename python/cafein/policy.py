@@ -283,23 +283,23 @@ class StreetLegPolicy:
 
 
 def _validated_budgets(name, budgets):
-    budgets = dict(budgets or {})
-    for mode, seconds in budgets.items():
-        if mode not in STREET_POLICY_MODES:
-            raise ValueError(
-                f"{name} names an unknown street mode {mode!r}; expected one "
-                f"of {', '.join(STREET_POLICY_MODES)}"
-            )
-        try:
-            seconds = float(seconds)
-        except OverflowError:
-            # An integer beyond float range is a number that cannot be
-            # finite; refuse it as such.
-            seconds = math.inf
-        if not (math.isfinite(seconds) and seconds > 0.0):
-            raise ValueError(f"{name}[{mode!r}] must be a positive, finite time budget")
-        budgets[mode] = seconds
-    return budgets
+    """`budgets` as a ``{mode: seconds}`` dict over the policy modes."""
+    from cafein._validate import mode_mapping
+
+    return mode_mapping(name, budgets, STREET_POLICY_MODES, _positive_budget)
+
+
+def _positive_budget(name, value):
+    """`value` as a positive, finite time budget in seconds."""
+    try:
+        seconds = float(value)
+    except OverflowError:
+        # An integer beyond float range is a number that cannot be
+        # finite; refuse it as such.
+        seconds = math.inf
+    if not (math.isfinite(seconds) and seconds > 0.0):
+        raise ValueError(f"{name} must be a positive, finite time budget")
+    return seconds
 
 
 def reduction_modes(policy, side, walking_budget):

@@ -17,8 +17,8 @@ INACCESSIBLE_TRIPS = 3422
 def test_the_profile_validates_its_inputs():
     with pytest.raises(ValueError, match="unknown"):
         TravelerProfile(unknown="optimistic")
-    with pytest.raises(ValueError, match="walking_speed_kmph"):
-        TravelerProfile(walking_speed_kmph=0)
+    with pytest.raises(ValueError, match="speeds"):
+        TravelerProfile(speeds={"walk": 0})
     with pytest.raises(ValueError, match="max_walking_time"):
         TravelerProfile(max_walking_time=-5)
     with pytest.raises(TypeError, match="exclude_stops"):
@@ -145,19 +145,19 @@ def test_profile_and_call_exclusions_union(network):
 
 
 def test_walking_knobs_fold_and_conflict(network):
-    profile = TravelerProfile(walking_speed_kmph=3.0, max_walking_time=10)
+    profile = TravelerProfile(speeds={"walk": 3.0}, max_walking_time=10)
     folded = folded_constraints(profile, network, (), (), (), None, None)
     assert folded[3] == 3.0 and folded[4] == 10
-    with pytest.raises(ValueError, match="walking_speed_kmph"):
+    with pytest.raises(ValueError, match="speeds"):
         folded_constraints(profile, network, (), (), (), 5.0, None)
     with pytest.raises(ValueError, match="max_walking_time"):
         folded_constraints(profile, network, (), (), (), None, 15)
-    with pytest.raises(ValueError, match="walking_speed_kmph"):
+    with pytest.raises(ValueError, match="speeds"):
         network.route_between_stops(
             "4810551",
             "1250551",
             "2022-02-22 08:30:00",
-            walking_speed_kmph=5.0,
+            speeds={"walk": 5.0},
             traveler=profile,
         )
     with pytest.raises(TypeError, match="TravelerProfile"):
@@ -340,7 +340,7 @@ def test_the_wheelchair_traveler_bridges_to_the_street_policy(multimodal_network
             destination,
             "2022-02-22 08:30:00",
             traveler=profile,
-            walking_speed_kmph=5.0,
+            speeds={"walk": 5.0},
         )
 
 
@@ -502,7 +502,7 @@ def test_policy_less_point_surfaces_refuse_the_wheelchair_traveler(
             "2022-02-22 08:30:00",
             budgets=(15.0,),
             traveler=profile,
-            walking_speed_kmph=5.0,
+            speeds={"walk": 5.0},
         )
     with pytest.raises(ValueError, match="street_modes"):
         Catchment(

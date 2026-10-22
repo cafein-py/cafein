@@ -344,7 +344,7 @@ def test_access_stops_respect_the_walking_cutoff(network_with_footpaths):
 def test_faster_walking_reaches_more_stops(network_with_footpaths):
     lat, lon = stop_coordinates(network_with_footpaths, "1040602")
     walked = network_with_footpaths.access_stops(lat, lon)
-    ran = network_with_footpaths.access_stops(lat, lon, walking_speed_kmph=7.2)
+    ran = network_with_footpaths.access_stops(lat, lon, speeds={"walk": 7.2})
     assert set(ran) > set(walked)
 
 
@@ -353,8 +353,11 @@ def test_access_stops_refusals(network, network_with_footpaths):
     lat, lon = stop_coordinates(network_with_footpaths, "1040602")
     for args, kwargs, match in (
         ((float("nan"), lon), {}, "lat and lon"),
-        ((lat, lon), dict(walking_speed_kmph=float("inf")), "walking_speed_kmph"),
-        ((lat, lon), dict(walking_speed_kmph=0.0), "walking_speed_kmph"),
+        ((lat, lon), dict(speeds={"walk": float("inf")}), "speeds"),
+        ((lat, lon), dict(speeds={"walk": 0.0}), "speeds"),
+        # Only the walking speed shapes a walking search.
+        ((lat, lon), dict(speeds={"bicycle": 15.0}), "names 'bicycle'"),
+        ((lat, lon), dict(speeds={"segway": 10.0}), "names 'segway'"),
         ((lat, lon), dict(max_walking_time=float("nan")), "max_walking_time"),
         (
             (lat, lon),
@@ -366,6 +369,8 @@ def test_access_stops_refusals(network, network_with_footpaths):
     ):
         with pytest.raises(ValueError, match=match):
             network_with_footpaths.access_stops(*args, **kwargs)
+    with pytest.raises(TypeError, match="speeds must be a mapping"):
+        network_with_footpaths.access_stops(lat, lon, speeds=4.5)
     # Without a street network the query refuses outright.
     with pytest.raises(ValueError, match="no street network"):
         network.access_stops(60.168, 24.931)
@@ -462,12 +467,12 @@ def test_door_to_door_needs_streets_and_valid_coordinates(
         network_with_footpaths.route_between_coordinates(
             origin, (60.10, 24.90), "2022-02-22 08:30:00"
         )
-    with pytest.raises(ValueError, match="walking_speed_kmph"):
+    with pytest.raises(ValueError, match="speeds"):
         network_with_footpaths.route_between_coordinates(
             origin,
             destination,
             "2022-02-22 08:30:00",
-            walking_speed_kmph=float("nan"),
+            speeds={"walk": float("nan")},
         )
     with pytest.raises(ValueError, match="origin lat and lon"):
         network_with_footpaths.travel_times_from_coordinate(

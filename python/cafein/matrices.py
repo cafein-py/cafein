@@ -24,6 +24,7 @@ from cafein._validate import (
 )
 from cafein import _memory, _sweep
 from cafein._units import duration_seconds, memory_spec
+from cafein.streets import walking_speed
 from cafein.travelers import (
     folded_constraints,
     folded_street_policy,
@@ -788,15 +789,16 @@ class TravelCostMatrix(pd.DataFrame):
         ``departure=``, the destinations with ``arrival=`` — so ``n``
         batch jobs cover all pairs disjointly and their shards
         concatenate.
-    walking_speed_kmph, max_walking_time, snap_distance : float
+    speeds, max_walking_time, snap_distance : optional
         The street-search options for the walking access/egress, as in
-        ``TransportNetwork.access_stops``: speed in km/h, walking time
-        in minutes (or a timedelta), snap distance in meters. They
-        bound the walking for point origins/destinations, and for stop
-        origins/destinations only when a whole-day shortcut set routes
-        them door-to-door; otherwise stop matrices ignore them. Only
-        ``snap_distance`` applies to a ``StreetNetwork``, whose speeds
-        come from the mode's profile.
+        ``TransportNetwork.access_stops``: the ``{"walk": km/h}`` speed
+        mapping, walking time in minutes (or a timedelta), snap
+        distance in meters. They bound the walking for point
+        origins/destinations, and for stop origins/destinations only
+        when a whole-day shortcut set routes them door-to-door;
+        otherwise stop matrices ignore them. Only ``snap_distance``
+        applies to a ``StreetNetwork``, whose speeds come from the
+        mode's profile.
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
         one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
@@ -952,7 +954,7 @@ class TravelCostMatrix(pd.DataFrame):
         exclude_stops=(),
         geometries=False,
         chunk=None,
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         transport_mode=None,
@@ -973,6 +975,7 @@ class TravelCostMatrix(pd.DataFrame):
         workers=None,
         max_memory=None,
     ):
+        walking_speed_kmph = walking_speed(speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -1078,7 +1081,7 @@ class TravelCostMatrix(pd.DataFrame):
                     "departure_time_window": window,
                     "max_travel_time": within,
                     "fares": fares,
-                    "walking_speed_kmph": walking_speed_kmph,
+                    "speeds": walking_speed_kmph,
                     "max_walking_time": max_walking_time,
                     "max_rides": None if max_rides == 8 else max_rides,
                     "optimize": _transit_objective(optimize),
@@ -1349,7 +1352,7 @@ class TravelCostMatrix(pd.DataFrame):
         exclude_stops=(),
         geometries=False,
         chunk=None,
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         transport_mode=None,
@@ -1396,6 +1399,7 @@ class TravelCostMatrix(pd.DataFrame):
         directory run exactly as ``travel_cost_table`` does.
         """
         _log.sync()
+        walking_speed_kmph = walking_speed(speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -1483,7 +1487,7 @@ class TravelCostMatrix(pd.DataFrame):
                     "departure_time_window": window,
                     "max_travel_time": within,
                     "fares": fares,
-                    "walking_speed_kmph": walking_speed_kmph,
+                    "speeds": walking_speed_kmph,
                     "max_walking_time": max_walking_time,
                     "max_rides": None if max_rides == 8 else max_rides,
                     "optimize": _transit_objective(optimize),
@@ -1723,15 +1727,16 @@ class TravelTimeMatrix(pd.DataFrame):
         RAPTOR path routes door-to-door and auto prefers it; point
         matrices share the ULTRA set on both engines, so the cache
         alone decides there.
-    walking_speed_kmph, max_walking_time, snap_distance : float
+    speeds, max_walking_time, snap_distance : optional
         The street-search options for the walking access/egress, as in
-        ``TransportNetwork.access_stops``: speed in km/h, walking time
-        in minutes (or a timedelta), snap distance in meters. They
-        bound the walking for point origins/destinations, and for stop
-        origins/destinations only when a whole-day shortcut set routes
-        them door-to-door; otherwise stop matrices ignore them. Only
-        ``snap_distance`` applies to a ``StreetNetwork``, whose speeds
-        come from the mode's profile.
+        ``TransportNetwork.access_stops``: the ``{"walk": km/h}`` speed
+        mapping, walking time in minutes (or a timedelta), snap
+        distance in meters. They bound the walking for point
+        origins/destinations, and for stop origins/destinations only
+        when a whole-day shortcut set routes them door-to-door;
+        otherwise stop matrices ignore them. Only ``snap_distance``
+        applies to a ``StreetNetwork``, whose speeds come from the
+        mode's profile.
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
         one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
@@ -1813,7 +1818,7 @@ class TravelTimeMatrix(pd.DataFrame):
         exclude_trips=(),
         traveler=None,
         exclude_stops=(),
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         transport_mode=None,
@@ -1827,6 +1832,7 @@ class TravelTimeMatrix(pd.DataFrame):
         workers=None,
         max_memory=None,
     ):
+        walking_speed_kmph = walking_speed(speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -1913,7 +1919,7 @@ class TravelTimeMatrix(pd.DataFrame):
                     "departure_time_window": window,
                     "percentiles": percentiles,
                     "confidence": confidence,
-                    "walking_speed_kmph": walking_speed_kmph,
+                    "speeds": walking_speed_kmph,
                     "max_walking_time": max_walking_time,
                     "max_rides": None if max_rides == 8 else max_rides,
                     "router": None if router == "auto" else router,
@@ -2061,7 +2067,7 @@ class TravelTimeMatrix(pd.DataFrame):
         exclude_trips=(),
         traveler=None,
         exclude_stops=(),
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         transport_mode=None,
@@ -2108,6 +2114,7 @@ class TravelTimeMatrix(pd.DataFrame):
         ``travel_cost_table`` does.
         """
         _log.sync()
+        walking_speed_kmph = walking_speed(speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -2197,7 +2204,7 @@ class TravelTimeMatrix(pd.DataFrame):
                     "departure_time_window": window,
                     "percentiles": percentiles,
                     "confidence": confidence,
-                    "walking_speed_kmph": walking_speed_kmph,
+                    "speeds": walking_speed_kmph,
                     "max_walking_time": max_walking_time,
                     "max_rides": None if max_rides == 8 else max_rides,
                     "router": None if router == "auto" else router,
@@ -3090,7 +3097,7 @@ def _time_matrix_data(
             "window": window,
             "percentiles": percentiles,
             "confidence": confidence,
-            "walking_speed_kmph": walking_speed_kmph,
+            "speeds": walking_speed_kmph,
             "max_walking_time": max_walking_time,
             "max_snap_distance": max_snap_distance,
         }
@@ -3622,7 +3629,7 @@ def travel_cost_table(
     exclude_trips=(),
     traveler=None,
     exclude_stops=(),
-    walking_speed_kmph=None,
+    speeds=None,
     max_walking_time=None,
     snap_distance=None,
     transport_mode=None,
@@ -3712,6 +3719,7 @@ def travel_cost_table(
     ``chunk``, and ``batch_size`` — else the directory is refused,
     never overwritten.
     """
+    walking_speed_kmph = walking_speed(speeds)
     if not _is_street_network(network):
         (
             exclude_routes,
@@ -3790,7 +3798,7 @@ def travel_cost_table(
                 "departure_time_window": window,
                 "max_travel_time": within,
                 "fares": fares,
-                "walking_speed_kmph": walking_speed_kmph,
+                "speeds": walking_speed_kmph,
                 "max_walking_time": max_walking_time,
                 "max_rides": None if max_rides == 8 else max_rides,
                 "optimize": _transit_objective(optimize),
@@ -4114,7 +4122,7 @@ def _stream_transit_cost(
         "exclude_routes": exclude_routes,
         "exclude_trips": exclude_trips,
         "exclude_stops": exclude_stops,
-        "walking_speed_kmph": walking_speed_kmph,
+        "speeds": {} if walking_speed_kmph is None else {"walk": walking_speed_kmph},
         "max_walking_time": max_walking_time,
         "max_snap_distance": max_snap_distance,
         # The fingerprint hashes the layer data itself, so a resume with
@@ -4972,7 +4980,7 @@ def _stream_transit_time(
         "exclude_routes": exclude_routes,
         "exclude_trips": exclude_trips,
         "exclude_stops": exclude_stops,
-        "walking_speed_kmph": walking_speed_kmph,
+        "speeds": {} if walking_speed_kmph is None else {"walk": walking_speed_kmph},
         "max_walking_time": max_walking_time,
         "max_snap_distance": max_snap_distance,
         "output_time_units": output_time_units,
@@ -5499,7 +5507,7 @@ def _cost_matrix_data(
                     ("max_travel_time", within),
                     ("candidates", None if candidates == "time" else candidates),
                     ("router", None if router == "auto" else router),
-                    ("walking_speed_kmph", walking_speed_kmph),
+                    ("speeds", walking_speed_kmph),
                     ("max_walking_time", max_walking_time),
                     ("snap_distance", max_snap_distance),
                 )

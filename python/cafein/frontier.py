@@ -44,6 +44,7 @@ import pandas as pd
 from cafein import emissions
 from cafein._validate import component_selection, id_sequence, sequence_not_string
 from cafein.travelers import folded_constraints, refuse_wheelchair_streets
+from cafein.streets import walking_speed
 
 _COLUMNS = [
     "departure_s",
@@ -79,7 +80,7 @@ def journey_frontier(
     exclude_trips=(),
     traveler=None,
     exclude_stops=(),
-    walking_speed_kmph=None,
+    speeds=None,
     max_walking_time=None,
     snap_distance=None,
     geometries=False,
@@ -231,11 +232,12 @@ def journey_frontier(
         whose final arrival is inside the band may still be excluded
         when its prefix strays outside it. ``None`` (the default) keeps
         today's exact behavior.
-    walking_speed_kmph, max_walking_time, snap_distance : float
+    speeds, max_walking_time, snap_distance : optional
         Street-search options for the walking access/egress, as in
-        ``route_between_coordinates``. For stop origins/destinations they
-        apply only when a whole-day shortcut set routes them door-to-door
-        (ULTRA for ``candidates="time"``, McULTRA for ``"pareto"``).
+        ``route_between_coordinates`` (``speeds={"walk": km/h}``). For
+        stop origins/destinations they apply only when a whole-day
+        shortcut set routes them door-to-door (ULTRA for
+        ``candidates="time"``, McULTRA for ``"pareto"``).
     geometries : bool (optional, default: False)
         Attach leg geometries to the returned journeys.
 
@@ -251,6 +253,7 @@ def journey_frontier(
         on any criterion never are), and ``journey``, the annotated
         journey dict as returned by the routing calls.
     """
+    walking_speed_kmph = walking_speed(speeds)
     (
         exclude_routes,
         exclude_trips,
@@ -475,7 +478,7 @@ def journey_frontiers(
     exclude_trips=(),
     traveler=None,
     exclude_stops=(),
-    walking_speed_kmph=None,
+    speeds=None,
     max_walking_time=None,
     snap_distance=None,
     geometries=False,
@@ -515,9 +518,9 @@ def journey_frontiers(
         rows, on either engine).
     exclude_routes, exclude_trips, exclude_stops
         As in ``journey_frontier``.
-    walking_speed_kmph, max_walking_time, snap_distance : float
+    speeds, max_walking_time, snap_distance : optional
         Street-search options for the coordinate queries, as in
-        ``route_between_coordinates``.
+        ``route_between_coordinates`` (``speeds={"walk": km/h}``).
     geometries : bool (optional, default: False)
         Attach leg geometries to the returned journeys.
 
@@ -529,6 +532,7 @@ def journey_frontiers(
         rows within a cell the frame's travel-time sort; a cell with no
         feasible journey contributes no rows.
     """
+    walking_speed_kmph = walking_speed(speeds)
     (
         exclude_routes,
         exclude_trips,
@@ -662,7 +666,7 @@ def frontier_table(
     exclude_trips=(),
     traveler=None,
     exclude_stops=(),
-    walking_speed_kmph=None,
+    speeds=None,
     max_walking_time=None,
     snap_distance=None,
     output_time_units="minutes",
@@ -685,9 +689,9 @@ def frontier_table(
         As in ``journey_frontiers``.
     exclude_routes, exclude_trips, exclude_stops
         As in ``journey_frontiers``.
-    walking_speed_kmph, max_walking_time, snap_distance : float
+    speeds, max_walking_time, snap_distance : optional
         Street-search options for the coordinate queries, as in
-        ``route_between_coordinates``.
+        ``route_between_coordinates`` (``speeds={"walk": km/h}``).
 
     Returns
     -------
@@ -696,6 +700,7 @@ def frontier_table(
         ``travel_time``, ``rides``, ``emissions`` (NaN where a transit
         leg's factor is unresolved), and ``frontier``.
     """
+    walking_speed_kmph = walking_speed(speeds)
     (
         exclude_routes,
         exclude_trips,
@@ -1303,7 +1308,7 @@ def fare_frontier(
     max_travel_time=None,
     exact=True,
     departure_time_step=1,
-    walking_speed_kmph=None,
+    speeds=None,
     max_walking_time=None,
     snap_distance=None,
     output_time_units="minutes",
@@ -1376,9 +1381,10 @@ def fare_frontier(
         by waiting past the last in-window event belongs to the grid,
         so neither mode's travel times bound the other's at a
         window's edge.
-    walking_speed_kmph, max_walking_time, snap_distance : float
+    speeds, max_walking_time, snap_distance : optional
         Street-search options for the point form, as in
-        ``route_between_coordinates`` (walking time in minutes);
+        ``route_between_coordinates`` (``speeds={"walk": km/h}``,
+        walking time in minutes);
         rejected beside stop ids. The walking-time bound is clamped to
         ``max_travel_time`` — a longer walk cannot join a journey that
         fits the cap.
@@ -1390,6 +1396,7 @@ def fare_frontier(
         (in ``output_time_units``), ``money``, and ``rides``; a
         (pair, cutoff) whose cutoff no journey fits is absent.
     """
+    walking_speed_kmph = walking_speed(speeds)
     from cafein._units import (
         departure_parts,
         duration_seconds,

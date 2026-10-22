@@ -242,7 +242,7 @@ def test_street_keywords_on_a_transport_network_are_rejected(network):
         {"exclude_routes": ["1001"]},
         {"exclude_trips": ["t1"]},
         {"exclude_stops": ["s1"]},
-        {"walking_speed_kmph": 5.0},
+        {"speeds": {"walk": 5.0}},
         {"max_walking_time": 10.0},
     ],
 )
@@ -492,7 +492,7 @@ def test_cost_matrix_geometry(streets, origins, destinations):
         {"exclude_routes": ["1001"]},
         {"exclude_trips": ["t1"]},
         {"exclude_stops": ["s1"]},
-        {"walking_speed_kmph": 5.0},
+        {"speeds": {"walk": 5.0}},
         {"max_walking_time": 10.0},
     ],
 )

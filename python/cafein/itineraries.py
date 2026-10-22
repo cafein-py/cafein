@@ -16,6 +16,7 @@ import pandas as pd
 import shapely
 
 from cafein.travelers import folded_constraints, folded_street_policy
+from cafein.streets import walking_speed
 from cafein.matrices import (
     _factor_tables,
     _is_point_frame,
@@ -303,13 +304,13 @@ class DetailedItineraries(gpd.GeoDataFrame):
     geometries : bool (optional, default: True)
         Attach each leg's geometry. Turn off to skip the geometry work
         when only the leg records are needed.
-    walking_speed_kmph, max_walking_time, snap_distance : float
+    speeds, max_walking_time, snap_distance : optional
         The street-search options for point origins/destinations, as in
-        ``TransportNetwork.route_between_coordinates``: speed in km/h,
-        walking time in minutes (or a timedelta), snap distance in
-        meters; only valid with points. Only ``snap_distance`` applies
-        to a ``StreetNetwork``, whose speeds come from the mode's
-        profile.
+        ``TransportNetwork.route_between_coordinates``: the
+        ``{"walk": km/h}`` speed mapping, walking time in minutes (or a
+        timedelta), snap distance in meters; only valid with points.
+        Only ``snap_distance`` applies to a ``StreetNetwork``, whose
+        speeds come from the mode's profile.
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
         one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
@@ -485,7 +486,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         traveler=None,
         exclude_stops=(),
         geometries=True,
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         transport_mode=None,
@@ -505,6 +506,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         cost_components=None,
         output_time_units="minutes",
     ):
+        walking_speed_kmph = walking_speed(speeds)
         origins, _origin_dtype = freeze_ids(origins)
         destinations, _destination_dtype = freeze_ids(destinations)
         if destinations is None and hasattr(origins, "geometry"):
@@ -645,7 +647,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
                         "traveler": traveler,
                         "tolerance_minutes": slack_seconds,
                         "max_options": max_options,
-                        "walking_speed_kmph": walking_speed_kmph,
+                        "speeds": walking_speed_kmph,
                         "max_walking_time": max_walking_time,
                         "max_rides": None if max_rides == 8 else max_rides,
                         "candidates": (
@@ -852,6 +854,9 @@ def _itineraries_frame(
     currency=None,
     cost_components=None,
 ):
+    """The transit itineraries of every origin-destination pair as one
+    leg-per-row frame, ``DetailedItineraries``'s body on a
+    ``TransportNetwork``."""
     import copy
 
     components = component_selection(components)
@@ -904,7 +909,7 @@ def _itineraries_frame(
             # the direct walk; the policy owns only the car chain.
             raise ValueError(
                 "street_policy carries its own budgets; passing "
-                "walking_speed_kmph, max_walking_time, or max_snap_distance "
+                "speeds, max_walking_time, or max_snap_distance "
                 "beside it is a conflict"
             )
     if router == "tbtr" and candidates != "pareto":

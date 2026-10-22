@@ -458,17 +458,17 @@ def test_walking_knobs_validate_before_any_file_is_read():
     from cafein import TransportNetwork
     from cafein.streets import walking_footpaths, walking_streets
 
-    with pytest.raises(ValueError, match="walking_speed_kmph must be a positive"):
+    with pytest.raises(ValueError, match=r"speeds\['walk'\] must be a positive"):
         TransportNetwork.from_gtfs(
-            ["no-such-feed.zip"], osm_pbf="no-such.osm.pbf", walking_speed_kmph=0
+            ["no-such-feed.zip"], osm_pbf="no-such.osm.pbf", speeds={"walk": 0}
         )
     with pytest.raises(ValueError, match="snap_distance must be a non-negative"):
         TransportNetwork.from_gtfs(
             ["no-such-feed.zip"], osm_pbf="no-such.osm.pbf", snap_distance=-1
         )
-    with pytest.raises(TypeError, match="walking_speed_kmph must be a number"):
+    with pytest.raises(TypeError, match=r"speeds\['walk'\] must be a number"):
         TransportNetwork.from_gtfs(
-            ["no-such-feed.zip"], osm_pbf="no-such.osm.pbf", walking_speed_kmph="fast"
+            ["no-such-feed.zip"], osm_pbf="no-such.osm.pbf", speeds={"walk": "fast"}
         )
     with pytest.raises(ValueError, match="four finite numbers"):
         TransportNetwork.from_gtfs(
@@ -487,8 +487,8 @@ def test_walking_knobs_validate_before_any_file_is_read():
             ["no-such-feed.zip"], osm_pbf="no-such.osm.pbf", max_walking_time=10**8
         )
     for build in (walking_footpaths, walking_streets):
-        with pytest.raises(ValueError, match="walking_speed_kmph must be a positive"):
-            build("no-such.osm.pbf", [], walking_speed_kmph=-3.6)
+        with pytest.raises(ValueError, match=r"speeds\['walk'\] must be a positive"):
+            build("no-such.osm.pbf", [], speeds={"walk": -3.6})
         with pytest.raises(ValueError, match="snap_distance must be a non-negative"):
             build("no-such.osm.pbf", [], snap_distance=float("nan"))
         with pytest.raises(TypeError, match="bounding_box must be four numbers"):
@@ -496,8 +496,8 @@ def test_walking_knobs_validate_before_any_file_is_read():
         with pytest.raises(ValueError, match="overflows the router clock"):
             build("no-such.osm.pbf", [], max_walking_time=10**8)
     # Numeric-looking strings are the wrong KIND, never quietly parsed.
-    with pytest.raises(TypeError, match="walking_speed_kmph must be a number"):
-        walking_footpaths("no-such.osm.pbf", [], walking_speed_kmph="3.6")
+    with pytest.raises(TypeError, match=r"speeds\['walk'\] must be a number"):
+        walking_footpaths("no-such.osm.pbf", [], speeds={"walk": "3.6"})
     # The extractor validates its bounding box before the PBF read too.
     from cafein.streets import park_and_ride_facilities
 
@@ -528,8 +528,8 @@ def test_walking_knobs_validate_before_any_file_is_read():
 
     with pytest.raises(ValueError, match="geometry must have four finite bounds"):
         validated_bounding_box(Polygon())
-    with pytest.raises(ValueError, match="walking_speed_kmph must be a positive"):
-        walking_footpaths("no-such.osm.pbf", [], walking_speed_kmph=10**400)
+    with pytest.raises(ValueError, match=r"speeds\['walk'\] must be a positive"):
+        walking_footpaths("no-such.osm.pbf", [], speeds={"walk": 10**400})
     with pytest.raises(ValueError, match="non-negative, finite duration"):
         walking_footpaths("no-such.osm.pbf", [], max_walking_time=10**400)
 
@@ -544,9 +544,9 @@ def test_query_walking_knobs_fail_by_their_public_names(network):
             "2022-02-22 08:30:00",
             snap_distance=-5,
         )
-    with pytest.raises(ValueError, match="walking_speed_kmph must be a positive"):
+    with pytest.raises(ValueError, match=r"speeds\['walk'\] must be a positive"):
         network.travel_times_from_coordinate(
-            (60.1690, 24.9320), "2022-02-22 08:30:00", walking_speed_kmph=0
+            (60.1690, 24.9320), "2022-02-22 08:30:00", speeds={"walk": 0}
         )
     # The stop-matrix branches that ignore the knobs still refuse
     # garbage — the reverse stop axis and the windowed form included.
@@ -560,7 +560,7 @@ def test_query_walking_knobs_fail_by_their_public_names(network):
             arrival="2022-02-22 09:30:00",
             snap_distance=-1,
         )
-    with pytest.raises(ValueError, match="walking_speed_kmph must be a positive"):
+    with pytest.raises(ValueError, match=r"speeds\['walk'\] must be a positive"):
         TravelTimeMatrix(
             network,
             ["1000202"],
@@ -568,7 +568,7 @@ def test_query_walking_knobs_fail_by_their_public_names(network):
             "2022-02-22 08:30:00",
             departure_time_window=10,
             percentiles=(50,),
-            walking_speed_kmph=-1,
+            speeds={"walk": -1},
         )
 
 

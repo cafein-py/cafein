@@ -168,7 +168,7 @@ def test_geometries_false_drops_the_shapes(streets, places):
         {"diversity": "spread"},
         {"penalty": 60},
         {"exclude_routes": ["1001"]},
-        {"walking_speed_kmph": 5.0},
+        {"speeds": {"walk": 5.0}},
         {"max_walking_time": 10.0},
         {"fares": FareStructure()},
     ],

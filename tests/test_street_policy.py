@@ -20,7 +20,7 @@ def shared(facilities="any_stop"):
 
 def test_policy_construction_refusals():
     for ctor, kwargs, match in [
-        (StreetLegPolicy, {"access": {"segway": 600}}, "unknown street mode"),
+        (StreetLegPolicy, {"access": {"segway": 600}}, "names 'segway'"),
         (StreetLegPolicy, {"access": {"walk": 0}}, "positive, finite time budget"),
         (
             StreetLegPolicy,

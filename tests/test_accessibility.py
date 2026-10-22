@@ -1117,9 +1117,9 @@ def test_catchment_validates_eagerly(network_with_footpaths, helsinki_streets):
         # unusable walking options
         (
             transit,
-            {"departure_time_window": 10, "walking_speed_kmph": float("nan")},
+            {"departure_time_window": 10, "speeds": {"walk": float("nan")}},
             ValueError,
-            "walking_speed_kmph",
+            "speeds",
         ),
         (transit, {"snap_distance": 0}, ValueError, "snap_distance"),
         (

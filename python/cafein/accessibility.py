@@ -36,6 +36,7 @@ from cafein.matrices import (
     _stream_batch,
 )
 from cafein.travelers import folded_constraints, refuse_wheelchair_streets
+from cafein.streets import walking_speed
 
 #: The parameter each decay family takes (None: no parameter).
 DECAY_PARAMETERS = {
@@ -605,7 +606,7 @@ def _resolved_cost_matrix(
             "departure_time_window": window,
             "percentiles": percentiles,
             "confidence": confidence,
-            "walking_speed_kmph": walking_speed_kmph,
+            "speeds": walking_speed_kmph,
             "max_walking_time": max_walking_time,
         }
         named = [name for name, value in rejected.items() if value is not None]
@@ -1297,13 +1298,14 @@ class Accessibility(pd.DataFrame):
         exclude_trips=(),
         traveler=None,
         exclude_stops=(),
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         street_policy=None,
         workers=None,
         max_memory=None,
     ):
+        walking_speed_kmph = walking_speed(speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -1514,7 +1516,7 @@ class Accessibility(pd.DataFrame):
         exclude_trips=(),
         traveler=None,
         exclude_stops=(),
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         street_policy=None,
@@ -1544,6 +1546,7 @@ class Accessibility(pd.DataFrame):
         complete time query, refusing a resume that differs in axis,
         moment, window, or percentiles.
         """
+        walking_speed_kmph = walking_speed(speeds)
         _log.sync()
         if workers is not None:
             workers = positive_int("workers", workers)
@@ -1753,7 +1756,9 @@ class Accessibility(pd.DataFrame):
             "exclude_routes": list(exclude_routes),
             "exclude_trips": list(exclude_trips),
             "exclude_stops": list(exclude_stops),
-            "walking_speed_kmph": walking_speed_kmph,
+            "speeds": (
+                {} if walking_speed_kmph is None else {"walk": walking_speed_kmph}
+            ),
             "max_walking_time": max_walking_time,
             "max_snap_distance": max_snap_distance,
             # Sorted for the hash only, exactly as the matrix
@@ -2537,13 +2542,14 @@ class NearestDestinations(pd.DataFrame):
         exclude_trips=(),
         traveler=None,
         exclude_stops=(),
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         output_time_units="minutes",
         workers=None,
         max_memory=None,
     ):
+        walking_speed_kmph = walking_speed(speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -3028,7 +3034,7 @@ class Catchment(gpd.GeoDataFrame):
     some profiled deadline. The wheelchair traveler's directed street
     bridge does not combine with ``arrival=`` yet. A wheelchair traveler's catchment rides the
     fixed compiled profile at the multimodal snap radius —
-    ``walking_speed_kmph`` and ``snap_distance`` are rejected beside
+    a walking speed and ``snap_distance`` are rejected beside
     it, while ``max_walking_time`` stays configurable. Requires the
     optional ``h3`` extra (``cafein[h3]``).
     """
@@ -3062,12 +3068,13 @@ class Catchment(gpd.GeoDataFrame):
         exclude_trips=(),
         traveler=None,
         exclude_stops=(),
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         workers=None,
         max_memory=None,
     ):
+        walking_speed_kmph = walking_speed(speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -3111,7 +3118,7 @@ class Catchment(gpd.GeoDataFrame):
                 )
             if walking_speed_kmph is not None:
                 raise ValueError(
-                    "walking_speed_kmph cannot reshape the wheelchair "
+                    "speeds['walk'] cannot reshape the wheelchair "
                     "street profile, which rides its fixed speed"
                 )
             if snap_distance is not None:
@@ -3238,7 +3245,7 @@ class Catchment(gpd.GeoDataFrame):
             rejected = {
                 "departure": departure,
                 "departure_time_window": window,
-                "walking_speed_kmph": walking_speed_kmph,
+                "speeds": walking_speed_kmph,
                 "max_walking_time": max_walking_time,
             }
             named = [name for name, value in rejected.items() if value is not None]
@@ -3327,7 +3334,7 @@ class Catchment(gpd.GeoDataFrame):
             snap = float(snap)
             if not math.isfinite(speed_kmph) or speed_kmph <= 0.0:
                 raise ValueError(
-                    "walking_speed_kmph must be a positive finite speed, "
+                    "speeds['walk'] must be a positive finite speed, "
                     f"not {walking_speed_kmph!r}"
                 )
             if not math.isfinite(snap) or snap <= 0.0:

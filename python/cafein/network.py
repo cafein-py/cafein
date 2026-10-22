@@ -15,6 +15,7 @@ from cafein._validate import (
 )
 from cafein._units import memory_spec
 from cafein.matrices import _planned_entry, _query_details
+from cafein.streets import walking_speed
 from cafein.travelers import (
     folded_constraints,
     folded_street_policy,
@@ -1473,7 +1474,7 @@ class TransportNetwork:
         paths,
         *,
         osm_pbf=None,
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         bounding_box=None,
@@ -1504,8 +1505,9 @@ class TransportNetwork:
             transfers, and installed as the street network behind
             coordinate-based access/egress searches (``access_stops``);
             without it the network has neither.
-        walking_speed_kmph : float (optional, default: 3.6)
-            Walking speed in km/h of the footpath precompute.
+        speeds : mapping (optional)
+            ``{"walk": km/h}``: the walking speed of the footpath
+            precompute (default: 3.6 km/h).
         max_walking_time : float or datetime.timedelta (optional, default: 20 minutes)
             Walking-time cutoff of the direct footpath search, in
             minutes; chained footpaths may exceed it.
@@ -1551,7 +1553,7 @@ class TransportNetwork:
             Also compute the whole-day ULTRA intermediate-transfer
             shortcuts (see ``compute_ultra_shortcuts``), giving the
             point-destination time queries unrestricted intermediate
-            walking. Requires ``osm_pbf`` and uses ``walking_speed_kmph``.
+            walking. Requires ``osm_pbf`` and uses the walking speed of ``speeds``.
             It is a heavy, run-once operation (minutes over a metropolitan
             network); ``save`` the result and reuse it. Off by default.
 
@@ -1564,19 +1566,12 @@ class TransportNetwork:
         """
         _log.sync()
         from cafein._units import duration_seconds
-        from cafein._validate import (
-            non_negative_finite,
-            positive_finite,
-            validated_bounding_box,
-        )
+        from cafein._validate import non_negative_finite, validated_bounding_box
 
         # Every parameter problem surfaces here, before any file is
         # read — not minutes later, once the timetable is built.
         max_walking_time = duration_seconds("max_walking_time", max_walking_time)
-        if walking_speed_kmph is not None:
-            walking_speed_kmph = positive_finite(
-                "walking_speed_kmph", walking_speed_kmph
-            )
+        walking_speed_kmph = walking_speed(speeds)
         max_snap_distance = (
             None
             if snap_distance is None
@@ -1654,7 +1649,7 @@ class TransportNetwork:
             footpaths, street_network = streets.walking_streets(
                 osm_pbf,
                 core.stops,
-                walking_speed_kmph=walking_speed_kmph,
+                speeds={"walk": walking_speed_kmph},
                 # Internal values are seconds; the public streets API
                 # takes minutes or timedeltas — a timedelta is exact.
                 max_walking_time=_datetime.timedelta(seconds=max_walking_time),
@@ -2159,7 +2154,7 @@ class TransportNetwork:
     def compute_ultra_shortcuts(
         self,
         *,
-        walking_speed_kmph=None,
+        speeds=None,
         max_transfer_time=30.0,
         min_departure="00:00",
         max_departure=None,
@@ -2196,8 +2191,9 @@ class TransportNetwork:
 
         Parameters
         ----------
-        walking_speed_kmph : float (optional, default: 3.6)
-            Walking speed in km/h of the shortcut search.
+        speeds : mapping (optional)
+            ``{"walk": km/h}``: the walking speed of the shortcut search
+            (default: 3.6 km/h).
         max_transfer_time : float or datetime.timedelta (optional, default: 30)
             Cutoff of an intermediate walk, in minutes.
         min_departure : str or datetime.time (optional, default: "00:00")
@@ -2223,8 +2219,7 @@ class TransportNetwork:
             duration_seconds("max_transfer_time", max_transfer_time)
         )
         earliest = clock_seconds("min_departure", min_departure)
-        if walking_speed_kmph is None:
-            walking_speed_kmph = streets.WALKING_SPEED_KMPH
+        walking_speed_kmph = walking_speed(speeds, streets.WALKING_SPEED_KMPH)
         if max_departure is None:
             return self._core.compute_ultra_shortcuts(
                 walking_speed_kmph, transfer_seconds, earliest
@@ -2321,7 +2316,7 @@ class TransportNetwork:
         lat,
         lon,
         *,
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
     ):
@@ -2335,8 +2330,9 @@ class TransportNetwork:
         ----------
         lat, lon : float
             The coordinate, in EPSG:4326.
-        walking_speed_kmph : float (optional, default: 3.6)
-            Walking speed in km/h, on the network and on the connectors.
+        speeds : mapping (optional)
+            ``{"walk": km/h}``: the walking speed on the network and on
+            the connectors (default: 3.6 km/h).
         max_walking_time : float or datetime.timedelta (optional, default: 120 minutes)
             Walking-time cutoff in minutes.
         snap_distance : float (optional, default: 1600)
@@ -2350,6 +2346,7 @@ class TransportNetwork:
             Walking time in seconds to each reachable stop, keyed by
             stop_id; stops beyond the cutoff are absent.
         """
+        walking_speed_kmph = walking_speed(speeds)
         from cafein._units import duration_seconds
 
         max_walking_time = duration_seconds("max_walking_time", max_walking_time)
@@ -2393,7 +2390,7 @@ class TransportNetwork:
         exclude_trips=(),
         traveler=None,
         exclude_stops=(),
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         geometries=True,
@@ -2414,7 +2411,7 @@ class TransportNetwork:
         With a whole-day ULTRA set (``compute_ultra_shortcuts``), the two
         stops are routed **door-to-door between their coordinates** — the
         same unrestricted initial/intermediate/final walking as
-        ``route_between_coordinates`` — and ``walking_speed_kmph``,
+        ``route_between_coordinates`` — and ``speeds``,
         ``max_walking_time``, and ``snap_distance`` bound that walking.
         Without such a set (or when a stop has no coordinate or is off the
         walking network) the query boards at the origin stop and relaxes
@@ -2461,9 +2458,10 @@ class TransportNetwork:
             catch it, sorted by departure and then rides. A journey that
             leaves within the window but waits for a ride beyond it
             carries the window's final second as its departure.
-        walking_speed_kmph : float (optional, default: 3.6)
-            Walking speed in km/h of the door-to-door searches (whole-day
-            ULTRA only; ignored otherwise).
+        speeds : mapping (optional)
+            ``{"walk": km/h}``: the walking speed of the door-to-door
+            searches (default: 3.6 km/h; whole-day ULTRA only, ignored
+            otherwise).
         max_walking_time : float or datetime.timedelta (optional, default: 120 minutes)
             Walking-time cutoff in minutes of each street search
             (whole-day ULTRA only; ignored otherwise).
@@ -2492,6 +2490,7 @@ class TransportNetwork:
             journey carries its legs; the ``*_s`` times are seconds past
             the service day's start.
         """
+        walking_speed_kmph = walking_speed(speeds)
         (
             exclude_routes,
             exclude_trips,
@@ -2586,7 +2585,7 @@ class TransportNetwork:
         exclude_trips=(),
         traveler=None,
         exclude_stops=(),
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         geometries=True,
@@ -2637,8 +2636,9 @@ class TransportNetwork:
             transfers: 8 rides allow 7 transfers).
         departure_time_window : float or datetime.timedelta (optional)
             Departure window in minutes, as in ``route_between_stops``.
-        walking_speed_kmph : float (optional, default: 3.6)
-            Walking speed in km/h of the access and egress searches.
+        speeds : mapping (optional)
+            ``{"walk": km/h}``: the walking speed of the access and egress
+            searches (default: 3.6 km/h).
         max_walking_time : float or datetime.timedelta (optional, default: 120 minutes)
             Walking-time cutoff in minutes of each street search.
         snap_distance : float (optional, default: 1600)
@@ -2696,6 +2696,7 @@ class TransportNetwork:
             Journeys as in ``route_between_stops``; arrivals include
             the egress walk.
         """
+        walking_speed_kmph = walking_speed(speeds)
         (
             exclude_routes,
             exclude_trips,
@@ -2818,7 +2819,7 @@ class TransportNetwork:
             ):
                 raise ValueError(
                     "street_policy carries its own budgets; passing "
-                    "walking_speed_kmph, max_walking_time, or "
+                    "speeds, max_walking_time, or "
                     "snap_distance beside it is a conflict"
                 )
             if window is not None:
@@ -2983,7 +2984,7 @@ class TransportNetwork:
         exclude_trips=(),
         traveler=None,
         exclude_stops=(),
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         street_policy=None,
@@ -3021,8 +3022,9 @@ class TransportNetwork:
         max_rides : int (optional, default: 8)
             Maximum number of boarded vehicles per journey (rides, not
             transfers: 8 rides allow 7 transfers).
-        walking_speed_kmph : float (optional, default: 3.6)
-            Walking speed in km/h of the access search.
+        speeds : mapping (optional)
+            ``{"walk": km/h}``: the walking speed of the access search
+            (default: 3.6 km/h).
         max_walking_time : float or datetime.timedelta (optional, default: 120 minutes)
             Walking-time cutoff in minutes of the access search.
         snap_distance : float (optional, default: 1600)
@@ -3055,6 +3057,7 @@ class TransportNetwork:
             Travel time in seconds to every reachable stop, keyed by
             stop_id; unreachable stops are absent.
         """
+        walking_speed_kmph = walking_speed(speeds)
         (
             exclude_routes,
             exclude_trips,
@@ -3143,7 +3146,7 @@ class TransportNetwork:
             ):
                 raise ValueError(
                     "street_policy carries its own budgets; passing "
-                    "walking_speed_kmph, max_walking_time, or "
+                    "speeds, max_walking_time, or "
                     "snap_distance beside it is a conflict"
                 )
             from cafein.network import _policy_transfer_mode
@@ -3286,7 +3289,7 @@ class TransportNetwork:
         exclude_trips=(),
         traveler=None,
         exclude_stops=(),
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
     ):
@@ -3325,9 +3328,10 @@ class TransportNetwork:
         max_rides : int (optional, default: 8)
             Maximum number of boarded vehicles per journey (rides, not
             transfers: 8 rides allow 7 transfers).
-        walking_speed_kmph : float (optional, default: 3.6)
-            Walking speed in km/h of the door-to-door searches (whole-day
-            ULTRA only; ignored otherwise).
+        speeds : mapping (optional)
+            ``{"walk": km/h}``: the walking speed of the door-to-door
+            searches (default: 3.6 km/h; whole-day ULTRA only, ignored
+            otherwise).
         max_walking_time : float or datetime.timedelta (optional, default: 120 minutes)
             Walking-time cutoff in minutes of the initial and final
             walks (whole-day ULTRA only; ignored otherwise).
@@ -3344,6 +3348,7 @@ class TransportNetwork:
             door-to-door time from the origin stop's coordinate, so the origin
             may cost its short walk to the platform.
         """
+        walking_speed_kmph = walking_speed(speeds)
         (
             exclude_routes,
             exclude_trips,
@@ -3406,7 +3411,7 @@ class TransportNetwork:
         confidence=None,
         chunk=None,
         router="auto",
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         workers=None,
@@ -3502,10 +3507,10 @@ class TransportNetwork:
             set, where only the RAPTOR path routes door-to-door and
             auto prefers it; point matrices share the ULTRA set on
             both engines, so the cache alone decides there.
-        walking_speed_kmph, max_walking_time, snap_distance : float
-            The street-search options, as in ``access_stops``: speed in
-            km/h, walking time in minutes (or a timedelta), snap
-            distance in meters. They apply to
+        speeds, max_walking_time, snap_distance : optional
+            The street-search options, as in ``access_stops``: the
+            ``{"walk": km/h}`` speed mapping, walking time in minutes (or
+            a timedelta), snap distance in meters. They apply to
             point origins, and to stop origins of the ``"raptor"`` matrix under
             a whole-day ULTRA set (which routes them door-to-door); they are
             ignored for stop origins otherwise.
@@ -3523,6 +3528,7 @@ class TransportNetwork:
             Unreachable pairs hold the maximum uint32 value
             (4294967295).
         """
+        walking_speed_kmph = walking_speed(speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
