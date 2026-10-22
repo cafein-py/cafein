@@ -16,13 +16,13 @@ import pandas as pd
 import shapely
 
 from cafein.travelers import folded_constraints, folded_street_policy
-from cafein.streets import walking_speed
 from cafein.matrices import (
     _factor_tables,
     _is_point_frame,
     _is_street_network,
     _point_list,
     _street_query,
+    _transit_walking_speed,
     _warn_unsnapped,
 )
 
@@ -309,8 +309,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
         ``TransportNetwork.route_between_coordinates``: the
         ``{"walk": km/h}`` speed mapping, walking time in minutes (or a
         timedelta), snap distance in meters; only valid with points.
-        Only ``snap_distance`` applies to a ``StreetNetwork``, whose
-        speeds come from the mode's profile.
+        On a ``StreetNetwork`` ``max_walking_time`` does not
+        apply and ``speeds`` sets the routed mode's speed and its
+        walking legs, as in ``StreetNetwork.travel_time``.
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
         one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
@@ -506,7 +507,11 @@ class DetailedItineraries(gpd.GeoDataFrame):
         cost_components=None,
         output_time_units="minutes",
     ):
-        walking_speed_kmph = walking_speed(speeds)
+        from cafein.street_network import frozen_speeds
+
+        # A sweep's searches all read one copy.
+        speeds = frozen_speeds(speeds)
+        walking_speed_kmph = _transit_walking_speed(network, speeds)
         origins, _origin_dtype = freeze_ids(origins)
         destinations, _destination_dtype = freeze_ids(destinations)
         if destinations is None and hasattr(origins, "geometry"):
@@ -622,6 +627,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
                     transport_mode=transport_mode,
                     max_street_time=max_street_time,
                     max_snap_distance=max_snap_distance,
+                    speeds=speeds,
                     geometries=geometries,
                     exposure=frozen,
                     multipliers=(
@@ -647,7 +653,6 @@ class DetailedItineraries(gpd.GeoDataFrame):
                         "traveler": traveler,
                         "tolerance_minutes": slack_seconds,
                         "max_options": max_options,
-                        "speeds": walking_speed_kmph,
                         "max_walking_time": max_walking_time,
                         "max_rides": None if max_rides == 8 else max_rides,
                         "candidates": (
@@ -1542,6 +1547,7 @@ def _street_itineraries_frame(
     max_snap_distance,
     geometries,
     transit_only,
+    speeds=None,
     factors=None,
     components=None,
     intersection_delays=False,
@@ -1575,6 +1581,7 @@ def _street_itineraries_frame(
         max_snap_distance=max_snap_distance,
         chunk=None,
         transit_only=transit_only,
+        speeds=speeds,
     )
     # Resolved after the argument validation but before the routing call,
     # exactly as the cost matrix does.
@@ -1596,6 +1603,7 @@ def _street_itineraries_frame(
         car_model=_resolved_delays(
             transport_mode, intersection_delays, profile, delay_model
         ),
+        speeds=query.speeds,
         multipliers=None if multipliers is None else list(multipliers),
         street_edges=exposure is not None,
     )

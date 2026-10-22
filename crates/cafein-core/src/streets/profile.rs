@@ -345,6 +345,27 @@ impl StreetProfileDefinition {
         definition
     }
 
+    /// This definition riding `speed` m/s on a default edge. `max_speed`
+    /// scales by the same ratio, so a bound that covers a slope credit or a
+    /// class multiplier stays one, and never drops below the dismount arcs'
+    /// speed (with their slope credit) a slower ride still attains.
+    pub fn with_base_speed(mut self, speed: f64) -> StreetProfileDefinition {
+        let dismount = self.dismount_speed / self.min_slope_multiplier();
+        self.max_speed = (self.max_speed * speed / self.base_speed).max(dismount);
+        self.base_speed = speed;
+        self
+    }
+
+    /// This definition with its walking legs — the snap connectors and the
+    /// dismount arcs — at `speed` m/s; `max_speed` rises to cover a dismount
+    /// arc (with its slope credit) faster than every ridden one.
+    pub fn with_walking_speed(mut self, speed: f64) -> StreetProfileDefinition {
+        self.connector_speed = speed;
+        self.dismount_speed = speed;
+        self.max_speed = self.max_speed.max(speed / self.min_slope_multiplier());
+        self
+    }
+
     /// Checks the numeric invariants the compiler and the later A* heuristic
     /// rely on: finite positive speeds, correctly sized multiplier tables with
     /// finite positive entries, and a `max_speed` at least the greatest
@@ -617,6 +638,74 @@ impl CompiledStreetProfile {
             car_partials,
             max_effective_speed: std::sync::OnceLock::new(),
         })
+    }
+}
+
+/// How many compiled profiles with caller-set speeds a [`ProfileCache`]
+/// keeps at once.
+pub const OVERRIDE_PROFILES: usize = 4;
+
+/// Compiled profiles keyed by exact definition. The shipped definitions stay
+/// for the cache's lifetime; at most [`OVERRIDE_PROFILES`] caller-modified
+/// ones (speeds, a car delay model) are kept, the least recently used
+/// evicted first, so a sweep over speeds holds bounded memory.
+#[derive(Debug, Clone, Default)]
+pub struct ProfileCache {
+    entries: Vec<(CompiledStreetProfile, bool)>,
+}
+
+impl ProfileCache {
+    /// The position of `definition`'s compiled profile, compiled by `compile`
+    /// on a miss. `overridden` marks a caller-modified definition, which a
+    /// hit moves to the most recently used end. A position is valid until the
+    /// next call.
+    pub fn position<E>(
+        &mut self,
+        definition: &StreetProfileDefinition,
+        overridden: bool,
+        compile: impl FnOnce(&StreetProfileDefinition) -> Result<CompiledStreetProfile, E>,
+    ) -> Result<usize, E> {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|(compiled, _)| compiled.definition == *definition)
+        {
+            if !self.entries[index].1 {
+                return Ok(index);
+            }
+            let entry = self.entries.remove(index);
+            self.entries.push(entry);
+            return Ok(self.entries.len() - 1);
+        }
+        let compiled = compile(definition)?;
+        let evictable = |entry: &(CompiledStreetProfile, bool)| entry.1;
+        if overridden
+            && self.entries.iter().filter(|entry| evictable(entry)).count() >= OVERRIDE_PROFILES
+        {
+            let least_recent = self
+                .entries
+                .iter()
+                .position(evictable)
+                .expect("an overridden entry was counted");
+            self.entries.remove(least_recent);
+        }
+        self.entries.push((compiled, overridden));
+        Ok(self.entries.len() - 1)
+    }
+
+    /// The compiled profile at `index`, as [`ProfileCache::position`] gave it.
+    pub fn get(&self, index: usize) -> &CompiledStreetProfile {
+        &self.entries[index].0
+    }
+
+    /// How many compiled profiles the cache holds.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the cache holds no compiled profile.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 

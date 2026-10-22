@@ -34,9 +34,9 @@ from cafein.matrices import (
     _planned_entry,
     _query_details,
     _stream_batch,
+    _transit_walking_speed,
 )
 from cafein.travelers import folded_constraints, refuse_wheelchair_streets
-from cafein.streets import walking_speed
 
 #: The parameter each decay family takes (None: no parameter).
 DECAY_PARAMETERS = {
@@ -574,6 +574,7 @@ def _resolved_cost_matrix(
     arrive_by=False,
     workers=None,
     max_memory=None,
+    speeds=None,
 ):
     """The per-origin cost matrix on the chosen axis, dispatched by
     network kind exactly as the matrix computers dispatch: (matrix,
@@ -593,7 +594,7 @@ def _resolved_cost_matrix(
         if arrive_by:
             raise ValueError(
                 "arrival applies to transit; a StreetNetwork takes "
-                "transport_mode, max_street_time, and snap_distance"
+                "transport_mode, speeds, max_street_time, and snap_distance"
             )
         if transport_mode is None:
             raise ValueError(
@@ -606,7 +607,6 @@ def _resolved_cost_matrix(
             "departure_time_window": window,
             "percentiles": percentiles,
             "confidence": confidence,
-            "speeds": walking_speed_kmph,
             "max_walking_time": max_walking_time,
         }
         named = [name for name, value in rejected.items() if value is not None]
@@ -618,10 +618,12 @@ def _resolved_cost_matrix(
             offending = ", ".join(named) or "exclusions"
             raise ValueError(
                 f"{offending} apply to transit; a StreetNetwork takes "
-                "transport_mode, max_street_time, and snap_distance"
+                "transport_mode, speeds, max_street_time, and snap_distance"
             )
-        from cafein.street_network import MAX_STREET_TIME
+        from cafein.street_network import MAX_STREET_TIME, profile_speeds
         from cafein.streets import MAX_SNAP_DISTANCE
+
+        street_speeds = profile_speeds(speeds, transport_mode)
 
         from_ids, origin_points = _point_list(origins, "origins")
         to_ids, destination_points = _point_list(destinations, "destinations")
@@ -643,6 +645,7 @@ def _resolved_cost_matrix(
                 street_snap,
                 False,
                 None,
+                speeds=street_speeds,
                 workers=_memory.width_or(workers),
             )
             _warn_unsnapped(table, from_ids, to_ids, network="the street network")
@@ -658,6 +661,7 @@ def _resolved_cost_matrix(
                 street_seconds,
                 street_snap,
                 None,
+                speeds=street_speeds,
                 workers=_memory.width_or(workers),
             )
             _warn_unsnapped(table, from_ids, to_ids, network="the street network")
@@ -892,6 +896,7 @@ def _accessibility_columns(
     _surface=None,
     workers=None,
     max_memory=None,
+    speeds=None,
 ):
     """The long accessibility frame for `origins` — the computation
     the constructor and the streaming classmethod share, inputs
@@ -935,6 +940,7 @@ def _accessibility_columns(
             arrive_by=arrive_by,
             workers=workers,
             max_memory=max_memory,
+            speeds=speeds,
         )
 
     return _aggregate_surface(
@@ -1305,7 +1311,7 @@ class Accessibility(pd.DataFrame):
         workers=None,
         max_memory=None,
     ):
-        walking_speed_kmph = walking_speed(speeds)
+        walking_speed_kmph = _transit_walking_speed(network, speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -1328,7 +1334,7 @@ class Accessibility(pd.DataFrame):
         elif traveler is not None:
             raise ValueError(
                 "traveler applies to transit; a StreetNetwork takes "
-                "transport_mode, max_street_time, and snap_distance"
+                "transport_mode, speeds, max_street_time, and snap_distance"
             )
         from cafein.matrices import _is_point_frame as _points
 
@@ -1481,6 +1487,7 @@ class Accessibility(pd.DataFrame):
             arrive_by=arrive_by,
             workers=workers,
             max_memory=max_memory,
+            speeds=speeds,
         )
         super().__init__(restore_id_dtypes(frame, _id_dtypes))
 
@@ -1546,7 +1553,11 @@ class Accessibility(pd.DataFrame):
         complete time query, refusing a resume that differs in axis,
         moment, window, or percentiles.
         """
-        walking_speed_kmph = walking_speed(speeds)
+        from cafein.street_network import frozen_speeds
+
+        # The fingerprint and every streamed batch read one copy.
+        speeds = frozen_speeds(speeds)
+        walking_speed_kmph = _transit_walking_speed(network, speeds)
         _log.sync()
         if workers is not None:
             workers = positive_int("workers", workers)
@@ -1575,7 +1586,7 @@ class Accessibility(pd.DataFrame):
         elif traveler is not None:
             raise ValueError(
                 "traveler applies to transit; a StreetNetwork takes "
-                "transport_mode, max_street_time, and snap_distance"
+                "transport_mode, speeds, max_street_time, and snap_distance"
             )
         from cafein.matrices import _is_point_frame as _points
 
@@ -1675,6 +1686,16 @@ class Accessibility(pd.DataFrame):
                     f"cost={cost!r} yields the window's single optimum per "
                     "destination; percentiles apply to cost='time'"
                 )
+        # The speeds the run rides, for its fingerprint: a StreetNetwork's
+        # profile overrides, or the transit walking speed.
+        if _is_street_network(network) and transport_mode is not None:
+            from cafein.street_network import profile_speeds
+
+            ridden_speeds = profile_speeds(speeds, transport_mode)
+        else:
+            ridden_speeds = (
+                {} if walking_speed_kmph is None else {"walk": walking_speed_kmph}
+            )
 
         import pyarrow
 
@@ -1756,9 +1777,7 @@ class Accessibility(pd.DataFrame):
             "exclude_routes": list(exclude_routes),
             "exclude_trips": list(exclude_trips),
             "exclude_stops": list(exclude_stops),
-            "speeds": (
-                {} if walking_speed_kmph is None else {"walk": walking_speed_kmph}
-            ),
+            "speeds": ridden_speeds,
             "max_walking_time": max_walking_time,
             "max_snap_distance": max_snap_distance,
             # Sorted for the hash only, exactly as the matrix
@@ -1810,6 +1829,7 @@ class Accessibility(pd.DataFrame):
                 arrive_by=True,
                 workers=workers,
                 max_memory=max_memory,
+                speeds=speeds,
             )
 
         def make_batch(rows, shared_from, shared_to):
@@ -1867,6 +1887,7 @@ class Accessibility(pd.DataFrame):
                 _surface=batch_surface,
                 workers=workers,
                 max_memory=max_memory,
+                speeds=speeds,
             )
             block = np.repeat(np.arange(rows.start, rows.stop), per_origin)
             planes = 1 if resolved_percentiles is None else len(resolved_percentiles)
@@ -2549,7 +2570,7 @@ class NearestDestinations(pd.DataFrame):
         workers=None,
         max_memory=None,
     ):
-        walking_speed_kmph = walking_speed(speeds)
+        walking_speed_kmph = _transit_walking_speed(network, speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -2572,7 +2593,7 @@ class NearestDestinations(pd.DataFrame):
         elif traveler is not None:
             raise ValueError(
                 "traveler applies to transit; a StreetNetwork takes "
-                "transport_mode, max_street_time, and snap_distance"
+                "transport_mode, speeds, max_street_time, and snap_distance"
             )
         from cafein.matrices import _is_point_frame as _points
 
@@ -2741,6 +2762,7 @@ class NearestDestinations(pd.DataFrame):
             arrive_by=arrive_by,
             workers=workers,
             max_memory=max_memory,
+            speeds=speeds,
         )
         matrix = np.asarray(matrix)
         if resolved_percentiles is not None:
@@ -3074,7 +3096,7 @@ class Catchment(gpd.GeoDataFrame):
         workers=None,
         max_memory=None,
     ):
-        walking_speed_kmph = walking_speed(speeds)
+        walking_speed_kmph = _transit_walking_speed(network, speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -3097,7 +3119,7 @@ class Catchment(gpd.GeoDataFrame):
         elif traveler is not None:
             raise ValueError(
                 "traveler applies to transit; a StreetNetwork takes "
-                "transport_mode, max_street_time, and snap_distance"
+                "transport_mode, speeds, max_street_time, and snap_distance"
             )
         from cafein.matrices import _is_point_frame as _points  # noqa: F401
 
@@ -3230,7 +3252,7 @@ class Catchment(gpd.GeoDataFrame):
             if arrive_by:
                 raise ValueError(
                     "arrival applies to transit; a StreetNetwork takes "
-                    "transport_mode and snap_distance"
+                    "transport_mode, speeds, and snap_distance"
                 )
             if transport_mode is None:
                 raise ValueError(
@@ -3245,7 +3267,6 @@ class Catchment(gpd.GeoDataFrame):
             rejected = {
                 "departure": departure,
                 "departure_time_window": window,
-                "speeds": walking_speed_kmph,
                 "max_walking_time": max_walking_time,
             }
             named = [name for name, value in rejected.items() if value is not None]
@@ -3257,10 +3278,12 @@ class Catchment(gpd.GeoDataFrame):
                 offending = ", ".join(named) or "exclusions"
                 raise ValueError(
                     f"{offending} apply to transit; a StreetNetwork takes "
-                    "transport_mode and snap_distance"
+                    "transport_mode, speeds, and snap_distance"
                 )
+            from cafein.street_network import profile_speeds
             from cafein.streets import MAX_SNAP_DISTANCE
 
+            street_speeds = profile_speeds(speeds, transport_mode)
             snap = float(
                 MAX_SNAP_DISTANCE if max_snap_distance is None else max_snap_distance
             )
@@ -3279,7 +3302,7 @@ class Catchment(gpd.GeoDataFrame):
             horizon = max(budget_values)
             for identifier, point in zip(from_ids, points):
                 lats, lons, costs = network._core._reached_vertices(
-                    point, transport_mode, horizon, cost, snap
+                    point, transport_mode, horizon, cost, snap, speeds=street_speeds
                 )
                 rows.extend(
                     _cell_rows(

@@ -52,16 +52,26 @@ def coordinates(frame):
     return list(zip(frame.geometry.y, frame.geometry.x))
 
 
-@pytest.mark.parametrize("mode", ["walk", "bicycle", "e_bike", "e_scooter"])
-def test_matrix_cells_match_single_routes(streets, origins, destinations, mode):
+@pytest.mark.parametrize(
+    "mode, speeds",
+    [
+        ("walk", None),
+        ("bicycle", None),
+        ("e_bike", None),
+        ("e_scooter", None),
+        ("e_bike", {"e_bike": 22.0, "walk": 5.0}),
+    ],
+)
+def test_matrix_cells_match_single_routes(streets, origins, destinations, mode, speeds):
     # The oracle: every cell is the answer the one-pair route gives. The matrix
     # runs one search per origin rather than one per pair, so this pins that the
-    # shared arrival step produces identical times.
+    # shared arrival step produces identical times, at overridden speeds too.
     matrix = TravelTimeMatrix(
         streets,
         origins,
         destinations,
         transport_mode=mode,
+        speeds=speeds,
         max_street_time=60,
         output_time_units="seconds",
     )
@@ -72,9 +82,25 @@ def test_matrix_cells_match_single_routes(streets, origins, destinations, mode):
     for from_id, origin in zip(origins["id"], coordinates(origins)):
         for to_id, destination in zip(destinations["id"], coordinates(destinations)):
             expected = streets.travel_time(
-                origin, destination, mode=mode, max_travel_time=60
+                origin, destination, mode=mode, speeds=speeds, max_travel_time=60
             )
             assert cells.get((from_id, to_id)) == expected
+
+
+def test_doubled_speeds_halve_street_times(streets):
+    # Every leg of a street route — ridden arcs, snap connectors — scales
+    # with its speed, so doubling them all halves the time, up to the
+    # per-arc millisecond and final whole-second rounding. Naming the
+    # default speeds changes nothing.
+    origin, destination = (60.1699, 24.9384), (60.1798, 24.9509)
+    shipped = streets.travel_time(origin, destination, mode="bicycle")
+    named = {"bicycle": 15.3, "walk": 3.6}
+    doubled = {"bicycle": 30.6, "walk": 7.2}
+    assert streets.travel_time(origin, destination, mode="bicycle", speeds=named) == (
+        shipped
+    )
+    fast = streets.travel_time(origin, destination, mode="bicycle", speeds=doubled)
+    assert abs(2 * fast - shipped) <= 2
 
 
 def test_matrix_columns_and_long_format(streets, origins, destinations):
@@ -186,6 +212,35 @@ def test_street_matrix_mode_and_input_refusals(streets, origins):
             TypeError,
             "GeoDataFrame of points",
         ),
+        # A speed for a mode the query does not ride, or a bad value.
+        (
+            lambda: TravelTimeMatrix(
+                streets, origins, transport_mode="bicycle", speeds={"e_bike": 20}
+            ),
+            ValueError,
+            "names 'e_bike'",
+        ),
+        (
+            lambda: TravelTimeMatrix(
+                streets, origins, transport_mode="wheelchair", speeds={"walk": 5}
+            ),
+            ValueError,
+            "names 'walk'",
+        ),
+        (
+            lambda: TravelTimeMatrix(
+                streets, origins, transport_mode="bicycle", speeds={"bicycle": 0}
+            ),
+            ValueError,
+            "positive, finite",
+        ),
+        (
+            lambda: TravelTimeMatrix(
+                streets, origins, transport_mode="bicycle", speeds=15.3
+            ),
+            TypeError,
+            "speeds must be a mapping",
+        ),
     ]:
         with pytest.raises(exception, match=match):
             build()
@@ -242,7 +297,6 @@ def test_street_keywords_on_a_transport_network_are_rejected(network):
         {"exclude_routes": ["1001"]},
         {"exclude_trips": ["t1"]},
         {"exclude_stops": ["s1"]},
-        {"speeds": {"walk": 5.0}},
         {"max_walking_time": 10.0},
     ],
 )
@@ -372,10 +426,17 @@ def test_cost_matrix_distance_is_the_sum_of_its_parts(streets, origins, destinat
     assert (costs.connector_distance_m >= 0).all()
 
 
-def test_cost_matrix_times_match_the_time_matrix(streets, origins, destinations):
+@pytest.mark.parametrize("speeds", [None, {"bicycle": 20.0}])
+def test_cost_matrix_times_match_the_time_matrix(
+    streets, origins, destinations, speeds
+):
     # The two computers run the same search; they must not disagree.
-    times = TravelTimeMatrix(streets, origins, destinations, transport_mode="bicycle")
-    costs = TravelCostMatrix(streets, origins, destinations, transport_mode="bicycle")
+    times = TravelTimeMatrix(
+        streets, origins, destinations, transport_mode="bicycle", speeds=speeds
+    )
+    costs = TravelCostMatrix(
+        streets, origins, destinations, transport_mode="bicycle", speeds=speeds
+    )
     timed = {(r.from_id, r.to_id): r.travel_time for r in times.itertuples(index=False)}
     costed = {
         (r.from_id, r.to_id): r.travel_time for r in costs.itertuples(index=False)
@@ -492,7 +553,6 @@ def test_cost_matrix_geometry(streets, origins, destinations):
         {"exclude_routes": ["1001"]},
         {"exclude_trips": ["t1"]},
         {"exclude_stops": ["s1"]},
-        {"speeds": {"walk": 5.0}},
         {"max_walking_time": 10.0},
     ],
 )

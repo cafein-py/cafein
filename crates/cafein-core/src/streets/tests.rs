@@ -1477,10 +1477,7 @@ fn uniform_attributes(network: &StreetNetwork, access: u8, flags: u16) -> Street
 /// The built-in bicycle at a round 4 m/s, so hand-computed costs stay exact
 /// whatever the shipped default speed.
 fn bicycle_4ms() -> StreetProfileDefinition {
-    let mut definition = StreetProfileDefinition::bicycle();
-    definition.max_speed *= 4.0 / definition.base_speed;
-    definition.base_speed = 4.0;
-    definition
+    StreetProfileDefinition::bicycle().with_base_speed(4.0)
 }
 
 #[test]
@@ -1631,6 +1628,89 @@ fn builtin_profile_speeds_and_modes() {
     assert_eq!(bike.highway_multipliers.len(), HIGHWAY_CODE_COUNT);
     assert_eq!(bike.surface_multipliers.len(), SURFACE_CODE_COUNT);
     assert_eq!(bike.smoothness_multipliers.len(), SMOOTHNESS_CODE_COUNT);
+}
+
+#[test]
+fn speed_overrides_keep_the_bound_and_set_the_walking_legs() {
+    // A riding speed scales max_speed with it, so the slope-credit bound
+    // stays a bound; a walking speed sets the connectors and dismount arcs
+    // and lifts max_speed only when a dismount arc would outrun the ride.
+    let bike = StreetProfileDefinition::bicycle().with_base_speed(8.0);
+    assert_eq!(bike.base_speed, 8.0);
+    assert!((bike.max_speed - 8.0 / (1.0 - 0.3 * MAX_SLOPE)).abs() < 1e-12);
+    let walking = StreetProfileDefinition::bicycle().with_walking_speed(2.0);
+    assert_eq!(
+        (walking.connector_speed, walking.dismount_speed),
+        (2.0, 2.0)
+    );
+    assert_eq!(
+        walking.max_speed,
+        StreetProfileDefinition::bicycle().max_speed
+    );
+    let walk = StreetProfileDefinition::walk().with_walking_speed(3.0);
+    assert_eq!(walk.max_speed, 3.0);
+    assert!(walk.with_base_speed(3.0).validate().is_ok());
+    // A ride slower than walking still attains the dismount speed — on the
+    // slope-aware bicycle with the dismount arcs' downhill credit — and so
+    // does a walk faster than the ride.
+    let crawl = StreetProfileDefinition::e_scooter().with_base_speed(0.5);
+    assert_eq!(crawl.max_speed, crawl.dismount_speed);
+    assert!(crawl.validate().is_ok());
+    assert!(StreetProfileDefinition::bicycle()
+        .with_base_speed(0.5)
+        .validate()
+        .is_ok());
+    assert!(StreetProfileDefinition::bicycle()
+        .with_walking_speed(10.0)
+        .validate()
+        .is_ok());
+}
+
+#[test]
+fn the_profile_cache_keeps_shipped_profiles_and_bounds_overrides() {
+    let mut net = triangle();
+    net.install_street_attributes(uniform_attributes(&net, MODE_WALK | MODE_BICYCLE, 0))
+        .unwrap();
+    let mut cache = ProfileCache::default();
+    let shipped = StreetProfileDefinition::bicycle();
+    let first = cache
+        .position(&shipped, false, |definition| {
+            net.compile_profile(definition)
+        })
+        .unwrap();
+    // A cached definition compiles nothing.
+    let again = cache
+        .position(&shipped, false, |_| -> Result<_, ProfileError> {
+            panic!("a cached definition recompiled")
+        })
+        .unwrap();
+    assert_eq!(again, first);
+    let at = |speed: usize| StreetProfileDefinition::bicycle().with_base_speed(speed as f64);
+    for speed in 1..=OVERRIDE_PROFILES {
+        cache
+            .position(&at(speed), true, |definition| {
+                net.compile_profile(definition)
+            })
+            .unwrap();
+    }
+    // Using the first override again makes the second the least recently
+    // used: one more override evicts that one, never a shipped profile.
+    cache
+        .position(&at(1), true, |_| -> Result<_, ProfileError> {
+            panic!("a cached override recompiled")
+        })
+        .unwrap();
+    cache
+        .position(&at(OVERRIDE_PROFILES + 1), true, |definition| {
+            net.compile_profile(definition)
+        })
+        .unwrap();
+    assert_eq!(cache.len(), 1 + OVERRIDE_PROFILES);
+    assert_eq!(cache.get(0).definition, shipped);
+    let held: Vec<_> = (0..cache.len())
+        .map(|index| cache.get(index).definition.clone())
+        .collect();
+    assert!(held.contains(&at(1)) && !held.contains(&at(2)));
 }
 
 #[test]

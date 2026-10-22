@@ -24,7 +24,7 @@ use cafein_core::reverse;
 use cafein_core::router::{factor_fingerprint, same_factors, Exclusions, Request, TransitRouter};
 use cafein_core::streets::{
     Backing, CarAttributes, CompiledStreetProfile, MappedStreets, Snap, StopLink, StoredLink,
-    StreetAttributes, StreetNetwork, StreetNetworkParts, StreetProfileDefinition, WalkedStop,
+    StreetAttributes, StreetNetwork, StreetNetworkParts, WalkedStop,
 };
 use cafein_core::tbtr::{DayView, TbtrEngine};
 use cafein_core::timetable::{StopIdx, Timetable, TripIdx};
@@ -129,7 +129,7 @@ struct TransportNetwork {
     /// Compiled profiles for the multimodal graph, keyed by exact
     /// definition equality — the 12a-planned cache, arriving with its first
     /// consumers.
-    multimodal_profiles: std::sync::Mutex<Vec<(StreetProfileDefinition, CompiledStreetProfile)>>,
+    multimodal_profiles: std::sync::Mutex<cafein_core::streets::ProfileCache>,
     /// The merged shared-vehicle transfer set (stage 15a): the walking
     /// closure with one mode's rental edges folded in and re-closed,
     /// beside its reconstruction tokens and the exact binding it was

@@ -321,7 +321,7 @@ impl TransportNetwork {
             multimodal_elevation: None,
             multimodal_modes: None,
             multimodal_links: std::sync::OnceLock::new(),
-            multimodal_profiles: std::sync::Mutex::new(Vec::new()),
+            multimodal_profiles: std::sync::Mutex::new(Default::default()),
             mode_transfers: None,
             carriage_transfers: None,
         })
@@ -1466,7 +1466,7 @@ impl TransportNetwork {
         // graph; recompute.
         self.mode_transfers = None;
         self.carriage_transfers = None;
-        self.multimodal_profiles = std::sync::Mutex::new(Vec::new());
+        self.multimodal_profiles = std::sync::Mutex::new(Default::default());
         Ok(())
     }
 
@@ -1544,7 +1544,7 @@ impl TransportNetwork {
         if network.car_attributes().is_none() {
             return Err(missing_car());
         }
-        let mut definition = crate::streets::profile_definition("car")?;
+        let mut definition = crate::streets::profile_definition("car", &[])?;
         if let Some(payload) = car_model.as_ref() {
             definition.car = Some(crate::streets::car_cost_model(payload)?);
         }
@@ -3085,7 +3085,7 @@ impl TransportNetwork {
                  or egress — park-and-ride rides street_policy=CarParkPolicy(...)",
             ));
         }
-        let definition = crate::streets::profile_definition(mode)?;
+        let definition = crate::streets::profile_definition(mode, &[])?;
         self.compiled_multimodal(network, definition)
     }
 
@@ -3097,18 +3097,19 @@ impl TransportNetwork {
         network: &StreetNetwork,
         definition: cafein_core::streets::StreetProfileDefinition,
     ) -> PyResult<CompiledStreetProfile> {
+        // Anything but the shipped definition of its mode — a delay model,
+        // speeds — is a caller's variant the cache bounds.
+        let overridden = definition != crate::streets::profile_definition(&definition.name, &[])?;
         let mut cache = self
             .multimodal_profiles
             .lock()
             .expect("profile cache poisoned");
-        if let Some((_, compiled)) = cache.iter().find(|(known, _)| known == &definition) {
-            return Ok(compiled.clone());
-        }
-        let compiled = network
-            .compile_profile(&definition)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        cache.push((definition, compiled.clone()));
-        Ok(compiled)
+        let index = cache.position(&definition, overridden, |definition| {
+            network
+                .compile_profile(definition)
+                .map_err(|error| PyValueError::new_err(error.to_string()))
+        })?;
+        Ok(cache.get(index).clone())
     }
 
     /// The lazily built per-stop links onto the multimodal graph: each stop

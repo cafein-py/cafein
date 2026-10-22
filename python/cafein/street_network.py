@@ -23,6 +23,34 @@ without being a separate build mode. `car` requires a build with ``"car"`` in
 `modes` (the persisted driving speeds and junction classes)."""
 
 
+def frozen_speeds(speeds):
+    """`speeds` read once: a mapping is copied, so every search of one call
+    rides the same speeds whatever happens to the caller's object meanwhile;
+    anything else passes through for validation to refuse."""
+    import collections.abc
+
+    return dict(speeds) if isinstance(speeds, collections.abc.Mapping) else speeds
+
+
+def profile_speeds(speeds, mode):
+    """The ``speeds=`` overrides `mode`'s street profile takes, as the
+    routing core's ``[(mode, m/s)]`` list. Keys are the mode itself (its
+    riding speed) and ``"walk"`` (its walking legs: the snap connectors and
+    dismount arcs); the wheelchair takes only its own key and the car only
+    ``"walk"``, its driving speeds being the persisted limits. Values are
+    km/h; any other key is refused."""
+    from cafein._validate import mode_mapping, positive_finite
+
+    if mode == "wheelchair":
+        modes = ("wheelchair",)
+    elif mode in ("walk", "car"):
+        modes = ("walk",)
+    else:
+        modes = (mode, "walk")
+    resolved = mode_mapping("speeds", speeds, modes, positive_finite)
+    return [(name, kmh / 3.6) for name, kmh in sorted(resolved.items())]
+
+
 def validate_build_modes(modes):
     """`modes` as a validated tuple of build-mode names.
 
@@ -397,6 +425,7 @@ class StreetNetwork:
         destination,
         *,
         mode,
+        speeds=None,
         max_travel_time=None,
         snap_distance=streets.MAX_SNAP_DISTANCE,
         intersection_delays=False,
@@ -414,6 +443,12 @@ class StreetNetwork:
         mode : str
             ``walk``, ``bicycle``, ``e_bike``, ``e_scooter``,
             ``wheelchair``, or ``car``.
+        speeds : mapping, optional
+            Speeds in km/h replacing the profile's defaults: the mode's own
+            key sets its riding speed (e.g. ``{"e_bike": 20}``) and
+            ``"walk"`` its walking legs — the snap connectors and dismount
+            arcs, or the whole walk. The wheelchair takes only its own key,
+            the car only ``"walk"``.
         max_travel_time : float or datetime.timedelta (optional)
             Cutoff in minutes; beyond it the destination counts as
             unreachable. Unset uses the shipped street default (120
@@ -451,6 +486,7 @@ class StreetNetwork:
             Seconds, or ``None`` when the destination is not reachable within
             `max_travel_time`. Returned times are seconds.
         """
+        overrides = profile_speeds(speeds, mode)
         from cafein._units import duration_seconds
 
         max_time = (
@@ -472,6 +508,7 @@ class StreetNetwork:
             float(max_time),
             non_negative_finite("snap_distance", max_snap_distance),
             car_model=_resolved_delays(mode, intersection_delays, profile, delay_model),
+            speeds=overrides,
         )
         if seconds is None or resolved is None:
             return seconds

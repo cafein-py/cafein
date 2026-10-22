@@ -1978,7 +1978,7 @@ pub(super) fn assemble(
         multimodal_elevation,
         multimodal_modes,
         multimodal_links: std::sync::OnceLock::new(),
-        multimodal_profiles: std::sync::Mutex::new(Vec::new()),
+        multimodal_profiles: std::sync::Mutex::new(Default::default()),
         mode_transfers,
         carriage_transfers,
         stops_by_id,

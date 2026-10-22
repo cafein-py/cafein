@@ -796,9 +796,10 @@ class TravelCostMatrix(pd.DataFrame):
         distance in meters. They bound the walking for point
         origins/destinations, and for stop origins/destinations only
         when a whole-day shortcut set routes them door-to-door;
-        otherwise stop matrices ignore them. Only ``snap_distance``
-        applies to a ``StreetNetwork``, whose speeds come from the
-        mode's profile.
+        otherwise stop matrices ignore them. On a ``StreetNetwork``
+        ``max_walking_time`` does not apply and ``speeds`` sets the
+        routed mode's speed and its walking legs, as in
+        ``StreetNetwork.travel_time``.
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
         one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
@@ -975,7 +976,7 @@ class TravelCostMatrix(pd.DataFrame):
         workers=None,
         max_memory=None,
     ):
-        walking_speed_kmph = walking_speed(speeds)
+        walking_speed_kmph = _transit_walking_speed(network, speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -1074,6 +1075,7 @@ class TravelCostMatrix(pd.DataFrame):
                 exposure=exposure,
                 weights=_street_weights(optimize),
                 sweep=candidates == "sweep",
+                speeds=speeds,
                 transit_only={
                     "departure": departure,
                     "arrival": arrival,
@@ -1081,7 +1083,6 @@ class TravelCostMatrix(pd.DataFrame):
                     "departure_time_window": window,
                     "max_travel_time": within,
                     "fares": fares,
-                    "speeds": walking_speed_kmph,
                     "max_walking_time": max_walking_time,
                     "max_rides": None if max_rides == 8 else max_rides,
                     "optimize": _transit_objective(optimize),
@@ -1399,7 +1400,7 @@ class TravelCostMatrix(pd.DataFrame):
         directory run exactly as ``travel_cost_table`` does.
         """
         _log.sync()
-        walking_speed_kmph = walking_speed(speeds)
+        walking_speed_kmph = _transit_walking_speed(network, speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -1480,6 +1481,7 @@ class TravelCostMatrix(pd.DataFrame):
                 chunk=chunk,
                 weights=_street_weights(optimize),
                 sweep=candidates == "sweep",
+                speeds=speeds,
                 transit_only={
                     "departure": departure,
                     "arrival": arrival,
@@ -1487,7 +1489,6 @@ class TravelCostMatrix(pd.DataFrame):
                     "departure_time_window": window,
                     "max_travel_time": within,
                     "fares": fares,
-                    "speeds": walking_speed_kmph,
                     "max_walking_time": max_walking_time,
                     "max_rides": None if max_rides == 8 else max_rides,
                     "optimize": _transit_objective(optimize),
@@ -1659,8 +1660,8 @@ class TravelTimeMatrix(pd.DataFrame):
     timetable, so ``departure`` does not apply, and the
     arguments that only mean something to a timetable — ``max_rides``,
     ``router``, the departure-window percentiles, the transit exclusions,
-    and the walking-speed options, whose speeds come from the profile —
-    are rejected. Origins and destinations are point GeoDataFrames (or
+    and ``max_walking_time`` — are rejected; ``speeds`` sets the routed
+    mode's speed and its walking legs. Origins and destinations are point GeoDataFrames (or
     polygon frames routed by centroid, as on the transit side);
     a point routes to itself in zero seconds.
 
@@ -1734,9 +1735,10 @@ class TravelTimeMatrix(pd.DataFrame):
         distance in meters. They bound the walking for point
         origins/destinations, and for stop origins/destinations only
         when a whole-day shortcut set routes them door-to-door;
-        otherwise stop matrices ignore them. Only ``snap_distance``
-        applies to a ``StreetNetwork``, whose speeds come from the
-        mode's profile.
+        otherwise stop matrices ignore them. On a ``StreetNetwork``
+        ``max_walking_time`` does not apply and ``speeds`` sets the
+        routed mode's speed and its walking legs, as in
+        ``StreetNetwork.travel_time``.
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
         one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
@@ -1832,7 +1834,7 @@ class TravelTimeMatrix(pd.DataFrame):
         workers=None,
         max_memory=None,
     ):
-        walking_speed_kmph = walking_speed(speeds)
+        walking_speed_kmph = _transit_walking_speed(network, speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -1912,6 +1914,7 @@ class TravelTimeMatrix(pd.DataFrame):
                 profile=profile,
                 delay_model=delay_model,
                 parking=parking,
+                speeds=speeds,
                 transit_only={
                     "departure": departure,
                     "arrival": arrival,
@@ -1919,7 +1922,6 @@ class TravelTimeMatrix(pd.DataFrame):
                     "departure_time_window": window,
                     "percentiles": percentiles,
                     "confidence": confidence,
-                    "speeds": walking_speed_kmph,
                     "max_walking_time": max_walking_time,
                     "max_rides": None if max_rides == 8 else max_rides,
                     "router": None if router == "auto" else router,
@@ -2114,7 +2116,7 @@ class TravelTimeMatrix(pd.DataFrame):
         ``travel_cost_table`` does.
         """
         _log.sync()
-        walking_speed_kmph = walking_speed(speeds)
+        walking_speed_kmph = _transit_walking_speed(network, speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -2198,13 +2200,13 @@ class TravelTimeMatrix(pd.DataFrame):
                 max_street_time=max_street_time,
                 max_snap_distance=max_snap_distance,
                 chunk=chunk,
+                speeds=speeds,
                 transit_only={
                     "departure": departure,
                     "traveler": traveler,
                     "departure_time_window": window,
                     "percentiles": percentiles,
                     "confidence": confidence,
-                    "speeds": walking_speed_kmph,
                     "max_walking_time": max_walking_time,
                     "max_rides": None if max_rides == 8 else max_rides,
                     "router": None if router == "auto" else router,
@@ -2336,6 +2338,13 @@ def _humanize_time_columns(data, output_time_units):
     return out
 
 
+def _transit_walking_speed(network, speeds):
+    """The walking speed in km/h ``speeds=`` sets on a transit call, or
+    ``None``; a ``StreetNetwork`` call's speeds are checked against its
+    routed mode by the street query instead."""
+    return None if _is_street_network(network) else walking_speed(speeds)
+
+
 def _is_street_network(network):
     """Whether `network` is a standalone street network rather than a transit one."""
     from cafein.street_network import StreetNetwork
@@ -2433,6 +2442,7 @@ class _StreetQuery:
         destination_points,
         max_seconds,
         max_snap_distance,
+        speeds,
     ):
         self.from_ids = from_ids
         self.to_ids = to_ids
@@ -2440,6 +2450,8 @@ class _StreetQuery:
         self.destination_points = destination_points
         self.max_seconds = max_seconds
         self.max_snap_distance = max_snap_distance
+        # The routing core's ``[(mode, m/s)]`` profile overrides.
+        self.speeds = speeds
 
 
 def _street_query(
@@ -2451,6 +2463,7 @@ def _street_query(
     max_snap_distance,
     chunk,
     transit_only,
+    speeds=None,
 ):
     """Validates a street-matrix call and resolves its points and bounds.
 
@@ -2481,8 +2494,9 @@ def _street_query(
     if unsupported:
         raise ValueError(
             f"{', '.join(unsupported)} have no meaning for a street matrix, "
-            "which carries no timetable and takes its speeds from the profile"
+            "which carries no timetable"
         )
+    speeds = street_network.profile_speeds(speeds, transport_mode)
     if not _is_point_frame(origins):
         raise TypeError(
             "a street matrix needs origins as a GeoDataFrame of points (or "
@@ -2520,6 +2534,7 @@ def _street_query(
             if max_snap_distance is None
             else non_negative_finite("snap_distance", max_snap_distance)
         ),
+        speeds,
     )
 
 
@@ -2534,6 +2549,7 @@ def _street_cost_columns(
     chunk,
     geometries,
     transit_only,
+    speeds=None,
     factors=None,
     components=None,
     intersection_delays=False,
@@ -2565,6 +2581,7 @@ def _street_cost_columns(
         max_snap_distance=max_snap_distance,
         chunk=chunk,
         transit_only=transit_only,
+        speeds=speeds,
         factors=factors,
         components=components,
         intersection_delays=intersection_delays,
@@ -2633,6 +2650,7 @@ def _street_cost_resolution(
     factors,
     components,
     intersection_delays,
+    speeds=None,
     profile,
     delay_model,
     parking,
@@ -2712,6 +2730,7 @@ def _street_cost_resolution(
         max_snap_distance=max_snap_distance,
         chunk=chunk,
         transit_only=transit_only,
+        speeds=speeds,
     )
     # Resolved after the argument validation but before the routing call:
     # the factor and cost account the query started with are the ones
@@ -2822,6 +2841,7 @@ def _street_cost_cells(
         query.max_snap_distance,
         bool(geometries),
         car_model=resolved["car_model"],
+        speeds=query.speeds,
         multipliers=multipliers,
         street_edges=exposure is not None or keep_edges,
         workers=_memory.width_or(workers),
@@ -2908,6 +2928,7 @@ def _street_time_columns(
     max_snap_distance,
     chunk,
     transit_only,
+    speeds=None,
     intersection_delays=False,
     profile=None,
     delay_model=None,
@@ -2924,6 +2945,7 @@ def _street_time_columns(
         max_snap_distance=max_snap_distance,
         chunk=chunk,
         transit_only=transit_only,
+        speeds=speeds,
         intersection_delays=intersection_delays,
         profile=profile,
         delay_model=delay_model,
@@ -2955,6 +2977,7 @@ def _street_time_resolution(
     profile,
     delay_model,
     parking,
+    speeds=None,
 ):
     """Every result-affecting street-time input resolved exactly once."""
     from cafein import _parking
@@ -2969,6 +2992,7 @@ def _street_time_resolution(
         max_snap_distance=max_snap_distance,
         chunk=chunk,
         transit_only=transit_only,
+        speeds=speeds,
     )
     parking_seconds = (
         None
@@ -2995,6 +3019,7 @@ def _street_time_cells(network, query, resolved, workers=None, max_memory=None):
         query.max_seconds,
         query.max_snap_distance,
         car_model=resolved["car_model"],
+        speeds=query.speeds,
         workers=_memory.width_or(workers),
     )
     _warn_unsnapped(
@@ -3719,7 +3744,7 @@ def travel_cost_table(
     ``chunk``, and ``batch_size`` — else the directory is refused,
     never overwritten.
     """
-    walking_speed_kmph = walking_speed(speeds)
+    walking_speed_kmph = _transit_walking_speed(network, speeds)
     if not _is_street_network(network):
         (
             exclude_routes,
@@ -3791,6 +3816,7 @@ def travel_cost_table(
             max_street_time=duration_seconds("max_street_time", max_street_time),
             max_snap_distance=max_snap_distance,
             chunk=chunk,
+            speeds=speeds,
             transit_only={
                 "departure": departure,
                 "arrival": arrival,
@@ -3798,7 +3824,6 @@ def travel_cost_table(
                 "departure_time_window": window,
                 "max_travel_time": within,
                 "fares": fares,
-                "speeds": walking_speed_kmph,
                 "max_walking_time": max_walking_time,
                 "max_rides": None if max_rides == 8 else max_rides,
                 "optimize": _transit_objective(optimize),
@@ -4723,6 +4748,7 @@ def _stream_street_cost(
         "transport_mode": resolved["transport_mode"],
         "max_street_time": query.max_seconds,
         "max_snap_distance": query.max_snap_distance,
+        "speeds": query.speeds,
         "geometries": bool(geometries),
         "chunk": None if chunk is None else list(chunk),
         "car_model": resolved["car_model"],
@@ -4746,6 +4772,7 @@ def _stream_street_cost(
             query.destination_points,
             query.max_seconds,
             query.max_snap_distance,
+            query.speeds,
         )
         from_index, to_index, numeric, wkb = _street_cost_searches(
             network,
@@ -4835,6 +4862,7 @@ def _stream_street_time(
         "transport_mode": resolved["transport_mode"],
         "max_street_time": query.max_seconds,
         "max_snap_distance": query.max_snap_distance,
+        "speeds": query.speeds,
         "chunk": None if chunk is None else list(chunk),
         "car_model": resolved["car_model"],
         "parking_seconds": resolved["parking_seconds"],
@@ -4849,6 +4877,7 @@ def _stream_street_time(
             query.destination_points,
             query.max_seconds,
             query.max_snap_distance,
+            query.speeds,
         )
         cell_rows, cell_columns, travel_time_s = _street_time_cells(
             network,
