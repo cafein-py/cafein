@@ -156,9 +156,9 @@ struct TransportNetwork {
     /// Monotonic count of walking street-network installs; exposure
     /// reporting pins its cached per-edge arrays to it.
     streets_generation: u64,
-    /// Monotonic count of footpath (transfer-set) installs; a
+    /// Monotonic count of footpath, mode-set and carriage-set installs; a
     /// computation spanning several engine calls pins it to prove
-    /// they all read the same closure.
+    /// they all read the same closure and vehicle sets.
     transfers_generation: u64,
 }
 

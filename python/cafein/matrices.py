@@ -23,6 +23,7 @@ from cafein._validate import (
     sequence_not_string,
 )
 from cafein import _memory, _sweep
+from cafein._snapshot import NetworkSnapshot
 from cafein._units import duration_seconds, memory_spec
 from cafein.policy import policy_speeds
 from cafein.street_network import core_speeds
@@ -6205,6 +6206,9 @@ def _policy_time_columns(
         raise ValueError(
             "street_policy matrices take point-set origins and destinations"
         )
+    # The reductions, the engine fan-out and the direct walk read one
+    # street graph and one transfer set.
+    snapshot = NetworkSnapshot(core)
     # Materialised once: a one-shot iterable must not exhaust between the
     # per-point reductions, and later mutation must not desynchronise them.
     exclude_routes = id_sequence("exclude_routes", exclude_routes)
@@ -6292,6 +6296,7 @@ def _policy_time_columns(
         speeds=core_speeds(speeds),
         workers=_memory.width_or(workers),
     )
+    snapshot.verify("the street-policy matrix")
     # A point is unsnapped only when neither the policy's modes nor the
     # direct walking alternative can snap it — a snap fact from both
     # searches, never inferred from reachability.
@@ -6370,10 +6375,10 @@ def _car_park_time_matrix(
     origin_points = origin_points[rows_slice]
     walk_options = _walk_options(*walk_options)
     walking_speed, walk_budget, snap_distance = walk_options
-    # One pinned generation for the WHOLE matrix: every origin's
+    # One network state for the WHOLE matrix: every origin's
     # composition, the egress linking, and the direct-walk fold must
     # read the same street graph; an install mid-computation refuses.
-    generation = core._streets_generation
+    snapshot = NetworkSnapshot(core)
     access_rows, undriven = [], []
     for index, point in enumerate(origin_points):
         try:
@@ -6424,11 +6429,7 @@ def _car_park_time_matrix(
         walk_budget,
         snap_distance,
     )
-    if core._streets_generation != generation:
-        raise RuntimeError(
-            "the street network was replaced while the park-and-ride "
-            "matrix was being computed; rerun the query"
-        )
+    snapshot.verify("the park-and-ride matrix")
     if undriven:
         named = ", ".join(str(from_ids[index]) for index in undriven[:5])
         suffix = ", …" if len(undriven) > 5 else ""
@@ -6545,7 +6546,9 @@ def _carriage_time_columns(
         raise ValueError(
             "street_policy matrices take point-set origins and destinations"
         )
-    # Snapshot every policy term before the GIL-releasing searches.
+    # Snapshot every policy term and the network state before the
+    # GIL-releasing searches.
+    snapshot = NetworkSnapshot(core)
     _, vehicle = carriage_terms(policy)
     unknown_rule = vehicle.unknown_bike_trips
     park = (
@@ -6632,6 +6635,7 @@ def _carriage_time_columns(
         speeds=core_speeds(speeds),
         workers=_memory.width_or(workers),
     )
+    snapshot.verify("the carriage matrix")
     _warn_unsnapped(
         {
             "unsnapped_from": sorted(
@@ -6726,11 +6730,10 @@ def _policy_cost_columns(
         raise ValueError(
             "street_policy matrices take point-set origins and destinations"
         )
-    # One pinned generation for the whole matrix: the reductions, the
+    # One network state for the whole matrix: the reductions, the
     # engine fan-out, and the pricing must read the same street graph and
     # the same transfer set.
-    generation = core._streets_generation
-    transfers_generation = core._transfers_generation
+    snapshot = NetworkSnapshot(core)
     # Materialised once: a one-shot iterable must not exhaust between the
     # per-point reductions, and later mutation must not desynchronise them.
     exclude_routes = id_sequence("exclude_routes", exclude_routes)
@@ -6870,16 +6873,7 @@ def _policy_cost_columns(
         speeds=core_speeds(speeds),
         workers=_memory.width_or(workers),
     )
-    if core._streets_generation != generation:
-        raise RuntimeError(
-            "the street network was replaced while the street-policy "
-            "matrix was being computed; rerun the query"
-        )
-    if core._transfers_generation != transfers_generation:
-        raise RuntimeError(
-            "the transfer set was replaced while the street-policy "
-            "matrix was being computed; rerun the query"
-        )
+    snapshot.verify("the street-policy matrix")
     # A point is unsnapped only when neither the policy's modes nor the
     # direct walking alternative can snap it — a snap fact from both
     # searches, never inferred from reachability.
@@ -7023,10 +7017,10 @@ def _car_park_cost_columns(
     )
     car_factor = float("nan") if pd.isna(value) else float(value)
     fees = [float(fee) for fee in policy.facilities["fee"]]
-    # One pinned generation for the WHOLE matrix: every origin's
+    # One network state for the WHOLE matrix: every origin's
     # composition, the egress linking, and the direct-walk fold must
     # read the same street graph; an install mid-computation refuses.
-    generation = core._streets_generation
+    snapshot = NetworkSnapshot(core)
     access_rows, fee_by_stop, undriven = [], [], []
     for index, point in enumerate(origin_points):
         try:
@@ -7190,11 +7184,7 @@ def _car_park_cost_columns(
                 columns["access_stop"][at] = no_stop
                 if shapes is not None:
                     shapes[at] = walk_shape(i, j)
-    if core._streets_generation != generation:
-        raise RuntimeError(
-            "the street network was replaced while the park-and-ride "
-            "matrix was being computed; rerun the query"
-        )
+    snapshot.verify("the park-and-ride matrix")
     if undriven:
         named = ", ".join(str(from_ids[index]) for index in undriven[:5])
         suffix = ", …" if len(undriven) > 5 else ""
@@ -7319,10 +7309,10 @@ def _car_park_arrive_by_time_matrix(
     destination_points = destination_points[columns]
     walk_options = _walk_options(*walk_options)
     walking_speed, walk_budget, snap_distance = walk_options
-    # One pinned generation for the whole matrix, as on the departure
+    # One network state for the whole matrix, as on the departure
     # axis: composition, egress linking, and the walk fold must read
     # the same street graph.
-    generation = core._streets_generation
+    snapshot = NetworkSnapshot(core)
     access_rows, undriven = [], []
     for index, point in enumerate(origin_points):
         try:
@@ -7369,11 +7359,7 @@ def _car_park_arrive_by_time_matrix(
         walk_budget,
         snap_distance,
     )
-    if core._streets_generation != generation:
-        raise RuntimeError(
-            "the street network was replaced while the park-and-ride "
-            "matrix was being computed; rerun the query"
-        )
+    snapshot.verify("the park-and-ride matrix")
     if undriven:
         named = ", ".join(str(from_ids[index]) for index in undriven[:5])
         suffix = ", …" if len(undriven) > 5 else ""
@@ -7538,11 +7524,10 @@ def _car_park_arrive_by_cost_columns(
     )
     car_factor = float("nan") if pd.isna(value) else float(value)
     fees = [float(fee) for fee in policy.facilities["fee"]]
-    generation = core._streets_generation
     # The election and the per-group repricing are separate engine
-    # calls; pinning the transfer generation proves they all read the
-    # same closure.
-    transfers_generation = core._transfers_generation
+    # calls; the snapshot proves they all read the same street graph
+    # and closure.
+    snapshot = NetworkSnapshot(core)
     access_offsets, rows_by_stop, fee_by_stop, undriven = [], [], [], []
     for index, point in enumerate(origin_points):
         try:
@@ -7822,16 +7807,7 @@ def _car_park_arrive_by_cost_columns(
         columns["fee"].append(0.0)
         if shapes is not None:
             shapes.append(walk_shape(i, j))
-    if core._streets_generation != generation:
-        raise RuntimeError(
-            "the street network was replaced while the park-and-ride "
-            "matrix was being computed; rerun the query"
-        )
-    if core._transfers_generation != transfers_generation:
-        raise RuntimeError(
-            "the transfer set was replaced while the park-and-ride "
-            "matrix was being computed; rerun the query"
-        )
+    snapshot.verify("the park-and-ride matrix")
     order = sorted(
         range(len(columns["from"])),
         key=lambda at: (columns["from"][at], columns["to"][at]),

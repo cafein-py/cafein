@@ -947,9 +947,9 @@ impl TransportNetwork {
         self.streets_generation
     }
 
-    /// The transfer-set generation: bumps on every footpath or mode-set
-    /// install, so a computation spanning several engine calls can prove
-    /// they all read the same closure and mode set.
+    /// The transfer-set generation: bumps on every footpath, mode-set or
+    /// carriage-set install, so a computation spanning several engine calls
+    /// can prove they all read the same closure and vehicle sets.
     #[getter]
     fn _transfers_generation(&self) -> u64 {
         self.transfers_generation
@@ -2499,6 +2499,8 @@ impl TransportNetwork {
             }
         }
         let counts = (set.edge_count(), winners.len());
+        // A carriage set is read by pinned queries like a mode set.
+        self.transfers_generation += 1;
         self.carriage_transfers = Some(CarriageTransferSet {
             mode: mode.to_owned(),
             budget: max_seconds,

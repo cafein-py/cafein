@@ -11,6 +11,7 @@ from cafein._validate import (
 import geopandas as gpd
 
 from cafein import _log, _sweep
+from cafein._snapshot import NetworkSnapshot
 import numpy as np
 import pandas as pd
 import shapely
@@ -523,7 +524,11 @@ class DetailedItineraries(gpd.GeoDataFrame):
         if destinations is None and hasattr(origins, "geometry"):
             _destination_dtype = _origin_dtype
         _id_dtypes = {"from_id": _origin_dtype, "to_id": _destination_dtype}
+        snapshot = None
         if not _is_street_network(network) and hasattr(network, "route_between_stops"):
+            # A transit frame reads one street graph and one transfer set,
+            # from the traveler's folding to the last OD pair.
+            snapshot = NetworkSnapshot(network._core)
             (
                 exclude_routes,
                 exclude_trips,
@@ -795,6 +800,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
             max_snap_distance=max_snap_distance,
             street_policy=street_policy,
             speeds=riding,
+            snapshot=snapshot,
             street_edges=exposure is not None,
             perspectives=perspectives,
             costs=costs,
@@ -870,10 +876,12 @@ def _itineraries_frame(
     currency=None,
     cost_components=None,
     speeds=None,
+    snapshot,
 ):
     """The transit itineraries of every origin-destination pair as one
     leg-per-row frame, ``DetailedItineraries``'s body on a
-    ``TransportNetwork``."""
+    ``TransportNetwork``, refused unless the network still holds the
+    state ``snapshot`` recorded."""
     import copy
 
     components = component_selection(components)
@@ -1088,6 +1096,7 @@ def _itineraries_frame(
                         # after it is a wait the reporting synthesizes.
                         record["journey_departure_s"] = journey["departure_s"]
                     records.append(record)
+    snapshot.verify("the itineraries")
     columns = _COLUMNS if street_policy is None else _POLICY_COLUMNS
     if car_park:
         columns = list(columns)

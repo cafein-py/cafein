@@ -13,6 +13,7 @@ from cafein._validate import (
     positive_int,
     sequence_not_string,
 )
+from cafein._snapshot import NetworkSnapshot
 from cafein._units import memory_spec
 from cafein.matrices import _planned_entry, _query_details, _transit_walking_speed
 from cafein.policy import policy_speeds
@@ -395,9 +396,8 @@ def _car_park_table(core, origin, policy, walk_options, geometries):
     # fires before the first composition.
     raise_if_refused()
     walking_speed, walk_budget, snap_distance = walk_options
-    # A street install bumps the core's generation; pinning it proves
-    # the car rows and the walking rows read the same graph.
-    generation = core._streets_generation
+    # The car rows and the walking rows read the same graph.
+    snapshot = NetworkSnapshot(core)
     best = _car_park_offsets(core, origin, policy, walk_options, geometries)
     linked = core._link_walking_stops(
         [tuple(origin)], walking_speed, walk_budget, snap_distance
@@ -409,11 +409,7 @@ def _car_park_table(core, origin, policy, walk_options, geometries):
         if linked is None
         else {stop: (int(seconds), meters) for stop, seconds, meters in linked}
     )
-    if core._streets_generation != generation:
-        raise RuntimeError(
-            "the street network was replaced while the park-and-ride "
-            "access table was being composed; rerun the query"
-        )
+    snapshot.verify("the park-and-ride access table")
     offsets, tokens = [], {}
     for stop, (total, token) in best.items():
         walked = walking.get(stop)
@@ -458,9 +454,8 @@ def _car_park_journeys(
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
 
     core = network._core
-    # The rebuilt legs must read the graph the access table searched;
-    # a street install mid-query bumps the pinned generation.
-    generation = core._streets_generation
+    # The rebuilt legs must read the graph the access table searched.
+    snapshot = NetworkSnapshot(core)
     # One frozen policy for the whole query: the composition, the
     # GIL-releasing searches, and the reconstruction all read the
     # same snapshot even if the caller mutates theirs mid-query.
@@ -727,11 +722,7 @@ def _car_park_journeys(
         snap_distance,
         geometries,
     )
-    if core._streets_generation != generation:
-        raise RuntimeError(
-            "the street network was replaced mid-query; the rebuilt "
-            "walking legs would not match the searched access table"
-        )
+    snapshot.verify("the park-and-ride journeys")
     if direct is None:
         return journeys
     network_m, connector_m, shape = direct
@@ -905,6 +896,9 @@ def _policy_journeys(
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
     from cafein.policy import reduction_modes
 
+    # The reductions, the engine search, the leg rebuilds and the direct
+    # walk read one street graph and one transfer set.
+    snapshot = NetworkSnapshot(core)
     # One immutable snapshot of the caller's exclusions, reused across
     # every search below — a one-shot iterable or a list mutated between
     # the GIL-releasing calls must not shift the exclusion set mid-query.
@@ -1068,6 +1062,7 @@ def _policy_journeys(
         geometries,
         speeds=core_speeds(speeds),
     )
+    snapshot.verify("the street-policy journeys")
     if direct is None:
         unsnapped = access_error or egress_error
         if unsnapped is not None:
@@ -1132,7 +1127,9 @@ def _carriage_journeys(
             "street_policy needs the multimodal street graph; build with "
             "street_modes="
         )
-    # Snapshot every policy term before the GIL-releasing searches.
+    # Snapshot every policy term and the network state before the
+    # GIL-releasing searches.
+    snapshot = NetworkSnapshot(core)
     unknown_rule = vehicle.unknown_bike_trips
     park = (
         None
@@ -1290,6 +1287,7 @@ def _carriage_journeys(
         geometries,
         speeds=core_speeds(speeds),
     )
+    snapshot.verify("the carriage journeys")
     if direct is None:
         if unsnapped is not None and not journeys:
             raise unsnapped
@@ -1366,6 +1364,7 @@ def _policy_mc_journeys(
     from cafein.policy import reject_carriage
 
     reject_carriage(policy, "the multicriteria candidates")
+    snapshot = NetworkSnapshot(core)
     # The rental's ride grams enter the dominance, exactly as a granted
     # access mode's do.
     transfer_mode = _policy_transfer_mode(policy)
@@ -1498,6 +1497,7 @@ def _policy_mc_journeys(
         geometries,
         speeds=core_speeds(speeds),
     )
+    snapshot.verify("the street-policy journeys")
     if direct is None:
         unsnapped = access_error or egress_error
         if unsnapped is not None:
@@ -2773,6 +2773,9 @@ class TransportNetwork:
             the egress walk.
         """
         walking_speed_kmph = _transit_walking_speed(self, speeds, street_policy)
+        # The traveler's folding and the route read one street graph and
+        # one transfer set.
+        snapshot = NetworkSnapshot(self._core)
         (
             exclude_routes,
             exclude_trips,
@@ -2811,7 +2814,7 @@ class TransportNetwork:
                 )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
-        return self._route_between_coordinates(
+        journeys = self._route_between_coordinates(
             origin=origin,
             destination=destination,
             date=date,
@@ -2832,6 +2835,8 @@ class TransportNetwork:
             street_policy=street_policy,
             speeds=riding,
         )
+        snapshot.verify("the route")
+        return journeys
 
     def _route_between_coordinates(
         self,
@@ -3159,6 +3164,9 @@ class TransportNetwork:
             stop_id; unreachable stops are absent.
         """
         walking_speed_kmph = _transit_walking_speed(self, speeds, street_policy)
+        # A street-policy query reads one street graph and one transfer
+        # set, from the traveler's folding to the engine search.
+        snapshot = NetworkSnapshot(self._core)
         (
             exclude_routes,
             exclude_trips,
@@ -3235,7 +3243,7 @@ class TransportNetwork:
                     ),
                     False,
                 )
-                return self._core._travel_times_with_access(
+                times = self._core._travel_times_with_access(
                     offsets,
                     date,
                     departure,
@@ -3245,6 +3253,8 @@ class TransportNetwork:
                     exclude_trips=list(exclude_trips),
                     exclude_stops=list(exclude_stops),
                 )
+                snapshot.verify("the park-and-ride travel times")
+                return times
             if any(
                 option is not None
                 for option in (walking_speed_kmph, max_walking_time, max_snap_distance)
@@ -3319,7 +3329,7 @@ class TransportNetwork:
                         "coordinate too far from the multimodal street "
                         "network for every policy mode"
                     )
-                return self._core._carriage_travel_times(
+                times = self._core._carriage_travel_times(
                     carrying or [],
                     free or [],
                     date,
@@ -3330,6 +3340,8 @@ class TransportNetwork:
                     transfer_mode=transfer_mode,
                     speeds=core_speeds(riding),
                 )
+                snapshot.verify("the carriage travel times")
+                return times
             if transfer_mode is None and all(mode == "walk" for mode, *_ in modes):
                 # A walking-only policy IS the current walking path, at the
                 # policy's walking budget; a transfers= binding changes the
@@ -3362,7 +3374,7 @@ class TransportNetwork:
                     speeds=core_speeds(riding),
                 )
             ]
-            return self._core._travel_times_with_access(
+            times = self._core._travel_times_with_access(
                 access,
                 date,
                 departure,
@@ -3373,6 +3385,8 @@ class TransportNetwork:
                 exclude_stops=list(exclude_stops),
                 speeds=core_speeds(riding),
             )
+            snapshot.verify("the street-policy travel times")
+            return times
         return self._core.travel_times_from_coordinate(
             tuple(origin),
             date,

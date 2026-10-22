@@ -28,6 +28,7 @@ from cafein._validate import (
     sequence_not_string,
 )
 from cafein import _memory
+from cafein._snapshot import NetworkSnapshot
 from cafein._units import memory_spec
 from cafein.matrices import (
     _planned_aggregation,
@@ -3102,7 +3103,11 @@ class Catchment(gpd.GeoDataFrame):
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
+        snapshot = None
         if hasattr(network, "route_between_stops"):
+            # A transit catchment reads one street graph and one transfer
+            # set, from the traveler's checks to the last street field.
+            snapshot = NetworkSnapshot(network._core)
             (
                 exclude_routes,
                 exclude_trips,
@@ -3484,6 +3489,7 @@ class Catchment(gpd.GeoDataFrame):
                             resolution,
                         )
                     )
+                snapshot.verify("the catchment")
                 import geopandas
 
                 frame = geopandas.GeoDataFrame(
@@ -3593,6 +3599,7 @@ class Catchment(gpd.GeoDataFrame):
                                     ),
                                 )
                             )
+            snapshot.verify("the catchment")
         import geopandas
 
         frame = geopandas.GeoDataFrame(

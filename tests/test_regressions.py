@@ -1161,3 +1161,130 @@ def test_park_and_ride_facilities_state_epsg_4326(monkeypatch):
     frame = streets.park_and_ride_facilities("unread.osm.pbf")
     assert str(frame.crs) == "EPSG:4326"
     assert frame["id"].tolist() == ["node/1"]
+
+
+class _ReplaceAfter:
+    """The routing core, with `replace()` run once, right after the first
+    call to `method` returns — a transfer set installed mid-query."""
+
+    def __init__(self, core, method, replace):
+        self._core, self._method, self._replace = core, method, replace
+        self._replaced = False
+
+    def __getattr__(self, name):
+        attribute = getattr(self._core, name)
+        if name != self._method or self._replaced:
+            return attribute
+
+        def call(*args, **kwargs):
+            result = attribute(*args, **kwargs)
+            if not self._replaced:
+                self._replaced = True
+                self._replace()
+            return result
+
+        return call
+
+
+@pytest.mark.parametrize(
+    "query, method, replacement",
+    [
+        ("time_matrix", "_time_matrix_with_access", "mode"),
+        ("route", "_route_with_access", "mode"),
+        ("travel_times", "_travel_times_with_access", "mode"),
+        ("pareto_itineraries", "_mc_route_with_access", "mode"),
+        ("itineraries", "folded_street_policy", "mode"),
+        ("catchment", "travel_times_from_coordinate", "mode"),
+        ("carriage_matrix", "_carriage_time_matrix", "carriage"),
+        ("carriage_route", "_carriage_route", "carriage"),
+        ("carriage_travel_times", "_reduced_street_offsets", "carriage"),
+    ],
+)
+def test_multi_call_queries_refuse_a_transfer_set_replaced_mid_query(
+    multimodal_network, artifact_cache, monkeypatch, query, method, replacement
+):
+    # Each query reads the street graph and the transfer set in several
+    # core calls; a mode or carriage set installed between them is refused
+    # rather than mixed into the result.
+    pytest.importorskip("cafein._cafein")
+    from cafein import Catchment, DetailedItineraries, TransportNetwork
+    from cafein import TravelTimeMatrix
+    from test_street_policy import (
+        DEST,
+        ORIGIN,
+        _bike_walk_policy,
+        _carriage_policy,
+        _carried,
+        _points_frame,
+        _scooter_factor_rows,
+        _scooter_policy,
+    )
+
+    network = TransportNetwork.load(artifact_cache / "helsinki-multimodal.cafein")
+    departure = "2022-02-22 08:30:00"
+    origins, destinations = _points_frame([ORIGIN]), _points_frame([DEST])
+    carriage = _carriage_policy(_carried(unknown_bike_trips="allow"))
+
+    def replace():
+        if replacement == "carriage":
+            network.compute_carriage_transfers("bicycle", 15)
+        else:
+            network.compute_mode_transfers("e_scooter", 10)
+
+    if query == "itineraries":
+        # After the traveler's folding, before any OD pair routes.
+        from cafein import itineraries
+
+        fold = itineraries.folded_street_policy
+
+        def fold_then_replace(*args, **kwargs):
+            folded = fold(*args, **kwargs)
+            replace()
+            return folded
+
+        monkeypatch.setattr(itineraries, "folded_street_policy", fold_then_replace)
+    else:
+        network._core = _ReplaceAfter(network._core, method, replace)
+    queries = {
+        "time_matrix": lambda: TravelTimeMatrix(
+            network, origins, destinations, departure, street_policy=_bike_walk_policy()
+        ),
+        "route": lambda: network.route_between_coordinates(
+            ORIGIN, DEST, departure, street_policy=_bike_walk_policy()
+        ),
+        "travel_times": lambda: network.travel_times_from_coordinate(
+            ORIGIN, departure, street_policy=_bike_walk_policy()
+        ),
+        "pareto_itineraries": lambda: DetailedItineraries(
+            network,
+            origins,
+            destinations,
+            departure,
+            candidates="pareto",
+            street_policy=_scooter_policy(),
+            factors=_scooter_factor_rows(),
+            geometries=False,
+        ),
+        "itineraries": lambda: DetailedItineraries(
+            network,
+            origins,
+            destinations,
+            departure,
+            street_policy=_bike_walk_policy(),
+            geometries=False,
+        ),
+        "catchment": lambda: Catchment(network, origins, departure, budgets=(10,)),
+        "carriage_matrix": lambda: TravelTimeMatrix(
+            network, origins, destinations, departure, street_policy=carriage
+        ),
+        "carriage_route": lambda: network.route_between_coordinates(
+            ORIGIN, DEST, departure, street_policy=carriage
+        ),
+        "carriage_travel_times": lambda: network.travel_times_from_coordinate(
+            ORIGIN, departure, street_policy=carriage
+        ),
+    }
+    if query == "catchment":
+        pytest.importorskip("h3")
+    with pytest.raises(RuntimeError, match="transfer set was replaced"):
+        queries[query]()
