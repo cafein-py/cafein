@@ -879,47 +879,54 @@ def union_filter(car=False):
     }
 
 
-_EXTRA_ATTRIBUTES = [
+UNION_TAGS = (
+    "highway",
+    "surface",
+    "smoothness",
+    "bridge",
+    "tunnel",
+    "indoor",
+    "segregated",
+    "lit",
+    "junction",
+    "access",
+    "foot",
+    "wheelchair",
+    "bicycle",
     "vehicle",
+    "motor_vehicle",
+    "motorcar",
+    "oneway",
+    "oneway:bicycle",
+    "cycleway",
     "cycleway:left",
     "cycleway:right",
     "cycleway:both",
     "cycleway:left:oneway",
     "cycleway:right:oneway",
     "cycleway:both:oneway",
-    "layer",
-    "indoor",
-    "incline",
-    "wheelchair",
-    # Also requested explicitly (though in pyrosm's default highway columns) so
-    # the directional and facility logic never silently loses them to a config
-    # change: `oneway:bicycle`, `junction`, `segregated`.
-    "oneway:bicycle",
-    "junction",
-    "segregated",
-    # The car chain and its speeds.
-    "motor_vehicle",
-    "motorcar",
     "maxspeed",
     "maxspeed:forward",
     "maxspeed:backward",
-]
-"""Tags cafein needs kept on the extracted ways; the first block is not in
-pyrosm's default highway columns, the second is requested defensively."""
+)
+"""The way tags the union extraction keeps as columns: every tag the class
+codes, flags, mode permissions and car speeds read, and no other."""
 
 
 def union_network(osm_pbf, bounding_box=None, car=False):
     """The union street network of a PBF extract, as (nodes, edges).
 
-    One `pyrosm` pass over the broadly-filtered network with the multimodal
-    tags retained. Unlike `streets._walking_network`, no mode is filtered out
-    here; connectivity is pruned per mode afterwards by
-    `prune_components_per_profile`. A car build (`car=True`) keeps the
-    motor-only highway classes in the extraction.
+    One `pyrosm` pass over the broadly-filtered network keeping only the
+    `UNION_TAGS` columns and no element metadata. Unlike
+    `streets._walking_network`, no mode is filtered out here; connectivity
+    is pruned per mode afterwards by `prune_components_per_profile`. A car
+    build (`car=True`) keeps the motor-only highway classes in the
+    extraction.
     """
     osm = pyrosm.OSM(
         str(osm_pbf),
         bounding_box=bounding_box,
+        keep_metadata=False,
         engine="out_of_core",
         workers="auto",
     )
@@ -927,7 +934,7 @@ def union_network(osm_pbf, bounding_box=None, car=False):
         network_type="all",
         custom_filter=union_filter(car=car),
         filter_type="exclude",
-        extra_attributes=_EXTRA_ATTRIBUTES,
+        tags_to_keep=list(UNION_TAGS),
         nodes=True,
     )
     if network is None:
@@ -941,7 +948,11 @@ def _column(edges, name):
     extract yields no column). pyrosm's out-of-core engine returns string
     columns whose missing entries are the literal string ``"nan"`` (and float
     ``NaN`` on the in-memory path), both normalised to `None` here so the plain
-    ``is None`` checks downstream are correct."""
+    ``is None`` checks downstream are correct. A tag outside `UNION_TAGS` is
+    refused: the extraction never reads it, so its column would be all-`None`
+    whatever the data says."""
+    if name not in UNION_TAGS:
+        raise ValueError(f"way tag {name!r} is not among the extracted UNION_TAGS")
     if name not in edges.columns:
         return np.full(len(edges), None, dtype=object)
     values = edges[name].to_numpy(dtype=object)

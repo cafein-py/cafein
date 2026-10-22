@@ -259,7 +259,9 @@ def _walking_network(osm_pbf, bounding_box=None):
     stay in (R5 applies the same permissive rule).
     """
     # The out-of-core engine streams the PBF instead of loading it into
-    # memory, so country-scale extracts parse within bounded RAM.
+    # memory, so country-scale extracts parse within bounded RAM. The walk
+    # reads only the ids, end nodes, lengths and geometries, so no tag
+    # beyond `highway` and no element metadata is kept.
     with _log.phase(
         "build.streets.read",
         _log.build,
@@ -269,6 +271,7 @@ def _walking_network(osm_pbf, bounding_box=None):
         osm = pyrosm.OSM(
             str(osm_pbf),
             bounding_box=bounding_box,
+            keep_metadata=False,
             engine="out_of_core",
             workers="auto",
         )
@@ -276,6 +279,7 @@ def _walking_network(osm_pbf, bounding_box=None):
             network_type="walking",
             custom_filter=_UNWALKABLE_FILTER,
             filter_type="exclude",
+            tags_to_keep=["highway"],
             nodes=True,
         )
         if network is None:
