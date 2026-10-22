@@ -14,7 +14,9 @@ from cafein._validate import (
     sequence_not_string,
 )
 from cafein._units import memory_spec
-from cafein.matrices import _planned_entry, _query_details
+from cafein.matrices import _planned_entry, _query_details, _transit_walking_speed
+from cafein.policy import policy_speeds
+from cafein.street_network import core_speeds
 from cafein.streets import walking_speed
 from cafein.travelers import (
     folded_constraints,
@@ -173,10 +175,13 @@ def _policy_transfer_arg(transfer_mode, street_factors, components, purpose):
     return (mode, budget, float(value) / 1000.0)
 
 
-def _policy_reduced(core, point, egress, modes, exclude_stops, transfer_mode=None):
+def _policy_reduced(
+    core, point, egress, modes, exclude_stops, transfer_mode=None, speeds=None
+):
     """One side's reduction: the ``(stop, seconds)`` offsets the engine
     seeds, and the per-stop ``StreetChoice`` tokens the reconstruction
-    rebuilds the street legs from."""
+    rebuilds the street legs from. ``speeds`` is the query's validated
+    ``{mode: km/h}``."""
     rows = core._reduced_street_offsets(
         point[0],
         point[1],
@@ -184,6 +189,7 @@ def _policy_reduced(core, point, egress, modes, exclude_stops, transfer_mode=Non
         modes,
         list(id_sequence("exclude_stops", exclude_stops)),
         transfer_mode=transfer_mode,
+        speeds=core_speeds(speeds),
     )
     offsets = [(stop, seconds) for stop, seconds, *_ in rows]
     tokens = {row[0]: row[1:] for row in rows}
@@ -771,7 +777,15 @@ def _car_park_journeys(
 
 
 def _policy_street_legs(
-    core, leg, point, tokens, budgets, egress, geometries, transfer_mode=None
+    core,
+    leg,
+    point,
+    tokens,
+    budgets,
+    egress,
+    geometries,
+    transfer_mode=None,
+    speeds=None,
 ):
     """The reconstructed street leg(s) behind one access or egress row.
 
@@ -799,6 +813,7 @@ def _policy_street_legs(
         egress,
         budgets[mode],
         geometries,
+        speeds=core_speeds(speeds),
     )
     if parts is None:
         # The reduction proved this link reachable within the budget; a
@@ -856,8 +871,10 @@ def _policy_journeys(
     policy,
     exclusions,
     geometries,
+    speeds=None,
 ):
-    """Door-to-door journeys under a street-leg policy.
+    """Door-to-door journeys under a street-leg policy, at the query's
+    validated ``speeds`` (``{mode: km/h}``).
 
     Each side reduces over the multimodal graph, the engine routes from
     the reduced offsets, the street legs rebuild from the kept tokens,
@@ -889,7 +906,7 @@ def _policy_journeys(
         # walk either, it is the honest answer.
         try:
             offsets, tokens = _policy_reduced(
-                core, point, egress_side, modes, exclude_stops, transfer_mode
+                core, point, egress_side, modes, exclude_stops, transfer_mode, speeds
             )
         except ValueError as error:
             if "too far from the multimodal street network" not in str(error):
@@ -983,6 +1000,7 @@ def _policy_journeys(
                         False,
                         geometries,
                         transfer_mode,
+                        speeds,
                     )
                 )
             elif leg["type"] == "egress":
@@ -996,6 +1014,7 @@ def _policy_journeys(
                         True,
                         geometries,
                         transfer_mode,
+                        speeds,
                     )
                 )
             elif leg["type"] == "transfer" and transfer_mode is not None:
@@ -1022,7 +1041,12 @@ def _policy_journeys(
     # wheelchair-only policy, else walking at the legacy convention.
     direct_mode, walk_budget = _direct_walking_mode(access_budgets, egress_budgets)
     direct = core._multimodal_direct_leg(
-        origin, destination, direct_mode, walk_budget, geometries
+        origin,
+        destination,
+        direct_mode,
+        walk_budget,
+        geometries,
+        speeds=core_speeds(speeds),
     )
     if direct is None:
         unsnapped = access_error or egress_error
@@ -1279,8 +1303,10 @@ def _policy_mc_journeys(
     slack,
     max_options,
     router="auto",
+    speeds=None,
 ):
-    """Door-to-door multicriteria journeys under a street-leg policy.
+    """Door-to-door multicriteria journeys under a street-leg policy, at the
+    query's validated ``speeds`` (``{mode: km/h}``).
 
     Each side reduces to its ``(seconds, grams)`` Pareto frontier, and
     the resolved multicriteria engine — McRAPTOR, or McTBTR when the
@@ -1335,6 +1361,7 @@ def _policy_mc_journeys(
                 modes,
                 list(exclude_stops),
                 transfer_mode=transfer_arg,
+                speeds=core_speeds(speeds),
             )
         except ValueError as error:
             if "too far from the multimodal street network" not in str(error):
@@ -1388,6 +1415,7 @@ def _policy_mc_journeys(
                         False,
                         geometries,
                         transfer_mode,
+                        speeds,
                     )
                 )
             elif leg["type"] == "egress":
@@ -1403,6 +1431,7 @@ def _policy_mc_journeys(
                         True,
                         geometries,
                         transfer_mode,
+                        speeds,
                     )
                 )
             elif leg["type"] == "transfer" and transfer_mode is not None:
@@ -1423,7 +1452,12 @@ def _policy_mc_journeys(
         journey["legs"] = legs
     direct_mode, walk_budget = _direct_walking_mode(access_budgets, egress_budgets)
     direct = core._multimodal_direct_leg(
-        origin, destination, direct_mode, walk_budget, geometries
+        origin,
+        destination,
+        direct_mode,
+        walk_budget,
+        geometries,
+        speeds=core_speeds(speeds),
     )
     if direct is None:
         unsnapped = access_error or egress_error
@@ -2638,7 +2672,8 @@ class TransportNetwork:
             Departure window in minutes, as in ``route_between_stops``.
         speeds : mapping (optional)
             ``{"walk": km/h}``: the walking speed of the access and egress
-            searches (default: 3.6 km/h).
+            searches (default: 3.6 km/h). Beside a ``StreetLegPolicy`` it
+            also takes the modes the policy's access and egress grant.
         max_walking_time : float or datetime.timedelta (optional, default: 120 minutes)
             Walking-time cutoff in minutes of each street search.
         snap_distance : float (optional, default: 1600)
@@ -2686,9 +2721,10 @@ class TransportNetwork:
             engine, journeys latest-departure-first, the walk placed
             to arrive exactly at the deadline; time windows are
             rejected beside the policy on both axes.
-            Conflicts with the walking knobs above and with
+            Conflicts with ``max_walking_time``, ``snap_distance`` and
             ``departure_time_window``, which are rejected rather than
-            silently ignored.
+            silently ignored; ``speeds`` sets the policy's modes, except
+            beside its transfers or a carried vehicle.
 
         Returns
         -------
@@ -2696,7 +2732,8 @@ class TransportNetwork:
             Journeys as in ``route_between_stops``; arrivals include
             the egress walk.
         """
-        walking_speed_kmph = walking_speed(speeds)
+        walking_speed_kmph = _transit_walking_speed(self, speeds, street_policy)
+        riding = policy_speeds(street_policy, speeds)
         (
             exclude_routes,
             exclude_trips,
@@ -2750,6 +2787,7 @@ class TransportNetwork:
             walking_speed_kmph=walking_speed_kmph,
             geometries=geometries,
             street_policy=street_policy,
+            speeds=riding,
         )
 
     def _route_between_coordinates(
@@ -2770,13 +2808,15 @@ class TransportNetwork:
         geometries=True,
         street_policy=None,
         arrive_by=False,
+        speeds=None,
     ):
         """``route_between_coordinates`` in core space: split ``date`` +
         ``departure`` strings, ``max_transfers``, and every duration
         in seconds — the form internal callers use to avoid double
         conversion. With ``arrive_by`` the time is the arrival deadline
         (the public wrapper rejects a street-leg policy beside it; the
-        car-park policy serves both axes)."""
+        car-park policy serves both axes). ``speeds`` is a street-leg
+        policy's validated ``{mode: km/h}``."""
         if street_policy is not None:
             from cafein.matrices import _walking_only_policy
             from cafein.policy import CarParkPolicy
@@ -2819,8 +2859,8 @@ class TransportNetwork:
             ):
                 raise ValueError(
                     "street_policy carries its own budgets; passing "
-                    "speeds, max_walking_time, or "
-                    "snap_distance beside it is a conflict"
+                    "max_walking_time or snap_distance beside it is a "
+                    "conflict"
                 )
             if window is not None:
                 raise ValueError(
@@ -2860,7 +2900,7 @@ class TransportNetwork:
                     list(id_sequence("exclude_routes", exclude_routes)),
                     list(id_sequence("exclude_trips", exclude_trips)),
                     list(id_sequence("exclude_stops", exclude_stops)),
-                    *_walk_options(None, walk_budget, None),
+                    *_walk_options((speeds or {}).get("walk"), walk_budget, None),
                     geometries,
                 )
             if not self._core.has_multimodal_streets:
@@ -2878,6 +2918,7 @@ class TransportNetwork:
                 street_policy,
                 (exclude_routes, exclude_trips, exclude_stops),
                 geometries,
+                speeds=speeds,
             )
         return self._core.route_between_coordinates(
             tuple(origin),
@@ -3024,7 +3065,8 @@ class TransportNetwork:
             transfers: 8 rides allow 7 transfers).
         speeds : mapping (optional)
             ``{"walk": km/h}``: the walking speed of the access search
-            (default: 3.6 km/h).
+            (default: 3.6 km/h). Beside a ``StreetLegPolicy`` it also takes
+            the modes the policy's access grants.
         max_walking_time : float or datetime.timedelta (optional, default: 120 minutes)
             Walking-time cutoff in minutes of the access search.
         snap_distance : float (optional, default: 1600)
@@ -3040,9 +3082,10 @@ class TransportNetwork:
             over it. With ``transfers={mode: budget}`` the run relaxes
             the merged mode-transfer set of
             :meth:`compute_mode_transfers`, which must be computed with
-            exactly that binding. Conflicts with the walking knobs above
-            and with exclusions, which are rejected rather than
-            silently ignored. A ``CarParkPolicy`` here serves
+            exactly that binding. Conflicts with ``max_walking_time``,
+            ``snap_distance`` and exclusions, which are rejected rather
+            than silently ignored; ``speeds`` sets the policy's modes,
+            except beside its transfers or a carried vehicle. A ``CarParkPolicy`` here serves
             park-and-ride instead: the drive-park-walk chain competes
             beside ordinary walking, and the query's walking knobs
             stay active, timing the walking access. It serves the
@@ -3057,7 +3100,8 @@ class TransportNetwork:
             Travel time in seconds to every reachable stop, keyed by
             stop_id; unreachable stops are absent.
         """
-        walking_speed_kmph = walking_speed(speeds)
+        walking_speed_kmph = _transit_walking_speed(self, speeds, street_policy)
+        riding = policy_speeds(street_policy, speeds)
         (
             exclude_routes,
             exclude_trips,
@@ -3146,8 +3190,8 @@ class TransportNetwork:
             ):
                 raise ValueError(
                     "street_policy carries its own budgets; passing "
-                    "speeds, max_walking_time, or "
-                    "snap_distance beside it is a conflict"
+                    "max_walking_time or snap_distance beside it is a "
+                    "conflict"
                 )
             from cafein.network import _policy_transfer_mode
             from cafein.policy import carriage_terms
@@ -3237,7 +3281,9 @@ class TransportNetwork:
                     list(exclude_routes),
                     list(exclude_trips),
                     list(exclude_stops),
-                    *_walk_options(walking_speed_kmph, walk_budget, max_snap_distance),
+                    *_walk_options(
+                        (riding or {}).get("walk"), walk_budget, max_snap_distance
+                    ),
                 )
             if not self._core.has_multimodal_streets:
                 raise ValueError(
@@ -3247,7 +3293,11 @@ class TransportNetwork:
             access = [
                 (stop, seconds)
                 for stop, seconds, *_ in self._core._reduced_street_offsets(
-                    *tuple(origin), False, modes, transfer_mode=transfer_mode
+                    *tuple(origin),
+                    False,
+                    modes,
+                    transfer_mode=transfer_mode,
+                    speeds=core_speeds(riding),
                 )
             ]
             return self._core._travel_times_with_access(

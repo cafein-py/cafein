@@ -24,6 +24,8 @@ from cafein._validate import (
 )
 from cafein import _memory, _sweep
 from cafein._units import duration_seconds, memory_spec
+from cafein.policy import policy_speeds
+from cafein.street_network import core_speeds
 from cafein.streets import walking_speed
 from cafein.travelers import (
     folded_constraints,
@@ -799,7 +801,9 @@ class TravelCostMatrix(pd.DataFrame):
         otherwise stop matrices ignore them. On a ``StreetNetwork``
         ``max_walking_time`` does not apply and ``speeds`` sets the
         routed mode's speed and its walking legs, as in
-        ``StreetNetwork.travel_time``.
+        ``StreetNetwork.travel_time``. Beside a ``StreetLegPolicy``,
+        ``speeds`` takes ``"walk"`` and the modes its access and egress
+        grant.
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
         one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
@@ -976,7 +980,8 @@ class TravelCostMatrix(pd.DataFrame):
         workers=None,
         max_memory=None,
     ):
-        walking_speed_kmph = _transit_walking_speed(network, speeds)
+        walking_speed_kmph = _transit_walking_speed(network, speeds, street_policy)
+        riding = policy_speeds(street_policy, speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -1285,6 +1290,7 @@ class TravelCostMatrix(pd.DataFrame):
                 currency=currency,
                 cost_components=cost_components,
                 street_policy=street_policy,
+                speeds=riding,
                 exposure=exposure,
                 fares=fares,
                 max_transfers=max_transfers,
@@ -1738,7 +1744,9 @@ class TravelTimeMatrix(pd.DataFrame):
         otherwise stop matrices ignore them. On a ``StreetNetwork``
         ``max_walking_time`` does not apply and ``speeds`` sets the
         routed mode's speed and its walking legs, as in
-        ``StreetNetwork.travel_time``.
+        ``StreetNetwork.travel_time``. Beside a ``StreetLegPolicy``,
+        ``speeds`` takes ``"walk"`` and the modes its access and egress
+        grant.
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
         one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
@@ -1834,7 +1842,8 @@ class TravelTimeMatrix(pd.DataFrame):
         workers=None,
         max_memory=None,
     ):
-        walking_speed_kmph = _transit_walking_speed(network, speeds)
+        walking_speed_kmph = _transit_walking_speed(network, speeds, street_policy)
+        riding = policy_speeds(street_policy, speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -2028,6 +2037,7 @@ class TravelTimeMatrix(pd.DataFrame):
                 max_walking_time=max_walking_time,
                 max_snap_distance=max_snap_distance,
                 street_policy=street_policy,
+                speeds=riding,
                 max_transfers=max_transfers,
                 workers=workers,
                 max_memory=max_memory,
@@ -2338,11 +2348,16 @@ def _humanize_time_columns(data, output_time_units):
     return out
 
 
-def _transit_walking_speed(network, speeds):
+def _transit_walking_speed(network, speeds, street_policy=None):
     """The walking speed in km/h ``speeds=`` sets on a transit call, or
-    ``None``; a ``StreetNetwork`` call's speeds are checked against its
-    routed mode by the street query instead."""
-    return None if _is_street_network(network) else walking_speed(speeds)
+    ``None``. A ``StreetNetwork`` call's speeds are checked against its
+    routed mode by the street query instead, and a ``StreetLegPolicy``
+    call's against the policy's modes (``policy.policy_speeds``)."""
+    from cafein.policy import StreetLegPolicy
+
+    if _is_street_network(network) or isinstance(street_policy, StreetLegPolicy):
+        return None
+    return walking_speed(speeds)
 
 
 def _is_street_network(network):
@@ -3062,9 +3077,11 @@ def _time_matrix_data(
     max_transfers,
     workers,
     max_memory=None,
+    speeds=None,
 ):
     """The long-format columns of one moment's transit time matrix,
-    dispatched by street policy exactly as the constructor did."""
+    dispatched by street policy exactly as the constructor did; ``speeds``
+    is a street-leg policy's validated ``{mode: km/h}``."""
     if street_policy is not None:
         from cafein.policy import CarParkPolicy
 
@@ -3122,7 +3139,6 @@ def _time_matrix_data(
             "window": window,
             "percentiles": percentiles,
             "confidence": confidence,
-            "speeds": walking_speed_kmph,
             "max_walking_time": max_walking_time,
             "max_snap_distance": max_snap_distance,
         }
@@ -3171,7 +3187,7 @@ def _time_matrix_data(
                 exclude_routes=exclude_routes,
                 exclude_trips=exclude_trips,
                 exclude_stops=exclude_stops,
-                walking_speed_kmph=None,
+                walking_speed_kmph=(speeds or {}).get("walk"),
                 max_walking_time=walk_budget,
                 max_snap_distance=None,
                 workers=workers,
@@ -3191,6 +3207,7 @@ def _time_matrix_data(
             exclude_stops,
             workers=workers,
             max_memory=max_memory,
+            speeds=speeds,
         )
     return _time_columns(
         network,
@@ -5435,9 +5452,11 @@ def _cost_matrix_data(
     _resolved=None,
     _slot_table=None,
     max_memory=None,
+    speeds=None,
 ):
     """The long-format columns of one moment's transit cost matrix,
-    dispatched by street policy exactly as the constructor did."""
+    dispatched by street policy exactly as the constructor did; ``speeds``
+    is a street-leg policy's validated ``{mode: km/h}``."""
     _reject_cost_street_args(
         transport_mode,
         max_street_time,
@@ -5536,7 +5555,6 @@ def _cost_matrix_data(
                     ("max_travel_time", within),
                     ("candidates", None if candidates == "time" else candidates),
                     ("router", None if router == "auto" else router),
-                    ("speeds", walking_speed_kmph),
                     ("max_walking_time", max_walking_time),
                     ("snap_distance", max_snap_distance),
                 )
@@ -5581,7 +5599,7 @@ def _cost_matrix_data(
                 exclude_stops=exclude_stops,
                 geometries=geometries,
                 chunk=chunk,
-                walking_speed_kmph=None,
+                walking_speed_kmph=(speeds or {}).get("walk"),
                 max_walking_time=walk_budget,
                 max_snap_distance=None,
                 workers=workers,
@@ -5606,6 +5624,7 @@ def _cost_matrix_data(
                 fares=fares,
                 workers=workers,
                 max_memory=max_memory,
+                speeds=speeds,
             )
         data = {
             "from_id": np.array(from_ids, dtype=object)[table["from"]],
@@ -6157,9 +6176,11 @@ def _policy_time_columns(
     exclude_stops=(),
     workers=None,
     max_memory=None,
+    speeds=None,
 ):
     """The street-policy travel-time matrix columns: per-point reductions
-    through the engine fan-out, the direct walking alternative folded in."""
+    through the engine fan-out, the direct walking alternative folded in,
+    at the validated ``speeds`` (``{mode: km/h}``)."""
     from cafein import streets as _streets
     from cafein.network import _policy_transfer_mode
     from cafein.policy import reduction_modes, reject_carriage
@@ -6206,6 +6227,7 @@ def _policy_time_columns(
                             modes,
                             exclude_stops=list(exclude_stops),
                             transfer_mode=transfer_mode,
+                            speeds=core_speeds(speeds),
                         )
                     ]
                 )
@@ -6257,6 +6279,7 @@ def _policy_time_columns(
         list(destination_points),
         direct_mode,
         float(walk_budget),
+        speeds=core_speeds(speeds),
         workers=_memory.width_or(workers),
     )
     # A point is unsnapped only when neither the policy's modes nor the
@@ -6655,6 +6678,7 @@ def _policy_cost_columns(
     fares=None,
     workers=None,
     max_memory=None,
+    speeds=None,
 ):
     """The street-policy cost matrix columns: per-point meters-carrying
     reductions through the engine fan-out, street distances and emissions
@@ -6745,6 +6769,7 @@ def _policy_cost_columns(
                     modes,
                     exclude_stops=list(exclude_stops),
                     transfer_mode=transfer_mode,
+                    speeds=core_speeds(speeds),
                 )
             except ValueError as error:
                 if "too far from the multimodal street network" not in str(error):
@@ -6828,6 +6853,7 @@ def _policy_cost_columns(
         transfer_mode=transfer_arg,
         direct_mode=direct_mode,
         fares=fare_tables,
+        speeds=core_speeds(speeds),
         workers=_memory.width_or(workers),
     )
     if core._streets_generation != generation:

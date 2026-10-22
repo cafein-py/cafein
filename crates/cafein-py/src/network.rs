@@ -1612,7 +1612,8 @@ impl TransportNetwork {
         mode: &str,
         max_seconds: f64,
     ) -> PyResult<Vec<StreetRow>> {
-        let (row, targets) = self.street_row(py, latitude, longitude, mode, max_seconds, false)?;
+        let (row, targets) =
+            self.street_row(py, latitude, longitude, mode, max_seconds, false, &[])?;
         Ok(self.stop_rows(row, &targets))
     }
 
@@ -1627,7 +1628,7 @@ impl TransportNetwork {
         max_seconds: f64,
     ) -> PyResult<Vec<StreetRow>> {
         let (column, sources) =
-            self.street_row(py, latitude, longitude, mode, max_seconds, true)?;
+            self.street_row(py, latitude, longitude, mode, max_seconds, true, &[])?;
         Ok(self.stop_rows(column, &sources))
     }
 
@@ -1650,7 +1651,9 @@ impl TransportNetwork {
     /// whole seconds under ``mode`` (``None`` beyond ``max_seconds``), plus
     /// the unsnapped origin and destination indices — snap facts, not
     /// reachability inferences. Internal.
-    #[pyo3(signature = (origins, destinations, mode, max_seconds, workers=None))]
+    #[pyo3(signature = (origins, destinations, mode, max_seconds, speeds = Vec::new(),
+                        workers=None))]
+    #[allow(clippy::too_many_arguments)]
     fn _multimodal_direct_matrix(
         &self,
         py: Python<'_>,
@@ -1658,9 +1661,10 @@ impl TransportNetwork {
         destinations: Vec<(f64, f64)>,
         mode: &str,
         max_seconds: f64,
+        speeds: crate::streets::SpeedOverrides,
         workers: Option<usize>,
     ) -> PyResult<DirectMatrix> {
-        let profile = self.multimodal_profile(mode)?;
+        let profile = self.multimodal_profile(mode, &speeds)?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
         Ok(py.allow_threads(|| {
             crate::workers::with_workers("multimodal_direct_matrix", workers, || {
@@ -1685,7 +1689,7 @@ impl TransportNetwork {
     /// the reduction's zero-coincident convention; the token and the
     /// coordinate's snap are validated first either way. Internal.
     #[pyo3(signature = (latitude, longitude, mode, stop, edge, fraction, connector,
-                        egress, max_seconds, geometries))]
+                        egress, max_seconds, geometries, speeds = Vec::new()))]
     #[allow(clippy::too_many_arguments)]
     fn _multimodal_leg(
         &self,
@@ -1700,8 +1704,9 @@ impl TransportNetwork {
         egress: bool,
         max_seconds: f64,
         geometries: bool,
+        speeds: crate::streets::SpeedOverrides,
     ) -> PyResult<Option<StreetLegParts>> {
-        let profile = self.multimodal_profile(mode)?;
+        let profile = self.multimodal_profile(mode, &speeds)?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
         let stop = self.resolve_stop(stop)?;
         let feed_stop = &self.feed.stops[stop.0 as usize];
@@ -1742,6 +1747,9 @@ impl TransportNetwork {
     /// ``None`` when either coordinate has no snap for the mode or the pair
     /// is beyond ``max_seconds``; equal coordinates that snap are a zero leg
     /// when the cutoff admits one. Internal.
+    #[pyo3(signature = (origin, destination, mode, max_seconds, geometries,
+                        speeds = Vec::new()))]
+    #[allow(clippy::too_many_arguments)]
     fn _multimodal_direct_leg(
         &self,
         py: Python<'_>,
@@ -1750,8 +1758,9 @@ impl TransportNetwork {
         mode: &str,
         max_seconds: f64,
         geometries: bool,
+        speeds: crate::streets::SpeedOverrides,
     ) -> PyResult<Option<StreetLegParts>> {
-        let profile = self.multimodal_profile(mode)?;
+        let profile = self.multimodal_profile(mode, &speeds)?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
         let snaps = (
             network.snap_for_profile(origin.0, origin.1, MULTIMODAL_STOP_SNAP, &profile),
@@ -1855,7 +1864,7 @@ impl TransportNetwork {
         let Some(token) = held.tokens.get(&(from.0, to.0)).copied() else {
             return Ok(None);
         };
-        let profile = self.multimodal_profile(&held.mode)?;
+        let profile = self.multimodal_profile(&held.mode, &[])?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
         let links = self.mode_link_targets(network, profile.definition.mode.bit());
         let (Some(pickup_link), Some(drop_link)) =
@@ -1901,7 +1910,8 @@ impl TransportNetwork {
     /// the winning mode, its link snap identity, and, for a
     /// closure-carried choice, the seed stop the vehicle actually
     /// reached (``None`` when direct). Internal until the policy surface.
-    #[pyo3(signature = (latitude, longitude, egress, modes, exclude_stops = vec![], transfer_mode = None))]
+    #[pyo3(signature = (latitude, longitude, egress, modes, exclude_stops = vec![], transfer_mode = None,
+                        speeds = Vec::new()))]
     #[allow(clippy::type_complexity)]
     #[allow(clippy::too_many_arguments)]
     fn _reduced_street_offsets(
@@ -1913,6 +1923,7 @@ impl TransportNetwork {
         modes: Vec<(String, f64, bool, Option<Vec<String>>)>,
         exclude_stops: Vec<String>,
         transfer_mode: Option<(String, f64)>,
+        speeds: crate::streets::SpeedOverrides,
     ) -> PyResult<Vec<ReducedChoice>> {
         let best = self.reduce_street_choices(
             py,
@@ -1923,6 +1934,7 @@ impl TransportNetwork {
             &exclude_stops,
             false,
             transfer_mode.as_ref(),
+            &speeds,
         )?;
         Ok(best
             .into_iter()
@@ -1962,7 +1974,8 @@ impl TransportNetwork {
     /// link_edge, link_fraction, connector_meters, vehicle_network_m,
     /// vehicle_connector_m, walk_m, via_stop)`` per kept point, per-stop
     /// points sorted by seconds. Internal.
-    #[pyo3(signature = (latitude, longitude, egress, modes, exclude_stops = vec![], transfer_mode = None))]
+    #[pyo3(signature = (latitude, longitude, egress, modes, exclude_stops = vec![], transfer_mode = None,
+                        speeds = Vec::new()))]
     #[allow(clippy::type_complexity)]
     #[allow(clippy::too_many_arguments)]
     fn _pareto_street_rows(
@@ -1974,6 +1987,7 @@ impl TransportNetwork {
         modes: Vec<(String, f64, bool, Option<Vec<String>>, f64)>,
         exclude_stops: Vec<String>,
         transfer_mode: Option<(String, f64, f64)>,
+        speeds: crate::streets::SpeedOverrides,
     ) -> PyResult<Vec<ParetoRow>> {
         let stop_count = self.build.timetable.stop_count() as usize;
         let mut frontiers: Vec<Vec<ParetoChoice>> = vec![Vec::new(); stop_count];
@@ -1990,8 +2004,15 @@ impl TransportNetwork {
                 }
                 None => None,
             };
-            let Some((cells, links)) =
-                self.try_street_meters_row(py, latitude, longitude, mode, *max_seconds, egress)?
+            let Some((cells, links)) = self.try_street_meters_row(
+                py,
+                latitude,
+                longitude,
+                mode,
+                *max_seconds,
+                egress,
+                &speeds,
+            )?
             else {
                 continue;
             };
@@ -2157,7 +2178,8 @@ impl TransportNetwork {
     /// ``transfer_*`` fields instead), names its seed in ``via``, and keeps
     /// the seed's own leg in ``vehicle_seconds``. Seconds are identical to
     /// ``_reduced_street_offsets`` cell for cell. Internal.
-    #[pyo3(signature = (latitude, longitude, egress, modes, exclude_stops = vec![], transfer_mode = None))]
+    #[pyo3(signature = (latitude, longitude, egress, modes, exclude_stops = vec![], transfer_mode = None,
+                        speeds = Vec::new()))]
     #[allow(clippy::type_complexity)]
     #[allow(clippy::too_many_arguments)]
     fn _reduced_street_rows(
@@ -2169,6 +2191,7 @@ impl TransportNetwork {
         modes: Vec<(String, f64, bool, Option<Vec<String>>)>,
         exclude_stops: Vec<String>,
         transfer_mode: Option<(String, f64)>,
+        speeds: crate::streets::SpeedOverrides,
     ) -> PyResult<Vec<ReducedRow>> {
         let best = self.reduce_street_choices(
             py,
@@ -2179,6 +2202,7 @@ impl TransportNetwork {
             &exclude_stops,
             true,
             transfer_mode.as_ref(),
+            &speeds,
         )?;
         Ok(best
             .into_iter()
@@ -2272,7 +2296,7 @@ impl TransportNetwork {
                 "max_seconds must be a positive, finite transfer budget",
             ));
         }
-        let profile = self.multimodal_profile(mode)?;
+        let profile = self.multimodal_profile(mode, &[])?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
         let links = self.mode_link_targets(network, profile.definition.mode.bit());
         let stop_count = self.build.timetable.stop_count();
@@ -2384,7 +2408,7 @@ impl TransportNetwork {
                 "max_seconds must be a positive, finite transfer budget",
             ));
         }
-        let profile = self.multimodal_profile(mode)?;
+        let profile = self.multimodal_profile(mode, &[])?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
         let links = self.mode_link_targets(network, profile.definition.mode.bit());
         let stop_count = self.build.timetable.stop_count();
@@ -2508,7 +2532,7 @@ impl TransportNetwork {
         if !geometries {
             return Ok(Some((seconds, network_meters, connector_meters, None)));
         }
-        let profile = self.multimodal_profile(&held.mode)?;
+        let profile = self.multimodal_profile(&held.mode, &[])?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
         let links = self.mode_link_targets(network, profile.definition.mode.bit());
         let shape = match (links[from.0 as usize], links[to.0 as usize]) {
@@ -3070,7 +3094,11 @@ impl TransportNetwork {
     /// per the documented build contract, the modes select *component
     /// pruning only* — every physical edge is kept — so a mode outside the
     /// list routes correctly, just without its small-island pruning.
-    pub(super) fn multimodal_profile(&self, mode: &str) -> PyResult<CompiledStreetProfile> {
+    pub(super) fn multimodal_profile(
+        &self,
+        mode: &str,
+        speeds: &[(String, f64)],
+    ) -> PyResult<CompiledStreetProfile> {
         let network = self.multimodal.as_ref().ok_or_else(|| {
             PyValueError::new_err(
                 "no multimodal street graph is installed; build with street_modes=",
@@ -3085,7 +3113,7 @@ impl TransportNetwork {
                  or egress — park-and-ride rides street_policy=CarParkPolicy(...)",
             ));
         }
-        let definition = crate::streets::profile_definition(mode, &[])?;
+        let definition = crate::streets::profile_definition(mode, speeds)?;
         self.compiled_multimodal(network, definition)
     }
 
@@ -3182,6 +3210,7 @@ impl TransportNetwork {
     /// One mode's per-stop row over the multimodal graph — forward (access)
     /// or reverse (egress) — with the zero-coincident convention applied and
     /// the mode-masked links returned beside it.
+    #[allow(clippy::too_many_arguments)]
     fn street_row(
         &self,
         py: Python<'_>,
@@ -3190,8 +3219,9 @@ impl TransportNetwork {
         mode: &str,
         max_seconds: f64,
         egress: bool,
+        speeds: &[(String, f64)],
     ) -> PyResult<ModeRow> {
-        self.try_street_row(py, latitude, longitude, mode, max_seconds, egress)?
+        self.try_street_row(py, latitude, longitude, mode, max_seconds, egress, speeds)?
             .ok_or_else(|| {
                 PyValueError::new_err("coordinate too far from the multimodal street network")
             })
@@ -3238,6 +3268,7 @@ impl TransportNetwork {
         exclude_stops: &[String],
         with_meters: bool,
         transfer_mode: Option<&(String, f64)>,
+        speeds: &[(String, f64)],
     ) -> PyResult<Vec<Option<Winner>>> {
         let stop_count = self.build.timetable.stop_count() as usize;
         let mut best: Vec<Option<Winner>> = vec![None; stop_count];
@@ -3258,9 +3289,17 @@ impl TransportNetwork {
                 None => None,
             };
             let row = if with_meters {
-                self.try_street_meters_row(py, latitude, longitude, mode, *max_seconds, egress)?
+                self.try_street_meters_row(
+                    py,
+                    latitude,
+                    longitude,
+                    mode,
+                    *max_seconds,
+                    egress,
+                    speeds,
+                )?
             } else {
-                self.try_street_row(py, latitude, longitude, mode, *max_seconds, egress)?
+                self.try_street_row(py, latitude, longitude, mode, *max_seconds, egress, speeds)?
                     .map(|(row, links)| {
                         let cells = row
                             .into_iter()
@@ -3413,6 +3452,7 @@ impl TransportNetwork {
     /// zero-coincident convention (a stop at the query's own coordinate
     /// is zero away with zero meters) and `None` when the coordinate has
     /// no snap for this mode.
+    #[allow(clippy::too_many_arguments)]
     fn try_street_meters_row(
         &self,
         py: Python<'_>,
@@ -3421,8 +3461,9 @@ impl TransportNetwork {
         mode: &str,
         max_seconds: f64,
         egress: bool,
+        speeds: &[(String, f64)],
     ) -> PyResult<Option<MeterRow>> {
-        let profile = self.multimodal_profile(mode)?;
+        let profile = self.multimodal_profile(mode, speeds)?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
         let links = self.mode_link_targets(network, profile.definition.mode.bit());
         let Some(snap) =
@@ -3466,6 +3507,7 @@ impl TransportNetwork {
     /// [`street_row`](Self::street_row), answering `None` when the
     /// coordinate has no snap for this mode — a mixed policy skips such a
     /// mode instead of aborting.
+    #[allow(clippy::too_many_arguments)]
     fn try_street_row(
         &self,
         py: Python<'_>,
@@ -3474,8 +3516,9 @@ impl TransportNetwork {
         mode: &str,
         max_seconds: f64,
         egress: bool,
+        speeds: &[(String, f64)],
     ) -> PyResult<Option<ModeRow>> {
-        let profile = self.multimodal_profile(mode)?;
+        let profile = self.multimodal_profile(mode, speeds)?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
         let links = self.mode_link_targets(network, profile.definition.mode.bit());
         let Some(snap) =

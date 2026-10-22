@@ -356,7 +356,7 @@ impl TransportNetwork {
         cutoff_seconds: f64,
         max_snap_distance: f64,
     ) -> PyResult<FieldArrays<'py>> {
-        let profile = self.multimodal_profile(mode)?;
+        let profile = self.multimodal_profile(mode, &[])?;
         let network = self.multimodal.as_ref().ok_or_else(|| {
             PyValueError::new_err(
                 "no multimodal street graph is installed; build with street_modes=",

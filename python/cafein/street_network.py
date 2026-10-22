@@ -47,8 +47,13 @@ def profile_speeds(speeds, mode):
         modes = ("walk",)
     else:
         modes = (mode, "walk")
-    resolved = mode_mapping("speeds", speeds, modes, positive_finite)
-    return [(name, kmh / 3.6) for name, kmh in sorted(resolved.items())]
+    return core_speeds(mode_mapping("speeds", speeds, modes, positive_finite))
+
+
+def core_speeds(speeds):
+    """A validated ``{mode: km/h}`` mapping (or ``None``) as the routing
+    core's ``[(mode, m/s)]`` profile overrides."""
+    return [(name, kmh / 3.6) for name, kmh in sorted((speeds or {}).items())]
 
 
 def validate_build_modes(modes):

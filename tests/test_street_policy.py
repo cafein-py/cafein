@@ -257,6 +257,56 @@ def test_the_reduction_keeps_the_fastest_choice_per_stop(multimodal_network):
                 assert mode == "walk"
 
 
+def test_doubled_speeds_halve_the_reduced_street_legs(multimodal_network):
+    # A direct choice (not carried over an installed transfer) is one
+    # street leg; doubling its mode's riding and walking speeds halves it,
+    # up to the per-arc millisecond and whole-second rounding.
+    pytest.importorskip("cafein._cafein")
+    core = multimodal_network._core
+
+    def direct_offsets(budget, speeds):
+        rows = core._reduced_street_offsets(
+            *ORIGIN, False, [("bicycle", budget, False, None)], speeds=speeds
+        )
+        return {row[0]: row[1] for row in rows if row[-1] in (None, row[0])}
+
+    shipped = direct_offsets(1800.0, [])
+    doubled = direct_offsets(900.0, [("bicycle", 2 * 15.3 / 3.6), ("walk", 2.0)])
+    common = shipped.keys() & doubled.keys()
+    assert len(common) > 10
+    assert all(abs(2 * doubled[stop] - shipped[stop]) <= 2 for stop in common)
+
+
+def test_policy_speed_refusals(multimodal_network):
+    pytest.importorskip("cafein._cafein")
+    from cafein import TravelTimeMatrix
+
+    points = _points_frame(MATRIX_POINTS[:2])
+    transfers = StreetLegPolicy(
+        access={"walk": 900, "e_scooter": 900},
+        egress={"walk": 900},
+        transfers={"e_scooter": 600},
+        vehicles={"e_scooter": shared()},
+    )
+    for policy, speeds, match in [
+        # A mode the policy grants no access or egress.
+        (_bike_walk_policy(), {"e_bike": 20.0}, "names 'e_bike'"),
+        # Transfers ride a set precomputed at the shipped speeds.
+        (transfers, {"e_scooter": 20.0}, "precomputed transfer set"),
+        (transfers, {"walk": 5.0}, "precomputed transfer set"),
+        (_bike_walk_policy(), {"bicycle": 0}, "positive, finite"),
+    ]:
+        with pytest.raises(ValueError, match=match):
+            TravelTimeMatrix(
+                multimodal_network,
+                points,
+                points,
+                "2022-02-22 08:30:00",
+                street_policy=policy,
+                speeds=speeds,
+            )
+
+
 def test_eligibility_masks_gate_the_vehicle_modes(multimodal_network):
     pytest.importorskip("cafein._cafein")
     core = multimodal_network._core
@@ -504,11 +554,13 @@ def _points_frame(coordinates):
 MATRIX_POINTS = [(60.1690, 24.9320), (60.1795, 24.9520), (60.1580, 24.9350)]
 
 
-def test_policy_matrix_cells_reconcile_with_single_queries(multimodal_network):
+@pytest.mark.parametrize("speeds", [None, {"bicycle": 22.0, "walk": 5.0}])
+def test_policy_matrix_cells_reconcile_with_single_queries(multimodal_network, speeds):
     pytest.importorskip("cafein._cafein")
     from cafein import TravelTimeMatrix
     from cafein import streets as _streets
     from cafein.policy import reduction_modes
+    from cafein.street_network import core_speeds
 
     policy = StreetLegPolicy(
         access={"walk": 1200, "bicycle": 900},
@@ -523,6 +575,7 @@ def test_policy_matrix_cells_reconcile_with_single_queries(multimodal_network):
         _points_frame(MATRIX_POINTS),
         "2022-02-22 08:30:00",
         street_policy=policy,
+        speeds=speeds,
         output_time_units="seconds",
     )
     core = multimodal_network._core
@@ -530,13 +583,13 @@ def test_policy_matrix_cells_reconcile_with_single_queries(multimodal_network):
     cells = {(row.from_id, row.to_id): row.travel_time for row in frame.itertuples()}
     for i, origin in enumerate(MATRIX_POINTS):
         arrivals = multimodal_network.travel_times_from_coordinate(
-            origin, "2022-02-22 08:30:00", street_policy=policy
+            origin, "2022-02-22 08:30:00", street_policy=policy, speeds=speeds
         )
         for j, destination in enumerate(MATRIX_POINTS):
             egress = {
                 stop: seconds
                 for stop, seconds, *_ in core._reduced_street_offsets(
-                    *destination, True, egress_modes
+                    *destination, True, egress_modes, speeds=core_speeds(speeds)
                 )
             }
             best = min(
@@ -548,7 +601,7 @@ def test_policy_matrix_cells_reconcile_with_single_queries(multimodal_network):
                 default=None,
             )
             direct = core._multimodal_direct_matrix(
-                [origin], [destination], "walk", 1200.0
+                [origin], [destination], "walk", 1200.0, speeds=core_speeds(speeds)
             )[0][0][0]
             if direct is not None:
                 best = direct if best is None else min(best, direct)
@@ -956,7 +1009,8 @@ def test_policy_journeys_honour_exclusions(multimodal_network):
                 assert leg.get(key) != boarded
 
 
-def test_policy_itineraries_reconcile_with_the_time_matrix(multimodal_network):
+@pytest.mark.parametrize("speeds", [None, {"bicycle": 22.0, "walk": 5.0}])
+def test_policy_itineraries_reconcile_with_the_time_matrix(multimodal_network, speeds):
     pytest.importorskip("cafein._cafein")
     from cafein import DetailedItineraries, TravelTimeMatrix
 
@@ -967,6 +1021,7 @@ def test_policy_itineraries_reconcile_with_the_time_matrix(multimodal_network):
         _points_frame([DEST]),
         "2022-02-22 08:30:00",
         street_policy=policy,
+        speeds=speeds,
         geometries=False,
     )
     per_option = itineraries.groupby("option").agg(
@@ -979,6 +1034,7 @@ def test_policy_itineraries_reconcile_with_the_time_matrix(multimodal_network):
         _points_frame([DEST]),
         "2022-02-22 08:30:00",
         street_policy=policy,
+        speeds=speeds,
         output_time_units="seconds",
     )
     assert int(matrix["travel_time"].iloc[0]) == fastest
@@ -1099,6 +1155,8 @@ def test_policy_cost_matrix_reconciles_with_the_itineraries(multimodal_network):
     from cafein import DetailedItineraries, TravelCostMatrix
 
     policy = _bike_walk_policy()
+    # Overridden speeds, so both paths pin the same street profiles.
+    speeds = {"bicycle": 22.0, "walk": 5.0}
     factors = _street_factor_rows()
     origins = _points_frame([ORIGIN, MATRIX_POINTS[1]])
     destinations = _points_frame([DEST, MATRIX_POINTS[2]])
@@ -1108,6 +1166,7 @@ def test_policy_cost_matrix_reconciles_with_the_itineraries(multimodal_network):
         destinations,
         "2022-02-22 08:30:00",
         street_policy=policy,
+        speeds=speeds,
         factors=factors,
         output_time_units="seconds",
     )
@@ -1129,6 +1188,7 @@ def test_policy_cost_matrix_reconciles_with_the_itineraries(multimodal_network):
             destinations[destinations["id"] == to_id],
             "2022-02-22 08:30:00",
             street_policy=policy,
+            speeds=speeds,
             factors=factors,
             geometries=False,
         )
