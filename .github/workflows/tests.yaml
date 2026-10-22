@@ -44,17 +44,17 @@ jobs:
         # ubuntu-latest (26.04) ends the test jobs with a runner shutdown
         # mid-suite; the jobs run on 24.04.
         os: [ubuntu-24.04, macos-latest, windows-latest]
-        python: ["310", "311", "312", "313", "314"]
+        python: ["311", "312", "313", "314", "315"]
         # macOS runners are few and queue behind a low concurrency cap,
         # so they cover only the boundary Pythons; ubuntu and windows
         # keep the full version axis.
         exclude:
           - os: macos-latest
-            python: "311"
-          - os: macos-latest
             python: "312"
           - os: macos-latest
             python: "313"
+          - os: macos-latest
+            python: "314"
     steps:
       - uses: actions/checkout@v4
       - uses: mamba-org/setup-micromamba@v2
@@ -96,9 +96,6 @@ jobs:
       - name: Run Rust tests
         shell: bash -el {0}
         run: cargo test --workspace
-      # Dependencies install separately with default build isolation:
-      # pyrosm's cykhash ships no wheels and needs Cython to build, which
-      # --no-build-isolation would hide.
       - name: Install Python dependencies
         shell: bash -el {0}
         run: pip install geopandas numpy pandas pyrosm scipy shapely

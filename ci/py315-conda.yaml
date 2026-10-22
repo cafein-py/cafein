@@ -1,0 +1,22 @@
+name: test
+channels:
+  - conda-forge
+dependencies:
+  - python=3.15
+  # Pin the GIL build: pyarrow pulls in the free-threaded variant on some
+  # platforms, and pyo3's abi3 build cannot target it.
+  - python_abi=3.15=*_cp315
+  - pip
+  - rust
+  - maturin
+  - pytest
+  - pytest-cov
+  - pytest-xdist
+  - pyarrow
+  - rioxarray
+  - pyyaml
+  # h3 has no 3.15 build on conda-forge nor a 3.15 wheel on PyPI: pip
+  # builds it from source, which needs cmake.
+  - cmake
+  - pip:
+      - h3
