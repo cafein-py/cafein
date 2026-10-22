@@ -111,17 +111,18 @@ jobs:
         # worker's Rust compute is capped to two rayon threads: uncapped,
         # every worker spawns a pool as wide as the machine, and the heavy
         # multicriteria tests contend N-fold for the same cores. Linux
-        # runners cap at three workers: with four, the workers' session
-        # network fixtures together exceed the 7 GB runner near the end
-        # of the suite and the OOM reaper stops the runner service —
-        # the job dies with "runner received a shutdown signal", not a
-        # test failure.
-        env:
-          RAYON_NUM_THREADS: 2
+        # runners (16 GB, 3 GB swap) run two workers: each grows to 4–6 GB
+        # over the suite, three exhaust memory and swap, and the OOM reaper
+        # then stops the runner service — the job dies with "runner
+        # received a shutdown signal", not a test failure. Temporary files
+        # go to the runner's disk: newer Ubuntu images mount /tmp as tmpfs,
+        # where the tests' artifacts would take memory too.
         # Coverage is informational (term-missing, no upload), so one
         # cell collects it; the rest skip the instrumentation overhead.
-        run: >-
-          pytest -n ${{ runner.os == 'Linux' && '3' || 'auto' }}
-          --dist load --durations=20
-          ${{ matrix.os == 'ubuntu-24.04' && matrix.python == '312'
-              && '--cov=cafein --cov-report=term-missing' || '' }}
+        env:
+          RAYON_NUM_THREADS: 2
+          WORKERS: ${{ runner.os == 'Linux' && '2' || 'auto' }}
+          COVERAGE: ${{ matrix.os == 'ubuntu-24.04' && matrix.python == '312' && '--cov=cafein --cov-report=term-missing' || '' }}
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then export TMPDIR="$RUNNER_TEMP"; fi
+          pytest -n "$WORKERS" --dist load --durations=20 $COVERAGE

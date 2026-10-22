@@ -71,6 +71,9 @@ include = '(python/cafein|tests)/.*\.py$'
 testpaths = ["tests"]
 # Surface the slowest tests on every run.
 addopts = "--durations=25"
+# A passing test's tmp_path is removed when it ends: many tests save a full
+# network artifact (~260 MB), and keeping them all left ~15 GB per run.
+tmp_path_retention_policy = "failed"
 markers = [
     "metro_scale: metro-scale runs over cafein.sampledata.helsinki (skipped without the package)",
 ]
