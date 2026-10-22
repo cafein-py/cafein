@@ -19,6 +19,10 @@ def test_the_profile_validates_its_inputs():
         TravelerProfile(unknown="optimistic")
     with pytest.raises(ValueError, match="speeds"):
         TravelerProfile(speeds={"walk": 0})
+    with pytest.raises(ValueError, match="names 'car'"):
+        TravelerProfile(speeds={"car": 50.0})
+    with pytest.raises(TypeError, match="speeds must be a mapping"):
+        TravelerProfile(speeds=5.0)
     with pytest.raises(ValueError, match="max_walking_time"):
         TravelerProfile(max_walking_time=-5)
     with pytest.raises(TypeError, match="exclude_stops"):
@@ -334,7 +338,7 @@ def test_the_wheelchair_traveler_bridges_to_the_street_policy(multimodal_network
             traveler=profile,
             street_policy=StreetLegPolicy(access={"walk": 900}, egress={"walk": 900}),
         )
-    with pytest.raises(ValueError, match="fixed speed"):
+    with pytest.raises(ValueError, match="wheelchair street profile"):
         multimodal_network.route_between_coordinates(
             origin,
             destination,
@@ -342,6 +346,61 @@ def test_the_wheelchair_traveler_bridges_to_the_street_policy(multimodal_network
             traveler=profile,
             speeds={"walk": 5.0},
         )
+    # The profile's wheelchair speed rides the bridged street legs exactly
+    # as the explicit policy rides it from the call.
+    brisk = TravelerProfile(wheelchair=True, speeds={"wheelchair": 7.2})
+    brisk_routes = multimodal_network.route_between_coordinates(
+        origin, destination, "2022-02-22 08:30:00", traveler=brisk
+    )
+    assert brisk_routes != bridged
+    assert brisk_routes == multimodal_network.route_between_coordinates(
+        origin,
+        destination,
+        "2022-02-22 08:30:00",
+        exclude_stops=stops,
+        exclude_trips=trips,
+        street_policy=StreetLegPolicy(
+            access={"wheelchair": MAX_ACCESS_EGRESS_TIME},
+            egress={"wheelchair": MAX_ACCESS_EGRESS_TIME},
+        ),
+        speeds={"wheelchair": 7.2},
+    )
+
+
+def test_profile_speeds_ride_a_street_policy(multimodal_network):
+    from cafein import StreetLegPolicy, TravelTimeMatrix, VehiclePolicy
+
+    policy = StreetLegPolicy(
+        access={"walk": 900, "bicycle": 900},
+        egress={"walk": 900},
+        vehicles={
+            "bicycle": VehiclePolicy(source="own", side="origin", facilities="any_stop")
+        },
+    )
+    points = gpd.GeoDataFrame(
+        {"id": ["a", "b"]},
+        geometry=gpd.points_from_xy([24.9350, 24.9610], [60.1580, 60.1870]),
+        crs="EPSG:4326",
+    )
+
+    def matrix(**options):
+        return pd.DataFrame(
+            TravelTimeMatrix(
+                multimodal_network,
+                points,
+                departure="2022-02-22 08:30:00",
+                street_policy=policy,
+                output_time_units="seconds",
+                **options,
+            )
+        )
+
+    fast = {"bicycle": 22.0, "walk": 5.0}
+    # A profile speed the policy never rides (the scooter) is ignored.
+    profile = TravelerProfile(speeds={**fast, "e_scooter": 20.0})
+    pd.testing.assert_frame_equal(matrix(traveler=profile), matrix(speeds=fast))
+    with pytest.raises(ValueError, match="set on both"):
+        matrix(traveler=profile, speeds={"bicycle": 18.0})
 
 
 def test_the_bridge_serves_the_point_computers(multimodal_network):
@@ -495,7 +554,21 @@ def test_policy_less_point_surfaces_refuse_the_wheelchair_traveler(
         budgets=(15.0,),
     )
     assert wheeled.iloc[0].geometry.within(walked.iloc[0].geometry.buffer(1e-6))
-    with pytest.raises(ValueError, match="fixed speed"):
+    # The profile's wheelchair speed widens the wheelchair spread.
+    brisk = (
+        Catchment(
+            multimodal_network,
+            ["1020453"],
+            "2022-02-22 08:30:00",
+            budgets=(15.0,),
+            traveler=TravelerProfile(wheelchair=True, speeds={"wheelchair": 7.2}),
+        )
+        .iloc[0]
+        .geometry
+    )
+    assert wheeled.iloc[0].geometry.within(brisk.buffer(1e-6))
+    assert brisk.area > wheeled.iloc[0].geometry.area
+    with pytest.raises(ValueError, match="wheelchair street profile"):
         Catchment(
             multimodal_network,
             ["1020453"],

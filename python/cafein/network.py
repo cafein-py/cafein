@@ -2773,7 +2773,6 @@ class TransportNetwork:
             the egress walk.
         """
         walking_speed_kmph = _transit_walking_speed(self, speeds, street_policy)
-        riding = policy_speeds(street_policy, speeds)
         (
             exclude_routes,
             exclude_trips,
@@ -2792,6 +2791,10 @@ class TransportNetwork:
         street_policy, max_walking_time = folded_street_policy(
             traveler, self, street_policy, walking_speed_kmph, max_walking_time
         )
+        riding = policy_speeds(street_policy, speeds, traveler)
+        if riding is not None:
+            # The traveler's walking speed rides in the policy's speeds.
+            walking_speed_kmph = None
         from cafein._units import duration_seconds, time_axis, window_axis
 
         date, departure, arrive_by = time_axis(departure, arrival)
@@ -3156,7 +3159,6 @@ class TransportNetwork:
             stop_id; unreachable stops are absent.
         """
         walking_speed_kmph = _transit_walking_speed(self, speeds, street_policy)
-        riding = policy_speeds(street_policy, speeds)
         (
             exclude_routes,
             exclude_trips,
@@ -3175,6 +3177,10 @@ class TransportNetwork:
         street_policy, max_walking_time = folded_street_policy(
             traveler, self, street_policy, walking_speed_kmph, max_walking_time
         )
+        riding = policy_speeds(street_policy, speeds, traveler)
+        if riding is not None:
+            # The traveler's walking speed rides in the policy's speeds.
+            walking_speed_kmph = None
         from cafein._units import duration_seconds, time_axis
 
         date, departure, arrive_by = time_axis(departure, arrival)

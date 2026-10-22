@@ -982,7 +982,6 @@ class TravelCostMatrix(pd.DataFrame):
         max_memory=None,
     ):
         walking_speed_kmph = _transit_walking_speed(network, speeds, street_policy)
-        riding = policy_speeds(street_policy, speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -1006,6 +1005,10 @@ class TravelCostMatrix(pd.DataFrame):
             street_policy, max_walking_time = folded_street_policy(
                 traveler, network, street_policy, walking_speed_kmph, max_walking_time
             )
+        riding = policy_speeds(street_policy, speeds, traveler)
+        if riding is not None:
+            # The traveler's walking speed rides in the policy's speeds.
+            walking_speed_kmph = None
         origins, _origin_dtype = freeze_ids(origins)
         destinations, _destination_dtype = freeze_ids(destinations)
         if destinations is None and _is_point_frame(origins):
@@ -1845,7 +1848,6 @@ class TravelTimeMatrix(pd.DataFrame):
         max_memory=None,
     ):
         walking_speed_kmph = _transit_walking_speed(network, speeds, street_policy)
-        riding = policy_speeds(street_policy, speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -1869,6 +1871,10 @@ class TravelTimeMatrix(pd.DataFrame):
             street_policy, max_walking_time = folded_street_policy(
                 traveler, network, street_policy, walking_speed_kmph, max_walking_time
             )
+        riding = policy_speeds(street_policy, speeds, traveler)
+        if riding is not None:
+            # The traveler's walking speed rides in the policy's speeds.
+            walking_speed_kmph = None
         origins, _origin_dtype = freeze_ids(origins)
         destinations, _destination_dtype = freeze_ids(destinations)
         if destinations is None and _is_point_frame(origins):

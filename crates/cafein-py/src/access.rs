@@ -347,6 +347,9 @@ impl TransportNetwork {
     /// profile, seeded at the origin (profile-aware snap) and at each
     /// stop's mode link with its transit arrival cost. The wheelchair
     /// arm of `_catchment_walk_field`. Internal.
+    #[pyo3(signature = (origin, stop_costs, mode, cutoff_seconds, max_snap_distance,
+                        speeds = Vec::new()))]
+    #[allow(clippy::too_many_arguments)]
     fn _catchment_directed_field<'py>(
         &self,
         py: Python<'py>,
@@ -355,8 +358,9 @@ impl TransportNetwork {
         mode: &str,
         cutoff_seconds: f64,
         max_snap_distance: f64,
+        speeds: crate::streets::SpeedOverrides,
     ) -> PyResult<FieldArrays<'py>> {
-        let profile = self.multimodal_profile(mode, &[])?;
+        let profile = self.multimodal_profile(mode, &speeds)?;
         let network = self.multimodal.as_ref().ok_or_else(|| {
             PyValueError::new_err(
                 "no multimodal street graph is installed; build with street_modes=",

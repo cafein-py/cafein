@@ -36,6 +36,7 @@ from cafein.matrices import (
     _stream_batch,
     _transit_walking_speed,
 )
+from cafein.street_network import core_speeds
 from cafein.travelers import folded_constraints, refuse_wheelchair_streets
 
 #: The parameter each decay family takes (None: no parameter).
@@ -3054,10 +3055,11 @@ class Catchment(gpd.GeoDataFrame):
     its deadline-profile optimum toward the origin, so the region is
     everything that can reach the place within the cost budget by
     some profiled deadline. The wheelchair traveler's directed street
-    bridge does not combine with ``arrival=`` yet. A wheelchair traveler's catchment rides the
-    fixed compiled profile at the multimodal snap radius —
-    a walking speed and ``snap_distance`` are rejected beside
-    it, while ``max_walking_time`` stays configurable. Requires the
+    bridge does not combine with ``arrival=`` yet. A wheelchair
+    traveler's catchment rides the compiled wheelchair profile, at the
+    profile's ``speeds["wheelchair"]`` when it sets one, at the
+    multimodal snap radius — a walking speed and ``snap_distance`` are
+    rejected beside it, while ``max_walking_time`` stays configurable. Requires the
     optional ``h3`` extra (``cafein[h3]``).
     """
 
@@ -3128,6 +3130,12 @@ class Catchment(gpd.GeoDataFrame):
             and traveler.wheelchair
             and hasattr(network, "route_between_stops")
         )
+        # The wheelchair streets ride the traveler's wheelchair speed.
+        wheel_speeds = core_speeds(
+            {"wheelchair": traveler.speeds["wheelchair"]}
+            if wheeled and "wheelchair" in traveler.speeds
+            else None
+        )
         if wheeled:
             # The residual spread rides the compiled wheelchair profile
             # over the multimodal graph instead of the walking field.
@@ -3141,7 +3149,7 @@ class Catchment(gpd.GeoDataFrame):
             if walking_speed_kmph is not None:
                 raise ValueError(
                     "speeds['walk'] cannot reshape the wheelchair "
-                    "street profile, which rides its fixed speed"
+                    "street profile, which rides speeds['wheelchair']"
                 )
             if snap_distance is not None:
                 # The synthesized policy's transit seeds snap at the
@@ -3512,6 +3520,7 @@ class Catchment(gpd.GeoDataFrame):
                 arrive_by=arrive_by,
                 workers=workers,
                 max_memory=max_memory,
+                wheel_speeds=wheel_speeds,
             )
             speed_ms = speed_kmph / 3.6
             for identifier, point, stop_costs in zip(from_ids, points, surfaces):
@@ -3524,7 +3533,12 @@ class Catchment(gpd.GeoDataFrame):
                     ]
                     if wheeled:
                         lats, lons, costs = network._core._catchment_directed_field(
-                            point, seeds, "wheelchair", horizon, snap
+                            point,
+                            seeds,
+                            "wheelchair",
+                            horizon,
+                            snap,
+                            speeds=wheel_speeds,
                         )
                     else:
                         lats, lons, costs = network._core._catchment_walk_field(
@@ -3553,7 +3567,12 @@ class Catchment(gpd.GeoDataFrame):
                         if wheeled:
                             lats, lons, _costs = (
                                 network._core._catchment_directed_field(
-                                    point, seeds, "wheelchair", walk_cutoff, snap
+                                    point,
+                                    seeds,
+                                    "wheelchair",
+                                    walk_cutoff,
+                                    snap,
+                                    speeds=wheel_speeds,
                                 )
                             )
                         else:
@@ -3643,6 +3662,7 @@ def _catchment_stop_costs(
     arrive_by=False,
     workers=None,
     max_memory=None,
+    wheel_speeds=(),
 ):
     """Per origin, the ``(global stop index, cost)`` pairs of every
     reached stop on the chosen axis — the walking field's seeds. With
@@ -3786,7 +3806,11 @@ def _catchment_stop_costs(
                 access = [
                     (stop, seconds)
                     for stop, seconds, *_ in network._core._reduced_street_offsets(
-                        *point, False, modes, transfer_mode=transfer_arg
+                        *point,
+                        False,
+                        modes,
+                        transfer_mode=transfer_arg,
+                        speeds=list(wheel_speeds),
                     )
                 ]
                 arrivals = network._core._travel_times_with_access(
@@ -3798,6 +3822,7 @@ def _catchment_stop_costs(
                     exclude_routes=list(exclude_routes),
                     exclude_trips=list(exclude_trips),
                     exclude_stops=list(exclude_stops),
+                    speeds=list(wheel_speeds),
                     workers=_memory.width_or(workers),
                 )
             else:

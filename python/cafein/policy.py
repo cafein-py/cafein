@@ -328,12 +328,14 @@ def reduction_modes(policy, side, walking_budget):
     return modes
 
 
-def policy_speeds(policy, speeds):
+def policy_speeds(policy, speeds, traveler=None):
     """The ``speeds=`` a ``StreetLegPolicy`` query rides, as a validated
     ``{mode: km/h}`` mapping (``None`` for any other `policy`): keys are
     ``"walk"`` and the modes the policy's access, egress and transfers
-    grant. A transfer set serves only the speeds it was computed at for
-    its mode; the routing core refuses it at any other."""
+    grant, the `traveler` profile's speeds for those modes joining the
+    call's (a mode set on both is a conflict). A transfer set serves only
+    the speeds it was computed at for its mode; the routing core refuses
+    it at any other."""
     from cafein._validate import mode_mapping, positive_finite
 
     if not isinstance(policy, StreetLegPolicy):
@@ -344,7 +346,17 @@ def policy_speeds(policy, speeds):
         for mode in budgets or {}
     }
     modes = ("walk", *sorted(granted - {"walk"}))
-    return mode_mapping("speeds", speeds, modes, positive_finite)
+    resolved = mode_mapping("speeds", speeds, modes, positive_finite)
+    for mode, kmh in (traveler.speeds if traveler is not None else {}).items():
+        if mode not in modes:
+            continue
+        if mode in resolved:
+            raise ValueError(
+                f"speeds[{mode!r}] is set on both the call and the traveler "
+                "profile; set it in one place"
+            )
+        resolved[mode] = kmh
+    return resolved
 
 
 def carriage_terms(policy):

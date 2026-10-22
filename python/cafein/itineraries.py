@@ -518,7 +518,6 @@ class DetailedItineraries(gpd.GeoDataFrame):
         # A sweep's searches all read one copy.
         speeds = frozen_speeds(speeds)
         walking_speed_kmph = _transit_walking_speed(network, speeds, street_policy)
-        riding = policy_speeds(street_policy, speeds)
         origins, _origin_dtype = freeze_ids(origins)
         destinations, _destination_dtype = freeze_ids(destinations)
         if destinations is None and hasattr(origins, "geometry"):
@@ -548,6 +547,10 @@ class DetailedItineraries(gpd.GeoDataFrame):
             street_policy, max_walking_time = folded_street_policy(
                 traveler, network, street_policy, walking_speed_kmph, max_walking_time
             )
+        riding = policy_speeds(street_policy, speeds, traveler)
+        if riding is not None:
+            # The traveler's walking speed rides in the policy's speeds.
+            walking_speed_kmph = None
         from cafein._units import (
             departure_parts,
             duration_seconds,
