@@ -1,8 +1,9 @@
 name: sampledata
 
-# The user-facing path, on a schedule: install the published cafein and
-# cafein.sampledata from PyPI, download the pinned Helsinki data release,
-# and run the metro-scale tests against them.
+# The user-facing path, on a schedule: install the published cafein (with
+# the h3 extra the catchment test needs) and cafein.sampledata from PyPI,
+# download the pinned Helsinki data release, and run the metro-scale tests
+# against them.
 
 on:
   schedule:
@@ -35,7 +36,7 @@ jobs:
             pip
       - name: Install the published packages
         shell: bash -el {0}
-        run: python -m pip install cafein cafein.sampledata
+        run: python -m pip install "cafein[h3]" cafein.sampledata
       - name: Fetch the pinned sample test data
         shell: bash -el {0}
         run: python scripts/fetch_test_data.py
