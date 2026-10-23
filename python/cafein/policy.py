@@ -283,23 +283,23 @@ class StreetLegPolicy:
 
 
 def _validated_budgets(name, budgets):
-    budgets = dict(budgets or {})
-    for mode, seconds in budgets.items():
-        if mode not in STREET_POLICY_MODES:
-            raise ValueError(
-                f"{name} names an unknown street mode {mode!r}; expected one "
-                f"of {', '.join(STREET_POLICY_MODES)}"
-            )
-        try:
-            seconds = float(seconds)
-        except OverflowError:
-            # An integer beyond float range is a number that cannot be
-            # finite; refuse it as such.
-            seconds = math.inf
-        if not (math.isfinite(seconds) and seconds > 0.0):
-            raise ValueError(f"{name}[{mode!r}] must be a positive, finite time budget")
-        budgets[mode] = seconds
-    return budgets
+    """`budgets` as a ``{mode: seconds}`` dict over the policy modes."""
+    from cafein._validate import mode_mapping
+
+    return mode_mapping(name, budgets, STREET_POLICY_MODES, _positive_budget)
+
+
+def _positive_budget(name, value):
+    """`value` as a positive, finite time budget in seconds."""
+    try:
+        seconds = float(value)
+    except OverflowError:
+        # An integer beyond float range is a number that cannot be
+        # finite; refuse it as such.
+        seconds = math.inf
+    if not (math.isfinite(seconds) and seconds > 0.0):
+        raise ValueError(f"{name} must be a positive, finite time budget")
+    return seconds
 
 
 def reduction_modes(policy, side, walking_budget):
@@ -326,6 +326,37 @@ def reduction_modes(policy, side, walking_budget):
         eligible = None if terms.facilities == "any_stop" else list(terms.facilities)
         modes.append((mode, seconds, terms.source == "shared", eligible))
     return modes
+
+
+def policy_speeds(policy, speeds, traveler=None):
+    """The ``speeds=`` a ``StreetLegPolicy`` query rides, as a validated
+    ``{mode: km/h}`` mapping (``None`` for any other `policy`): keys are
+    ``"walk"`` and the modes the policy's access, egress and transfers
+    grant, the `traveler` profile's speeds for those modes joining the
+    call's (a mode set on both is a conflict). A transfer set serves only
+    the speeds it was computed at for its mode; the routing core refuses
+    it at any other."""
+    from cafein._validate import mode_mapping, positive_finite
+
+    if not isinstance(policy, StreetLegPolicy):
+        return None
+    granted = {
+        mode
+        for budgets in (policy.access, policy.egress, policy.transfers)
+        for mode in budgets or {}
+    }
+    modes = ("walk", *sorted(granted - {"walk"}))
+    resolved = mode_mapping("speeds", speeds, modes, positive_finite)
+    for mode, kmh in (traveler.speeds if traveler is not None else {}).items():
+        if mode not in modes:
+            continue
+        if mode in resolved:
+            raise ValueError(
+                f"speeds[{mode!r}] is set on both the call and the traveler "
+                "profile; set it in one place"
+            )
+        resolved[mode] = kmh
+    return resolved
 
 
 def carriage_terms(policy):

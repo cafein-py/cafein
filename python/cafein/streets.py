@@ -112,11 +112,22 @@ def _uint32_array(values, name):
     return np.ascontiguousarray(array, dtype=np.uint32)
 
 
+def walking_speed(speeds, default=None):
+    """The walking speed in km/h a ``speeds=`` mapping sets, `default`
+    when it sets none. Only ``"walk"`` may be set, to a positive,
+    finite speed."""
+    from cafein._validate import mode_mapping, positive_finite
+
+    return mode_mapping("speeds", speeds, ("walk",), positive_finite).get(
+        "walk", default
+    )
+
+
 def walking_footpaths(
     osm_pbf,
     stops,
     *,
-    walking_speed_kmph=WALKING_SPEED_KMPH,
+    speeds=None,
     max_walking_time=None,
     snap_distance=MAX_SNAP_DISTANCE,
     bounding_box=None,
@@ -132,8 +143,9 @@ def walking_footpaths(
         ``TransportNetwork.stops``. Stops without coordinates or farther
         than `snap_distance` from the walking network get no
         footpaths.
-    walking_speed_kmph : float (optional, default: 3.6)
-        Walking speed in km/h, on the network and on the stop connectors.
+    speeds : mapping (optional)
+        ``{"walk": km/h}``: the walking speed on the network and on the
+        stop connectors (default: 3.6 km/h).
     max_walking_time : float or datetime.timedelta (optional, default: 20 minutes)
         Walking-time cutoff of the footpath search, in minutes: no
         stop-to-stop transfer exceeds it.
@@ -158,39 +170,17 @@ def walking_footpaths(
         meters)`` tuples.
     """
     _log.sync()
-    from cafein._units import duration_seconds
-    from cafein._validate import (
-        non_negative_finite,
-        positive_finite,
-        validated_bounding_box,
+    nodes, edges, options = _walking_build(
+        osm_pbf, speeds, max_walking_time, snap_distance, bounding_box
     )
-
-    # The whole parameter set validates before the extract is read: a
-    # bad knob fails in milliseconds, never after the PBF parse.
-    walking_speed_kmph = positive_finite("walking_speed_kmph", walking_speed_kmph)
-    max_walking_time = (
-        MAX_WALKING_TIME
-        if max_walking_time is None
-        else duration_seconds("max_walking_time", max_walking_time)
-    )
-    max_snap_distance = non_negative_finite("snap_distance", snap_distance)
-    bounding_box = validated_bounding_box(bounding_box)
-    nodes, edges = _walking_network(osm_pbf, bounding_box)
-    return _network_footpaths(
-        stops,
-        nodes,
-        edges,
-        walking_speed_kmph=walking_speed_kmph,
-        max_walking_time=max_walking_time,
-        max_snap_distance=max_snap_distance,
-    )
+    return _network_footpaths(stops, nodes, edges, **options)
 
 
 def walking_streets(
     osm_pbf,
     stops,
     *,
-    walking_speed_kmph=WALKING_SPEED_KMPH,
+    speeds=None,
     max_walking_time=None,
     snap_distance=MAX_SNAP_DISTANCE,
     bounding_box=None,
@@ -212,32 +202,31 @@ def walking_streets(
         records.
     """
     _log.sync()
-    from cafein._units import duration_seconds
-    from cafein._validate import (
-        non_negative_finite,
-        positive_finite,
-        validated_bounding_box,
+    nodes, edges, options = _walking_build(
+        osm_pbf, speeds, max_walking_time, snap_distance, bounding_box
     )
+    return _network_streets(stops, nodes, edges, **options)
 
-    # The whole parameter set validates before the extract is read: a
-    # bad knob fails in milliseconds, never after the PBF parse.
-    walking_speed_kmph = positive_finite("walking_speed_kmph", walking_speed_kmph)
-    max_walking_time = (
-        MAX_WALKING_TIME
-        if max_walking_time is None
-        else duration_seconds("max_walking_time", max_walking_time)
-    )
-    max_snap_distance = non_negative_finite("snap_distance", snap_distance)
-    bounding_box = validated_bounding_box(bounding_box)
-    nodes, edges = _walking_network(osm_pbf, bounding_box)
-    return _network_streets(
-        stops,
-        nodes,
-        edges,
-        walking_speed_kmph=walking_speed_kmph,
-        max_walking_time=max_walking_time,
-        max_snap_distance=max_snap_distance,
-    )
+
+def _walking_build(osm_pbf, speeds, max_walking_time, snap_distance, bounding_box):
+    """The walking network of `osm_pbf` and the validated keyword options
+    of the ``_network_*`` builders, as ``(nodes, edges, options)``. Every
+    option is checked before the extract is read: a bad knob fails in
+    milliseconds, never after the PBF parse."""
+    from cafein._units import duration_seconds
+    from cafein._validate import non_negative_finite, validated_bounding_box
+
+    options = {
+        "walking_speed_kmph": walking_speed(speeds, WALKING_SPEED_KMPH),
+        "max_walking_time": (
+            MAX_WALKING_TIME
+            if max_walking_time is None
+            else duration_seconds("max_walking_time", max_walking_time)
+        ),
+        "max_snap_distance": non_negative_finite("snap_distance", snap_distance),
+    }
+    nodes, edges = _walking_network(osm_pbf, validated_bounding_box(bounding_box))
+    return nodes, edges, options
 
 
 _UNWALKABLE_FILTER = {

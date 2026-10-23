@@ -11,10 +11,12 @@ from cafein._validate import (
 import geopandas as gpd
 
 from cafein import _log, _sweep
+from cafein._snapshot import NetworkSnapshot
 import numpy as np
 import pandas as pd
 import shapely
 
+from cafein.policy import policy_speeds
 from cafein.travelers import folded_constraints, folded_street_policy
 from cafein.matrices import (
     _factor_tables,
@@ -22,6 +24,7 @@ from cafein.matrices import (
     _is_street_network,
     _point_list,
     _street_query,
+    _transit_walking_speed,
     _warn_unsnapped,
 )
 
@@ -303,13 +306,17 @@ class DetailedItineraries(gpd.GeoDataFrame):
     geometries : bool (optional, default: True)
         Attach each leg's geometry. Turn off to skip the geometry work
         when only the leg records are needed.
-    walking_speed_kmph, max_walking_time, snap_distance : float
+    speeds, max_walking_time, snap_distance : optional
         The street-search options for point origins/destinations, as in
-        ``TransportNetwork.route_between_coordinates``: speed in km/h,
-        walking time in minutes (or a timedelta), snap distance in
-        meters; only valid with points. Only ``snap_distance`` applies
-        to a ``StreetNetwork``, whose speeds come from the mode's
-        profile.
+        ``TransportNetwork.route_between_coordinates``: the
+        ``{"walk": km/h}`` speed mapping, walking time in minutes (or a
+        timedelta), snap distance in meters; only valid with points.
+        On a ``StreetNetwork`` ``max_walking_time`` does not
+        apply and ``speeds`` sets the routed mode's speed and its
+        walking legs, as in ``StreetNetwork.travel_time``.
+        Beside a ``StreetLegPolicy``, ``speeds`` takes ``"walk"`` and the
+        modes its access, egress and transfers grant; a transfer set
+        serves only the speeds it was computed at.
     transport_mode : str (optional)
         The mode to route. Required for a ``StreetNetwork``, where it is
         one of ``"walk"``, ``"bicycle"``, ``"e_bike"``, ``"e_scooter"``,
@@ -383,8 +390,10 @@ class DetailedItineraries(gpd.GeoDataFrame):
         walking path, and the direct door-to-door alternative stays the
         walking one — direct vehicle journeys ride the standalone street
         products until the vehicle-terms fold arrives. Conflicts with
-        the walking options, which are rejected rather than silently
-        ignored.
+        ``max_walking_time`` and ``snap_distance``, which are rejected
+        rather than silently ignored; ``speeds`` sets the policy's
+        modes, at the speeds its transfer set was computed at when it
+        grants transfers.
     """
 
     def exposure_totals(self):
@@ -485,7 +494,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
         traveler=None,
         exclude_stops=(),
         geometries=True,
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         transport_mode=None,
@@ -505,12 +514,21 @@ class DetailedItineraries(gpd.GeoDataFrame):
         cost_components=None,
         output_time_units="minutes",
     ):
+        from cafein.street_network import frozen_speeds
+
+        # A sweep's searches all read one copy.
+        speeds = frozen_speeds(speeds)
+        walking_speed_kmph = _transit_walking_speed(network, speeds, street_policy)
         origins, _origin_dtype = freeze_ids(origins)
         destinations, _destination_dtype = freeze_ids(destinations)
         if destinations is None and hasattr(origins, "geometry"):
             _destination_dtype = _origin_dtype
         _id_dtypes = {"from_id": _origin_dtype, "to_id": _destination_dtype}
+        snapshot = None
         if not _is_street_network(network) and hasattr(network, "route_between_stops"):
+            # A transit frame reads one street graph and one transfer set,
+            # from the traveler's folding to the last OD pair.
+            snapshot = NetworkSnapshot(network._core)
             (
                 exclude_routes,
                 exclude_trips,
@@ -534,6 +552,10 @@ class DetailedItineraries(gpd.GeoDataFrame):
             street_policy, max_walking_time = folded_street_policy(
                 traveler, network, street_policy, walking_speed_kmph, max_walking_time
             )
+        riding = policy_speeds(street_policy, speeds, traveler)
+        if riding is not None:
+            # The traveler's walking speed rides in the policy's speeds.
+            walking_speed_kmph = None
         from cafein._units import (
             departure_parts,
             duration_seconds,
@@ -620,6 +642,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
                     transport_mode=transport_mode,
                     max_street_time=max_street_time,
                     max_snap_distance=max_snap_distance,
+                    speeds=speeds,
                     geometries=geometries,
                     exposure=frozen,
                     multipliers=(
@@ -645,7 +668,6 @@ class DetailedItineraries(gpd.GeoDataFrame):
                         "traveler": traveler,
                         "tolerance_minutes": slack_seconds,
                         "max_options": max_options,
-                        "walking_speed_kmph": walking_speed_kmph,
                         "max_walking_time": max_walking_time,
                         "max_rides": None if max_rides == 8 else max_rides,
                         "candidates": (
@@ -777,6 +799,8 @@ class DetailedItineraries(gpd.GeoDataFrame):
             max_walking_time=max_walking_time,
             max_snap_distance=max_snap_distance,
             street_policy=street_policy,
+            speeds=riding,
+            snapshot=snapshot,
             street_edges=exposure is not None,
             perspectives=perspectives,
             costs=costs,
@@ -851,7 +875,13 @@ def _itineraries_frame(
     costs=None,
     currency=None,
     cost_components=None,
+    speeds=None,
+    snapshot,
 ):
+    """The transit itineraries of every origin-destination pair as one
+    leg-per-row frame, ``DetailedItineraries``'s body on a
+    ``TransportNetwork``, refused unless the network still holds the
+    state ``snapshot`` recorded."""
     import copy
 
     components = component_selection(components)
@@ -904,7 +934,7 @@ def _itineraries_frame(
             # the direct walk; the policy owns only the car chain.
             raise ValueError(
                 "street_policy carries its own budgets; passing "
-                "walking_speed_kmph, max_walking_time, or max_snap_distance "
+                "max_walking_time or max_snap_distance "
                 "beside it is a conflict"
             )
     if router == "tbtr" and candidates != "pareto":
@@ -1017,6 +1047,7 @@ def _itineraries_frame(
                     street_factors,
                     components,
                     arrive_by=arrive_by,
+                    speeds=speeds,
                 )
             if not journeys:
                 continue
@@ -1065,6 +1096,7 @@ def _itineraries_frame(
                         # after it is a wait the reporting synthesizes.
                         record["journey_departure_s"] = journey["departure_s"]
                     records.append(record)
+    snapshot.verify("the itineraries")
     columns = _COLUMNS if street_policy is None else _POLICY_COLUMNS
     if car_park:
         columns = list(columns)
@@ -1135,10 +1167,12 @@ def _route(
     street_factors=None,
     components=None,
     arrive_by=False,
+    speeds=None,
 ):
     """The Pareto-optimal journeys of one OD pair — the time-optimal
     (arrival, rides) set, or the (arrival, emissions) McRAPTOR set with
-    ``candidates="pareto"`` / ``"relaxed"``."""
+    ``candidates="pareto"`` / ``"relaxed"``; ``speeds`` is a street-leg
+    policy's validated ``{mode: km/h}``."""
     if candidates in ("pareto", "relaxed"):
         return _route_pareto(
             network,
@@ -1159,6 +1193,7 @@ def _route(
             street_policy,
             street_factors,
             components,
+            speeds=speeds,
         )
     if kind == "points":
         walking_speed_kmph, max_walking_time, max_snap_distance = walk
@@ -1177,6 +1212,7 @@ def _route(
             geometries=geometries,
             street_policy=street_policy,
             arrive_by=arrive_by,
+            speeds=speeds,
         )
     return network._route_between_stops(
         origin_key,
@@ -1211,6 +1247,7 @@ def _route_pareto(
     street_policy=None,
     street_factors=None,
     components=None,
+    speeds=None,
 ):
     """The (arrival, emissions) McRAPTOR journeys of one OD pair — the
     cleaner-but-slower alternatives the time-optimal set misses, widened by
@@ -1242,10 +1279,11 @@ def _route_pareto(
                 slack or 0.0,
                 options,
                 router,
+                speeds=speeds,
             )
         # A walking-only policy IS the legacy multicriteria walking path,
         # at the policy's one walking budget.
-        walk = (None, walk_budget, None)
+        walk = ((speeds or {}).get("walk"), walk_budget, None)
     if kind == "points":
         return network._core.mc_route_between_coordinates(
             origin_key,
@@ -1537,6 +1575,7 @@ def _street_itineraries_frame(
     max_snap_distance,
     geometries,
     transit_only,
+    speeds=None,
     factors=None,
     components=None,
     intersection_delays=False,
@@ -1570,6 +1609,7 @@ def _street_itineraries_frame(
         max_snap_distance=max_snap_distance,
         chunk=None,
         transit_only=transit_only,
+        speeds=speeds,
     )
     # Resolved after the argument validation but before the routing call,
     # exactly as the cost matrix does.
@@ -1591,6 +1631,7 @@ def _street_itineraries_frame(
         car_model=_resolved_delays(
             transport_mode, intersection_delays, profile, delay_model
         ),
+        speeds=query.speeds,
         multipliers=None if multipliers is None else list(multipliers),
         street_edges=exposure is not None,
     )

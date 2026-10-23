@@ -74,8 +74,12 @@ def test_one_leg_per_pair_carrying_its_mode(streets, places, mode):
 
 def test_agrees_with_the_cost_matrix(streets, places):
     # Both read the same reconstruction; they must not disagree.
-    routes = DetailedItineraries(streets, places, transport_mode="bicycle")
-    costs = TravelCostMatrix(streets, places, transport_mode="bicycle")
+    # At an overridden speed, so both paths pin the same profile.
+    speeds = {"bicycle": 20.0}
+    routes = DetailedItineraries(
+        streets, places, transport_mode="bicycle", speeds=speeds
+    )
+    costs = TravelCostMatrix(streets, places, transport_mode="bicycle", speeds=speeds)
     columns = [
         "travel_time",
         "distance_m",
@@ -168,7 +172,6 @@ def test_geometries_false_drops_the_shapes(streets, places):
         {"diversity": "spread"},
         {"penalty": 60},
         {"exclude_routes": ["1001"]},
-        {"walking_speed_kmph": 5.0},
         {"max_walking_time": 10.0},
         {"fares": FareStructure()},
     ],

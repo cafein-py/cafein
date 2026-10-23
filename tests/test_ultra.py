@@ -801,7 +801,7 @@ def test_mcultra_routes_stop_pareto_queries_door_to_door(
         )
     coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
     ids = list(coords)[:25]
-    walk = dict(walking_speed_kmph=3.6, max_walking_time=5.0, snap_distance=1600.0)
+    walk = dict(speeds={"walk": 3.6}, max_walking_time=5.0, snap_distance=1600.0)
 
     def frontier(origin, destination, components=None):
         frame = journey_frontier(
@@ -873,7 +873,7 @@ def test_mcultra_routes_the_emissions_matrix_door_to_door(
         )
     coords = {s: (lat, lon) for s, lat, lon in net.stops if lat is not None}
     ids = list(coords)[:25]
-    walk = dict(walking_speed_kmph=3.6, max_walking_time=5.0, snap_distance=1600.0)
+    walk = dict(speeds={"walk": 3.6}, max_walking_time=5.0, snap_distance=1600.0)
 
     def frontier(origin, destination, components=None):
         return journey_frontier(
@@ -1042,7 +1042,7 @@ def test_auto_router_prefers_the_mcultra_door_to_door_path(
             optimize="emissions",
             candidates="pareto",
             departure_time_window=30,
-            walking_speed_kmph=3.6,
+            speeds={"walk": 3.6},
             max_walking_time=5.0,
             snap_distance=1600.0,
             **extra,

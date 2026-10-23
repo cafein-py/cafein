@@ -21,6 +21,21 @@
   mapping of lists the columns, and a list of mappings one row each, as
   in a JSON or YAML factor file; a mapping mixing both is refused.
   ([#408](https://github.com/cafein-py/cafein/pull/408))
+- The bicycle and e-bike ride 15.3 and 17.4 km/h by default, the mean
+  speeds per trip in Schleinitz et al. (2017), and street speeds are set
+  per call with `speeds={mode: km/h}`, which replaces `walking_speed_kmph`:
+  on a `StreetNetwork` for the routed mode and its walking legs, beside a
+  street-leg policy for the modes it grants, on `compute_mode_transfers`
+  (a set serves only its own speeds) and on `TravelerProfile`. Networks
+  saved by earlier versions must be rebuilt.
+  ([#410](https://github.com/cafein-py/cafein/pull/410), [#411](https://github.com/cafein-py/cafein/pull/411), [#412](https://github.com/cafein-py/cafein/pull/412), [#413](https://github.com/cafein-py/cafein/pull/413), [#414](https://github.com/cafein-py/cafein/pull/414), [#415](https://github.com/cafein-py/cafein/pull/415))
+- Queries that read the network in several steps — street-policy,
+  carriage and park-and-ride queries, `route_between_coordinates`,
+  `DetailedItineraries` and the transit `Catchment` — raise
+  `RuntimeError` when the street graph or a transfer set is replaced
+  while they run, instead of combining two network states in one result;
+  installing a carriage transfer set counts as such a replacement.
+  ([#417](https://github.com/cafein-py/cafein/pull/417))
 - Warnings name the line of the caller's code that triggered them, also
   when raised deep inside a computation or by the network build, instead
   of a line inside cafein.

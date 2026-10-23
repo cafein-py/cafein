@@ -733,7 +733,7 @@ def test_stop_matrices_gate_walking_options(network):
         departure="08:30:00",
         optimize="emissions",
         departure_time_window=30,
-        walking_speed_kmph=5.0,
+        speeds={"walk": 5.0},
     )
     assert len(accepted_emissions) >= 1
     with pytest.raises(ValueError, match="point origins"):

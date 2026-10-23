@@ -24,7 +24,7 @@ use cafein_core::reverse;
 use cafein_core::router::{factor_fingerprint, same_factors, Exclusions, Request, TransitRouter};
 use cafein_core::streets::{
     Backing, CarAttributes, CompiledStreetProfile, MappedStreets, Snap, StopLink, StoredLink,
-    StreetAttributes, StreetNetwork, StreetNetworkParts, StreetProfileDefinition, WalkedStop,
+    StreetAttributes, StreetNetwork, StreetNetworkParts, WalkedStop,
 };
 use cafein_core::tbtr::{DayView, TbtrEngine};
 use cafein_core::timetable::{StopIdx, Timetable, TripIdx};
@@ -47,6 +47,9 @@ struct ModeTransferSet {
     /// bit and the tie-breaks derive from; meters and factors may both
     /// legitimately be zero.
     rental_edge: Vec<bool>,
+    /// The caller-set speeds the set was computed at, as the core's
+    /// `(mode, m/s)` profile overrides; empty for the shipped speeds.
+    speeds: Vec<(String, f64)>,
 }
 
 /// The carriage transfer set (stage 17a): per pair the faster of the
@@ -60,6 +63,9 @@ struct CarriageTransferSet {
     set: Transfers,
     ride_edge: Vec<bool>,
     ride_network_meters: Vec<f64>,
+    /// The caller-set speeds the set was computed at, as the core's
+    /// `(mode, m/s)` profile overrides; empty for the shipped speeds.
+    speeds: Vec<(String, f64)>,
 }
 
 /// A routable public-transport network built from GTFS data.
@@ -129,7 +135,7 @@ struct TransportNetwork {
     /// Compiled profiles for the multimodal graph, keyed by exact
     /// definition equality — the 12a-planned cache, arriving with its first
     /// consumers.
-    multimodal_profiles: std::sync::Mutex<Vec<(StreetProfileDefinition, CompiledStreetProfile)>>,
+    multimodal_profiles: std::sync::Mutex<cafein_core::streets::ProfileCache>,
     /// The merged shared-vehicle transfer set (stage 15a): the walking
     /// closure with one mode's rental edges folded in and re-closed,
     /// beside its reconstruction tokens and the exact binding it was
@@ -150,9 +156,9 @@ struct TransportNetwork {
     /// Monotonic count of walking street-network installs; exposure
     /// reporting pins its cached per-edge arrays to it.
     streets_generation: u64,
-    /// Monotonic count of footpath (transfer-set) installs; a
+    /// Monotonic count of footpath, mode-set and carriage-set installs; a
     /// computation spanning several engine calls pins it to prove
-    /// they all read the same closure.
+    /// they all read the same closure and vehicle sets.
     transfers_generation: u64,
 }
 
