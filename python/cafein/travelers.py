@@ -23,13 +23,14 @@ class TravelerProfile:
     explicitly marked accessible remains, which on sparsely tagged
     feeds can exclude nearly everything. With ``wheelchair=False`` (the
     default) the feed's accessibility fields are not consulted and the
-    profile carries only its walking knobs and manual exclusions.
+    profile carries only its speeds, walking budget and manual
+    exclusions.
 
     The profile's ``exclude_*`` sequences union with any passed on the
     call itself — constraints add up. The walking knobs are singular:
-    a profile that sets ``walking_speed_kmph`` or ``max_walking_time``
-    beside a call-level value for the same knob is rejected rather
-    than silently resolved.
+    a profile that sets the walking speed (``speeds={"walk": …}``) or
+    ``max_walking_time`` beside a call-level value for the same knob is
+    rejected rather than silently resolved.
 
     On a door-to-door query over a network built with the
     ``"wheelchair"`` street mode, ``wheelchair=True`` also takes the
@@ -37,9 +38,9 @@ class TravelerProfile:
     the wheelchair profile — no stairs, ``wheelchair=no`` respected,
     gradients capped on DEM builds — via an internally synthesized
     street policy (an explicit ``street_policy=`` beside it is
-    rejected, as is ``walking_speed_kmph``: the profile's speed is
-    fixed). Mid-journey transfers ride the computed wheelchair
-    transfer set when the network carries one — accessible end to end,
+    rejected, as is a walking speed: it rides ``speeds["wheelchair"]``).
+    Mid-journey transfers ride the computed wheelchair transfer set
+    when the network carries one — accessible end to end,
     excluded stops refused at the endpoints — and otherwise the
     installed walking closure with excluded endpoints refused, whose
     walked paths may cross stairs; compute the wheelchair set for the
@@ -58,9 +59,13 @@ class TravelerProfile:
         Whether supply the feed says nothing about stays usable
         (default) or is excluded too — guaranteed-accessible routing.
         Applies only with ``wheelchair=True``.
-    walking_speed_kmph : float (optional)
-        Walking speed in km/h, applied to every call made with this
-        profile unless the call sets its own.
+    speeds : mapping (optional)
+        Street speeds in km/h — ``"walk"``, ``"bicycle"``, ``"e_bike"``,
+        ``"e_scooter"``, ``"wheelchair"`` — applied to every call made
+        with this profile wherever the call routes that mode: the walking
+        speed on any point query, the vehicles on a street-leg policy's
+        legs, and ``"wheelchair"`` on a wheelchair traveler's streets. A
+        mode set on both the profile and the call is rejected.
     max_walking_time : float or datetime.timedelta (optional)
         Walking-time budget in minutes, as on the calls themselves.
     exclude_stops, exclude_trips, exclude_routes : list of str (optional)
@@ -74,24 +79,25 @@ class TravelerProfile:
         *,
         wheelchair=False,
         unknown="usable",
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         exclude_stops=(),
         exclude_trips=(),
         exclude_routes=(),
     ):
         from cafein._units import duration_seconds
+        from cafein._validate import mode_mapping, positive_finite
+        from cafein.policy import STREET_POLICY_MODES
 
         if unknown not in ("usable", "excluded"):
             raise ValueError("unknown must be 'usable' or 'excluded'")
-        if walking_speed_kmph is not None and not walking_speed_kmph > 0:
-            raise ValueError("walking_speed_kmph must be positive")
+        speeds = mode_mapping("speeds", speeds, STREET_POLICY_MODES, positive_finite)
         # Validation only; the raw value is handed to the call sites in
         # the unit their own conversion expects.
         duration_seconds("max_walking_time", max_walking_time)
         self.wheelchair = bool(wheelchair)
         self.unknown = unknown
-        self.walking_speed_kmph = walking_speed_kmph
+        self.speeds = speeds
         self.max_walking_time = max_walking_time
         self.exclude_stops = tuple(id_sequence("exclude_stops", exclude_stops))
         self.exclude_trips = tuple(id_sequence("exclude_trips", exclude_trips))
@@ -139,8 +145,8 @@ def folded_street_policy(
     Passing an explicit ``street_policy`` beside such a traveler is a
     conflict (a policy names its own modes), a network built without
     the wheelchair street mode raises with a rebuild hint, and
-    ``walking_speed_kmph`` is rejected — the wheelchair profile rides
-    its fixed speed. The synthesized policy carries the street-policy
+    a walking speed is rejected — the wheelchair profile rides
+    ``speeds["wheelchair"]``. The synthesized policy carries the street-policy
     query restrictions: a ``departure_time_window`` on a door-to-door
     query is rejected beside it, exactly as beside any policy.
     Returns ``(street_policy, max_walking_time)`` with the walking
@@ -162,8 +168,8 @@ def folded_street_policy(
         )
     if walking_speed_kmph is not None:
         raise ValueError(
-            "walking_speed_kmph cannot reshape the wheelchair street "
-            "profile, which rides its fixed speed"
+            "speeds['walk'] cannot reshape the wheelchair street "
+            "profile, which rides speeds['wheelchair']"
         )
     from cafein import streets as _streets
     from cafein._units import duration_seconds
@@ -221,13 +227,13 @@ def folded_constraints(
     if not isinstance(traveler, TravelerProfile):
         raise TypeError("traveler must be a cafein.TravelerProfile")
     routes, trips, stops = traveler._resolve(network)
-    if traveler.walking_speed_kmph is not None:
+    if "walk" in traveler.speeds:
         if walking_speed_kmph is not None:
             raise ValueError(
-                "walking_speed_kmph is set on both the call and the "
+                "speeds['walk'] is set on both the call and the "
                 "traveler profile; set it in one place"
             )
-        walking_speed_kmph = traveler.walking_speed_kmph
+        walking_speed_kmph = traveler.speeds["walk"]
     if traveler.max_walking_time is not None:
         if max_walking_time is not None:
             raise ValueError(

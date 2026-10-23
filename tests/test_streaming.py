@@ -525,7 +525,11 @@ def test_to_parquet_street_car_equals_constructor(
     import pandas as pd
 
     options = dict(
-        transport_mode="car", intersection_delays=True, profile="rush", parking=True
+        transport_mode="car",
+        intersection_delays=True,
+        profile="rush",
+        parking=True,
+        speeds={"walk": 5.0},
     )
     if cls is TravelCostMatrix:
         options.update(
@@ -543,6 +547,18 @@ def test_to_parquet_street_car_equals_constructor(
         batch_size=2,
     )
     assert result.batches == 3
+    # The speeds join the fingerprint: another walking speed is another query.
+    fingerprints = {
+        cls.to_parquet(
+            car_streets,
+            origins=street_points,
+            **{**options, "speeds": {"walk": walk}},
+            output=tmp_path / f"walk-{walk}",
+            batch_size=2,
+        ).manifest["fingerprint"]
+        for walk in (4.0, 5.0)
+    }
+    assert len(fingerprints) == 2
     read, expected = _read_aligned(tmp_path / "car.parquet", frame)
     if cls is TravelCostMatrix:
         import shapely

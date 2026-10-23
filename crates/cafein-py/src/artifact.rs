@@ -257,6 +257,7 @@ impl TransportNetwork {
                         tokens,
                         rental_network_meters: &held.rental_network_meters,
                         rental_edge: &held.rental_edge,
+                        speeds: &held.speeds,
                     }
                 }),
                 carriage_transfers: self.carriage_transfers.as_ref().map(|held| {
@@ -266,6 +267,7 @@ impl TransportNetwork {
                         set: &held.set,
                         ride_edge: &held.ride_edge,
                         ride_network_meters: &held.ride_network_meters,
+                        speeds: &held.speeds,
                     }
                 }),
             }
@@ -374,6 +376,11 @@ pub(super) const STREET_ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINST";
 // format 13.
 pub(super) const STREET_ARTIFACT_FORMAT: u32 = 4;
 
+// 22: the mode-transfer and carriage sets record the speeds they were
+// computed at, so a query at other speeds refuses them.
+// 21: the bicycle and e-bike default speeds changed (15.3 and 17.4 km/h);
+// earlier formats' bicycle and e-bike transfer sets rode the old 14.4 km/h
+// and must be rebuilt.
 // 20: a persisted wheelchair mode-transfer set is the pure
 // walking-class build (no walking-closure union); earlier formats'
 // wheelchair sets carried the merge and must be rebuilt.
@@ -395,7 +402,7 @@ pub(super) const STREET_ARTIFACT_FORMAT: u32 = 4;
 // STREETS section (descriptor offsets pre-shifted to their position).
 // 13 added optional elevation metadata to `StreetsMeta`. Earlier formats
 // must be rebuilt.
-pub(super) const ARTIFACT_FORMAT: u32 = 20;
+pub(super) const ARTIFACT_FORMAT: u32 = 22;
 
 /// Section tags in the container directory.
 pub(super) const SECTION_META: u16 = 1;
@@ -468,6 +475,7 @@ struct PersistedCarriageRef<'a> {
     set: &'a Transfers,
     ride_edge: &'a [bool],
     ride_network_meters: &'a [f64],
+    speeds: &'a [(String, f64)],
 }
 
 #[derive(serde::Deserialize)]
@@ -477,6 +485,7 @@ pub(super) struct PersistedCarriage {
     set: Transfers,
     ride_edge: Vec<bool>,
     ride_network_meters: Vec<f64>,
+    speeds: Vec<(String, f64)>,
 }
 
 /// The merged mode-transfer set as persisted: the token map flattened
@@ -492,6 +501,7 @@ struct PersistedModeTransfersRef<'a> {
     tokens: Vec<((u32, u32), cafein_core::mode_transfers::RentalToken)>,
     rental_network_meters: &'a [f64],
     rental_edge: &'a [bool],
+    speeds: &'a [(String, f64)],
 }
 
 #[derive(serde::Deserialize)]
@@ -502,6 +512,7 @@ pub(super) struct PersistedModeTransfers {
     tokens: Vec<((u32, u32), cafein_core::mode_transfers::RentalToken)>,
     rental_network_meters: Vec<f64>,
     rental_edge: Vec<bool>,
+    speeds: Vec<(String, f64)>,
 }
 
 /// The decoded part of the saved network, owned after reading.
@@ -1909,6 +1920,7 @@ pub(super) fn assemble(
             mut set,
             ride_edge,
             ride_network_meters,
+            speeds,
         } = persisted;
         // A persisted carriage set is never a closure.
         set.mark_unclosed();
@@ -1918,6 +1930,7 @@ pub(super) fn assemble(
             set,
             ride_edge,
             ride_network_meters,
+            speeds,
         }
     });
     let mode_transfers = mode_transfers.map(|persisted| {
@@ -1928,6 +1941,7 @@ pub(super) fn assemble(
             tokens,
             rental_network_meters,
             rental_edge,
+            speeds,
         } = persisted;
         // A persisted merged set is never a closure; the skip-serialized
         // marking must not default it back to one.
@@ -1939,6 +1953,7 @@ pub(super) fn assemble(
             tokens: tokens.into_iter().collect(),
             rental_network_meters,
             rental_edge,
+            speeds,
         }
     });
     let multimodal_elevation = multimodal_meta.and_then(|meta| meta.elevation);
@@ -1975,7 +1990,7 @@ pub(super) fn assemble(
         multimodal_elevation,
         multimodal_modes,
         multimodal_links: std::sync::OnceLock::new(),
-        multimodal_profiles: std::sync::Mutex::new(Vec::new()),
+        multimodal_profiles: std::sync::Mutex::new(Default::default()),
         mode_transfers,
         carriage_transfers,
         stops_by_id,

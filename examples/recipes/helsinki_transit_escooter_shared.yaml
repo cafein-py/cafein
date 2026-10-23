@@ -25,7 +25,7 @@ inputs:
 parameters:
   network:                                   # TransportNetwork.from_gtfs(**network)
     street_modes: [walk, e_scooter]           # build the multimodal street graph
-    walking_speed_kmph: 4.5
+    speeds: {walk: 4.5}                      # km/h of the footpath precompute
   matrix:                                    # TravelCostMatrix(**matrix)
     departure: "2026-08-18 08:00:00"
     max_rides: 4

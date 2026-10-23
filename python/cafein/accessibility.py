@@ -28,13 +28,16 @@ from cafein._validate import (
     sequence_not_string,
 )
 from cafein import _memory
+from cafein._snapshot import NetworkSnapshot
 from cafein._units import memory_spec
 from cafein.matrices import (
     _planned_aggregation,
     _planned_entry,
     _query_details,
     _stream_batch,
+    _transit_walking_speed,
 )
+from cafein.street_network import core_speeds
 from cafein.travelers import folded_constraints, refuse_wheelchair_streets
 
 #: The parameter each decay family takes (None: no parameter).
@@ -573,6 +576,7 @@ def _resolved_cost_matrix(
     arrive_by=False,
     workers=None,
     max_memory=None,
+    speeds=None,
 ):
     """The per-origin cost matrix on the chosen axis, dispatched by
     network kind exactly as the matrix computers dispatch: (matrix,
@@ -592,7 +596,7 @@ def _resolved_cost_matrix(
         if arrive_by:
             raise ValueError(
                 "arrival applies to transit; a StreetNetwork takes "
-                "transport_mode, max_street_time, and snap_distance"
+                "transport_mode, speeds, max_street_time, and snap_distance"
             )
         if transport_mode is None:
             raise ValueError(
@@ -605,7 +609,6 @@ def _resolved_cost_matrix(
             "departure_time_window": window,
             "percentiles": percentiles,
             "confidence": confidence,
-            "walking_speed_kmph": walking_speed_kmph,
             "max_walking_time": max_walking_time,
         }
         named = [name for name, value in rejected.items() if value is not None]
@@ -617,10 +620,12 @@ def _resolved_cost_matrix(
             offending = ", ".join(named) or "exclusions"
             raise ValueError(
                 f"{offending} apply to transit; a StreetNetwork takes "
-                "transport_mode, max_street_time, and snap_distance"
+                "transport_mode, speeds, max_street_time, and snap_distance"
             )
-        from cafein.street_network import MAX_STREET_TIME
+        from cafein.street_network import MAX_STREET_TIME, profile_speeds
         from cafein.streets import MAX_SNAP_DISTANCE
+
+        street_speeds = profile_speeds(speeds, transport_mode)
 
         from_ids, origin_points = _point_list(origins, "origins")
         to_ids, destination_points = _point_list(destinations, "destinations")
@@ -642,6 +647,7 @@ def _resolved_cost_matrix(
                 street_snap,
                 False,
                 None,
+                speeds=street_speeds,
                 workers=_memory.width_or(workers),
             )
             _warn_unsnapped(table, from_ids, to_ids, network="the street network")
@@ -657,6 +663,7 @@ def _resolved_cost_matrix(
                 street_seconds,
                 street_snap,
                 None,
+                speeds=street_speeds,
                 workers=_memory.width_or(workers),
             )
             _warn_unsnapped(table, from_ids, to_ids, network="the street network")
@@ -891,6 +898,7 @@ def _accessibility_columns(
     _surface=None,
     workers=None,
     max_memory=None,
+    speeds=None,
 ):
     """The long accessibility frame for `origins` — the computation
     the constructor and the streaming classmethod share, inputs
@@ -934,6 +942,7 @@ def _accessibility_columns(
             arrive_by=arrive_by,
             workers=workers,
             max_memory=max_memory,
+            speeds=speeds,
         )
 
     return _aggregate_surface(
@@ -1297,13 +1306,14 @@ class Accessibility(pd.DataFrame):
         exclude_trips=(),
         traveler=None,
         exclude_stops=(),
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         street_policy=None,
         workers=None,
         max_memory=None,
     ):
+        walking_speed_kmph = _transit_walking_speed(network, speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -1326,7 +1336,7 @@ class Accessibility(pd.DataFrame):
         elif traveler is not None:
             raise ValueError(
                 "traveler applies to transit; a StreetNetwork takes "
-                "transport_mode, max_street_time, and snap_distance"
+                "transport_mode, speeds, max_street_time, and snap_distance"
             )
         from cafein.matrices import _is_point_frame as _points
 
@@ -1479,6 +1489,7 @@ class Accessibility(pd.DataFrame):
             arrive_by=arrive_by,
             workers=workers,
             max_memory=max_memory,
+            speeds=speeds,
         )
         super().__init__(restore_id_dtypes(frame, _id_dtypes))
 
@@ -1514,7 +1525,7 @@ class Accessibility(pd.DataFrame):
         exclude_trips=(),
         traveler=None,
         exclude_stops=(),
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         street_policy=None,
@@ -1544,6 +1555,11 @@ class Accessibility(pd.DataFrame):
         complete time query, refusing a resume that differs in axis,
         moment, window, or percentiles.
         """
+        from cafein.street_network import frozen_speeds
+
+        # The fingerprint and every streamed batch read one copy.
+        speeds = frozen_speeds(speeds)
+        walking_speed_kmph = _transit_walking_speed(network, speeds)
         _log.sync()
         if workers is not None:
             workers = positive_int("workers", workers)
@@ -1572,7 +1588,7 @@ class Accessibility(pd.DataFrame):
         elif traveler is not None:
             raise ValueError(
                 "traveler applies to transit; a StreetNetwork takes "
-                "transport_mode, max_street_time, and snap_distance"
+                "transport_mode, speeds, max_street_time, and snap_distance"
             )
         from cafein.matrices import _is_point_frame as _points
 
@@ -1672,6 +1688,16 @@ class Accessibility(pd.DataFrame):
                     f"cost={cost!r} yields the window's single optimum per "
                     "destination; percentiles apply to cost='time'"
                 )
+        # The speeds the run rides, for its fingerprint: a StreetNetwork's
+        # profile overrides, or the transit walking speed.
+        if _is_street_network(network) and transport_mode is not None:
+            from cafein.street_network import profile_speeds
+
+            ridden_speeds = profile_speeds(speeds, transport_mode)
+        else:
+            ridden_speeds = (
+                {} if walking_speed_kmph is None else {"walk": walking_speed_kmph}
+            )
 
         import pyarrow
 
@@ -1753,7 +1779,7 @@ class Accessibility(pd.DataFrame):
             "exclude_routes": list(exclude_routes),
             "exclude_trips": list(exclude_trips),
             "exclude_stops": list(exclude_stops),
-            "walking_speed_kmph": walking_speed_kmph,
+            "speeds": ridden_speeds,
             "max_walking_time": max_walking_time,
             "max_snap_distance": max_snap_distance,
             # Sorted for the hash only, exactly as the matrix
@@ -1805,6 +1831,7 @@ class Accessibility(pd.DataFrame):
                 arrive_by=True,
                 workers=workers,
                 max_memory=max_memory,
+                speeds=speeds,
             )
 
         def make_batch(rows, shared_from, shared_to):
@@ -1862,6 +1889,7 @@ class Accessibility(pd.DataFrame):
                 _surface=batch_surface,
                 workers=workers,
                 max_memory=max_memory,
+                speeds=speeds,
             )
             block = np.repeat(np.arange(rows.start, rows.stop), per_origin)
             planes = 1 if resolved_percentiles is None else len(resolved_percentiles)
@@ -2537,13 +2565,14 @@ class NearestDestinations(pd.DataFrame):
         exclude_trips=(),
         traveler=None,
         exclude_stops=(),
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         output_time_units="minutes",
         workers=None,
         max_memory=None,
     ):
+        walking_speed_kmph = _transit_walking_speed(network, speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
@@ -2566,7 +2595,7 @@ class NearestDestinations(pd.DataFrame):
         elif traveler is not None:
             raise ValueError(
                 "traveler applies to transit; a StreetNetwork takes "
-                "transport_mode, max_street_time, and snap_distance"
+                "transport_mode, speeds, max_street_time, and snap_distance"
             )
         from cafein.matrices import _is_point_frame as _points
 
@@ -2735,6 +2764,7 @@ class NearestDestinations(pd.DataFrame):
             arrive_by=arrive_by,
             workers=workers,
             max_memory=max_memory,
+            speeds=speeds,
         )
         matrix = np.asarray(matrix)
         if resolved_percentiles is not None:
@@ -3026,10 +3056,11 @@ class Catchment(gpd.GeoDataFrame):
     its deadline-profile optimum toward the origin, so the region is
     everything that can reach the place within the cost budget by
     some profiled deadline. The wheelchair traveler's directed street
-    bridge does not combine with ``arrival=`` yet. A wheelchair traveler's catchment rides the
-    fixed compiled profile at the multimodal snap radius —
-    ``walking_speed_kmph`` and ``snap_distance`` are rejected beside
-    it, while ``max_walking_time`` stays configurable. Requires the
+    bridge does not combine with ``arrival=`` yet. A wheelchair
+    traveler's catchment rides the compiled wheelchair profile, at the
+    profile's ``speeds["wheelchair"]`` when it sets one, at the
+    multimodal snap radius — a walking speed and ``snap_distance`` are
+    rejected beside it, while ``max_walking_time`` stays configurable. Requires the
     optional ``h3`` extra (``cafein[h3]``).
     """
 
@@ -3062,16 +3093,21 @@ class Catchment(gpd.GeoDataFrame):
         exclude_trips=(),
         traveler=None,
         exclude_stops=(),
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         workers=None,
         max_memory=None,
     ):
+        walking_speed_kmph = _transit_walking_speed(network, speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)
+        snapshot = None
         if hasattr(network, "route_between_stops"):
+            # A transit catchment reads one street graph and one transfer
+            # set, from the traveler's checks to the last street field.
+            snapshot = NetworkSnapshot(network._core)
             (
                 exclude_routes,
                 exclude_trips,
@@ -3090,7 +3126,7 @@ class Catchment(gpd.GeoDataFrame):
         elif traveler is not None:
             raise ValueError(
                 "traveler applies to transit; a StreetNetwork takes "
-                "transport_mode, max_street_time, and snap_distance"
+                "transport_mode, speeds, max_street_time, and snap_distance"
             )
         from cafein.matrices import _is_point_frame as _points  # noqa: F401
 
@@ -3098,6 +3134,12 @@ class Catchment(gpd.GeoDataFrame):
             traveler is not None
             and traveler.wheelchair
             and hasattr(network, "route_between_stops")
+        )
+        # The wheelchair streets ride the traveler's wheelchair speed.
+        wheel_speeds = core_speeds(
+            {"wheelchair": traveler.speeds["wheelchair"]}
+            if wheeled and "wheelchair" in traveler.speeds
+            else None
         )
         if wheeled:
             # The residual spread rides the compiled wheelchair profile
@@ -3111,8 +3153,8 @@ class Catchment(gpd.GeoDataFrame):
                 )
             if walking_speed_kmph is not None:
                 raise ValueError(
-                    "walking_speed_kmph cannot reshape the wheelchair "
-                    "street profile, which rides its fixed speed"
+                    "speeds['walk'] cannot reshape the wheelchair "
+                    "street profile, which rides speeds['wheelchair']"
                 )
             if snap_distance is not None:
                 # The synthesized policy's transit seeds snap at the
@@ -3223,7 +3265,7 @@ class Catchment(gpd.GeoDataFrame):
             if arrive_by:
                 raise ValueError(
                     "arrival applies to transit; a StreetNetwork takes "
-                    "transport_mode and snap_distance"
+                    "transport_mode, speeds, and snap_distance"
                 )
             if transport_mode is None:
                 raise ValueError(
@@ -3238,7 +3280,6 @@ class Catchment(gpd.GeoDataFrame):
             rejected = {
                 "departure": departure,
                 "departure_time_window": window,
-                "walking_speed_kmph": walking_speed_kmph,
                 "max_walking_time": max_walking_time,
             }
             named = [name for name, value in rejected.items() if value is not None]
@@ -3250,10 +3291,12 @@ class Catchment(gpd.GeoDataFrame):
                 offending = ", ".join(named) or "exclusions"
                 raise ValueError(
                     f"{offending} apply to transit; a StreetNetwork takes "
-                    "transport_mode and snap_distance"
+                    "transport_mode, speeds, and snap_distance"
                 )
+            from cafein.street_network import profile_speeds
             from cafein.streets import MAX_SNAP_DISTANCE
 
+            street_speeds = profile_speeds(speeds, transport_mode)
             snap = float(
                 MAX_SNAP_DISTANCE if max_snap_distance is None else max_snap_distance
             )
@@ -3272,7 +3315,7 @@ class Catchment(gpd.GeoDataFrame):
             horizon = max(budget_values)
             for identifier, point in zip(from_ids, points):
                 lats, lons, costs = network._core._reached_vertices(
-                    point, transport_mode, horizon, cost, snap
+                    point, transport_mode, horizon, cost, snap, speeds=street_speeds
                 )
                 rows.extend(
                     _cell_rows(
@@ -3327,7 +3370,7 @@ class Catchment(gpd.GeoDataFrame):
             snap = float(snap)
             if not math.isfinite(speed_kmph) or speed_kmph <= 0.0:
                 raise ValueError(
-                    "walking_speed_kmph must be a positive finite speed, "
+                    "speeds['walk'] must be a positive finite speed, "
                     f"not {walking_speed_kmph!r}"
                 )
             if not math.isfinite(snap) or snap <= 0.0:
@@ -3446,6 +3489,7 @@ class Catchment(gpd.GeoDataFrame):
                             resolution,
                         )
                     )
+                snapshot.verify("the catchment")
                 import geopandas
 
                 frame = geopandas.GeoDataFrame(
@@ -3482,6 +3526,7 @@ class Catchment(gpd.GeoDataFrame):
                 arrive_by=arrive_by,
                 workers=workers,
                 max_memory=max_memory,
+                wheel_speeds=wheel_speeds,
             )
             speed_ms = speed_kmph / 3.6
             for identifier, point, stop_costs in zip(from_ids, points, surfaces):
@@ -3494,7 +3539,12 @@ class Catchment(gpd.GeoDataFrame):
                     ]
                     if wheeled:
                         lats, lons, costs = network._core._catchment_directed_field(
-                            point, seeds, "wheelchair", horizon, snap
+                            point,
+                            seeds,
+                            "wheelchair",
+                            horizon,
+                            snap,
+                            speeds=wheel_speeds,
                         )
                     else:
                         lats, lons, costs = network._core._catchment_walk_field(
@@ -3523,7 +3573,12 @@ class Catchment(gpd.GeoDataFrame):
                         if wheeled:
                             lats, lons, _costs = (
                                 network._core._catchment_directed_field(
-                                    point, seeds, "wheelchair", walk_cutoff, snap
+                                    point,
+                                    seeds,
+                                    "wheelchair",
+                                    walk_cutoff,
+                                    snap,
+                                    speeds=wheel_speeds,
                                 )
                             )
                         else:
@@ -3544,6 +3599,7 @@ class Catchment(gpd.GeoDataFrame):
                                     ),
                                 )
                             )
+            snapshot.verify("the catchment")
         import geopandas
 
         frame = geopandas.GeoDataFrame(
@@ -3613,6 +3669,7 @@ def _catchment_stop_costs(
     arrive_by=False,
     workers=None,
     max_memory=None,
+    wheel_speeds=(),
 ):
     """Per origin, the ``(global stop index, cost)`` pairs of every
     reached stop on the chosen axis — the walking field's seeds. With
@@ -3756,7 +3813,11 @@ def _catchment_stop_costs(
                 access = [
                     (stop, seconds)
                     for stop, seconds, *_ in network._core._reduced_street_offsets(
-                        *point, False, modes, transfer_mode=transfer_arg
+                        *point,
+                        False,
+                        modes,
+                        transfer_mode=transfer_arg,
+                        speeds=list(wheel_speeds),
                     )
                 ]
                 arrivals = network._core._travel_times_with_access(
@@ -3768,6 +3829,7 @@ def _catchment_stop_costs(
                     exclude_routes=list(exclude_routes),
                     exclude_trips=list(exclude_trips),
                     exclude_stops=list(exclude_stops),
+                    speeds=list(wheel_speeds),
                     workers=_memory.width_or(workers),
                 )
             else:

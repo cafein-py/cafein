@@ -559,7 +559,7 @@ impl TransportNetwork {
                         factors, walk_budget, max_transfers,
                         exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![],
                         geometries = false, transfer_mode = None, direct_mode = None,
-                        fares = None, workers=None))]
+                        fares = None, speeds = Vec::new(), workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn _cost_matrix_with_access(
         &self,
@@ -580,6 +580,7 @@ impl TransportNetwork {
         transfer_mode: Option<(String, f64, f64)>,
         direct_mode: Option<&str>,
         fares: Option<Bound<'_, PyDict>>,
+        speeds: crate::streets::SpeedOverrides,
         workers: Option<usize>,
     ) -> PyResult<Py<PyDict>> {
         if access_rows.len() != origins.len() || egress_rows.len() != destinations.len() {
@@ -685,7 +686,7 @@ impl TransportNetwork {
         let binding = transfer_mode
             .as_ref()
             .map(|(mode, budget, _)| (mode.clone(), *budget));
-        let relaxed = self.policy_transfers(binding.as_ref())?;
+        let relaxed = self.policy_transfers(binding.as_ref(), &speeds)?;
         // A walking-class transfer set keeps its tokens for itinerary
         // reconstruction only: no rental view, so its meters stay
         // walking meters in the attribution.
@@ -727,7 +728,7 @@ impl TransportNetwork {
         // skips it, and the caller folds its own walking alternative.
         let direct = match direct_mode {
             Some(mode) => {
-                let profile = self.multimodal_profile(mode)?;
+                let profile = self.multimodal_profile(mode, &speeds)?;
                 let graph = self.multimodal.as_ref().ok_or_else(|| {
                     PyValueError::new_err(
                         "no multimodal street graph is installed; build with street_modes=",

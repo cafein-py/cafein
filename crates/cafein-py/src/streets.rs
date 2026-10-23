@@ -15,7 +15,8 @@ use rayon::prelude::*;
 use cafein_core::geometry::wkb_line_string;
 use cafein_core::streets::{
     Backing, CarCostModel, CarEdgeAttributes, CompiledStreetProfile, EdgeAttributes, MappedStreets,
-    Snap, StopLink, StreetLeg, StreetNetwork as CoreStreetNetwork, StreetProfileDefinition,
+    ProfileCache, Snap, StopLink, StreetLeg, StreetNetwork as CoreStreetNetwork,
+    StreetProfileDefinition,
 };
 use cafein_core::timetable::StopIdx;
 
@@ -25,22 +26,54 @@ use crate::artifact::{
     MmapMode, StreetsMeta, STREET_ARRAY_ORDER, STREET_ARTIFACT_FORMAT, STREET_ARTIFACT_MAGIC,
 };
 
-/// The street-mode names accepted by the public API, with the shipped profile
-/// definition each resolves to. The car resolves to its free-flow default;
-/// a resolved delay model arrives separately (see [`car_cost_model`]).
-pub(super) fn profile_definition(mode: &str) -> PyResult<StreetProfileDefinition> {
-    match mode {
-        "walk" => Ok(StreetProfileDefinition::walk()),
-        "bicycle" => Ok(StreetProfileDefinition::bicycle()),
-        "e_bike" => Ok(StreetProfileDefinition::e_bike()),
-        "e_scooter" => Ok(StreetProfileDefinition::e_scooter()),
-        "wheelchair" => Ok(StreetProfileDefinition::wheelchair()),
-        "car" => Ok(StreetProfileDefinition::car(None)),
-        other => Err(PyValueError::new_err(format!(
-            "unknown street mode '{other}'; expected one of \
-             'walk', 'bicycle', 'e_bike', 'e_scooter', 'wheelchair', 'car'"
-        ))),
+/// Caller-set street speeds in m/s by mode name, as the Python layer resolves
+/// them from `speeds=`; empty for the shipped speeds.
+pub(super) type SpeedOverrides = Vec<(String, f64)>;
+
+/// The street-mode names accepted by the public API, with the profile
+/// definition each resolves to: the shipped one with `speeds` applied. The
+/// mode's own entry sets its riding speed; `"walk"` sets the walking legs —
+/// the whole walking profile, and the connectors and dismount arcs of the
+/// vehicles. The wheelchair rides its own entry alone. The car resolves to
+/// its free-flow default; a resolved delay model arrives separately (see
+/// [`car_cost_model`]).
+pub(super) fn profile_definition(
+    mode: &str,
+    speeds: &[(String, f64)],
+) -> PyResult<StreetProfileDefinition> {
+    let speed = |name: &str| {
+        speeds
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|&(_, value)| value)
+    };
+    let mut definition = match mode {
+        "walk" => StreetProfileDefinition::walk(),
+        "bicycle" => StreetProfileDefinition::bicycle(),
+        "e_bike" => StreetProfileDefinition::e_bike(),
+        "e_scooter" => StreetProfileDefinition::e_scooter(),
+        "wheelchair" => StreetProfileDefinition::wheelchair(),
+        "car" => StreetProfileDefinition::car(None),
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown street mode '{other}'; expected one of \
+                 'walk', 'bicycle', 'e_bike', 'e_scooter', 'wheelchair', 'car'"
+            )))
+        }
+    };
+    let walking_class = mode == "walk" || mode == "wheelchair";
+    if let Some(own) = speed(mode).filter(|_| mode != "car") {
+        definition = definition.with_base_speed(own);
+        if walking_class {
+            definition = definition.with_walking_speed(own);
+        }
     }
+    if !walking_class {
+        if let Some(walking) = speed("walk") {
+            definition = definition.with_walking_speed(walking);
+        }
+    }
+    Ok(definition)
 }
 
 /// The resolved car delay model as the Python layer passes it: one period's
@@ -100,7 +133,7 @@ pub struct StreetNetwork {
     /// repeated queries reuse the per-arc millisecond array instead of
     /// rescanning every arc. Keyed by full equality, never by name: a changed
     /// speed or multiplier compiles afresh rather than reusing stale costs.
-    profiles: Vec<(StreetProfileDefinition, CompiledStreetProfile)>,
+    profiles: ProfileCache,
     /// STREETS-section bytes a load explicitly read: the whole section for an
     /// owned load, and just the owned optional arrays for a lazy mapped one.
     /// Zero only for a network built from arrays rather than loaded.
@@ -164,7 +197,7 @@ impl StreetNetwork {
         )?;
         Ok(StreetNetwork {
             inner,
-            profiles: Vec::new(),
+            profiles: ProfileCache::default(),
             streets_bytes_read: 0,
             elevation,
             source: None,
@@ -293,7 +326,8 @@ impl StreetNetwork {
     /// by `budget` on the chosen `axis` — seconds for `"time"`,
     /// street metres for `"distance"`. A street catchment's target
     /// universe.
-    #[pyo3(signature = (origin, mode, budget, axis, max_snap_distance, car_model = None))]
+    #[pyo3(signature = (origin, mode, budget, axis, max_snap_distance, car_model = None,
+                        speeds = Vec::new()))]
     fn _reached_vertices(
         &mut self,
         py: Python<'_>,
@@ -303,14 +337,15 @@ impl StreetNetwork {
         axis: &str,
         max_snap_distance: f64,
         car_model: Option<CarModelPayload>,
+        speeds: SpeedOverrides,
     ) -> PyResult<(Py<PyAny>, Py<PyAny>, Py<PyAny>)> {
         if axis != "time" && axis != "distance" {
             return Err(PyValueError::new_err(format!(
                 "axis must be 'time' or 'distance', not {axis:?}"
             )));
         }
-        let index = self.compiled(mode, car_model.as_ref())?;
-        let (_, profile) = &self.profiles[index];
+        let index = self.compiled(mode, car_model.as_ref(), &speeds)?;
+        let profile = self.profiles.get(index);
         let field: Vec<(f64, f64, f64)> = py.allow_threads(|| {
             let (latitude, longitude) = origin;
             let Some(snap) =
@@ -352,7 +387,7 @@ impl StreetNetwork {
     /// Coordinates are `(latitude, longitude)` in EPSG:4326.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (origins, destinations, mode, max_seconds, max_snap_distance,
-                        car_model = None, workers=None))]
+                        car_model = None, speeds = Vec::new(), workers=None))]
     fn travel_time_matrix(
         &mut self,
         py: Python<'_>,
@@ -362,10 +397,11 @@ impl StreetNetwork {
         max_seconds: f64,
         max_snap_distance: f64,
         car_model: Option<CarModelPayload>,
+        speeds: SpeedOverrides,
         workers: Option<usize>,
     ) -> PyResult<Py<PyDict>> {
-        let index = self.compiled(mode, car_model.as_ref())?;
-        let (_, profile) = &self.profiles[index];
+        let index = self.compiled(mode, car_model.as_ref(), &speeds)?;
+        let profile = self.profiles.get(index);
         let destination_count = destinations.len();
         let (rows, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
             crate::workers::with_workers("travel_time_matrix", workers, || {
@@ -417,8 +453,8 @@ impl StreetNetwork {
     /// `geometries`, off the metres path's winning chain without.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (origins, destinations, mode, max_seconds, max_snap_distance,
-                        geometries, car_model = None, multipliers = None,
-                        street_edges = false, workers=None))]
+                        geometries, car_model = None, speeds = Vec::new(),
+                        multipliers = None, street_edges = false, workers=None))]
     fn cost_matrix(
         &mut self,
         py: Python<'_>,
@@ -429,12 +465,13 @@ impl StreetNetwork {
         max_snap_distance: f64,
         geometries: bool,
         car_model: Option<CarModelPayload>,
+        speeds: SpeedOverrides,
         multipliers: Option<Vec<f64>>,
         street_edges: bool,
         workers: Option<usize>,
     ) -> PyResult<Py<PyDict>> {
-        let index = self.compiled(mode, car_model.as_ref())?;
-        let (_, profile) = &self.profiles[index];
+        let index = self.compiled(mode, car_model.as_ref(), &speeds)?;
+        let profile = self.profiles.get(index);
         let weighted = match &multipliers {
             Some(multipliers) => Some(
                 self.inner
@@ -722,8 +759,9 @@ impl StreetNetwork {
     /// Coordinates are `(latitude, longitude)` in EPSG:4326. A coordinate that
     /// does not snap to the network raises `ValueError` — unreachable and
     /// unsnappable are different answers.
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (origin, destination, mode, max_seconds, max_snap_distance,
-                        car_model = None))]
+                        car_model = None, speeds = Vec::new()))]
     fn travel_time(
         &mut self,
         origin: (f64, f64),
@@ -732,11 +770,12 @@ impl StreetNetwork {
         max_seconds: f64,
         max_snap_distance: f64,
         car_model: Option<CarModelPayload>,
+        speeds: SpeedOverrides,
     ) -> PyResult<Option<u32>> {
         // Compile first: snapping is profile-aware, so that a bicycle query
         // does not land on a footway it may not enter.
-        let index = self.compiled(mode, car_model.as_ref())?;
-        let (_, profile) = &self.profiles[index];
+        let index = self.compiled(mode, car_model.as_ref(), &speeds)?;
+        let profile = self.profiles.get(index);
         let from = self.snap_endpoint(origin, max_snap_distance, "origin", profile)?;
         let to = self.snap_endpoint(destination, max_snap_distance, "destination", profile)?;
         // A coordinate routes to itself in no time. The connector is the walk
@@ -764,7 +803,7 @@ impl StreetNetwork {
     ) -> StreetNetwork {
         StreetNetwork {
             inner,
-            profiles: Vec::new(),
+            profiles: ProfileCache::default(),
             streets_bytes_read,
             elevation,
             source,
@@ -791,12 +830,18 @@ impl StreetNetwork {
             })
     }
 
-    /// The position of `mode`'s compiled profile, compiling and caching it on
-    /// first use. Returns an index rather than a reference so the cache can be
-    /// extended while the network stays borrowed. A resolved car delay model
-    /// joins the definition, so each model caches separately by equality.
-    fn compiled(&mut self, mode: &str, car_model: Option<&CarModelPayload>) -> PyResult<usize> {
-        let mut definition = profile_definition(mode)?;
+    /// The position of `mode`'s compiled profile at `speeds`, compiling and
+    /// caching it on first use. Returns an index rather than a reference so
+    /// the cache can be extended while the network stays borrowed. A resolved
+    /// car delay model joins the definition, so each model caches separately
+    /// by equality.
+    fn compiled(
+        &mut self,
+        mode: &str,
+        car_model: Option<&CarModelPayload>,
+        speeds: &[(String, f64)],
+    ) -> PyResult<usize> {
+        let mut definition = profile_definition(mode, speeds)?;
         if let Some(payload) = car_model {
             if mode != "car" {
                 return Err(PyValueError::new_err(
@@ -805,19 +850,16 @@ impl StreetNetwork {
             }
             definition.car = Some(car_cost_model(payload)?);
         }
-        if let Some(index) = self
-            .profiles
-            .iter()
-            .position(|(cached, _)| *cached == definition)
-        {
-            return Ok(index);
-        }
-        let compiled = self
-            .inner
-            .compile_profile(&definition)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        self.profiles.push((definition, compiled));
-        Ok(self.profiles.len() - 1)
+        // Anything but the shipped definition — speeds, a delay model — is a
+        // caller's variant the cache bounds.
+        let overridden = definition != profile_definition(mode, &[])?;
+        let inner = &self.inner;
+        self.profiles
+            .position(&definition, overridden, |definition| {
+                inner
+                    .compile_profile(definition)
+                    .map_err(|error| PyValueError::new_err(error.to_string()))
+            })
     }
 }
 
@@ -1092,7 +1134,7 @@ impl StreetNetwork {
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (origins, destinations, opportunities, fields, budgets,
                         decay, decay_param, mode, max_seconds, max_snap_distance,
-                        car_model = None))]
+                        car_model = None, speeds = Vec::new()))]
     fn _accessibility_to_points(
         &mut self,
         py: Python<'_>,
@@ -1107,11 +1149,12 @@ impl StreetNetwork {
         max_seconds: f64,
         max_snap_distance: f64,
         car_model: Option<CarModelPayload>,
+        speeds: SpeedOverrides,
     ) -> PyResult<Py<PyDict>> {
         let decay = parse_decay(decay, decay_param)?;
         validated_aggregation(destinations.len(), &opportunities, fields, &budgets)?;
-        let index = self.compiled(mode, car_model.as_ref())?;
-        let (_, profile) = &self.profiles[index];
+        let index = self.compiled(mode, car_model.as_ref(), &speeds)?;
+        let profile = self.profiles.get(index);
         let width = budgets.len() * fields;
         let (flat, unsnapped_from, unsnapped_to) = py.allow_threads(|| {
             let ticker = crate::logging::ProgressTicker::new("street matrix", origins.len());

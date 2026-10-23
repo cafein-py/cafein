@@ -13,6 +13,7 @@ the compiled core.
 
 from __future__ import annotations
 
+import collections.abc
 import math
 
 
@@ -125,6 +126,24 @@ def positive_int(name, value):
     if value < 1:
         raise ValueError(f"{name} must be at least 1")
     return value
+
+
+def mode_mapping(name, values, modes, number):
+    """`values` as a ``{mode: float}`` dict, ``{}`` for ``None``: every key
+    one of `modes`, every value checked by ``number(label, value)``."""
+    if values is None:
+        return {}
+    if not isinstance(values, collections.abc.Mapping):
+        raise TypeError(
+            f"{name} must be a mapping of street mode to value, not {values!r}"
+        )
+    resolved = {}
+    for mode, value in values.items():
+        if mode not in modes:
+            listed = ", ".join(repr(option) for option in modes)
+            raise ValueError(f"{name} names {mode!r}; expected one of {listed}")
+        resolved[mode] = number(f"{name}[{mode!r}]", value)
+    return resolved
 
 
 def choice(name, value, options):

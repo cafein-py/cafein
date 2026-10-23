@@ -13,8 +13,12 @@ from cafein._validate import (
     positive_int,
     sequence_not_string,
 )
+from cafein._snapshot import NetworkSnapshot
 from cafein._units import memory_spec
-from cafein.matrices import _planned_entry, _query_details
+from cafein.matrices import _planned_entry, _query_details, _transit_walking_speed
+from cafein.policy import policy_speeds
+from cafein.street_network import core_speeds, profile_speeds
+from cafein.streets import walking_speed
 from cafein.travelers import (
     folded_constraints,
     folded_street_policy,
@@ -172,10 +176,13 @@ def _policy_transfer_arg(transfer_mode, street_factors, components, purpose):
     return (mode, budget, float(value) / 1000.0)
 
 
-def _policy_reduced(core, point, egress, modes, exclude_stops, transfer_mode=None):
+def _policy_reduced(
+    core, point, egress, modes, exclude_stops, transfer_mode=None, speeds=None
+):
     """One side's reduction: the ``(stop, seconds)`` offsets the engine
     seeds, and the per-stop ``StreetChoice`` tokens the reconstruction
-    rebuilds the street legs from."""
+    rebuilds the street legs from. ``speeds`` is the query's validated
+    ``{mode: km/h}``."""
     rows = core._reduced_street_offsets(
         point[0],
         point[1],
@@ -183,6 +190,7 @@ def _policy_reduced(core, point, egress, modes, exclude_stops, transfer_mode=Non
         modes,
         list(id_sequence("exclude_stops", exclude_stops)),
         transfer_mode=transfer_mode,
+        speeds=core_speeds(speeds),
     )
     offsets = [(stop, seconds) for stop, seconds, *_ in rows]
     tokens = {row[0]: row[1:] for row in rows}
@@ -199,7 +207,14 @@ def _carrying_offsets(rows):
 
 
 def _transfer_leg_dicts(
-    core, from_stop, to_stop, departure_s, arrival_s, geometries, transfer_mode
+    core,
+    from_stop,
+    to_stop,
+    departure_s,
+    arrival_s,
+    geometries,
+    transfer_mode,
+    speeds=None,
 ):
     """The leg dicts of one relaxed transfer edge: a single walking leg,
     or — when the merged set's edge rode a rental — the walk-ride-walk
@@ -214,7 +229,11 @@ def _transfer_leg_dicts(
     )
     if token is None:
         walked = core._transfer_leg(
-            from_stop, to_stop, geometries, transfer_mode=transfer_mode
+            from_stop,
+            to_stop,
+            geometries,
+            transfer_mode=transfer_mode,
+            speeds=core_speeds(speeds),
         )
         return [
             {
@@ -377,9 +396,8 @@ def _car_park_table(core, origin, policy, walk_options, geometries):
     # fires before the first composition.
     raise_if_refused()
     walking_speed, walk_budget, snap_distance = walk_options
-    # A street install bumps the core's generation; pinning it proves
-    # the car rows and the walking rows read the same graph.
-    generation = core._streets_generation
+    # The car rows and the walking rows read the same graph.
+    snapshot = NetworkSnapshot(core)
     best = _car_park_offsets(core, origin, policy, walk_options, geometries)
     linked = core._link_walking_stops(
         [tuple(origin)], walking_speed, walk_budget, snap_distance
@@ -391,11 +409,7 @@ def _car_park_table(core, origin, policy, walk_options, geometries):
         if linked is None
         else {stop: (int(seconds), meters) for stop, seconds, meters in linked}
     )
-    if core._streets_generation != generation:
-        raise RuntimeError(
-            "the street network was replaced while the park-and-ride "
-            "access table was being composed; rerun the query"
-        )
+    snapshot.verify("the park-and-ride access table")
     offsets, tokens = [], {}
     for stop, (total, token) in best.items():
         walked = walking.get(stop)
@@ -440,9 +454,8 @@ def _car_park_journeys(
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
 
     core = network._core
-    # The rebuilt legs must read the graph the access table searched;
-    # a street install mid-query bumps the pinned generation.
-    generation = core._streets_generation
+    # The rebuilt legs must read the graph the access table searched.
+    snapshot = NetworkSnapshot(core)
     # One frozen policy for the whole query: the composition, the
     # GIL-releasing searches, and the reconstruction all read the
     # same snapshot even if the caller mutates theirs mid-query.
@@ -709,11 +722,7 @@ def _car_park_journeys(
         snap_distance,
         geometries,
     )
-    if core._streets_generation != generation:
-        raise RuntimeError(
-            "the street network was replaced mid-query; the rebuilt "
-            "walking legs would not match the searched access table"
-        )
+    snapshot.verify("the park-and-ride journeys")
     if direct is None:
         return journeys
     network_m, connector_m, shape = direct
@@ -770,7 +779,15 @@ def _car_park_journeys(
 
 
 def _policy_street_legs(
-    core, leg, point, tokens, budgets, egress, geometries, transfer_mode=None
+    core,
+    leg,
+    point,
+    tokens,
+    budgets,
+    egress,
+    geometries,
+    transfer_mode=None,
+    speeds=None,
 ):
     """The reconstructed street leg(s) behind one access or egress row.
 
@@ -798,6 +815,7 @@ def _policy_street_legs(
         egress,
         budgets[mode],
         geometries,
+        speeds=core_speeds(speeds),
     )
     if parts is None:
         # The reduction proved this link reachable within the budget; a
@@ -831,7 +849,14 @@ def _policy_street_legs(
         # leaves from the seed's link.
         boundary = max(leg["arrival_s"] - leg_seconds, leg["departure_s"])
         transfer_legs = _transfer_leg_dicts(
-            core, stop, seed, leg["departure_s"], boundary, geometries, transfer_mode
+            core,
+            stop,
+            seed,
+            leg["departure_s"],
+            boundary,
+            geometries,
+            transfer_mode,
+            speeds,
         )
         street.update(from_stop=seed, departure_s=boundary, arrival_s=leg["arrival_s"])
         return transfer_legs + [street]
@@ -840,7 +865,7 @@ def _policy_street_legs(
     boundary = min(leg["departure_s"] + leg_seconds, leg["arrival_s"])
     street.update(to_stop=seed, departure_s=leg["departure_s"], arrival_s=boundary)
     transfer_legs = _transfer_leg_dicts(
-        core, seed, stop, boundary, leg["arrival_s"], geometries, transfer_mode
+        core, seed, stop, boundary, leg["arrival_s"], geometries, transfer_mode, speeds
     )
     return [street] + transfer_legs
 
@@ -855,8 +880,10 @@ def _policy_journeys(
     policy,
     exclusions,
     geometries,
+    speeds=None,
 ):
-    """Door-to-door journeys under a street-leg policy.
+    """Door-to-door journeys under a street-leg policy, at the query's
+    validated ``speeds`` (``{mode: km/h}``).
 
     Each side reduces over the multimodal graph, the engine routes from
     the reduced offsets, the street legs rebuild from the kept tokens,
@@ -869,6 +896,9 @@ def _policy_journeys(
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
     from cafein.policy import reduction_modes
 
+    # The reductions, the engine search, the leg rebuilds and the direct
+    # walk read one street graph and one transfer set.
+    snapshot = NetworkSnapshot(core)
     # One immutable snapshot of the caller's exclusions, reused across
     # every search below — a one-shot iterable or a list mutated between
     # the GIL-releasing calls must not shift the exclusion set mid-query.
@@ -888,7 +918,7 @@ def _policy_journeys(
         # walk either, it is the honest answer.
         try:
             offsets, tokens = _policy_reduced(
-                core, point, egress_side, modes, exclude_stops, transfer_mode
+                core, point, egress_side, modes, exclude_stops, transfer_mode, speeds
             )
         except ValueError as error:
             if "too far from the multimodal street network" not in str(error):
@@ -909,6 +939,7 @@ def _policy_journeys(
         list(exclude_stops),
         geometries,
         transfer_mode=transfer_mode,
+        speeds=core_speeds(speeds),
     )
     access_budgets = {mode: seconds for mode, seconds, *_ in access_modes}
     egress_budgets = {mode: seconds for mode, seconds, *_ in egress_modes}
@@ -982,6 +1013,7 @@ def _policy_journeys(
                         False,
                         geometries,
                         transfer_mode,
+                        speeds,
                     )
                 )
             elif leg["type"] == "egress":
@@ -995,6 +1027,7 @@ def _policy_journeys(
                         True,
                         geometries,
                         transfer_mode,
+                        speeds,
                     )
                 )
             elif leg["type"] == "transfer" and transfer_mode is not None:
@@ -1010,6 +1043,7 @@ def _policy_journeys(
                         leg["arrival_s"],
                         geometries,
                         transfer_mode,
+                        speeds,
                     )
                 )
             else:
@@ -1021,8 +1055,14 @@ def _policy_journeys(
     # wheelchair-only policy, else walking at the legacy convention.
     direct_mode, walk_budget = _direct_walking_mode(access_budgets, egress_budgets)
     direct = core._multimodal_direct_leg(
-        origin, destination, direct_mode, walk_budget, geometries
+        origin,
+        destination,
+        direct_mode,
+        walk_budget,
+        geometries,
+        speeds=core_speeds(speeds),
     )
+    snapshot.verify("the street-policy journeys")
     if direct is None:
         unsnapped = access_error or egress_error
         if unsnapped is not None:
@@ -1060,12 +1100,21 @@ def _policy_journeys(
 
 
 def _carriage_journeys(
-    core, origin, destination, date, departure, max_transfers, policy, geometries
+    core,
+    origin,
+    destination,
+    date,
+    departure,
+    max_transfers,
+    policy,
+    geometries,
+    speeds=None,
 ):
-    """Door-to-door carriage journeys: the possession-state search per
-    plane-reduced side, the winning chain decorated — street legs from
-    the planes' tokens, ride transfers under the carried mode, park
-    events and ``bike_aboard`` flags passed through."""
+    """Door-to-door carriage journeys at the validated ``speeds``
+    (``{mode: km/h}``): the possession-state search per plane-reduced
+    side, the winning chain decorated — street legs from the planes'
+    tokens, ride transfers under the carried mode, park events and
+    ``bike_aboard`` flags passed through."""
     from cafein import streets as _streets
     from cafein.network import _policy_transfer_mode
     from cafein.policy import carriage_plane_modes, carriage_terms
@@ -1078,7 +1127,9 @@ def _carriage_journeys(
             "street_policy needs the multimodal street graph; build with "
             "street_modes="
         )
-    # Snapshot every policy term before the GIL-releasing searches.
+    # Snapshot every policy term and the network state before the
+    # GIL-releasing searches.
+    snapshot = NetworkSnapshot(core)
     unknown_rule = vehicle.unknown_bike_trips
     park = (
         None
@@ -1097,7 +1148,7 @@ def _carriage_journeys(
 
     def reduced(point, egress, modes):
         try:
-            return _policy_reduced(core, point, egress, modes, ())
+            return _policy_reduced(core, point, egress, modes, (), speeds=speeds)
         except ValueError as error:
             if "too far from the multimodal street network" not in str(error):
                 raise
@@ -1139,6 +1190,7 @@ def _carriage_journeys(
         geometries,
         park_stops=park,
         transfer_mode=transfer_mode,
+        speeds=core_speeds(speeds),
     )
     acc_budgets = {name: seconds for name, seconds, *_ in acc_modes}
     egr_budgets = {name: seconds for name, seconds, *_ in egr_modes}
@@ -1163,6 +1215,7 @@ def _carriage_journeys(
                         budgets,
                         False,
                         geometries,
+                        speeds=speeds,
                     )
                 )
             elif leg["type"] == "egress":
@@ -1177,6 +1230,7 @@ def _carriage_journeys(
                         budgets,
                         True,
                         geometries,
+                        speeds=speeds,
                     )
                 )
             elif leg["type"] == "transfer" and leg.pop("ride", False):
@@ -1226,8 +1280,14 @@ def _carriage_journeys(
 
     departed = _departure_seconds(departure)
     direct = core._multimodal_direct_leg(
-        origin, destination, "walk", walk_budgets_acc["walk"], geometries
+        origin,
+        destination,
+        "walk",
+        walk_budgets_acc["walk"],
+        geometries,
+        speeds=core_speeds(speeds),
     )
+    snapshot.verify("the carriage journeys")
     if direct is None:
         if unsnapped is not None and not journeys:
             raise unsnapped
@@ -1278,8 +1338,10 @@ def _policy_mc_journeys(
     slack,
     max_options,
     router="auto",
+    speeds=None,
 ):
-    """Door-to-door multicriteria journeys under a street-leg policy.
+    """Door-to-door multicriteria journeys under a street-leg policy, at the
+    query's validated ``speeds`` (``{mode: km/h}``).
 
     Each side reduces to its ``(seconds, grams)`` Pareto frontier, and
     the resolved multicriteria engine — McRAPTOR, or McTBTR when the
@@ -1302,6 +1364,7 @@ def _policy_mc_journeys(
     from cafein.policy import reject_carriage
 
     reject_carriage(policy, "the multicriteria candidates")
+    snapshot = NetworkSnapshot(core)
     # The rental's ride grams enter the dominance, exactly as a granted
     # access mode's do.
     transfer_mode = _policy_transfer_mode(policy)
@@ -1334,6 +1397,7 @@ def _policy_mc_journeys(
                 modes,
                 list(exclude_stops),
                 transfer_mode=transfer_arg,
+                speeds=core_speeds(speeds),
             )
         except ValueError as error:
             if "too far from the multimodal street network" not in str(error):
@@ -1368,6 +1432,7 @@ def _policy_mc_journeys(
         list(exclude_stops),
         geometries,
         transfer_mode=transfer_arg,
+        speeds=core_speeds(speeds),
     )
     access_budgets = {mode: seconds for mode, seconds, *_ in access_modes}
     egress_budgets = {mode: seconds for mode, seconds, *_ in egress_modes}
@@ -1387,6 +1452,7 @@ def _policy_mc_journeys(
                         False,
                         geometries,
                         transfer_mode,
+                        speeds,
                     )
                 )
             elif leg["type"] == "egress":
@@ -1402,6 +1468,7 @@ def _policy_mc_journeys(
                         True,
                         geometries,
                         transfer_mode,
+                        speeds,
                     )
                 )
             elif leg["type"] == "transfer" and transfer_mode is not None:
@@ -1414,6 +1481,7 @@ def _policy_mc_journeys(
                         leg["arrival_s"],
                         geometries,
                         transfer_mode,
+                        speeds,
                     )
                 )
             else:
@@ -1422,8 +1490,14 @@ def _policy_mc_journeys(
         journey["legs"] = legs
     direct_mode, walk_budget = _direct_walking_mode(access_budgets, egress_budgets)
     direct = core._multimodal_direct_leg(
-        origin, destination, direct_mode, walk_budget, geometries
+        origin,
+        destination,
+        direct_mode,
+        walk_budget,
+        geometries,
+        speeds=core_speeds(speeds),
     )
+    snapshot.verify("the street-policy journeys")
     if direct is None:
         unsnapped = access_error or egress_error
         if unsnapped is not None:
@@ -1473,7 +1547,7 @@ class TransportNetwork:
         paths,
         *,
         osm_pbf=None,
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         bounding_box=None,
@@ -1504,8 +1578,9 @@ class TransportNetwork:
             transfers, and installed as the street network behind
             coordinate-based access/egress searches (``access_stops``);
             without it the network has neither.
-        walking_speed_kmph : float (optional, default: 3.6)
-            Walking speed in km/h of the footpath precompute.
+        speeds : mapping (optional)
+            ``{"walk": km/h}``: the walking speed of the footpath
+            precompute (default: 3.6 km/h).
         max_walking_time : float or datetime.timedelta (optional, default: 20 minutes)
             Walking-time cutoff of the direct footpath search, in
             minutes; chained footpaths may exceed it.
@@ -1551,7 +1626,7 @@ class TransportNetwork:
             Also compute the whole-day ULTRA intermediate-transfer
             shortcuts (see ``compute_ultra_shortcuts``), giving the
             point-destination time queries unrestricted intermediate
-            walking. Requires ``osm_pbf`` and uses ``walking_speed_kmph``.
+            walking. Requires ``osm_pbf`` and uses the walking speed of ``speeds``.
             It is a heavy, run-once operation (minutes over a metropolitan
             network); ``save`` the result and reuse it. Off by default.
 
@@ -1564,19 +1639,12 @@ class TransportNetwork:
         """
         _log.sync()
         from cafein._units import duration_seconds
-        from cafein._validate import (
-            non_negative_finite,
-            positive_finite,
-            validated_bounding_box,
-        )
+        from cafein._validate import non_negative_finite, validated_bounding_box
 
         # Every parameter problem surfaces here, before any file is
         # read — not minutes later, once the timetable is built.
         max_walking_time = duration_seconds("max_walking_time", max_walking_time)
-        if walking_speed_kmph is not None:
-            walking_speed_kmph = positive_finite(
-                "walking_speed_kmph", walking_speed_kmph
-            )
+        walking_speed_kmph = walking_speed(speeds)
         max_snap_distance = (
             None
             if snap_distance is None
@@ -1654,7 +1722,7 @@ class TransportNetwork:
             footpaths, street_network = streets.walking_streets(
                 osm_pbf,
                 core.stops,
-                walking_speed_kmph=walking_speed_kmph,
+                speeds={"walk": walking_speed_kmph},
                 # Internal values are seconds; the public streets API
                 # takes minutes or timedeltas — a timedelta is exact.
                 max_walking_time=_datetime.timedelta(seconds=max_walking_time),
@@ -2159,7 +2227,7 @@ class TransportNetwork:
     def compute_ultra_shortcuts(
         self,
         *,
-        walking_speed_kmph=None,
+        speeds=None,
         max_transfer_time=30.0,
         min_departure="00:00",
         max_departure=None,
@@ -2196,8 +2264,9 @@ class TransportNetwork:
 
         Parameters
         ----------
-        walking_speed_kmph : float (optional, default: 3.6)
-            Walking speed in km/h of the shortcut search.
+        speeds : mapping (optional)
+            ``{"walk": km/h}``: the walking speed of the shortcut search
+            (default: 3.6 km/h).
         max_transfer_time : float or datetime.timedelta (optional, default: 30)
             Cutoff of an intermediate walk, in minutes.
         min_departure : str or datetime.time (optional, default: "00:00")
@@ -2223,8 +2292,7 @@ class TransportNetwork:
             duration_seconds("max_transfer_time", max_transfer_time)
         )
         earliest = clock_seconds("min_departure", min_departure)
-        if walking_speed_kmph is None:
-            walking_speed_kmph = streets.WALKING_SPEED_KMPH
+        walking_speed_kmph = walking_speed(speeds, streets.WALKING_SPEED_KMPH)
         if max_departure is None:
             return self._core.compute_ultra_shortcuts(
                 walking_speed_kmph, transfer_seconds, earliest
@@ -2321,7 +2389,7 @@ class TransportNetwork:
         lat,
         lon,
         *,
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
     ):
@@ -2335,8 +2403,9 @@ class TransportNetwork:
         ----------
         lat, lon : float
             The coordinate, in EPSG:4326.
-        walking_speed_kmph : float (optional, default: 3.6)
-            Walking speed in km/h, on the network and on the connectors.
+        speeds : mapping (optional)
+            ``{"walk": km/h}``: the walking speed on the network and on
+            the connectors (default: 3.6 km/h).
         max_walking_time : float or datetime.timedelta (optional, default: 120 minutes)
             Walking-time cutoff in minutes.
         snap_distance : float (optional, default: 1600)
@@ -2350,6 +2419,7 @@ class TransportNetwork:
             Walking time in seconds to each reachable stop, keyed by
             stop_id; stops beyond the cutoff are absent.
         """
+        walking_speed_kmph = walking_speed(speeds)
         from cafein._units import duration_seconds
 
         max_walking_time = duration_seconds("max_walking_time", max_walking_time)
@@ -2393,7 +2463,7 @@ class TransportNetwork:
         exclude_trips=(),
         traveler=None,
         exclude_stops=(),
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         geometries=True,
@@ -2414,7 +2484,7 @@ class TransportNetwork:
         With a whole-day ULTRA set (``compute_ultra_shortcuts``), the two
         stops are routed **door-to-door between their coordinates** — the
         same unrestricted initial/intermediate/final walking as
-        ``route_between_coordinates`` — and ``walking_speed_kmph``,
+        ``route_between_coordinates`` — and ``speeds``,
         ``max_walking_time``, and ``snap_distance`` bound that walking.
         Without such a set (or when a stop has no coordinate or is off the
         walking network) the query boards at the origin stop and relaxes
@@ -2461,9 +2531,10 @@ class TransportNetwork:
             catch it, sorted by departure and then rides. A journey that
             leaves within the window but waits for a ride beyond it
             carries the window's final second as its departure.
-        walking_speed_kmph : float (optional, default: 3.6)
-            Walking speed in km/h of the door-to-door searches (whole-day
-            ULTRA only; ignored otherwise).
+        speeds : mapping (optional)
+            ``{"walk": km/h}``: the walking speed of the door-to-door
+            searches (default: 3.6 km/h; whole-day ULTRA only, ignored
+            otherwise).
         max_walking_time : float or datetime.timedelta (optional, default: 120 minutes)
             Walking-time cutoff in minutes of each street search
             (whole-day ULTRA only; ignored otherwise).
@@ -2492,6 +2563,7 @@ class TransportNetwork:
             journey carries its legs; the ``*_s`` times are seconds past
             the service day's start.
         """
+        walking_speed_kmph = walking_speed(speeds)
         (
             exclude_routes,
             exclude_trips,
@@ -2586,7 +2658,7 @@ class TransportNetwork:
         exclude_trips=(),
         traveler=None,
         exclude_stops=(),
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         geometries=True,
@@ -2637,8 +2709,10 @@ class TransportNetwork:
             transfers: 8 rides allow 7 transfers).
         departure_time_window : float or datetime.timedelta (optional)
             Departure window in minutes, as in ``route_between_stops``.
-        walking_speed_kmph : float (optional, default: 3.6)
-            Walking speed in km/h of the access and egress searches.
+        speeds : mapping (optional)
+            ``{"walk": km/h}``: the walking speed of the access and egress
+            searches (default: 3.6 km/h). Beside a ``StreetLegPolicy`` it
+            also takes the modes the policy's access and egress grant.
         max_walking_time : float or datetime.timedelta (optional, default: 120 minutes)
             Walking-time cutoff in minutes of each street search.
         snap_distance : float (optional, default: 1600)
@@ -2686,9 +2760,11 @@ class TransportNetwork:
             engine, journeys latest-departure-first, the walk placed
             to arrive exactly at the deadline; time windows are
             rejected beside the policy on both axes.
-            Conflicts with the walking knobs above and with
+            Conflicts with ``max_walking_time``, ``snap_distance`` and
             ``departure_time_window``, which are rejected rather than
-            silently ignored.
+            silently ignored; ``speeds`` sets the policy's modes, at the
+            speeds its transfer set was computed at when it grants
+            transfers.
 
         Returns
         -------
@@ -2696,6 +2772,10 @@ class TransportNetwork:
             Journeys as in ``route_between_stops``; arrivals include
             the egress walk.
         """
+        walking_speed_kmph = _transit_walking_speed(self, speeds, street_policy)
+        # The traveler's folding and the route read one street graph and
+        # one transfer set.
+        snapshot = NetworkSnapshot(self._core)
         (
             exclude_routes,
             exclude_trips,
@@ -2714,6 +2794,10 @@ class TransportNetwork:
         street_policy, max_walking_time = folded_street_policy(
             traveler, self, street_policy, walking_speed_kmph, max_walking_time
         )
+        riding = policy_speeds(street_policy, speeds, traveler)
+        if riding is not None:
+            # The traveler's walking speed rides in the policy's speeds.
+            walking_speed_kmph = None
         from cafein._units import duration_seconds, time_axis, window_axis
 
         date, departure, arrive_by = time_axis(departure, arrival)
@@ -2730,7 +2814,7 @@ class TransportNetwork:
                 )
         if max_rides < 1:
             raise ValueError("max_rides must be at least 1")
-        return self._route_between_coordinates(
+        journeys = self._route_between_coordinates(
             origin=origin,
             destination=destination,
             date=date,
@@ -2749,7 +2833,10 @@ class TransportNetwork:
             walking_speed_kmph=walking_speed_kmph,
             geometries=geometries,
             street_policy=street_policy,
+            speeds=riding,
         )
+        snapshot.verify("the route")
+        return journeys
 
     def _route_between_coordinates(
         self,
@@ -2769,13 +2856,15 @@ class TransportNetwork:
         geometries=True,
         street_policy=None,
         arrive_by=False,
+        speeds=None,
     ):
         """``route_between_coordinates`` in core space: split ``date`` +
         ``departure`` strings, ``max_transfers``, and every duration
         in seconds — the form internal callers use to avoid double
         conversion. With ``arrive_by`` the time is the arrival deadline
         (the public wrapper rejects a street-leg policy beside it; the
-        car-park policy serves both axes)."""
+        car-park policy serves both axes). ``speeds`` is a street-leg
+        policy's validated ``{mode: km/h}``."""
         if street_policy is not None:
             from cafein.matrices import _walking_only_policy
             from cafein.policy import CarParkPolicy
@@ -2818,8 +2907,8 @@ class TransportNetwork:
             ):
                 raise ValueError(
                     "street_policy carries its own budgets; passing "
-                    "walking_speed_kmph, max_walking_time, or "
-                    "snap_distance beside it is a conflict"
+                    "max_walking_time or snap_distance beside it is a "
+                    "conflict"
                 )
             if window is not None:
                 raise ValueError(
@@ -2844,6 +2933,7 @@ class TransportNetwork:
                     max_transfers,
                     street_policy,
                     geometries,
+                    speeds=speeds,
                 )
             walk_only, walk_budget = _walking_only_policy(street_policy)
             if walk_only:
@@ -2859,7 +2949,7 @@ class TransportNetwork:
                     list(id_sequence("exclude_routes", exclude_routes)),
                     list(id_sequence("exclude_trips", exclude_trips)),
                     list(id_sequence("exclude_stops", exclude_stops)),
-                    *_walk_options(None, walk_budget, None),
+                    *_walk_options((speeds or {}).get("walk"), walk_budget, None),
                     geometries,
                 )
             if not self._core.has_multimodal_streets:
@@ -2877,6 +2967,7 @@ class TransportNetwork:
                 street_policy,
                 (exclude_routes, exclude_trips, exclude_stops),
                 geometries,
+                speeds=speeds,
             )
         return self._core.route_between_coordinates(
             tuple(origin),
@@ -2901,7 +2992,7 @@ class TransportNetwork:
                 "street_modes=(..., 'car')"
             )
 
-    def compute_carriage_transfers(self, mode, max_transfer_time):
+    def compute_carriage_transfers(self, mode, max_transfer_time, *, speeds=None):
         """Compute the carriage transfer set for a carried ``mode``.
 
         Per stop pair the faster of the walking closure row and the own
@@ -2920,6 +3011,10 @@ class TransportNetwork:
             The carried vehicle's street mode (``"bicycle"``).
         max_transfer_time : float or datetime.timedelta
             The per-movement ride budget, in minutes.
+        speeds : mapping, optional
+            Speeds in km/h the rides are computed at, as in
+            ``StreetNetwork.travel_time``: ``mode`` and ``"walk"``. A query
+            relaxes the set only at the same speeds.
 
         Returns
         -------
@@ -2928,10 +3023,13 @@ class TransportNetwork:
         """
         from cafein._units import duration_seconds
 
+        overrides = profile_speeds(speeds, mode)
         seconds = duration_seconds("max_transfer_time", max_transfer_time)
-        return self._core._compute_carriage_transfers(mode, float(seconds))
+        return self._core._compute_carriage_transfers(
+            mode, float(seconds), speeds=overrides
+        )
 
-    def compute_mode_transfers(self, mode, max_transfer_time):
+    def compute_mode_transfers(self, mode, max_transfer_time, *, speeds=None):
         """Compute the merged shared-vehicle transfer set for ``mode``.
 
         Per stop with a street link for `mode`, one directed search over
@@ -2946,8 +3044,11 @@ class TransportNetwork:
         ``StreetLegPolicy(transfers={mode: budget})`` — the same budget,
         in the policy's seconds — then relax
         this set; a missing or differently bound set is rejected, never
-        silently substituted. Heavy precompute; persisted by ``save``
-        and restored by ``load`` with its exact binding.
+        silently substituted. ``speeds`` (km/h for ``mode`` and
+        ``"walk"``, as in ``StreetNetwork.travel_time``) sets the speeds
+        the rides are computed at, and a query relaxes the set only at
+        the same speeds. Heavy precompute; persisted by ``save`` and
+        restored by ``load`` with its exact binding.
 
         The ``"wheelchair"`` mode builds a walking-class set instead:
         the wheelchair-profile movements alone, with no walking-closure
@@ -2963,8 +3064,11 @@ class TransportNetwork:
         """
         from cafein._units import duration_seconds
 
+        overrides = profile_speeds(speeds, mode)
         seconds = duration_seconds("max_transfer_time", max_transfer_time)
-        return self._core._compute_mode_transfers(mode, float(seconds))
+        return self._core._compute_mode_transfers(
+            mode, float(seconds), speeds=overrides
+        )
 
     @_log.timed_computer(
         "matrix.travel_times",
@@ -2983,7 +3087,7 @@ class TransportNetwork:
         exclude_trips=(),
         traveler=None,
         exclude_stops=(),
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         street_policy=None,
@@ -3021,8 +3125,10 @@ class TransportNetwork:
         max_rides : int (optional, default: 8)
             Maximum number of boarded vehicles per journey (rides, not
             transfers: 8 rides allow 7 transfers).
-        walking_speed_kmph : float (optional, default: 3.6)
-            Walking speed in km/h of the access search.
+        speeds : mapping (optional)
+            ``{"walk": km/h}``: the walking speed of the access search
+            (default: 3.6 km/h). Beside a ``StreetLegPolicy`` it also takes
+            the modes the policy's access grants.
         max_walking_time : float or datetime.timedelta (optional, default: 120 minutes)
             Walking-time cutoff in minutes of the access search.
         snap_distance : float (optional, default: 1600)
@@ -3038,9 +3144,11 @@ class TransportNetwork:
             over it. With ``transfers={mode: budget}`` the run relaxes
             the merged mode-transfer set of
             :meth:`compute_mode_transfers`, which must be computed with
-            exactly that binding. Conflicts with the walking knobs above
-            and with exclusions, which are rejected rather than
-            silently ignored. A ``CarParkPolicy`` here serves
+            exactly that binding. Conflicts with ``max_walking_time``,
+            ``snap_distance`` and exclusions, which are rejected rather
+            than silently ignored; ``speeds`` sets the policy's modes, at
+            the speeds its transfer set was computed at when it grants
+            transfers. A ``CarParkPolicy`` here serves
             park-and-ride instead: the drive-park-walk chain competes
             beside ordinary walking, and the query's walking knobs
             stay active, timing the walking access. It serves the
@@ -3055,6 +3163,10 @@ class TransportNetwork:
             Travel time in seconds to every reachable stop, keyed by
             stop_id; unreachable stops are absent.
         """
+        walking_speed_kmph = _transit_walking_speed(self, speeds, street_policy)
+        # A street-policy query reads one street graph and one transfer
+        # set, from the traveler's folding to the engine search.
+        snapshot = NetworkSnapshot(self._core)
         (
             exclude_routes,
             exclude_trips,
@@ -3073,6 +3185,10 @@ class TransportNetwork:
         street_policy, max_walking_time = folded_street_policy(
             traveler, self, street_policy, walking_speed_kmph, max_walking_time
         )
+        riding = policy_speeds(street_policy, speeds, traveler)
+        if riding is not None:
+            # The traveler's walking speed rides in the policy's speeds.
+            walking_speed_kmph = None
         from cafein._units import duration_seconds, time_axis
 
         date, departure, arrive_by = time_axis(departure, arrival)
@@ -3127,7 +3243,7 @@ class TransportNetwork:
                     ),
                     False,
                 )
-                return self._core._travel_times_with_access(
+                times = self._core._travel_times_with_access(
                     offsets,
                     date,
                     departure,
@@ -3137,14 +3253,16 @@ class TransportNetwork:
                     exclude_trips=list(exclude_trips),
                     exclude_stops=list(exclude_stops),
                 )
+                snapshot.verify("the park-and-ride travel times")
+                return times
             if any(
                 option is not None
                 for option in (walking_speed_kmph, max_walking_time, max_snap_distance)
             ):
                 raise ValueError(
                     "street_policy carries its own budgets; passing "
-                    "walking_speed_kmph, max_walking_time, or "
-                    "snap_distance beside it is a conflict"
+                    "max_walking_time or snap_distance beside it is a "
+                    "conflict"
                 )
             from cafein.network import _policy_transfer_mode
             from cafein.policy import carriage_terms
@@ -3192,7 +3310,7 @@ class TransportNetwork:
                 def reduced(plane_modes, carrying_plane=False):
                     try:
                         rows = self._core._reduced_street_offsets(
-                            *origin, False, plane_modes
+                            *origin, False, plane_modes, speeds=core_speeds(riding)
                         )
                     except ValueError as error:
                         if "too far from the multimodal street network" not in str(
@@ -3211,7 +3329,7 @@ class TransportNetwork:
                         "coordinate too far from the multimodal street "
                         "network for every policy mode"
                     )
-                return self._core._carriage_travel_times(
+                times = self._core._carriage_travel_times(
                     carrying or [],
                     free or [],
                     date,
@@ -3220,7 +3338,10 @@ class TransportNetwork:
                     unknown_rule,
                     park_stops=park,
                     transfer_mode=transfer_mode,
+                    speeds=core_speeds(riding),
                 )
+                snapshot.verify("the carriage travel times")
+                return times
             if transfer_mode is None and all(mode == "walk" for mode, *_ in modes):
                 # A walking-only policy IS the current walking path, at the
                 # policy's walking budget; a transfers= binding changes the
@@ -3234,7 +3355,9 @@ class TransportNetwork:
                     list(exclude_routes),
                     list(exclude_trips),
                     list(exclude_stops),
-                    *_walk_options(walking_speed_kmph, walk_budget, max_snap_distance),
+                    *_walk_options(
+                        (riding or {}).get("walk"), walk_budget, max_snap_distance
+                    ),
                 )
             if not self._core.has_multimodal_streets:
                 raise ValueError(
@@ -3244,10 +3367,14 @@ class TransportNetwork:
             access = [
                 (stop, seconds)
                 for stop, seconds, *_ in self._core._reduced_street_offsets(
-                    *tuple(origin), False, modes, transfer_mode=transfer_mode
+                    *tuple(origin),
+                    False,
+                    modes,
+                    transfer_mode=transfer_mode,
+                    speeds=core_speeds(riding),
                 )
             ]
-            return self._core._travel_times_with_access(
+            times = self._core._travel_times_with_access(
                 access,
                 date,
                 departure,
@@ -3256,7 +3383,10 @@ class TransportNetwork:
                 exclude_routes=list(exclude_routes),
                 exclude_trips=list(exclude_trips),
                 exclude_stops=list(exclude_stops),
+                speeds=core_speeds(riding),
             )
+            snapshot.verify("the street-policy travel times")
+            return times
         return self._core.travel_times_from_coordinate(
             tuple(origin),
             date,
@@ -3286,7 +3416,7 @@ class TransportNetwork:
         exclude_trips=(),
         traveler=None,
         exclude_stops=(),
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
     ):
@@ -3325,9 +3455,10 @@ class TransportNetwork:
         max_rides : int (optional, default: 8)
             Maximum number of boarded vehicles per journey (rides, not
             transfers: 8 rides allow 7 transfers).
-        walking_speed_kmph : float (optional, default: 3.6)
-            Walking speed in km/h of the door-to-door searches (whole-day
-            ULTRA only; ignored otherwise).
+        speeds : mapping (optional)
+            ``{"walk": km/h}``: the walking speed of the door-to-door
+            searches (default: 3.6 km/h; whole-day ULTRA only, ignored
+            otherwise).
         max_walking_time : float or datetime.timedelta (optional, default: 120 minutes)
             Walking-time cutoff in minutes of the initial and final
             walks (whole-day ULTRA only; ignored otherwise).
@@ -3344,6 +3475,7 @@ class TransportNetwork:
             door-to-door time from the origin stop's coordinate, so the origin
             may cost its short walk to the platform.
         """
+        walking_speed_kmph = walking_speed(speeds)
         (
             exclude_routes,
             exclude_trips,
@@ -3406,7 +3538,7 @@ class TransportNetwork:
         confidence=None,
         chunk=None,
         router="auto",
-        walking_speed_kmph=None,
+        speeds=None,
         max_walking_time=None,
         snap_distance=None,
         workers=None,
@@ -3502,10 +3634,10 @@ class TransportNetwork:
             set, where only the RAPTOR path routes door-to-door and
             auto prefers it; point matrices share the ULTRA set on
             both engines, so the cache alone decides there.
-        walking_speed_kmph, max_walking_time, snap_distance : float
-            The street-search options, as in ``access_stops``: speed in
-            km/h, walking time in minutes (or a timedelta), snap
-            distance in meters. They apply to
+        speeds, max_walking_time, snap_distance : optional
+            The street-search options, as in ``access_stops``: the
+            ``{"walk": km/h}`` speed mapping, walking time in minutes (or
+            a timedelta), snap distance in meters. They apply to
             point origins, and to stop origins of the ``"raptor"`` matrix under
             a whole-day ULTRA set (which routes them door-to-door); they are
             ignored for stop origins otherwise.
@@ -3523,6 +3655,7 @@ class TransportNetwork:
             Unreachable pairs hold the maximum uint32 value
             (4294967295).
         """
+        walking_speed_kmph = walking_speed(speeds)
         if workers is not None:
             workers = positive_int("workers", workers)
         memory_spec("max_memory", max_memory)

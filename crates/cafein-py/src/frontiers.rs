@@ -583,7 +583,7 @@ impl TransportNetwork {
     #[pyo3(signature = (access, egress, date, departure, trip_factors, max_transfers, bucket,
                         slack = 0.0, max_options = None, router = "auto",
                         exclude_routes = vec![], exclude_trips = vec![], exclude_stops = vec![],
-                        geometries = true, transfer_mode = None))]
+                        geometries = true, transfer_mode = None, speeds = Vec::new()))]
     #[allow(clippy::too_many_arguments)]
     fn _mc_route_with_access(
         &self,
@@ -603,6 +603,7 @@ impl TransportNetwork {
         exclude_stops: Vec<String>,
         geometries: bool,
         transfer_mode: Option<(String, f64, f64)>,
+        speeds: crate::streets::SpeedOverrides,
     ) -> PyResult<Py<PyList>> {
         if !bucket.is_finite() || bucket <= 0.0 {
             return Err(PyValueError::new_err(
@@ -696,7 +697,7 @@ impl TransportNetwork {
         let binding = transfer_mode
             .as_ref()
             .map(|(mode, budget, _)| (mode.clone(), *budget));
-        let relaxed = self.policy_transfers(binding.as_ref())?;
+        let relaxed = self.policy_transfers(binding.as_ref(), &speeds)?;
         // The binding was just validated, so the held set is the one
         // `policy_transfers` returned.
         let rental = transfer_mode.as_ref().map(|&(_, _, grams_per_meter)| {

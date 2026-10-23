@@ -547,6 +547,31 @@ def test_street_distance_accessibility_counts_within_metres(helsinki_streets):
     wide = timed.pivot(index="from_id", columns="budget", values="accessibility")
     assert (wide[10.0] <= wide[30.0]).all()
     assert (wide[30.0] <= 3.0).all()
+    # Speeds reach the street search: the counts at a brisk walk are the
+    # street time matrix's at the same speed.
+    from cafein import TravelTimeMatrix
+
+    brisk = {"walk": 7.2}
+    counted = Accessibility(
+        helsinki_streets,
+        origins,
+        destinations,
+        transport_mode="walk",
+        speeds=brisk,
+        budgets=(10.0,),
+    )
+    times = TravelTimeMatrix(
+        helsinki_streets,
+        origins,
+        destinations,
+        transport_mode="walk",
+        speeds=brisk,
+        output_time_units="seconds",
+    )
+    within = times[times["travel_time"] <= 600].groupby("from_id").size()
+    assert counted.set_index("from_id")["accessibility"].to_dict() == {
+        origin: float(within.get(origin, 0)) for origin in ("o1", "o2")
+    }
 
 
 def test_empty_origins_and_duplicate_destinations_are_served(network):
@@ -1042,6 +1067,16 @@ def test_catchment_street_mode_spreads_by_time_and_distance(helsinki_streets):
     assert len(timed) == 2
     inner, outer = timed.geometry
     assert inner.within(outer.buffer(1e-9))
+    # Speeds reach the spread: a brisk walk's five-minute area strictly
+    # contains the default walk's.
+    brisk = Catchment(
+        helsinki_streets,
+        origin,
+        transport_mode="walk",
+        speeds={"walk": 7.2},
+        budgets=(5,),
+    ).geometry.iloc[0]
+    assert inner.within(brisk.buffer(1e-9)) and brisk.area > inner.area
     metered = Catchment(
         helsinki_streets,
         origin,
@@ -1117,9 +1152,9 @@ def test_catchment_validates_eagerly(network_with_footpaths, helsinki_streets):
         # unusable walking options
         (
             transit,
-            {"departure_time_window": 10, "walking_speed_kmph": float("nan")},
+            {"departure_time_window": 10, "speeds": {"walk": float("nan")}},
             ValueError,
-            "walking_speed_kmph",
+            "speeds",
         ),
         (transit, {"snap_distance": 0}, ValueError, "snap_distance"),
         (
