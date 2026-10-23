@@ -42,9 +42,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: ubuntu-latest, python: "313", variant: profile}
-          - {os: ubuntu-latest, python: "313", variant: malloc}
-          - {os: ubuntu-latest, python: "313", variant: loop}
+          - {os: ubuntu-latest, python: "313", variant: exitcodes}
+          - {os: ubuntu-24.04, python: "313", variant: exitcodes}
     steps:
       - uses: actions/checkout@v4
       - uses: mamba-org/setup-micromamba@v2
@@ -122,6 +121,10 @@ jobs:
           echo "variant=${{ matrix.variant }} MALLOC_MMAP_THRESHOLD_=${MALLOC_MMAP_THRESHOLD_:-unset}"
           if [ "${{ matrix.variant }}" = "loop" ]; then
             python ci/memdiag/memloop.py
+            exit 0
+          fi
+          if [ "${{ matrix.variant }}" = "exitcodes" ]; then
+            bash ci/memdiag/exitcodes.sh
             exit 0
           fi
           status=0
