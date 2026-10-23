@@ -41,20 +41,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # ubuntu-latest (26.04) ends the test jobs with a runner shutdown
-        # mid-suite; the jobs run on 24.04.
-        os: [ubuntu-24.04, macos-latest, windows-latest]
-        python: ["310", "311", "312", "313", "314"]
-        # macOS runners are few and queue behind a low concurrency cap,
-        # so they cover only the boundary Pythons; ubuntu and windows
-        # keep the full version axis.
-        exclude:
-          - os: macos-latest
-            python: "311"
-          - os: macos-latest
-            python: "312"
-          - os: macos-latest
-            python: "313"
+        include:
+          - {os: ubuntu-latest, python: "313", variant: profile}
+          - {os: ubuntu-latest, python: "313", variant: malloc}
+          - {os: ubuntu-latest, python: "313", variant: loop}
     steps:
       - uses: actions/checkout@v4
       - uses: mamba-org/setup-micromamba@v2
@@ -125,4 +115,16 @@ jobs:
           COVERAGE: ${{ matrix.os == 'ubuntu-24.04' && matrix.python == '312' && '--cov=cafein --cov-report=term-missing' || '' }}
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then export TMPDIR="$RUNNER_TEMP"; fi
-          pytest -n "$WORKERS" --dist load --durations=20 $COVERAGE
+          export PYTHONPATH="$PWD/ci/memdiag" MEMPROF_DIR="$RUNNER_TEMP/memprof"
+          if [ "${{ matrix.variant }}" = "malloc" ]; then
+            export MALLOC_MMAP_THRESHOLD_=131072 MALLOC_TRIM_THRESHOLD_=131072
+          fi
+          echo "variant=${{ matrix.variant }} MALLOC_MMAP_THRESHOLD_=${MALLOC_MMAP_THRESHOLD_:-unset}"
+          if [ "${{ matrix.variant }}" = "loop" ]; then
+            python ci/memdiag/memloop.py
+            exit 0
+          fi
+          status=0
+          pytest -n "$WORKERS" --dist load -q -p memprof_plugin --durations=10 || status=$?
+          python ci/memdiag/analyse.py "$MEMPROF_DIR"
+          exit $status
