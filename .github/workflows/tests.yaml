@@ -42,8 +42,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: ubuntu-latest, python: "313", variant: exitcodes}
-          - {os: ubuntu-24.04, python: "313", variant: exitcodes}
+          - {os: ubuntu-latest, python: "313", variant: profile_trim}
+          - {os: ubuntu-latest, python: "313", variant: trim}
     steps:
       - uses: actions/checkout@v4
       - uses: mamba-org/setup-micromamba@v2
@@ -118,16 +118,16 @@ jobs:
           if [ "${{ matrix.variant }}" = "malloc" ]; then
             export MALLOC_MMAP_THRESHOLD_=131072 MALLOC_TRIM_THRESHOLD_=131072
           fi
-          echo "variant=${{ matrix.variant }} MALLOC_MMAP_THRESHOLD_=${MALLOC_MMAP_THRESHOLD_:-unset}"
-          if [ "${{ matrix.variant }}" = "loop" ]; then
-            python ci/memdiag/memloop.py
-            exit 0
+          if [ "${{ matrix.variant }}" = "profile_trim" ]; then
+            export MEMPROF_TRIM=1
           fi
-          if [ "${{ matrix.variant }}" = "exitcodes" ]; then
-            bash ci/memdiag/exitcodes.sh
-            exit 0
+          echo "variant=${{ matrix.variant }} MEMPROF_TRIM=${MEMPROF_TRIM:-unset}"
+          if [ "${{ matrix.variant }}" = "trim" ]; then
+            python ci/memdiag/trim.py
+          else
+            status=0
+            pytest -n "$WORKERS" --dist load -q -p memprof_plugin --durations=10 || status=$?
+            echo "PYTEST_EXIT $status"
+            python ci/memdiag/analyse.py "$MEMPROF_DIR"
+            test "$status" -eq 0
           fi
-          status=0
-          pytest -n "$WORKERS" --dist load -q -p memprof_plugin --durations=10 || status=$?
-          python ci/memdiag/analyse.py "$MEMPROF_DIR"
-          exit $status

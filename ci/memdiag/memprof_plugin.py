@@ -40,10 +40,24 @@ def _memory_row(phase, nodeid):
     ]
 
 
+def trim_heap():
+    """Ask glibc to return free heap pages to the OS (``malloc_trim(0)``);
+    a no-op where glibc is absent."""
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 def _record_memory(phase, nodeid):
-    """Append this process's memory row to its CSV, opening the file first."""
+    """Append this process's memory row to its CSV, opening the file first;
+    with ``MEMPROF_TRIM=1`` the free heap pages are returned first."""
     global _writer, _file, _seq
     gc.collect()
+    if os.environ.get("MEMPROF_TRIM") == "1":
+        trim_heap()
     if _writer is None:
         out = os.environ["MEMPROF_DIR"]
         os.makedirs(out, exist_ok=True)
