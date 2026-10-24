@@ -999,15 +999,19 @@ def normalise_codes(edges):
 def prune_components_per_profile(
     u, v, vertex_count, access_forward, access_reverse, modes=None
 ):
-    """Clear each mode's permission from the components too small to route on.
+    """Clear each mode's permission outside the part of each component it can
+    route through in both directions.
 
     `u`, `v` are the edges' endpoint vertex indices (as `streets._vertex_
     endpoints` returns them). Connectivity is judged per mode: a union component
     that only connects a mode's streets through a way that mode cannot use is
-    not connected for it. For each mode, the sub-`MIN_ISLAND_VERTICES` weak
-    components over that mode's permitted arcs have the mode's bit cleared (in
-    both directions); the physical edge stays as long as another mode still uses
-    it. Returns the pruned (access_forward, access_reverse).
+    not connected for it. For each mode, every weak component over that mode's
+    permitted arcs keeps only its largest strongly connected part, and only when
+    that part has at least `MIN_ISLAND_VERTICES` vertices: a one-way pocket can
+    be entered or left but not both, so a point snapped into it reaches nothing
+    or is reached from nowhere. Elsewhere the mode's bit is cleared (in both
+    directions); the physical edge stays as long as another mode still uses it.
+    Returns the pruned (access_forward, access_reverse).
 
     `modes` names the modes to prune, defaulting to all of them. Pruning is the
     only thing a mode selection changes: no edge is dropped, so a mode left out
@@ -1034,14 +1038,34 @@ def prune_components_per_profile(
             (np.ones(usable.sum()), (u[usable], v[usable])),
             shape=(vertex_count, vertex_count),
         )
-        _, labels = csgraph.connected_components(graph, directed=False)
-        sizes = np.bincount(labels, minlength=vertex_count)
-        # An edge is on a routable component for this mode when both its
-        # endpoints sit in a component of at least MIN_ISLAND_VERTICES.
-        small = (sizes[labels[u]] < MIN_ISLAND_VERTICES) | (
-            sizes[labels[v]] < MIN_ISLAND_VERTICES
+        _, weak = csgraph.connected_components(graph, directed=False)
+        ahead = (forward & bit) != 0
+        behind = (reverse & bit) != 0
+        arcs = sparse.coo_matrix(
+            (
+                np.ones(ahead.sum() + behind.sum()),
+                (
+                    np.concatenate([u[ahead], v[behind]]),
+                    np.concatenate([v[ahead], u[behind]]),
+                ),
+            ),
+            shape=(vertex_count, vertex_count),
         )
-        drop = small & usable
+        count, strong = csgraph.connected_components(
+            arcs, directed=True, connection="strong"
+        )
+        # Strong parts nest in the weak components; each weak component's
+        # largest one (lowest label on a tie) is the part kept.
+        weak_of = np.empty(count, dtype=weak.dtype)
+        weak_of[strong] = weak
+        size_of = np.bincount(strong, minlength=count)
+        order = np.lexsort((np.arange(count), -size_of, weak_of))
+        first = np.ones(count, dtype=bool)
+        first[1:] = weak_of[order[1:]] != weak_of[order[:-1]]
+        largest = np.zeros(count, dtype=bool)
+        largest[order[first]] = True
+        kept = largest[strong] & (size_of[strong] >= MIN_ISLAND_VERTICES)
+        drop = usable & ~(kept[u] & kept[v])
         clear = np.uint8(0xFF ^ bit)
         forward[drop] &= clear
         reverse[drop] &= clear
