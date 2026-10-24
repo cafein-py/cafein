@@ -297,7 +297,11 @@ def test_the_extractor_semantics_on_controlled_content(kantakaupunki_pbf, tmp_pa
     assert len(plain)
     subset = pd.concat([yes_way, modal_way, no_way, plain], ignore_index=False)
     staged = tmp_path / "mini.osm.pbf"
-    osm.write_pbf(subset, str(staged), subset_only=True)
+    # Written by element identity, so each element keeps its own tags: the
+    # concatenated fetches carry different tag columns, and a column one
+    # of them lacks would be written as a removed tag (a park-and-ride lot
+    # without `amenity` reads back as a line, not an area).
+    osm.write_pbf(subset[["id", "osm_type", "geometry"]], str(staged), subset_only=True)
     frame = park_and_ride_facilities(str(staged))
 
     def qualified(rows):
