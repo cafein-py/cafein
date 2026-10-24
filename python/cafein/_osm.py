@@ -13,13 +13,13 @@ arrays carry.
 import json
 import math
 import re
-import warnings
 
 import numpy as np
 import pyrosm
 from scipy import sparse
 from scipy.sparse import csgraph
 
+from . import _log
 from .streets import MIN_ISLAND_VERTICES
 
 # --- Mode permission bits (one per street mode) -------------------------------
@@ -577,21 +577,17 @@ def speed_limit_row(country=None):
     from cafein._speed_limits import SPEED_LIMITS
 
     if country is None:
-        warnings.warn(
+        _log.warn(
             "no country= given; using the Generic legal default speed "
             "limits for untagged ways",
-            UserWarning,
-            stacklevel=3,
         )
         return SPEED_LIMITS[""]
     code = validated_country(country)
     for key in (code, code.split("-")[0]):
         if key in SPEED_LIMITS:
             return SPEED_LIMITS[key]
-    warnings.warn(
+    _log.warn(
         f"no legal default speed limits for '{code}'; using the Generic row",
-        UserWarning,
-        stacklevel=3,
     )
     return SPEED_LIMITS[""]
 

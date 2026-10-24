@@ -11,7 +11,6 @@ matching) arrive with the OSM preprocessing.
 
 import os
 import pathlib
-import warnings
 import zipfile
 
 import geopandas as gpd
@@ -19,6 +18,8 @@ import numpy as np
 import pandas as pd
 import pyproj
 import shapely
+
+from cafein import _log
 
 SHAPE_DIST = "shape_dist"
 SHAPE_LINREF = "shape_linref"
@@ -367,11 +368,10 @@ def _shape_lines(path, stops):
         usable = np.isfinite(x) & np.isfinite(y)
         if not usable.all():
             unusable = sorted(set(shapes.loc[~usable, "shape_id"]))
-            warnings.warn(
+            _log.warn(
                 f"{len(unusable)} shape(s) have points that cannot be projected "
                 "and are not used (their trips fall past the shape tier): "
                 + ", ".join(unusable[:5]),
-                stacklevel=2,
             )
             keep = ~shapes["shape_id"].isin(unusable).to_numpy()
             shapes, x, y = shapes[keep], x[keep], y[keep]
@@ -390,8 +390,7 @@ def _shape_lines(path, stops):
                 )
         return lines, transformer
     except Exception as error:
-        warnings.warn(
+        _log.warn(
             f"shapes could not be used ({error}); trips fall past the shape tier",
-            stacklevel=2,
         )
         return None

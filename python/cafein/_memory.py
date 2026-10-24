@@ -17,8 +17,8 @@ import logging
 import os
 import sys
 import threading
-import warnings
 
+from cafein import _log
 from cafein._units import memory_spec
 
 logger = logging.getLogger("cafein")
@@ -191,13 +191,13 @@ def _windows_resident():
     return int(counters.WorkingSetSize)
 
 
-def resolve_budget(spec, stacklevel=3):
+def resolve_budget(spec):
     """A spec (``None``: the process default) as bytes, floored at
     200 MiB with a warning."""
-    return _resolve(spec, stacklevel + 1)[0]
+    return _resolve(spec)[0]
 
 
-def _resolve(spec, stacklevel):
+def _resolve(spec):
     """``(budget, floored)``: the resolved bytes and whether the
     minimum applied."""
     parsed = memory_spec("max_memory", max_memory() if spec is None else spec)
@@ -214,11 +214,9 @@ def _resolve(spec, stacklevel):
     else:
         budget = number
     if budget < MINIMUM_BUDGET:
-        warnings.warn(
+        _log.warn(
             f"max_memory resolves to {budget} bytes, below the "
-            f"{MINIMUM_BUDGET}-byte minimum; planning at the minimum",
-            UserWarning,
-            stacklevel=stacklevel,
+            f"{MINIMUM_BUDGET}-byte minimum; planning at the minimum"
         )
         return MINIMUM_BUDGET, True
     return budget, False
@@ -257,10 +255,6 @@ def _call_fixed(engine, size):
     return max(0, CALL_BYTES_PER_UNIT[engine] * size + CALL_FIXED_BYTES[engine])
 
 
-def _warn(message, stacklevel):
-    warnings.warn(message, UserWarning, stacklevel=stacklevel)
-
-
 def plan_call(
     engine,
     size,
@@ -274,7 +268,6 @@ def plan_call(
     batch_rows=None,
     refinement_engine=None,
     fixed_bytes=0,
-    stacklevel=3,
 ):
     """Plan one call against the budget.
 
@@ -293,7 +286,7 @@ def plan_call(
     if engine not in ENGINES:
         raise ValueError(f"unknown engine {engine!r}; the engines are {ENGINES}")
     explicit_budget = max_memory is not None
-    budget, floored = _resolve(max_memory, stacklevel + 1)
+    budget, floored = _resolve(max_memory)
     baseline = resident_bytes()
     if baseline is None:
         raise ValueError(
@@ -314,11 +307,10 @@ def plan_call(
 
     def overrun(what):
         floors.append(what)
-        _warn(
+        _log.warn(
             f"{label}: {what} exceeds the memory budget ({budget} bytes, "
             f"{baseline} resident, {headroom} headroom); proceeding at the "
-            "floor — raise max_memory= to plan wider",
-            stacklevel + 1,
+            "floor — raise max_memory= to plan wider"
         )
 
     # The result (or batch) reservation, sized against the phase that

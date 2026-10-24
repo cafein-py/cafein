@@ -16,9 +16,11 @@ import copy
 import functools
 import inspect
 import logging
+import os
 import sys
 import threading
 import time
+import warnings
 from contextlib import contextmanager
 
 root = logging.getLogger("cafein")
@@ -65,6 +67,33 @@ class TimingReport:
                 "details": [entry["details"] for entry in self.phases],
             }
         )
+
+
+# The package's own source files, which warn() steps out of.
+_PACKAGE_PREFIX = os.path.dirname(os.path.abspath(__file__)) + os.sep
+
+
+@functools.lru_cache(maxsize=256)
+def _in_package(filename):
+    return os.path.abspath(filename).startswith(_PACKAGE_PREFIX)
+
+
+def warn(message, category=UserWarning):
+    """Warn at the first caller outside the cafein package.
+
+    A fixed ``stacklevel`` lands inside cafein whenever the internal
+    call depth changes; stepping over cafein's own frames keeps the
+    warning on the line of user code that made the call.
+    """
+    try:
+        frame = sys._getframe(1)
+    except ValueError:
+        frame = None
+    level = 2
+    while frame is not None and _in_package(frame.f_code.co_filename):
+        frame = frame.f_back
+        level += 1
+    warnings.warn(message, category, stacklevel=level)
 
 
 def _emit(
@@ -324,12 +353,9 @@ class _CafeinHandler(logging.StreamHandler):
                     if not self._warned:
                         self._warned = True
                         try:
-                            import warnings
-
-                            warnings.warn(
+                            warn(
                                 "tqdm is not installed; progress='bar' falls "
-                                "back to line output (pip install tqdm)",
-                                stacklevel=2,
+                                "back to line output (pip install tqdm)"
                             )
                         except Exception:
                             # Warnings promoted to errors must not eat

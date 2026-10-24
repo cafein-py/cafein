@@ -1288,3 +1288,38 @@ def test_multi_call_queries_refuse_a_transfer_set_replaced_mid_query(
         pytest.importorskip("h3")
     with pytest.raises(RuntimeError, match="transfer set was replaced"):
         queries[query]()
+
+
+@pytest.mark.parametrize("source", ["rust build", "python build", "loader"])
+def test_warnings_point_at_the_calling_code(tmp_path, source):
+    # Fixed stack levels landed inside cafein once the internal call
+    # depth changed; every warning names the first caller outside it.
+    from cafein import TransportNetwork
+    from cafein.emissions import load_factors
+
+    tables = {
+        **_TWO_STOP_TABLES,
+        "trips.txt": ["route_id,service_id,trip_id,shape_id", "R1,SV,T1,SH"],
+        "stop_times.txt": [
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+            "T1,08:00:00,08:00:00,S1,1",
+            "T1,08:10:00,08:10:00,S2,2",
+        ],
+    }
+    if source == "rust build":
+        del tables["agency.txt"]
+    elif source == "python build":
+        tables["shapes.txt"] = [
+            "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence",
+            "SH,60.0,24.0,1",
+            "SH,95.0,24.005,2",
+        ]
+    if source == "loader":
+        target = load_factors
+        argument = {"route_type": 3, "vehicle": 1.0, "fuel": 1.0, "colour": "red"}
+    else:
+        target = TransportNetwork.from_gtfs
+        argument = [_gtfs_zip(tmp_path / "gtfs.zip", tables)]
+    with pytest.warns(UserWarning) as records:
+        target(argument)
+    assert {record.filename for record in records} == {__file__}
