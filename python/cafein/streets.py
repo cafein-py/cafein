@@ -526,16 +526,24 @@ def _street_footpaths(payload, snapped, speed, max_walking_time):
     )
 
 
+_PARK_RIDE_AMENITIES = frozenset({"parking", "parking_entrance"})
+"""The ``amenity`` values of a park-and-ride facility: OSM documents
+``park_ride`` as a sub-tag of a car park."""
+
+
 def park_and_ride_facilities(osm_pbf, bounding_box=None):
     """Park-and-ride facilities from OSM, as ``CarParkPolicy`` input.
 
-    A facility is any element carrying a ``park_ride`` tag with a
-    value other than ``no`` — ``yes`` and the mode-specific values
+    A facility is a car park — an element tagged ``amenity=parking``
+    or ``amenity=parking_entrance`` — whose ``park_ride`` tag has a
+    value other than ``no``: ``yes`` and the mode-specific values
     (``bus``, ``train``, ``tram``, ``metro``, ``ferry``, ``hov``)
-    alike, standalone or beside ``amenity=parking``; plain parking
-    without a qualifying ``park_ride`` value is not a facility. Area
+    alike. Plain parking without a qualifying ``park_ride`` value is
+    not a facility, nor is a ``park_ride`` element that is not a car
+    park, such as bicycle parking, a former lot
+    (``was:amenity=parking``) or one under construction. Area
     geometries collapse to ``representative_point()`` (a point
-    guaranteed inside), so the frame is point-only by construction.
+    inside the area), so the frame is point-only by construction.
 
     Returns a GeoDataFrame in EPSG:4326 with ``id`` (the qualified
     OSM id, ``type/number`` — raw ids are unique per element type
@@ -553,6 +561,7 @@ def park_and_ride_facilities(osm_pbf, bounding_box=None):
     found = osm.get_data_by_custom_criteria(
         custom_filter={"park_ride": True},
         filter_type="keep",
+        extra_attributes=["amenity"],
         keep_nodes=True,
         keep_ways=True,
         keep_relations=True,
@@ -565,7 +574,15 @@ def park_and_ride_facilities(osm_pbf, bounding_box=None):
             crs="EPSG:4326",
         )
     values = found["park_ride"].astype(str).str.lower()
-    found = found[found["park_ride"].notna() & (values != "no")]
+    if "amenity" in found.columns:
+        amenity = found["amenity"].astype(str).str.strip().str.lower()
+    else:
+        amenity = pd.Series("", index=found.index)
+    found = found[
+        found["park_ride"].notna()
+        & (values != "no")
+        & amenity.isin(_PARK_RIDE_AMENITIES)
+    ]
     points = found.geometry.representative_point()
     # OSM ids are unique per element type only; the qualified
     # "type/id" form keeps nodes, ways, and relations apart.
