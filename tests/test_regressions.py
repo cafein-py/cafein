@@ -1323,3 +1323,30 @@ def test_warnings_point_at_the_calling_code(tmp_path, source):
     with pytest.warns(UserWarning) as records:
         target(argument)
     assert {record.filename for record in records} == {__file__}
+
+
+def test_one_way_pockets_lose_the_mode_that_cannot_leave_or_enter_them():
+    # A 45-vertex two-way chain, a one-way dead end hanging off it (enter,
+    # never leave) and a one-way feeder into it (leave, never enter). A point
+    # snapped into either spur would reach nothing, or be reached from nowhere,
+    # by bicycle, so the spurs lose the bicycle bit; walking keeps them.
+    import numpy as np
+
+    from cafein import _osm
+
+    chain = [(i, i + 1) for i in range(44)]
+    dead_end = [(44, 45), (45, 46)]
+    feeder = [(47, 48), (48, 0)]
+    edges = chain + dead_end + feeder
+    u = np.array([a for a, _ in edges])
+    v = np.array([b for _, b in edges])
+    walk, bicycle = _osm.WALK, _osm.BICYCLE
+    forward = np.full(len(edges), walk | bicycle, dtype=np.uint8)
+    reverse = forward.copy()
+    one_way = slice(len(chain), len(edges))
+    reverse[one_way] = walk
+    pruned_f, pruned_r = _osm.prune_components_per_profile(u, v, 49, forward, reverse)
+    assert (pruned_f[: len(chain)] & bicycle != 0).all()
+    assert (pruned_r[: len(chain)] & bicycle != 0).all()
+    assert (pruned_f[one_way] & bicycle == 0).all()
+    assert (pruned_f & walk != 0).all() and (pruned_r & walk != 0).all()
