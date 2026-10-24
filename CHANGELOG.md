@@ -36,10 +36,6 @@
   while they run, instead of combining two network states in one result;
   installing a carriage transfer set counts as such a replacement.
   ([#417](https://github.com/cafein-py/cafein/pull/417))
-- Warnings name the line of the caller's code that triggered them, also
-  when raised deep inside a computation or by the network build, instead
-  of a line inside cafein.
-  ([#409](https://github.com/cafein-py/cafein/pull/409))
 
 ## 0.29.0 — 2026-09-30
 
