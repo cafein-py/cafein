@@ -31,7 +31,8 @@ if False:  # noqa: SIM108 — typing-only import; pyarrow stays optional
 #: 4: the slot list joins the parameters, so a scalar moment and a
 #: one-slot list never share a fingerprint.
 #: 5: the bicycle and e-bike default speeds change.
-FINGERPRINT_VERSION = 5
+#: 6: the wheelchair's default speed and slope model change.
+FINGERPRINT_VERSION = 6
 MANIFEST_FORMAT = 2
 MANIFEST_NAME = "manifest.json"
 DEFAULT_BATCH_SIZE = 500

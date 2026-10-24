@@ -4734,14 +4734,19 @@ fn sloped_chain() -> StreetNetwork {
     })
 }
 
+/// The wheelchair profile with an explicit 8 % cap.
+fn capped_wheelchair() -> StreetProfileDefinition {
+    let mut definition = StreetProfileDefinition::wheelchair();
+    definition.max_gradient = Some(0.08);
+    definition
+}
+
 #[test]
-fn the_gradient_cap_forbids_steeper_arcs_for_the_wheelchair() {
-    // The wheelchair's 8 % cap crosses the 5 % edge and refuses the 10 %
-    // one; capless walking passes both.
+fn a_gradient_cap_forbids_steeper_arcs() {
+    // An 8 % cap crosses the 5 % edge and refuses the 10 % one; capless
+    // walking passes both.
     let net = sloped_chain();
-    let chair = net
-        .compile_profile(&StreetProfileDefinition::wheelchair())
-        .unwrap();
+    let chair = net.compile_profile(&capped_wheelchair()).unwrap();
     let walk = net
         .compile_profile(&StreetProfileDefinition::walk())
         .unwrap();
@@ -4793,9 +4798,7 @@ fn unavailable_elevations_never_cap() {
         facility_reverse: vec![0; 1],
     };
     let net = elevated_network(2, &edges, &attrs, |_, _| f32::NAN);
-    let chair = net
-        .compile_profile(&StreetProfileDefinition::wheelchair())
-        .unwrap();
+    let chair = net.compile_profile(&capped_wheelchair()).unwrap();
     assert!(chair.arc_millis().iter().any(|&millis| millis != u32::MAX));
 }
 
@@ -4805,18 +4808,13 @@ fn a_network_without_elevations_never_caps() {
     let mut net = triangle();
     let attributes = uniform_attributes(&net, MODE_WALK | MODE_WHEELCHAIR, 0);
     net.install_street_attributes(attributes).unwrap();
-    let chair = net
-        .compile_profile(&StreetProfileDefinition::wheelchair())
-        .unwrap();
+    let chair = net.compile_profile(&capped_wheelchair()).unwrap();
     assert!(chair.arc_millis().iter().all(|&millis| millis != u32::MAX));
 }
 
 #[test]
-fn max_gradient_ships_on_the_wheelchair_and_validates() {
-    assert_eq!(
-        StreetProfileDefinition::wheelchair().max_gradient,
-        Some(0.08)
-    );
+fn max_gradient_ships_on_no_profile_and_validates() {
+    assert_eq!(StreetProfileDefinition::wheelchair().max_gradient, None);
     assert_eq!(StreetProfileDefinition::walk().max_gradient, None);
     assert_eq!(StreetProfileDefinition::bicycle().max_gradient, None);
     for bad_cap in [0.0, -0.05, f64::NAN, f64::INFINITY] {
@@ -4854,6 +4852,209 @@ fn a_car_profile_rejects_a_gradient_cap() {
     let mut bad = StreetProfileDefinition::car(None);
     bad.max_gradient = Some(f64::NAN);
     assert_eq!(bad.validate(), Err(ProfileError::InvalidMaxGradient));
+}
+
+// ---- The wheelchair incline cost ----
+
+#[test]
+fn the_incline_cost_follows_accessmaps_curve() {
+    let incline = InclineCost::accessmap(50.0);
+    let ratio = |grade: f64| incline.multiplier(0.0) / incline.multiplier(grade);
+    // The flat keeps the base speed.
+    assert!((incline.multiplier(0.0) - 1.0).abs() < 1e-12);
+    // Continuous at the fastest grade, where it is cheapest.
+    let at = incline.multiplier(incline.ideal);
+    for epsilon in [1e-9, -1e-9] {
+        assert!((incline.multiplier(incline.ideal + epsilon) - at).abs() < 1e-6);
+    }
+    assert!(at < 1.0 && at < incline.multiplier(0.05) && at < incline.multiplier(-0.05));
+    // A fifth of the fastest-grade speed at 8.5 % up and 10 % down.
+    let fastest = 1.0 / at;
+    for grade in [0.085, -0.10] {
+        assert!((ratio(grade) / fastest - 0.2).abs() < 1e-9);
+    }
+    // Uphill costs more than the same descent below the fastest grade.
+    assert!(incline.multiplier(0.05) > incline.multiplier(-0.05));
+}
+
+#[test]
+fn the_wheelchair_bound_covers_its_fastest_grade() {
+    let definition = StreetProfileDefinition::wheelchair();
+    assert_eq!(definition.validate(), Ok(()));
+    let incline = definition.incline.unwrap();
+    let fastest = definition.base_speed / incline.multiplier(incline.ideal);
+    assert!(definition.max_speed >= fastest);
+    assert!((definition.base_speed - 0.67).abs() < 1e-12);
+    assert!((definition.connector_speed - 0.67).abs() < 1e-12);
+}
+
+#[test]
+fn the_incline_grade_spreads_short_runs() {
+    let incline = InclineCost::accessmap(50.0);
+    // A 1 m rise over a 10 m edge reads over 50 m: 2 %, not 10 %.
+    assert!((incline.grade(1.0, 10.0) - 0.02).abs() < 1e-12);
+    // A long edge uses its own length.
+    assert!((incline.grade(10.0, 200.0) - 0.05).abs() < 1e-12);
+    // Unavailable data and empty runs are flat; spikes clamp.
+    assert_eq!(incline.grade(f64::NAN, 100.0), 0.0);
+    assert_eq!(incline.grade(1.0, 0.0), 0.0);
+    assert_eq!(incline.grade(500.0, 100.0), MAX_SLOPE);
+}
+
+#[test]
+fn the_incline_cost_reads_the_whole_edge_grade() {
+    // A 100 m edge with level ends and a 10 m spike midway: the bicycle's
+    // per-sub-segment model sees the hill, the wheelchair's whole-edge grade
+    // is flat both ways — exactly the cost compiled without the incline.
+    // A missing end elevation reads flat too.
+    let spike = vec![(0.0, 0.0), (50.0, 0.0), (100.0, 0.0)];
+    let edges: Vec<TestEdge> = vec![(0, 1, 100.0, spike)];
+    let all = MODE_WALK | MODE_WHEELCHAIR | MODE_BICYCLE;
+    let attrs = Attrs {
+        highway: vec![0; 1],
+        surface: vec![0; 1],
+        smoothness: vec![0; 1],
+        flags: vec![0; 1],
+        access_forward: vec![all; 1],
+        access_reverse: vec![all; 1],
+        facility_forward: vec![0; 1],
+        facility_reverse: vec![0; 1],
+    };
+    let mut no_incline = StreetProfileDefinition::wheelchair();
+    no_incline.incline = None;
+    for ends in [0.0_f32, f32::NAN] {
+        let net = elevated_network(2, &edges, &attrs, |x, _| {
+            if (x - 50.0).abs() < 1e-9 {
+                10.0
+            } else if x < 1e-9 {
+                ends
+            } else {
+                0.0
+            }
+        });
+        let chair = net
+            .compile_profile(&StreetProfileDefinition::wheelchair())
+            .unwrap();
+        let flat = net.compile_profile(&no_incline).unwrap();
+        for (a, b) in [(0, 1), (1, 0)] {
+            let slot = directed_slot(&net, a, b);
+            assert_eq!(chair.arc_millis()[slot], flat.arc_millis()[slot]);
+        }
+        if !ends.is_nan() {
+            let bike = net
+                .compile_profile(&StreetProfileDefinition::bicycle())
+                .unwrap();
+            let mut level = StreetProfileDefinition::bicycle();
+            level.slope_uphill = 0.0;
+            level.slope_downhill = 0.0;
+            let level = net.compile_profile(&level).unwrap();
+            let slot = directed_slot(&net, 0, 1);
+            assert!(bike.arc_millis()[slot] > level.arc_millis()[slot]);
+        }
+    }
+}
+
+#[test]
+fn a_wheelchair_speed_moves_its_connectors() {
+    // The wheelchair moves at one speed; a bicycle's connectors stay walking.
+    let chair = StreetProfileDefinition::wheelchair().with_base_speed(1.2);
+    assert_eq!(chair.validate(), Ok(()));
+    assert_eq!(
+        (
+            chair.base_speed,
+            chair.connector_speed,
+            chair.dismount_speed
+        ),
+        (1.2, 1.2, 1.2)
+    );
+    let bike = StreetProfileDefinition::bicycle().with_base_speed(6.0);
+    assert_eq!(
+        bike.connector_speed,
+        StreetProfileDefinition::bicycle().connector_speed
+    );
+}
+
+#[test]
+fn an_overflow_the_slope_did_not_cause_still_fails() {
+    // An incline-bearing definition at an absurd speed overflows a level
+    // edge by itself: saturating it would understate the cost, so it fails.
+    let edges: Vec<TestEdge> = vec![(0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0)))];
+    let both = MODE_WALK | MODE_WHEELCHAIR;
+    let attrs = Attrs {
+        highway: vec![0; 1],
+        surface: vec![0; 1],
+        smoothness: vec![0; 1],
+        flags: vec![0; 1],
+        access_forward: vec![both; 1],
+        access_reverse: vec![both; 1],
+        facility_forward: vec![0; 1],
+        facility_reverse: vec![0; 1],
+    };
+    let net = elevated_network(2, &edges, &attrs, |_, _| 0.0);
+    let crawl = StreetProfileDefinition::wheelchair().with_base_speed(1e-6);
+    assert_eq!(crawl.validate(), Ok(()));
+    assert_eq!(
+        net.compile_profile(&crawl).unwrap_err(),
+        ProfileError::ArcCostOverflow
+    );
+}
+
+#[test]
+fn the_incline_cost_validates() {
+    let mut bad = StreetProfileDefinition::wheelchair();
+    bad.incline = Some(InclineCost::accessmap(0.0));
+    assert_eq!(bad.validate(), Err(ProfileError::InvalidInclineCost));
+    let mut linear = StreetProfileDefinition::wheelchair();
+    linear.slope_uphill = 1.0;
+    assert_eq!(linear.validate(), Err(ProfileError::InvalidInclineCost));
+    let mut car = StreetProfileDefinition::car(None);
+    car.incline = Some(InclineCost::accessmap(50.0));
+    assert_eq!(car.validate(), Err(ProfileError::InvalidInclineCost));
+}
+
+#[test]
+fn the_wheelchair_climbs_every_grade_at_a_cost() {
+    // The 5 % and 10 % chain: nothing is forbidden, each climb costs more
+    // than its descent, and the steeper climb costs more per metre.
+    let net = sloped_chain();
+    let chair = net
+        .compile_profile(&StreetProfileDefinition::wheelchair())
+        .unwrap();
+    assert!(chair.arc_millis().iter().all(|&millis| millis != u32::MAX));
+    let arc = |a, b| chair.arc_millis()[directed_slot(&net, a, b)];
+    assert!(arc(0, 1) > arc(1, 0));
+    assert!(arc(1, 2) > arc(2, 1));
+    assert!(arc(1, 2) > arc(0, 1));
+    // The 100 m, 5 % climb runs at the curve's speed for that grade.
+    let incline = StreetProfileDefinition::wheelchair().incline.unwrap();
+    let expected = (100.0 / 0.67 * incline.multiplier(0.05) * 1000.0).ceil();
+    assert!((f64::from(arc(0, 1)) / expected - 1.0).abs() < 1e-4);
+}
+
+#[test]
+fn the_steepest_incline_arcs_saturate_instead_of_failing() {
+    // A 10 km edge at the 100 % spike clamp overflows the arc cost both
+    // ways (the curve slows steep descents too); the incline cost compiles
+    // each arc just below the forbidden sentinel.
+    let edges: Vec<TestEdge> = vec![(0, 1, 10_000.0, straight((0.0, 0.0), (10_000.0, 0.0)))];
+    let both = MODE_WALK | MODE_WHEELCHAIR;
+    let attrs = Attrs {
+        highway: vec![0; 1],
+        surface: vec![0; 1],
+        smoothness: vec![0; 1],
+        flags: vec![0; 1],
+        access_forward: vec![both; 1],
+        access_reverse: vec![both; 1],
+        facility_forward: vec![0; 1],
+        facility_reverse: vec![0; 1],
+    };
+    let net = elevated_network(2, &edges, &attrs, |x, _| x as f32);
+    let chair = net
+        .compile_profile(&StreetProfileDefinition::wheelchair())
+        .unwrap();
+    for (a, b) in [(0, 1), (1, 0)] {
+        assert_eq!(chair.arc_millis()[directed_slot(&net, a, b)], u32::MAX - 1);
+    }
 }
 
 #[test]
