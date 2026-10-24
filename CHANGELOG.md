@@ -36,6 +36,15 @@
   while they run, instead of combining two network states in one result;
   installing a carriage transfer set counts as such a replacement.
   ([#417](https://github.com/cafein-py/cafein/pull/417))
+- Warnings name the line of the caller's code that triggered them, also
+  when raised deep inside a computation or by the network build, instead
+  of a line inside cafein.
+  ([#409](https://github.com/cafein-py/cafein/pull/409))
+- Points no longer snap into one-way pockets, streets a mode can enter but
+  not leave or leave but not enter, where they reached nothing or were
+  reached from nowhere: each street mode keeps only the largest part of
+  each street component it can travel in both directions.
+  ([#422](https://github.com/cafein-py/cafein/pull/422))
 
 ## 0.29.0 — 2026-09-30
 
