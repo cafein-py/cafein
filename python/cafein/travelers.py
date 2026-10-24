@@ -36,7 +36,7 @@ class TravelerProfile:
     ``"wheelchair"`` street mode, ``wheelchair=True`` also takes the
     streets: access, egress, and the direct street alternative ride
     the wheelchair profile — no stairs, ``wheelchair=no`` respected,
-    gradients capped on DEM builds — via an internally synthesized
+    slopes adjusting its time on DEM builds — via an internally synthesized
     street policy (an explicit ``street_policy=`` beside it is
     rejected, as is a walking speed: it rides ``speeds["wheelchair"]``).
     Mid-journey transfers ride the computed wheelchair transfer set

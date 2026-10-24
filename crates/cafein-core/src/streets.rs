@@ -190,7 +190,7 @@ pub use graph::{
 };
 use index::*;
 pub use profile::{
-    CarCostModel, CompiledStreetProfile, ProfileCache, ProfileError, StreetMode,
+    CarCostModel, CompiledStreetProfile, InclineCost, ProfileCache, ProfileError, StreetMode,
     StreetProfileDefinition, CAR_HIGH_SPEED_KMH, CAR_SPEED_CEILING_KMH, FLAG_BRIDGE, FLAG_DISMOUNT,
     FLAG_INDOOR, FLAG_LIT, FLAG_ROUNDABOUT, FLAG_SEGREGATED, FLAG_STEPS, FLAG_TUNNEL,
     HIGHWAY_CODE_COUNT, JUNCTION_PRIORITY, JUNCTION_RAMP, JUNCTION_SIGNALS, JUNCTION_TOPOLOGICAL,

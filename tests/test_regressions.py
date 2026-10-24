@@ -1350,3 +1350,61 @@ def test_one_way_pockets_lose_the_mode_that_cannot_leave_or_enter_them():
     assert (pruned_r[: len(chain)] & bicycle != 0).all()
     assert (pruned_f[one_way] & bicycle == 0).all()
     assert (pruned_f & walk != 0).all() and (pruned_r & walk != 0).all()
+
+
+def test_elevation_noise_slows_the_wheelchair_but_never_strands_it(
+    kantakaupunki_pbf,
+):
+    # A hard 8 % cap on the steepest sampled sub-segment turned a coarse
+    # elevation model's metre of noise into forbidden streets and stranded
+    # most wheelchair trips. Slope is now a cost on each edge's whole-edge
+    # grade: ±1 m of ripple leaves every flat-reachable pair reachable, and
+    # a real 5 % ramp makes the climb slower than the descent.
+    import geopandas as gpd
+    import numpy as np
+    import pandas as pd
+    from shapely.geometry import Point
+
+    from cafein import StreetNetwork, TravelTimeMatrix
+
+    def ripple(lons, lats):
+        lons, lats = np.asarray(lons), np.asarray(lats)
+        return (10.0 + np.sin(lons * 7e4) * np.cos(lats * 7e4)).astype("float32")
+
+    def ramp(lons, lats):
+        # 5 % rising northwards: 111 km per degree of latitude.
+        return ((np.asarray(lats) - 60.16) * 111_000 * 0.05).astype("float32")
+
+    networks = {
+        name: StreetNetwork.from_osm(
+            str(kantakaupunki_pbf), modes=("walk", "wheelchair"), dem=dem
+        )
+        for name, dem in (("flat", None), ("ripple", ripple), ("ramp", ramp))
+    }
+    lats, lons = np.meshgrid(
+        np.linspace(60.160, 60.178, 6), np.linspace(24.930, 24.955, 6)
+    )
+    grid = gpd.GeoDataFrame(
+        {"id": [f"p{i}" for i in range(lats.size)]},
+        geometry=[Point(x, y) for x, y in zip(lons.ravel(), lats.ravel())],
+        crs="EPSG:4326",
+    )
+
+    def cells(name):
+        frame = pd.DataFrame(
+            TravelTimeMatrix(
+                networks[name], grid, transport_mode="wheelchair", max_street_time=600
+            )
+        )
+        return frame.set_index(["from_id", "to_id"])["travel_time"]
+
+    flat, rippled = cells("flat"), cells("ripple")
+    reachable = flat.dropna().index
+    assert len(reachable) > 0.5 * len(grid) ** 2
+    assert rippled.reindex(reachable).notna().all()
+
+    south, north = (60.1610, 24.9420), (60.1770, 24.9420)
+    up = networks["ramp"].travel_time(south, north, mode="wheelchair")
+    down = networks["ramp"].travel_time(north, south, mode="wheelchair")
+    level = networks["flat"].travel_time(south, north, mode="wheelchair")
+    assert up > level and up > down
