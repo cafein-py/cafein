@@ -539,6 +539,22 @@ def test_union_pruning_clears_disconnected_bicycle_arcs(union_extract):
     bike_after = int((pruned_f & _osm.BICYCLE != 0).sum())
     assert walk_after > 0.9 * walk_before
     assert bike_after < bike_before
+    # What remains of a mode in each weak component is one strongly
+    # connected part: no one-way pocket survives.
+    from scipy import sparse
+    from scipy.sparse import csgraph
+
+    ahead = pruned_f & _osm.BICYCLE != 0
+    behind = pruned_r & _osm.BICYCLE != 0
+    rows = np.concatenate([u[ahead], v[behind]])
+    cols = np.concatenate([v[ahead], u[behind]])
+    arcs = sparse.coo_matrix(
+        (np.ones(len(rows)), (rows, cols)), shape=(len(nodes),) * 2
+    )
+    _, weak = csgraph.connected_components(arcs, directed=False)
+    _, strong = csgraph.connected_components(arcs, directed=True, connection="strong")
+    used = np.unique(np.concatenate([rows, cols]))
+    assert len(np.unique(weak[used])) == len(np.unique(strong[used]))
 
 
 def test_pruning_touches_only_the_named_modes(union_extract):

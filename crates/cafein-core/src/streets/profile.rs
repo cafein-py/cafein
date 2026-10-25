@@ -82,6 +82,81 @@ pub const MAX_SLOPE: f64 = 1.0;
 /// factor can produce a non-positive cost.
 pub const MIN_SLOPE_MULTIPLIER: f64 = 0.1;
 
+/// A travel-time cost on an edge's whole-edge grade, the shape of the
+/// wheelchair cost in AccessMap (Bolten & Caspi 2019,
+/// doi:10.1145/3308561.3354598): relative to the fastest grade `ideal`, the
+/// speed is `s(g) = exp(−k·|g − ideal|)` with `k = k_up` above `ideal` and
+/// `k_down` at or below it, and the arc's time divides by `s(g) / s(0)`, so
+/// the flat keeps the base speed. The grade is the edge's rise over
+/// `max(length, min_run)`: a short edge's rise is spread over `min_run`,
+/// since a coarse elevation model cannot resolve grade over a few metres.
+/// Slope only costs time; it never forbids an arc.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InclineCost {
+    /// The fastest grade, as a slope fraction.
+    pub ideal: f64,
+    /// Speed decay rate above `ideal`.
+    pub k_up: f64,
+    /// Speed decay rate at or below `ideal`.
+    pub k_down: f64,
+    /// The shortest run a grade is measured over, in metres.
+    pub min_run: f64,
+}
+
+impl InclineCost {
+    /// AccessMap's curve: the fastest grade is Tobler's −0.0087, and the
+    /// speed falls to a fifth of it at 8.5 % uphill and 10 % downhill.
+    pub fn accessmap(min_run: f64) -> InclineCost {
+        let ideal = -0.0087;
+        InclineCost {
+            ideal,
+            k_up: 5.0_f64.ln() / (0.085 - ideal).abs(),
+            k_down: 5.0_f64.ln() / (-0.10 - ideal).abs(),
+            min_run,
+        }
+    }
+
+    /// The speed at grade `g` relative to the speed at `ideal`.
+    fn speed_ratio(&self, grade: f64) -> f64 {
+        let k = if grade > self.ideal {
+            self.k_up
+        } else {
+            self.k_down
+        };
+        (-k * (grade - self.ideal).abs()).exp()
+    }
+
+    /// The travel-time multiplier at grade `g`: 1 on the flat.
+    pub fn multiplier(&self, grade: f64) -> f64 {
+        self.speed_ratio(0.0) / self.speed_ratio(grade)
+    }
+
+    /// The grade of a run with `rise` metres over `length` metres, clamped to
+    /// the spike limit; flat when either is unavailable or the run is empty.
+    pub fn grade(&self, rise: f64, length: f64) -> f64 {
+        if rise.is_nan() || length.is_nan() || length <= 0.0 {
+            return 0.0;
+        }
+        (rise / length.max(self.min_run)).clamp(-MAX_SLOPE, MAX_SLOPE)
+    }
+
+    fn is_valid(&self) -> bool {
+        let positive = |value: f64| value.is_finite() && value > 0.0;
+        self.ideal.is_finite()
+            && self.ideal.abs() < MAX_SLOPE
+            && positive(self.k_up)
+            && positive(self.k_down)
+            && positive(self.min_run)
+    }
+}
+
+/// The default manual wheelchair speed in m/s: the unassisted mean speed in
+/// Huang et al. (2025), PLOS One, doi:10.1371/journal.pone.0335663.
+const WHEELCHAIR_SPEED: f64 = 0.67;
+
+/// The run the wheelchair's grade is measured over at least, in metres.
+const WHEELCHAIR_MIN_RUN: f64 = 50.0;
+
 /// The street mode a profile routes — exactly one. It maps to a single
 /// `adj_access` permission bit, so a profile can never match arcs by any-of
 /// several modes.
@@ -123,6 +198,9 @@ pub enum ProfileError {
     /// `max_gradient` is not finite and positive, or set on a car
     /// profile (the car models no gradients).
     InvalidMaxGradient,
+    /// The incline cost is malformed, set on a car profile, or set beside
+    /// the linear slope factors.
+    InvalidInclineCost,
     /// A non-walk profile has no `adj_access` to route by — the network was
     /// built without the multimodal attributes.
     MissingAttributes,
@@ -132,7 +210,8 @@ pub enum ProfileError {
     InvalidCarModel,
     /// A validated definition produced an arc cost at or above the forbidden
     /// sentinel (`u32::MAX`), which cannot be represented; the definition is
-    /// physically implausible (an extreme speed or multiplier).
+    /// physically implausible (an extreme speed or multiplier). An overflow
+    /// the incline cost alone causes saturates below the sentinel instead.
     ArcCostOverflow,
 }
 
@@ -150,6 +229,13 @@ impl std::fmt::Display for ProfileError {
             }
             ProfileError::InvalidMaxGradient => {
                 write!(f, "max_gradient is malformed or set on a car profile")
+            }
+            ProfileError::InvalidInclineCost => {
+                write!(
+                    f,
+                    "the incline cost is malformed, set on a car profile, or \
+                     combined with linear slope factors"
+                )
             }
             ProfileError::MaxSpeedTooLow => {
                 write!(f, "max_speed is below the greatest attainable speed")
@@ -222,6 +308,10 @@ pub struct StreetProfileDefinition {
     /// disables the cap; without installed elevations it is inert
     /// (unavailable data never forbids).
     pub max_gradient: Option<f64>,
+    /// A time cost on each edge's whole-edge grade, in place of the linear
+    /// per-sub-segment factors; `None` disables it. Inert without installed
+    /// elevations.
+    pub incline: Option<InclineCost>,
     /// The car delay model, resolved to one period's flat numbers. `None`
     /// compiles free-flow — the default regime; only a car profile may carry
     /// `Some`. The car mode reads the per-arc driving speeds either way; this
@@ -278,6 +368,7 @@ impl StreetProfileDefinition {
             slope_uphill: 0.0,
             slope_downhill: 0.0,
             max_gradient: None,
+            incline: None,
             car: None,
         }
     }
@@ -287,18 +378,20 @@ impl StreetProfileDefinition {
         StreetProfileDefinition::flat("walk", StreetMode::Walk, "walk", WALK_SPEED)
     }
 
-    /// The default wheelchair profile: walk speed over the wheelchair
-    /// permission bit — walkable arcs without stairs, per the
-    /// extraction's tag rules.
+    /// The default (manual) wheelchair profile over the wheelchair permission
+    /// bit — walkable arcs without stairs, per the extraction's tag rules —
+    /// at 0.67 m/s, connectors included, with AccessMap's incline cost.
     pub fn wheelchair() -> StreetProfileDefinition {
         let mut definition = StreetProfileDefinition::flat(
             "wheelchair",
             StreetMode::Wheelchair,
             "wheelchair",
-            WALK_SPEED,
+            WHEELCHAIR_SPEED,
         );
-        // Near the ADA 1:12 ramp standard; strictly steeper is forbidden.
-        definition.max_gradient = Some(0.08);
+        definition.connector_speed = WHEELCHAIR_SPEED;
+        definition.dismount_speed = WHEELCHAIR_SPEED;
+        definition.incline = Some(InclineCost::accessmap(WHEELCHAIR_MIN_RUN));
+        definition.max_speed = WHEELCHAIR_SPEED / definition.min_slope_multiplier();
         definition
     }
 
@@ -348,8 +441,14 @@ impl StreetProfileDefinition {
     /// This definition riding `speed` m/s on a default edge. `max_speed`
     /// scales by the same ratio, so a bound that covers a slope credit or a
     /// class multiplier stays one, and never drops below the dismount arcs'
-    /// speed (with their slope credit) a slower ride still attains.
+    /// speed (with their slope credit) a slower ride still attains. The
+    /// wheelchair moves at one speed, so its connectors and dismount arcs
+    /// take `speed` too.
     pub fn with_base_speed(mut self, speed: f64) -> StreetProfileDefinition {
+        if self.mode == StreetMode::Wheelchair {
+            self.connector_speed = speed;
+            self.dismount_speed = speed;
+        }
         let dismount = self.dismount_speed / self.min_slope_multiplier();
         self.max_speed = (self.max_speed * speed / self.base_speed).max(dismount);
         self.base_speed = speed;
@@ -389,6 +488,9 @@ impl StreetProfileDefinition {
                 return Err(ProfileError::InvalidMaxGradient);
             }
         }
+        if self.incline.is_some() && self.mode == StreetMode::Car {
+            return Err(ProfileError::InvalidInclineCost);
+        }
         if let Some(model) = &self.car {
             let factor = |value: f64| value.is_finite() && value >= 0.0;
             let numbers_ok = model.group_seconds.iter().all(|&b| factor(b))
@@ -426,6 +528,11 @@ impl StreetProfileDefinition {
         if !factor_ok(self.slope_uphill) || !factor_ok(self.slope_downhill) {
             return Err(ProfileError::InvalidSlopeFactors);
         }
+        if let Some(incline) = &self.incline {
+            if !incline.is_valid() || self.slope_uphill != 0.0 || self.slope_downhill != 0.0 {
+                return Err(ProfileError::InvalidInclineCost);
+            }
+        }
         // The greatest attainable on-network speed. `multiplied` is the base
         // speed scaled by each class table's true peak (the tables are
         // validated non-empty and all-positive above, so a `0.0`-seeded max is
@@ -454,9 +561,13 @@ impl StreetProfileDefinition {
         Ok(())
     }
 
-    /// The smallest sub-segment multiplier this definition can produce: the
-    /// steepest clamped descent's credit, floored — or 1.0 with slope off.
+    /// The smallest slope multiplier this definition can produce: the
+    /// incline cost's value at its fastest grade, or the steepest clamped
+    /// descent's linear credit, floored — or 1.0 with slope off.
     fn min_slope_multiplier(&self) -> f64 {
+        if let Some(incline) = &self.incline {
+            return incline.multiplier(incline.ideal);
+        }
         if self.slope_uphill == 0.0 && self.slope_downhill == 0.0 {
             return 1.0;
         }
@@ -814,12 +925,19 @@ impl StreetNetwork {
                 }
             }
             // Validated speeds keep this finite and positive.
-            let millis = (length / speed * 1000.0).ceil();
+            let mut millis = (length / speed * 1000.0).ceil();
             // `u32::MAX` is the forbidden sentinel; a cost reaching it cannot be
             // stored, so a (physically implausible) definition that produces one
-            // is rejected rather than silently understated.
+            // is rejected rather than silently understated. An incline cost
+            // only ever slows an arc, so when the slope alone pushes an arc
+            // past it, the arc saturates just below the sentinel: absurdly
+            // slow, never forbidden.
             if millis >= u32::MAX as f64 {
-                return Err(ProfileError::ArcCostOverflow);
+                let unsloped = (meters[slot] / speed * 1000.0).ceil();
+                if definition.incline.is_none() || unsloped >= u32::MAX as f64 {
+                    return Err(ProfileError::ArcCostOverflow);
+                }
+                millis = f64::from(u32::MAX - 1);
             }
             // A positive-length arc costs at least 1 ms — an extreme speed or a
             // tiny length can underflow the product to `0.0`, which must not
@@ -966,12 +1084,12 @@ impl StreetNetwork {
         })
     }
 
-    /// Per edge: the distance-weighted mean slope multiplier per direction
-    /// (`(forward, reverse)`, integrating `1 + f(s)` over the stored
-    /// sub-segments) and the maximum absolute sub-segment slope, for the
-    /// `max_gradient` cap — `None` when the network carries no elevations
-    /// or the definition needs neither (slope off and no cap), which
-    /// compiles flat.
+    /// Per edge: the slope multiplier per direction (`(forward, reverse)`) and
+    /// the maximum absolute sub-segment slope, for the `max_gradient` cap —
+    /// `None` when the network carries no elevations or the definition needs
+    /// none of them, which compiles flat. The multipliers integrate the
+    /// linear `1 + f(s)` over the stored sub-segments (distance-weighted), or,
+    /// with an incline cost, read the edge's whole-edge grade.
     ///
     /// A sub-segment with unavailable elevation (NaN) or no length counts as
     /// flat in both directions: unavailable data never invents a penalty, a
@@ -982,6 +1100,7 @@ impl StreetNetwork {
         if definition.slope_uphill == 0.0
             && definition.slope_downhill == 0.0
             && definition.max_gradient.is_none()
+            && definition.incline.is_none()
         {
             return None;
         }
@@ -1020,7 +1139,18 @@ impl StreetNetwork {
                 forward += length * up;
                 reverse += length * down;
             }
-            means.push(if total > 0.0 {
+            means.push(if let Some(incline) = &definition.incline {
+                let last = end.saturating_sub(1);
+                let grade = if last > start {
+                    incline.grade(
+                        f64::from(elevations[last]) - f64::from(elevations[start]),
+                        f64::from(cumulative[last]) - f64::from(cumulative[start]),
+                    )
+                } else {
+                    0.0
+                };
+                (incline.multiplier(grade), incline.multiplier(-grade))
+            } else if total > 0.0 {
                 (forward / total, reverse / total)
             } else {
                 (1.0, 1.0)

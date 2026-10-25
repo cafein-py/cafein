@@ -1288,3 +1288,123 @@ def test_multi_call_queries_refuse_a_transfer_set_replaced_mid_query(
         pytest.importorskip("h3")
     with pytest.raises(RuntimeError, match="transfer set was replaced"):
         queries[query]()
+
+
+@pytest.mark.parametrize("source", ["rust build", "python build", "loader"])
+def test_warnings_point_at_the_calling_code(tmp_path, source):
+    # Fixed stack levels landed inside cafein once the internal call
+    # depth changed; every warning names the first caller outside it.
+    from cafein import TransportNetwork
+    from cafein.emissions import load_factors
+
+    tables = {
+        **_TWO_STOP_TABLES,
+        "trips.txt": ["route_id,service_id,trip_id,shape_id", "R1,SV,T1,SH"],
+        "stop_times.txt": [
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+            "T1,08:00:00,08:00:00,S1,1",
+            "T1,08:10:00,08:10:00,S2,2",
+        ],
+    }
+    if source == "rust build":
+        del tables["agency.txt"]
+    elif source == "python build":
+        tables["shapes.txt"] = [
+            "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence",
+            "SH,60.0,24.0,1",
+            "SH,95.0,24.005,2",
+        ]
+    if source == "loader":
+        target = load_factors
+        argument = {"route_type": 3, "vehicle": 1.0, "fuel": 1.0, "colour": "red"}
+    else:
+        target = TransportNetwork.from_gtfs
+        argument = [_gtfs_zip(tmp_path / "gtfs.zip", tables)]
+    with pytest.warns(UserWarning) as records:
+        target(argument)
+    assert {record.filename for record in records} == {__file__}
+
+
+def test_one_way_pockets_lose_the_mode_that_cannot_leave_or_enter_them():
+    # A 45-vertex two-way chain, a one-way dead end hanging off it (enter,
+    # never leave) and a one-way feeder into it (leave, never enter). A point
+    # snapped into either spur would reach nothing, or be reached from nowhere,
+    # by bicycle, so the spurs lose the bicycle bit; walking keeps them.
+    import numpy as np
+
+    from cafein import _osm
+
+    chain = [(i, i + 1) for i in range(44)]
+    dead_end = [(44, 45), (45, 46)]
+    feeder = [(47, 48), (48, 0)]
+    edges = chain + dead_end + feeder
+    u = np.array([a for a, _ in edges])
+    v = np.array([b for _, b in edges])
+    walk, bicycle = _osm.WALK, _osm.BICYCLE
+    forward = np.full(len(edges), walk | bicycle, dtype=np.uint8)
+    reverse = forward.copy()
+    one_way = slice(len(chain), len(edges))
+    reverse[one_way] = walk
+    pruned_f, pruned_r = _osm.prune_components_per_profile(u, v, 49, forward, reverse)
+    assert (pruned_f[: len(chain)] & bicycle != 0).all()
+    assert (pruned_r[: len(chain)] & bicycle != 0).all()
+    assert (pruned_f[one_way] & bicycle == 0).all()
+    assert (pruned_f & walk != 0).all() and (pruned_r & walk != 0).all()
+
+
+def test_elevation_noise_slows_the_wheelchair_but_never_strands_it(
+    kantakaupunki_pbf,
+):
+    # A hard 8 % cap on the steepest sampled sub-segment turned a coarse
+    # elevation model's metre of noise into forbidden streets and stranded
+    # most wheelchair trips. Slope is now a cost on each edge's whole-edge
+    # grade: ±1 m of ripple leaves every flat-reachable pair reachable, and
+    # a real 5 % ramp makes the climb slower than the descent.
+    import geopandas as gpd
+    import numpy as np
+    import pandas as pd
+    from shapely.geometry import Point
+
+    from cafein import StreetNetwork, TravelTimeMatrix
+
+    def ripple(lons, lats):
+        lons, lats = np.asarray(lons), np.asarray(lats)
+        return (10.0 + np.sin(lons * 7e4) * np.cos(lats * 7e4)).astype("float32")
+
+    def ramp(lons, lats):
+        # 5 % rising northwards: 111 km per degree of latitude.
+        return ((np.asarray(lats) - 60.16) * 111_000 * 0.05).astype("float32")
+
+    networks = {
+        name: StreetNetwork.from_osm(
+            str(kantakaupunki_pbf), modes=("walk", "wheelchair"), dem=dem
+        )
+        for name, dem in (("flat", None), ("ripple", ripple), ("ramp", ramp))
+    }
+    lats, lons = np.meshgrid(
+        np.linspace(60.160, 60.178, 6), np.linspace(24.930, 24.955, 6)
+    )
+    grid = gpd.GeoDataFrame(
+        {"id": [f"p{i}" for i in range(lats.size)]},
+        geometry=[Point(x, y) for x, y in zip(lons.ravel(), lats.ravel())],
+        crs="EPSG:4326",
+    )
+
+    def cells(name):
+        frame = pd.DataFrame(
+            TravelTimeMatrix(
+                networks[name], grid, transport_mode="wheelchair", max_street_time=600
+            )
+        )
+        return frame.set_index(["from_id", "to_id"])["travel_time"]
+
+    flat, rippled = cells("flat"), cells("ripple")
+    reachable = flat.dropna().index
+    assert len(reachable) > 0.5 * len(grid) ** 2
+    assert rippled.reindex(reachable).notna().all()
+
+    south, north = (60.1610, 24.9420), (60.1770, 24.9420)
+    up = networks["ramp"].travel_time(south, north, mode="wheelchair")
+    down = networks["ramp"].travel_time(north, south, mode="wheelchair")
+    level = networks["flat"].travel_time(south, north, mode="wheelchair")
+    assert up > level and up > down

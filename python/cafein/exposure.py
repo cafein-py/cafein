@@ -24,7 +24,6 @@ or retraced edges claim through a dense-sampling fallback).
 
 from __future__ import annotations
 
-import warnings
 import math
 import os
 import re
@@ -72,7 +71,7 @@ class _StripPlan:
             from cafein import _memory
 
             # The floor warning lands on the Exposure caller's frame.
-            self.budget = _memory.resolve_budget(self._max_memory, stacklevel=8)
+            self.budget = _memory.resolve_budget(self._max_memory)
             self.resident = _memory.resident_bytes()
             if self.resident is None:
                 raise ValueError(
@@ -1442,14 +1441,12 @@ def _ingest_polygons_rasterized(
         if width > cells:
             from cafein import _memory
 
-            warnings.warn(
+            _log.warn(
                 f"one raster row of {width} cells exceeds the memory budget's "
                 f"strip share of {cells} cells ({strip.budget} bytes, "
                 f"{strip.resident} resident, {_memory.BYTES_PER_CELL} bytes per "
                 "cell); rasterizing one row at a time — raise max_memory= to "
                 "plan wider strips",
-                UserWarning,
-                stacklevel=2,
             )
         ordered = frame.sort_values(_VALUE)
         shapes = [

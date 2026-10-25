@@ -75,15 +75,12 @@ pub fn emit_full<F>(
     });
 }
 
-/// A build diagnostic: a `UserWarning` attributed to the caller, and
-/// the same text as a WARNING record on the build logger.
+/// A build diagnostic: a `UserWarning` attributed to the first caller
+/// outside cafein, and the same text as a WARNING record on the build
+/// logger.
 pub fn build_warning(py: Python<'_>, message: String) -> PyResult<()> {
     emit("cafein.build", WARNING, || message.clone(), None, None);
-    let warnings = py.import("warnings")?;
-    warnings.call_method1(
-        "warn",
-        (message, py.get_type::<pyo3::exceptions::PyUserWarning>(), 2),
-    )?;
+    py.import("cafein._log")?.call_method1("warn", (message,))?;
     Ok(())
 }
 

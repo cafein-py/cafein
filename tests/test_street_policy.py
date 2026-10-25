@@ -1969,6 +1969,9 @@ def test_mc_policy_engines_answer_identically(multimodal_mctbtr_network):
             router=router,
             street_policy=_scooter_policy(),
             factors=_scooter_factor_rows(),
+            # Within one emissions bucket each engine may keep a different
+            # representative; an exact bucket makes the answer unique.
+            bucket=1e-6,
             geometries=False,
         )
     # Engine neutrality with policy label sets: McTBTR (the cached set
