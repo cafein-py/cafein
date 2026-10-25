@@ -27,16 +27,24 @@ use crate::artifact::{
 };
 
 /// Caller-set street speeds in m/s by mode name, as the Python layer resolves
-/// them from `speeds=`; empty for the shipped speeds.
+/// them from `speeds=`; empty for the shipped speeds. A wheelchair
+/// traveler's grade limits ride along as slope fractions under
+/// [`WHEELCHAIR_MAX_UPHILL`] and [`WHEELCHAIR_MAX_DOWNHILL`].
 pub(super) type SpeedOverrides = Vec<(String, f64)>;
+
+/// The override name carrying a wheelchair traveler's steepest climb.
+const WHEELCHAIR_MAX_UPHILL: &str = "wheelchair:max_uphill";
+
+/// The override name carrying a wheelchair traveler's steepest descent.
+const WHEELCHAIR_MAX_DOWNHILL: &str = "wheelchair:max_downhill";
 
 /// The street-mode names accepted by the public API, with the profile
 /// definition each resolves to: the shipped one with `speeds` applied. The
 /// mode's own entry sets its riding speed; `"walk"` sets the walking legs —
 /// the whole walking profile, and the connectors and dismount arcs of the
-/// vehicles. The wheelchair rides its own entry alone. The car resolves to
-/// its free-flow default; a resolved delay model arrives separately (see
-/// [`car_cost_model`]).
+/// vehicles. The wheelchair rides its own entry alone, plus the grade limits.
+/// The car resolves to its free-flow default; a resolved delay model arrives
+/// separately (see [`car_cost_model`]).
 pub(super) fn profile_definition(
     mode: &str,
     speeds: &[(String, f64)],
@@ -72,6 +80,10 @@ pub(super) fn profile_definition(
         if let Some(walking) = speed("walk") {
             definition = definition.with_walking_speed(walking);
         }
+    }
+    if mode == "wheelchair" {
+        definition.max_uphill = speed(WHEELCHAIR_MAX_UPHILL);
+        definition.max_downhill = speed(WHEELCHAIR_MAX_DOWNHILL);
     }
     Ok(definition)
 }

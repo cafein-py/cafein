@@ -366,7 +366,7 @@ impl TransportNetwork {
                 "no multimodal street graph is installed; build with street_modes=",
             )
         })?;
-        let links = self.mode_link_targets(network, profile.definition.mode.bit());
+        let links = self.mode_link_targets(network, &profile);
         for &(stop, _) in &stop_costs {
             if stop as usize >= links.len() {
                 return Err(PyValueError::new_err(format!(

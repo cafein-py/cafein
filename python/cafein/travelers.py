@@ -68,6 +68,14 @@ class TravelerProfile:
         mode set on both the profile and the call is rejected.
     max_walking_time : float or datetime.timedelta (optional)
         Walking-time budget in minutes, as on the calls themselves.
+    max_uphill, max_downhill : float (optional)
+        The steepest climb and descent a wheelchair traveler takes, as
+        slope fractions between 0 and 1 (``0.085`` is 8.5 %), measured over
+        each street segment's whole length on DEM builds: a segment longer
+        than the measuring run that climbs (or descends) more is not used
+        in that direction. Without them slope only costs time. Only with
+        ``wheelchair=True``; a computed wheelchair transfer set serves only
+        the same limits (``compute_mode_transfers``).
     exclude_stops, exclude_trips, exclude_routes : list of str (optional)
         GTFS ids the traveler must not use, merged into the compiled
         exclusions — personal no-go supply on top of the feed-derived
@@ -81,6 +89,8 @@ class TravelerProfile:
         unknown="usable",
         speeds=None,
         max_walking_time=None,
+        max_uphill=None,
+        max_downhill=None,
         exclude_stops=(),
         exclude_trips=(),
         exclude_routes=(),
@@ -88,10 +98,17 @@ class TravelerProfile:
         from cafein._units import duration_seconds
         from cafein._validate import mode_mapping, positive_finite
         from cafein.policy import STREET_POLICY_MODES
+        from cafein.street_network import grade_limits
 
         if unknown not in ("usable", "excluded"):
             raise ValueError("unknown must be 'usable' or 'excluded'")
         speeds = mode_mapping("speeds", speeds, STREET_POLICY_MODES, positive_finite)
+        limits = grade_limits(max_uphill, max_downhill)
+        if limits and not wheelchair:
+            raise ValueError(
+                "max_uphill and max_downhill are a wheelchair traveler's grade "
+                "limits; set wheelchair=True"
+            )
         # Validation only; the raw value is handed to the call sites in
         # the unit their own conversion expects.
         duration_seconds("max_walking_time", max_walking_time)
@@ -99,6 +116,8 @@ class TravelerProfile:
         self.unknown = unknown
         self.speeds = speeds
         self.max_walking_time = max_walking_time
+        self.max_uphill = limits.get("wheelchair:max_uphill")
+        self.max_downhill = limits.get("wheelchair:max_downhill")
         self.exclude_stops = tuple(id_sequence("exclude_stops", exclude_stops))
         self.exclude_trips = tuple(id_sequence("exclude_trips", exclude_trips))
         self.exclude_routes = tuple(id_sequence("exclude_routes", exclude_routes))

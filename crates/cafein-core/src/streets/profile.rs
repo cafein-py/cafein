@@ -199,7 +199,8 @@ pub enum ProfileError {
     /// profile (the car models no gradients).
     InvalidMaxGradient,
     /// The incline cost is malformed, set on a car profile, or set beside
-    /// the linear slope factors.
+    /// the linear slope factors; or a grade limit is malformed or set
+    /// without an incline cost.
     InvalidInclineCost,
     /// A non-walk profile has no `adj_access` to route by — the network was
     /// built without the multimodal attributes.
@@ -233,8 +234,9 @@ impl std::fmt::Display for ProfileError {
             ProfileError::InvalidInclineCost => {
                 write!(
                     f,
-                    "the incline cost is malformed, set on a car profile, or \
-                     combined with linear slope factors"
+                    "the incline cost or a grade limit is malformed, set on a \
+                     car profile, combined with linear slope factors, or set \
+                     without an incline cost"
                 )
             }
             ProfileError::MaxSpeedTooLow => {
@@ -312,6 +314,12 @@ pub struct StreetProfileDefinition {
     /// per-sub-segment factors; `None` disables it. Inert without installed
     /// elevations.
     pub incline: Option<InclineCost>,
+    /// The steepest whole-edge climb the traveler takes, as a slope
+    /// fraction: an arc climbing more on an edge longer than the incline's
+    /// `min_run` compiles forbidden in that direction. Needs `incline`.
+    pub max_uphill: Option<f64>,
+    /// The steepest whole-edge descent, likewise.
+    pub max_downhill: Option<f64>,
     /// The car delay model, resolved to one period's flat numbers. `None`
     /// compiles free-flow — the default regime; only a car profile may carry
     /// `Some`. The car mode reads the per-arc driving speeds either way; this
@@ -369,6 +377,8 @@ impl StreetProfileDefinition {
             slope_downhill: 0.0,
             max_gradient: None,
             incline: None,
+            max_uphill: None,
+            max_downhill: None,
             car: None,
         }
     }
@@ -489,6 +499,18 @@ impl StreetProfileDefinition {
             }
         }
         if self.incline.is_some() && self.mode == StreetMode::Car {
+            return Err(ProfileError::InvalidInclineCost);
+        }
+        // Grade limits read the incline's whole-edge grade, so they need one
+        // (the car carries none) and must lie inside the slope clamp.
+        let limit_ok = |limit: Option<f64>| {
+            limit.is_none_or(|grade| grade.is_finite() && grade > 0.0 && grade < MAX_SLOPE)
+        };
+        let limited = self.max_uphill.is_some() || self.max_downhill.is_some();
+        if !limit_ok(self.max_uphill)
+            || !limit_ok(self.max_downhill)
+            || (limited && self.incline.is_none())
+        {
             return Err(ProfileError::InvalidInclineCost);
         }
         if let Some(model) = &self.car {
@@ -887,7 +909,22 @@ impl StreetNetwork {
             if !permitted {
                 continue;
             }
-            if let (Some((_, maxima)), Some(cap)) = (&slope, cap) {
+            if let (Some((_, _, grades)), Some(reverse), Some(incline)) =
+                (&slope, &slot_reverse, &definition.incline)
+            {
+                // A grade limit forbids only the over-limit direction, and only
+                // on edges long enough for the grade to be measured.
+                let (grade, run) = grades[edges[slot] as usize];
+                let climb = if reverse[slot] { -grade } else { grade };
+                let over =
+                    |limit: Option<f64>, grade: f64| limit.is_some_and(|limit| grade > limit);
+                if run > incline.min_run
+                    && (over(definition.max_uphill, climb) || over(definition.max_downhill, -climb))
+                {
+                    continue;
+                }
+            }
+            if let (Some((_, maxima, _)), Some(cap)) = (&slope, cap) {
                 // Strictly steeper than the profile tolerates: the arc is
                 // forbidden in both directions (the maximum is unsigned).
                 if maxima[edges[slot] as usize] > cap {
@@ -895,7 +932,7 @@ impl StreetNetwork {
                 }
             }
             let mut length = meters[slot];
-            if let (Some((means, _)), Some(reverse)) = (&slope, &slot_reverse) {
+            if let (Some((means, _, _)), Some(reverse)) = (&slope, &slot_reverse) {
                 let (forward_mean, reverse_mean) = means[edges[slot] as usize];
                 length *= if reverse[slot] {
                     reverse_mean
@@ -1117,6 +1154,7 @@ impl StreetNetwork {
         };
         let mut means = Vec::with_capacity(offsets.len() - 1);
         let mut maxima = Vec::with_capacity(offsets.len() - 1);
+        let mut grades = Vec::new();
         for edge in 0..offsets.len() - 1 {
             let start = offsets[edge] as usize;
             let end = offsets[edge + 1] as usize;
@@ -1141,14 +1179,17 @@ impl StreetNetwork {
             }
             means.push(if let Some(incline) = &definition.incline {
                 let last = end.saturating_sub(1);
-                let grade = if last > start {
-                    incline.grade(
-                        f64::from(elevations[last]) - f64::from(elevations[start]),
-                        f64::from(cumulative[last]) - f64::from(cumulative[start]),
+                let (grade, run) = if last > start {
+                    let run = f64::from(cumulative[last]) - f64::from(cumulative[start]);
+                    let rise = f64::from(elevations[last]) - f64::from(elevations[start]);
+                    (
+                        incline.grade(rise, run),
+                        if run.is_nan() { 0.0 } else { run },
                     )
                 } else {
-                    0.0
+                    (0.0, 0.0)
                 };
+                grades.push((grade, run));
                 (incline.multiplier(grade), incline.multiplier(-grade))
             } else if total > 0.0 {
                 (forward / total, reverse / total)
@@ -1157,7 +1198,7 @@ impl StreetNetwork {
             });
             maxima.push(steepest);
         }
-        Some((means, maxima))
+        Some((means, maxima, grades))
     }
 
     /// Whether each adjacency slot traverses its edge against the stored
@@ -1179,9 +1220,10 @@ impl StreetNetwork {
     }
 }
 
-/// Per edge: the `(forward, reverse)` mean slope multipliers and the
-/// maximum absolute sub-segment slope.
-type EdgeSlopes = (Vec<(f64, f64)>, Vec<f64>);
+/// Per edge: the `(forward, reverse)` mean slope multipliers, the maximum
+/// absolute sub-segment slope, and — with an incline cost, else empty — the
+/// whole-edge grade in the stored direction with its run in metres.
+type EdgeSlopes = (Vec<(f64, f64)>, Vec<f64>, Vec<(f64, f64)>);
 
 /// A class multiplier by code. Every attribute path validates codes against
 /// the table sizes (`check_street_attributes`) and every profile validates its

@@ -14,19 +14,25 @@ UNKNOWN_STOPS = 5933
 INACCESSIBLE_TRIPS = 3422
 
 
-def test_the_profile_validates_its_inputs():
-    with pytest.raises(ValueError, match="unknown"):
-        TravelerProfile(unknown="optimistic")
-    with pytest.raises(ValueError, match="speeds"):
-        TravelerProfile(speeds={"walk": 0})
-    with pytest.raises(ValueError, match="names 'car'"):
-        TravelerProfile(speeds={"car": 50.0})
-    with pytest.raises(TypeError, match="speeds must be a mapping"):
-        TravelerProfile(speeds=5.0)
-    with pytest.raises(ValueError, match="max_walking_time"):
-        TravelerProfile(max_walking_time=-5)
-    with pytest.raises(TypeError, match="exclude_stops"):
-        TravelerProfile(exclude_stops="1010107")
+@pytest.mark.parametrize(
+    "options, error, match",
+    [
+        ({"unknown": "optimistic"}, ValueError, "unknown"),
+        ({"speeds": {"walk": 0}}, ValueError, "speeds"),
+        ({"speeds": {"car": 50.0}}, ValueError, "names 'car'"),
+        ({"speeds": 5.0}, TypeError, "speeds must be a mapping"),
+        ({"max_walking_time": -5}, ValueError, "max_walking_time"),
+        ({"exclude_stops": "1010107"}, TypeError, "exclude_stops"),
+        ({"wheelchair": True, "max_uphill": 0}, ValueError, "max_uphill must be"),
+        ({"wheelchair": True, "max_downhill": 1.0}, ValueError, "max_downhill"),
+        ({"wheelchair": True, "max_uphill": float("nan")}, ValueError, "max_uphill"),
+        ({"wheelchair": True, "max_downhill": "8%"}, TypeError, "max_downhill"),
+        ({"max_uphill": 0.08}, ValueError, "wheelchair=True"),
+    ],
+)
+def test_the_profile_validates_its_inputs(options, error, match):
+    with pytest.raises(error, match=match):
+        TravelerProfile(**options)
 
 
 def test_the_policy_matrix_covers_every_state():
@@ -468,6 +474,79 @@ def test_the_bridge_serves_the_point_computers(multimodal_network):
     assert not set(stops) & set(bridged_times)
 
 
+@pytest.mark.parametrize("surface", ["point query", "matrix"])
+def test_grade_limits_close_long_steep_streets_one_way(multimodal_network, surface):
+    # The fixture's DEM climbs about 1.8 % eastward. A 0.5 % limit slows
+    # an eastward trip under max_uphill and a westward one under
+    # max_downhill, and leaves the trips the other way as they were.
+    lons = [24.940, 24.944, 24.948]
+    east, west = [(0, 1), (0, 2)], [(1, 0), (2, 0)]
+
+    def times(profile):
+        if surface == "matrix":
+            points = gpd.GeoDataFrame(
+                {"id": [0, 1, 2]},
+                geometry=gpd.points_from_xy(lons, [60.1678] * 3),
+                crs="EPSG:4326",
+            )
+            frame = TravelTimeMatrix(
+                multimodal_network,
+                points,
+                departure="2022-02-22 08:30:00",
+                traveler=profile,
+                output_time_units="seconds",
+            )
+            cells = frame.set_index(["from_id", "to_id"])["travel_time"]
+            return {pair: int(cells[pair]) for pair in east + west}
+        return {
+            (a, b): min(
+                journey["arrival_s"] - journey["departure_s"]
+                for journey in multimodal_network.route_between_coordinates(
+                    (60.1678, lons[a]),
+                    (60.1678, lons[b]),
+                    "2022-02-22 08:30:00",
+                    traveler=profile,
+                )
+            )
+            for a, b in east + west
+        }
+
+    free = times(TravelerProfile(wheelchair=True))
+    for limit, slowed, kept in (
+        ("max_uphill", east, west),
+        ("max_downhill", west, east),
+    ):
+        limited = times(TravelerProfile(wheelchair=True, **{limit: 0.005}))
+        assert all(limited[pair] >= free[pair] for pair in slowed)
+        assert any(limited[pair] > free[pair] for pair in slowed)
+        assert all(limited[pair] == free[pair] for pair in kept)
+
+
+def test_grade_limits_resnap_stops_whose_street_they_close(multimodal_network):
+    # Stops link to the streets once, by the unlimited wheelchair profile.
+    # Limits of 0.1 % both ways close the fixture's long ramp streets in
+    # both directions, stop 1020448's link among them: the stop snaps again
+    # by the limited profile, so the trip still boards there and arrives as
+    # it does without limits.
+    origin, destination = (60.1680, 24.9440), (60.16915, 24.95611)
+
+    def fastest(profile):
+        journeys = multimodal_network.route_between_coordinates(
+            origin, destination, "2022-02-22 08:30:00", traveler=profile
+        )
+        return min(journeys, key=lambda j: j["arrival_s"] - j["departure_s"])
+
+    free = fastest(TravelerProfile(wheelchair=True))
+    limited = fastest(
+        TravelerProfile(wheelchair=True, max_uphill=0.001, max_downhill=0.001)
+    )
+    assert limited["legs"][0]["to_stop"] == free["legs"][0]["to_stop"] == "1020448"
+    assert (
+        limited["arrival_s"] - limited["departure_s"]
+        == free["arrival_s"] - free["departure_s"]
+    )
+
+
 def test_the_bridge_needs_the_wheelchair_build(network_with_footpaths):
     with pytest.raises(
         ValueError, match=r"wheelchair.*street_modes=\('walk', 'wheelchair'\)"
@@ -534,7 +613,7 @@ def test_policy_less_point_surfaces_refuse_the_wheelchair_traveler(
         )
     # A transit Catchment serves the wheelchair traveler through the
     # profile-aware directed spread: its cells are a subset of the
-    # walking catchment's (stairs and capped gradients pruned), and the
+    # walking catchment's (stairs pruned, slopes slowing it), and the
     # fixed profile speed rejects the walking knob.
     from cafein import Catchment
 
@@ -568,6 +647,21 @@ def test_policy_less_point_surfaces_refuse_the_wheelchair_traveler(
     )
     assert wheeled.iloc[0].geometry.within(brisk.buffer(1e-6))
     assert brisk.area > wheeled.iloc[0].geometry.area
+    # Each grade limit closes streets to the spread and narrows it.
+    for limit in ({"max_uphill": 0.005}, {"max_downhill": 0.005}):
+        limited = (
+            Catchment(
+                multimodal_network,
+                ["1020453"],
+                "2022-02-22 08:30:00",
+                budgets=(15.0,),
+                traveler=TravelerProfile(wheelchair=True, **limit),
+            )
+            .iloc[0]
+            .geometry
+        )
+        assert limited.within(wheeled.iloc[0].geometry.buffer(1e-6))
+        assert limited.area < wheeled.iloc[0].geometry.area
     with pytest.raises(ValueError, match="wheelchair street profile"):
         Catchment(
             multimodal_network,

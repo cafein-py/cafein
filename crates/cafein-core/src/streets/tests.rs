@@ -4831,7 +4831,7 @@ fn the_boundary_is_strictly_greater() {
     // at the next representable step below it.
     let net = sloped_chain();
     let definition = StreetProfileDefinition::wheelchair();
-    let (_, maxima) = net.slope_means(&definition).unwrap();
+    let (_, maxima, _) = net.slope_means(&definition).unwrap();
     let gentle = maxima.iter().cloned().fold(f64::MAX, f64::min);
     assert!(gentle > 0.0);
     let mut at = StreetProfileDefinition::wheelchair();
@@ -5010,6 +5010,66 @@ fn the_incline_cost_validates() {
     let mut car = StreetProfileDefinition::car(None);
     car.incline = Some(InclineCost::accessmap(50.0));
     assert_eq!(car.validate(), Err(ProfileError::InvalidInclineCost));
+    for limit in [0.0, -0.05, MAX_SLOPE, f64::NAN] {
+        let mut chair = StreetProfileDefinition::wheelchair();
+        chair.max_downhill = Some(limit);
+        assert_eq!(chair.validate(), Err(ProfileError::InvalidInclineCost));
+    }
+    let mut unsloped = StreetProfileDefinition::wheelchair();
+    unsloped.incline = None;
+    unsloped.max_uphill = Some(0.08);
+    assert_eq!(unsloped.validate(), Err(ProfileError::InvalidInclineCost));
+    let mut limited_car = StreetProfileDefinition::car(None);
+    limited_car.max_uphill = Some(0.08);
+    assert_eq!(
+        limited_car.validate(),
+        Err(ProfileError::InvalidInclineCost)
+    );
+}
+
+#[test]
+fn a_grade_limit_closes_long_edges_one_way() {
+    // A 100 m and a 30 m edge, both climbing 10 % eastward: an 8 % uphill
+    // limit closes the long edge eastward only, a downhill limit westward
+    // only, and the short edge, shorter than the measuring run, stays open.
+    let edges: Vec<TestEdge> = vec![
+        (0, 1, 100.0, straight((0.0, 0.0), (100.0, 0.0))),
+        (1, 2, 30.0, straight((100.0, 0.0), (130.0, 0.0))),
+    ];
+    let both = MODE_WALK | MODE_WHEELCHAIR;
+    let attrs = Attrs {
+        highway: vec![0; 2],
+        surface: vec![0; 2],
+        smoothness: vec![0; 2],
+        flags: vec![0; 2],
+        access_forward: vec![both; 2],
+        access_reverse: vec![both; 2],
+        facility_forward: vec![0; 2],
+        facility_reverse: vec![0; 2],
+    };
+    let net = elevated_network(3, &edges, &attrs, |x, _| (0.10 * x) as f32);
+    let open = net
+        .compile_profile(&StreetProfileDefinition::wheelchair())
+        .unwrap();
+    for (uphill, downhill, closed) in [(Some(0.08), None, (0, 1)), (None, Some(0.08), (1, 0))] {
+        let mut chair = StreetProfileDefinition::wheelchair();
+        chair.max_uphill = uphill;
+        chair.max_downhill = downhill;
+        let limited = net.compile_profile(&chair).unwrap();
+        for (a, b) in [(0, 1), (1, 0), (1, 2), (2, 1)] {
+            let slot = directed_slot(&net, a, b);
+            if (a, b) == closed {
+                assert_eq!(limited.arc_millis()[slot], u32::MAX);
+            } else {
+                assert_eq!(limited.arc_millis()[slot], open.arc_millis()[slot]);
+            }
+        }
+    }
+    // A limit above the grade closes nothing.
+    let mut lenient = StreetProfileDefinition::wheelchair();
+    lenient.max_uphill = Some(0.12);
+    let lenient = net.compile_profile(&lenient).unwrap();
+    assert_eq!(lenient.arc_millis(), open.arc_millis());
 }
 
 #[test]

@@ -333,10 +333,12 @@ def policy_speeds(policy, speeds, traveler=None):
     ``{mode: km/h}`` mapping (``None`` for any other `policy`): keys are
     ``"walk"`` and the modes the policy's access, egress and transfers
     grant, the `traveler` profile's speeds for those modes joining the
-    call's (a mode set on both is a conflict). A transfer set serves only
-    the speeds it was computed at for its mode; the routing core refuses
-    it at any other."""
+    call's (a mode set on both is a conflict), and its grade limits when
+    the policy grants the wheelchair. A transfer set serves only the
+    speeds and limits it was computed at for its mode; the routing core
+    refuses it at any other."""
     from cafein._validate import mode_mapping, positive_finite
+    from cafein.street_network import grade_limits
 
     if not isinstance(policy, StreetLegPolicy):
         return None
@@ -356,6 +358,8 @@ def policy_speeds(policy, speeds, traveler=None):
                 "profile; set it in one place"
             )
         resolved[mode] = kmh
+    if traveler is not None and "wheelchair" in modes:
+        resolved.update(grade_limits(traveler.max_uphill, traveler.max_downhill))
     return resolved
 
 

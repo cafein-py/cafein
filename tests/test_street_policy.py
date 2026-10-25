@@ -3270,3 +3270,15 @@ def test_the_wheelchair_bridge_rides_the_computed_transfer_set(
         for leg in journey["legs"]:
             if leg["type"] == "transfer":
                 assert endpoint not in (leg["from_stop"], leg["to_stop"])
+    # The set serves only the grade limits it was computed at.
+    limited = TravelerProfile(wheelchair=True, max_uphill=0.005)
+    with pytest.raises(ValueError, match="grade limits.*max_uphill="):
+        network.route_between_coordinates(
+            origin, destination, "2022-02-22 08:30:00", traveler=limited
+        )
+    network.compute_mode_transfers("wheelchair", 10, max_uphill=0.005)
+    assert network.route_between_coordinates(
+        origin, destination, "2022-02-22 08:30:00", traveler=limited
+    )
+    with pytest.raises(ValueError, match="wheelchair grade limits"):
+        network.compute_mode_transfers("e_scooter", 10, max_downhill=0.005)

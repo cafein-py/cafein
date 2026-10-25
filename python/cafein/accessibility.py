@@ -37,7 +37,7 @@ from cafein.matrices import (
     _stream_batch,
     _transit_walking_speed,
 )
-from cafein.street_network import core_speeds
+from cafein.street_network import core_speeds, grade_limits
 from cafein.travelers import folded_constraints, refuse_wheelchair_streets
 
 #: The parameter each decay family takes (None: no parameter).
@@ -3135,10 +3135,18 @@ class Catchment(gpd.GeoDataFrame):
             and traveler.wheelchair
             and hasattr(network, "route_between_stops")
         )
-        # The wheelchair streets ride the traveler's wheelchair speed.
+        # The wheelchair streets ride the traveler's wheelchair speed and
+        # grade limits.
         wheel_speeds = core_speeds(
-            {"wheelchair": traveler.speeds["wheelchair"]}
-            if wheeled and "wheelchair" in traveler.speeds
+            {
+                **{
+                    mode: kmh
+                    for mode, kmh in traveler.speeds.items()
+                    if mode == "wheelchair"
+                },
+                **grade_limits(traveler.max_uphill, traveler.max_downhill),
+            }
+            if wheeled
             else None
         )
         if wheeled:
