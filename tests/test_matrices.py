@@ -1230,6 +1230,30 @@ def test_zone_fare_point_matrix_prices_and_walks(network_with_footpaths, helsink
     assert walk.transit_distance_m == pytest.approx(0.0)
 
 
+def test_zone_fare_cells_past_the_time_limit_stay_unpriced(network, helsinki_gtfs):
+    from cafein import fares as fare_module
+
+    # Stop 1293110 reaches these eight stops only after 140 minutes: under
+    # the 120-minute default they close unpriced without the exact search,
+    # and a 160-minute limit prices them.
+    hsl = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
+    far = [f"129311{digit}" for digit in range(1, 9)]
+    query = dict(
+        origins=["1293110"],
+        destinations=far,
+        departure="08:30:00",
+        optimize="money",
+        departure_time_window=1,
+        fares=hsl,
+        output_time_units="seconds",
+    )
+    assert cost_matrix(network, **query).empty
+    priced = cost_matrix(network, **query, max_travel_time=160)
+    assert sorted(priced.to_id) == far
+    assert priced.money.tolist() == pytest.approx([4.10] * len(far))
+    assert (priced.travel_time > 120 * 60).all()
+
+
 def test_zone_fare_matrix_prices_zero_fare_products(network, helsinki_gtfs):
     from cafein import fares as fare_module
 
