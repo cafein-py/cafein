@@ -36,6 +36,23 @@
   while they run, instead of combining two network states in one result;
   installing a carriage transfer set counts as such a replacement.
   ([#417](https://github.com/cafein-py/cafein/pull/417))
+- Warnings name the line of the caller's code that triggered them, also
+  when raised deep inside a computation or by the network build, instead
+  of a line inside cafein.
+  ([#409](https://github.com/cafein-py/cafein/pull/409))
+- Points no longer snap into one-way pockets, streets a mode can enter but
+  not leave or leave but not enter, where they reached nothing or were
+  reached from nowhere: each street mode keeps only the largest part of
+  each street component it can travel in both directions.
+  ([#422](https://github.com/cafein-py/cafein/pull/422))
+- With an elevation model the wheelchair no longer refuses every street
+  with a stretch steeper than 8 %, which on a 10 m model left most trips
+  without a route: slope costs time, along AccessMap's curve (a fifth of
+  the speed at 8.5 % uphill or 10 % downhill), read over each street's
+  whole length. The wheelchair's default speed is 0.67 m/s, and
+  `TravelerProfile(max_uphill=..., max_downhill=...)` closes the streets
+  steeper than a traveler takes, in that direction only.
+  ([#424](https://github.com/cafein-py/cafein/pull/424), [#425](https://github.com/cafein-py/cafein/pull/425))
 
 ## 0.29.0 — 2026-09-30
 

@@ -140,9 +140,10 @@ struct Winner {
     walk_transfer_m: f64,
 }
 
-/// Refuses a transfer set computed at other speeds than the query rides for
-/// its `mode` — compared by the profile definitions the two speed lists
-/// resolve to, so equal effective speeds match however they were written.
+/// Refuses a transfer set computed at other speeds (or wheelchair grade
+/// limits) than the query rides for its `mode` — compared by the profile
+/// definitions the two override lists resolve to, so equal effective
+/// settings match however they were written.
 pub(super) fn rides_set_speeds(
     kind: &str,
     setter: &str,
@@ -159,13 +160,24 @@ pub(super) fn rides_set_speeds(
     } else {
         recorded
             .iter()
-            .map(|(name, ms)| format!("{name} {} km/h", (ms * 3.6 * 1000.0).round() / 1000.0))
+            .map(|(name, value)| match name.strip_prefix("wheelchair:") {
+                Some(limit) => format!("{limit} {} %", (value * 100.0 * 1000.0).round() / 1000.0),
+                None => format!("{name} {} km/h", (value * 3.6 * 1000.0).round() / 1000.0),
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let (settings, knobs) = if mode == "wheelchair" {
+        (
+            "speeds and grade limits",
+            "speeds=..., max_uphill=..., max_downhill=...",
+        )
+    } else {
+        ("speeds", "speeds=...")
+    };
     Err(PyValueError::new_err(format!(
         "the computed {kind} set rides {speeds} for '{mode}', not this query's \
-         speeds; recompute it with {setter}(..., speeds=...)"
+         {settings}; recompute it with {setter}(..., {knobs})"
     )))
 }
 
@@ -1897,7 +1909,7 @@ impl TransportNetwork {
         };
         let profile = self.multimodal_profile(&held.mode, &held.speeds)?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
-        let links = self.mode_link_targets(network, profile.definition.mode.bit());
+        let links = self.mode_link_targets(network, &profile);
         let (Some(pickup_link), Some(drop_link)) =
             (links[token.pickup.0 as usize], links[token.drop.0 as usize])
         else {
@@ -2331,7 +2343,7 @@ impl TransportNetwork {
         }
         let profile = self.multimodal_profile(mode, &speeds)?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
-        let links = self.mode_link_targets(network, profile.definition.mode.bit());
+        let links = self.mode_link_targets(network, &profile);
         let stop_count = self.build.timetable.stop_count();
         let (edges, tokens) = py.allow_threads(|| {
             use rayon::prelude::*;
@@ -2446,7 +2458,7 @@ impl TransportNetwork {
         }
         let profile = self.multimodal_profile(mode, &speeds)?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
-        let links = self.mode_link_targets(network, profile.definition.mode.bit());
+        let links = self.mode_link_targets(network, &profile);
         let stop_count = self.build.timetable.stop_count();
         let (edges, winners) = py.allow_threads(|| {
             use rayon::prelude::*;
@@ -2591,7 +2603,7 @@ impl TransportNetwork {
         }
         let profile = self.multimodal_profile(&held.mode, &held.speeds)?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
-        let links = self.mode_link_targets(network, profile.definition.mode.bit());
+        let links = self.mode_link_targets(network, &profile);
         let shape = match (links[from.0 as usize], links[to.0 as usize]) {
             (Some(from_link), Some(to_link)) => {
                 let point = |stop: StopIdx| {
@@ -3205,8 +3217,9 @@ impl TransportNetwork {
         use cafein_core::streets::{MODE_BICYCLE, MODE_E_SCOOTER, MODE_WALK, MODE_WHEELCHAIR};
         self.multimodal_links.get_or_init(|| {
             // The wheelchair snaps by its compiled profile, not its bit:
-            // the gradient cap lives only in the compiled arc costs, and
-            // a bit-snapped link could sit on a capped edge.
+            // a gradient cap lives only in the compiled arc costs, and a
+            // bit-snapped link could sit on a capped edge (a query's grade
+            // limits re-snap in `mode_link_targets`).
             let wheelchair = network
                 .compile_profile(&cafein_core::streets::StreetProfileDefinition::wheelchair())
                 .ok();
@@ -3251,15 +3264,30 @@ impl TransportNetwork {
         })
     }
 
-    /// Each stop's link snap for a mode bit, aligned with the stop indices.
-    pub(crate) fn mode_link_targets(&self, network: &StreetNetwork, bit: u8) -> Vec<Option<Snap>> {
+    /// Each stop's link snap for `profile`'s mode, aligned with the stop
+    /// indices: the cached link, unless `profile` travels its edge in neither
+    /// direction (a wheelchair's grade limits can close an edge both ways) —
+    /// then the stop snaps again by `profile` itself.
+    pub(crate) fn mode_link_targets(
+        &self,
+        network: &StreetNetwork,
+        profile: &CompiledStreetProfile,
+    ) -> Vec<Option<Snap>> {
+        let bit = profile.definition.mode.bit();
+        let mut stops = None;
         self.multimodal_stop_links(network)
             .iter()
-            .map(|candidates| {
-                candidates
+            .enumerate()
+            .map(|(index, candidates)| {
+                let snap = candidates
                     .iter()
                     .find(|(_, mask)| mask & bit != 0)
-                    .map(|(snap, _)| *snap)
+                    .map(|(snap, _)| *snap)?;
+                if network.edge_permits(snap.edge, profile) {
+                    return Some(snap);
+                }
+                let (_, latitude, longitude) = &stops.get_or_insert_with(|| self.stops())[index];
+                network.snap_for_profile((*latitude)?, (*longitude)?, MULTIMODAL_STOP_SNAP, profile)
             })
             .collect()
     }
@@ -3526,7 +3554,7 @@ impl TransportNetwork {
     ) -> PyResult<Option<MeterRow>> {
         let profile = self.multimodal_profile(mode, speeds)?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
-        let links = self.mode_link_targets(network, profile.definition.mode.bit());
+        let links = self.mode_link_targets(network, &profile);
         let Some(snap) =
             network.snap_for_profile(latitude, longitude, MULTIMODAL_STOP_SNAP, &profile)
         else {
@@ -3581,7 +3609,7 @@ impl TransportNetwork {
     ) -> PyResult<Option<ModeRow>> {
         let profile = self.multimodal_profile(mode, speeds)?;
         let network = self.multimodal.as_ref().expect("profile lookup checked");
-        let links = self.mode_link_targets(network, profile.definition.mode.bit());
+        let links = self.mode_link_targets(network, &profile);
         let Some(snap) =
             network.snap_for_profile(latitude, longitude, MULTIMODAL_STOP_SNAP, &profile)
         else {

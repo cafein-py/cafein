@@ -111,6 +111,14 @@ def positive_finite(name, value):
     return number
 
 
+def open_fraction(name, value):
+    """`value` as a float strictly between 0 and 1."""
+    number = _number(name, value)
+    if not 0.0 < number < 1.0:
+        raise ValueError(f"{name} must be a number between 0 and 1 (exclusive)")
+    return number
+
+
 def non_negative_finite(name, value):
     """`value` as a non-negative, finite float."""
     number = _number(name, value)

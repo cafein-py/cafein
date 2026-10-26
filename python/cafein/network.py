@@ -17,7 +17,7 @@ from cafein._snapshot import NetworkSnapshot
 from cafein._units import memory_spec
 from cafein.matrices import _planned_entry, _query_details, _transit_walking_speed
 from cafein.policy import policy_speeds
-from cafein.street_network import core_speeds, profile_speeds
+from cafein.street_network import core_speeds, grade_limits, profile_speeds
 from cafein.streets import walking_speed
 from cafein.travelers import (
     folded_constraints,
@@ -3029,7 +3029,15 @@ class TransportNetwork:
             mode, float(seconds), speeds=overrides
         )
 
-    def compute_mode_transfers(self, mode, max_transfer_time, *, speeds=None):
+    def compute_mode_transfers(
+        self,
+        mode,
+        max_transfer_time,
+        *,
+        speeds=None,
+        max_uphill=None,
+        max_downhill=None,
+    ):
         """Compute the merged shared-vehicle transfer set for ``mode``.
 
         Per stop with a street link for `mode`, one directed search over
@@ -3054,7 +3062,9 @@ class TransportNetwork:
         the wheelchair-profile movements alone, with no walking-closure
         union — a stricter same-speed profile would always lose to the
         unrestricted walking rows — and its edges attribute as walking,
-        never as rentals.
+        never as rentals. ``max_uphill`` and ``max_downhill`` (slope
+        fractions, as on ``TravelerProfile``) apply only to it: the set
+        then serves the wheelchair travelers with the same limits.
 
         Returns
         -------
@@ -3065,6 +3075,13 @@ class TransportNetwork:
         from cafein._units import duration_seconds
 
         overrides = profile_speeds(speeds, mode)
+        limits = grade_limits(max_uphill, max_downhill)
+        if limits and mode != "wheelchair":
+            raise ValueError(
+                "max_uphill and max_downhill are wheelchair grade limits; "
+                f"the '{mode}' transfer set takes none"
+            )
+        overrides = sorted(overrides + list(limits.items()))
         seconds = duration_seconds("max_transfer_time", max_transfer_time)
         return self._core._compute_mode_transfers(
             mode, float(seconds), speeds=overrides

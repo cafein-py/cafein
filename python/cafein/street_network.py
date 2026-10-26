@@ -55,10 +55,32 @@ def profile_speeds(speeds, mode):
     )
 
 
+#: The override names carrying a wheelchair traveler's grade limits, as
+#: slope fractions beside the km/h speeds.
+GRADE_LIMITS = ("wheelchair:max_downhill", "wheelchair:max_uphill")
+
+
+def grade_limits(max_uphill=None, max_downhill=None):
+    """Validated wheelchair grade limits (slope fractions between 0 and 1)
+    as override entries; ``{}`` without limits."""
+    from cafein._validate import open_fraction
+
+    limits = {}
+    if max_uphill is not None:
+        limits["wheelchair:max_uphill"] = open_fraction("max_uphill", max_uphill)
+    if max_downhill is not None:
+        limits["wheelchair:max_downhill"] = open_fraction("max_downhill", max_downhill)
+    return limits
+
+
 def core_speeds(speeds):
     """A validated ``{mode: km/h}`` mapping (or ``None``) as the routing
-    core's ``[(mode, m/s)]`` profile overrides."""
-    return [(name, kmh / 3.6) for name, kmh in sorted((speeds or {}).items())]
+    core's ``[(mode, m/s)]`` profile overrides; grade-limit entries
+    (:data:`GRADE_LIMITS`) pass through as slope fractions."""
+    return [
+        (name, value if name in GRADE_LIMITS else value / 3.6)
+        for name, value in sorted((speeds or {}).items())
+    ]
 
 
 def validate_build_modes(modes):
