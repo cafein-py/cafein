@@ -928,26 +928,28 @@ def points_to_frame(network, stops):
     )
 
 
-def test_merged_feed_aliases_share_their_column(helsinki_gtfs, fares_poa):
+def test_merged_feed_aliases_share_their_column(helsinki_gtfs, tmp_path):
     # On a merged feed a unique unqualified id and its qualified form
     # resolve to the same stop; the cost surfaces must fill both
     # columns instead of NaN-ing whichever alias lost the dedupe.
     from cafein import NearestDestinations, TransportNetwork
+    from test_frontier import build_two_line_gtfs
 
-    poa = helsinki_gtfs.parent / "poa_eptc.zip"
+    poa = helsinki_gtfs.parent / "poa_trensurb.zip"
     if not poa.exists():
-        pytest.skip("poa_eptc.zip not fetched")
-    merged = TransportNetwork.from_gtfs([str(helsinki_gtfs), str(poa)])
+        pytest.skip("poa_trensurb.zip not fetched")
+    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
+    merged = TransportNetwork.from_gtfs([str(feed), str(poa)])
     frame = NearestDestinations(
         merged,
-        ["0:4810551"],
-        ["1250551", "0:1250551"],
-        DEPARTURE,
+        ["0:A"],
+        ["B", "0:B"],
+        "2022-02-22 08:00:00",
         k=2,
         cost="emissions",
         departure_time_window=10,
     )
-    assert list(frame["destination_id"]) == ["1250551", "0:1250551"]
+    assert list(frame["destination_id"]) == ["B", "0:B"]
     assert frame["cost"].iloc[0] == frame["cost"].iloc[1]
 
 

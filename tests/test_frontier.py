@@ -8,7 +8,7 @@ import pytest
 from cafein import journey_frontier, least_emissions
 
 
-def build_two_line_gtfs(path, tram_route_type=0):
+def build_two_line_gtfs(path, tram_route_type=0, at=(60.0, 24.0)):
     """Two stops joined by a fast two-bus chain (dirty) and a slow direct
     tram (clean), twice each within 08:00–08:30.
 
@@ -18,7 +18,11 @@ def build_two_line_gtfs(path, tram_route_type=0):
     defaults: bus 92 g/pkm, tram 25 g/pkm). The 08:15 bus chain has a
     long transfer wait, making it slower than the 08:00 chain at equal
     emissions: a candidate that must fall off the frontier.
+
+    ``at`` is the origin's ``(latitude, longitude)``; the hub and the
+    destination lie 0.03° and 0.05° east of it.
     """
+    lat, lon = at
     tables = {
         "agency.txt": [
             "agency_id,agency_name,agency_url,agency_timezone",
@@ -26,9 +30,9 @@ def build_two_line_gtfs(path, tram_route_type=0):
         ],
         "stops.txt": [
             "stop_id,stop_name,stop_lat,stop_lon",
-            "A,Origin,60.0,24.0",
-            "H,Hub,60.0,24.03",
-            "B,Destination,60.0,24.05",
+            f"A,Origin,{lat},{lon}",
+            f"H,Hub,{lat},{round(lon + 0.03, 6)}",
+            f"B,Destination,{lat},{round(lon + 0.05, 6)}",
         ],
         "routes.txt": [
             "route_id,route_short_name,route_type",

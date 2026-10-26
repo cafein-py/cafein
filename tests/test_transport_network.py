@@ -248,20 +248,23 @@ def test_route_between_stops_refusals(network):
             network.route_between_stops(origin, "1250551", when)
 
 
-def test_merged_feeds_require_qualified_stop_ids(helsinki_gtfs):
-    merged = TransportNetwork.from_gtfs([str(helsinki_gtfs), str(helsinki_gtfs)])
-    assert merged.stop_count == 2 * 8305
+def test_merged_feeds_require_qualified_stop_ids(tmp_path):
+    from test_frontier import build_two_line_gtfs
+
+    feed = str(build_two_line_gtfs(tmp_path / "two_line_gtfs.zip"))
+    merged = TransportNetwork.from_gtfs([feed, feed])
+    assert merged.stop_count == 2 * 3
     with pytest.raises(KeyError, match="several feeds"):
-        merged.route_between_stops("4810551", "1250551", "2022-02-22 08:30:00")
+        merged.route_between_stops("A", "B", "2022-02-22 08:00:00")
     for feed in (0, 1):
         journeys = merged.route_between_stops(
-            f"{feed}:4810551", f"{feed}:1250551", "2022-02-22 08:30:00"
+            f"{feed}:A", f"{feed}:B", "2022-02-22 08:00:00"
         )
-        assert journeys[0]["arrival_s"] == 8 * 3600 + 58 * 60
+        assert journeys[0]["arrival_s"] == 8 * 3600 + 30 * 60
         transit = journeys[0]["legs"][1]
-        assert transit["board_stop"] == f"{feed}:4810551"
-        assert transit["alight_stop"] == f"{feed}:1250551"
-        assert transit["trip_id"] == f"{feed}:3001K_20220222_S1_2_0831"
+        assert transit["board_stop"] == f"{feed}:A"
+        assert transit["alight_stop"] == f"{feed}:B"
+        assert transit["trip_id"] == f"{feed}:TRAM_1"
 
 
 def test_an_osm_extract_installs_transfers(network_with_footpaths):

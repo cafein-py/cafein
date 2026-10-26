@@ -694,15 +694,14 @@ def test_compute_is_deterministic(helsinki_gtfs, kantakaupunki_pbf, ultra_networ
     assert again.ultra_shortcuts == ultra_network.ultra_shortcuts
 
 
-def test_a_new_street_network_clears_the_shortcuts(helsinki_gtfs, kantakaupunki_pbf):
+def test_a_new_street_network_clears_the_shortcuts(kantakaupunki_pbf, tmp_path):
     # Rebuilding the street network invalidates shortcuts derived from the
     # old one, so recomputing is required rather than silently reusing them.
     from cafein import streets
+    from test_frontier import build_two_line_gtfs
 
-    with pytest.warns(UserWarning):
-        net = TransportNetwork.from_gtfs(
-            [str(helsinki_gtfs)], osm_pbf=str(kantakaupunki_pbf)
-        )
+    feed = build_two_line_gtfs(tmp_path / "central_gtfs.zip", at=(60.17, 24.93))
+    net = TransportNetwork.from_gtfs([str(feed)], osm_pbf=str(kantakaupunki_pbf))
     net.compute_ultra_shortcuts(max_transfer_time=CUTOFF, **WINDOW)
     assert net.ultra_shortcut_count is not None
 

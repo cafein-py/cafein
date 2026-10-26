@@ -122,17 +122,19 @@ def test_cost_matrix_is_deterministic(network):
     assert first.equals(second)
 
 
-def test_cost_matrix_requires_installed_payloads(helsinki_gtfs):
+def test_cost_matrix_requires_installed_payloads(tmp_path):
     from cafein import TransportNetwork
+    from test_frontier import build_two_line_gtfs
 
-    lean = TransportNetwork.from_gtfs([str(helsinki_gtfs)], trip_distances=False)
+    feed = str(build_two_line_gtfs(tmp_path / "two_line_gtfs.zip"))
+    lean = TransportNetwork.from_gtfs([feed], trip_distances=False)
     with pytest.raises(ValueError, match="no trip distances"):
-        cost_matrix(lean, origins=["4810551"], departure="08:30:00")
-    slim = TransportNetwork.from_gtfs([str(helsinki_gtfs)], leg_geometries=False)
+        cost_matrix(lean, origins=["A"], departure="08:00:00")
+    slim = TransportNetwork.from_gtfs([feed], leg_geometries=False)
     with pytest.raises(ValueError, match="no leg geometries"):
-        cost_matrix(slim, origins=["4810551"], departure="08:30:00", geometries=True)
+        cost_matrix(slim, origins=["A"], departure="08:00:00", geometries=True)
     # Costs without geometries stay available on the slim build.
-    matrix = cost_matrix(slim, origins=["4810551"], departure="08:30:00")
+    matrix = cost_matrix(slim, origins=["A"], departure="08:00:00")
     assert "geometry" not in matrix.columns
     assert len(matrix) > 0
 
