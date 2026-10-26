@@ -53,6 +53,10 @@
   `TravelerProfile(max_uphill=..., max_downhill=...)` closes the streets
   steeper than a traveler takes, in that direction only.
   ([#424](https://github.com/cafein-py/cafein/pull/424), [#425](https://github.com/cafein-py/cafein/pull/425))
+- cafein supports Python 3.11 to 3.15; Python 3.10 is no longer
+  supported. Wheels target the stable ABI from Python 3.11, and pyrosm
+  0.23 or newer is required.
+  ([#426](https://github.com/cafein-py/cafein/pull/426))
 
 ## 0.29.0 — 2026-09-30
 

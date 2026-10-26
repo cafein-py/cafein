@@ -20,7 +20,7 @@ cafein-gtfs.workspace = true
 chrono.workspace = true
 memmap2.workspace = true
 numpy.workspace = true
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310", "multiple-pymethods"] }
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py311", "multiple-pymethods"] }
 rayon.workspace = true
 serde.workspace = true
 sha2 = "0.11"
