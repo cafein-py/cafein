@@ -84,6 +84,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       CAFEIN_REQUIRE_TEST_DATA: "1"
+      # Each cell runs one of two shards of the test files, balanced by the
+      # weights in tests/conftest.py.
+      CAFEIN_TEST_SHARD: ${{ matrix.shard }}/2
     strategy:
       fail-fast: false
       matrix:
@@ -91,15 +94,22 @@ jobs:
         # mid-suite; the jobs run on 24.04.
         os: [ubuntu-24.04, macos-latest, windows-latest]
         python: ["311", "312", "313", "314", "315"]
-        # macOS runners are few and queue behind a low concurrency cap,
-        # so they cover only the boundary Pythons; ubuntu and windows
-        # keep the full version axis.
+        shard: [1, 2]
+        # macOS and Windows cover only the boundary Pythons, which keeps the
+        # matrix within the account's concurrent runners; ubuntu keeps the
+        # full version axis.
         exclude:
           - os: macos-latest
             python: "312"
           - os: macos-latest
             python: "313"
           - os: macos-latest
+            python: "314"
+          - os: windows-latest
+            python: "312"
+          - os: windows-latest
+            python: "313"
+          - os: windows-latest
             python: "314"
     steps:
       - uses: actions/checkout@v4
@@ -158,7 +168,8 @@ jobs:
         # go to the runner's disk: newer Ubuntu images mount /tmp as tmpfs,
         # where the tests' artifacts would take memory too.
         # Coverage is informational (term-missing, no upload), so one
-        # cell collects it; the rest skip the instrumentation overhead.
+        # Python version collects it, each shard for its own files; the
+        # rest skip the instrumentation overhead.
         env:
           RAYON_NUM_THREADS: 2
           WORKERS: ${{ runner.os == 'Linux' && '2' || 'auto' }}
@@ -166,3 +177,18 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then export TMPDIR="$RUNNER_TEMP"; fi
           pytest -n "$WORKERS" --dist load --durations=20 $COVERAGE
+
+  # The check branch protection requires: it passes only when lint, the Rust
+  # tests and every cell of the Python matrix passed, so the required check
+  # survives changes to the matrix.
+  all-tests:
+    name: All tests
+    if: always()
+    needs: [lint, rust, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every job to pass
+        run: |
+          test "${{ needs.lint.result }}" = success
+          test "${{ needs.rust.result }}" = success
+          test "${{ needs.test.result }}" = success

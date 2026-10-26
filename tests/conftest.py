@@ -9,6 +9,85 @@ import pytest
 
 DATA_DIRECTORY = pathlib.Path(__file__).parent / "data"
 
+#: Seconds each test file takes (setup included) in a local run on four
+#: workers: the weights ``CAFEIN_TEST_SHARD`` balances. A file missing here
+#: weighs as the median; stale weights only unbalance the shards.
+SHARD_WEIGHTS = {
+    "test_ultra.py": 216,
+    "test_arrive_by.py": 203,
+    "test_street_policy.py": 142,
+    "test_serialization.py": 139,
+    "test_frontier.py": 131,
+    "test_streaming.py": 123,
+    "test_workers.py": 122,
+    "test_exposure.py": 122,
+    "test_park_and_ride.py": 73,
+    "test_regressions.py": 71,
+    "test_matrices.py": 63,
+    "test_accessibility.py": 61,
+    "test_logging.py": 45,
+    "test_recipes.py": 35,
+    "test_car_routing.py": 31,
+    "test_router_auto.py": 31,
+    "test_emissions.py": 31,
+    "test_multimodal_transport.py": 30,
+    "test_exclusions.py": 25,
+    "test_equity.py": 15,
+    "test_fares.py": 15,
+    "test_itineraries.py": 14,
+    "test_transport_network.py": 14,
+    "test_elevation.py": 11,
+    "test_street_network.py": 7,
+    "test_travelers.py": 6,
+    "test_geometry.py": 4,
+    "test_street_costs.py": 2,
+    "test_streets.py": 2,
+    "test_zones.py": 2,
+    "test_street_matrix.py": 1,
+    "test_ipea_accessibility.py": 1,
+    "test_osm_extraction.py": 1,
+    "test_memory.py": 1,
+    "test_package.py": 1,
+    "test_street_itineraries.py": 1,
+    "test_units.py": 1,
+    # Skipped in the Tests workflow, which installs no cafein.sampledata.
+    "test_metro_scale.py": 0,
+}
+
+
+def shard_files(files, count):
+    """The test file names `files` split into `count` shards of near-equal
+    :data:`SHARD_WEIGHTS`, heaviest file first onto the lightest shard."""
+    weights = sorted(SHARD_WEIGHTS.values())
+    default = weights[len(weights) // 2]
+    loads = [0] * count
+    shards = [set() for _ in range(count)]
+    for name in sorted(
+        files, key=lambda name: (-SHARD_WEIGHTS.get(name, default), name)
+    ):
+        lightest = loads.index(min(loads))
+        shards[lightest].add(name)
+        loads[lightest] += SHARD_WEIGHTS.get(name, default)
+    return shards
+
+
+def pytest_collection_modifyitems(config, items):
+    """``CAFEIN_TEST_SHARD=i/n`` keeps the test files of shard ``i`` of ``n``."""
+    spec = os.environ.get("CAFEIN_TEST_SHARD")
+    if not spec:
+        return
+    try:
+        index, count = (int(part) for part in spec.split("/"))
+    except ValueError:
+        raise pytest.UsageError(f"CAFEIN_TEST_SHARD must be i/n, not {spec!r}")
+    if not 1 <= index <= count:
+        raise pytest.UsageError(f"CAFEIN_TEST_SHARD {spec!r} names no shard")
+    keep = shard_files({item.path.name for item in items}, count)[index - 1]
+    config.hook.pytest_deselected(
+        items=[item for item in items if item.path.name not in keep]
+    )
+    items[:] = [item for item in items if item.path.name in keep]
+
 
 def _data_file(name):
     path = DATA_DIRECTORY / name
