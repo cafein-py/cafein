@@ -33,6 +33,52 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # The Rust tests do not depend on the Python version, so they run once per
+  # OS rather than in every cell of the Python matrix.
+  rust:
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    env:
+      CAFEIN_REQUIRE_TEST_DATA: "1"
+      # Dependencies already build optimised; optimising the workspace crates
+      # too keeps the Helsinki integration tests from running unoptimised.
+      # Debug assertions and overflow checks stay on.
+      CARGO_PROFILE_DEV_OPT_LEVEL: "2"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: ci/py314-conda.yaml
+          environment-name: test
+          cache-environment: true
+          condarc: |
+            channel_priority: strict
+      - name: Cache Rust builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+            target
+          key: rust-tests-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: rust-tests-${{ runner.os }}-
+      - name: Cache test data
+        uses: actions/cache@v4
+        with:
+          path: tests/data
+          key: test-data-${{ hashFiles('scripts/fetch_test_data.py') }}
+      - name: Fetch test data
+        shell: bash -el {0}
+        run: python scripts/fetch_test_data.py
+      - name: Run Rust tests
+        shell: bash -el {0}
+        run: cargo test --workspace
+
   test:
     needs: lint
     runs-on: ${{ matrix.os }}
@@ -64,9 +110,9 @@ jobs:
           cache-environment: true
           condarc: |
             channel_priority: strict
-      # The Rust workspace and the crate registry rebuild identically
-      # across the Python matrix (the extension is abi3), so one warm
-      # cache per OS serves every cell.
+      # The extension and the crate registry rebuild identically across the
+      # Python matrix (the extension is abi3), so one warm cache per OS
+      # serves every cell.
       - name: Cache Rust builds
         uses: actions/cache@v4
         with:
@@ -75,8 +121,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git
             target
-          key: rust-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: rust-${{ runner.os }}-
+          key: rust-extension-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: rust-extension-${{ runner.os }}-
       - name: Cache pip wheels
         uses: actions/cache@v4
         with:
@@ -93,9 +139,6 @@ jobs:
       - name: Fetch test data
         shell: bash -el {0}
         run: python scripts/fetch_test_data.py
-      - name: Run Rust tests
-        shell: bash -el {0}
-        run: cargo test --workspace
       - name: Install Python dependencies
         shell: bash -el {0}
         run: pip install geopandas numpy pandas pyrosm scipy shapely
