@@ -436,7 +436,11 @@ def fare_surface(network, helsinki_gtfs):
 
     structure = fare_module.zone_fare_structure(helsinki_gtfs, rules="zones")
     origins, destinations = _stop_sets(network)
-    origins, destinations = origins[:3], destinations[:30]
+    # One origin and the destinations it reaches within the 120-minute limit
+    # of zone-fare money queries (the eight after it lie beyond): proving
+    # that no fare exists past the limit costs the exact engine seconds per
+    # destination.
+    origins, destinations = origins[:1], destinations[:1] + destinations[9:30]
     surface = _cost_surface(
         network, origins, destinations, "money", structure, window=FARE_WINDOW
     )
