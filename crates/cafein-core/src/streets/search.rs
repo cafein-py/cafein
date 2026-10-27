@@ -470,6 +470,27 @@ impl StreetNetwork {
         walking_speed: f64,
         max_seconds: f64,
     ) -> Vec<(StopIdx, StopIdx, u32, f64)> {
+        self.stop_transfers_with_progress(walking_speed, max_seconds, None)
+    }
+
+    /// The number of stops with at least one link: those
+    /// [`StreetNetwork::stop_transfers`] searches from.
+    pub fn linked_stop_count(&self) -> usize {
+        self.links()
+            .iter()
+            .map(|link| link.stop)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
+    /// [`StreetNetwork::stop_transfers`], calling `progress` once per
+    /// stop searched from.
+    pub fn stop_transfers_with_progress(
+        &self,
+        walking_speed: f64,
+        max_seconds: f64,
+        progress: crate::progress::Progress<'_>,
+    ) -> Vec<(StopIdx, StopIdx, u32, f64)> {
         if !walking_speed.is_finite()
             || walking_speed <= 0.0
             || !max_seconds.is_finite()
@@ -493,11 +514,16 @@ impl StreetNetwork {
         let mut edges: Vec<(StopIdx, StopIdx, u32, f64)> = sources
             .into_par_iter()
             .flat_map_iter(|(stop, snaps)| {
-                self.reachable_from_snaps(&snaps, walking_speed, max_seconds)
+                let walks = self
+                    .reachable_from_snaps(&snaps, walking_speed, max_seconds)
                     .into_iter()
                     .filter(move |walk| walk.stop != stop)
                     .map(move |walk| (stop, walk.stop, walk.seconds, walk.meters))
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                if let Some(tick) = progress {
+                    tick();
+                }
+                walks
             })
             .collect();
         // Deterministic order regardless of worker scheduling.

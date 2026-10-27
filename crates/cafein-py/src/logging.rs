@@ -164,14 +164,15 @@ impl PhaseTimer {
     }
 }
 
-/// Emits throttled INFO progress lines from an origin fan-out: one
-/// `tick` per completed origin, a line at each ~5% boundary (at most
-/// ~20 GIL acquisitions per run), between a start and an end event.
-/// Constructed disarmed when neither logging nor progress is on, or the
-/// run is small; disarmed call sites pass the core `None` so the
-/// fan-out runs exactly as before.
+/// Emits throttled INFO progress lines from a fan-out: one `tick` per
+/// completed unit (an origin, a stop, a step), a line at each ~5%
+/// boundary (at most ~20 GIL acquisitions per run), between a start and
+/// an end event. Constructed disarmed when neither logging nor progress
+/// is on, or the fan-out is small; disarmed call sites pass the core
+/// `None` so the fan-out runs exactly as before.
 pub struct ProgressTicker {
     label: &'static str,
+    unit: &'static str,
     total: usize,
     step: usize,
     completed: AtomicUsize,
@@ -189,8 +190,24 @@ impl ProgressTicker {
     /// completion is report enough.
     const MIN_TOTAL: usize = 40;
 
+    /// A fan-out over `total` origins.
     pub fn new(label: &'static str, total: usize) -> Self {
-        let armed = total >= Self::MIN_TOTAL
+        Self::counting(label, total, "origins")
+    }
+
+    /// A fan-out over `total` units of the kind `unit`.
+    pub fn counting(label: &'static str, total: usize, unit: &'static str) -> Self {
+        Self::armed_from(label, total, unit, Self::MIN_TOTAL)
+    }
+
+    /// An operation of `total` steps, each ticked when done: it has
+    /// progress however few its steps.
+    pub fn steps(label: &'static str, total: usize) -> Self {
+        Self::armed_from(label, total, "steps", 1)
+    }
+
+    fn armed_from(label: &'static str, total: usize, unit: &'static str, minimum: usize) -> Self {
+        let armed = total >= minimum
             && (enabled(INFO) || PROGRESS.load(Ordering::Relaxed))
             && DISPATCH.get().is_some();
         let run = if armed {
@@ -203,6 +220,7 @@ impl ProgressTicker {
         }
         ProgressTicker {
             label,
+            unit,
             total,
             step: total.div_ceil(20).max(1),
             completed: AtomicUsize::new(0),
@@ -213,26 +231,30 @@ impl ProgressTicker {
         }
     }
 
-    /// One completed origin. Call only where the GIL is released.
+    /// One completed unit. On a worker thread, call only where the GIL
+    /// is released.
     pub fn tick(&self) {
         if !self.armed {
             return;
         }
         let done = self.completed.fetch_add(1, Ordering::Relaxed) + 1;
-        if !done.is_multiple_of(self.step) {
+        let last = done == self.total;
+        if !done.is_multiple_of(self.step) && !last {
             return;
         }
         let mut emitted = self.emitted.lock().unwrap_or_else(PoisonError::into_inner);
-        while *emitted + self.step <= done {
-            *emitted += self.step;
+        // The last unit closes the run at its total, a boundary or not;
+        // nothing is reported past the total.
+        while *emitted < done.min(self.total) && (*emitted + self.step <= done || last) {
+            *emitted = (*emitted + self.step).min(self.total);
             let at = *emitted;
-            let (label, total) = (self.label, self.total);
+            let (label, unit, total) = (self.label, self.unit, self.total);
             let percent = at * 100 / total;
             let seconds = self.started.elapsed().as_secs_f64();
             deliver(
                 "cafein.matrix",
                 INFO,
-                || format!("{label} {percent}% ({at}/{total} origins, {seconds:.1} s elapsed)"),
+                || format!("{label} {percent}% ({at}/{total} {unit}, {seconds:.1} s elapsed)"),
                 None,
                 None,
                 Some((label, at, total)),

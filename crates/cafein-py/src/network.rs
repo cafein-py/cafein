@@ -200,14 +200,20 @@ impl TransportNetwork {
     ///     input order.
     #[staticmethod]
     fn from_gtfs(py: Python<'_>, paths: Vec<String>) -> PyResult<TransportNetwork> {
+        // Steps: the read, the timetable, the indexes.
+        let progress =
+            crate::logging::ProgressTicker::steps("building the transit core from GTFS", 3);
         let timer = crate::logging::PhaseTimer::start(
             "cafein.build",
             "build.gtfs.read",
             "reading the GTFS feed",
             "read the GTFS feed",
         );
-        let feed = Feed::from_paths(&paths).map_err(to_py_error)?;
+        let feed = py
+            .allow_threads(|| Feed::from_paths(&paths))
+            .map_err(to_py_error)?;
         timer.finish();
+        progress.tick();
         for skipped in &feed.skipped_files {
             let message = format!(
                 "{}: skipped {} (routing does not use it): {}",
@@ -307,8 +313,11 @@ impl TransportNetwork {
             "building the timetable",
             "built the timetable",
         );
-        let build = build_timetable(&feed).map_err(to_py_error)?;
+        let build = py
+            .allow_threads(|| build_timetable(&feed))
+            .map_err(to_py_error)?;
         timer.finish();
+        progress.tick();
         if !build.quarantined.is_empty() {
             crate::logging::build_warning(
                 py,
@@ -337,6 +346,7 @@ impl TransportNetwork {
         let (stops_by_id, stops_by_qualified_id, trips_by_public_id) =
             derived_indexes(&feed, &build.timetable);
         timer.finish();
+        progress.tick();
         Ok(TransportNetwork {
             feed,
             build,

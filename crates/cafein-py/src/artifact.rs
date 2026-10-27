@@ -19,9 +19,11 @@ impl TransportNetwork {
     /// atomically renamed into place, so saving over an artifact never
     /// rewrites it under live mapped readers.
     fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
-        let parts = self.streets.as_ref().map(StreetNetwork::to_parts);
-        let multimodal_parts = self.multimodal.as_ref().map(StreetNetwork::to_parts);
         py.allow_threads(|| {
+            // Steps: encoding the payload, writing the file.
+            let progress = crate::logging::ProgressTicker::steps("saving the network", 2);
+            let parts = self.streets.as_ref().map(StreetNetwork::to_parts);
+            let multimodal_parts = self.multimodal.as_ref().map(StreetNetwork::to_parts);
             let timer = crate::logging::PhaseTimer::start(
                 "cafein.artifact",
                 "artifact.save.encode",
@@ -30,7 +32,10 @@ impl TransportNetwork {
             );
             let (meta, streets_bytes) = self.encode_artifact(&parts, &multimodal_parts)?;
             timer.finish();
-            write_container(path, ARTIFACT_MAGIC, ARTIFACT_FORMAT, &meta, &streets_bytes)
+            progress.tick();
+            write_container(path, ARTIFACT_MAGIC, ARTIFACT_FORMAT, &meta, &streets_bytes)?;
+            progress.tick();
+            Ok(())
         })
     }
 
@@ -84,25 +89,31 @@ impl TransportNetwork {
                 )))
             }
         };
+        // Steps: reading and decoding the file, rebuilding the indexes.
+        let progress = crate::logging::ProgressTicker::steps("loading the network", 2);
         let timer = decode_timer();
-        if mode != MmapMode::Off {
-            match py.allow_threads(|| load_mapped(path, verify))? {
-                Ok(loaded) => {
-                    timer.finish();
-                    return Ok(rebuilt(loaded));
-                }
+        let mapped = match mode {
+            MmapMode::Off => None,
+            _ => match py.allow_threads(|| load_mapped(path, verify))? {
+                Ok(loaded) => Some(loaded),
                 Err(reason) if mode == MmapMode::Require => {
                     return Err(PyValueError::new_err(format!(
                         "'{path}' cannot be memory-mapped ({reason}) and \
                          mmap='require' forbids the owned fallback"
                     )))
                 }
-                Err(_) => {}
-            }
-        }
-        let loaded = py.allow_threads(|| load_owned(path, verify))?;
+                Err(_) => None,
+            },
+        };
+        let loaded = match mapped {
+            Some(loaded) => loaded,
+            None => py.allow_threads(|| load_owned(path, verify))?,
+        };
         timer.finish();
-        Ok(rebuilt(loaded))
+        progress.tick();
+        let network = py.allow_threads(|| rebuilt(loaded));
+        progress.tick();
+        Ok(network)
     }
 
     /// Whether the street arrays are memory-mapped views of the loaded

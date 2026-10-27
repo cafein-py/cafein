@@ -54,8 +54,7 @@
   steeper than a traveler takes, in that direction only.
   ([#424](https://github.com/cafein-py/cafein/pull/424), [#425](https://github.com/cafein-py/cafein/pull/425))
 - cafein supports Python 3.11 to 3.15; Python 3.10 is no longer
-  supported. Wheels target the stable ABI from Python 3.11, and pyrosm
-  0.23 or newer is required.
+  supported. Wheels target the stable ABI from Python 3.11.
   ([#426](https://github.com/cafein-py/cafein/pull/426))
 - Money queries on zone fares (`optimize="money"` matrices, accessibility
   and catchments) no longer spend seconds on each pair no journey reaches
@@ -68,6 +67,24 @@
   components (306 g CO₂e/pkm). A component no matching row states leaves
   the leg unresolved, with a warning naming the route types and components.
   ([#433](https://github.com/cafein-py/cafein/pull/433))
+- The OSM street read keeps only the way tags the street builds use and
+  no element metadata, which lowers its peak memory by about 15 %; the
+  built networks are unchanged.
+  ([#435](https://github.com/cafein-py/cafein/pull/435))
+- `park_and_ride_facilities` takes facilities only from car parks
+  (`amenity=parking` or `parking_entrance`) with a `park_ride` value
+  other than `no`: bicycle parking, former lots and buildings tagged
+  `park_ride` are no longer facilities.
+  ([#436](https://github.com/cafein-py/cafein/pull/436))
+- Long operations show progress without any setup: matrices,
+  itineraries, frontiers and accessibility, the OSM reads, building a
+  network from GTFS, the footpath search, and saving and loading a
+  network draw a bar on stderr once they have run two seconds; without
+  a terminal, an operation of two seconds or more writes one line with
+  its time. `enable_logging(level="warning", progress=False)` turns
+  progress off. pyrosm 0.24 or newer is required, and tqdm is a
+  dependency instead of the `progress` extra.
+  ([#437](https://github.com/cafein-py/cafein/pull/437), [#438](https://github.com/cafein-py/cafein/pull/438))
 
 ## 0.29.0 — 2026-09-30
 

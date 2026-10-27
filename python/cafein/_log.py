@@ -316,6 +316,10 @@ _DELAY = 2.0
 # Progress without enable_logging; cafein's test suite turns it off.
 _default_progress = True
 
+# How often a shown bar is redrawn, so its time moves on while a long
+# step runs.
+_REDRAW_SECONDS = 1.0
+
 
 def _bar_class(stream):
     """``(tqdm class, disable)`` for a bar on ``stream`` (None: stderr).
@@ -369,7 +373,7 @@ _bar_factory = _default_bar_factory
 
 class _Run:
     """The bar of one running operation, with its label, stream and
-    start time."""
+    start time; a shown bar is redrawn while it is open."""
 
     def __init__(self, bar, label, stream):
         self.bar = bar
@@ -378,13 +382,33 @@ class _Run:
         self.started = time.monotonic()
         # Read now: tqdm marks every bar disabled once it closes.
         self.hidden = bool(getattr(bar, "disable", False))
+        self._closed = threading.Event()
+        self._redraw = None
+        if not self.hidden:
+            self._redraw = threading.Thread(target=self._redraw_while_open, daemon=True)
+            self._redraw.start()
 
-    def close(self):
-        """Close the bar; a hidden one that ran ``_DELAY`` seconds or
-        more writes one line with the time it took to its stream."""
+    def _redraw_while_open(self):
+        """Redraw the bar every ``_REDRAW_SECONDS`` once it has run
+        ``_DELAY`` seconds, until it closes, so a bar shows and its time
+        moves on while no tick comes."""
+        while not self._closed.wait(_REDRAW_SECONDS):
+            if time.monotonic() - self.started >= _DELAY:
+                try:
+                    self.bar.refresh()
+                except Exception:
+                    pass
+
+    def close(self, timed=True):
+        """Stop redrawing and close the bar; with ``timed``, a hidden bar
+        that ran ``_DELAY`` seconds or more writes one line with the time
+        it took to its stream."""
+        self._closed.set()
+        if self._redraw is not None:
+            self._redraw.join()
         self.bar.close()
         elapsed = time.monotonic() - self.started
-        if self.hidden and elapsed >= _DELAY:
+        if timed and self.hidden and elapsed >= _DELAY:
             took = self.bar.format_interval(elapsed)
             self.bar.write(f"{self.label} took {took}", file=self.stream)
 
@@ -401,7 +425,7 @@ def _drop_runs():
         _runs.clear()
         for run in runs:
             try:
-                run.bar.close()
+                run.close(timed=False)
             except Exception:
                 pass
 

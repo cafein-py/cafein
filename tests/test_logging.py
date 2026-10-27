@@ -139,6 +139,17 @@ def test_artifact_phases_carry_structured_attributes(network, tmp_path, caplog):
         assert record.cafein_seconds > 0
     for parent in ("artifact.save", "artifact.load"):
         assert phases[parent].cafein_details["path"] == str(path)
+    steps = [
+        tuple(record.cafein_progress[key] for key in ("label", "done", "total"))
+        for record in caplog.records
+        if hasattr(record, "cafein_progress")
+    ]
+    assert steps == [
+        ("saving the network", 1, 2),
+        ("saving the network", 2, 2),
+        ("loading the network", 1, 2),
+        ("loading the network", 2, 2),
+    ]
 
 
 def test_from_gtfs_emits_build_phases(kantakaupunki_pbf, tmp_path, caplog):
@@ -179,6 +190,13 @@ def test_from_gtfs_emits_build_phases(kantakaupunki_pbf, tmp_path, caplog):
         if getattr(record, "cafein_phase", None) == "build.multimodal"
     )
     assert multimodal.cafein_details["modes"] == ["walk"]
+    steps = [
+        record.cafein_progress["done"]
+        for record in caplog.records
+        if getattr(record, "cafein_progress", {}).get("label")
+        == "building the transit core from GTFS"
+    ]
+    assert steps == [1, 2, 3]
     streets = next(
         record
         for record in caplog.records
@@ -737,7 +755,11 @@ class _FakeBar:
         self.total = total
         self.n = 0
         self.seen = []
+        self.refreshed = 0
         self.closed = False
+
+    def refresh(self):
+        self.refreshed += 1
 
     def update(self, step):
         self.n += step
@@ -865,6 +887,42 @@ def test_overlapping_runs_of_one_label_keep_their_own_bars(monkeypatch):
     assert [(bar.n, bar.closed) for bar in bars] == [(6, True), (2, False)]
     _log._present("end", "b", "matrix", 2, 10)
     assert bars[1].closed
+
+
+def test_shown_bars_redraw_while_a_step_runs(monkeypatch):
+    import time
+
+    bars = []
+
+    def factory(label, total, stream):
+        bars.append(_FakeBar(label, total))
+        return bars[-1]
+
+    monkeypatch.setattr(_log, "_bar_factory", factory)
+    monkeypatch.setattr(_log, "_default_progress", True)
+    monkeypatch.setattr(_log, "_DELAY", 0.0)
+    monkeypatch.setattr(_log, "_REDRAW_SECONDS", 0.01)
+    _log._present("start", "a", "reading", 0, 3)
+    time.sleep(0.2)
+    _log._present("end", "a", "reading", 0, 3)
+    redraws = bars[0].refreshed
+    assert redraws > 0 and bars[0].closed
+    time.sleep(0.05)
+    assert bars[0].refreshed == redraws
+
+
+def test_footpath_search_ticks_once_per_stop():
+    from test_streets import STRAIGHT_STREET, footpaths, stop
+
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    # 41 stops tick at every third (the 5 % step) and at the last one.
+    stops = [stop(f"s{index}", 5 + 9 * index, 0) for index in range(41)]
+    footpaths(STRAIGHT_STREET, [("A", "B", 400)], stops)
+    ticks = [line for line in buffer.getvalue().splitlines() if "footpath" in line]
+    ticks = [line for line in ticks if "% (" in line]
+    assert len(ticks) == 14
+    assert "(39/41 stops," in ticks[-2] and "(41/41 stops," in ticks[-1]
 
 
 def test_reconfiguring_progress_closes_open_bars(monkeypatch):

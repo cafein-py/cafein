@@ -1274,7 +1274,17 @@ pub fn street_footpaths<'py>(
                 links,
             )
             .map_err(|error| error.to_string())?;
-            Ok::<_, String>(network.stop_transfers(walking_speed, max_seconds))
+            let ticker = crate::logging::ProgressTicker::counting(
+                "footpath search",
+                network.linked_stop_count(),
+                "stops",
+            );
+            let tick = || ticker.tick();
+            Ok::<_, String>(network.stop_transfers_with_progress(
+                walking_speed,
+                max_seconds,
+                crate::logging::progress_hook(&ticker, &tick),
+            ))
         })
         .map_err(PyValueError::new_err)?;
     let from_index: Vec<u32> = walks.iter().map(|walk| walk.0 .0).collect();
