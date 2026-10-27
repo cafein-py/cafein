@@ -923,20 +923,22 @@ def union_network(osm_pbf, bounding_box=None, car=False):
     build (`car=True`) keeps the motor-only highway classes in the
     extraction.
     """
-    osm = pyrosm.OSM(
-        str(osm_pbf),
-        bounding_box=bounding_box,
-        keep_metadata=False,
-        engine="out_of_core",
-        workers="auto",
-    )
-    network = osm.get_network(
-        network_type="all",
-        custom_filter=union_filter(car=car),
-        filter_type="exclude",
-        tags_to_keep=list(UNION_TAGS),
-        nodes=True,
-    )
+    with _log.reporting("reading the OSM street network", _log.build) as progress:
+        osm = pyrosm.OSM(
+            str(osm_pbf),
+            bounding_box=bounding_box,
+            keep_metadata=False,
+            engine="out_of_core",
+            workers="auto",
+            progress=progress,
+        )
+        network = osm.get_network(
+            network_type="all",
+            custom_filter=union_filter(car=car),
+            filter_type="exclude",
+            tags_to_keep=list(UNION_TAGS),
+            nodes=True,
+        )
     if network is None:
         raise ValueError(f"no routable ways in '{osm_pbf}'")
     return network

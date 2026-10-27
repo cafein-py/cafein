@@ -262,18 +262,22 @@ def _walking_network(osm_pbf, bounding_box=None):
     # memory, so country-scale extracts parse within bounded RAM. The walk
     # reads only the ids, end nodes, lengths and geometries, so no tag
     # beyond `highway` and no element metadata is kept.
-    with _log.phase(
-        "build.streets.read",
-        _log.build,
-        "reading the OSM walking network",
-        "read the OSM walking network",
-    ) as ph:
+    with (
+        _log.phase(
+            "build.streets.read",
+            _log.build,
+            "reading the OSM walking network",
+            "read the OSM walking network",
+        ) as ph,
+        _log.reporting("reading the OSM walking network", _log.build) as progress,
+    ):
         osm = pyrosm.OSM(
             str(osm_pbf),
             bounding_box=bounding_box,
             keep_metadata=False,
             engine="out_of_core",
             workers="auto",
+            progress=progress,
         )
         network = osm.get_network(
             network_type="walking",
@@ -557,15 +561,17 @@ def park_and_ride_facilities(osm_pbf, bounding_box=None):
     from cafein._validate import validated_bounding_box
 
     bounding_box = validated_bounding_box(bounding_box)
-    osm = pyrosm.OSM(str(osm_pbf), bounding_box=bounding_box)
-    found = osm.get_data_by_custom_criteria(
-        custom_filter={"park_ride": True},
-        filter_type="keep",
-        extra_attributes=["amenity"],
-        keep_nodes=True,
-        keep_ways=True,
-        keep_relations=True,
-    )
+    label = "reading the OSM park-and-ride facilities"
+    with _log.reporting(label, _log.build) as progress:
+        osm = pyrosm.OSM(str(osm_pbf), bounding_box=bounding_box, progress=progress)
+        found = osm.get_data_by_custom_criteria(
+            custom_filter={"park_ride": True},
+            filter_type="keep",
+            extra_attributes=["amenity"],
+            keep_nodes=True,
+            keep_ways=True,
+            keep_relations=True,
+        )
     columns = ["id", "park_ride", "geometry"]
     if found is None or len(found) == 0:
         return gpd.GeoDataFrame(

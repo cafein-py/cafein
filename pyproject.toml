@@ -35,9 +35,10 @@ dependencies = [
     "geopandas>=0.14",
     "numpy",
     "pandas",
-    "pyrosm>=0.23",
+    "pyrosm>=0.24",
     "scipy>=1.8",
     "shapely>=2.0",
+    "tqdm>=4.66",
 ]
 
 [project.scripts]
@@ -49,7 +50,6 @@ arrow = ["pyarrow"]
 dem = ["rioxarray"]
 h3 = ["h3>=4"]
 yaml = ["pyyaml"]
-progress = ["tqdm"]
 
 [project.urls]
 Repository = "https://github.com/cafein-py/cafein"

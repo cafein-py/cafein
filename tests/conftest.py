@@ -90,6 +90,14 @@ def pytest_collection_modifyitems(config, items):
     items[:] = [item for item in items if item.path.name in keep]
 
 
+def pytest_configure(config):
+    """Progress bars stay off in the suite; the tests of them turn them on."""
+    from cafein import _log
+
+    _log._default_progress = False
+    _log.sync()
+
+
 def _data_file(name):
     path = DATA_DIRECTORY / name
     if not path.exists():

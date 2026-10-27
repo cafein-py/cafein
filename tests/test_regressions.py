@@ -1145,7 +1145,7 @@ def _fake_park_ride_reader(monkeypatch, frame, calls=None):
     recording the read's keyword arguments in ``calls``."""
 
     class _OSM:
-        def __init__(self, path, bounding_box=None):
+        def __init__(self, path, bounding_box=None, progress=None):
             pass
 
         def get_data_by_custom_criteria(self, **kwargs):
