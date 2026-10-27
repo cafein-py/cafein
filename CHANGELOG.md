@@ -62,6 +62,12 @@
   within `max_travel_time`: the earliest-arrival pass the exact refinement
   already runs closes such pairs; results are unchanged.
   ([#431](https://github.com/cafein-py/cafein/pull/431))
+- A transit emission-factor row's blank components take the values of
+  the broader rows below it instead of counting as 0 g:
+  `factors={"route_type": 4, "fuel": 300}` keeps the shipped ferry's other
+  components (306 g CO₂e/pkm). A component no matching row states leaves
+  the leg unresolved, with a warning naming the route types and components.
+  ([#433](https://github.com/cafein-py/cafein/pull/433))
 
 ## 0.29.0 — 2026-09-30
 
