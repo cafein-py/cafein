@@ -44,12 +44,21 @@ def test_probe_reports_requested_widths():
     assert _probe_workers(3) == 3
 
 
-def test_surfaces_ride_the_requested_pool(network, tmp_path, caplog):
+def test_surfaces_ride_the_requested_pool(
+    network, network_with_footpaths, tmp_path, caplog
+):
+    import geopandas as gpd
+
     from cafein import Accessibility, TravelCostMatrix, TravelTimeMatrix
 
     requested = _distinct_width()
     origins = _served_stops(network, 40)
     small = _served_stops(network, 5)
+    points = gpd.GeoDataFrame(
+        {"id": ["a", "b"]},
+        geometry=gpd.points_from_xy([24.9350, 24.9610], [60.1580, 60.1870]),
+        crs="EPSG:4326",
+    )
     surfaces = (
         lambda: TravelTimeMatrix(
             network, origins, departure=DEPARTURE, workers=requested
@@ -65,9 +74,12 @@ def test_surfaces_ride_the_requested_pool(network, tmp_path, caplog):
             output=tmp_path / "stream",
             workers=requested,
         ),
+        # Point ends: an arrive-by stop matrix runs once per stop of the
+        # network, a minute or more on the fixture.
         lambda: TravelTimeMatrix.to_parquet(
-            network,
-            _served_stops(network, 8),
+            network_with_footpaths,
+            points,
+            points,
             arrival=DEPARTURE,
             output=tmp_path / "arrive",
             workers=requested,

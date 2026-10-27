@@ -761,14 +761,25 @@ pub(crate) fn refine_zone_fare_rows(
                 // hold the money bound at its ceiling for the whole run
                 // and every escalation; one earliest-arrival pass closes
                 // those soundly (the engine's journeys are a subset of
-                // earliest-arrival reachability).
+                // earliest-arrival reachability). Under a duration cap it
+                // also closes the slots reached only after the window's
+                // last departure plus the cap: no journey of any price
+                // arrives earlier than the earliest arrival.
                 if staircase.iter().any(|&climbing| climbing) {
                     let arrivals = Raptor.one_to_all(timetable, transfers, request);
+                    let deadline = budget
+                        .map(|cap| request.departure.saturating_add(window).saturating_add(cap));
+                    let in_time = |stop: StopIdx, seconds: u32| {
+                        arrivals[stop.0 as usize].is_some_and(|arrival| {
+                            deadline
+                                .is_none_or(|deadline| arrival.saturating_add(seconds) <= deadline)
+                        })
+                    };
                     for slot in 0..slots.len() {
                         if staircase[slot]
                             && !slots[slot]
                                 .iter()
-                                .any(|&(stop, _, _)| arrivals[stop.0 as usize].is_some())
+                                .any(|&(stop, seconds, _)| in_time(stop, seconds))
                         {
                             staircase[slot] = false;
                             working[slot] = CLOSED;

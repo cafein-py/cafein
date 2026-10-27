@@ -140,9 +140,12 @@ def test_artifact_phases_carry_structured_attributes(network, tmp_path, caplog):
         assert phases[parent].cafein_details["path"] == str(path)
 
 
-def test_from_gtfs_emits_build_phases(helsinki_gtfs, kantakaupunki_pbf, caplog):
+def test_from_gtfs_emits_build_phases(kantakaupunki_pbf, tmp_path, caplog):
+    from test_frontier import build_two_line_gtfs
+
+    feed = build_two_line_gtfs(tmp_path / "central_gtfs.zip", at=(60.17, 24.93))
     with caplog.at_level(logging.INFO, logger="cafein"):
-        cafein.TransportNetwork.from_gtfs(helsinki_gtfs, osm_pbf=kantakaupunki_pbf)
+        cafein.TransportNetwork.from_gtfs(feed, osm_pbf=kantakaupunki_pbf)
     phases = [
         record.cafein_phase
         for record in caplog.records
@@ -189,9 +192,12 @@ def test_from_gtfs_emits_build_phases(helsinki_gtfs, kantakaupunki_pbf, caplog):
     )
 
 
-def test_gtfs_only_build_emits_no_street_phases(helsinki_gtfs, caplog):
+def test_gtfs_only_build_emits_no_street_phases(tmp_path, caplog):
+    from test_frontier import build_two_line_gtfs
+
+    feed = build_two_line_gtfs(tmp_path / "two_line_gtfs.zip")
     with caplog.at_level(logging.INFO, logger="cafein"):
-        cafein.TransportNetwork.from_gtfs(helsinki_gtfs)
+        cafein.TransportNetwork.from_gtfs(feed)
     phases = [
         record.cafein_phase
         for record in caplog.records

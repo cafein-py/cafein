@@ -57,6 +57,11 @@
   supported. Wheels target the stable ABI from Python 3.11, and pyrosm
   0.23 or newer is required.
   ([#426](https://github.com/cafein-py/cafein/pull/426))
+- Money queries on zone fares (`optimize="money"` matrices, accessibility
+  and catchments) no longer spend seconds on each pair no journey reaches
+  within `max_travel_time`: the earliest-arrival pass the exact refinement
+  already runs closes such pairs; results are unchanged.
+  ([#431](https://github.com/cafein-py/cafein/pull/431))
 
 ## 0.29.0 — 2026-09-30
 
