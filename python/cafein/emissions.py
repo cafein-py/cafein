@@ -375,26 +375,7 @@ def street_factor_with_basis(
             f"unknown street mode {transport_mode!r}; expected one of "
             f"{', '.join(sorted(STREET_MODE_IDENTITIES))}"
         )
-    if components is None:
-        selected = COMPONENT_COLUMNS
-    else:
-        if isinstance(components, str):
-            raise TypeError(
-                f"components must be an iterable of component names, not "
-                f"the string {components!r} — pass ({components!r},)"
-            )
-        chosen = set(components)
-        unknown = chosen - set(COMPONENT_COLUMNS)
-        if unknown:
-            raise ValueError(
-                f"unknown emission component(s): {', '.join(sorted(unknown))}"
-            )
-        selected = [column for column in COMPONENT_COLUMNS if column in chosen]
-        if not selected:
-            raise ValueError(
-                "components selects nothing; an empty selection would report "
-                "zero emissions rather than unresolved ones"
-            )
+    selected = _selected_components(components)
     mode, identity_class, identity_service = STREET_MODE_IDENTITIES[transport_mode]
     vehicle_class = identity_class if vehicle_class is None else vehicle_class
     service_model = identity_service if service_model is None else service_model
@@ -503,7 +484,8 @@ def load_factors(source):
         of scalars is one row, a mapping of sequences is the table's
         columns, and a list of mappings is one row each — the records a
         JSON or YAML file holds; a mapping mixing scalars and sequences
-        is refused.
+        is refused. A component left empty falls through to the broader
+        rows below the row (see `annotate`).
 
     Returns
     -------
@@ -520,8 +502,8 @@ def load_factors(source):
         # NA marks an unresolved component; an infinity is data corruption.
         if np.isinf(frame[column].to_numpy(dtype=float)).any():
             raise ValueError(f"non-finite values in factor component '{column}'")
-    # A keyed row with no component values would resolve as zero
-    # emissions and shadow broader rows.
+    # A row with no component values states nothing: refused, since its
+    # component columns are most likely misnamed.
     empty = frame[COMPONENT_COLUMNS].isna().all(axis=1)
     if empty.any():
         raise ValueError(f"{int(empty.sum())} factor row(s) have no component values")
@@ -595,7 +577,10 @@ def annotate(journeys, network, factors=None, components=None):
         metadata the factor ladder resolves against.
     factors : DataFrame, mapping, list of mappings, or path (optional)
         Extra factor rows (see `load_factors`), layered over the shipped
-        defaults — at equal specificity, later rows win.
+        defaults. Each component resolves on its own: the most specific
+        row that states it wins, later rows at equal specificity, so a
+        row's blank component falls through to the broader rows (user
+        or shipped) below it; a stated zero is a value.
     components : list of str (optional)
         The life-cycle components to include (default: all four). For
         example ``["fuel", "operations"]`` yields operational-scope
@@ -605,25 +590,12 @@ def annotate(journeys, network, factors=None, components=None):
     -------
     list of dict
         The journeys, each leg carrying ``emissions`` in grams CO₂e
-        (zero for walking legs, ``None`` where no factor row matches)
-        and each journey carrying the summed ``emissions`` (``None`` if
-        any of its transit legs is unresolved).
+        (zero for walking legs, ``None`` where no matching row states a
+        selected component; a warning names the route types and
+        components) and each journey carrying the summed ``emissions``
+        (``None`` if any of its transit legs is unresolved).
     """
-    if components is None:
-        components = COMPONENT_COLUMNS
-    else:
-        if isinstance(components, str):
-            raise TypeError(
-                f"components must be an iterable of component names, not "
-                f"the string {components!r} — pass ({components!r},)"
-            )
-        chosen = set(components)
-        unknown = chosen - set(COMPONENT_COLUMNS)
-        if unknown:
-            raise ValueError(f"unknown component(s): {', '.join(sorted(unknown))}")
-        components = [column for column in COMPONENT_COLUMNS if column in chosen]
-        if not components:
-            raise ValueError("components must name at least one component column")
+    components = _selected_components(components)
     _log.sync()
     with _log.phase(
         "emissions.annotate",
@@ -638,15 +610,14 @@ def annotate(journeys, network, factors=None, components=None):
 
 
 def _annotated(journeys, network, factors, components):
-    table = default_factors()
-    if factors is not None:
-        table = pd.concat([table, load_factors(factors)], ignore_index=True)
-    resolver = _Resolver(table, components)
+    """`annotate` past its argument checks: each leg's emissions set in
+    place, one warning for the route types left unresolved."""
+    resolver = _transit_resolver(factors, components)
     routes = {
         route_id: (agency_id, route_type)
         for route_id, agency_id, route_type in network.routes
     }
-    unmatched = set()
+    unmatched = {}
     for journey in journeys:
         total = 0.0
         complete = True
@@ -660,31 +631,27 @@ def _annotated(journeys, network, factors, components):
                     "with trip distances enabled"
                 )
             agency_id, route_type = routes[leg["route_id"]]
-            factor = resolver.resolve(
+            factor, missing = resolver.resolve(
                 leg["trip_id"], leg["route_id"], agency_id, route_type
             )
-            if factor is None:
+            if missing:
                 leg["emissions"] = None
                 complete = False
-                unmatched.add(route_type)
+                unmatched.setdefault(route_type, set()).update(missing)
             else:
                 leg["emissions"] = leg["distance_m"] / 1000.0 * factor
                 total += leg["emissions"]
         journey["emissions"] = total if complete else None
-    if unmatched:
-        _log.warn(
-            f"no emission factor matches route_type(s) {sorted(unmatched)}; "
-            "the affected legs carry no emissions",
-        )
+    _warn_unmatched(unmatched, "the affected legs carry no emissions")
     return journeys
 
 
 def trip_factors(network, factors=None, components=None):
     """Resolve one emission factor per routable trip through the ladder.
 
-    The per-trip form the bulk computations consume: the most specific
-    matching factor row for every trip of the network, in grams CO₂e per
-    passenger-kilometer.
+    The per-trip form the bulk computations consume: every trip's factor,
+    each component from the most specific matching row that states it, in
+    grams CO₂e per passenger-kilometer.
 
     Parameters
     ----------
@@ -700,47 +667,74 @@ def trip_factors(network, factors=None, components=None):
     -------
     list of (str, float)
         ``(trip_id, factor)`` pairs covering every routable trip;
-        ``float("nan")`` marks trips no factor row matches (a warning
-        names the affected route types, as in `annotate`).
+        ``float("nan")`` marks trips for which no matching row states a
+        selected component (a warning names the route types and
+        components, as in `annotate`).
     """
-    if components is None:
-        components = COMPONENT_COLUMNS
-    else:
-        if isinstance(components, str):
-            raise TypeError(
-                f"components must be an iterable of component names, not "
-                f"the string {components!r} — pass ({components!r},)"
-            )
-        chosen = set(components)
-        unknown = chosen - set(COMPONENT_COLUMNS)
-        if unknown:
-            raise ValueError(f"unknown component(s): {', '.join(sorted(unknown))}")
-        components = [column for column in COMPONENT_COLUMNS if column in chosen]
-        if not components:
-            raise ValueError("components must name at least one component column")
-    table = default_factors()
-    if factors is not None:
-        table = pd.concat([table, load_factors(factors)], ignore_index=True)
-    resolver = _Resolver(table, components)
+    resolver = _transit_resolver(factors, _selected_components(components))
     routes = {
         route_id: (agency_id, route_type)
         for route_id, agency_id, route_type in network.routes
     }
-    unmatched = set()
+    unmatched = {}
     results = []
     for trip_id, route_id in network.trips:
         agency_id, route_type = routes[route_id]
-        factor = resolver.resolve(trip_id, route_id, agency_id, route_type)
-        if factor is None:
-            unmatched.add(route_type)
+        factor, missing = resolver.resolve(trip_id, route_id, agency_id, route_type)
+        if missing:
+            unmatched.setdefault(route_type, set()).update(missing)
             factor = float("nan")
         results.append((trip_id, factor))
-    if unmatched:
-        _log.warn(
-            f"no emission factor matches route_type(s) {sorted(unmatched)}; "
-            "journeys riding the affected trips carry no emissions",
-        )
+    _warn_unmatched(unmatched, "journeys riding the affected trips carry no emissions")
     return results
+
+
+def _selected_components(components):
+    """The validated ``components=`` argument as component columns in
+    table order (all four when ``None``)."""
+    if components is None:
+        return list(COMPONENT_COLUMNS)
+    if isinstance(components, str):
+        raise TypeError(
+            f"components must be an iterable of component names, not "
+            f"the string {components!r} — pass ({components!r},)"
+        )
+    chosen = set(components)
+    unknown = chosen - set(COMPONENT_COLUMNS)
+    if unknown:
+        raise ValueError(f"unknown component(s): {', '.join(sorted(unknown))}")
+    selected = [column for column in COMPONENT_COLUMNS if column in chosen]
+    if not selected:
+        raise ValueError(
+            "components selects nothing; an empty selection would report "
+            "zero emissions rather than unresolved ones"
+        )
+    return selected
+
+
+def _transit_resolver(factors, components):
+    """The ladder over the shipped transit factors with the user's
+    `factors` rows layered after them."""
+    table = default_factors()
+    if factors is not None:
+        table = pd.concat([table, load_factors(factors)], ignore_index=True)
+    return _Resolver(table, components)
+
+
+def _warn_unmatched(unmatched, consequence):
+    """One warning naming, per route type, the components no matching
+    factor row states."""
+    if not unmatched:
+        return
+    order = {part: at for at, part in enumerate(COMPONENT_COLUMNS)}
+    details = "; ".join(
+        f"route_type {route_type}: " + ", ".join(sorted(parts, key=order.__getitem__))
+        for route_type, parts in sorted(unmatched.items())
+    )
+    _log.warn(
+        f"no emission factor matches route_type(s) {sorted(unmatched)} for "
+        f"every selected component ({details}); {consequence}",
+    )
 
 
 def budget(
@@ -1019,52 +1013,91 @@ def _table_frame(source, what):
 
 
 class _Resolver:
-    """The most-specific-wins ladder over a factor table.
+    """The most-specific-wins ladder over a factor table, component by
+    component.
 
-    Rows are bucketed by the most specific key they carry; within a
-    bucket, later rows win, so user rows layered after the defaults
-    override them at equal specificity.
+    Rows are bucketed by the most specific key they carry. Each selected
+    component resolves on its own, from the most specific bucket on a
+    leg's ladder where a row states it; within a bucket the last row
+    stating it wins, so user rows layered after the defaults override
+    them component by component at equal specificity. A stated zero is a
+    value; a blank falls through to the broader buckets.
     """
 
     def __init__(self, table, components=COMPONENT_COLUMNS):
-        factor = table[list(components)].fillna(0.0).sum(axis=1)
+        self.components = list(components)
         trip = table["trip_id"].notna()
-        route = table["route_id"].notna()
+        route = ~trip & table["route_id"].notna()
         agency = table["agency_id"].notna()
         mode = table["route_type"].notna()
-        self.by_trip = dict(zip(table.loc[trip, "trip_id"], factor[trip]))
-        by_route = ~trip & route
-        self.by_route = dict(zip(table.loc[by_route, "route_id"], factor[by_route]))
-        by_agency = ~trip & ~route & agency & mode
-        self.by_agency_mode = dict(
+        unrouted = ~trip & ~table["route_id"].notna()
+        by_agency = unrouted & agency & mode
+        by_mode = unrouted & ~agency & mode
+        rest = unrouted & ~agency & ~mode
+        self.by_trip = self._stated(table[trip], table.loc[trip, "trip_id"])
+        self.by_route = self._stated(table[route], table.loc[route, "route_id"])
+        self.by_agency_mode = self._stated(
+            table[by_agency],
             zip(
-                zip(
-                    table.loc[by_agency, "agency_id"],
-                    table.loc[by_agency, "route_type"].astype(int),
-                ),
-                factor[by_agency],
-            )
+                table.loc[by_agency, "agency_id"],
+                table.loc[by_agency, "route_type"].astype(int),
+            ),
         )
-        by_mode = ~trip & ~route & ~agency & mode
-        self.by_mode = dict(
-            zip(table.loc[by_mode, "route_type"].astype(int), factor[by_mode])
+        self.by_mode = self._stated(
+            table[by_mode], table.loc[by_mode, "route_type"].astype(int)
         )
-        rest = table[~trip & ~route & ~agency & ~mode]
-        self.default = float(factor[rest.index[-1]]) if len(rest) else None
+        self.default = self._stated(table[rest], [None] * int(rest.sum())).get(None, {})
+        self._shared = {}
+
+    def _stated(self, rows, keys):
+        """Per key, the last value each selected component is given among
+        `rows`."""
+        stated = {}
+        values = rows[self.components].to_numpy(dtype=float)
+        for key, row in zip(keys, values):
+            parts = stated.setdefault(key, {})
+            for part, value in zip(self.components, row):
+                if not np.isnan(value):
+                    parts[part] = float(value)
+        return stated
 
     def resolve(self, trip_id, route_id, agency_id, route_type):
-        candidates = [route_type, _base_route_type(route_type)]
+        """The leg's factor — the sum of its selected components, ``None``
+        when one is missing — and the components no row on its ladder
+        states. Legs without a trip row share their route's answer."""
         if trip_id in self.by_trip:
-            return self.by_trip[trip_id]
-        if route_id in self.by_route:
-            return self.by_route[route_id]
-        for mode in candidates:
-            if mode is not None and (agency_id, mode) in self.by_agency_mode:
-                return self.by_agency_mode[(agency_id, mode)]
-        for mode in candidates:
-            if mode is not None and mode in self.by_mode:
-                return self.by_mode[mode]
-        return self.default
+            return self._summed(self._ladder(trip_id, route_id, agency_id, route_type))
+        key = (route_id, agency_id, route_type)
+        if key not in self._shared:
+            self._shared[key] = self._summed(
+                self._ladder(None, route_id, agency_id, route_type)
+            )
+        return self._shared[key]
+
+    def _ladder(self, trip_id, route_id, agency_id, route_type):
+        """The buckets applying to a leg, most specific first."""
+        modes = [
+            mode
+            for mode in (route_type, _base_route_type(route_type))
+            if mode is not None
+        ]
+        buckets = [self.by_trip.get(trip_id), self.by_route.get(route_id)]
+        buckets += [self.by_agency_mode.get((agency_id, mode)) for mode in modes]
+        buckets += [self.by_mode.get(mode) for mode in modes]
+        buckets.append(self.default)
+        return [bucket for bucket in buckets if bucket]
+
+    def _summed(self, ladder):
+        """The ladder's total over the selected components and the
+        components none of its buckets states."""
+        total, missing = 0.0, []
+        for part in self.components:
+            value = next((bucket[part] for bucket in ladder if part in bucket), None)
+            if value is None:
+                missing.append(part)
+            else:
+                total += value
+        return (None if missing else total), tuple(missing)
 
 
 def _base_route_type(route_type):

@@ -81,6 +81,9 @@ def test_default_factors_apply_per_mode():
 
 
 def test_the_resolution_ladder_is_most_specific_wins():
+    # Each component comes from the most specific row stating it: the
+    # fuel-only rows keep the shipped bus's vehicle 8, infrastructure 4
+    # and operations 8.
     factors = pd.DataFrame(
         [
             {"route_type": 3, "fuel": 50.0},
@@ -90,28 +93,66 @@ def test_the_resolution_ladder_is_most_specific_wins():
         ]
     )
     trip = journey(
-        transit_leg(1000.0),  # route override: 10
-        transit_leg(1000.0, trip="T-ELECTRIC"),  # trip override: 1
-        transit_leg(1000.0, route="R-FANCY"),  # agency+mode: 20
+        transit_leg(1000.0),  # route fuel 10
+        transit_leg(1000.0, trip="T-ELECTRIC"),  # trip fuel 1
+        transit_leg(1000.0, route="R-FANCY"),  # agency+mode fuel 20
         transit_leg(1000.0, route="R-TRAM"),  # untouched default: 25
     )
     (annotated,) = emissions.annotate([trip], StubNetwork(), factors)
     values = [leg["emissions"] for leg in annotated["legs"][1:-1]]
-    assert values == pytest.approx([10.0, 1.0, 20.0, 25.0])
+    assert values == pytest.approx([30.0, 21.0, 40.0, 25.0])
 
 
-def test_user_rows_override_defaults_at_equal_specificity():
-    factors = pd.DataFrame([{"route_type": 3, "fuel": 30.0}])
-    trip = journey(transit_leg(1000.0))
-    (annotated,) = emissions.annotate([trip], StubNetwork(), factors)
-    assert annotated["legs"][1]["emissions"] == pytest.approx(30.0)
-
-
-def test_an_all_empty_row_is_the_global_default():
-    factors = pd.DataFrame([{"vehicle": 7.0}])
-    trip = journey(transit_leg(1000.0, route="R-FUNICULAR"))
-    (annotated,) = emissions.annotate([trip], StubNetwork(), factors)
-    assert annotated["legs"][1]["emissions"] == pytest.approx(7.0)
+@pytest.mark.parametrize(
+    "rows, route, components, expected, unresolved",
+    [
+        # A one-component row replaces that component of the shipped row
+        # at equal specificity: ferry 6 + 300 + 0 + 0.
+        ([{"route_type": 4, "fuel": 300.0}], "R-FERRY", None, 306.0, None),
+        # A stated zero is a value, not a blank.
+        (
+            [{"route_type": 4, "vehicle": 0.0, "fuel": 300.0}],
+            "R-FERRY",
+            None,
+            300.0,
+            None,
+        ),
+        # A key-less row is the global default for modes without a row.
+        (
+            [{"vehicle": 7.0, "fuel": 0.0, "infrastructure": 0.0, "operations": 0.0}],
+            "R-FUNICULAR",
+            None,
+            7.0,
+            None,
+        ),
+        # A component no row states leaves the leg unresolved, warned.
+        (
+            [{"vehicle": 7.0}],
+            "R-FUNICULAR",
+            None,
+            None,
+            "route_type 7: fuel, infrastructure, operations",
+        ),
+        # Unless the selection leaves it out.
+        ([{"vehicle": 7.0}], "R-FUNICULAR", ["vehicle"], 7.0, None),
+    ],
+)
+def test_each_component_resolves_on_its_own(
+    rows, route, components, expected, unresolved
+):
+    trip = journey(transit_leg(1000.0, route=route))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        (annotated,) = emissions.annotate(
+            [trip], StubNetwork(), pd.DataFrame(rows), components=components
+        )
+    messages = [str(warning.message) for warning in caught]
+    if expected is None:
+        assert annotated["legs"][1]["emissions"] is None
+        assert any(unresolved in message for message in messages)
+    else:
+        assert annotated["legs"][1]["emissions"] == pytest.approx(expected)
+        assert not any("no emission factor" in message for message in messages)
 
 
 def test_unmatched_modes_warn_and_stay_unresolved():
@@ -143,7 +184,7 @@ def test_blank_key_strings_mean_not_applicable(tmp_path):
     assert loaded[emissions.KEY_COLUMNS].isna().all().all()
     # A row with no keys at all is the global default.
     trip = journey(transit_leg(1000.0, route="R-FUNICULAR"))
-    (annotated,) = emissions.annotate([trip], StubNetwork(), path)
+    (annotated,) = emissions.annotate([trip], StubNetwork(), path, ["fuel"])
     assert annotated["legs"][1]["emissions"] == pytest.approx(7.0)
 
 
@@ -227,13 +268,13 @@ def test_street_and_cost_tables_take_mappings(load, rows):
     "case, route, expected",
     [
         # A numeric-looking id in a CSV table still matches the string
-        # route id the legs carry.
-        ("numeric_csv", "42", 11.0),
+        # route id the legs carry (fuel 11 on the bus's other 20 g).
+        ("numeric_csv", "42", 31.0),
         # Mixing keyed and unkeyed records makes pandas coerce numeric
         # ids to floats; they must still match the string ids legs carry.
-        ("float_coerced_json", "42", 11.0),
+        ("float_coerced_json", "42", 31.0),
         # "NA" is a legal GTFS identifier, not a missing value.
-        ("na_csv", "NA", 5.0),
+        ("na_csv", "NA", 25.0),
     ],
 )
 def test_coerced_ids_in_factor_tables_still_match(tmp_path, case, route, expected):
@@ -307,7 +348,7 @@ def test_provenance_columns_survive_and_unknown_ones_warn(load, keys, tmp_path):
         (
             emissions.load_factors,
             {"route_type": 3},
-            lambda table: emissions._Resolver(table).resolve(None, None, None, 3),
+            lambda table: emissions._Resolver(table).resolve(None, None, None, 3)[0],
         ),
         (
             emissions.load_street_factors,
