@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.30.0 — 2026-10-28
 
 - `cafein.emissions.budget` routes a cost matrix and reports each
   pair's share of a carbon budget (1000 g CO₂e by default), the grams
