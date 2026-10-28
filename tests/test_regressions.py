@@ -1140,27 +1140,78 @@ def test_frequency_row_problems_are_reported_once_per_trip(tmp_path):
     assert 30 * 60 < times["S2"] <= 40 * 60
 
 
+def _fake_park_ride_reader(monkeypatch, frame, calls=None):
+    """Make ``park_and_ride_facilities`` read ``frame`` instead of a PBF,
+    recording the read's keyword arguments in ``calls``."""
+
+    class _OSM:
+        def __init__(self, path, bounding_box=None, progress=None):
+            pass
+
+        def get_data_by_custom_criteria(self, **kwargs):
+            if calls is not None:
+                calls.append(kwargs)
+            return frame
+
+    monkeypatch.setattr(streets.pyrosm, "OSM", _OSM)
+
+
 def test_park_and_ride_facilities_state_epsg_4326(monkeypatch):
     # An extractor handing back WGS 84 as PROJJSON: to_crs keeps that
     # definition, so the frame's CRS must be restated as EPSG:4326.
     import geopandas as gpd
     import pyproj
 
-    class _OSM:
-        def __init__(self, path, bounding_box=None):
-            pass
-
-        def get_data_by_custom_criteria(self, **kwargs):
-            return gpd.GeoDataFrame(
-                {"id": [1], "osm_type": ["node"], "park_ride": ["yes"]},
-                geometry=gpd.points_from_xy([24.94], [60.17]),
-                crs=pyproj.CRS.from_json(pyproj.CRS("EPSG:4326").to_json()),
-            )
-
-    monkeypatch.setattr(streets.pyrosm, "OSM", _OSM)
+    _fake_park_ride_reader(
+        monkeypatch,
+        gpd.GeoDataFrame(
+            {
+                "id": [1],
+                "osm_type": ["node"],
+                "park_ride": ["yes"],
+                "amenity": ["parking"],
+            },
+            geometry=gpd.points_from_xy([24.94], [60.17]),
+            crs=pyproj.CRS.from_json(pyproj.CRS("EPSG:4326").to_json()),
+        ),
+    )
     frame = streets.park_and_ride_facilities("unread.osm.pbf")
     assert str(frame.crs) == "EPSG:4326"
     assert frame["id"].tolist() == ["node/1"]
+
+
+def test_park_and_ride_facilities_are_car_parks(monkeypatch):
+    # park_ride is a sub-tag of a car park: bicycle shelters, former
+    # lots (was:amenity=parking) and construction sites tagged park_ride
+    # were offered to CarParkPolicy as places to leave the car.
+    import geopandas as gpd
+
+    rows = [
+        ("node", 1, "yes", "parking"),
+        ("node", 2, "train", "parking_entrance"),
+        ("way", 3, "metro;bus", "Parking"),
+        ("way", 4, "yes", "bicycle_parking"),
+        ("way", 5, "train", None),
+        ("way", 6, "no", "parking"),
+    ]
+    calls = []
+    _fake_park_ride_reader(
+        monkeypatch,
+        gpd.GeoDataFrame(
+            {
+                "osm_type": [r[0] for r in rows],
+                "id": [r[1] for r in rows],
+                "park_ride": [r[2] for r in rows],
+                "amenity": [r[3] for r in rows],
+            },
+            geometry=gpd.points_from_xy([24.94] * len(rows), [60.17] * len(rows)),
+            crs="EPSG:4326",
+        ),
+        calls,
+    )
+    frame = streets.park_and_ride_facilities("unread.osm.pbf")
+    assert frame["id"].tolist() == ["node/1", "node/2", "way/3"]
+    assert "amenity" in calls[0]["extra_attributes"]
 
 
 class _ReplaceAfter:

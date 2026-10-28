@@ -1,7 +1,8 @@
-"""The logging surface: quiet default, enable/disable, phases, timings."""
+"""The logging surface: progress, enable/disable, phases, timings."""
 
 import io
 import logging
+import sys
 
 import pandas as pd
 import pytest
@@ -39,7 +40,7 @@ def _saved(network, tmp_path, name="net.cafein"):
     return path
 
 
-def test_quiet_by_default(network, tmp_path, capsys):
+def test_no_log_lines_by_default(network, tmp_path, capsys):
     from cafein import TravelTimeMatrix
 
     path = _saved(network, tmp_path)
@@ -138,6 +139,17 @@ def test_artifact_phases_carry_structured_attributes(network, tmp_path, caplog):
         assert record.cafein_seconds > 0
     for parent in ("artifact.save", "artifact.load"):
         assert phases[parent].cafein_details["path"] == str(path)
+    steps = [
+        tuple(record.cafein_progress[key] for key in ("label", "done", "total"))
+        for record in caplog.records
+        if hasattr(record, "cafein_progress")
+    ]
+    assert steps == [
+        ("saving the network", 1, 2),
+        ("saving the network", 2, 2),
+        ("loading the network", 1, 2),
+        ("loading the network", 2, 2),
+    ]
 
 
 def test_from_gtfs_emits_build_phases(kantakaupunki_pbf, tmp_path, caplog):
@@ -178,6 +190,13 @@ def test_from_gtfs_emits_build_phases(kantakaupunki_pbf, tmp_path, caplog):
         if getattr(record, "cafein_phase", None) == "build.multimodal"
     )
     assert multimodal.cafein_details["modes"] == ["walk"]
+    steps = [
+        record.cafein_progress["done"]
+        for record in caplog.records
+        if getattr(record, "cafein_progress", {}).get("label")
+        == "building the transit core from GTFS"
+    ]
+    assert steps == [1, 2, 3]
     streets = next(
         record
         for record in caplog.records
@@ -736,9 +755,14 @@ class _FakeBar:
         self.total = total
         self.n = 0
         self.seen = []
+        self.refreshed = 0
         self.closed = False
 
     def refresh(self):
+        self.refreshed += 1
+
+    def update(self, step):
+        self.n += step
         self.seen.append(self.n)
 
     def close(self):
@@ -761,59 +785,212 @@ def test_progress_false_logs_only_phases(network, caplog):
     assert len(ticks) == 20
 
 
-def test_progress_bar_drives_one_bar_per_label(network, monkeypatch):
+@pytest.mark.parametrize("setting", ["default", "bar", "off"])
+def test_fanouts_draw_one_bar_as_progress_is_set(network, monkeypatch, setting):
     from cafein import TravelTimeMatrix
 
     bars = []
+    buffer = io.StringIO()
 
     def factory(label, total, stream):
-        assert stream is buffer
+        assert stream is (None if setting == "default" else buffer)
         bar = _FakeBar(label, total)
         bars.append(bar)
         return bar
 
     origins = _served_stops(network, 40)
-    buffer = io.StringIO()
     monkeypatch.setattr(_log, "_bar_factory", factory)
-    cafein.enable_logging(stream=buffer, progress="bar")
+    monkeypatch.setattr(_log, "_default_progress", True)
+    _log.sync()
+    if setting == "bar":
+        cafein.enable_logging(stream=buffer, progress="bar")
+    elif setting == "off":
+        cafein.enable_logging(stream=buffer, level="warning", progress=False)
     TravelTimeMatrix(network, origins, departure=DEPARTURE)
+    assert not [line for line in buffer.getvalue().splitlines() if "% (" in line]
+    if setting == "off":
+        assert bars == [] and buffer.getvalue() == ""
+        return
     assert len(bars) == 1
     bar = bars[0]
-    assert bar.label == "travel_time_matrix"
-    assert bar.total == 40
-    assert bar.n == 40
-    assert bar.closed
+    assert (bar.label, bar.total, bar.n) == ("travel_time_matrix", 40, 40)
     assert bar.seen == list(range(2, 41, 2))
-    output = buffer.getvalue()
-    assert "computed the travel time matrix in" in output
-    assert not [line for line in output.splitlines() if "% (" in line]
+    assert bar.closed
 
 
-@pytest.mark.parametrize("filters", ["default", "error"])
-def test_progress_bar_without_tqdm_falls_back_to_lines(network, monkeypatch, filters):
-    import sys
-    import warnings
-
-    from cafein import TravelTimeMatrix
-
-    # The real import path: a poisoned module entry makes
-    # ``from tqdm.auto import tqdm`` raise inside the default factory.
-    monkeypatch.setitem(sys.modules, "tqdm.auto", None)
-    origins = _served_stops(network, 40)
+@pytest.mark.parametrize(
+    "setting, delay, line",
+    [
+        ("default", 0.0, "reading took 00:00\n"),
+        ("default", 2.0, ""),
+        ("bar", 0.0, "reading took 00:00\n"),
+    ],
+)
+def test_hidden_bars_write_one_line_with_their_time(
+    monkeypatch, capsys, setting, delay, line
+):
+    # Captured stderr and a StringIO are no terminals: the bar is hidden,
+    # and an operation that ran the delay or longer writes its time.
     buffer = io.StringIO()
-    cafein.enable_logging(stream=buffer, progress="bar")
-    if filters == "default":
-        with pytest.warns(UserWarning) as caught:
-            TravelTimeMatrix(network, origins, departure=DEPARTURE)
-        missing = [
-            warning
-            for warning in caught
-            if "tqdm is not installed" in str(warning.message)
-        ]
-        assert len(missing) == 1
-    else:
-        # The missing-tqdm fallback survives warnings-as-errors too.
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
-            TravelTimeMatrix(network, origins, departure=DEPARTURE)
-    assert len([line for line in buffer.getvalue().splitlines() if "% (" in line]) == 20
+    monkeypatch.setattr(_log, "_default_progress", True)
+    monkeypatch.setattr(_log, "_DELAY", delay)
+    if setting == "bar":
+        cafein.enable_logging(stream=buffer, progress="bar")
+    for event, done in (("start", 0), ("tick", 10), ("end", 10)):
+        _log._present(event, "run", "reading", done, 10)
+    written = buffer.getvalue() if setting == "bar" else capsys.readouterr().err
+    assert written == line
+
+
+class _WriteOnly:
+    def write(self, text):
+        pass
+
+
+@pytest.mark.parametrize(
+    "kernel, stream, shown",
+    [
+        (True, None, True),
+        (True, io.StringIO(), False),
+        (False, _WriteOnly(), False),
+    ],
+)
+def test_bars_show_on_terminals_and_on_a_kernel_s_stderr(
+    monkeypatch, kernel, stream, shown
+):
+    import types
+
+    class ZMQInteractiveShell:
+        pass
+
+    shell = ZMQInteractiveShell() if kernel else None
+    ipython = types.SimpleNamespace(get_ipython=lambda: shell)
+    monkeypatch.setitem(sys.modules, "IPython", ipython)
+    _, disable = _log._bar_class(stream)
+    assert disable is not shown
+
+
+def test_overlapping_runs_of_one_label_keep_their_own_bars(monkeypatch):
+    bars = []
+
+    def factory(label, total, stream):
+        bars.append(_FakeBar(label, total))
+        return bars[-1]
+
+    monkeypatch.setattr(_log, "_bar_factory", factory)
+    monkeypatch.setattr(_log, "_default_progress", True)
+    _log._present("start", "a", "matrix", 0, 10)
+    _log._present("start", "b", "matrix", 0, 10)
+    _log._present("tick", "a", "matrix", 6, 10)
+    _log._present("tick", "b", "matrix", 2, 10)
+    _log._present("end", "a", "matrix", 6, 10)
+    assert [(bar.n, bar.closed) for bar in bars] == [(6, True), (2, False)]
+    _log._present("end", "b", "matrix", 2, 10)
+    assert bars[1].closed
+
+
+def test_shown_bars_redraw_while_a_step_runs(monkeypatch):
+    import time
+
+    bars = []
+
+    def factory(label, total, stream):
+        bars.append(_FakeBar(label, total))
+        return bars[-1]
+
+    monkeypatch.setattr(_log, "_bar_factory", factory)
+    monkeypatch.setattr(_log, "_default_progress", True)
+    monkeypatch.setattr(_log, "_DELAY", 0.0)
+    monkeypatch.setattr(_log, "_REDRAW_SECONDS", 0.01)
+    _log._present("start", "a", "reading", 0, 3)
+    time.sleep(0.2)
+    _log._present("end", "a", "reading", 0, 3)
+    redraws = bars[0].refreshed
+    assert redraws > 0 and bars[0].closed
+    time.sleep(0.05)
+    assert bars[0].refreshed == redraws
+
+
+def test_footpath_search_ticks_once_per_stop():
+    from test_streets import STRAIGHT_STREET, footpaths, stop
+
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer)
+    # 41 stops tick at every third (the 5 % step) and at the last one.
+    stops = [stop(f"s{index}", 5 + 9 * index, 0) for index in range(41)]
+    footpaths(STRAIGHT_STREET, [("A", "B", 400)], stops)
+    ticks = [line for line in buffer.getvalue().splitlines() if "footpath" in line]
+    ticks = [line for line in ticks if "% (" in line]
+    assert len(ticks) == 14
+    assert "(39/41 stops," in ticks[-2] and "(41/41 stops," in ticks[-1]
+
+
+def test_reconfiguring_progress_closes_open_bars(monkeypatch):
+    bars = []
+
+    def factory(label, total, stream):
+        bars.append(_FakeBar(label, total))
+        return bars[-1]
+
+    monkeypatch.setattr(_log, "_bar_factory", factory)
+    monkeypatch.setattr(_log, "_default_progress", True)
+    _log._present("start", "a", "matrix", 0, 10)
+    cafein.enable_logging(stream=io.StringIO(), level="warning", progress=False)
+    assert bars[0].closed
+    _log._present("tick", "a", "matrix", 5, 10)
+    _log._present("start", "b", "matrix", 0, 10)
+    assert (len(bars), bars[0].n) == (1, 0)
+
+
+@pytest.mark.parametrize(
+    "read, label",
+    [
+        ("streets._walking_network", "reading the OSM walking network"),
+        ("_osm.union_network", "reading the OSM street network"),
+        (
+            "streets.park_and_ride_facilities",
+            "reading the OSM park-and-ride facilities",
+        ),
+    ],
+)
+def test_pyrosm_reads_show_cafein_progress(monkeypatch, tmp_path, read, label):
+    import importlib
+
+    import pyrosm
+
+    bars = []
+
+    def factory(label, total, stream):
+        bars.append(_FakeBar(label, total))
+        return bars[-1]
+
+    class _OSM:
+        def __init__(self, path, progress, **options):
+            for done in (0, 50, 100):
+                progress(done, 100)
+            raise RuntimeError("stop after the progress")
+
+    monkeypatch.setattr(_log, "_bar_factory", factory)
+    monkeypatch.setattr(_log, "_default_progress", True)
+    monkeypatch.setattr(pyrosm, "OSM", _OSM)
+    module, function = read.split(".")
+    reader = getattr(importlib.import_module(f"cafein.{module}"), function)
+    with pytest.raises(RuntimeError, match="stop after"):
+        reader(str(tmp_path / "area.osm.pbf"))
+    assert [(bar.label, bar.seen, bar.closed) for bar in bars] == [
+        (label, [50, 100], True)
+    ]
+
+
+def test_pyrosm_progress_follows_the_logging_setting():
+    buffer = io.StringIO()
+    cafein.enable_logging(stream=buffer, level="warning", progress=False)
+    with _log.reporting("reading", _log.build) as report:
+        assert report is False
+    cafein.enable_logging(stream=buffer)
+    with _log.reporting("reading", _log.build) as report:
+        for done in range(101):
+            report(done, 100)
+    lines = [line for line in buffer.getvalue().splitlines() if "% (" in line]
+    assert len(lines) == 20
+    assert "reading 5% (" in lines[0] and "reading 100% (" in lines[-1]

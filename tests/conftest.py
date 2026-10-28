@@ -9,47 +9,48 @@ import pytest
 
 DATA_DIRECTORY = pathlib.Path(__file__).parent / "data"
 
-#: Seconds each test file takes (setup included) in a local run on four
-#: workers: the weights ``CAFEIN_TEST_SHARD`` balances. A file missing here
-#: weighs as the median; stale weights only unbalance the shards.
+#: Seconds of each test file's steps of a second or more (setup included),
+#: summed over its workers, in its slowest measured CI job: the weights
+#: ``CAFEIN_TEST_SHARD`` balances. A file missing here weighs as the median;
+#: stale weights only unbalance the shards.
 SHARD_WEIGHTS = {
-    "test_ultra.py": 216,
-    "test_arrive_by.py": 203,
-    "test_street_policy.py": 142,
-    "test_serialization.py": 139,
-    "test_frontier.py": 131,
-    "test_streaming.py": 123,
-    "test_workers.py": 122,
-    "test_exposure.py": 122,
-    "test_park_and_ride.py": 73,
-    "test_regressions.py": 71,
-    "test_matrices.py": 63,
-    "test_accessibility.py": 61,
-    "test_logging.py": 45,
-    "test_recipes.py": 35,
-    "test_car_routing.py": 31,
-    "test_router_auto.py": 31,
-    "test_emissions.py": 31,
-    "test_multimodal_transport.py": 30,
-    "test_exclusions.py": 25,
-    "test_equity.py": 15,
-    "test_fares.py": 15,
-    "test_itineraries.py": 14,
-    "test_transport_network.py": 14,
-    "test_elevation.py": 11,
-    "test_street_network.py": 7,
-    "test_travelers.py": 6,
-    "test_geometry.py": 4,
-    "test_street_costs.py": 2,
-    "test_streets.py": 2,
-    "test_zones.py": 2,
-    "test_street_matrix.py": 1,
-    "test_ipea_accessibility.py": 1,
-    "test_osm_extraction.py": 1,
+    "test_ultra.py": 1444,
+    "test_serialization.py": 725,
+    "test_arrive_by.py": 546,
+    "test_exposure.py": 519,
+    "test_street_policy.py": 510,
+    "test_logging.py": 443,
+    "test_streaming.py": 395,
+    "test_workers.py": 366,
+    "test_regressions.py": 357,
+    "test_matrices.py": 338,
+    "test_frontier.py": 318,
+    "test_park_and_ride.py": 291,
+    "test_multimodal_transport.py": 216,
+    "test_car_routing.py": 175,
+    "test_accessibility.py": 166,
+    "test_recipes.py": 163,
+    "test_exclusions.py": 156,
+    "test_elevation.py": 129,
+    "test_street_network.py": 109,
+    "test_itineraries.py": 103,
+    "test_router_auto.py": 92,
+    "test_emissions.py": 76,
+    "test_fares.py": 68,
+    "test_transport_network.py": 51,
+    "test_street_matrix.py": 50,
+    "test_travelers.py": 40,
+    "test_ipea_accessibility.py": 35,
+    "test_equity.py": 32,
+    "test_street_costs.py": 31,
+    "test_streets.py": 26,
+    "test_geometry.py": 24,
+    "test_street_itineraries.py": 13,
+    "test_zones.py": 11,
+    "test_osm_extraction.py": 4,
+    "test_units.py": 3,
     "test_memory.py": 1,
     "test_package.py": 1,
-    "test_street_itineraries.py": 1,
-    "test_units.py": 1,
     # Skipped in the Tests workflow, which installs no cafein.sampledata.
     "test_metro_scale.py": 0,
 }
@@ -87,6 +88,14 @@ def pytest_collection_modifyitems(config, items):
         items=[item for item in items if item.path.name not in keep]
     )
     items[:] = [item for item in items if item.path.name in keep]
+
+
+def pytest_configure(config):
+    """Progress bars stay off in the suite; the tests of them turn them on."""
+    from cafein import _log
+
+    _log._default_progress = False
+    _log.sync()
 
 
 def _data_file(name):

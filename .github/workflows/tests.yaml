@@ -169,14 +169,16 @@ jobs:
         # where the tests' artifacts would take memory too.
         # Coverage is informational (term-missing, no upload), so one
         # Python version collects it, each shard for its own files; the
-        # rest skip the instrumentation overhead.
+        # rest skip the instrumentation overhead. Every test step of a
+        # second or more is listed: the shard weights in tests/conftest.py
+        # come from these timings.
         env:
           RAYON_NUM_THREADS: 2
           WORKERS: ${{ runner.os == 'Linux' && '2' || 'auto' }}
           COVERAGE: ${{ matrix.os == 'ubuntu-24.04' && matrix.python == '312' && '--cov=cafein --cov-report=term-missing' || '' }}
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then export TMPDIR="$RUNNER_TEMP"; fi
-          pytest -n "$WORKERS" --dist load --durations=20 $COVERAGE
+          pytest -n "$WORKERS" --dist load --durations=0 --durations-min=1.0 $COVERAGE
 
   # The check branch protection requires: it passes only when lint, the Rust
   # tests and every cell of the Python matrix passed, so the required check

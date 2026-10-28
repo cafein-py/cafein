@@ -1,12 +1,15 @@
 """Process and timing visibility: the ``cafein`` logging surface.
 
-Quiet by default: the ``"cafein"`` logger carries a ``NullHandler``
-and propagation stays on, so nothing is printed until the user calls
-:func:`enable_logging` or configures the stdlib ``logging`` machinery
-directly. Phase completions additionally carry structured attributes
-(``cafein_phase``, ``cafein_seconds``, ``cafein_details``) and are
-delivered to any active :func:`collect_timings` collector
-independently of the visible logging configuration.
+No log lines by default: the ``"cafein"`` logger carries a
+``NullHandler`` and propagation stays on, so nothing is logged until
+the user calls :func:`enable_logging` or configures the stdlib
+``logging`` machinery directly. Progress shows by default: a long
+operation draws a bar on stderr once it has run two seconds (see
+:func:`enable_logging`). Phase completions additionally carry
+structured attributes (``cafein_phase``, ``cafein_seconds``,
+``cafein_details``) and are delivered to any active
+:func:`collect_timings` collector independently of the visible
+logging configuration.
 
 Logging must never break a computation: every record is delivered
 through the exception-guarded :func:`_emit`.
@@ -14,6 +17,7 @@ through the exception-guarded :func:`_emit`.
 
 import copy
 import functools
+import importlib.util
 import inspect
 import logging
 import os
@@ -246,7 +250,8 @@ def sync():
 
     Passes the minimum effective level over the Rust target
     namespaces, capped at INFO while a collector is active, clamped
-    into the bridge's range. A no-op until the bridge exists.
+    into the bridge's range, and whether progress is drawn. A no-op
+    until the bridge exists.
     """
     try:
         from cafein import _cafein
@@ -260,12 +265,28 @@ def sync():
         if _collectors:
             threshold = min(threshold, logging.INFO)
         set_level(max(0, min(int(threshold), _DISARMED - 1)))
+        _cafein.set_progress(_presentation()[0])
     except Exception:
         pass
 
 
-def _from_rust(target, levelno, message, phase=None, seconds=None, progress=None):
-    """The dispatch the PyO3 bridge calls for every Rust-side record."""
+def _from_rust(
+    target,
+    levelno,
+    message,
+    phase=None,
+    seconds=None,
+    progress=None,
+    event=None,
+    run=None,
+):
+    """The dispatch the PyO3 bridge calls for every Rust-side record,
+    and for the ``"start"``/``"end"`` events of a fan-out's progress,
+    which are drawn but never logged. ``run`` is the fan-out's id."""
+    if progress is not None:
+        _present(event or "tick", ("rust", run), *progress)
+        if event is not None:
+            return
     logger = logging.getLogger(target)
     if phase is None:
         _emit(logger, levelno, message, progress=progress)
@@ -288,101 +309,220 @@ def _install_bridge():
 _install_bridge()
 
 
-def _default_bar_factory(label, total, stream):
-    """One live bar on the chosen stream, or None when tqdm is
-    unavailable. Inside Jupyter ``tqdm.auto`` renders a widget and
-    the stream is moot; in terminals the bar writes where the log
-    lines go."""
+# A bar shows once its operation has run this long; without a terminal,
+# an operation that ran this long prints one line with its time instead.
+_DELAY = 2.0
+
+# Progress without enable_logging; cafein's test suite turns it off.
+_default_progress = True
+
+# How often a shown bar is redrawn, so its time moves on while a long
+# step runs.
+_REDRAW_SECONDS = 1.0
+
+
+def _bar_class(stream):
+    """``(tqdm class, disable)`` for a bar on ``stream`` (None: stderr).
+
+    On stderr in a Jupyter kernel it is the widget bar when ipywidgets
+    is installed, else the text bar, which the notebook redraws in
+    place; both show although the kernel's stderr is no terminal.
+    Otherwise it is the text bar, hidden unless the stream says it is a
+    terminal.
+    """
+    from tqdm import std
+
+    if stream is None or stream is sys.stderr:
+        # A kernel has imported IPython already, so it is looked up,
+        # not imported.
+        ipython = sys.modules.get("IPython")
+        shell = getattr(ipython, "get_ipython", lambda: None)()
+        if type(shell).__name__ == "ZMQInteractiveShell":
+            if importlib.util.find_spec("ipywidgets") is None:
+                return std.tqdm, False
+            from tqdm import notebook
+
+            return notebook.tqdm, False
+        stream = sys.stderr
     try:
-        from tqdm.auto import tqdm
-    except ImportError:
-        return None
-    return tqdm(total=total, desc=label, leave=False, file=stream)
+        terminal = bool(stream.isatty())
+    except Exception:
+        terminal = False
+    return std.tqdm, not terminal
+
+
+def _default_bar_factory(label, total, stream):
+    """One operation's bar, shown once it has run ``_DELAY`` seconds and
+    cleared when it closes: on ``stream`` for
+    ``enable_logging(progress="bar")``, or with ``stream`` None on
+    stderr (see :func:`_bar_class`)."""
+    tqdm, disable = _bar_class(stream)
+    return tqdm(
+        total=total,
+        desc=label,
+        file=sys.stderr if stream is None else stream,
+        delay=_DELAY,
+        leave=False,
+        mininterval=0.2,
+        disable=disable,
+    )
 
 
 _bar_factory = _default_bar_factory
 
 
+class _Run:
+    """The bar of one running operation, with its label, stream and
+    start time; a shown bar is redrawn while it is open."""
+
+    def __init__(self, bar, label, stream):
+        self.bar = bar
+        self.label = label
+        self.stream = sys.stderr if stream is None else stream
+        self.started = time.monotonic()
+        # Read now: tqdm marks every bar disabled once it closes.
+        self.hidden = bool(getattr(bar, "disable", False))
+        self._closed = threading.Event()
+        self._redraw = None
+        if not self.hidden:
+            self._redraw = threading.Thread(target=self._redraw_while_open, daemon=True)
+            self._redraw.start()
+
+    def _redraw_while_open(self):
+        """Redraw the bar every ``_REDRAW_SECONDS`` once it has run
+        ``_DELAY`` seconds, until it closes, so a bar shows and its time
+        moves on while no tick comes."""
+        while not self._closed.wait(_REDRAW_SECONDS):
+            if time.monotonic() - self.started >= _DELAY:
+                try:
+                    self.bar.refresh()
+                except Exception:
+                    pass
+
+    def close(self, timed=True):
+        """Stop redrawing and close the bar; with ``timed``, a hidden bar
+        that ran ``_DELAY`` seconds or more writes one line with the time
+        it took to its stream."""
+        self._closed.set()
+        if self._redraw is not None:
+            self._redraw.join()
+        self.bar.close()
+        elapsed = time.monotonic() - self.started
+        if timed and self.hidden and elapsed >= _DELAY:
+            took = self.bar.format_interval(elapsed)
+            self.bar.write(f"{self.label} took {took}", file=self.stream)
+
+
+_runs = {}
+_runs_lock = threading.RLock()
+
+
+def _drop_runs():
+    """Close every open bar without its time line: progress was
+    reconfigured, and a new start follows the new setting."""
+    with _runs_lock:
+        runs = list(_runs.values())
+        _runs.clear()
+        for run in runs:
+            try:
+                run.close(timed=False)
+            except Exception:
+                pass
+
+
+def _presentation():
+    """``(on, stream)``: whether progress is drawn now, and on which
+    stream — None for the default bars on stderr."""
+    handler = _handler
+    if handler is None:
+        return _default_progress, None
+    return handler._progress == "bar", handler.stream
+
+
+def _present(event, key, label, done, total):
+    """Draw one progress event of the operation run ``key``, shown as
+    ``label``: ``"start"`` opens its bar when progress is drawn,
+    ``"tick"`` moves an open bar to ``done``, ``"end"`` closes it.
+    Never raises."""
+    try:
+        with _runs_lock:
+            if event == "start":
+                on, stream = _presentation()
+                if on:
+                    bar = _bar_factory(label, total, stream)
+                    _runs[key] = _Run(bar, label, stream)
+            elif event == "tick":
+                run = _runs.get(key)
+                if run is not None and done > run.bar.n:
+                    run.bar.update(done - run.bar.n)
+            else:
+                run = _runs.pop(key, None)
+                if run is not None:
+                    run.close()
+    except Exception:
+        pass
+
+
+@contextmanager
+def reporting(label, logger):
+    """Progress of a pyrosm read, shown as cafein's own.
+
+    Yields pyrosm's ``progress`` callable, called as
+    ``report(done, 100)``: it moves the bar of ``label`` and, with
+    ``logger`` enabled for INFO, logs a line whenever the read passes
+    a further 5 %. Yields
+    ``False``, which turns pyrosm's own bar off too, when neither
+    shows. The bar closes on exit.
+    """
+    if not (_presentation()[0] or logger.isEnabledFor(logging.INFO)):
+        yield False
+        return
+    key = object()
+    started = time.perf_counter()
+    logged = 0
+
+    def report(done, total):
+        nonlocal logged
+        try:
+            _present("tick", key, label, done, total)
+            percent = int(done * 100 // total)
+            if percent >= logged + 5:
+                logged = percent - percent % 5
+                seconds = time.perf_counter() - started
+                _emit(
+                    logger,
+                    logging.INFO,
+                    f"{label} {logged}% ({seconds:.1f} s elapsed)",
+                    progress=(label, logged, 100),
+                )
+        except Exception:
+            pass
+
+    _present("start", key, label, 0, 100)
+    try:
+        yield report
+    finally:
+        _present("end", key, label, 0, 100)
+
+
 class _CafeinHandler(logging.StreamHandler):
     """The handler ``enable_logging`` installs: phase and message
-    lines to the stream; tick records shaped by the progress mode
-    ("lines" prints them, "bar" drives one live bar per fan-out
-    label, False drops them). Only cafein's own handler is shaped —
-    the records reach every other handler identically."""
+    lines to the stream, and tick records as lines when the progress
+    mode is "lines" ("bar" draws them as bars instead, False drops
+    them). Only cafein's own handler is shaped — the records reach
+    every other handler identically."""
 
     def __init__(self, stream, progress):
         super().__init__(stream)
         self._progress = progress
-        self._bars = {}
-        self._warned = False
-        self._closed = False
 
     def emit(self, record):
-        # ``handle`` holds the handler lock here and ``close`` sets the
-        # flag under the same lock, so a tick already past the logger's
-        # handler list cannot recreate a bar after ``disable_logging``.
-        if self._closed:
-            return
-        info = getattr(record, "cafein_progress", None)
-        if info is None:
+        """Write the record, unless it is a tick and progress is not
+        shown as lines."""
+        if getattr(record, "cafein_progress", None) is None or (
+            self._progress == "lines"
+        ):
             super().emit(record)
-            return
-        if self._progress is False:
-            return
-        if self._progress == "bar" and self._bar(info):
-            return
-        super().emit(record)
-
-    def _bar(self, info):
-        try:
-            label, done, total = info["label"], info["done"], info["total"]
-            bar = self._bars.get(label)
-            # A non-advancing done or a changed total means a new run
-            # reused the label: retire the stale bar. (Sequential
-            # same-label runs with identical totals share one bar —
-            # the triple alone cannot tell them apart.)
-            if bar is not None and (
-                done <= getattr(bar, "n", 0) or getattr(bar, "total", total) != total
-            ):
-                bar.close()
-                self._bars.pop(label, None)
-                bar = None
-            if bar is None:
-                bar = _bar_factory(label, total, self.stream)
-                if bar is None:
-                    if not self._warned:
-                        self._warned = True
-                        try:
-                            warn(
-                                "tqdm is not installed; progress='bar' falls "
-                                "back to line output (pip install tqdm)"
-                            )
-                        except Exception:
-                            # Warnings promoted to errors must not eat
-                            # the tick: it still renders as a line.
-                            pass
-                    return False
-                self._bars[label] = bar
-            bar.n = done
-            bar.refresh()
-            step = max(1, -(-total // 20))
-            if done + step > total:
-                bar.close()
-                self._bars.pop(label, None)
-            return True
-        except Exception:
-            return True
-
-    def close(self):
-        with self.lock:
-            self._closed = True
-            for bar in list(self._bars.values()):
-                try:
-                    bar.close()
-                except Exception:
-                    pass
-            self._bars.clear()
-        super().close()
 
 
 def _validated_progress(progress):
@@ -423,19 +563,23 @@ def enable_logging(stream=None, level="info", progress="lines"):
     stream : writable text stream, optional
         Any object with a ``write`` method; ``sys.stderr`` when None.
     level : int or {"debug", "info", "warning"}
-        "info" (default) shows phases and progress; "debug" adds
-        phase starting lines.
+        "info" (default) shows phases and progress lines; "debug"
+        adds phase starting lines.
     progress : {"lines", "bar", False}
-        How cafein's own handler presents fan-out progress ticks:
-        "lines" (default) prints them, "bar" drives one live bar
-        per fan-out (``tqdm.auto``: a widget inside Jupyter, a
-        carriage-return line in terminals; falls back to lines
-        with a warning when tqdm is not installed), and ``False``
-        drops them — phase completions only, for pipeline logs.
-        Ticks are emitted identically in every mode, so handlers
-        you attach yourself always see them (they carry a
-        ``cafein_progress`` attribute with ``label``/``done``/
-        ``total``).
+        How progress shows while this handler is installed: "lines"
+        (default) logs a line at each 5 % of a long operation, "bar"
+        draws one bar per operation on ``stream``, and ``False``
+        shows none. Without a call to this function, progress draws
+        as bars on stderr. A bar shows once its operation has run two
+        seconds (a widget inside Jupyter); where the stream is no
+        terminal, an operation that took two seconds or more writes
+        one line with its time instead.
+        ``enable_logging(level="warning", progress=False)`` turns
+        progress off without logging anything. Ticks are logged
+        identically in every mode, so handlers you attach yourself
+        see them at INFO (they carry a ``cafein_progress`` attribute
+        with ``label``/``done``/``total``); the bars of pyrosm's OSM
+        reads follow this setting too.
     """
     global _handler, _prior_level
     if stream is None:
@@ -459,6 +603,7 @@ def enable_logging(stream=None, level="info", progress="lines"):
         root.addHandler(handler)
         root.setLevel(levelno)
         _handler = handler
+    _drop_runs()
     sync()
 
 
@@ -476,6 +621,7 @@ def disable_logging():
         root.setLevel(_prior_level)
         _handler = None
         _prior_level = None
+    _drop_runs()
     sync()
 
 
@@ -525,3 +671,7 @@ def collect_timings():
         with _lock:
             _collectors.remove(report)
         sync()
+
+
+# Arms the bridge for the default progress.
+sync()

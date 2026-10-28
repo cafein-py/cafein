@@ -476,7 +476,7 @@ def union_extract(kantakaupunki_pbf):
     return _osm.union_network(str(kantakaupunki_pbf), bounding_box=_CENTRAL_BBOX)
 
 
-def test_union_extraction_retains_consumed_tags(union_extract):
+def test_union_extraction_keeps_only_consumed_tags(union_extract):
     # Every tag the compilers consume must survive the extraction; the
     # directional ones in particular are easy to lose to a pyrosm config change.
     _, edges = union_extract
@@ -484,6 +484,12 @@ def test_union_extraction_retains_consumed_tags(union_extract):
         assert tag in edges.columns, tag
     # oneway ways exist in central Helsinki, so the tag carries real values.
     assert (edges["oneway"] == "yes").any()
+    # Tags and metadata nothing reads stay out of the frame, and reading one
+    # is refused rather than answered with an all-None column.
+    for column in ("name", "lanes", "timestamp", "version", "changeset"):
+        assert column not in edges.columns, column
+    with pytest.raises(ValueError, match="UNION_TAGS"):
+        _osm._column(edges, "name")
 
 
 def test_union_extraction_shape_and_codes(union_extract):
