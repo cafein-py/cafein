@@ -10,7 +10,7 @@ members = [
 [workspace.package]
 version = "0.30.0"
 edition = "2021"
-license = "MIT"
+license = "BSD-3-Clause"
 repository = "https://github.com/cafein-py/cafein"
 authors = ["Henrikki Tenkanen"]
 
