@@ -5,11 +5,6 @@
 - cafein is licensed under the BSD 3-Clause License instead of the MIT
   License; releases up to 0.30.0 remain under MIT.
   ([#444](https://github.com/cafein-py/cafein/pull/444))
-- On Linux with glibc, building a network (`TransportNetwork.from_gtfs`,
-  `StreetNetwork.from_osm`) and loading one hand the memory the build or
-  load freed back to the operating system, instead of the process staying
-  resident at nearly the build's peak.
-  ([#445](https://github.com/cafein-py/cafein/pull/445))
 
 ## 0.30.0 — 2026-10-28
 
