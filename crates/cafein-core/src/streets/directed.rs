@@ -367,7 +367,9 @@ impl StreetNetwork {
 
     /// Snaps a coordinate to the nearest edge whose `adj_access` carries
     /// `bit` in either direction — the stop-link builder's mode-aware snap,
-    /// needing no compiled profile. `None` on a graph without attributes.
+    /// needing no compiled profile. `None` on a graph without attributes. The
+    /// bicycle and e-scooter bits prefer a street they can ride (see
+    /// [`snap_riding_first`](Self::snap_riding_first)).
     pub fn snap_for_mode_bit(
         &self,
         latitude: f64,
@@ -376,13 +378,18 @@ impl StreetNetwork {
         bit: u8,
     ) -> Option<Snap> {
         let attributes = self.street_attributes()?;
-        self.snap_filtered(latitude, longitude, max_snap_distance, |edge| {
+        let usable = |edge: u32| {
             let (forward, reverse) = self.edge_slots(edge);
             [forward, reverse]
                 .into_iter()
                 .flatten()
                 .any(|slot| attributes.adj_access[slot] & bit != 0)
-        })
+        };
+        if bit & (MODE_BICYCLE | MODE_E_SCOOTER) != 0 {
+            self.snap_riding_first(latitude, longitude, max_snap_distance, usable)
+        } else {
+            self.snap_filtered(latitude, longitude, max_snap_distance, usable)
+        }
     }
 
     /// Snaps a coordinate to the nearest edge `profile` can actually use.
@@ -391,7 +398,8 @@ impl StreetNetwork {
     /// query on a footway the mode may not enter — leaving the search with no
     /// permitted arc to start from and reporting the destination unreachable.
     /// This skips those edges, so a route starts from the nearest street the
-    /// mode is allowed on.
+    /// mode is allowed on; the bicycle and e-scooter prefer one they can ride
+    /// (see [`snap_riding_first`](Self::snap_riding_first)).
     pub fn snap_for_profile(
         &self,
         latitude: f64,
@@ -399,9 +407,38 @@ impl StreetNetwork {
         max_snap_distance: f64,
         profile: &CompiledStreetProfile,
     ) -> Option<Snap> {
+        let usable = |edge: u32| self.edge_permits(edge, profile);
+        if matches!(
+            profile.definition.mode,
+            StreetMode::Bicycle | StreetMode::EScooter
+        ) {
+            self.snap_riding_first(latitude, longitude, max_snap_distance, usable)
+        } else {
+            self.snap_filtered(latitude, longitude, max_snap_distance, usable)
+        }
+    }
+
+    /// The nearest `usable` edge that is no dismount way (`FLAG_DISMOUNT`), or
+    /// the nearest `usable` dismount way when no other is within reach. A
+    /// bicycle or e-scooter is pushed along a dismount way at walking speed:
+    /// a point next to a road and its sidewalk starts on the road, as a rider
+    /// would, and pushing only bridges what cannot be ridden.
+    fn snap_riding_first(
+        &self,
+        latitude: f64,
+        longitude: f64,
+        max_snap_distance: f64,
+        usable: impl Fn(u32) -> bool,
+    ) -> Option<Snap> {
+        let flags = self
+            .street_attributes()
+            .map(|attributes| &attributes.edge_flags);
+        let dismount =
+            |edge: u32| flags.is_some_and(|flags| flags[edge as usize] & FLAG_DISMOUNT != 0);
         self.snap_filtered(latitude, longitude, max_snap_distance, |edge| {
-            self.edge_permits(edge, profile)
+            usable(edge) && !dismount(edge)
         })
+        .or_else(|| self.snap_filtered(latitude, longitude, max_snap_distance, &usable))
     }
 
     /// The starting frontier for a coordinate snapped at `snap`, leaving toward

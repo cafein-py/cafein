@@ -7,6 +7,7 @@ from cafein import _osm
 
 W, B, S, C = _osm.WALK, _osm.BICYCLE, _osm.E_SCOOTER, _osm.CAR
 WC = _osm.WHEELCHAIR
+D = _osm.FLAG_DISMOUNT
 _LEGACY = W | B | S | C
 
 
@@ -70,14 +71,18 @@ def _perm(**tags):
 @pytest.mark.parametrize(
     "tags, forward, reverse, flags",
     [
-        # Highway defaults, before any explicit access tags.
-        (dict(highway="footway"), W, W, 0),
-        (dict(highway="pedestrian"), W, W, 0),
+        # Highway defaults, before any explicit access tags. Where the bicycle
+        # may not be ridden but people may walk, it is pushed (a dismount way,
+        # both directions); never on steps.
+        (dict(highway="footway"), W | B | S, W | B | S, D),
+        (dict(highway="pedestrian"), W | B | S, W | B | S, D),
         (dict(highway="steps"), W, W, 0),
         (dict(highway="cycleway"), B | S, B | S, 0),
         (dict(highway="residential"), W | B | S | C, W | B | S | C, 0),
         (dict(highway="track"), W | B | S | C, W | B | S | C, 0),
-        (dict(highway="platform"), W, W, 0),
+        (dict(highway="platform"), W | B | S, W | B | S, D),
+        (dict(highway="corridor"), W | B | S, W | B | S, D),
+        (dict(highway="bridleway"), W | B | S, W | B | S, D),
         (dict(highway="trunk"), C, C, 0),
         # A motorway carriageway is implicitly one-way; an explicit false
         # oneway opens it, and links follow their explicit tags only.
@@ -96,11 +101,16 @@ def _perm(**tags):
         # a general access ALLOW does not grant a mode the type denies.
         (dict(highway="residential", access="no"), 0, 0, 0),
         (dict(highway="residential", access="private"), 0, 0, 0),
-        (dict(highway="footway", access="destination"), W, W, 0),
-        (dict(highway="footway", access="yes"), W, W, 0),
-        # Mode-specific tags override the general access.
+        (dict(highway="footway", access="destination"), W | B | S, W | B | S, D),
+        (dict(highway="footway", access="yes"), W | B | S, W | B | S, D),
+        # Mode-specific tags override the general access. A denying bicycle=
+        # keeps the pushed bicycle out too; a way closed to walking is never
+        # pushed on.
         (dict(highway="residential", foot="no"), B | S | C, B | S | C, 0),
         (dict(highway="footway", bicycle="yes"), W | B | S, W | B | S, 0),
+        (dict(highway="footway", bicycle="no"), W, W, 0),
+        (dict(highway="footway", foot="no"), 0, 0, 0),
+        (dict(highway="residential", access="no", foot="yes"), W | B | S, W | B | S, D),
         (dict(highway="cycleway", bicycle="no"), 0, 0, 0),
         (dict(highway="cycleway", foot="yes"), W | B | S, W | B | S, 0),
         # bicycle=dismount permits the bike but sets the dismount flag.
@@ -113,9 +123,9 @@ def _perm(**tags):
         # use_sidepath denies the bicycle on this way; the car is untouched.
         (dict(highway="primary", bicycle="use_sidepath"), W | C, W | C, 0),
         # vehicle sits between access and bicycle in the hierarchy: vehicle=no
-        # denies bike and car, vehicle=yes re-grants what the type permits,
-        # but never grants a type-denied mode.
-        (dict(highway="service", vehicle="no"), W, W, 0),
+        # denies riding and the car (the bicycle is pushed), vehicle=yes
+        # re-grants what the type permits, but never grants a type-denied mode.
+        (dict(highway="service", vehicle="no"), W | B | S, W | B | S, D),
         (
             dict(highway="service", vehicle="no", bicycle="yes"),
             W | B | S,
@@ -125,7 +135,7 @@ def _perm(**tags):
         # access=no denies pedestrians (foot has no vehicle re-grant), while
         # vehicle=yes re-opens bike and car on this permitting way.
         (dict(highway="service", access="no", vehicle="yes"), B | S | C, B | S | C, 0),
-        (dict(highway="footway", vehicle="yes"), W, W, 0),
+        (dict(highway="footway", vehicle="yes"), W | B | S, W | B | S, D),
         # The car chain continues below vehicle: motor_vehicle / motorcar.
         (dict(highway="residential", motor_vehicle="no"), W | B | S, W | B | S, 0),
         (dict(highway="residential", motorcar="no"), W | B | S, W | B | S, 0),
@@ -135,10 +145,15 @@ def _perm(**tags):
             W | B | S | C,
             0,
         ),
-        (dict(highway="residential", vehicle="no", motorcar="yes"), W | C, W | C, 0),
+        (
+            dict(highway="residential", vehicle="no", motorcar="yes"),
+            W | B | S | C,
+            W | B | S | C,
+            D,
+        ),
         (dict(highway="residential", access="no", motorcar="yes"), C, C, 0),
         # The most-specific motorcar= overrides freely, like bicycle= does.
-        (dict(highway="footway", motorcar="yes"), W | C, W | C, 0),
+        (dict(highway="footway", motorcar="yes"), W | B | S | C, W | B | S | C, D),
         (dict(highway="cycleway", motorcar="yes"), B | S | C, B | S | C, 0),
         # Directionality: oneway blocks the reverse bicycle and car; foot is
         # unaffected.
@@ -246,7 +261,7 @@ def _perm(**tags):
         # Restrictive access values are not general-public access.
         (dict(highway="service", access="delivery"), 0, 0, 0),
         (dict(highway="track", access="agricultural"), 0, 0, 0),
-        (dict(highway="track", access="forestry", foot="yes"), W, W, 0),
+        (dict(highway="track", access="forestry", foot="yes"), W | B | S, W | B | S, D),
         # A dismounted cyclist is pedestrian-like and ignores the oneway; the
         # car still follows it.
         (
@@ -351,7 +366,7 @@ def test_unknown_access_is_conservative_and_counted():
     assert forward == reverse == W | B | S | C | WC
     assert unknown_access
     forward, _, _, unknown_access, _ = _perm(highway="footway", access="wat")
-    assert forward == W | WC
+    assert forward == W | B | S | WC
     assert unknown_access
 
 
@@ -361,11 +376,12 @@ def test_unknown_highway_denies_and_is_counted():
     forward, reverse, _, _, unknown_highway = _perm(highway="rest_area")
     assert forward == reverse == 0
     assert unknown_highway
-    # An explicit mode tag still opens it, and that is not an unknown-access.
+    # An explicit mode tag still opens it (walking, so the pushed bicycle
+    # too), and that is not an unknown-access.
     forward, _, _, unknown_access, unknown_highway = _perm(
         highway="rest_area", foot="yes"
     )
-    assert forward == W | WC
+    assert forward == W | B | S | WC
     assert unknown_highway and not unknown_access
 
 

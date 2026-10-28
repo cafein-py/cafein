@@ -85,6 +85,13 @@
   progress off. pyrosm 0.24 or newer is required, and tqdm is a
   dependency instead of the `progress` extra.
   ([#437](https://github.com/cafein-py/cafein/pull/437), [#438](https://github.com/cafein-py/cafein/pull/438))
+- The bicycle and e-scooter are pushed at walking speed, in both
+  directions, where people may walk but riding is not allowed (steps
+  and ways a `bicycle=` tag closes excepted); a point still snaps to the
+  nearest street they can ride when one is within reach. A car park
+  reached from the streets only on foot no longer leaves a point there
+  with no route.
+  ([#442](https://github.com/cafein-py/cafein/pull/442))
 
 ## 0.29.0 — 2026-09-30
 
