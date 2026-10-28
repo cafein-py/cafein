@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- cafein is licensed under the BSD 3-Clause License instead of the MIT
+  License; releases up to 0.30.0 remain under MIT.
+  ([#444](https://github.com/cafein-py/cafein/pull/444))
+
 ## 0.30.0 — 2026-10-28
 
 - `cafein.emissions.budget` routes a cost matrix and reports each

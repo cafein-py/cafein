@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "cafein"
 description = "Public-transport routing with per-leg distance and emissions tracking"
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "BSD-3-Clause" }
 requires-python = ">=3.11"
 authors = [{ name = "Henrikki Tenkanen" }]
 keywords = [
@@ -20,7 +20,7 @@ keywords = [
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: BSD License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
