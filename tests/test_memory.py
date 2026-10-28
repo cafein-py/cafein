@@ -266,3 +266,38 @@ def test_the_active_plan_scopes_to_its_call():
     with _memory.use_plan(plan):
         assert _memory.active_plan() is plan and _memory.width_or(7) == 3
     assert _memory.active_plan() is None
+
+
+def test_freed_memory_goes_back_where_the_c_library_allows(monkeypatch):
+    import platform
+
+    # glibc exports malloc_trim; other C libraries (macOS, Windows, musl)
+    # do not, and the call is then a no-op.
+    glibc = sys.platform.startswith("linux") and platform.libc_ver()[0] == "glibc"
+    assert (_memory._malloc_trim() is not None) is glibc
+    trims = []
+    monkeypatch.setattr(_memory, "_malloc_trim", lambda: trims.append)
+    assert _memory.release_freed_memory() is True and trims == [0]
+    monkeypatch.setattr(_memory, "_malloc_trim", lambda: None)
+    assert _memory.release_freed_memory() is False
+
+
+def test_builds_and_loads_release_their_freed_memory(
+    tmp_path, monkeypatch, kantakaupunki_pbf
+):
+    from test_frontier import build_two_line_gtfs
+
+    from cafein import StreetNetwork, TransportNetwork
+
+    calls = []
+    monkeypatch.setattr(_memory, "release_freed_memory", lambda: calls.append(1))
+    feed = build_two_line_gtfs(tmp_path / "gtfs.zip")
+    TransportNetwork.from_gtfs([str(feed)]).save(tmp_path / "network.cafein")
+    TransportNetwork.load(tmp_path / "network.cafein")
+    StreetNetwork.from_osm(
+        str(kantakaupunki_pbf),
+        modes=("walk",),
+        bounding_box=[24.935, 60.168, 24.945, 60.172],
+    ).save(tmp_path / "streets.cafein")
+    StreetNetwork.load(tmp_path / "streets.cafein")
+    assert len(calls) == 4

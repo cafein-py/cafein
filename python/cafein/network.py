@@ -1704,6 +1704,8 @@ class TransportNetwork:
                 )
                 core.set_trip_distances(distances)
                 core.set_leg_geometries(*polylines)
+                # The core keeps its own copies.
+                del distances, polylines
             else:
                 core.set_trip_distances(
                     geometry.trip_distances(paths, include=set(core.trip_ids))
@@ -1737,6 +1739,7 @@ class TransportNetwork:
                 footpaths.meters,
             )
             core.set_street_network(*street_network)
+            del footpaths, street_network
             if street_modes:
                 with _log.phase(
                     "build.multimodal",
@@ -1761,6 +1764,9 @@ class TransportNetwork:
                     )
             if ultra:
                 core.compute_ultra_shortcuts(walking_speed_kmph)
+        from cafein._memory import release_freed_memory
+
+        release_freed_memory()
         return cls(core)
 
     @property
@@ -1858,6 +1864,9 @@ class TransportNetwork:
         ) as ph:
             ph.details["path"] = source
             core = _TransportNetwork.load(source, mmap=modes[mmap], verify=verify)
+        from cafein._memory import release_freed_memory
+
+        release_freed_memory()
         return cls(core)
 
     @property
