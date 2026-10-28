@@ -181,12 +181,35 @@ def _cached_network(cache, name, build):
 
     Building the Helsinki network from GTFS costs ~18 s; loading the artifact
     it saves costs ~1 s, so every fixture and every worker after the first
-    pays the cheap path. The lock is an exclusive create: whichever process
-    wins builds, the rest wait for the artifact to appear.
+    pays the cheap path.
     """
     from cafein import TransportNetwork
 
-    artifact = cache / f"{name}.cafein"
+    artifact = _cached_file(cache, f"{name}.cafein", lambda path: build().save(path))
+    return TransportNetwork.load(artifact)
+
+
+def _osm_network(cache, name, gtfs, osm_pbf, **options):
+    """A network of ``gtfs`` with the walking structures of ``osm_pbf``,
+    loaded from the cached artifact ``name``; built once if it is missing."""
+    from cafein import TransportNetwork
+
+    def build():
+        with pytest.warns(UserWarning):
+            return TransportNetwork.from_gtfs(
+                [str(gtfs)], osm_pbf=str(osm_pbf), **options
+            )
+
+    return _cached_network(cache, name, build)
+
+
+def _cached_file(cache, name, write):
+    """The path of the cached file ``name``, written once if it is missing.
+
+    ``write(path)`` writes the file. The lock is an exclusive create:
+    whichever process wins writes, the rest wait for the file to appear.
+    """
+    artifact = cache / name
     lock = cache / f"{name}.lock"
     deadline = time.monotonic() + 600
     while not artifact.exists():
@@ -203,12 +226,12 @@ def _cached_network(cache, name, build):
                 # lock; the build-once guarantee holds.
                 break
             staged = cache / f"{name}.building"
-            build().save(staged)
+            write(staged)
             staged.replace(artifact)
         finally:
             os.close(handle)
             lock.unlink(missing_ok=True)
-    return TransportNetwork.load(artifact)
+    return artifact
 
 
 @pytest.fixture(scope="session")
@@ -234,15 +257,9 @@ def network(helsinki_gtfs, artifact_cache):
 def network_with_footpaths(helsinki_gtfs, kantakaupunki_pbf, artifact_cache):
     """The Helsinki network with the OSM extract's walking structures."""
     pytest.importorskip("cafein._cafein")
-    from cafein import TransportNetwork
-
-    def build():
-        with pytest.warns(UserWarning):
-            return TransportNetwork.from_gtfs(
-                [str(helsinki_gtfs)], osm_pbf=str(kantakaupunki_pbf)
-            )
-
-    return _cached_network(artifact_cache, "helsinki-footpaths", build)
+    return _osm_network(
+        artifact_cache, "helsinki-footpaths", helsinki_gtfs, kantakaupunki_pbf
+    )
 
 
 @pytest.fixture(scope="session")
@@ -385,16 +402,11 @@ def network_with_footpaths_mctbtr(helsinki_gtfs, kantakaupunki_pbf, artifact_cac
     so the comparisons ride one cached set per run.
     """
     pytest.importorskip("cafein._cafein")
-    from cafein import TransportNetwork
 
     def build():
-        def base():
-            with pytest.warns(UserWarning):
-                return TransportNetwork.from_gtfs(
-                    [str(helsinki_gtfs)], osm_pbf=str(kantakaupunki_pbf)
-                )
-
-        network = _cached_network(artifact_cache, "helsinki-footpaths", base)
+        network = _osm_network(
+            artifact_cache, "helsinki-footpaths", helsinki_gtfs, kantakaupunki_pbf
+        )
         network.compute_mctbtr_transfers("2022-02-22")
         return network
 
@@ -410,16 +422,11 @@ def ultra_network(helsinki_gtfs, kantakaupunki_pbf, artifact_cache):
     the shortcut set each time.
     """
     pytest.importorskip("cafein._cafein")
-    from cafein import TransportNetwork
 
     def build():
-        def base():
-            with pytest.warns(UserWarning):
-                return TransportNetwork.from_gtfs(
-                    [str(helsinki_gtfs)], osm_pbf=str(kantakaupunki_pbf)
-                )
-
-        network = _cached_network(artifact_cache, "helsinki-footpaths", base)
+        network = _osm_network(
+            artifact_cache, "helsinki-footpaths", helsinki_gtfs, kantakaupunki_pbf
+        )
         network.compute_ultra_shortcuts(max_transfer_time=ULTRA_CUTOFF, **ULTRA_WINDOW)
         return network
 
