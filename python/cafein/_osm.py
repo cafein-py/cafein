@@ -129,8 +129,10 @@ SMOOTHNESS_CODES = {
 
 # Default (foot, bicycle, car) permission per highway class, before any explicit
 # access tags, following the OSM wiki defaults and R5's foot/bike traversal
-# conventions. A way that passed the exclusion filter but carries an
-# unrecognised highway value falls back to `_DEFAULT_HIGHWAY_PERMISSION`.
+# conventions; the bicycle column is riding (`_row_permissions` lets a bicycle
+# be pushed where only walking is allowed). A way that passed the exclusion
+# filter but carries an unrecognised highway value falls back to
+# `_DEFAULT_HIGHWAY_PERMISSION`.
 HIGHWAY_DEFAULTS = {
     "footway": (True, False, False),
     "pedestrian": (True, False, False),
@@ -361,7 +363,9 @@ def _row_permissions(row):
     oneway); bicycle and e-scooter are directional, with oneway, roundabouts,
     `oneway:bicycle`, and contraflow cycleway tags resolved per the design's
     precedence ladder. e-scooter mirrors bicycle (the default "bicycle_like"
-    policy). An unrecognised highway value denies both modes (only explicit
+    policy). Where people may walk but the bicycle may not be ridden, it is
+    pushed: a dismount way, except on steps and against a `bicycle=` tag that
+    denies it. An unrecognised highway value denies both modes (only explicit
     mode tags open it) and is reported.
     """
     highway = row.get("highway")
@@ -378,6 +382,14 @@ def _row_permissions(row):
     bike_ok, dismount, bike_unknown = _bicycle_permission(
         bike_default, access, row.get("vehicle"), row.get("bicycle")
     )
+    # A cyclist on foot is a pedestrian pushing the bicycle.
+    if (
+        not bike_ok
+        and foot_ok
+        and highway != "steps"
+        and row.get("bicycle") not in _DENIED_ACCESS
+    ):
+        bike_ok = dismount = True
     car_ok, car_unknown = _car_permission(
         car_default,
         access,

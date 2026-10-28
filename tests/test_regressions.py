@@ -1403,6 +1403,43 @@ def test_one_way_pockets_lose_the_mode_that_cannot_leave_or_enter_them():
     assert (pruned_f & walk != 0).all() and (pruned_r & walk != 0).all()
 
 
+def test_a_car_park_reached_over_a_footway_joins_the_bicycle_network():
+    # A car park's service roads that the streets reach only over a footway
+    # were a bicycle network of their own, kept by the pruning: a point
+    # snapped there reached nothing by bicycle. The bicycle is now pushed over
+    # the footway, so car park and streets are one bicycle network.
+    import numpy as np
+    import pandas as pd
+    from scipy import sparse
+    from scipy.sparse import csgraph
+
+    from cafein import _osm
+
+    rows = (
+        [(i, i + 1, "residential") for i in range(44)]
+        + [(44, 45, "footway")]
+        + [(i, i + 1, "service") for i in range(45, 89)]
+    )
+    u = np.array([a for a, _, _ in rows])
+    v = np.array([b for _, b, _ in rows])
+    forward, reverse, flags, _ = _osm.edge_permissions(
+        pd.DataFrame({"highway": [highway for _, _, highway in rows]})
+    )
+    pruned_f, pruned_r = _osm.prune_components_per_profile(u, v, 90, forward, reverse)
+    bicycle = _osm.BICYCLE
+    ahead, behind = pruned_f & bicycle != 0, pruned_r & bicycle != 0
+    arcs = sparse.coo_matrix(
+        (
+            np.ones(ahead.sum() + behind.sum()),
+            (np.r_[u[ahead], v[behind]], np.r_[v[ahead], u[behind]]),
+        ),
+        shape=(90, 90),
+    )
+    count, _ = csgraph.connected_components(arcs, directed=True, connection="strong")
+    assert count == 1
+    assert flags[44] & _osm.FLAG_DISMOUNT
+
+
 def test_elevation_noise_slows_the_wheelchair_but_never_strands_it(
     kantakaupunki_pbf,
 ):

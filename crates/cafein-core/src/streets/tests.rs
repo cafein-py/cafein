@@ -2464,6 +2464,43 @@ fn mode_bit_snapping_respects_each_bit() {
     assert_eq!(net.snap_for_mode_bit(lat, lon, 300.0, MODE_E_SCOOTER), None);
 }
 
+#[test]
+fn bicycle_snapping_prefers_a_street_it_can_ride() {
+    // A sidewalk the bicycle may only be pushed on, 10 m from the point, and a
+    // road it rides 50 m away: the bicycle and e-scooter snap to the road,
+    // through the mode bit and the compiled profile alike, while walking keeps
+    // the sidewalk. With the road out of reach, the sidewalk is the fallback.
+    let edges: Vec<TestEdge> = vec![
+        (0, 1, 200.0, straight((0.0, 0.0), (200.0, 0.0))),
+        (2, 3, 200.0, straight((0.0, 60.0), (200.0, 60.0))),
+    ];
+    let mut attrs = plain_attrs(2);
+    let all = MODE_WALK | MODE_BICYCLE | MODE_E_SCOOTER;
+    attrs.access_forward = vec![all, all];
+    attrs.access_reverse = vec![all, all];
+    attrs.flags = vec![FLAG_DISMOUNT, 0];
+    let net = multimodal_network(4, &edges, &attrs).unwrap();
+    let (lon, lat) = lonlat(100.0, 10.0);
+    let walk = net.snap_for_mode_bit(lat, lon, 300.0, MODE_WALK).unwrap();
+    assert!(walk.connector < 20.0);
+    for bit in [MODE_BICYCLE, MODE_E_SCOOTER] {
+        let ride = net.snap_for_mode_bit(lat, lon, 300.0, bit).unwrap();
+        assert!(ride.connector > 40.0);
+        let pushed = net.snap_for_mode_bit(lat, lon, 30.0, bit).unwrap();
+        assert!(pushed.connector < 20.0);
+    }
+    for definition in [
+        StreetProfileDefinition::bicycle(),
+        StreetProfileDefinition::e_scooter(),
+    ] {
+        let profile = net.compile_profile(&definition).unwrap();
+        let ride = net.snap_for_profile(lat, lon, 300.0, &profile).unwrap();
+        assert!(ride.connector > 40.0);
+        let pushed = net.snap_for_profile(lat, lon, 30.0, &profile).unwrap();
+        assert!(pushed.connector < 20.0);
+    }
+}
+
 // --- Directed profile-aware search -------------------------------------------
 
 fn directed_slot(net: &StreetNetwork, from: u32, to: u32) -> usize {
