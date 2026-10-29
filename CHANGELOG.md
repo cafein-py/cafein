@@ -5,6 +5,14 @@
 - cafein is licensed under the BSD 3-Clause License instead of the MIT
   License; releases up to 0.30.0 remain under MIT.
   ([#444](https://github.com/cafein-py/cafein/pull/444))
+- `max_memory=` plans against the memory a process holds now: psutil is a
+  required dependency (without it, Linux and macOS read the lifetime peak,
+  so after a network build a call ran narrower than it could or was
+  refused), and on Linux with glibc, building a network
+  (`TransportNetwork.from_gtfs`, `StreetNetwork.from_osm`) or loading one
+  hands the memory it freed back to the operating system.
+  ([#445](https://github.com/cafein-py/cafein/pull/445),
+  [#446](https://github.com/cafein-py/cafein/pull/446))
 
 ## 0.30.0 — 2026-10-28
 

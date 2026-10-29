@@ -1496,3 +1496,21 @@ def test_elevation_noise_slows_the_wheelchair_but_never_strands_it(
     down = networks["ramp"].travel_time(north, south, mode="wheelchair")
     level = networks["flat"].travel_time(south, north, mode="wheelchair")
     assert up > level and up > down
+
+
+def test_the_memory_budget_plans_against_the_current_resident_size():
+    # Without psutil the budget read the lifetime peak (ru_maxrss) on Linux
+    # and macOS, so memory a build had already freed still counted against
+    # it and later calls ran narrower or were refused.
+    import sys
+
+    import numpy as np
+
+    from cafein import _memory
+
+    resource = pytest.importorskip("resource")
+    block = np.ones(256 * 1024**2 // 8)
+    del block
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    peak *= 1 if sys.platform == "darwin" else 1024
+    assert _memory.resident_bytes() < peak - 128 * 1024**2

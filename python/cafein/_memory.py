@@ -13,6 +13,8 @@ remains; the only overruns are the documented floors, each warned.
 import contextlib
 import contextvars
 import dataclasses
+import functools
+import gc
 import logging
 import os
 import sys
@@ -151,6 +153,40 @@ def resident_bytes():
         with contextlib.suppress(Exception):
             return _windows_resident()
     return None
+
+
+@functools.lru_cache(maxsize=None)
+def _malloc_trim():
+    """glibc's ``malloc_trim``, or ``None`` where the C library has none
+    (macOS, Windows, musl)."""
+    if not sys.platform.startswith("linux"):
+        return None
+    import ctypes
+
+    with contextlib.suppress(OSError, AttributeError):
+        trim = ctypes.CDLL(None).malloc_trim
+        trim.argtypes = [ctypes.c_size_t]
+        trim.restype = ctypes.c_int
+        return trim
+    return None
+
+
+def release_freed_memory():
+    """Hand the heap memory the process has freed back to the operating
+    system; whether the C library could (glibc only).
+
+    glibc keeps freed memory mapped for reuse, so after a network build
+    the process stays resident at nearly the build's peak although only
+    the network itself is still in use. Unreachable reference cycles (the
+    build's data frames) are collected first, so their memory is free
+    to hand back.
+    """
+    trim = _malloc_trim()
+    if trim is None:
+        return False
+    gc.collect()
+    trim(0)
+    return True
 
 
 def _windows_resident():

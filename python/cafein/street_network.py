@@ -344,6 +344,9 @@ class StreetNetwork:
             resolved = list(modes)
             ph.note = ", ".join(resolved)
             ph.details["modes"] = resolved
+        from cafein._memory import release_freed_memory
+
+        release_freed_memory()
         return network
 
     @property
@@ -416,6 +419,9 @@ class StreetNetwork:
         ) as ph:
             ph.details["path"] = source
             core = _CoreStreetNetwork.load(source, modes[mmap], verify)
+        from cafein._memory import release_freed_memory
+
+        release_freed_memory()
         return cls(core)
 
     @property
