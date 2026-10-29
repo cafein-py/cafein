@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.31.0 — 2026-10-29
 
 - cafein is licensed under the BSD 3-Clause License instead of the MIT
   License; releases up to 0.30.0 remain under MIT.
