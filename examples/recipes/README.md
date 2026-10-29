@@ -39,7 +39,8 @@ binary format must start with its signature, so a renamed file is refused at
 validation (and again on the run's private copy). A `sample` input names a pinned asset of
 `cafein.sampledata` as `<region>.<asset>` (`helsinki.osm_pbf`,
 `helsinki.air_quality`, `helsinki.poi_library`), fetched and verified on first
-use. Validation resolves every input before anything is read; an unknown
+use. A `pyrosm` input (`streets` only) names a pyrosm recipe that makes the
+OSM extract (see below). Validation resolves every input before anything is read; an unknown
 kind, a missing key, a missing file, or an asset that does not suit its role
 is refused by name.
 
@@ -82,6 +83,43 @@ parameter's effective value (defaults included), each input's SHA-256 taken
 from the bytes actually read, the table's SHA-256, the invocation, and a UTC
 timestamp. Two records that agree on everything but the timestamp and the
 invocation came from the same method on the same data.
+
+## OSM data from a pyrosm recipe
+
+The `streets` input can name a pyrosm recipe, pyrosm's YAML description of
+how an OSM extract is made, instead of a PBF file:
+
+```yaml
+# osm.yaml: the OSM data, made by pyrosm
+recipe: pyrosm
+extract:
+  area: {place: "Kallio, Helsinki"}
+  crop: polygon
+outputs:
+  extract: data/kallio.osm.pbf
+```
+
+```yaml
+# the cafein recipe
+inputs:
+  streets: {kind: pyrosm, recipe: osm.yaml}
+```
+
+`cafein validate` has pyrosm check the pyrosm recipe without downloading
+anything. The pyrosm recipe needs an extract stage, as cafein reads the PBF it
+writes; a local PBF stays `{kind: file, path: …}`. `cafein run` runs the
+pyrosm recipe first. pyrosm writes its outputs where `pyrosm run osm.yaml`
+would, beside the pyrosm recipe under the names its `outputs` give, so the
+two commands reuse each other's work: a rerun downloads nothing while the
+pyrosm recipe is unchanged, unless its extract sets `update: true`. pyrosm's
+`sha256` and `snapshot` pins apply as they do in pyrosm.
+
+The run's record keeps pyrosm's own provenance record under
+`inputs.streets.pyrosm`, so it says where the extract came from, and cafein
+refuses an extract whose SHA-256 differs from the one pyrosm's record gives
+it. A cafein output that would overwrite a pyrosm output, and a pyrosm output
+that would overwrite the recipe or one of its inputs, are refused before
+pyrosm runs.
 
 ## Recipe types
 

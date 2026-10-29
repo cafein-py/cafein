@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- A recipe's `streets` input can name a pyrosm recipe,
+  `{kind: pyrosm, recipe: osm.yaml}`: `cafein run` runs it (pyrosm downloads,
+  crops and pins the OSM extract, reusing unchanged stages), reads the
+  extract it writes, and keeps pyrosm's provenance record in its own.
+  ([#449](https://github.com/cafein-py/cafein/pull/449))
+
 ## 0.31.0 — 2026-10-29
 
 - cafein is licensed under the BSD 3-Clause License instead of the MIT

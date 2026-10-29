@@ -15,6 +15,7 @@ import json
 import math
 import pathlib
 import re
+import unicodedata
 
 from cafein._validate import choice, non_negative_finite
 
@@ -201,6 +202,7 @@ def _check_signature(where, path, filename):
 _STREET_KEYS = {
     "file": (("path",), (), _STREET_SUFFIXES),
     "sample": (("name",), (), _STREET_SUFFIXES),
+    "pyrosm": (("recipe",), (), _STREET_SUFFIXES),
 }
 _EXPOSURE_KEYS = {
     "raster": (("path", "value"), ("units",), _RASTER_SUFFIXES),
@@ -290,13 +292,61 @@ def _sample_pin(name, where):
     return {"asset": name, "region": region, **table[asset]}
 
 
+def _pyrosm_pin(name, recipe_dir, where):
+    """The pyrosm recipe ``name`` (relative to the recipe's directory), checked
+    by pyrosm without running it: the recipe file and its SHA-256, the extract
+    it writes, its provenance record, and every output it declares, as
+    resolved paths (where pyrosm writes them)."""
+    if not isinstance(name, str):
+        raise ValueError(f"{where}: 'recipe' must be a string")
+    path = (recipe_dir / name).resolve()
+    if not path.is_file():
+        raise ValueError(f"{where}: pyrosm recipe not found: {path}")
+    digest = _file_digest(path)
+    try:
+        from pyrosm import recipes as pyrosm_recipes
+    except ImportError as error:
+        raise ImportError(
+            f"{where}: kind 'pyrosm' needs pyrosm 0.24 or newer"
+        ) from error
+    try:
+        recipe = pyrosm_recipes.validate(path)
+    except ValueError as error:
+        raise ValueError(f"{where}.recipe: {error}") from None
+    if recipe["extract"] is None:
+        raise ValueError(
+            f"{where}.recipe: the pyrosm recipe has no extract stage; give the "
+            "PBF as {kind: file, path: ...}"
+        )
+    outputs, root = recipe["outputs"], recipe["recipe_dir"]
+    declared = [outputs["extract"], outputs["provenance"]]
+    declared += [*outputs["layers"].values(), *(outputs["graph"] or {}).values()]
+    for output in declared:
+        # pyrosm replaces a symlinked output with a file, so the resolved path
+        # would name the link's old target, not what pyrosm wrote.
+        if (root / output).is_symlink():
+            raise ValueError(
+                f"{where}.recipe: the pyrosm output {root / output} is a symlink"
+            )
+    return {
+        "recipe": path,
+        "recipe_sha256": digest,
+        "extract_name": outputs["extract"],
+        "extract": (root / outputs["extract"]).resolve(),
+        "provenance": (root / outputs["provenance"]).resolve(),
+        "outputs": [(root / output).resolve() for output in declared],
+    }
+
+
 def _resolve_source(where, spec, recipe_dir, *, keys):
     """Validate + resolve one `kind:`-tagged input, or raise by name.
 
     Local paths resolve relative to the recipe's directory, so a recipe + its
     data move together; the file must exist and be a self-contained format. A
     ``sample`` names a pinned ``cafein.sampledata`` asset: its pin is resolved
-    here without downloading, the file is fetched when the recipe runs.
+    here without downloading, the file is fetched when the recipe runs. A
+    ``pyrosm`` input names a pyrosm recipe: pyrosm checks it here, and the
+    recipe runs (writing the extract) when the cafein recipe runs.
     """
     if not isinstance(spec, dict):
         raise ValueError(f"{where}: must be a mapping with a 'kind'")
@@ -317,6 +367,9 @@ def _resolve_source(where, spec, recipe_dir, *, keys):
     if kind == "sample":
         sample = _sample_pin(spec["name"], where)
         path, filename = None, sample["name"]
+    elif kind == "pyrosm":
+        pyrosm = _pyrosm_pin(spec["recipe"], recipe_dir, where)
+        path, filename = None, pyrosm["extract"].name
     else:
         if not isinstance(spec["path"], str):
             raise ValueError(f"{where}: 'path' must be a string")
@@ -357,6 +410,8 @@ def _resolve_source(where, spec, recipe_dir, *, keys):
     resolved = {"kind": kind, "path": path}
     if kind == "sample":
         resolved["sample"] = sample
+    elif kind == "pyrosm":
+        resolved["pyrosm"] = pyrosm
     for key in (*required, *optional):
         if key != "path" and key in spec:
             resolved[key] = spec[key]
@@ -778,7 +833,7 @@ def validate(path):
     _check_requires(document.get("requires"))
     recipe_dir = path.parent
     body = _RECIPES[name].resolve(document, recipe_dir)
-    return {
+    resolved = {
         "recipe": name,
         "version": version,
         "requires": document.get("requires"),
@@ -787,6 +842,36 @@ def validate(path):
         "parameters": body["parameters"],
         "outputs": body["outputs"],
     }
+    _check_pyrosm_outputs(resolved, path)
+    return resolved
+
+
+def _check_pyrosm_outputs(resolved, recipe_path):
+    """Refuse a pyrosm input whose recipe would write over the recipe or
+    another input before it is read; an input without a local path yet (a
+    sample not fetched) is skipped."""
+    roles = _RECIPES[resolved["recipe"]].roles
+    sources = list(_input_sources(resolved["inputs"], roles))
+    sources += [
+        (f"parameters.{g}.{k}", s)
+        for g, k, s in _parameter_sources(resolved["parameters"])
+    ]
+    others = [("the recipe", recipe_path)]
+    others += [
+        (f"the input '{role}'", pathlib.Path(s["path"]).resolve())
+        for role, s in sources
+        if s["path"] is not None
+    ]
+    for role, source in sources:
+        if "pyrosm" not in source:
+            continue
+        for output in source["pyrosm"]["outputs"]:
+            for name, path in others:
+                if _same_file(output, path):
+                    raise ValueError(
+                        f"inputs.{role}: the pyrosm recipe writes {output}, which "
+                        f"is also {name}"
+                    )
 
 
 class _RecipeType:
@@ -939,14 +1024,67 @@ def _snapshot(index, role, source, run_dir, checksums):
                 f"{digest.hexdigest()}, not its pin {source['sample']['sha256']}"
             )
         checksums[role]["sample"] = source["sample"]
+    if "pyrosm" in source:
+        checksums[role]["pyrosm"] = _pyrosm_record(
+            role, source["pyrosm"], digest.hexdigest()
+        )
     return {**source, "path": copy}
 
 
-def _materialise(source):
+def _pyrosm_record(where, pin, sha256):
+    """pyrosm's provenance record of a pyrosm input, refused unless it gives
+    the extract the SHA-256 of the bytes the run copied."""
+    try:
+        record = json.loads(pin["provenance"].read_text(encoding="utf-8"))
+        recorded = record["outputs"][pin["extract_name"]]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise ValueError(
+            f"{where}: cannot read the extract's SHA-256 from pyrosm's record "
+            f"{pin['provenance']}: {error!r}"
+        ) from None
+    if recorded != sha256:
+        raise ValueError(
+            f"{where}: the extract {pin['extract']} read as {sha256}, not the "
+            f"{recorded} of pyrosm's record {pin['provenance']}"
+        )
+    return {"recipe": pin["recipe"], "provenance": pin["provenance"], "record": record}
+
+
+def _run_pyrosm(where, pin):
+    """Run a pyrosm input's recipe (pyrosm reuses its unchanged stages) and
+    return the extract's path; a recipe changed since validation is refused,
+    as the guards checked the outputs it declared then. pyrosm's refusals keep
+    their type, prefixed; an error type that takes no single message falls
+    back to its base."""
+    from pyrosm import recipes as pyrosm_recipes
+
+    if _file_digest(pin["recipe"]) != pin["recipe_sha256"]:
+        raise ValueError(
+            f"{where}: the pyrosm recipe {pin['recipe']} changed after the cafein "
+            "recipe was validated; run it again"
+        )
+    try:
+        pyrosm_recipes.run(pin["recipe"])
+    except (ValueError, OSError) as error:
+        message = f"{where}: pyrosm recipe {pin['recipe']}: {error}"
+        try:
+            prefixed = type(error)(message)
+        except Exception:
+            prefixed = (ValueError if isinstance(error, ValueError) else OSError)(
+                message
+            )
+        raise prefixed from error
+    return pin["extract"]
+
+
+def _materialise(source, where=None):
     """A source with a local path: a file input as declared, a sample asset
-    fetched and verified by ``cafein.sampledata`` (cached after first use)."""
+    fetched and verified by ``cafein.sampledata`` (cached after first use), a
+    pyrosm input's extract written by its recipe."""
     if source["path"] is not None:
         return source
+    if "pyrosm" in source:
+        return {**source, "path": _run_pyrosm(where, source["pyrosm"])}
     from cafein.sampledata import Asset, fetch
 
     sample = source["sample"]
@@ -955,12 +1093,17 @@ def _materialise(source):
 
 
 def _materialise_inputs(inputs, roles):
-    """Every input with a local path (sample assets fetched)."""
+    """Every sample input fetched; a pyrosm input is left to run with the
+    pipeline, after the output guards."""
+
+    def fetched(source):
+        return source if "pyrosm" in source else _materialise(source)
+
     return {
         role: (
-            {name: _materialise(source) for name, source in value.items()}
+            {name: fetched(source) for name, source in value.items()}
             if _is_layers(roles[role])
-            else _materialise(value)
+            else fetched(value)
         )
         for role, value in inputs.items()
     }
@@ -986,7 +1129,7 @@ def _run_exposure_tradeoff(resolved):
             (f"parameters.{g}.{k}", src) for g, k, src in _parameter_sources(parameters)
         ]
         copies = {
-            role: _snapshot(index, role, _materialise(source), run_dir, checksums)
+            role: _snapshot(index, role, _materialise(source, role), run_dir, checksums)
             for index, (role, source) in enumerate(roles)
         }
         streets_source = copies["streets"]
@@ -1096,7 +1239,7 @@ def _run_transit_cost_matrix(resolved):
             (f"parameters.{g}.{k}", src) for g, k, src in _parameter_sources(parameters)
         ]
         copies = {
-            role: _snapshot(index, role, _materialise(source), run_dir, checksums)
+            role: _snapshot(index, role, _materialise(source, role), run_dir, checksums)
             for index, (role, source) in enumerate(roles)
         }
         gtfs_path = copies["gtfs"]["path"]
@@ -1230,15 +1373,26 @@ def _output_path(out_root, table, protected):
     provenance = target.with_name(record.name)
     for candidate in (target, provenance):
         for path in protected:
-            same = candidate == path or (
-                candidate.exists() and path.exists() and candidate.samefile(path)
-            )
-            if same:
+            if _same_file(candidate, path):
                 raise ValueError(
                     f"outputs.table '{table}' would overwrite an input or the "
                     f"recipe itself ({path})"
                 )
     return target, provenance
+
+
+def _same_file(a, b):
+    """Whether two paths may name one file: equal, one existing file, or
+    equal once case-folded and Unicode-normalised, as a case-insensitive or
+    normalising filesystem (macOS by default) treats them; the last test
+    also refuses such pairs where they would be two files."""
+    if a == b or (a.exists() and b.exists() and a.samefile(b)):
+        return True
+
+    def folded(path):
+        return unicodedata.normalize("NFC", str(path)).casefold()
+
+    return folded(a) == folded(b)
 
 
 def _identity(path):
@@ -1284,16 +1438,21 @@ def _execute(recipe_path, resolved, out_dir, entry_point, invocation):
     import shutil
     import tempfile
 
-    # Sample assets are fetched first, so the output guards see their paths.
+    # Sample assets are fetched first, so the output guards see their paths;
+    # a pyrosm recipe runs with the pipeline, after the guards, and the guards
+    # protect its recipe and every output it declares.
     recipe = _RECIPES[resolved["recipe"]]
     resolved["inputs"] = _materialise_inputs(resolved["inputs"], recipe.roles)
     for group, key, source in list(_parameter_sources(resolved["parameters"])):
         resolved["parameters"][group][key] = _materialise(source)
+    _check_pyrosm_outputs(resolved, recipe_path)
     out_root = pathlib.Path(out_dir or pathlib.Path.cwd()).resolve()
     protected = [recipe_path]
-    protected += [
-        source["path"] for _, source in _input_sources(resolved["inputs"], recipe.roles)
-    ]
+    for _, source in _input_sources(resolved["inputs"], recipe.roles):
+        if "pyrosm" in source:
+            protected += [source["pyrosm"]["recipe"], *source["pyrosm"]["outputs"]]
+        else:
+            protected.append(source["path"])
     protected += [s["path"] for _, _, s in _parameter_sources(resolved["parameters"])]
     unresolved = out_root / resolved["outputs"]["table"]
     target, provenance = _output_path(out_root, resolved["outputs"]["table"], protected)
