@@ -7,6 +7,11 @@
   crops and pins the OSM extract, reusing unchanged stages), reads the
   extract it writes, and keeps pyrosm's provenance record in its own.
   ([#449](https://github.com/cafein-py/cafein/pull/449))
+- A pyrosm `streets` input can also give its settings inline,
+  `{kind: pyrosm, path: data/kallio.osm.pbf, extract: {...}}`, without a
+  pyrosm recipe file; pyrosm's record is written beside the extract. This
+  form needs pyrosm 0.27 or newer.
+  ([#450](https://github.com/cafein-py/cafein/pull/450))
 
 ## 0.31.0 — 2026-10-29
 
