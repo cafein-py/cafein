@@ -21,7 +21,7 @@ DataFrame.
 recipe: exposure_tradeoff      # selects a built-in pipeline (see below)
 version: 1                     # the recipe-schema version
 requires:                      # optional: refuse to run outside this range
-  cafein: ">=0.22,<0.23"
+  cafein: ">=0.22"
 inputs:                        # every input names its kind
   streets: {kind: file, path: data/city.osm.pbf}
   ...
