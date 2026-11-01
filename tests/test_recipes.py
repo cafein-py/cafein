@@ -2,6 +2,7 @@
 
 import functools
 import hashlib
+import inspect
 import json
 import pathlib
 
@@ -910,6 +911,31 @@ _PYROSM_INPUTS = {
 }
 
 
+_INLINE_STREETS = {
+    "kind": "pyrosm",
+    "path": "data/helsinki.osm.pbf",
+    "extract": {"area": {"name": "helsinki_pbf"}},
+}
+
+
+def _needs_inline_pyrosm():
+    """Skip unless pyrosm takes a recipe as a mapping (0.27 or newer)."""
+    pyrosm_recipes = pytest.importorskip("pyrosm.recipes")
+    if "base_dir" not in inspect.signature(pyrosm_recipes.validate).parameters:
+        pytest.skip("pyrosm settings given inline need pyrosm 0.27 or newer")
+
+
+def _write_area(path):
+    """A GeoJSON polygon in central Helsinki, an area file for pyrosm."""
+    ring = [[24.93, 60.16], [24.95, 60.16], [24.95, 60.17], [24.93, 60.16]]
+    feature = {
+        "type": "Feature",
+        "properties": {},
+        "geometry": {"type": "Polygon", "coordinates": [ring]},
+    }
+    path.write_text(json.dumps({"type": "FeatureCollection", "features": [feature]}))
+
+
 def _write_pyrosm(tmp_path, **sections):
     """``osm.yaml``: a pyrosm recipe on pyrosm's bundled Helsinki extract
     (nothing is downloaded) writing ``data/helsinki.osm.pbf``; ``sections``
@@ -926,15 +952,31 @@ def _write_pyrosm(tmp_path, **sections):
     (tmp_path / "osm.yaml").write_text(yaml.safe_dump(recipe))
 
 
-def test_run_on_a_pyrosm_input_keeps_pyrosm_s_record(tmp_path, monkeypatch):
-    """A pyrosm recipe as the streets input: validate checks it without
-    running it, the run writes the extract where pyrosm puts it, and the
-    record keeps pyrosm's record beside the SHA-256 of the extract read."""
+@pytest.mark.parametrize("inline", [False, True])
+def test_run_on_a_pyrosm_input_keeps_pyrosm_s_record(tmp_path, monkeypatch, inline):
+    """A pyrosm recipe, or its extract settings given inline, as the streets
+    input: validate checks it without running it, the run writes the extract
+    where pyrosm puts it (an inline one at its path, with pyrosm's record
+    beside it, relative to the recipe's folder whatever the current folder),
+    and the record keeps pyrosm's record beside the SHA-256 of the extract
+    read. A rerun reuses the extract and replaces the table."""
+    import pandas as pd
+
     pytest.importorskip("pyarrow")
     from cafein import recipes
 
-    _write_pyrosm(tmp_path)
-    path = _two_route_recipe(tmp_path, monkeypatch, inputs=_PYROSM_INPUTS)
+    if inline:
+        _needs_inline_pyrosm()
+        inputs = {**_PYROSM_INPUTS, "streets": _INLINE_STREETS}
+        name, record_name = "helsinki.osm.pbf", "data/helsinki.osm.pbf.provenance.json"
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+    else:
+        _write_pyrosm(tmp_path)
+        inputs = _PYROSM_INPUTS
+        name, record_name = "data/helsinki.osm.pbf", "osm.provenance.json"
+    path = _two_route_recipe(tmp_path, monkeypatch, inputs=inputs)
     resolved = recipes.validate(path)
     assert resolved["inputs"]["streets"]["path"] is None
     assert not (tmp_path / "data").exists()
@@ -943,20 +985,44 @@ def test_run_on_a_pyrosm_input_keeps_pyrosm_s_record(tmp_path, monkeypatch):
 
     assert len(frame) == 2
     extract = tmp_path.resolve() / "data" / "helsinki.osm.pbf"
+    assert (tmp_path / record_name).is_file()
     record = json.loads((tmp_path / "out" / "tradeoff.provenance.json").read_text())
     entry = record["inputs"]["streets"]
     assert entry["path"] == str(extract)
     assert entry["sha256"] == hashlib.sha256(extract.read_bytes()).hexdigest()
     pyrosm_record = entry["pyrosm"]["record"]
-    assert pyrosm_record["outputs"]["data/helsinki.osm.pbf"] == entry["sha256"]
+    assert pyrosm_record["outputs"][name] == entry["sha256"]
     assert pyrosm_record["extract"]["dataset"] == "helsinki_pbf"
+    if inline:
+        assert not any(elsewhere.iterdir())
+    written = extract.stat().st_mtime_ns
+    table = tmp_path / "out" / "tradeoff.parquet"
+    table.write_bytes(b"stale")
+    recipes.run(path, out_dir=tmp_path / "out")
+    assert extract.stat().st_mtime_ns == written
+    assert len(pd.read_parquet(table)) == 2
 
 
 @pytest.mark.parametrize(
     "streets, osm, inputs, match",
     [
         ({"recipe": "missing.yaml"}, {}, {}, "pyrosm recipe not found"),
-        ({"recipe": "osm.yaml", "path": "x.pbf"}, {}, {}, "does not take 'path'"),
+        ({"recipe": "osm.yaml", "path": "x.pbf"}, {}, {}, "'extract', not both"),
+        ({"path": "x.pbf"}, {}, {}, "takes 'recipe', or 'path' and 'extract'$"),
+        ({"path": "x.pbf", "extract": "x"}, {}, {}, "'extract' must be a mapping"),
+        ({**_INLINE_STREETS, "path": "x.osm"}, {}, {}, "'path' must name a .pbf"),
+        (
+            {**_INLINE_STREETS, "extract": {**_INLINE_STREETS["extract"], "nope": 1}},
+            {},
+            {},
+            r"^inputs\.streets: extract: unknown keyword 'nope'",
+        ),
+        (
+            {**_INLINE_STREETS, "path": "linked.pbf"},
+            {},
+            {},
+            "the pyrosm output .*linked.pbf is a symlink",
+        ),
         (
             {"recipe": "osm.yaml"},
             {"extract": {"area": {"name": "helsinki_pbf"}, "nope": 1}},
@@ -1006,6 +1072,8 @@ def test_validate_refuses_bad_pyrosm_inputs(
 
     from cafein import recipes
 
+    if "recipe" not in streets:
+        _needs_inline_pyrosm()
     _write_pyrosm(tmp_path, **osm)
     if "pbf" in osm:
         from pyrosm import get_data
@@ -1017,7 +1085,37 @@ def test_validate_refuses_bad_pyrosm_inputs(
         (tmp_path / "destinations.geojson").read_bytes()
     )
     (tmp_path / "linked.json").symlink_to(tmp_path / "osm.provenance.json")
+    (tmp_path / "linked.pbf").symlink_to(tmp_path / "streets.pbf")
     with pytest.raises(ValueError, match=match):
+        recipes.validate(path)
+
+
+def test_inline_pyrosm_paths_are_read_from_the_recipe_folder(tmp_path, monkeypatch):
+    """A path inside inline pyrosm settings (an area file) is read from the
+    recipe's folder, not the current one."""
+    _needs_inline_pyrosm()
+    from cafein import recipes
+
+    _write_area(tmp_path / "area.geojson")
+    streets = {**_INLINE_STREETS, "extract": {"area": {"file": "area.geojson"}}}
+    path = _two_route_recipe(
+        tmp_path, monkeypatch, inputs={**_PYROSM_INPUTS, "streets": streets}
+    )
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.chdir(tmp_path / "elsewhere")
+    recipes.validate(path)
+
+
+def test_inline_pyrosm_settings_refuse_an_older_pyrosm(tmp_path, monkeypatch):
+    """A pyrosm whose recipes take no mapping refuses inline settings by the
+    version they need."""
+    pyrosm_recipes = pytest.importorskip("pyrosm.recipes")
+    from cafein import recipes
+
+    monkeypatch.setattr(pyrosm_recipes, "validate", lambda path: None)
+    inputs = {**_PYROSM_INPUTS, "streets": _INLINE_STREETS}
+    path = _two_route_recipe(tmp_path, monkeypatch, inputs=inputs)
+    with pytest.raises(ImportError, match="inline need pyrosm 0.27 or newer"):
         recipes.validate(path)
 
 
@@ -1127,6 +1225,13 @@ def test_run_refuses_an_extract_pyrosm_s_record_does_not_name(
             "would overwrite an input",
         ),
         ({}, "osm.parquet", None, "would overwrite an input"),
+        (_INLINE_STREETS, "data/helsinki.osm.pbf.parquet", None, "would overwrite"),
+        (
+            {**_INLINE_STREETS, "extract": {"area": {"file": "area.provenance.json"}}},
+            "area.parquet",
+            None,
+            "would overwrite an input",
+        ),
         ({}, "tradeoff.parquet", "records", "which is also the input 'destinations'"),
         ({}, "tradeoff.parquet", "edit", "changed after the cafein recipe was"),
     ],
@@ -1136,9 +1241,11 @@ def test_run_refuses_pyrosm_output_collisions_before_pyrosm_runs(
 ):
     """A cafein output over a declared pyrosm output (a layer, also named in
     another case or reached through a symlinked folder, a graph table,
-    pyrosm's record next to the cafein record), a fetched sample that is
-    pyrosm's record, and a pyrosm recipe edited while a sample is fetched are
-    refused before pyrosm runs."""
+    pyrosm's record next to the cafein record, also that of inline settings
+    (``osm`` the streets input itself)), a cafein record over a file pyrosm
+    reads (an area file), a fetched sample that is pyrosm's record, and a
+    pyrosm recipe edited while a sample is fetched are refused before pyrosm
+    runs."""
     import sys
 
     pytest.importorskip("pyarrow")
@@ -1146,8 +1253,13 @@ def test_run_refuses_pyrosm_output_collisions_before_pyrosm_runs(
 
     (tmp_path / "real").mkdir()
     (tmp_path / "link").symlink_to(tmp_path / "real", target_is_directory=True)
-    _write_pyrosm(tmp_path, **osm)
+    _write_area(tmp_path / "area.provenance.json")
     inputs = dict(_PYROSM_INPUTS)
+    if osm.get("kind") == "pyrosm":
+        _needs_inline_pyrosm()
+        inputs["streets"] = osm
+    else:
+        _write_pyrosm(tmp_path, **osm)
     if fetch is not None:
         name = "records" if fetch == "records" else "destinations"
         inputs["destinations"] = {
@@ -1179,29 +1291,48 @@ def test_run_refuses_pyrosm_output_collisions_before_pyrosm_runs(
     assert calls == []
 
 
+_PINNED_EXTRACT = {"area": {"name": "helsinki_pbf"}, "sha256": "0" * 64}
+
+
 @pytest.mark.parametrize(
-    "arrange, error",
+    "streets, arrange, error, named",
     [
-        (lambda root: (root / ".osm.provenance.json.lock").touch(), FileExistsError),
         (
-            lambda root: _write_pyrosm(
-                root, extract={"area": {"name": "helsinki_pbf"}, "sha256": "0" * 64}
-            ),
+            None,
+            lambda root: (root / ".osm.provenance.json.lock").touch(),
+            FileExistsError,
+            "pyrosm recipe .*osm.yaml",
+        ),
+        (
+            None,
+            lambda root: _write_pyrosm(root, extract=_PINNED_EXTRACT),
             ValueError,
+            "pyrosm recipe .*osm.yaml",
+        ),
+        (
+            {**_INLINE_STREETS, "extract": _PINNED_EXTRACT},
+            lambda root: None,
+            ValueError,
+            "pyrosm",
         ),
     ],
 )
 def test_run_keeps_the_type_of_pyrosm_s_own_errors(
-    tmp_path, monkeypatch, arrange, error
+    tmp_path, monkeypatch, streets, arrange, error, named
 ):
     """pyrosm's refusals (a held lock, an extract that differs from its pin)
-    reach the caller with their own type, naming the input and recipe."""
+    reach the caller with their own type, naming the input and the recipe
+    (pyrosm alone for inline settings)."""
     from cafein import recipes
 
     _write_pyrosm(tmp_path)
-    path = _two_route_recipe(tmp_path, monkeypatch, inputs=_PYROSM_INPUTS)
+    inputs = _PYROSM_INPUTS
+    if streets is not None:
+        _needs_inline_pyrosm()
+        inputs = {**_PYROSM_INPUTS, "streets": streets}
+    path = _two_route_recipe(tmp_path, monkeypatch, inputs=inputs)
     arrange(tmp_path)
-    with pytest.raises(error, match="^streets: pyrosm recipe .*osm.yaml: ") as raised:
+    with pytest.raises(error, match=f"^streets: {named}: ") as raised:
         recipes.run(path, out_dir=tmp_path / "out")
     assert type(raised.value) is error
 

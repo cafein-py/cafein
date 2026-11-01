@@ -202,7 +202,7 @@ def _check_signature(where, path, filename):
 _STREET_KEYS = {
     "file": (("path",), (), _STREET_SUFFIXES),
     "sample": (("name",), (), _STREET_SUFFIXES),
-    "pyrosm": (("recipe",), (), _STREET_SUFFIXES),
+    "pyrosm": ((), ("recipe", "path", "extract"), _STREET_SUFFIXES),
 }
 _EXPOSURE_KEYS = {
     "raster": (("path", "value"), ("units",), _RASTER_SUFFIXES),
@@ -292,50 +292,110 @@ def _sample_pin(name, where):
     return {"asset": name, "region": region, **table[asset]}
 
 
-def _pyrosm_pin(name, recipe_dir, where):
-    """The pyrosm recipe ``name`` (relative to the recipe's directory), checked
-    by pyrosm without running it: the recipe file and its SHA-256, the extract
-    it writes, its provenance record, and every output it declares, as
+def _pyrosm_pin(spec, recipe_dir, where):
+    """A pyrosm input checked by pyrosm without running it: a pyrosm recipe
+    file (``recipe``, pinned by its SHA-256), or pyrosm's ``extract`` settings
+    given inline, written to ``path`` with pyrosm's record beside it. Paths are
+    relative to the recipe's directory, those inside ``extract`` too. Returns
+    what to run (``recipe`` or ``settings``, with pyrosm's ``options``), the
+    extract, its provenance record, and every output pyrosm declares, as
     resolved paths (where pyrosm writes them)."""
-    if not isinstance(name, str):
-        raise ValueError(f"{where}: 'recipe' must be a string")
-    path = (recipe_dir / name).resolve()
-    if not path.is_file():
-        raise ValueError(f"{where}: pyrosm recipe not found: {path}")
-    digest = _file_digest(path)
+    import inspect
+
+    given = {key for key in ("recipe", "path", "extract") if spec.get(key) is not None}
+    if given not in ({"recipe"}, {"path", "extract"}):
+        raise ValueError(
+            f"{where}: kind 'pyrosm' takes 'recipe', or 'path' and 'extract'"
+            + (", not both" if "recipe" in given else "")
+        )
+    inline = "recipe" not in given
+    if inline:
+        if not isinstance(spec["path"], str):
+            raise ValueError(f"{where}: 'path' must be a string")
+        if not isinstance(spec["extract"], dict):
+            raise ValueError(f"{where}: 'extract' must be a mapping")
+        target = recipe_dir / spec["path"]
+        if not _suffix_ok(target, _STREET_SUFFIXES):
+            raise ValueError(f"{where}: 'path' must name a .pbf file")
+        name = target.name
+        settings = {
+            "recipe": "pyrosm",
+            "extract": spec["extract"],
+            "outputs": {"extract": name, "provenance": f"{name}.provenance.json"},
+        }
+        options = {"out_dir": target.parent.resolve(), "base_dir": recipe_dir}
+        path = digest = None
+    else:
+        if not isinstance(spec["recipe"], str):
+            raise ValueError(f"{where}: 'recipe' must be a string")
+        path = (recipe_dir / spec["recipe"]).resolve()
+        if not path.is_file():
+            raise ValueError(f"{where}: pyrosm recipe not found: {path}")
+        digest = _file_digest(path)
+        settings, options = None, {}
+    if inline:
+        needed = "pyrosm settings given inline need pyrosm 0.27 or newer"
+    else:
+        needed = "kind 'pyrosm' needs pyrosm 0.24 or newer"
     try:
         from pyrosm import recipes as pyrosm_recipes
     except ImportError as error:
-        raise ImportError(
-            f"{where}: kind 'pyrosm' needs pyrosm 0.24 or newer"
-        ) from error
+        raise ImportError(f"{where}: {needed}") from error
+    if (
+        inline
+        and "base_dir" not in inspect.signature(pyrosm_recipes.validate).parameters
+    ):
+        raise ImportError(f"{where}: {needed}")
+    label = where if inline else f"{where}.recipe"
     try:
-        recipe = pyrosm_recipes.validate(path)
+        if inline:
+            recipe = pyrosm_recipes.validate(settings, base_dir=recipe_dir)
+        else:
+            recipe = pyrosm_recipes.validate(path)
     except ValueError as error:
-        raise ValueError(f"{where}.recipe: {error}") from None
+        raise ValueError(f"{label}: {error}") from None
     if recipe["extract"] is None:
         raise ValueError(
-            f"{where}.recipe: the pyrosm recipe has no extract stage; give the "
+            f"{label}: the pyrosm recipe has no extract stage; give the "
             "PBF as {kind: file, path: ...}"
         )
-    outputs, root = recipe["outputs"], recipe["recipe_dir"]
+    outputs = recipe["outputs"]
+    root = options["out_dir"] if inline else recipe["recipe_dir"]
     declared = [outputs["extract"], outputs["provenance"]]
     declared += [*outputs["layers"].values(), *(outputs["graph"] or {}).values()]
     for output in declared:
         # pyrosm replaces a symlinked output with a file, so the resolved path
         # would name the link's old target, not what pyrosm wrote.
         if (root / output).is_symlink():
-            raise ValueError(
-                f"{where}.recipe: the pyrosm output {root / output} is a symlink"
-            )
+            raise ValueError(f"{label}: the pyrosm output {root / output} is a symlink")
     return {
         "recipe": path,
         "recipe_sha256": digest,
+        "settings": settings,
+        "options": options,
         "extract_name": outputs["extract"],
         "extract": (root / outputs["extract"]).resolve(),
         "provenance": (root / outputs["provenance"]).resolve(),
         "outputs": [(root / output).resolve() for output in declared],
+        "reads": [
+            read.resolve()
+            for section in ("extract", "pbf", "reader", "layers", "graph")
+            for read in _paths_in(recipe[section])
+        ],
     }
+
+
+def _paths_in(value):
+    """Every path inside nested mappings and lists, such as the files (a PBF,
+    an area file, ``must_cover``) and folders of pyrosm's resolved recipe."""
+    if isinstance(value, pathlib.PurePath):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _paths_in(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _paths_in(item)
 
 
 def _resolve_source(where, spec, recipe_dir, *, keys):
@@ -345,8 +405,9 @@ def _resolve_source(where, spec, recipe_dir, *, keys):
     data move together; the file must exist and be a self-contained format. A
     ``sample`` names a pinned ``cafein.sampledata`` asset: its pin is resolved
     here without downloading, the file is fetched when the recipe runs. A
-    ``pyrosm`` input names a pyrosm recipe: pyrosm checks it here, and the
-    recipe runs (writing the extract) when the cafein recipe runs.
+    ``pyrosm`` input names a pyrosm recipe or gives its extract settings:
+    pyrosm checks them here, and runs them (writing the extract) when the
+    cafein recipe runs.
     """
     if not isinstance(spec, dict):
         raise ValueError(f"{where}: must be a mapping with a 'kind'")
@@ -368,7 +429,7 @@ def _resolve_source(where, spec, recipe_dir, *, keys):
         sample = _sample_pin(spec["name"], where)
         path, filename = None, sample["name"]
     elif kind == "pyrosm":
-        pyrosm = _pyrosm_pin(spec["recipe"], recipe_dir, where)
+        pyrosm = _pyrosm_pin(spec, recipe_dir, where)
         path, filename = None, pyrosm["extract"].name
     else:
         if not isinstance(spec["path"], str):
@@ -1051,22 +1112,26 @@ def _pyrosm_record(where, pin, sha256):
 
 
 def _run_pyrosm(where, pin):
-    """Run a pyrosm input's recipe (pyrosm reuses its unchanged stages) and
-    return the extract's path; a recipe changed since validation is refused,
-    as the guards checked the outputs it declared then. pyrosm's refusals keep
-    their type, prefixed; an error type that takes no single message falls
-    back to its base."""
+    """Run a pyrosm input's recipe or inline settings (pyrosm reuses its
+    unchanged stages) and return the extract's path; a recipe file changed
+    since validation is refused, as the guards checked the outputs it declared
+    then. pyrosm's refusals keep their type, prefixed; an error type that takes
+    no single message falls back to its base."""
     from pyrosm import recipes as pyrosm_recipes
 
-    if _file_digest(pin["recipe"]) != pin["recipe_sha256"]:
+    inline = pin["recipe"] is None
+    if not inline and _file_digest(pin["recipe"]) != pin["recipe_sha256"]:
         raise ValueError(
             f"{where}: the pyrosm recipe {pin['recipe']} changed after the cafein "
             "recipe was validated; run it again"
         )
     try:
-        pyrosm_recipes.run(pin["recipe"])
+        pyrosm_recipes.run(
+            pin["settings"] if inline else pin["recipe"], **pin["options"]
+        )
     except (ValueError, OSError) as error:
-        message = f"{where}: pyrosm recipe {pin['recipe']}: {error}"
+        named = "pyrosm" if inline else f"pyrosm recipe {pin['recipe']}"
+        message = f"{where}: {named}: {error}"
         try:
             prefixed = type(error)(message)
         except Exception:
@@ -1440,7 +1505,7 @@ def _execute(recipe_path, resolved, out_dir, entry_point, invocation):
 
     # Sample assets are fetched first, so the output guards see their paths;
     # a pyrosm recipe runs with the pipeline, after the guards, and the guards
-    # protect its recipe and every output it declares.
+    # protect its recipe, every output it declares and every file it reads.
     recipe = _RECIPES[resolved["recipe"]]
     resolved["inputs"] = _materialise_inputs(resolved["inputs"], recipe.roles)
     for group, key, source in list(_parameter_sources(resolved["parameters"])):
@@ -1450,7 +1515,8 @@ def _execute(recipe_path, resolved, out_dir, entry_point, invocation):
     protected = [recipe_path]
     for _, source in _input_sources(resolved["inputs"], recipe.roles):
         if "pyrosm" in source:
-            protected += [source["pyrosm"]["recipe"], *source["pyrosm"]["outputs"]]
+            protected += [p for p in [source["pyrosm"]["recipe"]] if p is not None]
+            protected += source["pyrosm"]["outputs"] + source["pyrosm"]["reads"]
         else:
             protected.append(source["path"])
     protected += [s["path"] for _, _, s in _parameter_sources(resolved["parameters"])]

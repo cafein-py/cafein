@@ -40,7 +40,7 @@ validation (and again on the run's private copy). A `sample` input names a pinne
 `cafein.sampledata` as `<region>.<asset>` (`helsinki.osm_pbf`,
 `helsinki.air_quality`, `helsinki.poi_library`), fetched and verified on first
 use. A `pyrosm` input (`streets` only) names a pyrosm recipe that makes the
-OSM extract (see below). Validation resolves every input before anything is read; an unknown
+OSM extract, or gives its settings inline (see below). Validation resolves every input before anything is read; an unknown
 kind, a missing key, a missing file, or an asset that does not suit its role
 is refused by name.
 
@@ -113,6 +113,26 @@ would, beside the pyrosm recipe under the names its `outputs` give, so the
 two commands reuse each other's work: a rerun downloads nothing while the
 pyrosm recipe is unchanged, unless its extract sets `update: true`. pyrosm's
 `sha256` and `snapshot` pins apply as they do in pyrosm.
+
+The settings can also stay in the cafein recipe, without a pyrosm recipe file:
+`path` names the PBF pyrosm writes, and `extract` holds what a pyrosm recipe's
+`extract` section would. This form needs pyrosm 0.27 or newer.
+
+```yaml
+inputs:
+  streets:
+    kind: pyrosm
+    path: data/kallio.osm.pbf
+    extract:
+      area: {place: "Kallio, Helsinki"}
+      crop: polygon
+```
+
+pyrosm writes its record beside the extract, as
+`data/kallio.osm.pbf.provenance.json`, and the paths inside `extract` (an area
+file, `must_cover`, `directory`) are relative to the cafein recipe's folder. A
+pyrosm recipe file suits settings shared between analyses, or a pyrosm recipe
+that also writes layers; the inline form keeps an analysis in one file.
 
 The run's record keeps pyrosm's own provenance record under
 `inputs.streets.pyrosm`, so it says where the extract came from, and cafein
