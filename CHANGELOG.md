@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.32.0 — 2026-11-01
 
 - A recipe's `streets` input can name a pyrosm recipe,
   `{kind: pyrosm, recipe: osm.yaml}`: `cafein run` runs it (pyrosm downloads,
