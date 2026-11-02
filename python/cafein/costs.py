@@ -111,6 +111,9 @@ def load_street_costs(source):
         raise ValueError(
             "cost rows are street-only; unknown street_mode(s): "
             + ", ".join(sorted(map(str, off_street)))
+            + f" (expected one of {', '.join(_STREET_MODES)}). A row names "
+            "a street mode, not a vehicle class: the e-bike prices with the "
+            "bicycle rows and every car powertrain with the car rows"
         )
     if not all(isinstance(name, str) and name for name in frame["component"]):
         raise ValueError("every cost row needs a non-empty component name (a string)")

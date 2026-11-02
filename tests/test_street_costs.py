@@ -127,52 +127,23 @@ def test_cost_overrides_merge_partially_and_validate():
         0.108 - 0.011 + 0.020
     )
     assert costs.street_cost("e_scooter", "societal", costs=override) == 0.030
-    for bad in [
-        pd.DataFrame(
-            [
-                {
-                    "perspective": "societal",
-                    "street_mode": "bus",
-                    "component": "climate",
-                    "cost_per_km": 0.1,
-                }
-            ]
-        ),
-        pd.DataFrame(
-            [
-                {
-                    "perspective": "commercial",
-                    "street_mode": "car",
-                    "component": "climate",
-                    "cost_per_km": 0.1,
-                }
-            ]
-        ),
-        pd.DataFrame(
-            [
-                {
-                    "perspective": "societal",
-                    "street_mode": "car",
-                    "component": "climate",
-                    "cost_per_km": float("inf"),
-                }
-            ]
-        ),
-        pd.DataFrame(
-            [
-                {
-                    "perspective": "societal",
-                    "street_mode": "car",
-                    "component": "",
-                    "cost_per_km": 0.1,
-                }
-            ]
-        ),
-        override.iloc[[0, 0]],  # duplicate key
-        pd.DataFrame([{"perspective": "societal", "cost_per_km": 0.1}]),
+    row = {
+        "perspective": "societal",
+        "street_mode": "car",
+        "component": "climate",
+        "cost_per_km": 0.1,
+    }
+    for bad, message in [
+        ([{**row, "street_mode": "bus"}], "unknown street_mode"),
+        ([{**row, "street_mode": "e_bike"}], "e-bike prices with the bicycle rows"),
+        ([{**row, "perspective": "commercial"}], "unknown cost perspective"),
+        ([{**row, "cost_per_km": float("inf")}], "finite"),
+        ([{**row, "component": ""}], "non-empty component"),
+        (override.iloc[[0, 0]], "duplicate"),  # duplicate key
+        ([{"perspective": "societal", "cost_per_km": 0.1}], "misses column"),
     ]:
-        with pytest.raises(ValueError):
-            costs.load_street_costs(bad)
+        with pytest.raises(ValueError, match=message):
+            costs.load_street_costs(pd.DataFrame(bad))
 
 
 def test_uncovered_modes_stay_nan_even_with_component_columns(
