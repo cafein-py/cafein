@@ -256,6 +256,47 @@ class IndicatorSettings:
         """The climate cost of `grams` CO₂e (a number or an array)."""
         return grams / 1e6 * self.co2_price
 
+    def check_supported(self, supported, where):
+        """Refuse every requested indicator `where` does not report."""
+        missing = [name for name in self.indicators if name not in supported]
+        if missing:
+            raise ValueError(
+                f"indicators {', '.join(missing)} are not available on {where}"
+            )
+
+    def street_leg_columns(self, mode, network_metres, connector_metres, emissions):
+        """The requested activity and climate columns of single-mode street
+        legs: the network metres ride `mode`, the connectors are walked."""
+        columns = {}
+        if "physical_activity" in self.indicators:
+            columns["physical_activity"] = (
+                network_metres * self.activity_rate(mode)
+                + connector_metres * self.activity_rate("walk")
+            ) / 1000.0
+        if "climate_cost" in self.indicators:
+            columns["climate_cost"] = self.climate_cost(emissions)
+        return columns
+
+    def fingerprint(self):
+        """The resolved settings as plain data, for a stream's manifest."""
+        activity = particles = None
+        if self._activity is not None:
+            rates, unpublished, case = self._activity
+            activity = [sorted(rates.items()), sorted(unpublished), case]
+        if self._particles is not None:
+            factors, unpublished, case = self._particles
+            particles = [
+                sorted([*key, *values] for key, values in factors.items()),
+                sorted(map(list, unpublished)),
+                case,
+            ]
+        return {
+            "indicators": list(self.indicators),
+            "co2_price": self.co2_price,
+            "activity": activity,
+            "particles": particles,
+        }
+
     def activity_rate(self, mode):
         """MET-hours per km of a leg in street mode `mode`.
 
@@ -349,11 +390,19 @@ def resolve_query(indicators, co2_price, activity_rates, particle_factors):
                 f"{name}= sets {' and '.join(serves[name])}; add it to indicators="
             )
     return IndicatorSettings(
-        tuple(chosen),
+        tuple(name for name in INDICATORS if name in chosen),
         _co2_price(co2_price) if "climate_cost" in chosen else None,
         _activity(activity_rates) if "physical_activity" in chosen else None,
         _particles(particle_factors) if {"pm10", "pm2_5"} & set(chosen) else None,
     )
+
+
+def reject_query(where, indicators, co2_price, activity_rates, particle_factors):
+    """Validate a query's indicator arguments and refuse any request:
+    `where` reports none of the indicators."""
+    settings = resolve_query(indicators, co2_price, activity_rates, particle_factors)
+    if settings is not None:
+        settings.check_supported((), where)
 
 
 def _co2_price(value):

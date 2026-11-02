@@ -11,6 +11,7 @@ from cafein._validate import (
 import geopandas as gpd
 
 from cafein import _log, _sweep
+from cafein import indicators as _indicators
 from cafein._snapshot import NetworkSnapshot
 import numpy as np
 import pandas as pd
@@ -352,6 +353,13 @@ class DetailedItineraries(gpd.GeoDataFrame):
         (2019) defaults with ``costs=`` overrides, per-component
         columns via ``cost_components=`` (one perspective), and the
         declared ``currency`` label column.
+    indicators, co2_price, activity_rates, particle_factors : optional
+        Per-trip indicator columns of the street legs, off by default,
+        exactly as in ``TravelCostMatrix``: ``"physical_activity"``
+        (MET-hours) and ``"climate_cost"`` (``emissions`` times
+        ``co2_price``), with ``"low"`` / ``"middle"`` / ``"high"`` cases
+        or own values (``cafein.indicators``). StreetNetwork queries
+        only.
     street_policy : StreetLegPolicy (optional)
         Which street modes may serve the access and egress, on what
         vehicle terms (``cafein.StreetLegPolicy``); point origins and
@@ -512,6 +520,10 @@ class DetailedItineraries(gpd.GeoDataFrame):
         costs=None,
         currency=None,
         cost_components=None,
+        indicators=None,
+        co2_price=None,
+        activity_rates=None,
+        particle_factors=None,
         output_time_units="minutes",
     ):
         from cafein.street_network import frozen_speeds
@@ -620,6 +632,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
                     "candidates='sweep' sweeps exposure weights; pass the "
                     "Exposure carrying the layers as exposure= too"
                 )
+            indicator_settings = _indicators.resolve_query(
+                indicators, co2_price, activity_rates, particle_factors
+            )
             frozen = None
             if exposure is not None:
                 exposure._check_network(network)
@@ -663,6 +678,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
                     costs=costs,
                     currency=currency,
                     cost_components=cost_components,
+                    indicator_settings=indicator_settings,
                     transit_only={
                         "fares": fares,
                         "traveler": traveler,
@@ -756,6 +772,13 @@ class DetailedItineraries(gpd.GeoDataFrame):
                 "street kilometres and apply to a StreetNetwork query "
                 "(transit perspective costs are not supported)"
             )
+        _indicators.reject_query(
+            "a TransportNetwork query",
+            indicators,
+            co2_price,
+            activity_rates,
+            particle_factors,
+        )
         if departure is None and not arrive_by:
             raise ValueError("give exactly one of departure= or arrival=")
         if optimize is not None:
@@ -1588,6 +1611,7 @@ def _street_itineraries_frame(
     costs=None,
     currency=None,
     cost_components=None,
+    indicator_settings=None,
     exposure=None,
     multipliers=None,
     keep_edges=False,
@@ -1597,6 +1621,10 @@ def _street_itineraries_frame(
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
     from cafein.street_network import _resolved_delays
 
+    if indicator_settings is not None:
+        indicator_settings.check_supported(
+            ("physical_activity", "climate_cost"), "a StreetNetwork query"
+        )
     resolved_parking = _parking.resolve(parking, transport_mode)
     occupancy, vehicle_class = emissions._car_query_options(
         transport_mode, occupancy, vehicle_class
@@ -1709,6 +1737,16 @@ def _street_itineraries_frame(
         },
         columns=[column for column in STREET_COLUMNS if column != "geometry"],
     )
+    if indicator_settings is not None:
+        # After the fixed leg schema, before the cost account, as in the
+        # street cost matrix.
+        for name, values in indicator_settings.street_leg_columns(
+            transport_mode,
+            network_distance,
+            connector_distance,
+            frame["emissions"].to_numpy(),
+        ).items():
+            frame[name] = values
     if account is not None:
         # Appended after the fixed leg schema: costs ride the same driven
         # kilometres as the emissions, and a missing row's NaN propagates.

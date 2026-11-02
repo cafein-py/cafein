@@ -22,6 +22,7 @@ from cafein._validate import (
     sequence_not_string,
 )
 from cafein import _memory, _sweep
+from cafein import indicators as _indicators
 from cafein._snapshot import NetworkSnapshot
 from cafein._units import duration_seconds, memory_spec
 from cafein.policy import policy_speeds
@@ -118,6 +119,13 @@ def _optional_columns(kwargs, exposure_snapshot):
     count = 0
     for key in ("perspectives", "cost_components", "components"):
         count += _log.sized(kwargs.get(key)) or 0
+    indicators = kwargs.get("indicators")
+    if isinstance(indicators, str):
+        count += 1
+    elif indicators is not None:
+        # An iterable without a length is never consumed here: it counts
+        # as every indicator.
+        count += _log.sized(indicators) or len(_indicators.INDICATORS)
     if exposure_snapshot is not None:
         count += len(exposure_snapshot.column_names())
     return count
@@ -856,6 +864,21 @@ class TravelCostMatrix(pd.DataFrame):
         ``currency=`` (default ``"EUR2017"``) is a declared label
         carried in a ``currency`` column, never a conversion. A mode
         without a matching row prices NaN, never zero.
+    indicators, co2_price, activity_rates, particle_factors : optional
+        Per-trip indicator columns of a street matrix, off by default
+        (values and sources in ``cafein.indicators``).
+        ``indicators=`` selects ``"physical_activity"`` (MET-hours of
+        walking and cycling: the network kilometres times the mode's
+        rate, the connectors at the walking rate) and ``"climate_cost"``
+        (``emissions`` times a CO₂ price per tonne, in the price's
+        currency). ``co2_price=`` takes ``"low"``, ``"middle"`` (the
+        default) or ``"high"`` — the European Commission handbook's 60,
+        100 and 189 per tonne in 2016 euros — or a number;
+        ``activity_rates=`` takes a case name or own MET-hours per km by
+        street mode (a mapping or a table). A case no source gives uses
+        the middle value with a warning, and a mode without a rate
+        leaves ``physical_activity`` NaN. The societal cost account
+        already counts climate: ``climate_cost`` is not added to it.
 
     Notes
     -----
@@ -976,6 +999,10 @@ class TravelCostMatrix(pd.DataFrame):
         costs=None,
         currency=None,
         cost_components=None,
+        indicators=None,
+        co2_price=None,
+        activity_rates=None,
+        particle_factors=None,
         exposure=None,
         output_time_units="minutes",
         workers=None,
@@ -1081,6 +1108,9 @@ class TravelCostMatrix(pd.DataFrame):
                 costs=costs,
                 currency=currency,
                 cost_components=cost_components,
+                indicator_settings=_indicators.resolve_query(
+                    indicators, co2_price, activity_rates, particle_factors
+                ),
                 exposure=exposure,
                 weights=_street_weights(optimize),
                 sweep=candidates == "sweep",
@@ -1118,6 +1148,13 @@ class TravelCostMatrix(pd.DataFrame):
                 )
             )
             return
+        _indicators.reject_query(
+            "a TransportNetwork matrix",
+            indicators,
+            co2_price,
+            activity_rates,
+            particle_factors,
+        )
         # The moment(s): a scalar keeps today's frame; a list or mapping
         # adds the slot columns, one block of rows per slot.
         slots, labeled, multi = _time_slots(departure, arrival, arrive_by)
@@ -1379,6 +1416,10 @@ class TravelCostMatrix(pd.DataFrame):
         costs=None,
         currency=None,
         cost_components=None,
+        indicators=None,
+        co2_price=None,
+        activity_rates=None,
+        particle_factors=None,
         exposure=None,
         output_time_units="minutes",
         workers=None,
@@ -1527,6 +1568,9 @@ class TravelCostMatrix(pd.DataFrame):
                 costs=costs,
                 currency=currency,
                 cost_components=cost_components,
+                indicator_settings=_indicators.resolve_query(
+                    indicators, co2_price, activity_rates, particle_factors
+                ),
                 exposure=exposure,
             )
             return _stream_street_cost(
@@ -1555,6 +1599,13 @@ class TravelCostMatrix(pd.DataFrame):
                 arrive_by=arrive_by,
                 router=router,
             )
+        _indicators.reject_query(
+            "a TransportNetwork matrix",
+            indicators,
+            co2_price,
+            activity_rates,
+            particle_factors,
+        )
         _reject_cost_street_args(
             transport_mode,
             max_street_time,
@@ -2585,6 +2636,7 @@ def _street_cost_columns(
     costs=None,
     currency=None,
     cost_components=None,
+    indicator_settings=None,
     exposure=None,
     weights=None,
     sweep=False,
@@ -2617,6 +2669,7 @@ def _street_cost_columns(
         costs=costs,
         currency=currency,
         cost_components=cost_components,
+        indicator_settings=indicator_settings,
         exposure=exposure,
         weights=weights,
         sweep=sweep,
@@ -2651,6 +2704,7 @@ def _street_cost_columns(
     order += ["travel_time_s", "distance_m"]
     order += ["network_distance_m", "connector_distance_m", "distance_provenance"]
     order += ["emissions"]
+    order += _indicator_columns(resolved)
     order += [name for name in data if name.startswith("cost_")]
     if "currency" in data:
         order.append("currency")
@@ -2683,6 +2737,7 @@ def _street_cost_resolution(
     costs,
     currency,
     cost_components,
+    indicator_settings=None,
     exposure=None,
     weights=None,
     sweep=False,
@@ -2697,6 +2752,10 @@ def _street_cost_resolution(
     from cafein import _parking, costs as _costs, emissions
     from cafein.street_network import _resolved_delays
 
+    if indicator_settings is not None:
+        indicator_settings.check_supported(
+            ("physical_activity", "climate_cost"), "a StreetNetwork matrix"
+        )
     if exposure is not None:
         exposure._check_network(network)
     # The reporting snapshot first: the multiplier vector derives from
@@ -2780,6 +2839,7 @@ def _street_cost_resolution(
         "occupancy": occupancy,
         "factor": factor,
         "account": account,
+        "indicators": indicator_settings,
         # A frozen copy: the streamed batches and the manifest
         # fingerprint read one state, whatever happens to the caller's
         # Exposure meanwhile — the fare/policy frozen-input pattern.
@@ -2899,6 +2959,15 @@ def _street_cost_cells(
         # row was divided by the occupancy at resolution).
         "emissions": network_distance / 1000.0 * resolved["factor"],
     }
+    if resolved["indicators"] is not None:
+        numeric.update(
+            resolved["indicators"].street_leg_columns(
+                transport_mode,
+                network_distance,
+                connector_distance,
+                numeric["emissions"],
+            )
+        )
     if resolved["account"] is not None:
         # Costs ride the same driven kilometres as the emissions —
         # parking-search metres included, connectors excluded — and a
@@ -3695,6 +3764,10 @@ def travel_cost_table(
     costs=None,
     currency=None,
     cost_components=None,
+    indicators=None,
+    co2_price=None,
+    activity_rates=None,
+    particle_factors=None,
     exposure=None,
     output=None,
     batch_size=None,
@@ -3870,6 +3943,9 @@ def travel_cost_table(
             costs=costs,
             currency=currency,
             cost_components=cost_components,
+            indicator_settings=_indicators.resolve_query(
+                indicators, co2_price, activity_rates, particle_factors
+            ),
             exposure=exposure,
         )
         if output is None:
@@ -3893,6 +3969,13 @@ def travel_cost_table(
             resume=resume,
             output_time_units=output_time_units,
         )
+    _indicators.reject_query(
+        "a TransportNetwork matrix",
+        indicators,
+        co2_price,
+        activity_rates,
+        particle_factors,
+    )
     _reject_cost_street_args(
         transport_mode,
         max_street_time,
@@ -4681,6 +4764,12 @@ def _transit_exposure_columns(
     return out
 
 
+def _indicator_columns(resolved):
+    """The trip-indicator columns a resolved street query reports."""
+    settings = resolved["indicators"]
+    return [] if settings is None else list(settings.indicators)
+
+
 def _street_arrow_table(network, resolved, geometries, pa, output_time_units):
     """The street cost matrix as one Arrow table — ``travel_cost_table``'s
     street form, the streamed shards' schema in a single batch."""
@@ -4712,6 +4801,8 @@ def _street_arrow_table(network, resolved, geometries, pa, output_time_units):
         ),
         "emissions": pa.array(numeric["emissions"]),
     }
+    for name in _indicator_columns(resolved):
+        data[name] = pa.array(numeric[name])
     for name, values in numeric.items():
         if name.startswith("cost_"):
             data[name] = pa.array(values)
@@ -4759,6 +4850,7 @@ def _stream_street_cost(
         "distance_provenance",
         "emissions",
     ]
+    columns += _indicator_columns(resolved)
     if account is not None:
         totals, breakdown, label = account
         columns += [f"cost_{perspective}" for perspective in totals]
@@ -4782,6 +4874,11 @@ def _stream_street_cost(
         "occupancy": resolved["occupancy"],
         "factor": resolved["factor"],
         "account": None if account is None else [totals, breakdown, label],
+        "indicators": (
+            None
+            if resolved["indicators"] is None
+            else resolved["indicators"].fingerprint()
+        ),
         # The fingerprint hashes the layer data itself, so a resume with
         # a same-named but different exposure can never wrongly match.
         "exposure": None if exposure is None else exposure._fingerprint(),
@@ -4838,6 +4935,8 @@ def _stream_street_cost(
                 "emissions": pa.array(numeric["emissions"]),
             }
         )
+        for name in _indicator_columns(resolved):
+            data[name] = pa.array(numeric[name])
         for name, values in numeric.items():
             if name.startswith("cost_"):
                 data[name] = pa.array(values)

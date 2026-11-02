@@ -255,6 +255,7 @@ def test_car_park_arm_rides_the_requested_pool(car_park_network, caplog):
         ("network entry", "time", "origins x stops", 4),
         ("street time", "street", "points x points", 64),
         ("street cost", "street", "points x points", 48),
+        ("street indicators", "street", "points x points", 48 + 2 * 8),
         ("car park", "time", "1", 64),
         ("point time", "time", "points x points", 64),
         ("point cost", "time", "points x points", 48),
@@ -335,6 +336,13 @@ def test_every_public_call_plans_once(
         ),
         "street cost": lambda: TravelCostMatrix(
             helsinki_streets, points, points, transport_mode="walk"
+        ),
+        "street indicators": lambda: TravelCostMatrix(
+            helsinki_streets,
+            points,
+            points,
+            transport_mode="walk",
+            indicators=["physical_activity", "climate_cost"],
         ),
         "chunked": lambda: TravelTimeMatrix(
             network, origins, departure=DEPARTURE, chunk=(0, 2)
