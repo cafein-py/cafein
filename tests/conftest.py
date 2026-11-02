@@ -49,6 +49,7 @@ SHARD_WEIGHTS = {
     "test_ipea_accessibility.py": 5,
     "test_osm_extraction.py": 3,
     "test_street_matrix.py": 2,
+    "test_indicators.py": 1,
     "test_memory.py": 1,
     "test_package.py": 1,
     # Skipped in the Tests workflow, which installs no cafein.sampledata.
