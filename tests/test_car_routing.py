@@ -800,3 +800,128 @@ def test_car_builds_mark_each_street_s_road_class(
     split.save(tmp_path / "split.cafein")
     loaded = StreetNetwork.load(tmp_path / "split.cafein")
     assert loaded.streets_gdf["road_class"].tolist() == streets["road_class"].tolist()
+
+
+def test_car_outputs_report_particles_by_road_class(
+    car_network, origins, destinations, tmp_path
+):
+    from cafein import DetailedItineraries, travel_cost_table
+
+    names = ["pm10", "pm2_5"]
+    # One factor on every road class: the particles are the driven
+    # kilometres times it, per person.
+    flat = pd.DataFrame(
+        [
+            {"vehicle_class": "ICE", "road_class": road, "pm10": 10.0, "pm2_5": 4.0}
+            for road in ("urban", "rural", "motorway")
+        ]
+    )
+    base = {"transport_mode": "car", "occupancy": 2.0, "indicators": names}
+    matrix = TravelCostMatrix(
+        car_network, origins, destinations, particle_factors=flat, **base
+    )
+    assert len(matrix) > 0
+    assert np.allclose(matrix.pm10, matrix.network_distance_m / 1000 * 10.0 / 2)
+    assert np.allclose(matrix.pm2_5, matrix.network_distance_m / 1000 * 4.0 / 2)
+    # A parking search's 200 metres drive as urban.
+    urban = flat.assign(pm10=[30.0, 10.0, 10.0])
+    unparked, parked = (
+        TravelCostMatrix(
+            car_network,
+            origins,
+            destinations,
+            parking=parking,
+            particle_factors=urban,
+            **base,
+        )
+        for parking in (None, (300, 200))
+    )
+    assert np.allclose(parked.pm10 - unparked.pm10, 0.2 * 30.0 / 2)
+    # The shipped factors: a BEV's high case releases more than its middle,
+    # and the itineraries, the Arrow table and the streamed shards agree.
+    bev = {**base, "vehicle_class": "BEV"}
+    middle = TravelCostMatrix(car_network, origins, destinations, **bev)
+    high = TravelCostMatrix(
+        car_network, origins, destinations, particle_factors="high", **bev
+    )
+    assert (high.pm10 >= middle.pm10).all() and (high.pm10 > middle.pm10).any()
+    legs = DetailedItineraries(
+        car_network, origins, destinations, geometries=False, **bev
+    )
+    table = travel_cost_table(car_network, origins, destinations, **bev)
+    TravelCostMatrix.to_parquet(
+        car_network, origins, destinations, output=tmp_path / "pm.parquet", **bev
+    )
+    # With geometries the cells come from the rebuilt legs.
+    shaped = TravelCostMatrix(
+        car_network, origins, destinations, geometries=True, **bev
+    )
+    keys = ["from_id", "to_id"]
+    streamed = pd.read_parquet(tmp_path / "pm.parquet")
+    for other in (legs, table.to_pandas(), streamed, pd.DataFrame(shaped)):
+        joined = middle[keys + names].merge(
+            other[keys + names].astype({"from_id": str, "to_id": str}),
+            on=keys,
+            suffixes=("", "_other"),
+        )
+        assert len(joined) == len(middle)
+        for name in names:
+            assert np.allclose(joined[name], joined[f"{name}_other"])
+    # A resumable stream keys on the vehicle class even where the emission
+    # factors agree, and a class without a factor for a road class no leg
+    # drives still resolves.
+    same_factor = pd.DataFrame(
+        {
+            "street_mode": ["car", "car"],
+            "vehicle_class": ["ICE", "BEV"],
+            "vehicle": [10.0, 10.0],
+            "fuel": [50.0, 50.0],
+            "infrastructure": [5.0, 5.0],
+            "operations": [0.0, 0.0],
+        }
+    )
+    fingerprints = {
+        powertrain: TravelCostMatrix.to_parquet(
+            car_network,
+            origins,
+            destinations,
+            output=tmp_path / powertrain,
+            factors=same_factor,
+            **{**base, "vehicle_class": powertrain},
+        ).manifest["fingerprint"]
+        for powertrain in ("ICE", "BEV")
+    }
+    assert fingerprints["ICE"] != fingerprints["BEV"]
+    rows = [
+        {"vehicle_class": "HEV", "road_class": road, "pm10": 20.0, "pm2_5": 8.0}
+        for road in ("urban", "motorway")
+    ]
+    hybrid_rows = TravelCostMatrix(
+        car_network,
+        origins,
+        destinations,
+        particle_factors=rows,
+        **{**base, "vehicle_class": "HEV"},
+    )
+    assert np.allclose(
+        hybrid_rows.pm10, hybrid_rows.network_distance_m / 1000 * 20.0 / 2
+    )
+    # Walking releases none; a vehicle class or mode no source covers is NaN.
+    walked = TravelCostMatrix(
+        car_network, origins, destinations, transport_mode="walk", indicators=names
+    )
+    assert (walked.pm10 == 0).all()
+    with pytest.warns(UserWarning, match="no particle factor covers"):
+        hybrid = TravelCostMatrix(
+            car_network, origins, destinations, **{**base, "vehicle_class": "HEV"}
+        )
+    assert hybrid.pm10.isna().all()
+    with pytest.warns(UserWarning, match="street mode 'bicycle'"):
+        cycled = TravelCostMatrix(
+            car_network,
+            origins,
+            destinations,
+            transport_mode="bicycle",
+            indicators=names,
+        )
+    assert cycled.pm2_5.isna().all()

@@ -345,11 +345,3 @@ def test_street_outputs_report_the_trip_indicators(
         assert len(joined) == len(expected) > 0
         for name in ("physical_activity", "climate_cost"):
             assert np.allclose(joined[name], joined[f"{name}_other"])
-    with pytest.raises(ValueError, match="pm10 are not available"):
-        TravelCostMatrix(
-            helsinki_streets,
-            origins,
-            destinations,
-            transport_mode="bicycle",
-            indicators=["pm10", "climate_cost"],
-        )

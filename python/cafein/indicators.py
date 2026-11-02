@@ -325,6 +325,44 @@ class IndicatorSettings:
             )
         return columns
 
+    def street_particles(self, mode, metres_by_class, count, vehicle_class, occupancy):
+        """The requested ``pm10`` / ``pm2_5`` columns, mg per person, of
+        `count` single-mode street legs in `mode`: a car's metres on each
+        road class (`metres_by_class`, ``{road class: metres per leg}``) at
+        its `vehicle_class`'s factors (``None``: the default car's),
+        divided by `occupancy`. Walking and
+        the wheelchair release none; another mode, which no source
+        covers, resolves NaN with a warning."""
+        wanted = [name for name in ("pm10", "pm2_5") if name in self.indicators]
+        if not wanted:
+            return {}
+        if mode in ("walk", "wheelchair"):
+            return {name: np.zeros(count) for name in wanted}
+        if mode != "car":
+            self._warn_once(
+                ("particles", mode),
+                f"no particle factor covers street mode '{mode}'; pm10 and "
+                "pm2_5 stay unresolved",
+            )
+            return {name: np.full(count, math.nan) for name in wanted}
+        if vehicle_class is None:
+            # The car's default powertrain, as its emission factors take it.
+            from cafein.emissions import STREET_MODE_IDENTITIES
+
+            vehicle_class = STREET_MODE_IDENTITIES["car"][1]
+        totals = np.zeros((2, count))
+        for road_class, metres in metres_by_class.items():
+            driven = np.asarray(metres, dtype=float) > 0
+            if not driven.any():
+                # A class no leg drives needs no factor: a missing one
+                # must not poison legs that never touch it.
+                continue
+            factors = np.asarray(self.particle_factor(vehicle_class, road_class))
+            kilometres = np.where(driven, np.asarray(metres, dtype=float), 0.0) / 1000.0
+            totals += np.where(driven, np.outer(factors, kilometres), 0.0)
+        totals /= occupancy
+        return {name: totals[("pm10", "pm2_5").index(name)] for name in wanted}
+
     def fingerprint(self):
         """The resolved settings as plain data, for a stream's manifest."""
         activity = particles = None

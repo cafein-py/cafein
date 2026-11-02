@@ -20,10 +20,12 @@ import shapely
 from cafein.policy import policy_speeds
 from cafein.travelers import folded_constraints, folded_street_policy
 from cafein.matrices import (
+    _car_road_classes,
     _factor_tables,
     _is_point_frame,
     _is_street_network,
     _point_list,
+    _road_class_metres,
     _street_query,
     _transit_walking_speed,
     _warn_unsnapped,
@@ -358,9 +360,11 @@ class DetailedItineraries(gpd.GeoDataFrame):
         ``TravelCostMatrix``: ``"physical_activity"`` (MET-hours: a
         street leg's network metres at its mode's rate and its
         connectors walked; transit rides, park events and a car-park
-        drive count zero) and ``"climate_cost"`` (``emissions`` times
-        ``co2_price``), with ``"low"`` / ``"middle"`` / ``"high"`` cases
-        or own values (``cafein.indicators``).
+        drive count zero), ``"climate_cost"`` (``emissions`` times
+        ``co2_price``) and, on StreetNetwork car legs, ``"pm10"`` and
+        ``"pm2_5"`` (mg per person by road class), with ``"low"`` /
+        ``"middle"`` / ``"high"`` cases or own values
+        (``cafein.indicators``).
     street_policy : StreetLegPolicy (optional)
         Which street modes may serve the access and egress, on what
         vehicle terms (``cafein.StreetLegPolicy``); point origins and
@@ -1650,10 +1654,7 @@ def _street_itineraries_frame(
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
     from cafein.street_network import _resolved_delays
 
-    if indicator_settings is not None:
-        indicator_settings.check_supported(
-            ("physical_activity", "climate_cost"), "a StreetNetwork query"
-        )
+    road_classes = _car_road_classes(network, indicator_settings, transport_mode)
     resolved_parking = _parking.resolve(parking, transport_mode)
     occupancy, vehicle_class = emissions._car_query_options(
         transport_mode, occupancy, vehicle_class
@@ -1691,6 +1692,7 @@ def _street_itineraries_frame(
         speeds=query.speeds,
         multipliers=None if multipliers is None else list(multipliers),
         street_edges=exposure is not None,
+        edge_bins=road_classes,
     )
     _warn_unsnapped(
         table,
@@ -1718,7 +1720,10 @@ def _street_itineraries_frame(
         )
         to_index = np.asarray(table["to"])
         travel_time = travel_time + np.rint(seconds[to_index]).astype(np.int64)
-        network_distance = network_distance + metres[to_index]
+        parked = metres[to_index]
+        network_distance = network_distance + parked
+    else:
+        parked = None
     rows = len(travel_time)
     # A street network has no timetable, so absolute times exist only when a
     # time is supplied to place the leg on a clock: departures anchor
@@ -1772,6 +1777,14 @@ def _street_itineraries_frame(
         for name, values in indicator_settings.trip_columns(
             [(transport_mode, network_distance), ("walk", connector_distance)],
             frame["emissions"].to_numpy(),
+        ).items():
+            frame[name] = values
+        for name, values in indicator_settings.street_particles(
+            transport_mode,
+            _road_class_metres(table, road_classes, parked),
+            rows,
+            vehicle_class,
+            occupancy,
         ).items():
             frame[name] = values
     if account is not None:

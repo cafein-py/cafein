@@ -866,24 +866,36 @@ class TravelCostMatrix(pd.DataFrame):
         without a matching row prices NaN, never zero.
     indicators, co2_price, activity_rates, particle_factors : optional
         Per-trip indicator columns, off by default (values and sources
-        in ``cafein.indicators``). ``indicators=`` selects
-        ``"physical_activity"`` (MET-hours of walking and cycling: each
-        mode's kilometres times its rate — a street matrix's network
-        kilometres in its mode and its connectors walked, a transit
-        matrix's ``walk_distance_m``, a car-park drive counting zero) and
-        ``"climate_cost"`` (``emissions`` times a CO₂ price per tonne, in
-        the price's currency). Under a ``street_policy`` each end's
-        ridden network metres count at their mode's rate, its connectors
-        walked, and rental transfers at the transfer mode's rate; a policy
-        granting the wheelchair reports ``climate_cost`` only, its rolled
-        and walked metres being one total. ``co2_price=`` takes ``"low"``, ``"middle"`` (the
-        default) or ``"high"`` — the European Commission handbook's 60,
-        100 and 189 per tonne in 2016 euros — or a number;
-        ``activity_rates=`` takes a case name or own MET-hours per km by
-        street mode (a mapping or a table). A case no source gives uses
-        the middle value with a warning, and a mode without a rate
-        leaves ``physical_activity`` NaN. The societal cost account
-        already counts climate: ``climate_cost`` is not added to it.
+        in ``cafein.indicators``). ``indicators=`` selects any of:
+
+        - ``"physical_activity"``: MET-hours of walking and cycling, each
+          mode's kilometres times its rate — a street matrix's network
+          kilometres in its mode and its connectors walked, a transit
+          matrix's ``walk_distance_m``, a car-park drive counting zero.
+          Under a ``street_policy`` each end's ridden network metres
+          count at their mode's rate, its connectors walked, and rental
+          transfers at the transfer mode's rate; a policy granting the
+          wheelchair reports ``climate_cost`` only, its rolled and
+          walked metres being one total.
+        - ``"climate_cost"``: ``emissions`` times a CO₂ price per tonne,
+          in the price's currency. The societal cost account already
+          counts climate: ``climate_cost`` is not added to it.
+        - ``"pm10"`` and ``"pm2_5"``: the particles a car releases into
+          street air (tyre, brake and road wear, road dust, exhaust), mg
+          per person — a StreetNetwork car matrix's metres on each road
+          class (``streets_gdf``'s ``road_class``; parking-search metres
+          count as urban) times the factor of its ``vehicle_class``,
+          divided by ``occupancy``. Walking and the wheelchair release
+          none; other street modes, which no source covers, are NaN.
+
+        ``co2_price=`` takes ``"low"``, ``"middle"`` (the default) or
+        ``"high"`` — the European Commission handbook's 60, 100 and 189
+        per tonne in 2016 euros — or a number; ``activity_rates=`` takes
+        a case name or own MET-hours per km by street mode (a mapping or
+        a table); ``particle_factors=`` a case name or own mg per
+        vehicle-km by vehicle class and road class (a table). A case no
+        source gives uses the middle value with a warning, and a mode or
+        vehicle class without a value leaves its column NaN.
 
     Notes
     -----
@@ -2751,10 +2763,6 @@ def _street_cost_resolution(
     from cafein import _parking, costs as _costs, emissions
     from cafein.street_network import _resolved_delays
 
-    if indicator_settings is not None:
-        indicator_settings.check_supported(
-            ("physical_activity", "climate_cost"), "a StreetNetwork matrix"
-        )
     if exposure is not None:
         exposure._check_network(network)
     # The reporting snapshot first: the multiplier vector derives from
@@ -2823,6 +2831,7 @@ def _street_cost_resolution(
     account = _costs.resolve_query(
         transport_mode, perspectives, costs, currency, cost_components
     )
+    road_classes = _car_road_classes(network, indicator_settings, transport_mode)
     parking_costs = (
         None
         if resolved_parking is None
@@ -2836,9 +2845,13 @@ def _street_cost_resolution(
         ),
         "parking_costs": parking_costs,
         "occupancy": occupancy,
+        "vehicle_class": vehicle_class,
         "factor": factor,
         "account": account,
         "indicators": indicator_settings,
+        # Each edge's road class, frozen for a car query's particles (None
+        # otherwise).
+        "road_classes": road_classes,
         # A frozen copy: the streamed batches and the manifest
         # fingerprint read one state, whatever happens to the caller's
         # Exposure meanwhile — the fare/policy frozen-input pattern.
@@ -2926,6 +2939,7 @@ def _street_cost_cells(
         speeds=query.speeds,
         multipliers=multipliers,
         street_edges=exposure is not None or keep_edges,
+        edge_bins=resolved["road_classes"],
         workers=_memory.width_or(workers),
     )
     _warn_unsnapped(
@@ -2937,6 +2951,7 @@ def _street_cost_cells(
     network_distance = table["network_distance"]
     connector_distance = table["connector_distance"]
     travel_time_s = table["travel_time_s"]
+    parked = None
     if resolved["parking_costs"] is not None:
         # The parking search ends each reachable trip: its seconds join the
         # travel time and its metres the driven network distance (and with
@@ -2944,7 +2959,8 @@ def _street_cost_cells(
         seconds, metres = resolved["parking_costs"]
         to_index = np.asarray(table["to"])
         travel_time_s = travel_time_s + np.rint(seconds[to_index]).astype(np.int64)
-        network_distance = network_distance + metres[to_index]
+        parked = metres[to_index]
+        network_distance = network_distance + parked
     numeric = {
         "travel_time_s": travel_time_s,
         # Reported alongside its parts, not instead of them: the two are
@@ -2963,6 +2979,15 @@ def _street_cost_cells(
             resolved["indicators"].trip_columns(
                 [(transport_mode, network_distance), ("walk", connector_distance)],
                 numeric["emissions"],
+            )
+        )
+        numeric.update(
+            resolved["indicators"].street_particles(
+                transport_mode,
+                _road_class_metres(table, resolved["road_classes"], parked),
+                len(network_distance),
+                resolved["vehicle_class"],
+                resolved["occupancy"],
             )
         )
     if resolved["account"] is not None:
@@ -4782,6 +4807,46 @@ def _transit_exposure_columns(
     return out
 
 
+def _car_road_classes(network, settings, transport_mode):
+    """Each edge's road-class index (into ``cafein.indicators.ROAD_CLASSES``)
+    as a list, for a car query that requests particles, else ``None``;
+    refused on a network without the road classes of a car build."""
+    if (
+        settings is None
+        or transport_mode != "car"
+        or not {"pm10", "pm2_5"} & set(settings.indicators)
+    ):
+        return None
+    from cafein._osm import road_classes
+
+    codes = network._core._car_edge_codes()
+    if codes is None:
+        raise ValueError(
+            "pm10 and pm2_5 need the road classes of a car build; build the "
+            'network with "car" in its modes'
+        )
+    return road_classes(*codes).tolist()
+
+
+def _road_class_metres(table, road_classes, parked=None):
+    """Each cell's driven metres by road class, ``{class: metres}``, from
+    the core's ``binned_meters`` (the traversed network metres summed per
+    class); a parking search's metres (`parked`) count as urban. ``{}``
+    without road classes."""
+    if road_classes is None:
+        return {}
+    cells = len(table["from"])
+    present = max(road_classes, default=-1) + 1
+    binned = np.asarray(table["binned_meters"], dtype=float).reshape(cells, present)
+    metres = {
+        name: binned[:, at] if at < present else np.zeros(cells)
+        for at, name in enumerate(_indicators.ROAD_CLASSES)
+    }
+    if parked is not None:
+        metres["urban"] = metres["urban"] + parked
+    return metres
+
+
 def _indicator_columns(resolved):
     """The trip-indicator columns a resolved street query reports."""
     settings = resolved["indicators"]
@@ -4890,6 +4955,7 @@ def _stream_street_cost(
         "car_model": resolved["car_model"],
         "parking_costs": resolved["parking_costs"],
         "occupancy": resolved["occupancy"],
+        "vehicle_class": resolved["vehicle_class"],
         "factor": resolved["factor"],
         "account": None if account is None else [totals, breakdown, label],
         "indicators": (

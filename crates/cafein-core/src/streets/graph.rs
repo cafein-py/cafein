@@ -1012,6 +1012,11 @@ impl StreetNetwork {
         (self.arrays().endpoints().len() / 2) as u32
     }
 
+    /// Each physical edge's stored length in meters.
+    pub fn edge_lengths(&self) -> &[f64] {
+        self.arrays().lengths()
+    }
+
     /// Number of stored geometry coordinates (the elevation array's length).
     pub fn coordinate_count(&self) -> u32 {
         self.arrays().lons().len() as u32

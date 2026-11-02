@@ -466,10 +466,15 @@ impl StreetNetwork {
     /// `street_edges` attaches each cell's traversed ``(edge, fraction,
     /// true seconds)`` provenance — from the reconstructed legs with
     /// `geometries`, off the metres path's winning chain without.
+    /// `edge_bins`, one bin index per edge, adds ``binned_meters``: each
+    /// cell's traversed network meters summed per bin, row-major over
+    /// (cell, bin) for ``max(edge_bins) + 1`` bins, without exporting the
+    /// provenance itself.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (origins, destinations, mode, max_seconds, max_snap_distance,
                         geometries, car_model = None, speeds = Vec::new(),
-                        multipliers = None, street_edges = false, workers=None))]
+                        multipliers = None, street_edges = false, edge_bins = None,
+                        workers=None))]
     fn cost_matrix(
         &mut self,
         py: Python<'_>,
@@ -483,8 +488,20 @@ impl StreetNetwork {
         speeds: SpeedOverrides,
         multipliers: Option<Vec<f64>>,
         street_edges: bool,
+        edge_bins: Option<Vec<u8>>,
         workers: Option<usize>,
     ) -> PyResult<Py<PyDict>> {
+        if let Some(bins) = &edge_bins {
+            if bins.len() != self.inner.edge_count() as usize {
+                return Err(PyValueError::new_err(format!(
+                    "edge_bins holds {} values for {} edges",
+                    bins.len(),
+                    self.inner.edge_count()
+                )));
+            }
+        }
+        // The binned meters read the same traversed provenance.
+        let traversal = street_edges || edge_bins.is_some();
         let index = self.compiled(mode, car_model.as_ref(), &speeds)?;
         let profile = self.profiles.get(index);
         let weighted = match &multipliers {
@@ -543,7 +560,7 @@ impl StreetNetwork {
                                     .into_iter()
                                     .map(|leg| leg.map(CostCell::from_leg))
                                     .collect()
-                                } else if street_edges {
+                                } else if traversal {
                                     // The metres path serves street_edges too: the
                                     // provenance reads off the winning chain the
                                     // metres already walk, no shape assembled.
@@ -649,6 +666,12 @@ impl StreetNetwork {
         let (mut network, mut connector) = (Vec::new(), Vec::new());
         let shapes = PyList::empty(py);
         let traversed = PyList::empty(py);
+        let lengths = self.inner.edge_lengths();
+        let bin_count = edge_bins
+            .as_ref()
+            .and_then(|bins| bins.iter().max())
+            .map_or(0, |&top| top as usize + 1);
+        let mut binned = Vec::new();
         for (origin, row) in cells.iter().enumerate() {
             for (destination, cell) in row.iter().enumerate() {
                 let Some(cell) = cell else { continue };
@@ -662,6 +685,14 @@ impl StreetNetwork {
                 }
                 if street_edges {
                     traversed.append(cell.edges.clone())?;
+                }
+                if let Some(bins) = &edge_bins {
+                    let at = binned.len();
+                    binned.resize(at + bin_count, 0.0);
+                    for &(edge, fraction, _) in &cell.edges {
+                        let edge = edge as usize;
+                        binned[at + bins[edge] as usize] += fraction * lengths[edge];
+                    }
                 }
             }
         }
@@ -684,6 +715,9 @@ impl StreetNetwork {
         }
         if street_edges {
             table.set_item("street_edges", traversed)?;
+        }
+        if edge_bins.is_some() {
+            table.set_item("binned_meters", binned.into_pyarray(py))?;
         }
         table.set_item("unsnapped_from", unsnapped(&origin_snaps).into_pyarray(py))?;
         table.set_item("unsnapped_to", unsnapped(&target_snaps).into_pyarray(py))?;
