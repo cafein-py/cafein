@@ -168,3 +168,21 @@ def test_cases_and_own_values_resolve_with_their_warnings():
     table = pd.DataFrame([{"street_mode": "wheelchair", "met_hours_per_km": 0.9}])
     tabled = indicators.resolve_query("physical_activity", None, table, None)
     assert tabled.activity_rate("wheelchair") == 0.9
+
+
+def test_journey_totals_keep_an_unresolved_leg_unresolved():
+    from cafein import compare_to_fastest
+
+    legs = pd.DataFrame(
+        {
+            "from_id": ["a"] * 3,
+            "to_id": ["b"] * 3,
+            "option": [0, 0, 1],
+            "segment": [0, 1, 0],
+            "leg_type": ["walk", "e_scooter", "walk"],
+            "travel_time_s": [60, 120, 400],
+            "physical_activity": [0.1, math.nan, 0.5],
+        }
+    )
+    totals = compare_to_fastest(legs).set_index("option").physical_activity
+    assert math.isnan(totals[0]) and totals[1] == 0.5

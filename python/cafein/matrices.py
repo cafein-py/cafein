@@ -865,13 +865,16 @@ class TravelCostMatrix(pd.DataFrame):
         carried in a ``currency`` column, never a conversion. A mode
         without a matching row prices NaN, never zero.
     indicators, co2_price, activity_rates, particle_factors : optional
-        Per-trip indicator columns of a street matrix, off by default
-        (values and sources in ``cafein.indicators``).
-        ``indicators=`` selects ``"physical_activity"`` (MET-hours of
-        walking and cycling: the network kilometres times the mode's
-        rate, the connectors at the walking rate) and ``"climate_cost"``
-        (``emissions`` times a CO₂ price per tonne, in the price's
-        currency). ``co2_price=`` takes ``"low"``, ``"middle"`` (the
+        Per-trip indicator columns, off by default (values and sources
+        in ``cafein.indicators``). ``indicators=`` selects
+        ``"physical_activity"`` (MET-hours of walking and cycling: each
+        mode's kilometres times its rate — a street matrix's network
+        kilometres in its mode and its connectors walked, a transit
+        matrix's ``walk_distance_m``, a car-park drive counting zero) and
+        ``"climate_cost"`` (``emissions`` times a CO₂ price per tonne, in
+        the price's currency). A ``street_policy`` with street vehicles
+        reports ``climate_cost`` only: its ``street_distance_m`` is one
+        total over the vehicle modes. ``co2_price=`` takes ``"low"``, ``"middle"`` (the
         default) or ``"high"`` — the European Commission handbook's 60,
         100 and 189 per tonne in 2016 euros — or a number;
         ``activity_rates=`` takes a case name or own MET-hours per km by
@@ -1148,12 +1151,8 @@ class TravelCostMatrix(pd.DataFrame):
                 )
             )
             return
-        _indicators.reject_query(
-            "a TransportNetwork matrix",
-            indicators,
-            co2_price,
-            activity_rates,
-            particle_factors,
+        indicator_settings = _transit_indicator_settings(
+            indicators, co2_price, activity_rates, particle_factors
         )
         # The moment(s): a scalar keeps today's frame; a list or mapping
         # adds the slot columns, one block of rows per slot.
@@ -1356,6 +1355,7 @@ class TravelCostMatrix(pd.DataFrame):
                 arrival=arrival,
                 _resolved=_resolved,
                 _slot_table=_slot_tables.get(at),
+                indicator_settings=indicator_settings,
             )
             frame = pd.DataFrame(_humanize_time_columns(data, output_time_units))
             if multi:
@@ -1599,12 +1599,8 @@ class TravelCostMatrix(pd.DataFrame):
                 arrive_by=arrive_by,
                 router=router,
             )
-        _indicators.reject_query(
-            "a TransportNetwork matrix",
-            indicators,
-            co2_price,
-            activity_rates,
-            particle_factors,
+        indicator_settings = _transit_indicator_settings(
+            indicators, co2_price, activity_rates, particle_factors
         )
         _reject_cost_street_args(
             transport_mode,
@@ -1653,6 +1649,7 @@ class TravelCostMatrix(pd.DataFrame):
             resume=resume,
             output_time_units=output_time_units,
             exposure=exposure,
+            indicator_settings=indicator_settings,
             workers=workers,
             max_memory=max_memory,
         )
@@ -2961,10 +2958,8 @@ def _street_cost_cells(
     }
     if resolved["indicators"] is not None:
         numeric.update(
-            resolved["indicators"].street_leg_columns(
-                transport_mode,
-                network_distance,
-                connector_distance,
+            resolved["indicators"].trip_columns(
+                [(transport_mode, network_distance), ("walk", connector_distance)],
                 numeric["emissions"],
             )
         )
@@ -3603,7 +3598,8 @@ def compare_to_fastest(frame):
     The result has one row per journey: the keys and ``option`` when
     present; the journey's totals — from leg rows, ``travel_time``
     summed over the journey's rows (waits included), ``emissions`` and
-    ``distance_m`` summed, ``money`` once, and the ``exposure_totals()``
+    ``distance_m`` summed, the trip-indicator columns summed (NaN when a
+    leg's value is), ``money`` once, and the ``exposure_totals()``
     columns when the frame was built with ``exposure=``; from journey
     rows, the numeric columns as they are — a boolean ``fastest``
     marking the pair's fastest journey (the least ``travel_time``, ties
@@ -3637,6 +3633,21 @@ def compare_to_fastest(frame):
         for column in ("emissions", "distance_m"):
             if column in frame.columns:
                 journeys[column] = grouped[column].sum(min_count=1)
+        for column in _indicators.INDICATORS:
+            if column in frame.columns:
+                # An unresolved leg leaves its journey's total unresolved.
+                unresolved = (
+                    frame[column]
+                    .isna()
+                    .groupby(
+                        [frame[key] for key in keys + ["option"]],
+                        sort=False,
+                        dropna=False,
+                        observed=True,
+                    )
+                    .any()
+                )
+                journeys[column] = grouped[column].sum().where(~unresolved)
         if "money" in frame.columns:
             journeys["money"] = grouped["money"].first()
         for label in _JOURNEY_LABELS:
@@ -3969,12 +3980,8 @@ def travel_cost_table(
             resume=resume,
             output_time_units=output_time_units,
         )
-    _indicators.reject_query(
-        "a TransportNetwork matrix",
-        indicators,
-        co2_price,
-        activity_rates,
-        particle_factors,
+    indicator_settings = _transit_indicator_settings(
+        indicators, co2_price, activity_rates, particle_factors
     )
     _reject_cost_street_args(
         transport_mode,
@@ -4081,6 +4088,7 @@ def travel_cost_table(
                 pyarrow,
                 output_time_units,
                 exposure=report,
+                indicator_settings=indicator_settings,
             )
             if multi:
                 arrow = _insert_slot_arrow_columns(
@@ -4122,6 +4130,7 @@ def travel_cost_table(
         resume=resume,
         output_time_units=output_time_units,
         exposure=exposure,
+        indicator_settings=indicator_settings,
     )
 
 
@@ -4159,6 +4168,7 @@ def _stream_transit_cost(
     resume=False,
     output_time_units="minutes",
     exposure=None,
+    indicator_settings=None,
     workers=None,
     max_memory=None,
 ):
@@ -4223,6 +4233,8 @@ def _stream_transit_cost(
         "walk_distance_m",
         "emissions",
     ]
+    if indicator_settings is not None:
+        columns += list(indicator_settings.indicators)
     if fares is not None:
         columns.append("money")
     if exposure is not None:
@@ -4262,6 +4274,9 @@ def _stream_transit_cost(
         # The fingerprint hashes the layer data itself, so a resume with
         # a same-named but different exposure can never wrongly match.
         "exposure": None if exposure is None else exposure._fingerprint(),
+        "indicators": (
+            None if indicator_settings is None else indicator_settings.fingerprint()
+        ),
         "output_time_units": output_time_units,
     }
 
@@ -4343,6 +4358,7 @@ def _stream_transit_cost(
             # keep their global keys, so only the point form offsets.
             to_offset=rows.start if arrive_by and points is not None else 0,
             exposure=report,
+            indicator_settings=indicator_settings,
         )
 
     make_batch = _slot_batches(make_moment, slots, labeled, multi, arrive_by, pyarrow)
@@ -5446,6 +5462,7 @@ def _arrow_table(
     output_time_units,
     to_offset=0,
     exposure=None,
+    indicator_settings=None,
 ):
     """One batch's Arrow table over the shared id dictionary domains.
 
@@ -5471,6 +5488,11 @@ def _arrow_table(
         "walk_distance_m": pa.array(table["walk_distance"]),
         "emissions": pa.array(table["emissions"]),
     }
+    if indicator_settings is not None:
+        for name, values in indicator_settings.trip_columns(
+            [("walk", table["walk_distance"])], table["emissions"]
+        ).items():
+            columns[name] = pa.array(values)
     if fares is not None:
         columns["money"] = pa.array(table["fare"])
     if exposure is not None:
@@ -5561,6 +5583,7 @@ def _cost_matrix_data(
     _slot_table=None,
     max_memory=None,
     speeds=None,
+    indicator_settings=None,
 ):
     """The long-format columns of one moment's transit cost matrix,
     dispatched by street policy exactly as the constructor did; ``speeds``
@@ -5632,7 +5655,7 @@ def _cost_matrix_data(
                 if arrive_by
                 else _car_park_cost_columns
             )
-            return arm(
+            data = arm(
                 network,
                 origins,
                 destinations,
@@ -5653,6 +5676,12 @@ def _cost_matrix_data(
                 exclude_trips=exclude_trips,
                 workers=workers,
                 max_memory=max_memory,
+            )
+            # The drive counts no activity; the walks do.
+            return _with_indicators(
+                data,
+                indicator_settings,
+                [("walk", data["walk_distance_m"]), ("car", data["street_distance_m"])],
             )
         offending = next(
             (
@@ -5680,6 +5709,12 @@ def _cost_matrix_data(
 
         _reject_carriage(street_policy, "matrix computation")
         walk_only, walk_budget = _walking_only_policy(street_policy)
+        walking = _grants_walking_only(street_policy)
+        if indicator_settings is not None and not walking:
+            # Its street metres are one total over every vehicle mode.
+            indicator_settings.check_supported(
+                ("climate_cost",), "a street_policy matrix with street vehicles"
+            )
         if walk_only:
             # A walking-only policy IS the legacy cost matrix, at the
             # policy's one walking budget. A street-mode factor table
@@ -5754,7 +5789,8 @@ def _cost_matrix_data(
             data["geometry"] = shapely.from_wkb(
                 np.array(table["geometry"], dtype=object)
             )
-        return data
+        walked = [("walk", data["walk_distance_m"])] if walking else []
+        return _with_indicators(data, indicator_settings, walked)
     if exposure is not None:
         router = _validate_transit_exposure(
             exposure,
@@ -5819,7 +5855,38 @@ def _cost_matrix_data(
             data[column] = table[column]
     if geometries:
         data["geometry"] = shapely.from_wkb(np.array(table["geometry"], dtype=object))
-    return data
+    return _with_indicators(
+        data, indicator_settings, [("walk", data["walk_distance_m"])]
+    )
+
+
+def _transit_indicator_settings(
+    indicators, co2_price, activity_rates, particle_factors
+):
+    """The resolved trip-indicator settings of a transit cost matrix, which
+    reports physical activity and climate cost."""
+    settings = _indicators.resolve_query(
+        indicators, co2_price, activity_rates, particle_factors
+    )
+    if settings is not None:
+        settings.check_supported(
+            ("physical_activity", "climate_cost"), "a TransportNetwork matrix"
+        )
+    return settings
+
+
+def _with_indicators(data, settings, legs):
+    """`data` with the requested trip-indicator columns of trips riding
+    `legs` (``[(street mode, metres), ...]``) right after ``emissions``."""
+    if settings is None:
+        return data
+    columns = settings.trip_columns(legs, data["emissions"])
+    placed = {}
+    for name, values in data.items():
+        placed[name] = values
+        if name == "emissions":
+            placed.update(columns)
+    return placed
 
 
 def _cost_columns(
@@ -6243,6 +6310,16 @@ def _warn_unsnapped(table, from_ids, to_ids, network="the walking network"):
             f"{len(missed)} {side} point(s) are off {network} "
             f"and unreachable ({named}{suffix})",
         )
+
+
+def _grants_walking_only(policy):
+    """Whether a street-leg policy grants no street vehicle, whatever its
+    walking budgets (``transfers=`` never names walking)."""
+    return not policy.transfers and all(
+        mode == "walk"
+        for side in (policy.access, policy.egress)
+        for mode in (side or {"walk": None})
+    )
 
 
 def _walking_only_policy(policy):

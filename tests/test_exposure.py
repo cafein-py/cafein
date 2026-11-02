@@ -995,6 +995,7 @@ def reported_frame(street_network, reporting_exposure):
         destinations,
         departure="2022-02-22 08:30",
         exposure=reporting_exposure,
+        indicators=["physical_activity", "climate_cost"],
     )
 
 
@@ -1025,6 +1026,9 @@ def test_walk_based_legs_report_the_constant_layer(reported_frame):
     fastest = out[out["fastest"]].iloc[0]
     assert fastest["noise_mean_delta"] == 0.0 and fastest["travel_time_delta"] == 0.0
     assert (out["travel_time_delta"] >= 0).all()
+    # The synthesized waits count zero, so every journey total resolves.
+    assert out["physical_activity"].notna().all()
+    assert out["climate_cost"].notna().all()
 
 
 def test_transit_legs_carry_nan_exposure(reported_frame):
@@ -1041,6 +1045,8 @@ def test_waits_materialize_as_sampled_rows(reported_frame):
     assert waits["noise_coverage"].values == pytest.approx(1.0)
     assert (waits["from_stop"] == waits["to_stop"]).all()
     assert waits["geometry"].isna().all()
+    assert (waits["physical_activity"] == 0).all()
+    assert (waits["climate_cost"] == 0).all()
     # wait time counts fully toward the 55 dB minutes
     exact_minutes = (waits["arrival_s"] - waits["departure_s"]).values / 60.0
     assert waits["noise_minutes_above_55"].values == pytest.approx(

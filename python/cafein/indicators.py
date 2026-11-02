@@ -39,6 +39,7 @@ import collections.abc
 import math
 import pathlib
 
+import numpy as np
 import pandas as pd
 
 from cafein import _log, _validate
@@ -264,17 +265,24 @@ class IndicatorSettings:
                 f"indicators {', '.join(missing)} are not available on {where}"
             )
 
-    def street_leg_columns(self, mode, network_metres, connector_metres, emissions):
-        """The requested activity and climate columns of single-mode street
-        legs: the network metres ride `mode`, the connectors are walked."""
+    def trip_columns(self, legs, emissions):
+        """The requested activity and climate columns of trips that ride
+        `legs`, ``[(street mode, metres per trip), ...]``, and emit
+        `emissions` grams CO₂e per person; metres outside the listed
+        modes (transit rides) count no activity."""
         columns = {}
         if "physical_activity" in self.indicators:
             columns["physical_activity"] = (
-                network_metres * self.activity_rate(mode)
-                + connector_metres * self.activity_rate("walk")
-            ) / 1000.0
+                sum(
+                    np.asarray(metres, dtype=float) * self.activity_rate(mode)
+                    for mode, metres in legs
+                )
+                / 1000.0
+            )
         if "climate_cost" in self.indicators:
-            columns["climate_cost"] = self.climate_cost(emissions)
+            columns["climate_cost"] = self.climate_cost(
+                np.asarray(emissions, dtype=float)
+            )
         return columns
 
     def fingerprint(self):
@@ -395,14 +403,6 @@ def resolve_query(indicators, co2_price, activity_rates, particle_factors):
         _activity(activity_rates) if "physical_activity" in chosen else None,
         _particles(particle_factors) if {"pm10", "pm2_5"} & set(chosen) else None,
     )
-
-
-def reject_query(where, indicators, co2_price, activity_rates, particle_factors):
-    """Validate a query's indicator arguments and refuse any request:
-    `where` reports none of the indicators."""
-    settings = resolve_query(indicators, co2_price, activity_rates, particle_factors)
-    if settings is not None:
-        settings.check_supported((), where)
 
 
 def _co2_price(value):

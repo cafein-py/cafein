@@ -1527,6 +1527,40 @@ def test_policy_cost_matrix_rejects_incompatible_knobs(multimodal_network):
                 street_policy=policy,
                 **kwargs,
             )
+    # The ridden street metres are one total over the vehicle modes, so a
+    # vehicle policy reports the climate cost but not the activity.
+    with pytest.raises(ValueError, match="physical_activity are not available"):
+        TravelCostMatrix(
+            multimodal_network,
+            *points,
+            "2022-02-22 08:30:00",
+            street_policy=policy,
+            indicators=["physical_activity", "climate_cost"],
+        )
+    priced = TravelCostMatrix(
+        multimodal_network,
+        *points,
+        "2022-02-22 08:30:00",
+        street_policy=policy,
+        indicators=["climate_cost"],
+        co2_price=189,
+    )
+    assert list(priced.climate_cost) == pytest.approx(
+        list(priced.emissions * 189 / 1e6)
+    )
+    # Walking alone at distinct access and egress budgets runs over the
+    # multimodal graph, and all its metres are walked.
+    walking = TravelCostMatrix(
+        multimodal_network,
+        *points,
+        "2022-02-22 08:30:00",
+        street_policy=StreetLegPolicy(access={"walk": 600}, egress={"walk": 900}),
+        indicators=["physical_activity"],
+    )
+    assert len(walking) > 0
+    assert list(walking.physical_activity) == pytest.approx(
+        list(walking.walk_distance_m / 1000 * 4.0 / 5.3)
+    )
 
 
 def test_policy_cost_matrix_street_emissions_never_zero_silently(multimodal_network):

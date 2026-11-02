@@ -779,6 +779,7 @@ def test_the_cost_matrix_carries_the_car_chain(car_park_network):
         street_policy=policy,
         max_walking_time=8,
         output_time_units="seconds",
+        indicators=["physical_activity"],
     )
     assert list(frame["from_id"]) == ["o"] and list(frame["to_id"]) == ["d"]
     assert "facility_id" not in frame.columns
@@ -789,6 +790,7 @@ def test_the_cost_matrix_carries_the_car_chain(car_park_network):
         DEPARTURE_TIME,
         street_policy=policy,
         max_walking_time=8,
+        indicators=["physical_activity"],
     )
     # The itineraries enumerate ride-count options; the matrix cell is
     # the time-fastest of them.
@@ -815,6 +817,14 @@ def test_the_cost_matrix_carries_the_car_chain(car_park_network):
         walks["distance_m"].sum(), rel=1e-6
     )
     assert frame["travel_time"].iloc[0] == int(durations.min())
+    # Only the walks count activity, in the cell and on the legs alike.
+    assert (drive["physical_activity"] == 0).all()
+    assert frame["physical_activity"].iloc[0] == pytest.approx(
+        frame["walk_distance_m"].iloc[0] / 1000 * 4.0 / 5.3, rel=1e-9
+    )
+    assert frame["physical_activity"].iloc[0] == pytest.approx(
+        float(journey["physical_activity"].sum()), rel=1e-6
+    )
 
 
 def test_a_walk_won_cell_prices_zero(car_park_network):

@@ -354,12 +354,13 @@ class DetailedItineraries(gpd.GeoDataFrame):
         columns via ``cost_components=`` (one perspective), and the
         declared ``currency`` label column.
     indicators, co2_price, activity_rates, particle_factors : optional
-        Per-trip indicator columns of the street legs, off by default,
-        exactly as in ``TravelCostMatrix``: ``"physical_activity"``
-        (MET-hours) and ``"climate_cost"`` (``emissions`` times
+        Per-leg indicator columns, off by default, as in
+        ``TravelCostMatrix``: ``"physical_activity"`` (MET-hours: a
+        street leg's network metres at its mode's rate and its
+        connectors walked; transit rides, park events and a car-park
+        drive count zero) and ``"climate_cost"`` (``emissions`` times
         ``co2_price``), with ``"low"`` / ``"middle"`` / ``"high"`` cases
-        or own values (``cafein.indicators``). StreetNetwork queries
-        only.
+        or own values (``cafein.indicators``).
     street_policy : StreetLegPolicy (optional)
         Which street modes may serve the access and egress, on what
         vehicle terms (``cafein.StreetLegPolicy``); point origins and
@@ -772,13 +773,13 @@ class DetailedItineraries(gpd.GeoDataFrame):
                 "street kilometres and apply to a StreetNetwork query "
                 "(transit perspective costs are not supported)"
             )
-        _indicators.reject_query(
-            "a TransportNetwork query",
-            indicators,
-            co2_price,
-            activity_rates,
-            particle_factors,
+        indicator_settings = _indicators.resolve_query(
+            indicators, co2_price, activity_rates, particle_factors
         )
+        if indicator_settings is not None:
+            indicator_settings.check_supported(
+                ("physical_activity", "climate_cost"), "a TransportNetwork query"
+            )
         if departure is None and not arrive_by:
             raise ValueError("give exactly one of departure= or arrival=")
         if optimize is not None:
@@ -825,6 +826,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
             speeds=riding,
             snapshot=snapshot,
             street_edges=exposure is not None,
+            indicator_settings=indicator_settings,
             perspectives=perspectives,
             costs=costs,
             currency=currency,
@@ -894,6 +896,7 @@ def _itineraries_frame(
     max_snap_distance,
     street_policy=None,
     street_edges=False,
+    indicator_settings=None,
     perspectives=None,
     costs=None,
     currency=None,
@@ -1101,6 +1104,8 @@ def _itineraries_frame(
                         leg,
                         mode=street_policy is not None,
                     )
+                    if indicator_settings is not None:
+                        record.update(_leg_indicators(record, indicator_settings))
                     if fares is not None:
                         # A fare prices the whole journey (tickets span
                         # legs); every row of the option repeats it.
@@ -1137,6 +1142,9 @@ def _itineraries_frame(
     if fares is not None:
         columns = list(columns)
         columns.insert(columns.index("emissions") + 1, "money")
+    if indicator_settings is not None:
+        at = columns.index("emissions") + 1
+        columns = [*columns[:at], *indicator_settings.indicators, *columns[at:]]
     if street_edges:
         columns = list(columns) + [
             "street_edges",
@@ -1478,6 +1486,10 @@ def _exposed_frame(frame, exposure):
                 for column in ("money", "journey_departure_s"):
                     if column in record:
                         wait[column] = record[column]
+                # Waiting is neither walking nor cycling, and emits nothing.
+                for column in _indicators.INDICATORS:
+                    if column in record:
+                        wait[column] = 0.0
                 wait.update(
                     {
                         "from_id": record["from_id"],
@@ -1511,6 +1523,23 @@ def _exposed_frame(frame, exposure):
         ["from_id", "to_id", "option"], sort=False, dropna=False
     ).cumcount()
     return exposed
+
+
+def _leg_indicators(record, settings):
+    """A leg record's requested trip-indicator values: transit rides, park
+    events and a car-park drive (connectors included, as the matrix
+    counts its ``street_distance_m``) count no activity; another street
+    leg's network metres ride its mode and its connectors are walked."""
+    legs = []
+    mode = record.get("mode") or "walk"
+    if record["leg_type"] not in ("transit", "park") and mode != "car_park":
+        network = record.get("network_distance_m")
+        if network is None:
+            legs = [(mode, record["distance_m"])]
+        else:
+            legs = [(mode, network), ("walk", record["connector_distance_m"])]
+    columns = settings.trip_columns(legs, record["emissions"])
+    return {name: float(value) for name, value in columns.items()}
 
 
 def _leg_record(from_id, to_id, option, segment, leg, mode=False):
@@ -1740,10 +1769,8 @@ def _street_itineraries_frame(
     if indicator_settings is not None:
         # After the fixed leg schema, before the cost account, as in the
         # street cost matrix.
-        for name, values in indicator_settings.street_leg_columns(
-            transport_mode,
-            network_distance,
-            connector_distance,
+        for name, values in indicator_settings.trip_columns(
+            [(transport_mode, network_distance), ("walk", connector_distance)],
             frame["emissions"].to_numpy(),
         ).items():
             frame[name] = values
