@@ -327,24 +327,17 @@ class IndicatorSettings:
 
     def street_particles(self, mode, metres_by_class, count, vehicle_class, occupancy):
         """The requested ``pm10`` / ``pm2_5`` columns, mg per person, of
-        `count` single-mode street legs in `mode`: a car's metres on each
-        road class (`metres_by_class`, ``{road class: metres per leg}``) at
-        its `vehicle_class`'s factors (``None``: the default car's),
-        divided by `occupancy`. Walking and
-        the wheelchair release none; another mode, which no source
-        covers, resolves NaN with a warning."""
+        `count` single-mode street legs in `mode`: the particles a car
+        releases, its metres on each road class (`metres_by_class`,
+        ``{road class: metres per leg}``) at its `vehicle_class`'s factors
+        (``None``: the default car's), divided by `occupancy`. Every other
+        mode counts none: the columns are the car's particles, and no
+        source covers those of bicycles, e-bikes or e-scooters."""
         wanted = [name for name in ("pm10", "pm2_5") if name in self.indicators]
         if not wanted:
             return {}
-        if mode in ("walk", "wheelchair"):
-            return {name: np.zeros(count) for name in wanted}
         if mode != "car":
-            self._warn_once(
-                ("particles", mode),
-                f"no particle factor covers street mode '{mode}'; pm10 and "
-                "pm2_5 stay unresolved",
-            )
-            return {name: np.full(count, math.nan) for name in wanted}
+            return {name: np.zeros(count) for name in wanted}
         if vehicle_class is None:
             # The car's default powertrain, as its emission factors take it.
             from cafein.emissions import STREET_MODE_IDENTITIES

@@ -21,6 +21,7 @@ from cafein.policy import policy_speeds
 from cafein.travelers import folded_constraints, folded_street_policy
 from cafein.matrices import (
     _car_road_classes,
+    _drive_class_metres,
     _factor_tables,
     _is_point_frame,
     _is_street_network,
@@ -361,9 +362,10 @@ class DetailedItineraries(gpd.GeoDataFrame):
         street leg's network metres at its mode's rate and its
         connectors walked; transit rides, park events and a car-park
         drive count zero), ``"climate_cost"`` (``emissions`` times
-        ``co2_price``) and, on StreetNetwork car legs, ``"pm10"`` and
-        ``"pm2_5"`` (mg per person by road class), with ``"low"`` /
-        ``"middle"`` / ``"high"`` cases or own values
+        ``co2_price``) and ``"pm10"`` / ``"pm2_5"`` (the car's particles,
+        mg per person by road class: a StreetNetwork car leg or a
+        ``CarParkPolicy`` drive; every other leg counts none), with
+        ``"low"`` / ``"middle"`` / ``"high"`` cases or own values
         (``cafein.indicators``).
     street_policy : StreetLegPolicy (optional)
         Which street modes may serve the access and egress, on what
@@ -781,8 +783,15 @@ class DetailedItineraries(gpd.GeoDataFrame):
             indicators, co2_price, activity_rates, particle_factors
         )
         if indicator_settings is not None:
+            # A park-and-ride drive is the one car a transit query rides.
             indicator_settings.check_supported(
-                ("physical_activity", "climate_cost"), "a TransportNetwork query"
+                ("physical_activity", "climate_cost")
+                + (
+                    ("pm10", "pm2_5")
+                    if isinstance(street_policy, _CarParkPolicy)
+                    else ()
+                ),
+                "a TransportNetwork query",
             )
         if departure is None and not arrive_by:
             raise ValueError("give exactly one of departure= or arrival=")
@@ -936,6 +945,10 @@ def _itineraries_frame(
     from cafein.policy import CarParkPolicy
 
     car_park = isinstance(street_policy, CarParkPolicy)
+    # A car-park drive's network metres per road class, for its particles.
+    road_bins = (
+        _car_road_classes(network, indicator_settings, "car") if car_park else None
+    )
     if street_policy is not None:
         if kind != "points":
             raise ValueError("street_policy applies to point origins and destinations")
@@ -1078,6 +1091,7 @@ def _itineraries_frame(
                     components,
                     arrive_by=arrive_by,
                     speeds=speeds,
+                    edge_bins=road_bins,
                 )
             if not journeys:
                 continue
@@ -1109,7 +1123,21 @@ def _itineraries_frame(
                         mode=street_policy is not None,
                     )
                     if indicator_settings is not None:
-                        record.update(_leg_indicators(record, indicator_settings))
+                        record.update(
+                            _leg_indicators(
+                                record,
+                                indicator_settings,
+                                leg.get("road_metres"),
+                                (
+                                    (
+                                        street_policy.vehicle_class,
+                                        street_policy.occupancy,
+                                    )
+                                    if car_park
+                                    else None
+                                ),
+                            )
+                        )
                     if fares is not None:
                         # A fare prices the whole journey (tickets span
                         # legs); every row of the option repeats it.
@@ -1203,6 +1231,7 @@ def _route(
     components=None,
     arrive_by=False,
     speeds=None,
+    edge_bins=None,
 ):
     """The Pareto-optimal journeys of one OD pair — the time-optimal
     (arrival, rides) set, or the (arrival, emissions) McRAPTOR set with
@@ -1248,6 +1277,7 @@ def _route(
             street_policy=street_policy,
             arrive_by=arrive_by,
             speeds=speeds,
+            edge_bins=edge_bins,
         )
     return network._route_between_stops(
         origin_key,
@@ -1529,11 +1559,14 @@ def _exposed_frame(frame, exposure):
     return exposed
 
 
-def _leg_indicators(record, settings):
+def _leg_indicators(record, settings, road_metres=None, car_terms=None):
     """A leg record's requested trip-indicator values: transit rides, park
     events and a car-park drive (connectors included, as the matrix
     counts its ``street_distance_m``) count no activity; another street
-    leg's network metres ride its mode and its connectors are walked."""
+    leg's network metres ride its mode and its connectors are walked. A
+    car-park drive's particles come from its network metres per road class
+    (`road_metres`) at the policy's ``(vehicle_class, occupancy)``
+    (`car_terms`); every other leg releases no car particles."""
     legs = []
     mode = record.get("mode") or "walk"
     if record["leg_type"] not in ("transit", "park") and mode != "car_park":
@@ -1542,8 +1575,20 @@ def _leg_indicators(record, settings):
             legs = [(mode, record["distance_m"])]
         else:
             legs = [(mode, network), ("walk", record["connector_distance_m"])]
-    columns = settings.trip_columns(legs, record["emissions"])
-    return {name: float(value) for name, value in columns.items()}
+    columns = {
+        name: float(value)
+        for name, value in settings.trip_columns(legs, record["emissions"]).items()
+    }
+    if mode == "car_park" and road_metres is not None:
+        vehicle_class, occupancy = car_terms
+        particles = settings.street_particles(
+            "car", _drive_class_metres([road_metres]), 1, vehicle_class, occupancy
+        )
+    else:
+        particles = settings.street_particles(mode, {}, 1, None, 1.0)
+    # One leg: each particle column holds a single value.
+    columns.update({name: float(values[0]) for name, values in particles.items()})
+    return columns
 
 
 def _leg_record(from_id, to_id, option, segment, leg, mode=False):

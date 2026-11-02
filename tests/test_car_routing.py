@@ -906,7 +906,7 @@ def test_car_outputs_report_particles_by_road_class(
     assert np.allclose(
         hybrid_rows.pm10, hybrid_rows.network_distance_m / 1000 * 20.0 / 2
     )
-    # Walking releases none; a vehicle class or mode no source covers is NaN.
+    # Walking releases none; a vehicle class no source covers is NaN.
     walked = TravelCostMatrix(
         car_network, origins, destinations, transport_mode="walk", indicators=names
     )
@@ -916,12 +916,8 @@ def test_car_outputs_report_particles_by_road_class(
             car_network, origins, destinations, **{**base, "vehicle_class": "HEV"}
         )
     assert hybrid.pm10.isna().all()
-    with pytest.warns(UserWarning, match="street mode 'bicycle'"):
-        cycled = TravelCostMatrix(
-            car_network,
-            origins,
-            destinations,
-            transport_mode="bicycle",
-            indicators=names,
-        )
-    assert cycled.pm2_5.isna().all()
+    # The columns are the car's particles: a bicycle trip counts none.
+    cycled = TravelCostMatrix(
+        car_network, origins, destinations, transport_mode="bicycle", indicators=names
+    )
+    assert (cycled.pm2_5 == 0).all()
