@@ -23,6 +23,12 @@ Every row names its source:
   Physical Activity 11, 132, doi:10.1186/s12966-014-0132-x.
 - Berntsen et al. (2017), International Journal of Behavioral Nutrition
   and Physical Activity 14, 55, doi:10.1186/s12966-017-0513-z.
+- Kozey et al. (2010), Medicine & Science in Sports & Exercise 42(9),
+  1776-1784, doi:10.1249/mss.0b013e3181d479f2.
+- Gojanovic et al. (2011), Medicine & Science in Sports & Exercise 43(11),
+  2204-2210, doi:10.1249/mss.0b013e31821cbdc8.
+- Payne et al. (2025), Journal of Transport & Health 41, 101963,
+  doi:10.1016/j.jth.2024.101963.
 - Riiser, Aadland & Nordengen (2026), Frontiers in Sports and Active
   Living 7, 1653833, doi:10.3389/fspor.2025.1653833.
 - WHO Regional Office for Europe (2024), Health economic assessment tool
@@ -58,6 +64,7 @@ CO2_PRICE_CURRENCY = "EUR2016"
 
 _KELLY = "Kelly et al. (2014), p. 3"
 _BERNTSEN = "Berntsen et al. (2017), Table 2"
+_GOJANOVIC = "Gojanovic et al. (2011), Table 2"
 _HEAT = "WHO Regional Office for Europe (2024)"
 _BEDDOWS = "Beddows & Harrison (2021)"
 _HICKS = "Hicks, Green & Beevers (2023), p. 1"
@@ -72,6 +79,14 @@ _ACTIVITY = [
         _KELLY,
         "assumed; the intensity behind the walking risk",
     ),
+    (
+        "walk",
+        "high",
+        4.5,
+        1.56 * 3.6,
+        "Kozey et al. (2010), Table 4",
+        "measured on a level treadmill at 1.56 m/s",
+    ),
     ("bicycle", "low", 8.1, 20.7, _BERNTSEN, "measured on 8 riders, flat route"),
     (
         "bicycle",
@@ -81,7 +96,14 @@ _ACTIVITY = [
         f"{_KELLY}; {_HEAT}, p. 63",
         "assumed; the intensity behind the cycling risk",
     ),
-    ("bicycle", "high", 8.5, 16.3, _BERNTSEN, "measured on 8 riders, hilly route"),
+    (
+        "bicycle",
+        "high",
+        8.2,
+        10.3,
+        _GOJANOVIC,
+        "measured on 16 sedentary riders, uphill commute (mean grade 3.4 %)",
+    ),
     (
         "e_bike",
         "low",
@@ -97,6 +119,22 @@ _ACTIVITY = [
         17.0,
         f"{_HEAT}, pp. 62-63",
         "the HEAT expert-panel value",
+    ),
+    (
+        "e_bike",
+        "high",
+        7.3,
+        15.1,
+        _GOJANOVIC,
+        "measured on 17 sedentary riders at standard assistance, uphill commute",
+    ),
+    (
+        "e_scooter",
+        "middle",
+        1.6,
+        12.0,
+        "Payne et al. (2025), pp. 3-4",
+        "measured on 42 riders standing on a scooter fixed to a treadmill",
     ),
 ]
 
@@ -168,10 +206,12 @@ def activity_rates():
     One row per street mode and case: the MET, the speed it belongs to,
     and the rate ``met / speed_kmh``. The middle values are the
     intensities the walking and cycling mortality risks were computed
-    with (Kelly et al. 2014; the WHO HEAT tool for the e-bike); the low
-    and high values are measured pairs of MET and speed. A case no
-    source gives keeps the middle value with ``published=False``. No
-    source covers the e-scooter or the wheelchair: they have no rows.
+    with (Kelly et al. 2014; the WHO HEAT tool for the e-bike), the
+    e-scooter's a laboratory measurement; the low and high values are the
+    most extreme measured pairs of MET and speed, their conditions in
+    ``note`` (the high ones include uphill riding). A case no source
+    gives keeps the middle value with ``published=False``. No source
+    covers the wheelchair at cafein's speed: it has no rows.
     """
     stated = {
         (mode, case): {

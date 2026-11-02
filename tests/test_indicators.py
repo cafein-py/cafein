@@ -142,26 +142,26 @@ def test_cases_and_own_values_resolve_with_their_warnings():
         assert low.activity_rate("walk") == low.activity_rate("walk") == 4.0 / 5.3
         assert low.activity_rate("e_bike") == pytest.approx(5.9 / 21.5)
         assert low.activity_rate("car") == 0.0
-        assert math.isnan(low.activity_rate("e_scooter"))
+        assert math.isnan(low.activity_rate("wheelchair"))
         assert low.particle_factor("BEV", "rural") == (30.5, 13.5)
         assert low.particle_factor("ICE", "urban") == (40.4, 19.1)
         assert all(math.isnan(value) for value in low.particle_factor("HEV", "urban"))
     messages = [str(warning.message) for warning in caught]
-    # One warning per mode or class: walk, e_scooter, ICE, HEV.
+    # One warning per mode or class: walk, wheelchair, ICE, HEV.
     assert len(messages) == 4
     assert any("no source gives a low value for 'walk'" in m for m in messages)
-    assert any("'e_scooter'" in m and "unresolved" in m for m in messages)
+    assert any("'wheelchair'" in m and "unresolved" in m for m in messages)
 
     own = indicators.resolve_query(
         ["climate_cost", "physical_activity", "pm2_5"],
         150,
-        {"e_scooter": 0.1},
+        {"wheelchair": 0.1},
         pd.DataFrame(
             [{"vehicle_class": "HEV", "road_class": "urban", "pm10": 35, "pm2_5": 16}]
         ),
     )
     assert own.climate_cost(1e6) == 150.0
-    assert own.activity_rate("e_scooter") == 0.1
+    assert own.activity_rate("wheelchair") == 0.1
     assert own.activity_rate("bicycle") == pytest.approx(6.8 / 14.0)
     assert own.particle_factor("HEV", "urban") == (35.0, 16.0)
     assert own.particle_factor("ICE", "motorway") == (26.4, 12.6)
