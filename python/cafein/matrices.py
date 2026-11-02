@@ -872,9 +872,11 @@ class TravelCostMatrix(pd.DataFrame):
         kilometres in its mode and its connectors walked, a transit
         matrix's ``walk_distance_m``, a car-park drive counting zero) and
         ``"climate_cost"`` (``emissions`` times a CO₂ price per tonne, in
-        the price's currency). A ``street_policy`` with street vehicles
-        reports ``climate_cost`` only: its ``street_distance_m`` is one
-        total over the vehicle modes. ``co2_price=`` takes ``"low"``, ``"middle"`` (the
+        the price's currency). Under a ``street_policy`` each end's
+        ridden network metres count at their mode's rate, its connectors
+        walked, and rental transfers at the transfer mode's rate; a policy
+        granting the wheelchair reports ``climate_cost`` only, its rolled
+        and walked metres being one total. ``co2_price=`` takes ``"low"``, ``"middle"`` (the
         default) or ``"high"`` — the European Commission handbook's 60,
         100 and 189 per tonne in 2016 euros — or a number;
         ``activity_rates=`` takes a case name or own MET-hours per km by
@@ -5709,12 +5711,15 @@ def _cost_matrix_data(
 
         _reject_carriage(street_policy, "matrix computation")
         walk_only, walk_budget = _walking_only_policy(street_policy)
-        walking = _grants_walking_only(street_policy)
-        if indicator_settings is not None and not walking:
-            # Its street metres are one total over every vehicle mode.
+        if indicator_settings is not None and _grants_wheelchair(street_policy):
+            # Its rolled and walked metres are one walking-class total.
             indicator_settings.check_supported(
-                ("climate_cost",), "a street_policy matrix with street vehicles"
+                ("climate_cost",), "a street_policy matrix granting the wheelchair"
             )
+        activity = (
+            indicator_settings is not None
+            and "physical_activity" in indicator_settings.indicators
+        )
         if walk_only:
             # A walking-only policy IS the legacy cost matrix, at the
             # policy's one walking budget. A street-mode factor table
@@ -5768,6 +5773,7 @@ def _cost_matrix_data(
                 workers=workers,
                 max_memory=max_memory,
                 speeds=speeds,
+                mode_metres=activity,
             )
         data = {
             "from_id": np.array(from_ids, dtype=object)[table["from"]],
@@ -5789,8 +5795,11 @@ def _cost_matrix_data(
             data["geometry"] = shapely.from_wkb(
                 np.array(table["geometry"], dtype=object)
             )
-        walked = [("walk", data["walk_distance_m"])] if walking else []
-        return _with_indicators(data, indicator_settings, walked)
+        # The street vehicles' metres by mode beside the walked metres.
+        ridden = list(table.get("mode_metres", {}).items())
+        return _with_indicators(
+            data, indicator_settings, [("walk", data["walk_distance_m"]), *ridden]
+        )
     if exposure is not None:
         router = _validate_transit_exposure(
             exposure,
@@ -6312,13 +6321,12 @@ def _warn_unsnapped(table, from_ids, to_ids, network="the walking network"):
         )
 
 
-def _grants_walking_only(policy):
-    """Whether a street-leg policy grants no street vehicle, whatever its
-    walking budgets (``transfers=`` never names walking)."""
-    return not policy.transfers and all(
-        mode == "walk"
-        for side in (policy.access, policy.egress)
-        for mode in (side or {"walk": None})
+def _grants_wheelchair(policy):
+    """Whether a street-leg policy grants the wheelchair anywhere: at
+    either end or for the transfers."""
+    return any(
+        "wheelchair" in (grants or {})
+        for grants in (policy.access, policy.egress, policy.transfers)
     )
 
 
@@ -6870,11 +6878,14 @@ def _policy_cost_columns(
     workers=None,
     max_memory=None,
     speeds=None,
+    mode_metres=False,
 ):
     """The street-policy cost matrix columns: per-point meters-carrying
     reductions through the engine fan-out, street distances and emissions
     attributed per row from the winning choices, and the direct walking
-    alternative folded in over the same multimodal graph."""
+    alternative folded in over the same multimodal graph. With
+    ``mode_metres`` the table also carries each row's street metres by
+    the mode that rode them (`_policy_mode_metres`)."""
     components = component_selection(components)
     from cafein import emissions
     from cafein import streets as _streets
@@ -6949,7 +6960,7 @@ def _policy_cost_columns(
     def reduced(points, egress, modes):
         """The engine's meters rows per point, the unsnapped points, and
         per point the street facts a tariff bills, by stop."""
-        rows, unsnapped, facts = [], [], []
+        rows, unsnapped, facts, ridden = [], [], [], []
         for index, (lat, lon) in enumerate(points):
             try:
                 cells = core._reduced_street_rows(
@@ -6967,6 +6978,7 @@ def _policy_cost_columns(
                 # An unsnapped point reaches nothing; its cells are omitted.
                 rows.append([])
                 facts.append({})
+                ridden.append({})
                 unsnapped.append(index)
                 continue
             rows.append(
@@ -7001,12 +7013,18 @@ def _policy_cost_columns(
             facts.append(
                 {cell[0]: (cell[2], cell[9], cell[10], cell[8]) for cell in cells}
             )
-        return rows, unsnapped, facts
+            ridden.append(
+                {
+                    cell[0]: (cell[2], cell[3], cell[4], cell[6], cell[7])
+                    for cell in cells
+                }
+            )
+        return rows, unsnapped, facts, ridden
 
-    access_rows, unsnapped_origins, access_facts = reduced(
+    access_rows, unsnapped_origins, access_facts, access_ridden = reduced(
         origin_points, False, access_modes
     )
-    egress_rows, unsnapped_destinations, egress_facts = reduced(
+    egress_rows, unsnapped_destinations, egress_facts, egress_ridden = reduced(
         destination_points, True, egress_modes
     )
     # The direct walking alternative always applies — walking needs no
@@ -7075,7 +7093,46 @@ def _policy_cost_columns(
             egress_facts,
             core,
         )
+    if mode_metres:
+        table["mode_metres"] = _policy_mode_metres(
+            table,
+            None if transfer_mode is None else transfer_mode[0],
+            access_ridden,
+            egress_ridden,
+            core,
+        )
     return table, from_ids, to_ids
+
+
+def _policy_mode_metres(table, rental_mode, access_ridden, egress_ridden, core):
+    """Each row's street metres by the mode that rode them,
+    ``{mode: metres per row}``: network metres in the mode that rode them
+    (an end's own mode, the transfer mode for a carried rental transfer and
+    the mid-journey rentals), every connector walked. With the row's
+    ``walk_distance`` they make up every metre the street legs covered."""
+    stops_by_index = [stop for stop, _lat, _lon in core.stops]
+    count = len(table["street_distance"])
+    metres = collections.defaultdict(lambda: np.zeros(count))
+
+    def add(stops, points, ridden):
+        for at, (stop_index, point) in enumerate(zip(stops, points)):
+            if stop_index == _NO_STOP:
+                continue
+            mode, network_m, connector_m, transfer_network_m, transfer_total_m = ridden[
+                point
+            ][stops_by_index[stop_index]]
+            metres[mode][at] += network_m
+            metres["walk"][at] += connector_m + transfer_total_m - transfer_network_m
+            if transfer_network_m:
+                metres[rental_mode][at] += transfer_network_m
+
+    add(table["access_stop"], table["from"], access_ridden)
+    add(table["egress_stop"], table["to"], egress_ridden)
+    if rental_mode is not None:
+        ridden = np.asarray(table["rental_network_distance"], dtype=float)
+        metres[rental_mode] += ridden
+        metres["walk"] += np.asarray(table["rental_street_distance"]) - ridden
+    return dict(metres)
 
 
 def _policy_money(table, street, shared, rental_mode, access_facts, egress_facts, core):

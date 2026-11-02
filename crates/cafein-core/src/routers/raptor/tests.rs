@@ -257,7 +257,14 @@ fn cost_rows_aggregate_the_fastest_journey() {
         (to_4.seconds, to_4.rental_transfers, to_4.rental_minutes),
         (350, 1, 1)
     );
-    assert_eq!((to_4.street_meters, to_4.walk_meters), (50.0, 0.0));
+    assert_eq!(
+        (
+            to_4.street_meters,
+            to_4.rental_network_meters,
+            to_4.walk_meters
+        ),
+        (50.0, 0.0, 0.0)
+    );
     assert!((to_4.emission_grams - 12.0).abs() < 1e-9);
 }
 

@@ -1357,8 +1357,8 @@ def test_policy_cost_matrix_prices_fares_without_rentals(
             assert cell["money"] == pytest.approx(float(fastest["money"].iloc[0]))
 
 
-def _fastest_money(network, origins, destinations, from_id, to_id, **kwargs):
-    """The itineraries' money for a pair's fastest option, or None when the
+def _fastest_option(network, origins, destinations, from_id, to_id, **kwargs):
+    """The leg rows of a pair's fastest itinerary option, or None when the
     fastest time is shared by several options."""
     from cafein import DetailedItineraries
 
@@ -1370,14 +1370,19 @@ def _fastest_money(network, origins, destinations, from_id, to_id, **kwargs):
         geometries=False,
         **kwargs,
     )
-    options = itineraries.groupby("option").agg(
-        departure=("departure_s", "min"),
-        arrival=("arrival_s", "max"),
-        money=("money", "first"),
-    )
-    durations = options["arrival"] - options["departure"]
-    fastest = options[durations == durations.min()]
-    return float(fastest["money"].iloc[0]) if len(fastest) == 1 else None
+    by_option = itineraries.groupby("option")
+    durations = by_option["arrival_s"].max() - by_option["departure_s"].min()
+    fastest = durations[durations == durations.min()].index
+    if len(fastest) != 1:
+        return None
+    return itineraries[itineraries["option"] == fastest[0]]
+
+
+#: A user activity rate for the e-scooter, which ships none.
+SCOOTER_ACTIVITY = {
+    "indicators": ["physical_activity"],
+    "activity_rates": {"e_scooter": 0.1},
+}
 
 
 def test_policy_cost_matrix_prices_shared_rentals(
@@ -1407,11 +1412,12 @@ def test_policy_cost_matrix_prices_shared_rentals(
         street_policy=policy,
         factors=_scooter_factor_rows(),
         fares=structure,
+        **SCOOTER_ACTIVITY,
     )
     assert matrix["money"].notna().all()
     priced = 0
     for (from_id, to_id), cell in matrix.groupby(["from_id", "to_id"]):
-        expected = _fastest_money(
+        option = _fastest_option(
             multimodal_network,
             origins,
             destinations,
@@ -1420,9 +1426,14 @@ def test_policy_cost_matrix_prices_shared_rentals(
             street_policy=policy,
             factors=_scooter_factor_rows(),
             fares=structure,
+            **SCOOTER_ACTIVITY,
         )
-        if expected is not None:
-            assert cell["money"].iloc[0] == pytest.approx(expected)
+        if option is not None:
+            assert cell["money"].iloc[0] == pytest.approx(option["money"].iloc[0])
+            # The ridden and walked metres count activity as the legs do.
+            assert cell["physical_activity"].iloc[0] == pytest.approx(
+                option["physical_activity"].sum()
+            )
             priced += 1
     assert priced
     # Mid-journey rental transfers price too: count times unlock plus minutes.
@@ -1434,8 +1445,9 @@ def test_policy_cost_matrix_prices_shared_rentals(
         "2022-02-22 08:30:00",
         street_policy=_transfer_policy(),
         fares=structure,
+        **SCOOTER_ACTIVITY,
     )
-    expected = _fastest_money(
+    option = _fastest_option(
         multimodal_transfers_network,
         origin,
         dest,
@@ -1443,9 +1455,14 @@ def test_policy_cost_matrix_prices_shared_rentals(
         "p0",
         street_policy=_transfer_policy(),
         fares=structure,
+        **SCOOTER_ACTIVITY,
     )
-    assert expected is not None and expected > 0
-    assert with_transfers["money"].iloc[0] == pytest.approx(expected)
+    assert option is not None and option["money"].iloc[0] > 0
+    assert with_transfers["money"].iloc[0] == pytest.approx(option["money"].iloc[0])
+    # The mid-journey rental metres count at the rental mode's rate.
+    assert with_transfers["physical_activity"].iloc[0] == pytest.approx(
+        option["physical_activity"].sum()
+    )
     # No tariff for a ridden rental mode: NaN, never a silent zero.
     untariffed = fares.zone_fare_structure(helsinki_gtfs, rules="zones")
     bare = TravelCostMatrix(
@@ -1527,16 +1544,20 @@ def test_policy_cost_matrix_rejects_incompatible_knobs(multimodal_network):
                 street_policy=policy,
                 **kwargs,
             )
-    # The ridden street metres are one total over the vehicle modes, so a
-    # vehicle policy reports the climate cost but not the activity.
-    with pytest.raises(ValueError, match="physical_activity are not available"):
-        TravelCostMatrix(
-            multimodal_network,
-            *points,
-            "2022-02-22 08:30:00",
-            street_policy=policy,
-            indicators=["physical_activity", "climate_cost"],
-        )
+    # A wheelchair end's rolled metres join the walked total, so a policy
+    # granting it reports the climate cost but not the activity.
+    for wheelchair in (
+        StreetLegPolicy(access={"wheelchair": 900}),
+        StreetLegPolicy(transfers={"wheelchair": 600}),
+    ):
+        with pytest.raises(ValueError, match="granting the wheelchair"):
+            TravelCostMatrix(
+                multimodal_network,
+                *points,
+                "2022-02-22 08:30:00",
+                street_policy=wheelchair,
+                indicators=["physical_activity", "climate_cost"],
+            )
     priced = TravelCostMatrix(
         multimodal_network,
         *points,

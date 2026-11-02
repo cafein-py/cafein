@@ -33,6 +33,9 @@ pub struct CostRow {
     /// (ride network meters plus their connectors); 0 outside
     /// merged-set policy queries.
     pub street_meters: f64,
+    /// The ride network meters within `street_meters`, without the
+    /// connectors.
+    pub rental_network_meters: f64,
     /// How many rental-bearing transfers the journey rode — the street
     /// identity the tie-breaks read (meters may legitimately be zero).
     pub rental_transfers: u32,
