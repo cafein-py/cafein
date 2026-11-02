@@ -1777,7 +1777,8 @@ def test_compare_to_fastest_marks_each_pairs_fastest_journey():
             "segment": [0, 1, 0, 0],
             "leg_type": ["transit", "walk", "transit", "walk"],
             "travel_time": [10.0, 5.0, 12.0, 7.0],
-            "emissions": [100.0, np.nan, 50.0, np.nan],
+            # Walking legs emit nothing, as cafein annotates them.
+            "emissions": [100.0, 0.0, 50.0, 0.0],
             "distance_m": [1000.0, 400.0, 900.0, 500.0],
             "money": [4.1, 4.1, 2.8, 0.0],
         }
@@ -1787,8 +1788,7 @@ def test_compare_to_fastest_marks_each_pairs_fastest_journey():
     assert out["travel_time"].tolist() == [15.0, 12.0, 7.0]
     assert out["fastest"].tolist() == [False, True, True]
     assert out["travel_time_delta"].tolist() == [3.0, 0.0, 0.0]
-    assert out["emissions_delta"].tolist()[:2] == [50.0, 0.0]
-    assert np.isnan(out["emissions_delta"].iloc[2])  # no emissions to compare
+    assert out["emissions_delta"].tolist() == [50.0, 0.0, 0.0]
     assert out["money_delta"].tolist() == pytest.approx([1.3, 0.0, 0.0])
     # Journey rows (a frontier): ties toward fewer rides; the frontier
     # flag and the journey objects take no delta.

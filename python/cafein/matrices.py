@@ -3624,9 +3624,10 @@ def compare_to_fastest(frame):
 
     The result has one row per journey: the keys and ``option`` when
     present; the journey's totals — from leg rows, ``travel_time``
-    summed over the journey's rows (waits included), ``emissions`` and
-    ``distance_m`` summed, the trip-indicator columns summed (NaN when a
-    leg's value is), ``money`` once, and the ``exposure_totals()``
+    summed over the journey's rows (waits included), ``emissions``,
+    ``distance_m`` and the trip-indicator columns summed — NaN when a
+    moving leg's value is NaN, while waits, park events and zero-duration
+    legs count zero — ``money`` once, and the ``exposure_totals()``
     columns when the frame was built with ``exposure=``; from journey
     rows, the numeric columns as they are — a boolean ``fastest``
     marking the pair's fastest journey (the least ``travel_time``, ties
@@ -3657,24 +3658,30 @@ def compare_to_fastest(frame):
             keys + ["option"], sort=False, dropna=False, observed=True
         )
         journeys = grouped[time_column].sum(min_count=1).to_frame(time_column)
-        for column in ("emissions", "distance_m"):
+        # A movement leg with an unresolved value leaves its journey's total
+        # unresolved; waits, park events and zero-duration placeholder legs
+        # move nowhere and count zero.
+        duration = frame[time_column].astype("Float64")
+        if {"departure_s", "arrival_s"} <= set(frame.columns):
+            # Exact seconds where the legs carry clock times: a short walk
+            # rounds to zero minutes but still moves.
+            clock = (frame["arrival_s"] - frame["departure_s"]).astype("Float64")
+            duration = clock.fillna(duration)
+        moving = duration.fillna(0).to_numpy(dtype=float) > 0
+        if "leg_type" in frame.columns:
+            moving &= ~frame["leg_type"].isin(["wait", "park"]).to_numpy()
+        for column in ("emissions", "distance_m", *_indicators.INDICATORS):
             if column in frame.columns:
-                journeys[column] = grouped[column].sum(min_count=1)
-        for column in _indicators.INDICATORS:
-            if column in frame.columns:
-                # An unresolved leg leaves its journey's total unresolved.
-                unresolved = (
-                    frame[column]
-                    .isna()
-                    .groupby(
-                        [frame[key] for key in keys + ["option"]],
-                        sort=False,
-                        dropna=False,
-                        observed=True,
-                    )
-                    .any()
+                values = pd.to_numeric(frame[column], errors="coerce").to_numpy(
+                    dtype=float, na_value=np.nan
                 )
-                journeys[column] = grouped[column].sum().where(~unresolved)
+                per_journey = frame.assign(
+                    _value=np.where(moving, values, 0.0),
+                    _unresolved=np.isnan(values) & moving,
+                ).groupby(keys + ["option"], sort=False, dropna=False, observed=True)
+                journeys[column] = (
+                    per_journey["_value"].sum().where(~per_journey["_unresolved"].any())
+                )
         if "money" in frame.columns:
             journeys["money"] = grouped["money"].first()
         for label in _JOURNEY_LABELS:
