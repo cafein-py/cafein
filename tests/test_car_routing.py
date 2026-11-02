@@ -765,3 +765,38 @@ def test_transit_matrices_reject_the_delay_options(network):
 def test_the_car_never_serves_transit_access(multimodal_network):
     with pytest.raises(ValueError, match="street-only"):
         multimodal_network._core._street_access_seconds(60.1690, 24.9320, "car", 900.0)
+
+
+def test_car_builds_mark_each_street_s_road_class(
+    car_network, helsinki_streets, kantakaupunki_pbf, tmp_path
+):
+    from shapely.geometry import box
+
+    # Motorways by their class, other streets by the urban flag.
+    codes = np.array(
+        [_osm.HIGHWAY_CODES[name] for name in ("motorway", "motorway_link")] * 2
+        + [_osm.HIGHWAY_CODES["residential"]] * 2
+    )
+    flags = np.array([_osm.FLAG_URBAN, 0, _osm.FLAG_URBAN, 0, _osm.FLAG_URBAN, 0])
+    assert list(_osm.road_classes(codes, flags)) == [2, 2, 2, 2, 0, 1]
+    # Without urban_areas every street is urban; a walk-only build has
+    # no road classes.
+    streets = car_network.streets_gdf
+    motorway = streets["highway"].isin(["motorway", "motorway_link"])
+    assert (streets.loc[~motorway, "road_class"] == "urban").all()
+    assert (streets.loc[motorway, "road_class"] == "motorway").all()
+    assert "road_class" not in helsinki_streets.streets_gdf.columns
+    # With areas, a street is urban when it touches one, as for speeds.
+    west = gpd.GeoDataFrame(geometry=[box(24.80, 60.10, 24.94, 60.25)], crs=4326)
+    split = StreetNetwork.from_osm(
+        str(kantakaupunki_pbf), modes=("walk", "car"), country="FI", urban_areas=west
+    )
+    streets = split.streets_gdf
+    touching = streets.intersects(west.geometry.iloc[0])
+    motorway = streets["highway"].isin(["motorway", "motorway_link"])
+    assert set(streets.loc[~motorway & touching, "road_class"]) == {"urban"}
+    assert set(streets.loc[~motorway & ~touching, "road_class"]) == {"rural"}
+    # The classes survive a save and load.
+    split.save(tmp_path / "split.cafein")
+    loaded = StreetNetwork.load(tmp_path / "split.cafein")
+    assert loaded.streets_gdf["road_class"].tolist() == streets["road_class"].tolist()

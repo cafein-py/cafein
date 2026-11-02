@@ -2173,13 +2173,17 @@ class TransportNetwork:
         ``bicycle``, ``e_scooter``, ``car``, ``wheelchair``) holding
         the edge's permission as ``"both"``, ``"forward"``,
         ``"reverse"``, or ``"no"`` (forward is the stored geometry
-        direction). Raises when no street network is installed.
+        direction); a car build adds ``road_class``, as in
+        ``StreetNetwork.streets_gdf``. Raises when no street network is
+        installed.
         Computed lazily on first access and cached on the network.
         """
         if getattr(self, "_streets_gdf_cache", None) is None:
             from cafein.street_network import _edge_layer_frame
 
-            self._streets_gdf_cache = _edge_layer_frame(self._core._street_edge_layer())
+            self._streets_gdf_cache = _edge_layer_frame(
+                self._core._street_edge_layer(), self._core._car_edge_codes()
+            )
         return self._streets_gdf_cache
 
     def annotate_emissions(self, journeys, factors=None, components=None):

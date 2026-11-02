@@ -379,14 +379,19 @@ pub(super) const ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINET";
 /// failing later in a checksum or a decode.
 pub(super) const STREET_ARTIFACT_MAGIC: &[u8; 8] = b"CAFEINST";
 
+// 5: car builds mark each edge inside an urban area in `edge_flags`, as
+// in network format 23.
 // 4: `adj_access` carries the wheelchair permission bit, as in network
 // format 19.
 // 3: the optional car array group (per-slot driving speeds and junction
 // head classes), as in network format 17.
 // 2 added optional elevation metadata in `StreetsMeta`, as in network
 // format 13.
-pub(super) const STREET_ARTIFACT_FORMAT: u32 = 4;
+pub(super) const STREET_ARTIFACT_FORMAT: u32 = 5;
 
+// 23: car builds mark each edge inside an urban area in `edge_flags`
+// (bit 8), the road class of car particle factors; earlier car builds
+// carry no such bit and must be rebuilt.
 // 22: the mode-transfer and carriage sets record the speeds they were
 // computed at, so a query at other speeds refuses them.
 // 21: the bicycle and e-bike default speeds changed (15.3 and 17.4 km/h);
@@ -413,7 +418,7 @@ pub(super) const STREET_ARTIFACT_FORMAT: u32 = 4;
 // STREETS section (descriptor offsets pre-shifted to their position).
 // 13 added optional elevation metadata to `StreetsMeta`. Earlier formats
 // must be rebuilt.
-pub(super) const ARTIFACT_FORMAT: u32 = 22;
+pub(super) const ARTIFACT_FORMAT: u32 = 23;
 
 /// Section tags in the container directory.
 pub(super) const SECTION_META: u16 = 1;

@@ -943,6 +943,16 @@ impl TransportNetwork {
         }
     }
 
+    /// The multimodal graph's highway-class codes and packed edge flags
+    /// on a car build, in the ``streets_gdf`` edge order, or ``None``
+    /// without car data. Internal: the road classes derive from them.
+    fn _car_edge_codes<'py>(&self, py: Python<'py>) -> Option<crate::streets::CarEdgeCodes<'py>> {
+        self.multimodal
+            .as_ref()
+            .and_then(|streets| streets.car_edge_codes())
+            .map(|(highway, flags)| (highway.into_pyarray(py), flags.into_pyarray(py)))
+    }
+
     /// Per-edge rows of the WALKING graph — the graph whose edge
     /// indices the walk searches and ``street_edges`` leg provenance
     /// speak — even when a multimodal union graph is installed.

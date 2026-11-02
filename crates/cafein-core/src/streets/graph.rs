@@ -903,6 +903,18 @@ impl StreetNetwork {
             .collect()
     }
 
+    /// The highway-class codes and packed flags per physical edge of a
+    /// car build — the inputs of its road classes — or `None` without
+    /// the car attribute group.
+    pub fn car_edge_codes(&self) -> Option<(Vec<u8>, Vec<u16>)> {
+        self.graph.car.as_ref()?;
+        let attributes = self.graph.attributes.as_ref()?;
+        Some((
+            attributes.edge_highway.clone(),
+            attributes.edge_flags.clone(),
+        ))
+    }
+
     /// Per-edge export for the geo-layer surface: each physical
     /// edge's polyline in EPSG:4326 degrees, its stored length in
     /// meters, and — when the multimodal attribute group is present —

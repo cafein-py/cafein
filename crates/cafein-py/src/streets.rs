@@ -26,6 +26,9 @@ use crate::artifact::{
     MmapMode, StreetsMeta, STREET_ARRAY_ORDER, STREET_ARTIFACT_FORMAT, STREET_ARTIFACT_MAGIC,
 };
 
+/// A car build's per-edge highway codes and packed flags, as arrays.
+pub(crate) type CarEdgeCodes<'py> = (Bound<'py, PyArray1<u8>>, Bound<'py, PyArray1<u16>>);
+
 /// Caller-set street speeds in m/s by mode name, as the Python layer resolves
 /// them from `speeds=`; empty for the shipped speeds. A wheelchair
 /// traveler's grade limits ride along as slope fractions under
@@ -762,6 +765,15 @@ impl StreetNetwork {
     #[allow(clippy::type_complexity)]
     fn _street_edge_layer(&self) -> Vec<(Vec<f64>, Vec<f64>, f64, Option<u8>, Option<(u8, u8)>)> {
         self.inner.edge_layer()
+    }
+
+    /// The highway-class codes and packed edge flags of a car build, in
+    /// the ``streets_gdf`` edge order, or ``None`` without car data.
+    /// Internal: the road classes derive from them.
+    fn _car_edge_codes<'py>(&self, py: Python<'py>) -> Option<CarEdgeCodes<'py>> {
+        self.inner
+            .car_edge_codes()
+            .map(|(highway, flags)| (highway.into_pyarray(py), flags.into_pyarray(py)))
     }
 
     /// The travel time in whole seconds from `origin` to `destination` under

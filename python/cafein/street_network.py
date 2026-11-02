@@ -450,11 +450,16 @@ class StreetNetwork:
         ``bicycle``, ``e_scooter``, ``car``, ``wheelchair``) holding
         the edge's permission as ``"both"``, ``"forward"``,
         ``"reverse"``, or ``"no"`` (forward is the stored geometry
-        direction). Computed lazily on first access and cached on the
-        network.
+        direction). A car build adds ``road_class``: ``"motorway"``
+        (a motorway or its link), else ``"urban"`` inside the build's
+        ``urban_areas`` (every way when none were given), else
+        ``"rural"`` — the road classes of the car particle factors.
+        Computed lazily on first access and cached on the network.
         """
         if getattr(self, "_streets_gdf_cache", None) is None:
-            self._streets_gdf_cache = _edge_layer_frame(self._core._street_edge_layer())
+            self._streets_gdf_cache = _edge_layer_frame(
+                self._core._street_edge_layer(), self._core._car_edge_codes()
+            )
         return self._streets_gdf_cache
 
     def travel_time(
@@ -574,11 +579,12 @@ def _resolved_delays(mode, intersection_delays, profile, delay_model):
     return _delays.resolve(intersection_delays, profile, delay_model)
 
 
-def _edge_layer_frame(rows):
+def _edge_layer_frame(rows, car_codes=None):
     """One GeoDataFrame row per graph edge from a core edge layer, in
     the graph's edge order: geometry, ``length_m``, and — when the
     graph carries attributes — the highway class and per-mode
-    permission columns."""
+    permission columns; on a car build (`car_codes`, the core's
+    per-edge highway codes and flags) also the ``road_class``."""
     import geopandas
     from shapely.geometry import LineString
 
@@ -613,6 +619,13 @@ def _edge_layer_frame(rows):
                 directions[(bool(forward & bit), bool(reverse & bit))]
                 for _, _, _, _, (forward, reverse) in rows
             ]
+    if car_codes is not None:
+        from cafein._osm import road_classes
+        from cafein.indicators import ROAD_CLASSES
+
+        data["road_class"] = np.asarray(ROAD_CLASSES, dtype=object)[
+            road_classes(*car_codes)
+        ]
     geometry = [LineString(list(zip(lons, lats))) for lons, lats, _, _, _ in rows]
     return geopandas.GeoDataFrame(data, geometry=geometry, crs="EPSG:4326")
 
@@ -756,9 +769,13 @@ def multimodal_payload(
             "attributed car speeds and junction delays",
         ) as ph:
             # Speeds and junction classes read the pruned permissions: the
-            # drivable graph the routing engine will actually see.
+            # drivable graph the routing engine will actually see. The urban
+            # membership that picks the speed defaults also marks the edges'
+            # road class.
+            inside = _osm.urban_membership(edges, urban_areas)
+            flags = flags | np.where(inside, _osm.FLAG_URBAN, 0).astype(np.uint16)
             speed_forward, speed_reverse = _osm.car_speeds(
-                edges, country=country, urban=urban_areas, speed_limits=speed_limits
+                edges, country=country, urban=inside, speed_limits=speed_limits
             )
             junction_forward, junction_reverse = _osm.junction_delay_classes(
                 _osm.node_delay_tags(nodes),
