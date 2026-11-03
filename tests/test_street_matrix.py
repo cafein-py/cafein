@@ -651,17 +651,17 @@ def test_emission_components_select_a_subset(streets, origins):
     ("mode", "components", "per_km"),
     [
         # The shipped sourced defaults: ITF "Good to Go?" components on the
-        # Finland 2020 mix (via cafein-lca), the conventional bicycle's
-        # dietary 21 g/km on top, walking the zero baseline.
+        # Finland 2020 mix (via cafein-lca), the conventional bicycle the
+        # ECF life-cycle 21 g/km, walking the zero baseline.
         ("walk", None, 0.0),
-        ("bicycle", None, 37.0),
+        ("bicycle", None, 21.0),
         ("e_bike", None, 25.0),
         ("e_scooter", None, 36.0),
         # Narrowed to the use phase: walking is free; the conventional
-        # bicycle carries the shipped dietary energy factor of 21 g/km;
-        # the battery modes their Finnish-mix charging electricity.
+        # bicycle carries the cyclist's extra food, 16 g/km; the battery
+        # modes their Finnish-mix charging electricity.
         ("walk", ["fuel", "operations"], 0.0),
-        ("bicycle", ["fuel", "operations"], 21.0),
+        ("bicycle", ["fuel", "operations"], 16.0),
         ("e_bike", ["fuel", "operations"], 3.0),
         ("e_scooter", ["fuel", "operations"], 1.0),
     ],

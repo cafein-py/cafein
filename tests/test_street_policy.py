@@ -2050,11 +2050,11 @@ def test_the_shipped_street_factors_resolve_by_service_model():
     from cafein import emissions
 
     # ITF "Good to Go?" components on the Finland 2020 mix (cafein-lca),
-    # the conventional bicycle's dietary 21 g/km on top; the shared
+    # the conventional bicycle the ECF life-cycle 21 g/km; the shared
     # e-scooter follows Judl et al. (2026) 2GEN gross plus the ITF
     # infrastructure graft.
     assert emissions.street_factor("walk") == 0.0
-    assert emissions.street_factor("bicycle") == pytest.approx(37.0)
+    assert emissions.street_factor("bicycle") == pytest.approx(21.0)
     assert emissions.street_factor("e_bike") == pytest.approx(25.0)
     assert emissions.street_factor("e_scooter") == pytest.approx(36.0)
     assert emissions.street_factor(
