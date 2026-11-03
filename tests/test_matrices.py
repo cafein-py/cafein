@@ -1777,7 +1777,8 @@ def test_compare_to_fastest_marks_each_pairs_fastest_journey():
             "segment": [0, 1, 0, 0],
             "leg_type": ["transit", "walk", "transit", "walk"],
             "travel_time": [10.0, 5.0, 12.0, 7.0],
-            "emissions": [100.0, np.nan, 50.0, np.nan],
+            # Walking legs emit nothing, as cafein annotates them.
+            "emissions": [100.0, 0.0, 50.0, 0.0],
             "distance_m": [1000.0, 400.0, 900.0, 500.0],
             "money": [4.1, 4.1, 2.8, 0.0],
         }
@@ -1787,8 +1788,7 @@ def test_compare_to_fastest_marks_each_pairs_fastest_journey():
     assert out["travel_time"].tolist() == [15.0, 12.0, 7.0]
     assert out["fastest"].tolist() == [False, True, True]
     assert out["travel_time_delta"].tolist() == [3.0, 0.0, 0.0]
-    assert out["emissions_delta"].tolist()[:2] == [50.0, 0.0]
-    assert np.isnan(out["emissions_delta"].iloc[2])  # no emissions to compare
+    assert out["emissions_delta"].tolist() == [50.0, 0.0, 0.0]
     assert out["money_delta"].tolist() == pytest.approx([1.3, 0.0, 0.0])
     # Journey rows (a frontier): ties toward fewer rides; the frontier
     # flag and the journey objects take no delta.
@@ -2032,4 +2032,61 @@ def test_slots_span_service_dates_on_both_axes(network, network_with_footpaths):
         )
         pd.testing.assert_frame_equal(
             block.reset_index(drop=True), pd.DataFrame(single)
+        )
+
+
+def test_transit_outputs_report_the_trip_indicators(network_with_footpaths, tmp_path):
+    from cafein import DetailedItineraries, compare_to_fastest, travel_cost_table
+
+    names = ["physical_activity", "climate_cost"]
+    origins = scattered_points(network_with_footpaths, 2, seed=3)
+    destinations = scattered_points(network_with_footpaths, 2, seed=11)
+    options = {
+        "departure": "2022-02-22 08:30:00",
+        "indicators": list(reversed(names)),
+        "co2_price": "low",
+    }
+    matrix = TravelCostMatrix(network_with_footpaths, origins, destinations, **options)
+    after = list(matrix.columns).index("emissions") + 1
+    assert list(matrix.columns)[after : after + 2] == names
+    walk = 4.0 / 5.3
+    assert np.allclose(matrix.physical_activity, matrix.walk_distance_m / 1000 * walk)
+    assert np.allclose(matrix.climate_cost, matrix.emissions * 60 / 1e6)
+    table = travel_cost_table(network_with_footpaths, origins, destinations, **options)
+    TravelCostMatrix.to_parquet(
+        network_with_footpaths,
+        origins,
+        destinations,
+        output=tmp_path / "streamed.parquet",
+        **options,
+    )
+    keys = ["from_id", "to_id"]
+    for other in (table.to_pandas(), pd.read_parquet(tmp_path / "streamed.parquet")):
+        joined = matrix[keys + names].merge(
+            other[keys + names].astype({"from_id": str, "to_id": str}),
+            on=keys,
+            suffixes=("", "_other"),
+        )
+        assert len(joined) == len(matrix) > 0
+        for name in names:
+            assert np.allclose(joined[name], joined[f"{name}_other"])
+    legs = DetailedItineraries(
+        network_with_footpaths, origins, destinations, geometries=False, **options
+    )
+    rides = legs.leg_type == "transit"
+    assert rides.any() and (legs.physical_activity[rides] == 0).all()
+    walked = legs[~rides]
+    assert np.allclose(walked.physical_activity, walked.distance_m / 1000 * walk)
+    assert np.allclose(legs.climate_cost, legs.emissions * 60 / 1e6)
+    summary = compare_to_fastest(legs)
+    assert {"physical_activity", "physical_activity_delta"} <= set(summary.columns)
+    with pytest.raises(
+        ValueError, match="pm10 are not available on a TransportNetwork"
+    ):
+        TravelCostMatrix(
+            network_with_footpaths,
+            origins,
+            destinations,
+            departure="2022-02-22 08:30:00",
+            indicators=["pm10"],
         )

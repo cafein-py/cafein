@@ -14,7 +14,9 @@ type StreetRow = (String, u32, u32, f64, f64);
 
 /// One park-and-ride drive row: seconds, network metres, connector
 /// metres, and the optional WKB shape.
-type DriveRow = (u32, f64, f64, Option<Py<PyBytes>>);
+/// A park-and-ride drive: seconds, network and connector metres, WKB, and
+/// with `edge_bins` the network metres per bin.
+type DriveRow = (u32, f64, f64, Option<Py<PyBytes>>, Option<Vec<f64>>);
 
 /// A rebuilt walking shape: network metres, connector metres, WKB.
 type WalkShape = (f64, f64, Option<Py<PyBytes>>);
@@ -943,6 +945,16 @@ impl TransportNetwork {
         }
     }
 
+    /// The multimodal graph's highway-class codes and packed edge flags
+    /// on a car build, in the ``streets_gdf`` edge order, or ``None``
+    /// without car data. Internal: the road classes derive from them.
+    fn _car_edge_codes<'py>(&self, py: Python<'py>) -> Option<crate::streets::CarEdgeCodes<'py>> {
+        self.multimodal
+            .as_ref()
+            .and_then(|streets| streets.car_edge_codes())
+            .map(|(highway, flags)| (highway.into_pyarray(py), flags.into_pyarray(py)))
+    }
+
     /// Per-edge rows of the WALKING graph — the graph whose edge
     /// indices the walk searches and ``street_edges`` leg provenance
     /// speak — even when a multimodal union graph is installed.
@@ -1566,14 +1578,16 @@ impl TransportNetwork {
     }
 
     /// Per-facility drive rows for the park-and-ride access plane:
-    /// ``(seconds, network_m, connector_m, wkb)`` per facility
+    /// ``(seconds, network_m, connector_m, wkb, bins)`` per facility
     /// coordinate, ``None`` where the facility is beyond the budget or
-    /// off the car subgraph. Runs the car profile WITH the resolved
+    /// off the car subgraph; ``bins`` is the drive's network metres per
+    /// bin of ``edge_bins`` (one bin index per multimodal-graph edge),
+    /// ``None`` without them. Runs the car profile WITH the resolved
     /// delay payload on the multimodal graph — the internal
     /// park-and-ride entry; the public street_policy channel still
     /// refuses the car mode outright.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (latitude, longitude, facilities, car_model, max_seconds, max_snap_distance, geometries))]
+    #[pyo3(signature = (latitude, longitude, facilities, car_model, max_seconds, max_snap_distance, geometries, edge_bins = None))]
     fn _car_park_drive_seconds(
         &self,
         py: Python<'_>,
@@ -1584,6 +1598,7 @@ impl TransportNetwork {
         max_seconds: f64,
         max_snap_distance: f64,
         geometries: bool,
+        edge_bins: Option<Vec<u8>>,
     ) -> PyResult<Vec<Option<DriveRow>>> {
         let missing_car = || {
             PyValueError::new_err(
@@ -1595,6 +1610,31 @@ impl TransportNetwork {
         if network.car_attributes().is_none() {
             return Err(missing_car());
         }
+        if let Some(bins) = &edge_bins {
+            if bins.len() != network.edge_count() as usize {
+                return Err(PyValueError::new_err(format!(
+                    "edge_bins holds {} values for {} edges",
+                    bins.len(),
+                    network.edge_count()
+                )));
+            }
+        }
+        // Each drive's traversed network meters summed per bin.
+        let bin_count = edge_bins
+            .as_ref()
+            .and_then(|bins| bins.iter().max())
+            .map_or(0, |&top| top as usize + 1);
+        let lengths = network.edge_lengths();
+        let binned = |edges: &[(u32, f64, f64)]| {
+            edge_bins.as_ref().map(|bins| {
+                let mut meters = vec![0.0; bin_count];
+                for &(edge, fraction, _) in edges {
+                    let edge = edge as usize;
+                    meters[bins[edge] as usize] += fraction * lengths[edge];
+                }
+                meters
+            })
+        };
         let mut definition = crate::streets::profile_definition("car", &[])?;
         if let Some(payload) = car_model.as_ref() {
             definition.car = Some(crate::streets::car_cost_model(payload)?);
@@ -1636,12 +1676,19 @@ impl TransportNetwork {
                     let shape = geometries.then(|| {
                         crate::points::wkb_line_string(py, &[(longitude, latitude); 2]).unbind()
                     });
-                    return Some((0, 0.0, 0.0, shape));
+                    return Some((0, 0.0, 0.0, shape, binned(&[])));
                 }
                 leg.map(|leg| {
                     let shape = geometries
                         .then(|| crate::points::wkb_line_string(py, &leg.geometry).unbind());
-                    (leg.seconds, leg.network_meters, leg.connector_meters, shape)
+                    let meters = binned(&leg.edges);
+                    (
+                        leg.seconds,
+                        leg.network_meters,
+                        leg.connector_meters,
+                        shape,
+                        meters,
+                    )
                 })
             })
             .collect())

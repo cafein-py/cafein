@@ -55,6 +55,9 @@ FLAG_LIT = 1 << 6
 FLAG_ROUNDABOUT = 1 << 7
 """A roundabout interior (`junction=roundabout`); the car delay model
 charges it `b/4` in place of endpoint shares."""
+FLAG_URBAN = 1 << 8
+"""On a car build, an edge inside an urban area — every edge when no
+``urban_areas`` are given, as for the car speeds."""
 
 
 # --- Normalised class codes (the edge_highway / edge_surface / … arrays) ------
@@ -668,6 +671,36 @@ def _validated_speed_limits(speed_limits):
     return overrides
 
 
+def urban_membership(edges, urban):
+    """Whether each edge counts as urban: a polygon GeoDataFrame resolves
+    per edge by spatial join, a per-edge boolean array is taken as given,
+    and ``None`` treats every way as urban."""
+    n = len(edges)
+    if urban is None:
+        return np.ones(n, dtype=bool)
+    if hasattr(urban, "geometry"):
+        return _inside_urban_areas(edges, urban)
+    inside = np.asarray(urban, dtype=bool)
+    if inside.shape != (n,):
+        raise ValueError("urban must be a boolean value per edge")
+    return inside
+
+
+def road_classes(highway, flags):
+    """Each edge's road class as an index into
+    ``cafein.indicators.ROAD_CLASSES``: a motorway or its link, else
+    urban when the edge carries `FLAG_URBAN`, else rural."""
+    from .indicators import ROAD_CLASSES
+
+    highway = np.asarray(highway)
+    urban = (np.asarray(flags, dtype=np.uint16) & FLAG_URBAN).astype(bool)
+    motorway = np.isin(
+        highway, [HIGHWAY_CODES["motorway"], HIGHWAY_CODES["motorway_link"]]
+    )
+    classes = np.where(urban, ROAD_CLASSES.index("urban"), ROAD_CLASSES.index("rural"))
+    return np.where(motorway, ROAD_CLASSES.index("motorway"), classes).astype(np.uint8)
+
+
 def car_speeds(edges, country=None, urban=None, speed_limits=None):
     """Per-edge (forward_kmh, reverse_kmh) car speeds.
 
@@ -688,14 +721,7 @@ def car_speeds(edges, country=None, urban=None, speed_limits=None):
     forward_tag = _column(edges, "maxspeed:forward")
     backward_tag = _column(edges, "maxspeed:backward")
     n = len(edges)
-    if urban is None:
-        inside = np.ones(n, dtype=bool)
-    elif hasattr(urban, "geometry"):
-        inside = _inside_urban_areas(edges, urban)
-    else:
-        inside = np.asarray(urban, dtype=bool)
-        if inside.shape != (n,):
-            raise ValueError("urban must be a boolean value per edge")
+    inside = urban_membership(edges, urban)
     forward = np.empty(n, dtype=np.float64)
     reverse = np.empty(n, dtype=np.float64)
     for i in range(n):

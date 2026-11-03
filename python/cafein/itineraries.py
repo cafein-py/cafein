@@ -11,6 +11,7 @@ from cafein._validate import (
 import geopandas as gpd
 
 from cafein import _log, _sweep
+from cafein import indicators as _indicators
 from cafein._snapshot import NetworkSnapshot
 import numpy as np
 import pandas as pd
@@ -19,10 +20,13 @@ import shapely
 from cafein.policy import policy_speeds
 from cafein.travelers import folded_constraints, folded_street_policy
 from cafein.matrices import (
+    _car_road_classes,
+    _drive_class_metres,
     _factor_tables,
     _is_point_frame,
     _is_street_network,
     _point_list,
+    _road_class_metres,
     _street_query,
     _transit_walking_speed,
     _warn_unsnapped,
@@ -352,6 +356,17 @@ class DetailedItineraries(gpd.GeoDataFrame):
         (2019) defaults with ``costs=`` overrides, per-component
         columns via ``cost_components=`` (one perspective), and the
         declared ``currency`` label column.
+    indicators, co2_price, activity_rates, particle_factors : optional
+        Per-leg indicator columns, off by default, as in
+        ``TravelCostMatrix``: ``"physical_activity"`` (MET-hours: a
+        street leg's network metres at its mode's rate and its
+        connectors walked; transit rides, park events and a car-park
+        drive count zero), ``"climate_cost"`` (``emissions`` times
+        ``co2_price``) and ``"pm10"`` / ``"pm2_5"`` (the car's particles,
+        mg per person by road class: a StreetNetwork car leg or a
+        ``CarParkPolicy`` drive; every other leg counts none), with
+        ``"low"`` / ``"middle"`` / ``"high"`` cases or own values
+        (``cafein.indicators``).
     street_policy : StreetLegPolicy (optional)
         Which street modes may serve the access and egress, on what
         vehicle terms (``cafein.StreetLegPolicy``); point origins and
@@ -512,6 +527,10 @@ class DetailedItineraries(gpd.GeoDataFrame):
         costs=None,
         currency=None,
         cost_components=None,
+        indicators=None,
+        co2_price=None,
+        activity_rates=None,
+        particle_factors=None,
         output_time_units="minutes",
     ):
         from cafein.street_network import frozen_speeds
@@ -620,6 +639,9 @@ class DetailedItineraries(gpd.GeoDataFrame):
                     "candidates='sweep' sweeps exposure weights; pass the "
                     "Exposure carrying the layers as exposure= too"
                 )
+            indicator_settings = _indicators.resolve_query(
+                indicators, co2_price, activity_rates, particle_factors
+            )
             frozen = None
             if exposure is not None:
                 exposure._check_network(network)
@@ -663,6 +685,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
                     costs=costs,
                     currency=currency,
                     cost_components=cost_components,
+                    indicator_settings=indicator_settings,
                     transit_only={
                         "fares": fares,
                         "traveler": traveler,
@@ -756,6 +779,20 @@ class DetailedItineraries(gpd.GeoDataFrame):
                 "street kilometres and apply to a StreetNetwork query "
                 "(transit perspective costs are not supported)"
             )
+        indicator_settings = _indicators.resolve_query(
+            indicators, co2_price, activity_rates, particle_factors
+        )
+        if indicator_settings is not None:
+            # A park-and-ride drive is the one car a transit query rides.
+            indicator_settings.check_supported(
+                ("physical_activity", "climate_cost")
+                + (
+                    ("pm10", "pm2_5")
+                    if isinstance(street_policy, _CarParkPolicy)
+                    else ()
+                ),
+                "a TransportNetwork query",
+            )
         if departure is None and not arrive_by:
             raise ValueError("give exactly one of departure= or arrival=")
         if optimize is not None:
@@ -802,6 +839,7 @@ class DetailedItineraries(gpd.GeoDataFrame):
             speeds=riding,
             snapshot=snapshot,
             street_edges=exposure is not None,
+            indicator_settings=indicator_settings,
             perspectives=perspectives,
             costs=costs,
             currency=currency,
@@ -871,6 +909,7 @@ def _itineraries_frame(
     max_snap_distance,
     street_policy=None,
     street_edges=False,
+    indicator_settings=None,
     perspectives=None,
     costs=None,
     currency=None,
@@ -906,6 +945,10 @@ def _itineraries_frame(
     from cafein.policy import CarParkPolicy
 
     car_park = isinstance(street_policy, CarParkPolicy)
+    # A car-park drive's network metres per road class, for its particles.
+    road_bins = (
+        _car_road_classes(network, indicator_settings, "car") if car_park else None
+    )
     if street_policy is not None:
         if kind != "points":
             raise ValueError("street_policy applies to point origins and destinations")
@@ -1048,6 +1091,7 @@ def _itineraries_frame(
                     components,
                     arrive_by=arrive_by,
                     speeds=speeds,
+                    edge_bins=road_bins,
                 )
             if not journeys:
                 continue
@@ -1078,6 +1122,22 @@ def _itineraries_frame(
                         leg,
                         mode=street_policy is not None,
                     )
+                    if indicator_settings is not None:
+                        record.update(
+                            _leg_indicators(
+                                record,
+                                indicator_settings,
+                                leg.get("road_metres"),
+                                (
+                                    (
+                                        street_policy.vehicle_class,
+                                        street_policy.occupancy,
+                                    )
+                                    if car_park
+                                    else None
+                                ),
+                            )
+                        )
                     if fares is not None:
                         # A fare prices the whole journey (tickets span
                         # legs); every row of the option repeats it.
@@ -1114,6 +1174,9 @@ def _itineraries_frame(
     if fares is not None:
         columns = list(columns)
         columns.insert(columns.index("emissions") + 1, "money")
+    if indicator_settings is not None:
+        at = columns.index("emissions") + 1
+        columns = [*columns[:at], *indicator_settings.indicators, *columns[at:]]
     if street_edges:
         columns = list(columns) + [
             "street_edges",
@@ -1168,6 +1231,7 @@ def _route(
     components=None,
     arrive_by=False,
     speeds=None,
+    edge_bins=None,
 ):
     """The Pareto-optimal journeys of one OD pair — the time-optimal
     (arrival, rides) set, or the (arrival, emissions) McRAPTOR set with
@@ -1213,6 +1277,7 @@ def _route(
             street_policy=street_policy,
             arrive_by=arrive_by,
             speeds=speeds,
+            edge_bins=edge_bins,
         )
     return network._route_between_stops(
         origin_key,
@@ -1455,6 +1520,10 @@ def _exposed_frame(frame, exposure):
                 for column in ("money", "journey_departure_s"):
                     if column in record:
                         wait[column] = record[column]
+                # Waiting is neither walking nor cycling, and emits nothing.
+                for column in _indicators.INDICATORS:
+                    if column in record:
+                        wait[column] = 0.0
                 wait.update(
                     {
                         "from_id": record["from_id"],
@@ -1488,6 +1557,38 @@ def _exposed_frame(frame, exposure):
         ["from_id", "to_id", "option"], sort=False, dropna=False
     ).cumcount()
     return exposed
+
+
+def _leg_indicators(record, settings, road_metres=None, car_terms=None):
+    """A leg record's requested trip-indicator values: transit rides, park
+    events and a car-park drive (connectors included, as the matrix
+    counts its ``street_distance_m``) count no activity; another street
+    leg's network metres ride its mode and its connectors are walked. A
+    car-park drive's particles come from its network metres per road class
+    (`road_metres`) at the policy's ``(vehicle_class, occupancy)``
+    (`car_terms`); every other leg releases no car particles."""
+    legs = []
+    mode = record.get("mode") or "walk"
+    if record["leg_type"] not in ("transit", "park") and mode != "car_park":
+        network = record.get("network_distance_m")
+        if network is None:
+            legs = [(mode, record["distance_m"])]
+        else:
+            legs = [(mode, network), ("walk", record["connector_distance_m"])]
+    columns = {
+        name: float(value)
+        for name, value in settings.trip_columns(legs, record["emissions"]).items()
+    }
+    if mode == "car_park" and road_metres is not None:
+        vehicle_class, occupancy = car_terms
+        particles = settings.street_particles(
+            "car", _drive_class_metres([road_metres]), 1, vehicle_class, occupancy
+        )
+    else:
+        particles = settings.street_particles(mode, {}, 1, None, 1.0)
+    # One leg: each particle column holds a single value.
+    columns.update({name: float(values[0]) for name, values in particles.items()})
+    return columns
 
 
 def _leg_record(from_id, to_id, option, segment, leg, mode=False):
@@ -1588,6 +1689,7 @@ def _street_itineraries_frame(
     costs=None,
     currency=None,
     cost_components=None,
+    indicator_settings=None,
     exposure=None,
     multipliers=None,
     keep_edges=False,
@@ -1597,6 +1699,7 @@ def _street_itineraries_frame(
     from cafein._cafein import STREET_DISTANCE_PROVENANCE
     from cafein.street_network import _resolved_delays
 
+    road_classes = _car_road_classes(network, indicator_settings, transport_mode)
     resolved_parking = _parking.resolve(parking, transport_mode)
     occupancy, vehicle_class = emissions._car_query_options(
         transport_mode, occupancy, vehicle_class
@@ -1634,6 +1737,7 @@ def _street_itineraries_frame(
         speeds=query.speeds,
         multipliers=None if multipliers is None else list(multipliers),
         street_edges=exposure is not None,
+        edge_bins=road_classes,
     )
     _warn_unsnapped(
         table,
@@ -1661,7 +1765,10 @@ def _street_itineraries_frame(
         )
         to_index = np.asarray(table["to"])
         travel_time = travel_time + np.rint(seconds[to_index]).astype(np.int64)
-        network_distance = network_distance + metres[to_index]
+        parked = metres[to_index]
+        network_distance = network_distance + parked
+    else:
+        parked = None
     rows = len(travel_time)
     # A street network has no timetable, so absolute times exist only when a
     # time is supplied to place the leg on a clock: departures anchor
@@ -1709,6 +1816,22 @@ def _street_itineraries_frame(
         },
         columns=[column for column in STREET_COLUMNS if column != "geometry"],
     )
+    if indicator_settings is not None:
+        # After the fixed leg schema, before the cost account, as in the
+        # street cost matrix.
+        for name, values in indicator_settings.trip_columns(
+            [(transport_mode, network_distance), ("walk", connector_distance)],
+            frame["emissions"].to_numpy(),
+        ).items():
+            frame[name] = values
+        for name, values in indicator_settings.street_particles(
+            transport_mode,
+            _road_class_metres(table, road_classes, parked),
+            rows,
+            vehicle_class,
+            occupancy,
+        ).items():
+            frame[name] = values
     if account is not None:
         # Appended after the fixed leg schema: costs ride the same driven
         # kilometres as the emissions, and a missing row's NaN propagates.

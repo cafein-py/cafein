@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- `TravelCostMatrix`, `travel_cost_table` and `DetailedItineraries` add
+  per-trip indicator columns on request, `indicators=`:
+  `physical_activity` (MET-hours of walking and cycling, from the
+  distance), `climate_cost` (`emissions` times a CO₂ price; `co2_price=`
+  `"low"`, `"middle"` or `"high"`, 60, 100 and 189 €/t, or a number), and
+  `pm10` and `pm2_5` (mg of a car's exhaust and non-exhaust particles by
+  road class; other modes count none).
+  ([#456](https://github.com/cafein-py/cafein/pull/456), [#457](https://github.com/cafein-py/cafein/pull/457), [#458](https://github.com/cafein-py/cafein/pull/458), [#461](https://github.com/cafein-py/cafein/pull/461), [#463](https://github.com/cafein-py/cafein/pull/463))
+- `cafein.indicators` holds the shipped values with their sources
+  (`co2_prices()`, `activity_rates()`, `particle_factors()`), with low,
+  middle and high cases where sources give them; `activity_rates=` and
+  `particle_factors=` pick a case or take own tables. Car builds store each
+  street's `road_class`; networks saved by earlier versions must be rebuilt.
+  ([#454](https://github.com/cafein-py/cafein/pull/454), [#459](https://github.com/cafein-py/cafein/pull/459), [#460](https://github.com/cafein-py/cafein/pull/460))
+- A cost-table row with an unknown `street_mode` is refused with a message
+  listing the street modes: an e-bike prices with the bicycle rows and
+  every car powertrain with the car rows. ([#453](https://github.com/cafein-py/cafein/pull/453))
+- `compare_to_fastest` reports a journey's `emissions`, `distance_m` and
+  indicator totals as NaN when a moving leg's value is unresolved, instead
+  of leaving that leg out of the sum. ([#462](https://github.com/cafein-py/cafein/pull/462))
+
 ## 0.32.0 — 2026-11-01
 
 - A recipe's `streets` input can name a pyrosm recipe,

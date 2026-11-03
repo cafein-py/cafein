@@ -127,52 +127,23 @@ def test_cost_overrides_merge_partially_and_validate():
         0.108 - 0.011 + 0.020
     )
     assert costs.street_cost("e_scooter", "societal", costs=override) == 0.030
-    for bad in [
-        pd.DataFrame(
-            [
-                {
-                    "perspective": "societal",
-                    "street_mode": "bus",
-                    "component": "climate",
-                    "cost_per_km": 0.1,
-                }
-            ]
-        ),
-        pd.DataFrame(
-            [
-                {
-                    "perspective": "commercial",
-                    "street_mode": "car",
-                    "component": "climate",
-                    "cost_per_km": 0.1,
-                }
-            ]
-        ),
-        pd.DataFrame(
-            [
-                {
-                    "perspective": "societal",
-                    "street_mode": "car",
-                    "component": "climate",
-                    "cost_per_km": float("inf"),
-                }
-            ]
-        ),
-        pd.DataFrame(
-            [
-                {
-                    "perspective": "societal",
-                    "street_mode": "car",
-                    "component": "",
-                    "cost_per_km": 0.1,
-                }
-            ]
-        ),
-        override.iloc[[0, 0]],  # duplicate key
-        pd.DataFrame([{"perspective": "societal", "cost_per_km": 0.1}]),
+    row = {
+        "perspective": "societal",
+        "street_mode": "car",
+        "component": "climate",
+        "cost_per_km": 0.1,
+    }
+    for bad, message in [
+        ([{**row, "street_mode": "bus"}], "unknown street_mode"),
+        ([{**row, "street_mode": "e_bike"}], "e-bike prices with the bicycle rows"),
+        ([{**row, "perspective": "commercial"}], "unknown cost perspective"),
+        ([{**row, "cost_per_km": float("inf")}], "finite"),
+        ([{**row, "component": ""}], "non-empty component"),
+        (override.iloc[[0, 0]], "duplicate"),  # duplicate key
+        ([{"perspective": "societal", "cost_per_km": 0.1}], "misses column"),
     ]:
-        with pytest.raises(ValueError):
-            costs.load_street_costs(bad)
+        with pytest.raises(ValueError, match=message):
+            costs.load_street_costs(pd.DataFrame(bad))
 
 
 def test_uncovered_modes_stay_nan_even_with_component_columns(
@@ -323,3 +294,54 @@ def test_itinerary_legs_carry_the_cost_account(helsinki_streets, origins, destin
     assert np.allclose(legs.cost_private, kilometres * 0.047)
     assert np.allclose(legs.cost_societal, kilometres * -0.184)
     assert (legs.currency == "EUR2017").all()
+
+
+def test_street_outputs_report_the_trip_indicators(
+    helsinki_streets, origins, destinations, tmp_path
+):
+    from cafein import indicators, travel_cost_table
+
+    options = {
+        "transport_mode": "bicycle",
+        "indicators": ["climate_cost", "physical_activity"],
+        "co2_price": "high",
+    }
+    matrix = TravelCostMatrix(helsinki_streets, origins, destinations, **options)
+    after = list(matrix.columns).index("emissions") + 1
+    assert list(matrix.columns)[after : after + 2] == [
+        "physical_activity",
+        "climate_cost",
+    ]
+    rates = indicators.activity_rates().set_index(["street_mode", "case"])
+    rate = rates.met_hours_per_km
+    walked = matrix.connector_distance_m * rate["walk", "middle"]
+    ridden = matrix.network_distance_m * rate["bicycle", "middle"]
+    assert np.allclose(matrix.physical_activity, (ridden + walked) / 1000)
+    assert np.allclose(matrix.climate_cost, matrix.emissions * 189 / 1e6)
+    # The itineraries, the Arrow table and the streamed shards report the
+    # same values per pair.
+    legs = DetailedItineraries(
+        helsinki_streets, origins, destinations, geometries=False, **options
+    )
+    table = travel_cost_table(helsinki_streets, origins, destinations, **options)
+    TravelCostMatrix.to_parquet(
+        helsinki_streets,
+        origins,
+        destinations,
+        output=tmp_path / "streamed.parquet",
+        **options,
+    )
+    streamed = pd.read_parquet(tmp_path / "streamed.parquet")
+    keys = ["from_id", "to_id"]
+    expected = matrix[keys + ["physical_activity", "climate_cost"]]
+    for other in (legs, table.to_pandas(), streamed):
+        joined = expected.merge(
+            other[keys + ["physical_activity", "climate_cost"]].astype(
+                {"from_id": str, "to_id": str}
+            ),
+            on=keys,
+            suffixes=("", "_other"),
+        )
+        assert len(joined) == len(expected) > 0
+        for name in ("physical_activity", "climate_cost"):
+            assert np.allclose(joined[name], joined[f"{name}_other"])

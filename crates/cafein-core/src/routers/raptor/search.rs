@@ -331,6 +331,7 @@ impl<'a> Search<'a> {
         let mut transit_meters = 0.0;
         let mut walk_meters = 0.0;
         let mut street_meters = 0.0;
+        let mut rental_network_meters = 0.0;
         let mut rental_transfers = 0u32;
         let mut rental_minutes = 0u32;
         let mut grams = 0.0;
@@ -460,6 +461,7 @@ impl<'a> Search<'a> {
                         Some((token, grams_per_meter)) => {
                             walk_meters += (edge_meters - token.ride_total_meters).max(0.0);
                             street_meters += token.ride_total_meters;
+                            rental_network_meters += token.ride_network_meters;
                             rental_transfers += 1;
                             rental_minutes += token.ride_seconds.div_ceil(60);
                             // A zero-meter ride adds nothing, whatever the
@@ -590,6 +592,7 @@ impl<'a> Search<'a> {
             transit_meters,
             walk_meters,
             street_meters,
+            rental_network_meters,
             rental_transfers,
             rental_minutes,
             emission_grams: if resolved { grams } else { f64::NAN },

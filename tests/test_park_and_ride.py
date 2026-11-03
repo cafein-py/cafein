@@ -761,7 +761,7 @@ def test_the_time_matrix_cells_reconcile_with_the_route(car_park_network, axis):
                 assert abs(cell - best) <= 1
 
 
-def test_the_cost_matrix_carries_the_car_chain(car_park_network):
+def test_the_cost_matrix_carries_the_car_chain(car_park_network, monkeypatch):
     from cafein import DetailedItineraries, TravelCostMatrix
 
     policy = _pasila_policy(vehicle_class="ICE", occupancy=2.0)
@@ -771,6 +771,16 @@ def test_the_cost_matrix_carries_the_car_chain(car_park_network):
     destinations = geopandas.GeoDataFrame(
         {"id": ["d"]}, geometry=[Point(24.9520, 60.1795)], crs="EPSG:4326"
     )
+    itinerary = DetailedItineraries(
+        car_park_network,
+        origins,
+        destinations,
+        DEPARTURE_TIME,
+        street_policy=policy,
+        max_walking_time=8,
+        **CAR_PARTICLES,
+    )
+    _mutate_occupancy_mid_query(monkeypatch, policy)
     frame = TravelCostMatrix(
         car_park_network,
         origins,
@@ -779,17 +789,10 @@ def test_the_cost_matrix_carries_the_car_chain(car_park_network):
         street_policy=policy,
         max_walking_time=8,
         output_time_units="seconds",
+        **CAR_PARTICLES,
     )
     assert list(frame["from_id"]) == ["o"] and list(frame["to_id"]) == ["d"]
     assert "facility_id" not in frame.columns
-    itinerary = DetailedItineraries(
-        car_park_network,
-        origins,
-        destinations,
-        DEPARTURE_TIME,
-        street_policy=policy,
-        max_walking_time=8,
-    )
     # The itineraries enumerate ride-count options; the matrix cell is
     # the time-fastest of them.
     durations = (
@@ -815,6 +818,20 @@ def test_the_cost_matrix_carries_the_car_chain(car_park_network):
         walks["distance_m"].sum(), rel=1e-6
     )
     assert frame["travel_time"].iloc[0] == int(durations.min())
+    # Only the walks count activity, in the cell and on the legs alike.
+    assert (drive["physical_activity"] == 0).all()
+    assert frame["physical_activity"].iloc[0] == pytest.approx(
+        frame["walk_distance_m"].iloc[0] / 1000 * 4.0 / 5.3, rel=1e-9
+    )
+    assert frame["physical_activity"].iloc[0] == pytest.approx(
+        float(journey["physical_activity"].sum()), rel=1e-6
+    )
+    # The particles are the drive's: its network kilometres at the flat
+    # factor over the occupancy, on the leg and in the cell alike.
+    expected = kilometres * 10.0 / 2.0
+    assert drive["pm10"].iloc[0] == pytest.approx(expected, rel=1e-9)
+    assert (journey.loc[journey["mode"] != "car_park", "pm10"] == 0).all()
+    assert frame["pm10"].iloc[0] == pytest.approx(expected, rel=1e-6)
 
 
 def test_a_walk_won_cell_prices_zero(car_park_network):
@@ -1051,7 +1068,32 @@ def test_the_walk_still_wins_nearby_under_the_deadline(car_park_network):
     assert best["arrival_s"] == DEADLINE_S
 
 
-def test_the_arrive_by_cost_matrix_carries_the_car_chain(car_park_network):
+#: The trip indicators with one flat car particle factor on every road class.
+CAR_PARTICLES = {
+    "indicators": ["physical_activity", "pm10"],
+    "particle_factors": [
+        {"vehicle_class": "ICE", "road_class": road, "pm10": 10.0, "pm2_5": 4.0}
+        for road in ("urban", "rural", "motorway")
+    ],
+}
+
+
+def _mutate_occupancy_mid_query(monkeypatch, policy):
+    """Make the caller's `policy` change its occupancy once a car-park
+    query has started building its access tables; the query must keep
+    the terms it started with."""
+    import cafein.network
+
+    build = cafein.network._car_park_table
+
+    def mutating(*args, **kwargs):
+        policy.occupancy = 4.0
+        return build(*args, **kwargs)
+
+    monkeypatch.setattr(cafein.network, "_car_park_table", mutating)
+
+
+def test_the_arrive_by_cost_matrix_carries_the_car_chain(car_park_network, monkeypatch):
     from cafein import DetailedItineraries, TravelCostMatrix
 
     # Two viable facilities with distinct fees: the cell must carry
@@ -1068,6 +1110,16 @@ def test_the_arrive_by_cost_matrix_carries_the_car_chain(car_park_network):
     destinations = geopandas.GeoDataFrame(
         {"id": ["d"]}, geometry=[Point(24.9520, 60.1795)], crs="EPSG:4326"
     )
+    itinerary = DetailedItineraries(
+        car_park_network,
+        origins,
+        destinations,
+        arrival=ARRIVAL_TIME,
+        street_policy=policy,
+        max_walking_time=8,
+        **CAR_PARTICLES,
+    )
+    _mutate_occupancy_mid_query(monkeypatch, policy)
     frame = TravelCostMatrix(
         car_park_network,
         origins,
@@ -1076,16 +1128,9 @@ def test_the_arrive_by_cost_matrix_carries_the_car_chain(car_park_network):
         street_policy=policy,
         max_walking_time=8,
         output_time_units="seconds",
+        **CAR_PARTICLES,
     )
     assert list(frame["from_id"]) == ["o"] and list(frame["to_id"]) == ["d"]
-    itinerary = DetailedItineraries(
-        car_park_network,
-        origins,
-        destinations,
-        arrival=ARRIVAL_TIME,
-        street_policy=policy,
-        max_walking_time=8,
-    )
     # The cell is the complete-journey winner — the LATEST departure,
     # the itineraries' leading option — never a faster-but-earlier or
     # more-ridden substitution.
@@ -1102,6 +1147,13 @@ def test_the_arrive_by_cost_matrix_carries_the_car_chain(car_park_network):
     )
     duration = int(journey["arrival_s"].max() - journey["departure_s"].min())
     assert frame["travel_time"].iloc[0] == duration
+    # The elected drive's particles, as on its leg.
+    assert frame["pm10"].iloc[0] == pytest.approx(
+        float(journey["pm10"].sum()), rel=1e-6
+    )
+    assert frame["pm10"].iloc[0] == pytest.approx(
+        drive["network_distance_m"].iloc[0] / 1000 * 10.0 / 2.0, rel=1e-6
+    )
 
 
 def test_a_tied_walk_beats_the_through_stop_car_cell(car_park_network):

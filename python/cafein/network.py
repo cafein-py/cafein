@@ -315,7 +315,7 @@ def _transfer_leg_dicts(
 _CAR_PARK_SNAP_METERS = 500.0
 
 
-def _car_park_offsets(core, origin, policy, walk_options, geometries):
+def _car_park_offsets(core, origin, policy, walk_options, geometries, edge_bins=None):
     """The composed park-and-ride access table and its tokens.
 
     Per stop, the best of (drive to a facility + its parking search +
@@ -324,7 +324,9 @@ def _car_park_offsets(core, origin, policy, walk_options, geometries):
     time every ordinary walk, the policy's budgets bound the car
     chain. The token records the winning chain for reconstruction:
     ``(facility_position, drive_s, park_s, walk_s, drive_network_m,
-    drive_connector_m, walk_m, drive_wkb)``.
+    drive_connector_m, walk_m, drive_wkb, drive_bins)``; `drive_bins` is
+    the drive's network metres per bin of `edge_bins` (one bin index per
+    multimodal edge), ``None`` without them.
     """
     from cafein.street_network import _resolved_delays
 
@@ -342,6 +344,7 @@ def _car_park_offsets(core, origin, policy, walk_options, geometries):
         float(policy.max_car_seconds),
         _CAR_PARK_SNAP_METERS,
         geometries,
+        edge_bins=edge_bins,
     )
     if all(drive is None for drive in drives):
         raise ValueError(
@@ -358,7 +361,7 @@ def _car_park_offsets(core, origin, policy, walk_options, geometries):
     for position, drive in enumerate(drives):
         if drive is None:
             continue
-        drive_s, network_m, connector_m, shape = drive
+        drive_s, network_m, connector_m, shape, bins = drive
         park_s = int(round(float(facilities["search_seconds"].iloc[position])))
         walks = linked[position]
         if walks is None:
@@ -380,12 +383,13 @@ def _car_park_offsets(core, origin, policy, walk_options, geometries):
                         connector_m,
                         walk_m,
                         shape,
+                        bins,
                     ),
                 )
     return best
 
 
-def _car_park_table(core, origin, policy, walk_options, geometries):
+def _car_park_table(core, origin, policy, walk_options, geometries, edge_bins=None):
     """The merged access table: per stop, the better of the composed
     car chain and the ordinary walk (ties to the walk), with tokens
     for the stops the car carries and the walking plane's
@@ -398,7 +402,9 @@ def _car_park_table(core, origin, policy, walk_options, geometries):
     walking_speed, walk_budget, snap_distance = walk_options
     # The car rows and the walking rows read the same graph.
     snapshot = NetworkSnapshot(core)
-    best = _car_park_offsets(core, origin, policy, walk_options, geometries)
+    best = _car_park_offsets(
+        core, origin, policy, walk_options, geometries, edge_bins=edge_bins
+    )
     linked = core._link_walking_stops(
         [tuple(origin)], walking_speed, walk_budget, snap_distance
     )[0]
@@ -437,6 +443,7 @@ def _car_park_journeys(
     geometries,
     walk_options,
     arrive_by=False,
+    edge_bins=None,
 ):
     """Door-to-door journeys under a ``CarParkPolicy``.
 
@@ -467,7 +474,7 @@ def _car_park_journeys(
     destination = tuple(destination)
     walking_speed, walk_budget, snap_distance = walk_options
     offsets, tokens, _walking = _car_park_table(
-        core, origin, policy, walk_options, geometries
+        core, origin, policy, walk_options, geometries, edge_bins=edge_bins
     )
     egress_walks = core.access_stops(
         destination[0], destination[1], walking_speed, walk_budget, snap_distance
@@ -546,6 +553,7 @@ def _car_park_journeys(
                     connector_m,
                     _walk_m,
                     drive_wkb,
+                    drive_bins,
                 ) = tokens[stop]
                 facility_id = facilities["id"].iloc[position]
                 latitude = facilities.geometry.iloc[position].y
@@ -567,6 +575,7 @@ def _car_park_journeys(
                         "connector_distance_m": connector_m,
                         "distance_provenance": STREET_DISTANCE_PROVENANCE,
                         "geometry": drive_wkb,
+                        "road_metres": drive_bins,
                     }
                 )
                 legs.append(
@@ -650,6 +659,7 @@ def _car_park_journeys(
                 connector_m,
                 _walk_m,
                 drive_wkb,
+                drive_bins,
             ) = tokens[stop]
             facility_id = facilities["id"].iloc[position]
             latitude = facilities.geometry.iloc[position].y
@@ -674,6 +684,7 @@ def _car_park_journeys(
                         "connector_distance_m": connector_m,
                         "distance_provenance": STREET_DISTANCE_PROVENANCE,
                         "geometry": drive_wkb,
+                        "road_metres": drive_bins,
                     },
                     {
                         "type": "park",
@@ -2173,13 +2184,17 @@ class TransportNetwork:
         ``bicycle``, ``e_scooter``, ``car``, ``wheelchair``) holding
         the edge's permission as ``"both"``, ``"forward"``,
         ``"reverse"``, or ``"no"`` (forward is the stored geometry
-        direction). Raises when no street network is installed.
+        direction); a car build adds ``road_class``, as in
+        ``StreetNetwork.streets_gdf``. Raises when no street network is
+        installed.
         Computed lazily on first access and cached on the network.
         """
         if getattr(self, "_streets_gdf_cache", None) is None:
             from cafein.street_network import _edge_layer_frame
 
-            self._streets_gdf_cache = _edge_layer_frame(self._core._street_edge_layer())
+            self._streets_gdf_cache = _edge_layer_frame(
+                self._core._street_edge_layer(), self._core._car_edge_codes()
+            )
         return self._streets_gdf_cache
 
     def annotate_emissions(self, journeys, factors=None, components=None):
@@ -2866,6 +2881,7 @@ class TransportNetwork:
         street_policy=None,
         arrive_by=False,
         speeds=None,
+        edge_bins=None,
     ):
         """``route_between_coordinates`` in core space: split ``date`` +
         ``departure`` strings, ``max_transfers``, and every duration
@@ -2873,7 +2889,9 @@ class TransportNetwork:
         conversion. With ``arrive_by`` the time is the arrival deadline
         (the public wrapper rejects a street-leg policy beside it; the
         car-park policy serves both axes). ``speeds`` is a street-leg
-        policy's validated ``{mode: km/h}``."""
+        policy's validated ``{mode: km/h}``; ``edge_bins`` (one bin index
+        per multimodal edge) gives a car-park drive leg its network metres
+        per bin as ``road_metres``."""
         if street_policy is not None:
             from cafein.matrices import _walking_only_policy
             from cafein.policy import CarParkPolicy
@@ -2909,6 +2927,7 @@ class TransportNetwork:
                         walking_speed_kmph, max_walking_time, max_snap_distance
                     ),
                     arrive_by=arrive_by,
+                    edge_bins=edge_bins,
                 )
             if any(
                 option is not None

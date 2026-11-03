@@ -1514,3 +1514,52 @@ def test_the_memory_budget_plans_against_the_current_resident_size():
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     peak *= 1 if sys.platform == "darwin" else 1024
     assert _memory.resident_bytes() < peak - 128 * 1024**2
+
+
+def test_a_journey_with_an_unresolved_leg_keeps_its_totals_unresolved():
+    # Roadmap §62: compare_to_fastest skipped a leg's NaN emissions and
+    # distance, so a journey with missing data looked cleaner and shorter.
+    # Waits, park events and zero-duration placeholder legs move nowhere
+    # and still count zero.
+    import math
+
+    import pandas as pd
+
+    from cafein import compare_to_fastest
+
+    nan = math.nan
+    legs = pd.DataFrame(
+        {
+            "from_id": ["a"] * 8,
+            "to_id": ["b"] * 8,
+            "option": [0, 0, 0, 1, 1, 1, 1, 2],
+            "segment": [0, 1, 2, 0, 1, 2, 3, 0],
+            "leg_type": [
+                "access",
+                "transit",
+                "walk",
+                "access",
+                "wait",
+                "park",
+                "transit",
+                "walk",
+            ],
+            "departure_s": [0, 0, 300, 0, 0, 120, 120, 0],
+            "arrival_s": [0, 300, 900, 0, 120, 120, 960, 0],
+            "travel_time_s": [0, 300, 600, 0, 120, 0, 840, 0],
+            "distance_m": [nan, 3000.0, nan, nan, 5.0, nan, 9000.0, nan],
+            "emissions": [nan, nan, 0.0, nan, nan, nan, 90.0, nan],
+        }
+    )
+    # A nullable column's pd.NA reads as unresolved, as NaN does.
+    legs["distance_m"] = legs["distance_m"].astype("Float64")
+    totals = compare_to_fastest(legs).set_index("option")
+    # The walk's distance and the ride's emissions are unknown.
+    assert math.isnan(totals.loc[0, "distance_m"])
+    assert math.isnan(totals.loc[0, "emissions"])
+    # The placeholder access, the wait and the park event count zero,
+    # whatever they carry.
+    assert totals.loc[1, "distance_m"] == 9000.0
+    assert totals.loc[1, "emissions"] == 90.0
+    # A journey of a single placeholder leg goes nowhere.
+    assert totals.loc[2, ["distance_m", "emissions"]].tolist() == [0.0, 0.0]

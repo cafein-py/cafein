@@ -22,6 +22,7 @@ from cafein._validate import (
     sequence_not_string,
 )
 from cafein import _memory, _sweep
+from cafein import indicators as _indicators
 from cafein._snapshot import NetworkSnapshot
 from cafein._units import duration_seconds, memory_spec
 from cafein.policy import policy_speeds
@@ -118,6 +119,13 @@ def _optional_columns(kwargs, exposure_snapshot):
     count = 0
     for key in ("perspectives", "cost_components", "components"):
         count += _log.sized(kwargs.get(key)) or 0
+    indicators = kwargs.get("indicators")
+    if isinstance(indicators, str):
+        count += 1
+    elif indicators is not None:
+        # An iterable without a length is never consumed here: it counts
+        # as every indicator.
+        count += _log.sized(indicators) or len(_indicators.INDICATORS)
     if exposure_snapshot is not None:
         count += len(exposure_snapshot.column_names())
     return count
@@ -856,6 +864,41 @@ class TravelCostMatrix(pd.DataFrame):
         ``currency=`` (default ``"EUR2017"``) is a declared label
         carried in a ``currency`` column, never a conversion. A mode
         without a matching row prices NaN, never zero.
+    indicators, co2_price, activity_rates, particle_factors : optional
+        Per-trip indicator columns, off by default (values and sources
+        in ``cafein.indicators``). ``indicators=`` selects any of:
+
+        - ``"physical_activity"``: MET-hours of walking and cycling, each
+          mode's kilometres times its rate — a street matrix's network
+          kilometres in its mode and its connectors walked, a transit
+          matrix's ``walk_distance_m``, a car-park drive counting zero.
+          Under a ``street_policy`` each end's ridden network metres
+          count at their mode's rate, its connectors walked, and rental
+          transfers at the transfer mode's rate; a policy granting the
+          wheelchair reports ``climate_cost`` only, its rolled and
+          walked metres being one total.
+        - ``"climate_cost"``: ``emissions`` times a CO₂ price per tonne,
+          in the price's currency. The societal cost account already
+          counts climate: ``climate_cost`` is not added to it.
+        - ``"pm10"`` and ``"pm2_5"``: the particles the trip's car
+          releases into street air (tyre, brake and road wear, road dust,
+          exhaust), mg per person — the car's metres on each road class
+          (``streets_gdf``'s ``road_class``; parking-search metres count as
+          urban) times the factor of its ``vehicle_class``, divided by
+          ``occupancy``: a StreetNetwork car matrix's drive, or a
+          ``CarParkPolicy`` row's drive to its facility. Every other mode
+          counts none — no source covers the particles of bicycles,
+          e-bikes, e-scooters or transit vehicles — and other transit
+          matrices refuse these columns.
+
+        ``co2_price=`` takes ``"low"``, ``"middle"`` (the default) or
+        ``"high"`` — the European Commission handbook's 60, 100 and 189
+        per tonne in 2016 euros — or a number; ``activity_rates=`` takes
+        a case name or own MET-hours per km by street mode (a mapping or
+        a table); ``particle_factors=`` a case name or own mg per
+        vehicle-km by vehicle class and road class (a table). A case no
+        source gives uses the middle value with a warning, and a mode or
+        vehicle class without a value leaves its column NaN.
 
     Notes
     -----
@@ -976,6 +1019,10 @@ class TravelCostMatrix(pd.DataFrame):
         costs=None,
         currency=None,
         cost_components=None,
+        indicators=None,
+        co2_price=None,
+        activity_rates=None,
+        particle_factors=None,
         exposure=None,
         output_time_units="minutes",
         workers=None,
@@ -1081,6 +1128,9 @@ class TravelCostMatrix(pd.DataFrame):
                 costs=costs,
                 currency=currency,
                 cost_components=cost_components,
+                indicator_settings=_indicators.resolve_query(
+                    indicators, co2_price, activity_rates, particle_factors
+                ),
                 exposure=exposure,
                 weights=_street_weights(optimize),
                 sweep=candidates == "sweep",
@@ -1118,6 +1168,9 @@ class TravelCostMatrix(pd.DataFrame):
                 )
             )
             return
+        indicator_settings = _transit_indicator_settings(
+            indicators, co2_price, activity_rates, particle_factors, street_policy
+        )
         # The moment(s): a scalar keeps today's frame; a list or mapping
         # adds the slot columns, one block of rows per slot.
         slots, labeled, multi = _time_slots(departure, arrival, arrive_by)
@@ -1319,6 +1372,7 @@ class TravelCostMatrix(pd.DataFrame):
                 arrival=arrival,
                 _resolved=_resolved,
                 _slot_table=_slot_tables.get(at),
+                indicator_settings=indicator_settings,
             )
             frame = pd.DataFrame(_humanize_time_columns(data, output_time_units))
             if multi:
@@ -1379,6 +1433,10 @@ class TravelCostMatrix(pd.DataFrame):
         costs=None,
         currency=None,
         cost_components=None,
+        indicators=None,
+        co2_price=None,
+        activity_rates=None,
+        particle_factors=None,
         exposure=None,
         output_time_units="minutes",
         workers=None,
@@ -1527,6 +1585,9 @@ class TravelCostMatrix(pd.DataFrame):
                 costs=costs,
                 currency=currency,
                 cost_components=cost_components,
+                indicator_settings=_indicators.resolve_query(
+                    indicators, co2_price, activity_rates, particle_factors
+                ),
                 exposure=exposure,
             )
             return _stream_street_cost(
@@ -1555,6 +1616,9 @@ class TravelCostMatrix(pd.DataFrame):
                 arrive_by=arrive_by,
                 router=router,
             )
+        indicator_settings = _transit_indicator_settings(
+            indicators, co2_price, activity_rates, particle_factors
+        )
         _reject_cost_street_args(
             transport_mode,
             max_street_time,
@@ -1602,6 +1666,7 @@ class TravelCostMatrix(pd.DataFrame):
             resume=resume,
             output_time_units=output_time_units,
             exposure=exposure,
+            indicator_settings=indicator_settings,
             workers=workers,
             max_memory=max_memory,
         )
@@ -2585,6 +2650,7 @@ def _street_cost_columns(
     costs=None,
     currency=None,
     cost_components=None,
+    indicator_settings=None,
     exposure=None,
     weights=None,
     sweep=False,
@@ -2617,6 +2683,7 @@ def _street_cost_columns(
         costs=costs,
         currency=currency,
         cost_components=cost_components,
+        indicator_settings=indicator_settings,
         exposure=exposure,
         weights=weights,
         sweep=sweep,
@@ -2651,6 +2718,7 @@ def _street_cost_columns(
     order += ["travel_time_s", "distance_m"]
     order += ["network_distance_m", "connector_distance_m", "distance_provenance"]
     order += ["emissions"]
+    order += _indicator_columns(resolved)
     order += [name for name in data if name.startswith("cost_")]
     if "currency" in data:
         order.append("currency")
@@ -2683,6 +2751,7 @@ def _street_cost_resolution(
     costs,
     currency,
     cost_components,
+    indicator_settings=None,
     exposure=None,
     weights=None,
     sweep=False,
@@ -2765,6 +2834,7 @@ def _street_cost_resolution(
     account = _costs.resolve_query(
         transport_mode, perspectives, costs, currency, cost_components
     )
+    road_classes = _car_road_classes(network, indicator_settings, transport_mode)
     parking_costs = (
         None
         if resolved_parking is None
@@ -2778,8 +2848,13 @@ def _street_cost_resolution(
         ),
         "parking_costs": parking_costs,
         "occupancy": occupancy,
+        "vehicle_class": vehicle_class,
         "factor": factor,
         "account": account,
+        "indicators": indicator_settings,
+        # Each edge's road class, frozen for a car query's particles (None
+        # otherwise).
+        "road_classes": road_classes,
         # A frozen copy: the streamed batches and the manifest
         # fingerprint read one state, whatever happens to the caller's
         # Exposure meanwhile — the fare/policy frozen-input pattern.
@@ -2867,6 +2942,7 @@ def _street_cost_cells(
         speeds=query.speeds,
         multipliers=multipliers,
         street_edges=exposure is not None or keep_edges,
+        edge_bins=resolved["road_classes"],
         workers=_memory.width_or(workers),
     )
     _warn_unsnapped(
@@ -2878,6 +2954,7 @@ def _street_cost_cells(
     network_distance = table["network_distance"]
     connector_distance = table["connector_distance"]
     travel_time_s = table["travel_time_s"]
+    parked = None
     if resolved["parking_costs"] is not None:
         # The parking search ends each reachable trip: its seconds join the
         # travel time and its metres the driven network distance (and with
@@ -2885,7 +2962,8 @@ def _street_cost_cells(
         seconds, metres = resolved["parking_costs"]
         to_index = np.asarray(table["to"])
         travel_time_s = travel_time_s + np.rint(seconds[to_index]).astype(np.int64)
-        network_distance = network_distance + metres[to_index]
+        parked = metres[to_index]
+        network_distance = network_distance + parked
     numeric = {
         "travel_time_s": travel_time_s,
         # Reported alongside its parts, not instead of them: the two are
@@ -2899,6 +2977,22 @@ def _street_cost_cells(
         # row was divided by the occupancy at resolution).
         "emissions": network_distance / 1000.0 * resolved["factor"],
     }
+    if resolved["indicators"] is not None:
+        numeric.update(
+            resolved["indicators"].trip_columns(
+                [(transport_mode, network_distance), ("walk", connector_distance)],
+                numeric["emissions"],
+            )
+        )
+        numeric.update(
+            resolved["indicators"].street_particles(
+                transport_mode,
+                _road_class_metres(table, resolved["road_classes"], parked),
+                len(network_distance),
+                resolved["vehicle_class"],
+                resolved["occupancy"],
+            )
+        )
     if resolved["account"] is not None:
         # Costs ride the same driven kilometres as the emissions —
         # parking-search metres included, connectors excluded — and a
@@ -3533,8 +3627,10 @@ def compare_to_fastest(frame):
 
     The result has one row per journey: the keys and ``option`` when
     present; the journey's totals — from leg rows, ``travel_time``
-    summed over the journey's rows (waits included), ``emissions`` and
-    ``distance_m`` summed, ``money`` once, and the ``exposure_totals()``
+    summed over the journey's rows (waits included), ``emissions``,
+    ``distance_m`` and the trip-indicator columns summed — NaN when a
+    moving leg's value is NaN, while waits, park events and zero-duration
+    legs count zero — ``money`` once, and the ``exposure_totals()``
     columns when the frame was built with ``exposure=``; from journey
     rows, the numeric columns as they are — a boolean ``fastest``
     marking the pair's fastest journey (the least ``travel_time``, ties
@@ -3565,9 +3661,30 @@ def compare_to_fastest(frame):
             keys + ["option"], sort=False, dropna=False, observed=True
         )
         journeys = grouped[time_column].sum(min_count=1).to_frame(time_column)
-        for column in ("emissions", "distance_m"):
+        # A movement leg with an unresolved value leaves its journey's total
+        # unresolved; waits, park events and zero-duration placeholder legs
+        # move nowhere and count zero.
+        duration = frame[time_column].astype("Float64")
+        if {"departure_s", "arrival_s"} <= set(frame.columns):
+            # Exact seconds where the legs carry clock times: a short walk
+            # rounds to zero minutes but still moves.
+            clock = (frame["arrival_s"] - frame["departure_s"]).astype("Float64")
+            duration = clock.fillna(duration)
+        moving = duration.fillna(0).to_numpy(dtype=float) > 0
+        if "leg_type" in frame.columns:
+            moving &= ~frame["leg_type"].isin(["wait", "park"]).to_numpy()
+        for column in ("emissions", "distance_m", *_indicators.INDICATORS):
             if column in frame.columns:
-                journeys[column] = grouped[column].sum(min_count=1)
+                values = pd.to_numeric(frame[column], errors="coerce").to_numpy(
+                    dtype=float, na_value=np.nan
+                )
+                per_journey = frame.assign(
+                    _value=np.where(moving, values, 0.0),
+                    _unresolved=np.isnan(values) & moving,
+                ).groupby(keys + ["option"], sort=False, dropna=False, observed=True)
+                journeys[column] = (
+                    per_journey["_value"].sum().where(~per_journey["_unresolved"].any())
+                )
         if "money" in frame.columns:
             journeys["money"] = grouped["money"].first()
         for label in _JOURNEY_LABELS:
@@ -3695,6 +3812,10 @@ def travel_cost_table(
     costs=None,
     currency=None,
     cost_components=None,
+    indicators=None,
+    co2_price=None,
+    activity_rates=None,
+    particle_factors=None,
     exposure=None,
     output=None,
     batch_size=None,
@@ -3870,6 +3991,9 @@ def travel_cost_table(
             costs=costs,
             currency=currency,
             cost_components=cost_components,
+            indicator_settings=_indicators.resolve_query(
+                indicators, co2_price, activity_rates, particle_factors
+            ),
             exposure=exposure,
         )
         if output is None:
@@ -3893,6 +4017,9 @@ def travel_cost_table(
             resume=resume,
             output_time_units=output_time_units,
         )
+    indicator_settings = _transit_indicator_settings(
+        indicators, co2_price, activity_rates, particle_factors
+    )
     _reject_cost_street_args(
         transport_mode,
         max_street_time,
@@ -3998,6 +4125,7 @@ def travel_cost_table(
                 pyarrow,
                 output_time_units,
                 exposure=report,
+                indicator_settings=indicator_settings,
             )
             if multi:
                 arrow = _insert_slot_arrow_columns(
@@ -4039,6 +4167,7 @@ def travel_cost_table(
         resume=resume,
         output_time_units=output_time_units,
         exposure=exposure,
+        indicator_settings=indicator_settings,
     )
 
 
@@ -4076,6 +4205,7 @@ def _stream_transit_cost(
     resume=False,
     output_time_units="minutes",
     exposure=None,
+    indicator_settings=None,
     workers=None,
     max_memory=None,
 ):
@@ -4140,6 +4270,8 @@ def _stream_transit_cost(
         "walk_distance_m",
         "emissions",
     ]
+    if indicator_settings is not None:
+        columns += list(indicator_settings.indicators)
     if fares is not None:
         columns.append("money")
     if exposure is not None:
@@ -4179,6 +4311,9 @@ def _stream_transit_cost(
         # The fingerprint hashes the layer data itself, so a resume with
         # a same-named but different exposure can never wrongly match.
         "exposure": None if exposure is None else exposure._fingerprint(),
+        "indicators": (
+            None if indicator_settings is None else indicator_settings.fingerprint()
+        ),
         "output_time_units": output_time_units,
     }
 
@@ -4260,6 +4395,7 @@ def _stream_transit_cost(
             # keep their global keys, so only the point form offsets.
             to_offset=rows.start if arrive_by and points is not None else 0,
             exposure=report,
+            indicator_settings=indicator_settings,
         )
 
     make_batch = _slot_batches(make_moment, slots, labeled, multi, arrive_by, pyarrow)
@@ -4681,6 +4817,63 @@ def _transit_exposure_columns(
     return out
 
 
+def _car_road_classes(network, settings, transport_mode):
+    """Each edge's road-class index (into ``cafein.indicators.ROAD_CLASSES``)
+    as a list, for a car query that requests particles, else ``None``;
+    refused on a network without the road classes of a car build."""
+    if (
+        settings is None
+        or transport_mode != "car"
+        or not {"pm10", "pm2_5"} & set(settings.indicators)
+    ):
+        return None
+    from cafein._osm import road_classes
+
+    codes = network._core._car_edge_codes()
+    if codes is None:
+        raise ValueError(
+            "pm10 and pm2_5 need the road classes of a car build; build the "
+            'network with "car" in its modes'
+        )
+    return road_classes(*codes).tolist()
+
+
+def _road_class_metres(table, road_classes, parked=None):
+    """Each cell's driven metres by road class, ``{class: metres}``, from
+    the core's ``binned_meters`` (the traversed network metres summed per
+    class); a parking search's metres (`parked`) count as urban. ``{}``
+    without road classes."""
+    if road_classes is None:
+        return {}
+    cells = len(table["from"])
+    present = max(road_classes, default=-1) + 1
+    binned = np.asarray(table["binned_meters"], dtype=float).reshape(cells, present)
+    metres = {
+        name: binned[:, at] if at < present else np.zeros(cells)
+        for at, name in enumerate(_indicators.ROAD_CLASSES)
+    }
+    if parked is not None:
+        metres["urban"] = metres["urban"] + parked
+    return metres
+
+
+def _drive_class_metres(drives):
+    """Per row, a car-park drive's network metres by road class,
+    ``{class: metres}``, from each row's per-bin metres (``None``: the row
+    drove nothing)."""
+    metres = {name: np.zeros(len(drives)) for name in _indicators.ROAD_CLASSES}
+    for at, bins in enumerate(drives):
+        for slot, value in enumerate(() if bins is None else bins):
+            metres[_indicators.ROAD_CLASSES[slot]][at] = value
+    return metres
+
+
+def _indicator_columns(resolved):
+    """The trip-indicator columns a resolved street query reports."""
+    settings = resolved["indicators"]
+    return [] if settings is None else list(settings.indicators)
+
+
 def _street_arrow_table(network, resolved, geometries, pa, output_time_units):
     """The street cost matrix as one Arrow table — ``travel_cost_table``'s
     street form, the streamed shards' schema in a single batch."""
@@ -4712,6 +4905,8 @@ def _street_arrow_table(network, resolved, geometries, pa, output_time_units):
         ),
         "emissions": pa.array(numeric["emissions"]),
     }
+    for name in _indicator_columns(resolved):
+        data[name] = pa.array(numeric[name])
     for name, values in numeric.items():
         if name.startswith("cost_"):
             data[name] = pa.array(values)
@@ -4759,6 +4954,7 @@ def _stream_street_cost(
         "distance_provenance",
         "emissions",
     ]
+    columns += _indicator_columns(resolved)
     if account is not None:
         totals, breakdown, label = account
         columns += [f"cost_{perspective}" for perspective in totals]
@@ -4780,8 +4976,14 @@ def _stream_street_cost(
         "car_model": resolved["car_model"],
         "parking_costs": resolved["parking_costs"],
         "occupancy": resolved["occupancy"],
+        "vehicle_class": resolved["vehicle_class"],
         "factor": resolved["factor"],
         "account": None if account is None else [totals, breakdown, label],
+        "indicators": (
+            None
+            if resolved["indicators"] is None
+            else resolved["indicators"].fingerprint()
+        ),
         # The fingerprint hashes the layer data itself, so a resume with
         # a same-named but different exposure can never wrongly match.
         "exposure": None if exposure is None else exposure._fingerprint(),
@@ -4838,6 +5040,8 @@ def _stream_street_cost(
                 "emissions": pa.array(numeric["emissions"]),
             }
         )
+        for name in _indicator_columns(resolved):
+            data[name] = pa.array(numeric[name])
         for name, values in numeric.items():
             if name.startswith("cost_"):
                 data[name] = pa.array(values)
@@ -5347,6 +5551,7 @@ def _arrow_table(
     output_time_units,
     to_offset=0,
     exposure=None,
+    indicator_settings=None,
 ):
     """One batch's Arrow table over the shared id dictionary domains.
 
@@ -5372,6 +5577,11 @@ def _arrow_table(
         "walk_distance_m": pa.array(table["walk_distance"]),
         "emissions": pa.array(table["emissions"]),
     }
+    if indicator_settings is not None:
+        for name, values in indicator_settings.trip_columns(
+            [("walk", table["walk_distance"])], table["emissions"]
+        ).items():
+            columns[name] = pa.array(values)
     if fares is not None:
         columns["money"] = pa.array(table["fare"])
     if exposure is not None:
@@ -5462,6 +5672,7 @@ def _cost_matrix_data(
     _slot_table=None,
     max_memory=None,
     speeds=None,
+    indicator_settings=None,
 ):
     """The long-format columns of one moment's transit cost matrix,
     dispatched by street policy exactly as the constructor did; ``speeds``
@@ -5533,7 +5744,12 @@ def _cost_matrix_data(
                 if arrive_by
                 else _car_park_cost_columns
             )
-            return arm(
+            # One frozen policy for the routing and the particles, even if
+            # the caller mutates theirs mid-query.
+            import copy
+
+            street_policy = copy.deepcopy(street_policy)
+            data = arm(
                 network,
                 origins,
                 destinations,
@@ -5554,6 +5770,27 @@ def _cost_matrix_data(
                 exclude_trips=exclude_trips,
                 workers=workers,
                 max_memory=max_memory,
+                indicator_settings=indicator_settings,
+            )
+            # The drive counts no activity; the walks do. The particles are
+            # the drive's, by the road classes it drove.
+            drive = data.pop("_drive_metres", None)
+            particles = (
+                {}
+                if indicator_settings is None
+                else indicator_settings.street_particles(
+                    "car",
+                    drive or {},
+                    len(data["emissions"]),
+                    street_policy.vehicle_class,
+                    street_policy.occupancy,
+                )
+            )
+            return _with_indicators(
+                data,
+                indicator_settings,
+                [("walk", data["walk_distance_m"]), ("car", data["street_distance_m"])],
+                particles,
             )
         offending = next(
             (
@@ -5581,6 +5818,15 @@ def _cost_matrix_data(
 
         _reject_carriage(street_policy, "matrix computation")
         walk_only, walk_budget = _walking_only_policy(street_policy)
+        if indicator_settings is not None and _grants_wheelchair(street_policy):
+            # Its rolled and walked metres are one walking-class total.
+            indicator_settings.check_supported(
+                ("climate_cost",), "a street_policy matrix granting the wheelchair"
+            )
+        activity = (
+            indicator_settings is not None
+            and "physical_activity" in indicator_settings.indicators
+        )
         if walk_only:
             # A walking-only policy IS the legacy cost matrix, at the
             # policy's one walking budget. A street-mode factor table
@@ -5634,6 +5880,7 @@ def _cost_matrix_data(
                 workers=workers,
                 max_memory=max_memory,
                 speeds=speeds,
+                mode_metres=activity,
             )
         data = {
             "from_id": np.array(from_ids, dtype=object)[table["from"]],
@@ -5655,7 +5902,11 @@ def _cost_matrix_data(
             data["geometry"] = shapely.from_wkb(
                 np.array(table["geometry"], dtype=object)
             )
-        return data
+        # The street vehicles' metres by mode beside the walked metres.
+        ridden = list(table.get("mode_metres", {}).items())
+        return _with_indicators(
+            data, indicator_settings, [("walk", data["walk_distance_m"]), *ridden]
+        )
     if exposure is not None:
         router = _validate_transit_exposure(
             exposure,
@@ -5720,7 +5971,46 @@ def _cost_matrix_data(
             data[column] = table[column]
     if geometries:
         data["geometry"] = shapely.from_wkb(np.array(table["geometry"], dtype=object))
-    return data
+    return _with_indicators(
+        data, indicator_settings, [("walk", data["walk_distance_m"])]
+    )
+
+
+def _transit_indicator_settings(
+    indicators, co2_price, activity_rates, particle_factors, street_policy=None
+):
+    """The resolved trip-indicator settings of a transit cost matrix, which
+    reports physical activity and climate cost, and under a
+    ``CarParkPolicy`` the drive's particles."""
+    from cafein.policy import CarParkPolicy
+
+    settings = _indicators.resolve_query(
+        indicators, co2_price, activity_rates, particle_factors
+    )
+    if settings is not None:
+        drives = isinstance(street_policy, CarParkPolicy)
+        settings.check_supported(
+            ("physical_activity", "climate_cost")
+            + (("pm10", "pm2_5") if drives else ()),
+            "a TransportNetwork matrix",
+        )
+    return settings
+
+
+def _with_indicators(data, settings, legs, particles=None):
+    """`data` with the requested trip-indicator columns of trips riding
+    `legs` (``[(street mode, metres), ...]``) — and the `particles`
+    columns, when given — right after ``emissions``."""
+    if settings is None:
+        return data
+    columns = settings.trip_columns(legs, data["emissions"])
+    columns.update(particles or {})
+    placed = {}
+    for name, values in data.items():
+        placed[name] = values
+        if name == "emissions":
+            placed.update(columns)
+    return placed
 
 
 def _cost_columns(
@@ -6144,6 +6434,15 @@ def _warn_unsnapped(table, from_ids, to_ids, network="the walking network"):
             f"{len(missed)} {side} point(s) are off {network} "
             f"and unreachable ({named}{suffix})",
         )
+
+
+def _grants_wheelchair(policy):
+    """Whether a street-leg policy grants the wheelchair anywhere: at
+    either end or for the transfers."""
+    return any(
+        "wheelchair" in (grants or {})
+        for grants in (policy.access, policy.egress, policy.transfers)
+    )
 
 
 def _walking_only_policy(policy):
@@ -6694,11 +6993,14 @@ def _policy_cost_columns(
     workers=None,
     max_memory=None,
     speeds=None,
+    mode_metres=False,
 ):
     """The street-policy cost matrix columns: per-point meters-carrying
     reductions through the engine fan-out, street distances and emissions
     attributed per row from the winning choices, and the direct walking
-    alternative folded in over the same multimodal graph."""
+    alternative folded in over the same multimodal graph. With
+    ``mode_metres`` the table also carries each row's street metres by
+    the mode that rode them (`_policy_mode_metres`)."""
     components = component_selection(components)
     from cafein import emissions
     from cafein import streets as _streets
@@ -6773,7 +7075,7 @@ def _policy_cost_columns(
     def reduced(points, egress, modes):
         """The engine's meters rows per point, the unsnapped points, and
         per point the street facts a tariff bills, by stop."""
-        rows, unsnapped, facts = [], [], []
+        rows, unsnapped, facts, ridden = [], [], [], []
         for index, (lat, lon) in enumerate(points):
             try:
                 cells = core._reduced_street_rows(
@@ -6791,6 +7093,7 @@ def _policy_cost_columns(
                 # An unsnapped point reaches nothing; its cells are omitted.
                 rows.append([])
                 facts.append({})
+                ridden.append({})
                 unsnapped.append(index)
                 continue
             rows.append(
@@ -6825,12 +7128,18 @@ def _policy_cost_columns(
             facts.append(
                 {cell[0]: (cell[2], cell[9], cell[10], cell[8]) for cell in cells}
             )
-        return rows, unsnapped, facts
+            ridden.append(
+                {
+                    cell[0]: (cell[2], cell[3], cell[4], cell[6], cell[7])
+                    for cell in cells
+                }
+            )
+        return rows, unsnapped, facts, ridden
 
-    access_rows, unsnapped_origins, access_facts = reduced(
+    access_rows, unsnapped_origins, access_facts, access_ridden = reduced(
         origin_points, False, access_modes
     )
-    egress_rows, unsnapped_destinations, egress_facts = reduced(
+    egress_rows, unsnapped_destinations, egress_facts, egress_ridden = reduced(
         destination_points, True, egress_modes
     )
     # The direct walking alternative always applies — walking needs no
@@ -6899,7 +7208,46 @@ def _policy_cost_columns(
             egress_facts,
             core,
         )
+    if mode_metres:
+        table["mode_metres"] = _policy_mode_metres(
+            table,
+            None if transfer_mode is None else transfer_mode[0],
+            access_ridden,
+            egress_ridden,
+            core,
+        )
     return table, from_ids, to_ids
+
+
+def _policy_mode_metres(table, rental_mode, access_ridden, egress_ridden, core):
+    """Each row's street metres by the mode that rode them,
+    ``{mode: metres per row}``: network metres in the mode that rode them
+    (an end's own mode, the transfer mode for a carried rental transfer and
+    the mid-journey rentals), every connector walked. With the row's
+    ``walk_distance`` they make up every metre the street legs covered."""
+    stops_by_index = [stop for stop, _lat, _lon in core.stops]
+    count = len(table["street_distance"])
+    metres = collections.defaultdict(lambda: np.zeros(count))
+
+    def add(stops, points, ridden):
+        for at, (stop_index, point) in enumerate(zip(stops, points)):
+            if stop_index == _NO_STOP:
+                continue
+            mode, network_m, connector_m, transfer_network_m, transfer_total_m = ridden[
+                point
+            ][stops_by_index[stop_index]]
+            metres[mode][at] += network_m
+            metres["walk"][at] += connector_m + transfer_total_m - transfer_network_m
+            if transfer_network_m:
+                metres[rental_mode][at] += transfer_network_m
+
+    add(table["access_stop"], table["from"], access_ridden)
+    add(table["egress_stop"], table["to"], egress_ridden)
+    if rental_mode is not None:
+        ridden = np.asarray(table["rental_network_distance"], dtype=float)
+        metres[rental_mode] += ridden
+        metres["walk"] += np.asarray(table["rental_street_distance"]) - ridden
+    return dict(metres)
 
 
 def _policy_money(table, street, shared, rental_mode, access_facts, egress_facts, core):
@@ -6960,6 +7308,7 @@ def _car_park_cost_columns(
     exclude_trips=(),
     workers=None,
     max_memory=None,
+    indicator_settings=None,
 ):
     """The CarParkPolicy cost-matrix columns.
 
@@ -7018,11 +7367,12 @@ def _car_park_cost_columns(
     # composition, the egress linking, and the direct-walk fold must
     # read the same street graph; an install mid-computation refuses.
     snapshot = NetworkSnapshot(core)
-    access_rows, fee_by_stop, undriven = [], [], []
+    road_classes = _car_road_classes(network, indicator_settings, "car")
+    access_rows, fee_by_stop, drive_by_stop, undriven = [], [], [], []
     for index, point in enumerate(origin_points):
         try:
             offsets, tokens, walking = _car_park_table(
-                core, tuple(point), policy, walk_options, False
+                core, tuple(point), policy, walk_options, False, edge_bins=road_classes
             )
         except ValueError as error:
             message = str(error)
@@ -7033,9 +7383,10 @@ def _car_park_cost_columns(
                 raise
             access_rows.append([])
             fee_by_stop.append({})
+            drive_by_stop.append({})
             undriven.append(index)
             continue
-        row, stop_fees = [], {}
+        row, stop_fees, stop_drives = [], {}, {}
         for stop, total in offsets:
             token = tokens.get(stop)
             if token is None:
@@ -7043,7 +7394,7 @@ def _car_park_cost_columns(
                     (stop, total, 0.0, 0.0, walking[stop][1], 0.0, 0.0, 0.0, False)
                 )
                 continue
-            position, _d, _p, _w, network_m, connector_m, walk_m, _shape = token
+            position, _d, _p, _w, network_m, connector_m, walk_m, _shape, bins = token
             row.append(
                 (
                     stop,
@@ -7058,8 +7409,10 @@ def _car_park_cost_columns(
                 )
             )
             stop_fees[stop] = fees[position]
+            stop_drives[stop] = bins
         access_rows.append(row)
         fee_by_stop.append(stop_fees)
+        drive_by_stop.append(stop_drives)
     egress_linked = core._link_walking_stops(
         list(destination_points), walking_speed, walk_budget, snap_distance
     )
@@ -7206,6 +7559,14 @@ def _car_park_cost_columns(
         )
         for i, stop_index in zip(columns["from"], columns["access_stop"])
     ]
+    drive_column = [
+        (
+            drive_by_stop[i].get(stops_by_index[stop_index])
+            if stop_index != no_stop
+            else None
+        )
+        for i, stop_index in zip(columns["from"], columns["access_stop"])
+    ]
     order = sorted(
         range(len(columns["from"])),
         key=lambda at: (columns["from"][at], columns["to"][at]),
@@ -7223,6 +7584,8 @@ def _car_park_cost_columns(
         "emissions": [columns["emissions"][at] for at in order],
         "fee": [fee_column[at] for at in order],
     }
+    if road_classes is not None:
+        data["_drive_metres"] = _drive_class_metres([drive_column[at] for at in order])
     if geometries:
         data["geometry"] = shapely.from_wkb(
             np.array([shapes[at] for at in order], dtype=object)
@@ -7471,6 +7834,7 @@ def _car_park_arrive_by_cost_columns(
     exclude_trips=(),
     workers=None,
     max_memory=None,
+    indicator_settings=None,
 ):
     """The CarParkPolicy arrive-by cost-matrix columns.
 
@@ -7523,11 +7887,13 @@ def _car_park_arrive_by_cost_columns(
     # calls; the snapshot proves they all read the same street graph
     # and closure.
     snapshot = NetworkSnapshot(core)
+    road_classes = _car_road_classes(network, indicator_settings, "car")
     access_offsets, rows_by_stop, fee_by_stop, undriven = [], [], [], []
+    drive_by_stop = []
     for index, point in enumerate(origin_points):
         try:
             offsets, tokens, walking = _car_park_table(
-                core, tuple(point), policy, walk_options, False
+                core, tuple(point), policy, walk_options, False, edge_bins=road_classes
             )
         except ValueError as error:
             message = str(error)
@@ -7539,9 +7905,10 @@ def _car_park_arrive_by_cost_columns(
             access_offsets.append([])
             rows_by_stop.append({})
             fee_by_stop.append({})
+            drive_by_stop.append({})
             undriven.append(index)
             continue
-        by_stop, stop_fees = {}, {}
+        by_stop, stop_fees, stop_drives = {}, {}, {}
         for stop, total in offsets:
             token = tokens.get(stop)
             if token is None:
@@ -7557,7 +7924,7 @@ def _car_park_arrive_by_cost_columns(
                     False,
                 )
                 continue
-            position, _d, _p, _w, network_m, connector_m, walk_m, _shape = token
+            position, _d, _p, _w, network_m, connector_m, walk_m, _shape, bins = token
             by_stop[stop] = (
                 stop,
                 total,
@@ -7570,9 +7937,11 @@ def _car_park_arrive_by_cost_columns(
                 True,
             )
             stop_fees[stop] = fees[position]
+            stop_drives[stop] = bins
         access_offsets.append(offsets)
         rows_by_stop.append(by_stop)
         fee_by_stop.append(stop_fees)
+        drive_by_stop.append(stop_drives)
     egress_linked = core._link_walking_stops(
         list(destination_points), walking_speed, walk_budget, snap_distance
     )
@@ -7687,6 +8056,7 @@ def _car_park_arrive_by_cost_columns(
         "street_distance": [],
         "emissions": [],
         "fee": [],
+        "drive": [],
     }
     shapes = [] if geometries else None
     for (i, departure_s, stop_index, rides), cells in sorted(groups.items()):
@@ -7736,6 +8106,7 @@ def _car_park_arrive_by_cost_columns(
             columns["street_distance"].append(float(priced["street_distance"][at]))
             columns["emissions"].append(float(priced["emissions"][at]))
             columns["fee"].append(fee)
+            columns["drive"].append(drive_by_stop[i].get(stop))
             if shapes is not None:
                 shapes.append(priced["geometry"][at])
         missing = [j for j in cells if j not in found]
@@ -7768,6 +8139,7 @@ def _car_park_arrive_by_cost_columns(
         columns["street_distance"].append(network_m + connector_m if used else 0.0)
         columns["emissions"].append(grams)
         columns["fee"].append(fee_by_stop[i].get(stop, 0.0))
+        columns["drive"].append(drive_by_stop[i].get(stop) if used else None)
         if shapes is not None:
             shapes.append(None)
 
@@ -7799,6 +8171,7 @@ def _car_park_arrive_by_cost_columns(
         columns["street_distance"].append(0.0)
         columns["emissions"].append(0.0)
         columns["fee"].append(0.0)
+        columns["drive"].append(None)
         if shapes is not None:
             shapes.append(walk_shape(i, j))
     snapshot.verify("the park-and-ride matrix")
@@ -7819,6 +8192,10 @@ def _car_park_arrive_by_cost_columns(
         "emissions": [columns["emissions"][at] for at in order],
         "fee": [columns["fee"][at] for at in order],
     }
+    if road_classes is not None:
+        data["_drive_metres"] = _drive_class_metres(
+            [columns["drive"][at] for at in order]
+        )
     if geometries:
         data["geometry"] = shapely.from_wkb(
             np.array([shapes[at] for at in order], dtype=object)

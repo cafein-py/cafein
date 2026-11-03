@@ -506,6 +506,7 @@ impl TransportNetwork {
                                 transit_meters: 0.0,
                                 walk_meters: *meters,
                                 street_meters: 0.0,
+                                rental_network_meters: 0.0,
                                 rental_transfers: 0,
                                 rental_minutes: 0,
                                 emission_grams: 0.0,
@@ -899,6 +900,7 @@ impl TransportNetwork {
                                             transit_meters: 0.0,
                                             walk_meters: meters,
                                             street_meters: 0.0,
+                                            rental_network_meters: 0.0,
                                             rental_transfers: 0,
                                             rental_minutes: 0,
                                             emission_grams: 0.0,
@@ -926,6 +928,7 @@ impl TransportNetwork {
                                             transit_meters: 0.0,
                                             walk_meters: meters,
                                             street_meters: 0.0,
+                                            rental_network_meters: 0.0,
                                             rental_transfers: 0,
                                             rental_minutes: 0,
                                             emission_grams: 0.0,
@@ -1640,6 +1643,7 @@ impl TransportNetwork {
                                 transit_meters: 0.0,
                                 walk_meters: *meters,
                                 street_meters: 0.0,
+                                rental_network_meters: 0.0,
                                 rental_transfers: 0,
                                 rental_minutes: 0,
                                 emission_grams: 0.0,
@@ -2143,6 +2147,7 @@ impl TransportNetwork {
                                 transit_meters: 0.0,
                                 walk_meters: *meters,
                                 street_meters: 0.0,
+                                rental_network_meters: 0.0,
                                 rental_transfers: 0,
                                 rental_minutes: 0,
                                 emission_grams: 0.0,
@@ -2451,8 +2456,9 @@ pub(super) fn parse_objective(objective: &str, fares: Option<&FareTables>) -> Py
 
 /// The policy cost rows as equal-length arrays — `cost_rows_dict` plus
 /// the attributed ``street_distance`` column, the winning access and
-/// egress stops, and the rental transfers ridden with the started
-/// minutes they bill.
+/// egress stops, the rental transfers ridden with the started minutes
+/// they bill, and the mid-journey rental metres within the street
+/// distance, in total and on the network alone.
 fn policy_cost_rows_dict(
     py: Python<'_>,
     rows: Vec<Vec<PolicyCostRow>>,
@@ -2466,6 +2472,8 @@ fn policy_cost_rows_dict(
     let mut egress = Vec::with_capacity(total);
     let mut rentals = Vec::with_capacity(total);
     let mut minutes = Vec::with_capacity(total);
+    let mut rental_meters = Vec::with_capacity(total);
+    let mut rental_network = Vec::with_capacity(total);
     let plain = rows
         .into_iter()
         .map(|origin_rows| {
@@ -2477,6 +2485,8 @@ fn policy_cost_rows_dict(
                     egress.push(policy_row.row.egress_stop);
                     rentals.push(policy_row.row.rental_transfers);
                     minutes.push(policy_row.row.rental_minutes);
+                    rental_meters.push(policy_row.row.street_meters);
+                    rental_network.push(policy_row.row.rental_network_meters);
                     policy_row.row
                 })
                 .collect()
@@ -2489,6 +2499,8 @@ fn policy_cost_rows_dict(
     dict.set_item("egress_stop", egress.into_pyarray(py))?;
     dict.set_item("rental_transfers", rentals.into_pyarray(py))?;
     dict.set_item("rental_minutes", minutes.into_pyarray(py))?;
+    dict.set_item("rental_street_distance", rental_meters.into_pyarray(py))?;
+    dict.set_item("rental_network_distance", rental_network.into_pyarray(py))?;
     Ok(result)
 }
 
@@ -2641,6 +2653,7 @@ pub(super) fn merge_direct_walk_cells(
             transit_meters: 0.0,
             walk_meters: meters,
             street_meters: 0.0,
+            rental_network_meters: 0.0,
             rental_transfers: 0,
             rental_minutes: 0,
             emission_grams: 0.0,
