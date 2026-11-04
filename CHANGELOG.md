@@ -22,6 +22,11 @@
 - `compare_to_fastest` reports a journey's `emissions`, `distance_m` and
   indicator totals as NaN when a moving leg's value is unresolved, instead
   of leaving that leg out of the sum. ([#462](https://github.com/cafein-py/cafein/pull/462))
+- The conventional bicycle emits 32 g CO₂e per km instead of 37 g: its
+  extra food is 16 g, the European Cyclists' Federation's value, beside the
+  ITF manufacture and infrastructure; the 21 g it carried was a whole
+  life-cycle factor that counted the manufacture a second time.
+  ([#464](https://github.com/cafein-py/cafein/pull/464))
 
 ## 0.32.0 — 2026-11-01
 

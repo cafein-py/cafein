@@ -139,25 +139,29 @@ def street_factors():
     The micromobility life-cycle components come from the ITF "Good to
     Go?" LCA model (Cazzola & Crist 2020) computed with the Finland 2020
     electricity mix through its ``cafein-lca`` reimplementation — the
-    same calibration as the transit defaults — except the shared
-    e-scooter, whose values follow the Helsinki fleet study of Judl,
-    Horn, Mosoni & Suomalainen (2026, doi:10.1007/s11367-026-02685-2):
-    the current-generation (2GEN) scenario's gross impacts, without
-    end-of-life recycling credits, split by the paper's contribution
-    shares — plus the ITF infrastructure component, which that study's
-    system boundary excludes, grafted on so every micromobility row
-    shares one boundary. Assumptions ride the sources: ITF private
-    micromobility lifetimes (bicycle and e-bike 6 y, e-scooter 3 y) and
-    the Judl 5-year, 5,000 km shared-scooter lifetime.
+    same calibration as the transit defaults. The e-bike's ``fuel`` is
+    its charging electricity. The conventional bicycle's ``fuel`` is the
+    extra food a cyclist eats on an average European diet, 16 g CO₂e per
+    km, from the European Cyclists' Federation (Blondel, Mispelon &
+    Ferguson 2011, "Cycle more often 2 cool down the planet!", pp. 9–10),
+    the food share of the 21 g life-cycle factor Marin-Flores et al.
+    (2026, doi:10.5281/zenodo.23342365, eq. 6) use; the ITF model counts
+    no food. The e-bike counts no food either: assistance cuts the
+    rider's extra energy use. The shared e-scooter follows the Helsinki
+    fleet study of Judl, Horn, Mosoni & Suomalainen (2026,
+    doi:10.1007/s11367-026-02685-2): the current-generation (2GEN)
+    scenario's gross impacts, without end-of-life recycling credits,
+    split by the paper's contribution shares — plus the ITF
+    infrastructure component, which that study's system boundary
+    excludes, grafted on so every micromobility row shares one boundary.
+    Assumptions ride the sources: ITF private micromobility lifetimes
+    (bicycle and e-bike 6 y, e-scooter 3 y) and the Judl 5-year,
+    5,000 km shared-scooter lifetime.
 
     Walking is the model's zero baseline by convention — no vehicle, no
-    fuel, and its infrastructure is not allocated. The conventional
-    bicycle's ``fuel`` keeps the dietary energy-expenditure factor of
-    21 g CO₂e per km — the additional food intake compensating cycling
-    caloric expenditure under average European dietary patterns — which
-    the ITF model does not count; the e-bike carries its charging
-    electricity instead. Sourced user rows layered through ``factors=``
-    beat all of these — see ``load_street_factors``.
+    fuel, and its infrastructure is not allocated. Sourced user rows
+    layered through ``factors=`` beat all of these — see
+    ``load_street_factors``.
     """
     rows = [
         {
@@ -184,8 +188,8 @@ def street_factors():
             "vehicle_class": "conventional",
             "service_model": "private",
             "vehicle": 7.0,
-            # Dietary energy expenditure, average European diet: 21 g/km.
-            "fuel": 21.0,
+            # The extra food of an average European diet (ECF 2011).
+            "fuel": 16.0,
             "infrastructure": 9.0,
             "operations": 0.0,
         },
