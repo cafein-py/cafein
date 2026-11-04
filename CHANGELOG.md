@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.33.0 — 2026-11-04
 
 - `TravelCostMatrix`, `travel_cost_table` and `DetailedItineraries` add
   per-trip indicator columns on request, `indicators=`:
