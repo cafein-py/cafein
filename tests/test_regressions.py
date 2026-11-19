@@ -1563,3 +1563,64 @@ def test_a_journey_with_an_unresolved_leg_keeps_its_totals_unresolved():
     assert totals.loc[1, "emissions"] == 90.0
     # A journey of a single placeholder leg goes nowhere.
     assert totals.loc[2, ["distance_m", "emissions"]].tolist() == [0.0, 0.0]
+
+
+@pytest.mark.parametrize("pruning", ["walking build", "per-mode"])
+def test_an_unconnected_tunnel_system_is_pruned_however_large(pruning):
+    # A 202-vertex service tunnel under central Helsinki touched no street,
+    # so the island prune kept it; points above it snapped onto it and
+    # reached only the stops snapped there too. A component of only
+    # underground ways goes; a building passage, or a tunnel that reaches a
+    # street, stays.
+    import numpy as np
+    import pandas as pd
+
+    from cafein import _osm
+
+    def chain(start, count, tunnel):
+        return [(i, i + 1, tunnel) for i in range(start, start + count)]
+
+    rows = (
+        chain(0, 50, None)
+        + chain(100, 45, "yes")
+        + chain(200, 45, "building_passage")
+        + chain(300, 44, "yes")
+        + [(344, 345, None)]
+    )
+    edges = pd.DataFrame(rows, columns=["u", "v", "tunnel"])
+    nodes = pd.DataFrame({"id": sorted(set(edges["u"]) | set(edges["v"]))})
+    if pruning == "walking build":
+        kept = set(streets._prune_islands(nodes, edges)[1]["u"])
+    else:
+        u, v = streets._vertex_endpoints(nodes, edges)
+        walk = np.full(len(edges), _osm.WALK, dtype=np.uint8)
+        forward, _ = _osm.prune_components_per_profile(
+            u, v, len(nodes), walk, walk.copy(), underground=streets._underground(edges)
+        )
+        kept = set(edges["u"][forward & _osm.WALK != 0])
+    assert kept == set(edges["u"]) - set(range(100, 145))
+
+
+def test_senate_square_reaches_the_city_on_foot(
+    network_with_footpaths, helsinki_streets
+):
+    # The square's centre lay nearer the tunnel than any street in plan; it
+    # reached 4 stops on foot, and a walk from it reached nothing.
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    from cafein import DetailedItineraries
+
+    lat, lon = 60.16952, 24.95222
+    assert len(network_with_footpaths.access_stops(lat, lon)) > 100
+
+    def point(name, lat, lon):
+        return gpd.GeoDataFrame({"id": [name]}, geometry=[Point(lon, lat)], crs=4326)
+
+    legs = DetailedItineraries(
+        helsinki_streets,
+        point("senate_square", lat, lon),
+        point("kauppatori_pier", 60.167248, 24.955786),
+        transport_mode="walk",
+    )
+    assert len(legs) == 1

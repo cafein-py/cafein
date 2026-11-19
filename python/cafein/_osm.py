@@ -20,7 +20,7 @@ from scipy import sparse
 from scipy.sparse import csgraph
 
 from . import _log
-from .streets import MIN_ISLAND_VERTICES
+from .streets import MIN_ISLAND_VERTICES, _underground_islands
 
 # --- Mode permission bits (one per street mode) -------------------------------
 
@@ -1048,7 +1048,7 @@ def normalise_codes(edges):
 
 
 def prune_components_per_profile(
-    u, v, vertex_count, access_forward, access_reverse, modes=None
+    u, v, vertex_count, access_forward, access_reverse, modes=None, underground=None
 ):
     """Clear each mode's permission outside the part of each component it can
     route through in both directions.
@@ -1060,9 +1060,12 @@ def prune_components_per_profile(
     permitted arcs keeps only its largest strongly connected part, and only when
     that part has at least `MIN_ISLAND_VERTICES` vertices: a one-way pocket can
     be entered or left but not both, so a point snapped into it reaches nothing
-    or is reached from nowhere. Elsewhere the mode's bit is cleared (in both
-    directions); the physical edge stays as long as another mode still uses it.
-    Returns the pruned (access_forward, access_reverse).
+    or is reached from nowhere. A weak component that is an underground island
+    for the mode (`streets._underground_islands`, over the per-edge
+    `underground` flags; none without them) loses the mode too. Elsewhere the
+    mode's bit is cleared (in both directions); the physical edge stays as long
+    as another mode still uses it. Returns the pruned (access_forward,
+    access_reverse).
 
     `modes` names the modes to prune, defaulting to all of them. Pruning is the
     only thing a mode selection changes: no edge is dropped, so a mode left out
@@ -1116,6 +1119,11 @@ def prune_components_per_profile(
         largest = np.zeros(count, dtype=bool)
         largest[order[first]] = True
         kept = largest[strong] & (size_of[strong] >= MIN_ISLAND_VERTICES)
+        if underground is not None:
+            buried = _underground_islands(
+                weak[u[usable]], underground[usable], np.bincount(weak)
+            )
+            kept &= ~buried[weak]
         drop = usable & ~(kept[u] & kept[v])
         clear = np.uint8(0xFF ^ bit)
         forward[drop] &= clear
