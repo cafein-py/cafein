@@ -298,8 +298,8 @@ impl<'a> Search<'a> {
     ) -> Option<CostRow> {
         let mut best_round = 0;
         let mut best_arrival = UNREACHED;
-        for round in 0..=self.rounds {
-            let arrival = self.tau[round][stop.0 as usize];
+        for (round, tau) in self.tau.iter().enumerate().take(self.rounds + 1) {
+            let arrival = tau[stop.0 as usize];
             if arrival < best_arrival {
                 best_arrival = arrival;
                 best_round = round;

@@ -3,17 +3,6 @@
 use super::*;
 
 impl<'a> McTbtrEngine<'a> {
-    /// The batched Pareto frontiers over this engine's candidate set:
-    /// per request × destination slot, the (departure, arrival,
-    /// emissions bucket) Pareto journeys of the departure window —
-    /// each cell exactly the one-pair `route_range` set, the McTBTR
-    /// counterpart of `mcraptor::frontier_matrix`. Stop mode takes the
-    /// destination stops; door-to-door mode (`egress_active`) a
-    /// per-stop final-egress map over `slot_count` destination points,
-    /// the walking-only journey being the caller's overlay. One engine
-    /// build (one transfer set) serves every origin, fanned out with
-    /// rayon.
-    #[allow(clippy::too_many_arguments)]
     /// [`McTbtrEngine::frontier_matrix_with_progress`] without
     /// progress reporting.
     #[allow(clippy::too_many_arguments)]
@@ -41,6 +30,16 @@ impl<'a> McTbtrEngine<'a> {
         )
     }
 
+    /// The batched Pareto frontiers over this engine's candidate set:
+    /// per request × destination slot, the (departure, arrival,
+    /// emissions bucket) Pareto journeys of the departure window —
+    /// each cell exactly the one-pair `route_range` set, the McTBTR
+    /// counterpart of `mcraptor::frontier_matrix`. Stop mode takes the
+    /// destination stops; door-to-door mode (`egress_active`) a
+    /// per-stop final-egress map over `slot_count` destination points,
+    /// the walking-only journey being the caller's overlay. One engine
+    /// build (one transfer set) serves every origin, fanned out with
+    /// rayon.
     #[allow(clippy::too_many_arguments)]
     pub fn frontier_matrix_with_progress(
         &self,
