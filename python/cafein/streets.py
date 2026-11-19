@@ -13,9 +13,10 @@ cutoff is a direct footpath by the triangle inequality. The street network itsel
 over as flat arrays (edges with their geometry, plus the stops' snap
 links) for the core's query-time access/egress searches from arbitrary
 coordinates. Tiny disconnected components (mapping artifacts, clipped
-boundary stubs) are pruned so a snap cannot get trapped on one; larger
-disconnected components (genuine islands) stay, and stops snapped onto
-different components simply get no footpath between them.
+boundary stubs) are pruned so a snap cannot get trapped on one, as are
+disconnected components made only of tunnels; other larger disconnected
+components (genuine islands) stay, and stops snapped onto different
+components simply get no footpath between them.
 """
 
 import math
@@ -261,7 +262,7 @@ def _walking_network(osm_pbf, bounding_box=None):
     # The out-of-core engine streams the PBF instead of loading it into
     # memory, so country-scale extracts parse within bounded RAM. The walk
     # reads only the ids, end nodes, lengths and geometries, so no tag
-    # beyond `highway` and no element metadata is kept.
+    # beyond `highway` and `tunnel` and no element metadata is kept.
     with (
         _log.phase(
             "build.streets.read",
@@ -283,7 +284,7 @@ def _walking_network(osm_pbf, bounding_box=None):
             network_type="walking",
             custom_filter=_UNWALKABLE_FILTER,
             filter_type="exclude",
-            tags_to_keep=["highway"],
+            tags_to_keep=["highway", "tunnel"],
             nodes=True,
         )
         if network is None:
@@ -305,7 +306,8 @@ def _walking_network(osm_pbf, bounding_box=None):
 
 
 def _prune_islands(nodes, edges):
-    """The network without its sub-`MIN_ISLAND_VERTICES` components.
+    """The network without its sub-`MIN_ISLAND_VERTICES` components and its
+    underground islands (`_underground_islands`).
 
     A nearest-edge snap cannot tell a real street from a disconnected
     stub, so stubs must not exist to be snapped onto.
@@ -314,9 +316,52 @@ def _prune_islands(nodes, edges):
     graph = sparse.coo_matrix((np.ones(len(u)), (u, v)), shape=(len(nodes), len(nodes)))
     _, labels = csgraph.connected_components(graph, directed=False)
     sizes = np.bincount(labels)
-    edges = edges[sizes[labels[u]] >= MIN_ISLAND_VERTICES].reset_index(drop=True)
-    nodes = nodes[sizes[labels] >= MIN_ISLAND_VERTICES].reset_index(drop=True)
+    kept = (sizes >= MIN_ISLAND_VERTICES) & ~_underground_islands(
+        labels[u], _underground(edges), sizes
+    )
+    edges = edges[kept[labels[u]]].reset_index(drop=True)
+    nodes = nodes[kept[labels]].reset_index(drop=True)
     return nodes, edges
+
+
+_STREET_LEVEL_TUNNEL = (
+    "no",
+    "false",
+    "0",
+    "building_passage",
+    "covered",
+    "avalanche_protector",
+    "nan",
+    "",
+)
+"""`tunnel` values of a way at street level: negatives, passages through a
+building or under a roof, and pyrosm's missing-value spellings."""
+
+
+def _underground(edges):
+    """Whether each way is underground: tagged `tunnel` with a value not in
+    `_STREET_LEVEL_TUNNEL`. All False without a `tunnel` column."""
+    if "tunnel" not in edges.columns:
+        return np.zeros(len(edges), dtype=bool)
+    return np.array(
+        [isinstance(t, str) and t not in _STREET_LEVEL_TUNNEL for t in edges["tunnel"]],
+        dtype=bool,
+    )
+
+
+def _underground_islands(component, underground, sizes):
+    """Which components are underground islands: all of their edges are
+    underground, and they are not the largest component.
+
+    `component` labels each edge's component, `underground` flags each edge
+    (`_underground`) and `sizes` holds each component's vertex count. Such a
+    component is a tunnel system the extract leaves unconnected, such as a
+    service tunnel beneath a city centre; a point above it is nearer in plan
+    to the tunnel than to the street on top, so a snap would land in it.
+    """
+    islands = np.bincount(component[~underground], minlength=len(sizes)) == 0
+    islands[np.argmax(sizes)] = False
+    return islands
 
 
 def _network_footpaths(

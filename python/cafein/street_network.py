@@ -681,7 +681,13 @@ def multimodal_payload(
         access_forward, access_reverse, access_flags, _ = _osm.edge_permissions(edges)
         flags = class_flags | access_flags
         access_forward, access_reverse = _osm.prune_components_per_profile(
-            u, v, len(nodes), access_forward, access_reverse, modes=modes
+            u,
+            v,
+            len(nodes),
+            access_forward,
+            access_reverse,
+            modes=modes,
+            underground=streets._underground(edges),
         )
         ph.note = f"{len(edges):,} edges"
         ph.details.update(edges=len(edges), modes=list(modes))
